@@ -1,0 +1,78 @@
+.demo-header {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.2em;
+  padding: 0.8em 1em;
+  background: var(--vscode-sideBar-background);
+  border-bottom: 1px solid var(--vscode-widget-border);
+  color: var(--vscode-foreground);
+}
+.demo-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2em;
+  min-width: 14em;
+}
+.demo-heading strong {
+  font-size: 1.18em;
+}
+.demo-heading span {
+  color: var(--vscode-descriptionForeground);
+  line-height: 1.35;
+}
+#demo-notice {
+  color: var(--vscode-editorWarning-foreground);
+}
+#demo-notice:empty {
+  position: absolute;
+}
+.demo-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  flex-wrap: wrap;
+}
+.demo-tools label {
+  white-space: nowrap;
+}
+.demo-tools select {
+  font: inherit;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border);
+  border-radius: 3px;
+  padding: 0.35em 0.5em;
+}
+.demo-tools select:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+body {
+  padding-top: var(--demo-header-height, 0px);
+}
+#rail,
+#railsash {
+  top: var(--demo-header-height, 0px);
+  height: calc(100vh - var(--demo-header-height, 0px));
+}
+.controls {
+  top: var(--demo-header-height, 0px);
+}
+#composer,
+.quotefloat,
+.sessionmenu:not(.sessionlayout) {
+  display: none !important;
+}
+@media (max-width: 700px) {
+  .demo-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .demo-tools {
+    width: 100%;
+  }
+}
