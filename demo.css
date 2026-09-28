@@ -64,7 +64,7 @@ body {
 }
 #composer,
 .quotefloat,
-.sessionmenu:not(.sessionlayout) {
+.sessionpin {
   display: none !important;
 }
 @media (max-width: 700px) {
@@ -75,4 +75,52 @@ body {
   .demo-tools {
     width: 100%;
   }
+}
+
+.demo-menu {
+  position: fixed;
+  z-index: 40;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: 16em;
+  max-width: calc(100vw - 16px);
+  padding: 0.3em 0;
+  border: 1px solid
+    var(--vscode-menu-border, var(--vscode-editorWidget-border, var(--vscode-widget-border, transparent)));
+  border-radius: 5px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+  color: var(--vscode-menu-foreground, var(--vscode-foreground));
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, #0000005c);
+  font: inherit;
+}
+.demo-menu [role='menuitem'] {
+  display: block;
+  box-sizing: border-box;
+  width: auto;
+  margin: 0 0.4em;
+  padding: 0.28em 2em 0.28em 1.6em;
+  overflow: hidden;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.demo-menu [role='menuitem']:hover,
+.demo-menu [role='menuitem']:focus-visible {
+  outline: none;
+  background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+  color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+}
+.demo-menu [role='separator'] {
+  height: 1px;
+  margin: 0.3em 0.4em;
+  background: var(
+    --vscode-menu-separatorBackground,
+    var(--vscode-editorWidget-border, var(--vscode-widget-border, currentColor))
+  );
 }

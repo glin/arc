@@ -1,4 +1,4 @@
-(()=>{function A(t,e,n){if(t.length<=e)return t;let o=t.slice(0,Math.max(0,e-n.length)),s=o.charCodeAt(o.length-1);return s>=55296&&s<=56319&&(o=o.slice(0,-1)),o+n}var S=/[\p{Cc}\p{Cf}\p{Cs}]/gu,N=/[\u200c\u200d\u{e0020}-\u{e007f}]/u,x=/\u200d+$/u,M=/[^\p{White_Space}\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/u;function y(t,e){if(typeof t!="string")return"";let s=t.normalize("NFC").replace(/\p{White_Space}+/gu," ").replace(S,r=>N.test(r)?r:"").normalize("NFC").trim(),i=A(s,e,"").replace(x,"").trim();return M.test(i)?i:""}function c(t){return t.toLocaleLowerCase()}function u(t){return t===1?"carried by one session":`carried by ${t} sessions`}var C=20,I=500,O=2;function p(t){return y(t,40)}function m(t,e){let n=[],o=new Set;for(let s of t){let i=p(s);if(!i)continue;let r=c(i),a=e.get(r);if(a===void 0&&e.set(r,i),!o.has(r)&&(o.add(r),n.push(a??i),n.length===C))break}return n}function d(t,e){let n=Object.prototype.hasOwnProperty.call(t,e)?t[e]:null;return Array.isArray(n)?[...n]:[]}function L(t,e,n){let o=!!e&&e!=="__proto__"&&m(n,new Map).length>0,s=[];for(let[l,g]of Object.entries(t))l!==e&&l!=="__proto__"&&s.push([l,g]);let i=I-(o?1:0),r=new Map,a={};for(let[l,g]of s.slice(Math.max(0,s.length-Math.max(0,i)))){a[l]=[...g];for(let _ of g){let b=c(_);r.has(b)||r.set(b,_)}}return o&&(a[e]=m(n,r)),a}function T(t){let e=t.slice(0,O),n=t.slice(e.length);return{chips:e,more:n.length?`+${n.length}`:null,rest:n}}function E(t,e){let{chips:n,more:o,rest:s}=T(t);return{labels:[...t],labelChips:n,labelsMore:o,labelsMoreName:s.length?s.join(", "):null,labelClause:t.length?`${e} ${t.join(", ")}`:null}}function f(t){let e=new Map;for(let[n,o]of Object.entries(t)){if(!n||n==="__proto__"||!Array.isArray(o))continue;let s=new Set;for(let i of o){let r=p(i);if(!r)continue;let a=c(r);if(s.has(a))continue;s.add(a);let l=e.get(a);l?l.count+=1:e.set(a,{name:r,count:1})}}return[...e.values()].sort((n,o)=>o.count-n.count||n.name.localeCompare(o.name)).map(n=>({...n,countName:u(n.count)}))}function k(t,e){let n=f(t),o=new Map(n.map(r=>[c(r.name),r])),s=new Set,i=[];for(let r of d(t,e)){let a=p(r);if(!a)continue;let l=c(a),g=o.get(l);!g||s.has(l)||(s.add(l),i.push({...g,applied:!0}))}for(let r of n)s.has(c(r.name))||i.push({...r,applied:!1});return i}function R(t,e,n,o,s=n){let i=e.find(r=>r.id===n)?.label??n;return{type:"labelEditor",session:s,heading:`${o} ${i}`,rows:k(t,n)}}window.__ARC_DEMO_SAMPLES__.labelRules={labelCounts:f,labelEditorReply:R,labelsOf:d,railLabelFields:E,setSessionLabels:L};})();
+(()=>{function B(t,s,n){if(t.length<=s)return t;let e=t.slice(0,Math.max(0,s-n.length)),o=e.charCodeAt(e.length-1);return o>=55296&&o<=56319&&(e=e.slice(0,-1)),e+n}var H=/[\p{Cc}\p{Cf}\p{Cs}]/gu,W=/[\u200c\u200d\u{e0020}-\u{e007f}]/u,j=/\u200d+$/u,F=/[^\p{White_Space}\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/u;function I(t,s){if(typeof t!="string")return"";let o=t.normalize("NFC").replace(/\p{White_Space}+/gu," ").replace(H,r=>W.test(r)?r:"").normalize("NFC").trim(),i=B(o,s,"").replace(j,"").trim();return F.test(i)?i:""}function h(t){return t.toLocaleLowerCase()}function L(t){return t===1?"carried by one session":`carried by ${t} sessions`}var z=20,X=500,U=2;function w(t){return I(t,40)}function v(t,s){let n=[],e=new Set;for(let o of t){let i=w(o);if(!i)continue;let r=h(i),l=s.get(r);if(l===void 0&&s.set(r,i),!e.has(r)&&(e.add(r),n.push(l??i),n.length===z))break}return n}function M(t,s){let n=Object.prototype.hasOwnProperty.call(t,s)?t[s]:null;return Array.isArray(n)?[...n]:[]}function T(t,s,n){let e=!!s&&s!=="__proto__"&&v(n,new Map).length>0,o=[];for(let[c,g]of Object.entries(t))c!==s&&c!=="__proto__"&&o.push([c,g]);let i=X-(e?1:0),r=new Map,l={};for(let[c,g]of o.slice(Math.max(0,o.length-Math.max(0,i)))){l[c]=[...g];for(let u of g){let p=h(u);r.has(p)||r.set(p,u)}}return e&&(l[s]=v(n,r)),l}function K(t){let s=t.slice(0,U),n=t.slice(s.length);return{chips:s,more:n.length?`+${n.length}`:null,rest:n}}function k(t,s){let{chips:n,more:e,rest:o}=K(t);return{labels:[...t],labelChips:n,labelsMore:e,labelsMoreName:o.length?o.join(", "):null,labelClause:t.length?`${s} ${t.join(", ")}`:null}}function S(t){let s=new Map;for(let[n,e]of Object.entries(t)){if(!n||n==="__proto__"||!Array.isArray(e))continue;let o=new Set;for(let i of e){let r=w(i);if(!r)continue;let l=h(r);if(o.has(l))continue;o.add(l);let c=s.get(l);c?c.count+=1:s.set(l,{name:r,count:1})}}return[...s.values()].sort((n,e)=>e.count-n.count||n.name.localeCompare(e.name)).map(n=>({...n,countName:L(n.count)}))}function V(t,s){let n=S(t),e=new Map(n.map(r=>[h(r.name),r])),o=new Set,i=[];for(let r of M(t,s)){let l=w(r);if(!l)continue;let c=h(l),g=e.get(c);!g||o.has(c)||(o.add(c),i.push({...g,applied:!0}))}for(let r of n)o.has(h(r.name))||i.push({...r,applied:!1});return i}function D(t,s,n,e,o=n){let i=s.find(r=>r.id===n)?.label??n;return{type:"labelEditor",session:o,heading:`${e} ${i}`,rows:V(t,n)}}function Y(t,s){if(!t.trim())return!0;let n=a=>{throw new Error(`The menu stand-in cannot read the when clause "${t}": ${a}.`)},e=[],o=/\s*('[^']*'|==|!=|&&|\|\||[!()]|[A-Za-z_][\w.:-]*)/y;for(;o.lastIndex<t.length&&t.slice(o.lastIndex).trim();){let a=o.lastIndex,f=o.exec(t);f||n(`unsupported text at "${t.slice(a).trim()}"`),e.push(f[1])}let i=a=>a!==void 0&&/^[A-Za-z_]/.test(a),r=0,l=a=>a?.startsWith("'")?a.slice(1,-1):(i(a)||n(`a comparison has no value after "${e[r-2]} ${e[r-1]}"`),a==="true"?!0:a==="false"?!1:a),c=()=>{let a=e[r++];if(a==="("){let b=u();return e[r++]!==")"&&n("a parenthesis is not closed"),b}if(a==="!")return!c();i(a)||n(a===void 0?"it ends early":`unexpected "${a}"`);let f=s[a];if(e[r]==="=="||e[r]==="!="){let b=e[r++]==="==",y=l(e[r++]);return(f===y||String(f)===String(y))===b}return!!f},g=()=>{let a=c();for(;e[r]==="&&";)r++,a=c()&&a;return a},u=()=>{let a=g();for(;e[r]==="||";)r++,a=g()||a;return a},p=u();return r<e.length&&n(`unexpected "${e[r]}"`),p}function q(t,s){let n=new Map;for(let e of t){if(!Y(e.when,s))continue;let[o,i]=e.group.split("@"),r=n.get(o)??[];r.push({order:Number(i)||0,entry:e}),n.set(o,r)}return[...n.keys()].sort((e,o)=>e==="navigation"?-1:o==="navigation"?1:e<o?-1:e>o?1:0).map(e=>n.get(e).sort((o,i)=>o.order-i.order).map(o=>o.entry))}function G(t){let s=[];for(let n=t;n;n=n.parentElement){let e=n.dataset?.vscodeContext;if(e)try{s.push(JSON.parse(e))}catch{}}return Object.assign({},...s.reverse())}function $(t,s,n){let e=t.defaultView,o=null;e.addEventListener("contextmenu",i=>{let r=i.target instanceof Element?i.target:null;if(!r||r.closest(".demo-menu"))return;o?.(!1);let l=G(r),c=q(s,l);if(!c.length)return;i.preventDefault();let g=t.activeElement instanceof HTMLElement?t.activeElement:null,u=t.createElement("div");u.className="demo-menu",u.setAttribute("role","menu"),c.forEach((d,E)=>{if(E){let m=t.createElement("div");m.setAttribute("role","separator"),u.append(m)}for(let m of d){let _=t.createElement("button");_.type="button",_.setAttribute("role","menuitem"),_.tabIndex=-1,_.textContent=m.title,_.addEventListener("click",()=>{o?.(!0),n(m.command,l)}),u.append(_)}}),t.body.append(u);let p=Array.from(u.querySelectorAll('[role="menuitem"]')),a=r.getBoundingClientRect(),f=i.clientX===0&&i.clientY===0,b=f?a.left:i.clientX,y=f?a.bottom:i.clientY,A=u.offsetWidth,R=u.offsetHeight;u.style.left=`${Math.max(0,b+A>e.innerWidth?e.innerWidth-A:b)}px`,u.style.top=`${Math.max(0,y+R>e.innerHeight?y-R:y)}px`;let C=d=>{(!(d.target instanceof Node)||!u.contains(d.target))&&o?.(!1)},x=d=>{u.remove(),t.removeEventListener("pointerdown",C,!0),e.removeEventListener("blur",N),o=null,d&&g?.isConnected&&g.focus()},N=()=>x(!1);o=x,t.addEventListener("pointerdown",C,!0),e.addEventListener("blur",N),u.addEventListener("keydown",d=>{let E=p.indexOf(t.activeElement),m=d.key==="ArrowDown"?(E+1)%p.length:d.key==="ArrowUp"?(E-1+p.length)%p.length:d.key==="Home"?0:d.key==="End"?p.length-1:-1;m>=0?(d.preventDefault(),p[m].focus()):(d.key==="Escape"||d.key==="Tab")&&(d.preventDefault(),x(!0))}),p[0].focus()})}window.__ARC_DEMO_SAMPLES__.labelRules={labelCounts:S,labelEditorReply:D,labelsOf:M,railLabelFields:k,setSessionLabels:T};window.__ARC_DEMO_SAMPLES__.installMenu=$;})();
 (() => {
   'use strict';
   const sample = window.__ARC_DEMO_SAMPLES__;
@@ -121,6 +121,68 @@
   function readOnlyNotice() {
     notice.replaceChildren(document.createTextNode('Open Arc in VS Code to start a conversation.'));
   }
+  function membership(action, session) {
+    if (!ids.includes(session)) return;
+    if (action === 'pin') {
+      pinnedTop.add(session);
+      hidden.delete(session);
+    } else if (action === 'unpin') pinnedTop.delete(session);
+    else if (action === 'archive') {
+      hidden.add(session);
+      pinnedTop.delete(session);
+    } else if (action === 'unarchive') hidden.delete(session);
+    else return;
+    browserState = { ...browserState, hidden: [...hidden], pinnedTop: [...pinnedTop] };
+    railMessage();
+  }
+  function copy(text) {
+    if (typeof text === 'string' && text) navigator.clipboard?.writeText(text).catch(() => {});
+  }
+  // The context menu's entries, answered the way the extension answers them, in page memory.
+  // New session with the same labels and the Send entries start nothing and show the notice.
+  sample.installMenu(document, sample.menuEntries, (command, context) => {
+    const session = ids.includes(context.session) ? context.session : null;
+    const card = Object.values(sample.payloads)
+      .flatMap((payload) => payload.cards)
+      .find((item) => item.key === context.key);
+    switch (command) {
+      case 'arc.pinSession':
+      case 'arc.unpinSession':
+      case 'arc.archiveSession':
+      case 'arc.unarchiveSession':
+        membership(
+          { 'arc.pinSession': 'pin', 'arc.unpinSession': 'unpin', 'arc.archiveSession': 'archive' }[command] ??
+            'unarchive',
+          session,
+        );
+        break;
+      case 'arc.markSessionRead':
+      case 'arc.markSessionUnread':
+        if (!session) break;
+        if (command === 'arc.markSessionUnread') unread.add(session);
+        deliver({ type: 'setSessionRead', session, read: command === 'arc.markSessionRead' });
+        if (command === 'arc.markSessionUnread') railMessage();
+        break;
+      case 'arc.markTurnRead':
+      case 'arc.markTurnUnread':
+        if (card) deliver({ type: 'setRead', key: card.key, read: command === 'arc.markTurnRead' });
+        break;
+      case 'arc.labelSession':
+        if (session) deliver({ type: 'openLabelEditor', session });
+        break;
+      case 'arc.showSessionDetails':
+        if (session) deliver({ type: 'showSessionDetails', session });
+        break;
+      case 'arc.copySessionId':
+        copy(session);
+        break;
+      case 'arc.copyTurnSummary':
+        copy(card?.summary);
+        break;
+      default:
+        readOnlyNotice();
+    }
+  });
   const allowed = new Set([
     'ready',
     'painted',
@@ -134,6 +196,9 @@
     'newSession',
     'labelEditor',
     'setLabels',
+    'armSessionDetails',
+    'armSelectedText',
+    'armComposer',
   ]);
   window.acquireVsCodeApi = () => ({
     postMessage(message) {
@@ -185,18 +250,7 @@
             railMessage();
             break;
           }
-          if (!ids.includes(message.session)) break;
-          if (message.action === 'pin') {
-            pinnedTop.add(message.session);
-            hidden.delete(message.session);
-          } else if (message.action === 'unpin') pinnedTop.delete(message.session);
-          else if (message.action === 'archive') {
-            hidden.add(message.session);
-            pinnedTop.delete(message.session);
-          } else if (message.action === 'unarchive') hidden.delete(message.session);
-          else break;
-          browserState = { ...browserState, hidden: [...hidden], pinnedTop: [...pinnedTop] };
-          railMessage();
+          membership(message.action, message.session);
           break;
         case 'setLayout':
           if (message.key === 'cardLayout' && ['compact', 'one-column', 'two-columns'].includes(message.value))
@@ -226,6 +280,9 @@
           break;
         case 'painted':
         case 'perf':
+        case 'armSessionDetails':
+        case 'armSelectedText':
+        case 'armComposer':
           break;
       }
     },
