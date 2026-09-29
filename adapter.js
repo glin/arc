@@ -19,7 +19,7 @@
   // those marks with the extension's rule.
   const initialState = {
     composerHidden: true,
-    railWidth: 300,
+    railWidth: sample.railWidth,
     open: [sample.payloads[selected].cards[0].key],
     read: ids
       .filter((id) => !unread.has(id))
