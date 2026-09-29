@@ -14,7 +14,7 @@
   const readRules = sample.readRules;
   let labels = sample.labels;
   let browserState = null;
-  // A session the sample lists as read starts with its turns marked read, so the panel's read
+  // A session the demo lists as read starts with its turns marked read, so the panel's read
   // marks and the session list agree. Each save then decides a session's unread state from
   // those marks with the extension's rule.
   const initialState = {
@@ -213,7 +213,7 @@
   window.acquireVsCodeApi = () => ({
     postMessage(message) {
       if (!message || typeof message.type !== 'string' || !allowed.has(message.type)) {
-        console.warn('Arc sample ignored a panel action');
+        console.warn('Arc demo ignored a panel action');
         return;
       }
       switch (message.type) {
