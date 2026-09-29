@@ -1,4 +1,4 @@
-(()=>{function B(t,s,n){if(t.length<=s)return t;let e=t.slice(0,Math.max(0,s-n.length)),o=e.charCodeAt(e.length-1);return o>=55296&&o<=56319&&(e=e.slice(0,-1)),e+n}var H=/[\p{Cc}\p{Cf}\p{Cs}]/gu,W=/[\u200c\u200d\u{e0020}-\u{e007f}]/u,j=/\u200d+$/u,F=/[^\p{White_Space}\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/u;function I(t,s){if(typeof t!="string")return"";let o=t.normalize("NFC").replace(/\p{White_Space}+/gu," ").replace(H,r=>W.test(r)?r:"").normalize("NFC").trim(),i=B(o,s,"").replace(j,"").trim();return F.test(i)?i:""}function h(t){return t.toLocaleLowerCase()}function L(t){return t===1?"carried by one session":`carried by ${t} sessions`}var z=20,X=500,U=2;function w(t){return I(t,40)}function v(t,s){let n=[],e=new Set;for(let o of t){let i=w(o);if(!i)continue;let r=h(i),l=s.get(r);if(l===void 0&&s.set(r,i),!e.has(r)&&(e.add(r),n.push(l??i),n.length===z))break}return n}function M(t,s){let n=Object.prototype.hasOwnProperty.call(t,s)?t[s]:null;return Array.isArray(n)?[...n]:[]}function T(t,s,n){let e=!!s&&s!=="__proto__"&&v(n,new Map).length>0,o=[];for(let[c,g]of Object.entries(t))c!==s&&c!=="__proto__"&&o.push([c,g]);let i=X-(e?1:0),r=new Map,l={};for(let[c,g]of o.slice(Math.max(0,o.length-Math.max(0,i)))){l[c]=[...g];for(let u of g){let p=h(u);r.has(p)||r.set(p,u)}}return e&&(l[s]=v(n,r)),l}function K(t){let s=t.slice(0,U),n=t.slice(s.length);return{chips:s,more:n.length?`+${n.length}`:null,rest:n}}function k(t,s){let{chips:n,more:e,rest:o}=K(t);return{labels:[...t],labelChips:n,labelsMore:e,labelsMoreName:o.length?o.join(", "):null,labelClause:t.length?`${s} ${t.join(", ")}`:null}}function S(t){let s=new Map;for(let[n,e]of Object.entries(t)){if(!n||n==="__proto__"||!Array.isArray(e))continue;let o=new Set;for(let i of e){let r=w(i);if(!r)continue;let l=h(r);if(o.has(l))continue;o.add(l);let c=s.get(l);c?c.count+=1:s.set(l,{name:r,count:1})}}return[...s.values()].sort((n,e)=>e.count-n.count||n.name.localeCompare(e.name)).map(n=>({...n,countName:L(n.count)}))}function V(t,s){let n=S(t),e=new Map(n.map(r=>[h(r.name),r])),o=new Set,i=[];for(let r of M(t,s)){let l=w(r);if(!l)continue;let c=h(l),g=e.get(c);!g||o.has(c)||(o.add(c),i.push({...g,applied:!0}))}for(let r of n)o.has(h(r.name))||i.push({...r,applied:!1});return i}function D(t,s,n,e,o=n){let i=s.find(r=>r.id===n)?.label??n;return{type:"labelEditor",session:o,heading:`${e} ${i}`,rows:V(t,n)}}function Y(t,s){if(!t.trim())return!0;let n=a=>{throw new Error(`The menu stand-in cannot read the when clause "${t}": ${a}.`)},e=[],o=/\s*('[^']*'|==|!=|&&|\|\||[!()]|[A-Za-z_][\w.:-]*)/y;for(;o.lastIndex<t.length&&t.slice(o.lastIndex).trim();){let a=o.lastIndex,f=o.exec(t);f||n(`unsupported text at "${t.slice(a).trim()}"`),e.push(f[1])}let i=a=>a!==void 0&&/^[A-Za-z_]/.test(a),r=0,l=a=>a?.startsWith("'")?a.slice(1,-1):(i(a)||n(`a comparison has no value after "${e[r-2]} ${e[r-1]}"`),a==="true"?!0:a==="false"?!1:a),c=()=>{let a=e[r++];if(a==="("){let b=u();return e[r++]!==")"&&n("a parenthesis is not closed"),b}if(a==="!")return!c();i(a)||n(a===void 0?"it ends early":`unexpected "${a}"`);let f=s[a];if(e[r]==="=="||e[r]==="!="){let b=e[r++]==="==",y=l(e[r++]);return(f===y||String(f)===String(y))===b}return!!f},g=()=>{let a=c();for(;e[r]==="&&";)r++,a=c()&&a;return a},u=()=>{let a=g();for(;e[r]==="||";)r++,a=g()||a;return a},p=u();return r<e.length&&n(`unexpected "${e[r]}"`),p}function q(t,s){let n=new Map;for(let e of t){if(!Y(e.when,s))continue;let[o,i]=e.group.split("@"),r=n.get(o)??[];r.push({order:Number(i)||0,entry:e}),n.set(o,r)}return[...n.keys()].sort((e,o)=>e==="navigation"?-1:o==="navigation"?1:e<o?-1:e>o?1:0).map(e=>n.get(e).sort((o,i)=>o.order-i.order).map(o=>o.entry))}function G(t){let s=[];for(let n=t;n;n=n.parentElement){let e=n.dataset?.vscodeContext;if(e)try{s.push(JSON.parse(e))}catch{}}return Object.assign({},...s.reverse())}function $(t,s,n){let e=t.defaultView,o=null;e.addEventListener("contextmenu",i=>{let r=i.target instanceof Element?i.target:null;if(!r||r.closest(".demo-menu"))return;o?.(!1);let l=G(r),c=q(s,l);if(!c.length)return;i.preventDefault();let g=t.activeElement instanceof HTMLElement?t.activeElement:null,u=t.createElement("div");u.className="demo-menu",u.setAttribute("role","menu"),c.forEach((d,E)=>{if(E){let m=t.createElement("div");m.setAttribute("role","separator"),u.append(m)}for(let m of d){let _=t.createElement("button");_.type="button",_.setAttribute("role","menuitem"),_.tabIndex=-1,_.textContent=m.title,_.addEventListener("click",()=>{o?.(!0),n(m.command,l)}),u.append(_)}}),t.body.append(u);let p=Array.from(u.querySelectorAll('[role="menuitem"]')),a=r.getBoundingClientRect(),f=i.clientX===0&&i.clientY===0,b=f?a.left:i.clientX,y=f?a.bottom:i.clientY,A=u.offsetWidth,R=u.offsetHeight;u.style.left=`${Math.max(0,b+A>e.innerWidth?e.innerWidth-A:b)}px`,u.style.top=`${Math.max(0,y+R>e.innerHeight?y-R:y)}px`;let C=d=>{(!(d.target instanceof Node)||!u.contains(d.target))&&o?.(!1)},x=d=>{u.remove(),t.removeEventListener("pointerdown",C,!0),e.removeEventListener("blur",N),o=null,d&&g?.isConnected&&g.focus()},N=()=>x(!1);o=x,t.addEventListener("pointerdown",C,!0),e.addEventListener("blur",N),u.addEventListener("keydown",d=>{let E=p.indexOf(t.activeElement),m=d.key==="ArrowDown"?(E+1)%p.length:d.key==="ArrowUp"?(E-1+p.length)%p.length:d.key==="Home"?0:d.key==="End"?p.length-1:-1;m>=0?(d.preventDefault(),p[m].focus()):(d.key==="Escape"||d.key==="Tab")&&(d.preventDefault(),x(!0))}),p[0].focus()})}window.__ARC_DEMO_SAMPLES__.labelRules={labelCounts:S,labelEditorReply:D,labelsOf:M,railLabelFields:k,setSessionLabels:T};window.__ARC_DEMO_SAMPLES__.installMenu=$;})();
+(()=>{function H(e,s,n){if(e.length<=s)return e;let t=e.slice(0,Math.max(0,s-n.length)),o=t.charCodeAt(t.length-1);return o>=55296&&o<=56319&&(t=t.slice(0,-1)),t+n}var P=/[\p{Cc}\p{Cf}\p{Cs}]/gu,j=/[\u200c\u200d\u{e0020}-\u{e007f}]/u,F=/\u200d+$/u,z=/[^\p{White_Space}\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/u;function N(e,s){if(typeof e!="string")return"";let o=e.normalize("NFC").replace(/\p{White_Space}+/gu," ").replace(P,r=>j.test(r)?r:"").normalize("NFC").trim(),i=H(o,s,"").replace(F,"").trim();return z.test(i)?i:""}function b(e){return e.toLocaleLowerCase()}function L(e){return e===1?"carried by one session":`carried by ${e} sessions`}var K=20,U=500,J=2;function M(e){return N(e,40)}function O(e,s){let n=[],t=new Set;for(let o of e){let i=M(o);if(!i)continue;let r=b(i),a=s.get(r);if(a===void 0&&s.set(r,i),!t.has(r)&&(t.add(r),n.push(a??i),n.length===K))break}return n}function w(e,s){let n=Object.prototype.hasOwnProperty.call(e,s)?e[s]:null;return Array.isArray(n)?[...n]:[]}function v(e,s,n){let t=!!s&&s!=="__proto__"&&O(n,new Map).length>0,o=[];for(let[c,g]of Object.entries(e))c!==s&&c!=="__proto__"&&o.push([c,g]);let i=U-(t?1:0),r=new Map,a={};for(let[c,g]of o.slice(Math.max(0,o.length-Math.max(0,i)))){a[c]=[...g];for(let u of g){let f=b(u);r.has(f)||r.set(f,u)}}return t&&(a[s]=O(n,r)),a}function V(e){let s=e.slice(0,J),n=e.slice(s.length);return{chips:s,more:n.length?`+${n.length}`:null,rest:n}}function k(e,s){let{chips:n,more:t,rest:o}=V(e);return{labels:[...e],labelChips:n,labelsMore:t,labelsMoreName:o.length?o.join(", "):null,labelClause:e.length?`${s} ${e.join(", ")}`:null}}function S(e){let s=new Map;for(let[n,t]of Object.entries(e)){if(!n||n==="__proto__"||!Array.isArray(t))continue;let o=new Set;for(let i of t){let r=M(i);if(!r)continue;let a=b(r);if(o.has(a))continue;o.add(a);let c=s.get(a);c?c.count+=1:s.set(a,{name:r,count:1})}}return[...s.values()].sort((n,t)=>t.count-n.count||n.name.localeCompare(t.name)).map(n=>({...n,countName:L(n.count)}))}function Y(e,s){let n=S(e),t=new Map(n.map(r=>[b(r.name),r])),o=new Set,i=[];for(let r of w(e,s)){let a=M(r);if(!a)continue;let c=b(a),g=t.get(c);!g||o.has(c)||(o.add(c),i.push({...g,applied:!0}))}for(let r of n)o.has(b(r.name))||i.push({...r,applied:!1});return i}function D(e,s,n,t,o=n){let i=s.find(r=>r.id===n)?.label??n;return{type:"labelEditor",session:o,heading:`${t} ${i}`,rows:Y(e,n)}}function $(e,s,n,t=0){if(s.has(e.key))return!0;let o=n.get(e.sessionId)??t;return o>0&&e.startedAt<=o}function B(e,s,n,t=0){let o=new Set(s),i=new Map;for(let a of e){if(a.kind!=="turn"||!$(a,o,n,t))continue;let c=i.get(a.sessionId);(c===void 0||a.startedAt>c)&&i.set(a.sessionId,a.startedAt)}let r=new Map;for(let a of e){if(a.kind!=="turn"||(r.has(a.sessionId)||r.set(a.sessionId,0),$(a,o,n,t)))continue;let c=i.get(a.sessionId);c!==void 0&&a.startedAt<=c||r.set(a.sessionId,r.get(a.sessionId)+1)}return r}function q(e,s){if(!e.trim())return!0;let n=l=>{throw new Error(`The menu stand-in cannot read the when clause "${e}": ${l}.`)},t=[],o=/\s*('[^']*'|==|!=|&&|\|\||[!()]|[A-Za-z_][\w.:-]*)/y;for(;o.lastIndex<e.length&&e.slice(o.lastIndex).trim();){let l=o.lastIndex,p=o.exec(e);p||n(`unsupported text at "${e.slice(l).trim()}"`),t.push(p[1])}let i=l=>l!==void 0&&/^[A-Za-z_]/.test(l),r=0,a=l=>l?.startsWith("'")?l.slice(1,-1):(i(l)||n(`a comparison has no value after "${t[r-2]} ${t[r-1]}"`),l==="true"?!0:l==="false"?!1:l),c=()=>{let l=t[r++];if(l==="("){let h=u();return t[r++]!==")"&&n("a parenthesis is not closed"),h}if(l==="!")return!c();i(l)||n(l===void 0?"it ends early":`unexpected "${l}"`);let p=s[l];if(t[r]==="=="||t[r]==="!="){let h=t[r++]==="==",y=a(t[r++]);return(p===y||String(p)===String(y))===h}return!!p},g=()=>{let l=c();for(;t[r]==="&&";)r++,l=c()&&l;return l},u=()=>{let l=g();for(;t[r]==="||";)r++,l=g()||l;return l},f=u();return r<t.length&&n(`unexpected "${t[r]}"`),f}function G(e,s){let n=new Map;for(let t of e){if(!q(t.when,s))continue;let[o,i]=t.group.split("@"),r=n.get(o)??[];r.push({order:Number(i)||0,entry:t}),n.set(o,r)}return[...n.keys()].sort((t,o)=>t==="navigation"?-1:o==="navigation"?1:t<o?-1:t>o?1:0).map(t=>n.get(t).sort((o,i)=>o.order-i.order).map(o=>o.entry))}function Z(e){let s=[];for(let n=e;n;n=n.parentElement){let t=n.dataset?.vscodeContext;if(t)try{s.push(JSON.parse(t))}catch{}}return Object.assign({},...s.reverse())}function W(e,s,n){let t=e.defaultView,o=null;t.addEventListener("contextmenu",i=>{let r=i.target instanceof Element?i.target:null;if(!r||r.closest(".demo-menu"))return;o?.(!1);let a=Z(r),c=G(s,a);if(!c.length)return;i.preventDefault();let g=e.activeElement instanceof HTMLElement?e.activeElement:null,u=e.createElement("div");u.className="demo-menu",u.setAttribute("role","menu"),c.forEach((d,x)=>{if(x){let m=e.createElement("div");m.setAttribute("role","separator"),u.append(m)}for(let m of d){let _=e.createElement("button");_.type="button",_.setAttribute("role","menuitem"),_.tabIndex=-1,_.textContent=m.title,_.addEventListener("click",()=>{o?.(!0),n(m.command,a)}),u.append(_)}}),e.body.append(u);let f=Array.from(u.querySelectorAll('[role="menuitem"]')),l=r.getBoundingClientRect(),p=i.clientX===0&&i.clientY===0,h=p?l.left:i.clientX,y=p?l.bottom:i.clientY,R=u.offsetWidth,A=u.offsetHeight;u.style.left=`${Math.max(0,h+R>t.innerWidth?t.innerWidth-R:h)}px`,u.style.top=`${Math.max(0,y+A>t.innerHeight?y-A:y)}px`;let I=d=>{(!(d.target instanceof Node)||!u.contains(d.target))&&o?.(!1)},E=d=>{u.remove(),e.removeEventListener("pointerdown",I,!0),t.removeEventListener("blur",C),o=null,d&&g?.isConnected&&g.focus()},C=()=>E(!1);o=E,e.addEventListener("pointerdown",I,!0),t.addEventListener("blur",C),u.addEventListener("keydown",d=>{let x=f.indexOf(e.activeElement),m=d.key==="ArrowDown"?(x+1)%f.length:d.key==="ArrowUp"?(x-1+f.length)%f.length:d.key==="Home"?0:d.key==="End"?f.length-1:-1;m>=0?(d.preventDefault(),f[m].focus()):(d.key==="Escape"||d.key==="Tab")&&(d.preventDefault(),E(!0))}),f[0].focus()})}window.__ARC_DEMO_SAMPLES__.labelRules={labelCounts:S,labelEditorReply:D,labelsOf:w,railLabelFields:k,setSessionLabels:v};window.__ARC_DEMO_SAMPLES__.readRules={newBySession:B};window.__ARC_DEMO_SAMPLES__.installMenu=W;})();
 (() => {
   'use strict';
   const sample = window.__ARC_DEMO_SAMPLES__;
@@ -11,8 +11,20 @@
   const hidden = new Set(sample.payloads[selected].hidden);
   const unread = new Set(sample.payloads[selected].rail.filter((row) => row.unread).map((row) => row.id));
   const labelRules = sample.labelRules;
+  const readRules = sample.readRules;
   let labels = sample.labels;
   let browserState = null;
+  // A session the sample lists as read starts with its turns marked read, so the panel's read
+  // marks and the session list agree. Each save then decides a session's unread state from
+  // those marks with the extension's rule.
+  const initialState = {
+    composerHidden: true,
+    railWidth: 300,
+    open: [sample.payloads[selected].cards[0].key],
+    read: ids
+      .filter((id) => !unread.has(id))
+      .flatMap((id) => sample.payloads[id].cards.filter((card) => card.kind === 'turn').map((card) => card.key)),
+  };
   const approved = new WeakSet();
   const header = document.querySelector('.demo-header');
   const notice = document.getElementById('demo-notice');
@@ -158,10 +170,7 @@
         break;
       case 'arc.markSessionRead':
       case 'arc.markSessionUnread':
-        if (!session) break;
-        if (command === 'arc.markSessionUnread') unread.add(session);
-        deliver({ type: 'setSessionRead', session, read: command === 'arc.markSessionRead' });
-        if (command === 'arc.markSessionUnread') railMessage();
+        if (session) deliver({ type: 'setSessionRead', session, read: command === 'arc.markSessionRead' });
         break;
       case 'arc.markTurnRead':
       case 'arc.markTurnUnread':
@@ -199,6 +208,7 @@
     'armSessionDetails',
     'armSelectedText',
     'armComposer',
+    'copy',
   ]);
   window.acquireVsCodeApi = () => ({
     postMessage(message) {
@@ -218,6 +228,9 @@
           break;
         case 'newSession':
           readOnlyNotice();
+          break;
+        case 'copy':
+          copy(message.text);
           break;
         case 'setViews':
           if (!Array.isArray(message.views)) break;
@@ -263,17 +276,19 @@
         case 'saveState':
           browserState = message.state;
           if (browserState && typeof browserState === 'object') {
+            const read = Array.isArray(browserState.read) ? browserState.read : [];
+            const readTo = new Map(
+              Object.entries(browserState.readTo ?? {}).filter(([, at]) => typeof at === 'number'),
+            );
+            const since = typeof browserState.since === 'number' ? browserState.since : 0;
             let changed = false;
-            for (const id of unread) {
-              const turn = sample.payloads[id].cards.find((card) => card.kind === 'turn');
-              if (
-                turn &&
-                (browserState.read?.includes(turn.key) ||
-                  (typeof browserState.readTo?.[id] === 'number' && browserState.readTo[id] >= turn.startedAt))
-              ) {
-                unread.delete(id);
-                changed = true;
-              }
+            for (const id of ids) {
+              const isUnread =
+                (readRules.newBySession(sample.payloads[id].cards, read, readTo, since).get(id) ?? 0) > 0;
+              if (isUnread === unread.has(id)) continue;
+              if (isUnread) unread.add(id);
+              else unread.delete(id);
+              changed = true;
             }
             if (changed) railMessage();
           }
@@ -287,7 +302,7 @@
       }
     },
     getState() {
-      return browserState ?? { composerHidden: true, railWidth: 300, open: [sample.payloads[selected].cards[0].key] };
+      return browserState ?? initialState;
     },
     setState(state) {
       browserState = state;
