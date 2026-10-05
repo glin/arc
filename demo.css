@@ -45,7 +45,6 @@
   outline: 2px solid var(--vscode-focusBorder);
   outline-offset: 2px;
 }
-.quotefloat,
 .sessionpin {
   display: none !important;
 }
