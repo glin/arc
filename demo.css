@@ -24,12 +24,6 @@
   color: var(--vscode-descriptionForeground);
   line-height: 1.35;
 }
-#demo-notice {
-  color: var(--vscode-editorWarning-foreground);
-}
-#demo-notice:empty {
-  position: absolute;
-}
 .demo-tools {
   display: flex;
   align-items: center;
@@ -51,18 +45,6 @@
   outline: 2px solid var(--vscode-focusBorder);
   outline-offset: 2px;
 }
-body {
-  padding-top: var(--demo-header-height, 0px);
-}
-#rail,
-#railsash {
-  top: var(--demo-header-height, 0px);
-  height: calc(100vh - var(--demo-header-height, 0px));
-}
-.controls {
-  top: var(--demo-header-height, 0px);
-}
-#composer,
 .quotefloat,
 .sessionpin {
   display: none !important;
@@ -74,6 +56,222 @@ body {
   }
   .demo-tools {
     width: 100%;
+  }
+}
+
+:root {
+  --demo-frame-space: 0px;
+  --demo-activity-width: 34px;
+  --demo-title-height: 1.8461538462em;
+  --demo-tab-height: 2.3076923077em;
+  --demo-panel-left: calc(var(--demo-frame-space) + var(--demo-activity-width));
+  --demo-shell-background: var(--vscode-sideBar-background);
+  --demo-shell-border: var(--vscode-widget-border);
+}
+:root[data-theme='onedark'] {
+  --demo-shell-background: #23272e;
+  --demo-shell-border: #343941;
+}
+:root[data-theme='onedark'] .demo-shell {
+  color: #b7bec9;
+}
+:root[data-theme='onedark'] .shell-command {
+  color: #a9b0bb;
+}
+:root[data-theme='onedark'] .shell-controls {
+  color: #929aa7;
+}
+:root[data-theme='onedark'] .shell-activity-icon {
+  color: #858f9d;
+}
+:root[data-theme='onedark'] .shell-activity-icon.shell-selected {
+  color: #c1c9d4;
+}
+:root[data-theme='onedark'] .shell-tab {
+  background: #1e2227;
+  color: #c7ced8;
+}
+:root[data-theme='onedark'] .shell-tab-close {
+  color: #8b95a1;
+}
+body {
+  /* The header observer sets its height on body, so this offset resolves here. */
+  --demo-panel-top: calc(
+    var(--demo-header-height, 0px) + var(--demo-frame-space) + var(--demo-title-height) + var(--demo-tab-height)
+  );
+  padding: var(--demo-panel-top) var(--demo-frame-space) var(--demo-frame-space) var(--demo-panel-left);
+}
+.demo-shell {
+  position: fixed;
+  inset: calc(var(--demo-header-height, 0px) + var(--demo-frame-space)) var(--demo-frame-space) var(--demo-frame-space);
+  z-index: 7;
+  overflow: hidden;
+  border-radius: 6px;
+  box-shadow:
+    0 4px 12px #0005,
+    inset 0 0 0 1px #3a4048;
+  pointer-events: none;
+  font:
+    1em/1.35 'Segoe WPF',
+    'Segoe UI',
+    system-ui,
+    sans-serif;
+  color: var(--vscode-foreground);
+}
+.shell-titlebar {
+  display: flex;
+  align-items: center;
+  height: var(--demo-title-height);
+  padding: 0 0.76923em;
+  background: var(--demo-shell-background);
+}
+.shell-brand {
+  display: flex;
+  width: 1.38462em;
+  margin-right: 0.92308em;
+}
+.shell-brand svg {
+  width: 1.23077em;
+  height: 1.23077em;
+}
+.shell-command {
+  margin: 0 auto;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92308em;
+}
+.shell-controls {
+  display: flex;
+  gap: 1.38462em;
+  width: 5.38462em;
+  justify-content: flex-end;
+  color: var(--vscode-descriptionForeground);
+}
+.shell-work {
+  display: flex;
+  height: calc(100% - var(--demo-title-height));
+}
+.shell-activity {
+  width: var(--demo-activity-width);
+  flex: none;
+  padding-top: 0.38462em;
+  border-right: 1px solid var(--demo-shell-border);
+  background: var(--demo-shell-background);
+}
+.shell-activity-icon {
+  display: grid;
+  place-items: center;
+  height: 2.76923em;
+  color: var(--vscode-descriptionForeground);
+}
+.shell-activity-icon.shell-selected {
+  border-left: 2px solid #aab3bf;
+  color: var(--vscode-foreground);
+}
+.shell-activity-icon svg {
+  width: 1.38462em;
+  height: 1.38462em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.shell-editor {
+  flex: 1;
+  min-width: 0;
+}
+.shell-tabs {
+  display: flex;
+  height: var(--demo-tab-height);
+  background: var(--demo-shell-background);
+}
+.shell-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.61538em;
+  padding: 0 1em;
+  border-right: 1px solid #353b44;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+}
+.shell-tab-icon {
+  color: #91a5bd;
+}
+.shell-tab-close {
+  margin-left: 0.3125em;
+  color: var(--vscode-descriptionForeground);
+  font-size: 1.23077em;
+}
+#rail,
+#railsash {
+  top: var(--demo-panel-top);
+  height: calc(100vh - var(--demo-panel-top) - var(--demo-frame-space) - var(--statusbar-height, 0px));
+}
+.controls {
+  top: var(--demo-panel-top);
+}
+.sessionrow {
+  top: calc(var(--demo-panel-top) + var(--session-top, 0px));
+}
+.controls:not([hidden]) + .timeline-root .sessionrow {
+  top: calc(var(--demo-panel-top) + var(--session-top, 0px) + 2px);
+}
+#composer {
+  left: calc(var(--demo-panel-left) + var(--list-left, 0px));
+  right: var(--demo-frame-space);
+  bottom: calc(var(--demo-frame-space) + var(--statusbar-height, 0px));
+}
+#statusbar {
+  left: var(--demo-panel-left);
+  right: var(--demo-frame-space);
+  bottom: var(--demo-frame-space);
+}
+.totop {
+  right: calc(var(--demo-frame-space) + 12px);
+  bottom: calc(var(--demo-frame-space) + var(--foot-height, 0px) + 12px);
+}
+.demo-capture {
+  --demo-frame-space: 16px;
+  background: transparent;
+}
+.demo-capture body {
+  background: transparent;
+}
+.demo-capture #list {
+  height: calc(100vh - var(--demo-panel-top) - var(--demo-frame-space));
+  overflow: clip;
+}
+.demo-capture #statusbar {
+  border-bottom-right-radius: 6px;
+}
+.demo-capture body::before {
+  content: '';
+  position: fixed;
+  inset: var(--demo-panel-top) var(--demo-frame-space) var(--demo-frame-space) var(--demo-panel-left);
+  z-index: -1;
+  background: var(--vscode-editor-background);
+  border-bottom-right-radius: 6px;
+}
+.demo-capture .demo-header {
+  visibility: hidden;
+  height: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+}
+@media (max-width: 700px) {
+  :root {
+    --demo-activity-width: 0px;
+    --demo-title-height: 0px;
+  }
+  .shell-titlebar,
+  .shell-activity,
+  .shell-tab-close {
+    display: none;
+  }
+  .demo-shell {
+    border-radius: 0;
+    box-shadow: none;
   }
 }
 
