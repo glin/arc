@@ -177,6 +177,8 @@ npm --prefix extension run test:browser
 
 Each browser process that waits for a shared slot prints `Browser test slot wait: <milliseconds> ms.` after it acquires one. The figure uses a monotonic clock and covers only time waiting for a slot. An immediate acquisition prints no wait line.
 
+The shared browser launcher tries Edge, Chrome, and bundled Chromium in that order. Each launch attempt has a ten-second timeout before the launcher tries the next channel. This bounds stalled launches before the panel-mockup scale test's sixty-second deadline.
+
 A browser lane that waits for the machine-wide lock prints one line naming the PID, the extension directory, and the start time of the run holding it, once, when the wait begins. The lane prints a second line once it resumes, naming how long it waited. An immediate acquisition prints neither line.
 
 The `panel.layout*.test.ts` files and the other browser files build the panel and measure it in Edge or Chrome. Each test skips when neither browser exists. Full mode names the browser executable it found before the browser lane runs, or states that the lane found no browser. Read the skip result after changing panel styles.

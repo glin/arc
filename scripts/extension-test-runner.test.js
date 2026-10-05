@@ -239,6 +239,45 @@ test('failed browser channels release their slot', async () => {
   assert.deepEqual({ launches, releases }, { launches: 3, releases: 1 });
 });
 
+test('stalled browser channels reach an available fallback before the mockup test deadline', async () => {
+  vi.useFakeTimers();
+  let releases = 0;
+  const channels = [];
+  const browser = { close: async () => {} };
+  try {
+    const launched = browserChannels.launchAnyBrowser({
+      acquireSlot: async () => ({
+        release: () => {
+          releases++;
+          return true;
+        },
+      }),
+      loadChromium: async () => ({
+        launch: ({ channel, timeout = 180_000 }) => {
+          channels.push(channel);
+          if (!channel) return Promise.resolve(browser);
+          return new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('browser did not start')), timeout);
+          });
+        },
+      }),
+    });
+    let result;
+    void launched.then((value) => {
+      result = value;
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    assert.ok(result, 'stalled preferred channels prevented the available browser from launching');
+    assert.deepEqual(channels, ['msedge', 'chrome', undefined]);
+    assert.equal(result.browser, browser);
+    assert.equal(releases, 0);
+    await result.browser.close();
+    assert.equal(releases, 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 function lockFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-browser-lock-test-'));
   return path.join(dir, 'arc-browser-tests.lock');

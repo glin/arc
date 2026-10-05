@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 const CHANNELS = ['msedge', 'chrome', undefined];
+const BROWSER_LAUNCH_TIMEOUT_MS = 10_000;
 export const BROWSER_SLOT_COUNT = 16;
 // A Vitest run moves TEMP to a directory of its own, so the slots read the machine temporary
 // directory that extension/test/temp-run.ts recorded before the move.
@@ -236,6 +237,7 @@ export async function launchAnyBrowser({
     try {
       const browser = await chromium.launch({
         headless: true,
+        timeout: BROWSER_LAUNCH_TIMEOUT_MS,
         ...(args.length ? { args } : {}),
         ...(channel ? { channel } : {}),
       });
