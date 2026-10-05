@@ -182,6 +182,8 @@ import {
   measuredInstance,
   linesOf,
   outcomeOf,
+  instrumentStartup,
+  pollStartup,
 } from '../scripts/panel-startup-measure/measure';
 
 test('selection measurements reject missing stages, unrelated worker replies, and reversed browser clocks', () => {
@@ -508,6 +510,261 @@ test('isolated startup cannot complete from copied historical diagnostics', () =
   assert.deepEqual(linesOf(historic, null, 'owned'), []);
 });
 
+test('isolated startup remains incomplete after selected content until background session-list completion', () => {
+  const lines = ['shellReady', 'catalogReady', 'railReady', 'firstCard'].map((milestone) => ({
+    event: 'startup',
+    milestone,
+    instance: 'current',
+    measurementRun: 'owned',
+  }));
+  const early = outcomeOf(lines, 'current', null);
+  assert.equal(early.complete, false);
+  assert.match(early.note!, /completeRender/);
+  assert.equal(outcomeOf([...lines, { ...lines[0], milestone: 'completeRender' }], 'current', null).complete, true);
+  assert.equal(
+    outcomeOf(
+      lines.filter((line) => line.milestone !== 'firstCard').concat({ ...lines[0], milestone: 'completeRender' }),
+      'current',
+      null,
+    ).complete,
+    false,
+  );
+});
+
+test('isolated startup requires visible rows and the frozen selected newest turn', () => {
+  const milestones = ['shellReady', 'catalogReady', 'railReady', 'firstCard', 'completeRender'].map((milestone) => ({
+    event: 'startup',
+    milestone,
+  }));
+  const selection = { session: 'selected', key: 'selected:2', prompt: 'Newest prompt', summary: 'Newest response' };
+  const row = { event: 'measurementPaint', stage: 'railReady', accepted: true, usableRows: true };
+  const card = {
+    event: 'measurementPaint',
+    stage: 'firstCard',
+    accepted: true,
+    observation: {
+      ...selection,
+      key: 'selected:2',
+      responseRegion: 'response' as const,
+      renderedResponse: 'Newest response',
+      visibleResponse: 'Newest response',
+      expectedRenderedResponse: 'Newest response',
+    },
+  };
+  const complete = [...milestones, row, card];
+  assert.equal(outcomeOf(complete, 'current', null, selection).complete, true);
+  for (const observation of [
+    { ...card.observation, session: 'other' },
+    { ...card.observation, prompt: 'Older prompt' },
+    { ...card.observation, summary: 'Older response' },
+    { ...card.observation, renderedResponse: '' },
+    { ...card.observation, visibleResponse: '' },
+    { ...card.observation, renderedResponse: 'Older response' },
+    { ...card.observation, responseRegion: undefined },
+    { ...card.observation, key: '' },
+    { ...card.observation, key: 'selected:1' },
+  ])
+    assert.equal(outcomeOf([...milestones, row, { ...card, observation }], 'current', null, selection).complete, false);
+  assert.equal(
+    outcomeOf([...milestones, row, { ...card, accepted: false }], 'current', null, selection).complete,
+    false,
+  );
+  assert.equal(
+    outcomeOf([...milestones, { ...row, usableRows: false }, card], 'current', null, selection).complete,
+    false,
+  );
+  assert.equal(outcomeOf(complete, 'current', null, { session: 'selected' }).complete, false);
+  const formatted = {
+    ...selection,
+    summary: '**Newest** response with [details](https://example.com).\n\nSecond paragraph.',
+  };
+  for (const responseRegion of ['response', 'headline'] as const) {
+    const renderedResponse =
+      responseRegion === 'response'
+        ? 'Newest response with details. Second paragraph.'
+        : 'Newest response with details.';
+    const observation = {
+      ...formatted,
+      responseRegion,
+      renderedResponse,
+      visibleResponse: renderedResponse,
+      expectedRenderedResponse: renderedResponse,
+    };
+    assert.equal(outcomeOf([...milestones, row, { ...card, observation }], 'current', null, formatted).complete, true);
+    assert.equal(
+      outcomeOf(
+        [...milestones, row, { ...card, observation: { ...observation, key: 'selected:1' } }],
+        'current',
+        null,
+        formatted,
+      ).complete,
+      false,
+    );
+  }
+});
+
+test('isolated startup rejects late completion and caps its final poll at the deadline', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(10_000);
+  try {
+    const milestones = ['shellReady', 'catalogReady', 'railReady', 'firstCard', 'completeRender'].map((milestone) => ({
+      event: 'startup',
+      milestone,
+      instance: 'current',
+      measurementRun: 'owned',
+      at: new Date(10_100).toISOString(),
+    }));
+    assert.equal(outcomeOf(milestones, 'current', null, null, 10_200).complete, true);
+    assert.equal(
+      outcomeOf(
+        milestones.map((line) =>
+          line.milestone === 'completeRender' ? { ...line, at: new Date(10_201).toISOString() } : line,
+        ),
+        'current',
+        null,
+        null,
+        10_200,
+      ).complete,
+      false,
+    );
+    const read = vi.fn<() => typeof milestones>(() => (Date.now() >= 10_250 ? milestones : []));
+    const pending = pollStartup(read, { failure: null }, 250, 'owned', null);
+    await vi.advanceTimersByTimeAsync(250);
+    const outcome = await pending;
+    assert.equal(outcome.complete, false);
+    assert.match(outcome.note!, /incomplete after/);
+    assert.equal(Date.now(), 10_250);
+    assert.equal(read.mock.calls.length, 2);
+    vi.setSystemTime(10_000);
+    const early = pollStartup(() => milestones, { failure: null }, 250, 'owned', null);
+    assert.equal((await early).complete, true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('isolated startup never retries cleanup after the linked target preservation check fails', () => {
+  const source = ts.createSourceFile(
+    'measure.ts',
+    fs.readFileSync(path.join(__dirname, '../scripts/panel-startup-measure/measure.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const functions = ['run', 'removeTree'].map((name) =>
+    source.statements
+      .find(
+        (statement): statement is ts.FunctionDeclaration =>
+          ts.isFunctionDeclaration(statement) && statement.name?.text === name,
+      )!
+      .getText(source),
+  );
+  let calls = 0;
+  const deps = {
+    process: { platform: 'win32', env: {}, stderr: { write() {} } },
+    spawnSync: () => {
+      calls++;
+      return { status: calls === 1 ? 1 : 0 };
+    },
+    fs: { existsSync: () => true },
+    os: { homedir: () => 'C:/home' },
+    path,
+    BUILD_TREE: 'owned-build',
+    REPOSITORY: 'owned-repository',
+    quoted: (text: string) => text,
+    stop: (message: string) => {
+      throw new Error(message);
+    },
+  };
+  const code = transformSync(`const {${Object.keys(deps).join(',')}} = deps; ${functions.join('\n')} removeTree();`, {
+    loader: 'ts',
+  }).code;
+  assert.throws(() => new Function('deps', code)(deps), /exited with 1/);
+  assert.equal(calls, 1);
+});
+
+test('isolated startup admits lowercase Windows retained paths while preserving platform boundaries and link rejection', () => {
+  const root = tempDir('startup-retained-case');
+  fs.mkdirSync(path.join(root, 'codex'));
+  const file = path.join(root, 'codex', 'rollout-codex.jsonl');
+  fs.writeFileSync(file, '{}');
+  const retainedPath = frozenPath(root, normalizeFsPath(file));
+  assert.equal(normalizeFsPath(retainedPath), normalizeFsPath(file));
+  assert.equal(fs.readFileSync(retainedPath, 'utf8'), '{}');
+  const runner = ts.createSourceFile(
+    'measure.ts',
+    fs.readFileSync(path.join(__dirname, '../scripts/panel-startup-measure/measure.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const transcript = ts.createSourceFile(
+    'transcript.ts',
+    fs.readFileSync(path.join(__dirname, 'transcript.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const extract = (source: ts.SourceFile, name: string) =>
+    transformSync(
+      source.statements
+        .find(
+          (statement): statement is ts.FunctionDeclaration =>
+            ts.isFunctionDeclaration(statement) && statement.name?.text === name,
+        )!
+        .getText(source)
+        .replace(/^export /, ''),
+      { loader: 'ts' },
+    ).code;
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const fixtureRoot = platform === 'win32' ? 'C:\\Frozen\\Inputs' : '/Frozen/Inputs';
+    const fixtureFile = paths.join(fixtureRoot, 'codex', 'source.jsonl');
+    let linked = false;
+    const fakeFs = {
+      realpathSync: (input: string) =>
+        platform === 'win32' && input.toLowerCase() === fixtureFile.toLowerCase() ? fixtureFile : input,
+      lstatSync: (input: string) => ({
+        isSymbolicLink: () => linked && paths.basename(input) === 'codex',
+        isDirectory: () => false,
+      }),
+    };
+    const normalize = new Function('process', `${extract(transcript, 'normalizeFsPath')} return normalizeFsPath;`)({
+      platform,
+    });
+    const resolve = new Function(
+      'fs',
+      'path',
+      'normalizeFsPath',
+      `${extract(runner, 'frozenPath')} return frozenPath;`,
+    )(fakeFs, paths, normalize);
+    assert.equal(resolve(fixtureRoot, fixtureFile), fixtureFile);
+    if (platform === 'win32') assert.equal(resolve(fixtureRoot, fixtureFile.toLowerCase()), fixtureFile);
+    else assert.throws(() => resolve(fixtureRoot, fixtureFile.toLowerCase()), /outside its fixture/);
+    assert.throws(
+      () => resolve(fixtureRoot, fixtureRoot + '-sibling' + paths.sep + 'source.jsonl'),
+      /outside its fixture/,
+    );
+    assert.throws(() => resolve(fixtureRoot, fixtureRoot), /outside its fixture/);
+    linked = true;
+    assert.throws(() => resolve(fixtureRoot, fixtureFile), /link/);
+  }
+});
+
+test('isolated startup observes accepted browser content without replacing startup completion', () => {
+  const tree = tempDir('startup-overlay');
+  const sources = ['panelhost.ts', 'webview/panel.ts'];
+  for (const relative of sources) {
+    const target = path.join(tree, 'extension/src', relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, relative), target);
+  }
+  instrumentStartup(tree);
+  const host = fs.readFileSync(path.join(tree, 'extension/src/panelhost.ts'), 'utf8');
+  const browser = fs.readFileSync(path.join(tree, 'extension/src/webview/panel.ts'), 'utf8');
+  assert.match(host, /accepted: this.readyHosts.has\(host\) && msg.generation === this.refreshGeneration/);
+  assert.match(browser, /measurementObservation:/);
+  assert.match(browser, /if \(stamp.complete\) send\('completeRender'\)/);
+  assert.match(browser, /item.key === article\?\.dataset.key/);
+});
+
 test('isolated startup pins source provenance before a moving reference builds', async () => {
   const text = fs.readFileSync(path.join(__dirname, '../scripts/panel-startup-measure/measure.ts'), 'utf8');
   const file = ts.createSourceFile('measure.ts', text, ts.ScriptTarget.Latest, true);
@@ -534,8 +791,8 @@ test('isolated startup pins source provenance before a moving reference builds',
     fs: {
       mkdirSync() {},
       readFileSync: () => 'MEASURE_BLOCK_AGENTS',
-      writeFileSync: (_file: string, value: string) => {
-        artifact = JSON.parse(value);
+      writeFileSync: (file: string, value: string) => {
+        if (file.endsWith('artifact.json')) artifact = JSON.parse(value);
       },
     },
     git: (args: string[]) => {
@@ -548,6 +805,9 @@ test('isolated startup pins source provenance before a moving reference builds',
       return 'tree';
     },
     protectBaseline() {},
+    instrumentStartup() {},
+    expectedSelection: { session: 'selected' },
+    __filename: 'measure.ts',
     npm: () => {
       reference = '2'.repeat(40);
     },

@@ -20,19 +20,9 @@ import {
 
 const MILESTONES: StartupMilestone[] = ['shellReady', 'catalogReady', 'railReady', 'firstCard', 'completeRender'];
 
-// The milestones a startup produces, and the one the run waits for. `completeRender` sits in
-// the table and outside the wait, because it reports the indexing of every session in the
-// store rather than a drawing step, and on a workspace of a few thousand sessions it lands
-// long after the panel is on screen. `firstCard` is the panel's first drawn card, which is
-// the measurement this script exists for.
-const AWAITED: StartupMilestone[] = ['shellReady', 'catalogReady', 'railReady', 'firstCard'];
-const LAST_MILESTONE: StartupMilestone = 'firstCard';
-
-// How long the run keeps reading after `firstCard`, to record a `completeRender` that is
-// already close. It matches the order of the first draw itself, so a corpus small enough to
-// finish indexing alongside the draw reports both, and one that is not adds ten seconds to
-// the run rather than the whole timeout.
-const GRACE_MS = 10_000;
+// Background session-list completion and selected content share one bounded measurement.
+const AWAITED = MILESTONES;
+const LAST_MILESTONE: StartupMilestone = 'completeRender';
 
 const REPOSITORY = path.resolve(__dirname, '../../..');
 const IS_MAIN = !!process.argv[1] && path.resolve(process.argv[1]) === __filename;
@@ -49,6 +39,7 @@ let fixture: {
 const STATE = path.join(SCRATCH, 'state.json');
 const MEASUREMENT_RUN = randomUUID();
 let selectionRequested = false;
+let expectedSelection: { session: string; key?: string; prompt?: string; summary?: string } | null = null;
 function isolatedEnvironment(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -79,6 +70,7 @@ interface Options {
 }
 
 interface LogLine {
+  at?: string;
   event?: string;
   milestone?: string;
   elapsedMs?: number;
@@ -87,6 +79,19 @@ interface LogLine {
   kind?: string;
   bytes?: number;
   measurementRun?: string;
+  stage?: string;
+  accepted?: boolean;
+  usableRows?: boolean;
+  observation?: {
+    session?: string;
+    key?: string;
+    prompt?: string;
+    summary?: string;
+    responseRegion?: 'response' | 'headline';
+    renderedResponse?: string;
+    visibleResponse?: string;
+    expectedRenderedResponse?: string;
+  };
 }
 
 // What one milestone line carries. `elapsedMs` counts from the extension host process and
@@ -195,12 +200,14 @@ function quoted(argument: string): string {
 
 function run(program: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): void {
   const shell = process.platform === 'win32' && program.toLowerCase().endsWith('.cmd');
-  const result = spawnSync(shell ? quoted(program) : program, shell ? args.map(quoted) : args, {
-    cwd,
-    env: env ?? process.env,
-    stdio: 'inherit',
-    shell,
-  });
+  const invoke = () =>
+    spawnSync(shell ? quoted(program) : program, shell ? args.map(quoted) : args, {
+      cwd,
+      env: env ?? process.env,
+      stdio: 'inherit',
+      shell,
+    });
+  const result = invoke();
   if (result.error) {
     stop(`${path.basename(program)} failed to start: ${result.error.message}`);
   }
@@ -241,7 +248,7 @@ function removeTree(): void {
   if (!fs.existsSync(helper)) throw new Error(`Cleanup helper is missing. Keep ${BUILD_TREE}.`);
   run(
     process.platform === 'win32' ? 'python' : 'python3',
-    [helper, '--repository', REPOSITORY, BUILD_TREE],
+    [helper, '--repository', REPOSITORY, '--force', BUILD_TREE],
     REPOSITORY,
   );
 }
@@ -278,7 +285,9 @@ export function sanitizeMeasurementState(raw: Record<string, unknown>): Record<s
 export function frozenPath(root: string, input: string): string {
   const canonicalRoot = fs.realpathSync(root);
   const lexical = path.resolve(canonicalRoot, input);
-  if (lexical === canonicalRoot || !lexical.startsWith(canonicalRoot + path.sep))
+  const rootIdentity = normalizeFsPath(canonicalRoot).replace(/\/$/, '');
+  const lexicalIdentity = normalizeFsPath(lexical);
+  if (lexicalIdentity === rootIdentity || !lexicalIdentity.startsWith(rootIdentity + '/'))
     throw new Error(`Frozen input sits outside its fixture: ${input}`);
   let ancestor = canonicalRoot;
   for (const part of path.relative(canonicalRoot, lexical).split(path.sep)) {
@@ -286,7 +295,8 @@ export function frozenPath(root: string, input: string): string {
     if (fs.lstatSync(ancestor).isSymbolicLink()) throw new Error(`Frozen input contains a link: ${ancestor}`);
   }
   const resolved = fs.realpathSync(path.resolve(root, input));
-  if (resolved === canonicalRoot || !resolved.startsWith(canonicalRoot + path.sep)) {
+  const resolvedIdentity = normalizeFsPath(resolved);
+  if (resolvedIdentity === rootIdentity || !resolvedIdentity.startsWith(rootIdentity + '/')) {
     throw new Error(`Frozen input sits outside its fixture: ${input}`);
   }
   const walk = (file: string) => {
@@ -357,6 +367,16 @@ function loadFixture(manifest: string): void {
   const live = [arcHome(), projectsRoot(), codexSessionsRoot()];
   const raw = JSON.parse(fs.readFileSync(manifest, 'utf8'));
   fixture = frozenFixturePaths(root, raw, live);
+  const selected = sanitizeMeasurementState(JSON.parse(fs.readFileSync(fixture.state, 'utf8'))).showing;
+  expectedSelection = typeof selected === 'string' ? { session: selected, ...raw.expectedSelection } : null;
+  if (!expectedSelection || expectedSelection.session !== selected)
+    throw new Error('The frozen fixture must name its selected session.');
+  if (
+    Object.entries(expectedSelection).some(
+      ([key, value]) => !['session', 'key', 'prompt', 'summary'].includes(key) || typeof value !== 'string' || !value,
+    )
+  )
+    throw new Error('Frozen selected-turn expectations must contain nonempty text.');
   if (fs.existsSync(path.join(fixture.workspace, '.git')))
     throw new Error('The frozen workspace must not resolve a live repository scope.');
   const hashes = inputHashes(root, [manifest, ...Object.values(fixture)]);
@@ -388,6 +408,51 @@ function loadFixture(manifest: string): void {
       null,
       2,
     ),
+  );
+}
+
+// The overlay records the visible card and accepted paint on the existing message route.
+export function instrumentStartup(tree: string): void {
+  const patch = (relative: string, needle: string, replacement: string) => {
+    const file = path.join(tree, 'extension', 'src', relative);
+    const source = fs.readFileSync(file, 'utf8');
+    if (!source.includes(needle)) throw new Error(`The baseline lacks its startup observation boundary: ${relative}`);
+    fs.writeFileSync(file, source.replace(needle, replacement));
+  };
+  patch(
+    'webview/panel.ts',
+    'stage: stage,',
+    `stage: stage,
+          measurementObservation: (() => {
+            const article = list.querySelector<HTMLElement>('.timeline-owner:not([hidden]) article.turn');
+            const card = latest?.cards.find((item) => item.key === article?.dataset.key);
+            const visible = (element: HTMLElement | null) => element && !element.closest('[hidden]');
+            const response = article?.querySelector<HTMLElement>('.body .sectionheading.saidonly + .summary') ?? null;
+            const headline = article?.querySelector<HTMLElement>('.headline') ?? null;
+            const responseRegion = visible(response) ? 'response' : visible(headline) ? 'headline' : undefined;
+            const region = responseRegion === 'response' ? response : responseRegion === 'headline' ? headline : null;
+            const content = region?.cloneNode(true) as HTMLElement | undefined;
+            content?.querySelectorAll('.copy').forEach((button) => button.remove());
+            const expected = document.createElement('div');
+            expected.innerHTML = responseRegion === 'response' ? card?.summaryHtml ?? '' : card?.headlineHtml ?? '';
+            const normalize = (text: string) => text.replace(/\\s+/g, ' ').trim();
+            return { session: article?.dataset.session, key: article?.dataset.key,
+              prompt: card?.prompt, summary: card?.summary, responseRegion,
+              visibleResponse: region?.innerText ?? '',
+              renderedResponse: normalize(content?.textContent ?? ''),
+              expectedRenderedResponse: normalize(expected.textContent || (responseRegion === 'headline' ? card?.headline ?? '' : '')) };
+          })(),`,
+  );
+  patch(
+    'panelhost.ts',
+    'this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);',
+    `this.diagnostics.log('measurementPaint', {
+          stage: msg.stage, generation: msg.generation, usableRows: msg.usableRows === true,
+          accepted: this.readyHosts.has(host) && msg.generation === this.refreshGeneration,
+          observation: (raw as { measurementObservation?: unknown }).measurementObservation,
+          hostMs: performance.now(),
+        });
+        this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);`,
   );
 }
 
@@ -579,11 +644,42 @@ function reached(lines: LogLine[], milestone: string): boolean {
   return lines.some((line) => line.event === 'startup' && line.milestone === milestone);
 }
 
-// A run is complete when every awaited milestone arrived. `firstCard` on its own is not
-// enough, because a missing earlier milestone leaves a hole in the table, and `completeRender`
-// is outside the wait, so its absence leaves the run complete.
-export function outcomeOf(lines: LogLine[], instance: string | null, note: string | null): Outcome {
-  const missing = AWAITED.filter((milestone) => !reached(lines, milestone));
+// Every startup milestone must arrive before the measurement deadline.
+export function outcomeOf(
+  lines: LogLine[],
+  instance: string | null,
+  note: string | null,
+  selection: { session: string; key?: string; prompt?: string; summary?: string } | null = null,
+  deadline = Infinity,
+): Outcome {
+  const timely = lines.filter((line) => deadline === Infinity || Date.parse(line.at ?? '') <= deadline);
+  const missing: string[] = AWAITED.filter((milestone) => !reached(timely, milestone));
+  if (selection) {
+    if (!selection.key || !selection.prompt || !selection.summary) missing.push('frozen newest-turn expectation');
+    const paints = timely.filter((line) => line.event === 'measurementPaint' && line.accepted === true);
+    if (!paints.some((line) => line.stage === 'railReady' && line.usableRows === true))
+      missing.push('usable session-list rows');
+    if (
+      !paints.some((line) => {
+        const observation = line.observation;
+        return (
+          line.stage === 'firstCard' &&
+          observation?.session === selection.session &&
+          !!observation.key &&
+          !!observation.prompt &&
+          !!observation.summary &&
+          (observation.responseRegion === 'response' || observation.responseRegion === 'headline') &&
+          !!observation.renderedResponse &&
+          !!observation.visibleResponse?.trim() &&
+          observation.renderedResponse === observation.expectedRenderedResponse &&
+          (!selection.key || observation.key === selection.key) &&
+          (!selection.prompt || observation.prompt === selection.prompt) &&
+          (!selection.summary || observation.summary === selection.summary)
+        );
+      })
+    )
+      missing.push('selected newest-turn text');
+  }
   if (missing.length === 0) {
     return { lines, instance, complete: true, note };
   }
@@ -618,17 +714,37 @@ function launchEditor(commandLine: string, workspace: string): Launch {
     ...(selectionRequested ? ['--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1'] : []),
     workspace,
   ];
+  const stdout = fs.openSync(path.join(SCRATCH, 'launch.stdout.log'), 'w');
+  const stderr = fs.openSync(path.join(SCRATCH, 'launch.stderr.log'), 'w');
   const child = spawn(shell ? quoted(commandLine) : commandLine, shell ? args.map(quoted) : args, {
     cwd: SCRATCH,
     env: isolatedEnvironment(),
-    stdio: 'ignore',
+    stdio: ['ignore', stdout, stderr],
     detached: true,
     shell,
   });
+  fs.closeSync(stdout);
+  fs.closeSync(stderr);
+  const receipt = (code: number | null, signal: string | null, error?: string) =>
+    fs.writeFileSync(
+      path.join(SCRATCH, 'launch.json'),
+      JSON.stringify({
+        commandLine,
+        args,
+        pid: child.pid ?? null,
+        profile: USER_DATA,
+        code,
+        signal,
+        error: error ?? null,
+      }),
+    );
+  receipt(null, null);
   child.on('error', (error: Error) => {
     launch.failure = `The editor did not start: ${error.message}`;
+    receipt(null, null, error.message);
   });
   child.on('exit', (code: number | null, signal: string | null) => {
+    receipt(code, signal);
     if (code === 0) {
       return;
     }
@@ -668,46 +784,51 @@ function stopEditor(): void {
   }
 }
 
-// Opens the workspace and waits for the panel's first drawn card. `firstCard` ends the run,
-// after a grace period that records a `completeRender` arriving on its heels. A run that
-// never draws a card stops on the deadline, or on an editor that went away, and says which
-// milestones did arrive.
+export async function pollStartup(
+  read: () => LogLine[],
+  launch: Launch,
+  timeoutMs: number,
+  measurementRun: string,
+  selection: typeof expectedSelection,
+): Promise<Outcome> {
+  const deadline = Date.now() + timeoutMs;
+  const waited = Math.round(timeoutMs / 1000);
+  for (;;) {
+    const lines = read();
+    const instance = measuredInstance(lines, measurementRun);
+    const run = linesOf(lines, instance, measurementRun);
+    const outcome = outcomeOf(run, instance, null, selection, deadline);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return {
+        ...outcome,
+        complete: false,
+        note:
+          lines.length === 0
+            ? `Arc wrote no diagnostics line in ${waited}s. Check that the window opened and that the panel tab is in the stored window state.`
+            : `The startup remained incomplete after ${waited}s. ${outcome.note ?? ''}`,
+      };
+    }
+    if (launch.failure !== null) return { ...outcome, complete: false, note: launch.failure };
+    if (outcome.complete) return outcome;
+    await delay(Math.min(1000, remaining));
+  }
+}
+
+// The panel acknowledges completion after discovery and session-list metadata settle.
 async function measure(commandLine: string, workspace: string, timeoutMs: number): Promise<Outcome> {
   const { acquireBrowserLock } = await import('../../test/browserlock.mjs');
-  const lock = selectionRequested ? await acquireBrowserLock({ deadlineMs: timeoutMs }) : null;
+  const lock = await acquireBrowserLock({ deadlineMs: timeoutMs });
   const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
   const reader = new LogReader(logs);
   const launch = launchEditor(commandLine, workspace);
-  const deadline = Date.now() + timeoutMs;
-  const waited = Math.round(timeoutMs / 1000);
-  let grace: number | null = null;
   try {
-    for (;;) {
-      const lines = reader.read();
-      const instance = measuredInstance(lines, MEASUREMENT_RUN);
-      const run = linesOf(lines, instance, MEASUREMENT_RUN);
-      if (reached(run, LAST_MILESTONE)) {
-        if (selectionRequested) {
-          const result = await measureSelection(SCRATCH, timeoutMs);
-          return { ...outcomeOf(run, instance, result.note), complete: result.complete };
-        }
-        grace ??= Date.now() + GRACE_MS;
-        if (reached(run, 'completeRender') || Date.now() >= grace) {
-          return outcomeOf(run, instance, null);
-        }
-      } else if (launch.failure !== null) {
-        return outcomeOf(run, instance, launch.failure);
-      } else if (Date.now() >= deadline) {
-        return outcomeOf(
-          run,
-          instance,
-          lines.length === 0
-            ? `Arc wrote no diagnostics line in ${waited}s. Check that the window opened and that the panel tab is in the stored window state.`
-            : `The panel had not reported ${LAST_MILESTONE} after ${waited}s.`,
-        );
-      }
-      await delay(1000);
+    const outcome = await pollStartup(() => reader.read(), launch, timeoutMs, MEASUREMENT_RUN, expectedSelection);
+    if (outcome.complete && selectionRequested) {
+      const result = await measureSelection(SCRATCH, timeoutMs);
+      return { ...outcome, note: result.note, complete: result.complete };
     }
+    return outcome;
   } finally {
     stopEditor();
     lock?.release();
@@ -768,7 +889,7 @@ function bytesOf(lines: LogLine[]): { largest: number; count: number } {
 
 function report(outcome: Outcome, label: string, workspace: string): void {
   const lines = outcome.lines;
-  const end = lines.findIndex((line) => line.event === 'startup' && line.milestone === LAST_MILESTONE);
+  const end = lines.findIndex((line) => line.event === 'startup' && line.milestone === 'firstCard');
   const startup = bytesOf(end < 0 ? lines : lines.slice(0, end + 1));
   const whole = bytesOf(lines);
   process.env.ARC_PROJECTS_ROOT = fixture.projects;
@@ -791,7 +912,7 @@ function report(outcome: Outcome, label: string, workspace: string): void {
             `  render          ${whole.largest.toLocaleString()} bytes, largest of ${whole.count} posted before the run stopped`,
           ]
         : [
-            `  startup render  ${startup.largest.toLocaleString()} bytes, largest of ${startup.count} posted up to ${LAST_MILESTONE}`,
+            `  startup render  ${startup.largest.toLocaleString()} bytes, largest of ${startup.count} posted up to firstCard`,
             `  whole run       ${whole.largest.toLocaleString()} bytes, largest of ${whole.count} posted`,
           ]),
       `  sessions        ${sessions.total.toLocaleString()} in the rail: ${sessions.claude.toLocaleString()} Claude, ${sessions.children.toLocaleString()} Claude children, ${sessions.codex.toLocaleString()} Codex`,
@@ -821,6 +942,7 @@ async function main(): Promise<void> {
     const source = git(['rev-parse', options.commit ?? 'HEAD']);
     const tree = prepareTree(source);
     protectBaseline(tree);
+    instrumentStartup(tree);
     if (selectionRequested) instrumentSelection(tree);
     const label = git(['rev-parse', '--short', source]);
     npm(['run', 'build'], path.join(tree, 'extension'));
@@ -853,6 +975,7 @@ async function main(): Promise<void> {
         source,
         measurementRun: MEASUREMENT_RUN,
         measurementOverlay: true,
+        startupOverlaySha256: createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'),
         ...(selectionRequested
           ? {
               selectionOverlaySha256: createHash('sha256')
@@ -867,6 +990,23 @@ async function main(): Promise<void> {
     );
     process.stdout.write(`Owned paths and artifacts: ${SCRATCH}\n`);
     const outcome = await measure(commandLine, options.workspace, options.timeoutMs);
+    fs.writeFileSync(
+      path.join(SCRATCH, 'result.json'),
+      JSON.stringify(
+        {
+          source,
+          artifact,
+          expectedSelection,
+          deadlineMs: options.timeoutMs,
+          ...outcome,
+          byteMeasurement: 'JSON content-size proxy',
+          nativeCloneBytes: null,
+          persistenceDurationMs: null,
+        },
+        null,
+        2,
+      ),
+    );
     report(outcome, label, options.workspace);
     if (!outcome.complete) {
       process.exitCode = 1;
