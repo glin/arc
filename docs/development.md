@@ -181,7 +181,7 @@ The shared browser launcher tries Edge, Chrome, and bundled Chromium in that ord
 
 A browser lane that waits for the machine-wide lock prints one line naming the PID, the extension directory, and the start time of the run holding it, once, when the wait begins. The lane prints a second line once it resumes, naming how long it waited. An immediate acquisition prints neither line.
 
-The `panel.layout*.test.ts` files and the other browser files build the panel and measure it in Edge or Chrome. Each test skips when neither browser exists. Full mode names the browser executable it found before the browser lane runs, or states that the lane found no browser. Read the skip result after changing panel styles.
+The `panel.layout*.test.ts` files and the other browser files build the panel and measure it in Edge, Chrome, or bundled Chromium. Each test skips when no browser exists. Full mode names the browser executable it found before the browser lane runs, or states that the lane found no browser. Read the skip result after changing panel styles.
 
 Build before opening the panel after changing its stylesheet, browser script, browser entry, or bundle input:
 
