@@ -215,7 +215,7 @@ export type HostToPanel =
   | { type: 'projectSpend'; projectSpend: ProjectSpend | null }
   | { type: 'layout'; layout: TimelineLayout }
   | { type: 'live'; session: string; live: ComposerLive[] }
-  | { type: 'activity'; session: string; card: PanelCard }
+  | ({ type: 'activity' } & ({ session: string; card: PanelCard } | { cards: PanelCard[] }))
   | SelectionMessage
   | {
       type: 'rail';
@@ -701,7 +701,11 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         ? { type: 'live', session: m.session, live: m.live }
         : null;
     case 'activity':
-      return isString(m.session) ? { type: 'activity', session: m.session, card: m.card as PanelCard } : null;
+      return records(m.cards)
+        ? { type: 'activity', cards: m.cards as unknown as PanelCard[] }
+        : isString(m.session)
+          ? { type: 'activity', session: m.session, card: m.card as PanelCard }
+          : null;
     case 'selection':
       return records(m.cards) &&
         records(m.sessions) &&

@@ -48,6 +48,9 @@ import {
   nextTurnBasisOf,
   distinctNames,
   dispatchedAgentCard,
+  dispatchedCostPrint,
+  movedDispatchedCards,
+  dispatchedState,
   doingOf,
   durationWord,
   enumeratedCount,
@@ -10012,6 +10015,40 @@ const dispatchedCost = ({
   ...over,
 });
 const costFigure = (card: TurnCard) => card.chips.find((chip) => chip.metric === 'cost')!;
+
+test('dispatched cost movement identifies only drawn cards whose contribution or discovery answer changed', () => {
+  const original = dispatchedCost();
+  const print = (costs = [original], hydrated = true, pending = false) => dispatchedCostPrint(costs, hydrated, pending);
+  const drawn = new Map([
+    ['parent:1', print()],
+    ['other:1', print()],
+  ]);
+  for (const changed of [
+    print([dispatchedCost({ parts: [dispatchedPart(3_000_000)] })]),
+    print([{ ...original, short: true }]),
+    print([{ ...original, ownSettledAt: NOW }]),
+    print([original], false),
+    print([original], true, true),
+  ]) {
+    assert.deepEqual(
+      movedDispatchedCards(
+        drawn,
+        new Map([
+          ['parent:1', changed],
+          ['other:1', print()],
+          ['new:1', changed],
+        ]),
+      ),
+      ['parent:1'],
+    );
+  }
+  assert.deepEqual(movedDispatchedCards(drawn, drawn), []);
+});
+
+test('a dispatched session waiting for input remains running on its row', () => {
+  assert.equal(dispatchedState('waiting'), 'running');
+  assert.equal(dispatchedState('done'), 'done');
+});
 
 test('the turn cost adds each dispatched session the card counts, and the session heading does not', () => {
   const t = turn();

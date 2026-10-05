@@ -997,6 +997,17 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     timelineRenderer.updateCard(session, card);
   }
 
+  function applyActivityCards(cards: PanelCard[]) {
+    if (!latest) return;
+    const accepted = cards.filter((card) => {
+      const at = activityCardIndexes.get(card.key);
+      if (at === undefined || latest!.cards[at].sessionId !== card.sessionId) return false;
+      latest!.cards[at] = card;
+      return true;
+    });
+    timelineRenderer.updateCards(accepted);
+  }
+
   onDocument('keydown', function (raw) {
     const e = raw as KeyboardEvent;
     if (e.key !== 'Escape' || !chrome.launcherOpen()) return;
@@ -1237,7 +1248,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         queueLiveRenderer.applyLive(msg.session, msg.live);
       },
       activity: function (msg) {
-        applyActivityCard(msg.session, msg.card);
+        if ('cards' in msg) applyActivityCards(msg.cards);
+        else applyActivityCard(msg.session, msg.card);
       },
       // Retain session list updates on latest so later repaints keep the current workspace state.
       rail: function (msg) {

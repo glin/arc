@@ -1073,6 +1073,104 @@ for (const hold of ['selection', 'comment press', 'comment edit']) {
   });
 }
 
+test('one Activity list updates two sessions while preserving focus and selected text', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(
+      themed(
+        pageHtml().replace(
+          'window.__posted = [];',
+          'window.__posted = []; window.__timelineDraws = 0; window.__arcOnDraw = (owner) => { if (owner === "timeline") window.__timelineDraws++; };',
+        ),
+      ),
+    );
+    const payload = twoSessionPayload();
+    await post(page, payload);
+    const first = payload.cards[0];
+    const second = payload.cards.at(-1)!;
+    const control = page.locator(`[data-control=${JSON.stringify(`card:${payload.cards[1].key}`)}]`);
+    await control.click();
+    const selected = await page.evaluate(`(() => {
+      window.__batchFocus = document.activeElement;
+      const range = document.createRange();
+      range.selectNodeContents(document.querySelector('[data-key="${payload.cards[1].key}"] .summary p'));
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      return getSelection().toString();
+    })()`);
+    const before = await page.evaluate<number>('window.__timelineDraws');
+    const cards = [
+      { ...first, headline: 'The first dispatched cost settled.' },
+      { ...second, headline: 'The second dispatched cost settled.' },
+    ];
+    await post(page, { type: 'activity', cards });
+    for (const card of cards) {
+      assert.equal(await page.locator(`[data-key=${JSON.stringify(card.key)}] .headline`).textContent(), card.headline);
+    }
+    assert.equal(await page.evaluate('window.__timelineDraws'), before + 1);
+    assert.equal(await page.evaluate('document.activeElement === window.__batchFocus'), true);
+    assert.equal(await page.evaluate('getSelection().toString()'), selected);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a settled Activity batch survives release of an older single-card update', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  try {
+    for (const theme of ['dark', 'light'] as const) {
+      const page = await browser.newPage();
+      await page.setContent(themed(pageHtml(), theme));
+      const payload = renderPayload() as Payload;
+      const card = payload.cards[0];
+      payload.cards = [card];
+      await post(page, payload);
+      await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
+      await page.evaluate(`(() => {
+        const range = document.createRange();
+        range.selectNodeContents(document.querySelector('article.turn .summary p'));
+        getSelection().removeAllRanges();
+        getSelection().addRange(range);
+        document.dispatchEvent(new Event('selectionchange'));
+      })()`);
+      const withCost = (label: string) => {
+        const updated = structuredClone(card);
+        const cost = (updated.chips as Array<Record<string, unknown>>).find((chip) => chip.metric === 'cost')!;
+        cost.label = label;
+        return updated;
+      };
+      await post(page, { type: 'activity', session: card.sessionId, card: withCost('$12.34+') });
+      await page.evaluate(`(() => {
+        window.__blockSelectionChange = (event) => event.stopImmediatePropagation();
+        document.addEventListener('selectionchange', window.__blockSelectionChange, true);
+        getSelection().removeAllRanges();
+      })()`);
+      await post(page, { type: 'activity', cards: [withCost('$56.78')] });
+      const cost = page.locator('article.turn button.statchip[data-metric="cost"]');
+      assert.equal(await cost.textContent(), '$56.78');
+      await page.evaluate(`(() => {
+        document.removeEventListener('selectionchange', window.__blockSelectionChange, true);
+        document.dispatchEvent(new Event('selectionchange'));
+      })()`);
+      await page.waitForFunction(() => getSelection()?.isCollapsed);
+      assert.equal(await cost.textContent(), '$56.78', `${theme}: release restored an older cost`);
+      await page.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
 test('Activity updates an unheld running card while another card waits for a full render', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

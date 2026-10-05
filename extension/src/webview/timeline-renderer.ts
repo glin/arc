@@ -845,6 +845,7 @@ export interface TimelineRenderer {
   drawRowContexts(sessions: readonly string[]): void;
   update(view: TimelineView, footers?: Node[]): void;
   updateCard(session: string, card: CardView): boolean;
+  updateCards(cards: readonly CardView[]): boolean;
   showForeign(nodes: Node[], footers?: Node[], retained?: TimelineView, showing?: string | null): void;
   // Adopt the heading figures a host message carried, without drawing. The caller draws next.
   applyStats(stats: Record<string, SessionStat[]>): void;
@@ -1313,24 +1314,36 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
   };
 
   const updateCard = (session: string, card: CardView): boolean => {
-    if (!latest || card.sessionId !== session) {
-      return false;
+    return card.sessionId === session && updateCards([card], true);
+  };
+
+  const updateCards = (cards: readonly CardView[], mountedOnly = false): boolean => {
+    if (!latest) return false;
+    const accepted: CardView[] = [];
+    for (const card of cards) {
+      const index = cardIndexes.get(card.key);
+      if (index === undefined || latest.cards[index].sessionId !== card.sessionId) continue;
+      latest.cards[index] = card;
+      accepted.push(card);
     }
-    const index = cardIndexes.get(card.key);
-    if (index === undefined) {
-      return false;
-    }
-    latest.cards[index] = card;
-    // Update latest while a structural replacement waits. That replacement draws the newest Activity snapshot when released.
+    if (!accepted.length) return false;
+    // Adopt accepted cards while a structural replacement waits. That replacement draws the newest Activity snapshots when released.
     if (pendingView && pendingViewReplaces) return true;
-    publishCard(card);
-    if (deferredCards.size) {
-      pendingCard = () => {
-        for (const pending of deferredCards.values()) publishCard(pending);
-      };
-    } else {
-      pendingCard = null;
+    if (mountedOnly) {
+      for (const card of accepted) publishCard(card);
+      pendingCard = deferredCards.size
+        ? () => {
+            for (const pending of deferredCards.values()) publishCard(pending);
+          }
+        : null;
+      return true;
     }
+    // The list draw adopts every current card, including held single-card updates.
+    deferredCards.clear();
+    pendingCard = null;
+    if (draw(latest, Array.from(footer.childNodes))) {
+      pendingView = () => update(latest!, Array.from(footer.childNodes));
+    } else pendingView = null;
     return true;
   };
 
@@ -1439,6 +1452,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
     settled: () => !pendingView && !pendingCard && !pendingRefresh,
     update,
     updateCard,
+    updateCards,
     showForeign,
     applyStats(stats) {
       sessionStats = stats;

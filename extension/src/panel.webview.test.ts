@@ -970,6 +970,7 @@ import type { TextEdit, UndoStack, UndoStep } from './domain/composer-editing.ts
 import {
   composerRuntimeBySession,
   countedDispatchedCosts,
+  dispatchedCostPrint,
   turnCost,
   dispatchedAgentCard,
   dispatchedChip,
@@ -990,6 +991,7 @@ import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webv
 import { emptyTrail, prunePlaces, stepBack, stepForward, trailPlace, visitPlace } from './turnplaces.ts';
 import {
   aggregateUsageEvents,
+  saveSpendLedger,
   normalizeSpendFile,
   normalizeWorkspace,
   SessionSpendSourceIndex,
@@ -3387,6 +3389,7 @@ test('the host payload keeps dispatched artifacts on the child card', () => {
     'withRecoveredCommits',
     'sameCommitSha',
     'countedDispatchedCosts',
+    'dispatchedCostPrint',
     `${compiled}\nreturn renderTurnCard;`,
   )(
     toCard,
@@ -3398,6 +3401,7 @@ test('the host payload keeps dispatched artifacts on the child card', () => {
     withRecoveredCommits,
     sameCommitSha,
     countedDispatchedCosts,
+    dispatchedCostPrint,
   ) as Function;
   const parent = turn({ sessionId: 'parent', files: [], commits: [], agents: [], dispatchToolUseIds: ['launch'] });
   const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
@@ -3421,6 +3425,8 @@ test('the host payload keeps dispatched artifacts on the child card', () => {
   const provider = {
     live: {},
     turnsByKey: new Map(),
+    dispatchedCostsForTurn: (PanelProvider.prototype as any).dispatchedCostsForTurn,
+    dispatchedDiscoveryWaiting: (PanelProvider.prototype as any).dispatchedDiscoveryWaiting,
     projectSpendHydrated: true,
     dispatchedTurnCosts: () => ({}),
     repositoryCommits: { apply() {} },
@@ -5131,6 +5137,8 @@ test("the host counts a dispatched session in its parent's cost once and files i
     liveActivity: Record<string, unknown>;
     turnsByKey: Map<string, unknown>;
     postActivity(session: string): boolean;
+    finishProjectSpendIndex(): void;
+    hydrateProjectSpend(workspace: string, generation: number, tick: unknown): void;
     renderTurnCard(...args: unknown[]): {
       label: string;
       dispatched?: { description: string }[];
@@ -5221,6 +5229,128 @@ test("the host counts a dispatched session in its parent's cost once and files i
       row,
       'the cost entry and the Dispatched row name the session differently',
     );
+  }
+  {
+    const host = cardHost([launch('parent', 'child')]);
+    const newest = parentTurn(['toolu_1']);
+    const older = parentTurn(['toolu_1'], newest.startedAt - 1);
+    cardOf(host, newest, true);
+    const posted: any[] = [];
+    const refresh = vi.fn<() => void>();
+    Object.assign(host, {
+      cards: [cardOf(host, newest), cardOf(host, older)],
+      turnsByKey: new Map([[turnKey(older), older]]),
+      sendToHost: (_host: unknown, message: unknown) => posted.push(message),
+      postProjectSpend: () => {},
+      postRail: () => {},
+      postRailIfSpendPendingMoved: () => {},
+      scheduleProjectSpendSave: () => {},
+      refresh,
+      projectSpendIndexing: true,
+      projectSpendFiles: records.map((record) =>
+        record.file === fileOf('child') ? { ...record, lifetimeBuckets: bucket(inputs.child * 2) } : record,
+      ),
+    });
+    host.finishProjectSpendIndex();
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].type, 'activity');
+    assert.deepEqual(
+      posted[0].cards.map((card: any) => costOf(card)?.label),
+      [amount(ownCost + child * 2), amount(ownCost + child * 2)],
+    );
+    assert.equal(refresh.mock.calls.length, 0);
+    host.projectSpendIndexing = true;
+    host.finishProjectSpendIndex();
+    assert.equal(posted.length, 1, 'an unchanged ledger pass posted cards');
+  }
+  {
+    const host = cardHost([launch('parent', 'child')]);
+    const newest = parentTurn(['toolu_1']);
+    cardOf(host, newest, true);
+    const posted: any[] = [];
+    const storage = tempDir('dispatch-cost-hydration-');
+    saveSpendLedger(
+      storage,
+      'w',
+      records.map((record) => ({ ...record, workspace: normalizeWorkspace('w') })),
+    );
+    Object.assign(host, {
+      projectSpendHydrated: false,
+      projectSpendFiles: [],
+      projectSpendVisibleFiles: [],
+      projectSpendQueued: new Set([childKey]),
+      projectSpendWorkspace: 'w',
+      projectSpendStorageDir: storage,
+      refreshGeneration: 1,
+      scheduleProjectSpendMidnight: () => {},
+      scheduleProjectSpendIndex: () => {},
+      scheduleProjectSpendSave: () => {},
+      postProjectSpend: () => {},
+      postRail: () => {},
+      sendToHost: (_host: unknown, message: unknown) => posted.push(message),
+      cards: [],
+    });
+    const before = cardOf(host, newest);
+    assert.match(costOf(before)!.label, /[+]$/);
+    Object.assign(host, { cards: [before] });
+    host.hydrateProjectSpend('w', 1, null);
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].type, 'activity');
+    assertCounted(posted[0].cards[0], 1, 'hydration redraw');
+  }
+  {
+    // Discovery readiness changes the cost even when no source ownership changes.
+    const host = cardHost([launch('parent', 'hidden')], ['parent']);
+    const newest = parentTurn(['toolu_1']);
+    cardOf(host, newest, true);
+    const provider = host as unknown as Record<string, any>;
+    const posted: any[] = [];
+    const refresh = vi.fn<() => void>();
+    Object.assign(provider, {
+      dispatchDiscoveryPending: true,
+      authoritativeCatalog: [session('parent')],
+      catalog: { sessions: [session('parent')] },
+      refreshGeneration: 1,
+      repositoryScopeRoots: [],
+      claudeParents: [session('parent')],
+      claudeChildReferenceEntries: new Map(),
+      claudeChildStatWrites: new Map(),
+      derivedCacheCheckpointState: { markChanged() {} },
+      checkpointDerivedCache() {},
+      hasHumanPrompt: () => true,
+      activityFor: () => 1,
+      pruneDerivedTitles: () => false,
+      sendToHost: (_host: unknown, message: unknown) => posted.push(message),
+      refresh,
+    });
+    const sourceRevision = provider.sessionSpendSourceIndex.revision;
+    for (const pending of [false, true]) {
+      provider.cards = [cardOf(host, newest)];
+      const before = costOf(provider.cards[0]);
+      assert.equal(before?.label, pending ? undefined : '$0.00+');
+      provider.progressiveWorker = {
+        run: async () => ({
+          generation: 1,
+          value: {
+            kind: 'claude-children',
+            complete: !pending,
+            continuation: false,
+            references: provider.claudeChildReferences,
+            referenceEntries: [],
+            children: [],
+            roots: [session('parent')],
+          },
+        }),
+      };
+      posted.length = 0;
+      assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
+      assert.equal(provider.dispatchDiscoveryPending, pending);
+      assert.equal(provider.sessionSpendSourceIndex.revision, sourceRevision);
+      assert.equal(posted.length, 1, `discovery ${pending ? 'pending' : 'complete'} posted no card`);
+      assert.equal(posted[0].type, 'activity');
+      assert.equal(costOf(posted[0].cards[0])?.label, pending ? '$0.00+' : undefined);
+      assert.equal(refresh.mock.calls.length, 0, 'discovery readiness required a full refresh');
+    }
   }
   {
     // One reference with receipts on two turns counts on the card of the first receipt.
@@ -21615,8 +21745,8 @@ test('the host counts a carried subagent on the rail and the newest card alike',
   }
 });
 
-// Dispatched rows remain running while their sessions retain background subagents or commands.
-test.each(['subagents', 'background'] as const)(
+// Dispatched rows remain running during background work and while waiting for input.
+test.each(['subagents', 'background', 'waiting'] as const)(
   'the host draws a dispatched row as running while its session reads %s, then done',
   (status) => {
     const stampAt = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
@@ -21699,6 +21829,7 @@ test.each(['subagents', 'background'] as const)(
       const { provider } = liveProviderFixture(livePress({ sessionId: 'parent' }));
       Object.assign(provider, {
         lifetimeRailFacts: () => ({}),
+        asks: status === 'waiting' ? [{ session: 'sess' }] : [],
         claudeChildren: subagent ? [{ parentSessionId: 'sess', sessionId: 'x1', mtimeMs: now - 10_000 }] : [],
         claudeChildStatWrites: new Map(),
         claudeChildReferences: [
@@ -21779,6 +21910,7 @@ test.each(['subagents', 'background'] as const)(
       );
       const later = Date.parse(stampAt(40));
       vi.setSystemTime(later);
+      Object.assign(provider, { asks: [] });
       assert.deepEqual(draw(later), {
         rail: 'done',
         subagents: undefined,

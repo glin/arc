@@ -1281,12 +1281,13 @@ function agentCard(
   };
 }
 
-// Maps session-list activity states to running, including subagents and background commands.
+// Maps session-list activity states to running, including subagents, background commands, and waiting for input.
 export function dispatchedState(status: RailStatus | undefined): AgentState {
   switch (status) {
     case 'running':
     case 'subagents':
     case 'background':
+    case 'waiting':
       return 'running';
     case 'failed':
     case 'interrupted':
@@ -1830,6 +1831,22 @@ export interface DispatchedSessionCost {
 export interface DispatchedTurnCost extends DispatchedSessionCost {
   sessionId: string;
   name: string;
+}
+
+// The contribution and discovery state that a drawn card used for its dispatched cost.
+export function dispatchedCostPrint(
+  costs: readonly DispatchedTurnCost[],
+  hydrated: boolean,
+  discoveryPending: boolean,
+): string {
+  return JSON.stringify([costs, hydrated, discoveryPending]);
+}
+
+export function movedDispatchedCards(
+  drawn: ReadonlyMap<string, string>,
+  current: ReadonlyMap<string, string>,
+): string[] {
+  return [...current].filter(([key, print]) => drawn.has(key) && drawn.get(key) !== print).map(([key]) => key);
 }
 
 // Dispatched session cost after subtracting Claude print rows already counted on this card.

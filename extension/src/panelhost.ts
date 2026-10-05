@@ -211,6 +211,8 @@ import {
   cacheExpiryReturnCount,
   composerRuntimeBySession,
   countedDispatchedCosts,
+  dispatchedCostPrint,
+  movedDispatchedCards,
   dispatchedAgentCard,
   dispatchedChip,
   dispatchedState,
@@ -1658,6 +1660,7 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendLastOfferAt = 0;
   private projectSpendRevision = 0;
   private lifetimeFigures = new SessionFiguresCache<SessionHeldFigures, LifetimeFigures>();
+  private dispatchedCardPrints = new Map<string, string>();
   private projectSpendFiles: SpendFileIndex[] = [];
   private projectSpendVisibleFiles: SpendFileIndex[] = [];
   private projectSpendQueue: { file: string; agent: AgentKind; primary?: boolean }[] = [];
@@ -7053,6 +7056,73 @@ export class PanelProvider implements vscode.Disposable {
     return out;
   }
 
+  private postDispatchedCostsIfMoved(): void {
+    if (!this.cards?.length || !this.dispatchedCardPrints?.size) return;
+    const drawnKeys = new Set(this.cards.map((card) => card.key));
+    for (const key of this.dispatchedCardPrints.keys()) {
+      if (!drawnKeys.has(key)) this.dispatchedCardPrints.delete(key);
+    }
+    const costs = this.dispatchedTurnCosts();
+    const current = new Map<string, string>();
+    const turns = new Map<string, Turn>();
+    for (const card of this.cards) {
+      if (card.kind !== 'turn' || !this.dispatchedCardPrints.has(card.key)) continue;
+      const newest = this.newestBySession.get(card.sessionId);
+      const recorded = newest && turnKey(newest) === card.key ? newest : this.turnsByKey.get(card.key);
+      if (!recorded) continue;
+      const turn = newest === recorded ? this.withActivity(recorded) : recorded;
+      const counted = this.dispatchedCostsForTurn(turn, () => costs);
+      current.set(card.key, dispatchedCostPrint(counted, this.projectSpendHydrated, this.dispatchedDiscoveryWaiting()));
+      turns.set(card.key, recorded);
+    }
+    const moved = new Set(movedDispatchedCards(this.dispatchedCardPrints, current));
+    if (!moved.size) return;
+    const now = Date.now();
+    const folders = this.folders();
+    const running = this.runningSessions();
+    const children = this.liveOpenChildren(now);
+    const statuses = this.railStatuses(now).statuses;
+    const changed: RenderCard[] = [];
+    for (let index = 0; index < this.cards.length; index++) {
+      const previous = this.cards[index];
+      if (!moved.has(previous.key)) continue;
+      const turn = turns.get(previous.key)!;
+      const latest = this.newestBySession.get(turn.sessionId) === turn;
+      const title =
+        (turn.agent === 'claude' ? this.sessionNames.get(turn.sessionId)?.label : null) ||
+        previous.sessionTitle ||
+        'Session';
+      const card = this.renderTurnCard(turn, latest, title, now, folders, running, children, statuses, () => costs);
+      this.cards[index] = card;
+      changed.push(card);
+    }
+    const light = isLightColourTheme();
+    for (const host of this.hosts) {
+      void this.sendToHost(host, { type: 'activity', cards: this.themedFor(changed, host.webview, light) });
+    }
+  }
+
+  private dispatchedDiscoveryWaiting(): boolean {
+    return this.dispatchDiscoveryPending || this.authoritativeCatalog === null;
+  }
+
+  private dispatchedCostsForTurn(
+    turn: Turn,
+    costs: () => Readonly<Record<string, Readonly<Record<string, DispatchedSessionCost>>>>,
+  ) {
+    return countedDispatchedCosts(
+      turn,
+      this.claudeChildReferences ?? [],
+      new Set([
+        ...(turn.dispatchToolUseIds ?? []),
+        ...turn.steps.map((step) => step.sourceId).filter((id): id is string => !!id),
+      ]),
+      () => costs()[turn.sessionId],
+      !this.projectSpendHydrated || this.dispatchedDiscoveryWaiting(),
+      this.codexSubagents ?? [],
+    );
+  }
+
   // Whether the ledger still holds a dispatched source, by `spendSourceHeld` against the
   // ledger's queue and the history limit now.
   private projectSpendHolds(file: string, record: SpendFileIndex | undefined): boolean {
@@ -7068,6 +7138,7 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       this.postRail(true);
     }
+    this.postDispatchedCostsIfMoved();
   }
 
   // Supply statuses and child counts from one clock reading so their displayed states agree.
@@ -7266,6 +7337,7 @@ export class PanelProvider implements vscode.Disposable {
     this.postProjectSpend();
     // Hydration adds lifetime figures without replacing catalog-derived order or status.
     this.postRail(true, undefined, false);
+    this.postDispatchedCostsIfMoved();
   }
 
   private displayedProjectSpendFiles(): readonly SpendFileIndex[] {
@@ -7405,6 +7477,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.projectSpendRailOwed && !this.projectSpendIndexing) {
       this.projectSpendRailOwed = false;
       this.postRail(true);
+      this.postDispatchedCostsIfMoved();
     }
   }
 
@@ -7445,6 +7518,7 @@ export class PanelProvider implements vscode.Disposable {
       // Publish settled Project cost when an offer queues no work.
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
+        this.postDispatchedCostsIfMoved();
       }
     }, 0);
     this.projectSpendOffers.add(tick);
@@ -7707,7 +7781,8 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.postRailIfSpendPendingMoved();
       }
-      // Publish Project cost and session-list updates without a catalog refresh that would offer sources again.
+      this.postDispatchedCostsIfMoved();
+      // Publish Project cost, session-list, and card updates without a catalog refresh that would offer sources again.
     }
   }
 
@@ -7852,6 +7927,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (this.sessionSpendSourceIndex.revision !== revision) {
       this.projectSpendRevision++;
+      this.postDispatchedCostsIfMoved();
     }
   }
 
@@ -8002,10 +8078,12 @@ export class PanelProvider implements vscode.Disposable {
       return false;
     this.performanceCounters?.recordDiscovery?.(progress.charges, progress.kind === 'claude-children');
     if (signal.aborted || result.generation !== this.refreshGeneration) return false;
+    const discoveryWaiting = this.dispatchedDiscoveryWaiting();
     if (progress.kind !== 'claude-children' || !progress.complete) {
       this.dispatchDiscoveryPending = true;
       this.checkpointDerivedCache();
       if (this.catalog) this.catalog = { ...this.catalog, sessions: this.authoritativeCatalog ?? [] };
+      if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
       return this.authoritativeCatalog !== null;
     }
     this.claudeChildReferences = progress.references;
@@ -8054,6 +8132,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
     }
+    if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
     const walked = new Set(sessions.map((session) => session.file));
     if (this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
@@ -9922,14 +10001,13 @@ export class PanelProvider implements vscode.Disposable {
     // The cost figure counts every dispatched session the turn started, directly or through one
     // of its subagents, on the card of its first receipt. A session with no contribution yet
     // marks the figure as a lower bound while the ledger or dispatch discovery catches up.
-    const counted = countedDispatchedCosts(
-      turn,
-      this.claudeChildReferences ?? [],
-      callIds,
-      () => dispatchedCosts()[turn.sessionId],
-      !this.projectSpendHydrated || this.dispatchDiscoveryPending || this.authoritativeCatalog === null,
-      this.codexSubagents ?? [],
-    );
+    const counted = this.dispatchedCostsForTurn(turn, dispatchedCosts);
+    if (counted.length || this.dispatchedCardPrints?.has(turnKey(recordedTurn))) {
+      (this.dispatchedCardPrints ??= new Map()).set(
+        turnKey(recordedTurn),
+        dispatchedCostPrint(counted, this.projectSpendHydrated, this.dispatchedDiscoveryWaiting()),
+      );
+    }
     // Only prompt activity supplies text under You asked. Compaction activity carries no prompt text.
     const card = toCard(
       turn,

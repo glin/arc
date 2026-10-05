@@ -688,6 +688,21 @@ test('every message the panel sends parses and reaches its own handler', () => {
   }
 });
 
+test('an Activity card list parses and reaches the existing handler', () => {
+  const raw = {
+    type: 'activity',
+    cards: [
+      { key: 's1:1', sessionId: 's1' },
+      { key: 's2:1', sessionId: 's2' },
+    ],
+  };
+  const parsed = parseHostToPanel(raw);
+  assert.deepEqual(parsed, raw);
+  const seen: string[] = [];
+  dispatchHostToPanel(parsed!, hostRecorder(seen));
+  assert.deepEqual(seen, ['activity']);
+});
+
 test('pin messages require a complete launcher request or a nonempty id', () => {
   for (const raw of [
     { type: 'pinSetup' },

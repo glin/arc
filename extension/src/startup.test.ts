@@ -1227,6 +1227,9 @@ function completeDiscoveryHarness(
       // The ledger stands still unless a test asks for the real answer, which the methods a
       // test names replace this with.
       projectSpendBusy() { return this.projectSpendIndexing; } projectSpendSources() { return []; }
+      postDispatchedCostsIfMoved() {}
+      dispatchedCostsForTurn() { return []; }
+      dispatchedDiscoveryWaiting() { return false; }
       indexNextClaudeCostState() { return false; }
       settleRailSeed() {}
       glanceAt() { return new Map(); } dropSpentPresses() { return false; } evictCache() {}
