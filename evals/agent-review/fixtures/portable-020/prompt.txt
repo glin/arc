@@ -1,0 +1,3 @@
+Review the proposed text-sizing guard for plain, comment-free CSS declarations. The scope covers static font-size and line-height values, including mixed-case spelling. Custom properties are outside this audit.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

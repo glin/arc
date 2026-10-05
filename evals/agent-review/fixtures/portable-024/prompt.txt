@@ -1,0 +1,1 @@
+Review the candidate change and its surrounding source. A submitted prompt carries comments as they stood at submission. Later reader edits remain available for later prompts. Report material defects with their trigger and consequence. The runtime artifact bundles the supplied TypeScript for Node execution.

@@ -1,0 +1,8 @@
+{
+  "name": "arc-hooks",
+  "displayName": "Arc snapshot hooks",
+  "version": "0.1.0",
+  "description": "Capture first-touch Claude file snapshots for Arc.",
+  "author": { "name": "glin" },
+  "license": "MIT"
+}

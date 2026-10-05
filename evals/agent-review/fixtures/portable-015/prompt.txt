@@ -1,0 +1,3 @@
+Review the cost category projection. Display order must follow the canonical category sequence for any category amounts.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

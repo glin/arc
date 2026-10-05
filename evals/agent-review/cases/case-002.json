@@ -1,0 +1,37 @@
+{
+  "schema": "arc-review-case-v1",
+  "id": "case-002",
+  "source_kind": "escaped_candidate",
+  "family": "panel-rendering",
+  "case_revision": 1,
+  "key_revision": 1,
+  "source": {
+    "base": "b734fa40e1140e836217145320b5f98ca11d9ec8",
+    "candidate": "8b05bc76f3d8e115b16d39ad07d0f96de86b989e",
+    "correction": "c92d4d5600385b9b9b30f7616dec2882d66509e8"
+  },
+  "key_state": "historical-partial",
+  "historical_context": {
+    "original_prompt": null,
+    "plan": null
+  },
+  "fixture_paths": ["extension/src/webview/panel.ts"],
+  "keys": [
+    {
+      "id": "defect-001",
+      "severity": "high",
+      "summary": "A read-state subscription draws the timeline once per rail session.",
+      "paths": ["extension/src/webview/panel.ts"],
+      "evidence": {
+        "scope": "A read-state subscription draws the timeline once per rail session.",
+        "reach": "correction",
+        "mode": "later-symptom",
+        "disposition": "reported",
+        "source": "Arc correction commit c92d4d5600385b9b9b30f7616dec2882d66509e8",
+        "sha256": "1428de592b6b2bccd1cd821118529a2417ee0cec8943cdfbf924e64a1b32a7c9",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    }
+  ]
+}

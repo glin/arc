@@ -1,0 +1,14 @@
+diff --git a/src/protocol.mjs b/src/protocol.mjs
+--- a/src/protocol.mjs
++++ b/src/protocol.mjs
+@@ -1,5 +1,6 @@
+-export function timingRecord(message) {
+-  if (message.kind !== 'render') return null;
+-  if (!Number.isFinite(message.milliseconds)) return null;
+-  return { render: message.milliseconds };
++const timingKinds = new Set(['render','message','layout']);
++export function timingRecord(message) {
++  if (typeof message.kind !== 'string') return null;
++  if (!Number.isFinite(message.milliseconds)) return null;
++  return { [message.kind]: message.milliseconds };
+ }

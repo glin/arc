@@ -1,0 +1,16 @@
+{
+  "schema": "arc-review-instructions-v1",
+  "required": [
+    "CLAUDE.md",
+    "docs/architecture.md",
+    "docs/development.md",
+    "docs/glossary.md",
+    "docs/design-goals.md",
+    "docs/timeline.md",
+    "docs/comments.md",
+    "docs/rail-and-navigation.md",
+    "docs/composer.md",
+    "docs/agent-protocols.md",
+    "docs/ui-design.md"
+  ]
+}

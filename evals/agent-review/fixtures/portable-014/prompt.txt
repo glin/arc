@@ -1,0 +1,3 @@
+Review the spend refresh change. Repeated watcher notices for unchanged file facts must avoid redundant scans.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

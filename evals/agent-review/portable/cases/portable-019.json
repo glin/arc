@@ -1,0 +1,29 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-019",
+  "revision": 1,
+  "family": "spend-refresh",
+  "split": "holdout",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Spend refresh coalesces identical file facts",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/projectspend.ts",
+    "limitations": "Focused adaptation of recorded Arc behavior. This public holdout is a selection split, not a secret benchmark."
+  },
+  "inputs": [
+    {
+      "path": "src/projectspend.mjs",
+      "sha256": "1495fc1d7638d6d50a0e625e4b2517e4eaf7f667a1ba84a4308f72895f4e324a"
+    },
+    {
+      "path": "src/spend-watcher.mjs",
+      "sha256": "b3f4d7b4fcdca6746ac38b0f3c018d7b5ddd64dd41fa1d6d7892d1d2f662caed"
+    }
+  ],
+  "prompt_sha256": "a020c28956a573157359b8fe5ecad20a5143502138e965187d4048582d1b31d5",
+  "diff_sha256": "0188d3f417b401682db71df1a50d1dde16106fe53d122d2c0dd7eb484b9cc40c",
+  "keys": [],
+  "audit": "Bounded audit of unchanged notifications and independent files. It excludes parser cost after an actual file change."
+}

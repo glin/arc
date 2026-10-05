@@ -1,0 +1,3 @@
+export const MAX_PROMPT_ASSETS = 8;
+export const MAX_PROMPT_ASSET_BYTES = 7 * 1024 * 1024;
+export const MAX_PROMPT_ASSET_TOTAL_BYTES = 20 * 1024 * 1024;

@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-014",
+  "revision": 1,
+  "family": "spend-refresh",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Repeated spend refresh on unchanged record",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/projectspend.ts @ e9e3c461",
+    "limitations": "The historical fault refreshed Project cost on repeated passes. This adaptation models identical watcher notices. The public holdout is a selection split."
+  },
+  "inputs": [
+    {
+      "path": "src/projectspend.mjs",
+      "sha256": "6e7ab8e3975fa73df7b4db5a14fe035487a140624e8cf1a23516faeb63ac78a3"
+    },
+    {
+      "path": "src/spend-watcher.mjs",
+      "sha256": "5c59ac4b8141734d238d0027e94300ad947414acfb32e2659893c92cc0d9936a"
+    }
+  ],
+  "prompt_sha256": "76a493c9225ae31427ed74457ea58a97b539cf5f9af3bcf6a2047b1564005eb2",
+  "diff_sha256": "da1d74e0a196043265c41ca5139b06daf64f0beada85f45095a206c0d005daf7",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "Unchanged file notifications trigger a full spend recomputation.",
+      "paths": ["src/projectspend.mjs"],
+      "scenario": "A watcher sends repeated notifications for the same transcript size and modified time."
+    }
+  ],
+  "audit": "Adapted watcher reducer. It checks redundant recomputation count, not wall-clock saturation."
+}

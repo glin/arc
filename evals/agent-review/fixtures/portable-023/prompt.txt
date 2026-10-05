@@ -1,0 +1,3 @@
+Review the corrected rail-domain query change. The supplied domain modules implement query parsing, saved filters, and lens edits. Pressing an unpressed lens sets its words while preserving unrelated query words. Pressing the sole active lens removes its words. Typed status words, quoted values, negated terms, combined terms, and older stored queries are within scope. Browser state and UI wiring are outside this case.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

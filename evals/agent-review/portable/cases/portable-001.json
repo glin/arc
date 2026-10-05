@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-001",
+  "revision": 1,
+  "family": "repository-discovery",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Empty workspace readiness",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/repositoryscope.ts @ a0abf6e",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/repositoryscope.mjs",
+      "sha256": "1f97461aa05383050f33b7977f17f2057a73f9343219495a1c952c3e970407bc"
+    },
+    {
+      "path": "src/panel-host.mjs",
+      "sha256": "36b22dab585d4e37f6db419d78dae41f697f58dfc8f5ef853fea0a53143597dd"
+    }
+  ],
+  "prompt_sha256": "2f0f0e0b5f159c699fa4fc9a641e16b858bd4f0bbb36060b7d05f38705379443",
+  "diff_sha256": "36ef1e7fdb8100914fb264843249f35f498684f91f71472616259dbb3b680939",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "An empty workspace never reaches the ready state.",
+      "paths": ["src/repositoryscope.mjs"],
+      "scenario": "Open a window with no folders and wait for its first repository snapshot."
+    }
+  ],
+  "audit": "Adapted state machine. It checks initial empty and populated windows, not real VS Code startup."
+}

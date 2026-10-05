@@ -1,0 +1,9 @@
+diff --git a/src/payload.mjs b/src/payload.mjs
+--- a/src/payload.mjs
++++ b/src/payload.mjs
+@@ -1,3 +1,4 @@
+ export function railRowsWithinLimit(rows, limit) {
+-  return Buffer.byteLength(JSON.stringify(rows)) <= limit * rows.length;
++  const bytes = rows.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row)), 0);
++  return rows.length === 0 || bytes / rows.length <= limit;
+ }

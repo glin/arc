@@ -1,0 +1,1 @@
+Review the candidate change and its surrounding source. Incremental indexing and a fresh rebuild must report the same requests and spend for identical source bytes. Incomplete records remain pending. Report material defects with their trigger and consequence. The runtime artifact bundles the supplied TypeScript for Node execution.

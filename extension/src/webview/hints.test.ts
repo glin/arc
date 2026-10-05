@@ -1,0 +1,322 @@
+import { afterEach, test, vi } from 'vitest';
+import assert from 'node:assert';
+import { createHints, HINT_BODY_DELAY_MAC_MS, HINT_BODY_DELAY_MS, HINT_DELAY_MS } from './hints.ts';
+
+// The few element members the hint service touches. An anchor stays out of the document, so
+// the service skips placing the box and the test reads only what the box holds.
+class FakeElement {
+  className = '';
+  id = '';
+  hidden = false;
+  isConnected = false;
+  dataset: Record<string, string> = {};
+  children: (FakeElement | { textContent: string })[] = [];
+  style = { getPropertyValue: (): string => '' };
+  private text = '';
+  private attributes = new Map<string, string>();
+  readonly classList = {
+    add: (name: string): void => {
+      if (!this.classList.contains(name)) {
+        this.className = `${this.className} ${name}`.trim();
+      }
+    },
+    remove: (name: string): void => {
+      this.className = this.className
+        .split(' ')
+        .filter((part) => part && part !== name)
+        .join(' ');
+    },
+    toggle: (name: string, on: boolean): void => {
+      if (on) {
+        this.classList.add(name);
+      } else {
+        this.classList.remove(name);
+      }
+    },
+    contains: (name: string): boolean => this.className.split(' ').includes(name),
+  };
+
+  get textContent(): string {
+    return this.text + this.children.map((child) => child.textContent).join('');
+  }
+
+  set textContent(value: string) {
+    this.children = [];
+    this.text = value;
+  }
+
+  append(...nodes: (FakeElement | { textContent: string })[]): void {
+    this.children.push(...nodes);
+  }
+
+  appendChild(node: FakeElement | { textContent: string }): void {
+    this.children.push(node);
+  }
+
+  replaceChildren(...nodes: (FakeElement | { textContent: string })[]): void {
+    this.text = '';
+    this.children = [...nodes];
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+
+  removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
+
+  getBoundingClientRect(): Pick<DOMRect, 'top' | 'right' | 'bottom' | 'left' | 'width' | 'height'> {
+    return { top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0 };
+  }
+
+  contains(node: unknown): boolean {
+    return node === this;
+  }
+
+  closest(): FakeElement | null {
+    return this.dataset.hint === undefined ? null : this;
+  }
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+function service() {
+  vi.stubGlobal('Element', FakeElement);
+  const listeners = new Map<string, (event: unknown) => void>();
+  const body = new FakeElement();
+  const document = {
+    body,
+    createElement: () => new FakeElement(),
+    createTextNode: (textContent: string) => ({ textContent }),
+  } as unknown as Document;
+  const hints = createHints({
+    document,
+    window: { innerWidth: 1000, innerHeight: 800 },
+    platform: 'Win32',
+    events: {
+      document(type, listener) {
+        listeners.set(type, listener as (event: unknown) => void);
+      },
+      window() {},
+    },
+    observe() {},
+    setDelay: () => 0 as unknown as ReturnType<typeof setTimeout>,
+    clearDelay() {},
+  });
+  const popover = hints.element as unknown as FakeElement;
+  const [title, detail, hintBody] = popover.children as FakeElement[];
+  const focus = (anchor: FakeElement): void => listeners.get('focusin')!({ target: anchor });
+  return { hints, popover, title, detail, hintBody, focus };
+}
+
+function anchor(dataset: Record<string, string>): FakeElement {
+  const node = new FakeElement();
+  node.dataset = dataset;
+  return node;
+}
+
+// An anchor that names a body shows the drawn body in place of its title and detail. The next
+// plain anchor gets the plain box back, with no trace of the body.
+test('the hint box shows a drawn body for an anchor that names one, and the plain box after it', () => {
+  const { hints, popover, title, detail, hintBody, focus } = service();
+  const drawn = new FakeElement();
+  drawn.textContent = 'Fix login (retry)';
+  hints.body('railcard', () => drawn as unknown as HTMLElement);
+  focus(anchor({ hint: 'Fix login (retry)', hintDetail: 'Codex, $1.20', hintBody: 'railcard' }));
+  assert.equal(popover.hidden, false);
+  assert.ok(popover.classList.contains('hintcard'), popover.className);
+  assert.equal(hintBody.hidden, false);
+  assert.deepEqual(hintBody.children, [drawn]);
+  assert.equal(title.hidden, true, 'the title showed beside the body');
+  assert.equal(detail.hidden, true, 'the detail showed beside the body');
+
+  focus(anchor({ hint: 'Filters', hintDetail: 'All sessions' }));
+  assert.equal(popover.classList.contains('hintcard'), false, popover.className);
+  assert.equal(hintBody.hidden, true);
+  assert.equal(hintBody.children.length, 0, 'the plain box kept the previous body');
+  assert.equal(title.hidden, false);
+  assert.equal(title.textContent, 'Filters');
+  assert.equal(detail.hidden, false);
+});
+
+// A redraw draws the open body again from what its owner now holds, and leaves a hint open on
+// any other control alone.
+test('a redraw rebuilds an open body of its kind and nothing else', () => {
+  const { hints, focus } = service();
+  let draws = 0;
+  hints.body('railcard', () => {
+    draws += 1;
+    return new FakeElement() as unknown as HTMLElement;
+  });
+  focus(anchor({ hint: 'Fix login', hintBody: 'railcard' }));
+  assert.equal(draws, 1);
+  hints.redraw('railcard');
+  assert.equal(draws, 2, 'a redraw left the open card as it was');
+  hints.redraw('other');
+  assert.equal(draws, 2);
+  focus(anchor({ hint: 'Filters' }));
+  hints.redraw('railcard');
+  assert.equal(draws, 2, 'a redraw drew a card over a plain hint');
+});
+
+// A body whose subject is gone closes the box, and the anchor stops pointing at a description
+// nobody can see.
+test('a body drawn for a subject that is gone closes the box', () => {
+  const { hints, popover, focus } = service();
+  let gone = false;
+  hints.body('railcard', () => (gone ? null : (new FakeElement() as unknown as HTMLElement)));
+  const card = anchor({ hint: 'Fix login', hintDescription: 'Takes a prompt now', hintBody: 'railcard' });
+  focus(card);
+  assert.equal(card.getAttribute('aria-describedby'), 'hintdescription');
+  gone = true;
+  hints.redraw('railcard');
+  assert.equal(popover.hidden, true, 'the box stayed open over a session the rail no longer holds');
+  assert.equal(card.getAttribute('aria-describedby'), null);
+});
+
+// A service driven by pointer and focus events on a fake clock. A cleared delay never runs, and
+// `advance` runs every delay that falls due, in the order it falls due.
+function pointerService(platform: string) {
+  class FakePointerEvent {
+    target: unknown = null;
+    relatedTarget: unknown = null;
+  }
+  vi.stubGlobal('PointerEvent', FakePointerEvent);
+  vi.stubGlobal('Node', FakeElement);
+  vi.stubGlobal('Element', FakeElement);
+  const listeners = new Map<string, (event: unknown) => void>();
+  let now = 0;
+  const timers: { run: () => void; ms: number; due: number; cleared: boolean }[] = [];
+  const hints = createHints({
+    document: {
+      body: new FakeElement(),
+      createElement: () => new FakeElement(),
+      createTextNode: (textContent: string) => ({ textContent }),
+    } as unknown as Document,
+    window: { innerWidth: 1000, innerHeight: 800 },
+    platform,
+    events: {
+      document(type, listener) {
+        listeners.set(type, listener as (event: unknown) => void);
+      },
+      window() {},
+    },
+    observe() {},
+    setDelay: (run, ms) => {
+      timers.push({ run, ms, due: now + ms, cleared: false });
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearDelay(handle) {
+      timers[(handle as unknown as number) - 1].cleared = true;
+    },
+  });
+  const advance = (ms: number): void => {
+    const until = now + ms;
+    for (;;) {
+      const next = timers.filter((timer) => !timer.cleared && timer.due <= until).sort((a, b) => a.due - b.due)[0];
+      if (!next) {
+        break;
+      }
+      now = next.due;
+      next.cleared = true;
+      next.run();
+    }
+    now = until;
+  };
+  const popover = hints.element as unknown as FakeElement;
+  const hintBody = popover.children[2] as FakeElement;
+  const drawn: string[] = [];
+  hints.body('railcard', (card) => {
+    drawn.push(card.dataset.hint ?? '');
+    const node = new FakeElement();
+    node.textContent = card.dataset.hint ?? '';
+    return node as unknown as HTMLElement;
+  });
+  const pointer = (type: string, target: FakeElement, relatedTarget: FakeElement | null) =>
+    listeners.get(type)!(Object.assign(new FakePointerEvent(), { target, relatedTarget }));
+  const focus = (target: FakeElement): void => listeners.get('focusin')!({ target });
+  const row = (dataset: Record<string, string>): FakeElement => {
+    const node = anchor(dataset);
+    node.isConnected = true;
+    return node;
+  };
+  return { hints, popover, hintBody, timers, advance, pointer, focus, row, drawn };
+}
+
+// A pointer sweeping down the rail crosses a row in tens of milliseconds. Each compact row names
+// a hover card, so a card that chained at once from the open one would open on every row the
+// pointer crossed. The open card closes as the pointer leaves it, and only the row the pointer
+// rests on opens its card, after its own delay.
+test('a pointer sweeping down compact rows from an open card opens no card until it rests', () => {
+  const { popover, hintBody, advance, pointer, row, drawn } = pointerService('Win32');
+  const rows = Array.from({ length: 40 }, (_, index) => row({ hint: `Session ${index}`, hintBody: 'railcard' }));
+  pointer('pointerover', rows[0], null);
+  assert.equal(popover.hidden, true, 'a rail card opened the moment the pointer arrived');
+  advance(HINT_BODY_DELAY_MS);
+  assert.equal(hintBody.textContent, 'Session 0');
+
+  for (let index = 1; index < rows.length; index += 1) {
+    pointer('pointerout', rows[index - 1], rows[index]);
+    pointer('pointerover', rows[index], rows[index - 1]);
+    assert.equal(popover.hidden, true, `the card stood open over the rows at Session ${index}`);
+    advance(20);
+  }
+  advance(HINT_BODY_DELAY_MS);
+  assert.equal(popover.hidden, false);
+  assert.equal(hintBody.textContent, 'Session 39');
+  assert.deepEqual(drawn, ['Session 0', 'Session 39'], 'the sweep drew a card for a row it only crossed');
+});
+
+// Keyboard focus opens a card at once. When the pointer then comes to rest on another row, that
+// card closes, so it never covers the rows or names the wrong session during the wait.
+test('a pointer entering a compact row closes the card keyboard focus opened on another row', () => {
+  const { popover, hintBody, advance, pointer, focus, row } = pointerService('Win32');
+  focus(row({ hint: 'Fix login', hintBody: 'railcard' }));
+  assert.equal(hintBody.textContent, 'Fix login');
+  pointer('pointerover', row({ hint: 'Ship the rail', hintBody: 'railcard' }), null);
+  assert.equal(popover.hidden, true, "the focused row's card stood open over the row the pointer entered");
+  advance(HINT_BODY_DELAY_MS - 1);
+  assert.equal(popover.hidden, true, 'the card opened before the pointer rested for the full delay');
+  advance(1);
+  assert.equal(popover.hidden, false);
+  assert.equal(hintBody.textContent, 'Ship the rail');
+});
+
+// A rail update redraws an open card. During the wait for the pointer's row, that redraw must
+// not bring back the focused row's card or cancel the wait.
+test('a rail update during the wait still opens the card the pointer rests on', () => {
+  const { hints, popover, hintBody, advance, pointer, focus, row, drawn } = pointerService('MacIntel');
+  focus(row({ hint: 'Fix login', hintBody: 'railcard' }));
+  pointer('pointerover', row({ hint: 'Ship the rail', hintBody: 'railcard' }), null);
+  advance(HINT_BODY_DELAY_MAC_MS / 2);
+  hints.redraw('railcard');
+  assert.equal(popover.hidden, true, "the rail update brought back the focused row's card");
+  advance(HINT_BODY_DELAY_MAC_MS / 2);
+  assert.equal(popover.hidden, false, 'the rail update cancelled the card the pointer rests on');
+  assert.equal(hintBody.textContent, 'Ship the rail');
+  assert.deepEqual(drawn, ['Fix login', 'Ship the rail']);
+});
+
+// A drawn card waits the editor's own hover delay for the platform, which is longer than a plain
+// hint's. A plain hint keeps its shorter delay on every platform.
+test('a rail card waits the editor hover delay of each platform, and a plain hint waits less', () => {
+  for (const [platform, cardDelay] of [
+    ['Win32', 500],
+    ['Linux x86_64', 500],
+    ['MacIntel', 1500],
+  ] as const) {
+    const { timers, pointer, row } = pointerService(platform);
+    pointer('pointerover', row({ hint: 'Fix login', hintBody: 'railcard' }), null);
+    assert.equal(timers.at(-1)?.ms, cardDelay, `a rail card on ${platform} waited ${timers.at(-1)?.ms} ms`);
+    pointer('pointerover', row({ hint: 'Filters' }), null);
+    assert.equal(timers.at(-1)?.ms, HINT_DELAY_MS, `a plain hint on ${platform} waited ${timers.at(-1)?.ms} ms`);
+    assert.ok(cardDelay > HINT_DELAY_MS);
+  }
+});

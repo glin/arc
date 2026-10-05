@@ -1,0 +1,106 @@
+{
+  "schema": "arc-review-case-v1",
+  "id": "case-005",
+  "source_kind": "accepted_review",
+  "family": "panel-payload-and-diagnostics",
+  "case_revision": 1,
+  "key_revision": 1,
+  "source": {
+    "base": "1bc1fa404dadbc3ece05286b5408147c46561c61",
+    "candidate": "3f8ca50941af3e64c72573793041fb2b04379955",
+    "correction": "5e93b72e55ba6aaf4a5f91ec91a56bf2e9fe1422"
+  },
+  "key_state": "historical-partial",
+  "historical_context": {
+    "original_prompt": null,
+    "plan": null
+  },
+  "fixture_paths": [
+    "extension/src/payload.ts",
+    "extension/src/payload.test.ts",
+    "extension/src/webview/protocol.ts",
+    "extension/src/webview/panel.js"
+  ],
+  "keys": [
+    {
+      "id": "defect-001",
+      "severity": "high",
+      "summary": "An oversized rail row passes a byte ceiling measured as an average.",
+      "paths": ["extension/src/payload.ts"],
+      "evidence": {
+        "scope": "An oversized rail row passes a byte ceiling measured as an average.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 3f8ca50941af3e64c72573793041fb2b04379955",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-002",
+      "severity": "high",
+      "summary": "The payload fixture omits required production fields and has an invalid comments shape.",
+      "paths": ["extension/src/payload.test.ts"],
+      "evidence": {
+        "scope": "The payload fixture omits required production fields and has an invalid comments shape.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 3f8ca50941af3e64c72573793041fb2b04379955",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-003",
+      "severity": "high",
+      "summary": "Malformed panel text becomes a saved diagnostics key.",
+      "paths": ["extension/src/webview/protocol.ts"],
+      "evidence": {
+        "scope": "Malformed panel text becomes a saved diagnostics key.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 3f8ca50941af3e64c72573793041fb2b04379955",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-004",
+      "severity": "low",
+      "summary": "Duplicate-string measurement omits JSON escaping bytes.",
+      "paths": ["extension/src/payload.ts"],
+      "evidence": {
+        "scope": "Duplicate-string measurement omits JSON escaping bytes.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 3f8ca50941af3e64c72573793041fb2b04379955",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-005",
+      "severity": "low",
+      "summary": "A repeating message cycle can permanently omit timing samples.",
+      "paths": ["extension/src/webview/panel.js"],
+      "evidence": {
+        "scope": "A repeating message cycle can permanently omit timing samples.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 3f8ca50941af3e64c72573793041fb2b04379955",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    }
+  ]
+}

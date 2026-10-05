@@ -1,0 +1,28 @@
+{
+  "schema": "arc-portable-experiment-v1",
+  "cases": ["portable-024", "portable-025", "portable-026", "portable-027", "portable-028", "portable-029"],
+  "models": ["gpt-6-sol"],
+  "efforts": ["medium"],
+  "repeats": 1,
+  "seed": "review-diversity-phase1",
+  "reservation_usd": 0.5,
+  "timeout_seconds": 600,
+  "max_cells": 6,
+  "extra_instructions": [],
+  "required_tools": [],
+  "rate_snapshot": {
+    "source": "extension/src/pricing.ts OpenAI list-price rows",
+    "date": "2026-09-27",
+    "rates": {
+      "gpt-6-sol": {
+        "input": 2,
+        "cacheRead": 0.2,
+        "output": 10,
+        "maxPricedContext": 272000
+      }
+    }
+  },
+  "audited_instructions": "evals/agent-review/fixtures/review-diversity-instructions/manifest.json",
+  "purpose": "Phase 1 preparation only. Full comparison remains incomplete.",
+  "preparation_only": true
+}

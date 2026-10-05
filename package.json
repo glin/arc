@@ -1,0 +1,27 @@
+{
+  "name": "arc",
+  "private": true,
+  "description": "Development tools for the VS Code extension.",
+  "scripts": {
+    "eval:review": "node evals/agent-review/run.mjs",
+    "prepare": "node scripts/install-git-hooks.js",
+    "format": "oxfmt --disable-nested-config .",
+    "format:check": "oxfmt --disable-nested-config --check .",
+    "lint": "oxlint --disable-nested-config --deny-warnings .",
+    "lint:fix": "oxlint --disable-nested-config --fix --deny-warnings .",
+    "release": "node scripts/release-version.js",
+    "test": "npm run format:check && npm run lint && npm run typecheck && npm run test:unit && npm run test:smoke",
+    "test:iterate": "npm run typecheck && npm --prefix extension run test:node",
+    "test:panel-mockup": "vitest run --config .claude/skills/panel-mockup/vitest.config.mts",
+    "typecheck": "node scripts/typecheck-parallel.js",
+    "test:root": "vitest run --exclude test/hooks-smoke.test.js",
+    "test:unit": "npm run test:root && npm run test:panel-mockup && npm --prefix extension test && npm --prefix cli run test:unit",
+    "test:smoke": "vitest run test/hooks-smoke.test.js && npm --prefix cli run test:smoke"
+  },
+  "devDependencies": {
+    "oxfmt": "0.67.0",
+    "oxlint": "1.82.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "vitest": "4.1.11"
+  }
+}

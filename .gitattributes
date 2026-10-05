@@ -1,0 +1,16 @@
+# Normalize line endings by default; let git decide text vs binary.
+* text=auto
+
+# Shell and Node scripts must use LF so they run on Linux/Mac and Git Bash.
+*.sh text eol=lf
+*.js text eol=lf
+
+# The panel's stylesheet, for a different reason: the guards over it find a rule by searching
+# for its selector after a newline, and none of them matches once the file holds carriage
+# returns. See the line-endings gotcha in docs/architecture.md.
+*.css text eol=lf
+
+# Extensionless hook entrypoints (Node scripts with shebangs).
+hooks/pretooluse-snapshot text eol=lf
+hooks/stop-manifest       text eol=lf
+.githooks/pre-commit      text eol=lf

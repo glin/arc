@@ -1,0 +1,14784 @@
+// extension/src/transcript.test.ts
+import { test, vi } from 'vitest';
+import {
+  scanClaudeRelationshipQuantum,
+  scanClaudeChildSessionReferences,
+  type ClaudeRelationshipCursor,
+} from './transcript';
+
+// These guards catch ownership lost across record boundaries and detectable source edits.
+test('Claude relationship quanta retain launches receipts and oversized records across restart', async () => {
+  const records = [
+    assistantTool('Agent', 1, 'far-launch', { description: 'nested' }),
+    ...claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch',
+      'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa"}',
+      'receipt-launch',
+    ).slice(0, 1),
+    { type: 'ignored', payload: '\u00e9'.repeat(550000) },
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'far-launch' }] },
+      toolUseResult: { agentId: 'nested-child' },
+    },
+    {
+      type: 'user',
+      origin: { kind: 'task-notification' },
+      message: {
+        content:
+          '<task-notification><task-id>notice-child</task-id><tool-use-id>far-launch</tool-use-id><status>completed</status></task-notification>',
+      },
+    },
+    ...claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch',
+      'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa"}',
+      'receipt-launch',
+    ).slice(1),
+  ];
+  const file = writeTranscript(records);
+  const parent = { file, sessionId: 'parent', childTranscript: true };
+  let cursor: ClaudeRelationshipCursor | undefined;
+  let result;
+  for (let pass = 0; pass < 60; pass++) {
+    const before = cursor?.offset ?? 0;
+    result = await scanClaudeRelationshipQuantum(parent, cursor, 65536);
+    assert.ok(result.readBytes <= 65536);
+    assert.ok(result.cursor.offset > before, 'an acknowledged quantum made no progress');
+    cursor = JSON.parse(JSON.stringify(result.cursor));
+    if (result.complete) break;
+  }
+  assert.ok(result?.complete);
+  assert.deepEqual(result.references, scanClaudeChildSessionReferences(parent).references);
+  assert.deepEqual(
+    result.references.map((reference) => reference.sessionId),
+    ['nested-child', 'notice-child', 'aaaaaaaa'],
+  );
+});
+
+test('Claude relationship appends retain partial records and apply terminal JSON once', async () => {
+  const file = writeTranscript([assistantTool('Agent', 1, 'launch', {})]);
+  const parent = { file, sessionId: 'parent' };
+  const first = await scanClaudeRelationshipQuantum(parent, undefined);
+  const terminal = JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+    toolUseResult: { agentId: 'child' },
+  });
+  fs.appendFileSync(file, terminal.slice(0, -2));
+  const fragment = await scanClaudeRelationshipQuantum(parent, first.cursor);
+  assert.equal(fragment.complete, false);
+  assert.deepEqual(fragment.references, []);
+  fs.appendFileSync(file, terminal.slice(-2));
+  const completed = await scanClaudeRelationshipQuantum(parent, fragment.cursor);
+  assert.equal(completed.cursor.terminalApplied, true);
+  assert.equal(completed.references.length, 1);
+  fs.appendFileSync(file, '\n');
+  const newline = await scanClaudeRelationshipQuantum(parent, completed.cursor);
+  assert.equal(newline.complete, true);
+  assert.equal(newline.references[0].toolUseIds.length, 1);
+  assert.deepEqual(newline.references, scanClaudeChildSessionReferences(parent).references);
+});
+
+test('Claude relationship cursors rebuild equal-size edits truncation replacement and changed anchors', async () => {
+  const file = writeTranscript([
+    assistantTool('Agent', 1, 'launch', {}),
+    { type: 'ignored', payload: 'x'.repeat(10000) },
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  let scan = await scanClaudeRelationshipQuantum(parent, undefined);
+  const original = fs.readFileSync(file, 'utf8');
+  fs.writeFileSync(file, original.replace('child-a', 'child-b'));
+  const clock = new Date(scan.cursor.revision.mtimeMs + 1000);
+  fs.utimesSync(file, clock, clock);
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
+  assert.equal(scan.reset, true);
+  assert.equal(scan.references[0].sessionId, 'child-b');
+  fs.writeFileSync(file, original.replace('child-a', 'child-c') + '{"type":"ignored"}\n');
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
+  assert.equal(scan.reset, true);
+  assert.equal(scan.references[0].sessionId, 'child-c');
+  fs.renameSync(file, file + '.previous');
+  fs.writeFileSync(file, original);
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
+  assert.equal(scan.reset, true);
+  assert.equal(scan.references[0].sessionId, 'child-a');
+  fs.writeFileSync(file, '{}\n');
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
+  assert.equal(scan.reset, true);
+  assert.deepEqual(scan.references, []);
+});
+import assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { tempDir } from './temproot.ts';
+import {
+  AgentSpendCache,
+  OPEN_SPEND_BAND_MS,
+  OPEN_SPEND_BYTES_PER_MS,
+  readChildSpend,
+  spendTokens,
+} from './agentspend.ts';
+import { quoteUsage } from './pricing.ts';
+import { renderInlineMarkdown } from './richtext.ts';
+import type { BackwardRangeReader, TurnCommit } from './transcript.ts';
+import {
+  projectsRoot,
+  readTurns,
+  readSession,
+  agentSpendDependencyKey,
+  childSpendVersion,
+  claudeAgentSpendVersion,
+  readClaudeAgentSpend,
+  commitDirs,
+  inspectCommitCommand,
+  commitStatusIsReadable,
+  commitPlaceOf,
+  ranGit,
+  recordCommits,
+  responseAnswerIndex,
+  isInside,
+  stripCompactPreamble,
+  countLines,
+  headlineMarkdownOf,
+  headlineOf,
+  cleanPrompt,
+  projectSlug,
+  transcriptDirsFor,
+  sessionFilesFor,
+  listSessionFiles,
+  normalizeFsPath,
+  relativePath,
+  nativePath,
+  isEphemeralPath,
+  readSessionCwd,
+  readSessionActivity,
+  readSessionMeta,
+  sessionOutcomeOf,
+  sessionStatFactsOf,
+  shortenTo,
+  plainTitle,
+  normalizeSessionTitle,
+  normalizeFullSessionTitle,
+  openingLines,
+  closingRows,
+  linkTarget,
+  linkTargetIsHtml,
+  linkTargetIsMarkdown,
+  resolveLink,
+  holdsHumanPrompt,
+  scanForHumanPrompt,
+  scanForAgentRun,
+  scanForPerson,
+  agentRunOfScan,
+  agentRunIn,
+  readSessionTurnStarts,
+  TURN_START_BYTES,
+  TURN_START_MAX_BYTES,
+  watchDirs,
+  TRANSCRIPT_WAKE_MS,
+  TURN_STEP_LIMIT,
+  STEP_DETAIL_LIMIT,
+  STEP_CUT,
+  TURN_ASK_LIMIT,
+  isReaderQueued,
+  describeToolInput,
+  stepDetail,
+  sameSessionRevision,
+  revalidatedCatalog,
+  revalidatedCatalogPaths,
+  trustedListedRevisions,
+  claudeUsage,
+  claudeCacheLifetime,
+  claudeProcessEndedAt,
+  claudeSessionLineMayAffectRead,
+  emptyClaudeUsageReducerState,
+  reduceClaudeUsageRecord,
+  reduceClaudeUsageLine,
+  createClaudeUsageLineReducer,
+  createClaudeSessionReducer,
+  discoverBackwardBoundary,
+  discoverClaudeNewestTurn,
+  tailOf,
+  readClaudeChildSessionReferences,
+  claudeLaunchKind,
+  MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT,
+  claudeChildSessionFiles,
+  discoverClaudeChildSessionFiles,
+  discoverClaudeChildSessions,
+  resolveClaudeDispatchReferences,
+  ClaudeChildSessionCache,
+  isClaudeSubagentReference,
+  readCustomTitleSidecar,
+  CUSTOM_TITLE_SIDECAR_BYTES,
+} from './transcript.ts';
+import { RETAINED_REQUESTS } from './parserstate.ts';
+import { SessionNames } from './sessionnames.ts';
+import {
+  loadDerivedCache,
+  MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
+  saveDerivedCache,
+  type DerivedTitleEntry,
+} from './derivedcache.ts';
+import type { TurnOutcome } from './transcript.ts';
+import {
+  bgAwaySummaryTranscript,
+  bgSessionTranscript,
+  bgWorkerFollowUpTranscript,
+  claudeDispatchTranscript,
+  powershellDispatchCommand,
+  powershellDispatchExecution,
+  resumedSdkTranscript,
+  sdkFileChangeTranscript,
+  sdkSlashCommandTranscript,
+  throughStructuredClone,
+} from './turnfixtures.ts';
+import { nextTurnBasisOf, statusOf, toCard, TURN_QUIET_MS } from './turncard.ts';
+import {
+  childWriteKey,
+  claudeChildWriteIndex,
+  liveOpenChildren,
+  openChildCounts,
+  outcomeWithWiderChildren,
+  writeTimeOfVersion,
+} from './turnrail.ts';
+import { searchableSummary } from './turnsearch.ts';
+import { BACKGROUND_COMMAND_CAP_MS, liveBackgroundCommands, sessionRunningSince, sessionStatusOf } from './turnrail.ts';
+import { resumeCommand } from './domain/resume.ts';
+import type { ClaudeHistoryCursor } from './claudehistory.ts';
+import { readClaudeHistoryPage, readClaudeHistoryPageAsync, readClaudeSessionIncremental } from './claudehistory.ts';
+import { readForwardSession, readSemanticHistoryPage, readSemanticHistoryPageAsync } from './history.ts';
+
+// Half of a character: a high surrogate with no low surrogate after it. This is what a cut
+// through the middle of an emoji leaves behind, and what a tab or a heading then draws as an
+// empty box.
+const HALF_A_CHARACTER = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
+
+let seq = 0;
+const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
+const ms = (n: number) => Date.parse(at(n));
+
+test('a growing session is a new revision even when its timestamp stays fixed', () => {
+  const cached = { mtimeMs: 1_700_000_000_000, size: 128 };
+  assert.equal(
+    sameSessionRevision(cached, { mtimeMs: 1_700_000_000_000, size: 256 }),
+    false,
+    'title and activity must be reread after a constant-mtime rollout grows',
+  );
+  assert.equal(sameSessionRevision(cached, { mtimeMs: 1_700_000_000_000, size: 128 }), true);
+});
+
+function userPrompt(text: string, second = 0, extra: Record<string, unknown> = {}) {
+  return {
+    type: 'user',
+    promptId: `p${++seq}`,
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'text', text }] },
+    ...extra,
+  };
+}
+function assistantText(text: string, second: number, usage?: Record<string, number>, effort?: string, stop?: string) {
+  return {
+    type: 'assistant',
+    timestamp: at(second),
+    effort,
+    message: {
+      role: 'assistant',
+      id: `m${++seq}`,
+      model: 'claude-opus-5',
+      stop_reason: stop,
+      content: [{ type: 'text', text }],
+      usage,
+    },
+  };
+}
+// The real store writes a stop_reason on every text line; a closing answer is a text
+// whose response stopped for anything but a tool call.
+function assistantAnswer(text: string, second: number, stop = 'end_turn') {
+  return assistantText(text, second, undefined, undefined, stop);
+}
+function assistantTool(name: string, second: number, id = 'tu1', input: Record<string, unknown> = {}, effort?: string) {
+  return {
+    type: 'assistant',
+    timestamp: at(second),
+    effort,
+    message: { role: 'assistant', model: 'claude-opus-5', content: [{ type: 'tool_use', id, name, input }] },
+  };
+}
+function editResult(filePath: string, second: number, added: number, removed: number) {
+  const lines = [...Array(added).fill('+new'), ...Array(removed).fill('-old')];
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: 'ok' }] },
+    toolUseResult: {
+      filePath,
+      structuredPatch: [{ oldStart: 1, oldLines: removed, newStart: 1, newLines: added, lines }],
+    },
+  };
+}
+// A child transcript's bare acknowledgement of a tool call, carrying neither output nor a
+// patch, which is the only kind of result most Claude child records ever hold. A call this
+// reader already read as a `pendingFileEdit` from its own input needs nothing more than this
+// to be recorded.
+function toolResult(id: string, second: number) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] },
+  };
+}
+function commitResult(stdout: string, second: number, id = 't1') {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] },
+    toolUseResult: { gitOperation: 'commit', stdout, stderr: '' },
+  };
+}
+// A Bash result carrying the CLI's own record of the files a shell command changed, shaped
+// as the vendor audit found it: hunks for up to five files, and every changed path in
+// `changedFiles` whether or not it made the `files` list.
+function bashEditResult(second: number, diff: Record<string, unknown>, id = 'b1') {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] },
+    toolUseResult: { stdout: '', stderr: '', bashEditDiff: diff },
+  };
+}
+
+function costState(startTime: number, totalDuration: number, modelUsage?: Record<string, Record<string, number>>) {
+  return { type: 'cost-state', startTime, totalDuration, ...(modelUsage ? { sessionId: 's', modelUsage } : {}) };
+}
+
+test('Claude process end timing accepts only a safe terminal record', () => {
+  assert.equal(claudeProcessEndedAt(costState(1_000, 250)), 1_250);
+  assert.equal(claudeProcessEndedAt({ ...costState(1_000, 250), type: 'system' }), null);
+  assert.equal(claudeProcessEndedAt(costState(-1, 250)), null);
+  assert.equal(claudeProcessEndedAt(costState(1_000, Number.POSITIVE_INFINITY)), null);
+  assert.equal(claudeProcessEndedAt(costState(Number.MAX_SAFE_INTEGER, 1)), null);
+});
+
+// The line Claude Code writes when something is handed to a turn that is already running.
+// Three different things share it, and only one of them is the reader.
+function queued(attachment: Record<string, unknown>, second: number) {
+  return {
+    type: 'attachment',
+    timestamp: at(second),
+    attachment: { type: 'queued_command', timestamp: at(second), ...attachment },
+  };
+}
+function typedMidTurn(text: string, second: number) {
+  return queued({ commandMode: 'prompt', origin: { kind: 'human' }, prompt: [{ type: 'text', text }] }, second);
+}
+
+function writeTranscript(lines: object[]): string {
+  const dir = tempDir('tl-');
+  const file = path.join(dir, 'sess.jsonl');
+  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  return file;
+}
+
+test('a Claude turn retains usage under each request pricing identity', () => {
+  const first = assistantText('one', 1) as Record<string, unknown>;
+  first.message = {
+    ...(first.message as object),
+    usage: {
+      input_tokens: 10,
+      output_tokens: 2,
+      service_tier: 'priority',
+      inference_geo: 'global',
+    },
+  };
+  const second = assistantText('two', 2, undefined, undefined, 'end_turn') as Record<string, unknown>;
+  second.message = {
+    ...(second.message as object),
+    usage: {
+      input_tokens: 20,
+      output_tokens: 3,
+      service_tier: 'standard',
+      inference_geo: 'in-region',
+    },
+  };
+  const [turn] = readSession(writeTranscript([userPrompt('go'), first, second]), 'sess').turns;
+  assert.deepEqual(
+    turn.usageParts?.map((part) => ({
+      model: part.model,
+      provider: part.provider,
+      inferenceClass: part.inferenceClass,
+      serviceTier: part.serviceTier,
+      requests: part.usage.requests,
+    })),
+    [
+      { model: 'claude-opus-5', provider: null, inferenceClass: 'global', serviceTier: 'priority', requests: 1 },
+      { model: 'claude-opus-5', provider: null, inferenceClass: 'in-region', serviceTier: 'standard', requests: 1 },
+    ],
+  );
+});
+
+function ignoredClaudeLineOfBytes(bytes: number): string {
+  const prefix = '{"type":"progress","payload":"';
+  const suffix = '"}\n';
+  assert.ok(bytes >= Buffer.byteLength(prefix + suffix));
+  return prefix + 'x'.repeat(bytes - Buffer.byteLength(prefix + suffix)) + suffix;
+}
+
+function recordingRangeReader(ranges: Array<[number, number]>): BackwardRangeReader {
+  return (file, start, length, revision) => {
+    ranges.push([start, start + length]);
+    const stat = fs.statSync(file);
+    if (stat.size !== revision.size || stat.mtimeMs !== revision.mtimeMs) {
+      return null;
+    }
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(length);
+      return fs.readSync(fd, buffer, 0, length, start) === length ? buffer : null;
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+}
+
+test('the Claude session reducer resumes every open tool association', () => {
+  const records = [
+    userPrompt('run the command', 0),
+    assistantTool('Bash', 1, 'call-resume', { command: 'echo first\necho second', description: 'Run both' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'call-resume', is_error: true, content: 'command failed' }],
+      },
+    },
+    typedMidTurn('also explain it', 3),
+    assistantAnswer('The command failed safely.', 4),
+  ];
+  const all = createClaudeSessionReducer('sess');
+  for (const record of records) {
+    all.pushLine(JSON.stringify(record));
+  }
+  const first = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 2)) {
+    first.pushLine(JSON.stringify(record));
+  }
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  for (const record of records.slice(2)) {
+    resumed.pushLine(JSON.stringify(record));
+  }
+  assert.deepEqual(resumed.read(), all.read());
+  const step = resumed.read().turns[0].steps[0];
+  assert.equal(Object.getOwnPropertyDescriptor(step, 'id')?.enumerable, false);
+  assert.equal((step as { id?: string }).id, 'call-resume');
+  assert.equal(Object.getOwnPropertyDescriptor(step, 'fullDetail')?.enumerable, false);
+  assert.equal((step as { fullDetail?: string }).fullDetail, 'echo first\necho second');
+});
+
+test('the Claude session reducer reads a non-string assistant text block without stopping the transcript', () => {
+  const reducer = createClaudeSessionReducer('sess');
+  reducer.pushLine(JSON.stringify(userPrompt('read the malformed reply', 0)));
+  reducer.pushLine(
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'malformed-text',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 42 }],
+      },
+    }),
+  );
+
+  const [turn] = reducer.read().turns;
+  assert.equal(turn.summary, '42');
+  assert.deepEqual(
+    turn.answers.map((answer) => answer.text),
+    ['42'],
+  );
+});
+
+test('a late Claude tool rejection after the next prompt updates its retained step and name', () => {
+  const before = [
+    userPrompt('start the command', 0),
+    assistantTool('Bash', 1, 'late-rejection', { command: 'exit 1', description: 'Run command' }),
+    assistantAnswer('The command is still pending.', 2),
+    userPrompt('continue while it finishes', 3),
+  ];
+  const after = [
+    {
+      type: 'user',
+      timestamp: at(4),
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'late-rejection',
+            is_error: true,
+            content: 'permission denied',
+          },
+        ],
+      },
+    },
+    assistantAnswer('Handled the rejection.', 5),
+  ];
+  const file = writeTranscript(before);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  fs.appendFileSync(file, after.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const resumed = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.deepEqual(resumed.read, readSession(file, 'sess'));
+  const read = resumed.read!;
+  assert.equal(read.turns[0].steps[0].status, 'failed');
+  assert.deepEqual(read.turns[1].failures, [{ tool: 'Bash', message: 'permission denied' }]);
+});
+
+test('a late Claude result keeps the name of a call beyond the visible step limit', () => {
+  const calls = Array.from({ length: TURN_STEP_LIMIT + 1 }, (_value, index) => ({
+    type: 'tool_use',
+    id: `oversized-call-${index}`,
+    name: 'Bash',
+    input: { command: `echo ${index}` },
+  }));
+  const file = writeTranscript([
+    userPrompt('run more calls than the card displays', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'oversized-call-message',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: calls,
+      },
+    },
+    userPrompt('continue before the first result', 2),
+  ]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.equal(initial.checkpoint?.parserState.stepById.size, TURN_STEP_LIMIT + 1);
+  fs.appendFileSync(
+    file,
+    [
+      {
+        type: 'user',
+        timestamp: at(3),
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'oversized-call-0',
+              is_error: true,
+              content: 'first call failed',
+            },
+          ],
+        },
+      },
+      assistantAnswer('Handled the first failure.', 4),
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const resumed = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.deepEqual(resumed.read, readSession(file, 'sess'));
+  assert.equal(resumed.read?.turns[0].steps[0].sourceId, 'oversized-call-1');
+  assert.deepEqual(resumed.read?.turns[1].failures, [{ tool: 'Bash', message: 'first call failed' }]);
+});
+
+test('one oversized Claude turn keeps a fixed newest association window', () => {
+  const associationLimit = TURN_STEP_LIMIT * 4;
+  const callCount = associationLimit * 3;
+  const reducer = createClaudeSessionReducer('sess');
+  reducer.pushLine(JSON.stringify(userPrompt('run an oversized call set', 0)));
+  reducer.pushLine(
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'association-window',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: Array.from({ length: callCount }, (_value, index) => ({
+          type: 'tool_use',
+          id: `window-call-${index}`,
+          name: 'Bash',
+          input: { command: `echo ${index}` },
+        })),
+      },
+    }),
+  );
+  const state = reducer.snapshot();
+  assert.deepEqual(
+    {
+      awaited: state.awaited.length,
+      toolNames: state.toolNames.size,
+      stepById: state.stepById.size,
+      toolOwnerById: state.toolOwnerById.size,
+      calls: state.calls.size,
+    },
+    {
+      awaited: associationLimit,
+      toolNames: associationLimit,
+      stepById: associationLimit,
+      toolOwnerById: associationLimit,
+      calls: associationLimit,
+    },
+  );
+  assert.equal(state.stepById.has(`window-call-${callCount - associationLimit - 1}`), false);
+  assert.equal(state.stepById.has(`window-call-${callCount - associationLimit}`), true);
+  assert.deepEqual(
+    state.cur?.steps.map((step) => step.sourceId),
+    Array.from({ length: TURN_STEP_LIMIT }, (_value, index) => `window-call-${callCount - TURN_STEP_LIMIT + index}`),
+  );
+});
+
+test('a next prompt leaves an interrupted unresolved Claude tool step running', () => {
+  const file = writeTranscript([
+    userPrompt('start a long command', 0),
+    assistantTool('Bash', 1, 'interrupted-command', { command: 'wait forever' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] },
+    },
+    userPrompt('do something else', 3),
+    assistantAnswer('The other work is done.', 4),
+  ]);
+  const read = readSession(file, 'sess');
+  assert.equal(read.turns[0].interrupted, true);
+  assert.equal(read.turns[0].steps[0].status, 'running');
+});
+
+test('a legacy string final answer settles an ordinary successful Claude tool call', () => {
+  const records = [
+    userPrompt('run the legacy command', 0),
+    assistantTool('Bash', 1, 'legacy-string-call', { command: 'echo legacy' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'legacy-string-call', content: 'ok' }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp: at(3),
+      message: {
+        role: 'assistant',
+        id: 'legacy-string-answer',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: 'legacy command finished',
+      },
+    },
+  ];
+  const turn = readSession(writeTranscript(records), 'sess').turns[0];
+  assert.equal(turn.summary, 'legacy command finished');
+  assert.deepEqual(
+    turn.steps.map((step) => [step.name, step.status]),
+    [['Bash', 'done']],
+  );
+});
+
+test('replayed Claude narration message ids continue across retained turns', () => {
+  const narration = (text: string, second: number, toolId: string) => ({
+    type: 'assistant',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id: 'replayed-narration',
+      model: 'claude-opus-5',
+      stop_reason: 'tool_use',
+      content: [
+        { type: 'text', text },
+        { type: 'tool_use', id: toolId, name: 'Bash', input: { command: `echo ${toolId}` } },
+      ],
+    },
+  });
+  const before = [
+    userPrompt('first narrated turn', 0),
+    narration('first update', 1, 'narration-one'),
+    assistantAnswer('first answer', 2),
+    userPrompt('second narrated turn', 3),
+    narration('second update', 4, 'narration-two'),
+  ];
+  const file = writeTranscript(before.slice(0, 4));
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  fs.appendFileSync(
+    file,
+    before
+      .slice(4)
+      .concat(assistantAnswer('second answer', 5))
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const resumed = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.deepEqual(resumed.read, readSession(file, 'sess'));
+  const read = resumed.read!;
+  assert.deepEqual(
+    read.turns.map((turn) => turn.updates.map((update) => update.sourceId)),
+    [['replayed-narration:text:0'], ['replayed-narration:text:1']],
+  );
+});
+
+test('replayed Claude narration after a wake continues within the same semantic turn', () => {
+  const narration = (text: string, second: number) => ({
+    type: 'assistant',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id: 'same-turn-narration',
+      model: 'claude-opus-5',
+      stop_reason: 'tool_use',
+      content: [{ type: 'text', text }],
+    },
+  });
+  const file = writeTranscript([
+    userPrompt('narrate around a wake', 0),
+    narration('first update', 1),
+    assistantAnswer('Waiting for a peer.', 2),
+    {
+      type: 'user',
+      timestamp: at(3),
+      origin: { kind: 'task-notification' },
+      message: { role: 'user', content: '<status>running</status>' },
+    },
+    narration('second update', 4),
+    assistantAnswer('Finished after the wake.', 5),
+  ]);
+  const [turn] = readSession(file, 'sess').turns;
+  assert.deepEqual(
+    turn.updates.map((update) => [update.sourceId, update.text]),
+    [
+      ['same-turn-narration:text:0', 'first update'],
+      ['same-turn-narration:text:1', 'second update'],
+    ],
+  );
+});
+
+test('unresolved Claude tool associations plateau with retained turns and the open turn', () => {
+  const reducer = createClaudeSessionReducer('sess', { maxTurns: 2 });
+  for (let index = 0; index < 12; index += 1) {
+    reducer.pushLine(JSON.stringify(userPrompt(`association ${index}`, index * 3)));
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: at(index * 3 + 1),
+        message: {
+          role: 'assistant',
+          id: `association-message-${index}`,
+          model: 'claude-opus-5',
+          stop_reason: 'tool_use',
+          content: [
+            { type: 'text', text: `working ${index}` },
+            {
+              type: 'tool_use',
+              id: `association-tool-${index}`,
+              name: 'Bash',
+              input: { command: `echo ${index}` },
+            },
+          ],
+        },
+      }),
+    );
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'user',
+        timestamp: at(index * 3 + 2),
+        message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] },
+      }),
+    );
+  }
+  const state = reducer.snapshot();
+  assert.equal(state.turns.length, 2);
+  assert.deepEqual(
+    {
+      toolNames: state.toolNames.size,
+      stepById: state.stepById.size,
+      toolOwnerById: state.toolOwnerById.size,
+      calls: state.calls.size,
+      narrationOrdinals: state.narrationOrdinals.size,
+    },
+    { toolNames: 3, stepById: 3, toolOwnerById: 3, calls: 3, narrationOrdinals: 3 },
+  );
+});
+
+test('Claude reducer reads stay independent while finish transfers owned state', () => {
+  const reducer = createClaudeSessionReducer('sess');
+  reducer.pushLine(JSON.stringify(userPrompt('ownership', 0)));
+  reducer.pushLine(JSON.stringify(assistantAnswer('original answer', 1)));
+  const copied = reducer.read();
+  copied.turns[0].summary = 'changed copy';
+  assert.equal(reducer.read().turns[0].summary, 'original answer');
+  const owned = reducer.finish();
+  owned.turns[0].summary = 'changed owned state';
+  assert.equal(reducer.finish().turns[0].summary, 'changed owned state');
+});
+
+test('the Claude reducer resumes a held prompt into the following turn', () => {
+  const records = [userPrompt('held', 0), userPrompt('real prompt', 1), assistantAnswer('done', 2)];
+  const reducer = createClaudeSessionReducer('sess');
+  reducer.pushLine(JSON.stringify(records[0]));
+  const resumed = createClaudeSessionReducer('sess', {}, reducer.snapshot());
+  for (const record of records.slice(1)) {
+    resumed.pushLine(JSON.stringify(record));
+  }
+  assert.equal(resumed.read().turns[0].prompt, 'held\n\nreal prompt');
+  const file = writeTranscript(records);
+  assert.deepEqual(resumed.read(fs.statSync(file).size), readSession(file, 'sess'));
+});
+
+test('the Claude reducer resumes an agent launch into its result', () => {
+  const records = [
+    userPrompt('delegate', 0),
+    assistantTool('Agent', 1, 'agent-call', { description: 'worker', subagent_type: 'general-purpose' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'agent-call', content: 'done' }] },
+      toolUseResult: {
+        agentId: 'agent-1',
+        description: 'worker',
+        totalTokens: 9,
+        totalToolUseCount: 2,
+        status: 'completed',
+      },
+    },
+    assistantAnswer('complete', 3),
+  ];
+  const reducer = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 2)) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  const resumed = createClaudeSessionReducer('sess', {}, reducer.snapshot());
+  for (const record of records.slice(2)) {
+    resumed.pushLine(JSON.stringify(record));
+  }
+  assert.deepEqual(
+    resumed.read().turns[0].agents.map((agent) => [agent.id, agent.tokens, agent.status]),
+    [['agent-1', 9, 'completed']],
+  );
+});
+
+test('a Claude background child survives a final response and the next prompt until notification', () => {
+  const records = [
+    userPrompt('launch in background', 0),
+    assistantTool('Agent', 1, 'background-call', { description: 'worker', subagent_type: 'general-purpose' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'background-call', content: 'launched' }],
+      },
+      toolUseResult: {
+        agentId: 'background-agent',
+        description: 'worker',
+        totalTokens: 0,
+        totalToolUseCount: 0,
+        status: 'running',
+      },
+    },
+    assistantAnswer('It is running in the background.', 3),
+    userPrompt('do something else', 4),
+    {
+      type: 'user',
+      timestamp: at(5),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<tool-use-id>background-call</tool-use-id><task-id>background-agent</task-id>' +
+          '<status>completed</status><subagent_tokens>37</subagent_tokens>' +
+          '<tool_uses>4</tool_uses><duration_ms>900</duration_ms>',
+      },
+    },
+    assistantAnswer('The other work is done.', 6),
+  ];
+  const reducer = createClaudeSessionReducer('sess', { maxTurns: 2 });
+  for (const record of records) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  const read = reducer.read();
+  assert.deepEqual(
+    read.turns[0].agents.map((agent) => [agent.id, agent.status, agent.tokens, agent.toolUses, agent.durationMs]),
+    [['background-agent', 'completed', 37, 4, 900]],
+  );
+  assert.equal(reducer.snapshot().launched.size, 0);
+});
+
+test('a Claude background child row counts up only while its turn runs', () => {
+  const records = [
+    userPrompt('launch in background', 0),
+    assistantTool('Agent', 1, 'row-call', { description: 'worker', subagent_type: 'general-purpose' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'row-call', content: 'launched' }] },
+      toolUseResult: { agentId: 'row-agent', description: 'worker', status: 'running' },
+    },
+    assistantAnswer('It is running in the background.', 3),
+  ];
+  // While the turn runs, the row counts up from the Agent call.
+  const [running] = readSession(writeTranscript(records.slice(0, -1)), 'sess').turns;
+  const live = toCard(running, true, ms(2) + 120_000);
+  assert.equal(live.status, 'running');
+  assert.deepEqual(
+    live.agents.map((agent) => [agent.description, agent.state, agent.stateWord, agent.since]),
+    [['worker', 'running', 'running', ms(1)]],
+  );
+  // Arc cannot tell whether the child outlived its session, so a finished or stopped turn draws no time.
+  const [turn] = readSession(writeTranscript(records), 'sess').turns;
+  const done = toCard(turn, true, ms(3) + 3 * 24 * 60 * 60_000);
+  assert.equal(done.status, 'done');
+  assert.deepEqual(
+    done.agents.map((agent) => [agent.description, agent.state, agent.stateWord, agent.since]),
+    [['worker', 'open', 'no ending recorded', null]],
+  );
+  const stopped = toCard(running, false, ms(2) + 3 * 24 * 60 * 60_000);
+  assert.equal(stopped.status, 'stopped');
+  assert.deepEqual(
+    stopped.agents.map((agent) => [agent.description, agent.state, agent.stateWord, agent.since]),
+    [['worker', 'open', 'no ending recorded', null]],
+  );
+});
+
+test('a Claude background child expires with its evicted owner and ignores a late notification', () => {
+  const reducer = createClaudeSessionReducer('sess', { maxTurns: 2 });
+  const owner = [
+    userPrompt('launch then age out', 0),
+    assistantTool('Agent', 1, 'evicted-background', { description: 'worker', subagent_type: 'general-purpose' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'evicted-background', content: 'launched' }],
+      },
+      toolUseResult: { agentId: 'evicted-agent', description: 'worker', status: 'running' },
+    },
+    assistantAnswer('It is running.', 3),
+  ];
+  const later = [
+    userPrompt('middle one', 4),
+    assistantAnswer('middle done', 5),
+    userPrompt('middle two', 6),
+    assistantAnswer('middle two done', 7),
+    userPrompt('current work', 8),
+  ];
+  for (const record of [...owner, ...later]) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  assert.equal(reducer.snapshot().launched.size, 0);
+  reducer.pushLine(
+    JSON.stringify({
+      type: 'user',
+      timestamp: at(9),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<tool-use-id>evicted-background</tool-use-id><task-id>evicted-agent</task-id>' +
+          '<status>completed</status><subagent_tokens>99</subagent_tokens>',
+      },
+    }),
+  );
+  const read = reducer.read();
+  assert.equal(reducer.snapshot().launched.size, 0);
+  assert.equal(read.turns.flatMap((turn) => turn.agents).length, 0);
+  assert.equal(read.turns.at(-1)?.prompt, 'current work');
+});
+
+test('unfinished Claude background children plateau at the retained owner horizon', () => {
+  const reducer = createClaudeSessionReducer('sess', { maxTurns: 3 });
+  for (let index = 0; index < 20; index += 1) {
+    const callId = `plateau-agent-${index}`;
+    const records = [
+      userPrompt(`plateau prompt ${index}`, index * 4),
+      assistantTool('Agent', index * 4 + 1, callId, { description: `worker ${index}` }),
+      {
+        type: 'user',
+        timestamp: at(index * 4 + 2),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: callId, content: 'launched' }] },
+        toolUseResult: { agentId: `plateau-child-${index}`, description: `worker ${index}`, status: 'running' },
+      },
+      assistantAnswer(`background ${index} is running`, index * 4 + 3),
+    ];
+    for (const record of records) {
+      reducer.pushLine(JSON.stringify(record));
+    }
+    assert.ok(reducer.snapshot().launched.size <= 4);
+  }
+  const state = reducer.snapshot();
+  assert.equal(state.turns.length, 3);
+  assert.equal(state.launched.size, 4);
+  assert.equal(new Set(state.launched.values()).size, 4);
+});
+
+test('a long Claude checkpoint bounds every retained turn association', () => {
+  const records: object[] = [];
+  for (let index = 0; index < 20; index += 1) {
+    const second = index * 6;
+    const bashId = `bounded-bash-${index}`;
+    const agentId = `bounded-agent-${index}`;
+    records.push(
+      userPrompt(`bounded prompt ${index}`, second),
+      {
+        type: 'assistant',
+        timestamp: at(second + 1),
+        message: {
+          role: 'assistant',
+          id: `bounded-message-${index}`,
+          model: 'claude-opus-5',
+          stop_reason: 'tool_use',
+          content: [
+            { type: 'text', text: `working ${index}` },
+            { type: 'tool_use', id: bashId, name: 'Bash', input: { command: `echo ${index}` } },
+            { type: 'tool_use', id: agentId, name: 'Agent', input: { description: `worker-${index}` } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: at(second + 2),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: bashId, content: 'ok' }] },
+        toolUseResult: { stdout: 'ok' },
+      },
+      {
+        type: 'user',
+        timestamp: at(second + 3),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: agentId, content: 'done' }] },
+        toolUseResult: {
+          agentId: `worker-id-${index}`,
+          description: `worker-${index}`,
+          totalTokens: 9,
+          totalToolUseCount: 2,
+          status: 'completed',
+        },
+      },
+      assistantAnswer(`answer ${index}`, second + 4),
+      {
+        type: 'system',
+        timestamp: at(second + 5),
+        compactMetadata: {
+          trigger: 'manual',
+          preTokens: 20 + index,
+          postTokens: 2,
+          durationMs: 4,
+        },
+      },
+      {
+        ...userPrompt(`summary ${index}`, second + 5),
+        isCompactSummary: true,
+        message: { role: 'user', content: `summary ${index}` },
+      },
+    );
+  }
+  for (let index = 0; index < 20; index += 1) {
+    records.push({
+      type: 'system',
+      timestamp: at(1000 + index * 20),
+      compactMetadata: { trigger: 'manual', preTokens: 100 + index, postTokens: 1 },
+    });
+  }
+  const reducer = createClaudeSessionReducer('sess', { maxTurns: 3 });
+  for (const record of records) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  const state = reducer.snapshot();
+  assert.deepEqual(
+    {
+      turns: state.turns.length,
+      turnRanges: state.turnRanges.length,
+      turnMembershipStarts: state.turnMembershipStarts.length,
+      launched: state.launched.size,
+      toolNames: state.toolNames.size,
+      stepById: state.stepById.size,
+      toolOwnerById: state.toolOwnerById.size,
+      narrationOrdinals: state.narrationOrdinals.size,
+      awaited: state.awaited.length,
+      calls: state.calls.size,
+      compactions: state.compactions.length,
+      compactionRanges: state.compactionRanges.length,
+      compactionMetadataRanges: state.compactionMetadataRanges.length,
+      compactionValueSources: state.compactionValueSources.length,
+      compactMeta: state.compactMeta.length,
+    },
+    {
+      turns: 3,
+      turnRanges: 3,
+      turnMembershipStarts: 3,
+      launched: 0,
+      toolNames: 4,
+      stepById: 4,
+      toolOwnerById: 4,
+      narrationOrdinals: 4,
+      awaited: 0,
+      calls: 4,
+      compactions: 3,
+      compactionRanges: 3,
+      compactionMetadataRanges: 3,
+      compactionValueSources: 3,
+      compactMeta: 1,
+    },
+  );
+  const file = writeTranscript(records);
+  assert.deepEqual(reducer.read(fs.statSync(file).size), readSession(file, 'sess', { maxTurns: 3 }));
+});
+
+test('the Claude reducer resumes usage and compaction metadata together', () => {
+  const response = assistantText('first answer', 1, { input_tokens: 5, cache_read_input_tokens: 20, output_tokens: 3 });
+  const summary = {
+    ...userPrompt('saved summary', 3),
+    isCompactSummary: true,
+    message: { role: 'user', content: 'saved summary' },
+  };
+  const records = [
+    userPrompt('first', 0),
+    response,
+    { type: 'system', timestamp: at(2), compactMetadata: { trigger: 'manual', preTokens: 25, postTokens: 4 } },
+    summary,
+    userPrompt('second', 4),
+    assistantAnswer('second answer', 5),
+  ];
+  const first = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 3)) {
+    first.pushLine(JSON.stringify(record));
+  }
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  for (const record of records.slice(3)) {
+    resumed.pushLine(JSON.stringify(record));
+  }
+  const all = createClaudeSessionReducer('sess');
+  for (const record of records) {
+    all.pushLine(JSON.stringify(record));
+  }
+  assert.deepEqual(resumed.read(), all.read());
+  assert.deepEqual(
+    resumed.read().compactions.map((item) => [item.trigger, item.contextBefore, item.contextAfter]),
+    [['manual', 25, 4]],
+  );
+  assert.equal(resumed.read().turns[0].usage.requests, 1);
+});
+
+test('a Claude checkpoint applies an append and equals a one-shot read', () => {
+  const firstRecords = [userPrompt('append', 0), assistantTool('Bash', 1, 'append-call', { command: 'echo hi' })];
+  const file = writeTranscript(firstRecords);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.equal(initial.kind, 'reset');
+  assert.ok(initial.checkpoint);
+  fs.appendFileSync(
+    file,
+    [
+      JSON.stringify({
+        type: 'user',
+        timestamp: at(2),
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'append-call', is_error: true, content: 'bad' }],
+        },
+      }),
+      JSON.stringify(assistantAnswer('recovered', 3)),
+      '',
+    ].join('\n'),
+  );
+  const applied = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(applied.kind, 'appended');
+  assert.deepEqual(applied.read, readSession(file, 'sess'));
+});
+
+test('a Claude checkpoint clears a prior overflow after its source leaves the tail', () => {
+  const turn = (index: number) => [
+    userPrompt(`overflow ${index}`, index * 2),
+    assistantAnswer(`answer ${index}`, index * 2 + 1),
+  ];
+  const file = writeTranscript([...turn(0), ...turn(1)]);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(4096));
+  fs.appendFileSync(file, [...turn(2), ...turn(3)].map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const options = { maxTurns: 2, tailBytes: fs.statSync(file).size };
+  const initial = readClaudeSessionIncremental(file, 'sess', undefined, options);
+  assert.equal(initial.checkpoint?.parserState.turnLimitReached, true);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(2000));
+  const resumed = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined, options);
+  const fresh = readSession(file, 'sess', options);
+  assert.equal(resumed.kind, 'appended');
+  assert.deepEqual(resumed.read, fresh);
+  assert.equal(resumed.read?.turnLimitReached, false);
+});
+
+test('a prompt submitted into an idle Claude session keeps the newest card across a cloned checkpoint', () => {
+  const records: object[] = [];
+  for (let index = 1; index <= 12; index += 1) {
+    records.push(userPrompt(`prompt ${index}`, index * 2));
+    records.push(assistantAnswer(`answer ${index} ${'x'.repeat(600)}`, index * 2 + 1));
+  }
+  const file = writeTranscript(records);
+  // Smaller than the transcript, so the resumed read has a tail floor above byte zero. That
+  // floor is what discards a turn whose range came back as zero.
+  const options = { tailBytes: 4096 };
+  const initial = readClaudeSessionIncremental(file, 'sess', undefined, options);
+  assert.equal(initial.read?.turns[initial.read.turns.length - 1].finished, true);
+  fs.appendFileSync(file, JSON.stringify(userPrompt('the new message', 100)) + '\n');
+  const resumed = readClaudeSessionIncremental(file, 'sess', throughStructuredClone(initial.checkpoint!), options);
+  const cold = readSession(file, 'sess', options);
+  assert.ok(resumed.checkpoint!.coveredFrom > 0);
+  assert.deepEqual(
+    resumed.read?.turns.map((turn) => turn.prompt),
+    cold.turns.map((turn) => turn.prompt),
+  );
+  assert.deepEqual(resumed.read, cold);
+});
+
+test('a sliding Claude checkpoint retains its final generated title', () => {
+  const fullTitle = `Title retained across the window ${'with its complete source '.repeat(4)}`;
+  const file = writeTranscript([
+    { type: 'ai-title', timestamp: at(0), aiTitle: fullTitle },
+    userPrompt('first titled prompt', 1),
+    assistantAnswer('first answer', 2),
+  ]);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'sess', undefined, options);
+  assert.equal(initial.read?.turns[0].sessionTitle, normalizeSessionTitle(fullTitle));
+  assert.equal(initial.read?.turns[0].sessionFullTitle, fullTitle.trim());
+  const appended = [
+    userPrompt(`newer ${'x'.repeat(500)}`, 3),
+    assistantAnswer('newer answer', 4),
+    userPrompt(`newest ${'y'.repeat(500)}`, 5),
+    assistantAnswer('newest answer', 6),
+  ];
+  fs.appendFileSync(file, appended.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const resumed = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined, options);
+  assert.ok(resumed.checkpoint!.coveredFrom > initial.checkpoint!.parserState.titleRecord!.end);
+  assert.equal(resumed.checkpoint?.parserState.title, normalizeSessionTitle(fullTitle));
+  assert.equal(resumed.checkpoint?.parserState.fullTitle, fullTitle.trim());
+  assert.ok(resumed.read?.turns.every((turn) => turn.sessionTitle === normalizeSessionTitle(fullTitle)));
+  assert.ok(resumed.read?.turns.every((turn) => turn.sessionFullTitle === fullTitle.trim()));
+});
+
+test('a Claude checkpoint excludes a turn whose prompt starts at the exact tail floor', () => {
+  const prefix = { type: 'progress', payload: 'p'.repeat(200) };
+  const records = [prefix, userPrompt('exact Claude floor', 1), assistantAnswer('answer above floor', 2)];
+  const promptStart = Buffer.byteLength(JSON.stringify(prefix) + '\n');
+  const file = writeTranscript(records);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'sess', undefined, options);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(promptStart));
+  const resumed = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined, options);
+  assert.equal(resumed.checkpoint?.coveredFrom, promptStart);
+  assert.deepEqual(resumed.read, readSession(file, 'sess', options));
+  assert.deepEqual(resumed.read?.turns, []);
+});
+
+test('Claude tail membership follows the actual prompt while pages own an earlier carried prompt', () => {
+  const prefix = { type: 'progress', payload: 'p'.repeat(240) };
+  const carried = userPrompt('carried prompt outside the later tail', 1);
+  const actual = userPrompt('actual prompt inside the later tail', 2);
+  const answer = assistantAnswer('answer for the actual prompt', 3);
+  const records = [prefix, carried, actual, answer];
+  const encoded = records.map((record) => JSON.stringify(record));
+  const starts: number[] = [];
+  let cursor = 0;
+  for (const line of encoded) {
+    starts.push(cursor);
+    cursor += Buffer.byteLength(`${line}\n`);
+  }
+  const carriedStart = starts[1];
+  const actualStart = starts[2];
+  const floors = [
+    ...new Set([carriedStart - 1, carriedStart, carriedStart + 1, actualStart - 2, actualStart - 1, actualStart]),
+  ];
+  for (const floor of floors) {
+    const file = writeTranscript(records);
+    const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+    const initial = readClaudeSessionIncremental(file, `claude-membership-${floor}`, undefined, options);
+    fs.appendFileSync(file, ignoredClaudeLineOfBytes(floor));
+    const resumed = readClaudeSessionIncremental(
+      file,
+      `claude-membership-${floor}`,
+      initial.checkpoint ?? undefined,
+      options,
+    );
+    const fresh = readSession(file, `claude-membership-${floor}`, options);
+    assert.equal(resumed.checkpoint?.coveredFrom, floor);
+    assert.deepEqual(
+      resumed.read?.turns.map((turn) => ({
+        prompt: turn.prompt,
+        laterPrompts: turn.laterPrompts,
+        summary: turn.summary,
+        startedAt: turn.startedAt,
+        endedAt: turn.endedAt,
+      })),
+      fresh.turns.map((turn) => ({
+        prompt: turn.prompt,
+        laterPrompts: turn.laterPrompts,
+        summary: turn.summary,
+        startedAt: turn.startedAt,
+        endedAt: turn.endedAt,
+      })),
+      `turn fields at tail floor ${floor}`,
+    );
+    assert.deepEqual(resumed.read, fresh, `tail floor ${floor}`);
+    if (floor >= carriedStart && floor < actualStart) {
+      assert.equal(fresh.turns[0]?.prompt, 'actual prompt inside the later tail');
+    }
+  }
+
+  const pagedRecords = [userPrompt('older guard', 0), assistantAnswer('older answer', 1), carried, actual, answer];
+  const pageFile = writeTranscript(pagedRecords);
+  const carriedPageStart = Buffer.byteLength(
+    `${JSON.stringify(pagedRecords[0])}\n${JSON.stringify(pagedRecords[1])}\n`,
+  );
+  const page = readClaudeHistoryPage(pageFile, 'sess', null, {
+    chunkBytes: fs.statSync(pageFile).size,
+    targetTurns: 1,
+  });
+  assert.equal(page.kind, 'page');
+  assert.equal(page.page?.ownedRange.start, carriedPageStart);
+  assert.equal(
+    page.page?.turns[0].prompt,
+    'carried prompt outside the later tail\n\nactual prompt inside the later tail',
+  );
+});
+
+test('an active Claude turn rebuilds when its carried prompt leaves the tail', () => {
+  const prefix = { type: 'progress', payload: 'p'.repeat(240) };
+  const carried = userPrompt('carried active prompt', 1);
+  const actual = userPrompt('actual active prompt', 2);
+  const records = [prefix, carried, actual];
+  const carriedStart = Buffer.byteLength(`${JSON.stringify(prefix)}\n`);
+  const actualStart = carriedStart + Buffer.byteLength(`${JSON.stringify(carried)}\n`);
+  const floor = carriedStart + 1;
+  assert.ok(floor < actualStart);
+  const file = writeTranscript(records);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'active-carried', undefined, options);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(floor));
+  const resumed = readClaudeSessionIncremental(file, 'active-carried', initial.checkpoint ?? undefined, options);
+  const fresh = readSession(file, 'active-carried', options);
+  assert.equal(resumed.checkpoint?.coveredFrom, floor);
+  assert.equal(resumed.kind, 'reset');
+  assert.deepEqual(resumed.read, fresh);
+  assert.equal(fresh.turns[0]?.prompt, 'actual active prompt');
+  assert.equal(fresh.turns[0]?.finished, false);
+});
+
+test('an oversized active Claude turn remains resumable after its membership leaves the tail', () => {
+  const records = [
+    userPrompt('oversized active prompt', 1),
+    assistantTool('Bash', 2, 'oversized-active-call', { command: `echo ${'x'.repeat(4_096)}` }),
+  ];
+  const file = writeTranscript(records);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'oversized-active', undefined, options);
+  const floor = 128;
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(floor));
+  const resumed = readClaudeSessionIncremental(file, 'oversized-active', initial.checkpoint ?? undefined, options);
+  assert.equal(resumed.checkpoint?.coveredFrom, floor);
+  assert.equal(resumed.kind, 'appended');
+  assert.equal(resumed.read?.turns[0]?.prompt, 'oversized active prompt');
+  assert.equal(resumed.read?.turns[0]?.finished, false);
+});
+
+test('a Claude checkpoint excludes compaction source facts at the exact tail floor', () => {
+  const prefix = { type: 'progress', payload: 'p'.repeat(200) };
+  const metadata = {
+    type: 'system',
+    timestamp: at(1),
+    compactMetadata: { trigger: 'manual', preTokens: 1000, postTokens: 100, durationMs: 25 },
+  };
+  const summary = {
+    ...userPrompt('exact-floor carried summary', 2),
+    isCompactSummary: true,
+    message: { role: 'user', content: 'exact-floor carried summary' },
+  };
+  const fixtures = [
+    { name: 'metadata', records: [prefix, metadata, summary], floor: Buffer.byteLength(JSON.stringify(prefix) + '\n') },
+    {
+      name: 'compaction',
+      records: [prefix, metadata, summary],
+      floor: Buffer.byteLength(JSON.stringify(prefix) + '\n' + JSON.stringify(metadata) + '\n'),
+    },
+  ];
+  for (const fixture of fixtures) {
+    const file = writeTranscript(fixture.records);
+    const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+    const initial = readClaudeSessionIncremental(file, `sess-${fixture.name}`, undefined, options);
+    fs.appendFileSync(file, ignoredClaudeLineOfBytes(fixture.floor));
+    const resumed = readClaudeSessionIncremental(
+      file,
+      `sess-${fixture.name}`,
+      initial.checkpoint ?? undefined,
+      options,
+    );
+    assert.equal(resumed.checkpoint?.coveredFrom, fixture.floor, fixture.name);
+    assert.deepEqual(resumed.read, readSession(file, `sess-${fixture.name}`, options), fixture.name);
+  }
+});
+
+function claudeImplicitCompactionFixture(includeCompaction = true) {
+  const prefix = { type: 'progress', payload: 'p'.repeat(240) };
+  const prompt = userPrompt('implicit Claude compaction source', 1);
+  const response = assistantText(
+    'answer before compaction',
+    2,
+    {
+      input_tokens: 31,
+      cache_read_input_tokens: 400,
+      output_tokens: 7,
+    },
+    undefined,
+    'end_turn',
+  );
+  const summary = {
+    ...userPrompt('implicit Claude summary', 3),
+    isCompactSummary: true,
+    message: { role: 'user', content: 'implicit Claude summary' },
+  };
+  const records = [prefix, prompt, response, ...(includeCompaction ? [summary] : [])];
+  const responseStart = Buffer.byteLength(`${JSON.stringify(prefix)}\n${JSON.stringify(prompt)}\n`);
+  return { records, response, responseStart, summary };
+}
+
+test('a Claude checkpoint drops implicit compaction values sourced at the exact tail floor', () => {
+  const fixture = claudeImplicitCompactionFixture();
+  const file = writeTranscript(fixture.records);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'implicit-claude-exact', undefined, options);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(fixture.responseStart));
+  const resumed = readClaudeSessionIncremental(file, 'implicit-claude-exact', initial.checkpoint ?? undefined, options);
+  assert.equal(resumed.checkpoint?.coveredFrom, fixture.responseStart);
+  assert.deepEqual(resumed.read, readSession(file, 'implicit-claude-exact', options));
+  assert.deepEqual(
+    resumed.read?.compactions.map((item) => [item.contextBefore, item.model]),
+    [[0, null]],
+  );
+});
+
+test('a Claude checkpoint drops implicit compaction values sourced below the tail floor', () => {
+  const fixture = claudeImplicitCompactionFixture();
+  const floor = fixture.responseStart + 8;
+  const file = writeTranscript(fixture.records);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'implicit-claude-beyond', undefined, options);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(floor));
+  const resumed = readClaudeSessionIncremental(
+    file,
+    'implicit-claude-beyond',
+    initial.checkpoint ?? undefined,
+    options,
+  );
+  assert.equal(resumed.checkpoint?.coveredFrom, floor);
+  assert.deepEqual(resumed.read, readSession(file, 'implicit-claude-beyond', options));
+  assert.deepEqual(
+    resumed.read?.compactions.map((item) => [item.contextBefore, item.model]),
+    [[0, null]],
+  );
+});
+
+test('a newly appended Claude compaction ignores expired implicit values', () => {
+  const fixture = claudeImplicitCompactionFixture(false);
+  const floor = fixture.responseStart + 8;
+  const file = writeTranscript(fixture.records);
+  const options = { tailBytes: fs.statSync(file).size, maxTurns: 3 };
+  const initial = readClaudeSessionIncremental(file, 'implicit-claude-appended', undefined, options);
+  fs.appendFileSync(file, ignoredClaudeLineOfBytes(floor));
+  const trimmed = readClaudeSessionIncremental(
+    file,
+    'implicit-claude-appended',
+    initial.checkpoint ?? undefined,
+    options,
+  );
+  assert.deepEqual([trimmed.checkpoint?.parserState.lastContext, trimmed.checkpoint?.parserState.lastModel], [0, null]);
+  fs.appendFileSync(file, `${JSON.stringify(fixture.summary)}\n`);
+  const resumed = readClaudeSessionIncremental(
+    file,
+    'implicit-claude-appended',
+    trimmed.checkpoint ?? undefined,
+    options,
+  );
+  assert.deepEqual(resumed.read, readSession(file, 'implicit-claude-appended', options));
+  assert.deepEqual(
+    resumed.read?.compactions.map((item) => [item.contextBefore, item.model]),
+    [[0, null]],
+  );
+});
+
+test('an unchanged Claude checkpoint reads no transcript bytes', () => {
+  const file = writeTranscript([userPrompt('same', 0), assistantAnswer('same', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.ok(initial.checkpoint);
+  assert.equal(initial.read?.readBytes, fs.statSync(file).size);
+  const reused = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(reused.kind, 'reused');
+  assert.equal(reused.readBytes, 0);
+  assert.equal(reused.read?.readBytes, fs.statSync(file).size);
+  assert.deepEqual(reused.read, initial.read);
+});
+
+test('a Claude checkpoint reset is bounded to its configured tail', () => {
+  const file = writeTranscript([
+    { type: 'progress', payload: 'x'.repeat(32 * 1024) },
+    userPrompt('bounded reset', 0),
+    assistantAnswer('done', 1),
+  ]);
+  const tailBytes = 4096;
+  const result = readClaudeSessionIncremental(file, 'sess', undefined, { tailBytes });
+  assert.equal(result.kind, 'reset');
+  assert.ok(result.readBytes <= tailBytes);
+  assert.equal(result.read?.readBytes, result.readBytes);
+  assert.equal(result.read?.turns[0].prompt, 'bounded reset');
+});
+
+test('a Claude checkpoint resets when parser options change', () => {
+  const records: object[] = [];
+  for (let index = 0; index < 3; index++) {
+    records.push(userPrompt(`configured ${index}`, index * 2), assistantAnswer(`answer ${index}`, index * 2 + 1));
+  }
+  const file = writeTranscript(records);
+  const first = readClaudeSessionIncremental(file, 'sess', undefined, { maxTurns: 1 });
+  assert.equal(first.read?.turns.length, 1);
+  const reset = readClaudeSessionIncremental(file, 'sess', first.checkpoint ?? undefined, { maxTurns: 3 });
+  assert.equal(reset.kind, 'reset');
+  assert.deepEqual(reset.read, readSession(file, 'sess', { maxTurns: 3 }));
+});
+
+test('exact checkpoint reuse performs no transcript range read', () => {
+  const file = writeTranscript([userPrompt('reuse without content I/O', 0), assistantAnswer('done', 1)]);
+  const factory = (restored?: Parameters<typeof createClaudeSessionReducer>[2]) =>
+    createClaudeSessionReducer('sess', {}, restored);
+  const initial = readForwardSession(file, 'claude', 'sess', factory);
+  assert.ok(initial.checkpoint);
+  const ranges: Array<[number, number]> = [];
+  const reused = readForwardSession(
+    file,
+    'claude',
+    'sess',
+    factory,
+    initial.checkpoint ?? undefined,
+    recordingRangeReader(ranges),
+  );
+  assert.equal(reused.kind, 'reused');
+  assert.ok(reused.read);
+  assert.equal(reused.appendFrom, null);
+  assert.deepEqual(ranges, []);
+  fs.appendFileSync(file, JSON.stringify(userPrompt('appended after reuse', 2)) + '\n');
+  const appended = readForwardSession(
+    file,
+    'claude',
+    'sess',
+    factory,
+    initial.checkpoint ?? undefined,
+    recordingRangeReader(ranges),
+  );
+  assert.equal(appended.kind, 'appended');
+  assert.ok(appended.read);
+  assert.deepEqual(appended.appendFrom, initial.checkpoint.revision);
+  const anchor = initial.checkpoint.contentAnchor;
+  assert.deepEqual(ranges[0], [anchor.start, anchor.start + anchor.bytes.length]);
+  assert.ok(anchor.bytes.length <= 4096);
+});
+
+test('forward checkpoint materialization transfers a disposable reducer exactly once', () => {
+  const file = writeTranscript([userPrompt('finish transfer', 0), assistantAnswer('done', 1)]);
+  let constructions = 0;
+  let reads = 0;
+  let finishes = 0;
+  const factory = (restored?: Parameters<typeof createClaudeSessionReducer>[2]) => {
+    constructions++;
+    const reducer = createClaudeSessionReducer('sess', {}, restored);
+    return {
+      ...reducer,
+      read: (readBytes?: number) => {
+        reads++;
+        return reducer.read(readBytes);
+      },
+      finish: (readBytes?: number) => {
+        finishes++;
+        return reducer.finish(readBytes);
+      },
+    };
+  };
+  const initial = readForwardSession(file, 'claude', 'sess', factory);
+  assert.ok(initial.checkpoint);
+  assert.deepEqual({ constructions, reads, finishes }, { constructions: 1, reads: 0, finishes: 1 });
+
+  constructions = reads = finishes = 0;
+  fs.appendFileSync(file, `${JSON.stringify(userPrompt('appended turn', 2))}\n`);
+  const appended = readForwardSession(file, 'claude', 'sess', factory, initial.checkpoint ?? undefined);
+  assert.equal(appended.kind, 'appended');
+  assert.deepEqual({ constructions, reads, finishes }, { constructions: 1, reads: 0, finishes: 1 });
+
+  constructions = reads = finishes = 0;
+  const reused = readForwardSession(file, 'claude', 'sess', factory, appended.checkpoint ?? undefined);
+  assert.equal(reused.kind, 'reused');
+  assert.deepEqual({ constructions, reads, finishes }, { constructions: 1, reads: 0, finishes: 1 });
+});
+
+test('a truncated Claude transcript resets its checkpoint', () => {
+  const file = writeTranscript([userPrompt('old', 0), assistantAnswer('old answer', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  fs.writeFileSync(file, JSON.stringify(userPrompt('new', 2)) + '\n');
+  const reset = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(reset.kind, 'reset');
+  assert.ok(reset.read);
+  assert.equal(reset.appendFrom, null);
+  assert.equal(reset.read?.turns[0].prompt, 'new');
+});
+
+test('a same-size Claude mutation resets its checkpoint', () => {
+  const file = writeTranscript([userPrompt('aaa', 0), assistantAnswer('done', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.ok(initial.checkpoint);
+  const body = fs.readFileSync(file, 'utf8').replace('aaa', 'bbb');
+  fs.writeFileSync(file, body);
+  const reset = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(reset.kind, 'reset');
+  assert.ok(reset.read);
+  assert.equal(reset.appendFrom, null);
+  assert.equal(reset.read?.turns[0].prompt, 'bbb');
+});
+
+test('a replaced Claude file resets even when its path is unchanged', () => {
+  const file = writeTranscript([userPrompt('old identity', 0), assistantAnswer('done', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  fs.unlinkSync(file);
+  fs.writeFileSync(
+    file,
+    [JSON.stringify(userPrompt('new identity', 2)), JSON.stringify(assistantAnswer('done', 3)), ''].join('\n'),
+  );
+  const reset = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(reset.kind, 'reset');
+  assert.ok(reset.read);
+  assert.equal(reset.appendFrom, null);
+  assert.equal(reset.read?.turns[0].prompt, 'new identity');
+});
+
+test('a Claude anchor mismatch rejects append-only resume', () => {
+  const file = writeTranscript([userPrompt('before', 0), assistantAnswer('done', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  const changed = fs.readFileSync(file, 'utf8').replace('before', 'mutate');
+  fs.writeFileSync(file, changed + JSON.stringify(userPrompt('after', 2)) + '\n');
+  const reset = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(reset.kind, 'reset');
+  assert.ok(reset.read);
+  assert.equal(reset.appendFrom, null);
+  assert.deepEqual(reset.read, readSession(file, 'sess'));
+});
+
+test('an incompatible Claude parser checkpoint rebuilds from the file', () => {
+  const file = writeTranscript([userPrompt('rebuild', 0), assistantAnswer('done', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.ok(initial.checkpoint);
+  (initial.checkpoint.parserState as { version: number }).version = 99;
+  const reset = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(reset.kind, 'reset');
+  assert.deepEqual(reset.read, readSession(file, 'sess'));
+});
+
+test('a different Claude session id resets a compatible file checkpoint', () => {
+  const file = writeTranscript([userPrompt('identity', 0), assistantAnswer('done', 1)]);
+  const initial = readClaudeSessionIncremental(file, 'old-session');
+  const reset = readClaudeSessionIncremental(file, 'new-session', initial.checkpoint ?? undefined);
+  assert.equal(reset.kind, 'reset');
+  assert.equal(reset.checkpoint?.sessionId, 'new-session');
+  assert.equal(reset.read?.turns[0].sessionId, 'new-session');
+});
+
+test('a missing and an empty Claude transcript have distinct complete results', () => {
+  const dir = tempDir('claude-history-');
+  assert.equal(readClaudeSessionIncremental(path.join(dir, 'missing.jsonl'), 'sess').kind, 'missing');
+  const empty = path.join(dir, 'empty.jsonl');
+  fs.writeFileSync(empty, '');
+  const result = readClaudeSessionIncremental(empty, 'sess');
+  assert.equal(result.kind, 'reset');
+  assert.deepEqual(result.read?.turns, []);
+  assert.equal(result.checkpoint?.appliedThrough, 0);
+});
+
+test('a final unterminated Claude record and malformed predecessor recover together', () => {
+  const dir = tempDir('claude-history-');
+  const file = path.join(dir, 'sess.jsonl');
+  fs.writeFileSync(
+    file,
+    ['{malformed', JSON.stringify(userPrompt('valid', 0)), JSON.stringify(assistantAnswer('unterminated', 1))].join(
+      '\n',
+    ),
+  );
+  const result = readClaudeSessionIncremental(file, 'sess');
+  assert.equal(result.read?.turns[0].summary, 'unterminated');
+  assert.ok((result.checkpoint?.lineFragment.length ?? 0) > 0);
+  assert.deepEqual(result.read, readSession(file, 'sess'));
+  assert.equal(result.checkpoint?.parserState.cur?.summary, '');
+  result.read!.turns[0].summary = 'mutated outside the checkpoint';
+  const reused = readClaudeSessionIncremental(file, 'sess', result.checkpoint ?? undefined);
+  assert.equal(reused.read?.turns[0].summary, 'unterminated');
+  assert.equal(reused.checkpoint?.parserState.cur?.summary, '');
+});
+
+test('a Claude checkpoint completes its saved line fragment after an append', () => {
+  const dir = tempDir('claude-history-');
+  const file = path.join(dir, 'sess.jsonl');
+  const prompt = JSON.stringify(userPrompt('fragmented answer', 0));
+  const answer = JSON.stringify(assistantAnswer('completed later', 1));
+  const cut = answer.length - 9;
+  fs.writeFileSync(file, `${prompt}\n${answer.slice(0, cut)}`);
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.ok((initial.checkpoint?.lineFragment.length ?? 0) > 0);
+  fs.appendFileSync(file, `${answer.slice(cut)}\n`);
+  const appended = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(appended.kind, 'appended');
+  assert.equal(appended.checkpoint?.lineFragment.length, 0);
+  assert.deepEqual(appended.read, readSession(file, 'sess'));
+});
+
+test('Claude semantic pages reconstruct UTF-8 records split across chunks', () => {
+  const file = writeTranscript([userPrompt('emoji 🌍 survives', 0), assistantAnswer('done', 1)]);
+  const result = readClaudeHistoryPage(file, 'sess', null, { chunkBytes: 7, targetTurns: 1 });
+  assert.equal(result.kind, 'page');
+  assert.equal(result.page?.turns[0].prompt, 'emoji 🌍 survives');
+  assert.equal(result.page?.source, 'claude');
+  assert.equal(result.page?.sessionId, 'sess');
+  const stat = fs.statSync(file);
+  assert.deepEqual(result.page?.revision, {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    dev: stat.dev,
+    ino: stat.ino,
+  });
+});
+
+function claudeCursorFixture(): { file: string; cursor: ClaudeHistoryCursor | null } {
+  const file = writeTranscript([
+    userPrompt('one', 0),
+    assistantAnswer('one done', 1),
+    userPrompt('two', 2),
+    assistantAnswer('two done', 3),
+    userPrompt('three', 4),
+    assistantAnswer('three done', 5),
+  ]);
+  const first = readClaudeHistoryPage(file, 'sess', null, { chunkBytes: 64, targetTurns: 1 });
+  assert.equal(first.kind, 'page');
+  return { file, cursor: first.page?.nextOlderCursor ?? null };
+}
+
+test('an append makes an older Claude page cursor stale', () => {
+  const { file, cursor } = claudeCursorFixture();
+  assert.ok(cursor);
+  fs.appendFileSync(file, JSON.stringify(userPrompt('four', 6)) + '\n');
+  assert.equal(readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 64, targetTurns: 1 }).kind, 'stale');
+});
+
+test('truncation makes an older Claude page cursor stale', () => {
+  const { file, cursor } = claudeCursorFixture();
+  assert.ok(cursor);
+  fs.truncateSync(file, Math.floor(fs.statSync(file).size / 2));
+  assert.equal(readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 64, targetTurns: 1 }).kind, 'stale');
+});
+
+test('replacement makes an older Claude page cursor stale', () => {
+  const { file, cursor } = claudeCursorFixture();
+  assert.ok(cursor);
+  fs.unlinkSync(file);
+  fs.writeFileSync(file, JSON.stringify(userPrompt('replacement', 7)) + '\n');
+  assert.equal(readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 64, targetTurns: 1 }).kind, 'stale');
+});
+
+test('empty and missing Claude history sources are explicit', () => {
+  const dir = tempDir('claude-pages-');
+  const empty = path.join(dir, 'empty.jsonl');
+  fs.writeFileSync(empty, '');
+  const page = readClaudeHistoryPage(empty, 'sess');
+  assert.equal(page.kind, 'page');
+  assert.deepEqual(page.page?.ownedRange, { start: 0, end: 0 });
+  assert.deepEqual(page.page?.turns, []);
+  assert.equal(readClaudeHistoryPage(path.join(dir, 'missing.jsonl'), 'sess').kind, 'missing');
+});
+
+test('an asynchronous Claude page scan yields and can be cancelled between chunks', async () => {
+  const file = writeTranscript([userPrompt(`large ${'x'.repeat(16 * 1024)}`, 0), assistantAnswer('done', 1)]);
+  const controller = new AbortController();
+  let pauses = 0;
+  const result = await readClaudeHistoryPageAsync(file, 'sess', null, {
+    chunkBytes: 64,
+    signal: controller.signal,
+    pause: async () => {
+      pauses++;
+      if (pauses === 2) {
+        controller.abort();
+      }
+    },
+  });
+  assert.equal(result.kind, 'cancelled');
+  assert.equal(pauses, 2);
+});
+
+test('a sparse semantic scan parses retained candidates once at the beginning', () => {
+  const dir = tempDir('sparse-history-');
+  const file = path.join(dir, 'sparse.jsonl');
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'ignored', payload: 'x'.repeat(80) })}\n`.repeat(4096));
+  let parses = 0;
+  const result = readSemanticHistoryPage(
+    file,
+    'sess',
+    {
+      source: 'claude',
+      initialState: () => ({}),
+      accepts: () => false,
+      parse: (_records, state) => {
+        parses++;
+        return { turns: [], compactions: [], openRange: null, adapterState: state };
+      },
+    },
+    null,
+    { chunkBytes: 1024 },
+  );
+  assert.equal(result.kind, 'page');
+  assert.equal(parses, 1);
+});
+
+test('a semantic page scan does not replay every retained record after every chunk', async () => {
+  const dir = tempDir('semantic-history-work-');
+  const file = path.join(dir, 'records.jsonl');
+  const records = Array.from({ length: 128 }, (_value, index) =>
+    JSON.stringify({ type: 'candidate', index, payload: 'x'.repeat(96) }),
+  );
+  fs.writeFileSync(file, `${records.join('\n')}\n`);
+  let parsedRecords = 0;
+  let parses = 0;
+  const result = await readSemanticHistoryPageAsync(
+    file,
+    'sess',
+    {
+      source: 'claude',
+      initialState: () => ({}),
+      accepts: () => true,
+      parse: (held, state) => {
+        parses++;
+        parsedRecords += held.length;
+        return { turns: [], compactions: [], openRange: null, adapterState: state };
+      },
+    },
+    null,
+    { chunkBytes: 256, pause: async () => {} },
+  );
+  assert.equal(result.kind, 'page');
+  assert.ok(parses > 1, 'the fixture did not cross a materialization boundary');
+  assert.ok(
+    parsedRecords <= records.length * 3,
+    `the page reader replayed ${parsedRecords} retained records for ${records.length} source records`,
+  );
+});
+
+test('semantic evidence receives one final BOF scan before page construction', async () => {
+  const dir = tempDir('semantic-evidence-eof-');
+  const file = path.join(dir, 'empty.jsonl');
+  fs.writeFileSync(file, '');
+  const run = async (asyncRead: boolean): Promise<number> => {
+    let scans = 0;
+    const adapter = {
+      source: 'claude' as const,
+      initialState: () => ({}),
+      accepts: () => false,
+      parse: (_records: readonly unknown[], state: object) => ({
+        turns: [],
+        compactions: [],
+        openRange: null,
+        adapterState: state,
+        olderEvidence: [{ key: 'turn', value: 'still-unresolved' }],
+      }),
+      scanOlderEvidence: (
+        _records: readonly unknown[],
+        claims: readonly { key: string; value: string }[],
+        state: object,
+      ) => {
+        scans++;
+        return { adapterState: state, remaining: [...claims] };
+      },
+    };
+    const result = asyncRead
+      ? await readSemanticHistoryPageAsync(file, 'sess', adapter, null)
+      : readSemanticHistoryPage(file, 'sess', adapter, null);
+    assert.equal(result.kind, 'page');
+    return scans;
+  };
+  assert.deepEqual([await run(false), await run(true)], [1, 1]);
+});
+
+test('persistent semantic evidence scans the source at most twice before an empty page', () => {
+  const dir = tempDir('semantic-evidence-bound-');
+  const file = path.join(dir, 'records.jsonl');
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'candidate', payload: 'x'.repeat(80) })}\n`.repeat(512));
+  const ranges: Array<[number, number]> = [];
+  const result = readSemanticHistoryPage(
+    file,
+    'sess',
+    {
+      source: 'claude',
+      initialState: () => ({}),
+      accepts: () => true,
+      parse: (_records, state) => ({
+        turns: [],
+        compactions: [],
+        openRange: null,
+        adapterState: state,
+        olderEvidence: [{ key: 'turn', value: 'never-resolved' }],
+      }),
+      scanOlderEvidence: (_records, claims, state) => ({
+        adapterState: state,
+        remaining: [...claims],
+      }),
+    },
+    null,
+    { chunkBytes: 127, readRange: recordingRangeReader(ranges) },
+  );
+  assert.equal(result.kind, 'page');
+  const sourceBytes = fs.statSync(file).size;
+  const readBytes = ranges.reduce((total, [start, end]) => total + end - start, 0);
+  assert.ok(
+    readBytes <= sourceBytes * 2,
+    `persistent evidence read ${readBytes} bytes from a ${sourceBytes}-byte source`,
+  );
+});
+
+test('Claude pages discard ordinary tool results before retaining an older guard', () => {
+  const ordinaryResults = Array.from({ length: 128 }, (_value, index) => ({
+    type: 'user',
+    timestamp: at(index + 1),
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: `ordinary-${index}`, content: 'x'.repeat(256) }],
+    },
+  }));
+  const file = writeTranscript([
+    userPrompt('older guard', 0),
+    ...ordinaryResults,
+    assistantAnswer('older answer', 130),
+    userPrompt('newest target', 131),
+    assistantAnswer('newest answer', 132),
+  ]);
+  const result = readClaudeHistoryPage(file, 'sess', null, {
+    chunkBytes: fs.statSync(file).size,
+    targetTurns: 1,
+  });
+  assert.equal(result.kind, 'page');
+  const retained = result.page?.nextOlderCursor?.heldRecords ?? [];
+  const ordinary = retained.filter((record) => record.text.includes('"tool_result"'));
+  assert.deepEqual(
+    { records: ordinary.length, bytes: ordinary.reduce((sum, record) => sum + record.end - record.start, 0) },
+    {
+      records: 0,
+      bytes: 0,
+    },
+  );
+});
+
+test('Claude page cursors expire ownerless terminal child evidence at the turn horizon', () => {
+  const records: object[] = [];
+  for (let index = 0; index < 24; index += 1) {
+    records.push(
+      userPrompt(`ownerless ${index}`, index * 3),
+      {
+        type: 'user',
+        timestamp: at(index * 3 + 1),
+        origin: { kind: 'task-notification' },
+        message: {
+          role: 'user',
+          content: `<tool-use-id>missing-${index}</tool-use-id><status>completed</status>`,
+        },
+      },
+      assistantAnswer(`ownerless answer ${index}`, index * 3 + 2),
+    );
+  }
+  const file = writeTranscript(records);
+  const retainedCounts: number[] = [];
+  let cursor: ClaudeHistoryCursor | null = null;
+  do {
+    const result = readClaudeHistoryPage(
+      file,
+      'sess',
+      cursor,
+      {
+        chunkBytes: 256,
+        targetTurns: 1,
+      },
+      { maxTurns: 3 },
+    );
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') {
+      break;
+    }
+    cursor = result.page.nextOlderCursor;
+    if (cursor) {
+      retainedCounts.push(cursor.adapterState.terminalChildren.length);
+    }
+  } while (cursor);
+  assert.ok(retainedCounts.length > 3);
+  assert.ok(Math.max(...retainedCounts) <= 3, `terminal child evidence grew to ${Math.max(...retainedCounts)}`);
+});
+
+test('a full Claude semantic page targets twenty complete turns', () => {
+  const records: object[] = [];
+  for (let index = 0; index < 25; index++) {
+    records.push(userPrompt(`prompt ${index}`, index * 2), assistantAnswer(`answer ${index}`, index * 2 + 1));
+  }
+  const result = readClaudeHistoryPage(writeTranscript(records), 'sess', null, {
+    chunkBytes: 1024 * 1024,
+  });
+  assert.equal(result.kind, 'page');
+  assert.equal(result.page?.turns.length, 20);
+  assert.ok(result.page?.nextOlderCursor);
+});
+
+test('three Claude history pages own disjoint ranges and stable turns', () => {
+  const records: object[] = [];
+  for (let index = 0; index < 4; index++) {
+    const second = index * 4;
+    records.push(userPrompt(`prompt ${index} ${'x'.repeat(180)}`, second));
+    records.push(
+      assistantTool('Bash', second + 1, `paged-claude-${index}`, {
+        command: `echo claude-${index}`,
+        description: `Run Claude ${index}`,
+      }),
+    );
+    if (index === 1) {
+      records.push({
+        type: 'system',
+        timestamp: at(second),
+        compactMetadata: { trigger: 'auto', preTokens: 123, postTokens: 17 },
+      });
+    }
+    records.push(assistantAnswer(`answer ${index}`, second + 2));
+    if (index === 0) {
+      records.push({
+        ...userPrompt('carried summary', second + 3),
+        isCompactSummary: true,
+        message: { role: 'user', content: 'carried summary' },
+      });
+    }
+  }
+  records.push({ type: 'ai-title', timestamp: at(20), aiTitle: 'Final paged title' });
+  const file = writeTranscript(records);
+  const reads: Array<[number, number]> = [];
+  const pages = [];
+  let cursor = null;
+  const readOptions = { sessionTitle: 'Supplied title' };
+  do {
+    const result = readClaudeHistoryPage(
+      file,
+      'sess',
+      cursor,
+      {
+        chunkBytes: 96,
+        targetTurns: 1,
+        readRange: recordingRangeReader(reads),
+      },
+      readOptions,
+    );
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') {
+      break;
+    }
+    pages.push(result.page);
+    cursor = result.page.nextOlderCursor;
+  } while (cursor && pages.length < 10);
+  assert.equal(pages.length, 4);
+  for (let index = 1; index < reads.length; index++) {
+    assert.equal(reads[index][1], reads[index - 1][0]);
+  }
+  for (let index = 1; index < pages.length; index++) {
+    assert.equal(pages[index].ownedRange.end, pages[index - 1].ownedRange.start);
+  }
+  const paged = [...pages].reverse().flatMap((page) => page.turns);
+  const oneShot = readSession(file, 'sess', readOptions);
+  assert.deepEqual(paged, oneShot.turns);
+  assert.deepEqual(
+    [...pages].reverse().flatMap((page) => page.compactions),
+    oneShot.compactions,
+  );
+  assert.equal(new Set(paged.map((turn) => turn.promptId)).size, paged.length);
+  for (let turnIndex = 0; turnIndex < paged.length; turnIndex++) {
+    for (let stepIndex = 0; stepIndex < paged[turnIndex].steps.length; stepIndex++) {
+      for (const key of ['id', 'fullDetail'] as const) {
+        const actual = Object.getOwnPropertyDescriptor(paged[turnIndex].steps[stepIndex], key);
+        const expected = Object.getOwnPropertyDescriptor(oneShot.turns[turnIndex].steps[stepIndex], key);
+        assert.deepEqual(actual?.value, expected?.value);
+        assert.equal(actual?.enumerable, false);
+        assert.equal(expected?.enumerable, false);
+      }
+    }
+  }
+});
+
+test('a generated Claude title older than the newest-page guard still titles that page', () => {
+  const records: object[] = [
+    userPrompt('oldest', 0),
+    assistantAnswer('oldest answer', 1),
+    { type: 'ai-title', timestamp: at(2), aiTitle: 'Title before the guard' },
+    { type: 'progress', payload: 'x'.repeat(300 * 1024) },
+  ];
+  for (let index = 1; index < 5; index++) {
+    records.push(userPrompt(`newer ${index}`, index * 2 + 1), assistantAnswer(`answer ${index}`, index * 2 + 2));
+  }
+  const file = writeTranscript(records);
+  const page = readClaudeHistoryPage(
+    file,
+    'sess',
+    null,
+    { chunkBytes: 180, targetTurns: 1 },
+    {
+      sessionTitle: 'Supplied fallback',
+    },
+  );
+  assert.equal(page.kind, 'page');
+  assert.equal(page.page?.turns.length, 1);
+  assert.equal(page.page?.turns[0].sessionTitle, 'Title before the guard');
+});
+
+test('Claude pages accept legacy turns with missing or duplicate prompt ids', () => {
+  const records = [
+    { ...userPrompt('first legacy', 0), promptId: undefined },
+    assistantAnswer('first answer', 1),
+    { ...userPrompt('second legacy', 2), promptId: 'same-vendor-id' },
+    assistantAnswer('second answer', 3),
+    { ...userPrompt('third legacy', 4), promptId: 'same-vendor-id' },
+    assistantAnswer('third answer', 5),
+  ];
+  const file = writeTranscript(records);
+  const result = readClaudeHistoryPage(file, 'sess', null, { chunkBytes: 1024 * 1024 });
+  assert.equal(result.kind, 'page');
+  assert.deepEqual(result.page?.turns, readSession(file, 'sess').turns);
+  assert.deepEqual(
+    result.page?.turns.map((turn) => turn.promptId),
+    ['', 'same-vendor-id', 'same-vendor-id'],
+  );
+});
+
+test('a Claude page keeps the next prompt as lookahead for an abrupt older turn', () => {
+  const file = writeTranscript([
+    userPrompt('older abrupt turn', 0),
+    assistantTool('Bash', 1, 'abrupt-claude', { command: 'echo older', description: 'Run older' }),
+    userPrompt('newer closed turn', 2),
+    assistantAnswer('newer answer', 3),
+  ]);
+  const pages = [];
+  let cursor = null;
+  do {
+    const result = readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 80, targetTurns: 1 });
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') {
+      break;
+    }
+    pages.push(result.page);
+    cursor = result.page.nextOlderCursor;
+  } while (cursor);
+  const paged = [...pages].reverse().flatMap((page) => page.turns);
+  const expected = readSession(file, 'sess').turns;
+  assert.deepEqual(paged, expected);
+  assert.equal((paged[0].steps[0] as { id?: string }).id, (expected[0].steps[0] as { id?: string }).id);
+  assert.equal(Object.getOwnPropertyDescriptor(paged[0].steps[0], 'id')?.enumerable, false);
+  assert.equal(
+    (paged[0].steps[0] as { fullDetail?: string }).fullDetail,
+    (expected[0].steps[0] as { fullDetail?: string }).fullDetail,
+  );
+  assert.equal(Object.getOwnPropertyDescriptor(paged[0].steps[0], 'fullDetail')?.enumerable, false);
+});
+
+test('Claude pages carry a later child completion back to its guard owner', () => {
+  const file = writeTranscript([
+    userPrompt('launch the older child', 0),
+    assistantTool('Agent', 1, 'paged-background-child', {
+      description: 'paged worker',
+      subagent_type: 'general-purpose',
+    }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'paged-background-child', content: 'launched' }],
+      },
+      toolUseResult: { agentId: 'paged-child', description: 'paged worker', status: 'running' },
+    },
+    assistantAnswer('The child is running.', 3),
+    userPrompt('newer owner-independent turn', 4),
+    {
+      type: 'user',
+      timestamp: at(5),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<tool-use-id>paged-background-child</tool-use-id><task-id>paged-child</task-id>' +
+          '<status>completed</status><subagent_tokens>41</subagent_tokens>' +
+          '<tool_uses>6</tool_uses><duration_ms>1200</duration_ms>',
+      },
+    },
+    assistantAnswer('The newer work is complete.', 6),
+  ]);
+  const pages = [];
+  let cursor = null;
+  do {
+    const result = readClaudeHistoryPage(file, 'sess', cursor, { chunkBytes: 80, targetTurns: 1 });
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') {
+      break;
+    }
+    pages.push(result.page);
+    cursor = result.page.nextOlderCursor;
+  } while (cursor);
+  const paged = [...pages].reverse().flatMap((page) => page.turns);
+  const oneShot = readSession(file, 'sess').turns;
+  assert.deepEqual(paged, oneShot);
+  assert.deepEqual(
+    paged[0].agents.map((agent) => [agent.status, agent.tokens, agent.toolUses, agent.durationMs]),
+    [['completed', 41, 6, 1200]],
+  );
+});
+
+test('Claude pages hold the open newest turn outside complete history', () => {
+  const file = writeTranscript([userPrompt('closed', 0), assistantAnswer('done', 1), userPrompt('still running', 2)]);
+  const result = readClaudeHistoryPage(file, 'sess', null, { chunkBytes: 64, targetTurns: 20 });
+  assert.equal(result.kind, 'page');
+  assert.deepEqual(
+    result.page?.turns.map((turn) => turn.prompt),
+    ['closed'],
+  );
+  assert.ok(result.openRange);
+  assert.equal(result.page?.ownedRange.end, result.openRange?.start);
+});
+
+test('a compaction summary starts where its content does', () => {
+  const raw =
+    'This session is being continued from a previous session that ran out of context. ' +
+    'The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. The ask';
+  assert.equal(stripCompactPreamble(raw), '1. The ask');
+  assert.equal(stripCompactPreamble('no preamble here'), 'no preamble here');
+});
+
+test('a compaction is reported with the context size it replaced', () => {
+  const file = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantText('Done.', 1, { output_tokens: 100, input_tokens: 5, cache_read_input_tokens: 620_000 }),
+    {
+      ...userPrompt('the summary that carried over', 2),
+      isCompactSummary: true,
+      message: { role: 'user', content: 'the summary that carried over' },
+    },
+    {
+      type: 'system',
+      timestamp: at(2),
+      compactMetadata: {
+        trigger: 'manual',
+        preTokens: 629_292,
+        postTokens: 14_172,
+        durationMs: 147_691,
+        cumulativeDroppedTokens: 615_120,
+      },
+    },
+    userPrompt('second ask', 3),
+    assistantText('Done again.', 4, { output_tokens: 20 }),
+  ]);
+  const { turns, compactions } = readSession(file, 'sess');
+  assert.equal(turns.length, 2, 'a compaction does not start or end a turn');
+  assert.equal(compactions.length, 1);
+  const [c] = compactions;
+  assert.equal(c.summary, 'the summary that carried over');
+  assert.equal(c.sessionId, 'sess');
+  assert.equal(c.model, 'claude-opus-5', 'priced at the model that was running');
+  // the recorded figures win over the running context count
+  assert.deepEqual(
+    [c.trigger, c.contextBefore, c.contextAfter, c.durationMs, c.droppedTokens],
+    ['manual', 629_292, 14_172, 147_691, 615_120],
+  );
+});
+
+test('Claude compact metadata keeps native pre-and-post context facts', () => {
+  const file = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantText('Done.', 1, { output_tokens: 100, input_tokens: 5, cache_read_input_tokens: 620_000 }),
+    { ...userPrompt('carried over', 2), isCompactSummary: true, message: { role: 'user', content: 'carried over' } },
+    {
+      type: 'system',
+      timestamp: at(2),
+      compactMetadata: {
+        trigger: 'auto',
+        preTokens: 620_010,
+        postTokens: 33_031,
+        durationMs: 147_691,
+        cumulativeDroppedTokens: 586_979,
+        tools: ['Bash'],
+      },
+    },
+  ]);
+  const [compaction] = readSession(file, 'sess').compactions;
+  assert.deepEqual(
+    [
+      compaction.trigger,
+      compaction.contextBefore,
+      compaction.contextAfter,
+      compaction.durationMs,
+      compaction.droppedTokens,
+    ],
+    ['auto', 620_010, 33_031, 147_691, 586_979],
+  );
+  assert.equal(compaction.usage, undefined);
+});
+
+test('a compaction with no figures recorded falls back to the running context count', () => {
+  const file = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantText('Done.', 1, { output_tokens: 100, input_tokens: 5, cache_read_input_tokens: 620_000 }),
+    { ...userPrompt('carried over', 2), isCompactSummary: true, message: { role: 'user', content: 'carried over' } },
+    userPrompt('second ask', 3),
+    assistantText('Done again.', 4, { output_tokens: 20 }),
+  ]);
+  const [c] = readSession(file, 'sess').compactions;
+  assert.equal(c.contextBefore, 620_005);
+  assert.deepEqual([c.trigger, c.contextAfter, c.durationMs], ['', 0, 0]);
+});
+
+test('compaction figures written far from any compaction are ignored', () => {
+  const file = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantText('Done.', 1, { output_tokens: 100, input_tokens: 42 }),
+    { ...userPrompt('carried over', 2), isCompactSummary: true, message: { role: 'user', content: 'carried over' } },
+    { type: 'system', timestamp: at(600), compactMetadata: { trigger: 'auto', preTokens: 999_999 } },
+  ]);
+  const [c] = readSession(file, 'sess').compactions;
+  assert.equal(c.trigger, '');
+  assert.equal(c.contextBefore, 42);
+});
+
+test('a compaction at the very start of the window is still reported', () => {
+  const file = writeTranscript([
+    { ...userPrompt('carried over', 0), isCompactSummary: true, message: { role: 'user', content: 'carried over' } },
+    userPrompt('first ask', 1),
+    assistantText('Done.', 2, { output_tokens: 10 }),
+  ]);
+  const { turns, compactions } = readSession(file, 'sess');
+  assert.equal(compactions.length, 1);
+  assert.equal(compactions[0].contextBefore, 0, 'nothing before it in the window to measure');
+  assert.equal(turns.length, 1);
+});
+
+test('a human prompt is a typed prompt whose origin, where recorded, is not the peer kind', () => {
+  const human = JSON.stringify(userPrompt('fix the panel', 0, { origin: { kind: 'human' } }));
+  const bare = JSON.stringify(userPrompt('an old prompt with no origin field', 0));
+  const unknownKind = JSON.stringify(userPrompt('a kind added later', 0, { origin: { kind: 'someday' } }));
+  const peerMeta = JSON.stringify({
+    ...userPrompt('Another Claude session sent a message', 0),
+    isMeta: true,
+    origin: { kind: 'peer' },
+  });
+  const peerPlain = JSON.stringify({
+    ...userPrompt('a peer prompt written without the meta flag', 0),
+    origin: { kind: 'peer' },
+  });
+  const toolResult = JSON.stringify(editResult('c:/repo/a.ts', 1, 1, 0));
+  const notify = JSON.stringify({
+    type: 'user',
+    timestamp: at(0),
+    origin: { kind: 'task-notification' },
+    message: { role: 'user', content: 'done' },
+  });
+  assert.equal(holdsHumanPrompt(human), true);
+  // Fail open, the way the Codex internal-thread rule does: a prompt from before the
+  // origin field existed, and one whose kind this code has never seen, both count as
+  // human, or old transcripts and future formats silently hide a user's sessions.
+  assert.equal(holdsHumanPrompt(bare), true, 'a transcript from before the origin field reads as machine work');
+  assert.equal(holdsHumanPrompt(unknownKind), true, 'an unknown origin kind hides a session');
+  assert.equal(holdsHumanPrompt(peerMeta), false, 'the wake message itself reads as a human prompt');
+  assert.equal(holdsHumanPrompt(peerPlain), false, 'a peer prompt without the meta flag reads as human');
+  assert.equal(holdsHumanPrompt([toolResult, notify].join('\n')), false, 'machine traffic reads as a human prompt');
+  assert.equal(holdsHumanPrompt([peerMeta, human].join('\n')), true, 'a human prompt after a wake goes unseen');
+  assert.equal(holdsHumanPrompt(''), false);
+});
+
+test('a session opened with a slash command is one somebody had', () => {
+  const skill =
+    '<command-message>write-ppm-docs</command-message>\n<command-name>/write-ppm-docs</command-name>\n<command-args>review the plugin pages</command-args>';
+  const setting =
+    '<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>';
+  const compaction =
+    '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>';
+  const effort =
+    '<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>low</command-args>';
+  const later = '<command-name>/added-next-year</command-name>\n<command-args>go</command-args>';
+  assert.equal(
+    holdsHumanPrompt(JSON.stringify(userPrompt(skill, 0, { origin: { kind: 'human' } }))),
+    true,
+    'a session whose only prompt is a slash command is off the rail entirely',
+  );
+  // The harness's own commands act on the session instead of asking for work, so a file
+  // holding nothing but those is still not a session anybody had.
+  assert.equal(
+    holdsHumanPrompt(JSON.stringify(userPrompt(setting, 0, { origin: { kind: 'human' } }))),
+    false,
+    'a model switch reads as a session',
+  );
+  assert.equal(
+    holdsHumanPrompt(JSON.stringify(userPrompt(compaction, 0, { origin: { kind: 'human' } }))),
+    false,
+    'a compaction reads as a session',
+  );
+  assert.equal(
+    holdsHumanPrompt(JSON.stringify(userPrompt(effort, 0, { origin: { kind: 'human' } }))),
+    false,
+    'an effort change reads as a session',
+  );
+  // A name this code has never seen counts as work, the direction every other doubt in
+  // this file takes: reading one oddly costs a line, and hiding one costs a whole session.
+  assert.equal(
+    holdsHumanPrompt(JSON.stringify(userPrompt(later, 0, { origin: { kind: 'human' } }))),
+    true,
+    'a command added to the harness later takes its sessions off the rail',
+  );
+});
+
+test('the human-prompt scan reads each byte once, and a wake file joins when a human prompts it', () => {
+  const file = writeTranscript([
+    { ...userPrompt('Another Claude session sent a message', 0), isMeta: true, origin: { kind: 'peer' } },
+    assistantAnswer('Noted; holding.', 1),
+  ]);
+  const size1 = fs.statSync(file).size;
+  const first = scanForHumanPrompt(file, size1);
+  assert.equal(first.found, false, 'a wake-only file reads as human work');
+  assert.equal(first.bytes, size1, 'the scan did not consume the complete lines it read');
+  // A quiet file costs nothing: the size says there is nothing new without opening it.
+  assert.deepEqual(scanForHumanPrompt(file, size1, first), { bytes: size1, found: false });
+  // A human prompts the session: the prompt lands in the unread bytes and the scan finds
+  // it there.
+  fs.appendFileSync(
+    file,
+    JSON.stringify(userPrompt('picking this up myself', 2, { origin: { kind: 'human' } })) + '\n',
+  );
+  const size2 = fs.statSync(file).size;
+  const second = scanForHumanPrompt(file, size2, first);
+  assert.equal(second.found, true, 'a human prompt in the new bytes goes unseen, so the session never joins the list');
+  // Found is sticky: a prompt does not unhappen.
+  assert.deepEqual(scanForHumanPrompt(file, size2, second), second);
+  // Only the new bytes are read: a cursor already past the prompt cannot see it, which
+  // is what makes the scan affordable on every poll.
+  fs.appendFileSync(file, JSON.stringify(assistantAnswer('More machine work.', 3)) + '\n');
+  const size3 = fs.statSync(file).size;
+  assert.equal(
+    scanForHumanPrompt(file, size3, { bytes: size2, found: false }).found,
+    false,
+    'the scan re-read bytes an earlier scan already answered for',
+  );
+  // A file that shrank was rewritten, so the cursor resets and the scan starts over.
+  fs.writeFileSync(file, JSON.stringify(userPrompt('rewritten from scratch', 0)) + '\n');
+  const size4 = fs.statSync(file).size;
+  assert.equal(
+    scanForHumanPrompt(file, size4, { bytes: size3, found: false }).found,
+    true,
+    'a rewritten file keeps the old cursor, which now points past the end',
+  );
+});
+
+test('the scan survives a line longer than its chunk, and waits for an unterminated one', () => {
+  // A peer line longer than the 256 KB chunk: the human prompt after it is only found if
+  // the carry across chunk boundaries works, at the byte level, so a multi-byte
+  // character split by the boundary cannot corrupt the line.
+  const file = writeTranscript([
+    { ...userPrompt('\u00e9' + 'x'.repeat(300 * 1024), 0), isMeta: true, origin: { kind: 'peer' } },
+    userPrompt('a human at last', 1, { origin: { kind: 'human' } }),
+  ]);
+  const size = fs.statSync(file).size;
+  assert.equal(scanForHumanPrompt(file, size).found, true, 'a line longer than one chunk ends the scan early');
+  // An unterminated final line is not scanned until its newline arrives: a prompt still
+  // being written is not yet a line, and the cursor stays before it.
+  const partial = writeTranscript([{ ...userPrompt('a wake', 0), isMeta: true, origin: { kind: 'peer' } }]);
+  const whole = fs.statSync(partial).size;
+  fs.appendFileSync(partial, JSON.stringify(userPrompt('typed but not yet flushed', 1)));
+  const grown = fs.statSync(partial).size;
+  const waiting = scanForHumanPrompt(partial, grown);
+  assert.equal(waiting.found, false, 'an incomplete line was parsed as though it were whole');
+  assert.equal(waiting.bytes, whole, 'the cursor moved past bytes the scan has not answered for');
+  fs.appendFileSync(partial, '\n');
+  assert.equal(
+    scanForHumanPrompt(partial, fs.statSync(partial).size, waiting).found,
+    true,
+    'the completed line was never picked up',
+  );
+});
+
+test('a prompt keeps its line structure, and its wrappers are stripped', () => {
+  const raw =
+    '<ide_selection>irrelevant</ide_selection>fix the panel:' +
+    '\n  - the cost chip' +
+    '\n  - the prompt block' +
+    '\n\n\n\nthanks';
+  assert.equal(cleanPrompt(raw), 'fix the panel:\n- the cost chip\n- the prompt block\n\nthanks');
+  assert.equal(cleanPrompt('   spaced    out   '), 'spaced out');
+});
+
+test('a session is named by its latest title, or by what the user first asked', () => {
+  const named = writeTranscript([
+    userPrompt('build the timeline', 0),
+    { type: 'ai-title', aiTitle: 'Timeline view for agent turns' },
+    { type: 'ai-title', aiTitle: 'Debug game server connection timeouts' },
+  ]);
+  assert.equal(
+    readSessionMeta(named).title,
+    'Debug game server connection timeouts',
+    'the last title is the current one',
+  );
+
+  const unnamed = writeTranscript([
+    { ...userPrompt('injected', 0), isMeta: true },
+    userPrompt('why does the panel show nothing in this repo', 1),
+  ]);
+  assert.equal(readSessionMeta(unnamed).title, 'why does the panel show nothing in this repo');
+
+  const silent = writeTranscript([assistantText('nobody asked anything', 0)]);
+  assert.equal(readSessionMeta(silent).title, null);
+});
+
+test('session titles are normalized as plain text and discard rich content', () => {
+  const rich = `\uE200visualize\uE202${JSON.stringify({ path: path.resolve('fixtures', 'rail.html') })}\uE201`;
+  assert.equal(normalizeSessionTitle(`  **Keep**\n${rich}\nthis   title  `), 'Keep this title');
+  assert.equal(normalizeSessionTitle(rich), null);
+
+  // The complete name carries no length limit of its own. The rename editor and the
+  // Details dialog read it, and either would silently drop the end of a long session name
+  // if a cap crept back in here: a bound belongs where the rail assembles its own name,
+  // not in this shared source.
+  const huge = 'x'.repeat(10_000);
+  assert.equal(normalizeFullSessionTitle(huge), huge);
+
+  const file = writeTranscript([
+    userPrompt('fallback to what I asked', 0),
+    { type: 'ai-title', aiTitle: 'Superseded title' },
+    { type: 'ai-title', aiTitle: rich },
+    assistantText('Done.', 1),
+  ]);
+  assert.equal(readSessionMeta(file).title, 'fallback to what I asked');
+  assert.equal(
+    readSession(file, 'sess', { sessionTitle: 'supplied prompt fallback' }).turns[0].sessionTitle,
+    'supplied prompt fallback',
+  );
+});
+
+test('a long Claude title keeps its full normalized source beside the compact title', () => {
+  const source = `**Keep** ${'the complete title text '.repeat(6)}`;
+  const file = writeTranscript([userPrompt('prompt fallback', 0), { type: 'ai-title', aiTitle: source }]);
+  const meta = readSessionMeta(file);
+  assert.equal(meta.title, normalizeSessionTitle(source));
+  assert.equal(meta.fullTitle, `Keep ${'the complete title text '.repeat(6)}`.trim());
+  assert.ok((meta.title?.length ?? 0) <= 60, 'the compact heading no longer has its display limit');
+});
+
+test('a parsed Claude title carries its matching full value beyond the metadata tail', () => {
+  const source = `**Generated** ${'title words '.repeat(12)}`;
+  const file = writeTranscript([
+    userPrompt('fallback prompt', 0),
+    { type: 'ai-title', aiTitle: source },
+    assistantAnswer('x'.repeat(300 * 1024), 1),
+  ]);
+  const metadata = readSessionMeta(file, 256 * 1024);
+  const parsed = readSession(file, 'sess', { tailBytes: 512 * 1024 });
+  assert.deepEqual(
+    [metadata.title, metadata.titleSource],
+    ['fallback prompt', 'prompt'],
+    'the metadata tail reaches the generated title',
+  );
+  assert.equal(parsed.turns[0].sessionTitle, normalizeSessionTitle(source));
+  assert.equal(parsed.turns[0].sessionFullTitle, `Generated ${'title words '.repeat(12)}`.trim());
+});
+
+test('a turn runs from one typed prompt to the next, absorbing task notifications', () => {
+  const file = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantTool('Bash', 1),
+    {
+      type: 'user',
+      timestamp: at(2),
+      origin: { kind: 'task-notification' },
+      message: { role: 'user', content: '<task-notification><status>completed</status></task-notification>' },
+    },
+    assistantText('First turn is done.', 3, { output_tokens: 100, input_tokens: 5, cache_read_input_tokens: 1000 }),
+    // none of these start a turn
+    { ...userPrompt('injected', 4), isMeta: true },
+    { ...userPrompt('compacted', 5), isCompactSummary: true },
+    { ...userPrompt('subagent chatter', 6), isSidechain: true },
+    userPrompt('second ask', 7),
+    assistantText('Second turn is done.', 8, { output_tokens: 20, input_tokens: 1, cache_read_input_tokens: 2000 }),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].prompt, 'first ask');
+  assert.equal(turns[0].summary, 'First turn is done.');
+  assert.equal(turns[0].usage.output, 100);
+  assert.equal(turns[0].contextTokens, 1005);
+  assert.equal(turns[0].toolUses, 1);
+  assert.equal(turns[1].prompt, 'second ask');
+  // the turn ends at its last assistant activity, not at the next prompt
+  assert.equal(turns[0].endedAt - turns[0].startedAt, 3000);
+});
+
+test('a turn woken mid-life keeps every answer it closed, in order and with its time', () => {
+  const file = writeTranscript([
+    userPrompt('take the batch', 0),
+    // Mid-work narration rides a response that went on to call a tool: not an answer.
+    assistantText('Let me check the plan first.', 1, undefined, undefined, 'tool_use'),
+    assistantTool('Bash', 2),
+    assistantAnswer('First answer: holding edits until the peer replies.', 3),
+    // A cross-session message is a meta user line, not a typed prompt.
+    { ...userPrompt('Another Claude session sent a message', 4), isMeta: true },
+    assistantAnswer('Second answer: coordination settled.', 5),
+    {
+      type: 'user',
+      timestamp: at(6),
+      origin: { kind: 'task-notification' },
+      message: { role: 'user', content: '<task-notification><status>completed</status></task-notification>' },
+    },
+    assistantAnswer('Third answer: the batch landed.', 7),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 1, 'a wake started a new turn');
+  const [t] = turns;
+  assert.deepEqual(
+    t.answers.map((a) => a.text),
+    [
+      'First answer: holding edits until the peer replies.',
+      'Second answer: coordination settled.',
+      'Third answer: the batch landed.',
+    ],
+  );
+  assert.deepEqual(
+    t.answers.map((a) => a.at),
+    [ms(3), ms(5), ms(7)],
+    'each answer carries the time it was written',
+  );
+  assert.equal(t.summary, 'Third answer: the batch landed.', 'the summary stays the last answer');
+});
+
+// The reported turn's shape. A subagent hands its report back, the agent writes the turn's
+// report, the same subagent's completion notice wakes the agent again, and it writes a note.
+const HANDBACK_FROM = 'a054545111561daad';
+const REPORT = [
+  'Phase 3 of the turn-card density plan (steps 22 to 30) is on main.',
+  '',
+  '- ❓ **Open questions / follow-ups** - choose whether phase 4 starts now.',
+].join('\n');
+const NOTE =
+  "The plan recorder's final numbers came in: 46k tokens in 1.1 minutes. Nothing else changed since my last report.";
+function peerHandback(from: string, second: number) {
+  return {
+    ...userPrompt(
+      `Another Claude session sent a message: <agent-message>[Subagent hand-back] ${from}</agent-message>`,
+      second,
+    ),
+    isMeta: true,
+    origin: { kind: 'peer', from, handback: true },
+  };
+}
+function completionNoticeText(taskId: string): string {
+  return `<task-notification><task-id>${taskId}</task-id><status>completed</status><result>This agent's report was delivered to you as a message.</result></task-notification>`;
+}
+function completionNotice(taskId: string, second: number) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    origin: { kind: 'task-notification' },
+    message: { role: 'user', content: completionNoticeText(taskId) },
+  };
+}
+function reportedTurnLines(notice: object) {
+  return [
+    userPrompt('/land the phase 3 plan', 0),
+    assistantTool('Agent', 1, 'tu-agent', { description: 'plan recorder', subagent_type: 'general-purpose' }),
+    assistantAnswer('The opus implementer is working on Phase 3 in its own worktree.', 2),
+    peerHandback(HANDBACK_FROM, 3),
+    assistantAnswer(REPORT, 4),
+    notice,
+    assistantAnswer(NOTE, 6),
+  ];
+}
+
+test('a note written after a subagent repeats its completion notice leaves the report as the card response', () => {
+  const [t] = readTurns(writeTranscript(reportedTurnLines(completionNotice(HANDBACK_FROM, 5))), 'sess');
+  const card = toCard(t, true, ms(60));
+  assert.ok(
+    card.summary.startsWith('Phase 3 of the turn-card density plan'),
+    `the response is ${JSON.stringify(card.summary)}`,
+  );
+  const replies = card.saidMessages.filter((message) => message.kind === 'answer').map((message) => message.text);
+  assert.deepEqual(
+    replies,
+    ['The opus implementer is working on Phase 3 in its own worktree.', NOTE],
+    'the note left Activity or the report stayed in it',
+  );
+  assert.equal(closingRows(card.summary).questions, 'choose whether phase 4 starts now.');
+  assert.equal(searchableSummary(t).split(REPORT).length, 2, 'the search text holds the report once');
+});
+
+// A `SubagentHandback` call and its tool result, which carries no `toolUseResult`.
+function handBack(message: unknown, second: number, id = `tu-handback-${second}`) {
+  return [
+    assistantTool('SubagentHandback', second, id, { message }),
+    {
+      type: 'user',
+      timestamp: at(second + 1),
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: id,
+            content: [{ type: 'text', text: '{"success":true,"message":"Report delivered to your caller."}' }],
+          },
+        ],
+      },
+    },
+  ];
+}
+function childRead(records: object[]) {
+  const sidechain = records.map((record) => ({ ...record, isSidechain: true }));
+  return readTurns(writeTranscript(sidechain), 'child', { childTranscript: true });
+}
+function metaUser(text: string, second: number, origin?: Record<string, unknown>) {
+  return { ...userPrompt(text, second), isMeta: true, ...(origin ? { origin } : {}) };
+}
+
+// A subagent in auto mode delivers its report as the message of a `SubagentHandback` call and
+// then writes a receipt. A subagent session is read as a child transcript, and the rule holds
+// for an ordinary read too.
+for (const childTranscript of [true, false]) {
+  test(`a subagent's hand-back message is its turn response and the receipt after it stays in Activity (${childTranscript ? 'child' : 'ordinary'} read)`, () => {
+    const receipt = 'Report delivered.';
+    const records = [
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      assistantTool('Grep', 1, 'tu-grep', { pattern: 'readings' }),
+      toolResult('tu-grep', 2),
+      assistantTool('Read', 3, 'tu-read', { file_path: 'c:/repo/usage.ts' }),
+      toolResult('tu-read', 4),
+      ...handBack(REPORT, 5),
+      assistantAnswer(receipt, 7),
+    ].map((record) => (childTranscript ? { ...record, isSidechain: true } : record));
+    const [t] = readTurns(writeTranscript(records), 'child', childTranscript ? { childTranscript } : {});
+    assert.equal(t.summary, REPORT, 'the turn summary is not the report');
+    assert.deepEqual(
+      t.answers.map((answer) => [answer.text, answer.notResponse]),
+      [
+        [REPORT, undefined],
+        [receipt, 'after-handback'],
+      ],
+    );
+    assert.equal(responseAnswerIndex(t), 0, 'the response is not the report');
+    const card = toCard(t, true, ms(60));
+    assert.equal(card.summary, REPORT, 'the card response is not the report');
+    assert.deepEqual(
+      card.saidMessages.filter((message) => message.kind === 'answer').map((message) => message.text),
+      [receipt],
+      'the receipt left Activity or the report stayed in it',
+    );
+    assert.equal(searchableSummary(t).split(REPORT).length, 2, 'the search text holds the report once');
+    assert.equal(t.toolCounts.coordination, 1, 'the hand-back call is not coordination');
+    assert.equal(t.toolCounts.other, 0, 'the hand-back call counted as other');
+    assert.deepEqual(t.stepKinds, ['searches', 'reads', 'coordination']);
+  });
+}
+
+// A prompt, a peer message or a coordinator message asks the subagent for more, so its reply
+// to that wake is the response. A completion notice for its own background work and the
+// harness nudge after an empty reply ask nothing new, so the reply after them stays a receipt.
+for (const [wake, record, answered] of [
+  ['a new prompt', userPrompt('Now list the writers of that cache.', 8), true],
+  ['a peer message', metaUser('Also list the writers of that cache.', 8, { kind: 'peer', from: 'lead' }), true],
+  [
+    'a coordinator message',
+    metaUser('The coordinator sent a message while you were working: commit the tests.', 8, { kind: 'coordinator' }),
+    true,
+  ],
+  ['a completion notice', completionNotice('b6vw3z1jn', 8), false],
+  ['the harness nudge', metaUser('[Your previous response had no visible output. Please continue...]', 8), false],
+] as const) {
+  test(`${wake} after a hand-back ${answered ? 'makes the next reply the response' : 'leaves the next reply a receipt'}`, () => {
+    const reply = 'I committed the tests as 776c5ca8.';
+    const turns = childRead([
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      ...handBack(REPORT, 5),
+      assistantAnswer('Report delivered.', 7),
+      record,
+      assistantAnswer(reply, 9),
+    ]);
+    const t = turns[turns.length - 1];
+    assert.equal(
+      t.answers.find((answer) => answer.text === reply)?.notResponse,
+      answered ? undefined : 'after-handback',
+    );
+    assert.equal(t.summary, answered ? reply : REPORT);
+  });
+}
+
+test('a second hand-back in one turn makes the later report the response', () => {
+  const later = 'The writers are the poller and the status hook.';
+  const [t] = childRead([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    ...handBack(REPORT, 5),
+    assistantAnswer('Report delivered.', 7),
+    ...handBack(later, 8),
+    assistantAnswer('Second report delivered.', 10),
+  ]);
+  assert.equal(t.summary, later);
+  assert.deepEqual(
+    t.answers.map((answer) => [answer.text, answer.notResponse]),
+    [
+      [REPORT, undefined],
+      ['Report delivered.', 'after-handback'],
+      [later, undefined],
+      ['Second report delivered.', 'after-handback'],
+    ],
+  );
+  assert.equal(responseAnswerIndex(t), 2);
+  const search = searchableSummary(t);
+  assert.equal(search.split(REPORT).length, 2, 'the search text holds the first report once');
+  assert.equal(search.split(later).length, 2, 'the search text holds the later report once');
+});
+
+// Some subagents write the report as a closing reply, get a reminder that it was not
+// delivered, and send it again through the call. One text can hold the other, with a line
+// added or dropped, and whitespace around either one does not count.
+const PREAMBLE = 'Here is the report.';
+for (const [shape, reply, report, kept] of [
+  ['the same text', REPORT, `${REPORT}\n`, `${REPORT}\n`],
+  ['a report that holds the reply', REPORT, `${PREAMBLE}\n\n${REPORT}`, `${PREAMBLE}\n\n${REPORT}`],
+  ['a reply that holds the report', `${PREAMBLE}\n\n${REPORT}`, REPORT, `${PREAMBLE}\n\n${REPORT}`],
+  ['whitespace around the reply', ` \n${REPORT}\t`, REPORT, REPORT],
+  [
+    'whitespace around a report the reply holds',
+    `${PREAMBLE}\n\n${REPORT}`,
+    `\n${REPORT}\t `,
+    `${PREAMBLE}\n\n${REPORT}`,
+  ],
+] as const) {
+  test(`a closing reply sent again as a hand-back with ${shape} draws the report once`, () => {
+    const receipt = 'Report delivered.';
+    const [t] = childRead([
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      assistantAnswer(reply, 3),
+      metaUser('[handback-send-enforce] Your report has not been delivered. Call SubagentHandback now.', 4),
+      ...handBack(report, 5),
+      assistantAnswer(receipt, 7),
+    ]);
+    assert.equal(t.summary, kept, 'the turn summary is not the longer text');
+    const card = toCard(t, true, ms(60));
+    assert.equal(card.summary, kept, 'the card response is not the longer text');
+    assert.deepEqual(
+      card.saidMessages.filter((message) => message.kind === 'answer').map((message) => message.text),
+      [receipt],
+      'the card draws the report a second time',
+    );
+    assert.equal(searchableSummary(t).split(REPORT).length, 2, 'the search text holds the report more than once');
+  });
+}
+
+test('a closing reply that differs from the hand-back report after it keeps both', () => {
+  const reply = 'Part 1 is written. I am waiting on the research for part 2.';
+  const [t] = childRead([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    assistantAnswer(reply, 3),
+    metaUser('[handback-send-enforce] Your report has not been delivered. Call SubagentHandback now.', 4),
+    ...handBack(REPORT, 5),
+  ]);
+  assert.equal(t.summary, REPORT);
+  const card = toCard(t, true, ms(60));
+  assert.equal(card.summary, REPORT);
+  assert.deepEqual(
+    card.saidMessages.filter((message) => message.kind === 'answer').map((message) => message.text),
+    [reply],
+  );
+  assert.equal(searchableSummary(t), `${reply}\n\n${REPORT}`);
+});
+
+// Only the closing reply of the wake the call answers can repeat the report. An earlier
+// hand-back, or a reply written before a coordinator message, is a report of its own.
+const DETAIL = 'The cache lives in usage.ts.';
+for (const [first, second] of [
+  [`${DETAIL} It holds three fields.`, DETAIL],
+  [DETAIL, `${DETAIL} It holds three fields.`],
+] as const) {
+  test(`a hand-back right after a hand-back that ${first.length > second.length ? 'holds' : 'is part of'} its report keeps both`, () => {
+    const [t] = childRead([
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      ...handBack(first, 3),
+      ...handBack(second, 5),
+    ]);
+    assert.equal(t.summary, second, 'the later report is not the response');
+    assert.deepEqual(
+      t.answers.map((answer) => answer.text),
+      [first, second],
+    );
+    assert.equal(responseAnswerIndex(t), 1);
+  });
+}
+
+test('a hand-back after a coordinator message keeps the reply written before that message', () => {
+  const report = `${DETAIL} It holds three fields.`;
+  const [t] = childRead([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    assistantAnswer(DETAIL, 3),
+    metaUser('The coordinator sent a message while you were working: list its fields too.', 4, { kind: 'coordinator' }),
+    ...handBack(report, 5),
+  ]);
+  assert.equal(t.summary, report);
+  assert.deepEqual(
+    t.answers.map((answer) => answer.text),
+    [DETAIL, report],
+  );
+});
+
+test('a "No response requested." reply between a closing reply and the same hand-back draws the report once', () => {
+  const [t] = childRead([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    assistantAnswer(REPORT, 3),
+    metaUser('[handback-send-enforce] Your report has not been delivered. Call SubagentHandback now.', 4),
+    assistantAnswer('No response requested.', 5),
+    metaUser('[handback-send-enforce] Your report has not been delivered. Call SubagentHandback now.', 6),
+    ...handBack(REPORT, 7),
+  ]);
+  assert.deepEqual(
+    t.answers.map((answer) => [answer.text, answer.notResponse]),
+    [
+      ['No response requested.', 'no-response-requested'],
+      [REPORT, undefined],
+    ],
+  );
+  const card = toCard(t, true, ms(60));
+  assert.equal(card.summary, REPORT);
+  assert.equal(searchableSummary(t).split(REPORT).length, 2, 'the search text holds the report more than once');
+});
+
+for (const message of ['', '   ', 42, undefined]) {
+  test(`a hand-back whose message is ${JSON.stringify(message) ?? 'missing'} leaves the reply after it the response`, () => {
+    const receipt = 'Report delivered.';
+    const [t] = childRead([
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      ...handBack(message, 5),
+      assistantAnswer(receipt, 7),
+    ]);
+    assert.equal(t.summary, receipt);
+    assert.deepEqual(
+      t.answers.map((answer) => [answer.text, answer.notResponse]),
+      [[receipt, undefined]],
+    );
+    assert.equal(t.toolCounts.coordination, 1);
+  });
+}
+
+// Claude Code writes the thinking and the text of one closing message as separate lines that
+// share the message id, and both lines carry the stop.
+function thoughtThenSaid(text: string, second: number) {
+  const said = assistantAnswer(text, second) as { message: { id: string } };
+  const thought = {
+    type: 'assistant',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id: said.message.id,
+      model: 'claude-opus-5',
+      stop_reason: 'end_turn',
+      content: [{ type: 'thinking', thinking: 'The recorder finished.', signature: 's' }],
+    },
+  };
+  return [thought, said];
+}
+
+test('a completion notice queued as an attachment repeats a handback the same way', () => {
+  const notice = queued({ commandMode: 'task-notification', prompt: completionNoticeText(HANDBACK_FROM) }, 5);
+  const [t] = readTurns(writeTranscript(reportedTurnLines(notice)), 'sess');
+  assert.equal(t.summary, REPORT);
+  assert.deepEqual(
+    t.answers.map((answer) => answer.text),
+    ['The opus implementer is working on Phase 3 in its own worktree.', REPORT, NOTE],
+  );
+  assert.deepEqual(
+    t.answers.map((answer) => answer.notResponse),
+    [undefined, undefined, 'repeat-notice'],
+  );
+});
+
+for (const [shape, notice] of [
+  ['wake', completionNotice],
+  [
+    'queued',
+    (taskId: string, second: number) =>
+      queued({ commandMode: 'task-notification', prompt: completionNoticeText(taskId) }, second),
+  ],
+] as const) {
+  test(`a note written after thinking on a repeat ${shape} notice stays out of the response`, () => {
+    const lines = reportedTurnLines(notice(HANDBACK_FROM, 5));
+    lines.splice(-1, 1, ...thoughtThenSaid(NOTE, 6));
+    const [t] = readTurns(writeTranscript(lines), 'sess');
+    assert.equal(t.summary, REPORT);
+    assert.deepEqual(
+      t.answers.map((answer) => answer.notResponse),
+      [undefined, undefined, 'repeat-notice'],
+    );
+  });
+}
+
+test('a note written as two text lines of one message stays out of the response on both lines', () => {
+  const lines = reportedTurnLines(completionNotice(HANDBACK_FROM, 5));
+  const first = assistantAnswer('The plan recorder finished.', 6) as { message: { id: string } };
+  const second = assistantAnswer('Nothing else changed.', 6) as { message: { id: string } };
+  second.message.id = first.message.id;
+  lines.splice(-1, 1, first, second);
+  const [t] = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(t.summary, REPORT);
+  assert.deepEqual(
+    t.answers.map((answer) => answer.notResponse),
+    [undefined, undefined, 'repeat-notice', 'repeat-notice'],
+  );
+});
+
+test('a handback queued while the agent works still makes its later completion notice a repeat', () => {
+  const [t] = readTurns(
+    writeTranscript([
+      userPrompt('draw the commit rows', 0),
+      assistantTool('Bash', 1, 'tu-shots'),
+      toolDone('tu-shots', 2),
+      queued(
+        {
+          commandMode: 'prompt',
+          origin: { kind: 'peer', from: 'ad348d57c8a4b16e9', handback: true },
+          prompt: '<agent-message from="ad348d57c8a4b16e9">[Subagent hand-back]</agent-message>',
+        },
+        3,
+      ),
+      ...thoughtThenSaid('Recommendation A is ready for review.', 4),
+      completionNotice('ad348d57c8a4b16e9', 5),
+      assistantAnswer('The review round is still running.', 6),
+    ]),
+    'sess',
+  );
+  assert.equal(t.summary, 'Recommendation A is ready for review.');
+  assert.deepEqual(
+    t.answers.map((answer) => answer.notResponse),
+    [undefined, 'repeat-notice'],
+  );
+  assert.deepEqual(t.laterPrompts, [], 'the handback became a prompt');
+});
+
+function toolDone(id: string, second: number) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] },
+  };
+}
+
+// The order Claude Code writes when a handback wakes the agent and the agent works on it: the
+// completion notice lands among the tool calls, before the reply to the handback. Both shapes of
+// the notice arrive this way.
+function workedHandback(
+  from: string,
+  notice: (taskId: string, second: number) => object,
+  second: number,
+  report: string,
+) {
+  return [
+    peerHandback(from, second),
+    assistantTool('Bash', second + 1, `tu-git-${from}`),
+    toolDone(`tu-git-${from}`, second + 2),
+    assistantTool('Agent', second + 3, `tu-review-${from}`, {
+      description: 'reviewer',
+      subagent_type: 'general-purpose',
+    }),
+    toolDone(`tu-review-${from}`, second + 4),
+    notice(from, second + 5),
+    assistantAnswer(report, second + 6),
+  ];
+}
+const queuedNotice = (taskId: string, second: number) =>
+  queued({ commandMode: 'task-notification', prompt: completionNoticeText(taskId) }, second);
+
+for (const [shape, notice] of [
+  ['wake', completionNotice],
+  ['queued', queuedNotice],
+] as const) {
+  test(`a ${shape} completion notice that arrives while the agent works on the handback leaves the next reply as the response`, () => {
+    const [t] = readTurns(
+      writeTranscript([
+        userPrompt('ship the plan', 0),
+        assistantAnswer('The implementer is running.', 1),
+        ...workedHandback('impl', notice, 10, 'The candidate commit passed its gate and a reviewer is checking it.'),
+        ...workedHandback('plan', notice, 30, 'The cost plan is written.'),
+      ]),
+      'sess',
+    );
+    assert.equal(t.summary, 'The cost plan is written.', `${shape} notice`);
+    assert.deepEqual(
+      t.answers.map((answer) => answer.notResponse),
+      [undefined, undefined, undefined],
+      `${shape} notice marked a reply to its handback`,
+    );
+    // With no work between, the notice still arrives before the reply.
+    const [bare] = readTurns(
+      writeTranscript([
+        userPrompt('ship it', 0),
+        peerHandback('z', 1),
+        notice('z', 2),
+        assistantAnswer('The subagent finished.', 3),
+      ]),
+      'sess',
+    );
+    assert.equal(bare.summary, 'The subagent finished.', `${shape} notice`);
+    assert.equal(bare.answers[0].notResponse, undefined, `${shape} notice`);
+  });
+}
+
+test('work or a closed reply after a repeat notice ends the repeat', () => {
+  // A plain notice for a background command, with no handback, wakes a real summary.
+  const [plain] = readTurns(
+    writeTranscript([
+      userPrompt('run the suite in the background', 0),
+      assistantAnswer('The suite is running.', 1),
+      completionNotice('bash-7', 2),
+      assistantAnswer('The suite passed.', 3),
+    ]),
+    'sess',
+  );
+  assert.equal(plain.summary, 'The suite passed.');
+  const [worked] = readTurns(
+    writeTranscript([
+      userPrompt('ship it', 0),
+      peerHandback('y', 1),
+      assistantAnswer('The report.', 2),
+      completionNotice('y', 3),
+      assistantTool('Bash', 4, 'tu-b'),
+      assistantAnswer('A new commit landed after the notice.', 5),
+    ]),
+    'sess',
+  );
+  assert.equal(worked.summary, 'A new commit landed after the notice.');
+  // A wake with no record of its own, such as a loop tick, follows the note.
+  const [ticked] = readTurns(
+    writeTranscript([
+      ...reportedTurnLines(completionNotice(HANDBACK_FROM, 5)),
+      assistantAnswer('The loop checked again and phase 4 is ready.', 7),
+    ]),
+    'sess',
+  );
+  assert.equal(ticked.summary, 'The loop checked again and phase 4 is ready.');
+  assert.deepEqual(
+    ticked.answers.map((answer) => answer.notResponse),
+    [undefined, undefined, 'repeat-notice', undefined],
+  );
+});
+
+// The live case in session `50fda840-5a87-4cb3-940c-e75eff827929`: a handback's completion
+// notice repeats after the reader typed the next prompt, because Claude Code can wait a full
+// turn before sending the second notice.
+test('a handback from an earlier turn still makes a later completion notice a repeat', () => {
+  const taskId = 'aa60c1c303d5a7c96';
+  const longReply = 'I recorded the decision and moved the ledger note into docs/design-goals.md.';
+  const shortReply = "The title-trigger subagent's background work has now finished too.";
+  const lines = [
+    // Turn A: a prompt, an Agent launch, a handback from task X, a reply, a queued notice for
+    // X, and a reply.
+    userPrompt('ship the title-trigger change', 0),
+    assistantTool('Agent', 1, 'tu-title-agent', { description: 'title trigger', subagent_type: 'general-purpose' }),
+    peerHandback(taskId, 2),
+    assistantAnswer('The title-trigger subagent handed back its patch.', 3),
+    queued({ commandMode: 'task-notification', prompt: completionNoticeText(taskId) }, 4),
+    assistantAnswer('Noted, nothing else changed.', 5),
+    // Turn B: a typed prompt, a long reply, a user-record task-notification for X, and a
+    // short reply.
+    userPrompt('lets not set it ffor now, record the decision instead', 6),
+    assistantAnswer(longReply, 7),
+    completionNotice(taskId, 8),
+    assistantAnswer(shortReply, 9),
+  ];
+  const turns = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(turns.length, 2, 'the typed prompt still opened a second turn');
+  const [, turnB] = turns;
+  assert.equal(turnB.summary, longReply, "turn B's own report stayed the response");
+  assert.deepEqual(
+    turnB.answers.map((answer) => answer.notResponse),
+    [undefined, 'repeat-notice'],
+  );
+  const card = toCard(turnB, true, ms(60));
+  assert.equal(card.summary, longReply);
+  const activityReplies = card.saidMessages
+    .filter((message) => message.kind === 'answer')
+    .map((message) => message.text);
+  assert.deepEqual(activityReplies, [shortReply], 'the repeat note sits in Activity marked repeat-notice');
+});
+
+// A notice arriving mid-work, after the turn's own unrelated reply already closed and the
+// agent then did more work, answers that work rather than the notice. `readTurns` must not
+// mark the reply that follows it, or it buries the turn's real final answer the same way a
+// notice delivered while the agent waits does when nothing separates it from the reply.
+test('a completion notice queued while the agent works after an unrelated reply leaves the following reply as the response', () => {
+  const taskId = 'ux1';
+  const finalAnswer = 'The migration finished and every row now carries the new column.';
+  const lines = [
+    // Turn A: a handback from X and a reply that closes it.
+    userPrompt('ship the migration', 0),
+    assistantTool('Agent', 1, 'tu-migration-agent', { description: 'migration', subagent_type: 'general-purpose' }),
+    peerHandback(taskId, 2),
+    assistantAnswer('The migration subagent handed back.', 3),
+    // Turn B: a typed prompt, an interim reply, a tool call and result, a queued notice for
+    // X, then the real final answer.
+    userPrompt('run it now', 4),
+    assistantAnswer('Starting the migration run.', 5),
+    assistantTool('Bash', 6, 'tu-migrate'),
+    toolDone('tu-migrate', 7),
+    queued({ commandMode: 'task-notification', prompt: completionNoticeText(taskId) }, 8),
+    assistantAnswer(finalAnswer, 9),
+  ];
+  const turns = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(turns.length, 2, 'the typed prompt still opened a second turn');
+  const [, turnB] = turns;
+  assert.deepEqual(
+    turnB.answers.map((answer) => answer.notResponse),
+    [undefined, undefined],
+    'the notice arrived after work done since the last reply, so the reply that followed it answers that work',
+  );
+  assert.equal(turnB.summary, finalAnswer, "the turn's real final answer stayed the response");
+  const card = toCard(turnB, true, ms(60));
+  assert.equal(card.summary, finalAnswer);
+  const activityReplies = card.saidMessages
+    .filter((message) => message.kind === 'answer')
+    .map((message) => message.text);
+  assert.deepEqual(
+    activityReplies,
+    ['Starting the migration run.'],
+    'the interim reply sits in Activity once, unmarked',
+  );
+});
+
+test('a turn opened by a repeat notice for an earlier handback keeps that reply as its response', () => {
+  const taskId = 'z9';
+  const reply = 'Nothing else changed since my last report.';
+  const lines = [
+    userPrompt('ship it', 0),
+    peerHandback(taskId, 1),
+    assistantAnswer('The subagent finished.', 2),
+    userPrompt('what else is queued', 3),
+    completionNotice(taskId, 4),
+    assistantAnswer(reply, 5),
+  ];
+  const turns = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(turns.length, 2);
+  const [, turnB] = turns;
+  assert.equal(turnB.answers.length, 1, "turn B's only reply answered the repeat notice");
+  assert.equal(
+    turnB.answers[0].notResponse,
+    undefined,
+    'the turn had no earlier response reply for the notice to repeat',
+  );
+  assert.equal(turnB.summary, reply, 'a turn whose only reply answers the notice shows that reply as the response');
+  const card = toCard(turnB, true, ms(60));
+  assert.equal(card.summary, reply);
+  const activityReplies = card.saidMessages.filter((message) => message.kind === 'answer');
+  assert.deepEqual(activityReplies, [], 'the reply reads once, as the response, never again in Activity');
+});
+
+// Two subagents each handed back in an earlier turn. A later turn's own two replies each
+// answer one subagent's repeat notice, and only the first of them has no earlier response
+// reply to protect, so it becomes the response and the second sits in Activity.
+test('a later turn with two repeat notices keeps its first reply as the response', () => {
+  const [x, y] = ['x7', 'y8'];
+  const firstReply = 'Filed the follow-up for the title-trigger regression.';
+  const secondReply = 'Filed the follow-up for the mockup diff too.';
+  const lines = [
+    userPrompt('ship both fixes', 0),
+    peerHandback(x, 1),
+    assistantAnswer('The title-trigger subagent handed back.', 2),
+    peerHandback(y, 3),
+    assistantAnswer('The mockup subagent handed back.', 4),
+    userPrompt('file the follow-ups', 5),
+    completionNotice(x, 6),
+    assistantAnswer(firstReply, 7),
+    completionNotice(y, 8),
+    assistantAnswer(secondReply, 9),
+  ];
+  const turns = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(turns.length, 2);
+  const [, turnB] = turns;
+  assert.deepEqual(
+    turnB.answers.map((answer) => answer.notResponse),
+    [undefined, 'repeat-notice'],
+    'the first reply protected no earlier response, the second answered a repeat with one already closed',
+  );
+  assert.equal(turnB.summary, firstReply);
+  const card = toCard(turnB, true, ms(60));
+  assert.equal(card.summary, firstReply);
+  const activityReplies = card.saidMessages
+    .filter((message) => message.kind === 'answer')
+    .map((message) => message.text);
+  assert.deepEqual(
+    activityReplies,
+    [secondReply],
+    'the first reply reads once, as the response, not again in Activity',
+  );
+});
+
+test('a handback id survives a parser state restore split between the turn it closed in and the turn that repeats it', () => {
+  const taskId = 'aa60c1c303d5a7c96';
+  const longReply = 'I recorded the decision.';
+  const shortReply = 'The subagent finished too.';
+  const records = [
+    userPrompt('ship the title-trigger change', 0),
+    peerHandback(taskId, 1),
+    assistantAnswer('The subagent handed back.', 2),
+    userPrompt('record the decision instead', 3),
+    assistantAnswer(longReply, 4),
+    completionNotice(taskId, 5),
+    assistantAnswer(shortReply, 6),
+  ];
+  const all = createClaudeSessionReducer('sess');
+  for (const record of records) {
+    all.pushLine(JSON.stringify(record));
+  }
+  // Split mid-way through turn A, well before the typed prompt that opens turn B.
+  const first = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 3)) {
+    first.pushLine(JSON.stringify(record));
+  }
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  for (const record of records.slice(3)) {
+    resumed.pushLine(JSON.stringify(record));
+  }
+  assert.deepEqual(resumed.read(), all.read());
+  const [, turnB] = resumed.read().turns;
+  assert.equal(turnB.summary, longReply);
+  assert.deepEqual(
+    turnB.answers.map((answer) => answer.notResponse),
+    [undefined, 'repeat-notice'],
+  );
+});
+
+test('a reply of "No response requested." is never the response', () => {
+  const [t] = readTurns(
+    writeTranscript([
+      userPrompt('run the suite in the background', 0),
+      assistantAnswer('The report.', 1),
+      completionNotice('bash-8', 2),
+      assistantAnswer('No response requested.', 3),
+    ]),
+    'sess',
+  );
+  assert.equal(t.summary, 'The report.');
+  assert.deepEqual(
+    t.answers.map((answer) => answer.notResponse),
+    [undefined, 'no-response-requested'],
+  );
+});
+
+test('a turn whose only reply is "No response requested." has no response', () => {
+  const [alone] = readTurns(
+    writeTranscript([
+      userPrompt('run the suite in the background', 0),
+      assistantTool('Bash', 1, 'tu-s'),
+      toolDone('tu-s', 2),
+      completionNotice('bash-9', 3),
+      assistantAnswer('No response requested.', 4),
+    ]),
+    'sess',
+  );
+  assert.equal(alone.summary, '');
+  assert.equal(toCard(alone, true, ms(60)).summary, '');
+});
+
+test('"No response requested." in a second text block of the report line does not take the place of the report', () => {
+  const line = assistantAnswer('The report.', 2) as { message: { content: object[] } };
+  line.message.content.push({ type: 'text', text: 'No response requested.' });
+  const [shared] = readTurns(
+    writeTranscript([userPrompt('report', 0), assistantAnswer('Working on it.', 1), line]),
+    'sess',
+  );
+  assert.equal(shared.summary, 'The report.');
+  assert.deepEqual(
+    shared.answers.map((answer) => [answer.text, answer.notResponse]),
+    [
+      ['Working on it.', undefined],
+      ['The report.', undefined],
+      ['No response requested.', 'no-response-requested'],
+    ],
+  );
+  const card = toCard(shared, true, ms(60));
+  assert.equal(card.summary, 'The report.');
+  assert.deepEqual(
+    card.saidMessages.filter((message) => message.kind === 'answer').map((message) => message.text),
+    ['Working on it.', 'No response requested.'],
+  );
+});
+
+test('what counts as a closed answer follows the stop the line carries', () => {
+  // Still running: the newest text has closed nothing yet, so it is the summary and not
+  // an answer. The reader of the last answer and the reader of the live text differ
+  // exactly here, and both have to be right.
+  const running = writeTranscript([
+    userPrompt('go', 0),
+    assistantAnswer('Answered once.', 1),
+    { ...userPrompt('a peer wake', 2), isMeta: true },
+    assistantText('Still working on the follow-up.', 3, undefined, undefined, 'tool_use'),
+  ]);
+  const [live] = readTurns(running, 'sess');
+  assert.deepEqual(
+    live.answers.map((a) => a.text),
+    ['Answered once.'],
+  );
+  assert.equal(live.summary, 'Answered once.');
+  assert.deepEqual(
+    live.updates.map((update) => update.text),
+    ['Still working on the follow-up.'],
+  );
+  // stop_sequence closed a response on older lines, and it closes an answer here too,
+  // the same reading `finished` already takes.
+  const stopped = writeTranscript([userPrompt('go', 0), assistantAnswer('Cut short but closed.', 1, 'stop_sequence')]);
+  assert.deepEqual(
+    readTurns(stopped, 'sess')[0].answers.map((a) => a.text),
+    ['Cut short but closed.'],
+  );
+  // Two text blocks on one closing line are one answer, the last text winning the way
+  // it wins the summary.
+  const doubled = writeTranscript([
+    userPrompt('go', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'm-double',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [
+          { type: 'text', text: 'half one' },
+          { type: 'text', text: 'half two' },
+        ],
+      },
+    },
+  ]);
+  const [two] = readTurns(doubled, 'sess');
+  assert.deepEqual(
+    two.answers.map((a) => a.text),
+    ['half two'],
+  );
+  assert.equal(two.summary, 'half two');
+  // A single-answer turn: the ordinary case, one answer and it is the summary.
+  const plain = writeTranscript([userPrompt('go', 0), assistantAnswer('Done.', 1)]);
+  assert.deepEqual(
+    readTurns(plain, 'sess')[0].answers.map((a) => a.text),
+    ['Done.'],
+  );
+});
+
+test('Claude tool-use narration is activity while final and undiscriminated text stays response text', () => {
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    {
+      type: 'assistant',
+      uuid: 'narration-record',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'message-one',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'I am checking the workspace.' }],
+      },
+    },
+    {
+      type: 'assistant',
+      uuid: 'fallback-narration',
+      timestamp: at(2),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'I am checking the result.' }],
+      },
+    },
+    assistantAnswer('The workspace is clean.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.summary, 'The workspace is clean.');
+  assert.deepEqual(
+    turn.answers.map((answer) => answer.text),
+    ['The workspace is clean.'],
+  );
+  assert.deepEqual(turn.updates, [
+    {
+      sourceId: 'message-one:text:0',
+      kind: 'commentary',
+      text: 'I am checking the workspace.',
+      at: ms(1),
+      status: 'done',
+      stepsBefore: 0,
+    },
+    {
+      sourceId: 'fallback-narration:text:0',
+      kind: 'commentary',
+      text: 'I am checking the result.',
+      at: ms(2),
+      status: 'done',
+      stepsBefore: 0,
+    },
+  ]);
+  assert.equal(turn.stepCount, 0);
+  assert.deepEqual(turn.toolCounts, {
+    reads: 0,
+    searches: 0,
+    edits: 0,
+    commands: 0,
+    agents: 0,
+    coordination: 0,
+    web: 0,
+    other: 0,
+  });
+
+  const [fallback] = readTurns(
+    writeTranscript([
+      userPrompt('older record', 0),
+      {
+        ...assistantText('Keep this response.', 1),
+        uuid: 'fallback-record',
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          content: [{ type: 'text', text: 'Keep this response.' }],
+        },
+      },
+    ]),
+    'sess',
+  );
+  assert.equal(fallback.summary, 'Keep this response.');
+  assert.deepEqual(fallback.updates, []);
+});
+
+test('Claude narration split across records with one message id keeps every text block', () => {
+  const shared = (text: string, second: number) => ({
+    type: 'assistant',
+    uuid: `record-${second}`,
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id: 'message-split',
+      model: 'claude-opus-5',
+      stop_reason: 'tool_use',
+      content: [{ type: 'text', text }],
+    },
+  });
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('do it', 0),
+      shared('Checking the parser.', 1),
+      shared('Running its focused test.', 2),
+      assistantAnswer('Done.', 3),
+    ]),
+    'sess',
+  );
+  assert.deepEqual(
+    turn.updates.map((update) => [update.sourceId, update.text]),
+    [
+      ['message-split:text:0', 'Checking the parser.'],
+      ['message-split:text:1', 'Running its focused test.'],
+    ],
+  );
+});
+
+test('empty and signed Claude thinking does not become visible activity', () => {
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('think', 0),
+      {
+        type: 'assistant',
+        uuid: 'thinking-record',
+        timestamp: at(1),
+        message: {
+          role: 'assistant',
+          id: 'thinking-message',
+          model: 'claude-opus-5',
+          stop_reason: 'tool_use',
+          content: [{ type: 'thinking', thinking: '', signature: 'signed-content' }],
+        },
+      },
+    ]),
+    'sess',
+  );
+  assert.deepEqual(turn.updates, []);
+  assert.equal(turn.summary, '');
+});
+
+test('edits are summed per file and agent scratch files are left out', () => {
+  const scratch = path.join(os.tmpdir(), 'claude', 'probe.py');
+  const file = writeTranscript([
+    userPrompt('change things', 0),
+    editResult('c:/repo/a.ts', 1, 10, 2),
+    editResult('c:/repo/a.ts', 2, 5, 1),
+    editResult('c:/repo/b.ts', 3, 3, 0),
+    editResult(scratch, 4, 99, 0),
+    {
+      type: 'user',
+      timestamp: at(5),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'ok' }] },
+      toolUseResult: { filePath: 'c:/repo/new.md', type: 'create', content: 'one\ntwo\nthree', structuredPatch: [] },
+    },
+    assistantText('Done.', 6),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.files.map((f) => [path.basename(f.path), f.added, f.removed, f.isNew]),
+    [
+      ['a.ts', 15, 3, false],
+      ['b.ts', 3, 0, false],
+      ['new.md', 3, 0, true],
+    ],
+  );
+});
+
+test('a turn keeps the patch text each edit recorded, beside the line counts', () => {
+  const file = writeTranscript([
+    userPrompt('change things', 0),
+    {
+      type: 'user',
+      timestamp: at(1),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: 'ok' }] },
+      toolUseResult: {
+        filePath: 'c:/repo/a.ts',
+        originalFile: 'one\ntwo\n',
+        structuredPatch: [
+          {
+            oldStart: 1,
+            oldLines: 2,
+            newStart: 1,
+            newLines: 2,
+            lines: [' one', '-two', '+TWO', '\\ No newline at end of file'],
+          },
+        ],
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'ok' }] },
+      toolUseResult: { filePath: 'c:/repo/new.md', type: 'create', content: 'fresh\ntext\n', structuredPatch: [] },
+    },
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  const [edited, created] = turn.files;
+  // The counts the card already showed are unchanged by keeping the patch.
+  assert.deepEqual([edited.added, edited.removed, edited.isNew], [1, 1, false]);
+  assert.deepEqual([created.added, created.removed, created.isNew], [2, 0, true]);
+  assert.equal(edited.edits.length, 1);
+  assert.deepEqual(edited.edits[0].hunks, [
+    {
+      oldStart: 1,
+      oldLines: 2,
+      newStart: 1,
+      newLines: 2,
+      lines: [' one', '-two', '+TWO', '\\ No newline at end of file'],
+    },
+  ]);
+  assert.equal(edited.edits[0].originalFile, 'one\ntwo\n');
+  assert.equal(edited.edits[0].content, null, 'an Edit records no after side');
+  assert.equal(edited.edits[0].isCreate, false);
+  assert.deepEqual(created.edits, [
+    {
+      hunks: [],
+      originalFile: null,
+      content: 'fresh\ntext\n',
+      isCreate: true,
+    },
+  ]);
+});
+
+test('a malformed structured patch keeps the file-level edit without partial patch detail', () => {
+  const malformedPatches = [
+    null,
+    {},
+    [null],
+    [{}],
+    [{ oldStart: 1, oldLines: 0, newStart: 1, newLines: 0, lines: [] }],
+    [{ oldStart: 1, oldLines: 0, newStart: 1, newLines: 0, lines: ['\\ No newline at end of file'] }],
+    [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['\\ No newline at end of file', ' old'] }],
+    [
+      {
+        oldStart: 1,
+        oldLines: 2,
+        newStart: 1,
+        newLines: 3,
+        lines: [' a', '+x', '\\ No newline at end of file', ' b'],
+      },
+    ],
+    [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['+valid'] }, null],
+    [{ oldStart: -1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+    [{ oldStart: 1, oldLines: 1.5, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+    [{ oldStart: '1', oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+    [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', 4] }],
+    [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['old', '+new'] }],
+    [{ oldStart: 0, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+    [{ oldStart: 1, oldLines: 1, newStart: 0, newLines: 1, lines: ['-old', '+new'] }],
+    [{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+    [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 2, lines: ['-old', '+new'] }],
+    [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['\\ another marker'] }],
+  ];
+
+  for (const [index, structuredPatch] of malformedPatches.entries()) {
+    const [turn] = readTurns(
+      writeTranscript([
+        userPrompt(`change malformed file ${index}`, 0),
+        {
+          type: 'user',
+          timestamp: at(1),
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: 'ok' }] },
+          toolUseResult: {
+            filePath: `c:/repo/malformed-${index}.ts`,
+            type: 'edit',
+            originalFile: 'old\n',
+            structuredPatch,
+          },
+        },
+        assistantText('Done.', 2),
+      ]),
+      'sess',
+    );
+
+    assert.equal(turn.files.length, 1, `case ${index} keeps the file edit`);
+    assert.deepEqual(turn.files[0], {
+      path: `c:/repo/malformed-${index}.ts`,
+      added: 0,
+      removed: 0,
+      isNew: false,
+      edits: [
+        {
+          hunks: [],
+          originalFile: 'old\n',
+          content: null,
+          isCreate: false,
+          patchInvalid: true,
+        },
+      ],
+    });
+  }
+});
+
+test('zero-length structured patch sides and complete Write content remain usable', () => {
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('replace an empty file', 0),
+      {
+        type: 'user',
+        timestamp: at(1),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: 'ok' }] },
+        toolUseResult: {
+          filePath: 'c:/repo/empty.ts',
+          originalFile: '',
+          structuredPatch: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+new'] }],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'ok' }] },
+        toolUseResult: {
+          filePath: 'c:/repo/write.ts',
+          type: 'write',
+          originalFile: 'old\n',
+          content: 'new\n',
+          structuredPatch: null,
+        },
+      },
+      {
+        type: 'user',
+        timestamp: at(3),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e2', content: 'ok' }] },
+        toolUseResult: {
+          filePath: 'c:/repo/cleared.ts',
+          originalFile: 'old\n',
+          structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 0, newLines: 0, lines: ['-old'] }],
+        },
+      },
+      assistantText('Done.', 4),
+    ]),
+    'sess',
+  );
+
+  assert.deepEqual(turn.files[0].edits[0], {
+    hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+new'] }],
+    originalFile: '',
+    content: null,
+    isCreate: false,
+  });
+  assert.deepEqual(turn.files[1].edits[0], {
+    hunks: [],
+    originalFile: 'old\n',
+    content: 'new\n',
+    isCreate: false,
+    patchInvalid: true,
+  });
+  assert.deepEqual(turn.files[2].edits[0], {
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 0, newLines: 0, lines: ['-old'] }],
+    originalFile: 'old\n',
+    content: null,
+    isCreate: false,
+  });
+});
+
+// One session writes the same file under either drive letter case, because each command
+// takes the case of its own working directory. Keyed on the raw string, each spelling drew a
+// second row for the file, which is what a create followed by an edit showed on the card.
+test('a file written under two drive letter spellings keeps one row', () => {
+  const file = writeTranscript([
+    userPrompt('create the files, then edit them', 0),
+    editResult('c:/repo/demo/notes.md', 1, 2, 0),
+    bashEditResult(
+      2,
+      {
+        files: [
+          {
+            filePath: 'c:\\repo\\demo\\mod1.txt',
+            hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 3, lines: ['+a', '+b', '+c'] }],
+          },
+        ],
+        moreFiles: 1,
+        changedFiles: ['c:\\repo\\demo\\mod1.txt', 'c:\\repo\\demo\\mod6.txt'],
+      },
+      'b1',
+    ),
+    bashEditResult(
+      3,
+      {
+        files: [
+          {
+            filePath: 'C:\\repo\\demo\\mod1.txt',
+            hunks: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ['-b', '+B'] }],
+          },
+          {
+            filePath: 'C:\\repo\\demo\\notes.md',
+            hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-x', '+y'] }],
+          },
+        ],
+        moreFiles: 1,
+        changedFiles: ['C:\\repo\\demo\\mod1.txt', 'C:\\repo\\demo\\notes.md', 'C:\\repo\\demo\\mod6.txt'],
+      },
+      'b2',
+    ),
+    assistantText('Done.', 4),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.files.map((f) => [f.path, f.added, f.removed, f.isNew, f.countsUnknown ?? false, f.edits.length]),
+    [
+      ['c:/repo/demo/notes.md', 3, 1, false, false, 2],
+      ['c:\\repo\\demo\\mod1.txt', 4, 1, true, false, 2],
+      ['c:\\repo\\demo\\mod6.txt', 0, 0, false, true, 0],
+    ],
+  );
+});
+
+test('a shell edit reads its file rows the way an edit tool result does', () => {
+  const file = writeTranscript([
+    userPrompt('port the fix through the shell', 0),
+    bashEditResult(1, {
+      files: [
+        {
+          filePath: 'c:/repo/docs/architecture.md',
+          hunks: [
+            { oldStart: 12, oldLines: 2, newStart: 12, newLines: 3, lines: [' context', '-old', '+new', '+another'] },
+          ],
+        },
+        {
+          filePath: 'c:/repo/extension/src/codex.ts',
+          hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+brand new'] }],
+        },
+      ],
+      moreFiles: 1,
+      changedFiles: [
+        'c:/repo/docs/architecture.md',
+        'c:/repo/extension/src/codex.ts',
+        'c:/repo/extension/src/unlisted.ts',
+      ],
+    }),
+    assistantText('Done.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.files.map((f) => [
+      path.basename(f.path),
+      f.added,
+      f.removed,
+      f.isNew,
+      f.countsUnknown ?? false,
+      f.unknownReason ?? null,
+    ]),
+    [
+      ['architecture.md', 2, 1, false, false, null],
+      ['codex.ts', 1, 0, true, false, null],
+      ['unlisted.ts', 0, 0, false, true, 'shell'],
+    ],
+  );
+  // The counts above pass whether or not the hunks themselves were kept, so the recorded
+  // edits are checked directly: deleting the push that carries them would leave this row
+  // green on the counts alone while every shell diff lost its content.
+  assert.deepEqual(turn.files[0].edits, [
+    {
+      hunks: [
+        { oldStart: 12, oldLines: 2, newStart: 12, newLines: 3, lines: [' context', '-old', '+new', '+another'] },
+      ],
+      originalFile: null,
+      content: null,
+      isCreate: false,
+    },
+  ]);
+  assert.deepEqual(turn.files[1].edits, [
+    {
+      hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+brand new'] }],
+      originalFile: null,
+      content: null,
+      isCreate: true,
+    },
+  ]);
+  assert.deepEqual(turn.files[2].edits, []);
+});
+
+// Decision 2's row survives no matter which of a turn's records reaches its file first. A
+// counted edit or a shell diff's own `files` entry sets the real numbers; a later mention of
+// the same path in another record's `changedFiles`, with no hunks, never resets the row back
+// to unknown.
+test('a counted file that a later shell record names again keeps its counts, order A', () => {
+  const file = writeTranscript([
+    userPrompt('edit then shell-touch the same file', 0),
+    editResult('c:/repo/src/store.ts', 1, 2, 1),
+    bashEditResult(2, { changedFiles: ['c:/repo/src/store.ts'] }),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.files.map((f) => [path.basename(f.path), f.added, f.removed, f.countsUnknown ?? false]),
+    [['store.ts', 2, 1, false]],
+  );
+});
+
+// The same rule, the other way round: an unlisted mention lands first and an edit tool
+// details the file afterward. Both orders must land on the one row above.
+test('an unlisted shell mention that a later edit details keeps its counts, order B', () => {
+  const file = writeTranscript([
+    userPrompt('shell-touch then edit the same file', 0),
+    bashEditResult(1, { changedFiles: ['c:/repo/src/store.ts'] }),
+    editResult('c:/repo/src/store.ts', 2, 2, 1),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.files.map((f) => [path.basename(f.path), f.added, f.removed, f.countsUnknown ?? false]),
+    [['store.ts', 2, 1, false]],
+  );
+});
+
+test('a record naming 53 files beyond its five-file cap lists all 58', () => {
+  const detailed = Array.from({ length: 5 }, (_, i) => ({
+    filePath: `c:/repo/src/detailed${i}.ts`,
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+  }));
+  const uncapped = Array.from({ length: 53 }, (_, i) => `c:/repo/src/more${i}.ts`);
+  const file = writeTranscript([
+    userPrompt('rewrite the whole tree', 0),
+    bashEditResult(1, {
+      files: detailed,
+      moreFiles: 53,
+      changedFiles: [...detailed.map((f) => f.filePath), ...uncapped],
+    }),
+    assistantText('Done.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.files.length, 58);
+  assert.equal(turn.files.filter((f) => !f.countsUnknown).length, 5);
+});
+
+test('a shell edit under a scratch root reports no rows, named and unnamed alike', () => {
+  const scratch = path.join(os.tmpdir(), 'claude', 'scratch.ts');
+  const file = writeTranscript([
+    userPrompt('run a scratch script', 0),
+    bashEditResult(1, {
+      files: [
+        { filePath: scratch, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }] },
+      ],
+      changedFiles: [scratch],
+    }),
+    assistantText('Done.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.files, []);
+});
+
+test('a created file is counted the way an editor numbers its lines', () => {
+  // Most files end with a newline. Splitting on it counts a line that is not there, and
+  // the overstatement is summed into the card's +N total.
+  assert.equal(countLines('one\ntwo\nthree'), 3);
+  assert.equal(countLines('one\ntwo\n'), 2);
+  assert.equal(countLines('one\r\ntwo\r\n'), 2);
+  assert.equal(countLines('one'), 1);
+  assert.equal(countLines(''), 0, 'an empty file has no lines');
+});
+
+test('a subagent is listed once, and its launch row is filled in by its result', () => {
+  const file = writeTranscript([
+    userPrompt('delegate this', 0),
+    assistantTool('Agent', 1, 'a1', { description: 'Audit the parser', subagent_type: 'Explore' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a1', content: 'done' }] },
+      toolUseResult: {
+        status: 'completed',
+        description: 'Audit the parser',
+        agentType: 'Explore',
+        agentId: 'child-1',
+        resolvedModel: 'claude-haiku-4-5',
+        totalDurationMs: 109000,
+        totalTokens: 70000,
+        totalToolUseCount: 20,
+      },
+    },
+    assistantText('Delegated and back.', 3),
+  ]);
+  const spend = [
+    {
+      model: 'claude-haiku-4-5',
+      usage: { input: 1, cacheWrite1h: 2, cacheWrite5m: 3, cacheRead: 4, output: 5, thinking: 1 },
+    },
+  ];
+  const [turn] = readTurns(file, 'sess', {
+    agentSpendOf: (agent) => ({
+      models: agent.id === 'child-1' ? spend : [],
+      found: agent.id === 'child-1',
+      partial: false,
+      effort: agent.id === 'child-1' ? 'high' : null,
+    }),
+    agentSessionTargetOf: (agent) => (agent.id === 'child-1' && agent.toolUseId === 'a1' ? agent.id : null),
+  });
+  assert.equal(turn.agents.length, 1);
+  assert.equal(turn.steps[0].id, 'a1');
+  assert.equal(turn.agents[0].toolUseId, 'a1');
+  assert.ok(!Object.keys(turn.steps[0]).includes('id'));
+  assert.ok(!Object.keys(turn.agents[0]).includes('toolUseId'));
+  assert.deepEqual(turn.agents[0], {
+    id: 'child-1',
+    description: 'Audit the parser',
+    agentType: 'Explore',
+    model: 'claude-haiku-4-5',
+    effort: 'high',
+    spend,
+    spendFound: true,
+    spendPartial: false,
+    durationMs: 109000,
+    tokens: 70000,
+    toolUses: 20,
+    status: 'completed',
+    childSessionId: 'child-1',
+  });
+});
+
+test('Claude child navigation requires a launch and result identity pair', () => {
+  const file = writeTranscript([
+    userPrompt('result without its launch', 0),
+    {
+      type: 'user',
+      timestamp: at(1),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'missing-call', content: 'done' }] },
+      toolUseResult: { agentId: 'child-1', description: 'Audit the parser', totalToolUseCount: 2, status: 'completed' },
+    },
+    assistantText('Done.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess', { agentSessionTargetOf: () => 'child-1' });
+  assert.equal(turn.agents.length, 1);
+  assert.equal(turn.agents[0].childSessionId, undefined);
+});
+
+test('a selected Claude child reads its sidechain prompt, edits, and response', () => {
+  const file = writeTranscript([
+    { ...userPrompt('inspect the parser', 0), isSidechain: true, agentId: 'child-1', cwd: 'c:/repo' },
+    { ...assistantTool('Edit', 1, 'edit-1', { file_path: 'c:/repo/parser.ts' }), isSidechain: true },
+    {
+      type: 'user',
+      isSidechain: true,
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'edit-1', content: 'ok' }] },
+      toolUseResult: {
+        filePath: 'c:/repo/parser.ts',
+        originalFile: 'old\n',
+        structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-old', '+new'] }],
+      },
+    },
+    {
+      ...assistantText(
+        'Child complete.',
+        3,
+        {
+          input_tokens: 17,
+          cache_read_input_tokens: 230,
+          cache_creation_input_tokens: 40,
+          output_tokens: 19,
+        },
+        undefined,
+        'end_turn',
+      ),
+      isSidechain: true,
+    },
+  ]);
+  const read = readSession(file, 'child-1', { childTranscript: true });
+  assert.equal(read.turns[0].prompt, 'inspect the parser');
+  assert.equal(read.turns[0].summary, 'Child complete.');
+  assert.deepEqual(
+    read.turns[0].files.map((entry) => entry.path),
+    ['c:/repo/parser.ts'],
+  );
+  assert.deepEqual(read.turns[0].usage, {
+    requests: 1,
+    input: 17,
+    cacheWrite1h: 40,
+    cacheWrite5m: 0,
+    cacheWrite30m: 0,
+    cacheRead: 230,
+    output: 19,
+    thinking: 0,
+  });
+  assert.equal(read.turns[0].contextTokens, 287);
+});
+
+// A subagent's own transcript records a nested `Agent` result as text alone, with no
+// `toolUseResult`. These are the text shapes Claude Code writes there.
+const nestedForegroundResult = (agentId: string, tokens: number, tools: number, took: number) =>
+  `  This agent's report was delivered to you as a message from "${agentId}" (its SubagentHandback call). ` +
+  `Read it there; it is not repeated here.\n  \nagentId: ${agentId} (use SendMessage with to: '${agentId}', ` +
+  `summary: '<5-10 word recap>' to continue this agent)\n` +
+  `<usage>subagent_tokens: ${tokens}\ntool_uses: ${tools}\nduration_ms: ${took}</usage>`;
+const nestedForegroundResultWithoutFigures = (agentId: string) =>
+  `  This agent's report was delivered to you as a message from "${agentId}" (its SubagentHandback call). ` +
+  'Read it there; it is not repeated here.\n  ';
+// A report whose own last line looks like the id line. With no `<usage>` block after it, the
+// line is report text and names no child.
+const nestedReportEndingOnAnId = 'Report only\nagentId: unrelated-child';
+const nestedBackgroundResult = (agentId: string) =>
+  'Async agent launched successfully. (This tool result is internal metadata.)\n' +
+  `agentId: ${agentId} (internal ID - do not mention to user. Use SendMessage with to: '${agentId}' to continue this agent.)\n` +
+  'The agent is working in the background. You will be notified automatically when it completes.';
+// Every record of a child transcript names its own agent at the top level.
+function nestedResult(toolUseId: string, second: number, text: string | string[], isError = false) {
+  const blocks = (Array.isArray(text) ? text : [text]).map((part) => ({ type: 'text', text: part }));
+  return {
+    type: 'user',
+    isSidechain: true,
+    agentId: 'child-1',
+    timestamp: at(second),
+    message: {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: toolUseId, ...(isError ? { is_error: true } : {}), content: blocks },
+      ],
+    },
+  };
+}
+const nestedRows = (file: string) =>
+  readSession(file, 'child-1', { childTranscript: true }).turns[0].agents.map(
+    ({ id, description, status, tokens, toolUses, durationMs }) => ({
+      id,
+      description,
+      status,
+      tokens,
+      toolUses,
+      durationMs,
+    }),
+  );
+
+test('a Claude child closes a nested subagent row when its foreground launch returns', () => {
+  const file = writeTranscript([
+    { ...userPrompt('launch two nested agents', 0), isSidechain: true, cwd: 'c:/repo' },
+    {
+      ...assistantTool('Agent', 1, 'launch-b', { description: 'Nested B', model: 'haiku', run_in_background: false }),
+      isSidechain: true,
+    },
+    nestedResult('launch-b', 2, nestedForegroundResult('adf3e8d2cb8d606c4', 28814, 2, 19553)),
+    { ...assistantTool('Agent', 3, 'launch-d', { description: 'Nested D', model: 'haiku' }), isSidechain: true },
+    nestedResult('launch-d', 4, nestedForegroundResultWithoutFigures('a76cc0a85b2dbe57c')),
+    { ...assistantTool('Agent', 5, 'launch-e', { description: 'Nested E' }), isSidechain: true },
+    nestedResult('launch-e', 6, nestedReportEndingOnAnId),
+    { ...assistantAnswer('The nested agents finished.', 7), isSidechain: true },
+  ]);
+  assert.deepEqual(nestedRows(file), [
+    {
+      id: 'adf3e8d2cb8d606c4',
+      description: 'Nested B',
+      status: 'completed',
+      tokens: 28814,
+      toolUses: 2,
+      durationMs: 19553,
+    },
+    { id: null, description: 'Nested D', status: 'completed', tokens: null, toolUses: null, durationMs: null },
+    { id: null, description: 'Nested E', status: 'completed', tokens: null, toolUses: null, durationMs: null },
+  ]);
+});
+
+test('a Claude child reads a foreground result whose report and figures sit in separate blocks', () => {
+  const file = writeTranscript([
+    { ...userPrompt('launch a nested agent', 0), isSidechain: true, cwd: 'c:/repo' },
+    { ...assistantTool('Agent', 1, 'launch-sweep', { description: 'Nested sweep' }), isSidechain: true },
+    nestedResult('launch-sweep', 2, [
+      'All done. The sweep found nothing else.\n\nagentId: in the report is not the id line.',
+      "agentId: a6dc23d1b0eaed94d (use SendMessage with to: 'a6dc23d1b0eaed94d', summary: '<5-10 word recap>' to continue this agent)\n" +
+        '<usage>subagent_tokens: 63920\ntool_uses: 57\nduration_ms: 221257</usage>',
+    ]),
+    { ...assistantAnswer('The sweep finished.', 3), isSidechain: true },
+  ]);
+  assert.deepEqual(nestedRows(file), [
+    {
+      id: 'a6dc23d1b0eaed94d',
+      description: 'Nested sweep',
+      status: 'completed',
+      tokens: 63920,
+      toolUses: 57,
+      durationMs: 221257,
+    },
+  ]);
+});
+
+test('a Claude child keeps a background nested subagent row open until its completion notice', () => {
+  const records = [
+    { ...userPrompt('launch a background nested agent', 0), isSidechain: true, cwd: 'c:/repo' },
+    { ...assistantTool('Agent', 1, 'launch-bg', { description: 'Nested scan' }), isSidechain: true },
+    nestedResult('launch-bg', 2, nestedBackgroundResult('a17339eacb3e8a85d')),
+    { ...assistantAnswer('The scan runs in the background.', 3), isSidechain: true },
+  ];
+  assert.deepEqual(
+    nestedRows(writeTranscript(records)).map((row) => [row.id, row.status]),
+    [['a17339eacb3e8a85d', 'running']],
+  );
+  const notice = queued(
+    {
+      commandMode: 'task-notification',
+      prompt:
+        '<task-notification><task-id>a17339eacb3e8a85d</task-id><tool-use-id>launch-bg</tool-use-id>' +
+        '<status>completed</status><usage><subagent_tokens>900</subagent_tokens><tool_uses>4</tool_uses>' +
+        '<duration_ms>1200</duration_ms></usage></task-notification>',
+    },
+    4,
+  );
+  assert.deepEqual(nestedRows(writeTranscript([...records, notice])), [
+    {
+      id: 'a17339eacb3e8a85d',
+      description: 'Nested scan',
+      status: 'completed',
+      tokens: 900,
+      toolUses: 4,
+      durationMs: 1200,
+    },
+  ]);
+});
+
+test('a Claude child does not finish a nested subagent row whose launch failed', () => {
+  const file = writeTranscript([
+    { ...userPrompt('launch a nested agent', 0), isSidechain: true, cwd: 'c:/repo' },
+    { ...assistantTool('Agent', 1, 'launch-denied', { description: 'Nested audit' }), isSidechain: true },
+    nestedResult('launch-denied', 2, "Agent type 'general' not found.", true),
+    { ...assistantAnswer('The launch failed.', 3), isSidechain: true },
+  ]);
+  const [row] = nestedRows(file);
+  assert.notEqual(row.status, 'completed');
+  assert.deepEqual([row.id, row.tokens, row.toolUses, row.durationMs], [null, null, null, null]);
+  assert.deepEqual(
+    readSession(file, 'child-1', { childTranscript: true }).turns[0].failures.map((failure) => failure.tool),
+    ['Agent'],
+  );
+});
+
+test("a child's own edit calls carry the cause `pendingFileEdit` read off each tool's input", () => {
+  // A child transcript carries no patch, so every uncounted row here comes from the raw
+  // tool_use input alone, through `pendingFileEdit`, rather than from a result this fixture
+  // never supplies. `write` and `replaceAll` never carry a before side to measure. `notebook`
+  // is a replace on a cell whose old text was never sent. `zero` is a real Edit whose before
+  // and after sides are the same text, so the counted change comes to nothing.
+  const file = writeTranscript([
+    { ...userPrompt('rewrite the config', 0), isSidechain: true, agentId: 'child-2', cwd: 'c:/repo' },
+    { ...assistantTool('Write', 1, 'w1', { file_path: 'c:/repo/config.ts', content: 'export {}' }), isSidechain: true },
+    { ...toolResult('w1', 2), isSidechain: true },
+    {
+      ...assistantTool('Edit', 3, 'e1', {
+        file_path: 'c:/repo/all.ts',
+        old_string: 'a',
+        new_string: 'b',
+        replace_all: true,
+      }),
+      isSidechain: true,
+    },
+    { ...toolResult('e1', 4), isSidechain: true },
+    {
+      ...assistantTool('NotebookEdit', 5, 'n1', {
+        notebook_path: 'c:/repo/nb.ipynb',
+        new_source: 'print(1)',
+        edit_mode: 'replace',
+      }),
+      isSidechain: true,
+    },
+    { ...toolResult('n1', 6), isSidechain: true },
+    {
+      ...assistantTool('Edit', 7, 'e2', {
+        file_path: 'c:/repo/same.ts',
+        old_string: 'unchanged\n',
+        new_string: 'unchanged\n',
+      }),
+      isSidechain: true,
+    },
+    { ...toolResult('e2', 8), isSidechain: true },
+    { ...assistantText('Done.', 9), isSidechain: true },
+  ]);
+  const read = readSession(file, 'child-2', { childTranscript: true });
+  assert.deepEqual(
+    read.turns[0].files.map((f) => [path.basename(f.path), f.countsUnknown ?? false, f.unknownReason ?? null]),
+    [
+      ['config.ts', true, 'write'],
+      ['all.ts', true, 'replaceAll'],
+      ['nb.ipynb', true, 'notebook'],
+      ['same.ts', true, 'zero'],
+    ],
+  );
+});
+
+test('Claude child metadata, title, and turn starts read sidechain records as the selected session', () => {
+  const file = writeTranscript([
+    { ...userPrompt('inspect child metadata', 4), isSidechain: true, cwd: 'c:/repo' },
+    { ...assistantAnswer('Child complete.', 5), isSidechain: true },
+  ]);
+  assert.equal(readSessionMeta(file, 256 * 1024, '', true).title, 'inspect child metadata');
+  assert.deepEqual(readSessionTurnStarts(file, undefined, true), { starts: [ms(4)], whole: true });
+  const meta = readSessionMeta(file, 256 * 1024, 'child-1', true);
+  assert.equal(meta.title, 'inspect child metadata');
+  assert.equal(meta.agentRun, true);
+  assert.equal(meta.outcome?.finished, true);
+  assert.equal(meta.stats?.turns.length, 1);
+});
+
+test('verified Claude children survive old parent history and accept a registered sibling worktree', () => {
+  const root = tempDir('claude-child-catalog-');
+  const parentId = 'parent-1';
+  const parent = path.join(root, `${parentId}.jsonl`);
+  const childDir = path.join(root, parentId, 'subagents');
+  const child = path.join(childDir, 'agent-child-1.jsonl');
+  fs.mkdirSync(childDir, { recursive: true });
+  fs.writeFileSync(
+    parent,
+    [
+      assistantTool('Agent', 1, 'launch-1', { description: 'Inspect history' }),
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'launch-1', content: 'done' }] },
+        toolUseResult: { agentId: 'child-1', status: 'completed', totalToolUseCount: 2 },
+      },
+      { type: 'progress', data: 'x'.repeat(300_000) },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  fs.writeFileSync(
+    child,
+    JSON.stringify({ ...userPrompt('child prompt', 3), isSidechain: true, cwd: 'd:/trees/topic' }) + '\n',
+  );
+
+  const references = readClaudeChildSessionReferences({ file: parent, sessionId: parentId });
+  const sessions = claudeChildSessionFiles(references, ['c:/repo/main', 'd:/trees/topic']);
+  assert.deepEqual(
+    sessions.map((session) => ({
+      id: session.sessionId,
+      parent: session.parentSessionId,
+      cwd: session.cwd,
+      agentRun: session.agentRun,
+      childTranscript: session.childTranscript,
+      toolUseIds: session.toolUseIds,
+    })),
+    [
+      {
+        id: 'child-1',
+        parent: parentId,
+        cwd: 'd:/trees/topic',
+        agentRun: true,
+        childTranscript: true,
+        toolUseIds: ['launch-1'],
+      },
+    ],
+  );
+  assert.deepEqual(
+    claudeChildSessionFiles(references, ['c:/repo/main']),
+    [],
+    'an existing child outside the registered repository scope remains unavailable',
+  );
+});
+
+test('a Claude shell launch resolves one dispatch reference through the existing catalog', () => {
+  const parentId = 'parent-dispatch';
+  const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const parent = writeTranscript(
+    claudeDispatchTranscript('claude --bg "review the branch"', 'backgrounded · 4f4bf298 · Review the branch'),
+  );
+  const childFile = path.join(path.dirname(parent), `${childId}.jsonl`);
+  const stat = fs.statSync(parent);
+  const catalog = [
+    {
+      agent: 'claude' as const,
+      file: childFile,
+      sessionId: childId,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+    },
+  ];
+  const scanned = readClaudeChildSessionReferences({ file: parent, sessionId: parentId });
+  assert.deepEqual(readSession(parent, parentId).turns[0]?.dispatchToolUseIds, ['dispatch-1']);
+  const references = resolveClaudeDispatchReferences(scanned, catalog);
+  assert.deepEqual(references, [
+    {
+      kind: 'dispatch',
+      agent: 'claude',
+      parentSessionId: parentId,
+      sessionId: childId,
+      file: childFile,
+      toolUseIds: ['dispatch-1'],
+      name: 'Review the branch',
+      owned: false,
+    },
+  ]);
+  assert.deepEqual(
+    resolveClaudeDispatchReferences(readClaudeChildSessionReferences({ file: parent, sessionId: parentId }), catalog),
+    references,
+    'reading the same parent again duplicated its dispatch edge',
+  );
+});
+
+// A receipt without `owned` links a child the reader did not ask for, and `"owned":true`
+// links one the reader did.
+test('opted-in wrappers resolve a named full ID and an unnamed unique prefix', () => {
+  const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const session = {
+    agent: 'claude' as const,
+    file: `C:/sessions/${childId}.jsonl`,
+    sessionId: childId,
+    mtimeMs: 1,
+    size: 1,
+  };
+  for (const [command, id, name, owned] of [
+    ['python C:/tools/reviewer.py --arc-dispatch task.md', childId, 'Review branch', false],
+    ['C:/tools/launch-review --arc-dispatch task.md', childId.slice(0, 8), null, false],
+    ['python C:/tools/dispatch.py --arc-dispatch --attach task.md', childId, 'Ship it', true],
+  ] as const) {
+    const receipt = `ARC_DISPATCH_SESSION=${JSON.stringify({
+      agent: 'claude',
+      session_id: id,
+      ...(name ? { name } : {}),
+      ...(owned ? { owned } : {}),
+    })}`;
+    const parent = writeTranscript(claudeDispatchTranscript(command, `Started\n${receipt}\nFinished`));
+    const scanned = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+    assert.deepEqual(scanned, [
+      {
+        kind: 'dispatch',
+        agent: 'claude',
+        parentSessionId: 'parent',
+        sessionId: id,
+        file: null,
+        toolUseIds: ['dispatch-1'],
+        name,
+        owned,
+      },
+    ]);
+    assert.deepEqual(resolveClaudeDispatchReferences(scanned, [session]), [
+      {
+        ...scanned[0],
+        sessionId: childId,
+        file: session.file,
+      },
+    ]);
+    assert.deepEqual(resolveClaudeDispatchReferences(scanned, []), [], 'an unknown child became a link');
+    if (id.length === 8) {
+      assert.deepEqual(
+        resolveClaudeDispatchReferences(scanned, [
+          session,
+          { ...session, sessionId: '4f4bf298-1111-1111-1111-111111111111' },
+        ]),
+        [],
+        'an ambiguous prefix became a link',
+      );
+    }
+    assert.deepEqual(readSession(parent, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1']);
+  }
+});
+
+test('opted-in wrapper receipts reject malformed, oversized, duplicate, and conflicting lines', () => {
+  const id = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const good = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id })}`;
+  for (const output of [
+    'ARC_DISPATCH_SESSION={bad json}',
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'unknown', session_id: id })}`,
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: '4f4bf298-958f' })}`,
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id, extra: true })}`,
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id, name: 4 })}`,
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id, owned: 'yes' })}`,
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id, owned: false })}`,
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id, owned: true, asked: true })}`,
+    `${good}${' '.repeat(4096)}`,
+    `${good}\n${good}`,
+    `${good}\nARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id.slice(0, 8) })}`,
+    `${good}\nARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: 'aaaaaaaa-1111-1111-1111-111111111111', extra: true })}`,
+    `> ${good}`,
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript('python arbitrary.py --arc-dispatch', output));
+    assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }), [], output.slice(0, 80));
+  }
+});
+
+// A command that chains two opted-in launches prints a receipt for each, and both children
+// link to the one Bash call.
+test('two receipts that name two sessions link both children', () => {
+  const first = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const second = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const receipt = (fields: Record<string, unknown>) => `ARC_DISPATCH_SESSION=${JSON.stringify(fields)}`;
+  const parent = writeTranscript(
+    claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch one.md && python dispatch.py --arc-dispatch two.md',
+      [
+        receipt({ agent: 'claude', session_id: first, name: 'First' }),
+        'started',
+        receipt({ agent: 'claude', session_id: second, owned: true }),
+      ].join('\n'),
+    ),
+  );
+  const launch = {
+    kind: 'dispatch',
+    agent: 'claude',
+    parentSessionId: 'parent',
+    file: null,
+    toolUseIds: ['dispatch-1'],
+  };
+  assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }), [
+    { ...launch, sessionId: first, name: 'First', owned: false },
+    { ...launch, sessionId: second, name: null, owned: true },
+  ]);
+});
+
+// A wrapper can print output relayed from another command, such as an orchestrator's reply
+// that quotes its own worker's receipt, or a prompt file echoed by `cat`. A result links more
+// than one receipt only when its command holds that many opted-in launches.
+test('receipts beyond the opted-in launches of a command link nothing', () => {
+  const receipt = (session: string) =>
+    `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: session })}`;
+  const orchestrator = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const worker = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const relayed = [receipt(orchestrator), 'Orchestrator reply:', `  worker said:`, receipt(worker)].join('\n');
+  for (const command of [
+    'python dispatch.py --arc-dispatch plan.md',
+    'cat prompt.md && python dispatch.py --arc-dispatch prompt.md',
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, relayed));
+    assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }), [], command);
+  }
+  const many = Array.from({ length: 5000 }, (_, at) => receipt(`${at.toString(16).padStart(8, '0')}-1111`)).join('\n');
+  const flood = writeTranscript(
+    claudeDispatchTranscript('python a.py --arc-dispatch && python b.py --arc-dispatch', many),
+  );
+  assert.deepEqual(readClaudeChildSessionReferences({ file: flood, sessionId: 'parent' }), []);
+});
+
+// The derived session cache drops a parent with more references than its limit, and startup
+// then reads that parent again. A command with that many opted-in launches and receipts links
+// nothing, and a command at the per-result limit links every receipt.
+test('a result with more receipts than the per-result limit links nothing, whatever its launch count', () => {
+  const linked = (count: number) => {
+    const ids = Array.from(
+      { length: count },
+      (_, at) => `${at.toString(16).padStart(8, '0')}-1111-1111-1111-111111111111`,
+    );
+    const command = ids.map((_, at) => `python dispatch.py --arc-dispatch ${at}.md`).join(' && ');
+    const output = ids
+      .map((id) => `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id })}`)
+      .join('\n');
+    return readClaudeChildSessionReferences({
+      file: writeTranscript(claudeDispatchTranscript(command, output)),
+      sessionId: 'parent',
+    }).length;
+  };
+  assert.equal(linked(MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT), MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT);
+  assert.equal(linked(MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT + 1), 0, 'a result past the limit linked receipts');
+  assert.equal(
+    linked(MAX_CLAUDE_CHILD_REFERENCES_PER_FILE + 1),
+    0,
+    'a result linked more receipts than the derived session cache keeps for one parent',
+  );
+});
+
+// One parent file keeps at most the references the derived session cache keeps for one file,
+// whatever mix of subagents and dispatches it names, so the cache keeps the parent. A parent
+// that grows keeps every child it already linked, even when a subagent arrives at the limit.
+test('a parent past the per-file reference limit keeps the children it linked first', () => {
+  const receipts = MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT;
+  const dispatched = (result: number) => {
+    const ids = Array.from(
+      { length: receipts },
+      (_, at) => `${(result * receipts + at).toString(16).padStart(8, '0')}-1111-1111-1111-111111111111`,
+    );
+    return claudeDispatchTranscript(
+      ids.map((_, at) => `python dispatch.py --arc-dispatch ${at}.md`).join(' && '),
+      ids.map((id) => `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: id })}`).join('\n'),
+      `dispatch-${result}`,
+    );
+  };
+  const subagent = (at: number) => [
+    {
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: `agent-${at}`, name: 'Agent', input: {} }] },
+    },
+    {
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `agent-${at}`, content: 'done' }] },
+      toolUseResult: { agentId: `sub${at}` },
+    },
+  ];
+  const scan = (records: object[]) =>
+    readClaudeChildSessionReferences({ file: writeTranscript(records), sessionId: 'parent' }).map(
+      (reference) => `${reference.kind}:${reference.sessionId}`,
+    );
+  const full = Array.from({ length: MAX_CLAUDE_CHILD_REFERENCES_PER_FILE / receipts }, (_, at) =>
+    dispatched(at),
+  ).flat();
+  const before = scan(full);
+  assert.equal(before.length, MAX_CLAUDE_CHILD_REFERENCES_PER_FILE, 'the fixture did not fill the per-file limit');
+  assert.deepEqual(scan([...full, ...subagent(0)]), before, 'a subagent that arrived at the limit evicted a dispatch');
+
+  const subagents = Array.from({ length: MAX_CLAUDE_CHILD_REFERENCES_PER_FILE + 1 }, (_, at) => subagent(at)).flat();
+  const linked = scan([...subagents, ...dispatched(0)]);
+  assert.equal(
+    linked.length,
+    MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
+    'a parent of subagents and dispatches kept more references than the derived session cache keeps',
+  );
+  assert.ok(
+    linked.every((reference, at) => reference === `subagent:sub${at}`),
+    'the parent did not keep the children it named first',
+  );
+});
+
+test('receipt lines need a standalone opt-in argument and a paired Bash result', () => {
+  const receipt = 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"4f4bf298"}';
+  for (const command of [
+    'python arbitrary.py task.md',
+    'python arbitrary.py --arc-dispatch-extra',
+    'grep "--arc-dispatch" transcript.jsonl',
+    'cat transcript.jsonl',
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, receipt));
+    assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }), [], command);
+    assert.deepEqual(readSession(parent, 'parent').turns[0]?.dispatchToolUseIds ?? [], [], command);
+  }
+  // A receipt names its own session, so a second opted-in launch that printed none leaves it
+  // linked. A direct launch beside an opted-in one prints no receipt, so neither links.
+  const chained = writeTranscript(
+    claudeDispatchTranscript('python first.py --arc-dispatch && python second.py --arc-dispatch', receipt),
+  );
+  assert.deepEqual(
+    readClaudeChildSessionReferences({ file: chained, sessionId: 'parent' }).map((reference) => reference.sessionId),
+    ['4f4bf298'],
+  );
+  const mixed = writeTranscript(
+    claudeDispatchTranscript('python first.py --arc-dispatch && claude --bg "review"', receipt),
+  );
+  assert.deepEqual(readClaudeChildSessionReferences({ file: mixed, sessionId: 'parent' }), []);
+});
+
+test('a receipt from a different Bash result does not link', () => {
+  const records = claudeDispatchTranscript(
+    'python arbitrary.py --arc-dispatch',
+    'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"4f4bf298"}',
+  );
+  const result = records[2] as { message: { content: Array<{ tool_use_id: string }> } };
+  result.message.content[0].tool_use_id = 'other-call';
+  const unpaired = writeTranscript(records);
+  assert.deepEqual(readClaudeChildSessionReferences({ file: unpaired, sessionId: 'parent' }), []);
+});
+
+test('a wrapper receipt needs structured Bash stdout', () => {
+  const receipt = 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"4f4bf298"}';
+  for (const stdout of [undefined, '']) {
+    const records = claudeDispatchTranscript('python arbitrary.py --arc-dispatch', receipt);
+    const result = records[2] as { toolUseResult: { stdout?: string } };
+    if (stdout === undefined) {
+      delete result.toolUseResult.stdout;
+    } else {
+      result.toolUseResult.stdout = stdout;
+    }
+    const parent = writeTranscript(records);
+    assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }), []);
+  }
+});
+
+test('two native Claude launches keep the first reported child', () => {
+  const records = claudeDispatchTranscript(
+    'claude --bg first && claude --bg second',
+    'backgrounded · 4f4bf298 · First child',
+  );
+  const parent = writeTranscript(records);
+  assert.equal(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' })[0]?.sessionId, '4f4bf298');
+  assert.deepEqual(readSession(parent, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1']);
+});
+
+test('an opted-in wrapper keeps its launch ID after activity steps are bounded', () => {
+  const receipt = 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"4f4bf298"}';
+  const records = claudeDispatchTranscript('python arbitrary.py --arc-dispatch', receipt);
+  for (let index = 0; index < TURN_STEP_LIMIT + 1; index++) {
+    records.push(assistantTool('Bash', index + 3, `later-${index}`, { command: 'echo later' }));
+  }
+  const parent = writeTranscript(records);
+  const turn = readSession(parent, 'parent').turns[0];
+  assert.equal(
+    turn?.steps.some((step) => step.sourceId === 'dispatch-1'),
+    false,
+  );
+  assert.deepEqual(turn?.dispatchToolUseIds, ['dispatch-1']);
+  assert.equal(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }).length, 1);
+});
+
+// A parent card repaints when its render key moves, and its worker reads the child's spend on
+// every trip. A running child that writes four times a second for a minute moves the key and
+// costs a read once a band, where the child's exact revision would move on every write.
+test('a running child moves its parent render key and its spend read once a band, not once a write', () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  try {
+    vi.setSystemTime(Date.UTC(2026, 0, 1));
+    const child = writeTranscript([
+      userPrompt('Inspect', 0),
+      assistantText('Reading', 1, { input_tokens: 100, output_tokens: 10 }),
+    ]);
+    const stamp = () => {
+      const now = new Date(Date.now());
+      fs.utimesSync(child, now, now);
+    };
+    stamp();
+    const turns = (status: string) =>
+      [
+        { agents: [{ id: 'child', description: 'Inspect', agentType: null, status, toolUseId: 'call' }] },
+      ] as unknown as Parameters<typeof agentSpendDependencyKey>[0];
+    const key = (status: string) =>
+      agentSpendDependencyKey(
+        turns(status),
+        () => child,
+        (file) => childSpendVersion('claude', file),
+        '',
+        [],
+        Date.now(),
+      );
+    const cache = new AgentSpendCache();
+    let reads = 0;
+    const read = () =>
+      readChildSpend(
+        cache,
+        child,
+        'running',
+        childSpendVersion('claude', child),
+        (file) => {
+          reads++;
+          return readClaudeAgentSpend(file, [], true);
+        },
+        '',
+        true,
+        Date.now(),
+      );
+    const first = read();
+    let drawn = key('running');
+    let revision = childSpendVersion('claude', child);
+    let writes = 0;
+    let repaints = 0;
+    let revisionMoves = 0;
+    let latest = first;
+    const writer = setInterval(() => {
+      fs.appendFileSync(
+        child,
+        JSON.stringify(assistantText('Working', 2, { input_tokens: 100, output_tokens: 10 })) + '\n',
+      );
+      stamp();
+      writes++;
+      const version = childSpendVersion('claude', child);
+      if (version !== revision) {
+        revision = version;
+        revisionMoves++;
+      }
+      const next = key('running');
+      if (next !== drawn) {
+        drawn = next;
+        repaints++;
+      }
+      latest = read();
+    }, 250);
+    vi.advanceTimersByTime(60_000);
+    clearInterval(writer);
+    const bands = 60_000 / OPEN_SPEND_BAND_MS;
+    assert.deepEqual(
+      { writes, revisionMoves, repaints, reads },
+      { writes: 240, revisionMoves: 240, repaints: bands, reads: 1 + bands },
+    );
+    // The figure keeps up: the last read holds the child's spend as of its last band.
+    assert.ok(spendTokens(latest.models) > spendTokens(first.models));
+    assert.equal(latest.artifacts, undefined, 'a running child showed its files or commits');
+    // A finished child keys on its exact revision, so its last write always reaches the card.
+    assert.match(key('completed'), new RegExp(`${revision.split('\n')[0]}$`));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// A running child's read parses its whole transcript and every nested one, so a band of fixed
+// length would parse a growing child ever faster. The band grows with those bytes instead.
+test('a running child that grows to 20 MB parses about 1 MB a second at most', () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  try {
+    vi.setSystemTime(Date.UTC(2026, 0, 1));
+    const child = writeTranscript([userPrompt('Inspect', 0)]);
+    const stamp = () => {
+      const now = new Date(Date.now());
+      fs.utimesSync(child, now, now);
+    };
+    const turns = [
+      { agents: [{ id: 'child', description: 'Inspect', agentType: null, status: 'running', toolUseId: 'call' }] },
+    ] as unknown as Parameters<typeof agentSpendDependencyKey>[0];
+    const cache = new AgentSpendCache();
+    let reads = 0;
+    let parsed = 0;
+    let repaints = 0;
+    let drawn = '';
+    // The loader counts the bytes a real read would parse. It parses none, so the run stays fast.
+    const load = (file: string) => {
+      reads++;
+      parsed += fs.statSync(file).size;
+      return { models: [], found: true, partial: false, effort: null };
+    };
+    const elapsed = 40 * 60_000;
+    const target = 20_000_000;
+    let writes = 0;
+    // Two writes a band, and one host poll after each write.
+    const writer = setInterval(() => {
+      writes++;
+      fs.truncateSync(child, Math.round((target * writes) / (elapsed / 2_500)));
+      stamp();
+      const now = Date.now();
+      const key = agentSpendDependencyKey(
+        turns,
+        () => child,
+        (file) => childSpendVersion('claude', file),
+        '',
+        [],
+        now,
+      );
+      if (key !== drawn) {
+        drawn = key;
+        repaints++;
+      }
+      readChildSpend(cache, child, 'running', childSpendVersion('claude', child), load, '', true, now);
+    }, 2_500);
+    vi.advanceTimersByTime(elapsed);
+    clearInterval(writer);
+    const measured = `${writes} writes, ${reads} reads, ${repaints} repaints, ${parsed} bytes parsed`;
+    assert.equal(fs.statSync(child).size, target, measured);
+    assert.ok(parsed <= elapsed * OPEN_SPEND_BYTES_PER_MS, measured);
+    assert.ok(repaints <= elapsed / OPEN_SPEND_BAND_MS, measured);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// A background child keeps its launch status after it ends, until the parent records its
+// completion notice. Its last writes can land in a band the card has already read. Once it has
+// written nothing for a band, its key becomes its exact revision, so the card reads it once more.
+test('a background child that goes quiet without a completion notice reaches its final cost', () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  try {
+    vi.setSystemTime(Date.UTC(2026, 0, 1));
+    const child = writeTranscript([
+      userPrompt('Inspect', 0),
+      assistantText('Reading', 1, { input_tokens: 100, output_tokens: 10 }),
+    ]);
+    const stamp = () => {
+      const now = new Date(Date.now());
+      fs.utimesSync(child, now, now);
+    };
+    stamp();
+    const turns = [
+      {
+        agents: [{ id: 'child', description: 'Inspect', agentType: null, status: 'async_launched', toolUseId: 'call' }],
+      },
+    ] as unknown as Parameters<typeof agentSpendDependencyKey>[0];
+    const cache = new AgentSpendCache();
+    let reads = 0;
+    let drawn = '';
+    let shown = 0;
+    // One host poll: a moved key starts one worker read, and both take one clock reading.
+    const poll = () => {
+      const now = Date.now();
+      const key = agentSpendDependencyKey(
+        turns,
+        () => child,
+        (file) => childSpendVersion('claude', file),
+        '',
+        [],
+        now,
+      );
+      if (key === drawn) {
+        return;
+      }
+      drawn = key;
+      shown = spendTokens(
+        readChildSpend(
+          cache,
+          child,
+          'async_launched',
+          childSpendVersion('claude', child),
+          (file) => {
+            reads++;
+            return readClaudeAgentSpend(file, [], true);
+          },
+          '',
+          true,
+          now,
+        ).models,
+      );
+    };
+    poll();
+    vi.advanceTimersByTime(1_000);
+    fs.appendFileSync(child, JSON.stringify(assistantText('Done', 2, { input_tokens: 400, output_tokens: 40 })) + '\n');
+    stamp();
+    poll();
+    const final = spendTokens(readClaudeAgentSpend(child, [], true).models);
+    assert.ok(shown < final, 'the closing write left the band the card had read');
+    const poller = setInterval(poll, 5_000);
+    vi.advanceTimersByTime(60_000);
+    clearInterval(poller);
+    assert.equal(shown, final, `the row kept ${shown} tokens of ${final}`);
+    // The quiet child costs one read more, and nothing after it.
+    assert.equal(reads, 2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a shell-dispatched top-level session supplies its own duration and tool count', () => {
+  const file = writeTranscript([
+    userPrompt('Review the branch', 0),
+    assistantTool('Bash', 2, 'run-check', { command: 'npm test' }),
+    assistantText('The checks passed', 5, { input_tokens: 100, output_tokens: 20 }, 'high', 'end_turn'),
+  ]);
+  const spend = readClaudeAgentSpend(file, [], false);
+  assert.deepEqual(
+    [spend.found, spend.startedAt, spend.endedAt, spend.toolUses, spend.effort],
+    [true, Date.parse(at(0)), Date.parse(at(5)), 1, 'high'],
+  );
+  assert.equal(spend.models[0]?.usage.output, 20);
+});
+
+test('a dispatched session whose first turn has no readable timestamp keeps no start rather than the epoch', () => {
+  const file = writeTranscript([
+    userPrompt('Review the branch', 0, { timestamp: '' }),
+    assistantTool('Bash', 2, 'run-check', { command: 'npm test' }),
+    assistantText('The checks passed', 5, { input_tokens: 100, output_tokens: 20 }, 'high', 'end_turn'),
+  ]);
+  const spend = readClaudeAgentSpend(file, [], false);
+  // A turn whose timestamp did not parse reads a zero start. Reading that zero as a real time
+  // would put the span at the epoch, so it is skipped the way a missing start already is.
+  assert.equal(spend.startedAt, null);
+  assert.equal(spend.endedAt, Date.parse(at(5)));
+});
+
+test('a dispatched session whose first turn recorded a process end before its last record keeps the later time', () => {
+  const file = writeTranscript([
+    userPrompt('Review the branch', 0),
+    assistantTool('Bash', 2, 'run-check', { command: 'npm test' }),
+    assistantText('The checks passed', 5, { input_tokens: 100, output_tokens: 20 }, 'high', 'end_turn'),
+    // The recorded process end lands two seconds in, well before the turn's own last record
+    // five seconds in. The turn's own record still names the later time, and this read's span
+    // must keep it rather than fall back to the earlier process end.
+    costState(ms(0), 2_000),
+  ]);
+  const spend = readClaudeAgentSpend(file, [], false);
+  assert.equal(spend.endedAt, Date.parse(at(5)));
+});
+
+test('a filename-only launch and private output record do not create a dispatched link', () => {
+  const parent = writeTranscript(
+    claudeDispatchTranscript('C:/tools/dispatch.sh task.md', 'runner: claude\nid: 4f4bf298'),
+  );
+  assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent-dispatch' }), []);
+  assert.deepEqual(readSession(parent, 'parent-dispatch').turns[0]?.dispatchToolUseIds ?? [], []);
+  const native = writeTranscript(claudeDispatchTranscript('claude --bg task.md', 'runner: claude\nid: 4f4bf298'));
+  assert.deepEqual(readClaudeChildSessionReferences({ file: native, sessionId: 'parent-dispatch' }), []);
+});
+
+test('an interpreter-wrapped filename-only launch cannot link native background output', () => {
+  for (const command of [
+    'bash "C:/tools/dispatch.sh" task.md',
+    'sh "C:/tools/dispatch.sh" task.md',
+    'pwsh "C:/tools/dispatch.ps1" task.md',
+    'powershell "C:/tools/dispatch.ps1" task.md',
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, 'backgrounded · 4f4bf298 · Review branch'));
+    assert.deepEqual(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent-dispatch' }), [], command);
+    assert.deepEqual(readSession(parent, 'parent-dispatch').turns[0]?.dispatchToolUseIds ?? [], [], command);
+  }
+});
+
+test('Claude dispatch reads foreground JSON results and rejects quoted output from grep', () => {
+  const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const foreground = writeTranscript(
+    claudeDispatchTranscript(
+      'claude -p --output-format json "review"',
+      `null\n${JSON.stringify({ type: 'result', session_id: childId })}`,
+    ),
+  );
+  assert.equal(readClaudeChildSessionReferences({ file: foreground, sessionId: 'parent' })[0]?.sessionId, childId);
+  const quoted = writeTranscript(
+    claudeDispatchTranscript('grep "backgrounded ·" parent.jsonl', 'backgrounded · 4f4bf298 · Quoted child'),
+  );
+  assert.deepEqual(readClaudeChildSessionReferences({ file: quoted, sessionId: 'parent' }), []);
+});
+
+// The reported symptom: a parent resumed a session it did not start, such as one the reader
+// started, and that session drew as a Dispatched row whose cost joined the parent's delegated
+// work. The result of a resume names the resumed session's own id. The card's Dispatched row
+// reads the turn's launch ids, and the delegated cost reads the resolved references.
+test('a Claude command that resumes a session dispatches nothing, and a fork of one does', () => {
+  const resumedId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const forkId = '9a1c2e3f-1111-4222-8333-444455556666';
+  const catalog = [resumedId, forkId].map((sessionId) => ({
+    agent: 'claude' as const,
+    file: `C:/sessions/${sessionId}.jsonl`,
+    sessionId,
+    mtimeMs: 1,
+    size: 1,
+  }));
+  const result = (sessionId: string) => JSON.stringify({ type: 'result', session_id: sessionId });
+  for (const command of [
+    `claude -p --resume ${resumedId} --output-format json "follow up"`,
+    `claude -p "review \`printf task\`" --resume ${resumedId} --output-format json`,
+    `claude -p --resume=${resumedId} --output-format json "follow up"`,
+    `claude -p -r ${resumedId} --output-format json "follow up"`,
+    `claude -pr ${resumedId} --output-format json "follow up"`,
+    'claude -p --continue --output-format json "follow up"',
+    'claude -pc --output-format json "follow up"',
+    `cd C:/repo && claude -p --output-format json "first" && claude -p --resume ${resumedId} --output-format json "again"`,
+    `claude -p --output-format json "a" && claude -p --output-format json "b" && claude -p --resume ${resumedId} --output-format json "c"`,
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, result(resumedId)));
+    const scanned = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+    assert.deepEqual(
+      resolveClaudeDispatchReferences(scanned, catalog),
+      [],
+      `a resume became a dispatched link: ${command}`,
+    );
+    assert.deepEqual(
+      readSession(parent, 'parent').turns[0]?.dispatchToolUseIds ?? [],
+      [],
+      `a resume drew a Dispatched row: ${command}`,
+    );
+  }
+  for (const command of [
+    `claude -p --resume ${resumedId} --fork-session --output-format json "branch off"`,
+    `claude -p "review \`printf task\`" --resume ${resumedId} --fork-session --output-format json`,
+    'claude -p --continue --fork-session --output-format json "branch off"',
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, result(forkId)));
+    const scanned = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+    assert.deepEqual(
+      resolveClaudeDispatchReferences(scanned, catalog).map((reference) => reference.sessionId),
+      [forkId],
+      `a forked session lost its dispatched link: ${command}`,
+    );
+    assert.deepEqual(readSession(parent, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], command);
+  }
+});
+
+// A dispatching agent often passes its prompt on standard input, as a heredoc or a PowerShell
+// here-string, or as one argument through a heredoc inside a quoted command substitution. A
+// prompt about a review names flags. A word in it that reads as a resume flag must not drop
+// the dispatch, and a double quote in a substituted heredoc must not end the argument.
+test('a prompt passed as a heredoc or here-string never reads as a resume flag', () => {
+  const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const catalog = [
+    { agent: 'claude' as const, file: `C:/sessions/${childId}.jsonl`, sessionId: childId, mtimeMs: 1, size: 1 },
+  ];
+  const result = JSON.stringify({ type: 'result', session_id: childId });
+  const body = 'Never run claude --resume or -r, rm -rf, git -c core.pager=cat, python -c pass or git log -pretty.';
+  // An apostrophe in a here-string once put the word scan out of step with the quotes.
+  const spoken = "Don't pass --resume or -c here, and don't run rm -rf.";
+  const quoted = 'Check the 27" monitor, then never run claude --resume or -r (or -c | cat).';
+  // A lone double quote, then a body line that reads as its own resume if the mask ends early.
+  const resumeLine = `Check the 27" monitor and never run:\nclaude --resume ${childId}`;
+  for (const command of [
+    `claude -p --output-format json <<'EOF'\n${body}\nEOF`,
+    `claude -p --output-format json <<-EOF\n\t${body}\n\tEOF`,
+    `cat <<'EOF' | claude -p --output-format json\n${body}\nEOF`,
+    `claude -p --output-format json @'\n${spoken}\n'@`,
+    `claude -p --output-format json "$(cat <<'EOF'\n${quoted}\nEOF\n)"`,
+    `claude -p "$(cat <<'EOF'\n${quoted}\nEOF\n)" --output-format json`,
+    // Both bodies of two openers on one line are input.
+    `claude -p "$(cat <<'ONE' - <<'TWO'\nfirst\nONE\n${resumeLine}\nTWO\n)" --output-format json`,
+    `claude -p --output-format json <<'ONE' 3<<'TWO'\nfirst\nONE\nclaude --resume ${childId}\nTWO`,
+    // A quoted argument inside the substitution closes only itself.
+    `claude -p "$(cat "notes.md" - <<'EOF'\n${resumeLine}\nEOF\n)" --output-format json`,
+    // A body line ends a heredoc only when it is exactly the delimiter.
+    `claude -p "$(cat <<'EOF'\n  EOF  \n${resumeLine}\nEOF\n)" --output-format json`,
+    `claude -p --output-format json <<-EOF\n \tEOF\nclaude --resume ${childId}\n\tEOF`,
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, result));
+    const scanned = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+    assert.deepEqual(
+      resolveClaudeDispatchReferences(scanned, catalog).map((reference) => reference.sessionId),
+      [childId],
+      `a prompt on standard input dropped the dispatch: ${command}`,
+    );
+    assert.deepEqual(readSession(parent, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], command);
+  }
+});
+
+// The flags a resume can take, and the words around them that are not flags.
+test('a resume flag counts wherever Claude reads one, and nowhere else', () => {
+  const resumedId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const freshId = '9a1c2e3f-1111-4222-8333-444455556666';
+  const catalog = [resumedId, freshId].map((sessionId) => ({
+    agent: 'claude' as const,
+    file: `C:/sessions/${sessionId}.jsonl`,
+    sessionId,
+    mtimeMs: 1,
+    size: 1,
+  }));
+  const dispatched = (command: string, sessionId: string): boolean => {
+    const parent = writeTranscript(
+      claudeDispatchTranscript(command, JSON.stringify({ type: 'result', session_id: sessionId })),
+    );
+    const scanned = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+    const linked = resolveClaudeDispatchReferences(scanned, catalog).length > 0;
+    const drawn = (readSession(parent, 'parent').turns[0]?.dispatchToolUseIds ?? []).length > 0;
+    assert.equal(linked, drawn, `the link and the Dispatched row disagree: ${command}`);
+    return linked;
+  };
+  for (const command of [
+    `claude -p "follow up" --resume ${resumedId} --output-format json`,
+    `claude -p "say \\"hi\\"" --resume ${resumedId} --output-format json`,
+    `C:/Users/me/.local/bin/claude -p --resume ${resumedId} --output-format json "x"`,
+    `CLAUDE_CODE_ENTRYPOINT=cli claude -p --resume ${resumedId} --output-format json "x"`,
+    `claude.exe -p -r ${resumedId} --output-format json "x"`,
+    `"C:/Program Files/Claude/claude.exe" --resume ${resumedId} -p --output-format json "x"`,
+    // A double quote in a heredoc inside the quoted prompt must not end the words early.
+    `claude -p "$(cat <<'EOF'\nsay "hi\nEOF\n)" --resume ${resumedId} --output-format json`,
+    // `<<<` passes a string and opens no heredoc, so the words after it still count.
+    `claude -p "$(cat <<< 'hello')" --resume ${resumedId} --output-format json\necho finished`,
+  ]) {
+    assert.equal(dispatched(command, resumedId), false, `a resume became a dispatched link: ${command}`);
+  }
+  for (const command of [
+    'claude -p "run git -c core.pager=cat log --resume nothing" --output-format json',
+    "claude -p ' --resume later, -c too' --output-format json",
+    'claude -p "say \\" -c" --output-format json',
+    'claude -p --output-format json -- --resume',
+    // `-d` takes an optional value, so `r` here is its filter and not `-r`.
+    'claude -p -dr --output-format json "x"',
+    `claude -p --fork-session --resume ${resumedId} --output-format json "x"`,
+    'C:/Users/me/.local/bin/claude -p --output-format json "x"',
+    'CLAUDE_CODE_ENTRYPOINT=cli claude -p --output-format json "x"',
+    'claude.exe -p --output-format json "x"',
+  ]) {
+    assert.equal(dispatched(command, freshId), true, `a fresh launch lost its dispatched link: ${command}`);
+  }
+});
+
+test('Claude dispatch recognizes quoted native and opted-in wrapper paths', () => {
+  const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  for (const [command, output] of [
+    [
+      'bash "C:/tools/review helper.sh" --arc-dispatch task.md',
+      `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`,
+    ],
+    [
+      'python "C:/tools/dispatch.py" --arc-dispatch task.md',
+      `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`,
+    ],
+    [
+      'bash "C:/tools/dispatch.sh" --arc-dispatch task.md',
+      `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`,
+    ],
+    ['"C:/Program Files/Claude/claude.exe" --bg task', `backgrounded · 4f4bf298 · Quoted path`],
+  ]) {
+    const parent = writeTranscript(claudeDispatchTranscript(command, output));
+    assert.equal(
+      readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' })[0]?.sessionId,
+      output.startsWith('backgrounded') ? childId.slice(0, 8) : childId,
+      `the quoted launch was not read: ${command}`,
+    );
+  }
+});
+
+test('parenthesized dispatch arguments retain the linked child and launch identity', () => {
+  const file = writeTranscript(
+    claudeDispatchTranscript(
+      powershellDispatchCommand,
+      powershellDispatchExecution.stdout,
+      powershellDispatchExecution.id,
+    ),
+  );
+  const references = readClaudeChildSessionReferences({ file, sessionId: 'parent' });
+  assert.deepEqual(
+    references.map((reference) => [reference.sessionId, reference.toolUseIds]),
+    [['3f99580e', [powershellDispatchExecution.id]]],
+  );
+  const catalog = [
+    {
+      agent: 'claude' as const,
+      sessionId: '3f99580e-a054-4ce7-a686-c4e65f32f98a',
+      file: 'C:/sessions/child.jsonl',
+      size: 1,
+      mtimeMs: 1,
+    },
+  ];
+  const linked = resolveClaudeDispatchReferences(references, catalog);
+  assert.deepEqual(
+    linked.map((reference) => [reference.sessionId, reference.toolUseIds]),
+    [[catalog[0].sessionId, [powershellDispatchExecution.id]]],
+  );
+  assert.deepEqual(
+    resolveClaudeDispatchReferences(references, [
+      ...catalog,
+      { ...catalog[0], sessionId: '3f99580e-1111-4111-8111-111111111111' },
+    ]),
+    [],
+  );
+  assert.deepEqual(readSession(file, 'parent').turns[0].dispatchToolUseIds, [powershellDispatchExecution.id]);
+});
+
+test('parenthesized dispatch values preserve opt-in ownership and shell boundaries', () => {
+  const receipt = powershellDispatchExecution.stdout;
+  for (const command of [
+    'python dispatch.py --prompt (Join-Path root file) --message "review --arc-dispatch"',
+    'echo "python dispatch.py --prompt (Join-Path root file) --arc-dispatch"',
+    "python dispatch.py --prompt ('--arc-dispatch')",
+    'python dispatch.py --prompt (Join-Path root file | echo --arc-dispatch',
+    ') python dispatch.py --arc-dispatch',
+    'python dispatch.py --prompt (Join-Path root; file) --arc-dispatch',
+    'python dispatch.py --prompt (Join-Path root\nfile) --arc-dispatch',
+    'python dispatch.py --prompt $(Join-Path root file) --arc-dispatch',
+    'python dispatch.py --prompt @(Join-Path root file) --arc-dispatch',
+    'python dispatch.py --prompt <(Join-Path root file) --arc-dispatch',
+    'python dispatch.py --prompt name(Join-Path root file) --arc-dispatch',
+    'python dispatch.py --prompt (Join-Path root file)--arc-dispatch',
+    'python dispatch.py --prompt (Join-Path root file) --message "hello `" --arc-dispatch"',
+    'python dispatch.py --prompt (Join-Path root file) --message "hello \\" --arc-dispatch"',
+    'python dispatch.py --prompt (Write-Output `) --arc-dispatch | Out-String)',
+    'python dispatch.py --prompt (Write-Output `( --arc-dispatch | Out-String)',
+    'python show_receipt.py --input (Join-Path root receipt.txt) # --arc-dispatch',
+    'python show_receipt.py --input (Join-Path root receipt.txt) # " ; python fake.py --arc-dispatch',
+    'python show_receipt.py --input (Join-Path root receipt.txt) <# --arc-dispatch #>',
+    'python show_receipt.py --input (Join-Path root receipt.txt) <# " ; python fake.py --arc-dispatch\nclaude --bg task #>',
+  ]) {
+    const file = writeTranscript(claudeDispatchTranscript(command, receipt));
+    assert.equal(claudeLaunchKind(command), null, command);
+    assert.deepEqual(readClaudeChildSessionReferences({ file, sessionId: 'parent' }), [], command);
+  }
+  for (const command of [
+    'python outer.py --prompt (python inner.py --arc-dispatch)',
+    'python outer.py --prompt (Join-Path root file --arc-dispatch)',
+    'python outer.py --prompt (Join-Path root file) | python inner.py --arc-dispatch',
+    'python outer.py --prompt (claude --bg task)',
+    'python outer.py --prompt (Join-Path root file) --arc-dispatch <# " ; python fake.py --arc-dispatch #>',
+  ]) {
+    const native = command.includes('claude --bg');
+    assert.deepEqual(claudeLaunchKind(command), { kind: native ? 'native' : 'receipt', count: 1 }, command);
+    const output = native ? 'backgrounded · 3f99580e · Review' : receipt;
+    const file = writeTranscript(claudeDispatchTranscript(command, output));
+    assert.equal(readClaudeChildSessionReferences({ file, sessionId: 'parent' }).length, 1, command);
+    if (!native) {
+      const two = writeTranscript(claudeDispatchTranscript(command, receipt + receipt.replace('3f99580e', '4f4bf298')));
+      assert.deepEqual(readClaudeChildSessionReferences({ file: two, sessionId: 'parent' }), [], command);
+    }
+  }
+  const escaped = 'python outer.py --prompt (Write-Output `) | Out-String) --arc-dispatch';
+  assert.deepEqual(claudeLaunchKind(escaped, 'powershell'), { kind: 'receipt', count: 1 });
+  assert.equal(claudeLaunchKind(escaped, 'bash'), null);
+  assert.equal(claudeLaunchKind(escaped), null);
+});
+
+test('Bash backtick substitutions retain native launch and quoted text ownership', () => {
+  const result = JSON.stringify({ type: 'result', session_id: '3f99580e-a054-4ce7-a686-c4e65f32f98a' });
+  for (const command of [
+    'claude -p "review `printf task`" --output-format json',
+    'cd "`git rev-parse --show-toplevel`" && claude -p hi',
+  ]) {
+    const file = writeTranscript(claudeDispatchTranscript(command, result));
+    assert.deepEqual(claudeLaunchKind(command), { kind: 'native', count: 1 }, command);
+    assert.equal(readClaudeChildSessionReferences({ file, sessionId: 'parent' }).length, 1, command);
+    assert.deepEqual(readSession(file, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], command);
+  }
+  const command = 'echo "`date`" "; claude -p hi"';
+  const file = writeTranscript(claudeDispatchTranscript(command, result));
+  assert.equal(claudeLaunchKind(command), null);
+  assert.deepEqual(readClaudeChildSessionReferences({ file, sessionId: 'parent' }), []);
+  assert.deepEqual(readSession(file, 'parent').turns[0]?.dispatchToolUseIds ?? [], []);
+});
+
+test('Bash arithmetic grouping preserves independent dispatch receipts', () => {
+  const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
+  const receipt = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`;
+  for (const statement of [
+    'echo $((2*(3)))',
+    'echo $((2+(3)))',
+    'echo $((2*(3+(4))))',
+    '((2*(3)))',
+    'echo $((((1)+2)*(3)))',
+    '((x=((1)+2)*(3)))',
+  ]) {
+    const command = `${statement}; python child.py --arc-dispatch`;
+    const file = writeTranscript(claudeDispatchTranscript(command, receipt));
+    assert.deepEqual(claudeLaunchKind(command, 'bash'), { kind: 'receipt', count: 1 }, command);
+    assert.deepEqual(
+      readClaudeChildSessionReferences({ file, sessionId: 'parent' }).map((reference) => [
+        reference.sessionId,
+        reference.toolUseIds,
+      ]),
+      [[childId, ['dispatch-1']]],
+      command,
+    );
+    assert.deepEqual(readSession(file, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], command);
+  }
+  for (const text of ['"+(tag)"', "'*(tag)'", '\\+(tag)']) {
+    assert.deepEqual(claudeLaunchKind(`echo ${text}; python child.py --arc-dispatch`, 'bash'), {
+      kind: 'receipt',
+      count: 1,
+    });
+  }
+});
+
+test('Bash parameter defaults and conditional patterns preserve receipt ownership', () => {
+  const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
+  const receipt = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`;
+  for (const command of [
+    'echo ${unset_arc_var:-+(tag)}; python child.py --arc-dispatch',
+    '[[ $x == @(a|b) ]]; python child.py --arc-dispatch',
+    '[[ $x != +(a|b) ]]; python child.py --arc-dispatch',
+    '{ [[ $x == @(a|b) ]]; }; python child.py --arc-dispatch',
+    '! { [[ $x == @(a|b) ]]; }; python child.py --arc-dispatch',
+    'time [[ $x == +(a) ]]; python child.py --arc-dispatch',
+    'time -p [[ $x == +(a) ]]; python child.py --arc-dispatch',
+    'time -- [[ $x == +(a) ]]; python child.py --arc-dispatch',
+    'time -p -- [[ $x == +(a) ]]; python child.py --arc-dispatch',
+    '! time [[ $x == +(a) ]]; python child.py --arc-dispatch',
+    'time ! [[ $x == +(a) ]]; python child.py --arc-dispatch',
+    'if [[ $x == @(a|b) ]]; then python child.py --arc-dispatch; fi',
+    'echo ${unset_arc_var:-$(python child.py --arc-dispatch)}',
+    'python child.py --prompt [[ literal ]] --arc-dispatch',
+    'python child.py --prompt { [[ literal ]] --arc-dispatch',
+    'python child.py --prompt time -p -- [[ literal ]] --arc-dispatch',
+    'python child.py --prompt "{ [[ literal ]]" --arc-dispatch',
+    'python child.py --prompt "time -p -- [[ literal ]]" --arc-dispatch',
+  ]) {
+    const file = writeTranscript(claudeDispatchTranscript(command, receipt));
+    assert.deepEqual(
+      readClaudeChildSessionReferences({ file, sessionId: 'parent' }).map((reference) => [
+        reference.sessionId,
+        reference.toolUseIds,
+      ]),
+      [[childId, ['dispatch-1']]],
+      command,
+    );
+    assert.deepEqual(readSession(file, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], command);
+  }
+  for (const command of [
+    'echo ${unset_arc_var:-+(python child.py --arc-dispatch)}',
+    '[[ $x == @(claude|python) ]]',
+    'echo ${unset_arc_var:-$(echo @(tag))}; python child.py --arc-dispatch',
+    '[[ $(echo @(tag)) == tag ]]; python child.py --arc-dispatch',
+    'echo "{ [[ literal ]]; python child.py --arc-dispatch"',
+    'echo "time -p -- [[ literal ]]; python child.py --arc-dispatch"',
+    '"{ " [[ @(tag) ]]; python child.py --arc-dispatch',
+    '"time" [[ @(tag) ]]; python child.py --arc-dispatch',
+    '\\{ [[ @(tag) ]]; python child.py --arc-dispatch',
+    'ti\\me [[ @(tag) ]]; python child.py --arc-dispatch',
+  ]) {
+    const output = `${receipt}\n${JSON.stringify({ type: 'result', session_id: childId })}`;
+    const file = writeTranscript(claudeDispatchTranscript(command, output));
+    assert.deepEqual(readClaudeChildSessionReferences({ file, sessionId: 'parent' }), [], command);
+    assert.deepEqual(readSession(file, 'parent').turns[0]?.dispatchToolUseIds ?? [], [], command);
+  }
+});
+
+test('Bash backtick heredocs preserve outer receipt and resume ownership', () => {
+  const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
+  const result = JSON.stringify({ type: 'result', session_id: childId });
+  const receipt = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`;
+  for (const statement of [
+    'echo `cat <<EOF #comment\nx\nEOF`',
+    "echo `cat <<-'EOF' #comment\n\tx\n\tEOF`",
+    "echo `cat <<'ONE' 3<<'TWO' #comment\nx\nONE\ny\nTWO`",
+  ]) {
+    const resumed = `claude -p fresh --output-format text; ${statement}; claude --resume ${childId} --output-format json`;
+    const resumedFile = writeTranscript(claudeDispatchTranscript(resumed, `fresh-response\n${result}`));
+    assert.deepEqual(readClaudeChildSessionReferences({ file: resumedFile, sessionId: 'parent' }), [], resumed);
+    assert.deepEqual(readSession(resumedFile, 'parent').turns[0]?.dispatchToolUseIds ?? [], [], resumed);
+    const command = `${statement}; python child.py --arc-dispatch`;
+    const file = writeTranscript(claudeDispatchTranscript(command, receipt));
+    assert.deepEqual(
+      readClaudeChildSessionReferences({ file, sessionId: 'parent' }).map((reference) => [
+        reference.sessionId,
+        reference.toolUseIds,
+      ]),
+      [[childId, ['dispatch-1']]],
+      command,
+    );
+    assert.deepEqual(readSession(file, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], command);
+  }
+});
+
+test('Bash backtick comments preserve later launch ownership', () => {
+  const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
+  const result = JSON.stringify({ type: 'result', session_id: childId });
+  const receipt = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: childId })}`;
+  for (const statement of [
+    'echo `true #x`',
+    'echo `true #x\n`',
+    'echo `true # "unterminated`',
+    'echo `true #x\\` ignored`',
+  ]) {
+    const resumed = `claude -p fresh --output-format text; ${statement}; claude -p follow-up --resume ${childId} --output-format json`;
+    const resumedFile = writeTranscript(claudeDispatchTranscript(resumed, `fresh-response\n${result}`));
+    assert.equal(claudeLaunchKind(resumed, 'bash'), null, resumed);
+    assert.equal(claudeLaunchKind(resumed), null, resumed);
+    assert.deepEqual(readClaudeChildSessionReferences({ file: resumedFile, sessionId: 'parent' }), [], resumed);
+    assert.deepEqual(readSession(resumedFile, 'parent').turns[0]?.dispatchToolUseIds ?? [], [], resumed);
+    const fresh = `${statement}; python child.py --arc-dispatch`;
+    const freshFile = writeTranscript(claudeDispatchTranscript(fresh, receipt));
+    assert.deepEqual(
+      readClaudeChildSessionReferences({ file: freshFile, sessionId: 'parent' }).map((reference) => [
+        reference.sessionId,
+        reference.toolUseIds,
+      ]),
+      [[childId, ['dispatch-1']]],
+      fresh,
+    );
+    assert.deepEqual(readSession(freshFile, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], fresh);
+  }
+  for (const statement of ["echo 'literal ` #x'", 'echo "literal \\` #x"', 'echo literal\\`#x']) {
+    const command = `${statement}; python child.py --arc-dispatch`;
+    assert.deepEqual(claudeLaunchKind(command, 'bash'), { kind: 'receipt', count: 1 }, command);
+  }
+  const unmatched = 'claude -p fresh --output-format text; echo `true #x; python child.py --arc-dispatch';
+  const unmatchedFile = writeTranscript(claudeDispatchTranscript(unmatched, result));
+  assert.equal(claudeLaunchKind(unmatched, 'bash'), null);
+  assert.deepEqual(readClaudeChildSessionReferences({ file: unmatchedFile, sessionId: 'parent' }), []);
+  const nested = 'echo `python child.py --arc-dispatch`';
+  const nestedFile = writeTranscript(claudeDispatchTranscript(nested, receipt));
+  assert.deepEqual(claudeLaunchKind(nested, 'bash'), { kind: 'receipt', count: 1 });
+  assert.deepEqual(
+    readClaudeChildSessionReferences({ file: nestedFile, sessionId: 'parent' }).map((reference) => [
+      reference.sessionId,
+      reference.toolUseIds,
+    ]),
+    [[childId, ['dispatch-1']]],
+  );
+  const excessFile = writeTranscript(
+    claudeDispatchTranscript(nested, `${receipt}\n${receipt.replace('3f99580e', '4f4bf298')}`),
+  );
+  assert.deepEqual(readClaudeChildSessionReferences({ file: excessFile, sessionId: 'parent' }), []);
+});
+
+test('Bash length expansions and literal hash tails preserve dispatch ownership', () => {
+  const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
+  const result = JSON.stringify({ type: 'result', session_id: childId });
+  const statements = [
+    'printf "%s\\n" ${tag}#note',
+    'printf "%s\\n" ${tags[@]}#note',
+    'printf "%s\\n" $(printf tag)#note',
+    'n=${#tasks[@]}',
+    'n=${#tag}',
+    'printf "%s\\n" $((1 + 1))#note',
+    'printf "%s\\n" <(printf tag)#note',
+    'printf "%s\\n" path#note',
+    'printf "%s\\n" "path "#note',
+    "printf '%s\\n' 'path '#note",
+    'printf "%s\\n" path\\#note',
+    'printf "%s\\n" path\\ #note',
+    'printf "%s\\n" path{#note',
+    'printf "%s\\n" path}#note',
+    'printf "%s\\n" {foo,bar}#note',
+    'printf "%s\\n" {1..3}#note',
+    'printf "%s\\n" {foo}#note',
+    'printf "%s\\n" {}#note',
+    'printf "%s\\n" {#note',
+    'printf "%s\\n" }#note',
+  ];
+  for (const statement of statements) {
+    const resumed = `claude -p fresh --output-format text; ${statement}; claude -p follow-up --resume ${childId} --output-format json`;
+    const resumedFile = writeTranscript(claudeDispatchTranscript(resumed, `fresh-response\npath#note\n${result}`));
+    assert.deepEqual(readClaudeChildSessionReferences({ file: resumedFile, sessionId: 'parent' }), [], resumed);
+    assert.equal(claudeLaunchKind(resumed, 'bash'), null, resumed);
+    assert.deepEqual(readSession(resumedFile, 'parent').turns[0]?.dispatchToolUseIds ?? [], [], resumed);
+
+    const fresh = `${statement}; claude -p summarize --output-format json`;
+    const freshFile = writeTranscript(claudeDispatchTranscript(fresh, result));
+    assert.deepEqual(claudeLaunchKind(fresh, 'bash'), { kind: 'native', count: 1 }, fresh);
+    assert.equal(
+      readClaudeChildSessionReferences({ file: freshFile, sessionId: 'parent' })[0]?.sessionId,
+      childId,
+      fresh,
+    );
+    assert.deepEqual(readSession(freshFile, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1'], fresh);
+  }
+});
+
+test('real comments retain their launch boundaries after shell expressions', () => {
+  const receipt = powershellDispatchExecution.stdout;
+  for (const command of [
+    'printf tag # ; python fake.py --arc-dispatch',
+    'printf "tag " # ; python fake.py --arc-dispatch',
+    'printf ${tag} # ; python fake.py --arc-dispatch',
+    'printf $(printf tag) # ; python fake.py --arc-dispatch',
+    'python show_receipt.py --input (Join-Path root receipt.txt)# --arc-dispatch',
+    'python show_receipt.py --input (Join-Path root receipt.txt)<# --arc-dispatch #>',
+  ]) {
+    const file = writeTranscript(claudeDispatchTranscript(command, receipt));
+    assert.equal(claudeLaunchKind(command), null, command);
+    assert.deepEqual(readClaudeChildSessionReferences({ file, sessionId: 'parent' }), [], command);
+  }
+  const scriptBlock = 'Write-Output {tag}# ; python fake.py --arc-dispatch';
+  assert.equal(claudeLaunchKind(scriptBlock, 'powershell'), null);
+  assert.equal(claudeLaunchKind(scriptBlock), null);
+});
+
+test('unknown shell context rejects conflicting native and receipt launch identities', () => {
+  const native = 'claude -p fresh; echo {tag}#note; claude --resume existing';
+  assert.equal(claudeLaunchKind(native, 'bash'), null);
+  assert.deepEqual(claudeLaunchKind(native, 'powershell'), { kind: 'native', count: 1 });
+  assert.equal(claudeLaunchKind(native), null);
+  const receipt = 'echo {tag}#note; python child.py --arc-dispatch';
+  assert.deepEqual(claudeLaunchKind(receipt, 'bash'), { kind: 'receipt', count: 1 });
+  assert.equal(claudeLaunchKind(receipt, 'powershell'), null);
+  assert.equal(claudeLaunchKind(receipt), null);
+  const differentLaunches =
+    'echo {tag}#note; python first.py --arc-dispatch\n<#\necho text\n#>; python second.py --arc-dispatch';
+  assert.deepEqual(claudeLaunchKind(differentLaunches, 'bash'), { kind: 'receipt', count: 1 });
+  assert.deepEqual(claudeLaunchKind(differentLaunches, 'powershell'), { kind: 'receipt', count: 1 });
+  assert.equal(claudeLaunchKind(differentLaunches), null);
+  for (const prefix of ['@', '?', '!', '+', '*']) {
+    const command = `python child.py --arc-dispatch; echo ${prefix}(tag)#note; claude --resume existing`;
+    assert.equal(claudeLaunchKind(command, 'bash'), null, command);
+    assert.equal(claudeLaunchKind(command), null, command);
+  }
+});
+
+test('Claude dispatch resolution indexes catalog identifiers once', () => {
+  let identifierReads = 0;
+  const catalog = Array.from({ length: 20 }, (_unused, index) => ({
+    agent: 'claude' as const,
+    file: `C:/sessions/${index}.jsonl`,
+    get sessionId() {
+      identifierReads++;
+      return `${index.toString(16).padStart(8, '0')}-1111-1111-1111-111111111111`;
+    },
+    mtimeMs: 1,
+    size: 1,
+  }));
+  const references = catalog.map((_session, index) => ({
+    kind: 'dispatch' as const,
+    agent: 'claude' as const,
+    parentSessionId: 'parent',
+    sessionId: index.toString(16).padStart(8, '0'),
+    file: null,
+    toolUseIds: [`dispatch-${index}`],
+    name: null,
+    owned: false,
+  }));
+  assert.equal(resolveClaudeDispatchReferences(references, catalog).length, catalog.length);
+  assert.equal(identifierReads, catalog.length, 'resolution rescanned the complete catalog for each reference');
+});
+
+test('Claude child discovery reaches verified grandchildren once and keeps their direct parent edges', () => {
+  const root = tempDir('claude-child-tree-');
+  const parentId = 'parent-tree';
+  const parent = path.join(root, `${parentId}.jsonl`);
+  const childDir = path.join(root, parentId, 'subagents');
+  const child = path.join(childDir, 'agent-child-tree.jsonl');
+  const grandchild = path.join(childDir, 'agent-grandchild-tree.jsonl');
+  fs.mkdirSync(childDir, { recursive: true });
+  const result = (toolUseId: string, agentId: string, second: number, sidechain = false) => ({
+    type: 'user',
+    timestamp: at(second),
+    isSidechain: sidechain,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'done' }] },
+    toolUseResult: { agentId, status: 'completed', totalToolUseCount: 1 },
+  });
+  fs.writeFileSync(
+    parent,
+    [
+      { ...userPrompt('delegate child', 0), cwd: 'c:/repo' },
+      assistantTool('Agent', 1, 'launch-child', { description: 'Child' }),
+      result('launch-child', 'child-tree', 2),
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  fs.writeFileSync(
+    child,
+    [
+      { ...userPrompt('delegate grandchild', 3), isSidechain: true, cwd: 'c:/repo' },
+      { ...assistantTool('Agent', 4, 'launch-grandchild', { description: 'Grandchild' }), isSidechain: true },
+      result('launch-grandchild', 'grandchild-tree', 5, true),
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  fs.writeFileSync(
+    grandchild,
+    JSON.stringify({ ...userPrompt('finish nested work', 6), isSidechain: true, cwd: 'c:/repo' }) + '\n',
+  );
+  const stat = fs.statSync(parent);
+  const visits = new Map<string, number>();
+  const children = discoverClaudeChildSessionFiles(
+    [
+      {
+        agent: 'claude',
+        file: parent,
+        sessionId: parentId,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+      },
+    ],
+    ['c:/repo'],
+    (session) => {
+      visits.set(session.sessionId, (visits.get(session.sessionId) ?? 0) + 1);
+      return readClaudeChildSessionReferences(session);
+    },
+  );
+  assert.deepEqual(
+    children.map((session) => [session.sessionId, session.parentSessionId]),
+    [
+      ['child-tree', parentId],
+      ['grandchild-tree', 'child-tree'],
+    ],
+  );
+  assert.deepEqual([...visits].sort(), [
+    ['child-tree', 1],
+    ['grandchild-tree', 1],
+    [parentId, 1],
+  ]);
+});
+
+test('Claude child discovery reaches a nested child whose launch result is text alone', () => {
+  const root = tempDir('claude-child-text-result-');
+  const parentId = 'parent-text';
+  const parent = path.join(root, `${parentId}.jsonl`);
+  const childDir = path.join(root, parentId, 'subagents');
+  fs.mkdirSync(childDir, { recursive: true });
+  writeRecords(parent, [
+    { ...userPrompt('delegate child', 0), cwd: 'c:/repo' },
+    assistantTool('Agent', 1, 'launch-child', { description: 'Child' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'launch-child', content: 'done' }] },
+      toolUseResult: { agentId: 'child-1', status: 'completed', totalToolUseCount: 3 },
+    },
+  ]);
+  writeRecords(path.join(childDir, 'agent-child-1.jsonl'), [
+    { ...userPrompt('delegate two nested agents', 3), isSidechain: true, cwd: 'c:/repo' },
+    { ...assistantTool('Agent', 4, 'launch-fg', { description: 'Nested foreground' }), isSidechain: true },
+    nestedResult('launch-fg', 5, nestedForegroundResult('adf3e8d2cb8d606c4', 28814, 2, 19553)),
+    { ...assistantTool('Agent', 6, 'launch-bg', { description: 'Nested background' }), isSidechain: true },
+    nestedResult('launch-bg', 7, nestedBackgroundResult('a17339eacb3e8a85d')),
+    { ...assistantTool('Agent', 8, 'launch-report', { description: 'Nested report' }), isSidechain: true },
+    nestedResult('launch-report', 9, nestedReportEndingOnAnId),
+  ]);
+  for (const id of ['adf3e8d2cb8d606c4', 'a17339eacb3e8a85d', 'unrelated-child']) {
+    writeRecords(path.join(childDir, `agent-${id}.jsonl`), [
+      { ...userPrompt('nested work', 8), isSidechain: true, cwd: 'c:/repo' },
+    ]);
+  }
+  const stat = fs.statSync(parent);
+  const children = discoverClaudeChildSessionFiles(
+    [{ agent: 'claude', file: parent, sessionId: parentId, mtimeMs: stat.mtimeMs, size: stat.size }],
+    ['c:/repo'],
+    readClaudeChildSessionReferences,
+  );
+  assert.deepEqual(
+    children.map((session) => [session.sessionId, session.parentSessionId, session.toolUseIds]),
+    [
+      ['child-1', parentId, ['launch-child']],
+      ['adf3e8d2cb8d606c4', 'child-1', ['launch-fg']],
+      ['a17339eacb3e8a85d', 'child-1', ['launch-bg']],
+    ],
+  );
+});
+
+test('Claude child discovery validates each reference once across many parents and children', () => {
+  const root = tempDir('claude-child-linear-');
+  const parents = Array.from({ length: 12 }, (_unused, parentIndex) => ({
+    agent: 'claude' as const,
+    file: path.join(root, `parent-${parentIndex}.jsonl`),
+    sessionId: `parent-${parentIndex}`,
+    mtimeMs: parentIndex,
+    size: 1,
+  }));
+  const references = new Map(
+    parents.map((parent, parentIndex) => [
+      parent.sessionId,
+      Array.from({ length: 8 }, (_unused, childIndex) => ({
+        parentSessionId: parent.sessionId,
+        sessionId: `child-${parentIndex}-${childIndex}`,
+        file: path.join(root, `agent-child-${parentIndex}-${childIndex}.jsonl`),
+        toolUseIds: [`launch-${parentIndex}-${childIndex}`],
+      })),
+    ]),
+  );
+  let validations = 0;
+  const found = discoverClaudeChildSessions(
+    parents,
+    ['c:/repo'],
+    (session) => references.get(session.sessionId) ?? [],
+    {
+      read(reference) {
+        validations++;
+        return {
+          agent: 'claude',
+          ...reference,
+          mtimeMs: 1,
+          size: 1,
+          cwd: 'c:/repo',
+          agentRun: true,
+          childTranscript: true,
+        };
+      },
+    },
+  );
+  const referenceCount = parents.length * 8;
+  assert.equal(found.children.length, referenceCount);
+  assert.equal(
+    validations,
+    referenceCount,
+    'discovery revalidated references it had already accepted while it walked later children',
+  );
+});
+
+test('Claude child validation reuses cwd until the child revision changes', () => {
+  const root = tempDir('claude-child-validation-cache-');
+  const file = path.join(root, 'agent-child.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  let cwdReads = 0;
+  const cache = new ClaudeChildSessionCache(() => {
+    cwdReads++;
+    return 'c:/repo';
+  });
+  const reference = { parentSessionId: 'parent', sessionId: 'child', file, toolUseIds: ['launch'] };
+  assert.ok(cache.read(reference, ['c:/repo']));
+  assert.ok(cache.read(reference, ['c:/repo']));
+  assert.equal(cwdReads, 1, 'an unchanged child repeated its head read');
+  fs.appendFileSync(file, '{}\n');
+  assert.ok(cache.read(reference, ['c:/repo']));
+  assert.equal(cwdReads, 2, 'a changed child reused validation from an older revision');
+});
+
+test('Claude child validation rereads cwd when a same-size same-mtime file replaces the child', () => {
+  const root = tempDir('claude-child-validation-identity-');
+  const file = path.join(root, 'agent-child.jsonl');
+  const replacement = path.join(root, 'replacement.jsonl');
+  fs.writeFileSync(file, 'c:/repo\n');
+  const fixedTime = new Date(Math.floor(Date.now() / 1_000) * 1_000);
+  fs.utimesSync(file, fixedTime, fixedTime);
+  const original = fs.statSync(file);
+  let cwdReads = 0;
+  const cache = new ClaudeChildSessionCache((target) => {
+    cwdReads++;
+    return fs.readFileSync(target, 'utf8').trim();
+  });
+  const reference = { parentSessionId: 'parent', sessionId: 'child', file, toolUseIds: ['launch'] };
+  assert.equal(cache.read(reference, ['c:/repo'])?.cwd, 'c:/repo');
+  fs.writeFileSync(replacement, 'd:/repo\n');
+  fs.unlinkSync(file);
+  fs.renameSync(replacement, file);
+  fs.utimesSync(file, original.atime, original.mtime);
+  const replaced = fs.statSync(file);
+  assert.equal(replaced.size, original.size);
+  assert.equal(replaced.mtimeMs, original.mtimeMs);
+  assert.ok(
+    replaced.dev !== original.dev || replaced.ino !== original.ino,
+    'the fixture did not replace the child file identity',
+  );
+  assert.equal(
+    cache.read(reference, ['d:/repo'])?.cwd,
+    'd:/repo',
+    "a replacement child reused the old file identity's working directory",
+  );
+  assert.equal(cwdReads, 2);
+});
+
+test('a background subagent stays running until its notification arrives', () => {
+  const file = writeTranscript([
+    userPrompt('run it in the background', 0),
+    assistantTool('Agent', 1, 'bg1', { description: 'Long scan', subagent_type: 'general-purpose' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'bg1', content: 'launched' }] },
+      toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'x1', description: 'Long scan' },
+    },
+    assistantText('Launched.', 3),
+  ]);
+  const [running] = readTurns(file, 'sess');
+  assert.equal(running.agents[0].status, 'running');
+  assert.equal(
+    running.agents[0].id,
+    'x1',
+    'the async launch result identified the child without reporting a final tool count',
+  );
+
+  const withNotice = writeTranscript([
+    userPrompt('run it in the background', 0),
+    assistantTool('Agent', 1, 'bg1', { description: 'Long scan' }),
+    {
+      type: 'user',
+      timestamp: at(3),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content: '<task-notification><tool-use-id>bg1</tool-use-id><status>completed</status></task-notification>',
+      },
+    },
+    assistantText('It finished.', 4),
+  ]);
+  assert.equal(readTurns(withNotice, 'sess')[0].agents[0].status, 'completed');
+});
+
+test('turn-start discovery parses only user records in parent and child modes', () => {
+  const records = [
+    ...Array.from({ length: 200 }, (_unused, index) =>
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: at(index),
+        message: { role: 'assistant', content: [] },
+      }),
+    ),
+    JSON.stringify({ ...userPrompt('child prompt', 201), isSidechain: true }),
+  ];
+  const file = path.join(tempDir('turn-start-prefilter-'), 'session.jsonl');
+  fs.writeFileSync(file, `${records.join('\n')}\n`);
+  const parse = JSON.parse;
+  let parses = 0;
+  const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation(((
+    text: string,
+    reviver?: (this: unknown, key: string, value: unknown) => unknown,
+  ) => {
+    parses++;
+    return parse(text, reviver);
+  }) as typeof JSON.parse);
+  try {
+    assert.deepEqual(readSessionTurnStarts(file, undefined, true).starts, [ms(201)]);
+    assert.equal(parses, 1, 'turn-start discovery parsed records that cannot open a turn');
+  } finally {
+    parseSpy.mockRestore();
+  }
+});
+
+test('an API error is reported, and is cleared when the model speaks afterwards', () => {
+  const failed = writeTranscript([
+    userPrompt('retry', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      isApiErrorMessage: true,
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [{ type: 'text', text: 'Usage credits are required for this model.' }],
+      },
+    },
+  ]);
+  assert.equal(readTurns(failed, 'sess')[0].error, 'Usage credits are required for this model.');
+
+  const recovered = writeTranscript([
+    userPrompt('retry', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      isApiErrorMessage: true,
+      message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'Overloaded.' }] },
+    },
+    assistantText('Second attempt worked.', 2),
+  ]);
+  const [turn] = readTurns(recovered, 'sess');
+  assert.equal(turn.error, null);
+  assert.equal(turn.summary, 'Second attempt worked.');
+});
+
+test('a turn whose prompt falls outside the tail window is dropped', () => {
+  const filler = 'x'.repeat(4000);
+  const file = writeTranscript([
+    userPrompt('older ask', 0),
+    assistantText(filler, 1),
+    userPrompt('newer ask', 2),
+    assistantText('Recent work.', 3),
+  ]);
+  const turns = readTurns(file, 'sess', { tailBytes: 2000 });
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].prompt, 'newer ask');
+});
+
+test('the selected Claude session discovers its newest turn through disjoint older ranges', async () => {
+  const file = writeTranscript([
+    userPrompt('older ask', 0),
+    assistantAnswer('Older work.', 1),
+    userPrompt('newest ask', 2),
+    assistantTool('Bash', 3, 'wide', { command: `x${'😀'.repeat(2500)}` }),
+    assistantAnswer('Newest work.', 4),
+  ]);
+
+  const initial = readSession(file, 'sess', { tailBytes: 256, prepareNewestTurnDiscovery: true });
+  assert.deepEqual(initial.turns, [], 'an ordinary tail that starts mid-turn drew a partial card');
+  assert.ok(initial.newestTurnCursor);
+  const ranges: Array<[number, number]> = [];
+  let yields = 0;
+  const found = await discoverClaudeNewestTurn(file, initial.newestTurnCursor, {
+    chunkBytes: 257,
+    readRange: recordingRangeReader(ranges),
+    pause: async () => {
+      yields += 1;
+    },
+  });
+  assert.equal(found.kind, 'found');
+  assert.ok(yields > 1, 'the fixture no longer crosses several yielded chunks');
+  for (let i = 1; i < ranges.length; i += 1) {
+    assert.equal(ranges[i][1], ranges[i - 1][0], 'two discovery reads overlap or leave a gap');
+  }
+  assert.equal(new Set(ranges.map(([start, end]) => `${start}:${end}`)).size, ranges.length);
+  if (found.kind !== 'found') {
+    return;
+  }
+  const recovered = readSession(file, 'sess', { tailBytes: found.readBytes, maxTurns: 1 });
+  assert.deepEqual(
+    recovered.turns.map((turn) => [turn.prompt, turn.summary]),
+    [['newest ask', 'Newest work.']],
+  );
+  assert.equal(recovered.turnLimitReached, false);
+});
+
+test('newest Claude turn discovery notices cancellation and file replacement', async () => {
+  const file = writeTranscript([
+    userPrompt('newest ask', 0),
+    assistantTool('Bash', 1, 'wide', { command: 'x'.repeat(5000) }),
+    assistantAnswer('Newest work.', 2),
+  ]);
+  const initial = readSession(file, 'sess', { tailBytes: 128, prepareNewestTurnDiscovery: true });
+  assert.ok(initial.newestTurnCursor);
+  const controller = new AbortController();
+  const cancelled = await discoverBackwardBoundary(file, initial.newestTurnCursor, () => false, {
+    chunkBytes: 64,
+    signal: controller.signal,
+    pause: async () => controller.abort(),
+  });
+  assert.equal(cancelled.kind, 'cancelled');
+
+  const cursor = tailOf(file, 128, true).cursor;
+  assert.ok(cursor);
+  const replacement = `${file}.replacement`;
+  fs.writeFileSync(replacement, Buffer.alloc(cursor.revision.size, 0x20));
+  fs.rmSync(file);
+  fs.renameSync(replacement, file);
+  const replaced = fs.statSync(file);
+  assert.equal(replaced.size, cursor.revision.size);
+  assert.ok(
+    replaced.dev !== cursor.revision.dev || replaced.ino !== cursor.revision.ino,
+    'the fixture did not replace the transcript identity',
+  );
+  assert.equal((await discoverClaudeNewestTurn(file, cursor, { chunkBytes: 64 })).kind, 'stale');
+});
+
+test('maxTurns keeps the newest turns', () => {
+  const lines: object[] = [];
+  for (let i = 0; i < 6; i++) {
+    lines.push(userPrompt(`ask ${i}`, i * 2), assistantText(`did ${i}`, i * 2 + 1));
+  }
+  const read = readSession(writeTranscript(lines), 'sess', { maxTurns: 2 });
+  assert.deepEqual(
+    read.turns.map((t) => t.prompt),
+    ['ask 4', 'ask 5'],
+  );
+  assert.equal(read.turnLimitReached, true);
+});
+
+test('the session title is taken from the last ai-title entry', () => {
+  const rich = `\uE200visualize\uE202${JSON.stringify({ path: path.resolve('fixtures', 'rail.html') })}\uE201`;
+  const file = writeTranscript([
+    { type: 'ai-title', aiTitle: 'First guess at a title' },
+    userPrompt('do the thing', 0),
+    { type: 'ai-title', aiTitle: `Timeline view\n${rich}\nfor agent turns` },
+    assistantText('Done.', 1),
+  ]);
+  assert.equal(readTurns(file, 'sess')[0].sessionTitle, 'Timeline view for agent turns');
+});
+
+test('cleanPrompt strips IDE context and slash-command scaffolding', () => {
+  const raw = '<ide_selection>The user selected lines 1 to 2 from a.ts</ide_selection>\ncommit do not push yet';
+  assert.equal(cleanPrompt(raw), 'commit do not push yet');
+  assert.equal(cleanPrompt('<command-name>/model</command-name>\n<command-args>opus</command-args>'), '');
+  assert.equal(
+    cleanPrompt(
+      '<command-message>write-ppm-docs</command-message>\n<command-name>/write-ppm-docs</command-name>\n<command-args>review the plugin pages</command-args>',
+    ),
+    '/write-ppm-docs review the plugin pages',
+    'the command and everything typed after it are cut out of the card',
+  );
+});
+
+test('headlineOf skips section headings and returns the first line of substance', () => {
+  assert.equal(headlineOf('## TLDR\n\n- Review fixes are in.\n- More detail.'), 'Review fixes are in.');
+  assert.equal(headlineOf('**Summary:**\n\nAll three findings are addressed.'), 'All three findings are addressed.');
+  assert.equal(headlineOf('Done. The hook is restored.'), 'Done. The hook is restored.');
+  assert.equal(headlineOf('1. Fixed the parser'), 'Fixed the parser');
+  assert.equal(headlineOf('See [store.ts](src/store.ts) for the rest'), 'See store.ts for the rest');
+  assert.equal(headlineOf(''), '');
+});
+
+test("headlineOf keeps a code span's own underscores and drops only its backticks", () => {
+  // The reported bug: a collapsed headline turned `CODEX_SESSION_ID` into CODEXSESSIONID,
+  // because the old stripMarkdown deleted every underscore in the line, not only the ones
+  // marking emphasis. This is the exact shape of the report.
+  assert.equal(
+    headlineOf('**Phase 0 is done.** Codex publishes `CODEX_SESSION_ID`, so both agents can name themselves.'),
+    'Phase 0 is done. Codex publishes CODEX_SESSION_ID, so both agents can name themselves.',
+  );
+  assert.equal(headlineOf('Run `a*b_c` to reproduce it.'), 'Run a*b_c to reproduce it.');
+});
+
+test('headlineOf keeps underscores and stray asterisks outside emphasis, and still strips real emphasis', () => {
+  // The reported bug: "Renamed my_file.py to calc_total.py" read as "Renamed myfile.py to
+  // calctotal.py" in the folded headline, because the strip deleted every underscore and
+  // asterisk in the line rather than only the ones marking GFM emphasis.
+  assert.equal(headlineOf('Renamed my_file.py to calc_total.py'), 'Renamed my_file.py to calc_total.py');
+  // A lone `*` with spaces on both sides is not an emphasis marker by the GFM rule.
+  assert.equal(headlineOf('The answer is 2 * 3, not 5.'), 'The answer is 2 * 3, not 5.');
+  // Real emphasis still loses its markers, on both punctuation marks.
+  assert.equal(headlineOf('**Bold** and *em* and _also em_ are done.'), 'Bold and em and also em are done.');
+});
+
+test('headlineOf agrees with what marked renders for nested, tripled and intraword markers', () => {
+  // Each line is checked against renderInlineMarkdown's own visible text, the same renderer
+  // headlineHtmlFor compares the plain headline against, rather than a hand-written guess.
+  const cases = [
+    'nested **bold *em* inside** text',
+    '*em **strong** em* text',
+    'a ***bold em*** line',
+    'a ___bold em___ line',
+    'call __init__ to set it up',
+    'use *args and **kwargs here',
+    'snake_case stays as is',
+  ];
+  for (const line of cases) {
+    const rendered = renderInlineMarkdown(line).replace(/<\/?(strong|em)>/g, '');
+    assert.equal(headlineOf(line), rendered, line);
+  }
+});
+
+test('headlineOf skips a fence line and reads the content it encloses', () => {
+  // The reported bug: a summary opening with a fenced block, for example "```markdown",
+  // turned the fence's language tag into the headline once its backticks were stripped.
+  assert.equal(headlineOf('```markdown\n**Done** - the report is ready.\n```'), 'Done - the report is ready.');
+  assert.equal(headlineOf('```\nPlain code line.\n```'), 'Plain code line.');
+});
+
+test('headlineMarkdownOf picks the same line as headlineOf and keeps its markup', () => {
+  const summary = '## TLDR\n\n- Ran `npm test` and **all** pass';
+  assert.equal(headlineOf(summary), 'Ran npm test and all pass');
+  assert.equal(headlineMarkdownOf(summary), 'Ran `npm test` and **all** pass');
+
+  assert.equal(
+    headlineMarkdownOf('**Summary:**\n\nAll three findings are addressed.'),
+    'All three findings are addressed.',
+  );
+  assert.equal(headlineMarkdownOf('1. Fixed the `parser`'), 'Fixed the `parser`');
+  assert.equal(
+    headlineMarkdownOf('```markdown\n**Done** - the report is ready.\n```'),
+    '**Done** - the report is ready.',
+  );
+  assert.equal(headlineMarkdownOf(''), '');
+});
+
+test('shortenTo leaves a line that fits alone, and never cuts a character in half', () => {
+  assert.equal(shortenTo('short enough', 20, '...'), 'short enough');
+  assert.equal(shortenTo('x'.repeat(20), 20, '...'), 'x'.repeat(20), 'a line at the limit is not cut');
+  assert.equal(shortenTo('x'.repeat(21), 20, '...'), 'x'.repeat(17) + '...');
+
+  // The emoji straddles the cut, so a count of code units ends on its first half.
+  const straddling = 'x'.repeat(16) + '\u{1F6A7} and more';
+  const cut = shortenTo(straddling, 20, '...');
+  assert.ok(!HALF_A_CHARACTER.test(cut), 'the cut left half a character behind');
+  assert.equal(cut, 'x'.repeat(16) + '...');
+
+  // One place earlier the emoji is whole, and is kept whole.
+  assert.equal(shortenTo('x'.repeat(15) + '\u{1F6A7} and more', 20, '...'), 'x'.repeat(15) + '\u{1F6A7}...');
+
+  // Whatever it drops, the result still fits the limit it was given. A limit shorter than
+  // the ellipsis is in here because a negative cut counts from the end of the line rather
+  // than shortening it, which returns more than the limit allows instead of less.
+  for (const limit of [20, 3, 1, 0]) {
+    for (const line of [straddling, 'x'.repeat(60), '\u{1F6A7}'.repeat(30)]) {
+      assert.ok(
+        shortenTo(line, limit, '...').length <= Math.max(limit, '...'.length),
+        `"${line}" was shortened past a limit of ${limit}`,
+      );
+    }
+  }
+});
+
+// The title conversion. Every answer is written out, and the unchanged cases matter as
+// much as the converted ones: the rule is conservative because a title that kept stray
+// syntax is readable while one that lost real characters is not.
+test('plainTitle reduces link and image syntax to the text a reader would see', () => {
+  assert.equal(plainTitle('[link text](https://x.example/page)'), 'link text');
+  // The escaped target parenthesis is what the VS Code wrapper writes when a prompt quotes
+  // a skill, and it is the shape that reached the picker verbatim.
+  assert.equal(plainTitle('[$review-ai-pr]\\(/c:/skills/review-ai-pr/SKILL.md)'), '$review-ai-pr');
+  assert.equal(plainTitle('![alt words](chart.png)'), 'alt words');
+  assert.equal(plainTitle('see [the doc](a.md) and ![a chart](b.png) here'), 'see the doc and a chart here');
+  // Malformed or half-typed syntax is left exactly as typed.
+  assert.equal(plainTitle('[text](unclosed'), '[text](unclosed');
+  assert.equal(plainTitle('[text] (a gap)'), '[text] (a gap)');
+  assert.equal(plainTitle('[no target]'), '[no target]');
+});
+
+test('plainTitle keeps the visible text of code and balanced emphasis, and literal marks stay', () => {
+  assert.equal(plainTitle('run `npm test` first'), 'run npm test first');
+  assert.equal(plainTitle('**bold** and *em* and _low_ and __dunder__'), 'bold and em and low and dunder');
+  // Emphasis inside a link is reduced too, the link first.
+  assert.equal(plainTitle('[**bold** name](x)'), 'bold name');
+  // Intraword and unbalanced marks are someone's real characters, not syntax.
+  assert.equal(plainTitle('foo_bar'), 'foo_bar');
+  assert.equal(plainTitle('a*b'), 'a*b');
+  assert.equal(plainTitle('2*3*4 is 24'), '2*3*4 is 24');
+  assert.equal(plainTitle('a ` lone backtick'), 'a ` lone backtick');
+  assert.equal(plainTitle('* not emphasis, a bullet'), '* not emphasis, a bullet');
+  // A code span shows its text as it stands, so emphasis is not run over what it held.
+  assert.equal(plainTitle('`*glob*` patterns'), '*glob* patterns');
+});
+
+test('openingLines takes the list a summary opens with, and stops before the one it closes with', () => {
+  // The shape a summary is written in: a heading, the list that says what the turn did, a
+  // rule, prose, then the closing rows. Those rows are a list as well, and they are written
+  // whether or not they hold anything, which is the reason for stopping.
+  const summary = [
+    '**TLDR**',
+    '',
+    '- Batch two landed and the suite is green.',
+    '- One decision is still open.',
+    '',
+    '---',
+    '',
+    'Some prose about the work, which is not a list at all.',
+    '',
+    '- **Your actions** - reload the panel',
+    '- **Open questions** - none',
+  ].join('\n');
+  assert.deepEqual(openingLines(summary), ['Batch two landed and the suite is green.', 'One decision is still open.']);
+
+  // The other heading form, and a list with no heading above it at all.
+  assert.deepEqual(openingLines('## TLDR\n\n- Only this one.'), ['Only this one.']);
+  assert.deepEqual(openingLines('- Straight into it.\n- And a second.'), ['Straight into it.', 'And a second.']);
+
+  // A summary that opens with a sentence has no such list, and neither has an empty one.
+  assert.deepEqual(openingLines('Done. The hook is restored.\n\n- a later bullet'), []);
+  assert.deepEqual(openingLines(''), []);
+
+  // A numbered list is a list, and a line set in under an item belongs to that item. Ending
+  // on either one keeps the items above it and drops every item below, which reads on a
+  // card as a turn that said less than it did.
+  assert.deepEqual(openingLines('1. First thing.\n2. Second thing.'), ['First thing.', 'Second thing.']);
+  assert.deepEqual(openingLines('- First thing,\n  wrapped onto a second line.\n- Second thing.'), [
+    'First thing,',
+    'Second thing.',
+  ]);
+
+  // The lines the closing rows are separated by are what stops the scan, and one blank line
+  // between two lists is enough on its own.
+  assert.deepEqual(openingLines('- The one thing.\n\n- **Your actions** - reload'), ['The one thing.']);
+
+  // Written on Windows, with a carriage return at the end of every line.
+  assert.deepEqual(openingLines('**TLDR**\r\n\r\n- One thing.\r\n- And another.\r\n'), ['One thing.', 'And another.']);
+
+  // A fence line is punctuation, not a bullet the list opens on: skip it and read the list
+  // that follows, rather than reading the fence's own language tag as an opening line.
+  assert.deepEqual(openingLines('```markdown\n- One thing.\n- And another.\n```'), ['One thing.', 'And another.']);
+});
+
+test('projectSlug and transcriptDirsFor match a workspace folder whatever the drive case', () => {
+  assert.equal(projectSlug('c:\\Users\\dev\\Projects\\work\\arc'), 'c--Users-dev-Projects-work-arc');
+  assert.equal(
+    projectSlug('C:\\Users\\dev\\Documents\\game-projects\\Lens_Custom'),
+    'C--Users-dev-Documents-game-projects-Lens-Custom',
+  );
+
+  const root = tempDir('proj-');
+  fs.mkdirSync(path.join(root, 'C--Users-dev-Documents-game-projects-Lens-Custom'));
+  fs.mkdirSync(path.join(root, 'c--Users-dev-Projects-elsewhere'));
+  const found = transcriptDirsFor(root, ['c:\\Users\\dev\\Documents\\game-projects\\Lens_Custom']);
+  assert.deepEqual(
+    found.map((d) => path.basename(d)),
+    ['C--Users-dev-Documents-game-projects-Lens-Custom'],
+    'an empty directory is kept on an exact name match, so the panel can say it was empty',
+  );
+  assert.deepEqual(transcriptDirsFor(root, []), []);
+});
+
+test('a directory whose name matches but whose sessions ran elsewhere is not read', () => {
+  // The slug turns every non-alphanumeric character into a dash, so two different folders
+  // produce the same directory name. Showing one project's prompts and summaries in
+  // another project's window is the failure this guards against.
+  const root = tempDir('proj-');
+  const dir = 'c--work-a-b';
+  fs.mkdirSync(path.join(root, dir));
+  fs.writeFileSync(
+    path.join(root, dir, 's.jsonl'),
+    JSON.stringify({ type: 'user', cwd: 'c:\\work\\a_b', message: { role: 'user', content: 'hi' } }) + '\n',
+  );
+  assert.deepEqual(
+    transcriptDirsFor(root, ['c:\\work\\a-b']),
+    [],
+    'the name collides but the recorded cwd is a different folder',
+  );
+  assert.deepEqual(
+    transcriptDirsFor(root, ['c:\\work\\a_b']).map((d) => path.basename(d)),
+    [dir],
+  );
+});
+
+test('listSessionFiles returns non-empty jsonl transcripts, newest first', () => {
+  const dir = tempDir('sess-');
+  fs.writeFileSync(path.join(dir, 'old.jsonl'), '{}\n');
+  fs.writeFileSync(path.join(dir, 'new.jsonl'), '{}\n');
+  fs.writeFileSync(path.join(dir, 'empty.jsonl'), '');
+  fs.writeFileSync(path.join(dir, 'notes.txt'), 'ignored');
+  const past = new Date(Date.now() - 60000);
+  fs.utimesSync(path.join(dir, 'old.jsonl'), past, past);
+  assert.deepEqual(
+    listSessionFiles(dir).map((s) => s.sessionId),
+    ['new', 'old'],
+  );
+  // Which agent wrote them. Nothing else in this suite reads it, and the panel hands a
+  // session to a reader chosen by this value, so a session mislabelled here goes to the
+  // Codex parser, which finds nothing in a Claude transcript and draws an empty list.
+  assert.deepEqual(
+    listSessionFiles(dir).map((s) => s.agent),
+    ['claude', 'claude'],
+  );
+});
+
+test('a turn says the agent that recorded it, which decides what a card may claim about it', () => {
+  const file = writeTranscript([userPrompt('build the timeline', 0), assistantText('Done.', 1, { output_tokens: 10 })]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.agent, 'claude');
+  // Claude Code records every edit as a tool result, so a turn here that changed nothing
+  // changed nothing. Labelled 'codex', the same turn would earn the mark that says its file
+  // list may be short.
+  assert.equal(turn.contextWindow, null, 'no window is recorded per turn, so the table answers');
+});
+
+test('normalizeFsPath makes transcript and snapshot-store paths comparable', () => {
+  assert.equal(normalizeFsPath('c:/repo/a.ts'), normalizeFsPath('C:\\repo\\a.ts'));
+  assert.notEqual(normalizeFsPath('c:/repo/a.ts'), normalizeFsPath('c:/repo/b.ts'));
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    vi.stubGlobal('process', { ...process, platform });
+    try {
+      assert.equal(normalizeFsPath('C:/Repo/File.ts'), 'c:/repo/file.ts');
+      assert.equal(normalizeFsPath('/Repo/File.ts'), platform === 'win32' ? '/repo/file.ts' : '/Repo/File.ts');
+      assert.equal(normalizeFsPath('/Repo/File.ts') === normalizeFsPath('/repo/file.ts'), platform === 'win32');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+});
+
+// The snapshot hook skips the same paths. Both sides run the cases in
+// test/fixtures/ephemeral-paths.json, so a change to one rule fails on the other.
+test('isEphemeralPath matches the shared ephemeral-paths fixture', () => {
+  const fixtureFile = path.join(__dirname, '..', '..', 'test', 'fixtures', 'ephemeral-paths.json');
+  const fixture = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as {
+    ignoreRoots: string[];
+    shapes: string[];
+    cases: { path: string; ephemeral: boolean; why: string }[];
+  };
+  const previousClaude = process.env.CLAUDE_CONFIG_DIR;
+  const previousCodex = process.env.CODEX_HOME;
+  process.env.CLAUDE_CONFIG_DIR =
+    path.join(os.homedir(), 'arc-agent-home-parent') + `${path.sep}..${path.sep}arc-claude-home-fixture`;
+  process.env.CODEX_HOME =
+    path.join(os.homedir(), 'arc-agent-home-parent') + `${path.sep}..${path.sep}arc-codex-home-fixture`;
+  const fill = (t: string) =>
+    t
+      .replace('{arcHome}', process.env.ARC_HOME || path.join(os.homedir(), '.arc'))
+      .replace('{claudeHome}', path.normalize(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')))
+      .replace('{codexHome}', path.normalize(process.env.CODEX_HOME || path.join(os.homedir(), '.codex')))
+      .replace('{tmp}', os.tmpdir())
+      .replace('{home}', os.homedir())
+      .split('/')
+      .join(path.sep);
+  const previous = process.env.ARC_IGNORE_ROOTS;
+  process.env.ARC_IGNORE_ROOTS = fixture.ignoreRoots.map(fill).join(path.delimiter);
+  try {
+    // Each case is checked in every shape the fixture lists. A rule that normalises one
+    // shape while the other side compares it raw is how the two drift apart, and only a
+    // shaped case can see it.
+    const shape = (native: string, kind: string) => {
+      if (kind === 'forward-slash') {
+        return native.split(path.sep).join('/');
+      }
+      if (kind === 'lower-drive') {
+        return native.replace(/^([A-Z]):/, (m: string, d: string) => d.toLowerCase() + ':');
+      }
+      if (kind === 'trailing-slash') {
+        return native + path.sep;
+      }
+      return native;
+    };
+    for (const c of fixture.cases) {
+      for (const kind of fixture.shapes) {
+        // A path that names a file does not take a trailing slash, so that shape is
+        // skipped for it. The fixture keeps directory cases on both sides of the answer
+        // so the shape still tests both.
+        if (kind === 'trailing-slash' && /\.[a-z]+$/.test(c.path)) {
+          continue;
+        }
+        assert.equal(isEphemeralPath(shape(fill(c.path), kind)), c.ephemeral, `${c.path} as ${kind}: ${c.why}`);
+      }
+    }
+    // The same answers again, against the list the code ships rather than the one the
+    // fixture hands it. Without this pass the fixture only says how a path is compared, and
+    // a root dropped from a default would leave every case still answering correctly.
+    delete process.env.ARC_IGNORE_ROOTS;
+    for (const c of fixture.cases) {
+      assert.equal(isEphemeralPath(fill(c.path)), c.ephemeral, `${c.path} against the shipped roots: ${c.why}`);
+    }
+    process.env.ARC_IGNORE_ROOTS = '';
+    assert.equal(isEphemeralPath(fill(fixture.cases[0].path)), false, 'an empty ignore list disables the rule');
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ARC_IGNORE_ROOTS;
+    } else {
+      process.env.ARC_IGNORE_ROOTS = previous;
+    }
+    if (previousClaude === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = previousClaude;
+    }
+    if (previousCodex === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodex;
+    }
+  }
+});
+
+test('CLAUDE_CONFIG_DIR moves the transcript tree that session discovery reads', () => {
+  const previousProjects = process.env.ARC_PROJECTS_ROOT;
+  const previousClaude = process.env.CLAUDE_CONFIG_DIR;
+  const claudeHome = tempDir('claude-home-');
+  const cwd = path.join(tempDir('claude-workspace-'), 'repo');
+  const projectDir = path.join(claudeHome, 'projects', projectSlug(cwd).toLowerCase());
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(projectDir, 'moved.jsonl'),
+    JSON.stringify({ type: 'user', cwd, message: { role: 'user', content: 'hi' } }) + '\n',
+  );
+  try {
+    delete process.env.ARC_PROJECTS_ROOT;
+    process.env.CLAUDE_CONFIG_DIR = claudeHome;
+    assert.deepEqual(
+      sessionFilesFor(projectsRoot(), [cwd]).map((session) => session.sessionId),
+      ['moved'],
+    );
+  } finally {
+    if (previousProjects === undefined) {
+      delete process.env.ARC_PROJECTS_ROOT;
+    } else {
+      process.env.ARC_PROJECTS_ROOT = previousProjects;
+    }
+    if (previousClaude === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = previousClaude;
+    }
+  }
+});
+
+test('the Arc project override wins, and an empty Claude config home uses the home directory', () => {
+  const previousProjects = process.env.ARC_PROJECTS_ROOT;
+  const previousClaude = process.env.CLAUDE_CONFIG_DIR;
+  const previousIgnore = process.env.ARC_IGNORE_ROOTS;
+  const projects = path.join(os.tmpdir(), 'arc-projects-fixture');
+  const claudeHome = path.join(os.tmpdir(), 'claude-home-fixture');
+  const ignored = path.join(os.homedir(), 'arc-ignored-fixture');
+  try {
+    process.env.CLAUDE_CONFIG_DIR = claudeHome;
+    process.env.ARC_PROJECTS_ROOT = projects;
+    assert.equal(projectsRoot(), projects);
+    delete process.env.ARC_PROJECTS_ROOT;
+    assert.equal(projectsRoot(), path.join(claudeHome, 'projects'));
+    process.env.CLAUDE_CONFIG_DIR = 'relative-claude-home';
+    assert.equal(projectsRoot(), path.join('relative-claude-home', 'projects'));
+    process.env.CLAUDE_CONFIG_DIR = '';
+    assert.equal(projectsRoot(), path.join(os.homedir(), '.claude', 'projects'));
+
+    process.env.ARC_IGNORE_ROOTS = ignored;
+    assert.equal(isEphemeralPath(path.join(ignored, 'note.md')), true);
+    process.env.ARC_IGNORE_ROOTS = '';
+    assert.equal(isEphemeralPath(path.join(ignored, 'note.md')), false, 'an empty ignore list disables the rule');
+  } finally {
+    if (previousProjects === undefined) {
+      delete process.env.ARC_PROJECTS_ROOT;
+    } else {
+      process.env.ARC_PROJECTS_ROOT = previousProjects;
+    }
+    if (previousClaude === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = previousClaude;
+    }
+    if (previousIgnore === undefined) {
+      delete process.env.ARC_IGNORE_ROOTS;
+    } else {
+      process.env.ARC_IGNORE_ROOTS = previousIgnore;
+    }
+  }
+});
+
+test('a stop by the user ends the turn instead of starting a new one', () => {
+  const file = writeTranscript([
+    userPrompt('do the long thing', 0),
+    assistantTool('Bash', 1),
+    { type: 'user', timestamp: at(2), message: { role: 'user', content: '[Request interrupted by user]' } },
+    userPrompt('never mind, do this instead', 3),
+    assistantText('Done.', 4),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].interrupted, true);
+  assert.equal(turns[0].prompt, 'do the long thing');
+  assert.equal(turns[1].interrupted, false);
+});
+
+test('the tool mix, failures, model and commits are read off the turn', () => {
+  const file = writeTranscript([
+    userPrompt('build and commit it', 0),
+    assistantTool('Read', 1, 't1'),
+    assistantTool('Grep', 2, 't2'),
+    assistantTool('Edit', 3, 't3'),
+    assistantTool('Bash', 4, 't4', { command: 'git commit -a -m "the change" && git commit -a -m "the second"' }),
+    commitResult(
+      '[feat/x 00facf2ab1] Add the timeline\n 3 files changed, 12 insertions(+)\n' +
+        '[main deadbee] Second commit\n 5 files changed, 7 insertions(+), 2 deletions(-)',
+      5,
+      't4',
+    ),
+    {
+      type: 'user',
+      timestamp: at(6),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 't2', is_error: true, content: 'denied' }],
+      },
+    },
+    assistantText('Committed.', 7),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.model, 'claude-opus-5');
+  assert.equal(turn.toolUses, 4);
+  assert.deepEqual(turn.toolCounts, {
+    edits: 1,
+    reads: 1,
+    searches: 1,
+    commands: 1,
+    agents: 0,
+    coordination: 0,
+    web: 0,
+    other: 0,
+  });
+  assert.deepEqual(turn.failures, [{ tool: 'Grep', message: 'denied' }]);
+  // Two commits in the same turn, each keeping its own figures rather than sharing one.
+  assert.deepEqual(turn.commits, [
+    {
+      sha: '00facf2a',
+      printedSha: '00facf2ab1',
+      subject: 'Add the timeline',
+      head: { kind: 'branch', name: 'feat/x' },
+      files: 3,
+      added: 12,
+      removed: 0,
+      at: ms(5),
+      place: null,
+      dir: null,
+    },
+    {
+      sha: 'deadbee',
+      subject: 'Second commit',
+      head: { kind: 'branch', name: 'main' },
+      files: 5,
+      added: 7,
+      removed: 2,
+      at: ms(5),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('agent coordination is separate from launches, and every tool is tallied', () => {
+  const file = writeTranscript([
+    userPrompt('delegate and report', 0),
+    assistantTool('Agent', 1, 'agent-1', { description: 'Review the diff' }),
+    assistantTool('SendMessage', 2, 'message-1', { recipient: 'reviewer' }),
+    assistantTool('ListAgents', 3, 'list-1'),
+    assistantTool('TaskOutput', 4, 'output-1'),
+    assistantTool('TaskStop', 5, 'stop-1'),
+    assistantText('Done.', 6),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.toolCounts.agents, 1);
+  assert.equal(turn.toolCounts.coordination, 4);
+  assert.equal(turn.toolCounts.other, 0);
+  assert.deepEqual(turn.toolTally, {
+    Agent: 1,
+    SendMessage: 1,
+    ListAgents: 1,
+    TaskOutput: 1,
+    TaskStop: 1,
+  });
+  assert.equal(turn.agents.length, 1);
+});
+
+test('the tool tally is complete beyond the activity step window', () => {
+  const tools = Array.from({ length: 80 }, (_, i) => assistantTool(`Tool${i}`, i + 1, `t${i}`));
+  const [turn] = readTurns(
+    writeTranscript([userPrompt('run many tools', 0), ...tools, assistantText('Done.', 81)]),
+    'sess',
+  );
+  assert.equal(Object.keys(turn.toolTally).length, 80);
+  assert.equal(
+    Object.values(turn.toolTally).reduce((sum, count) => sum + count, 0),
+    80,
+  );
+  assert.equal(turn.steps.length, 60);
+  assert.equal(turn.stepCount, 80);
+});
+
+test('tool names inherited by ordinary objects remain ordinary tally rows', () => {
+  const names = ['constructor', 'toString', '__proto__'];
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('run oddly named tools', 0),
+      ...names.map((name, i) => assistantTool(name, i + 1, `t${i}`)),
+      assistantText('Done.', 4),
+    ]),
+    'sess',
+  );
+  assert.deepEqual(Object.keys(turn.toolTally), names);
+  for (const name of names) {
+    assert.ok(Object.prototype.hasOwnProperty.call(turn.toolTally, name));
+    assert.equal(turn.toolTally[name], 1);
+  }
+});
+
+test('a deletions-only stat line leaves the insertions figure at zero, not null', () => {
+  const file = writeTranscript([
+    userPrompt('delete the dead code', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[main a1b2c3d4] Remove dead code\n 2 files changed, 30 deletions(-)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: 'a1b2c3d4',
+      subject: 'Remove dead code',
+      head: { kind: 'branch', name: 'main' },
+      files: 2,
+      added: 0,
+      removed: 30,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('singular file, insertion and deletion each parse on their own', () => {
+  const file = writeTranscript([
+    userPrompt('tiny fix', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[main cafebabe] One-line fix\n 1 file changed, 1 insertion(+), 1 deletion(-)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: 'cafebabe',
+      subject: 'One-line fix',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 1,
+      removed: 1,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('a commit line whose next line is not a stat line reports null figures, not zero', () => {
+  const file = writeTranscript([
+    userPrompt('commit it', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[main 9988776] Wire up the hook\nwarning: pre-commit hook printed extra output', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: '9988776',
+      subject: 'Wire up the hook',
+      head: { kind: 'branch', name: 'main' },
+      files: null,
+      added: null,
+      removed: null,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('an amend still reports its figures, though git puts a Date line above the stat line', () => {
+  const file = writeTranscript([
+    userPrompt('fix that commit', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[main 6441f1a] Second\n Date: Mon Aug 24 15:57:18 2026 -0500\n 1 file changed, 2 insertions(+)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: '6441f1a',
+      subject: 'Second',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 2,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('an Author line and a Date line together do not hide the stat line', () => {
+  const file = writeTranscript([
+    userPrompt('commit for someone else', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult(
+      '[main 1ed2347] Other author\n Author: Someone Else <se@x.com>\n Date: Mon Aug 24 15:57:39 2026 -0500\n 1 file changed, 2 insertions(+)',
+      2,
+    ),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: '1ed2347',
+      subject: 'Other author',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 2,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('the scan for a stat line stops at the next commit rather than borrowing its figures', () => {
+  const file = writeTranscript([
+    userPrompt('commit twice', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[main aaaaaaa1] Quiet one\n[main bbbbbbb2] Loud one\n 4 files changed, 9 insertions(+)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: 'aaaaaaa1',
+      subject: 'Quiet one',
+      head: { kind: 'branch', name: 'main' },
+      files: null,
+      added: null,
+      removed: null,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+    {
+      sha: 'bbbbbbb2',
+      subject: 'Loud one',
+      head: { kind: 'branch', name: 'main' },
+      files: 4,
+      added: 9,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('file, insertion and deletion pluralise independently of one another', () => {
+  const file = writeTranscript([
+    userPrompt('one big edit', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[main deadbee1] One file, many lines\n 1 file changed, 12 insertions(+)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: 'deadbee1',
+      subject: 'One file, many lines',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 12,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('a rename records the zeros git printed rather than reading as unknown', () => {
+  const file = writeTranscript([
+    userPrompt('rename it', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult(
+      '[main ecdc9c4] Rename\n 1 file changed, 0 insertions(+), 0 deletions(-)\n rename a.txt => b.txt (100%)',
+      2,
+    ),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: 'ecdc9c4',
+      subject: 'Rename',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 0,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+// The three lines below are what git actually printed, captured from a scratch repository
+// on 2026-08-26 rather than written from memory. Each has more than one token between the
+// bracket and the sha, which is the whole of what these three check.
+test('a repository first commit is recorded, though git names it a root commit', () => {
+  const file = writeTranscript([
+    userPrompt('start the repo', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult(
+      '[main (root-commit) 882e6ea] Initial commit\n 1 file changed, 1 insertion(+)\n create mode 100644 a.txt',
+      2,
+    ),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: '882e6ea',
+      subject: 'Initial commit',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 1,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('a commit made off a branch is recorded, though git names no branch', () => {
+  const file = writeTranscript([
+    userPrompt('commit while bisecting', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[detached HEAD cac66e9] On detached\n 1 file changed, 1 insertion(+)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: 'cac66e9',
+      subject: 'On detached',
+      head: { kind: 'detached' },
+      files: 1,
+      added: 1,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+test('a first commit made off a branch carries both markers and is still recorded', () => {
+  const file = writeTranscript([
+    userPrompt('start it detached', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult('[detached HEAD (root-commit) 882e6ea] Initial commit\n 1 file changed, 1 insertion(+)', 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, [
+    {
+      sha: '882e6ea',
+      subject: 'Initial commit',
+      head: { kind: 'detached' },
+      files: 1,
+      added: 1,
+      removed: 0,
+      at: ms(2),
+      place: null,
+      dir: null,
+    },
+  ]);
+});
+
+// Which repository a commit landed in. Every command quoted below is a shape taken from
+// the real transcripts, where the rule was measured before it was written.
+const HOME = 'C:/Users/dev';
+const REPO = 'c:/Users/dev/Projects/work/arc';
+const NOTES = 'C:/Users/dev/Projects/side-repo';
+
+test('the directory a commit is made in is tracked through the command that made it', () => {
+  const dirs = (command: string, cwd: string | null = REPO) => commitDirs(command, cwd, HOME);
+
+  assert.deepEqual(dirs('cd ~/Projects/side-repo && git add -A && git commit -m "notes"'), [NOTES]);
+  assert.deepEqual(dirs('cd "C:/Users/dev/Projects/side-repo" && git add . && git commit -m "notes"'), [NOTES]);
+  // Git Bash writes a drive as a directory under the root, and WSL writes it one deeper.
+  // Left alone both read as absolute paths inside nothing and outside everything.
+  assert.deepEqual(dirs('cd /c/Users/dev/Projects/side-repo && git commit -m "notes"'), [NOTES]);
+  assert.deepEqual(dirs('cd /mnt/c/Users/dev/Projects/side-repo && git commit -m "notes"'), [NOTES]);
+  // A relative move resolves against the directory the call started in. This one goes up
+  // out of a sub-directory and lands back in the repository it started under.
+  assert.deepEqual(dirs('cd .. && git add docs && git commit -m "up one"', REPO + '/extension'), [REPO]);
+  // `git -C` names the directory for one call and leaves the shell where it was, which is
+  // how eight of the nine foreign commits measured over the real transcripts were made.
+  assert.deepEqual(
+    dirs(
+      'git -C "C:/Users/dev/Projects/side-repo" add . && git -C "C:/Users/dev/Projects/side-repo" commit -m "notes"',
+    ),
+    [NOTES],
+  );
+  assert.deepEqual(dirs('git -C C:/Users/dev/Projects/side-repo commit -m "bare"'), [NOTES]);
+  assert.deepEqual(dirs('git -C "C:/Users/dev/Projects/side-repo" commit -m "a" && git commit -m "b"'), [NOTES, REPO]);
+  // PowerShell moves with its own verb.
+  assert.deepEqual(dirs('Push-Location "C:/Users/dev/Projects/side-repo"; git add .; git commit -m "notes"'), [NOTES]);
+  // A target this reader cannot expand names nothing rather than a guess.
+  assert.deepEqual(dirs('cd "$REPO" && git commit -m "x"'), [null]);
+  assert.deepEqual(dirs('cd - && git commit -m "x"'), [null]);
+  assert.deepEqual(dirs('git -C "$V" commit -m "x"'), [null]);
+  // Nor can a relative move be resolved with no directory recorded for the call.
+  assert.deepEqual(dirs('cd sub && git commit -m "x"', null), [null]);
+  // A call that makes no commit answers with nothing at all.
+  assert.deepEqual(dirs('git log --oneline -1 && git status --short'), []);
+});
+
+test('a relative parent command cannot leave a UNC share', () => {
+  assert.deepEqual(commitDirs('cd ../.. && git commit -m "x"', '//server/share/repo', HOME), ['//server/share']);
+});
+
+// Every spelling of a destination the two shells write, as the whole path in one go and as
+// the root on its own with the rest walked from there. A root that does not read as
+// absolute is joined onto the directory the call started in rather than replacing it, and
+// that miss only shows up one command later, so both halves are asserted.
+test('a destination is read the same in every shape a shell writes it', () => {
+  const dirs = (command: string, cwd: string | null = REPO) => commitDirs(command, cwd, HOME);
+  const shapes: { whole: string; root: string; under: string }[] = [
+    { whole: 'C:/Users/dev/Projects/side-repo', root: 'C:/', under: 'Users/dev/Projects/side-repo' },
+    { whole: 'C:\\Users\\dev\\Projects\\side-repo', root: 'C:\\', under: 'Users\\dev\\Projects\\side-repo' },
+    { whole: '"C:\\Users\\dev\\Projects\\side-repo"', root: '"C:/"', under: '"Users\\dev\\Projects\\side-repo"' },
+    { whole: '/c/Users/dev/Projects/side-repo', root: '/c', under: 'Users/dev/Projects/side-repo' },
+    { whole: '/mnt/c/Users/dev/Projects/side-repo', root: '/mnt/c', under: 'Users/dev/Projects/side-repo' },
+    { whole: '/cygdrive/c/Users/dev/Projects/side-repo', root: '/cygdrive/c', under: 'Users/dev/Projects/side-repo' },
+    { whole: '~/Projects/side-repo', root: '~', under: 'Projects/side-repo' },
+    { whole: '$HOME/Projects/side-repo', root: '$HOME', under: 'Projects/side-repo' },
+  ];
+  for (const s of shapes) {
+    assert.deepEqual(dirs(`cd ${s.whole} && git commit -m "x"`), [NOTES], s.whole);
+    assert.deepEqual(dirs(`cd ${s.root} && cd ${s.under} && git commit -m "x"`), [NOTES], `${s.root} then ${s.under}`);
+  }
+  // A backslash still takes the character after it out of the shell's hands, which is how a
+  // space is written into a path that is not quoted.
+  assert.deepEqual(dirs('cd /c/Users/dev/My\\ Documents && git commit -m "x"'), ['C:/Users/dev/My Documents']);
+});
+
+// PowerShell names the destination as readily as it writes it bare, and `-Path` and
+// `-LiteralPath` are the two spellings of the parameter that holds it.
+test('a move is read past the parameter that names its destination', () => {
+  const dirs = (command: string, cwd: string | null = REPO) => commitDirs(command, cwd, HOME);
+  const moves = [
+    'cd',
+    'chdir',
+    'Set-Location',
+    'set-location',
+    'Push-Location',
+    'pushd',
+    'Set-Location -Path',
+    'Set-Location -LiteralPath',
+    'Set-Location -path',
+    'Push-Location -Path',
+    'cd -Path',
+  ];
+  for (const move of moves) {
+    assert.deepEqual(dirs(`${move} "C:\\Users\\dev\\Projects\\side-repo"; git commit -m "x"`), [NOTES], move);
+    assert.deepEqual(
+      dirs(`${move} C:\\Users\\dev\\Projects\\side-repo; git commit -m "x"`),
+      [NOTES],
+      `${move} unquoted`,
+    );
+  }
+  // PowerShell also writes a parameter and its value joined by a colon.
+  assert.deepEqual(dirs('Set-Location -Path:"C:\\Users\\dev\\Projects\\side-repo"; git commit -m "x"'), [NOTES]);
+  // A switch this reader cannot read past could be hiding the destination behind it, so
+  // where the shell went is unknown rather than guessed from the switch itself.
+  assert.deepEqual(dirs('Set-Location -Stack work; git commit -m "x"'), [null]);
+  assert.deepEqual(dirs('cd -- sub; git commit -m "x"'), [null]);
+});
+
+test('a command is read past its quoting, so neither a heredoc nor a message is taken for a call', () => {
+  // The words `git commit` inside a heredoc body are text being written to a file, and the
+  // body's own newlines are not command separators either.
+  const heredoc = [
+    "cat > msg.txt <<'EOF'",
+    'The rule is that git commit is what prints the line;',
+    'cd /somewhere and run git commit, then read it back.',
+    'EOF',
+    'git commit -F msg.txt',
+  ].join('\n');
+  assert.deepEqual(commitDirs(heredoc, REPO, HOME), [REPO]);
+  // A message holding a semicolon and a quote of its own is one argument, not the end of
+  // the command, and nothing inside it is read as a call or as a move.
+  assert.deepEqual(commitDirs('git commit -m "Keep the panel; do not split it, said \\"the note\\""', REPO, HOME), [
+    REPO,
+  ]);
+  assert.deepEqual(commitDirs('git commit -m "cd /tmp && git commit again"', REPO, HOME), [REPO]);
+  // Arithmetic reads `<<` as a shift, so no heredoc hides the commit after it.
+  assert.deepEqual(commitDirs('echo "$((1 << 3))"\ngit commit -m real', REPO, HOME), [REPO]);
+  assert.deepEqual(commitDirs('echo $((1 << 3))\ngit commit -m real', REPO, HOME), [REPO]);
+  // A parenthesis inside arithmetic stays arithmetic, so its `<<` is a shift too.
+  assert.deepEqual(commitDirs('echo "$(((1 << 3)))"\ngit commit -m real', REPO, HOME), [REPO]);
+  assert.deepEqual(commitDirs('echo $(( (2 + (1 << 3)) * 2 ))\ngit commit -m real', REPO, HOME), [REPO]);
+});
+
+test('a directory is attributed to a call only when every commit in it names the same one', () => {
+  const call = (command: string, cwd: string | null = REPO) => commitPlaceOf({ command, cwd, at: 0 }, [REPO], HOME);
+
+  assert.deepEqual(call('cd ~/Projects/side-repo && git add -A && git commit -m "notes"'), {
+    kind: 'named',
+    dir: NOTES,
+  });
+  // Twice into the same foreign repository is still that one repository, named.
+  assert.deepEqual(call('cd ~/Projects/side-repo && git commit -m "a" && git commit -m "b"'), {
+    kind: 'named',
+    dir: NOTES,
+  });
+  // A commit made in the workspace carries no directory at all, so only a foreign one is
+  // ever drawn. Marking work the reader is looking at as somebody else's is the failure
+  // this rule exists to avoid; missing a foreign commit only leaves the row as it was.
+  assert.equal(call('git add -A && git commit -m "here"'), null);
+  assert.equal(call('cd extension && git commit -m "still here"'), null);
+  assert.equal(call('cd .. && git add docs && git commit -m "up one"', REPO + '/extension'), null);
+  // Two foreign repositories in one call: the lines git printed cannot be paired with the
+  // calls that printed them, so neither commit can be given a directory. Both are still
+  // outside this workspace, whichever line belongs to which, so both are marked and neither
+  // is named.
+  assert.deepEqual(
+    call('cd ~/Projects/side-repo && git commit -m "a" && cd ~/Projects/work/other-repo && git commit -m "b"'),
+    { kind: 'unnamed' },
+  );
+  // One of the two inside the workspace, and nothing is said at all: a mark here could land
+  // on the commit the reader is looking at.
+  assert.equal(call('git commit -m "a" && cd ~/Projects/side-repo && git commit -m "b"'), null);
+  assert.equal(call('cd ~/Projects/side-repo && git commit -m "a" && cd ' + REPO + ' && git commit -m "b"'), null);
+  // One target that cannot be worked out is enough to say nothing, whatever the other
+  // directories are: an unreadable target could be this workspace.
+  assert.equal(call('git -C "$R" commit -m "a" && git -C "C:/Users/dev/Projects/side-repo" commit -m "b"'), null);
+  assert.equal(call('git log --oneline -1'), null);
+  // With no folder open there is nothing to be outside of, and a call nothing was recorded
+  // for says nothing either.
+  assert.equal(
+    commitPlaceOf({ command: 'cd ~/Projects/side-repo && git commit -m "x"', cwd: REPO, at: 0 }, [], HOME),
+    null,
+  );
+  assert.equal(commitPlaceOf(null, [REPO], HOME), null);
+});
+
+// A Bash call the way the store writes one, carrying the directory the command started in.
+// The helper above leaves that out, and a quiet commit is read back against that directory.
+function bashCall(second: number, id: string, cwd: string, ...commands: string[]) {
+  return {
+    type: 'assistant',
+    timestamp: at(second),
+    cwd,
+    message: {
+      role: 'assistant',
+      model: 'claude-opus-5',
+      content: commands.map((command, i) => ({
+        type: 'tool_use',
+        id: `${id}${i || ''}`,
+        name: 'Bash',
+        input: { command },
+      })),
+    },
+  };
+}
+function bashResult(stdout: string, second: number, id: string, failed = false) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok', is_error: failed }] },
+    toolUseResult: { stdout, stderr: '' },
+  };
+}
+
+test('a commit is read back only when the call status stands for it', () => {
+  // `A && B` qualifies. A skipped B leaves the whole call non-zero, and a call that failed is
+  // refused before this rule is reached.
+  assert.equal(commitStatusIsReadable('git add -A && git commit -q -m "x"'), true);
+  assert.equal(commitStatusIsReadable('cd extension && git commit -q -F msg.txt && git log --oneline -1'), true);
+  assert.equal(commitStatusIsReadable('git commit --quiet -m "x"'), true);
+  // The guarded shape the reader's own instructions teach. When the guard fails, the shell
+  // prints the warning and exits zero, and the window then holds only another session's work.
+  assert.equal(
+    commitStatusIsReadable(
+      '[[ "$(git rev-parse --short HEAD)" == "abc1234" ]] && git commit -q -F m.txt || echo "HEAD changed, aborting"',
+    ),
+    false,
+  );
+  assert.equal(commitStatusIsReadable('git commit -q -m "x" || true'), false);
+  assert.equal(commitStatusIsReadable('git commit -m "fix `x`" || true'), false);
+  // An or-else before the commit skips it, and the call still succeeds.
+  assert.equal(commitStatusIsReadable('true || git commit -q -m "x"'), false);
+  // A dry run says outright that it makes no commit.
+  assert.equal(commitStatusIsReadable('git commit --dry-run -q'), false);
+  // A semicolon and a newline report somebody else's status. A pipe keeps the repository
+  // count and head-log guards, so a quiet commit behind one is still read back.
+  assert.equal(commitStatusIsReadable('git commit -q -m "x"; echo done'), false);
+  assert.equal(commitStatusIsReadable('git commit -q -m "x"\ngit log --oneline -1'), false);
+  assert.equal(commitStatusIsReadable('git commit -q -m "x" | tail -3'), true);
+  // A conditional can skip the commit and leave the call successful.
+  assert.equal(commitStatusIsReadable('if (git rev-parse HEAD) { git commit -q -F msg.txt }'), false);
+  // The same characters inside the message are message, not shape.
+  assert.equal(commitStatusIsReadable('git commit -q -m "read it back || give up; then stop"'), true);
+  // Nothing committed, nothing to read back.
+  assert.equal(commitStatusIsReadable('git log --oneline -1'), false);
+  // A conditional keyword is a keyword whatever its case, which PowerShell writes either way.
+  assert.equal(commitStatusIsReadable('If ($false) { git commit -q }'), false);
+  // A dry run anywhere disqualifies the whole command, because the count of commits it makes
+  // is read from the text and a dry run is counted like any other.
+  assert.equal(commitStatusIsReadable('git commit --dry-run -q && git commit -q --allow-empty'), false);
+  // A committer date the command chose puts its commit outside the window it ran in.
+  assert.equal(commitStatusIsReadable('GIT_COMMITTER_DATE=2000-01-01T00:00:00Z git commit -q -m "x"'), false);
+  // A background commit reports the shell's status and can still be running.
+  assert.equal(commitStatusIsReadable('git commit -q -m "x" & echo done'), false);
+  assert.equal(commitStatusIsReadable('git add -A && git commit -q -m "x"'), true);
+  // A negated commit reports the opposite of what git said.
+  assert.equal(commitStatusIsReadable('! git commit -q -m "x"'), false);
+  // Words that are not a command are not a commit. Counting this one twice would take the
+  // second commit from whoever really made it.
+  assert.equal(commitStatusIsReadable('git commit -q -m "x" && echo git commit'), false);
+  // A commit inside a guarded block still counts, which is why the count is not anchored to
+  // the head of a segment.
+  assert.equal(commitStatusIsReadable('(cd extension && git commit -q -m "x")'), true);
+  // A separator between two commits hides the first one's failure the same way one after the
+  // last hides that one's, so the test reads from the first commit rather than the last.
+  assert.equal(commitStatusIsReadable('git commit -q -m "a"; git commit -q -m "b"'), false);
+  // Ahead of every commit it makes, a separator costs the call nothing: the status still ends
+  // up being git's.
+  assert.equal(commitStatusIsReadable('git add -A; git commit -q -m "x"'), true);
+  // A redirect is not a background commit.
+  assert.equal(commitStatusIsReadable('git commit -q -m "x" 2>&1'), true);
+  // Quoting an option changes nothing about what git does with it.
+  assert.equal(commitStatusIsReadable('git commit "--dry-run" -q'), false);
+  // An environment name is not case sensitive on Windows.
+  assert.equal(commitStatusIsReadable('$env:git_committer_date = "2000-01-01"; git commit -q'), false);
+  // A substitution reports the status of whatever read it, not git's.
+  assert.equal(commitStatusIsReadable('echo $(git commit -q -m "x")'), false);
+  assert.equal(commitStatusIsReadable('echo `git commit -q -m "x"`'), false);
+  // A block can skip its own body and leave the call successful, whatever keyword opened it.
+  assert.equal(commitStatusIsReadable('switch ($false) { $true { git commit -q } }'), false);
+  assert.equal(commitStatusIsReadable('foreach ($f in $files) { git commit -q }'), false);
+  // A brace is what every one of those opens, so a block is refused on its own shape too.
+  assert.equal(commitStatusIsReadable('{ git commit -q -m "x" }'), false);
+  // `${VAR}` is not a block.
+  assert.equal(commitStatusIsReadable('cd ${HOME}/repo && git commit -q -m "x"'), true);
+  // A command that leaves before the commit runs reports the leaving, not git.
+  assert.equal(commitStatusIsReadable('exit 0; git commit -q'), false);
+});
+
+test('a call that names a commit it does not run is never read back', () => {
+  // `commitDirs` reads two commits out of this command and the call makes one. Recording it
+  // would leave room for a second commit that somebody else made.
+  const file = writeTranscript([
+    userPrompt('land it and say so', 0),
+    bashCall(1, 't1', REPO, 'git commit -q -m "x" && echo git commit'),
+    bashResult('git commit', 2, 't1'),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.commitIntents, undefined);
+});
+
+test('a commit whose call could have skipped it is never read back', () => {
+  const file = writeTranscript([
+    userPrompt('land it if head has not moved', 0),
+    bashCall(
+      1,
+      't1',
+      REPO,
+      '[[ "$(git rev-parse --short HEAD)" == "abc1234" ]] && git commit -q -F m.txt || echo "HEAD changed, aborting"',
+    ),
+    bashResult('HEAD changed, aborting', 2, 't1'),
+    assistantText('Stopped.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.commitIntents, undefined);
+});
+
+const GUARDED_HEREDOC_COMMIT = [
+  '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F - <<\'EOF\' && git log --oneline -1 || echo "HEAD changed, aborting"',
+  'docs(plans): document the plan directory convention',
+  '',
+  'Move plan folders from .github/prompts to .claude/plans, ...',
+  'EOF',
+].join('\n');
+
+test('a guarded quiet heredoc commit records the trailing log sha as its success witness', () => {
+  const file = writeTranscript([
+    userPrompt('land it if head has not moved', 0),
+    bashCall(1, 't1', REPO, GUARDED_HEREDOC_COMMIT),
+    bashResult('661544f0 docs(plans): document the plan directory convention', 2, 't1'),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commitIntents, [
+    {
+      dir: REPO,
+      from: ms(1),
+      to: ms(2),
+      expected: 1,
+      witnessedSha: '661544f0',
+    },
+  ]);
+});
+
+test('a guarded quiet commit records no intent unless its final log proves the success arm', () => {
+  const intentsFor = (command: string, stdout: string) => {
+    const file = writeTranscript([
+      userPrompt('land it if head has not moved', 0),
+      bashCall(1, 't1', REPO, command),
+      bashResult(stdout, 2, 't1'),
+      assistantText('Done.', 3),
+    ]);
+    return readTurns(file, 'sess')[0].commitIntents;
+  };
+  assert.equal(intentsFor(GUARDED_HEREDOC_COMMIT, 'HEAD changed, aborting'), undefined);
+  assert.equal(intentsFor('git commit -F msg.txt || echo aborted', 'aborted'), undefined);
+  assert.equal(
+    intentsFor(
+      'git log --oneline -1 && [[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt || echo aborted',
+      '661544f0 Prior commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt || echo aborted && git log --oneline -1',
+      '661544f0 Prior commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo "$fallback"',
+      '661544f0 Claimed commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo "661544f0 Claimed commit"',
+      '661544f0 Claimed commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q | true && git log --oneline -1 || echo aborted',
+      '661544f0 Prior commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo ""',
+      '661544f0 Prior commit\n\n',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo -n',
+      '661544f0 Prior commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo *',
+      '661544f0 Claimed commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo ?',
+      '661544f0 Claimed commit',
+    ),
+    undefined,
+  );
+  assert.equal(
+    intentsFor(
+      '[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo -n 661544f0 Claimed commit',
+      '661544f0 Claimed commit',
+    ),
+    undefined,
+  );
+  for (const flag of ['-e', '-E', '-ne', '-nE', '-eE', '-neE', '"-En"']) {
+    assert.equal(
+      intentsFor(
+        `[[ "$(git rev-parse --short HEAD)" == "661544f0" ]] && git commit -q -F msg.txt && git log --oneline -1 || echo ${flag} 661544f0 Claimed commit`,
+        '661544f0 Claimed commit',
+      ),
+      undefined,
+      `echo ${flag} can print a log-shaped fallback`,
+    );
+  }
+});
+
+test('a piped quiet commit records an intent while a plain or-else still records none', () => {
+  const intentsFor = (command: string) => {
+    const file = writeTranscript([
+      userPrompt('land it', 0),
+      bashCall(1, 't1', REPO, command),
+      bashResult('', 2, 't1'),
+      assistantText('Done.', 3),
+    ]);
+    return readTurns(file, 'sess')[0].commitIntents;
+  };
+  assert.deepEqual(intentsFor('git commit -q -F msg.txt | tee commit.log'), [
+    { dir: REPO, from: ms(1), to: ms(2), expected: 1 },
+  ]);
+  assert.equal(intentsFor('git commit -F msg.txt || echo aborted'), undefined);
+});
+
+test('a commit that printed nothing is recorded with the window to read it back in', () => {
+  // The symptom. A session committed with -q, git printed nothing, and the card showed no
+  // commit at all. A quiet flag is the common reason a commit-making call holds no line.
+  const file = writeTranscript([
+    userPrompt('land the change', 0),
+    bashCall(1, 't1', REPO, 'git commit -F msg.txt -q'),
+    bashResult('', 2, 't1'),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, []);
+  assert.deepEqual(turn.commitIntents, [{ dir: REPO, from: ms(1), to: ms(2), expected: 1 }]);
+});
+
+test('a commit whose line git printed asks the repository nothing', () => {
+  const file = writeTranscript([
+    userPrompt('land the change', 0),
+    bashCall(1, 't1', REPO, 'git commit -m "the change"'),
+    bashResult('[main a1b2c3d4] The change', 2, 't1'),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.commits.length, 1);
+  assert.equal(turn.commitIntents, undefined);
+});
+
+test('a commit that failed is never read back, because the window would hold somebody else', () => {
+  // A call that exits non-zero committed nothing. A window around it can still hold a
+  // parallel session's commit, and claiming that one is the failure the whole path avoids.
+  const file = writeTranscript([
+    userPrompt('land the change', 0),
+    bashCall(1, 't1', REPO, 'git commit -q'),
+    bashResult('nothing to commit, working tree clean', 2, 't1', true),
+    assistantText('Nothing to do.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.commitIntents, undefined);
+});
+
+test('a call that committed more than once says how many to expect', () => {
+  const file = writeTranscript([
+    userPrompt('split it in two', 0),
+    bashCall(1, 't1', REPO, 'git commit -q -m "first" && git commit -q -m "second"'),
+    bashResult('', 2, 't1'),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commitIntents, [{ dir: REPO, from: ms(1), to: ms(2), expected: 2 }]);
+});
+
+test('two calls issued by one record keep the whole record window', () => {
+  // Both calls carry the same record timestamp and can run at the same time, so the first
+  // result does not prove the second call had not started. Narrowing the second window would
+  // put its own commit outside it and leave the room for somebody else's. The windows overlap
+  // instead, and the count rule refuses whatever the overlap holds.
+  const file = writeTranscript([
+    userPrompt('two commits', 0),
+    bashCall(1, 't', REPO, 'git commit -q -m "first"', 'git commit -q -m "second"'),
+    bashResult('', 2, 't'),
+    bashResult('', 3, 't1'),
+    assistantText('Done.', 4),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commitIntents, [
+    { dir: REPO, from: ms(1), to: ms(2), expected: 1 },
+    { dir: REPO, from: ms(1), to: ms(3), expected: 1 },
+  ]);
+});
+
+test('a call issued after an earlier result starts where that result ended', () => {
+  // Two records, so the second call cannot have started before the first one finished. The
+  // window is narrowed to what the records prove, which keeps the first commit out of it.
+  const file = writeTranscript([
+    userPrompt('two commits', 0),
+    bashCall(1, 't1', REPO, 'git commit -q -m "first"'),
+    bashResult('', 2, 't1'),
+    bashCall(3, 't2', REPO, 'git commit -q -m "second"'),
+    bashResult('', 5, 't2'),
+    assistantText('Done.', 6),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commitIntents, [
+    { dir: REPO, from: ms(1), to: ms(2), expected: 1 },
+    { dir: REPO, from: ms(3), to: ms(5), expected: 1 },
+  ]);
+});
+
+test('a fast-forward landing is recorded with the window to read it back in', () => {
+  // The turn made no commit, so nothing printed an identity and the card showed nothing at
+  // all. What git printed carries two short shas and no subject, so the record is the window.
+  const file = writeTranscript([
+    userPrompt('land the branch', 0),
+    bashCall(1, 't1', REPO, 'git merge --ff-only 1ede4cb1 && git log --oneline -3'),
+    bashResult(
+      'Updating 4bf2931..1ede4cb\nFast-forward\n 9 files changed, 170 insertions(+), 44 deletions(-)\n1ede4cb1 Bundle the panel script',
+      2,
+      't1',
+    ),
+    assistantText('Landed.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, []);
+  assert.equal(turn.commitIntents, undefined);
+  assert.deepEqual(turn.landingIntents, [{ id: 't1', dir: REPO, from: ms(1), to: ms(2), expected: 1 }]);
+});
+
+test('a merge that failed is never read back, because the window would hold somebody else', () => {
+  const file = writeTranscript([
+    userPrompt('land the branch', 0),
+    bashCall(1, 't1', REPO, 'git merge --ff-only topic'),
+    bashResult('fatal: Not possible to fast-forward, aborting.', 2, 't1', true),
+    assistantText('It would not fast-forward.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.landingIntents, undefined);
+});
+
+test('a merge whose call could have skipped it is never read back', () => {
+  // The or-else leaves the merge unrun and the call successful, so whatever landed in that
+  // window belongs to somebody else. This is the shape the reader's own instructions teach.
+  const file = writeTranscript([
+    userPrompt('land it if head has not moved', 0),
+    bashCall(
+      1,
+      't1',
+      REPO,
+      '[[ "$(git rev-parse --short HEAD)" == "abc1234" ]] && git merge --ff-only topic || echo "main moved, aborting"',
+    ),
+    bashResult('main moved, aborting', 2, 't1'),
+    assistantText('Stopped.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.landingIntents, undefined);
+});
+
+test('a merge run in another repository names that repository', () => {
+  const file = writeTranscript([
+    userPrompt('land the notes branch', 0),
+    bashCall(1, 't1', REPO, `cd ${NOTES} && git merge --ff-only topic`),
+    bashResult('Fast-forward', 2, 't1'),
+    assistantText('Landed.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.landingIntents, [{ id: 't1', dir: NOTES, from: ms(1), to: ms(2), expected: 1 }]);
+});
+
+test('a workspace on a network share keeps local commits and marks foreign commits', () => {
+  const share = '//build-01/team/arc';
+  const inShare = 'cd //build-01/team/arc && git add -A && git commit -m "here"';
+  assert.equal(commitPlaceOf({ command: inShare, cwd: share, at: 0 }, [share], HOME), null);
+  assert.deepEqual(
+    commitPlaceOf({ command: 'cd ~/Projects/side-repo && git commit -m "x"', cwd: REPO, at: 0 }, [REPO], HOME),
+    { kind: 'named', dir: NOTES },
+  );
+  assert.deepEqual(
+    commitPlaceOf({ command: 'cd ~/Projects/side-repo && git commit -m "x"', cwd: share, at: 0 }, [share], HOME),
+    { kind: 'named', dir: NOTES },
+  );
+  const network: { commits: TurnCommit[] } = { commits: [] };
+  recordCommits(
+    network,
+    '[main abc1234] Here\n 1 file changed, 1 insertion(+)',
+    5,
+    { command: 'git commit -m "here"', cwd: share, at: 0 },
+    [share],
+  );
+  assert.deepEqual(network.commits[0], {
+    sha: 'abc1234',
+    subject: 'Here',
+    head: { kind: 'branch', name: 'main' },
+    files: 1,
+    added: 1,
+    removed: 0,
+    at: 5,
+    place: null,
+    dir: share,
+  });
+});
+
+// Two path rules in this file are handed the same folder from opposite directions. The
+// workspace folder reaches `isInside` as the host spells it, and the directory beside it
+// was built out of a command by `resolveDir` and `normalizeDir`. A shape the two spell
+// differently makes every commit in that folder read as somebody else's, which is the
+// failure the whole rule exists to avoid, and it is how the network share above was found.
+// Every shape a folder arrives in is walked here, so a shape cannot be taught to one side
+// alone.
+test('a folder and a directory read out of a command are spelled the same way', () => {
+  const shapes: [string, string, string][] = [
+    ['forward slashes', 'C:/Users/dev/work/repo', 'C:/Users/dev/work/repo'],
+    ['a folder spelled with backslashes', 'C:\\Users\\dev\\work\\repo', 'C:/Users/dev/work/repo'],
+    ['an unquoted backslash target', 'C:/Users/dev/work/repo', 'C:\\Users\\dev\\work\\repo'],
+    ['a Git Bash target', 'C:/Users/dev/work/repo', '/c/Users/dev/work/repo'],
+    ['a WSL target', 'C:/Users/dev/work/repo', '/mnt/c/Users/dev/work/repo'],
+    ['a Cygwin target', 'C:/Users/dev/work/repo', '/cygdrive/c/Users/dev/work/repo'],
+    ['a folder with a trailing slash', 'C:/Users/dev/work/repo/', 'C:/Users/dev/work/repo'],
+    ['a target reached through a parent', 'C:/Users/dev/work/repo', 'C:/Users/dev/work/repo/sub/..'],
+  ];
+  for (const [what, folder, target] of shapes) {
+    const dirs = commitDirs(`cd ${target} && git commit -m "x"`, folder, HOME);
+    assert.equal(dirs.length, 1, what);
+    assert.ok(dirs[0] !== null, `${what}: the target was not resolved at all`);
+    assert.ok(
+      isInside(dirs[0], [folder]),
+      `${what}: the folder and the directory read out of the command do not name the same place, so every commit in it reads as another repository's (${dirs[0]} against ${folder})`,
+    );
+  }
+  const share = '//build-01/team/repo';
+  const fromCommand = commitDirs(`cd ${share} && git commit -m "x"`, share, HOME)[0];
+  assert.ok(fromCommand !== null);
+  assert.equal(fromCommand, share);
+  assert.ok(isInside(fromCommand, [share]));
+});
+
+// Whether a call ran git, which is what says its output may be read for a commit at all.
+test('a call whose command word is git qualifies, whatever the subcommand', () => {
+  assert.equal(ranGit('git commit -m "add the plan"'), true);
+  assert.equal(ranGit('git cherry-pick feat'), true);
+  assert.equal(ranGit('git -C ../side-repo commit -m "notes"'), true);
+  assert.equal(ranGit('cd "C:/Users/dev/Projects/side-repo" && git add -A && git commit -m "notes"'), true);
+  assert.equal(ranGit('git log --oneline -1;\ngit commit -a -m "x"'), true);
+  // An environment assignment in front of the command word is still that command.
+  assert.equal(ranGit('GIT_EDITOR=true git rebase --continue'), true);
+  assert.equal(ranGit('GIT_AUTHOR_NAME="A B" git commit -m "x"'), true);
+});
+
+// A commit guarded against another session moving HEAD, which is the shape this workspace's
+// own commits are made with. The whole guard is one segment, because nothing in it is an
+// operator that separates commands, so the git call sits inside the block rather than at the
+// head. Three commits in one measured run of the real transcripts were made this way.
+test('a git call inside a conditional block qualifies, though the segment opens with the guard', () => {
+  assert.equal(
+    ranGit(
+      'if ((git rev-parse --short HEAD) -eq "007be02") { git commit -F msg.txt } else { Write-Output "HEAD moved" }',
+    ),
+    true,
+  );
+  assert.equal(ranGit('$sha=$(git rev-parse HEAD)'), true);
+  assert.equal(ranGit('npm run build | tee log.txt'), false);
+});
+
+test('a call that never ran git does not qualify on the word alone', () => {
+  assert.equal(ranGit('npm test'), false);
+  assert.equal(ranGit('python survey.py --root ~/.codex/sessions'), false);
+  // The word inside a quoted string, and inside a commit message, is text and not a command.
+  assert.equal(ranGit('echo "git commit -m x" > note.txt'), false);
+  assert.equal(ranGit("printf '%s' 'git commit -m x'"), false);
+  // A command whose name merely starts with git is a different command.
+  assert.equal(ranGit('gitk --all'), false);
+  assert.equal(ranGit(''), false);
+});
+
+// The shape most commits in this workspace are actually made with: the message is written
+// through a heredoc and the commit reads it back. The body is masked before anything is
+// split, so a `git commit` written inside the message does not qualify, and the real call
+// after the terminator does.
+test('a heredoc body does not qualify a call, and the command after it still does', () => {
+  const body = 'cat > /tmp/msg.txt <<\'EOF\'\ngit commit -m "this is the message"\nEOF';
+  assert.equal(ranGit(body), false);
+  assert.equal(ranGit(`${body}\ngit commit -F /tmp/msg.txt`), true);
+});
+
+// The characters read from `command` while `run` reads it. `run` receives the command behind
+// a proxy that counts each character read by index, so a loop that steps through the command
+// one character at a time counts as well as a string built-in does. The character array split
+// from the command counts each read and write, and the string it joins into counts its reads,
+// so work on a mask built from the command counts too. A search counts the stretch it
+// crossed, and a copy counts its length. Openers that each reread the rest of the
+// command show here as work that grows with the square of its length.
+function charactersRead(command: string, run: (command: string) => void): number {
+  const proto = String.prototype;
+  const saved = {
+    indexOf: proto.indexOf,
+    lastIndexOf: proto.lastIndexOf,
+    slice: proto.slice,
+    substring: proto.substring,
+    split: proto.split,
+  };
+  const join = Array.prototype.join;
+  let read = 0;
+  proto.indexOf = function (this: string, search: string, from?: number): number {
+    const start = Math.max(0, from ?? 0);
+    const at = saved.indexOf.call(this, search, start);
+    read += (at < 0 ? this.length : at + search.length) - start;
+    return at;
+  };
+  proto.lastIndexOf = function (this: string, search: string, from?: number): number {
+    const at = saved.lastIndexOf.call(this, search, from);
+    read += Math.min(from ?? this.length, this.length) - Math.max(at, 0);
+    return at;
+  };
+  proto.slice = function (this: string, start?: number, end?: number): string {
+    const part = saved.slice.call(this, start, end);
+    read += part.length;
+    return part;
+  };
+  proto.substring = function (this: string, start: number, end?: number): string {
+    const part = saved.substring.call(this, start, end);
+    read += part.length;
+    return part;
+  };
+  // A string object is the target, because its own characters and length must read the same
+  // through the proxy. A method runs on the plain string, so its own reading counts above.
+  const countedString = (text: string): string =>
+    new Proxy(Object(text) as object, {
+      get(target, key) {
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+          read++;
+          return text[Number(key)];
+        }
+        const value: unknown = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(text) : value;
+      },
+    }) as unknown as string;
+  // The characters of `command` split into an array count each read and each write, and the
+  // string the array joins back into is counted the same way. The mask is built that way.
+  const countedArray = (items: string[]): string[] =>
+    new Proxy(items, {
+      get(target, key) {
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+          read++;
+        }
+        if (key === 'join') {
+          return (separator?: string) => countedString(join.call(target, separator));
+        }
+        return Reflect.get(target, key);
+      },
+      set(target, key, value) {
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+          read++;
+        }
+        return Reflect.set(target, key, value);
+      },
+    });
+  proto.split = function (this: string, separator: string | RegExp, limit?: number): string[] {
+    const split = saved.split as (this: string, separator: string | RegExp, limit?: number) => string[];
+    const parts = split.call(this, separator, limit);
+    return this === command && separator === '' ? countedArray(parts) : parts;
+  } as typeof proto.split;
+  try {
+    run(countedString(command));
+  } finally {
+    Object.assign(proto, saved);
+  }
+  return read;
+}
+
+// Openers with no newline after them are read once, not once each: heredoc openers in a
+// substitution, and PowerShell here-string openers on one line. On a line that ends in a long
+// run of whitespace, the here-string openers scan back over that run once between them.
+test('reading a command costs work in step with its length', () => {
+  const commands = [
+    `claude -p "$(${'<<a '.repeat(1 << 14)})" --output-format json`,
+    `echo ${"@'x' ".repeat(1 << 14)}\ngit commit -m real`,
+    `echo ${"@'x' ".repeat(1 << 12)}${' '.repeat(1 << 12)}\ngit commit -m real`,
+  ];
+  for (const command of commands) {
+    let answer: boolean | undefined;
+    const read = charactersRead(command, (counted) => {
+      answer = ranGit(counted);
+    });
+    assert.equal(answer, ranGit(command), 'the counted command read differently from the plain one');
+    assert.ok(read >= command.length, `a command of ${command.length} characters counted only ${read} read`);
+    assert.ok(read < command.length * 16, `a command of ${command.length} characters read ${read}`);
+  }
+  for (const depth of [1 << 10, 1 << 12]) {
+    const command = `python dispatch.py --prompt (${'python wrapper --prompt ('.repeat(depth)}Join-Path root file${')'.repeat(depth + 1)} --arc-dispatch`;
+    let answer: ReturnType<typeof claudeLaunchKind> | undefined;
+    const read = charactersRead(command, (counted) => {
+      answer = claudeLaunchKind(counted, 'powershell');
+    });
+    assert.deepEqual(answer, { kind: 'receipt', count: 1 });
+    assert.ok(read >= command.length, `a command of ${command.length} characters counted only ${read} read`);
+    assert.ok(read < command.length * 24, `a command of ${command.length} characters read ${read}`);
+    const unknownRead = charactersRead(command, (counted) => {
+      answer = claudeLaunchKind(counted);
+    });
+    assert.deepEqual(answer, { kind: 'receipt', count: 1 });
+    assert.ok(
+      unknownRead < command.length * 48,
+      `an unknown-shell command of ${command.length} characters read ${unknownRead}`,
+    );
+  }
+  for (const count of [1 << 10, 1 << 12]) {
+    const command = `${'echo `true #x`; '.repeat(count)}echo $((2*(3+(4)))); python child.py --arc-dispatch`;
+    const read = charactersRead(command, (counted) => {
+      assert.deepEqual(claudeLaunchKind(counted, 'bash'), { kind: 'receipt', count: 1 });
+    });
+    assert.ok(read < command.length * 24, `a backtick command of ${command.length} characters read ${read}`);
+  }
+});
+
+// The same shape in PowerShell, and the one this workspace's own commits are written with.
+// The message goes into a `@'` here-string, the here-string goes to a file, and the commit
+// reads it back. An apostrophe in the body is what makes the mask worth having: without it
+// the scan reads everything from that apostrophe on as quoted text, so the git calls after
+// the terminator stop looking like calls at all. Four commits in the real transcripts are
+// made exactly this way.
+const HERE_STRING = [
+  "$msg = @'",
+  "The weight layer's Off state now reaches On when any of the three toggles",
+  'rises, and returns only when all three are off.',
+  "'@",
+  '[IO.File]::WriteAllText("$env:TEMP\\msg.txt", $msg, (New-Object System.Text.UTF8Encoding($false)))',
+  'git add "README.md" "README_JP.md"',
+  '$staged = @(git diff --cached --name-only); Write-Output "staged: $($staged.Count)"; $staged',
+  'if ($staged.Count -eq 2) { git commit -F "$env:TEMP\\msg.txt" } else { Write-Output "ABORT" }',
+  'git log --oneline -1',
+].join('\n');
+
+test('a PowerShell here-string body does not qualify a call, and the commit after it still does', () => {
+  assert.equal(ranGit(HERE_STRING), true);
+  assert.deepEqual(commitDirs(HERE_STRING, REPO, HOME), [REPO]);
+
+  // The words on their own are text being written to a file. A call that only writes the
+  // body makes no commit, whatever the body says.
+  const bodyOnly = [
+    "$note = @'",
+    "The owner's note reads:",
+    'git commit -m "the example" is what prints the line.',
+    "'@",
+    'Write-Output "written"',
+  ].join('\n');
+  assert.equal(ranGit(bodyOnly), false);
+});
+
+test('a here-string is masked to its terminator, and only when its opener ends the line', () => {
+  // The `@"` form is the same rule with the other quote.
+  const double = [
+    '$msg = @"',
+    'The note says "keep it and nothing else.',
+    'git commit -m "the example" is only the example.',
+    '"@',
+    'Write-Output "written"',
+  ].join('\n');
+  assert.equal(ranGit(double), false);
+  assert.equal(ranGit(`${double}\ngit commit -F msg.txt`), true);
+
+  // An opener with no terminator runs to the end of the command, the answer a heredoc with
+  // no terminator already gives, so nothing behind it is read as a call.
+  const unterminated = ["$t = @'", "The plan's next line reads:", 'git commit -m "x"'].join('\n');
+  assert.equal(ranGit(unterminated), false);
+
+  // PowerShell requires the opener to end its line, which is what separates a here-string
+  // from an argument that merely holds the two characters. This one is an ordinary quoted
+  // string, so the commit under it is a real call.
+  const notAnOpener = '$addr = user@\'example.com\'\ngit commit -m "x"';
+  assert.equal(ranGit(notAnOpener), true);
+  assert.deepEqual(commitDirs(notAnOpener, REPO, HOME), [REPO]);
+});
+
+// What the Codex reader passes, because a rollout keeps the shell command inside the
+// JavaScript program its exec sandbox ran. Refusing it would take every commit Codex has
+// made off the timeline, so a source that says it cannot read its own commands has its
+// output read whatever ran.
+test('a source that cannot read its own commands has its output read anyway', () => {
+  const unreadable: { commits: TurnCommit[] } = { commits: [] };
+  recordCommits(unreadable, '[main f572f41] Add the camera plan\n 1 file changed, 186 insertions(+)', 5, 'unreadable');
+  assert.deepEqual(unreadable.commits, [
+    {
+      sha: 'f572f41',
+      subject: 'Add the camera plan',
+      head: { kind: 'branch', name: 'main' },
+      files: 1,
+      added: 186,
+      removed: 0,
+      at: 5,
+      place: null,
+      dir: null,
+    },
+  ]);
+  // A reader that does record commands and recorded none for this result is the other
+  // answer: nothing says git ran, so nothing is read.
+  const unrecorded: { commits: TurnCommit[] } = { commits: [] };
+  recordCommits(unrecorded, '[main f572f41] Add the camera plan\n 1 file changed, 186 insertions(+)', 5, null);
+  assert.deepEqual(unrecorded.commits, []);
+});
+
+test('a commit made in another repository is reported with it, and one made here is not', () => {
+  const bash = (command: string, second: number, cwd: string) => ({
+    ...assistantTool('Bash', second, 't1', { command }),
+    cwd,
+  });
+  const readWith = (command: string, cwd: string, folders: string[]) => {
+    const file = writeTranscript([
+      userPrompt('write the run up', 0),
+      bash(command, 1, cwd),
+      commitResult('[main abc1234] Note the run\n 1 file changed, 4 insertions(+)', 2),
+      assistantText('Done.', 3),
+    ]);
+    return readTurns(file, 'sess', { folders })[0].commits[0];
+  };
+  const away = 'cd "C:/Users/dev/Projects/side-repo" && git add -A && git commit -m "notes"';
+  assert.deepEqual(readWith(away, REPO, [REPO]).place, { kind: 'named', dir: NOTES });
+  // The figures and the subject are untouched by any of this.
+  assert.deepEqual(readWith(away, REPO, [REPO]), {
+    sha: 'abc1234',
+    subject: 'Note the run',
+    head: { kind: 'branch', name: 'main' },
+    files: 1,
+    added: 4,
+    removed: 0,
+    at: ms(2),
+    place: { kind: 'named', dir: NOTES },
+    dir: NOTES,
+  });
+  const local = readWith('git add -A && git commit -m "here"', REPO, [REPO]);
+  assert.equal(local.place, null);
+  assert.equal(local.dir, REPO);
+  // A commit in the workspace, and the same commit read with no folder open, both say nothing.
+  assert.equal(readWith('git add -A && git commit -m "here"', REPO, [REPO]).place, null);
+  assert.equal(readWith(away, REPO, []).place, null);
+  // Two foreign repositories in one command: every commit the call printed is marked as made
+  // outside this workspace, and none of them names a directory.
+  const both =
+    'cd "C:/Users/dev/Projects/side-repo" && git commit -m "a" && cd "C:/Users/dev/Projects/work/other-repo" && git commit -m "b"';
+  const ambiguous = readWith(both, REPO, [REPO]);
+  assert.deepEqual(ambiguous.place, { kind: 'unnamed' });
+  assert.equal(ambiguous.dir, null);
+});
+
+test('the PowerShell tool is read for a commit the same way the Bash tool is', () => {
+  // 15 of the 133 commits in one measured run of the real transcripts came from it, and
+  // both tools carry the command in the same field.
+  const file = writeTranscript([
+    userPrompt('log the run', 0),
+    {
+      ...assistantTool('PowerShell', 1, 't1', {
+        command: 'Push-Location "C:/Users/dev/Projects/side-repo"; git add .; git commit -m "notes"',
+      }),
+      cwd: REPO,
+    },
+    commitResult('[main abc1234] Note the run\n 1 file changed, 4 insertions(+)', 2),
+    assistantText('Done.', 3),
+  ]);
+  assert.deepEqual(readTurns(file, 'sess', { folders: [REPO] })[0].commits[0].place, { kind: 'named', dir: NOTES });
+});
+
+test('a relative move is resolved against where the call started, not where it ended', () => {
+  // The transcript keeps no working directory on the tool call. The record carrying the
+  // call has the directory before the command ran and the record carrying the result has
+  // the directory after, and only the first one a relative `cd` can be resolved against.
+  const file = writeTranscript([
+    userPrompt('note it', 0),
+    { ...assistantTool('Bash', 1, 't1', { command: 'cd ../../side-repo && git commit -m "notes"' }), cwd: REPO },
+    { ...commitResult('[main abc1234] Note the run\n 1 file changed, 4 insertions(+)', 2), cwd: NOTES },
+    assistantText('Done.', 3),
+  ]);
+  // Spelled with the drive case the record wrote, because a directory keeps the case the
+  // command gave it: the reader is shown this path, and a path is compared through
+  // `normalizeFsPath` rather than lower-cased on the way in.
+  assert.deepEqual(readTurns(file, 'sess', { folders: [REPO] })[0].commits[0].place, {
+    kind: 'named',
+    dir: 'c:/Users/dev/Projects/side-repo',
+  });
+});
+
+// git's own output carries lines a pre-commit hook and a build step wrote, so what the rule
+// accepts is what it will read out of the rest of a git call's output. Each line below is a
+// shape a rule that merely counts tokens before the sha would draw on a card as a commit that
+// never happened.
+test('a bracketed log line is not read as a commit', () => {
+  const noise = [
+    '[2026-08-26 10:23:45 deadbeef] service started',
+    '[INFO worker 3 abc1234] job done',
+    '[ERROR db pool 0123456789abcdef] connection lost',
+  ].join('\n');
+  const file = writeTranscript([
+    userPrompt('run the server', 0),
+    assistantTool('Bash', 1, 't1', { command: 'git commit -a -m "the change"' }),
+    commitResult(noise, 2),
+    assistantText('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.commits, []);
+});
+
+// Which output may be read for a commit at all. Every command below is a shape taken from
+// the real transcripts, and the commit line under them is the one a real session drew on a
+// card without git having made it in that call.
+const PLAN_COMMIT = '[main f572f41] Add camera share freeze plan\n 1 file changed, 186 insertions(+)';
+const PLAN_ROW = {
+  sha: 'f572f41',
+  subject: 'Add camera share freeze plan',
+  head: { kind: 'branch' as const, name: 'main' },
+  files: 1,
+  added: 186,
+  removed: 0,
+  at: ms(2),
+  place: null,
+  dir: null,
+};
+
+// What a turn records for one command and the output that came back from it. Passing null
+// leaves the call with no command on it, which is a tool the reader recorded nothing for.
+function commitsFor(command: string | null, stdout: string) {
+  const file = writeTranscript([
+    userPrompt('do the work', 0),
+    command === null ? assistantTool('Bash', 1, 't1') : assistantTool('Bash', 1, 't1', { command }),
+    commitResult(stdout, 2),
+    assistantText('Done.', 3),
+  ]);
+  return readTurns(file, 'sess')[0].commits;
+}
+
+test('a commit printed by a plain git commit call is recorded', () => {
+  assert.deepEqual(commitsFor('git commit -m "add the plan"', PLAN_COMMIT), [PLAN_ROW]);
+});
+
+test('a git commit run after a move is recorded, since the call still ran git', () => {
+  assert.deepEqual(commitsFor('cd /c/Users/dev/Projects/side-repo && git commit -m "notes"', PLAN_COMMIT), [
+    { ...PLAN_ROW, dir: 'C:/Users/dev/Projects/side-repo' },
+  ]);
+});
+
+test('a commit made through git -C is recorded', () => {
+  assert.deepEqual(commitsFor('git -C ../side-repo commit -m "notes"', PLAN_COMMIT), [PLAN_ROW]);
+});
+
+// A cherry-pick and a revert print the same line a commit does, and both are the turn's own
+// work, so the rule asks whether git ran and not whether `commit` was the subcommand. The
+// two outputs below were captured from git rather than written from memory; `git merge`
+// itself prints "Merge made by the 'ort' strategy." and no bracketed line at all, and the
+// line for a merge comes from the `git commit` that closes a conflicted one.
+test('a cherry-pick and a revert are recorded, though neither call says commit', () => {
+  assert.deepEqual(
+    commitsFor(
+      'git cherry-pick feat',
+      '[other 71af154] feat work\n Date: Thu Aug 27 16:37:23 2026 -0500\n 1 file changed, 1 insertion(+)',
+    ),
+    [
+      {
+        sha: '71af154',
+        subject: 'feat work',
+        head: { kind: 'branch', name: 'other' },
+        files: 1,
+        added: 1,
+        removed: 0,
+        at: ms(2),
+        place: null,
+        dir: null,
+      },
+    ],
+  );
+  assert.deepEqual(
+    commitsFor(
+      'git revert --no-edit HEAD~1',
+      '[main 108efd5] Revert "main work"\n Date: Thu Aug 27 16:37:24 2026 -0500\n 1 file changed, 1 deletion(-)',
+    ),
+    [
+      {
+        sha: '108efd5',
+        subject: 'Revert "main work"',
+        head: { kind: 'branch', name: 'main' },
+        files: 1,
+        added: 0,
+        removed: 1,
+        at: ms(2),
+        place: null,
+        dir: null,
+      },
+    ],
+  );
+});
+
+// The defect this rule was written for. A session ran a script that surveyed other agents'
+// transcripts and printed one of their commit lines as sample output. That commit is real,
+// it is in another project, and git did not make it in this call; the card claimed it as
+// the turn's own work.
+test('a script that quoted a commit line records nothing, since the call never ran git', () => {
+  assert.deepEqual(commitsFor("cd /c/Users/dev/scratch && awk 'NR>95' sol.txt", PLAN_COMMIT), []);
+  assert.deepEqual(commitsFor('python survey.py --root ~/.codex/sessions', PLAN_COMMIT), []);
+});
+
+test('the word git inside a quoted message does not make a call a git call', () => {
+  assert.deepEqual(commitsFor('python tools/announce.py --message "git commit -m done"', PLAN_COMMIT), []);
+  assert.deepEqual(commitsFor("printf '%s' 'git commit -m x' > note.txt", PLAN_COMMIT), []);
+});
+
+test('a result whose call recorded no command records nothing', () => {
+  assert.deepEqual(commitsFor(null, PLAN_COMMIT), []);
+});
+
+test('reasoning effort is read from the top level of the assistant line, not from message', () => {
+  const file = writeTranscript([userPrompt('do it', 0), assistantText('Done.', 1, undefined, 'xhigh')]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.effort, 'xhigh');
+});
+
+test('a turn with no effort on any of its lines reports null', () => {
+  const file = writeTranscript([userPrompt('do it', 0), assistantText('Done.', 1)]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.effort, null);
+});
+
+test("a synthetic line's effort is ignored, since it was not written by the model", () => {
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      effort: 'xhigh',
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [{ type: 'text', text: 'Usage credits are required for this model.' }],
+      },
+    },
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.effort, null);
+});
+
+test('effort comes from the last reply that recorded one', () => {
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    assistantText('First.', 1, undefined, 'low'),
+    assistantText('Second.', 2, undefined, 'xhigh'),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.effort, 'xhigh');
+});
+
+test('an api error line cannot set the effort, since the model did not write it', () => {
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      effort: 'xhigh',
+      isApiErrorMessage: true,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500' }] },
+    },
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.effort, null);
+});
+
+test('an effort recorded mid-turn survives a closing reply that records none', () => {
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    assistantTool('Edit', 1, 'tu1', {}, 'xhigh'),
+    assistantText('Done.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(
+    turn.effort,
+    'xhigh',
+    'roughly one line in twenty carries no effort, which does not clear the effort of the turn',
+  );
+});
+
+test('a turn is finished only when its last reply closed the turn', () => {
+  const running = writeTranscript([
+    userPrompt('do it', 0),
+    {
+      ...assistantText('Working on the first part.', 1),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'Working on the first part.' }],
+      },
+    },
+    {
+      ...assistantTool('Bash', 2),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }],
+      },
+    },
+  ]);
+  assert.equal(readTurns(running, 'sess')[0].finished, false);
+
+  const done = writeTranscript([
+    userPrompt('do it', 0),
+    {
+      ...assistantTool('Bash', 1),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }],
+      },
+    },
+    {
+      ...assistantText('All done.', 2),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'All done.' }],
+      },
+    },
+  ]);
+  assert.equal(readTurns(done, 'sess')[0].finished, true);
+});
+
+test('usage is counted once per API response, not once per transcript line', () => {
+  // One response is written as several lines (thinking, text, tool_use), each repeating
+  // the same usage object. Counting per line multiplies the turn's tokens.
+  const usage = {
+    input_tokens: 5,
+    output_tokens: 1000,
+    cache_read_input_tokens: 90_000,
+    cache_creation_input_tokens: 2000,
+    cache_creation: { ephemeral_1h_input_tokens: 2000, ephemeral_5m_input_tokens: 0 },
+    output_tokens_details: { thinking_tokens: 600 },
+  };
+  const reply = (id: string, second: number, content: object[], stop = 'tool_use') => ({
+    type: 'assistant',
+    timestamp: at(second),
+    message: { role: 'assistant', id, model: 'claude-opus-5', stop_reason: stop, content, usage },
+  });
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    reply('msg_1', 1, [{ type: 'thinking', thinking: 'hmm' }]),
+    reply('msg_1', 2, [{ type: 'text', text: 'Working.' }]),
+    reply('msg_1', 3, [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }]),
+    reply('msg_2', 4, [{ type: 'text', text: 'Done.' }], 'end_turn'),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.usage.output, 2000); // two responses, not four lines
+  assert.equal(turn.usage.thinking, 1200);
+  assert.equal(turn.usage.cacheRead, 180_000);
+  assert.equal(turn.usage.cacheWrite1h, 4000);
+  assert.equal(turn.usage.input, 10);
+  assert.equal(turn.usage.output, 2000);
+  assert.equal(
+    turn.usage.requests,
+    2,
+    'the thinking, text and tool-use lines from one response were counted as separate requests',
+  );
+});
+
+test('an older transcript with no cache TTL split is charged at the 1h rate', () => {
+  const file = writeTranscript([
+    userPrompt('do it', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'm1',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Done.' }],
+        usage: { input_tokens: 1, output_tokens: 10, cache_creation_input_tokens: 5000 },
+      },
+    },
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.usage.cacheWrite1h, 5000);
+  assert.equal(turn.usage.cacheWrite5m, 0);
+});
+
+test('a prompt that never got a reply of its own joins the next turn instead of an empty card', () => {
+  // Messages queued while the agent is working are each recorded as their own prompt, but
+  // only the last one has the reply attached. The earlier ones would otherwise render as
+  // cards with nothing in them.
+  const file = writeTranscript([
+    userPrompt('first job', 0),
+    assistantTool('Bash', 1),
+    assistantText('First done.', 2),
+    userPrompt('queued one', 3),
+    userPrompt('queued two', 4),
+    assistantText('Both done.', 5),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].prompt, 'first job');
+  assert.equal(turns[1].prompt, 'queued one\n\nqueued two');
+  assert.equal(turns[1].summary, 'Both done.');
+  // The two are kept apart as well as joined. Anything offering the reader their prompts back
+  // has to hand them one at a time, or one press puts both in the box and sends both.
+  assert.deepEqual(
+    turns[1].promptParts?.map((one) => one.text),
+    ['queued one', 'queued two'],
+  );
+  assert.deepEqual(
+    turns[0].promptParts?.map((one) => one.text),
+    ['first job'],
+  );
+  // Each carries when it was typed, which is what orders it against the prompts the reader
+  // typed while the turn ran.
+  assert.ok((turns[1].promptParts ?? []).every((one) => one.at > 0));
+});
+
+test('a line the cleaning leaves empty opens no turn and no part', () => {
+  // A wrapper with nothing of the reader's in it cleans away to nothing. `isTypedPrompt`
+  // refuses it, which is what keeps an entry saying nothing out of the walk.
+  const file = writeTranscript([
+    userPrompt('<ide_selection>lines 4 to 9</ide_selection>', 0),
+    userPrompt('fix the parser', 1),
+    assistantText('Done.', 2),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 1);
+  assert.deepEqual(
+    turns[0].promptParts?.map((one) => one.text),
+    ['fix the parser'],
+  );
+  assert.equal(turns[0].prompt, 'fix the parser', 'the recorded prompt opens on a blank line');
+});
+
+test('a run of prompts with no reply between them is kept apart, not folded in pairs', () => {
+  // A turn carried forward can itself be carrying one. Handed on by its joined prompt, the
+  // first two rejoin into a single part and one press of Up puts both in the box.
+  const file = writeTranscript([
+    userPrompt('queued one', 0),
+    userPrompt('queued two', 1),
+    userPrompt('queued three', 2),
+    assistantText('All done.', 3),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 1);
+  assert.deepEqual(
+    turns[0].promptParts?.map((one) => one.text),
+    ['queued one', 'queued two', 'queued three'],
+  );
+});
+
+test('the turn at the end of the file is kept even before it has done anything', () => {
+  // The agent has taken the prompt but not yet called a tool. That looks identical to a
+  // queued message, so the last turn is always kept: it is the one running now.
+  const file = writeTranscript([
+    userPrompt('first job', 0),
+    assistantText('First done.', 1),
+    userPrompt('just asked this', 2),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 2);
+  assert.equal(turns[1].prompt, 'just asked this');
+  assert.equal(turns[1].finished, false);
+});
+
+test('a session run in a subfolder of an open folder belongs to that window', () => {
+  const root = tempDir('proj-');
+  const home = tempDir('home-');
+  const notes = path.join(home, 'notes');
+  const decoy = path.join(home, 'notes-elsewhere');
+
+  const mk = (dirName: string, cwd: string) => {
+    const dir = path.join(root, dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 's.jsonl'),
+      JSON.stringify({ type: 'user', cwd, timestamp: at(0), message: { role: 'user', content: 'x' } }) + '\n',
+    );
+  };
+  mk(projectSlug(home), home);
+  mk(projectSlug(notes), notes);
+  mk(projectSlug(decoy), decoy);
+
+  // opening the parent brings in the sessions run beneath it
+  const fromParent = transcriptDirsFor(root, [home])
+    .map((d) => path.basename(d))
+    .sort();
+  assert.deepEqual(fromParent, [projectSlug(decoy), projectSlug(home), projectSlug(notes)].sort());
+
+  // opening the subfolder brings in only its own, not the sibling that shares its prefix
+  assert.deepEqual(
+    transcriptDirsFor(root, [notes]).map((d) => path.basename(d)),
+    [projectSlug(notes)],
+  );
+});
+
+test('readSessionCwd reads the cwd out of a transcript head', () => {
+  const dir = tempDir('cwd-');
+  const file = path.join(dir, 's.jsonl');
+  fs.writeFileSync(
+    file,
+    [
+      JSON.stringify({ type: 'queue-operation', timestamp: at(0) }),
+      JSON.stringify({ type: 'user', cwd: 'c:/repo/here', timestamp: at(1), message: { role: 'user', content: 'x' } }),
+    ].join('\n') + '\n',
+  );
+  assert.equal(readSessionCwd(file), 'c:/repo/here');
+
+  const empty = path.join(dir, 'empty.jsonl');
+  fs.writeFileSync(empty, 'not json\n');
+  assert.equal(readSessionCwd(empty), null);
+});
+
+test('a background subagent reports its figures through the task notification', () => {
+  // Its own lines go to a separate transcript, so the notification is the only place the
+  // reader can learn what it spent. The three tag names are the part most likely to drift.
+  const file = writeTranscript([
+    userPrompt('run the audit in the background', 0),
+    assistantTool('Agent', 1, 'bg9', { description: 'Audit the parser', subagent_type: 'Explore' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<task-notification><task-id>child-bg9</task-id><tool-use-id>bg9</tool-use-id><status>completed</status></task-notification>' +
+          '<subagent_tokens>176288</subagent_tokens><tool_uses>49</tool_uses><duration_ms>940926</duration_ms>',
+      },
+    },
+    assistantText('The audit came back.', 3),
+  ]);
+  const spend = [
+    {
+      model: 'claude-sonnet-5',
+      usage: { input: 2, cacheWrite1h: 0, cacheWrite5m: 3, cacheRead: 40, output: 5, thinking: 1 },
+    },
+  ];
+  const [turn] = readTurns(file, 'sess', {
+    agentSpendOf: (agent) => ({
+      models: agent.id === 'child-bg9' ? spend : [],
+      found: agent.id === 'child-bg9',
+      partial: false,
+      effort: null,
+    }),
+  });
+  assert.equal(turn.agents.length, 1);
+  assert.equal(turn.agents[0].tokens, 176288);
+  assert.equal(turn.agents[0].toolUses, 49);
+  assert.equal(turn.agents[0].durationMs, 940926);
+  assert.equal(turn.agents[0].status, 'completed');
+  assert.equal(turn.agents[0].id, 'child-bg9');
+  assert.deepEqual(turn.agents[0].spend, spend);
+});
+
+test('a finished background subagent with no <tool_uses> tag counts its own calls', () => {
+  // A background launch's own result never carries a tool count, and measured across real
+  // notifications 42% carry no <tool_uses> tag either. This notice is one of those: it closes
+  // the child but says nothing about how many tools it ran.
+  const file = writeTranscript([
+    userPrompt('run the audit in the background', 0),
+    assistantTool('Agent', 1, 'bg9', { description: 'Audit the parser', subagent_type: 'Explore' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<task-notification><task-id>child-bg9</task-id><tool-use-id>bg9</tool-use-id><status>completed</status></task-notification>',
+      },
+    },
+    assistantText('The audit came back.', 3),
+  ]);
+  const artifacts = {
+    files: [],
+    commits: [],
+    tools: { Bash: 5, Edit: 2 },
+    complete: true,
+    revision: 'child-r1',
+  };
+  const [turn] = readTurns(file, 'sess', {
+    agentSpendOf: (agent) => ({
+      models: [],
+      found: agent.id === 'child-bg9',
+      partial: false,
+      effort: null,
+      artifacts: agent.id === 'child-bg9' ? artifacts : undefined,
+    }),
+  });
+  assert.equal(turn.agents.length, 1);
+  // The count from its own calls fills the row rather than leaving it with no tool count at all.
+  assert.equal(turn.agents[0].toolUses, 7);
+  assert.equal(turn.agents[0].status, 'completed');
+});
+
+test('a still-running background subagent with no tool-use tag keeps no tool count', () => {
+  // The fallback fills a finished row only. A child still open may yet run more tools, so its
+  // count-so-far must not be read as its final one.
+  const file = writeTranscript([
+    userPrompt('run the audit in the background', 0),
+    assistantTool('Agent', 1, 'bg9', { description: 'Audit the parser', subagent_type: 'Explore' }),
+    backgroundLaunch('bg9', 'child-bg9', 2),
+  ]);
+  const artifacts = {
+    files: [],
+    commits: [],
+    tools: { Bash: 5 },
+    complete: false,
+    revision: 'child-r1',
+  };
+  const [turn] = readTurns(file, 'sess', {
+    agentSpendOf: (agent) => ({
+      models: [],
+      found: agent.id === 'child-bg9',
+      partial: true,
+      effort: null,
+      artifacts: agent.id === 'child-bg9' ? artifacts : undefined,
+    }),
+  });
+  assert.equal(turn.agents.length, 1);
+  assert.equal(turn.agents[0].status, 'running');
+  assert.equal(turn.agents[0].id, 'child-bg9');
+  assert.equal(turn.agents[0].toolUses, null);
+});
+
+test('a background subagent that reports back as an attachment still leaves its row finished', () => {
+  // Claude Code writes the completion notice in two shapes. A notice delivered while the
+  // main agent waits lands as a user record. A notice delivered while the main agent works
+  // lands as a queued attachment, whose text sits in `attachment.prompt` and which carries
+  // no origin at all. Four rows of one real turn read "still running" with no cost, and the
+  // card under-reported that turn by 24 percent.
+  const asked: string[] = [];
+  const spend = [
+    {
+      model: 'claude-opus-5',
+      usage: { input: 4, cacheWrite1h: 0, cacheWrite5m: 6, cacheRead: 80, output: 9, thinking: 2 },
+    },
+  ];
+  const file = writeTranscript([
+    userPrompt('trace the submit path in the background', 0),
+    assistantTool('Agent', 1, 'bg4', { description: 'Trace webview submit render path', subagent_type: 'Explore' }),
+    queued(
+      {
+        commandMode: 'task-notification',
+        prompt:
+          '<task-notification><task-id>child-bg4</task-id><tool-use-id>bg4</tool-use-id><status>completed</status></task-notification>' +
+          '<subagent_tokens>204311</subagent_tokens><tool_uses>31</tool_uses><duration_ms>512000</duration_ms>',
+      },
+      4,
+    ),
+    assistantText('The trace came back.', 5),
+  ]);
+  const [turn] = readTurns(file, 'sess', {
+    agentSpendOf: (agent) => {
+      asked.push(String(agent.id));
+      return {
+        models: agent.id === 'child-bg4' ? spend : [],
+        found: agent.id === 'child-bg4',
+        partial: false,
+        effort: null,
+      };
+    },
+  });
+  assert.equal(turn.agents.length, 1, 'the attachment notice drew a second row for the same agent');
+  assert.equal(turn.agents[0].status, 'completed', 'the row kept the status its launch wrote');
+  assert.equal(turn.agents[0].id, 'child-bg4', 'the row never learned the child id, so its cost stays unread');
+  assert.deepEqual(asked, ['child-bg4'], 'the child transcript was never opened');
+  assert.deepEqual(turn.agents[0].spend, spend);
+  assert.equal(turn.agents[0].tokens, 204311);
+  assert.equal(turn.agents[0].toolUses, 31);
+  assert.equal(turn.agents[0].durationMs, 512000);
+});
+
+test('an attachment notice for an agent that is still running leaves the row running', () => {
+  // The same task reports more than once, and a later report can arrive under the id of the
+  // message that woke the agent rather than under its launch. A report that names no
+  // launched row must change nothing, or a resumed agent draws a second row and its cost is
+  // counted twice.
+  const file = writeTranscript([
+    userPrompt('start two background traces', 0),
+    assistantTool('Agent', 1, 'bg7', { description: 'Trace host submit path', subagent_type: 'Explore' }),
+    queued(
+      {
+        commandMode: 'task-notification',
+        prompt:
+          '<task-notification><task-id>child-bg7</task-id><tool-use-id>bg7</tool-use-id><status>running</status></task-notification>',
+      },
+      2,
+    ),
+    queued(
+      {
+        commandMode: 'task-notification',
+        prompt:
+          '<task-notification><task-id>child-other</task-id><tool-use-id>msg-9</tool-use-id><status>completed</status></task-notification>',
+      },
+      3,
+    ),
+    assistantText('Still waiting.', 4),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.agents.length, 1, 'a notice under an unknown tool-use id drew a row of its own');
+  assert.equal(turn.agents[0].status, 'running', 'a running agent stopped reading as running');
+  assert.equal(turn.agents[0].id, 'child-bg7');
+});
+
+test('a notice under an unknown tool-use id leaves the call that holds that id alone', () => {
+  // A resumed agent reports back under the id of the message that woke it, not under the id
+  // of its launch. That id belongs to a call the agent is still waiting on. Ending it here
+  // drops the call record, and the result that arrives next has no step left to join, so a
+  // failure the reader has to see never reaches the row.
+  const file = writeTranscript([
+    userPrompt('wake the trace agent', 0),
+    assistantTool('Agent', 1, 'bg7', { description: 'Trace host submit path', subagent_type: 'Explore' }),
+    assistantTool('SendMessage', 2, 'msg-9', { agent_id: 'child-bg7', message: 'check the refresh path too' }),
+    queued(
+      {
+        commandMode: 'task-notification',
+        prompt:
+          '<task-notification><task-id>child-bg7</task-id><tool-use-id>msg-9</tool-use-id><status>completed</status></task-notification>',
+      },
+      3,
+    ),
+    {
+      type: 'user',
+      timestamp: at(4),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'msg-9', is_error: true, content: 'the agent had already stopped' },
+        ],
+      },
+    },
+    assistantAnswer('The message did not land.', 5),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.steps.map((step) => [step.name, step.status]),
+    [
+      ['Agent', 'done'],
+      ['SendMessage', 'failed'],
+    ],
+    'the notice ended a call it does not own, so the failed result found no step',
+  );
+});
+
+test('a notice recorded in a block shape the reader has no name for still gives up its tags', () => {
+  // The tags are read out of the raw text with a regular expression, so the text has to
+  // arrive whole. A content array of any other block shape folds to `[object Object]` under
+  // a text-only reading, and the child id goes with it.
+  const file = writeTranscript([
+    userPrompt('trace the submit path in the background', 0),
+    assistantTool('Agent', 1, 'bg2', { description: 'Trace transcript append boundaries', subagent_type: 'Explore' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'task_notification',
+            notification:
+              '<task-notification><task-id>child-bg2</task-id><tool-use-id>bg2</tool-use-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    },
+    assistantAnswer('The trace came back.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.agents[0].status, 'completed');
+  assert.equal(turn.agents[0].id, 'child-bg2', 'the child id was lost with the block the reader could not name');
+});
+
+test('a turn that ends on an attachment notice ends when the notice arrived', () => {
+  // The line reducer that the project index runs keeps every line of type user, assistant or
+  // cost-state and drops the rest. A background agent that finishes while the main agent
+  // waits reports back as an attachment, and that report is the turn's last event.
+  const reducer = createClaudeUsageLineReducer();
+  reducer.pushLine(JSON.stringify(userPrompt('trace the submit path in the background', 1)));
+  reducer.pushLine(JSON.stringify(assistantText('Launched.', 2, { output_tokens: 1 }, undefined, 'end_turn')));
+  assert.equal(reducer.newestTurnOutcome()?.endedAt, ms(2));
+  reducer.pushLine(
+    JSON.stringify(
+      queued(
+        {
+          commandMode: 'task-notification',
+          prompt:
+            '<task-notification><task-id>child-bg4</task-id><tool-use-id>bg4</tool-use-id><status>completed</status></task-notification>',
+        },
+        9,
+      ),
+    ),
+  );
+  assert.equal(
+    reducer.newestTurnOutcome()?.endedAt,
+    ms(9),
+    'the turn ended before the agent it was waiting on reported back',
+  );
+});
+
+// Every record a child agent writes carries `isSidechain`, because the same mark tells a
+// parent read that the line belongs to a child. The fixture carries it for that reason: a
+// child fixture without it prices work that no real child transcript ever offers.
+test('a Claude child transcript keeps model rates apart, reports nested work, and retains its last effort', () => {
+  const file = writeTranscript([
+    {
+      type: 'assistant',
+      isSidechain: true,
+      uuid: 'u1',
+      effort: 'low',
+      message: {
+        id: 'm1',
+        model: 'claude-opus-5',
+        usage: {
+          input_tokens: 2,
+          cache_read_input_tokens: 30,
+          cache_creation_input_tokens: 40,
+          cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 40 },
+          output_tokens: 5,
+          output_tokens_details: { thinking_tokens: 3 },
+        },
+      },
+    },
+    // The same response is written again as it grows, and only the last record carries the
+    // whole output and thinking count.
+    {
+      type: 'assistant',
+      isSidechain: true,
+      uuid: 'u2',
+      effort: '',
+      message: {
+        id: 'm1',
+        model: 'claude-opus-5',
+        usage: {
+          input_tokens: 2,
+          cache_read_input_tokens: 30,
+          cache_creation_input_tokens: 40,
+          cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 40 },
+          output_tokens: 137,
+          output_tokens_details: { thinking_tokens: 9 },
+        },
+      },
+    },
+    {
+      type: 'assistant',
+      isSidechain: true,
+      uuid: 'u3',
+      effort: 'high',
+      message: {
+        id: 'm2',
+        model: 'claude-sonnet-5',
+        usage: {
+          input_tokens: 7,
+          cache_read_input_tokens: 11,
+          cache_creation_input_tokens: 13,
+          output_tokens: 17,
+        },
+      },
+    },
+    {
+      type: 'assistant',
+      isSidechain: true,
+      uuid: 'u4',
+      message: {
+        id: 'm3',
+        model: 'claude-sonnet-5',
+        content: [{ type: 'tool_use', name: 'Agent', id: 'nested', input: { description: 'check it' } }],
+      },
+    },
+  ]);
+  const { artifacts, ...spend } = readClaudeAgentSpend(file);
+  assert.deepEqual([artifacts?.files, artifacts?.commits, artifacts?.complete], [[], [], true]);
+  assert.deepEqual(
+    { ...spend, models: spend.models.map(({ usageParts: _usageParts, ...model }) => model) },
+    {
+      models: [
+        {
+          model: 'claude-opus-5',
+          usage: {
+            requests: 1,
+            input: 2,
+            cacheWrite1h: 0,
+            cacheWrite5m: 40,
+            cacheWrite30m: 0,
+            cacheRead: 30,
+            output: 137,
+            thinking: 9,
+          },
+        },
+        {
+          model: 'claude-sonnet-5',
+          usage: {
+            requests: 1,
+            input: 7,
+            cacheWrite1h: 13,
+            cacheWrite5m: 0,
+            cacheWrite30m: 0,
+            cacheRead: 11,
+            output: 17,
+            thinking: 0,
+          },
+        },
+      ],
+      found: true,
+      partial: true,
+      effort: 'high',
+    },
+  );
+  assert.deepEqual(
+    spend.models.map((model) =>
+      model.usageParts?.map((part) => [
+        part.model,
+        part.provider,
+        part.contextBand,
+        part.inferenceClass,
+        part.serviceTier,
+      ]),
+    ),
+    [[['claude-opus-5', null, null, null, null]], [['claude-sonnet-5', null, null, null, null]]],
+  );
+  assert.deepEqual(readClaudeAgentSpend(path.join(path.dirname(file), 'missing.jsonl')), {
+    models: [],
+    found: false,
+    partial: false,
+    effort: null,
+  });
+});
+
+// Claude Code writes every subagent of a session flat into one folder. A meta file beside each
+// transcript names the launching tool call, and a nested agent's meta file names its launcher.
+function writeRecords(file: string, records: object[]): void {
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+}
+function writeSubagentMeta(folder: string, id: string, toolUseId: string, parentAgentId?: string): void {
+  fs.writeFileSync(
+    path.join(folder, `agent-${id}.meta.json`),
+    JSON.stringify({ agentType: 'general-purpose', toolUseId, ...(parentAgentId ? { parentAgentId } : {}) }),
+  );
+}
+function haikuRequest(id: string, second: number, stop: string, content: object[], sidechain = true) {
+  return {
+    type: 'assistant',
+    isSidechain: sidechain,
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id,
+      model: 'claude-haiku-4-5',
+      stop_reason: stop,
+      content,
+      usage: { input_tokens: 1000, output_tokens: 0 },
+    },
+  };
+}
+const agentLaunch = (id: string) => [{ type: 'tool_use', id, name: 'Agent', input: { description: id } }];
+const doneText = [{ type: 'text', text: 'Done.' }];
+
+test('a nested subagent counts as running until its own last turn closes', () => {
+  const folder = tempDir('nested-running-');
+  const launcher = path.join(folder, 'agent-a1.jsonl');
+  const nested = path.join(folder, 'agent-a2.jsonl');
+  writeRecords(launcher, [
+    userPrompt('launch a nested agent', 0, { isSidechain: true }),
+    haikuRequest('m1', 1, 'end_turn', [...agentLaunch('launch-2'), ...doneText]),
+  ]);
+  writeSubagentMeta(folder, 'a2', 'launch-2', 'a1');
+  writeRecords(nested, [
+    userPrompt('nested work', 2, { isSidechain: true }),
+    haikuRequest('m2', 3, 'tool_use', [{ type: 'tool_use', id: 'run', name: 'Bash', input: { command: 'ls' } }]),
+  ]);
+  const running = readClaudeAgentSpend(launcher);
+  assert.deepEqual([running.models[0]?.usage.input, running.partial], [2000, true]);
+  fs.appendFileSync(nested, JSON.stringify(haikuRequest('m3', 4, 'end_turn', doneText)) + '\n');
+  const finished = readClaudeAgentSpend(launcher);
+  assert.deepEqual([finished.models[0]?.usage.input, finished.partial], [3000, false]);
+  assert.equal(
+    finished.models[0]?.usageParts?.reduce((total, part) => total + part.usage.input, 0),
+    3000,
+  );
+});
+
+test('a malformed meta cycle reads each subagent once', () => {
+  const folder = tempDir('nested-cycle-');
+  const launcher = path.join(folder, 'agent-a1.jsonl');
+  writeSubagentMeta(folder, 'a1', 'launch-1', 'a2');
+  writeRecords(launcher, [
+    userPrompt('first', 0, { isSidechain: true }),
+    haikuRequest('m1', 1, 'end_turn', [...agentLaunch('launch-2'), ...doneText]),
+  ]);
+  writeSubagentMeta(folder, 'a2', 'launch-2', 'a1');
+  writeRecords(path.join(folder, 'agent-a2.jsonl'), [
+    userPrompt('second', 2, { isSidechain: true }),
+    haikuRequest('m2', 3, 'end_turn', [...agentLaunch('launch-1'), ...doneText]),
+  ]);
+  assert.equal(readClaudeAgentSpend(launcher).models[0]?.usage.input, 2000);
+  assert.equal(claudeAgentSpendVersion(launcher).split('\n').length, 2);
+});
+
+test('a dispatched session folds its own subagents and theirs', () => {
+  const folder = tempDir('nested-dispatch-');
+  const session = path.join(folder, 'sess.jsonl');
+  const subagents = path.join(folder, 'sess', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  writeRecords(session, [
+    userPrompt('dispatch work', 0),
+    haikuRequest('m0', 1, 'end_turn', [...agentLaunch('launch-1'), ...doneText], false),
+  ]);
+  writeSubagentMeta(subagents, 'a1', 'launch-1');
+  writeRecords(path.join(subagents, 'agent-a1.jsonl'), [
+    userPrompt('first level', 2, { isSidechain: true }),
+    haikuRequest('m1', 3, 'end_turn', [...agentLaunch('launch-2'), ...doneText]),
+  ]);
+  // The second level launches a third that never wrote a meta file.
+  writeSubagentMeta(subagents, 'a2', 'launch-2', 'a1');
+  writeRecords(path.join(subagents, 'agent-a2.jsonl'), [
+    userPrompt('second level', 4, { isSidechain: true }),
+    haikuRequest('m2', 5, 'end_turn', [...agentLaunch('launch-3'), ...doneText]),
+  ]);
+  const spend = readClaudeAgentSpend(session, [], false);
+  assert.deepEqual([spend.models[0]?.usage.input, spend.partial], [3000, true]);
+  fs.writeFileSync(
+    path.join(subagents, 'agent-a2.jsonl'),
+    [userPrompt('second level', 4, { isSidechain: true }), haikuRequest('m2', 5, 'end_turn', doneText)]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const whole = readClaudeAgentSpend(session, [], false);
+  assert.deepEqual([whole.models[0]?.usage.input, whole.partial], [3000, false]);
+});
+
+test('a subagent launch that failed before it started leaves the row complete', () => {
+  const folder = tempDir('nested-failed-launch-');
+  const launcher = path.join(folder, 'agent-a1.jsonl');
+  writeRecords(launcher, [
+    userPrompt('launch a nested agent', 0, { isSidechain: true }),
+    haikuRequest('m1', 1, 'tool_use', agentLaunch('launch-denied')),
+    {
+      type: 'user',
+      isSidechain: true,
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'launch-denied', is_error: true, content: 'Agent type not found' },
+        ],
+      },
+    },
+    haikuRequest('m2', 3, 'end_turn', doneText),
+  ]);
+  const spend = readClaudeAgentSpend(launcher);
+  assert.deepEqual([spend.models[0]?.usage.input, spend.partial], [2000, false]);
+});
+
+test('a nested subagent write reads that subagent again and not its launcher', () => {
+  const folder = tempDir('nested-own-cache-');
+  const launcher = path.join(folder, 'agent-a1.jsonl');
+  const nested = path.join(folder, 'agent-a2.jsonl');
+  const records = [
+    userPrompt('launch a nested agent', 0, { isSidechain: true }),
+    haikuRequest('m1', 1, 'end_turn', [...agentLaunch('launch-2'), ...doneText]),
+  ];
+  writeRecords(launcher, records);
+  fs.utimesSync(launcher, 1000, 1000);
+  writeSubagentMeta(folder, 'a2', 'launch-2', 'a1');
+  writeRecords(nested, [
+    userPrompt('nested work', 2, { isSidechain: true }),
+    haikuRequest('m2', 3, 'end_turn', doneText),
+  ]);
+  assert.equal(readClaudeAgentSpend(launcher).models[0]?.usage.input, 2000);
+  // Same size and time, other bytes: only a fresh parse of the launcher would see the change.
+  fs.writeFileSync(launcher, fs.readFileSync(launcher, 'utf8').replace('"input_tokens":1000', '"input_tokens":9000'));
+  fs.utimesSync(launcher, 1000, 1000);
+  fs.appendFileSync(nested, JSON.stringify(haikuRequest('m3', 4, 'end_turn', doneText)) + '\n');
+  assert.equal(readClaudeAgentSpend(launcher).models[0]?.usage.input, 3000);
+});
+
+test('a nested transcript that appears or grows changes its launcher spend version', () => {
+  const folder = tempDir('nested-version-');
+  const launcher = path.join(folder, 'agent-a1.jsonl');
+  writeRecords(launcher, [
+    userPrompt('launch a nested agent', 0, { isSidechain: true }),
+    haikuRequest('m1', 1, 'end_turn', [...agentLaunch('launch-2'), ...doneText]),
+  ]);
+  const alone = claudeAgentSpendVersion(launcher);
+  const nested = path.join(folder, 'agent-a2.jsonl');
+  writeSubagentMeta(folder, 'a2', 'launch-2', 'a1');
+  writeRecords(nested, [userPrompt('nested work', 2, { isSidechain: true })]);
+  const appeared = claudeAgentSpendVersion(launcher);
+  assert.notEqual(appeared, alone);
+  fs.appendFileSync(nested, JSON.stringify(haikuRequest('m2', 3, 'end_turn', doneText)) + '\n');
+  assert.notEqual(claudeAgentSpendVersion(launcher), appeared);
+});
+
+test('a Claude child spend read carries commits from its own sidechain turns', () => {
+  const fileWithCommit = writeTranscript([
+    { ...userPrompt('commit the parser fix', 0), isSidechain: true, cwd: 'c:/repo' },
+    {
+      ...assistantTool('Bash', 1, 'commit-1', { command: 'git commit -am "fix parser"' }),
+      isSidechain: true,
+      cwd: 'c:/repo',
+    },
+    {
+      type: 'user',
+      isSidechain: true,
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'commit-1', content: 'done' }] },
+      toolUseResult: {
+        stdout: '[topic abc1234] Fix parser\n 1 file changed, 4 insertions(+), 1 deletion(-)',
+        stderr: '',
+      },
+    },
+    { ...assistantAnswer('Committed.', 3), isSidechain: true },
+  ]);
+  assert.deepEqual(
+    readClaudeAgentSpend(fileWithCommit).commits?.map((commit) => [
+      commit.sha,
+      commit.subject,
+      commit.added,
+      commit.removed,
+    ]),
+    [['abc1234', 'Fix parser', 4, 1]],
+  );
+});
+
+test('a Claude child transcript ignores synthetic and failed response effort', () => {
+  const file = writeTranscript([
+    { type: 'assistant', isSidechain: true, uuid: 'u1', effort: 'high', message: { id: 'm1', model: 'claude-opus-5' } },
+    { type: 'assistant', isSidechain: true, uuid: 'u2', effort: 'low', message: { id: 'm2', model: '<synthetic>' } },
+    {
+      type: 'assistant',
+      isSidechain: true,
+      uuid: 'u3',
+      effort: 'medium',
+      isApiErrorMessage: true,
+      message: { id: 'm3', model: 'claude-opus-5' },
+    },
+  ]);
+  assert.equal(readClaudeAgentSpend(file).effort, 'high');
+});
+
+test('a parent read refuses to bill a child line, and a child read bills it', () => {
+  const record = {
+    type: 'assistant',
+    isSidechain: true,
+    uuid: 'u1',
+    timestamp: at(1),
+    message: { id: 'm1', model: 'claude-opus-5', usage: { input_tokens: 3, output_tokens: 4 } },
+  };
+  assert.equal(
+    reduceClaudeUsageRecord(emptyClaudeUsageReducerState(), record),
+    null,
+    'the child transcript holds this request, so a parent read must not bill it twice',
+  );
+  const counted = reduceClaudeUsageRecord(emptyClaudeUsageReducerState(), record, { countSidechain: true });
+  assert.equal(counted?.usage.output, 4);
+  assert.equal(counted?.usage.input, 3);
+});
+
+test('a repeat is dropped by default, and the child reader keeps the last one', () => {
+  const growing = (output: number, uuid: string) => ({
+    type: 'assistant',
+    isSidechain: true,
+    uuid,
+    timestamp: at(1),
+    message: { id: 'm1', model: 'claude-opus-5', usage: { input_tokens: 3, output_tokens: output } },
+  });
+  const dropping = emptyClaudeUsageReducerState();
+  assert.equal(reduceClaudeUsageRecord(dropping, growing(2, 'u1'), { countSidechain: true })?.usage.output, 2);
+  assert.equal(
+    reduceClaudeUsageRecord(dropping, growing(90, 'u2'), { countSidechain: true }),
+    null,
+    'a parent transcript repeats the finished counts, so a repeat adds nothing there',
+  );
+  const keeping = emptyClaudeUsageReducerState();
+  const opts = { countSidechain: true, emitRepeats: true };
+  assert.equal(reduceClaudeUsageRecord(keeping, growing(2, 'u1'), opts)?.usage.output, 2);
+  const last = reduceClaudeUsageRecord(keeping, growing(90, 'u2'), opts);
+  assert.equal(last?.usage.output, 90, 'the child reader needs the repeat to reach the whole output count');
+  assert.equal(last?.requestKey, 'claude:m1', 'both records share one key, so the last one replaces the first');
+});
+
+test('child turn and spend readers share replacement accounting', () => {
+  const growing = (output: number, uuid: string) => ({
+    type: 'assistant',
+    isSidechain: true,
+    uuid,
+    timestamp: at(1),
+    message: {
+      id: 'same-request',
+      model: 'claude-opus-5',
+      stop_reason: 'end_turn',
+      content: [{ type: 'text', text: 'done' }],
+      usage: { input_tokens: 3, output_tokens: output },
+    },
+  });
+  const file = writeTranscript([
+    { ...userPrompt('do child work', 0), isSidechain: true },
+    growing(2, 'u1'),
+    growing(90, 'u2'),
+  ]);
+  const turnUsage = readSession(file, 'child', { childTranscript: true }).turns[0].usage;
+  const spendUsage = readClaudeAgentSpend(file).models[0].usage;
+  assert.deepEqual(
+    turnUsage,
+    spendUsage,
+    'the selected child and parent-card spend applied different repeated-request rules',
+  );
+});
+
+test('a child line reducer replaces a repeated cumulative response after restored state', () => {
+  const growing = (output: number) =>
+    JSON.stringify({
+      type: 'assistant',
+      isSidechain: true,
+      uuid: `u${output}`,
+      timestamp: at(output),
+      message: { id: 'm1', model: 'claude-opus-5', usage: { input_tokens: 3, output_tokens: output } },
+    });
+  const first = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  assert.deepEqual(first.pushLine(growing(4))[0].usage, {
+    requests: 1,
+    input: 3,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheWrite30m: 0,
+    cacheRead: 0,
+    output: 4,
+    thinking: 0,
+  });
+  const resumed = createClaudeUsageLineReducer(first.snapshot(), { childTranscript: true });
+  const replacement = resumed.pushLine(growing(10));
+  assert.equal(replacement.length, 2);
+  assert.deepEqual(replacement[0].usage, {
+    requests: -1,
+    input: -3,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheWrite30m: 0,
+    cacheRead: 0,
+    output: -4,
+    thinking: 0,
+  });
+  assert.deepEqual(replacement[1].usage, {
+    requests: 1,
+    input: 3,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheWrite30m: 0,
+    cacheRead: 0,
+    output: 10,
+    thinking: 0,
+  });
+});
+
+// One assistant record. `id` names the response, and `block` names the content block the
+// record was written for. A response writes one record per block, and each block carries its
+// own uuid. A repeat is therefore the same id under a different uuid.
+const usageRecord = (id: string, output: number, opts: { block?: number; sidechain?: boolean } = {}) =>
+  JSON.stringify({
+    type: 'assistant',
+    ...(opts.sidechain === true ? { isSidechain: true } : {}),
+    uuid: `${id}-${opts.block ?? output}`,
+    timestamp: at(output),
+    message: { id, model: 'claude-opus-5', usage: { input_tokens: 3, output_tokens: output } },
+  });
+
+const growingChildRequest = (id: string, output: number) => usageRecord(id, output, { sidechain: true });
+
+test('a child snapshot keeps an event for every request its queue still counts', () => {
+  const reducer = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  const requests = RETAINED_REQUESTS + 20;
+  for (let request = 0; request < requests; request++) {
+    reducer.pushLine(growingChildRequest(`m${request}`, 1));
+  }
+
+  const snapshot = reducer.snapshot();
+  assert.equal(snapshot.seenRequestKeys.length, RETAINED_REQUESTS);
+  assert.deepEqual(
+    Object.keys(snapshot.requestEvents ?? {}).sort(),
+    [...snapshot.seenRequestKeys].sort(),
+    'the two halves of the memory hold the same requests, so no counted request loses its event',
+  );
+
+  const oldest = snapshot.seenRequestKeys[0].replace('claude:', '');
+  const revision = reducer.pushLine(growingChildRequest(oldest, 9));
+  assert.equal(revision.length, 2, 'the oldest request the queue still counts can still be revised');
+  assert.equal(revision[0].usage.output, -1);
+  assert.equal(revision[1].usage.output, 9);
+});
+
+test('a record saved under a smaller window refuses to count its late revision twice', () => {
+  const keys = Array.from({ length: 4 }, (unused, request) => `claude:m${request}`);
+  const reducer = createClaudeUsageLineReducer(
+    {
+      seenRequestKeys: keys,
+      closedTurns: 0,
+      openTurn: false,
+      openTurnAnswered: false,
+      compactionCount: 0,
+      recentCompactions: [],
+      visibleTurns: 0,
+      firstTurnAt: null,
+      currentTurnStartedAt: null,
+      currentTurnEndedAt: null,
+      currentTurnOutcome: null,
+      requestEvents: {},
+    },
+    { childTranscript: true },
+  );
+
+  assert.deepEqual(
+    reducer.pushLine(growingChildRequest('m0', 9)),
+    [],
+    'the saved record already counted that request and kept no event to remove',
+  );
+  assert.equal(reducer.pushLine(growingChildRequest('m9', 9)).length, 1, 'an uncounted request is still counted');
+});
+
+test('a parent read bills one response once however many requests separate its records', () => {
+  // Claude Code writes one assistant record for each content block of a response. Every one
+  // repeats the same message id and the same usage under its own uuid, and other requests
+  // reach the reducer between them.
+  const reducer = createClaudeUsageLineReducer();
+  const billed = (id: string, block: number) => reducer.pushLine(usageRecord(id, 1, { block })).length;
+  assert.equal(billed('msg_01first', 1), 1);
+  for (let other = 0; other < RETAINED_REQUESTS + 20; other++) {
+    assert.equal(billed(`msg_01other${other}`, 1), 1, 'a separating request was not billed');
+  }
+  assert.equal(billed('msg_01first', 2), 0, 'a later content block was billed as a second request');
+
+  const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(reducer.snapshot())));
+  assert.equal(
+    resumed.pushLine(usageRecord('msg_01first', 1, { block: 3 })).length,
+    0,
+    'a read resumed from the saved record billed a request that record already counted',
+  );
+});
+
+test('a parent read carries forward no event map', () => {
+  const child = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  child.pushLine(growingChildRequest('msg_01kept', 1));
+  const saved = JSON.parse(JSON.stringify(child.snapshot()));
+  assert.ok(saved.requestEvents, 'the record under test must hold an event');
+
+  const parent = createClaudeUsageLineReducer(saved);
+  assert.equal(
+    parent.snapshot().requestEvents,
+    undefined,
+    'a parent read saved an event map that nothing pairs with its queue',
+  );
+});
+
+test('a child read replaces a repeated response after a window of other requests', () => {
+  const reducer = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  const requests = RETAINED_REQUESTS + 20;
+  for (let request = 0; request < requests; request++) {
+    reducer.pushLine(growingChildRequest(`msg_01r${request}`, 1));
+  }
+  const saved = JSON.parse(JSON.stringify(reducer.snapshot()));
+  assert.deepEqual(
+    Object.keys(saved.requestEvents ?? {}).sort(),
+    [...saved.seenRequestKeys].sort(),
+    'a saved child record keeps an event for every request its queue still counts',
+  );
+
+  const resumed = createClaudeUsageLineReducer(saved, { childTranscript: true });
+  const revision = resumed.pushLine(growingChildRequest(`msg_01r${requests - 1}`, 9));
+  assert.equal(revision.length, 2, 'the revision must remove what the earlier record reported');
+  assert.equal(
+    (revision[0].usage.requests ?? 0) + (revision[1].usage.requests ?? 0),
+    0,
+    'the revision counted the response a second time',
+  );
+  assert.equal(revision[0].usage.output, -1);
+  assert.equal(revision[1].usage.output, 9);
+});
+
+test('Claude usage events retain request metadata and deduplicate after state is restored', () => {
+  const record = {
+    type: 'assistant',
+    uuid: 'line-1',
+    timestamp: at(3),
+    message: {
+      id: 'message-1',
+      model: 'claude-sonnet-5',
+      usage: {
+        input_tokens: 12,
+        cache_read_input_tokens: 8,
+        cache_creation_input_tokens: 4,
+        output_tokens: 6,
+        service_tier: 'priority',
+        inference_geo: 'us',
+        cost_usd: 0.42,
+      },
+    },
+  };
+  const state = emptyClaudeUsageReducerState();
+  const event = reduceClaudeUsageRecord(state, record);
+  assert.deepEqual(event, {
+    timestamp: ms(3),
+    agent: 'claude',
+    provider: null,
+    model: 'claude-sonnet-5',
+    contextWindow: null,
+    contextBand: null,
+    billingClass: 'unknown',
+    inferenceClass: 'in-region',
+    serviceTier: 'priority',
+    effort: null,
+    toolListVersion: 0,
+    reportedCost: 0.42,
+    requestKey: 'claude:message-1',
+    // An unsplit cache write names no lifetime, and a record before any typed prompt names
+    // no visible turn. Both stay null so the adjacency pass calls the pair unavailable.
+    visibleTurnId: null,
+    cacheLifetime: null,
+    compactionsBefore: 0,
+    usage: {
+      requests: 1,
+      input: 12,
+      cacheWrite1h: 4,
+      cacheWrite5m: 0,
+      cacheWrite30m: 0,
+      cacheRead: 8,
+      output: 6,
+      thinking: 0,
+    },
+  });
+  const restored = JSON.parse(JSON.stringify(state));
+  assert.equal(reduceClaudeUsageRecord(restored, record), null);
+  assert.equal(
+    reduceClaudeUsageRecord(restored, {
+      ...record,
+      uuid: 'line-2',
+      message: { ...record.message, id: 'message-2' },
+    })?.requestKey,
+    'claude:message-2',
+  );
+});
+
+test('a fast-mode Claude turn carries its speed through the service tier field', () => {
+  const record = {
+    type: 'assistant',
+    uuid: 'line-1',
+    timestamp: at(3),
+    message: {
+      id: 'message-1',
+      model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        service_tier: 'standard',
+        speed: 'fast',
+      },
+    },
+  };
+  const event = reduceClaudeUsageRecord(emptyClaudeUsageReducerState(), record);
+  assert.equal(event?.serviceTier, 'fast', 'a fast speed must override a standard service tier');
+  const quote = quoteUsage({
+    usage: event!.usage,
+    model: event!.model,
+    provider: event!.provider,
+    inferenceClass: event!.inferenceClass,
+    serviceTier: event!.serviceTier,
+  });
+  assert.equal(quote?.cost, 8 + 40, 'a fast Opus 5.5 request is priced at the fast rate');
+});
+
+test('a Claude turn with no speed field still reads as standard', () => {
+  const record = {
+    type: 'assistant',
+    uuid: 'line-1',
+    timestamp: at(3),
+    message: {
+      id: 'message-1',
+      model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 12,
+        output_tokens: 6,
+        service_tier: 'standard',
+      },
+    },
+  };
+  const event = reduceClaudeUsageRecord(emptyClaudeUsageReducerState(), record);
+  assert.equal(event?.serviceTier, 'standard', 'an older transcript with no speed field must still price standard');
+});
+
+test('a Claude turn with speed explicitly standard keeps its service tier', () => {
+  const record = {
+    type: 'assistant',
+    uuid: 'line-1',
+    timestamp: at(3),
+    message: {
+      id: 'message-1',
+      model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 12,
+        output_tokens: 6,
+        service_tier: 'priority',
+        speed: 'standard',
+      },
+    },
+  };
+  const event = reduceClaudeUsageRecord(emptyClaudeUsageReducerState(), record);
+  assert.equal(event?.serviceTier, 'priority', 'a standard speed must not mask another recorded service tier');
+});
+
+test('the incremental Claude usage filter accepts a spaced assistant record and skips large tool output', () => {
+  const reducer = createClaudeUsageLineReducer();
+  const record = JSON.stringify({
+    type: 'assistant',
+    uuid: 'line-1',
+    timestamp: at(3),
+    message: { id: 'message-1', model: 'claude-sonnet-5', usage: { input_tokens: 2, output_tokens: 1 } },
+  }).replace('"type":"assistant"', '"type" : "assistant"');
+  assert.equal(reducer.pushLine(record)[0]?.requestKey, 'claude:message-1');
+  assert.deepEqual(
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'x'.repeat(1024 * 1024) }] },
+      }),
+    ),
+    [],
+  );
+});
+
+test('the incremental Claude usage reducer counts drawable turns across a resume', () => {
+  const prompt = (text: string) =>
+    JSON.stringify({
+      type: 'user',
+      timestamp: at(1),
+      message: { role: 'user', content: text },
+    });
+  const answer = (id: string) =>
+    JSON.stringify({
+      type: 'assistant',
+      uuid: id,
+      timestamp: at(2),
+      message: { id, model: 'claude-sonnet-5', content: [{ type: 'text', text: 'done' }], usage: { output_tokens: 1 } },
+    });
+  const first = createClaudeUsageLineReducer();
+  first.pushLine(prompt('first'));
+  assert.equal(first.turnCount(), 1, 'the current open turn is omitted');
+  first.pushLine(answer('answer-1'));
+
+  const resumed = createClaudeUsageLineReducer(first.snapshot());
+  resumed.pushLine(prompt('queued without an answer'));
+  resumed.pushLine(prompt('second answered turn'));
+  resumed.pushLine(answer('answer-2'));
+  assert.equal(resumed.turnCount(), 2, 'an absorbed prompt was counted as its own turn');
+  resumed.pushLine(prompt('third still open'));
+  assert.equal(resumed.turnCount(), 3, 'a resumed reducer lost its closed turn count');
+});
+
+test('the incremental Claude usage reducer tracks compactions and the session span across a resume', () => {
+  const prompt = (n: number, text: string) =>
+    JSON.stringify({
+      type: 'user',
+      timestamp: at(n),
+      message: { role: 'user', content: text },
+    });
+  const answer = (n: number, id: string) =>
+    JSON.stringify({
+      type: 'assistant',
+      uuid: id,
+      timestamp: at(n),
+      message: { id, model: 'claude-sonnet-5', content: [{ type: 'text', text: 'done' }], usage: { output_tokens: 1 } },
+    });
+  const compaction = (n: number) =>
+    JSON.stringify({
+      type: 'user',
+      timestamp: at(n),
+      isCompactSummary: true,
+      message: { content: 'summary' },
+    });
+  const first = createClaudeUsageLineReducer();
+  assert.equal(first.compactionCount(), 0, 'a session with no compaction reports zero, not a missing value');
+  assert.equal(first.firstTurnAt(), null);
+  assert.equal(first.lastTurnAt(), null);
+
+  first.pushLine(prompt(1, 'first'));
+  assert.equal(first.firstTurnAt(), ms(1));
+  assert.equal(first.lastTurnAt(), ms(1), 'an unanswered open turn falls back to its startedAt');
+  first.pushLine(answer(2, 'answer-1'));
+  assert.equal(first.newestTurnStartedAt(), ms(1));
+  assert.deepEqual(first.newestTurnOutcome(), {
+    finished: false,
+    error: false,
+    interrupted: false,
+    endedAt: ms(2),
+    startedAt: ms(1),
+  });
+  assert.equal(first.lastTurnAt(), ms(2), 'an answered turn reports its last activity as endedAt');
+  first.pushLine(compaction(3));
+  assert.equal(first.compactionCount(), 1);
+  assert.equal(first.lastTurnAt(), ms(2), 'a compaction does not move the last turn span');
+
+  const resumed = createClaudeUsageLineReducer(first.snapshot());
+  assert.equal(resumed.newestTurnStartedAt(), ms(1));
+  assert.deepEqual(resumed.newestTurnOutcome(), {
+    finished: false,
+    error: false,
+    interrupted: false,
+    endedAt: ms(2),
+    startedAt: ms(1),
+  });
+  assert.equal(resumed.compactionCount(), 1, 'a resumed reducer kept its compaction count');
+  assert.equal(resumed.firstTurnAt(), ms(1), 'a resumed reducer kept the first turn it saw');
+  resumed.pushLine(prompt(4, 'second'));
+  assert.equal(resumed.firstTurnAt(), ms(1), 'the first turn never moves once a later turn opens');
+  assert.equal(resumed.lastTurnAt(), ms(4), 'the newly opened turn is now the last one, open and unanswered');
+  resumed.pushLine(compaction(5));
+  assert.equal(resumed.compactionCount(), 2);
+});
+
+test('a Claude process end stops an unfinished rail turn in full and indexed reads', () => {
+  const records = [
+    userPrompt('run the command', 0),
+    {
+      ...assistantTool('PowerShell', 1, 'stop-call', { command: 'Start-Sleep -Seconds 60' }),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [
+          { type: 'tool_use', id: 'stop-call', name: 'PowerShell', input: { command: 'Start-Sleep -Seconds 60' } },
+        ],
+      },
+    },
+    costState(ms(0), 5_000),
+    costState(ms(0), 6_000),
+  ];
+  const file = writeTranscript(records);
+  const read = readSession(file, 'sess');
+  const full = read.turns[0] as (typeof read.turns)[number] & { processEndedAt?: number };
+  assert.equal(full.processEndedAt, ms(6));
+  assert.equal(full.endedAt, ms(1), 'process shutdown must not move the last activity time');
+  assert.equal(readSessionActivity(file), ms(1), 'process shutdown must not move rail recency');
+  assert.equal(statusOf(full, true, ms(2)), 'stopped', 'the selected rail turn still says running');
+  assert.equal(readSessionMeta(file).outcome?.processEndedAt, ms(6));
+
+  const semantic = createClaudeSessionReducer('sess');
+  for (const record of records) {
+    semantic.pushLine(JSON.stringify(record));
+  }
+  assert.equal(semantic.completedTurns().length, 1);
+  assert.equal(semantic.openRange(), null);
+
+  const indexed = createClaudeUsageLineReducer();
+  for (const record of records) {
+    indexed.pushLine(JSON.stringify(record));
+  }
+  const outcome = indexed.newestTurnOutcome() as ReturnType<typeof indexed.newestTurnOutcome> & {
+    processEndedAt?: number;
+  };
+  assert.ok(outcome);
+  assert.equal(outcome?.processEndedAt, ms(6));
+  assert.equal(
+    statusOf(outcome, true, ms(2)),
+    'stopped',
+    'a fresh rail rebuilt from the lifetime index still says running',
+  );
+
+  const restored = createClaudeUsageLineReducer(indexed.snapshot());
+  assert.equal(restored.newestTurnOutcome()?.processEndedAt, ms(6));
+  restored.pushLine(JSON.stringify(userPrompt('resume the session', 7)));
+  assert.equal(restored.newestTurnOutcome()?.processEndedAt, undefined);
+
+  const boundaryOnly = createClaudeUsageLineReducer();
+  boundaryOnly.pushLine(JSON.stringify(userPrompt('stop before an answer', 8)));
+  boundaryOnly.pushLine(JSON.stringify(costState(ms(8), 1_000)));
+  assert.equal(boundaryOnly.lastTurnAt(), ms(8), 'the process boundary must not become activity');
+  boundaryOnly.pushLine(JSON.stringify(userPrompt('start again', 10)));
+  assert.equal(boundaryOnly.turnCount(), 2, 'a stopped unanswered turn was lost after resume');
+  assert.equal(boundaryOnly.newestTurnOutcome()?.processEndedAt, undefined);
+
+  fs.appendFileSync(file, JSON.stringify(userPrompt('resume the session', 7)) + '\n');
+  const resumed = readSession(file, 'sess').turns;
+  assert.equal(resumed.length, 2);
+  assert.equal(resumed[0].processEndedAt, ms(6));
+  assert.equal(resumed[1].processEndedAt, undefined);
+});
+
+// The records Claude Code writes for a command it answers by itself: a caveat, the typed
+// command, and the answer that names the command as its parent.
+function localCommand(
+  name: string,
+  args: string,
+  second: number,
+  uuid: string,
+  answer: { stdout?: string; stderr?: string; parent?: string },
+): object[] {
+  const tag = answer.stdout !== undefined ? 'local-command-stdout' : 'local-command-stderr';
+  return [
+    {
+      type: 'user',
+      isMeta: true,
+      timestamp: at(second),
+      message: {
+        role: 'user',
+        content: '<local-command-caveat>Caveat: The messages below were generated by the user.</local-command-caveat>',
+      },
+    },
+    {
+      type: 'user',
+      uuid,
+      timestamp: at(second),
+      message: {
+        role: 'user',
+        content: `<command-name>${name}</command-name>\n<command-message>${name.slice(1)}</command-message>\n<command-args>${args}</command-args>`,
+      },
+    },
+    {
+      type: 'system',
+      subtype: 'local_command',
+      parentUuid: answer.parent ?? uuid,
+      timestamp: at(second),
+      level: 'info',
+      isMeta: false,
+      content: `<${tag}>${answer.stdout ?? answer.stderr ?? ''}</${tag}>`,
+      commandRun: { command: name.slice(1), args },
+    },
+  ];
+}
+
+const RENAMED = 'Session renamed to: claude entrypoint auto handback';
+const renameRecords = (): object[] => [
+  userPrompt('first question', 0),
+  assistantAnswer('first answer', 1),
+  ...localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', { stdout: RENAMED }),
+];
+// A minute after the command, well inside the quiet window that keeps an open turn running.
+// The command is no turn, so each reader's newest turn is the answered one before it.
+const AFTER_COMMAND = ms(2) + 60_000;
+
+// What each reader of the newest turn's outcome says about it at one clock.
+function localAnswerStatuses(records: object[], now = AFTER_COMMAND) {
+  const file = writeTranscript(records);
+  const turns = readSession(file, 'sess').turns;
+  const rail = readSessionMeta(file).outcome;
+  const indexed = createClaudeUsageLineReducer();
+  for (const record of records) {
+    indexed.pushLine(JSON.stringify(record));
+  }
+  const newest = indexed.newestTurnOutcome();
+  // An index saved and restored between any two records reads the same newest turn and count.
+  for (let split = 1; split < records.length; split++) {
+    const first = createClaudeUsageLineReducer();
+    for (const record of records.slice(0, split)) {
+      first.pushLine(JSON.stringify(record));
+    }
+    const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())));
+    for (const record of records.slice(split)) {
+      resumed.pushLine(JSON.stringify(record));
+    }
+    assert.deepEqual(
+      [resumed.turnCount(), resumed.newestTurnOutcome()],
+      [indexed.turnCount(), newest],
+      `an index restored after record ${split} reads the turns differently`,
+    );
+  }
+  return {
+    turns,
+    full: turns.length > 0 ? statusOf(turns[turns.length - 1], true, now) : null,
+    rail: rail ? statusOf(rail, true, now) : null,
+    index: newest ? statusOf(newest, true, now) : null,
+    count: indexed.turnCount(),
+    // When the newest turn of the full reader, the rail and the index started.
+    starts: [turns[turns.length - 1]?.startedAt ?? null, rail?.startedAt ?? null, newest?.startedAt ?? null],
+    railOutcome: rail,
+    indexOutcome: newest,
+  };
+}
+
+test('a Claude local command answer makes no turn in the full read', () => {
+  const file = writeTranscript(renameRecords());
+  const turns = readSession(file, 'sess').turns;
+  assert.deepEqual(
+    turns.map((turn) => turn.prompt),
+    ['first question'],
+    'the command drew a card of its own',
+  );
+  assert.equal(statusOf(turns[0], true, AFTER_COMMAND), 'done');
+
+  fs.appendFileSync(file, JSON.stringify(userPrompt('the next prompt', 70)) + '\n');
+  assert.deepEqual(
+    readSession(file, 'sess').turns.map((turn) => turn.prompt),
+    ['first question', 'the next prompt'],
+    'the command text carried onto the next card',
+  );
+});
+
+test('a Claude local command answer leaves the rail outcome on the turn before it', () => {
+  const before = readSessionMeta(
+    writeTranscript([userPrompt('first question', 0), assistantAnswer('first answer', 1)]),
+  ).outcome;
+  const outcome = readSessionMeta(writeTranscript(renameRecords())).outcome;
+  assert.ok(before);
+  assert.deepEqual(outcome, before, 'the rail outcome is the command, not the turn before it');
+  assert.equal(statusOf(outcome!, true, AFTER_COMMAND), 'done');
+
+  const alone = localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', { stdout: RENAMED });
+  assert.equal(
+    readSessionMeta(writeTranscript(alone)).outcome,
+    null,
+    'a command with no turn before it has an outcome',
+  );
+});
+
+test('a Claude local command answer makes no indexed turn across a resume', () => {
+  const lines = renameRecords().map((record) => JSON.stringify(record));
+  const indexed = createClaudeUsageLineReducer();
+  for (const line of lines) {
+    indexed.pushLine(line);
+  }
+  assert.equal(indexed.turnCount(), 1, 'the index counts the command as a turn');
+  assert.equal(indexed.newestTurnOutcome()?.startedAt, ms(0), 'the newest indexed outcome is the command');
+  assert.equal(statusOf(indexed.newestTurnOutcome()!, true, AFTER_COMMAND), 'done');
+  indexed.pushLine(JSON.stringify(userPrompt('the next prompt', 70)));
+  assert.equal(indexed.turnCount(), 2, 'the command turn was counted when the next prompt arrived');
+
+  // The turn before the command is saved with the open command, so an answer read after a
+  // restore still withdraws it.
+  const first = createClaudeUsageLineReducer();
+  for (const line of lines.slice(0, -1)) {
+    first.pushLine(line);
+  }
+  const resumed = createClaudeUsageLineReducer(first.snapshot());
+  resumed.pushLine(lines[lines.length - 1]);
+  assert.equal(resumed.turnCount(), 1, 'a restored index counts the command as a turn');
+  assert.equal(resumed.newestTurnOutcome()?.startedAt, ms(0), 'a restored index lost the turn before the command');
+});
+
+test('a Claude local command answer makes no semantic reader turn and passes the page filter', () => {
+  const lines = renameRecords().map((record) => JSON.stringify(record));
+  assert.equal(claudeSessionLineMayAffectRead(lines[lines.length - 1]), true, 'the page filter drops the answer');
+  const semantic = createClaudeSessionReducer('sess');
+  for (const line of lines) {
+    semantic.pushLine(line);
+  }
+  assert.equal(semantic.openRange(), null, 'the command turn is still open');
+  assert.deepEqual(
+    semantic.completedTurns().map((completed) => completed.turn.prompt),
+    ['first question'],
+    'the command is a completed turn',
+  );
+});
+
+test('a Claude local command answer followed by a synthetic no-response record makes no turn', () => {
+  const synthetic = {
+    type: 'assistant',
+    timestamp: at(3),
+    message: {
+      role: 'assistant',
+      id: 'synthetic-1',
+      model: '<synthetic>',
+      stop_reason: 'stop_sequence',
+      content: [{ type: 'text', text: 'No response requested.' }],
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  };
+  const read = localAnswerStatuses([...renameRecords(), synthetic]);
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+  assert.deepEqual([read.turns.length, read.count], [1, 1], 'the command became a turn');
+});
+
+test('a Claude local command error answer makes no turn', () => {
+  const read = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    ...localCommand('/rename', '', 2, 'rename-1', { stderr: 'Please provide a name' }),
+  ]);
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+  assert.deepEqual([read.turns.length, read.count], [1, 1], 'the failed command became a turn');
+});
+
+test('two Claude local commands in a row make no turn, the first with an empty answer', () => {
+  const records = [
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    ...localCommand('/usage', '', 2, 'usage-1', { stdout: '' }),
+    ...localCommand('/rename', 'claude entrypoint auto handback', 3, 'rename-1', { stdout: RENAMED }),
+  ];
+  const read = localAnswerStatuses(records);
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+  assert.deepEqual([read.turns.length, read.count], [1, 1], 'a command became a turn');
+  const next = readSession(writeTranscript([...records, userPrompt('the next prompt', 70)]), 'sess').turns;
+  assert.deepEqual(
+    next.map((turn) => turn.prompt),
+    ['first question', 'the next prompt'],
+    'a command text carried onto the next card',
+  );
+});
+
+test('a Claude local command answer to another record leaves an unanswered prompt running', () => {
+  const read = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('an unanswered prompt', 2, { uuid: 'prompt-2' }),
+    ...localCommand('/effort', 'high', 2, 'effort-1', { stdout: 'Set effort level to high' }),
+  ]);
+  assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+  assert.equal(read.turns[1].prompt, 'an unanswered prompt');
+});
+
+test('a Claude local command answer leaves an earlier unanswered prompt on a card of its own', () => {
+  const records = [
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('an unanswered prompt', 2, { uuid: 'prompt-2' }),
+    ...localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', { stdout: RENAMED }),
+  ];
+  const read = localAnswerStatuses(records);
+  // The unanswered prompt is the newest turn again. The CLI answered the command, so it was idle.
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+  assert.deepEqual(
+    [read.turns[1].processEndedAt, read.railOutcome?.processEndedAt, read.indexOutcome?.processEndedAt],
+    [ms(2), ms(2), ms(2)],
+    'the readers stop the prompt at different times',
+  );
+  assert.deepEqual(
+    read.turns.map((turn) => [turn.prompt, turn.summary]),
+    [
+      ['first question', 'first answer'],
+      ['an unanswered prompt', ''],
+    ],
+    'the command made a turn or took in the earlier prompt',
+  );
+  assert.equal(read.count, read.turns.length, 'the index counts the turns differently');
+
+  const next = [...records, userPrompt('the next prompt', 70)];
+  const turns = readSession(writeTranscript(next), 'sess').turns;
+  assert.deepEqual(
+    turns.map((turn) => turn.prompt),
+    ['first question', 'an unanswered prompt', 'the next prompt'],
+  );
+  const indexed = createClaudeUsageLineReducer();
+  for (const record of next) {
+    indexed.pushLine(JSON.stringify(record));
+  }
+  assert.equal(indexed.turnCount(), turns.length, 'the index counts the turns differently after the next prompt');
+});
+
+test("a Claude local command answer hours after an unanswered prompt keeps the prompt's own duration", () => {
+  // The prompt was typed at second 2. The session was resumed 14 hours later for /rename.
+  const later = 2 + 14 * 60 * 60;
+  const records = [
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('an unanswered prompt', 2, { uuid: 'prompt-2' }),
+    ...localCommand('/rename', 'claude entrypoint auto handback', later, 'rename-1', { stdout: RENAMED }),
+  ];
+  const now = ms(later) + 60_000;
+  const read = localAnswerStatuses(records, now);
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+  assert.deepEqual(
+    [read.turns[1].processEndedAt, read.railOutcome?.processEndedAt, read.indexOutcome?.processEndedAt],
+    [ms(2), ms(2), ms(2)],
+    'a reader stops the prompt at the answer, so its duration runs to the command',
+  );
+  const card = read.turns[1];
+  assert.equal(
+    toCard(card, true, now).duration,
+    toCard({ ...card, processEndedAt: undefined }, false, now).duration,
+    'the stopped card counts its duration past its own last record',
+  );
+});
+
+test('model work after a Claude local command answer makes the command the running turn', () => {
+  const records = [
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('an unanswered prompt', 2, { uuid: 'prompt-2' }),
+    ...localCommand('/rename', 'claude entrypoint auto handback', 3, 'rename-1', { stdout: RENAMED }),
+    assistantText('working on it', 4, { input_tokens: 10, output_tokens: 5 }, undefined, 'tool_use'),
+  ];
+  const read = localAnswerStatuses(records);
+  assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'a reader does not take the command as the newest turn');
+  // The prompt card loses the stop the answer gave it, and reads stopped because it is not the newest.
+  const prompt = read.turns.find((turn) => turn.prompt === 'an unanswered prompt');
+  assert.ok(prompt, 'the unanswered prompt lost its card');
+  assert.notEqual(prompt, read.turns[read.turns.length - 1], 'the unanswered prompt is still the newest turn');
+  assert.equal(prompt.processEndedAt, undefined, 'the answer still stops the prompt the model went on from');
+  assert.equal(statusOf(prompt, false, AFTER_COMMAND), 'stopped');
+  // A read restored between the answer and the model work removes the stop too.
+  const session = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, -1)) {
+    session.pushLine(JSON.stringify(record));
+  }
+  const restored = createClaudeSessionReducer('sess', {}, structuredClone(session.snapshot()));
+  restored.pushLine(JSON.stringify(records[records.length - 1]));
+  const card = restored.finish().turns.find((turn) => turn.prompt === 'an unanswered prompt');
+  assert.ok(card, 'a restored read lost the unanswered prompt card');
+  assert.equal(card.processEndedAt, undefined, 'a restored read still stops the prompt the model went on from');
+});
+
+test('a Claude local command after a real turn leaves the header turn count and the rail on that turn', () => {
+  const before = [userPrompt('first question', 0), assistantAnswer('first answer', 1)];
+  const count = (records: object[]) => {
+    const indexed = createClaudeUsageLineReducer();
+    for (const record of records) {
+      indexed.pushLine(JSON.stringify(record));
+    }
+    return indexed.turnCount();
+  };
+  const read = localAnswerStatuses(renameRecords());
+  assert.deepEqual([read.count, count(before)], [1, 1], 'the header counts the command as a turn');
+  assert.equal(read.rail, 'done', 'the rail row does not read done');
+  assert.deepEqual(
+    readSessionMeta(writeTranscript(renameRecords())).outcome,
+    readSessionMeta(writeTranscript(before)).outcome,
+    'the rail outcome is not the turn before the command',
+  );
+
+  const alone = localCommand('/usage', '', 0, 'usage-1', { stdout: 'Current session' });
+  const empty = localAnswerStatuses(alone);
+  assert.deepEqual([empty.turns.length, empty.count, empty.rail, empty.index], [0, 0, null, null]);
+});
+
+test('a Claude local command answer after a process end leaves every reader stopped', () => {
+  const [caveat, command, answer] = localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', {
+    stdout: RENAMED,
+  });
+  const read = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    caveat,
+    command,
+    costState(ms(0), 2_000),
+    answer,
+  ]);
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+  assert.equal(read.turns[1].summary, '');
+});
+
+test('a Claude local command answer after a model reply leaves the reply in charge', () => {
+  const [caveat, command, answer] = localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', {
+    stdout: RENAMED,
+  });
+  const reply = assistantText('working on it', 3, { input_tokens: 10, output_tokens: 5 }, undefined, 'tool_use');
+  const without = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    caveat,
+    command,
+    reply,
+  ]);
+  const read = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    caveat,
+    command,
+    reply,
+    { ...(answer as Record<string, unknown>), timestamp: at(4) },
+  ]);
+  assert.deepEqual([without.full, without.rail, without.index], ['running', 'running', 'running']);
+  assert.deepEqual(
+    [read.full, read.rail, read.index],
+    ['running', 'running', 'running'],
+    'the answer finished a turn the model answered',
+  );
+  assert.deepEqual(
+    [read.turns[1].summary, read.turns[1].endedAt, read.turns[1].finished],
+    [without.turns[1].summary, without.turns[1].endedAt, without.turns[1].finished],
+    'the answer replaced the reply on the card',
+  );
+});
+
+test('a hand-back reply after a Claude local command answer makes the command a turn in every reader', () => {
+  const usage = localCommand('/usage', '', 3, 'usage-1', { stdout: 'Current session: 4% used' });
+  const handback = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    ...usage,
+    peerHandback('a1b2c3d4e5f6a7b8c', 4),
+    assistantAnswer('The subagent finished its review.', 5),
+  ]);
+  assert.deepEqual(
+    [handback.turns.length, handback.count],
+    [2, 2],
+    'the timeline and the header count the hand-back reply differently',
+  );
+  assert.deepEqual(handback.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+  assert.deepEqual([handback.full, handback.rail, handback.index], ['done', 'done', 'done']);
+});
+
+test('a reply to a prompt that waited across a Claude local command makes the command a turn in every reader', () => {
+  const usage = localCommand('/usage', '', 3, 'usage-1', { stdout: 'Current session: 4% used' });
+  const waiting = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('a waiting prompt', 2, { uuid: 'prompt-2' }),
+    ...usage,
+    assistantAnswer('The waiting prompt is answered.', 5),
+  ]);
+  assert.deepEqual(
+    [waiting.turns.length, waiting.count],
+    [3, 3],
+    'the timeline and the header count the reply to the waiting prompt differently',
+  );
+  assert.deepEqual(waiting.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+  assert.deepEqual([waiting.full, waiting.rail, waiting.index], ['done', 'done', 'done']);
+});
+
+test('a process end after a Claude local command answer stops the turn before it in every reader', () => {
+  const read = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('a waiting prompt', 2, { uuid: 'prompt-2' }),
+    ...localCommand('/rename', 'claude entrypoint auto handback', 3, 'rename-1', { stdout: RENAMED }),
+    costState(ms(0), 4_000),
+  ]);
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+  assert.deepEqual([read.turns.length, read.count], [2, 2]);
+  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)]);
+});
+
+test('a Claude local command answer hands background children back to the turn before it', () => {
+  const launch = [
+    userPrompt('launch in background', 0),
+    assistantTool('Agent', 1, 'background-call', { description: 'worker', subagent_type: 'general-purpose' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'background-call', content: 'launched' }],
+      },
+      toolUseResult: { agentId: 'background-agent', description: 'worker', status: 'async_launched' },
+    },
+    assistantAnswer('It is running in the background.', 3),
+  ];
+  const open = localAnswerStatuses([
+    ...launch,
+    ...localCommand('/rename', 'claude entrypoint auto handback', 4, 'rename-1', { stdout: RENAMED }),
+  ]);
+  assert.deepEqual(open.starts, [ms(0), ms(0), ms(0)]);
+  assert.deepEqual(open.indexOutcome?.openChildren, ['background-agent'], 'the index lost the open child');
+  assert.deepEqual(open.indexOutcome?.openChildren, open.railOutcome?.openChildren, 'the index and the rail disagree');
+
+  const [caveat, command, answer] = localCommand('/rename', 'claude entrypoint auto handback', 4, 'rename-1', {
+    stdout: RENAMED,
+  });
+  const closed = localAnswerStatuses([
+    ...launch,
+    caveat,
+    command,
+    completionNotice('background-agent', 5),
+    { ...(answer as Record<string, unknown>), timestamp: at(6) },
+  ]);
+  assert.deepEqual(closed.starts, [ms(0), ms(0), ms(0)]);
+  assert.equal(closed.indexOutcome?.openChildren, undefined, 'the index kept a closed child open');
+  assert.deepEqual(
+    closed.indexOutcome?.closedChildren?.map((child) => (typeof child === 'string' ? child : child.id)),
+    ['background-agent'],
+    'the index lost the closed child',
+  );
+});
+
+test('a Claude usage index forgets the turn before an answered prompt', () => {
+  const indexed = createClaudeUsageLineReducer();
+  indexed.pushLine(JSON.stringify(userPrompt('first question', 0)));
+  indexed.pushLine(JSON.stringify(assistantAnswer('first answer', 1)));
+  indexed.pushLine(JSON.stringify(userPrompt('second question', 2)));
+  indexed.pushLine(JSON.stringify(assistantAnswer('second answer', 3)));
+  assert.equal(indexed.snapshot().currentTurnPrevious, null, 'the saved index keeps a turn no answer can restore');
+});
+
+test('a prompt queued after a Claude local command answer waits on an unanswered card in every reader', () => {
+  const records = [...renameRecords(), typedMidTurn('a queued follow-up', 3)];
+  const read = localAnswerStatuses(records);
+  assert.deepEqual(
+    read.turns.map((turn) => [turn.prompt, turn.summary]),
+    [
+      ['first question', 'first answer'],
+      ['a queued follow-up', ''],
+    ],
+    'the queued prompt is on no card',
+  );
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+
+  // Another local command answer stops the queued prompt, as it stops a typed one.
+  const stopped = localAnswerStatuses([
+    ...records,
+    ...localCommand('/rename', 'second name', 4, 'rename-2', { stdout: 'Session renamed to: second name' }),
+  ]);
+  assert.deepEqual(
+    stopped.turns.map((turn) => turn.prompt),
+    ['first question', 'a queued follow-up'],
+  );
+  assert.equal(stopped.count, stopped.turns.length, 'the header counts the turns differently after the command');
+  assert.deepEqual([stopped.full, stopped.rail, stopped.index], ['stopped', 'stopped', 'stopped']);
+});
+
+test('a typed prompt takes in a prompt queued after a Claude local command answer once', () => {
+  const records = [
+    ...renameRecords(),
+    typedMidTurn('a queued follow-up', 3),
+    userPrompt('the next prompt', 70),
+    assistantAnswer('the next answer', 71),
+  ];
+  const read = localAnswerStatuses(records, ms(71) + 60_000);
+  assert.deepEqual(
+    read.turns.map((turn) => turn.prompt),
+    ['first question', 'a queued follow-up\n\nthe next prompt'],
+    'the queued prompt is on a card of its own or on none',
+  );
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+});
+
+test('a process end after a prompt queued behind a Claude local command stops that prompt in every reader', () => {
+  const read = localAnswerStatuses([
+    ...renameRecords(),
+    typedMidTurn('a queued follow-up', 3),
+    costState(ms(0), 4_000),
+  ]);
+  assert.deepEqual(
+    read.turns.map((turn) => turn.prompt),
+    ['first question', 'a queued follow-up'],
+  );
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+});
+
+test('a typed prompt after a stopped prompt queued behind a Claude local command starts its own card', () => {
+  const read = localAnswerStatuses(
+    [
+      ...renameRecords(),
+      typedMidTurn('a queued follow-up', 3),
+      costState(ms(0), 4_000),
+      userPrompt('the next prompt', 70),
+      assistantAnswer('the next answer', 71),
+    ],
+    ms(71) + 60_000,
+  );
+  assert.deepEqual(
+    read.turns.map((turn) => turn.prompt),
+    ['first question', 'a queued follow-up', 'the next prompt'],
+    'the typed prompt took in a queued prompt the process end had stopped',
+  );
+  assert.equal(read.turns[1].processEndedAt, ms(4), 'the queued prompt lost its process end');
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+  assert.deepEqual(read.starts, [ms(70), ms(70), ms(70)], 'the readers disagree on the newest turn');
+});
+
+test('a second prompt queued behind a Claude local command joins the first across a process end', () => {
+  const read = localAnswerStatuses([
+    ...renameRecords(),
+    typedMidTurn('a queued follow-up', 3),
+    costState(ms(0), 4_000),
+    typedMidTurn('another follow-up', 5),
+  ]);
+  assert.deepEqual(
+    read.turns.map((turn) => turn.prompt),
+    ['first question', 'a queued follow-up\n\nanother follow-up'],
+  );
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+});
+
+test('model work after a stopped prompt queued behind a Claude local command makes the command the turn', () => {
+  const read = localAnswerStatuses([
+    ...renameRecords(),
+    typedMidTurn('a queued follow-up', 3),
+    costState(ms(0), 4_000),
+    assistantText('working on it', 5, { input_tokens: 10, output_tokens: 5 }, undefined, 'tool_use'),
+  ]);
+  assert.equal(read.turns.length, 2, 'the queued prompt kept a card of its own');
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)], 'the readers disagree on the newest turn');
+  // The process end stopped the queued prompt, which is on the command's card now.
+  assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
+});
+
+test('a prompt queued after a Claude local command stopped an earlier prompt gets a card of its own', () => {
+  const read = localAnswerStatuses([
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    userPrompt('an unanswered prompt', 2, { uuid: 'prompt-2' }),
+    ...localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', { stdout: RENAMED }),
+    typedMidTurn('a queued follow-up', 3),
+  ]);
+  assert.deepEqual(
+    read.turns.map((turn) => turn.prompt),
+    ['first question', 'an unanswered prompt', 'a queued follow-up'],
+  );
+  assert.equal(statusOf(read.turns[1], false, AFTER_COMMAND), 'stopped');
+  assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
+  assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+});
+
+test('a Claude record that only mentions local_command still reaches the readers', () => {
+  const records = [
+    userPrompt('find the local commands', 0),
+    assistantTool('Grep', 1, 'grep-1', { pattern: 'local_command' }),
+    toolResult('grep-1', 2),
+    assistantAnswer('found them', 3),
+  ];
+  assert.ok(JSON.stringify(records[1]).includes('"local_command"'));
+  const turns = readSession(writeTranscript(records), 'sess').turns;
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].toolUses, 1, 'the tool call was dropped');
+  assert.equal(turns[0].summary, 'found them');
+});
+
+test('a synthetic Claude API error closes the newest spend-reducer turn without usage', () => {
+  const prompt = JSON.stringify({
+    type: 'user',
+    timestamp: at(1),
+    message: { role: 'user', content: 'retry' },
+  });
+  const error = JSON.stringify({
+    type: 'assistant',
+    timestamp: at(2),
+    isApiErrorMessage: true,
+    message: { model: '<synthetic>', content: 'service unavailable' },
+  });
+  const reducer = createClaudeUsageLineReducer();
+  reducer.pushLine(prompt);
+  assert.deepEqual(reducer.pushLine(error), []);
+  assert.equal(reducer.lastTurnAt(), ms(2));
+  assert.deepEqual(reducer.newestTurnOutcome(), {
+    finished: false,
+    error: true,
+    interrupted: false,
+    endedAt: ms(2),
+    startedAt: ms(1),
+  });
+  const resumed = createClaudeUsageLineReducer(reducer.snapshot());
+  assert.deepEqual(resumed.newestTurnOutcome(), {
+    finished: false,
+    error: true,
+    interrupted: false,
+    endedAt: ms(2),
+    startedAt: ms(1),
+  });
+});
+
+test('sessions are matched to a workspace one file at a time, not one directory at a time', () => {
+  // Two folders whose slugs collide share one directory. Deciding the whole directory from
+  // its newest transcript is wrong both ways: it shows the other project's sessions here,
+  // and it hides this project's own.
+  const root = tempDir('proj-');
+  const dir = path.join(root, 'c--work-a-b');
+  fs.mkdirSync(dir);
+  const write = (name: string, cwd: string, ageMs: number) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd, message: { role: 'user', content: 'hi' } }) + '\n');
+    const when = new Date(Date.now() - ageMs);
+    fs.utimesSync(file, when, when);
+    return file;
+  };
+  write('underscore.jsonl', 'c:\\work\\a_b', 60_000);
+  write('dash.jsonl', 'c:\\work\\a-b', 0); // newest, and the other project's
+
+  assert.deepEqual(
+    sessionFilesFor(root, ['c:\\work\\a_b']).map((s) => s.sessionId),
+    ['underscore'],
+    'the newest file belongs elsewhere, but this project keeps its own session',
+  );
+  assert.deepEqual(
+    sessionFilesFor(root, ['c:\\work\\a-b']).map((s) => s.sessionId),
+    ['dash'],
+    'and the other project sees only its own',
+  );
+  assert.deepEqual(sessionFilesFor(root, []), []);
+});
+
+test('a Claude transcript identity with shell syntax never becomes a resume command', () => {
+  const root = tempDir('proj-');
+  const cwd = 'c:\\work\\repo';
+  const dir = path.join(root, projectSlug(cwd).toLowerCase());
+  fs.mkdirSync(dir);
+  fs.writeFileSync(
+    path.join(dir, 'safe;calc.jsonl'),
+    JSON.stringify({ type: 'user', cwd, message: { role: 'user', content: 'hi' } }) + '\n',
+  );
+  const [session] = sessionFilesFor(root, [cwd]);
+  assert.equal(session.sessionId, 'safe;calc');
+  assert.equal(resumeCommand(session.agent, session.sessionId), null);
+});
+
+test('a transcript with no readable cwd is kept only where the directory name matches exactly', () => {
+  const root = tempDir('proj-');
+  const exact = path.join(root, projectSlug('c:\\work\\thing').toLowerCase());
+  fs.mkdirSync(exact);
+  fs.writeFileSync(path.join(exact, 'nameless.jsonl'), '{"type":"user"}\n');
+  const prefixed = path.join(root, projectSlug('c:\\work\\thing').toLowerCase() + '-extra');
+  fs.mkdirSync(prefixed);
+  fs.writeFileSync(path.join(prefixed, 'stray.jsonl'), '{"type":"user"}\n');
+
+  assert.deepEqual(
+    sessionFilesFor(root, ['c:\\work\\thing']).map((s) => s.sessionId),
+    ['nameless'],
+    'a prefix-matched directory needs a cwd to earn its sessions',
+  );
+});
+
+test('registered worktree roots widen membership without widening the missing-cwd fallback', () => {
+  const root = tempDir('proj-');
+  const main = 'c:\\work\\main';
+  const sibling = 'd:\\trees\\topic';
+  const dir = path.join(root, projectSlug(sibling).toLowerCase());
+  fs.mkdirSync(dir);
+  fs.writeFileSync(
+    path.join(dir, 'known.jsonl'),
+    JSON.stringify({ type: 'user', cwd: sibling, message: { role: 'user', content: 'hi' } }) + '\n',
+  );
+  fs.writeFileSync(path.join(dir, 'unknown.jsonl'), '{"type":"user"}\n');
+
+  const found = sessionFilesFor(root, [main, sibling], readSessionCwd, [main]);
+  assert.deepEqual(
+    found.map((session) => session.sessionId),
+    ['known'],
+  );
+  assert.equal(found[0].cwd, sibling);
+});
+
+test('filesystem roots admit Claude directories for their descendants', () => {
+  const root = tempDir('proj-');
+  const write = (cwd: string, sessionId: string) => {
+    const dir = path.join(root, projectSlug(cwd).toLowerCase());
+    fs.mkdirSync(dir);
+    fs.writeFileSync(
+      path.join(dir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', cwd, message: { role: 'user', content: 'hi' } }) + '\n',
+    );
+  };
+  write('/home/dev/repo', 'posix-root-child');
+  write('c:\\work\\repo', 'drive-root-child');
+
+  assert.deepEqual(
+    sessionFilesFor(root, ['/']).map((session) => session.sessionId),
+    ['posix-root-child'],
+  );
+  assert.deepEqual(
+    sessionFilesFor(root, ['c:\\']).map((session) => session.sessionId),
+    ['drive-root-child'],
+  );
+});
+
+// The two rows a summary closes with. Every expected answer here is written out rather than
+// worked out from the reader, so a reader that stops finding a row cannot take the test with
+// it. The shapes are copied from real summaries on disk.
+test('the closing rows are read from the line they are written on', () => {
+  const summary = [
+    '- The hook is back and the suite is green.',
+    '',
+    '- 🙋 **Your actions** — reload the window, then open a turn.',
+    '- ❓ **Open questions / follow-ups** — (1) keep the store? (2) rename the view?',
+    '- 📊 **Context** — 9% of 1M (92k)',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), {
+    actions: 'reload the window, then open a turn.',
+    questions: '(1) keep the store? (2) rename the view?',
+  });
+});
+
+test('the hyphen inside follow-ups is not the separator', () => {
+  // The reader took "ups - ..." as the whole row on every summary in the store before the
+  // separator was made to need a space in front of it.
+  const rows = closingRows('- ❓ **Open questions / follow-ups** - whether to keep the store.');
+  assert.equal(rows.questions, 'whether to keep the store.');
+});
+
+test('a row written as a heading takes the list under it', () => {
+  const summary = [
+    '**Did** — read-only investigation.',
+    '',
+    '**Your actions**',
+    '- Reload the editor windows.',
+    '- Answer the item 5 question above.',
+    '',
+    '**Open questions / follow-ups**',
+    '- Whether item 7 comes before item 3.',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), {
+    actions: 'Reload the editor windows. Answer the item 5 question above.',
+    questions: 'Whether item 7 comes before item 3.',
+  });
+});
+
+test("a row named in passing in the summary's own prose is not a row", () => {
+  // Both lines are real, from summaries about the summary format itself.
+  const prose = [
+    'Measured over every transcript: `Your actions` 8 times, `Context` 7, `Open questions` 6.',
+    'The rows are 🙋 Your actions, ❓ Open questions, 📊 Context, 💭 Reflection candidates.',
+  ].join('\n');
+  assert.deepEqual(closingRows(prose), { actions: null, questions: null });
+});
+
+test('a row wrapped onto a second line keeps what is on it', () => {
+  const summary = [
+    '- ❓ **Open questions / follow-ups** — (1) the first one, which runs long',
+    '  and wraps onto another line. (2) the second one.',
+    '- 📊 **Context** — 9% of 1M (92k)',
+  ].join('\n');
+  assert.equal(
+    closingRows(summary).questions,
+    '(1) the first one, which runs long and wraps onto another line. (2) the second one.',
+  );
+});
+
+test('the row that closes the summary wins over one quoted earlier in it', () => {
+  const summary = [
+    '- 🙋 **Your actions** — the one from the quoted example.',
+    '',
+    'That was the shape. This turn wrote its own:',
+    '',
+    '- 🙋 **Your actions** — the real one.',
+  ].join('\n');
+  assert.equal(closingRows(summary).actions, 'the real one.');
+});
+
+test('a summary with neither row has neither', () => {
+  assert.deepEqual(closingRows('- Done, and the suite is green.'), { actions: null, questions: null });
+  assert.deepEqual(closingRows(''), { actions: null, questions: null });
+});
+
+test('openingLines still stops before the rows closingRows reads', () => {
+  const summary = ['- The one thing it did.', '', '- 🙋 **Your actions** — reload the window.'].join('\n');
+  assert.deepEqual(openingLines(summary), ['The one thing it did.']);
+  assert.equal(closingRows(summary).actions, 'reload the window.');
+});
+
+test('a row holds what is under it, and stops where the next row starts', () => {
+  // The rows are bullets themselves, so the row below looks like another item of the one
+  // above. Reading it as one leaves the actions row claiming the questions row's text.
+  const summary = [
+    '- 🙋 **Your actions**',
+    '  - Reload the window.',
+    '- ❓ **Open questions / follow-ups** — none.',
+    '- 📊 **Context** — 9% of 1M (92k)',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), { actions: 'Reload the window.', questions: 'none.' });
+
+  // The worse half of the same fault: an empty heading row taking the next row's text, which
+  // would say the reader is needed when the summary said nothing of the kind.
+  const empty = ['- 🙋 **Your actions**', '- ❓ **Open questions / follow-ups** — whether to keep the store.'].join(
+    '\n',
+  );
+  assert.deepEqual(closingRows(empty), { actions: null, questions: 'whether to keep the store.' });
+});
+
+test('a sentence that opens with a row name does not empty the row above it', () => {
+  // "Last one wins" written as an unconditional assignment lets a later line that holds
+  // nothing wipe out the real row, and the card then silently stops saying it is waiting.
+  const summary = [
+    '- 🙋 **Your actions** — reload the window and confirm.',
+    '',
+    'Your actions are done once that reload lands.',
+  ].join('\n');
+  assert.equal(closingRows(summary).actions, 'reload the window and confirm.');
+});
+
+test("a row written out inside a fenced example is not the turn's own row", () => {
+  // A summary about the summary format is a turn this panel has drawn several times.
+  const summary = [
+    '- Wrote the rule down.',
+    '',
+    'The shape is:',
+    '',
+    '```',
+    '- 🙋 **Your actions** — what only they can do',
+    '- ❓ **Open questions / follow-ups** — what is waiting on an answer',
+    '```',
+    '',
+    '- 🙋 **Your actions** — commit the rule.',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), { actions: 'commit the rule.', questions: null });
+});
+
+test('a row that is only a name, with nothing under it, is not a row', () => {
+  assert.deepEqual(closingRows('- 🙋 **Your actions**'), { actions: null, questions: null });
+  assert.deepEqual(closingRows('- 🙋 **Your actions**\n\nProse, not a list.'), { actions: null, questions: null });
+});
+
+test('an item that opens with a row name is an item, not the next row', () => {
+  // Both names are ordinary English for the very thing these rows hold, so an item that
+  // begins with one is common rather than contrived. Reading it as a row ends the list on it
+  // and throws away that item and everything under it: the turn then shows no badge and
+  // drops out of the filter, which is the feature failing in the direction nobody notices.
+  const summary = [
+    '- ❓ **Open questions / follow-ups**',
+    '  - Your actions here decide whether we ship Friday or slip to Monday.',
+    '  - Should the store rename land in the same release?',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), {
+    actions: null,
+    questions:
+      'Your actions here decide whether we ship Friday or slip to Monday.' +
+      ' Should the store rename land in the same release?',
+  });
+
+  // And the same one line below a row written on its own line, which is the shape in use.
+  const mixed = [
+    '- 🙋 **Your actions** — reload the window.',
+    '- ❓ **Open questions / follow-ups**',
+    '  - Your actions on this ticket decide the release date, so should we ship Friday?',
+  ].join('\n');
+  assert.deepEqual(closingRows(mixed), {
+    actions: 'reload the window.',
+    questions: 'Your actions on this ticket decide the release date, so should we ship Friday?',
+  });
+});
+
+test('the section the newer format closes with is read as the actions row', () => {
+  // The format the summaries on disk are written in changed: no symbols, and every ask
+  // folded into one section. A reader that knows only the named rows says every turn
+  // written since is waiting on nothing at all.
+  const summary = [
+    'The rail keeps its focus, and the suite is green.',
+    '',
+    '**Done**',
+    '- Moved the roving tab stop onto the rail.',
+    '- Added the two tests that hold it there.',
+    '',
+    '**Waiting on you**',
+    '- Reload the window and walk the rail with the arrow keys.',
+    '- Decide whether the picker keeps a tab stop of its own.',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), {
+    actions:
+      'Reload the window and walk the rail with the arrow keys.' +
+      '\nDecide whether the picker keeps a tab stop of its own.',
+    questions: null,
+  });
+});
+
+test('the label is read with its colon written on either side of the bold', () => {
+  // Both spellings are written by hand, and the colon is punctuation rather than part of
+  // the label, so neither spelling can be the one that stops the section being found.
+  const inside = ['**Waiting on you:**', '- Reload the window.'].join('\n');
+  assert.deepEqual(closingRows(inside), { actions: 'Reload the window.', questions: null });
+  const outside = ['**Waiting on you**:', '- Reload the window.'].join('\n');
+  assert.deepEqual(closingRows(outside), { actions: 'Reload the window.', questions: null });
+});
+
+test('the section takes both bullet markers, and a blank line above its first item', () => {
+  // Two markers are in use for the same flat list, and the blank line under the label is
+  // written as often as not. Either one read as the end of the section drops the asks.
+  const summary = ['**Waiting on you**', '', '- Reload the window.', '* Decide the icon set.'].join('\n');
+  assert.deepEqual(closingRows(summary), {
+    actions: 'Reload the window.\nDecide the icon set.',
+    questions: null,
+  });
+});
+
+test('the section takes the item shapes the older reader takes, and a wrap does not end it', () => {
+  // The older heading reader accepts numbered items and wrapped lines, and this section
+  // read bullets alone, so a numbered ask or an item that wrapped ended the section
+  // there and silently dropped every item after it.
+  const summary = [
+    '**Waiting on you**',
+    '- Install the build and look at the rail,',
+    '  the buckets most of all.',
+    '1. Decide the done-glyph shape.',
+    '- Answer the breakpoint question.',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), {
+    actions:
+      'Install the build and look at the rail, the buckets most of all.\nDecide the done-glyph shape.\nAnswer the breakpoint question.',
+    questions: null,
+  });
+  // An indented line with no item above it is not a wrap of anything, so it ends the
+  // section the way any other stray line does.
+  const stray = ['**Waiting on you**', '  not an item', '- Too late to count.'].join('\n');
+  assert.equal(closingRows(stray).actions, null);
+});
+
+test('the words waiting on you inside a sentence do not open a section', () => {
+  // A summary about the summary format names the section in its own prose, and the words
+  // are ordinary English besides. Either line read as a label hands the list under it to
+  // the card as work the reader owes.
+  const prose = [
+    'The rest of it is waiting on you to decide.',
+    '- Not an item of anything.',
+    '',
+    '**Waiting on you** is where the asks go now, and the symbols are gone.',
+    '- Nor is this one.',
+  ].join('\n');
+  assert.deepEqual(closingRows(prose), { actions: null, questions: null });
+});
+
+test("the newer section written out inside a fenced example is not the turn's own", () => {
+  // A turn that writes the format down quotes the section in full, and a quoted example
+  // asks the reader for nothing.
+  const summary = [
+    'Wrote the newer format down.',
+    '',
+    'The shape is:',
+    '',
+    '```',
+    '**Waiting on you**',
+    '- what only the reader can do',
+    '```',
+  ].join('\n');
+  assert.deepEqual(closingRows(summary), { actions: null, questions: null });
+});
+
+test('between the two shapes the one written later in the summary wins', () => {
+  // Both shapes are on disk, and a turn about the format itself carries the one it is not
+  // using. The rows close the summary, so whichever comes last is the turn's own.
+  const sectionLast = [
+    '- 🙋 **Your actions** — the shape this turn replaced.',
+    '- ❓ **Open questions / follow-ups** — whether to keep the store.',
+    '',
+    '**Waiting on you**',
+    '- Reload the window.',
+  ].join('\n');
+  assert.deepEqual(closingRows(sectionLast), { actions: 'Reload the window.', questions: null });
+
+  // And the other way round, where the named row sits directly under the section's list and
+  // looks exactly like another item of it.
+  const rowLast = [
+    '**Waiting on you**',
+    '- The shape this turn quoted.',
+    '',
+    '- 🙋 **Your actions** — reload the window.',
+  ].join('\n');
+  assert.deepEqual(closingRows(rowLast), { actions: 'reload the window.', questions: null });
+});
+
+test('a relative path is written against the folder holding it, with forward slashes', () => {
+  const one = ['C:/Users/dev/work/repo'];
+  // Forward slashes out, whatever shape the path arrived in: transcripts write one way and
+  // the snapshot store writes the other.
+  assert.equal(relativePath('C:/Users/dev/work/repo/src/a.ts', one), 'src/a.ts');
+  const BS = String.fromCharCode(92);
+  assert.equal(relativePath(['C:', 'Users', 'dev', 'work', 'repo', 'src', 'a.ts'].join(BS), one), 'src/a.ts');
+  // The drive letter's case follows whichever session wrote it, so it cannot decide a match.
+  assert.equal(relativePath('c:/Users/dev/work/repo/src/a.ts', one), 'src/a.ts');
+  // A trailing separator on the folder is not part of the answer.
+  assert.equal(relativePath('C:/Users/dev/work/repo/src/a.ts', ['C:/Users/dev/work/repo/']), 'src/a.ts');
+});
+
+test('the result keeps the case the disk holds, not the case the comparison used', () => {
+  // Comparing normalizes, which lower-cases the whole path on Windows. Cutting the result out
+  // of the normalized string would hand back a path that names nothing when it is pasted.
+  assert.equal(relativePath('C:/Users/dev/work/repo/src/MyFile.TS', ['c:/users/dev/work/repo']), 'src/MyFile.TS');
+});
+
+test('with more than one folder open the answer says which one', () => {
+  const two = ['C:/work/alpha', 'C:/work/beta'];
+  assert.equal(relativePath('C:/work/alpha/src/a.ts', two), 'alpha/src/a.ts');
+  assert.equal(relativePath('C:/work/beta/b.ts', two), 'beta/b.ts');
+  // With one folder the name would only stutter, so it is left off.
+  assert.equal(relativePath('C:/work/alpha/src/a.ts', ['C:/work/alpha']), 'src/a.ts');
+});
+
+test('a folder inside another names the file by the nearer of the two', () => {
+  const nested = ['C:/work/repo', 'C:/work/repo/packages/inner'];
+  // The inner folder's own name and the path under it, not the outer folder's.
+  assert.equal(relativePath('C:/work/repo/packages/inner/x.ts', nested), 'inner/x.ts');
+  assert.equal(relativePath('C:/work/repo/top.ts', nested), 'repo/top.ts');
+});
+
+test('a path outside every folder has no relative form, so it keeps its own', () => {
+  const one = ['C:/work/repo'];
+  const outside = 'C:/Users/dev/AppData/Local/Temp/scratch.txt';
+  assert.equal(relativePath(outside, one), outside);
+  // And with no folder open at all there is nothing to be relative to.
+  assert.equal(relativePath(outside, []), outside);
+  // A sibling whose name merely starts the same way is not inside it.
+  assert.equal(relativePath('C:/work/repo-two/a.ts', one), 'C:/work/repo-two/a.ts');
+});
+
+test('the four recorded spellings of one file copy as one string', () => {
+  // The two readers write `c:\`, `C:\`, `c:/` and `C:/` for the same file, so a path copied
+  // from one turn did not match the same path copied from the next.
+  const want = 'C:\\Users\\dev\\work\\repo\\src\\a.ts';
+  assert.equal(nativePath('c:\\Users\\dev\\work\\repo\\src\\a.ts'), want);
+  assert.equal(nativePath('C:\\Users\\dev\\work\\repo\\src\\a.ts'), want);
+  assert.equal(nativePath('c:/Users/dev/work/repo/src/a.ts'), want);
+  assert.equal(nativePath('C:/Users/dev/work/repo/src/a.ts'), want);
+  // Any drive, not just the one this machine happens to record most often.
+  assert.equal(nativePath('d:/work/repo/b.ts'), 'D:\\work\\repo\\b.ts');
+  assert.equal(nativePath('d:\\work\\repo\\b.ts'), 'D:\\work\\repo\\b.ts');
+});
+
+test('a path with no drive letter is copied byte for byte', () => {
+  // The relative form keeps its forward slashes, which is what a message or a config file
+  // wants. It has no drive letter, so the shape gate leaves it alone.
+  assert.equal(nativePath('src/a.ts'), 'src/a.ts');
+  assert.equal(nativePath('docs/architecture.md'), 'docs/architecture.md');
+  // A POSIX absolute path is already native where it names something.
+  assert.equal(nativePath('/home/dev/x'), '/home/dev/x');
+  // A UNC share names a drive nobody lettered, and its leading slashes are already the
+  // separator this rule converts to.
+  assert.equal(nativePath('\\\\server\\share\\a.ts'), '\\\\server\\share\\a.ts');
+});
+
+test('a drive letter with no separator after it is not an absolute path', () => {
+  // `C:` on its own names the current directory of that drive, and `c:relative/x.ts` names a
+  // file under it. Neither is absolute, so neither is this rule's business.
+  assert.equal(nativePath(''), '');
+  assert.equal(nativePath('C:'), 'C:');
+  assert.equal(nativePath('c:'), 'c:');
+  assert.equal(nativePath('c:relative/x.ts'), 'c:relative/x.ts');
+});
+
+test('a link names its file with the anchor stripped, and a URL names nothing', () => {
+  assert.equal(linkTarget('src/store.ts#L42'), 'src/store.ts');
+  assert.equal(linkTarget('src/store.ts#L42-L51'), 'src/store.ts');
+  assert.equal(linkTarget('src/store.ts:42'), 'src/store.ts');
+  assert.equal(linkTarget('src/store.ts:42:7'), 'src/store.ts');
+  assert.equal(linkTarget('src/store.ts'), 'src/store.ts');
+  // A Windows drive letter is a colon without slashes, and stays a file; the trailing
+  // line number still comes off.
+  assert.equal(linkTarget('c:/repo/a.ts:42'), 'c:/repo/a.ts');
+  assert.equal(linkTarget('https://example.com/a.ts'), null);
+  assert.equal(linkTarget('HTTP://x/y#L4'), null);
+  assert.equal(linkTarget(''), null);
+  // An anchor alone names nothing to copy.
+  assert.equal(linkTarget('#L42'), null);
+});
+
+test('a linked HTML file is recognized by its resolved suffix', () => {
+  for (const target of ['report.html', 'report.htm', 'nested/report.HTML', 'nested/report.HtM']) {
+    assert.equal(linkTargetIsHtml(target), true, `${target} did not use the browser route`);
+  }
+  for (const target of ['report.xhtml', 'report.html.md', 'report.md', 'html']) {
+    assert.equal(linkTargetIsHtml(target), false, `${target} used the browser route`);
+  }
+  assert.equal(
+    linkTargetIsHtml(linkTarget('report.html#L42') ?? ''),
+    true,
+    'a line anchor prevented an HTML target from using the browser route',
+  );
+});
+
+test('a linked Markdown file is recognized by its resolved suffix', () => {
+  for (const target of ['README.md', 'notes.markdown', 'nested/README.MD', 'nested/notes.MarkDown']) {
+    assert.equal(linkTargetIsMarkdown(target), true, `${target} did not use the Markdown Preview route`);
+  }
+  for (const target of ['notes.mdx', 'notes.md.txt', 'report.html', 'extensionless', '']) {
+    assert.equal(linkTargetIsMarkdown(target), false, `${target} used the Markdown Preview route`);
+  }
+  assert.equal(
+    linkTargetIsMarkdown(linkTarget('README.md#L42') ?? ''),
+    true,
+    'a line anchor prevented a Markdown target from using the Markdown Preview route',
+  );
+});
+
+test('a relative link resolves to the folder that holds it, or the first folder', () => {
+  const folders = ['/ws/app', '/ws/lib'];
+  const inLib = path.join('/ws/lib', 'src/a.ts');
+  assert.equal(
+    resolveLink('src/a.ts', folders, (p) => p === inLib),
+    inLib,
+  );
+  // Nothing holds it: the first folder's join, which is where opening would have looked.
+  assert.equal(
+    resolveLink('src/missing.ts', folders, () => false),
+    path.join('/ws/app', 'src/missing.ts'),
+  );
+  const abs = path.resolve('/abs/x.ts');
+  assert.equal(
+    resolveLink(abs, folders, () => false),
+    abs,
+  );
+  assert.equal(
+    resolveLink('a.ts', [], () => false),
+    null,
+  );
+  assert.equal(
+    resolveLink('', folders, () => false),
+    null,
+  );
+});
+
+test('a session was last active when it last recorded a time, not when its file was touched', () => {
+  // A transcript as an agent leaves it when a session is closed: real turns, then a
+  // run of bookkeeping that carries no time of its own. Those records still move the file,
+  // so a reader taking the mtime dates a session nobody touched to the moment it was
+  // closed.
+  const closed = writeTranscript([
+    userPrompt('why does the panel show nothing in this repo', 0),
+    assistantText('because no folder holding a transcript is open', 30),
+    { type: 'ai-title', aiTitle: 'Panel shows nothing' },
+    { type: 'last-prompt', prompt: 'why does the panel show nothing in this repo' },
+    { type: 'mode', mode: 'default' },
+    { type: 'file-history-snapshot', messageId: 'm1', snapshot: {} },
+    { type: 'bridge-session', bridgeSessionId: 'b1' },
+  ]);
+  assert.equal(readSessionActivity(closed), ms(30), 'the closing bookkeeping was read as activity');
+
+  // Nothing but bookkeeping. There is no recorded time to give, and saying so is what lets
+  // the caller fall back rather than invent one.
+  const silent = writeTranscript([
+    { type: 'ai-title', aiTitle: 'Named but never spoken in' },
+    { type: 'mode', mode: 'default' },
+  ]);
+  assert.equal(readSessionActivity(silent), null);
+
+  // A time that will not parse is skipped rather than counted. Counting it makes the answer
+  // NaN, and rounding it to zero claims the session was last active in 1970.
+  const broken = writeTranscript([
+    userPrompt('a real prompt', 10),
+    { type: 'system', timestamp: 'not a date', content: 'hook fired' },
+  ]);
+  assert.equal(readSessionActivity(broken), ms(10));
+  assert.equal(readSessionActivity(writeTranscript([{ type: 'system', timestamp: 'not a date' }])), null);
+});
+
+test('a record that lands out of order cannot pull a session back in time', () => {
+  // A sidechain's line is written when its answer arrives, so a line carrying an older time
+  // can land after a newer one. Taking the last time found rather than the newest reads
+  // that as the session going backwards.
+  const out = writeTranscript([
+    userPrompt('run three agents', 0),
+    assistantText('all three are done', 300),
+    {
+      type: 'user',
+      isSidechain: true,
+      timestamp: at(120),
+      message: { role: 'user', content: [{ type: 'text', text: 'the second agent reporting' }] },
+    },
+  ]);
+  assert.equal(readSessionActivity(out), ms(300), 'a late line carrying an older time lowered the answer');
+});
+
+test('a session name and its last activity come out of one read of the tail', () => {
+  const file = writeTranscript([
+    userPrompt('build the timeline', 0),
+    assistantText('here is the first card', 45),
+    { type: 'ai-title', aiTitle: 'Timeline view for agent turns' },
+    { type: 'mode', mode: 'default' },
+  ]);
+  // Not a run: its one turn never closed, and a session still inside its first turn
+  // is the one shape this rule refuses to guess at.
+  const { headKey, titleAt, coverage, ...meta } = readSessionMeta(file);
+  assert.deepEqual(coverage, { whole: true, windowBytes: 256 * 1024 });
+  assert.ok(headKey && titleAt, 'the read names the first record and places the title record');
+  assert.deepEqual(meta, {
+    title: 'Timeline view for agent turns',
+    fullTitle: 'Timeline view for agent turns',
+    titleSource: 'generated',
+    activityMs: ms(45),
+    agentRun: false,
+    outcome: { finished: false, error: false, interrupted: false, endedAt: ms(45), startedAt: ms(0) },
+  });
+  assert.deepEqual(
+    { ...readSessionMeta(writeTranscript([{ type: 'mode', mode: 'default' }])), headKey: undefined },
+    {
+      coverage: { whole: true, windowBytes: 256 * 1024 },
+      headKey: undefined,
+      title: null,
+      fullTitle: null,
+      titleSource: null,
+      activityMs: null,
+      agentRun: false,
+      outcome: null,
+    },
+  );
+});
+
+test('session metadata carries the newest turn outcome only when its start is in the tail', () => {
+  const failed = writeTranscript([
+    userPrompt('make the rail show failures', 0),
+    { type: 'assistant', isApiErrorMessage: true, timestamp: at(5), message: { content: 'stream disconnected' } },
+  ]);
+  const meta = readSessionMeta(failed);
+  assert.deepEqual(meta.outcome, {
+    finished: false,
+    error: true,
+    interrupted: false,
+    endedAt: ms(5),
+    startedAt: ms(0),
+  });
+
+  const partial = writeTranscript([
+    userPrompt('make the rail show failures', 0),
+    { type: 'assistant', isApiErrorMessage: true, timestamp: at(5), message: { content: 'stream disconnected' } },
+  ]);
+  const narrow = readSessionMeta(partial, 20);
+  assert.equal(narrow.outcome, null);
+});
+
+test('Claude metadata starts an externally running rail card without a busy child', () => {
+  const file = writeTranscript([userPrompt('keep working', 0)]);
+  const outcome = readSessionMeta(file).outcome;
+  const starts = sessionRunningSince([], new Set(), new Map([['external', outcome]]), ms(2));
+  assert.deepEqual([...starts], [['external', ms(0)]]);
+});
+
+test('Claude metadata statistics use the parser over the tail already in memory', () => {
+  const file = writeTranscript([
+    userPrompt('measure this turn', 0),
+    assistantText('Done.', 5, { input_tokens: 20_000, cache_read_input_tokens: 10_000, output_tokens: 500 }),
+  ]);
+  const parsed = readSession(file, 'sess', { tailBytes: 256 * 1024, maxTurns: 40 });
+  assert.deepEqual(readSessionMeta(file, 256 * 1024, 'sess').stats, sessionStatFactsOf(parsed));
+  assert.deepEqual(sessionOutcomeOf(parsed), readSessionMeta(file).outcome);
+  assert.equal(
+    readSessionMeta(file, 20, 'sess').stats,
+    null,
+    'a tail that cannot reach the newest turn start supplies no rail figures',
+  );
+});
+
+test('session metadata follows the parser through API errors and a turn that resumes work', () => {
+  const failed = writeTranscript([
+    userPrompt('show the error', 0),
+    {
+      type: 'assistant',
+      isApiErrorMessage: true,
+      timestamp: at(1),
+      message: { model: '<synthetic>', content: 'service unavailable' },
+    },
+  ]);
+  assert.equal(
+    readSessionMeta(failed).outcome?.error,
+    true,
+    'a real API error carries the synthetic marker the harness also uses',
+  );
+
+  const continued = writeTranscript([
+    userPrompt('continue after the first answer', 0),
+    assistantAnswer('The first answer closed.', 1),
+    {
+      ...assistantTool('Read', 2),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'e1', name: 'Read', input: {} }],
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at(3),
+      origin: { kind: 'task-notification' },
+      message: { role: 'user', content: 'the child finished' },
+    },
+    editResult('c:\\repo\\a.ts', 4, 1, 0),
+  ]);
+  const parsed = readTurns(continued, 'sess')[0];
+  assert.equal(parsed.finished, false);
+  assert.equal(parsed.endedAt, ms(4));
+  assert.deepEqual(readSessionMeta(continued).outcome, {
+    finished: false,
+    error: false,
+    interrupted: false,
+    endedAt: parsed.endedAt,
+    startedAt: parsed.startedAt,
+  });
+});
+
+// Two background subagents, one completion notice, and a typed prompt between them. The
+// session's newest turn is closed, but one child still runs, and every reader of the outcome
+// has to name it.
+function backgroundLaunch(toolUseId: string, agentId: string, second: number) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'launched' }] },
+    toolUseResult: { isAsync: true, status: 'async_launched', agentId, description: `Scan ${agentId}` },
+  };
+}
+function childNoticeText(toolUseId: string, taskId: string): string {
+  return `<task-notification><task-id>${taskId}</task-id><tool-use-id>${toolUseId}</tool-use-id><status>completed</status></task-notification>`;
+}
+const twoBackgroundChildren = [
+  userPrompt('scan both halves in the background', 0),
+  assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
+  backgroundLaunch('bg1', 'x1', 2),
+  assistantTool('Agent', 3, 'bg2', { description: 'Scan x2', run_in_background: true }),
+  backgroundLaunch('bg2', 'x2', 4),
+  assistantAnswer('Both scans are running.', 5),
+  userPrompt('what else is left?', 6),
+  assistantAnswer('Nothing else, the scans are still running.', 7),
+  {
+    type: 'user',
+    timestamp: at(8),
+    origin: { kind: 'task-notification' },
+    message: { role: 'user', content: childNoticeText('bg1', 'x1') },
+  },
+  assistantAnswer('The first scan is back.', 9),
+];
+
+function outcomeReaders(records: object[]) {
+  const file = writeTranscript(records);
+  const indexed = createClaudeUsageLineReducer();
+  for (const record of records) {
+    indexed.pushLine(JSON.stringify(record));
+  }
+  return {
+    tail: readSessionMeta(file).outcome,
+    full: sessionOutcomeOf(readSession(file, 'sess')),
+    lifetime: indexed.newestTurnOutcome(),
+    restored: createClaudeUsageLineReducer(structuredClone(indexed.snapshot())).newestTurnOutcome(),
+  };
+}
+
+test('a closed turn names the background children no notice has closed yet', () => {
+  const readers = outcomeReaders(twoBackgroundChildren);
+  for (const [reader, outcome] of Object.entries(readers)) {
+    assert.equal(outcome?.finished, true, `${reader}: the newest turn closed`);
+    assert.deepEqual(outcome?.openChildren, ['x2'], `${reader}: one child is still open`);
+    assert.deepEqual(outcome?.closedChildren, [{ id: 'x1', closedAt: ms(8) }], `${reader}: the close has a time`);
+  }
+});
+
+// A turn that started a command in the background and closed while it runs. The agent wakes
+// by itself when the command's end record arrives.
+function commandNotice(toolUseId: string, taskId: string, status: string, second: number) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    origin: { kind: 'task-notification' },
+    message: {
+      role: 'user',
+      content: `<task-notification><task-id>${taskId}</task-id><tool-use-id>${toolUseId}</tool-use-id><status>${status}</status></task-notification>`,
+    },
+  };
+}
+const backgroundCommandTurn = [
+  userPrompt('run the suite in the background', 0),
+  assistantTool('Bash', 1, 'cmd1', { command: 'npm test', run_in_background: true }),
+  {
+    type: 'user',
+    timestamp: at(2),
+    message: {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'cmd1', content: 'Command running in background with ID: b349silf3' },
+      ],
+    },
+    toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b349silf3' },
+  },
+  assistantAnswer('The suite runs in the background.', 3),
+];
+
+// The rail status the tail read gives the session at one clock, with the open children the
+// caller names.
+function railStatusFromTranscript(records: object[], now: number, openChildren = new Map<string, number>()) {
+  const outcomes = new Map([['sess', readSessionMeta(writeTranscript(records)).outcome]]);
+  return sessionStatusOf(
+    [],
+    new Set(),
+    outcomes,
+    now,
+    new Set(),
+    new Map(),
+    openChildren,
+    liveBackgroundCommands(outcomes, new Map(), now),
+  ).get('sess');
+}
+
+test('a closed turn reads background while a command it started in the background runs', () => {
+  const noCommand = railStatusFromTranscript([userPrompt('run the suite', 0), assistantAnswer('Done.', 3)], ms(4));
+  assert.equal(noCommand, 'done');
+  assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(4)), 'background');
+  // Any end record ends the state, whatever status it reports, in either notice shape.
+  for (const status of ['completed', 'failed', 'killed']) {
+    assert.equal(
+      railStatusFromTranscript([...backgroundCommandTurn, commandNotice('cmd1', 'b349silf3', status, 5)], ms(6)),
+      noCommand,
+      `a ${status} end record`,
+    );
+  }
+  assert.equal(
+    railStatusFromTranscript(
+      [
+        ...backgroundCommandTurn,
+        queued(
+          {
+            commandMode: 'task-notification',
+            prompt: commandNotice('cmd1', 'b349silf3', 'completed', 5).message.content,
+          },
+          5,
+        ),
+      ],
+      ms(6),
+    ),
+    noCommand,
+    'a queued end record',
+  );
+  // An end record for another call leaves the command running.
+  assert.equal(
+    railStatusFromTranscript([...backgroundCommandTurn, commandNotice('other', 'b000', 'completed', 5)], ms(6)),
+    'background',
+  );
+  // The state lasts one hour from the launch at most.
+  assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(1) + BACKGROUND_COMMAND_CAP_MS - 1), 'background');
+  assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(1) + BACKGROUND_COMMAND_CAP_MS), noCommand);
+  // A live background subagent wins, because it is work in progress and a command is a wait.
+  assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(4), new Map([['sess', 1]])), 'subagents');
+});
+
+// A stop call writes no end record. Its input names the task id the launch result reported.
+test('a command the agent stops leaves the background state', () => {
+  const [prompt, launch, launched] = backgroundCommandTurn;
+  const stopTurn = (name: string, input: Record<string, unknown>) => [
+    prompt,
+    launch,
+    launched,
+    assistantTool(name, 3, 'stop1', input),
+    {
+      type: 'user',
+      timestamp: at(4),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'stop1', content: 'Successfully stopped task: b349silf3 (npm test)' },
+        ],
+      },
+      toolUseResult: {
+        message: 'Successfully stopped task: b349silf3 (npm test)',
+        task_id: 'b349silf3',
+        task_type: 'local_bash',
+        command: 'npm test',
+      },
+    },
+    assistantAnswer('The suite is stopped.', 5),
+  ];
+  assert.equal(railStatusFromTranscript(stopTurn('TaskStop', { task_id: 'b349silf3' }), ms(6)), 'done');
+  assert.equal(railStatusFromTranscript(stopTurn('KillShell', { shell_id: 'b349silf3' }), ms(6)), 'done');
+  assert.equal(
+    railStatusFromTranscript(stopTurn('TaskStop', { task_id: 'b000' }), ms(6)),
+    'background',
+    'a stop of another task',
+  );
+});
+
+// A launch the reader rejects, or one that fails before its process starts, has an error result.
+test('a background launch whose result is an error does not read background', () => {
+  const rejected = [
+    userPrompt('run the suite in the background', 0),
+    assistantTool('Bash', 1, 'cmd1', { command: 'npm test', run_in_background: true }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'cmd1',
+            is_error: true,
+            content: "The user doesn't want to proceed with this tool use.",
+          },
+        ],
+      },
+      toolUseResult: "Error: The user doesn't want to proceed with this tool use.",
+    },
+    assistantAnswer('The suite did not start.', 3),
+  ];
+  assert.equal(readSessionMeta(writeTranscript(rejected)).outcome?.backgroundCommands, undefined);
+  assert.equal(railStatusFromTranscript(rejected, ms(4)), 'done');
+});
+
+test('a background subagent launch with no end record does not read background', () => {
+  const agentTurn = [
+    userPrompt('scan in the background', 0),
+    assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
+    backgroundLaunch('bg1', 'x1', 2),
+    assistantAnswer('The scan is running.', 3),
+  ];
+  assert.equal(readSessionMeta(writeTranscript(agentTurn)).outcome?.backgroundCommands, undefined);
+  assert.equal(railStatusFromTranscript(agentTurn, ms(4)), 'done');
+});
+
+// A long turn that end records keep waking. Its typed prompt lies before the tail read, and the
+// command it launched last lies inside it.
+test('a long turn reads background when its typed prompt lies before the tail read', () => {
+  const records = [
+    userPrompt('orchestrate the release', 0),
+    assistantTool('Bash', 1, 'cmd0', { command: 'npm run build', run_in_background: true }),
+    assistantAnswer(`The build runs in the background. ${'x'.repeat(8_000)}`, 2),
+    commandNotice('cmd0', 'b000', 'completed', 3),
+    ...backgroundCommandTurn.slice(1).map((record, index) => ({ ...record, timestamp: at(4 + index) })),
+  ];
+  const file = writeTranscript(records);
+  const meta = readSessionMeta(file, 2_048, 'sess');
+  assert.equal(meta.outcome, null, 'the tail holds no typed prompt');
+  const indexed = createClaudeUsageLineReducer();
+  for (const record of records) {
+    indexed.pushLine(JSON.stringify(record));
+  }
+  const parsed = sessionOutcomeOf(readSession(file, 'sess'));
+  // `outcomeWithWiderChildren` adds the tail's commands to the lifetime outcome of the same turn.
+  const outcomes = new Map([
+    ['sess', outcomeWithWiderChildren(meta.outcome, indexed.newestTurnOutcome(), parsed, meta.backgroundCommands)],
+  ]);
+  const now = ms(10);
+  const status = sessionStatusOf(
+    [],
+    new Set(),
+    outcomes,
+    now,
+    new Set(),
+    new Map(),
+    new Map(),
+    liveBackgroundCommands(outcomes, new Map(), now),
+  ).get('sess');
+  assert.equal(status, 'background', 'no tail outcome');
+});
+
+// A process end stops every command the process started, and a resume starts with none running.
+test('a recorded process end clears the background commands of the tail read', () => {
+  const [prompt, launch, launched] = backgroundCommandTurn;
+  const resumed = [
+    prompt,
+    launch,
+    launched,
+    costState(ms(0), ms(3) - ms(0)),
+    userPrompt('is the suite done?', 4),
+    assistantAnswer('The suite stopped with the session.', 5),
+  ];
+  const outcome = readSessionMeta(writeTranscript(resumed)).outcome;
+  assert.equal(outcome?.startedAt, ms(4), 'the tail outcome is the resumed turn');
+  assert.equal(outcome?.backgroundCommands, undefined);
+  assert.equal(railStatusFromTranscript(resumed, ms(6)), 'done');
+});
+
+test('the last completion notice empties the open children', () => {
+  const readers = outcomeReaders([
+    ...twoBackgroundChildren,
+    queued({ commandMode: 'task-notification', prompt: childNoticeText('bg2', 'x2') }, 10),
+    assistantAnswer('Both scans are back.', 11),
+  ]);
+  for (const [reader, outcome] of Object.entries(readers)) {
+    assert.equal(outcome?.finished, true, `${reader}: the newest turn closed`);
+    assert.equal(
+      outcome !== null && Object.prototype.hasOwnProperty.call(outcome, 'openChildren'),
+      false,
+      `${reader}: no child is open`,
+    );
+    assert.deepEqual(
+      outcome?.closedChildren,
+      [
+        { id: 'x1', closedAt: ms(8) },
+        { id: 'x2', closedAt: ms(10) },
+      ],
+      `${reader}: both closes have their record times`,
+    );
+  }
+});
+
+test('a restored lifetime scan indexes closed child ids once across a large completion burst', () => {
+  const count = 1_000;
+  let identifierReads = 0;
+  const closedChildren = Array.from({ length: count }, (_, index) =>
+    Object.defineProperty({ closedAt: ms(index) }, 'id', {
+      enumerable: true,
+      get: () => {
+        identifierReads++;
+        return `old-${index}`;
+      },
+    }),
+  ) as NonNullable<TurnOutcome['closedChildren']>;
+  const state = {
+    ...emptyClaudeUsageReducerState(),
+    openTurn: true,
+    currentTurnOutcome: {
+      finished: true,
+      error: false,
+      interrupted: false,
+      endedAt: ms(0),
+      closedChildren,
+    },
+  };
+
+  for (let index = 0; index < count; index++) {
+    reduceClaudeUsageLine(
+      state,
+      JSON.stringify({
+        type: 'user',
+        timestamp: at(count + index),
+        origin: { kind: 'task-notification' },
+        message: { role: 'user', content: childNoticeText(`call-${index}`, `new-${index}`) },
+      }),
+    );
+  }
+
+  assert.equal(identifierReads, count, 'each restored identifier is read once to build the index');
+  assert.equal(state.currentTurnOutcome?.closedChildren?.length, count * 2);
+  const lastRestored = state.currentTurnOutcome?.closedChildren?.[count - 1];
+  assert.equal(typeof lastRestored === 'string' ? lastRestored : lastRestored?.id, `old-${count - 1}`);
+  assert.deepEqual(state.currentTurnOutcome?.closedChildren?.[count], { id: 'new-0', closedAt: ms(count) });
+});
+
+test('a resume after a recorded process end carries no open child into the new turn', () => {
+  const readers = outcomeReaders([
+    ...twoBackgroundChildren,
+    costState(ms(0), 10_000),
+    userPrompt('pick up where you left off', 12),
+    assistantAnswer('Picking up.', 13),
+  ]);
+  for (const [reader, outcome] of Object.entries(readers)) {
+    assert.equal(outcome?.startedAt, ms(12), `${reader}: the resumed turn is the newest`);
+    assert.equal(
+      outcome !== null && Object.prototype.hasOwnProperty.call(outcome, 'openChildren'),
+      false,
+      `${reader}: the process end closed every child it held`,
+    );
+  }
+});
+
+// Child discovery names a child by the agent id its launch result carries, and the outcome names
+// the same id. The rail joins the two under the parent session to find the child's write time.
+test('a child discovery reference joins the open child its launch names', () => {
+  const file = writeTranscript(twoBackgroundChildren);
+  const references = readClaudeChildSessionReferences({ file, sessionId: 'sess' });
+  assert.deepEqual(references.map((reference) => reference.sessionId).sort(), ['x1', 'x2']);
+  const now = ms(20);
+  const version = `2048:${now - 60_000}`;
+  const subagentReferences = references.filter(isClaudeSubagentReference);
+  const writes = new Map(
+    subagentReferences.map((reference) => [reference.file, writeTimeOfVersion(version) as number]),
+  );
+  const index = claudeChildWriteIndex([], subagentReferences, writes);
+  const outcomes = new Map([['sess', readSessionMeta(file).outcome]]);
+  const live = liveOpenChildren(outcomes, (session, child) => index.get(childWriteKey(session, child)), new Map(), now);
+  assert.deepEqual(live, new Map([['sess', ['x2']]]));
+  assert.equal(writeTimeOfVersion('missing'), null);
+  assert.equal(writeTimeOfVersion('not-file'), null);
+  assert.equal(writeTimeOfVersion('2048:'), null);
+});
+
+// A real Claude background launch keeps its row open with the parser's own `running` status.
+// The card's agents figure counts the same children the rail counts, and an open row whose
+// child has gone quiet stays out of the count.
+test('the agents figure counts the live open children the rail counts', () => {
+  const file = writeTranscript(twoBackgroundChildren);
+  const read = readSession(file, 'sess');
+  const launched = read.turns.find((turn) => turn.agents.length > 0);
+  assert.ok(launched, 'the launch turn was not parsed');
+  assert.deepEqual(
+    launched.agents.map((agent) => agent.status),
+    ['completed', 'running'],
+  );
+  const outcomes = new Map([['sess', sessionOutcomeOf(read)]]);
+  const now = ms(20);
+  const figure = (written: number) => {
+    const live = liveOpenChildren(outcomes, () => written, new Map(), now);
+    const chip = toCard(launched, false, now, [], null, false, new Set(live.get('sess'))).chips.find(
+      (one) => one.metric === 'agents',
+    );
+    return { rail: openChildCounts(live).get('sess'), card: chip?.running };
+  };
+  assert.deepEqual(figure(now - 60_000), { rail: 1, card: 1 });
+  assert.deepEqual(figure(now - TURN_QUIET_MS - 1), { rail: undefined, card: undefined });
+});
+
+// Turn 1 launches a background child, and turn 2 finishes while the child still runs. The rail
+// says `1 subagent`, so the newest card must count the same carried subagent on its agents figure.
+test('the newest turn card counts a carried subagent', () => {
+  const records = [
+    userPrompt('scan in the background', 0),
+    assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
+    backgroundLaunch('bg1', 'x1', 2),
+    assistantAnswer('The scan is running.', 3),
+    userPrompt('anything else?', 4),
+    assistantAnswer('Nothing else yet.', 5),
+  ];
+  const read = readSession(writeTranscript(records), 'sess');
+  const [first, newest] = [...read.turns].sort((a, b) => a.startedAt - b.startedAt);
+  assert.ok(first && newest && first !== newest, 'both turns were parsed');
+  assert.equal(newest.agents.length, 0, 'the newest turn launched nothing');
+  const now = ms(20);
+  const live = liveOpenChildren(new Map([['sess', sessionOutcomeOf(read)]]), () => now - 60_000, new Map(), now);
+  const children = new Set(live.get('sess'));
+  const card = toCard(newest, true, now, [], null, false, children);
+  const chip = card.chips.find((one) => one.metric === 'agents');
+  assert.equal(card.statusWord, 'finished');
+  assert.equal(openChildCounts(live).get('sess'), 1, 'the rail counts one subagent');
+  assert.equal(chip?.running, 1, 'the newest card draws no running figure for the child the rail counts');
+  assert.equal(chip?.label, '1 subagent');
+  assert.equal(chip?.detailList?.heading?.label, '1 subagent started before this turn');
+  // The older card launched the child and draws its own row. It counts no carried subagent,
+  // even beside a second live child that another turn launched.
+  const older = toCard(first, false, now, [], null, false, new Set([...children, 'x2'])).chips.find(
+    (one) => one.metric === 'agents',
+  );
+  assert.deepEqual(
+    {
+      label: older?.label,
+      running: older?.running,
+      heading: older?.detailList?.heading?.label,
+      footer: older?.detailList?.footer,
+    },
+    { label: '1 subagent', running: 1, heading: '1 subagent in this turn', footer: undefined },
+    'the older card counts only its own row',
+  );
+  // The rail counts children only under a done, failed or interrupted newest turn, and the
+  // newest card follows the same rule. A running turn and a stopped turn count none.
+  const railFor = (outcome: TurnOutcome) =>
+    sessionStatusOf([], new Set(), new Map([['sess', outcome]]), now, new Set(), new Map(), openChildCounts(live)).get(
+      'sess',
+    );
+  const runningTurn = { ...newest, finished: false, endedAt: now - 1_000 };
+  const stoppedTurn = { ...newest, finished: false, processEndedAt: ms(6) };
+  const stoppedOwn = { ...first, finished: false, processEndedAt: ms(6) };
+  const figureOf = (card: ReturnType<typeof toCard>) => card.chips.find((one) => one.metric === 'agents')?.running;
+  assert.deepEqual(
+    {
+      running: {
+        status: statusOf(runningTurn, true, now),
+        card: figureOf(toCard(runningTurn, true, now, [], null, false, children)),
+      },
+      stopped: {
+        status: statusOf(stoppedTurn, true, now),
+        card: figureOf(toCard(stoppedTurn, true, now, [], null, false, children)),
+      },
+      stoppedOwn: {
+        status: statusOf(stoppedOwn, true, now),
+        card: figureOf(toCard(stoppedOwn, true, now, [], null, false, children)),
+      },
+    },
+    {
+      running: { status: 'running', card: undefined },
+      stopped: { status: 'stopped', card: undefined },
+      stoppedOwn: { status: 'stopped', card: undefined },
+    },
+  );
+  const outcome = sessionOutcomeOf(read)!;
+  assert.equal(
+    railFor({ ...outcome, finished: false, processEndedAt: ms(6) }),
+    'stopped',
+    'the rail counts no child on a stopped turn',
+  );
+  assert.equal(railFor({ ...outcome, finished: false, endedAt: now - 1_000 }), 'running');
+  // A live child whose row on the newest turn reads closed is still one the rail counts.
+  const closedRow = { ...newest, agents: [{ ...first.agents[0], status: 'completed' }] };
+  assert.equal(
+    figureOf(toCard(closedRow, true, now, [], null, false, children)),
+    1,
+    'the newest card counts every live child the rail counts',
+  );
+});
+
+// The session is at rest and its carried subagent still runs. Its outcome comes back from the
+// derived cache, where nothing closed and the stored outcome names no closed child. The rail
+// must still wear `subagents`, and the newest card must still count the carried subagent.
+test('a session at rest keeps its carried subagent through the derived cache', () => {
+  const read = readSession(
+    writeTranscript([
+      userPrompt('scan in the background', 0),
+      assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
+      backgroundLaunch('bg1', 'x1', 2),
+      assistantAnswer('The scan is running.', 3),
+      userPrompt('anything else?', 4),
+      assistantAnswer('Nothing else yet.', 5),
+    ]),
+    'sess',
+  );
+  const newest = [...read.turns].sort((a, b) => b.startedAt - a.startedAt)[0];
+  const stored = sessionOutcomeOf(read);
+  assert.deepEqual(stored?.openChildren, ['x1'], 'the stored outcome holds the open child');
+  assert.equal(stored?.closedChildren, undefined, 'nothing closed, so the outcome names none');
+  const entry: DerivedTitleEntry = {
+    mtimeMs: 10,
+    size: 20,
+    label: 'A session',
+    fullLabel: 'A session',
+    activityMs: 30,
+    agentRun: false,
+    outcome: stored,
+    stats: null,
+    starts: { starts: [0], whole: true },
+    foldedLabel: 'a session',
+  };
+  const cacheFile = path.join(tempDir('carried-cache-'), 'cache.json');
+  saveDerivedCache(cacheFile, [['/sess.jsonl', entry]]);
+  const cached = loadDerivedCache(cacheFile).titles.get('/sess.jsonl')?.outcome ?? null;
+  const now = ms(20);
+  const outcomes = new Map([['sess', cached]]);
+  const live = liveOpenChildren(outcomes, () => now - 60_000, new Map(), now);
+  const counts = openChildCounts(live);
+  const chip = toCard(newest, true, now, [], null, false, new Set(live.get('sess'))).chips.find(
+    (one) => one.metric === 'agents',
+  );
+  assert.deepEqual(
+    {
+      status: sessionStatusOf([], new Set(), outcomes, now, new Set(), new Map(), counts).get('sess'),
+      rail: counts.get('sess'),
+      card: chip?.running,
+      heading: chip?.detailList?.heading?.label,
+    },
+    { status: 'subagents', rail: 1, card: 1, heading: '1 subagent started before this turn' },
+  );
+
+  saveDerivedCache(cacheFile, [
+    [
+      '/legacy.jsonl',
+      {
+        ...entry,
+        outcome: { ...stored!, openChildren: undefined, closedChildren: ['x1'] },
+      },
+    ],
+  ]);
+  assert.deepEqual(
+    loadDerivedCache(cacheFile).titles.get('/legacy.jsonl')?.outcome?.closedChildren,
+    ['x1'],
+    'a persisted id without a close time still loads',
+  );
+
+  const commands = [{ id: 'cmd1', startedAt: ms(1) }];
+  saveDerivedCache(cacheFile, [
+    ['/command.jsonl', { ...entry, outcome: { ...stored!, backgroundCommands: commands } }],
+  ]);
+  assert.deepEqual(loadDerivedCache(cacheFile).titles.get('/command.jsonl')?.outcome?.backgroundCommands, commands);
+  const unstamped = [{ id: 'cmd1' }] as unknown as typeof commands;
+  saveDerivedCache(cacheFile, [
+    ['/unstamped.jsonl', { ...entry, outcome: { ...stored!, backgroundCommands: unstamped } }],
+  ]);
+  assert.equal(
+    loadDerivedCache(cacheFile).titles.get('/unstamped.jsonl')?.outcome?.backgroundCommands,
+    undefined,
+    'a command without a launch time is refused',
+  );
+  saveDerivedCache(cacheFile, [['/tail.jsonl', { ...entry, outcome: null, backgroundCommands: commands }]]);
+  assert.deepEqual(
+    loadDerivedCache(cacheFile).titles.get('/tail.jsonl')?.backgroundCommands,
+    commands,
+    'commands beside no tail outcome',
+  );
+  saveDerivedCache(cacheFile, [['/tail-unstamped.jsonl', { ...entry, outcome: null, backgroundCommands: unstamped }]]);
+  assert.equal(
+    loadDerivedCache(cacheFile).titles.get('/tail-unstamped.jsonl'),
+    undefined,
+    'an unstamped command beside no tail outcome is refused',
+  );
+});
+
+// A completion notice without a tool-use id closes its child in the tail read and the lifetime
+// facts, while the parsed window keeps the child's row open. No read may reopen the child.
+test('a child that any read closed does not count as open', () => {
+  const { tail, full, lifetime } = outcomeReaders([
+    userPrompt('scan in the background', 0),
+    assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
+    backgroundLaunch('bg1', 'x1', 2),
+    assistantAnswer('The scan is running.', 3),
+    {
+      type: 'user',
+      timestamp: at(4),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content: '<task-notification><task-id>x1</task-id><status>completed</status></task-notification>',
+      },
+    },
+    assistantAnswer('The scan is back.', 5),
+    userPrompt('anything else?', 6),
+    assistantAnswer('Nothing else.', 7),
+  ]);
+  assert.deepEqual(full?.openChildren, ['x1'], 'the parsed window keeps the row open');
+  assert.equal(tail?.openChildren, undefined, 'the tail read closed the child');
+  assert.equal(lifetime?.openChildren, undefined, 'the lifetime facts closed the child');
+  const merged = outcomeWithWiderChildren(tail, lifetime, full);
+  const now = ms(20);
+  assert.deepEqual(
+    liveOpenChildren(new Map([['sess', merged]]), () => now - 60_000, new Map(), now),
+    new Map(),
+  );
+});
+
+// The tail read reaches the newest turn and not the launch before it. The parsed window holds
+// the launch, and its card draws the child's row. The rail must count the same live child.
+test('the rail counts a live child only the parsed window holds', () => {
+  const file = writeTranscript([
+    userPrompt('scan in the background', 0),
+    assistantTool('Agent', 1, 'bg1', { description: 'Scan x1', run_in_background: true }),
+    backgroundLaunch('bg1', 'x1', 2),
+    assistantAnswer(`The scan is running. ${'x'.repeat(8_000)}`, 3),
+    userPrompt('anything else?', 4),
+    assistantAnswer('Nothing else yet.', 5),
+  ]);
+  const tail = readSessionMeta(file, 2_048, 'sess').outcome;
+  assert.equal(tail?.startedAt, ms(4), 'the tail reaches the newest turn');
+  assert.equal(tail?.openChildren, undefined, 'the tail does not reach the launch');
+  const read = readSession(file, 'sess');
+  const launched = read.turns.find((turn) => turn.agents.length > 0);
+  assert.ok(launched, 'the parsed window holds the launch');
+  const now = ms(20);
+  const outcomes = new Map([['sess', outcomeWithWiderChildren(tail, null, sessionOutcomeOf(read))]]);
+  const live = liveOpenChildren(outcomes, () => now - 60_000, new Map(), now);
+  const chip = toCard(launched, false, now, [], null, false, new Set(live.get('sess'))).chips.find(
+    (one) => one.metric === 'agents',
+  );
+  assert.deepEqual({ rail: openChildCounts(live).get('sess'), card: chip?.running }, { rail: 1, card: 1 });
+});
+
+test('session metadata skips an ordinary successful tool result like the full parser', () => {
+  const file = writeTranscript([
+    userPrompt('run the command', 0),
+    assistantTool('Bash', 1, 't1'),
+    {
+      type: 'user',
+      timestamp: at(4),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ordinary output' }] },
+      toolUseResult: { stdout: 'ordinary output' },
+    },
+  ]);
+  const parsed = readTurns(file, 'sess')[0];
+  assert.equal(parsed.endedAt, ms(1));
+  assert.equal(readSessionMeta(file).outcome?.endedAt, parsed.endedAt);
+});
+
+// A session another agent started by shelling out to the CLI is indistinguishable from
+// one the reader had, until you look for the reader. Nothing in the transcript names the
+// agent that started it, so the rule reads the six things only a person leaves behind, and
+// the one thing that outranks all six.
+//
+// Measured over the 86 sessions in this workspace: 44 answer true and every one is a
+// harness run, and over 67 sessions known to be runs it answers true for 66.
+test('a session with no sign of a person in it is an agent run', () => {
+  const run = writeTranscript([
+    userPrompt('write the closing message for a long working turn', 0),
+    assistantAnswer('Here it is.', 12),
+  ]);
+  assert.equal(readSessionMeta(run).agentRun, true);
+});
+
+test('any one sign of a person is enough to say a person was there', () => {
+  // Every case closes its turn, so the only thing left deciding the answer is the sign
+  // under test. Without the closing answer each case would come back false for the other
+  // reason and the whole table would pass while reading nothing.
+  const done = assistantAnswer('done', 1);
+  const cases: [string, object[]][] = [
+    [
+      'a second prompt',
+      [userPrompt('first', 0), done, userPrompt('and now this', 5), assistantAnswer('done again', 6)],
+    ],
+    [
+      'an editor selection',
+      [userPrompt('<ide_selection>lines 1 to 4 of store.ts</ide_selection>\nrename this', 0), done],
+    ],
+    ['an opened file', [userPrompt('<ide_opened_file>store.ts</ide_opened_file>\nwhat does this do', 0), done]],
+    [
+      'an editor diagnostic',
+      [userPrompt('<ide_diagnostics>store.ts has 2 errors</ide_diagnostics>\nfix them', 0), done],
+    ],
+    ['a slash command', [userPrompt('<command-name>/model</command-name>', 0), done]],
+    [
+      'a remote-control bridge record',
+      [userPrompt('one ask', 0), done, { type: 'bridge-session', bridgeSessionId: 'cse_1' }],
+    ],
+    ['a local command record', [userPrompt('one ask', 0), done, { type: 'system', subtype: 'local_command' }]],
+    [
+      'a system record of a kind the rule does not know',
+      [userPrompt('one ask', 0), done, { type: 'system', subtype: 'a_later_kind' }],
+    ],
+    ['a system record with no kind', [userPrompt('one ask', 0), done, { type: 'system' }]],
+    ['a prompt with a human origin', [userPrompt('one ask', 0, { origin: { kind: 'human' } }), done]],
+    [
+      'a refused tool call',
+      [
+        userPrompt('one ask', 0),
+        done,
+        { type: 'user', timestamp: at(2), toolDenialKind: 'user-rejected', message: { role: 'user', content: [] } },
+      ],
+    ],
+    ['a question put to the reader', [userPrompt('one ask', 0), assistantTool('AskUserQuestion', 1, 'q1'), done]],
+    // The prompt id is how the panel's other readers tell prompts apart, and an older
+    // transcript can carry a prompt without one. Counting ids rather than prompts read
+    // this session as a run and folded a person's second question away.
+    [
+      'a second prompt with no id of its own',
+      [
+        userPrompt('first', 0),
+        done,
+        {
+          type: 'user',
+          timestamp: at(5),
+          message: { role: 'user', content: [{ type: 'text', text: 'and now this' }] },
+        },
+        assistantAnswer('done again', 6),
+      ],
+    ],
+  ];
+  for (const [what, lines] of cases) {
+    assert.equal(readSessionMeta(writeTranscript(lines)).agentRun, false, `${what} was not read as a person`);
+  }
+});
+
+test('the system records Claude Code writes with nobody present are no sign of a person', () => {
+  for (const subtype of ['stop_hook_summary', 'compact_boundary', 'turn_duration', 'api_error', 'informational']) {
+    const run = writeTranscript([
+      userPrompt('review the diff and report', 0, { origin: { kind: 'sdk' }, entrypoint: 'sdk-cli' }),
+      assistantAnswer('Reported.', 4),
+      { type: 'system', subtype, timestamp: at(5) },
+    ]);
+    assert.equal(readSessionMeta(run).agentRun, true, `a ${subtype} record was read as a person`);
+  }
+});
+
+// An older editor build writes no origin on a prompt, so a long single-prompt editor session
+// that compacted shows one prompt, a finished turn and a compaction record, and nothing else.
+test('a compaction record in an editor session is a sign of a person', () => {
+  const editor = writeTranscript([
+    userPrompt('walk me through the store module', 0, { entrypoint: 'claude-vscode', version: '2.1.195' }),
+    { type: 'system', subtype: 'compact_boundary', timestamp: at(3), entrypoint: 'claude-vscode' },
+    assistantAnswer('Here is how it fits together.', 4),
+  ]);
+  assert.equal(readSessionMeta(editor).agentRun, false, 'an editor session that compacted was read as an agent run');
+});
+
+test('a follow-up the reader typed while the agent worked is a second prompt', () => {
+  const followed = writeTranscript([
+    userPrompt('review the diff and report', 0, { entrypoint: 'sdk-cli' }),
+    queued({ commandMode: 'prompt', prompt: 'and check the docs too' }, 1),
+    assistantAnswer('Reported.', 2),
+  ]);
+  assert.equal(readSessionMeta(followed).agentRun, false, 'a queued follow-up was not counted as a prompt');
+  const notified = writeTranscript([
+    userPrompt('review the diff and report', 0, { entrypoint: 'sdk-cli' }),
+    queued({ commandMode: 'task-notification', prompt: '<task-notification>done</task-notification>' }, 1),
+    assistantAnswer('Reported.', 2),
+  ]);
+  assert.equal(readSessionMeta(notified).agentRun, true, 'a background task notice was counted as a prompt');
+});
+
+// A finished single-prompt run from an SDK caller, whose tool result pads it past one read chunk.
+function sdkRunLines(padding: string): object[] {
+  return [
+    userPrompt('review the diff and report', 0, { entrypoint: 'sdk-cli' }),
+    assistantTool('Bash', 1, 'b1'),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b1', content: padding }] },
+    },
+    assistantAnswer('Reported.', 3),
+  ];
+}
+
+test('the agent-run scan never answers run while the final line has no newline', () => {
+  const file = writeTranscript(sdkRunLines('x'.repeat(300 * 1024)));
+  const complete = fs.statSync(file).size;
+  assert.equal(agentRunOfScan(scanForAgentRun(file, complete), complete), true);
+  fs.appendFileSync(file, JSON.stringify(userPrompt('and the tests', 4)));
+  const size = fs.statSync(file).size;
+  const scan = scanForAgentRun(file, size);
+  assert.equal(scan.bytes, complete);
+  assert.equal(agentRunOfScan(scan, size), false, 'a scan that has not read the final line answered run');
+});
+
+test('the agent-run scan reads a character split across two read chunks', () => {
+  const chunk = 256 * 1024;
+  const build = (lead: string) => {
+    const file = writeTranscript(sdkRunLines(lead + '€'.repeat(100_000)));
+    return { file, bytes: fs.readFileSync(file) };
+  };
+  let built = build('');
+  const shift = (chunk - built.bytes.indexOf('€')) % 3;
+  if (shift === 0) {
+    built = build('x');
+  }
+  assert.equal(built.bytes[chunk] & 0xc0, 0x80, 'the fixture no longer splits a character across the chunk boundary');
+  const scan = scanForAgentRun(built.file, built.bytes.length);
+  assert.equal(scan.bytes, built.bytes.length);
+  assert.equal(agentRunOfScan(scan, built.bytes.length), true, 'a line crossing the chunk boundary did not parse');
+});
+
+// The person fact files a dispatched session with the reader's sessions, so it reads only the
+// signs `agentRunIn` already treats as a person's. Every person case here is a person to
+// `agentRunIn` too, and the spend read of a quiet session reads the same signs.
+test('a dispatched session reads as a person only on a sign a person leaves', () => {
+  const bg = { sessionKind: 'bg' };
+  const human = { origin: { kind: 'human' } };
+  const launch = userPrompt('Review the branch', 1, { ...bg, ...human });
+  const slashLaunch = userPrompt('<command-name>/review-and-report</command-name>', 1, { ...bg, ...human });
+  const queuedPrompt = (origin: Record<string, unknown>, text: string) =>
+    queued({ commandMode: 'prompt', ...origin, prompt: [{ type: 'text', text }] }, 3);
+  const denied = (kind: string) => ({
+    type: 'user',
+    timestamp: at(3),
+    toolDenialKind: kind,
+    message: { role: 'user', content: [] },
+  });
+  const cases: Array<[string, object[], boolean]> = [
+    ['a background launch prompt', [launch, assistantAnswer('Reviewed.', 2)], false],
+    [
+      'a launch prompt after the record that names the background',
+      [
+        { type: 'system', subtype: 'informational', sessionKind: 'bg', timestamp: at(0) },
+        userPrompt('Review the branch', 1, human),
+      ],
+      false,
+    ],
+    [
+      'a human-origin prompt after the launch',
+      [launch, userPrompt('Use the other fixture', 3, { ...bg, ...human })],
+      true,
+    ],
+    ["a non-background child's first human-origin prompt", [userPrompt('Review the branch', 1, human)], true],
+    ['an SDK follow-up', [launch, userPrompt('Continue', 3, { ...bg, promptSource: 'sdk' })], false],
+    ['a human-origin queued follow-up', [launch, queuedPrompt(human, 'Stop there')], true],
+    ['a queued follow-up with no origin', [launch, queuedPrompt({}, 'Stop there')], true],
+    ['a peer hand-back', [launch, queuedPrompt({ origin: { kind: 'peer' } }, 'Handed back')], false],
+    [
+      'a task notice',
+      [launch, queued({ commandMode: 'task-notification', prompt: '<task-notification>done</task-notification>' }, 3)],
+      false,
+    ],
+    ['an editor tag on a later prompt', [launch, userPrompt('<ide_selection>x</ide_selection> fix this', 3, bg)], true],
+    [
+      'an editor tag quoted in the launch prompt',
+      [userPrompt('Check the <ide_selection> tag', 1, { ...bg, ...human })],
+      false,
+    ],
+    [
+      'an editor tag quoted in an SDK follow-up',
+      [launch, userPrompt('Check the <ide_opened_file> tag', 3, { ...bg, promptSource: 'sdk' })],
+      false,
+    ],
+    ['a tool call the reader refused', [launch, denied('user-rejected')], true],
+    ['a tool call a permission rule refused', [launch, denied('permission-rule')], false],
+    [
+      'a human-origin slash command',
+      [launch, userPrompt('<command-name>/review</command-name>', 3, { ...bg, ...human })],
+      true,
+    ],
+    [
+      'a human-origin slash command marked meta',
+      [launch, userPrompt('<command-name>/review</command-name>', 3, { ...bg, ...human, isMeta: true })],
+      true,
+    ],
+    ['a background launch prompt that is a slash command', [slashLaunch, assistantAnswer('Reviewed.', 2)], false],
+    [
+      'a human-origin slash command after a slash-command launch',
+      [slashLaunch, userPrompt('<command-name>/review</command-name>', 3, { ...bg, ...human })],
+      true,
+    ],
+  ];
+  for (const [name, lines, person] of cases) {
+    const file = writeTranscript(lines);
+    assert.equal(scanForPerson(file, fs.statSync(file).size).person, person, name);
+    assert.equal(readClaudeAgentSpend(file, [], false).person === true, person, `${name}, in the spend read`);
+    if (person) {
+      assert.equal(
+        agentRunIn(fs.readFileSync(file, 'utf8').split('\n'), true),
+        false,
+        `${name} is no person to agentRunIn`,
+      );
+    }
+  }
+});
+
+// A running child first seen before its launch prompt is written must not read that prompt as
+// a second one, because the scan cannot count what came before it.
+test('a dispatched session read from its end counts no prompt it could not see', () => {
+  const file = writeTranscript([{ type: 'system', subtype: 'informational', sessionKind: 'bg', timestamp: at(0) }]);
+  const end = fs.statSync(file).size;
+  let scan = scanForPerson(file, end, undefined, end);
+  fs.appendFileSync(file, JSON.stringify(userPrompt('Review the branch', 1, { origin: { kind: 'human' } })) + '\n');
+  scan = scanForPerson(file, fs.statSync(file).size, scan);
+  assert.equal(scan.person, false, 'the launch prompt written after discovery read as a person');
+  fs.appendFileSync(
+    file,
+    JSON.stringify(
+      queued({ commandMode: 'prompt', origin: { kind: 'human' }, prompt: [{ type: 'text', text: 'Stop there' }] }, 2),
+    ) + '\n',
+  );
+  scan = scanForPerson(file, fs.statSync(file).size, scan);
+  assert.equal(scan.person, true, 'a queued follow-up read from the end did not read as a person');
+});
+
+// A running background child can be first seen after its header records and before its launch
+// prompt. A slash-command launch the scan reads next is still the dispatching agent's. Once the
+// launch prompt sits before the point the scan starts from, a slash command is a person's.
+test('a dispatched session read from its end tells a slash-command launch from a person', () => {
+  const bg = { sessionKind: 'bg' };
+  const human = { origin: { kind: 'human' } };
+  const header = [
+    { type: 'custom-title', customTitle: 'review', sessionId: 's' },
+    { type: 'mode', mode: 'default', sessionId: 's' },
+    { type: 'file-history-snapshot', messageId: 'm', snapshot: { trackedFileBackups: {} } },
+  ];
+  const append = (file: string, record: object) => fs.appendFileSync(file, JSON.stringify(record) + '\n');
+  const slash = (name: string, n: number) =>
+    userPrompt(`<command-name>/${name}</command-name>`, n, { ...bg, ...human });
+  const early = writeTranscript(header);
+  let end = fs.statSync(early).size;
+  let scan = scanForPerson(early, end, undefined, end);
+  append(early, slash('review-and-report', 1));
+  scan = scanForPerson(early, fs.statSync(early).size, scan);
+  assert.equal(scan.person, false, 'a slash-command launch written after discovery read as a person');
+  const late = writeTranscript([
+    ...header,
+    userPrompt('Review the branch', 1, { ...bg, ...human }),
+    assistantAnswer('Reviewed.', 2),
+  ]);
+  end = fs.statSync(late).size;
+  scan = scanForPerson(late, end, undefined, end);
+  append(late, slash('review', 3));
+  scan = scanForPerson(late, fs.statSync(late).size, scan);
+  assert.equal(scan.person, true, 'a slash command a person typed after the launch did not read as a person');
+});
+
+// The shape the six signs cannot see, because every one of them arrives later in a
+// session than its first prompt. The reader asks a question, the agent reads and greps
+// its way towards an answer, and until it edits something or the reader types again the
+// transcript is indistinguishable from a print-mode run. Marking it would take the
+// session the reader is sitting in out of the panel that exists to show it.
+test('a session still inside its first turn is not called a run', () => {
+  const live = writeTranscript([
+    userPrompt('why is the panel slow', 0),
+    assistantTool('Read', 1, 't1', { file_path: 'store.ts' }),
+    {
+      type: 'user',
+      promptId: 'p1',
+      sourceToolAssistantUUID: 'a1',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    },
+    assistantText('still looking', 3),
+  ]);
+  assert.equal(readSessionMeta(live).agentRun, false);
+  // The same session once its turn closes.
+  const over = writeTranscript([
+    userPrompt('why is the panel slow', 0),
+    assistantTool('Read', 1, 't1', { file_path: 'store.ts' }),
+    assistantAnswer('Because the rail re-reads every tail.', 3),
+  ]);
+  assert.equal(readSessionMeta(over).agentRun, true);
+});
+
+// A subagent writes its own file, so this shape does not occur today. The guard is the belt
+// every other reader of a transcript already wears: `readSession` skips a sidechain line and
+// `isTypedPrompt` refuses one. Read here, a subagent's closing answer ends the reader's own
+// first turn while the reader is still sitting in it, which is what the rule above refuses.
+test('a subagent answering does not close the turn the reader is still in', () => {
+  const live = writeTranscript([
+    userPrompt('why is the panel slow', 0),
+    assistantTool('Task', 1, 't1', { prompt: 'go and look at the rail' }),
+    { ...assistantAnswer('the subagent finished', 2), isSidechain: true },
+    assistantText('still looking', 3),
+  ]);
+  assert.equal(readSessionMeta(live).agentRun, false);
+});
+
+// The harness writes an assistant record of its own when a run is interrupted or a tool is
+// refused, and `readSession` skips it for the same reason. Read here it closes the turn, and
+// a session the reader is still inside is then called a run.
+test('a record the harness wrote does not close the turn either', () => {
+  const live = writeTranscript([
+    userPrompt('why is the panel slow', 0),
+    assistantTool('Read', 1, 't1', { file_path: 'store.ts' }),
+    {
+      type: 'assistant',
+      timestamp: at(2),
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'No response requested.' }],
+      },
+    },
+  ]);
+  assert.equal(readSessionMeta(live).agentRun, false);
+});
+
+// A complete line that will not parse could hold any of the signs, so the tail reader answers
+// nothing. A transcript is appended to while an agent works, so a read can also land mid-write
+// and leave half a record after the last newline. That one waits for the next read, the way
+// the whole-file scan reads complete lines only.
+test('a complete line that will not parse leaves the question unanswered rather than assumed', () => {
+  const dir = tempDir('tl-');
+  const file = path.join(dir, 'sess.jsonl');
+  const whole = [userPrompt('one ask', 0), assistantAnswer('done', 1)].map((l) => JSON.stringify(l)).join('\n');
+  fs.writeFileSync(file, whole + '\n');
+  assert.equal(readSessionMeta(file).agentRun, true);
+  fs.writeFileSync(file, whole + '\n{"type":"system"\n');
+  assert.equal(readSessionMeta(file).agentRun, null, 'a complete line that will not parse was answered');
+  fs.writeFileSync(file, whole + '\n{"type":"system"');
+  assert.equal(readSessionMeta(file).agentRun, true, 'a half-written last record changed the answer');
+  // `null` is valid JSON and reading a field off it threw out of readSessionMeta, which
+  // every listed session goes through, so one such line took down the whole refresh.
+  fs.writeFileSync(file, whole + '\nnull\n');
+  assert.equal(readSessionMeta(file).agentRun, true);
+});
+
+// The rule that rescues the false positive that matters. The one session in this
+// workspace the six signs called a run and the owner had was him asking for help with a
+// hook error and getting it in a single turn, with two files changed and no reason to type
+// again. A session that touched the tree is also the last one this extension should
+// fold away, since showing what changed is the whole of its job.
+test('a changed file with no SDK entrypoint is never an agent run', () => {
+  // The call is what is read, not what came back. An edit that failed still says somebody
+  // meant to change this tree, and reading the result would need a second rule about what
+  // each tool calls success. So the fixture carries the call and nothing else: a result
+  // beside it would make the case pass whether the rule read the call or not.
+  const fixed = writeTranscript([
+    userPrompt('help, on windows i get a hook error', 0),
+    assistantTool('Edit', 4, 'e1', { file_path: 'scripts/register-hooks.js' }),
+    assistantAnswer('Fixed.', 6),
+  ]);
+  assert.equal(readSessionMeta(fixed).agentRun, false);
+  // A read is not a change, or nothing an agent ran would ever be marked.
+  const looked = writeTranscript([
+    userPrompt('what does register-hooks do', 0),
+    assistantTool('Read', 4, 'r1', { file_path: 'scripts/register-hooks.js' }),
+    assistantAnswer('It registers them.', 6),
+  ]);
+  assert.equal(readSessionMeta(looked).agentRun, true);
+});
+
+// The false negative that rescue introduced: a print-mode run started through the SDK, such
+// as a review Arc's own read-only dispatch launches, can write a plan or a report file and
+// then read as a person purely for touching the tree. A changed file steps back for a
+// transcript whose every record that names an entrypoint names an SDK one instead, so the
+// exception above never fires for the terminal entrypoint or the no-entrypoint case the test
+// above used. A finished single-prompt sdk-cli run that also wrote a file, padded past one
+// read chunk so the scan reader is exercised too.
+test('a changed file under an SDK entrypoint is an agent run, tail read and whole-file scan alike', () => {
+  const small = writeTranscript(sdkFileChangeTranscript('ok'));
+  assert.equal(
+    readSessionMeta(small).agentRun,
+    true,
+    'the tail read still called a changed file a person under sdk-cli',
+  );
+
+  const file = writeTranscript(sdkFileChangeTranscript('x'.repeat(300 * 1024)));
+  const complete = fs.statSync(file).size;
+  assert.equal(
+    agentRunOfScan(scanForAgentRun(file, complete), complete),
+    true,
+    'the whole-file scan still called a changed file a person under sdk-cli',
+  );
+
+  // The Write call arrives before the record naming the sdk-cli entrypoint, on both
+  // readers, to check the exception does not depend on entrypoint arriving first.
+  const lateEntrypoint = (padding: string): object[] => [
+    userPrompt('write the plan file', 0),
+    assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      entrypoint: 'sdk-cli',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: padding }] },
+    },
+    assistantAnswer('Wrote the plan.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(lateEntrypoint('ok'))).agentRun,
+    true,
+    'the tail read held a changed file against a person once the sdk-cli entrypoint named itself late',
+  );
+  const lateFile = writeTranscript(lateEntrypoint('x'.repeat(300 * 1024)));
+  const lateComplete = fs.statSync(lateFile).size;
+  assert.equal(
+    agentRunOfScan(scanForAgentRun(lateFile, lateComplete), lateComplete),
+    true,
+    'the whole-file scan held a changed file against a person once the sdk-cli entrypoint named itself late',
+  );
+});
+
+// A guard line built to scan past 256 KB, so both readers are exercised: `agentRunIn`
+// against its small twin above, and `scanForAgentRun`/`agentRunOfScan` here.
+function scannedAgentRun(lines: object[]): boolean {
+  const file = writeTranscript(lines);
+  const complete = fs.statSync(file).size;
+  return agentRunOfScan(scanForAgentRun(file, complete), complete);
+}
+
+test('the SDK file-change exception does not reach a terminal entrypoint or a human prompt', () => {
+  const terminal = writeTranscript([
+    userPrompt('write the plan file', 0, { entrypoint: 'cli' }),
+    assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+    assistantAnswer('Wrote the plan.', 2),
+  ]);
+  assert.equal(
+    readSessionMeta(terminal).agentRun,
+    false,
+    'a changed file under a terminal entrypoint was read as a run',
+  );
+  assert.equal(
+    scannedAgentRun([
+      userPrompt('write the plan file', 0, { entrypoint: 'cli' }),
+      assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'x'.repeat(300 * 1024) }],
+        },
+      },
+      assistantAnswer('Wrote the plan.', 3),
+    ]),
+    false,
+    'the whole-file scan read a changed file under a terminal entrypoint as a run',
+  );
+
+  const humanPrompt = writeTranscript([
+    userPrompt('write the plan file', 0, { entrypoint: 'sdk-cli', origin: { kind: 'human' } }),
+    assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+    assistantAnswer('Wrote the plan.', 2),
+  ]);
+  assert.equal(
+    readSessionMeta(humanPrompt).agentRun,
+    false,
+    'a human origin under an SDK entrypoint was read as a run',
+  );
+  assert.equal(
+    scannedAgentRun([
+      userPrompt('write the plan file', 0, { entrypoint: 'sdk-cli', origin: { kind: 'human' } }),
+      assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'x'.repeat(300 * 1024) }],
+        },
+      },
+      assistantAnswer('Wrote the plan.', 3),
+    ]),
+    false,
+    'the whole-file scan read a human origin under an SDK entrypoint as a run',
+  );
+
+  // The Write call arrives before any record names an entrypoint, on both readers. A
+  // terminal entrypoint named later still keeps the session a person's.
+  const changeFirst = [
+    userPrompt('write the plan file', 0),
+    assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      entrypoint: 'cli',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'ok' }] },
+    },
+    assistantAnswer('Wrote the plan.', 3),
+  ];
+  assert.equal(
+    agentRunIn(
+      changeFirst.map((l) => JSON.stringify(l)),
+      true,
+    ),
+    false,
+    'the tail reader excused a changed file that led a late terminal entrypoint',
+  );
+  assert.equal(
+    scannedAgentRun([
+      userPrompt('write the plan file', 0),
+      assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
+      {
+        type: 'user',
+        timestamp: at(2),
+        entrypoint: 'cli',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'x'.repeat(300 * 1024) }],
+        },
+      },
+      assistantAnswer('Wrote the plan.', 3),
+    ]),
+    false,
+    'the whole-file scan excused a changed file that led a late terminal entrypoint',
+  );
+});
+
+// A padded filler record, so a denial fixture can be pushed past the 256 KB tail window
+// for the whole-file scan without changing what the denial itself says.
+function padded(second: number, padding: string): object {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'pad', content: padding }] },
+  };
+}
+
+// Read-only dispatch runs `claude -p --permission-mode dontAsk`, so a command that is not
+// read-only comes back with `toolDenialKind: 'permission-rule'` and nobody saw the refusal.
+// That denial follows the same SDK-only exception as a changed file. A denial the reader
+// made themselves, `user-rejected`, is still a person under every entrypoint.
+test('a rule denial under an SDK entrypoint follows the same exception as a changed file', () => {
+  const excusedLines = (padding: string): object[] => [
+    userPrompt('run the safe commands', 0, { entrypoint: 'sdk-cli' }),
+    { type: 'user', timestamp: at(1), toolDenialKind: 'permission-rule', message: { role: 'user', content: [] } },
+    padded(2, padding),
+    assistantAnswer('Done.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(excusedLines('ok'))).agentRun,
+    true,
+    'a rule denial under sdk-cli was read as a person',
+  );
+  assert.equal(
+    scannedAgentRun(excusedLines('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan read a rule denial under sdk-cli as a person',
+  );
+
+  const terminalLines = (padding: string): object[] => [
+    userPrompt('run the safe commands', 0, { entrypoint: 'cli' }),
+    { type: 'user', timestamp: at(1), toolDenialKind: 'permission-rule', message: { role: 'user', content: [] } },
+    padded(2, padding),
+    assistantAnswer('Done.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(terminalLines('ok'))).agentRun,
+    false,
+    'a rule denial under a terminal entrypoint was read as a run',
+  );
+  assert.equal(
+    scannedAgentRun(terminalLines('x'.repeat(300 * 1024))),
+    false,
+    'the whole-file scan read a rule denial under a terminal entrypoint as a run',
+  );
+
+  const rejectedLines = (padding: string): object[] => [
+    userPrompt('run the safe commands', 0, { entrypoint: 'sdk-cli' }),
+    { type: 'user', timestamp: at(1), toolDenialKind: 'user-rejected', message: { role: 'user', content: [] } },
+    padded(2, padding),
+    assistantAnswer('Done.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(rejectedLines('ok'))).agentRun,
+    false,
+    'a reader rejection under sdk-cli was read as a run',
+  );
+  assert.equal(
+    scannedAgentRun(rejectedLines('x'.repeat(300 * 1024))),
+    false,
+    'the whole-file scan read a reader rejection under sdk-cli as a run',
+  );
+
+  // The denial arrives before the record naming the sdk-cli entrypoint, on both readers.
+  const denialFirst = (padding: string): object[] => [
+    userPrompt('run the safe commands', 0),
+    { type: 'user', timestamp: at(1), toolDenialKind: 'permission-rule', message: { role: 'user', content: [] } },
+    {
+      type: 'user',
+      timestamp: at(2),
+      entrypoint: 'sdk-cli',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'pad', content: padding }] },
+    },
+    assistantAnswer('Done.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(denialFirst('ok'))).agentRun,
+    true,
+    'the tail read held a rule denial against a person once the sdk-cli entrypoint named itself late',
+  );
+  assert.equal(
+    scannedAgentRun(denialFirst('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan held a rule denial against a person once the sdk-cli entrypoint named itself late',
+  );
+});
+
+test("a slash command with no origin in an SDK-only session is the run's own prompt", () => {
+  assert.equal(
+    readSessionMeta(writeTranscript(sdkSlashCommandTranscript())).agentRun,
+    true,
+    'the tail read called an SDK slash command a person',
+  );
+  assert.equal(
+    scannedAgentRun(sdkSlashCommandTranscript('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan called an SDK slash command a person',
+  );
+
+  // The command sign arrives before the record naming the sdk-cli entrypoint, on both
+  // readers, to check the exception does not depend on the entrypoint arriving first.
+  const entrypointLate = (padding: string): object[] => [
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(0),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<command-message>hello</command-message>\n<command-name>/hello</command-name>' },
+        ],
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at(1),
+      isMeta: true,
+      message: { role: 'user', content: [{ type: 'text', text: 'Say hello back' }] },
+    },
+    assistantTool('Bash', 2, 'b1', { command: 'echo hi' }),
+    {
+      type: 'user',
+      timestamp: at(3),
+      entrypoint: 'sdk-cli',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b1', content: padding }] },
+    },
+    assistantAnswer('Hello!', 4),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(entrypointLate('ok'))).agentRun,
+    true,
+    'the tail read held an SDK slash command against a person once the sdk-cli entrypoint named itself late',
+  );
+  assert.equal(
+    scannedAgentRun(entrypointLate('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan held an SDK slash command against a person once the sdk-cli entrypoint named itself late',
+  );
+});
+
+test('a slash command with a human origin under sdk-cli is still a person', () => {
+  const humanCommand = writeTranscript([
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(0),
+      entrypoint: 'sdk-cli',
+      origin: { kind: 'human' },
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<command-message>hello</command-message>\n<command-name>/hello</command-name>' },
+        ],
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at(1),
+      isMeta: true,
+      message: { role: 'user', content: [{ type: 'text', text: 'Say hello back' }] },
+    },
+    assistantAnswer('Hello!', 2),
+  ]);
+  assert.equal(
+    readSessionMeta(humanCommand).agentRun,
+    false,
+    "a slash command Arc's own panel sent under sdk-cli was read as a run",
+  );
+});
+
+test("a background session's one prompt reads as an agent run, tail read and whole-file scan alike", () => {
+  assert.equal(
+    readSessionMeta(writeTranscript(bgSessionTranscript())).agentRun,
+    true,
+    'the tail read called a background session a person',
+  );
+  assert.equal(
+    scannedAgentRun(bgSessionTranscript('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan called a background session a person',
+  );
+
+  // Claude Code's own remote-control bridge-session record arrives before the prompt record
+  // naming `sessionKind: 'bg'`, on both readers, to check the exception does not depend on
+  // that record arriving first.
+  const bridgeFirst = (padding: string): object[] => [
+    {
+      type: 'bridge-session',
+      timestamp: at(0),
+      sessionId: 'sess',
+      bridgeSessionId: 'bridge-1',
+      lastSequenceNum: 1,
+      ownerAccountUuid: 'acct-1',
+      ownerOrganizationUuid: 'org-1',
+    },
+    userPrompt('fix the failing lint rule', 1, { entrypoint: 'cli', origin: { kind: 'human' }, sessionKind: 'bg' }),
+    { type: 'system', timestamp: at(2), subtype: 'stop_hook_summary' },
+    assistantTool('Edit', 3, 'e1', { file_path: 'lint.config.ts' }),
+    {
+      type: 'user',
+      timestamp: at(4),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: padding }] },
+    },
+    assistantAnswer('Fixed the rule.', 5),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(bridgeFirst('ok'))).agentRun,
+    true,
+    'the tail read held a bridge-session record against a person once sessionKind named the session background late',
+  );
+  assert.equal(
+    scannedAgentRun(bridgeFirst('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan held a bridge-session record against a person once sessionKind named the session background late',
+  );
+});
+
+// `claude --bg "/review-and-report ..."` launches with a slash command that carries the human
+// origin a typed launch prompt carries. With no dispatch edge, the agent-run rule reads the two
+// launch forms alike: the launch prompt is no person, and a second prompt with a human origin is.
+test("a background session's slash-command launch reads as its typed launch does", () => {
+  const command = (name: string, n: number, extra: object = {}): object => ({
+    type: 'user',
+    timestamp: at(n),
+    entrypoint: 'cli',
+    origin: { kind: 'human' },
+    ...extra,
+    message: {
+      role: 'user',
+      content: [
+        { type: 'text', text: `<command-message>${name}</command-message>\n<command-name>/${name}</command-name>` },
+      ],
+    },
+  });
+  const slashLaunch = (padding?: string): object[] => {
+    const [launch, ...rest] = bgSessionTranscript(padding);
+    return [{ ...launch, ...command('review-and-report', 0, { promptId: 'p1', sessionKind: 'bg' }) }, ...rest];
+  };
+  for (const [form, launch] of [
+    ['typed', bgSessionTranscript],
+    ['slash-command', slashLaunch],
+  ] as const) {
+    assert.equal(
+      readSessionMeta(writeTranscript(launch())).agentRun,
+      true,
+      `the tail read called a background session with a ${form} launch a person`,
+    );
+    assert.equal(
+      scannedAgentRun(launch('x'.repeat(300 * 1024))),
+      true,
+      `the whole-file scan called a background session with a ${form} launch a person`,
+    );
+    assert.equal(
+      readSessionMeta(writeTranscript([...launch(), command('hello', 7)])).agentRun,
+      false,
+      `a second slash command with a human origin after a ${form} launch was read as a run`,
+    );
+  }
+});
+
+test("a background session's second typed prompt is still a person", () => {
+  const second = writeTranscript([...bgSessionTranscript(), userPrompt('actually also update the readme', 7)]);
+  assert.equal(readSessionMeta(second).agentRun, false, "a background session's second typed prompt was read as a run");
+});
+
+// The dispatching agent's own follow-up to a background worker carries `promptSource: 'sdk'`
+// and no human origin, so it must not fail the background branch's exactly-one-prompt check
+// the way a person's own second prompt does.
+test("a background worker's dispatched follow-up is an agent run, tail read and whole-file scan alike", () => {
+  assert.equal(
+    readSessionMeta(writeTranscript(bgWorkerFollowUpTranscript())).agentRun,
+    true,
+    'the tail read called a background worker with a dispatched follow-up a person',
+  );
+  assert.equal(
+    scannedAgentRun(bgWorkerFollowUpTranscript('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan called a background worker with a dispatched follow-up a person',
+  );
+});
+
+// A second prompt with a human origin is what `claude attach` plus typing writes, and it must
+// still mark the owner even though its `promptSource` also happens to read `sdk`: only a
+// prompt with no human origin is excused in a background session.
+test("a background session's second prompt with a human origin is still a person even under promptSource: sdk", () => {
+  const humanSecond = (padding: string): object[] => [
+    ...bgWorkerFollowUpTranscript(padding).slice(0, 4),
+    {
+      type: 'user',
+      promptId: 'p2',
+      timestamp: at(4),
+      entrypoint: 'sdk-cli',
+      promptSource: 'sdk',
+      origin: { kind: 'human' },
+      message: { role: 'user', content: [{ type: 'text', text: 'also update the readme' }] },
+    },
+    assistantAnswer('Updated.', 5),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(humanSecond('ok'))).agentRun,
+    false,
+    'the tail read excused a human-origin second prompt under promptSource: sdk',
+  );
+  assert.equal(
+    scannedAgentRun(humanSecond('x'.repeat(300 * 1024))),
+    false,
+    'the whole-file scan excused a human-origin second prompt under promptSource: sdk',
+  );
+});
+
+// The dispatched-follow-up exclusion only drops a prompt that carries no human origin and
+// `promptSource: 'sdk'` once `sessionKind: 'bg'` is already known. A background session whose
+// only prompt is shaped that way then counts no prompt at all, and `promptsOk` rejects that
+// the same way it rejects a background session with no prompt at all.
+test('a background session whose only prompt is a dispatched-shaped follow-up counts no prompt', () => {
+  const onlyDispatchedShape = (padding: string): object[] => [
+    {
+      type: 'bridge-session',
+      timestamp: at(0),
+      sessionId: 'sess',
+      bridgeSessionId: 'bridge-1',
+      lastSequenceNum: 1,
+      ownerAccountUuid: 'acct-1',
+      ownerOrganizationUuid: 'org-1',
+      sessionKind: 'bg',
+    },
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(1),
+      entrypoint: 'sdk-cli',
+      promptSource: 'sdk',
+      message: { role: 'user', content: [{ type: 'text', text: 'continue the review and report back' }] },
+    },
+    assistantTool('Read', 2, 'e1', { file_path: 'saved-views.ts' }),
+    padded(3, padding),
+    assistantAnswer('Reviewed the prototype.', 4),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(onlyDispatchedShape('ok'))).agentRun,
+    false,
+    'the tail read counted a dispatched-shaped prompt with sessionKind: bg already known',
+  );
+  assert.equal(
+    scannedAgentRun(onlyDispatchedShape('x'.repeat(300 * 1024))),
+    false,
+    'the whole-file scan counted a dispatched-shaped prompt with sessionKind: bg already known',
+  );
+});
+
+// Claude Code writes `away_summary` as a recap with nobody watching, the same direction as
+// `stop_hook_summary` and the other unattended subtypes, so it must not mark a background
+// session a person's.
+test('an away_summary record in a background session is an agent run, tail read and whole-file scan alike', () => {
+  assert.equal(
+    readSessionMeta(writeTranscript(bgAwaySummaryTranscript())).agentRun,
+    true,
+    'the tail read called a background session with an away_summary record a person',
+  );
+  assert.equal(
+    scannedAgentRun(bgAwaySummaryTranscript('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan called a background session with an away_summary record a person',
+  );
+});
+
+// The unattended system subtypes are tallied on sight and only judged once the whole tally is
+// in, so an `away_summary` record arriving before the record that names `sessionKind: 'bg'`
+// reads no differently from one arriving after it.
+test("an away_summary record seen before sessionKind: 'bg' is still an agent run for both readers", () => {
+  const awayBeforeBg = (padding: string): object[] => [
+    {
+      type: 'system',
+      timestamp: at(0),
+      subtype: 'away_summary',
+      content: 'Goal was to review the saved-views prototype and report back. (disable recaps in /config)',
+    },
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(1),
+      entrypoint: 'cli',
+      origin: { kind: 'human' },
+      promptSource: 'typed',
+      sessionKind: 'bg',
+      message: { role: 'user', content: [{ type: 'text', text: 'review the saved-views prototype' }] },
+    },
+    assistantTool('Read', 2, 'e1', { file_path: 'saved-views.ts' }),
+    {
+      type: 'user',
+      timestamp: at(3),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: padding }] },
+    },
+    assistantAnswer('Reviewed the prototype.', 4),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(awayBeforeBg('ok'))).agentRun,
+    true,
+    'the tail read held an away_summary record against a person once sessionKind named the session background late',
+  );
+  assert.equal(
+    scannedAgentRun(awayBeforeBg('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan held an away_summary record against a person once sessionKind named the session background late',
+  );
+});
+
+// A run needs exactly one counted prompt. `promptsOk`'s background branch once accepted
+// `tally.prompts <= 1`, which let a background session with no prompt at all read as a run.
+test('a background session with no counted prompt is never an agent run', () => {
+  const noPrompt = writeTranscript([
+    { type: 'system', timestamp: at(0), subtype: 'stop_hook_summary', sessionKind: 'bg' },
+    assistantAnswer('Fixed the rule.', 1),
+  ]);
+  assert.equal(
+    readSessionMeta(noPrompt).agentRun,
+    false,
+    'a background session with no counted prompt was read as a run',
+  );
+});
+
+test("a background session's reader rejection is still a person", () => {
+  const rejected = writeTranscript([
+    userPrompt('fix the failing lint rule', 0, { entrypoint: 'cli', origin: { kind: 'human' }, sessionKind: 'bg' }),
+    { type: 'user', timestamp: at(1), toolDenialKind: 'user-rejected', message: { role: 'user', content: [] } },
+    assistantAnswer('Stopped.', 2),
+  ]);
+  assert.equal(readSessionMeta(rejected).agentRun, false, "a background session's reader rejection was read as a run");
+});
+
+test('a cli session with a human prompt and a changed file, but no sessionKind, is still a person', () => {
+  const changed = writeTranscript([
+    userPrompt('fix the failing lint rule', 0, { entrypoint: 'cli', origin: { kind: 'human' } }),
+    assistantTool('Edit', 1, 'e1', { file_path: 'lint.config.ts' }),
+    assistantAnswer('Fixed the rule.', 2),
+  ]);
+  assert.equal(
+    readSessionMeta(changed).agentRun,
+    false,
+    'a cli session with a human prompt and a changed file, but no sessionKind, was read as a run',
+  );
+});
+
+test("a resumed SDK review's two prompts read as one agent run, tail read and whole-file scan alike", () => {
+  assert.equal(
+    readSessionMeta(writeTranscript(resumedSdkTranscript())).agentRun,
+    true,
+    'the tail read called a resumed SDK review a person',
+  );
+  assert.equal(
+    scannedAgentRun(resumedSdkTranscript('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan called a resumed SDK review a person',
+  );
+});
+
+test('a resumed SDK review with a human-origin second prompt is still a person', () => {
+  const humanSecond = writeTranscript([
+    userPrompt('review the diff', 0, { entrypoint: 'sdk-cli' }),
+    assistantAnswer('Looks fine.', 1),
+    userPrompt('now check the tests', 2, { entrypoint: 'sdk-cli', origin: { kind: 'human' } }),
+    assistantAnswer('Tests pass.', 3),
+  ]);
+  assert.equal(
+    readSessionMeta(humanSecond).agentRun,
+    false,
+    'a resumed SDK review with a human-origin second prompt was read as a run',
+  );
+});
+
+// `claude --bg` writes `sdk-cli` on most real background transcripts, not the terminal `cli`
+// entrypoint the other background fixtures use. `promptsOk` checked the SDK entrypoint before
+// the background one, so a bg session under sdk-cli with a human-origin first prompt failed
+// the SDK branch's prompt check and read as a person.
+test('a background session under sdk-cli with a human-origin first prompt is an agent run', () => {
+  const bgSdk = (padding: string): object[] => [
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(0),
+      entrypoint: 'sdk-cli',
+      origin: { kind: 'human' },
+      sessionKind: 'bg',
+      message: { role: 'user', content: [{ type: 'text', text: 'fix the failing lint rule' }] },
+    },
+    { type: 'system', timestamp: at(1), subtype: 'stop_hook_summary' },
+    assistantTool('Edit', 2, 'e1', { file_path: 'lint.config.ts' }),
+    {
+      type: 'user',
+      timestamp: at(3),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: padding }] },
+    },
+    assistantAnswer('Fixed the rule.', 4),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(bgSdk('ok'))).agentRun,
+    true,
+    'the tail read called a background session under sdk-cli a person',
+  );
+  assert.equal(
+    scannedAgentRun(bgSdk('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan called a background session under sdk-cli a person',
+  );
+});
+
+// Run through the tail reader and the whole-file scan alike, over a file padded past 256 KB,
+// because a real session is megabytes and the panel reads one that size through the scan.
+test("a background session's other person signs still mark a person, tail read and whole-file scan alike", () => {
+  const bgFirst = () =>
+    userPrompt('fix the failing lint rule', 0, { entrypoint: 'cli', origin: { kind: 'human' }, sessionKind: 'bg' });
+  const cases: [string, (padding: string) => object[]][] = [
+    [
+      'an editor selection',
+      (padding) => [
+        userPrompt('<ide_selection>lines 1 to 4 of lint.config.ts</ide_selection>\nfix it', 0, {
+          entrypoint: 'cli',
+          origin: { kind: 'human' },
+          sessionKind: 'bg',
+        }),
+        padded(1, padding),
+        assistantAnswer('Fixed the rule.', 2),
+      ],
+    ],
+    [
+      'a question put to the reader',
+      (padding) => [
+        bgFirst(),
+        assistantTool('AskUserQuestion', 1, 'q1'),
+        padded(2, padding),
+        assistantAnswer('Fixed the rule.', 3),
+      ],
+    ],
+    [
+      'a local command record',
+      (padding) => [
+        bgFirst(),
+        { type: 'system', timestamp: at(1), subtype: 'local_command' },
+        padded(2, padding),
+        assistantAnswer('Fixed the rule.', 3),
+      ],
+    ],
+    [
+      'a queued follow-up',
+      (padding) => [
+        bgFirst(),
+        typedMidTurn('and check the docs too', 1),
+        padded(2, padding),
+        assistantAnswer('Fixed the rule.', 3),
+      ],
+    ],
+    [
+      'a second typed prompt',
+      (padding) => [
+        bgFirst(),
+        padded(1, padding),
+        assistantAnswer('Fixed the rule.', 2),
+        userPrompt('actually also update the readme', 5),
+        assistantAnswer('done again', 6),
+      ],
+    ],
+  ];
+  for (const [what, build] of cases) {
+    assert.equal(
+      readSessionMeta(writeTranscript(build('ok'))).agentRun,
+      false,
+      `${what} in a background session was not read as a person, tail read`,
+    );
+    assert.equal(
+      scannedAgentRun(build('x'.repeat(300 * 1024))),
+      false,
+      `${what} in a background session was not read as a person, whole-file scan`,
+    );
+  }
+});
+
+// `scanForAgentRun` already stopped on a non-SDK entrypoint seen with no `sessionKind: 'bg'`
+// yet, but `agentRunIn` decided leniency from the tally's final `bg` state, so a `bg` record
+// arriving after the entrypoint made the tail reader and the whole-file scan disagree.
+test("a non-SDK entrypoint seen before sessionKind: 'bg' is a person for both readers", () => {
+  const entrypointBeforeBg = (padding: string): object[] => [
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(0),
+      entrypoint: 'cli',
+      message: { role: 'user', content: [{ type: 'text', text: 'fix the failing lint rule' }] },
+    },
+    assistantTool('Edit', 1, 'e1', { file_path: 'lint.config.ts' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      sessionKind: 'bg',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e1', content: padding }] },
+    },
+    assistantAnswer('Fixed the rule.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(entrypointBeforeBg('ok'))).agentRun,
+    false,
+    'the tail read excused a non-SDK entrypoint because sessionKind: bg arrived late',
+  );
+  assert.equal(
+    scannedAgentRun(entrypointBeforeBg('x'.repeat(300 * 1024))),
+    false,
+    'the whole-file scan excused a non-SDK entrypoint because sessionKind: bg arrived late',
+  );
+});
+
+// The entrypoint and `sessionKind` tallying run after the sidechain and synthetic-message
+// skips, so a subagent's own aside and the synthetic filler record Claude Code writes must
+// neither one speak for the main session they sit inside.
+test('a sidechain record and a synthetic-model record contribute no entrypoint or background marker', () => {
+  const leakage = (padding: string): object[] => [
+    {
+      type: 'user',
+      isSidechain: true,
+      entrypoint: 'cli',
+      sessionKind: 'bg',
+      timestamp: at(0),
+      message: { role: 'user', content: [{ type: 'text', text: 'a subagent aside' }] },
+    },
+    {
+      type: 'assistant',
+      entrypoint: 'cli',
+      sessionKind: 'bg',
+      timestamp: at(1),
+      message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'synthetic filler' }] },
+    },
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(2),
+      entrypoint: 'sdk-cli',
+      message: { role: 'user', content: [{ type: 'text', text: 'review the diff' }] },
+    },
+    assistantAnswer('Looks fine.', 3),
+    {
+      type: 'user',
+      timestamp: at(4),
+      entrypoint: 'sdk-cli',
+      message: { role: 'user', content: [{ type: 'text', text: 'now check the tests' }] },
+    },
+    assistantTool('Bash', 5, 'b1', { command: 'npm test' }),
+    padded(6, padding),
+    assistantAnswer('Tests pass.', 7),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(leakage('ok'))).agentRun,
+    true,
+    'the tail read let a sidechain entrypoint or a synthetic sessionKind reach the tally',
+  );
+  assert.equal(
+    scannedAgentRun(leakage('x'.repeat(300 * 1024))),
+    true,
+    'the whole-file scan let a sidechain entrypoint or a synthetic sessionKind reach the tally',
+  );
+});
+
+test("a bridge-session record with no sessionKind: 'bg' under sdk-cli stays a person", () => {
+  const noBg = writeTranscript([
+    userPrompt('fix the failing lint rule', 0, { entrypoint: 'sdk-cli' }),
+    {
+      type: 'bridge-session',
+      timestamp: at(1),
+      sessionId: 'sess',
+      bridgeSessionId: 'bridge-1',
+      lastSequenceNum: 1,
+      ownerAccountUuid: 'acct-1',
+      ownerOrganizationUuid: 'org-1',
+    },
+    assistantAnswer('Fixed the rule.', 2),
+  ]);
+  assert.equal(
+    readSessionMeta(noBg).agentRun,
+    false,
+    'a bridge-session record with no sessionKind: bg was read as a run',
+  );
+});
+
+test('a slash command with no origin stays a person when entrypoints mix sdk-cli and cli', () => {
+  const mixed = writeTranscript([
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(0),
+      entrypoint: 'sdk-cli',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<command-message>hello</command-message>\n<command-name>/hello</command-name>' },
+        ],
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at(1),
+      isMeta: true,
+      message: { role: 'user', content: [{ type: 'text', text: 'Say hello back' }] },
+    },
+    assistantTool('Bash', 2, 'b1', { command: 'echo hi' }),
+    {
+      type: 'user',
+      timestamp: at(3),
+      entrypoint: 'cli',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b1', content: 'ok' }] },
+    },
+    assistantAnswer('Hello!', 4),
+  ]);
+  assert.equal(
+    readSessionMeta(mixed).agentRun,
+    false,
+    'a slash command with no origin was excused once a cli-entrypoint record joined the sdk-cli ones',
+  );
+});
+
+test('a slash command with no origin in a bg session under cli is still a second prompt', () => {
+  const bgSecondCommand = writeTranscript([
+    userPrompt('fix the failing lint rule', 0, { entrypoint: 'cli', origin: { kind: 'human' }, sessionKind: 'bg' }),
+    assistantAnswer('Fixed.', 1),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<command-message>hello</command-message>\n<command-name>/hello</command-name>' },
+        ],
+      },
+    },
+    assistantAnswer('Hello!', 3),
+  ]);
+  assert.equal(
+    readSessionMeta(bgSecondCommand).agentRun,
+    false,
+    "a slash command with no origin as a bg session's second prompt was read as a run",
+  );
+});
+
+// A human origin is a final person sign the moment it is read, so it must still be one when
+// it arrives before the record naming the sdk-cli entrypoint, on both readers.
+test('a resumed SDK review with a human-origin sign before the entrypoint record is still a person, tail read and whole-file scan alike', () => {
+  const signFirst = (padding: string): object[] => [
+    userPrompt('now check the tests', 0, { origin: { kind: 'human' } }),
+    assistantTool('Bash', 1, 'b1', { command: 'npm test' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      entrypoint: 'sdk-cli',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b1', content: padding }] },
+    },
+    assistantAnswer('Tests pass.', 3),
+  ];
+  assert.equal(
+    readSessionMeta(writeTranscript(signFirst('ok'))).agentRun,
+    false,
+    'the tail read excused a human-origin prompt because the sdk-cli entrypoint named itself late',
+  );
+  assert.equal(
+    scannedAgentRun(signFirst('x'.repeat(300 * 1024))),
+    false,
+    'the whole-file scan excused a human-origin prompt because the sdk-cli entrypoint named itself late',
+  );
+});
+
+// The failure this rescues, as the owner met it. He asked for a question to be put to him,
+// chose an answer, and the rail filed the session he was sitting in under Run by
+// agents. One prompt closed by one answer is also the shape of a print-mode run, and until
+// the question was read nothing in the turn told the two apart.
+test('a question the reader answered is never an agent run', () => {
+  const chose = writeTranscript([
+    userPrompt('ask me which colour I prefer, with blue and red as options', 0),
+    assistantTool('AskUserQuestion', 1, 'q1', { questions: [{ header: 'Colour' }] }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'q1', content: 'Blue' }] },
+    },
+    assistantAnswer('You chose Blue.', 3),
+  ]);
+  assert.equal(readSessionMeta(chose).agentRun, false);
+});
+
+// Every tool call writes its result back as a user record carrying the prompt id of the
+// prompt that started the turn. Counting those would make one prompt that ran two tools
+// look like three prompts, and no session with a tool call in it would ever be read
+// as a run.
+test('the results a tool writes back are not read as the reader typing again', () => {
+  const run = writeTranscript([
+    userPrompt('one ask', 0),
+    assistantTool('Read', 1, 't1', { file_path: 'store.ts' }),
+    {
+      type: 'user',
+      promptId: 'p1',
+      sourceToolAssistantUUID: 'a1',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    },
+    assistantAnswer('Read it.', 3),
+  ]);
+  assert.equal(readSessionMeta(run).agentRun, true);
+});
+
+// The window this is read in is the tail, and a person's signs sit anywhere in a file. A
+// window that did not reach the start therefore answers nothing rather than guessing, and
+// the caller reads that as a person: the cost of missing a run is a row in a list, and the
+// cost of the other mistake is somebody's own work filed under an agent's name.
+test('a window that did not reach the start of the file says nothing either way', () => {
+  const long = writeTranscript([
+    userPrompt('the first ask, which the small window below will not reach', 0),
+    ...Array.from({ length: 40 }, (_, n) => assistantText('a line of an answer that takes up room', n + 1)),
+    assistantAnswer('and the answer that closed it', 41),
+  ]);
+  assert.equal(readSessionMeta(long, 512).agentRun, null);
+  assert.equal(readSessionMeta(long).agentRun, true);
+});
+
+// A session the panel never parses still has to say how much is new in it, and turn
+// starts out of a window off the end of the file are what it says it from. The window's
+// reach is reported beside them, because a count taken from part of a file and drawn as the
+// whole of it is wrong in the way that reads as right.
+test('the turn starts in a window come back with whether the window reached the start', () => {
+  const file = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantAnswer('Done.', 1),
+    userPrompt('second ask', 10),
+    assistantAnswer('Done again.', 11),
+    userPrompt('third ask', 20),
+  ]);
+  // A window wider than the file reaches its start, so the figure taken from it is a total.
+  assert.deepEqual(readSessionTurnStarts(file), { starts: [ms(0), ms(10), ms(20)], whole: true });
+
+  // A window that does not reach the start says so, and holds only what is inside it. The
+  // window is measured to open part way through the second turn's prompt, so that turn is
+  // the incomplete line the reader drops and the third is the only one left.
+  const raw = fs.readFileSync(file, 'utf8');
+  const secondAsk = raw.indexOf('second ask');
+  const cut = readSessionTurnStarts(file, raw.length - secondAsk - 4);
+  assert.equal(
+    cut.whole,
+    false,
+    `a window of ${raw.length - secondAsk - 4} bytes over a ${raw.length} byte file claims to have read all of it`,
+  );
+  assert.deepEqual(
+    cut.starts,
+    [ms(20)],
+    'the window did not open inside the second prompt, so this measures nothing about a partial one',
+  );
+
+  // The same rule for what a turn is that `readSession` uses, not a second one. A subagent,
+  // a tool result, a machine's own message and a resumed summary are none of them a turn.
+  const noise = writeTranscript([
+    userPrompt('first ask', 0),
+    { ...userPrompt('a subagent asking itself', 1), isSidechain: true },
+    { ...userPrompt('a task notification', 3), origin: { kind: 'task-notification' } },
+    { ...userPrompt('the summary that carried over', 4), isCompactSummary: true },
+    editResult('/tmp/a.ts', 5, 1, 0),
+    userPrompt('second ask', 6),
+  ]);
+  assert.deepEqual(readSessionTurnStarts(noise).starts, [ms(0), ms(6)]);
+
+  // A prompt from another session counts, and this is where the two readers part. Listing
+  // refuses it, because a session woken by a peer and never prompted by a human is not a
+  // session. Counting must not, because `readSession` opens a turn on one and draws a
+  // card for it: a glance that refused it would count fewer turns than the panel then shows,
+  // and would word an exact answer as a floor because the turn the reader had read was
+  // invisible to it. The two are held against each other here rather than described.
+  // Each prompt gets a reply, or the reader folds an unanswered one into the turn that
+  // follows and the two sides would be compared over a fixture with one turn in it.
+  const woken = writeTranscript([
+    userPrompt('first ask', 0),
+    assistantAnswer('Done.', 1),
+    { ...userPrompt('a wake from another session', 2), origin: { kind: 'peer' } },
+    assistantAnswer('Done again.', 3),
+    userPrompt('second ask', 6),
+    assistantAnswer('And again.', 7),
+  ]);
+  assert.deepEqual(readSessionTurnStarts(woken).starts, [ms(0), ms(2), ms(6)]);
+  assert.deepEqual(
+    readTurns(woken, 's').map((t) => t.startedAt),
+    [ms(0), ms(2), ms(6)],
+    'the parse and the glance disagree about whether a peer prompt starts a turn',
+  );
+  // And the listing rule still refuses it, which is the cut that keeps a session nobody
+  // prompted off the rail.
+  assert.equal(holdsHumanPrompt(JSON.stringify({ ...userPrompt('a wake', 0), origin: { kind: 'peer' } })), false);
+
+  // A session with nothing a reader typed says nothing, and that is not the same as
+  // zero: the count has to stay silent rather than claim the session is caught up.
+  assert.deepEqual(readSessionTurnStarts(writeTranscript([assistantAnswer('unprompted', 0)])), {
+    starts: [],
+    whole: true,
+  });
+
+  // A time that will not parse is dropped rather than counted. Date.parse answers NaN and
+  // the fallback elsewhere answers 0, which is a real epoch time that would sort as the
+  // oldest turn the session ever had.
+  assert.deepEqual(
+    readSessionTurnStarts(
+      writeTranscript([{ ...userPrompt('untimed', 0), timestamp: 'not a date' }, userPrompt('timed', 7)]),
+    ).starts,
+    [ms(7)],
+  );
+
+  // A file that is not there answers with nothing found and a window that did not reach the
+  // start, which is silence rather than a claim that the session is empty.
+  assert.deepEqual(readSessionTurnStarts(path.join(os.tmpdir(), 'no-such-transcript.jsonl')), {
+    starts: [],
+    whole: false,
+  });
+
+  // The window the panel actually takes, stated once so a change to it is a change to this
+  // line. Measured over the sessions a rail lists, not over every transcript on a disk.
+  assert.equal(TURN_START_BYTES, 1024 * 1024);
+  assert.equal(TURN_START_MAX_BYTES, 16 * 1024 * 1024);
+});
+
+test('a Claude glance grows backward when the newest turn starts before its first window', () => {
+  const bytes = 128;
+  const file = writeTranscript([userPrompt('the only ask', 7), assistantAnswer('x'.repeat(bytes * 5), 8)]);
+  // Whole, because the growth reached the start of the file. Growing is not what makes a count
+  // a floor, and a floor here would draw `at least 1 new` over a session whose one turn
+  // was counted.
+  assert.deepEqual(
+    readSessionTurnStarts(file, bytes),
+    { starts: [ms(7)], whole: true },
+    'the Claude glance did not find the turn start before its first window',
+  );
+});
+
+test('a glance that stops short of the file start reports a partial answer', () => {
+  const bytes = 128;
+  const file = writeTranscript([
+    userPrompt('the older ask', 5),
+    assistantAnswer('x'.repeat(bytes * 40), 6),
+    userPrompt('the newer ask', 7),
+    assistantAnswer('x'.repeat(bytes * 4), 8),
+  ]);
+  // The older turn sits past the ceiling this window scales to. The answer holds one start and
+  // says it did not reach the beginning, so the rail words the count as a floor.
+  assert.deepEqual(
+    readSessionTurnStarts(file, bytes),
+    { starts: [ms(7)], whole: false },
+    'a glance that stopped short of the file start claimed to hold every turn',
+  );
+});
+
+test('a glance keeps a turn start that begins on the byte its last read began on', () => {
+  const bytes = 128;
+  const ceiling = bytes * ((16 * 1024 * 1024) / (1024 * 1024));
+  const prompt = JSON.stringify(userPrompt('the ask on the boundary', 7)) + '\n';
+  // The prompt starts exactly where the widest read starts, so the read holds it whole and
+  // nothing older. A reader that dropped its first line unread would lose the only start the
+  // session has, and the rail would draw no mark on a session with an unread turn.
+  const body = ignoredClaudeLineOfBytes(512) + prompt + ignoredClaudeLineOfBytes(ceiling - Buffer.byteLength(prompt));
+  const dir = tempDir('tl-');
+  const file = path.join(dir, 'sess.jsonl');
+  fs.writeFileSync(file, body);
+  assert.equal(fs.statSync(file).size - ceiling, 512, 'the fixture did not put the prompt on the boundary');
+  assert.deepEqual(
+    readSessionTurnStarts(file, bytes),
+    { starts: [ms(7)], whole: false },
+    'the glance dropped a whole record that began on its own read boundary',
+  );
+});
+
+test('a glance stops at its backward ceiling when no nearer turn start exists', () => {
+  const bytes = 128;
+  const file = writeTranscript([userPrompt('past the ceiling', 7), assistantAnswer('x'.repeat(bytes * 20), 8)]);
+  assert.deepEqual(
+    readSessionTurnStarts(file, bytes),
+    { starts: [], whole: false },
+    'the glance read past its backward ceiling',
+  );
+});
+
+test('the panel watches directories rather than files, so a new session is seen', () => {
+  // A session started while the panel is open writes a file that did not exist when
+  // the watch was set up. Watched per file, that session would never appear until the
+  // window was reloaded, which is the whole failure this answers.
+  const dir = path.join('C:', 'Users', 'dev', '.claude', 'projects', 'a-repo');
+  const dirs = watchDirs([
+    { file: path.join(dir, 'one.jsonl') },
+    { file: path.join(dir, 'two.jsonl') },
+    { file: path.join('C:', 'Users', 'dev', '.codex', 'sessions', '2026', '08', '29', 'three.jsonl') },
+  ]);
+  assert.equal(dirs.length, 2, 'two files in one directory are watched twice over');
+  assert.ok(dirs.includes(dir));
+
+  // Sorted and without duplicates, so the caller can tell a set that has moved from one
+  // that has not and does not tear down a watcher to put the same one back.
+  assert.deepEqual(watchDirs([{ file: path.join(dir, 'b.jsonl') }, { file: path.join(dir, 'a.jsonl') }]), [dir]);
+  assert.deepEqual(watchDirs([]), []);
+  assert.deepEqual(watchDirs([{ file: path.join('C:', 'b', 'x.jsonl') }, { file: path.join('C:', 'a', 'y.jsonl') }]), [
+    path.join('C:', 'a'),
+    path.join('C:', 'b'),
+  ]);
+});
+
+test('a burst of appends is gathered before the panel reads again', () => {
+  // Both CLIs write a turn a message at a time and the writes arrive in pairs. Measured on
+  // a running turn: seven writes in twenty-five seconds. A fifth of a second folds a pair
+  // into one read and is far below what a reader sees as a wait.
+  assert.equal(TRANSCRIPT_WAKE_MS, 200);
+  assert.ok(
+    TRANSCRIPT_WAKE_MS < 2000,
+    'the wake is slower than the poll floor, so watching the transcript buys nothing',
+  );
+});
+
+test('a turn records what it did in order, and what each call was about', () => {
+  // A turn already says how many tools it ran and in what mix. That is a tally, and a
+  // reader watching a turn wants the order: what it is doing now, and what it did to get
+  // there.
+  const file = writeTranscript([
+    userPrompt('take the sandbox', 0),
+    assistantTool('Read', 1, 'a1', { file_path: 'extension/src/panelhost.ts' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a1', content: 'ok' }] },
+    },
+    assistantTool('Bash', 3, 'a2', { command: 'npm test' }),
+    {
+      type: 'user',
+      timestamp: at(4),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'a2', is_error: true, content: 'exit 1' }],
+      },
+    },
+    assistantTool('Grep', 5, 'a3', { pattern: 'livePressOver' }),
+    assistantAnswer('Done.', 6),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.steps.map((s) => [s.name, s.detail, s.status]),
+    [
+      ['Read', 'extension/src/panelhost.ts', 'done'],
+      ['Bash', 'npm test', 'failed'],
+      ['Grep', 'livePressOver', 'done'],
+    ],
+  );
+  assert.deepEqual(
+    turn.steps.map((s) => s.at),
+    [ms(1), ms(3), ms(5)],
+  );
+  assert.equal(turn.stepCount, 3);
+});
+
+test('Claude Bash steps prefer the human description and retain the exact command off JSON', () => {
+  const exact = ['npm test', '-- --runInBand', 'x'.repeat(STEP_DETAIL_LIMIT)].join('\n');
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('verify it', 0),
+      assistantTool('Bash', 1, 'both', { description: 'Run the focused checks', command: exact }),
+      assistantTool('Bash', 2, 'command-only', { command: 'git status --short' }),
+      assistantTool('Bash', 3, 'description-only', { description: 'Inspect generated output' }),
+      assistantAnswer('Done.', 4),
+    ]),
+    'sess',
+  );
+  const [both, commandOnly, descriptionOnly] = turn.steps;
+  assert.equal(both.sourceId, 'both');
+  assert.equal(both.headline, 'Run the focused checks');
+  assert.equal(both.detail.length, STEP_DETAIL_LIMIT);
+  assert.equal(both.fullDetail, exact);
+  assert.equal(Object.keys(both).includes('fullDetail'), false);
+  assert.equal(JSON.stringify(turn).includes(exact), false);
+  assert.deepEqual(
+    [commandOnly.headline, commandOnly.detail, descriptionOnly.headline, descriptionOnly.detail],
+    [undefined, 'git status --short', 'Inspect generated output', ''],
+  );
+});
+
+test('non-Bash tool detail and shared permission wording keep their field precedence', () => {
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('inspect it', 0),
+      assistantTool('Read', 1, 'read-one', { description: 'human words', file_path: 'a.ts' }),
+      assistantTool('Agent', 2, 'agent-one', { description: 'Review the parser', prompt: 'long instructions' }),
+      assistantAnswer('Done.', 3),
+    ]),
+    'sess',
+  );
+  assert.deepEqual(
+    turn.steps.map((step) => [step.name, step.detail, step.headline]),
+    [
+      ['Read', 'a.ts', undefined],
+      ['Agent', 'Review the parser', undefined],
+    ],
+  );
+  assert.equal(describeToolInput({ command: 'npm test', description: 'Run the checks' }), 'npm test');
+});
+
+test('saved Claude activity keeps captured query, recipient, task, and question subjects', () => {
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('inspect it', 0),
+      assistantTool('WebSearch', 1, 'search', { query: 'activity details' }),
+      assistantTool('SendMessage', 2, 'message', { recipient: 'reviewer', message: 'Review it' }),
+      assistantTool('TaskOutput', 3, 'task', { task_id: 'task-1' }),
+      assistantTool('AskUserQuestion', 4, 'question', { questions: [{ question: 'Which option?' }] }),
+      assistantAnswer('Done.', 5),
+    ]),
+    'sess',
+  );
+  assert.deepEqual(
+    turn.steps.map((step) => [step.name, step.detail]),
+    [
+      ['WebSearch', 'activity details'],
+      ['SendMessage', 'reviewer'],
+      ['TaskOutput', 'task-1'],
+      ['AskUserQuestion', 'Which option?'],
+    ],
+  );
+});
+
+test('a shortened non-command subject retains its exact text outside the card payload', () => {
+  const exact = `C:\\workspace\\${'deep-folder\\'.repeat(20)}file.ts`;
+  const [turn] = readTurns(
+    writeTranscript([
+      userPrompt('inspect it', 0),
+      assistantTool('Read', 1, 'read-long', { file_path: exact }),
+      assistantAnswer('Done.', 2),
+    ]),
+    'sess',
+  );
+  const [step] = turn.steps;
+  assert.ok(step.detail.endsWith(STEP_CUT));
+  assert.equal(step.fullDetail, exact);
+  assert.equal(Object.prototype.propertyIsEnumerable.call(step, 'fullDetail'), false);
+});
+
+test('the call the agent is on is the one still running, and nothing else is', () => {
+  // A successful tool result is never parsed: those lines are the bulk of a transcript and
+  // are skipped before JSON.parse, which is what keeps a read of a 4 MB file affordable. So
+  // a call is finished by the next thing the agent writes, which is sound because the model
+  // cannot write again until its results are back. What that leaves running is the calls in
+  // the agent's newest message, and that is the call a reader watching a live turn wants.
+  const running = writeTranscript([
+    userPrompt('take the sandbox', 0),
+    assistantTool('Read', 1, 'a1', { file_path: 'a.ts' }),
+    assistantTool('Bash', 2, 'a2', { command: 'npm test' }),
+  ]);
+  assert.deepEqual(
+    readTurns(running, 'sess')[0].steps.map((s) => s.status),
+    ['done', 'running'],
+  );
+
+  // Two calls in one message go out together and come back together, so both are the call
+  // the agent is on.
+  const together = writeTranscript([
+    userPrompt('take the sandbox', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        content: [
+          { type: 'tool_use', id: 'a1', name: 'Read', input: { file_path: 'a.ts' } },
+          { type: 'tool_use', id: 'a2', name: 'Read', input: { file_path: 'b.ts' } },
+        ],
+      },
+    },
+  ]);
+  assert.deepEqual(
+    readTurns(together, 'sess')[0].steps.map((s) => s.status),
+    ['running', 'running'],
+  );
+
+  // A call that failed keeps saying so. Its result line is one of the few that is parsed,
+  // and the next thing the agent writes must not quietly turn it into a success.
+  const failed = writeTranscript([
+    userPrompt('take the sandbox', 0),
+    assistantTool('Bash', 1, 'a1', { command: 'npm test' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'a1', is_error: true, content: 'exit 1' }],
+      },
+    },
+    assistantAnswer('It failed.', 3),
+  ]);
+  assert.deepEqual(
+    readTurns(failed, 'sess')[0].steps.map((s) => s.status),
+    ['failed'],
+  );
+});
+
+test('a skill is a step under its own name, and needs no reading of its own', () => {
+  // A skill load is an ordinary tool call carrying the skill in its input, and the input
+  // carries the skill body as a prompt beside it. The name is what the reader asked for.
+  const file = writeTranscript([
+    userPrompt('review this', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'review-the-change', prompt: 'the whole body of the skill' }),
+    assistantAnswer('Done.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.steps.map((s) => [s.name, s.detail]),
+    [['Skill', 'review-the-change']],
+  );
+});
+
+// The record Claude Code writes once a skill has loaded, carrying the skill's own
+// instructions. It names the call that loaded it and opens on the directory it was read from.
+function skillLoaded(directory: string, second: number, id = 'a1') {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    isMeta: true,
+    sourceToolUseID: id,
+    message: {
+      role: 'user',
+      content: [{ type: 'text', text: `Base directory for this skill: ${directory}\n\n# Polish\n\nTidy the wording.` }],
+    },
+  };
+}
+
+// What a `Skill` call comes back with. Carried by the fixtures below to keep them true to the
+// record stream: the reader drops an ordinary tool result before it parses anything, so this
+// line is one nothing reads, and the load's file arrives in the record after it.
+function skillResult(name: string, second: number, id = 'a1') {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: `Launching skill: ${name}` }] },
+    toolUseResult: { success: true, commandName: name },
+  };
+}
+
+// What the reader typed, exactly as the harness wraps it: the same tags `cleanPrompt` rewrites
+// into one line for the card.
+function typedCommand(name: string, args: string, second: number) {
+  const bare = name.replace(/^\//, '');
+  return userPrompt(
+    `<command-message>${bare}</command-message>\n<command-name>${name}</command-name>\n<command-args>${args}</command-args>`,
+    second,
+  );
+}
+
+// The record Claude Code writes right after a typed command that loaded a skill. It carries
+// no call id of its own: the command record immediately before it is the one it proves.
+function typedSkillCompanion(directory: string, second: number) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    isMeta: true,
+    message: {
+      role: 'user',
+      content: [{ type: 'text', text: `Base directory for this skill: ${directory}\n\n# Land\n\nRun the task.` }],
+    },
+  };
+}
+
+test('a Claude skill load is recorded with the file the client read', () => {
+  const file = writeTranscript([
+    userPrompt('clean the copy', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    skillResult('polish', 2),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 3),
+    assistantAnswer('Done.', 4),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.skillUses, [
+    {
+      sourceId: 'a1',
+      name: 'polish',
+      at: ms(1),
+      evidence: 'recorded',
+      path: 'C:\\Users\\dev\\.claude\\skills\\polish/SKILL.md',
+    },
+  ]);
+  assert.equal(turn.skillUseCount, 1);
+});
+
+test('a POSIX directory and a namespaced skill name are recorded as they were written', () => {
+  const file = writeTranscript([
+    userPrompt('write it simply', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'plain-language:plain-language' }),
+    skillResult('plain-language:plain-language', 2),
+    skillLoaded('/home/dev/.claude/skills/plain-language', 3),
+    assistantAnswer('Done.', 4),
+  ]);
+  assert.deepEqual(
+    readTurns(file, 'sess')[0].skillUses.map((use) => [use.name, use.path]),
+    [['plain-language:plain-language', '/home/dev/.claude/skills/plain-language/SKILL.md']],
+  );
+});
+
+test('a skill load is in no tool category, and holds its own place in the call kinds', () => {
+  // `Skill` is in no tool table, so counted as a tool it lands in `other` and the mix names
+  // a skill load an unrecognized call. The raw tool total still counts it: the call happened.
+  const file = writeTranscript([
+    userPrompt('clean the copy', 0),
+    assistantTool('Read', 1, 'a0', { file_path: 'a.ts' }),
+    assistantTool('Skill', 2, 'a1', { skill: 'polish' }),
+    assistantAnswer('Done.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.toolCounts.other, 0);
+  assert.deepEqual(turn.stepKinds, ['reads', 'skill']);
+  assert.equal(turn.toolUses, 2);
+  assert.deepEqual(turn.toolTally, { Read: 1, Skill: 1 });
+});
+
+test('a skill call that came back as an error loaded nothing', () => {
+  const file = writeTranscript([
+    userPrompt('clean the copy', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    {
+      type: 'user',
+      timestamp: at(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'a1', is_error: true, content: 'no such skill' }],
+      },
+    },
+    assistantAnswer('It failed.', 3),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.skillUses, []);
+  assert.equal(turn.skillUseCount, 0);
+  assert.deepEqual(
+    turn.steps.map((step) => step.status),
+    ['failed'],
+    'the call itself keeps its row',
+  );
+});
+
+test('a skill load with no instructions record keeps no path', () => {
+  // Measured over 858 real calls on this machine: 27 recorded nothing after the result. The
+  // load is still reported, without a file, and the row it draws opens nothing.
+  const file = writeTranscript([
+    userPrompt('clean the copy', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    skillResult('polish', 2),
+    assistantAnswer('Done.', 3),
+  ]);
+  assert.deepEqual(readTurns(file, 'sess')[0].skillUses, [
+    { sourceId: 'a1', name: 'polish', at: ms(1), evidence: 'recorded' },
+  ]);
+});
+
+test("an instructions record names its own call, so one load's file is never another's", () => {
+  // The record names its call, and that name is the whole of the pairing. The load it names
+  // is deliberately not the newest one here: a reader that took the newest instead would put
+  // one skill's file on another skill's row and say nothing was wrong.
+  const file = writeTranscript([
+    userPrompt('clean the copy then rewrite it', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    skillResult('polish', 2),
+    assistantTool('Skill', 3, 'a2', { skill: 'summarize' }),
+    skillResult('summarize', 4),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 5, 'a1'),
+    assistantAnswer('Done.', 6),
+  ]);
+  assert.deepEqual(
+    readTurns(file, 'sess')[0].skillUses.map((use) => [use.name, use.path]),
+    [
+      ['polish', 'C:\\Users\\dev\\.claude\\skills\\polish/SKILL.md'],
+      ['summarize', undefined],
+    ],
+  );
+});
+
+test('two Skill calls for the same name in one turn record two uses', () => {
+  // The turn really did load the skill twice. A name-only skip here would fold the second
+  // real load into the first, which is the regression the typed path's own dedupe must
+  // never reach into: it only ever steps aside for a use the typed path itself recorded.
+  const file = writeTranscript([
+    userPrompt('clean the copy twice', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    skillResult('polish', 2),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 3, 'a1'),
+    assistantTool('Skill', 4, 'a2', { skill: 'polish' }),
+    skillResult('polish', 5, 'a2'),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 6, 'a2'),
+    assistantAnswer('Done.', 7),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.skillUseCount, 2, 'a second real load under a different call id is a second use');
+  assert.deepEqual(
+    turn.skillUses.map((use) => use.sourceId),
+    ['a1', 'a2'],
+  );
+});
+
+test('a failed first Skill call does not withdraw a second call for the same name', () => {
+  // The first call's own result withdraws only the use its own id recorded. Before the
+  // fix, an unscoped name skip meant the second call never recorded its own use at all, so
+  // the withdrawal below left the turn reporting zero skills for a load that really happened.
+  const file = writeTranscript([
+    userPrompt('retry the skill', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    assistantTool('Skill', 2, 'a2', { skill: 'polish' }),
+    {
+      type: 'user',
+      timestamp: at(3),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'a1', is_error: true, content: 'no such skill' }],
+      },
+    },
+    skillResult('polish', 4, 'a2'),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 5, 'a2'),
+    assistantAnswer('Done.', 6),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.skillUseCount, 1, 'the second call really did load the skill, even though the first call failed');
+  assert.deepEqual(
+    turn.skillUses.map((use) => use.sourceId),
+    ['a2'],
+  );
+});
+
+test('a skill load outlives the step window that held the call', () => {
+  const lines: object[] = [
+    userPrompt('clean the copy', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    skillResult('polish', 2),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 3),
+  ];
+  for (let i = 0; i < TURN_STEP_LIMIT + 5; i++) {
+    lines.push(assistantTool('Read', i + 4, `r${i}`, { file_path: `file-${i}.ts` }));
+  }
+  lines.push(assistantAnswer('Done.', TURN_STEP_LIMIT + 20));
+  const [turn] = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(
+    turn.steps.some((step) => step.name === 'Skill'),
+    false,
+    'the call left the window',
+  );
+  assert.deepEqual(
+    turn.skillUses.map((use) => use.name),
+    ['polish'],
+  );
+  assert.equal(turn.skillUseCount, 1);
+});
+
+test('a record read twice reports one skill load', () => {
+  // The reader works in byte windows and rereads its tail, so the same call can arrive twice.
+  // The call id is the identity: the later copy replaces the earlier one.
+  const records = [
+    userPrompt('clean the copy', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\polish', 2),
+  ];
+  const reducer = createClaudeSessionReducer('sess');
+  for (const record of [...records, ...records.slice(1)]) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  const [turn] = reducer.read().turns;
+  assert.deepEqual(turn.skillUses, [
+    {
+      sourceId: 'a1',
+      name: 'polish',
+      at: ms(1),
+      evidence: 'recorded',
+      path: 'C:\\Users\\dev\\.claude\\skills\\polish/SKILL.md',
+    },
+  ]);
+  assert.equal(turn.skillUseCount, 1);
+});
+
+test('typing a command that loaded a skill records it exactly as a Skill call would', () => {
+  const file = writeTranscript([
+    typedCommand('/land', 'Phase 2', 0),
+    typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\land', 0),
+    assistantAnswer('Done.', 1),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.skillUses, [
+    {
+      sourceId: `at-${ms(0)}`,
+      name: 'land',
+      at: ms(0),
+      evidence: 'recorded',
+      path: 'C:\\Users\\dev\\.claude\\skills\\land/SKILL.md',
+    },
+  ]);
+  assert.equal(turn.skillUseCount, 1);
+  // Pinned against the literal string, not against cleanPrompt's own output, so a change
+  // to cleanPrompt's rendering of a command would fail this test rather than pass it blind.
+  assert.equal(turn.prompt, '/land Phase 2');
+  assert.equal(
+    turn.prompt.includes('Base directory for this skill'),
+    false,
+    'the companion record proves the load; its SKILL.md body never reaches the card',
+  );
+  assert.equal(turn.prompt.includes('Run the task'), false);
+});
+
+test('a typed skill invocation prefers the record uuid over the timestamp fallback for its source id', () => {
+  const file = writeTranscript([
+    userPrompt(
+      '<command-message>land</command-message>\n<command-name>/land</command-name>\n<command-args>Phase 2</command-args>',
+      0,
+      { uuid: 'uuid-land-1' },
+    ),
+    typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\land', 0),
+    assistantAnswer('Done.', 1),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.skillUses.map((use) => use.sourceId),
+    ['uuid-land-1'],
+  );
+});
+
+test('a typed plugin-namespaced skill is recorded with its name verbatim', () => {
+  const file = writeTranscript([
+    typedCommand('/plain-language:plain-language', '', 0),
+    typedSkillCompanion('/home/dev/.claude/skills/plain-language', 0),
+    assistantAnswer('Done.', 1),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(
+    turn.skillUses.map((use) => [use.name, use.path]),
+    [['plain-language:plain-language', '/home/dev/.claude/skills/plain-language/SKILL.md']],
+  );
+});
+
+test('a plain custom command with no base-directory record loads no skill', () => {
+  const rawText =
+    '<command-message>standup</command-message>\n<command-name>/standup</command-name>\n<command-args>today</command-args>';
+  const file = writeTranscript([typedCommand('/standup', 'today', 0), assistantAnswer('Standing up now.', 1)]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.skillUses, []);
+  assert.equal(turn.skillUseCount, 0);
+  assert.equal(turn.prompt, cleanPrompt(rawText));
+});
+
+test('a typed command followed by an unrelated meta record loads no skill', () => {
+  // The next record is the only proof this reader gets. An isMeta record that is not the
+  // base-directory line must refuse the load just as plainly as no record at all does.
+  const file = writeTranscript([
+    typedCommand('/standup', 'today', 0),
+    {
+      type: 'user',
+      timestamp: at(1),
+      isMeta: true,
+      message: { role: 'user', content: [{ type: 'text', text: 'Unrelated system note.' }] },
+    },
+    assistantAnswer('Standing up now.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.skillUses, []);
+  assert.equal(turn.skillUseCount, 0);
+});
+
+test('a harness command right after a typed skill clears the pending skill without resolving it', () => {
+  // `/compact` cleans to empty text (the harness blanks its scaffolding entirely) and so
+  // opens no turn of its own. It still arrives as the record right after the `/land`
+  // command, which is exactly the position a skill's base-directory line would take.
+  const file = writeTranscript([
+    typedCommand('/land', 'Phase 2', 0),
+    typedCommand('/compact', '', 1),
+    assistantAnswer('Compacted.', 2),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 1, 'the harness command opens no turn of its own');
+  assert.deepEqual(turns[0].skillUses, []);
+  assert.equal(turns[0].skillUseCount, 0);
+});
+
+test('a Claude effort change writes command scaffolding but opens no turn of its own', () => {
+  // The reader presses the effort control mid-conversation. The CLI answers with a caveat
+  // record and the typed command. It then adds a local_command system record and a new
+  // assistant line at the new level. None of those records is a second prompt, so the level
+  // change stays inside the turn the reader already opened.
+  const file = writeTranscript([
+    userPrompt('write the migration', 0),
+    assistantText('Working on it.', 1, undefined, 'high', 'end_turn'),
+    userPrompt(
+      '<local-command-caveat>Caveat: the messages below were generated by the user while ' +
+        'running local commands. Do not respond to them unless the user explicitly asks you ' +
+        'to.</local-command-caveat>',
+      2,
+    ),
+    typedCommand('/effort', 'low', 3),
+    { type: 'system', timestamp: at(4), subtype: 'local_command' },
+    assistantText('Set effort level to low.', 5, undefined, 'low', 'end_turn'),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.equal(turns.length, 1, 'an effort change opens no turn of its own');
+  assert.equal(turns[0].effort, 'low', 'the recorded effort follows the newest assistant record');
+});
+
+test('a stray base-directory line long after a typed command records no skill', () => {
+  // The pending skill is cleared on the record right after the command, whatever that record
+  // turns out to be. Without that clear, a base-directory line arriving much later would
+  // still find the stale pending state and record a skill named after the wrong command.
+  const file = writeTranscript([
+    typedCommand('/standup', 'today', 0),
+    assistantAnswer('Standing up now.', 1),
+    typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\land', 2),
+    assistantAnswer('Done.', 3),
+  ]);
+  const turns = readTurns(file, 'sess');
+  assert.deepEqual(
+    turns.flatMap((turn) => turn.skillUses),
+    [],
+    'the base-directory line arrived too late to prove the standup command loaded a skill',
+  );
+});
+
+test('a harness command name is excluded even when stray text keeps its record open', () => {
+  // A harness command ordinarily cleans to nothing and never reaches the skill check at all.
+  // Text outside the command tags survives cleaning, so this is the one shape that reaches
+  // the check with a harness name, and it is what the exclusion itself has to refuse.
+  const file = writeTranscript([
+    userPrompt('please <command-name>/compact</command-name><command-args></command-args>', 0),
+    typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\compact', 1),
+    assistantAnswer('Compacted.', 2),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.deepEqual(turn.skillUses, []);
+  assert.equal(turn.skillUseCount, 0);
+});
+
+test('a typed skill invocation and a later Skill call for the same name record one use', () => {
+  const file = writeTranscript([
+    typedCommand('/land', 'Phase 2', 0),
+    typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\land', 0),
+    assistantTool('Skill', 1, 'a1', { skill: 'land' }),
+    skillResult('land', 2),
+    skillLoaded('C:\\Users\\dev\\.claude\\skills\\land', 3),
+    assistantAnswer('Done.', 4),
+  ]);
+  const [turn] = readTurns(file, 'sess');
+  assert.equal(turn.skillUseCount, 1, 'the typed load and the tool call name the same skill');
+  assert.deepEqual(
+    turn.skillUses.map((use) => use.name),
+    ['land'],
+  );
+});
+
+test('a reread of a typed skill companion alone does not double the load', () => {
+  // The reader works in byte windows and rereads its tail, so the companion record can arrive
+  // a second time on its own without the command record ahead of it arriving again too. The
+  // pending skill was already cleared and resolved on its first arrival, so the second
+  // companion reaches no code path that could record a use at all: this proves the clear
+  // alone, since a command record cannot be replayed here without opening a second turn.
+  const command = typedCommand('/land', 'Phase 2', 0);
+  const companion = typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\land', 0);
+  const reducer = createClaudeSessionReducer('sess');
+  for (const record of [command, companion, companion]) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  const [turn] = reducer.read().turns;
+  assert.equal(turn.skillUseCount, 1);
+  assert.deepEqual(
+    turn.skillUses.map((use) => use.name),
+    ['land'],
+  );
+});
+
+test('a long turn carries its newest steps and says how many it ran', () => {
+  // Measured over this workspace: the median turn runs 11 tools and the longest ran 211.
+  // Every step of every turn would put a fifth of a megabyte of tool calls into a payload
+  // that is 64 KB today, so the list is cut and the count is not.
+  const lines: object[] = [userPrompt('do a lot', 0)];
+  for (let i = 0; i < TURN_STEP_LIMIT + 5; i++) {
+    lines.push(assistantTool('Read', i + 1, `a${i}`, { file_path: `file-${i}.ts` }));
+  }
+  lines.push(assistantAnswer('Done.', TURN_STEP_LIMIT + 10));
+  const [turn] = readTurns(writeTranscript(lines), 'sess');
+  assert.equal(turn.steps.length, TURN_STEP_LIMIT);
+  assert.equal(
+    turn.stepCount,
+    TURN_STEP_LIMIT + 5,
+    'the count is cut with the list, so the card cannot say what it is not showing',
+  );
+  assert.equal(turn.steps[0].detail, 'file-5.ts', 'the oldest steps were kept and the newest dropped');
+  assert.equal(turn.steps[turn.steps.length - 1].detail, `file-${TURN_STEP_LIMIT + 4}.ts`);
+});
+
+test('the Claude step cap preserves every message and the original call positions', () => {
+  for (const total of [TURN_STEP_LIMIT + 5, (TURN_STEP_LIMIT + 5) * 10]) {
+    const lines: object[] = [userPrompt('keep the complete log', 0)];
+    for (let ordinal = 1; ordinal <= total; ordinal++) {
+      lines.push(assistantTool('Read', ordinal, `call-${ordinal}`, { file_path: `${ordinal}.ts` }));
+      if (ordinal === 1) {
+        lines.push({
+          type: 'user',
+          timestamp: at(ordinal),
+          message: {
+            content: [{ type: 'tool_result', tool_use_id: 'call-1', is_error: true, content: 'Missing file' }],
+          },
+        });
+      }
+      if (ordinal % 10 === 0) {
+        lines.push(assistantText(`After call ${ordinal}`, ordinal, undefined, undefined, 'tool_use'));
+      }
+      if (ordinal === 20) {
+        lines.push(assistantAnswer('The first check is complete.', ordinal));
+      }
+      if (ordinal === 30) {
+        lines.push(typedMidTurn('Check the second file too.', ordinal));
+      }
+    }
+    const [turn] = readTurns(writeTranscript(lines), 'sess');
+    assert.equal(turn.steps.length, TURN_STEP_LIMIT);
+    assert.equal(turn.stepCount, total);
+    assert.deepEqual(
+      turn.steps.map((step) => step.ordinal),
+      Array.from({ length: TURN_STEP_LIMIT }, (_, i) => total - TURN_STEP_LIMIT + i + 1),
+    );
+    assert.equal(turn.updates.length, Math.floor(total / 10));
+    assert.deepEqual(
+      turn.updates.map((update) => update.stepsBefore),
+      Array.from({ length: Math.floor(total / 10) }, (_, i) => (i + 1) * 10),
+    );
+    assert.deepEqual(turn.answers, [{ text: 'The first check is complete.', at: ms(20), stepsBefore: 20 }]);
+    assert.deepEqual(turn.laterPrompts, [{ text: 'Check the second file too.', at: ms(30), stepsBefore: 30 }]);
+    assert.deepEqual(turn.failedOrdinals, [1]);
+    assert.deepEqual(turn.stepKinds, Array(total).fill('reads'));
+  }
+});
+
+test('the one thing a call acted on is read from whichever field named it', () => {
+  // One rule, read by two things: the permission ask and the step row on a card. The skill
+  // comes first because a skill call carries the skill body as a prompt beside it.
+  assert.equal(describeToolInput({ skill: 'polish', prompt: 'the body' }), 'polish');
+  assert.equal(describeToolInput({ command: 'npm test' }), 'npm test');
+  assert.equal(describeToolInput({ file_path: 'a.ts' }), 'a.ts');
+  assert.equal(describeToolInput({ pattern: 'livePress' }), 'livePress');
+  assert.equal(describeToolInput({ description: 'review the diff', prompt: 'a very long brief' }), 'review the diff');
+  // Codex names a subagent it starts by its task rather than by a description, and the
+  // message beside it is an encrypted blob.
+  assert.equal(describeToolInput({ task_name: 'head_review', message: 'gAAAAAB...' }), 'head_review');
+  assert.equal(describeToolInput({}), '', 'a tool taking no arguments is given words it never said');
+  assert.equal(describeToolInput({ command: '   ' }), '', 'whitespace is drawn as though it were a command');
+
+  // And cut to what a row can hold, whitespace first. A command written as a heredoc arrives
+  // with a whole script inside it: uncut, the shell commands alone took the payload for four
+  // turns of this workspace from 64 KB to 211 KB.
+  const heredoc = ['cat > f <<EOF', 'x'.repeat(600), 'EOF'].join('\n');
+  assert.equal(
+    stepDetail({ command: heredoc }).length,
+    STEP_DETAIL_LIMIT,
+    'the detail reaches the card whole, so a heredoc is carried as a step name',
+  );
+  assert.equal(
+    stepDetail({ command: ['npm  test', '', '  --watch'].join('\n') }),
+    'npm test --watch',
+    'a command keeps the gaps between its lines, so the row is mostly empty space',
+  );
+  assert.equal(stepDetail({ command: 'npm test' }), 'npm test', 'a short command is cut anyway');
+});
+
+test('a prompt typed while the turn ran reaches the turn, and the two things beside it do not', () => {
+  // Claude Code writes a mid-turn prompt as an attachment rather than as a user line, and
+  // the agent answers it inside the running turn. Drawn nowhere, the card showed a reply to
+  // a question it did not show. Measured over 172 of these records in this workspace's own
+  // transcripts: a peer's message and a background task's report are written on the same
+  // kind of line, and neither is the reader.
+  const file = writeTranscript([
+    userPrompt('start the parser work', 0),
+    assistantTool('Read', 1, 'tu1', { file_path: 'a.ts' }),
+    typedMidTurn('and keep the tests green', 2),
+    queued({ commandMode: 'prompt', origin: { kind: 'peer' }, prompt: 'another session says hello' }, 3),
+    queued({ commandMode: 'task-notification', prompt: 'a background task finished' }, 4),
+    assistantAnswer('Done.', 5),
+  ]);
+  const { turns } = readSession(file, 'sess');
+  assert.equal(turns.length, 1);
+  assert.deepEqual(
+    turns[0].laterPrompts.map((a) => a.text),
+    ['and keep the tests green'],
+  );
+  assert.equal(
+    turns[0].laterPrompts[0].at,
+    new Date(at(2)).getTime(),
+    'the prompt reached the turn with the wrong time',
+  );
+  assert.equal(
+    turns[0].prompt,
+    'start the parser work',
+    'a mid-turn prompt was folded into the one that started the turn',
+  );
+});
+
+test('a prompt typed into a turn that never answered goes to the turn that absorbs it', () => {
+  // A turn with no reply of its own is held back and its words join the next one, or the card
+  // would say less than the turn was asked. What was typed into it while it sat there is the
+  // reader's too, and it travels the same way.
+  const file = writeTranscript([
+    userPrompt('the first ask', 0),
+    typedMidTurn('and this while it sat there', 1),
+    userPrompt('the second ask', 2),
+    assistantAnswer('Done.', 3),
+  ]);
+  const { turns } = readSession(file, 'sess');
+  assert.equal(turns.length, 1, 'a turn with no reply of its own was drawn as an empty card');
+  assert.ok(turns[0].prompt.includes('the first ask') && turns[0].prompt.includes('the second ask'));
+  assert.deepEqual(
+    turns[0].laterPrompts.map((a) => a.text),
+    ['and this while it sat there'],
+    'what was typed into the held turn was dropped when it was absorbed',
+  );
+});
+
+test('a queued prompt written by a subagent is not the reader typing', () => {
+  // A subagent writes its own transcript, and the launch and the result are all of it that
+  // reaches this file. One that arrived here anyway would put a subagent's words under the
+  // reader's own heading.
+  const file = writeTranscript([
+    userPrompt('start the parser work', 0),
+    assistantTool('Read', 1, 'tu1', { file_path: 'a.ts' }),
+    { ...typedMidTurn('the subagent own queued prompt', 2), isSidechain: true },
+    assistantAnswer('Done.', 5),
+  ]);
+  const { turns } = readSession(file, 'sess');
+  assert.deepEqual(turns[0].laterPrompts, []);
+});
+
+test('a mid-turn prompt is read as blocks, kept in order, and bounded', () => {
+  // The prompt is an array of content blocks, the same shape a user line carries, so it
+  // needs the same reading rather than a String().
+  const many: object[] = [userPrompt('start', 0), assistantTool('Read', 1, 'tu1', { file_path: 'a.ts' })];
+  for (let i = 0; i < TURN_ASK_LIMIT + 3; i += 1) {
+    many.push(typedMidTurn(`ask ${i}`, 2 + i));
+  }
+  many.push(assistantAnswer('Done.', 90));
+  const { turns } = readSession(writeTranscript(many), 'sess');
+  const kept = turns[0].laterPrompts;
+  assert.equal(kept.length, TURN_ASK_LIMIT, 'a turn asked over and over drew every one of them');
+  // The newest are kept, the way the step list keeps its newest: the end of the list is
+  // where the turn is now.
+  assert.equal(kept[0].text, 'ask 3');
+  assert.equal(kept[kept.length - 1].text, `ask ${TURN_ASK_LIMIT + 2}`);
+});
+
+test('an ordinary line that happens to hold the words is still read as itself', () => {
+  // The prefilter is a substring test, and those two words can sit inside any prompt or any
+  // tool argument. A line taken out of the stream on that alone takes its whole turn with it,
+  // which is what this asks about.
+  // The words as a whole quoted value, which is the shape the filter looks for: a prompt that
+  // is exactly them, and a search run for them.
+  const file = writeTranscript([
+    userPrompt('queued_command', 0),
+    assistantTool('Grep', 1, 'tu1', { pattern: 'queued_command' }),
+    assistantAnswer('It is how a queued prompt is written.', 2),
+  ]);
+  const { turns } = readSession(file, 'sess');
+  assert.equal(turns.length, 1, 'a turn was dropped by a line that only quoted the words');
+  assert.equal(turns[0].prompt, 'queued_command');
+  assert.equal(turns[0].summary, 'It is how a queued prompt is written.');
+  assert.equal(turns[0].toolUses, 1, 'a tool call was dropped because its argument quoted the words');
+  assert.deepEqual(
+    turns[0].steps.map((st) => st.detail),
+    ['queued_command'],
+  );
+  assert.deepEqual(turns[0].laterPrompts, [], 'a line that quoted the words was read as a prompt');
+});
+
+test('the rule that picks the reader out reads the fields rather than the shape', () => {
+  // An absent origin counts as the reader, which is how a user line is read here too, and
+  // what the records written before the field existed carry.
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt' }), true);
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: { kind: 'human' } }), true);
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: { kind: 'peer' } }), false);
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'task-notification' }), false);
+  // And nothing else on that line is one of these at all.
+  assert.equal(isReaderQueued({ type: 'total_tokens_reminder', commandMode: 'prompt' }), false);
+  assert.equal(isReaderQueued(null), false);
+  // An origin that is not a name at all is a record this does not understand, and guessing
+  // would put another session's message under the reader's own heading.
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: 'peer' }), false);
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: [] }), false);
+  assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: { kind: 7 } }), false);
+});
+
+test('a selection reads one transcript again and not the whole workspace', () => {
+  // The measured symptom. The catalog walk ran 61 times in 30 seconds against a five-second
+  // poll, because clicking a session drove a refresh and every refresh walked. Selecting
+  // cannot add, remove or grow a transcript, so the walk answers a question the click already
+  // knew the answer to.
+  const held = [
+    { agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 },
+    { agent: 'claude' as const, file: 'b.jsonl', sessionId: 'b', mtimeMs: 2, size: 20 },
+    { agent: 'claude' as const, file: 'c.jsonl', sessionId: 'c', mtimeMs: 3, size: 30 },
+  ];
+
+  // One stat, for the session being shown, and none for its neighbours.
+  const asked: string[] = [];
+  const statOf = (file: string) => {
+    asked.push(file);
+    return { mtimeMs: 9, size: 90 };
+  };
+  const next = revalidatedCatalog(held, 'b', statOf);
+  assert.deepEqual(asked, ['b.jsonl'], 'a selection still reads files it was not asked about');
+  assert.ok(next);
+  assert.deepEqual(
+    next[1],
+    { agent: 'claude', file: 'b.jsonl', sessionId: 'b', mtimeMs: 9, size: 90 },
+    'the session the reader selected keeps the revision the last walk saw',
+  );
+  assert.deepEqual([next[0], next[2]], [held[0], held[2]], 'a selection rewrote a session it was not about');
+  assert.notEqual(next, held, 'the held catalog was written through rather than copied');
+
+  // A session that has not moved is handed back as it was.
+  const still = revalidatedCatalog(held, 'b', () => ({ mtimeMs: 2, size: 20 }));
+  assert.deepEqual(still, held);
+});
+
+test('a selection the held catalog cannot account for falls back to the walk', () => {
+  const held = [{ agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 }];
+  const stat = () => ({ mtimeMs: 1, size: 10 });
+
+  // Nothing shown, so there is nothing to state and no reason to trust the held list.
+  assert.equal(revalidatedCatalog(held, null, stat), null);
+  // A session the last walk never listed. It can only have arrived since, which is
+  // exactly what a walk is for.
+  assert.equal(revalidatedCatalog(held, 'gone', stat), null);
+  // The transcript has been removed underneath the panel.
+  assert.equal(
+    revalidatedCatalog(held, 'a', () => null),
+    null,
+  );
+});
+
+test('watcher revalidation stats only known changed files and preserves their revisions', () => {
+  const held = [
+    { agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 },
+    { agent: 'claude' as const, file: 'b.jsonl', sessionId: 'b', mtimeMs: 2, size: 20 },
+    { agent: 'claude' as const, file: 'c.jsonl', sessionId: 'c', mtimeMs: 3, size: 30 },
+  ];
+  const asked: string[] = [];
+  const next = revalidatedCatalogPaths(held, ['a.jsonl', 'c.jsonl'], (file) => {
+    asked.push(file);
+    return { mtimeMs: file === 'a.jsonl' ? 11 : 33, size: file === 'a.jsonl' ? 110 : 330 };
+  });
+
+  assert.deepEqual(asked, ['a.jsonl', 'c.jsonl']);
+  assert.deepEqual(next, [{ ...held[0], mtimeMs: 11, size: 110 }, held[1], { ...held[2], mtimeMs: 33, size: 330 }]);
+});
+
+test('unknown, removed, and empty watcher paths require an authoritative catalog walk', () => {
+  const held = [{ agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 }];
+  const stat = () => ({ mtimeMs: 1, size: 10 });
+
+  assert.equal(revalidatedCatalogPaths(held, [], stat), null);
+  assert.equal(revalidatedCatalogPaths(held, ['new.jsonl'], stat), null);
+  assert.equal(
+    revalidatedCatalogPaths(held, ['a.jsonl'], () => null),
+    null,
+  );
+});
+
+test('a reused catalog offers only the revision it read again', () => {
+  // The offer takes a listed revision in place of stating the file. A walk read every one of
+  // them, so a walk's list stands whole.
+  const held = [
+    { agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 },
+    { agent: 'claude' as const, file: 'b.jsonl', sessionId: 'b', mtimeMs: 2, size: 20 },
+  ];
+  assert.deepEqual([...trustedListedRevisions(held, true, 'a').keys()], ['a.jsonl', 'b.jsonl']);
+
+  // A reused catalog read one file. Every other entry is the size the last walk saw, and the
+  // offer compares that against the size in the ledger to decide whether to index the source
+  // again. Handed a stale pair that agree, it leaves a session that has grown out of
+  // Project cost until a later walking pass.
+  const trusted = trustedListedRevisions(held, false, 'a');
+  assert.deepEqual(
+    [...trusted.keys()],
+    ['a.jsonl'],
+    'a reused catalog hands the offer revisions it did not read, so a grown source is skipped',
+  );
+  assert.deepEqual(trusted.get('a.jsonl'), { mtimeMs: 1, size: 10 });
+
+  // Nothing shown means nothing was read again, so the offer states every file itself.
+  assert.equal(trustedListedRevisions(held, false, null).size, 0);
+});
+
+test('a cache write with no recorded split names no lifetime', () => {
+  // `claudeUsage` charges an unsplit write at the hour, because that is the tier this harness
+  // asks for. That is a price fallback. Anything telling a reader which lifetime was bought
+  // has to be able to tell the fallback from the record.
+  const unsplit = { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 620_000 } as never;
+  assert.equal(claudeUsage(unsplit).cacheWrite1h, 620_000, 'the unsplit write stopped being priced at the hour');
+  assert.equal(claudeCacheLifetime(unsplit), null, 'a price fallback is reported as a recorded lifetime');
+
+  const hour = {
+    input_tokens: 10,
+    output_tokens: 5,
+    cache_creation: { ephemeral_1h_input_tokens: 620_000 },
+  } as never;
+  assert.equal(claudeCacheLifetime(hour), '1h');
+
+  const short = {
+    input_tokens: 10,
+    output_tokens: 5,
+    cache_creation: { ephemeral_5m_input_tokens: 6_000 },
+  } as never;
+  assert.equal(claudeCacheLifetime(short), '5m');
+
+  assert.equal(
+    claudeCacheLifetime({ input_tokens: 10, output_tokens: 5 }),
+    null,
+    'a request that wrote no cache names a lifetime',
+  );
+});
+
+// The one request that set the current context level, read back off a parsed transcript. The
+// figure above the composer rests entirely on this: without it the panel dates the cache from
+// the turn's end, which a tool result moves, and takes the lifetime from the turn's summed
+// usage, which covers every request the turn made.
+test('a turn records the request that set its context level', () => {
+  const file = writeTranscript([
+    userPrompt('do the thing', 0),
+    // An early request buying an hour, then a much larger five-minute write. Summed, the turn
+    // says five minutes by volume and an hour by order, and neither is the answer.
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'm-a',
+        model: 'claude-opus-5',
+        content: [{ type: 'tool_use', id: 'tu-a', name: 'Bash', input: {} }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 1_000,
+          cache_creation: { ephemeral_1h_input_tokens: 400_000 },
+          service_tier: 'standard',
+        },
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp: at(2),
+      message: {
+        role: 'assistant',
+        id: 'm-b',
+        model: 'claude-opus-5',
+        content: [{ type: 'text', text: 'Working on it.' }],
+        usage: {
+          input_tokens: 20,
+          output_tokens: 40,
+          cache_read_input_tokens: 500_000,
+          cache_creation: { ephemeral_5m_input_tokens: 6_000 },
+          inference_geo: 'global',
+          service_tier: 'standard',
+        },
+      },
+    },
+    // A record the harness wrote, long after the last real request. It moves the turn's end and
+    // it refreshes no cache, because no model ran for it.
+    {
+      type: 'assistant',
+      timestamp: at(7_200),
+      message: {
+        role: 'assistant',
+        id: 'm-x',
+        model: '<synthetic>',
+        content: [{ type: 'text', text: 'API Error: overloaded' }],
+      },
+    },
+  ]);
+  const [only] = readTurns(file, 'sess');
+  assert.ok(only.contextRequest, 'the turn records nothing about the request behind its level');
+  assert.equal(
+    only.contextRequest.at,
+    Date.parse(at(2)),
+    'the request is dated from the turn end rather than from itself',
+  );
+  assert.equal(only.contextRequest.lifetime, '5m', 'the lifetime comes from the whole turn rather than that request');
+  assert.equal(only.contextRequest.readBack, true);
+  assert.equal(only.contextRequest.outputTokens, 40);
+  assert.equal(only.contextRequest.inferenceClass, 'global');
+  assert.equal(only.contextRequest.serviceTier, 'standard');
+  assert.equal(only.endedAt, Date.parse(at(7_200)), 'the turn no longer ends on its last activity');
+  assert.equal(only.contextTokens, 506_020);
+});
+
+// A compaction between the last request and the end of the turn that holds it. A tool result
+// or a synthetic response moves a turn's end with no model running, so the compaction is newer
+// than every request the turn made and older than the turn. Dated from the turn's end, the
+// panel carried the lifetime the request before the compaction bought and called a
+// session nobody has cached warm.
+test('a compaction between the last request and the end of its turn still drops the cache', () => {
+  const file = writeTranscript([
+    userPrompt('do the thing', 0),
+    {
+      type: 'assistant',
+      timestamp: at(2),
+      message: {
+        role: 'assistant',
+        id: 'm-a',
+        model: 'claude-opus-5',
+        content: [{ type: 'tool_use', id: 'tu-a', name: 'Bash', input: {} }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 600_000,
+          cache_creation: { ephemeral_1h_input_tokens: 20_000 },
+        },
+      },
+    },
+    {
+      type: 'system',
+      timestamp: at(3),
+      compactMetadata: { trigger: 'manual', preTokens: 620_010, postTokens: 42_000 },
+    },
+    { ...userPrompt('summary', 3), isCompactSummary: true, message: { role: 'user', content: 'summary' } },
+    // The harness wrote this long afterwards. It moves the turn's end and no model ran for it.
+    {
+      type: 'assistant',
+      timestamp: at(7_200),
+      message: {
+        role: 'assistant',
+        id: 'm-x',
+        model: '<synthetic>',
+        content: [{ type: 'text', text: 'API Error: overloaded' }],
+      },
+    },
+  ]);
+  const read = readSession(file, 'sess');
+  const newest = read.turns[read.turns.length - 1];
+  const compaction = read.compactions[read.compactions.length - 1];
+  assert.ok(newest.contextRequest, 'the turn records nothing about the request behind its level');
+  assert.ok(
+    newest.contextRequest.at < compaction.at && compaction.at < newest.endedAt,
+    'the fixture does not put the compaction between the request and the end of its turn',
+  );
+  const basis = nextTurnBasisOf(newest, compaction);
+  assert.equal(basis?.afterCompaction, true, 'the cache state is dated from the turn rather than from its request');
+  assert.equal(basis?.tier, null, 'the panel carries the lifetime a request before the compaction bought');
+  assert.equal(basis?.readBack, false);
+  assert.equal(basis?.lastRequestAt, compaction.at, 'the compaction is the newest request and is not the clock');
+});
+
+test('a request that only reads the prefix back keeps the lifetime the session bought', () => {
+  const file = writeTranscript([
+    userPrompt('first', 0),
+    assistantText('One.', 1, undefined, undefined, 'end_turn'),
+    userPrompt('second', 2),
+    {
+      type: 'assistant',
+      timestamp: at(3),
+      message: {
+        role: 'assistant',
+        id: 'm-c',
+        model: 'claude-opus-5',
+        content: [{ type: 'tool_use', id: 'tu-c', name: 'Read', input: {} }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 100,
+          cache_creation: { ephemeral_1h_input_tokens: 500_000 },
+        },
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp: at(4),
+      message: {
+        role: 'assistant',
+        id: 'm-d',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Two.' }],
+        usage: { input_tokens: 5, output_tokens: 30, cache_read_input_tokens: 510_000 },
+      },
+    },
+  ]);
+  const turns = readTurns(file, 'sess');
+  const last = turns[turns.length - 1];
+  // The closing request wrote nothing and read the whole prefix back. It names no lifetime of
+  // its own and it sits inside the one the request before it bought.
+  assert.equal(last.contextRequest?.lifetime, '1h');
+  assert.equal(last.contextRequest?.at, Date.parse(at(4)));
+  assert.equal(last.contextRequest?.readBack, true);
+});
+
+test('a request that wrote two lifetimes at once names neither', () => {
+  const file = writeTranscript([
+    userPrompt('mixed', 0),
+    {
+      type: 'assistant',
+      timestamp: at(1),
+      message: {
+        role: 'assistant',
+        id: 'm-e',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Done.' }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation: { ephemeral_1h_input_tokens: 1_000, ephemeral_5m_input_tokens: 619_000 },
+        },
+      },
+    },
+  ]);
+  const [only] = readTurns(file, 'sess');
+  // Part of that context expires in five minutes and part in an hour. Naming either one prices
+  // the rest at a rate it was never bought at.
+  assert.equal(only.contextRequest?.lifetime, null);
+  assert.equal(only.contextRequest?.readBack, false);
+});
+
+test('a session whose first prompt is a slash command is named by the command and its arguments', () => {
+  const file = writeTranscript([
+    userPrompt(
+      '<command-message>land</command-message>\n<command-name>/land</command-name>\n<command-args>stable session names</command-args>',
+      0,
+    ),
+    assistantAnswer('Done.', 1),
+    userPrompt('looks good', 2),
+  ]);
+  assert.equal(readSessionMeta(file).title, '/land stable session names');
+  assert.equal(readSessionMeta(file).titleSource, 'prompt');
+});
+
+test('a name the owner gave outranks a newer generated title', () => {
+  const file = writeTranscript([
+    userPrompt('build the timeline', 0),
+    { type: 'custom-title', customTitle: 'Owner name', sessionId: 'sess' },
+    { type: 'ai-title', aiTitle: 'Generated name', sessionId: 'sess' },
+    assistantAnswer('Done.', 1),
+  ]);
+  assert.equal(readSessionMeta(file).title, 'Owner name');
+  assert.equal(readSessionMeta(file).titleSource, 'custom');
+  const turn = readSession(file, 'sess').turns[0];
+  assert.equal(turn.sessionTitle, 'Owner name');
+  assert.equal(turn.sessionTitleSource, 'custom');
+});
+
+test('a blank custom title clears the custom name in the tail read and in the parse alike', () => {
+  const file = writeTranscript([
+    userPrompt('build the timeline', 0),
+    { type: 'ai-title', aiTitle: 'Generated name', sessionId: 'sess' },
+    { type: 'custom-title', customTitle: 'Owner name', sessionId: 'sess' },
+    assistantAnswer('Done.', 1),
+    { type: 'custom-title', customTitle: '   ', sessionId: 'sess' },
+  ]);
+  const meta = readSessionMeta(file);
+  const turn = readSession(file, 'sess').turns[0];
+  assert.deepEqual([meta.title, meta.titleSource], ['Generated name', 'generated']);
+  assert.deepEqual([turn.sessionTitle, turn.sessionTitleSource], ['Generated name', 'generated']);
+  fs.appendFileSync(file, JSON.stringify({ type: 'custom-title', customTitle: '', sessionId: 'sess' }) + '\n');
+  assert.equal(readSessionMeta(file).title, 'Generated name');
+  assert.equal(readSession(file, 'sess').turns[0].sessionTitle, 'Generated name');
+});
+
+// What a reader of `customTitleOf` is told happens next. The record clears the custom name
+// for the read that sees it. The panel holds a name of its own, and a held custom name never
+// gives way to the generated title under it, so the session goes on drawing the owner's name.
+test('a blank custom title leaves a held custom name where it was', () => {
+  const file = writeTranscript([
+    userPrompt('build the timeline', 0),
+    { type: 'ai-title', aiTitle: 'Generated name', sessionId: 'sess' },
+    { type: 'custom-title', customTitle: 'Owner name', sessionId: 'sess' },
+    assistantAnswer('Done.', 1),
+  ]);
+  const names = new SessionNames();
+  const named = readSessionMeta(file);
+  assert.deepEqual([named.title, named.titleSource], ['Owner name', 'custom']);
+  names.observe(
+    'sess',
+    {
+      label: named.title ?? '',
+      fullLabel: named.fullTitle ?? '',
+      source: 'custom',
+      at: named.titleAt,
+    },
+    { size: fs.statSync(file).size },
+  );
+
+  fs.appendFileSync(file, JSON.stringify({ type: 'custom-title', customTitle: '   ', sessionId: 'sess' }) + '\n');
+  const cleared = readSessionMeta(file);
+  assert.deepEqual([cleared.title, cleared.titleSource], ['Generated name', 'generated']);
+  names.observe(
+    'sess',
+    {
+      label: cleared.title ?? '',
+      fullLabel: cleared.fullTitle ?? '',
+      source: 'generated',
+      at: cleared.titleAt,
+    },
+    { size: fs.statSync(file).size },
+  );
+  assert.equal(
+    names.get('sess')?.label,
+    'Owner name',
+    'the panel dropped the custom name a blank record cleared for one read',
+  );
+});
+
+test('a title read from the tail knows the byte offset of its record', () => {
+  const file = writeTranscript([
+    userPrompt(`build the timeline ${'y'.repeat(3000)}`, 0),
+    { type: 'ai-title', aiTitle: 'Generated name', sessionId: 'sess' },
+    assistantAnswer('x'.repeat(2048), 1),
+  ]);
+  const text = fs.readFileSync(file, 'utf8');
+  const at = Buffer.byteLength(text.slice(0, text.indexOf('{"type":"ai-title"')));
+  assert.equal(readSessionMeta(file).titleAt, at);
+  assert.equal(readSessionMeta(file, 1024 + text.length - at).titleAt, at, 'a window that starts mid-file');
+});
+
+test('the saved Claude title file is read whole up to 4 KiB and not at all beyond it', () => {
+  const dir = tempDir('custom-title-');
+  const file = path.join(dir, 'session-7.jsonl');
+  fs.writeFileSync(file, '');
+  fs.mkdirSync(path.join(dir, 'session-7'));
+  const sidecar = path.join(dir, 'session-7', 'custom-title.json');
+  const saved = (title: string, padding = 0) =>
+    fs.writeFileSync(sidecar, JSON.stringify({ customTitle: title }) + ' '.repeat(padding));
+  const long = 'x'.repeat(300);
+  saved(long);
+  assert.equal(readCustomTitleSidecar(file), long, 'the saved title came back cut short');
+  const frame = JSON.stringify({ customTitle: 'Complete name' }).length;
+  saved('Complete name', CUSTOM_TITLE_SIDECAR_BYTES - frame);
+  assert.equal(fs.statSync(sidecar).size, CUSTOM_TITLE_SIDECAR_BYTES);
+  assert.equal(readCustomTitleSidecar(file), 'Complete name');
+  saved('Complete name', CUSTOM_TITLE_SIDECAR_BYTES - frame + 1);
+  assert.equal(readCustomTitleSidecar(file), null, 'a saved title file over 4 KiB was read');
+});
+
+// A Claude Code 2.1.281 session on Amazon Bedrock, trimmed to its model attachment, its prompt,
+// two requests and their tool results. The first request spans three records with one
+// `msg_bdrk_` id and no requestId. Claude Code recorded $0.1585482, which is list price.
+const BEDROCK_SESSION = fs.readFileSync(
+  path.join(__dirname, '..', '..', 'test', 'fixtures', 'bedrock-tool-calls.jsonl'),
+  'utf8',
+);
+const BEDROCK_LIST_PRICE = 0.1585482;
+
+function bedrockSessionCost(text: string) {
+  const [turn] = readSession(
+    writeTranscript(
+      text
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line)),
+    ),
+    'sess',
+  ).turns;
+  const cost = (turn.usageParts ?? []).reduce(
+    (total, part) =>
+      total +
+      (quoteUsage({
+        usage: part.usage,
+        model: part.model,
+        inferenceClass: part.inferenceClass,
+        serviceTier: part.serviceTier,
+      })?.cost ?? Number.NaN),
+    0,
+  );
+  return { turn, cost };
+}
+
+test('a Bedrock session prices each response once at 1.1 times list on a regional profile', () => {
+  const { turn, cost } = bedrockSessionCost(BEDROCK_SESSION);
+  assert.deepEqual(
+    turn.usageParts?.map((part) => [part.model, part.inferenceClass, part.usage.requests]),
+    [['claude-opus-5-5', 'bedrock-regional', 2]],
+  );
+  assert.ok(Math.abs(cost - BEDROCK_LIST_PRICE * 1.1) < 1e-9, `priced at ${cost}`);
+});
+
+test('every Bedrock profile but global. pays 1.1 times list, and a session with no profile does too', () => {
+  const profiles: Array<[string, number]> = [
+    ['global.anthropic.claude-opus-5-5[1m]', 1],
+    ['apac.anthropic.claude-opus-5-5', 1.1],
+    ['eu.anthropic.claude-opus-5-5', 1.1],
+    ['anthropic.claude-opus-5-5', 1.1],
+  ];
+  for (const [profile, multiplier] of profiles) {
+    const { cost } = bedrockSessionCost(BEDROCK_SESSION.replace('us.anthropic.claude-opus-5-5[1m]', profile));
+    assert.ok(Math.abs(cost - BEDROCK_LIST_PRICE * multiplier) < 1e-9, `${profile} priced at ${cost}`);
+  }
+  const unnamed = BEDROCK_SESSION.split('\n')
+    .filter((line) => !line.includes('"modelId"'))
+    .join('\n');
+  assert.ok(Math.abs(bedrockSessionCost(unnamed).cost - BEDROCK_LIST_PRICE * 1.1) < 1e-9);
+});
+
+test('a Bedrock request read as in-region pays the regional charge once', () => {
+  const { turn, cost } = bedrockSessionCost(BEDROCK_SESSION.replaceAll('"inference_geo":""', '"inference_geo":"us"'));
+  assert.equal(turn.usageParts?.[0].inferenceClass, 'bedrock-regional');
+  assert.ok(Math.abs(cost - BEDROCK_LIST_PRICE * 1.1) < 1e-9, `priced at ${cost}`);
+});
+
+test('a global. Bedrock request read as in-region still pays list', () => {
+  const { turn, cost } = bedrockSessionCost(
+    BEDROCK_SESSION.replace('us.anthropic.claude-opus-5-5[1m]', 'global.anthropic.claude-opus-5-5[1m]').replaceAll(
+      '"inference_geo":""',
+      '"inference_geo":"us"',
+    ),
+  );
+  assert.equal(turn.usageParts?.[0].inferenceClass, null);
+  assert.ok(Math.abs(cost - BEDROCK_LIST_PRICE) < 1e-9, `priced at ${cost}`);
+});
+
+test('the next-turn price and the compaction estimate carry the Bedrock class', () => {
+  const { turn } = bedrockSessionCost(BEDROCK_SESSION);
+  assert.equal(turn.contextRequest?.inferenceClass, 'bedrock-regional');
+  const reducer = createClaudeUsageLineReducer();
+  for (const line of BEDROCK_SESSION.trim().split('\n')) {
+    reducer.pushLine(line);
+  }
+  const boundary = {
+    type: 'system',
+    subtype: 'compact_boundary',
+    timestamp: '2026-09-24T00:09:00.000Z',
+    compactMetadata: { trigger: 'manual', preTokens: 29_500, postTokens: 400 },
+  };
+  const summary = {
+    type: 'user',
+    isCompactSummary: true,
+    timestamp: '2026-09-24T00:09:00.100Z',
+    message: { role: 'user', content: 'summary' },
+  };
+  reducer.pushLine(JSON.stringify(boundary));
+  const [estimate] = reducer.pushLine(JSON.stringify(summary));
+  assert.equal(estimate?.compactionEstimate, true);
+  assert.equal(estimate?.inferenceClass, 'bedrock-regional');
+});
+
+test('a Bedrock request pays by the newest model attachment, across a model switch and a restored state', () => {
+  const lines = BEDROCK_SESSION.trim().split('\n');
+  const attachment = lines.find((line) => line.includes('"modelId"'))!;
+  const requests = lines.filter((line) => line.includes('"type":"assistant"'));
+  const globalAttachment = attachment.replace('us.anthropic.claude-opus-5-5[1m]', 'global.anthropic.claude-opus-5-5');
+  const first = createClaudeUsageLineReducer();
+  first.pushLine(globalAttachment);
+  const [onGlobal] = first.pushLine(requests[0]);
+  assert.equal(onGlobal.inferenceClass, null);
+  const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())));
+  assert.equal(resumed.pushLine(requests[3])[0].inferenceClass, null, 'the restored state lost the profile');
+  resumed.pushLine(attachment);
+  const later = JSON.parse(requests[3]);
+  later.message.id = 'msg_bdrk_after_switch';
+  assert.equal(resumed.pushLine(JSON.stringify(later))[0].inferenceClass, 'bedrock-regional');
+});
+
+test('an appended Bedrock request after a cached parse still prices a global. session at list', () => {
+  const lines = BEDROCK_SESSION.trim()
+    .split('\n')
+    .map((line) => line.replace('us.anthropic.claude-opus-5-5[1m]', 'global.anthropic.claude-opus-5-5'));
+  const last = lines.map((line) => line.includes('"type":"assistant"')).lastIndexOf(true);
+  const file = writeTranscript(lines.slice(0, last).map((line) => JSON.parse(line)));
+  const initial = readClaudeSessionIncremental(file, 'sess');
+  assert.ok(initial.checkpoint);
+  fs.appendFileSync(file, lines.slice(last).join('\n') + '\n');
+  const applied = readClaudeSessionIncremental(file, 'sess', initial.checkpoint ?? undefined);
+  assert.equal(applied.kind, 'appended');
+  const [turn] = applied.read?.turns ?? [];
+  assert.deepEqual(
+    turn?.usageParts?.map((part) => [part.inferenceClass, part.usage.requests]),
+    [[null, 2]],
+  );
+  assert.equal(turn?.contextRequest?.inferenceClass, null);
+});
+
+test('a Bedrock subagent prices by the model attachment in its own transcript', () => {
+  const classes = (text: string) => {
+    const records = text
+      .trim()
+      .split('\n')
+      .map((line) => ({ ...JSON.parse(line), isSidechain: true }));
+    const spend = readClaudeAgentSpend(writeTranscript(records), [], true);
+    return spend.models.flatMap((model) => (model.usageParts ?? []).map((part) => part.inferenceClass));
+  };
+  assert.deepEqual(classes(BEDROCK_SESSION), ['bedrock-regional']);
+  assert.deepEqual(
+    classes(BEDROCK_SESSION.replace('us.anthropic.claude-opus-5-5[1m]', 'global.anthropic.claude-opus-5-5')),
+    [null],
+  );
+});
+
+test('Claude parents link exact Codex receipts and direct stdout without prefix or provider collisions', () => {
+  const ids = ['aaaaaaaa-1111-1111-1111-111111111111', 'aaaaaaaa-2222-2222-2222-222222222222'];
+  const receipt = (id: string) => `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'codex', session_id: id })}`;
+  const parent = writeTranscript(
+    claudeDispatchTranscript('python a.py --arc-dispatch && python b.py --arc-dispatch', ids.map(receipt).join('\n')),
+  );
+  const raw = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+  assert.deepEqual(
+    raw.map((reference) => reference.sessionId),
+    ids,
+  );
+  const catalog = ids.map((id) => ({
+    agent: 'codex' as const,
+    file: `C:/sessions/${id}.jsonl`,
+    sessionId: id,
+    mtimeMs: 1,
+    size: 1,
+  }));
+  assert.equal(resolveClaudeDispatchReferences(raw, catalog).length, 2);
+  assert.deepEqual(
+    resolveClaudeDispatchReferences(
+      raw,
+      catalog.map((session) => ({ ...session, agent: 'claude' as const })),
+    ),
+    [],
+  );
+  const short = writeTranscript(claudeDispatchTranscript('python a.py --arc-dispatch', receipt('aaaaaaaa')));
+  assert.deepEqual(readClaudeChildSessionReferences({ file: short, sessionId: 'parent' }), []);
+  const event = JSON.stringify({ type: 'thread.started', thread_id: ids[0] });
+  for (const command of ['codex exec --json -', '"C:/Tools/codex.cmd" exec --json -', '/usr/bin/codex exec --json -']) {
+    const file = writeTranscript(claudeDispatchTranscript(command, event));
+    assert.deepEqual(
+      readClaudeChildSessionReferences({ file, sessionId: 'parent' }).map((reference) => reference.sessionId),
+      [ids[0]],
+    );
+    assert.deepEqual(readSession(file, 'parent').turns[0].dispatchToolUseIds, ['dispatch-1']);
+  }
+});
+
+test('a Claude turn keeps the model attachment that names its reply model', () => {
+  const attach = (modelId: string, extra: Record<string, unknown> = {}) => ({
+    type: 'attachment',
+    timestamp: at(0),
+    attachment: { type: 'model', identity: { modelId } },
+    ...extra,
+  });
+  const reply = (model: string, text: string, second: number) => {
+    const record = assistantAnswer(text, second);
+    record.message.model = model;
+    return record;
+  };
+  const records = [
+    attach('claude-opus-5-5[1m]'),
+    userPrompt('one', 1),
+    reply('claude-opus-5-5', 'a', 2),
+    attach('claude-opus-5-5'),
+    userPrompt('two', 3),
+    reply('claude-opus-5-5', 'b', 4),
+    userPrompt('three', 5),
+    reply('claude-sonnet-5-5', 'c', 6),
+    userPrompt('four', 7),
+    reply('claude-opus-5-5', 'd', 8),
+    attach('global.anthropic.claude-opus-5-5[1m]'),
+    userPrompt('five', 9),
+    reply('claude-opus-5-5', 'e', 10),
+    attach('claude-opus-5-5', { isSidechain: true }),
+    userPrompt('six', 11),
+    reply('claude-opus-5-5', 'f', 12),
+  ];
+  const whole = createClaudeSessionReducer('sess');
+  for (const record of records) {
+    whole.pushLine(JSON.stringify(record));
+  }
+  assert.deepEqual(
+    whole.read().turns.map((turn) => [turn.prompt, turn.model, turn.modelAttachment ?? null]),
+    [
+      ['one', 'claude-opus-5-5', 'claude-opus-5-5[1m]'],
+      ['two', 'claude-opus-5-5', 'claude-opus-5-5'],
+      ['three', 'claude-sonnet-5-5', null],
+      ['four', 'claude-opus-5-5', null],
+      ['five', 'claude-opus-5-5', 'global.anthropic.claude-opus-5-5[1m]'],
+      ['six', 'claude-opus-5-5', 'global.anthropic.claude-opus-5-5[1m]'],
+    ],
+  );
+  const first = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 4)) {
+    first.pushLine(JSON.stringify(record));
+  }
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  for (const record of records.slice(4)) {
+    resumed.pushLine(JSON.stringify(record));
+  }
+  assert.deepEqual(resumed.read(), whole.read(), 'a restored checkpoint lost the attachment it had applied');
+});
+
+test('a reply before the first retained prompt invalidates attachment evidence', () => {
+  const reducer = createClaudeSessionReducer('sess');
+  reducer.pushLine(
+    JSON.stringify({ type: 'attachment', attachment: { type: 'model', identity: { modelId: 'claude-opus-5-5[1m]' } } }),
+  );
+  const reply = assistantAnswer('before prompt', 1);
+  reply.message.model = 'claude-sonnet-5-5';
+  reducer.pushLine(JSON.stringify(reply));
+  reducer.pushLine(JSON.stringify(userPrompt('Go', 2)));
+  reply.message.model = 'claude-opus-5-5';
+  reducer.pushLine(JSON.stringify(reply));
+  assert.equal(reducer.read().turns[0].modelAttachment, undefined);
+});
+
+test('an invalid model attachment cannot restore stale composer evidence', () => {
+  for (const invalidation of ['reply', 'skipped']) {
+    const reducer = createClaudeSessionReducer('sess');
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'attachment',
+        attachment: { type: 'model', identity: { modelId: 'claude-opus-5-5[1m]' } },
+      }),
+    );
+    reducer.pushLine(JSON.stringify(userPrompt('Go', 1)));
+    const reply = assistantAnswer('Done', 2);
+    reply.message.model = 'claude-sonnet-5-5';
+    if (invalidation === 'reply') reducer.pushLine(JSON.stringify(reply));
+    else reducer.skipped();
+    reducer.pushLine(
+      JSON.stringify({ type: 'attachment', attachment: { type: 'model', identity: { modelId: null } } }),
+    );
+    reply.message.model = 'claude-opus-5-5';
+    reducer.pushLine(JSON.stringify(reply));
+    assert.equal(reducer.read().turns[0].modelAttachment, undefined, invalidation);
+    assert.equal(reducer.snapshot().usageState.modelProfile, 'claude-opus-5-5[1m]');
+  }
+});
+
+test('literal nested commit scripts retain complete targets without output ordering', () => {
+  const command =
+    "Set-Location C:/repo; & 'C:/tools/bash.exe' -c 'cd child && git -C ../notes -C nested commit -m first; git -C C:/other commit -q -m second'";
+  assert.deepEqual(inspectCommitCommand(command, 'C:/start', 'powershell'), {
+    dirs: ['C:/repo/notes/nested', 'C:/other'],
+    complete: true,
+    ran: true,
+  });
+  for (const reverse of [false, true]) {
+    const row = { commits: [] as TurnCommit[] };
+    const stdout = '[main abc1234] Printed second\n 1 file changed, 2 insertions(+)';
+    if (reverse) recordCommits(row, stdout, 1, 'unreadable', [], 'C:/start');
+    recordCommits(row, stdout, 2, { command, shell: 'powershell', cwd: 'C:/start', at: 0 });
+    if (!reverse) recordCommits(row, stdout, 3, 'unreadable', [], 'C:/start');
+    assert.equal(row.commits.length, 1);
+    assert.equal(row.commits[0].dir, null);
+    assert.deepEqual(row.commits[0].candidates, {
+      dirs: ['C:/start', 'C:/repo/notes/nested', 'C:/other'],
+      complete: true,
+    });
+    assert.equal(row.commits[0].at, reverse ? 1 : 2);
+    assert.equal(row.commits[0].added, 2);
+  }
+});
+
+test('nested script admission rejects copied output and ambiguous arguments', () => {
+  for (const command of [
+    "echo bash -c 'git commit -m copied'",
+    "# bash -c 'git commit -m copied'",
+    'bash -c $script',
+    'bash -c "git -C $repo commit -m dynamic"',
+  ]) {
+    const row = { commits: [] as TurnCommit[] };
+    recordCommits(row, '[main abc1234] Copied', 1, { command, shell: 'bash', cwd: 'C:/repo', at: 0 });
+    assert.deepEqual(row.commits, [], command);
+  }
+  assert.equal(inspectCommitCommand('cd $target; git commit -m unknown', 'C:/repo', 'bash').complete, false);
+  const quiet = { commits: [] as TurnCommit[], commitIntents: [] };
+  recordCommits(
+    quiet,
+    '',
+    2,
+    { command: "bash -c 'git commit -q -m quiet'", shell: 'bash', cwd: 'C:/repo', at: 0 },
+    [],
+    null,
+    { from: 0, failed: false },
+  );
+  assert.deepEqual(quiet.commitIntents, [], 'nested exit status borrowed a quiet commit');
+});
+
+test('printed identities retain distinct full hashes behind the same displayed prefix', () => {
+  const row = { commits: [] as TurnCommit[] };
+  const first = 'abc12345' + '1'.repeat(32);
+  const second = 'abc12345' + '2'.repeat(32);
+  recordCommits(row, `[main ${first}] First\n[main ${second}] Second`, 1, {
+    command: 'git commit -m first',
+    cwd: 'C:/repo',
+    at: 0,
+  });
+  assert.deepEqual(
+    row.commits.map((c) => c.printedSha),
+    [first, second],
+  );
+});
+
+test('decoded nested scripts reject commented Git beside copied commit output', () => {
+  const slash = String.fromCharCode(92);
+  for (const command of [
+    "bash -c '# ignored\ngit --version # genuine read'",
+    "pwsh -Command '# ignored\ngit --version # genuine read'",
+  ]) {
+    assert.equal(inspectCommitCommand(command, 'C:/repo', 'bash').ran, true);
+  }
+  for (const command of [
+    "bash -c '# git commit -m copied'",
+    "pwsh -Command '# git commit -m copied'",
+    '# git commit -m copied',
+    `pwsh -Command 'Set-Location C:${slash}repo${slash} # copied; git commit -m copied'`,
+  ]) {
+    const row = { commits: [] as TurnCommit[] };
+    recordCommits(row, '[main abc1234] Copied', 1, { command, shell: 'bash', cwd: 'C:/repo', at: 0 });
+    assert.deepEqual(row.commits, [], command);
+    assert.deepEqual(inspectCommitCommand(command, 'C:/repo', 'bash').dirs, [], command);
+  }
+});
+
+test('decoded PowerShell scripts preserve literal directory quotes and trailing backslashes', () => {
+  const slash = String.fromCharCode(92);
+  for (const [command, dir] of [
+    [`pwsh -Command "Set-Location 'C:/O''Brien/'; git commit -m saved"`, "C:/O'Brien"],
+    [`pwsh -Command "git -C 'C:/O''Brien/' -C nested commit -m saved"`, "C:/O'Brien/nested"],
+    [`pwsh -Command 'Set-Location "C:${slash}repo${slash}"; git commit -m saved'`, 'C:/repo'],
+    [`pwsh -Command 'git -C "C:${slash}repo${slash}" commit -m saved'`, 'C:/repo'],
+  ]) {
+    assert.deepEqual(
+      inspectCommitCommand(command, 'C:/start', 'bash'),
+      {
+        dirs: [dir],
+        complete: true,
+        ran: true,
+      },
+      command,
+    );
+  }
+  assert.equal(
+    inspectCommitCommand(`pwsh -Command 'Set-Location "$repo"; git commit -m saved'`, 'C:/start', 'bash').complete,
+    false,
+  );
+});

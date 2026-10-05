@@ -1,0 +1,12 @@
+{
+  "name": "arc",
+  "description": "Optional Claude Code integrations for Arc.",
+  "owner": { "name": "glin" },
+  "plugins": [
+    {
+      "name": "arc-hooks",
+      "source": "./plugins/arc-hooks",
+      "description": "Capture first-touch file snapshots for Arc."
+    }
+  ]
+}

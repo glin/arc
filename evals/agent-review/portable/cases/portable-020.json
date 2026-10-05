@@ -1,0 +1,33 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-020",
+  "revision": 1,
+  "family": "style-guard",
+  "split": "holdout",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Relative text sizing guard",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/timeline.webview.test.ts",
+    "limitations": "Focused adaptation of recorded Arc behavior. This public holdout is a selection split, not a secret benchmark."
+  },
+  "inputs": [
+    {
+      "path": "src/style-guard.mjs",
+      "sha256": "2eadb9e7c89e31d2cb0c1999180353f6091d7a5b98ef571da6b4d318c7999371"
+    },
+    {
+      "path": "src/stylesheet-scan.mjs",
+      "sha256": "f62646314a7b0e065928a243f41c15af6286cb854879af35be2b0872d122152c"
+    },
+    {
+      "path": "src/panel.css",
+      "sha256": "84f9f3eeaffab1338a587443281ec3c4e9da25010a095b3eb6bdb80a4bc5db24"
+    }
+  ],
+  "prompt_sha256": "31d2e4c1bc9b814958c3b649b96c55a952655f5fc4cb4d6f5c1ef4a63a65873f",
+  "diff_sha256": "652283904b82c3a9ecc1a63227cc49de73091500eecc22b51b7b57a5f71625fd",
+  "keys": [],
+  "audit": "Bounded audit of static font-size and line-height declarations across CSS absolute units. It excludes CSS custom properties and browser layout."
+}

@@ -1,0 +1,718 @@
+{
+  "name": "arc",
+  "displayName": "Arc",
+  "description": "Arc runs parallel coding agents in VS Code.",
+  "version": "0.1.0",
+  "publisher": "glin",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Arc",
+      "properties": {
+        "arc.maxSessions": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "description": "How many recent sessions the panel keeps up to date. A pinned or open session remains available in addition to this limit."
+        },
+        "arc.projectCost.historyDays": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "How many days of transcript history Project cost reads. 0 reads all history. Project cost skips a transcript that last changed before the limit. A period that starts before the limit shows its cost as a lower bound."
+        },
+        "arc.diagnostics.log": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Write a diagnostics log while you investigate a slow panel. Each editor window writes its own file under `~/.arc/logs`, and Arc keeps the newest 20 files. Reload the window after you change this. Leave this off for normal work."
+        },
+        "arc.agentIdleMinutes": {
+          "type": "number",
+          "default": 60,
+          "minimum": 1,
+          "description": "How many idle minutes a session process stays open after a turn finishes. Archived sessions close as soon as their current work finishes."
+        },
+        "arc.sessionCacheMiB": {
+          "type": "integer",
+          "default": 16,
+          "minimum": 1,
+          "maximum": 256,
+          "description": "How much memory, in MiB, keeps recently viewed sessions ready. Returning to a kept session shows it without reading its transcript again. The session on screen always stays. The least recently viewed session is released first."
+        },
+        "arc.timeline.cardLayout": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "one-column",
+            "two-columns"
+          ],
+          "enumItemLabels": [
+            "Compact",
+            "One column",
+            "Two columns"
+          ],
+          "enumDescriptions": [
+            "The card keeps its subagents, commits and files in the popovers under the figures in the card's top row.",
+            "The card lists its subagents, commits and files under Activity.",
+            "The card lists its subagents, commits and files beside the response on a wide card, and under Activity on a narrow one."
+          ],
+          "default": "two-columns",
+          "description": "How an open turn card shows its subagents, commits and files. Compact keeps them in the popovers under the figures in the card's top row. One column and Two columns list them in the card."
+        },
+        "arc.timeline.promptPosition": {
+          "type": "string",
+          "enum": [
+            "above",
+            "below"
+          ],
+          "enumItemLabels": [
+            "Above the response",
+            "Below the response"
+          ],
+          "enumDescriptions": [
+            "The prompt leads the card, clamped to two lines.",
+            "The prompt follows the response, under its opening heading."
+          ],
+          "default": "below",
+          "description": "Where an open turn card shows the prompt that started the turn: above the response, or below it."
+        },
+        "arc.codexPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the Codex executable the panel starts when you send a prompt. On Windows, use the executable rather than a package entry. Leave empty to use `codex` on your PATH, then the official OpenAI editor extension's bundled executable, then a local Codex install."
+        },
+        "arc.claudePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the Claude Code executable the panel starts when you send a prompt. On Windows, use the executable rather than a package entry. Leave empty to use `claude` on your PATH, then the official Anthropic editor extension's bundled executable, then a standard local or npm install."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "arc.savePerformanceDiagnostics",
+        "title": "Save Performance Diagnostics",
+        "category": "Arc"
+      },
+      {
+        "command": "arc.openDiagnosticsLog",
+        "title": "Open Diagnostics Log",
+        "category": "Arc"
+      },
+      {
+        "command": "arc.showProjectSpend",
+        "title": "Project cost",
+        "category": "Arc"
+      },
+      {
+        "command": "arc.newSession",
+        "title": "New session",
+        "category": "Arc"
+      },
+      {
+        "command": "arc.openInEditor",
+        "title": "Open Arc in Editor",
+        "category": "Arc",
+        "icon": "$(agent)"
+      },
+      {
+        "command": "arc.openBeside",
+        "title": "Open Arc to the Side",
+        "category": "Arc",
+        "icon": "$(split-horizontal)"
+      },
+      {
+        "command": "arc.copyPath",
+        "title": "Copy Path"
+      },
+      {
+        "command": "arc.copyLink",
+        "title": "Copy Link"
+      },
+      {
+        "command": "arc.sendResponseLinkWithLabels",
+        "title": "Send to a new session with the same labels"
+      },
+      {
+        "command": "arc.sendResponseLink",
+        "title": "Send to a new session"
+      },
+      {
+        "command": "arc.sendSelectedTextWithLabels",
+        "title": "Send to a new session with the same labels"
+      },
+      {
+        "command": "arc.sendSelectedText",
+        "title": "Send to a new session"
+      },
+      {
+        "command": "arc.newSessionWithLabels",
+        "title": "New session with the same labels",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.copyRelativePath",
+        "title": "Copy Relative Path"
+      },
+      {
+        "command": "arc.markTurnRead",
+        "title": "Mark as read",
+        "category": "Arc Turn"
+      },
+      {
+        "command": "arc.markTurnUnread",
+        "title": "Mark as unread",
+        "category": "Arc Turn"
+      },
+      {
+        "command": "arc.copyTurnSummary",
+        "title": "Copy the summary"
+      },
+      {
+        "command": "arc.commentOnTurn",
+        "title": "Add a comment"
+      },
+      {
+        "command": "arc.copyTurnComments",
+        "title": "Copy the comments on this turn"
+      },
+      {
+        "command": "arc.labelSession",
+        "title": "Edit labels…",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.renameSession",
+        "title": "Rename…",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.showSessionDetails",
+        "title": "Show session details",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.copySessionId",
+        "title": "Copy session ID",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.hideComposer",
+        "title": "Collapse prompt box"
+      },
+      {
+        "command": "arc.showComposer",
+        "title": "Restore prompt box"
+      },
+      {
+        "command": "arc.renameView",
+        "title": "Edit view…"
+      },
+      {
+        "command": "arc.deleteView",
+        "title": "Delete this view"
+      },
+      {
+        "command": "arc.markSessionRead",
+        "title": "Mark as read",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.markSessionUnread",
+        "title": "Mark as unread",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.archiveSession",
+        "title": "Archive",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.unarchiveSession",
+        "title": "Unarchive",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.pinSession",
+        "title": "Pin to top",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.unpinSession",
+        "title": "Unpin",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.resetPanelState",
+        "title": "Reset Panel State",
+        "category": "Arc"
+      },
+      {
+        "command": "arc.goBack",
+        "title": "Go back",
+        "category": "Arc",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "arc.goForward",
+        "title": "Go forward",
+        "category": "Arc",
+        "icon": "$(arrow-right)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "arc.goBack",
+          "when": "activeWebviewPanelId == arc.panel",
+          "group": "navigation@1"
+        },
+        {
+          "command": "arc.goForward",
+          "when": "activeWebviewPanelId == arc.panel",
+          "group": "navigation@2"
+        },
+        {
+          "command": "arc.openInEditor",
+          "when": "activeWebviewPanelId != arc.panel",
+          "group": "navigation@9"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "arc.copyPath",
+          "when": "webviewSection == 'arcFile'",
+          "group": "5_copypath@1"
+        },
+        {
+          "command": "arc.copyRelativePath",
+          "when": "webviewSection == 'arcFile'",
+          "group": "5_copypath@2"
+        },
+        {
+          "command": "arc.copyLink",
+          "when": "arcCopyLink && link",
+          "group": "5_copypath@0"
+        },
+        {
+          "command": "arc.sendResponseLinkWithLabels",
+          "when": "webviewSection == 'arcLink' && link && session && key",
+          "group": "4_handoff@1"
+        },
+        {
+          "command": "arc.sendResponseLink",
+          "when": "webviewSection == 'arcLink' && link && session && key",
+          "group": "4_handoff@2"
+        },
+        {
+          "command": "arc.sendSelectedTextWithLabels",
+          "when": "arcSelection && session && key && webviewSection != 'arcLink'",
+          "group": "4_handoff@1"
+        },
+        {
+          "command": "arc.sendSelectedText",
+          "when": "arcSelection && session && key && webviewSection != 'arcLink'",
+          "group": "4_handoff@2"
+        },
+        {
+          "command": "arc.newSessionWithLabels",
+          "when": "session && key && webviewSection != 'arcLink' && webviewSection != 'arcTableLink' && webviewSection != 'arcFile' && !arcSelection",
+          "group": "4_handoff@3"
+        },
+        {
+          "command": "arc.copyPath",
+          "when": "webviewSection == 'arcLink'",
+          "group": "5_copypath@1"
+        },
+        {
+          "command": "arc.copyRelativePath",
+          "when": "webviewSection == 'arcLink'",
+          "group": "5_copypath@2"
+        },
+        {
+          "command": "arc.markTurnRead",
+          "when": "webviewSection == 'arcTurnUnread' || webviewSection == 'arcTurnUnreadSummary'",
+          "group": "1_read@1"
+        },
+        {
+          "command": "arc.markTurnUnread",
+          "when": "webviewSection == 'arcTurnRead' || webviewSection == 'arcTurnReadSummary'",
+          "group": "1_read@1"
+        },
+        {
+          "command": "arc.copyTurnSummary",
+          "when": "webviewSection == 'arcTurnReadSummary' || webviewSection == 'arcTurnUnreadSummary' || webviewSection == 'arcTurnSummary'",
+          "group": "2_copy@1"
+        },
+        {
+          "command": "arc.commentOnTurn",
+          "when": "arcTurn",
+          "group": "3_comment@1"
+        },
+        {
+          "command": "arc.copyTurnComments",
+          "when": "arcComments",
+          "group": "3_comment@2"
+        },
+        {
+          "command": "arc.pinSession",
+          "when": "webviewSection == 'arcSessionLive' && !sessionPinned",
+          "group": "1_triage@1"
+        },
+        {
+          "command": "arc.unpinSession",
+          "when": "webviewSection == 'arcSessionLive' && sessionPinned",
+          "group": "1_triage@1"
+        },
+        {
+          "command": "arc.pinSession",
+          "when": "(webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail') && !sessionPinned && !sessionArchived",
+          "group": "1_triage@1"
+        },
+        {
+          "command": "arc.unpinSession",
+          "when": "(webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail') && sessionPinned && !sessionArchived",
+          "group": "1_triage@1"
+        },
+        {
+          "command": "arc.markSessionRead",
+          "when": "(webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived') && sessionRead == 'unread'",
+          "group": "1_triage@2"
+        },
+        {
+          "command": "arc.markSessionUnread",
+          "when": "(webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived') && sessionRead == 'read'",
+          "group": "1_triage@2"
+        },
+        {
+          "command": "arc.markSessionRead",
+          "when": "webviewSection == 'arcRailUnread'",
+          "group": "1_triage@2"
+        },
+        {
+          "command": "arc.markSessionUnread",
+          "when": "webviewSection == 'arcRailRead'",
+          "group": "1_triage@2"
+        },
+        {
+          "command": "arc.archiveSession",
+          "when": "webviewSection == 'arcSessionLive'",
+          "group": "1_triage@3"
+        },
+        {
+          "command": "arc.unarchiveSession",
+          "when": "webviewSection == 'arcSessionArchived'",
+          "group": "1_triage@3"
+        },
+        {
+          "command": "arc.archiveSession",
+          "when": "(webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail') && !sessionArchived",
+          "group": "1_triage@3"
+        },
+        {
+          "command": "arc.unarchiveSession",
+          "when": "(webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail') && sessionArchived",
+          "group": "1_triage@3"
+        },
+        {
+          "command": "arc.renameSession",
+          "when": "sessionPersisted && (webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived')",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "arc.renameSession",
+          "when": "sessionPersisted && (webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail')",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "arc.labelSession",
+          "when": "webviewSection == 'arcSessionLive'",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "arc.labelSession",
+          "when": "webviewSection == 'arcSessionArchived'",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "arc.labelSession",
+          "when": "webviewSection == 'arcRailUnread'",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "arc.labelSession",
+          "when": "webviewSection == 'arcRailRead'",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "arc.labelSession",
+          "when": "webviewSection == 'arcRail'",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "arc.newSessionWithLabels",
+          "when": "session && (webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived')",
+          "group": "3_new@1"
+        },
+        {
+          "command": "arc.newSessionWithLabels",
+          "when": "session && (webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail')",
+          "group": "3_new@1"
+        },
+        {
+          "command": "arc.copySessionId",
+          "when": "webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived'",
+          "group": "z_details@1"
+        },
+        {
+          "command": "arc.copySessionId",
+          "when": "webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail'",
+          "group": "z_details@1"
+        },
+        {
+          "command": "arc.showSessionDetails",
+          "when": "webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived'",
+          "group": "z_details@2"
+        },
+        {
+          "command": "arc.showSessionDetails",
+          "when": "webviewSection == 'arcRailUnread' || webviewSection == 'arcRailRead' || webviewSection == 'arcRail'",
+          "group": "z_details@2"
+        },
+        {
+          "command": "arc.renameView",
+          "when": "webviewSection == 'arcRailView' && view",
+          "group": "7_view@1"
+        },
+        {
+          "command": "arc.deleteView",
+          "when": "webviewSection == 'arcRailView' && view",
+          "group": "7_view@2"
+        },
+        {
+          "command": "arc.hideComposer",
+          "when": "webviewSection == 'arcComposer'",
+          "group": "1_composer@1"
+        },
+        {
+          "command": "arc.showComposer",
+          "when": "webviewSection == 'arcComposerHidden'",
+          "group": "1_composer@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "arc.copyLink",
+          "when": "false"
+        },
+        {
+          "command": "arc.copyPath",
+          "when": "false"
+        },
+        {
+          "command": "arc.sendResponseLinkWithLabels",
+          "when": "false"
+        },
+        {
+          "command": "arc.sendResponseLink",
+          "when": "false"
+        },
+        {
+          "command": "arc.sendSelectedTextWithLabels",
+          "when": "false"
+        },
+        {
+          "command": "arc.sendSelectedText",
+          "when": "false"
+        },
+        {
+          "command": "arc.newSessionWithLabels",
+          "when": "false"
+        },
+        {
+          "command": "arc.copyRelativePath",
+          "when": "false"
+        },
+        {
+          "command": "arc.markTurnRead",
+          "when": "false"
+        },
+        {
+          "command": "arc.markTurnUnread",
+          "when": "false"
+        },
+        {
+          "command": "arc.copyTurnSummary",
+          "when": "false"
+        },
+        {
+          "command": "arc.commentOnTurn",
+          "when": "false"
+        },
+        {
+          "command": "arc.copyTurnComments",
+          "when": "false"
+        },
+        {
+          "command": "arc.markSessionRead",
+          "when": "false"
+        },
+        {
+          "command": "arc.markSessionUnread",
+          "when": "false"
+        },
+        {
+          "command": "arc.archiveSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.unarchiveSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.pinSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.unpinSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.labelSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.renameSession",
+          "when": "false"
+        },
+        {
+          "command": "arc.showSessionDetails",
+          "when": "false"
+        },
+        {
+          "command": "arc.copySessionId",
+          "when": "false"
+        },
+        {
+          "command": "arc.hideComposer",
+          "when": "false"
+        },
+        {
+          "command": "arc.showComposer",
+          "when": "false"
+        },
+        {
+          "command": "arc.renameView",
+          "when": "false"
+        },
+        {
+          "command": "arc.deleteView",
+          "when": "false"
+        },
+        {
+          "command": "arc.savePerformanceDiagnostics",
+          "when": "true"
+        },
+        {
+          "command": "arc.openDiagnosticsLog",
+          "when": "true"
+        },
+        {
+          "command": "arc.showProjectSpend",
+          "when": "true"
+        },
+        {
+          "command": "arc.newSession",
+          "when": "activeWebviewPanelId == arc.panel"
+        },
+        {
+          "command": "arc.openInEditor",
+          "when": "activeWebviewPanelId != arc.panel"
+        },
+        {
+          "command": "arc.openBeside",
+          "when": "true"
+        },
+        {
+          "command": "arc.resetPanelState",
+          "when": "true"
+        },
+        {
+          "command": "arc.goBack",
+          "when": "false"
+        },
+        {
+          "command": "arc.goForward",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "arc.newSession",
+        "key": "ctrl+n",
+        "mac": "cmd+n",
+        "when": "activeWebviewPanelId == arc.panel"
+      },
+      {
+        "command": "arc.openInEditor",
+        "key": "ctrl+k a",
+        "mac": "cmd+k a"
+      },
+      {
+        "command": "arc.goBack",
+        "key": "alt+left",
+        "mac": "ctrl+-",
+        "linux": "ctrl+alt+-",
+        "when": "activeWebviewPanelId == arc.panel"
+      },
+      {
+        "command": "arc.goForward",
+        "key": "alt+right",
+        "mac": "ctrl+shift+-",
+        "linux": "ctrl+shift+-",
+        "when": "activeWebviewPanelId == arc.panel"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "node --import tsx scripts/check-webview-globals.ts && tsc --noEmit -p tsconfig.json && tsc --noEmit -p src/webview/tsconfig.json",
+    "watch": "node esbuild.mjs --watch",
+    "dev": "node dev.mjs",
+    "test": "node test.mjs full",
+    "test:node": "node test.mjs node",
+    "test:browser": "node test.mjs browser",
+    "shots": "tsx scripts/panel-shots.ts",
+    "tones": "tsx ../.claude/skills/panel-mockup/snapshot-css.ts shots && tsx ../.claude/skills/panel-mockup/tone-sheet.ts shots",
+    "package": "node scripts/package.mjs --no-dependencies --allow-missing-repository -o arc.vsix"
+  },
+  "devDependencies": {
+    "@types/diff": "^5.2.3",
+    "@types/marked": "^4.3.2",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "diff": "^5.2.2",
+    "esbuild": "^0.28.2",
+    "playwright-core": "^1.62.1",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0",
+    "vite": "7.3.6",
+    "vitest": "4.1.11",
+    "yauzl": "^3.4.0"
+  },
+  "dependencies": {
+    "marked": "^4.3.0",
+    "preact": "^10.29.8"
+  }
+}

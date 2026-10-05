@@ -1,0 +1,1 @@
+Review the cross-platform diagnostic capture change. Unix captures must preserve unavailable counters and failures. Windows must retain its existing collector and argument boundaries.

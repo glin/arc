@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-006",
+  "revision": 2,
+  "family": "transcript-lifecycle",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Child lost at next turn boundary",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/codex.ts @ 1ca992c",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/codex.mjs",
+      "sha256": "8c422c333f85a8116a00475fd62505980c9ee60a5e9193dac7697b5c29cb1d5c"
+    },
+    {
+      "path": "src/session-cards.mjs",
+      "sha256": "52c396c8fa7da2c5ded50f422f036f0d97283d956559c6bbf8640595d7edbf3b"
+    }
+  ],
+  "prompt_sha256": "25fd46b6c312eef03100c31a7e2268a2464e0558d354e08a053eae2dde109394",
+  "diff_sha256": "1b4cebda365b8df85aa385ba43b8e505d0d2c71e288750c1f07efb6655c22373",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "high",
+      "summary": "A child of an unterminated turn disappears when another turn begins.",
+      "paths": ["src/codex.mjs"],
+      "scenario": "A child starts after a parent turn receives a stale inferred end. A later turn starts."
+    }
+  ],
+  "audit": "Adapted containment projection. It checks an inferred parent end and one subsequent turn."
+}

@@ -1,0 +1,165 @@
+diff --git a/src/sessioncost.mjs b/src/sessioncost.mjs
+index 46c91f72..ef2ebe13 100644
+--- a/src/sessioncost.mjs
++++ b/src/sessioncost.mjs
+@@ -256,8 +256,10 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+   const codexTools = /* @__PURE__ */ new Map();
+   const compactionPlaceholders = /* @__PURE__ */ new Set();
+   const billingRecords = /* @__PURE__ */ new Map();
++  const snapshotPositions = /* @__PURE__ */ new Map();
+   let pendingCompactionResponseId = null;
+   let afterCompaction = false;
++  let position = 0;
+   const consumeCodexTools = (event, previous = 0) => {
+     if (!codex || event.linkedInvocationId) return previous;
+     const turnId = /^codex:([^:]+):/.exec(event.requestKey)?.[1];
+@@ -272,6 +274,7 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+   };
+   const complete = scanLines(file, (line) => {
+     if (!line) return;
++    position++;
+     if (codex && line.includes("token_usage_record")) {
+       try {
+         const raw = JSON.parse(line);
+@@ -282,23 +285,26 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+           if (usage && turnId && !state.currentTurnCopied && !state.foreignSessionMeta && usage.input + usage.cacheRead + (usage.cacheWrite30m ?? 0) + usage.output + usage.thinking > 0) {
+             const model = state.turnModels[turnId] ?? null;
+             const provider = state.provider;
++            const billed = {
++              timestamp: Date.parse(raw.timestamp ?? "") || 0,
++              agent: "codex",
++              provider,
++              model,
++              contextWindow: state.turnWindows[turnId] ?? null,
++              contextBand: null,
++              billingClass: provider && provider !== "openai" ? "metered" : state.planType ? "subscription" : state.planKnown ? "metered" : "unknown",
++              inferenceClass: null,
++              serviceTier: state.serviceTier,
++              reportedCost: null,
++              usage,
++              requestKey: `codex-billing:${raw.payload.response_id}`,
++              toolCalls: 0
++            };
++            billed.toolCalls = consumeCodexTools({ ...billed, requestKey: `codex:${turnId}:billing` });
+             billingRecords.set(raw.payload.response_id, {
+               turnId,
+-              request: {
+-                timestamp: Date.parse(raw.timestamp ?? "") || 0,
+-                agent: "codex",
+-                provider,
+-                model,
+-                contextWindow: state.turnWindows[turnId] ?? null,
+-                contextBand: null,
+-                billingClass: provider && provider !== "openai" ? "metered" : state.planType ? "subscription" : state.planKnown ? "metered" : "unknown",
+-                inferenceClass: null,
+-                serviceTier: state.serviceTier,
+-                reportedCost: null,
+-                usage,
+-                requestKey: `codex-billing:${raw.payload.response_id}`,
+-                toolCalls: 0
+-              }
++              request: billed,
++              position
+             });
+           }
+         }
+@@ -329,6 +335,9 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+       }
+     }
+     const record = codex ? codexSnapshotRecord(line) : null;
++    if (record?.kind === "task_started" || record?.kind === "task_complete" || record?.kind === "turn_aborted") {
++      pendingCompactionResponseId = null;
++    }
+     if (record?.kind === "compacted") afterCompaction = true;
+     const placeholder = afterCompaction && record?.kind === "token_count" && record.zeroUsage;
+     const pendingBefore = placeholder ? new Set(reducer.pendingRequestKeys()) : null;
+@@ -347,7 +356,15 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+         codexTools.set(turnId, held);
+       }
+     }
++    const priorRequestNumber = codex && record?.kind === "token_count" ? reducer.snapshot().requestNumber : null;
+     const events = reducer.pushLine(line);
++    if (codex && record?.kind === "token_count") {
++      const state = reducer.snapshot();
++      if (state.requestNumber !== priorRequestNumber) {
++        const key = events.find((event) => event.agent === "codex")?.requestKey ?? state.pendingRequestKeys.at(-1);
++        if (key) snapshotPositions.set(key, position);
++      }
++    }
+     if (placeholder) {
+       for (const key of reducer.pendingRequestKeys()) {
+         if (!pendingBefore?.has(key)) compactionPlaceholders.add(key);
+@@ -378,6 +395,14 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+   if (!complete) throw new Error(`Cannot read transcript: ${file}`);
+   if (codex) {
+     const state = reducer.snapshot();
++    for (const [id, billed] of billingRecords) {
++      if (state.copiedTurnIds[billed.turnId]) {
++        billingRecords.delete(id);
++        continue;
++      }
++      billed.request.model ??= state.turnModels[billed.turnId] ?? null;
++      billed.request.contextWindow ??= state.turnWindows[billed.turnId] ?? null;
++    }
+     for (const events of Object.values(state.pendingRequests)) {
+       for (const event of events) {
+         ordered.set(event.requestKey, { ...event, incomplete: true, toolCalls: consumeCodexTools(event) });
+@@ -393,15 +418,50 @@ function readSessionRequests(file, role = isCodex(file) ? "codex" : "claude", in
+     toolCalls: codex ? request.toolCalls : toolIds.get(request.requestKey)?.size ?? 0
+   }));
+   if (!codex || !billingRecords.size) return requests;
+-  const matched = /* @__PURE__ */ new Set();
+-  for (const { turnId, request: billed } of billingRecords.values()) {
+-    const match = requests.find(
+-      (request) => !matched.has(request.requestKey) && request.agent === "codex" && request.requestKey.startsWith(`codex:${turnId}:`) && usageSignature(request.usage) === usageSignature(billed.usage)
+-    );
+-    if (match) matched.add(match.requestKey);
+-    else requests.push(billed);
++  const snapshotsByTurn = /* @__PURE__ */ new Map();
++  for (const request of requests) {
++    if (request.agent !== "codex") continue;
++    const turnId = /^codex:([^:]+):/.exec(request.requestKey)?.[1];
++    if (!turnId) continue;
++    const byUsage = snapshotsByTurn.get(turnId) ?? /* @__PURE__ */ new Map();
++    snapshotsByTurn.set(turnId, byUsage);
++    const signature = request.incomplete ? "incomplete" : usageSignature(request.usage);
++    const queue = byUsage.get(signature) ?? { items: [], next: 0 };
++    queue.items.push(request);
++    byUsage.set(signature, queue);
+   }
+-  return requests.sort((left, right) => left.timestamp - right.timestamp);
++  const matched = /* @__PURE__ */ new Set();
++  const replaced = /* @__PURE__ */ new Set();
++  for (const { turnId, request: billed, position: billingPosition } of billingRecords.values()) {
++    const byUsage = snapshotsByTurn.get(turnId);
++    const exact = byUsage?.get(usageSignature(billed.usage));
++    const incomplete = byUsage?.get("incomplete");
++    const eligible = (queue) => {
++      if (!queue) return void 0;
++      while (queue.next < queue.items.length) {
++        const candidate = queue.items[queue.next];
++        if ((snapshotPositions.get(candidate.requestKey) ?? 0) >= billingPosition) return candidate;
++        queue.next++;
++      }
++      return void 0;
++    };
++    const exactCandidate = eligible(exact);
++    const incompleteCandidate = eligible(incomplete);
++    const match = exactCandidate && incompleteCandidate ? (snapshotPositions.get(exactCandidate.requestKey) ?? 0) < (snapshotPositions.get(incompleteCandidate.requestKey) ?? 0) ? exactCandidate : incompleteCandidate : exactCandidate ?? incompleteCandidate;
++    if (match) {
++      const queue = match === exactCandidate ? exact : incomplete;
++      if (queue) queue.next++;
++      matched.add(match.requestKey);
++      if (match.incomplete) {
++        replaced.add(match.requestKey);
++        billed.toolCalls += match.toolCalls;
++        requests.push(billed);
++      } else {
++        match.toolCalls += billed.toolCalls;
++      }
++    } else requests.push(billed);
++  }
++  return requests.filter((request) => !replaced.has(request.requestKey)).sort((left, right) => left.timestamp - right.timestamp);
+ }
+ function sessionSources(file, roots = {}) {
+   const absolute = path.resolve(file);

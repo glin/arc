@@ -1,0 +1,106 @@
+{
+  "schema": "arc-review-case-v1",
+  "id": "case-004",
+  "source_kind": "accepted_review",
+  "family": "build-and-development-runtime",
+  "case_revision": 1,
+  "key_revision": 1,
+  "source": {
+    "base": "cb8fa7802b33b16b7ff5fe62fcfdecd4d56cc689",
+    "candidate": "141b7083cb7d6464aca2ac1119302e59ee2230c2",
+    "correction": "a44b5ddd5f00fe89cb7233b160f1dc2efa4e5f2e"
+  },
+  "key_state": "historical-partial",
+  "historical_context": {
+    "original_prompt": null,
+    "plan": null
+  },
+  "fixture_paths": [
+    "extension/src/transcript.ts",
+    "extension/src/webview/development.ts",
+    "extension/src/webview/bootstrap.ts",
+    "test/CHECKLIST.md"
+  ],
+  "keys": [
+    {
+      "id": "defect-001",
+      "severity": "high",
+      "summary": "A malformed transcript text block aborts parsing.",
+      "paths": ["extension/src/transcript.ts"],
+      "evidence": {
+        "scope": "A malformed transcript text block aborts parsing.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 141b7083cb7d6464aca2ac1119302e59ee2230c2",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-002",
+      "severity": "high",
+      "summary": "The development panel starts with an unresolved prompt asset token.",
+      "paths": ["extension/src/webview/development.ts"],
+      "evidence": {
+        "scope": "The development panel starts with an unresolved prompt asset token.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 141b7083cb7d6464aca2ac1119302e59ee2230c2",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-003",
+      "severity": "high",
+      "summary": "A component reload leaves the replacement document empty until another render event.",
+      "paths": ["extension/src/webview/bootstrap.ts"],
+      "evidence": {
+        "scope": "A component reload leaves the replacement document empty until another render event.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 141b7083cb7d6464aca2ac1119302e59ee2230c2",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-004",
+      "severity": "high",
+      "summary": "A server restart loses scroll, filters, and disclosures.",
+      "paths": ["extension/src/webview/development.ts"],
+      "evidence": {
+        "scope": "A server restart loses scroll, filters, and disclosures.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 141b7083cb7d6464aca2ac1119302e59ee2230c2",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-005",
+      "severity": "medium",
+      "summary": "The checklist command calls a deleted smoke script.",
+      "paths": ["test/CHECKLIST.md"],
+      "evidence": {
+        "scope": "The checklist command calls a deleted smoke script.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 141b7083cb7d6464aca2ac1119302e59ee2230c2",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    }
+  ]
+}

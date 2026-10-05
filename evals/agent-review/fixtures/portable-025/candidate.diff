@@ -1,0 +1,28 @@
+diff --git a/extension/src/projectspend.ts b/extension/src/projectspend.ts
+--- a/extension/src/projectspend.ts	
++++ b/extension/src/projectspend.ts	
+@@ -1513,13 +1513,6 @@
+         if (line.length && line[line.length - 1] === 0x0d) {
+           line = line.subarray(0, line.length - 1);
+         }
+-        if (completedOffset > 0) {
+-          let firstContent = 0;
+-          while (line[firstContent] === 0) {
+-            firstContent++;
+-          }
+-          line = line.subarray(firstContent);
+-        }
+         for (const event of reducer.pushLine(line.toString('utf8'))) {
+           add(event);
+         }
+@@ -1529,10 +1522,6 @@
+       held = Buffer.from(bytes.subarray(lineStart));
+     }
+     const complete = position >= size;
+-    if (complete && completedOffset > 0 && held.length > 0 && held.every((byte) => byte === 0)) {
+-      completedOffset = position;
+-      held = Buffer.alloc(0);
+-    }
+     return {
+       offset: completedOffset,
+       trailing: held,

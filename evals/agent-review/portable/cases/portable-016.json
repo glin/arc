@@ -1,0 +1,45 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-016",
+  "revision": 1,
+  "family": "style-guard",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Mixed-case absolute CSS unit escapes guard",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/timeline.webview.test.ts @ 698bfed",
+    "limitations": "Focused adaptation of recorded Arc behavior. This public holdout is a selection split, not a secret benchmark."
+  },
+  "inputs": [
+    {
+      "path": "src/style-guard.mjs",
+      "sha256": "8080753787ca19dab14e9d211be4a035baca6bfdf49ac70ccb80e387290209cc"
+    },
+    {
+      "path": "src/stylesheet-scan.mjs",
+      "sha256": "c9395d454c85e2b1a9311fb64601676412bc8d950d8d67e4fd97bc952ca45985"
+    },
+    {
+      "path": "src/relative.css",
+      "sha256": "84f9f3eeaffab1338a587443281ec3c4e9da25010a095b3eb6bdb80a4bc5db24"
+    },
+    {
+      "path": "src/panel.css",
+      "sha256": "3f4c473df24f326791614762c25672c4133b1da025974adfbde85d961dde7c8d"
+    }
+  ],
+  "prompt_sha256": "74a7f51520f5697f55bdb114c84b38f0eae74a62d963fad7531d784ab435ce0a",
+  "diff_sha256": "b4877654033d01813c0095984fedbe02d3b78081a77d48c69ab25b3d0ef8621a",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "A mixed-case absolute font size passes the style guard.",
+      "paths": ["src/style-guard.mjs"],
+      "scenario": "A stylesheet includes FONT-SIZE: 10PX and should fail the relative-unit rule."
+    }
+  ],
+  "audit": "Adapted text guard. It checks a mixed-case property and unit, not full CSS grammar."
+}

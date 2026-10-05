@@ -1,0 +1,210 @@
+import * as path from 'node:path';
+
+export interface SchedulerClock {
+  now(): number;
+  setTimer(callback: () => void, delayMs: number): unknown;
+  clearTimer(timer: unknown): void;
+}
+
+export interface ScheduledRun {
+  cause: 'quiet' | 'maximum' | 'flush';
+  firstAt: number;
+  lastAt: number;
+  firedAt: number;
+}
+
+const systemClock: SchedulerClock = {
+  now: () => Date.now(),
+  setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
+export class BoundedTrailingScheduler {
+  private quietTimer: unknown | null = null;
+  private maximumTimer: unknown | null = null;
+  private firstAt: number | null = null;
+  private lastAt: number | null = null;
+
+  constructor(
+    private readonly quietMs: number,
+    private readonly maximumMs: number,
+    private readonly run: (event: ScheduledRun) => void,
+    private readonly clock: SchedulerClock = systemClock,
+  ) {
+    if (!(quietMs > 0) || !(maximumMs >= quietMs)) {
+      throw new Error('A bounded scheduler needs a positive quiet period no longer than its maximum wait.');
+    }
+  }
+
+  offer(): void {
+    const now = this.clock.now();
+    if (this.firstAt === null) {
+      this.firstAt = now;
+      this.maximumTimer = this.clock.setTimer(() => this.fire('maximum'), this.maximumMs);
+    }
+    this.lastAt = now;
+    if (this.quietTimer !== null) {
+      this.clock.clearTimer(this.quietTimer);
+    }
+    this.quietTimer = this.clock.setTimer(() => this.fire('quiet'), this.quietMs);
+  }
+
+  flush(): boolean {
+    if (this.firstAt === null) {
+      return false;
+    }
+    this.fire('flush');
+    return true;
+  }
+
+  cancel(): void {
+    this.clearTimers();
+    this.firstAt = null;
+    this.lastAt = null;
+  }
+
+  get pending(): boolean {
+    return this.firstAt !== null;
+  }
+
+  pendingAge(now = this.clock.now()): number | null {
+    return this.firstAt === null ? null : Math.max(0, now - this.firstAt);
+  }
+
+  private fire(cause: ScheduledRun['cause']): void {
+    if (this.firstAt === null || this.lastAt === null) {
+      return;
+    }
+    const event: ScheduledRun = {
+      cause,
+      firstAt: this.firstAt,
+      lastAt: this.lastAt,
+      firedAt: this.clock.now(),
+    };
+    this.clearTimers();
+    this.firstAt = null;
+    this.lastAt = null;
+    this.run(event);
+  }
+
+  private clearTimers(): void {
+    if (this.quietTimer !== null) {
+      this.clock.clearTimer(this.quietTimer);
+    }
+    if (this.maximumTimer !== null) {
+      this.clock.clearTimer(this.maximumTimer);
+    }
+    this.quietTimer = null;
+    this.maximumTimer = null;
+  }
+}
+
+export type WatcherWakeReason = 'transcript' | 'activity-fallback';
+
+export interface WatcherWakeBatch {
+  eventCount: number;
+  changedPaths: string[];
+  broadRequired: boolean;
+  reasons: WatcherWakeReason[];
+}
+
+export class PendingWatcherWake {
+  private eventCount = 0;
+  private readonly changedPaths = new Set<string>();
+  private broadRequired = false;
+  private readonly reasons = new Set<WatcherWakeReason>();
+
+  noteFileEvent(
+    directory: string,
+    filename: unknown,
+    kind: string,
+    normalize: (file: string) => string = (file) => file,
+  ): boolean {
+    if (typeof filename === 'string' && !filename.endsWith('.jsonl')) {
+      return false;
+    }
+    this.eventCount++;
+    this.reasons.add('transcript');
+    if (typeof filename !== 'string') {
+      this.broadRequired = true;
+      return true;
+    }
+    this.changedPaths.add(normalize(path.join(directory, filename)));
+    if (kind !== 'change') {
+      this.broadRequired = true;
+    }
+    return true;
+  }
+
+  requireBroad(reason: WatcherWakeReason): void {
+    this.broadRequired = true;
+    this.reasons.add(reason);
+  }
+
+  snapshot(): WatcherWakeBatch {
+    return {
+      eventCount: this.eventCount,
+      changedPaths: [...this.changedPaths].sort(),
+      broadRequired: this.broadRequired,
+      reasons: [...this.reasons].sort(),
+    };
+  }
+
+  take(): WatcherWakeBatch {
+    const batch = this.snapshot();
+    this.eventCount = 0;
+    this.changedPaths.clear();
+    this.broadRequired = false;
+    this.reasons.clear();
+    return batch;
+  }
+
+  clear(): void {
+    this.take();
+  }
+}
+
+export function watcherRefreshDecision(
+  batch: WatcherWakeBatch,
+  knownPath: (file: string) => boolean,
+): { kind: 'broad' | 'targeted'; changedPaths: string[] } {
+  if (batch.broadRequired || batch.changedPaths.length === 0 || batch.changedPaths.some((file) => !knownPath(file))) {
+    return { kind: 'broad', changedPaths: [] };
+  }
+  return { kind: 'targeted', changedPaths: batch.changedPaths };
+}
+
+// How long a catalog refresh holds the triggers that wait behind it. After this, the next waiting
+// trigger abandons the refresh in flight and runs, so a worker request that never answers cannot
+// hold every later refresh. A walk that answers within this time is never abandoned.
+export const CATALOG_REFRESH_DEADLINE_MS = 30_000;
+
+export interface RefreshRequest {
+  reason: string;
+  force: boolean;
+  reuseCatalog: boolean;
+  metadataAfterRender: boolean;
+  // Null or empty asks for the broad catalog walk unless the request reuses the held catalog.
+  changedPaths: string[] | null;
+}
+
+// Folds a refresh request into the one that waits behind the refresh in flight. The result
+// does everything that either request asked for. A request that reuses the held catalog asks
+// for no walk. Two targeted requests revalidate the union of their files, and any broad
+// request makes the result broad. A render before metadata stays only when both accept it.
+export function mergeRefreshRequests(pending: RefreshRequest | null, next: RefreshRequest): RefreshRequest {
+  const requests = pending ? [pending, next] : [next];
+  const reuseCatalog = requests.every((request) => request.reuseCatalog);
+  const walking = requests.filter((request) => !request.reuseCatalog);
+  const changedPaths =
+    !reuseCatalog && walking.every((request) => request.changedPaths?.length)
+      ? [...new Set(walking.flatMap((request) => request.changedPaths ?? []))]
+      : null;
+  return {
+    reason: pending && pending.reason !== next.reason ? 'coalesced' : next.reason,
+    force: requests.some((request) => request.force),
+    reuseCatalog,
+    metadataAfterRender: requests.every((request) => request.metadataAfterRender),
+    changedPaths,
+  };
+}

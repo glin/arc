@@ -1,0 +1,11 @@
+diff --git a/src/turncard.mjs b/src/turncard.mjs
+--- a/src/turncard.mjs
++++ b/src/turncard.mjs
+@@ -1,4 +1,4 @@
+-const order = ['own','delegated'];
+-export function costRows(costs) {
+-  return order.map(kind => ({kind, dollars: costs[kind] ?? 0}));
++const order = ['own','delegated','tool'];
++export function costRows(costs) {
++  return order.map(kind => ({kind, dollars: costs[kind] ?? 0})).sort((a,b) => b.dollars - a.dollars);
+ }

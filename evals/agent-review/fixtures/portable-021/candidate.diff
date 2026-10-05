@@ -1,0 +1,100 @@
+diff --git a/src/domain/rail-filters.mjs b/src/domain/rail-filters.mjs
+index f70d64e3..2105c787 100644
+--- a/src/domain/rail-filters.mjs
++++ b/src/domain/rail-filters.mjs
+@@ -15,12 +15,22 @@ const ALL_RAIL_FILTER_ID = "all";
+ const OLD_NEEDS_YOU_FILTER_ID = "needs-you";
+ const OLD_NEEDS_YOU_LENS = "needs-you";
+ const OLD_NEEDS_YOU_WORDS = "is:needsyou -is:archived -is:agentrun";
+-const RESERVED_RAIL_FILTER_NAMES = ["All sessions", "Active", "Needs you", "Custom"];
++const RESERVED_RAIL_FILTER_NAMES = [
++  "All sessions",
++  "Active",
++  "Unread",
++  "Needs input",
++  "Needs you",
++  "Custom"
++];
+ const RESERVED_RAIL_FILTER_KEYS = new Set(RESERVED_RAIL_FILTER_NAMES.map((name) => railFilterKey(name)));
+-const RAIL_LENSES = ["active"];
++const RAIL_LENSES = ["active", "unread", "input"];
+ const RAIL_LENS_WORDS = {
+-  active: "is:active -is:archived -is:agentrun"
++  active: "is:active -is:archived -is:agentrun",
++  unread: "is:unread -is:archived -is:agentrun",
++  input: "is:input -is:archived -is:agentrun"
+ };
++const RAIL_KEEPING_LENSES = ["unread", "input"];
+ const RAIL_FILTER_STORED_QUERY_LIMIT = RAIL_FILTER_QUERY_LIMIT + Math.max(OLD_NEEDS_YOU_WORDS.length, ...RAIL_LENSES.map((lens) => RAIL_LENS_WORDS[lens].length)) + 1;
+ function isRailLens(raw) {
+   return RAIL_LENSES.includes(raw);
+@@ -151,6 +161,13 @@ function railQueryHoldsLens(query, lens) {
+   const held = new Set(queryWords(query).map((word) => word.key));
+   return queryWords(RAIL_LENS_WORDS[lens]).every((word) => held.has(word.key));
+ }
++function railQueryLenses(query) {
++  const held = new Set(queryWords(query).map((word) => word.key));
++  return RAIL_LENSES.filter((lens) => railLensKeys(lens).every((key) => held.has(key)));
++}
++function railQueryHeldLens(query) {
++  return railQueryLenses(query)[0] ?? null;
++}
+ function railQueryLens(query) {
+   if (queryWords(query).some((word) => word.key === null)) {
+     return null;
+@@ -163,11 +180,17 @@ function railLensKeys(lens) {
+ function withoutWords(query, drop) {
+   return queryWords(query).filter((word) => word.key === null || !drop.has(word.key)).map((word) => word.text).join(" ");
+ }
+-function withoutRailLens(query, lens) {
+-  return railQueryHoldsLens(query, lens) ? withoutWords(query, new Set(railLensKeys(lens))) : query;
++function withoutOtherRailLenses(query, kept) {
++  const held = railQueryLenses(query).filter((lens) => lens !== kept);
++  if (!held.length) {
++    return query;
++  }
++  const keep = new Set(kept === null ? [] : railLensKeys(kept));
++  const drop = new Set(held.flatMap((lens) => railLensKeys(lens)).filter((key) => !keep.has(key)));
++  return withoutWords(query, drop);
+ }
+ function withoutRailLenses(query) {
+-  return RAIL_LENSES.reduce((rest, lens) => withoutRailLens(rest, lens), query);
++  return withoutOtherRailLenses(query, null);
+ }
+ function withRailLensWords(query, lens) {
+   const held = new Set(queryWords(query).map((word) => word.key));
+@@ -175,10 +198,10 @@ function withRailLensWords(query, lens) {
+   return [...words, query.trim()].filter(Boolean).join(" ");
+ }
+ function withRailLens(query, lens) {
+-  return lens === null ? withoutRailLenses(query) : withRailLensWords(query, lens);
++  return lens === null ? withoutRailLenses(query) : withRailLensWords(withoutOtherRailLenses(query, lens), lens);
+ }
+ function pressRailLens(query, lens) {
+-  return railQueryHoldsLens(query, lens) ? withoutRailLens(query, lens) : withRailLens(query, lens);
++  return railQueryHoldsLens(query, lens) ? withoutRailLenses(query) : withRailLens(query, lens);
+ }
+ function termNames(term, field, value) {
+   return term.field === field && labelKey(term.needle) === labelKey(value);
+@@ -206,6 +229,7 @@ export {
+   RAIL_FILTER_NAME_LIMIT,
+   RAIL_FILTER_QUERY_LIMIT,
+   RAIL_FILTER_STORED_QUERY_LIMIT,
++  RAIL_KEEPING_LENSES,
+   RAIL_LENSES,
+   RAIL_LENS_WORDS,
+   RESERVED_RAIL_FILTER_NAMES,
+@@ -224,11 +248,12 @@ export {
+   railFilterQuery,
+   railFilterTermNegated,
+   railFilterTermSelected,
++  railQueryHeldLens,
+   railQueryHoldsLens,
+   railQueryLens,
++  railQueryLenses,
+   sameRailFilterLens,
+   toggleRailFilterTerm,
+   withRailLens,
+-  withoutRailLens,
+   withoutRailLenses
+ };

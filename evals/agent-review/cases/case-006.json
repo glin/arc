@@ -1,0 +1,85 @@
+{
+  "schema": "arc-review-case-v1",
+  "id": "case-006",
+  "source_kind": "accepted_review",
+  "family": "panel-rendering",
+  "case_revision": 1,
+  "key_revision": 1,
+  "source": {
+    "base": "a38f5029d8ddcdcc939b92d97ecaa4597fc568b7",
+    "candidate": "28433f1c355319fd06e572dffd377953ea8bf661",
+    "correction": "b1f0a6c232de4fdcab9c965a7f1ff692efb8962b"
+  },
+  "key_state": "historical-partial",
+  "historical_context": {
+    "original_prompt": null,
+    "plan": null
+  },
+  "fixture_paths": ["extension/src/webview/panel.js", "extension/src/webview/timeline-renderer.ts"],
+  "keys": [
+    {
+      "id": "defect-001",
+      "severity": "high",
+      "summary": "A replacement view destroys selected text or a painted comment anchor.",
+      "paths": ["extension/src/webview/panel.js"],
+      "evidence": {
+        "scope": "A replacement view destroys selected text or a painted comment anchor.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 28433f1c355319fd06e572dffd377953ea8bf661",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-002",
+      "severity": "high",
+      "summary": "A background insertion steals the roving Tab stop.",
+      "paths": ["extension/src/webview/panel.js"],
+      "evidence": {
+        "scope": "A background insertion steals the roving Tab stop.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 28433f1c355319fd06e572dffd377953ea8bf661",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-003",
+      "severity": "medium",
+      "summary": "Active-turn removal focuses a compaction before the next turn.",
+      "paths": ["extension/src/webview/timeline-renderer.ts"],
+      "evidence": {
+        "scope": "Active-turn removal focuses a compaction before the next turn.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 28433f1c355319fd06e572dffd377953ea8bf661",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    },
+    {
+      "id": "defect-004",
+      "severity": "medium",
+      "summary": "A conversation without recorded cards lacks a stable transient mount.",
+      "paths": ["extension/src/webview/timeline-renderer.ts"],
+      "evidence": {
+        "scope": "A conversation without recorded cards lacks a stable transient mount.",
+        "reach": "candidate",
+        "mode": "review",
+        "disposition": "accepted",
+        "source": "private Arc E2 benchmark, commit 28433f1c355319fd06e572dffd377953ea8bf661",
+        "sha256": "5b84c6638696f56a3dc53a21f26c1694d8ee95cad1c8c677480c448fada5aac5",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    }
+  ]
+}

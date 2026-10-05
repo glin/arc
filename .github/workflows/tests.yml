@@ -1,0 +1,92 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# The jobs run side by side. Together they run what `npm test` runs in one process.
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            extension/package-lock.json
+            cli/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix extension ci
+          npm --prefix cli ci
+      - name: Check formatting
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            extension/package-lock.json
+            cli/package-lock.json
+      - name: Install zsh and ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zsh imagemagick
+          # Ubuntu ships ImageMagick 6, which has no magick command. The panel shots call
+          # `magick <in> <out>` and `magick compare`, which map to convert and compare.
+          printf '#!/bin/sh\nif [ "$1" = compare ]; then shift; exec compare "$@"; fi\nexec convert "$@"\n' \
+            | sudo tee /usr/local/bin/magick > /dev/null
+          sudo chmod +x /usr/local/bin/magick
+          magick -list format | grep -i webp
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix extension ci
+          npm --prefix cli ci
+      - name: Root tests
+        run: npm run test:root
+      - name: Panel-mockup tests
+        run: npm run test:panel-mockup
+      - name: Extension node lane
+        run: npm --prefix extension run test:node
+      - name: CLI tests
+        run: npm --prefix cli run test:unit
+      - name: Smoke tests
+        run: npm run test:smoke
+
+  browser:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            extension/package-lock.json
+            cli/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix extension ci
+      - name: Extension browser lane, part ${{ matrix.shard }} of 3
+        run: npm --prefix extension run test:browser -- --shard=${{ matrix.shard }}/3

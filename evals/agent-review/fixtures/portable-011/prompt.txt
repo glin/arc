@@ -1,0 +1,3 @@
+Review the proposed rail payload guard. Every serialized row must remain within the configured byte ceiling.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

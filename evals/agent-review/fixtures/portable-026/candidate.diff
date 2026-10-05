@@ -1,0 +1,338 @@
+diff --git a/extension/src/panelhost.ts b/extension/src/panelhost.ts
+index 9840781b..2625110f 100644
+--- a/extension/src/panelhost.ts
++++ b/extension/src/panelhost.ts
+@@ -142,6 +142,8 @@ import {
+   unsentBySession,
+   webviewPanelState,
+   withSweptDraftLabels,
++  remapReaderParents,
++  abandonReaderParents,
+ } from './turnview';
+ import { DRAFT_SESSION_PREFIX, adoptLabelSession, labelEditorReply, labelsOf, setSessionLabels } from './turnlabels';
+ import { normalizeSavedViews } from './domain/views.ts';
+@@ -2947,6 +2949,7 @@ export class PanelProvider implements vscode.Disposable {
+     text: string,
+     copyLabels: boolean,
+     host?: PanelHost,
++    readerParent: boolean = false,
+   ): HandoffRefusal | null {
+     const turn = key === null ? null : this.turnsByKey.get(key);
+     if (key !== null && (!turn || turn.sessionId !== session)) {
+@@ -2957,7 +2960,7 @@ export class PanelProvider implements vscode.Disposable {
+       return 'source';
+     }
+     if (!source.settings?.selectedModel && this.attachmentRecoveryPending?.(session)) {
+-      void this.finishHandoffRecovery(session, key, text, copyLabels, owner);
++      void this.finishHandoffRecovery(session, key, text, copyLabels, owner, undefined, readerParent);
+       return null;
+     }
+     const profile = launcherProfile(view, { kind: 'row', key: 'current' });
+@@ -2983,6 +2986,7 @@ export class PanelProvider implements vscode.Disposable {
+     }
+     const origin = key === null ? null : { sessionId: session, turnKey: key };
+     this.createDraft(id, cwd, source.sessionId, Date.now(), profile, origin, text);
++    if (readerParent) this.saved.readerParents = { ...this.saved.readerParents, [id]: source.sessionId };
+     void this.writeDrafts();
+     if (labels.length) {
+       void this.post({ type: 'labelsChanged', session: id });
+@@ -3005,6 +3009,7 @@ export class PanelProvider implements vscode.Disposable {
+     copyLabels: boolean,
+     owner?: PanelHost,
+     launch?: { request?: LauncherRequest },
++    readerParent: boolean = false,
+   ): Promise<void> {
+     const generation = this.selectionGeneration;
+     const initiatingSession = owner ? this.hostSessions.get(owner) : this.showing;
+@@ -3066,7 +3071,7 @@ export class PanelProvider implements vscode.Disposable {
+             this.newSession(launch.request, owner);
+             return;
+           }
+-          const refusal = this.createHandoffDraft(sessionId, key, text, copyLabels, owner);
++          const refusal = this.createHandoffDraft(sessionId, key, text, copyLabels, owner, readerParent);
+           if (refusal) void vscode.window.showInformationMessage(handoffRefusalMessage(refusal, key !== null));
+           return;
+         }
+@@ -3101,7 +3106,7 @@ export class PanelProvider implements vscode.Disposable {
+     if (!arm || arm.session !== session || Date.now() - arm.at > 30_000 || !this.hosts.includes(arm.host)) {
+       return;
+     }
+-    const refusal = this.createHandoffDraft(session, null, '', true, arm.host);
++    const refusal = this.createHandoffDraft(session, null, '', true, arm.host, true);
+     if (refusal) {
+       void vscode.window.showInformationMessage(handoffRefusalMessage(refusal, false));
+     }
+@@ -3197,6 +3202,7 @@ export class PanelProvider implements vscode.Disposable {
+     this.showing = next.showing;
+     delete this.draftCommentIds[draftId];
+     delete this.newDrafts[draftId];
++    this.saved.readerParents = abandonReaderParents(this.saved.readerParents ?? {}, draftId);
+     delete this.mcpServers[draftId];
+     this.onDraftRemoved?.(removed);
+     // The labels go with the draft. A session that never started has no card to draw
+@@ -3223,6 +3229,7 @@ export class PanelProvider implements vscode.Disposable {
+       throw new Error(`session ${actual} is already waiting for its record`);
+     }
+     const archivedIdentityMoved = this.hidden.has(provisional);
++    this.saved.readerParents = remapReaderParents(this.saved.readerParents ?? {}, provisional, actual);
+     const next = adoptSessionIdentity(
+       {
+         drafts: this.drafts,
+@@ -5732,7 +5739,9 @@ export class PanelProvider implements vscode.Disposable {
+       ...Object.values(this.draftCommentIds).flat(),
+     ]);
+     const acceptedComments = this.saved.comments.filter((comment) => acceptedCommentIds.has(comment.id));
++    const readerParents = this.saved.readerParents;
+     this.saved = normalizePanelState(null);
++    this.saved.readerParents = readerParents;
+     // Forgetting is starting over, and starting over in a workspace means what opening one
+     // for the first time means: what is already there is not new.
+     this.saved.since = Date.now();
+@@ -8012,8 +8021,13 @@ export class PanelProvider implements vscode.Disposable {
+     return this.sessionParentEdgeSet;
+   }
+ 
+-  // The session that started `session`, for its heading, from the edges the last render built.
++  // The reader-started or delegated parent of `session`, from current catalog titles.
+   private parentOfShown(session: string | null): SessionParent | undefined {
++    const parentId = session ? this.saved.readerParents?.[session] : undefined;
++    if (parentId) {
++      const parent = this.sessionRows.find((row) => row.id === parentId);
++      return parent ? { id: parent.id, label: parent.label, relation: 'reader' } : undefined;
++    }
+     const held = this.sessionParentEdgeSet;
+     return held ? sessionParentOf(this.sessionRows, held.edges, session) : undefined;
+   }
+@@ -9771,7 +9785,15 @@ export class PanelProvider implements vscode.Disposable {
+     const parsed = parsePanelToHost(raw);
+     const browserSession = parsed && 'session' in parsed ? parsed.session : null;
+     const message =
+-      parsed && 'session' in parsed ? { ...parsed, session: this.panelSession(parsed.session, host) } : parsed;
++      parsed && 'session' in parsed
++        ? {
++            ...parsed,
++            session:
++              parsed.type === 'showReaderParent'
++                ? resolveSessionAlias(this.sessionAliases, parsed.session)
++                : this.panelSession(parsed.session, host),
++          }
++        : parsed;
+     if (!message) {
+       const named = raw !== null && typeof raw === 'object' ? (raw as { type?: unknown }).type : raw;
+       console.warn('Arc: a message from the panel was not understood, so nothing was done.', named);
+@@ -10055,6 +10077,9 @@ export class PanelProvider implements vscode.Disposable {
+       },
+       // Which session to show. An id the workspace no longer has, and the empty string,
+       // both fall to the newest in `refresh` below: the panel never draws no session.
++      showReaderParent: (msg) => {
++        this.show(msg.session || null, host);
++      },
+       showSession: (msg) => {
+         this.show(msg.session || null, host);
+       },
+@@ -10338,6 +10363,7 @@ export class PanelProvider implements vscode.Disposable {
+     // second host, opened before the reader filed anything, would write that empty set
+     // over every label the first host had put on.
+     const labels = this.saved.labels;
++    const readerParents = this.saved.readerParents;
+     // The saved views are held for the labels' reason. The panel posts them through a message
+     // of its own, so a state save carries back the copy that panel was served, and a second
+     // host opened before the reader made a view would write an empty list over every one of
+@@ -10357,6 +10383,7 @@ export class PanelProvider implements vscode.Disposable {
+     this.saved.draftCommentIds = draftCommentIds;
+     this.saved.started = started;
+     this.saved.labels = labels;
++    this.saved.readerParents = readerParents;
+     this.saved.views = views;
+     this.saved.railFilters = railFilters;
+     this.saved.showing = showing ?? '';
+diff --git a/extension/src/turnrail.ts b/extension/src/turnrail.ts
+index 285a02ae..76a92888 100644
+--- a/extension/src/turnrail.ts
++++ b/extension/src/turnrail.ts
+@@ -1046,7 +1046,7 @@ function sameIdSet(rows: Map<string, number>, sessions: readonly { sessionId: st
+ export interface SessionParent {
+   id: string;
+   label: string;
+-  relation: SessionParentRelation;
++  relation: SessionParentRelation | 'reader';
+ }
+ 
+ // The parent of one session: its id, the label the parent's own row draws, and the relation.
+diff --git a/extension/src/turnview.ts b/extension/src/turnview.ts
+index d9f122b3..b4658c41 100644
+--- a/extension/src/turnview.ts
++++ b/extension/src/turnview.ts
+@@ -1,4 +1,4 @@
+-import { normalizeSessionLabels, sweepDraftLabels } from './turnlabels';
++import { DRAFT_SESSION_PREFIX, normalizeSessionLabels, sweepDraftLabels } from './turnlabels';
+ import { normalizeSavedViews, type SavedView } from './domain/views.ts';
+ import { normalizeRailSort, type RailSort } from './domain/rail-sort.ts';
+ import {
+@@ -184,6 +184,7 @@ export interface QueuedSubmission {
+ }
+ 
+ export interface PanelState {
++  readerParents: Record<string, string>;
+   open: string[];
+   // The sessions a build with a fold on its heading had folded away. Nothing reads it:
+   // the panel draws one session at a time, so folding it left a heading over an empty
+@@ -323,6 +324,48 @@ export interface PanelState {
+   queues: Record<string, QueuedSubmission[]>;
+ }
+ 
++// Every node is visited once. A cycle loses its own edges, while incoming paths remain valid.
++export function normalizeReaderParents(raw: unknown): Record<string, string> {
++  const parents: Record<string, string> = {};
++  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return parents;
++  for (const [child, parent] of Object.entries(raw)) {
++    if (child && child !== '__proto__' && typeof parent === 'string' && parent && child !== parent)
++      parents[child] = parent;
++  }
++  const settled = new Set<string>();
++  for (const child of Object.keys(parents)) {
++    if (settled.has(child)) continue;
++    const path: string[] = [];
++    const positions = new Map<string, number>();
++    let id: string | undefined = child;
++    while (id !== undefined && !settled.has(id) && !positions.has(id)) {
++      positions.set(id, path.length);
++      path.push(id);
++      id = Object.hasOwn(parents, id) ? parents[id] : undefined;
++    }
++    if (id !== undefined && positions.has(id)) {
++      for (let index = positions.get(id)!; index < path.length; index++) delete parents[path[index]];
++    }
++    for (const node of path) settled.add(node);
++  }
++  return parents;
++}
++
++export function remapReaderParents(
++  parents: Record<string, string>,
++  provisional: string,
++  actual: string,
++): Record<string, string> {
++  const moved: Record<string, string> = {};
++  for (const [child, parent] of Object.entries(parents))
++    moved[child === provisional ? actual : child] = parent === provisional ? actual : parent;
++  return normalizeReaderParents(moved);
++}
++
++export function abandonReaderParents(parents: Record<string, string>, draft: string): Record<string, string> {
++  return Object.fromEntries(Object.entries(parents).filter(([child, parent]) => child !== draft && parent !== draft));
++}
++
+ // The saved state, made safe to use.
+ //
+ // It comes back from storage that outlives the code that wrote it: a set written by an older
+@@ -386,6 +429,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
+     // Rebuilt by the module that owns them. It cuts a session's list and the record
+     // itself to their ceilings, and files every name under one spelling.
+     labels: normalizeSessionLabels(src.labels),
++    readerParents: normalizeReaderParents(src.readerParents),
+     // Rebuilt by the module that owns them, which cuts the list to its ceiling and drops an
+     // entry it cannot read.
+     views,
+@@ -436,18 +480,25 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
+ // ceiling when the sweep ran a moment later. Sweeping first leaves the cut to decide between
+ // sessions that still exist.
+ //
+-// Every other field is handed back untouched, because normalization owns them and reads
+-// whatever storage held.
++// Reader parents also lose provisional identities at startup. Live normalization retains
++// them until adoption or abandonment. Every other field remains with its normalizer.
+ export function withSweptDraftLabels(raw: unknown): unknown {
+   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+     return raw;
+   }
+   const src = raw as Record<string, unknown>;
+   const labels = src.labels;
+-  if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
+-    return raw;
++  const readerParents = normalizeReaderParents(src.readerParents);
++  for (const [child, parent] of Object.entries(readerParents)) {
++    if (child.startsWith(DRAFT_SESSION_PREFIX) || parent.startsWith(DRAFT_SESSION_PREFIX)) delete readerParents[child];
+   }
+-  return { ...src, labels: sweepDraftLabels(labels as Record<string, string[]>) };
++  return {
++    ...src,
++    readerParents,
++    ...(labels && typeof labels === 'object' && !Array.isArray(labels)
++      ? { labels: sweepDraftLabels(labels as Record<string, string[]>) }
++      : {}),
++  };
+ }
+ 
+ // The stored state a webview is served, which is not the whole of it.
+@@ -460,11 +511,12 @@ export function withSweptDraftLabels(raw: unknown): unknown {
+ //
+ // Host-owned fields are taken out rather than naming the panel-owned fields to keep. A new
+ // panel-owned field then reaches the panel without changing this projection.
+-export function webviewPanelState(state: PanelState): Omit<PanelState, 'labels' | 'railFilters'> {
++export function webviewPanelState(state: PanelState): Omit<PanelState, 'labels' | 'railFilters' | 'readerParents'> {
+   const served: Partial<PanelState> = { ...state };
+   delete served.labels;
++  delete served.readerParents;
+   delete served.railFilters;
+-  return served as Omit<PanelState, 'labels' | 'railFilters'>;
++  return served as Omit<PanelState, 'labels' | 'railFilters' | 'readerParents'>;
+ }
+ 
+ // How many folds the record keeps. Saved views have no reader-facing limit, so this ceiling
+diff --git a/extension/src/view/card-words.ts b/extension/src/view/card-words.ts
+index 4ea3e186..6e681efc 100644
+--- a/extension/src/view/card-words.ts
++++ b/extension/src/view/card-words.ts
+@@ -320,7 +320,7 @@ export const CARD_ACTIONS = {
+   // what that card files under `Subagents`, and the word UI copy uses for one. Both hints
+   // end in `from`, the word the row draws.
+   sessionParentWord: 'from',
+-  sessionParentHint: { dispatched: 'Dispatched from', subagent: 'Subagent from' },
++  sessionParentHint: { dispatched: 'Dispatched from', subagent: 'Subagent from', reader: 'Started by you from' },
+   sessionParentDetail: 'Opens the session that started this one',
+   sessionParentAction: 'opens that session',
+   // What the editor calls itself over the session it edits. The popover is drawn clear
+diff --git a/extension/src/webview/protocol.ts b/extension/src/webview/protocol.ts
+index 9e2f6c34..5a9584fd 100644
+--- a/extension/src/webview/protocol.ts
++++ b/extension/src/webview/protocol.ts
+@@ -104,9 +104,9 @@ export interface PanelSessionRow {
+   at: number;
+   relative: string;
+   when: string;
+-  // The session that started this one, by a dispatch or as a subagent. Present only on the
+-  // shown session's row, and only when the host has a row for the parent.
+-  parent?: { id: string; label: string; relation: 'dispatched' | 'subagent' };
++  // The reader-started or delegated parent. Present only on the shown session's row,
++  // and only when the host has a row for the parent.
++  parent?: { id: string; label: string; relation: 'dispatched' | 'subagent' | 'reader' };
+ }
+ 
+ export type PanelRailCard = RailCardView;
+@@ -323,6 +323,7 @@ export type PanelToHost =
+   | { type: 'selectedTextHandoff'; session: string; key: string; text: string; copyLabels: boolean }
+   | { type: 'armSessionDetails'; session: string }
+   | { type: 'armComposer' }
++  | { type: 'showReaderParent'; session: string }
+   | { type: 'showSession'; session: string }
+   | { type: 'labelEditor'; session: string }
+   | { type: 'setLabels'; session: string; names: string[] }
+@@ -967,6 +968,8 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
+       return isString(m.session) && m.session.length > 0 ? { type: 'armSessionDetails', session: m.session } : null;
+     case 'armComposer':
+       return { type: 'armComposer' };
++    case 'showReaderParent':
++      return isString(m.session) && m.session.length > 0 ? { type: 'showReaderParent', session: m.session } : null;
+     case 'showSession':
+       return isString(m.session) ? { type: 'showSession', session: m.session } : null;
+     case 'labelEditor':
+@@ -1229,6 +1232,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
+       return handlers.armSessionDetails(message);
+     case 'armComposer':
+       return handlers.armComposer(message);
++    case 'showReaderParent':
++      return handlers.showReaderParent(message);
+     case 'showSession':
+       return handlers.showSession(message);
+     case 'labelEditor':

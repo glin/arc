@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-013",
+  "revision": 1,
+  "family": "usage-formatting",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Request scale omitted from exact usage detail",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/view/stat-detail.ts @ fd9c142",
+    "limitations": "Focused adaptation of recorded Arc behavior. This public holdout is a selection split, not a secret benchmark."
+  },
+  "inputs": [
+    {
+      "path": "src/stat-detail.mjs",
+      "sha256": "8a2b7548e6c1a2c1c3739ec919c6a79703693c05e47af50455e596eca0bdc27c"
+    },
+    {
+      "path": "src/usage-popover.mjs",
+      "sha256": "9a581a4a3e1999a003d67ad70067a8a8e4f5cfaa550e13b6de857f434782f03f"
+    }
+  ],
+  "prompt_sha256": "0de7de01ddb30d86e9a14c2d9c64fe85db5157eb3e060a979afbbd16ef9daed5",
+  "diff_sha256": "630a8c2d429e214a6a8bfd28366d27201e49f17da951da729c3f286913536f40",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "Exact usage detail hides the request count behind an aggregate token figure.",
+      "paths": ["src/stat-detail.mjs"],
+      "scenario": "A session has many tiny requests with the same total tokens as one large request."
+    }
+  ],
+  "audit": "Adapted formatter contract. It checks count visibility, not visual rendering."
+}

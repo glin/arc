@@ -1,0 +1,46 @@
+{
+  "name": "@glin/arc",
+  "version": "0.1.0",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "description": "Claude Code status line and session cost reports for Claude Code and Codex.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/glin/arc.git",
+    "directory": "cli"
+  },
+  "homepage": "https://github.com/glin/arc/tree/main/cli#readme",
+  "bugs": {
+    "url": "https://github.com/glin/arc/issues"
+  },
+  "bin": {
+    "arc": "dist/arc-status.cjs",
+    "arc-status": "dist/arc-status.cjs"
+  },
+  "files": [
+    "dist/arc-status.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:unit": "vitest run test/status.test.ts test/stream-fixtures.test.mjs test/cost.test.ts",
+    "test:smoke": "npm run build && vitest run test/smoke.test.mjs",
+    "test": "npm run typecheck && npm run test:unit && npm run test:smoke"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "4.1.11"
+  }
+}

@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "kind": "claude-stream",
+    "sessionId": "00000000-0000-4000-8000-000000000011"
+  },
+  "parent": {
+    "requests": 1,
+    "subagentRequests": 0,
+    "toolCalls": 0,
+    "tools": {},
+    "costUsd": 0.001,
+    "inputTokens": {
+      "uncached": 0,
+      "cacheWrite5m": 0,
+      "cacheWrite1h": 0,
+      "cacheRead": 0,
+      "total": 0
+    },
+    "outputTokens": 100,
+    "reasoningOutputTokens": 0,
+    "avgInputPerRequest": 0,
+    "cacheReadShare": null,
+    "contextFirst": 0,
+    "contextMax": 0,
+    "cache": {
+      "writeShare": null,
+      "writeUsd": 0,
+      "writeWarning": false,
+      "expiryReturns": null,
+      "returnInputTokens": null,
+      "returnInputUsd": null,
+      "longestExpiryGapSeconds": null
+    },
+    "models": [
+      {
+        "id": "claude-sonnet-5",
+        "canonical": "claude-sonnet-5",
+        "requests": 1,
+        "inputTokens": {
+          "uncached": 0,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "total": 0
+        },
+        "outputTokens": 100,
+        "reasoningOutputTokens": 0,
+        "costUsd": 0.001,
+        "clientCostUsd": 0.001,
+        "priceMultiplier": 1,
+        "priced": true,
+        "contextWindow": 1000000,
+        "costByType": {
+          "uncached": 0,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "output": 0.001
+        }
+      }
+    ]
+  },
+  "children": [],
+  "combined": {
+    "requests": 1,
+    "subagentRequests": 0,
+    "toolCalls": 0,
+    "tools": {},
+    "costUsd": 0.001,
+    "inputTokens": {
+      "uncached": 0,
+      "cacheWrite5m": 0,
+      "cacheWrite1h": 0,
+      "cacheRead": 0,
+      "total": 0
+    },
+    "outputTokens": 100,
+    "reasoningOutputTokens": 0,
+    "avgInputPerRequest": 0,
+    "cacheReadShare": null,
+    "contextFirst": 0,
+    "contextMax": 0,
+    "cache": {
+      "writeShare": null,
+      "writeUsd": 0,
+      "writeWarning": false,
+      "expiryReturns": null,
+      "returnInputTokens": null,
+      "returnInputUsd": null,
+      "longestExpiryGapSeconds": null
+    },
+    "models": [
+      {
+        "id": "claude-sonnet-5",
+        "canonical": "claude-sonnet-5",
+        "requests": 1,
+        "inputTokens": {
+          "uncached": 0,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "total": 0
+        },
+        "outputTokens": 100,
+        "reasoningOutputTokens": 0,
+        "costUsd": 0.001,
+        "clientCostUsd": 0.001,
+        "priceMultiplier": 1,
+        "priced": true,
+        "contextWindow": 1000000,
+        "costByType": {
+          "uncached": 0,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "output": 0.001
+        }
+      }
+    ]
+  },
+  "run": {
+    "turns": 1,
+    "durationMs": 1000,
+    "durationApiMs": 900,
+    "ttftMs": 100,
+    "isError": false,
+    "error": null,
+    "denials": {},
+    "subagents": {
+      "spawned": 0,
+      "completed": 0,
+      "failed": 0,
+      "byType": {}
+    },
+    "clientCostUsd": 0.001
+  }
+}

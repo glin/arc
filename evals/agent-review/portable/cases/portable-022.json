@@ -1,0 +1,138 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-022",
+  "revision": 1,
+  "family": "billing-reconciliation",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Session billing identity and snapshot order",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/sessioncost.ts @ 48385f69d1c404f1f05b074036239a6e7b9e5d63",
+    "limitations": "Whole domain runtime modules are transpiled without TypeScript types. The review boundary omits UI wiring and captured historical instructions."
+  },
+  "inputs": [
+    {
+      "path": "inspect.mjs",
+      "sha256": "d7eb21f133bc933d90920f13c28686810d5e9bb21c725b25e95d09e89565928d"
+    },
+    {
+      "path": "samples/ordinary.jsonl",
+      "sha256": "ca2f5ffb5e0d38e79d9574680d166e56bd0b1a71a464889bc899506ca4085e5c"
+    },
+    {
+      "path": "samples/two-turns.jsonl",
+      "sha256": "ce6ac7f31232b0be835ea0da720b2fc301c8dc4994edbaef62f1c74e8aa482f5"
+    },
+    {
+      "path": "src/activitydetail.mjs",
+      "sha256": "f4d0abd7fd2a63872f0ffe33927574f40a6b7e7e1ba5df17727707c9bc74660e"
+    },
+    {
+      "path": "src/agentpaths.mjs",
+      "sha256": "780c47132b9adbb3fed214920f348ae1468a841b56fa4979e7231fc0b63281b9"
+    },
+    {
+      "path": "src/agentspend.mjs",
+      "sha256": "f03f4d6ac12a44f3db8f2350387ff68425a644040a1b809fd76659180b32be3d"
+    },
+    {
+      "path": "src/atomicfile.mjs",
+      "sha256": "d13241e0198d59cecef72478b67ef1f65e0d9e57633ed860f986c053f60daab5"
+    },
+    {
+      "path": "src/childartifacts.mjs",
+      "sha256": "87c37bc8bf136f5907bb2640d5f750856903f0ed19876b7af6988bb23c1a7fe1"
+    },
+    {
+      "path": "src/codex.mjs",
+      "sha256": "1dd0185b76b00e65cba91df2b2bcb0a24e1e1b82b54892185a96f3021240780a"
+    },
+    {
+      "path": "src/codexreply.mjs",
+      "sha256": "d55b7e1cef649d453f5a08fd3e2d78d367adc391ac3e9fdd7be926a68ded6324"
+    },
+    {
+      "path": "src/domain/commit-sha.mjs",
+      "sha256": "d3a7160f882044852690ad0121d0a10f17c89bd066e44dc55a2c323b3d00aadf"
+    },
+    {
+      "path": "src/domain/link-path.mjs",
+      "sha256": "be250d25ed311bfa073d934012ede386ddf5b74df07bdb465e50fd9860b85e47"
+    },
+    {
+      "path": "src/domain/text.mjs",
+      "sha256": "6d3166b9aadb27186d7a0dce2a9672c1372575432a7b005a6865bd47f5e23ea8"
+    },
+    {
+      "path": "src/identity.mjs",
+      "sha256": "75d0d3ae3f541dcc006c975f35a77159d4649fd9c42af548ee850ede56c02f54"
+    },
+    {
+      "path": "src/parserstate.mjs",
+      "sha256": "2154f28f8e42146389555c6437bf253ac4e331f8de3b564da600eb290906dfae"
+    },
+    {
+      "path": "src/pricing.mjs",
+      "sha256": "1d168f0d5331fce40f79b1a5c3b88ae02180f13e8dae57f7ac0161ed63019bc3"
+    },
+    {
+      "path": "src/projectspend.mjs",
+      "sha256": "d5ed6d9a53ebbe3bf25461f2bd81e5876851726bf05c33a07249956842ae2795"
+    },
+    {
+      "path": "src/projectspendstate.mjs",
+      "sha256": "9c58dae2067bd9d1f5b2a59b82fc2a48c1429da4cb033d37a16e981f22a35e27"
+    },
+    {
+      "path": "src/richtext.mjs",
+      "sha256": "0e666a72e6a36a0f5b70d3e6c36ea97e8e4f73cd3223d6c08d0871300e30c947"
+    },
+    {
+      "path": "src/sessioncost.mjs",
+      "sha256": "b071642c25ff1e4ad13e0b07a83ea0f79a7859cd7803e2a9f08c1f1167bee8cc"
+    },
+    {
+      "path": "src/store.mjs",
+      "sha256": "8160a838e12208a627a2a9364a15b30a8acac3befda1aedea43d8fbeb605e7fc"
+    },
+    {
+      "path": "src/transcript.mjs",
+      "sha256": "408d18c9f122afe1798a506e45052ef739ec17b70e4b28d014dbd89550d203c3"
+    },
+    {
+      "path": "src/vendor/LICENSE.md",
+      "sha256": "8e3a3f82f59a60958f56ca08f445647c32a4733dc7ca6c2c46f6eb898471ab9c"
+    },
+    {
+      "path": "src/vendor/marked.mjs",
+      "sha256": "8da585ba07277fbed079acafdb08da48bb190d25406d043328ddcbaed8146d74"
+    },
+    {
+      "path": "src/view/cost.mjs",
+      "sha256": "96b754417671cf1db1d413f0929d46ac2048e10b3a3ef75a78ffb748b604c8b7"
+    }
+  ],
+  "prompt_sha256": "6fe67811b95fcf92e6c20696bd3e5c759773a2db48b5d12497bca742bc7da58b",
+  "diff_sha256": "5a792f9b95248819ac24d989a4c058748328d9303f2b2c75f885f2523c0790e9",
+  "keys": [
+    {
+      "id": "pending-snapshot-position",
+      "severity": "medium",
+      "summary": "The last of 65 pending snapshots loses its own pairing position.",
+      "paths": ["src/sessioncost.mjs"],
+      "scenario": "A billing record arrives before the 65th token snapshot while request metadata is pending.",
+      "origin": "historical-sol-xhigh"
+    },
+    {
+      "id": "late-copied-snapshot",
+      "severity": "medium",
+      "summary": "Late copied-turn classification leaves snapshot usage in the report.",
+      "paths": ["src/sessioncost.mjs"],
+      "scenario": "A copied prior turn is classified after 65 later turn starts, followed by an original-turn replay.",
+      "origin": "historical-sol-medium"
+    }
+  ],
+  "audit": "Candidate and correction run the 65-snapshot sequence, late copied-turn classification, original replay, and an ordinary bill through readSessionRequests and sessionCostReport."
+}

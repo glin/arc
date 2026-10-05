@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-009",
+  "revision": 1,
+  "family": "async-refresh",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Late page read overwrites newer child state",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/timeline.ts @ 1ca992c",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/timeline.mjs",
+      "sha256": "011e571cb63c682ffc6d58a25bb89e0e641023bf80cc36316ead7fd471ebb8bf"
+    },
+    {
+      "path": "src/timeline-host.mjs",
+      "sha256": "60f628d2b7f11603c4ddd9115a29048f4a725e8fc79de30c9859a769890b62c3"
+    }
+  ],
+  "prompt_sha256": "e47156ec172297263931118da98dae75756f66cbf47c8cb69c4f6603a4c37fb2",
+  "diff_sha256": "6f304be7eb7107fe73987ab0a72916e09d756987d711c1e4f3898db85cec852f",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "A late page read restores a stale child list.",
+      "paths": ["src/timeline.mjs"],
+      "scenario": "A child appears while an older-history page is in flight."
+    }
+  ],
+  "audit": "Adapted page admission. It checks a child-list change during the read await."
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-012",
+  "revision": 1,
+  "family": "diagnostics-privacy",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Panel diagnostic accepts arbitrary key",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/webview/protocol.ts @ 3f8ca50",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/protocol.mjs",
+      "sha256": "e2051a1ea2ffc02a1fc63c7f725234f451150e7ef1b6dc8fc837a83347028535"
+    },
+    {
+      "path": "src/diagnostics-store.mjs",
+      "sha256": "d59ade3dfb43458ae2dcd2ffca4aca8833821f471eb65e0e839c34e895356b80"
+    }
+  ],
+  "prompt_sha256": "cc2a8a84a2357cd5bcaa05805be97ba81703f23e58b0892dc886c1230177b169",
+  "diff_sha256": "232ede3a9e8d7107ce716caa2800e2c69762b66cb6502937c8c07d960f6e5109",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "high",
+      "summary": "Malformed panel text enters exported diagnostics as a key.",
+      "paths": ["src/protocol.mjs"],
+      "scenario": "A panel message supplies reader-owned text where a timing category belongs."
+    }
+  ],
+  "audit": "Adapted protocol validation. It checks the closed timing vocabulary, not actual file persistence."
+}

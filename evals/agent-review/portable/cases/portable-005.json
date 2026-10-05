@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-005",
+  "revision": 1,
+  "family": "usage-identity",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Unnamed model limit overwrites account usage",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/codexwire.ts @ 692cd7a",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/codexwire.mjs",
+      "sha256": "beb660d908363998c082318803134e857dbce57d76d89d378072cf29ad2c174d"
+    },
+    {
+      "path": "src/usage-dashboard.mjs",
+      "sha256": "caa95d76eaa77793060a059fd6a2f33126c29b03e7a898215a31aaec4449abe7"
+    }
+  ],
+  "prompt_sha256": "99c94ab645b4ddfeb955a27c420a231c26cba02003af45da4128d1834e6a1ddf",
+  "diff_sha256": "23e45e15f713a4ad6c1d26e6b83dbe609bb11f7eda22797ecbf544bd09e3c32f",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "A model-specific notification with no valid name overwrites account usage.",
+      "paths": ["src/codexwire.mjs"],
+      "scenario": "Account usage is 31 percent. A malformed named-model notification reports zero percent on the same clock."
+    }
+  ],
+  "audit": "Adapted identity reducer. It tests account and named-model separation plus a malformed name."
+}

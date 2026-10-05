@@ -1,0 +1,69 @@
+{
+  "schema": "arc-review-instructions-v1",
+  "condition": "audited-current-instructions",
+  "required": [
+    "CLAUDE.md",
+    "docs/glossary.md"
+  ],
+  "documents": [
+    {
+      "path": "CLAUDE.md",
+      "original_sha256": "03a208bf607d5aea622641e28307d02d364907bd4dbad561154d45f92689d9b7",
+      "exported_sha256": "a2bc64a12d8c2d920938d5d6a5f2103ab1db98dcbf7709b7d9129ef799d6cf5c",
+      "omissions": "Only repository Writing rules are retained. Workflow, environment, architecture and repair examples are omitted. A shared historical task boundary is added."
+    },
+    {
+      "path": "docs/glossary.md",
+      "original_sha256": "c4c83764862d7fd2046e0c2d87dcb8c8fe32664b6cd22dfc84c07307d32fdd35",
+      "exported_sha256": "c4c83764862d7fd2046e0c2d87dcb8c8fe32664b6cd22dfc84c07307d32fdd35",
+      "omissions": "No glossary content is omitted. Terms state reader contracts without first-publication repair ordering."
+    }
+  ],
+  "omitted_documents": [
+    {
+      "path": "docs/architecture.md",
+      "original_sha256": "5cf73def2d1e3e10b14f69f2b6c2ab89eaa845c86c2a033a0a783b5b70eeef24",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/development.md",
+      "original_sha256": "954c46682406673089769cc4c7efa79e7db486b56d5a8a5c882698c910d4e46d",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/design-goals.md",
+      "original_sha256": "8de3a5852dcb62169879835009490a7ce950868e4838236a4619fb97d8ff5d12",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/timeline.md",
+      "original_sha256": "3f1a201d48072c88cf2b12f5da9006f7f415026e5305b9c7cc5df29bc01af02d",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/comments.md",
+      "original_sha256": "a6ea4ead354a101b59a3d47b92642bc04497a3acac5b002da3ffca506ab1a1be",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/rail-and-navigation.md",
+      "original_sha256": "b1053ec47caff8cad3b958f235e2109080e059ca2a97a0bd13bf92625444e411",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/composer.md",
+      "original_sha256": "122f0c7390913c47566c0cd7dc35a2ac2c197dd026e55afe919bd303e4a3b2ba",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/agent-protocols.md",
+      "original_sha256": "484fa98aa5b572d605118353fed35c3516d79d6a1d237cb0cda123ce5517b7f4",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    },
+    {
+      "path": "docs/ui-design.md",
+      "original_sha256": "219360fc5834fb2a585bb0397902d332870637c19528b68953da98a98de481a5",
+      "reason": "Implementation guidance, current feature details and defect examples are excluded from the common historical review condition."
+    }
+  ]
+}

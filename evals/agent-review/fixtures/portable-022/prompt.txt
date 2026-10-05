@@ -1,0 +1,5 @@
+Review the session cost reconciliation change. The supplied modules parse Codex rollout JSONL through the real usage reducer and report producer. Billing records and token snapshots for a request must pair without changing request identity or order. Later metadata can classify an earlier turn as copied. Copied prior turns leave the report, while an original turn replayed later retains its original bill. Check behavior across long sequences and normal records.
+
+Inspect ordinary input with `node inspect.mjs samples/ordinary.jsonl` or `node inspect.mjs samples/two-turns.jsonl` from the workspace root. The command prints the real report and writes no files.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

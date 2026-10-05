@@ -1,0 +1,54 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-021",
+  "revision": 1,
+  "family": "rail-lens",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Rail lens over typed status",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/domain/rail-filters.ts @ 3444b2a2efbc652a5eaf9aac9ec24c1bdb39c022",
+    "limitations": "Whole domain runtime modules are transpiled without TypeScript types. The review boundary omits UI wiring and captured historical instructions."
+  },
+  "inputs": [
+    {
+      "path": "src/domain/labels.mjs",
+      "sha256": "9511d8a8d20ab047141ab04ad82f6d12c8ba9b70173d17aaa604960ba92c3e9b"
+    },
+    {
+      "path": "src/domain/rail-filters.mjs",
+      "sha256": "0158f1fa952eeb8dcfe6c79f4805ca5300cdf5a0afeab989eea18477dcfa17df"
+    },
+    {
+      "path": "src/domain/rail-sort.mjs",
+      "sha256": "5c3a72b1d84473ab4ce57052b13799d247d8dacefbffe35109d86b0ebdc6dc01"
+    },
+    {
+      "path": "src/domain/session-query.mjs",
+      "sha256": "6a0e2092d8737501c11384a57136c462ead91c959bf6491edbb0613c0b27973e"
+    },
+    {
+      "path": "src/domain/text.mjs",
+      "sha256": "6d3166b9aadb27186d7a0dce2a9672c1372575432a7b005a6865bd47f5e23ea8"
+    },
+    {
+      "path": "src/domain/views.mjs",
+      "sha256": "523f92be03a6abf178d94df53f7d2ed9299a3985f2392a0ddbe752c6d03fb17f"
+    }
+  ],
+  "prompt_sha256": "809814b384fbe336640a6b4042f44092fadaab0441fa5269181e2e96aa195482",
+  "diff_sha256": "db133e3c84b770537e5f99b1399105117854016b7e604eaf86861fe57beb430a",
+  "keys": [
+    {
+      "id": "typed-status-double-lens",
+      "severity": "medium",
+      "summary": "Setting a lens over a typed status term leaves two full lenses.",
+      "paths": ["src/domain/rail-filters.mjs"],
+      "scenario": "A typed is:unread word combines with the shared exclusions written by another lens.",
+      "origin": "historical-sol-xhigh"
+    }
+  ],
+  "audit": "Candidate and corrected module closures execute the typed status and complete lens paths with ordinary query behavior."
+}

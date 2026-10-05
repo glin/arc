@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-003",
+  "revision": 1,
+  "family": "repository-discovery",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "POSIX root normalization",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/repositoryscope.ts @ a0abf6e",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/repositoryscope.mjs",
+      "sha256": "31824410746706364df27fbd0e76c3d0f405ba350b2286e1e6db31fd9e5d801c"
+    },
+    {
+      "path": "src/session-source.mjs",
+      "sha256": "a8a2bbca4ece255d3480ca55617d3d3ea6487785c4961549621ca768d87e0e49"
+    }
+  ],
+  "prompt_sha256": "2f0f0e0b5f159c699fa4fc9a641e16b858bd4f0bbb36060b7d05f38705379443",
+  "diff_sha256": "d8ec89532b05bb1e6a22c1135321a2204ce8bda22d2366941bc5e70591d65210",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "low",
+      "summary": "The filesystem root disappears from the workspace root set.",
+      "paths": ["src/repositoryscope.mjs"],
+      "scenario": "Open the POSIX filesystem root as a workspace folder."
+    }
+  ],
+  "audit": "Adapted path normalization. It checks a POSIX root and ordinary folder deduplication."
+}

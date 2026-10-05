@@ -1,0 +1,509 @@
+{
+  "schema": "arc-review-cohort-v1",
+  "id": "review-diversity-v1",
+  "revision": 1,
+  "status": "partial-qualified",
+  "audited_instructions": "evals/agent-review/fixtures/review-diversity-instructions/manifest.json",
+  "targets": {
+    "bugs": 24,
+    "controls": 8,
+    "clusters": 16,
+    "production_exports": 12,
+    "subsystems": 8,
+    "runtime_mechanisms": 3,
+    "independent_controls": 4,
+    "diff-local": 6,
+    "cross-file": 10,
+    "runtime-interaction": 6
+  },
+  "entries": [
+    {
+      "case_id": "portable-024",
+      "revision": 1,
+      "kind": "bug",
+      "cluster": "comment-delivery-ownership",
+      "source_family": "comment-delivery-ownership",
+      "category": "runtime-interaction",
+      "subsystem": "prompt-delivery",
+      "runtime_mechanism": "controlled-storage-and-acceptance",
+      "evidence_group": "ordinary",
+      "selection_reason": "Nominated production defect preserves its reported symptom and real caller path.",
+      "independence_reason": "Version ownership removes a later edit under a delivered comment ID.",
+      "control_origin": null,
+      "provenance": {
+        "base": "465335967b76ba847957f6f74a9556acf77bef47",
+        "candidate": "d47bbb0863a1b52898e400b86854a008f3dbc1b3",
+        "correction": "bc896125191dc9283e332edbb6864d6bcbf93892",
+        "change_origin": "reconstructed-review-task"
+      },
+      "case_sha256": "26c8ead6e528ddf164d3ea70a7e5b1a2bbba0ec6106962080dd8fd264981dba4",
+      "provenance_sha256": "f53475c2e582dc207362c2eeb4f6f9a65969b5bd361b339c830532680269cdec",
+      "qualifier_sha256": "39529bee28ffe18521374dec3d20939a32e03d6638e49e2644985d45bfd228f2",
+      "readiness": "qualified",
+      "qualification": {
+        "result": {
+          "candidate": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": false
+            },
+            {
+              "id": "check-1",
+              "role": "symptom",
+              "pass": false
+            },
+            {
+              "id": "check-2",
+              "role": "normal",
+              "pass": true
+            }
+          ],
+          "reference": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "check-1",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "check-2",
+              "role": "normal",
+              "pass": true
+            }
+          ]
+        },
+        "reinjection": "symptom-fails",
+        "execution_evidence": "offline-production-boundary",
+        "model_discovery_execution": "not-observed"
+      },
+      "model_command": null,
+      "model_command_prerequisites": [],
+      "optional_model_execution": "not-provided",
+      "leakage_markers": ["submitted recovery freezes comment membership across queue note edit at"],
+      "generic_source_examples": [
+        "C:/Users/dev/.agents/skills",
+        "C:/Users/dev/...",
+        "C:\\Users\\dev",
+        "C:\\Users\\dev\\..."
+      ],
+      "execution_qualification_boundary": "Generated synthetic records and controlled host stubs. No model-side execution has been observed."
+    },
+    {
+      "case_id": "portable-025",
+      "revision": 1,
+      "kind": "bug",
+      "cluster": "padded-incremental-checkpoint",
+      "source_family": "padded-incremental-checkpoint",
+      "category": "diff-local",
+      "subsystem": "project-spend",
+      "runtime_mechanism": null,
+      "evidence_group": "ordinary",
+      "selection_reason": "Historical production defect retains its reported symptom. A reconstructed causal introduction replaces an unrelated recovered change.",
+      "independence_reason": "A byte checkpoint joins padding to an appended record. This does not involve asynchronous ownership.",
+      "control_origin": null,
+      "provenance": {
+        "base": "d18471c90e26b5f0de03b9835e193d891811a9a3",
+        "candidate": "935b3d7ce6bee2be37f6ac55c51c2574a176ccb8",
+        "correction": "d4d9893613ed1c9bd033d2eb72b018cfd1052d44",
+        "change_origin": "reconstructed-causal-introduction",
+        "historical_base_role": "source-snapshot-parent-not-review-base",
+        "review_base_origin": "candidate-snapshot-with-two-production-padding-branches"
+      },
+      "case_sha256": "1f30d8c295183a1047b588a8e7313a5ac47da0ebb2d37dcddc37263bcf68d7c9",
+      "provenance_sha256": "7ba835e7c851453c4675f71ab42d165a6db4a9c57b3926e8e0b41f3c1e2ba432",
+      "qualifier_sha256": "93249c9b257ba50220b48c6df69de9026af925fadd4e29ecf18982f27e447f28",
+      "readiness": "qualified",
+      "qualification": {
+        "result": {
+          "candidate": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": false
+            },
+            {
+              "id": "check-1",
+              "role": "normal",
+              "pass": true
+            }
+          ],
+          "reference": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "check-1",
+              "role": "normal",
+              "pass": true
+            }
+          ]
+        },
+        "reinjection": "symptom-fails",
+        "execution_evidence": "offline-production-boundary",
+        "model_discovery_execution": "not-observed"
+      },
+      "model_command": null,
+      "model_command_prerequisites": [],
+      "optional_model_execution": "not-provided",
+      "leakage_markers": ["newline followed by NUL padding indexes an appended line the same after a rebuild"],
+      "generic_source_examples": [
+        "C:/Users/dev/.agents/skills",
+        "C:/Users/dev/...",
+        "C:\\Users\\dev",
+        "C:\\Users\\dev\\..."
+      ],
+      "execution_qualification_boundary": "Generated synthetic records and controlled host stubs. No model-side execution has been observed."
+    },
+    {
+      "case_id": "portable-026",
+      "revision": 1,
+      "kind": "bug",
+      "cluster": "initial-reader-lineage-publication",
+      "source_family": "initial-reader-lineage-publication",
+      "category": "cross-file",
+      "subsystem": "session-lineage",
+      "runtime_mechanism": null,
+      "evidence_group": "ordinary",
+      "selection_reason": "Nominated production defect preserves its reported symptom and real caller path.",
+      "independence_reason": "The draft caller publishes a child before its parent relationship exists. It does not remove reader text.",
+      "control_origin": null,
+      "provenance": {
+        "base": "a0b81ef2592064f7c434054a1cab05d11803eddf",
+        "candidate": "7a19278064962990cd45e237a8048cbb25444d5a",
+        "correction": "b6dfad6ecbf188c13ad39be7da7c753b02d4a3b2",
+        "change_origin": "reconstructed-review-task"
+      },
+      "case_sha256": "0c8e653d909a05738f39dd4ad7d83b018b6afeb07c6a838dccd907033b9694ec",
+      "provenance_sha256": "6674d495f8accdaa46a31311632cfc7ee1a2211e9a771c97b86033f168698457",
+      "qualifier_sha256": "81c9b42d566b58d136b4481ed922b1a6cb2a84e9d76808ad62d74c8b278104a3",
+      "readiness": "qualified",
+      "qualification": {
+        "result": {
+          "candidate": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": false
+            },
+            {
+              "id": "check-1",
+              "role": "symptom",
+              "pass": false
+            },
+            {
+              "id": "check-2",
+              "role": "normal",
+              "pass": true
+            }
+          ],
+          "reference": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "check-1",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "check-2",
+              "role": "normal",
+              "pass": true
+            }
+          ]
+        },
+        "reinjection": "symptom-fails",
+        "execution_evidence": "offline-production-boundary",
+        "model_discovery_execution": "not-observed"
+      },
+      "model_command": null,
+      "model_command_prerequisites": [],
+      "optional_model_execution": "not-provided",
+      "leakage_markers": ["the first reader child selection includes its parent (recovery"],
+      "generic_source_examples": [
+        "C:/Users/dev/.agents/skills",
+        "C:/Users/dev/...",
+        "C:\\Users\\dev",
+        "C:\\Users\\dev\\..."
+      ],
+      "execution_qualification_boundary": "Generated synthetic records and controlled host stubs. No model-side execution has been observed."
+    },
+    {
+      "case_id": "portable-027",
+      "revision": 1,
+      "kind": "bug",
+      "cluster": "omitted-model-capability",
+      "source_family": "omitted-model-capability",
+      "category": "cross-file",
+      "subsystem": "session-setup",
+      "runtime_mechanism": null,
+      "evidence_group": "ordinary",
+      "selection_reason": "Nominated production defect preserves its reported symptom and real caller path.",
+      "independence_reason": "Capability lookup confuses an omitted model with an applied default. It does not involve picker focus.",
+      "control_origin": null,
+      "provenance": {
+        "base": "a0b81ef2592064f7c434054a1cab05d11803eddf",
+        "candidate": "bca6b2770f8b321a130314d6dda77200b55f2954",
+        "correction": "1410b2bd9832d173eb2055d140b20a603527f5d3",
+        "change_origin": "reconstructed-review-task"
+      },
+      "case_sha256": "bae1e20360966a4a47762877d9aaa4bfcd0ff2a3649af749462d5e148dec2d10",
+      "provenance_sha256": "29eac715b77564c229977273f580a97bc5ef8035e487eff7049269e9fc591496",
+      "qualifier_sha256": "81ab670ef87670f075f28f953cb4db2b39c89fa5073fe1fd309b67c0a6a892ee",
+      "readiness": "qualified",
+      "qualification": {
+        "result": {
+          "candidate": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": false
+            },
+            {
+              "id": "check-1",
+              "role": "normal",
+              "pass": true
+            }
+          ],
+          "reference": [
+            {
+              "id": "check-0",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "check-1",
+              "role": "normal",
+              "pass": true
+            }
+          ]
+        },
+        "reinjection": "symptom-fails",
+        "execution_evidence": "offline-production-boundary",
+        "model_discovery_execution": "not-observed"
+      },
+      "model_command": null,
+      "model_command_prerequisites": [],
+      "optional_model_execution": "not-provided",
+      "leakage_markers": ["omitted models keep supported effort through metadata changes and adoption"],
+      "generic_source_examples": [
+        "C:/Users/dev/.agents/skills",
+        "C:/Users/dev/...",
+        "C:\\Users\\dev",
+        "C:\\Users\\dev\\..."
+      ],
+      "execution_qualification_boundary": "Generated synthetic records and controlled host stubs. No model-side execution has been observed."
+    },
+    {
+      "case_id": "portable-028",
+      "revision": 1,
+      "kind": "clean",
+      "cluster": "cli-command-alias",
+      "source_family": "cli-command-alias",
+      "category": "diff-local",
+      "subsystem": "cli",
+      "runtime_mechanism": null,
+      "evidence_group": "ordinary",
+      "selection_reason": "Independently selected legitimate feature adds a precise contract outside nominated bug fixes.",
+      "independence_reason": "Command aliases share one CLI entry. This feature was selected independently of the four bug corrections.",
+      "control_origin": "independent-legitimate-change",
+      "provenance": {
+        "base": "605ef0c8cc61e2b8580fa1ab4c68faed3726392f",
+        "candidate": "3715b6d2517f2f5e1c6bb8cc888de30e204745e3",
+        "correction": "3715b6d2517f2f5e1c6bb8cc888de30e204745e3",
+        "change_origin": "independent-legitimate-change"
+      },
+      "case_sha256": "4ab75b00bc0c3386561d1b00a06b2d986adbd64cf3f150a08e4ac448d55f588e",
+      "provenance_sha256": "b1681933c441d43070a2cd8e235a1721fed2728d8473b16b1c2c6c7b7d6222ac",
+      "qualifier_sha256": "95ed0f1c4705a65c5c34f1d86d2b158d2413320a8ba4c58fa9ed04daf1bf8177",
+      "readiness": "qualified",
+      "qualification": {
+        "result": {
+          "candidate": [
+            {
+              "id": "aliases",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "normal-version",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "normal-status",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "normal-invalid",
+              "role": "normal",
+              "pass": true
+            }
+          ],
+          "reference": [
+            {
+              "id": "aliases",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "normal-version",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "normal-status",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "normal-invalid",
+              "role": "normal",
+              "pass": true
+            }
+          ]
+        },
+        "reinjection": "not-applicable",
+        "execution_evidence": "offline-production-boundary",
+        "model_discovery_execution": "not-observed"
+      },
+      "model_command": "node runtime.cjs --help",
+      "model_command_prerequisites": ["Node 22.18+"],
+      "optional_model_execution": "available",
+      "leakage_markers": [],
+      "generic_source_examples": [
+        "C:/Users/dev/.agents/skills",
+        "C:/Users/dev/...",
+        "C:\\Users\\dev",
+        "C:\\Users\\dev\\..."
+      ],
+      "execution_qualification_boundary": "Generated synthetic records and controlled host stubs. No model-side execution has been observed."
+    },
+    {
+      "case_id": "portable-029",
+      "revision": 1,
+      "kind": "clean",
+      "cluster": "cross-platform-diagnostics",
+      "source_family": "cross-platform-diagnostics",
+      "category": "runtime-interaction",
+      "subsystem": "diagnostics",
+      "runtime_mechanism": null,
+      "evidence_group": "ordinary",
+      "selection_reason": "Independently selected legitimate feature adds a precise contract outside nominated bug fixes.",
+      "independence_reason": "Collectors dispatch by platform and preserve process identities. This feature was selected independently of bug corrections.",
+      "control_origin": "independent-legitimate-change",
+      "provenance": {
+        "base": "9f27f61d0b9f1bd8ed63d13819217301a1c61048",
+        "candidate": "fe00298b948a685411681c201e1a7ab1727db865",
+        "correction": "fe00298b948a685411681c201e1a7ab1727db865",
+        "change_origin": "independent-legitimate-change"
+      },
+      "case_sha256": "76c81c7755752dde3a199bcf09c294a3f75adc40d60185e9992251670b810366",
+      "provenance_sha256": "4b805e64fc6ba5ab5b0221fd45ce569c2de307ce5fe91d13d34d27cba48520e1",
+      "qualifier_sha256": "15e826d00c83de1aab6768b5f4fb3a2dead17ff450ede3aee02ac88bae1a351c",
+      "readiness": "qualified",
+      "qualification": {
+        "result": {
+          "candidate": [
+            {
+              "id": "capture-0",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "capture-1",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-2",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-3",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-4",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-5",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-6",
+              "role": "normal",
+              "pass": true
+            }
+          ],
+          "reference": [
+            {
+              "id": "capture-0",
+              "role": "symptom",
+              "pass": true
+            },
+            {
+              "id": "capture-1",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-2",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-3",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-4",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-5",
+              "role": "normal",
+              "pass": true
+            },
+            {
+              "id": "capture-6",
+              "role": "normal",
+              "pass": true
+            }
+          ]
+        },
+        "reinjection": "not-applicable",
+        "execution_evidence": "offline-production-boundary",
+        "model_discovery_execution": "not-observed"
+      },
+      "model_command": null,
+      "model_command_prerequisites": [],
+      "optional_model_execution": "not-provided",
+      "leakage_markers": [],
+      "generic_source_examples": [
+        "C:/Users/dev/.agents/skills",
+        "C:/Users/dev/...",
+        "C:\\Users\\dev",
+        "C:\\Users\\dev\\..."
+      ],
+      "execution_qualification_boundary": "Generated synthetic records and controlled host stubs. No model-side execution has been observed."
+    }
+  ]
+}

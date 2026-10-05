@@ -1,0 +1,12 @@
+diff --git a/src/transcript.mjs b/src/transcript.mjs
+--- a/src/transcript.mjs
++++ b/src/transcript.mjs
+@@ -2,7 +2,7 @@
+   const text = [];
+   for (const line of lines) {
+     const event = JSON.parse(line);
+-    if (event.type === 'text' && typeof event.value === 'string') text.push(event.value);
++    if (event.type === 'text') text.push(event.value.trim());
+   }
+   return text;
+ }

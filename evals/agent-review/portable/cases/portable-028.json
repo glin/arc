@@ -1,0 +1,143 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-028",
+  "revision": 1,
+  "family": "cli-command-alias",
+  "split": "holdout",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Command aliases",
+  "provenance": {
+    "classification": "historical",
+    "base": "605ef0c8cc61e2b8580fa1ab4c68faed3726392f",
+    "candidate": "3715b6d2517f2f5e1c6bb8cc888de30e204745e3",
+    "correction": "3715b6d2517f2f5e1c6bb8cc888de30e204745e3",
+    "change_origin": "independent-legitimate-change",
+    "limitations": "Legitimate feature selected independently of bug corrections. Offline checks do not exercise installed npm launchers or real system commands.",
+    "candidate_origin": "recovered-commit-snapshot",
+    "diff_origin": "historical-git-diff-scoped-to-exported-source",
+    "original_review_evidence": "unavailable"
+  },
+  "inputs": [
+    {
+      "path": "cli/package.json",
+      "sha256": "937157e0a1ab4348ccaebdf132c3248dc2cfaec296f45d66798d1b8156f14e31"
+    },
+    {
+      "path": "cli/src/cost.ts",
+      "sha256": "41ad56307d0d4e9c41b7fd948e530f107fa20d8aff7d3f5eacfad8db089d7799"
+    },
+    {
+      "path": "cli/src/main.ts",
+      "sha256": "5e0e31f5baa3cafab2876eeddccefb96e71c8f5316693df3fa1aa40d5de1994e"
+    },
+    {
+      "path": "cli/src/status.ts",
+      "sha256": "24bbdc93f08f72a15a6b07a8a70b556214228d4a355ffb8785d32c2057f6092b"
+    },
+    {
+      "path": "extension/src/activitydetail.ts",
+      "sha256": "81fca8315bd76daa34d120f090b607af9e42216099315f13cf09a8d524914c0d"
+    },
+    {
+      "path": "extension/src/agentpaths.ts",
+      "sha256": "6ca92dc295a23e35678de430b12873e2b7ac815771c4b00437770092ef65f8d9"
+    },
+    {
+      "path": "extension/src/agentspend.ts",
+      "sha256": "b12887c723faedf11dd1794e5facb3c40e551ba94840464f63d445bebbfaa65c"
+    },
+    {
+      "path": "extension/src/atomicfile.ts",
+      "sha256": "7e24d743fdc3a36d83e44d307edeffe981b5d38857627dd5fb9423d8c6be2c97"
+    },
+    {
+      "path": "extension/src/childartifacts.ts",
+      "sha256": "284a5fa97e601ddd3bafaa2f75e8fbe237280a8e3335984aa1ca4926a9659cd3"
+    },
+    {
+      "path": "extension/src/codex.ts",
+      "sha256": "f12a56704d352ff72062a8eeed14ae03ce6aed26cd67699420a74ff9840f1ea5"
+    },
+    {
+      "path": "extension/src/codexreply.ts",
+      "sha256": "2ef3caa242c2fe9c1b1284a69191cc4255831b126ece69ab3b4705785f428a25"
+    },
+    {
+      "path": "extension/src/domain/commit-sha.ts",
+      "sha256": "fde6d659c60e1e6d7aa8b80c19a45b9c2c3330a8fa73fd6f5cd0cd32212734a7"
+    },
+    {
+      "path": "extension/src/domain/link-path.ts",
+      "sha256": "f501cad077c87fad030a6922546108d107c9f42932fba9fe5b17c8b63a936826"
+    },
+    {
+      "path": "extension/src/domain/model-identity.ts",
+      "sha256": "77b3b6dfabe255909bb1213b321a0a71443ca483a71c652c1f8744b6229c597e"
+    },
+    {
+      "path": "extension/src/domain/text.ts",
+      "sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4"
+    },
+    {
+      "path": "extension/src/identity.ts",
+      "sha256": "72f2fb4b07e370c3c564b8853e3e8e88328dfd6f9dbd4cb229f4ddfbc4ca6853"
+    },
+    {
+      "path": "extension/src/parserstate.ts",
+      "sha256": "d65ab74834beab67f8ea80128b0d12655a0c66f090fc472cc16018841c42cfb1"
+    },
+    {
+      "path": "extension/src/pricing.ts",
+      "sha256": "14b584bebf08a3a643d1f8a58ae19a9672843460b9e6c75f3e6689c91de2c21b"
+    },
+    {
+      "path": "extension/src/projectspend.ts",
+      "sha256": "57b1df8c24dece80e2f678041adec3b776bd7e77b32f2ca80de24165ad682849"
+    },
+    {
+      "path": "extension/src/projectspendstate.ts",
+      "sha256": "b1289833a612cd8089b243c39fdad66de99479195393aa693b9d22e7dbf45079"
+    },
+    {
+      "path": "extension/src/richtext.ts",
+      "sha256": "e0327d27436297c136d4754b4ef701c0c8bd9dcea04bc990aa2070ac43dbd1cf"
+    },
+    {
+      "path": "extension/src/sessioncost.ts",
+      "sha256": "8ee37512ee9e3d7edc9cc1c439ff6872defc2cf53dc745111de0a5dba1cfc8e4"
+    },
+    {
+      "path": "extension/src/store.ts",
+      "sha256": "babc5d910f8e499bb1a64c4be09aa855d3818777b0f84c1bd9146eb467a29c1e"
+    },
+    {
+      "path": "extension/src/transcript.ts",
+      "sha256": "1fd72556b23f9d6bec5c52debf6160f2b411ada21a5f74e51910c458e609b5d4"
+    },
+    {
+      "path": "extension/src/turnformat.ts",
+      "sha256": "86387b847154f2f337423ba97ec581e7fcbac49f1e40a313e79a00af4d9c1fce"
+    },
+    {
+      "path": "extension/src/view/cost.ts",
+      "sha256": "695c79e163b4cc43d47c822cb84b4a24e7b916f0fe5e2e04c163d3511acadbac"
+    },
+    {
+      "path": "extension/src/view/time.ts",
+      "sha256": "785d5b1ffc03793fa78657dffcff2a01b6d01698a0c0e0b7a9537a8bf8a0950a"
+    },
+    {
+      "path": "extension/src/view/tokens.ts",
+      "sha256": "6887780d668c42e1cd55838745ab267308eebebb3e779ec74a7d8ae1f0bc1ba3"
+    },
+    {
+      "path": "runtime.cjs",
+      "sha256": "96a9f429bf95a7b291f3ba86f4c86e665b2b2f81a9cea743c31b3de1229eafdc"
+    }
+  ],
+  "prompt_sha256": "ca14ce6efbc29431759f60df9378c7cfa5180c473ba0ce5bf9a39a7ab0a3b85f",
+  "diff_sha256": "4c2ca9fde54eaf5700547b7aedbb78d8ab5021e1e5678aafbe5c41ae5159e5b1",
+  "keys": [],
+  "audit": "Independent feature contract and exported dependency closure. Ordinary and boundary behavior passes without repairing a known bug."
+}

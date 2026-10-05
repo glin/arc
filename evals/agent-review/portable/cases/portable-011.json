@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-011",
+  "revision": 1,
+  "family": "payload-limits",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Rail row ceiling uses average size",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/payload.ts @ 3f8ca50",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/payload.mjs",
+      "sha256": "5b891d557818a068b98fefe26bab1ad091270543bdfe04656ad4ba37adf7b531"
+    },
+    {
+      "path": "src/rail-message.mjs",
+      "sha256": "998895a193ab79e8aa8daf9bce474c541f634ddcc80bd774950b60a27cbd68db"
+    }
+  ],
+  "prompt_sha256": "781d06312a4408fa92d3985468011683d13d506ebec99130575789f001dd8c11",
+  "diff_sha256": "c98601a2229435eb1ca46ccf23743665083ed059ea3d3ed246e32207aeeb08ec",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "An oversized rail row passes when small rows dilute its average.",
+      "paths": ["src/payload.mjs"],
+      "scenario": "One rail row exceeds the serialized byte ceiling while many small rows stay below it."
+    }
+  ],
+  "audit": "Adapted payload guard. It checks the maximum serialized row against a fixed limit."
+}

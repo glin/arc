@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "kind": "claude-stream",
+    "sessionId": "00000000-0000-4000-8000-000000000014"
+  },
+  "parent": {
+    "requests": 2,
+    "subagentRequests": 0,
+    "toolCalls": 0,
+    "tools": {},
+    "costUsd": null,
+    "inputTokens": {
+      "uncached": 2000,
+      "cacheWrite5m": 0,
+      "cacheWrite1h": 0,
+      "cacheRead": 0,
+      "total": 2000
+    },
+    "outputTokens": 400,
+    "reasoningOutputTokens": 0,
+    "avgInputPerRequest": 1000,
+    "cacheReadShare": 0,
+    "contextFirst": 1000,
+    "contextMax": 1000,
+    "cache": {
+      "writeShare": 0,
+      "writeUsd": 0,
+      "writeWarning": false,
+      "expiryReturns": null,
+      "returnInputTokens": null,
+      "returnInputUsd": null,
+      "longestExpiryGapSeconds": null
+    },
+    "models": [
+      {
+        "id": "us.anthropic.claude-opus-5-5[1m]",
+        "canonical": "claude-opus-5-5",
+        "requests": 1,
+        "inputTokens": {
+          "uncached": 1000,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "total": 1000
+        },
+        "outputTokens": 200,
+        "reasoningOutputTokens": 0,
+        "costUsd": null,
+        "clientCostUsd": 0.008,
+        "priceMultiplier": 1.1,
+        "priced": false,
+        "contextWindow": 1000000
+      },
+      {
+        "id": "global.anthropic.claude-opus-5-5[1m]",
+        "canonical": "claude-opus-5-5",
+        "requests": 1,
+        "inputTokens": {
+          "uncached": 1000,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "total": 1000
+        },
+        "outputTokens": 200,
+        "reasoningOutputTokens": 0,
+        "costUsd": null,
+        "clientCostUsd": 0.008,
+        "priceMultiplier": 1,
+        "priced": false,
+        "contextWindow": 1000000
+      }
+    ]
+  },
+  "children": [],
+  "combined": {
+    "requests": 2,
+    "subagentRequests": 0,
+    "toolCalls": 0,
+    "tools": {},
+    "costUsd": null,
+    "inputTokens": {
+      "uncached": 2000,
+      "cacheWrite5m": 0,
+      "cacheWrite1h": 0,
+      "cacheRead": 0,
+      "total": 2000
+    },
+    "outputTokens": 400,
+    "reasoningOutputTokens": 0,
+    "avgInputPerRequest": 1000,
+    "cacheReadShare": 0,
+    "contextFirst": 1000,
+    "contextMax": 1000,
+    "cache": {
+      "writeShare": 0,
+      "writeUsd": 0,
+      "writeWarning": false,
+      "expiryReturns": null,
+      "returnInputTokens": null,
+      "returnInputUsd": null,
+      "longestExpiryGapSeconds": null
+    },
+    "models": [
+      {
+        "id": "us.anthropic.claude-opus-5-5[1m]",
+        "canonical": "claude-opus-5-5",
+        "requests": 1,
+        "inputTokens": {
+          "uncached": 1000,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "total": 1000
+        },
+        "outputTokens": 200,
+        "reasoningOutputTokens": 0,
+        "costUsd": null,
+        "clientCostUsd": 0.008,
+        "priceMultiplier": 1.1,
+        "priced": false,
+        "contextWindow": 1000000
+      },
+      {
+        "id": "global.anthropic.claude-opus-5-5[1m]",
+        "canonical": "claude-opus-5-5",
+        "requests": 1,
+        "inputTokens": {
+          "uncached": 1000,
+          "cacheWrite5m": 0,
+          "cacheWrite1h": 0,
+          "cacheRead": 0,
+          "total": 1000
+        },
+        "outputTokens": 200,
+        "reasoningOutputTokens": 0,
+        "costUsd": null,
+        "clientCostUsd": 0.008,
+        "priceMultiplier": 1,
+        "priced": false,
+        "contextWindow": 1000000
+      }
+    ]
+  },
+  "run": {
+    "turns": 1,
+    "durationMs": 1000,
+    "durationApiMs": 900,
+    "ttftMs": 100,
+    "isError": false,
+    "error": null,
+    "denials": {},
+    "subagents": {
+      "spawned": 0,
+      "completed": 0,
+      "failed": 0,
+      "byType": {}
+    },
+    "clientCostUsd": 0.016
+  }
+}

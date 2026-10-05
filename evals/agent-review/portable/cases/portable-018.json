@@ -1,0 +1,29 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-018",
+  "revision": 1,
+  "family": "interaction-routing",
+  "split": "development",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Selected-text draft routed to one matching host",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/timeline.ts",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/timeline.mjs",
+      "sha256": "995099d0185ca0d6045beeee7b1682b3e91d39264e52b011095af6ef9b51e8a8"
+    },
+    {
+      "path": "src/draft-inbox.mjs",
+      "sha256": "1f9984ac495688b03fca1a3f26c1f6721064f8a972a082f777058f6c857a78d7"
+    }
+  ],
+  "prompt_sha256": "0f33004274546c794f444b95aeb90f4c7b3f85c3e5ed216a53474724a7eba591",
+  "diff_sha256": "b6171878959cce1ae62a4a969b795a2c427e64c8dc1465d50a5ce6dbe9754545",
+  "keys": [],
+  "audit": "Bounded audit of host identity, no matching destination, and duplicate session IDs in separate windows."
+}

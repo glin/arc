@@ -1,0 +1,3 @@
+Review the proposed selected-text routing helper. A destination host is identified by session ID and window ID. The helper handles nonempty text and matching or missing hosts.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

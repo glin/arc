@@ -1,0 +1,20 @@
+{
+  "schema": "arc-portable-experiment-v1",
+  "cases": ["portable-021", "portable-022", "portable-023"],
+  "models": ["gpt-6.1-sol"],
+  "efforts": ["low", "medium", "high", "xhigh"],
+  "repeats": 3,
+  "seed": "arc-sol61-current-effort-20260930",
+  "reservation_usd": 1,
+  "timeout_seconds": 600,
+  "max_cells": 36,
+  "extra_instructions": [],
+  "required_tools": [],
+  "rate_snapshot": {
+    "source": "extension/src/pricing.ts exact gpt-6.1-sol OpenAI list-price row",
+    "date": "2026-09-30",
+    "rates": {
+      "gpt-6.1-sol": { "input": 2, "cacheRead": 0.1, "output": 10, "maxPricedContext": 272000 }
+    }
+  }
+}

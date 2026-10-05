@@ -1,0 +1,86 @@
+name: VSIX candidate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            extension/package-lock.json
+            cli/package-lock.json
+      - name: Check the tag against the extension version
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version="$(node -p "require('./extension/package.json').version")"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match extension/package.json version ${version}."
+            exit 1
+          fi
+          node scripts/release-version.js --notes "$version" > /dev/null
+      - name: Install zsh and ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zsh imagemagick
+          # Ubuntu ships ImageMagick 6, which has no magick command. The panel shots call
+          # `magick <in> <out>` and `magick compare`, which map to convert and compare.
+          printf '#!/bin/sh\nif [ "$1" = compare ]; then shift; exec compare "$@"; fi\nexec convert "$@"\n' \
+            | sudo tee /usr/local/bin/magick > /dev/null
+          sudo chmod +x /usr/local/bin/magick
+          magick -list format | grep -i webp
+      - run: npm ci
+      - run: npm --prefix extension ci
+      - run: npm --prefix cli ci
+      - run: npm test
+      - run: npm --prefix extension run build
+      - run: npm --prefix extension run package
+      - run: node extension/scripts/check-vsix.mjs
+      - name: Prepare hosted plugin candidate
+        run: node scripts/package-claude-plugin.js release
+      - name: Prepare candidate files
+        shell: bash
+        run: |
+          version="$(node -p "require('./extension/package.json').version")"
+          mkdir -p release
+          cp extension/arc.vsix "release/glin.arc-${version}.vsix"
+          cd release
+          sha256sum "glin.arc-${version}.vsix" > "glin.arc-${version}.vsix.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arc-vsix-candidate-${{ github.sha }}
+          path: release/
+          retention-days: 14
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: arc-vsix-candidate-${{ github.sha }}
+          path: release/
+      - name: Create the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release-version.js --notes "${GITHUB_REF_NAME#v}" > release-notes.md
+          gh release create "$GITHUB_REF_NAME" release/* --title "$GITHUB_REF_NAME" --notes-file release-notes.md

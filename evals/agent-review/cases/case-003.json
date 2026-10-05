@@ -1,0 +1,37 @@
+{
+  "schema": "arc-review-case-v1",
+  "id": "case-003",
+  "source_kind": "escaped_candidate",
+  "family": "session-child-lifecycle",
+  "case_revision": 1,
+  "key_revision": 1,
+  "source": {
+    "base": "a386a58042ecb69725971638d02f2878f3e8d790",
+    "candidate": "8195ad2ca40895625795b58b958eecbd8d49d92a",
+    "correction": "2cf77e8ba47cc57ca0655a5b7bf2fe8cb3477a5f"
+  },
+  "key_state": "historical-partial",
+  "historical_context": {
+    "original_prompt": null,
+    "plan": null
+  },
+  "fixture_paths": ["extension/src/claudehistory.ts"],
+  "keys": [
+    {
+      "id": "defect-001",
+      "severity": "high",
+      "summary": "A trailing write reports a finished child as live again.",
+      "paths": ["extension/src/claudehistory.ts"],
+      "evidence": {
+        "scope": "A trailing write reports a finished child as live again.",
+        "reach": "correction",
+        "mode": "later-symptom",
+        "disposition": "reported",
+        "source": "Arc correction commit 2cf77e8ba47cc57ca0655a5b7bf2fe8cb3477a5f",
+        "sha256": "2a710bc5002b5d4c7ae915d0bd488ffb80fcea3d5178fb2a8ec7b5a4def6cce7",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+diff --git a/cli/package.json b/cli/package.json
+index 1ef1f31a..3f493a1a 100644
+--- a/cli/package.json
++++ b/cli/package.json
+@@ -1,18 +1,23 @@
+ {
+-  "name": "arc-agent-status",
++  "name": "@glin/arc",
+   "version": "0.1.0",
+-  "private": true,
++  "license": "MIT",
++  "publishConfig": {
++    "access": "public"
++  },
+   "type": "module",
+   "engines": {
+     "node": ">=18"
+   },
+   "description": "Command-line status surfaces for Arc.",
+   "bin": {
++    "arc": "dist/arc-status.cjs",
+     "arc-status": "dist/arc-status.cjs"
+   },
+   "files": [
+     "dist",
+-    "README.md"
++    "README.md",
++    "LICENSE"
+   ],
+   "scripts": {
+     "build": "node build.mjs",
+diff --git a/cli/src/main.ts b/cli/src/main.ts
+index c1f9cde2..35122c57 100644
+--- a/cli/src/main.ts
++++ b/cli/src/main.ts
+@@ -8,8 +8,8 @@ const VERSION = typeof ARC_VERSION === 'string' ? ARC_VERSION : 'unknown';
+ 
+ function help(): string {
+   return [
+-    'Usage: arc-status statusline [--json | --next-turn] [--width COLUMNS]',
+-    '       arc-status cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
++    'Usage: arc statusline [--json | --next-turn] [--width COLUMNS]',
++    '       arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
+     '',
+     'Reads Claude Code status-line JSON from stdin.',
+     'Text output includes context, prompt-cache state, next-turn starting price, session cost, and account limits.',

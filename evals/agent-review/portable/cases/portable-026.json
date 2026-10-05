@@ -1,0 +1,415 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-026",
+  "revision": 1,
+  "family": "initial-reader-lineage-publication",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Reader session navigation",
+  "provenance": {
+    "classification": "historical",
+    "base": "a0b81ef2592064f7c434054a1cab05d11803eddf",
+    "candidate": "7a19278064962990cd45e237a8048cbb25444d5a",
+    "correction": "b6dfad6ecbf188c13ad39be7da7c753b02d4a3b2",
+    "change_origin": "reconstructed-review-task",
+    "limitations": "Historical production bytes and dependency closure. Original review prompt is unavailable. Runtime bundles erase TypeScript types and use a minimal VS Code host stub.",
+    "candidate_origin": "recovered-commit-snapshot",
+    "diff_origin": "historical-git-diff-scoped-to-exported-source",
+    "original_review_evidence": "unavailable"
+  },
+  "inputs": [
+    {
+      "path": "extension/src/activitydetail.ts",
+      "sha256": "81fca8315bd76daa34d120f090b607af9e42216099315f13cf09a8d524914c0d"
+    },
+    {
+      "path": "extension/src/agentpaths.ts",
+      "sha256": "6ca92dc295a23e35678de430b12873e2b7ac815771c4b00437770092ef65f8d9"
+    },
+    {
+      "path": "extension/src/agentspend.ts",
+      "sha256": "b12887c723faedf11dd1794e5facb3c40e551ba94840464f63d445bebbfaa65c"
+    },
+    {
+      "path": "extension/src/agentwire.ts",
+      "sha256": "c8562ed1711d521c3008ec4d4eae85ebe13cd64783a02c94e58e1de9806beff6"
+    },
+    {
+      "path": "extension/src/atomicfile.ts",
+      "sha256": "7e24d743fdc3a36d83e44d307edeffe981b5d38857627dd5fb9423d8c6be2c97"
+    },
+    {
+      "path": "extension/src/childartifacts.ts",
+      "sha256": "284a5fa97e601ddd3bafaa2f75e8fbe237280a8e3335984aa1ca4926a9659cd3"
+    },
+    {
+      "path": "extension/src/claudehistory.ts",
+      "sha256": "3d705902a6456e83661d0b95a9187480911f303c565f1f8f9f31ca78867249e3"
+    },
+    {
+      "path": "extension/src/claudeskillpath.ts",
+      "sha256": "08b2acf753b8739262bf6bb461a3ef77a4556504060f15066d13f4b069dfbc13"
+    },
+    {
+      "path": "extension/src/claudewire.ts",
+      "sha256": "e6a891d8e3067258bef3b71ebbd36118d930157fe5ad627b9502a008997b7982"
+    },
+    {
+      "path": "extension/src/codex.ts",
+      "sha256": "f12a56704d352ff72062a8eeed14ae03ce6aed26cd67699420a74ff9840f1ea5"
+    },
+    {
+      "path": "extension/src/codexhistory.ts",
+      "sha256": "1f4e8240d69b3dfdb63a5f84133c87cbbc54d84e56df1246727f04a8b0285172"
+    },
+    {
+      "path": "extension/src/codexopenings.ts",
+      "sha256": "b472dec14f896c2a2f940002b790b3318e443b8e778db6c0e6d9666243722af4"
+    },
+    {
+      "path": "extension/src/codexreply.ts",
+      "sha256": "2ef3caa242c2fe9c1b1284a69191cc4255831b126ece69ab3b4705785f428a25"
+    },
+    {
+      "path": "extension/src/composerview.ts",
+      "sha256": "37d21c023360b4ff7a70614a10aecf8515943b3970906ea2ed91f1df0f7c10dc"
+    },
+    {
+      "path": "extension/src/config.ts",
+      "sha256": "cb00d6f6471622e7cce6d2a569312e554b3d1a3e91db441ee7c3840249faf4a3"
+    },
+    {
+      "path": "extension/src/derivedcache.ts",
+      "sha256": "45e1583bca2cf6fc4d7b3e36fb5154d3baac8f24b3c73263079bee9ceb63946d"
+    },
+    {
+      "path": "extension/src/diagnosticslog.ts",
+      "sha256": "b56fc2dce9ad472c7ffa57f4e46239d3316cd95fab3ebab3496ee0412df273d7"
+    },
+    {
+      "path": "extension/src/domain/ask-answer.ts",
+      "sha256": "e7af7108dd228bbd0867f71bdeb3df1a7b4d5d8e7d1277f6c0de7b650c1fa138"
+    },
+    {
+      "path": "extension/src/domain/claude-skills.ts",
+      "sha256": "02bffaab1ad8b2013de76b5af3fb961ba6290378d2a66ef0967d31fac820f465"
+    },
+    {
+      "path": "extension/src/domain/commit-sha.ts",
+      "sha256": "fde6d659c60e1e6d7aa8b80c19a45b9c2c3330a8fa73fd6f5cd0cd32212734a7"
+    },
+    {
+      "path": "extension/src/domain/composer-editing.ts",
+      "sha256": "be5d11b93cbee97b9a721c2516f474c208c0c5f8624c49b771dc9da6afa40e52"
+    },
+    {
+      "path": "extension/src/domain/labels.ts",
+      "sha256": "c0cb8b2c843922f95d8f7fd3d77e9edd02b42e6b0aacc0272b92f25830f25db1"
+    },
+    {
+      "path": "extension/src/domain/link-path.ts",
+      "sha256": "f501cad077c87fad030a6922546108d107c9f42932fba9fe5b17c8b63a936826"
+    },
+    {
+      "path": "extension/src/domain/model-identity.ts",
+      "sha256": "77b3b6dfabe255909bb1213b321a0a71443ca483a71c652c1f8744b6229c597e"
+    },
+    {
+      "path": "extension/src/domain/prompt-assets.ts",
+      "sha256": "d95abd7225b81bf117c3d1916408c930c99d24a558dd201e4b34c87fd29aadbb"
+    },
+    {
+      "path": "extension/src/domain/rail-filters.ts",
+      "sha256": "beecf6a38279ca5a5983b7d4af85a9b1183b47cf7dcde99d424bc25a6ec5b91a"
+    },
+    {
+      "path": "extension/src/domain/rail-sort.ts",
+      "sha256": "cfd00a780ecd66092d9911d8c22309f2c86daa936f13baea077b2d9ef47b9416"
+    },
+    {
+      "path": "extension/src/domain/read.ts",
+      "sha256": "41cc05107148c8868a50240c3e1b71dbcf41999da7e4830836afe6090fffc143"
+    },
+    {
+      "path": "extension/src/domain/session-query.ts",
+      "sha256": "99ad25d54052b32bd7e8e8da7482bf7f399f6ff24043ab9bf8cb37d75e701fa3"
+    },
+    {
+      "path": "extension/src/domain/session-setups.ts",
+      "sha256": "a27a889e55df7da5d15006690c9c2942008a88fb04008f071366a0c5a88dd63d"
+    },
+    {
+      "path": "extension/src/domain/text.ts",
+      "sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4"
+    },
+    {
+      "path": "extension/src/domain/views.ts",
+      "sha256": "93a6ca5ddde8f8c27725aeb5b8c7b835419f3a2d80545e390da7a061761d8f35"
+    },
+    {
+      "path": "extension/src/fileicons.ts",
+      "sha256": "500e8b5d25d6bdc0424b244713e2b5d6bdc0d09154ffb16bc146f7de9acb6152"
+    },
+    {
+      "path": "extension/src/gitcommits.ts",
+      "sha256": "38b8d6715a9f4b2317bc6c6a014a54980b723938554d533d7755fe07d3628353"
+    },
+    {
+      "path": "extension/src/history.ts",
+      "sha256": "d3da4a047cc71ce2a5b48ab69cd358429bef5b9bdf1f85ab78b3d01e67882dad"
+    },
+    {
+      "path": "extension/src/historypages.ts",
+      "sha256": "cab4bc5b58c46f2f75e52aff3616308683e7aeb5b992c7e1bfa47968c03ae7d7"
+    },
+    {
+      "path": "extension/src/icontheme.ts",
+      "sha256": "5e32fa5dcb588b6634761a4328cf645827e422495f57eb7fd000dbe574d15b23"
+    },
+    {
+      "path": "extension/src/identity.ts",
+      "sha256": "72f2fb4b07e370c3c564b8853e3e8e88328dfd6f9dbd4cb229f4ddfbc4ca6853"
+    },
+    {
+      "path": "extension/src/mcpview.ts",
+      "sha256": "ea41429ba79b97cc8457d679ab5bbbf6ded9e19e01c2d9cdfa5e612a27dbbf0d"
+    },
+    {
+      "path": "extension/src/paneldevelopment.ts",
+      "sha256": "90a3f7eee9d095207c508a939cbfa7fc239458e3ab765799ada231a2f485bc1e"
+    },
+    {
+      "path": "extension/src/panelhost.ts",
+      "sha256": "aee63ac69fbfa143a1f4b8bde5cb37d033837baea6b694a16271d6e515ce86c6"
+    },
+    {
+      "path": "extension/src/paneltext.ts",
+      "sha256": "cd24a78925eba12a6495c0d89dbccf5e3d96569d5ab45210f28a01a5ae61b697"
+    },
+    {
+      "path": "extension/src/parserstate.ts",
+      "sha256": "d65ab74834beab67f8ea80128b0d12655a0c66f090fc472cc16018841c42cfb1"
+    },
+    {
+      "path": "extension/src/patchview.ts",
+      "sha256": "c79d25a7d851158d51a21baf55eaef842a61f4e3e04808493d14a2d6c8ae754c"
+    },
+    {
+      "path": "extension/src/pathcompletion.ts",
+      "sha256": "1c134625d107a41a31ad819a85e8164a6479f29b77e4d545ce6ada81d987f282"
+    },
+    {
+      "path": "extension/src/payload.ts",
+      "sha256": "363c2ef4aba561b9966cfaa68faacadd16ca03c1018cec1e8e2581ba886d8d66"
+    },
+    {
+      "path": "extension/src/performancediagnostics.ts",
+      "sha256": "9ffdc3a1a7cf0617029ef8611b3b17d61ada70bfe0bd3c8ab57e4c199082e2cd"
+    },
+    {
+      "path": "extension/src/pricing.ts",
+      "sha256": "14b584bebf08a3a643d1f8a58ae19a9672843460b9e6c75f3e6689c91de2c21b"
+    },
+    {
+      "path": "extension/src/progressiveworker.ts",
+      "sha256": "b70a1bb0ca51ac29da586653df67a1d5504479b3aeeceabfabebdf6a8f1100bf"
+    },
+    {
+      "path": "extension/src/projectspend.ts",
+      "sha256": "57b1df8c24dece80e2f678041adec3b776bd7e77b32f2ca80de24165ad682849"
+    },
+    {
+      "path": "extension/src/projectspendstate.ts",
+      "sha256": "b1289833a612cd8089b243c39fdad66de99479195393aa693b9d22e7dbf45079"
+    },
+    {
+      "path": "extension/src/promptassets.ts",
+      "sha256": "1c8b2baf0550c86890e6520f1aee1a5ab09dedd91501d5ba3796843e69557c9e"
+    },
+    {
+      "path": "extension/src/repositoryscope.ts",
+      "sha256": "e9e6b9e847350af5b8a3e8d9416de00c83997a420c9fd9253294388ef6c6c14f"
+    },
+    {
+      "path": "extension/src/richtext.ts",
+      "sha256": "e0327d27436297c136d4754b4ef701c0c8bd9dcea04bc990aa2070ac43dbd1cf"
+    },
+    {
+      "path": "extension/src/scheduler.ts",
+      "sha256": "3a91e028009d3f1b428da1cce99e65e37d8e8a18ec3d79c6515bdf563fd9def3"
+    },
+    {
+      "path": "extension/src/sessiondetails.ts",
+      "sha256": "3934e53ddeb480fe4e2081ddb7f82f4477ff4eab814dda6af277a3a7585670c0"
+    },
+    {
+      "path": "extension/src/sessionnames.ts",
+      "sha256": "fa351c52af14beab43de56fa053e4c712c18b2aa28419401305a6c8942837931"
+    },
+    {
+      "path": "extension/src/sessionrename.ts",
+      "sha256": "0b390aa6b7154677bc4a222fbb06d2dd8f56383752713e4cb2f0cece1146e7c7"
+    },
+    {
+      "path": "extension/src/settings.ts",
+      "sha256": "f0ddfab5d97fd01323f36b0fb9ab200e95061fcb70c373e0eb350e4d07b30501"
+    },
+    {
+      "path": "extension/src/store.ts",
+      "sha256": "babc5d910f8e499bb1a64c4be09aa855d3818777b0f84c1bd9146eb467a29c1e"
+    },
+    {
+      "path": "extension/src/transcript.ts",
+      "sha256": "1fd72556b23f9d6bec5c52debf6160f2b411ada21a5f74e51910c458e609b5d4"
+    },
+    {
+      "path": "extension/src/turncard.ts",
+      "sha256": "a4757f175c18a1fe4d4f1eeddfe409fec17d6bdf54ccae6ff862ff418d0d6f55"
+    },
+    {
+      "path": "extension/src/turncomments.ts",
+      "sha256": "fcef8357d42267a267355917e088c4955a2a51cb54d09351f681c9966612ff5f"
+    },
+    {
+      "path": "extension/src/turnformat.ts",
+      "sha256": "86387b847154f2f337423ba97ec581e7fcbac49f1e40a313e79a00af4d9c1fce"
+    },
+    {
+      "path": "extension/src/turnlabels.ts",
+      "sha256": "e598f6119a71140fe251edbe92ec6b4ec0fef7dcaa422a34561c5dfd1df89866"
+    },
+    {
+      "path": "extension/src/turnplaces.ts",
+      "sha256": "4a65f25c25007c1f773f9f50cbb60a80e1716a607012c4fa2b99a4496ec7ca87"
+    },
+    {
+      "path": "extension/src/turnrail.ts",
+      "sha256": "d07a9d12e7a5b98927524e15a20b6c5e091db89d33d48f15d98158c02028d0f0"
+    },
+    {
+      "path": "extension/src/turnread.ts",
+      "sha256": "7033b6fd8c6a1af534a62de4c6385af65b40210644c1fbc80db020c1ea6d4b03"
+    },
+    {
+      "path": "extension/src/turnsearch.ts",
+      "sha256": "baff7f0c27254534a5cd7edf24ae428a3c4934bd640a08d79c2f53bc7e8dbba6"
+    },
+    {
+      "path": "extension/src/turnview.ts",
+      "sha256": "3023c0ef772b323a80cf2f1b9bc708511f89aebeb28809c2b9ce89f03b809e43"
+    },
+    {
+      "path": "extension/src/uris.ts",
+      "sha256": "d4ed409099e7cc179cd7c5c5181781530cff9826d59fa1d4b503634f4dfa808e"
+    },
+    {
+      "path": "extension/src/usageview.ts",
+      "sha256": "042f84e7c8fde46baa3d22155dff392701e4ef33cc44bdca580314c6d62499fe"
+    },
+    {
+      "path": "extension/src/view/card-menu.ts",
+      "sha256": "7685a540d85e1586132166804f07f22db426ad208d4eae391353188194787197"
+    },
+    {
+      "path": "extension/src/view/card-presentation.ts",
+      "sha256": "297c2ddc6cdae7a21baf452e6d8968b55da008fd01cd8a1a47d86d62bae05b78"
+    },
+    {
+      "path": "extension/src/view/card-words.ts",
+      "sha256": "693776c605c87ea25a21e22b8c8277b2fa65fe4aa33a6f0f10b4f6bfceb1aa9e"
+    },
+    {
+      "path": "extension/src/view/comments.ts",
+      "sha256": "2317e56c28118322a4900608964c47ff3b4430d9239954e1ef776ea6064741be"
+    },
+    {
+      "path": "extension/src/view/composer-editing.ts",
+      "sha256": "3c93033e97c6a057c6b7fd52990a0d52c27d2ea359488ae622375ddcf11112e1"
+    },
+    {
+      "path": "extension/src/view/composer-size.ts",
+      "sha256": "2c30a8c5a852403c882972148a6d637617f5e2195a5bc68934bad5aae0ae9cba"
+    },
+    {
+      "path": "extension/src/view/cost.ts",
+      "sha256": "695c79e163b4cc43d47c822cb84b4a24e7b916f0fe5e2e04c163d3511acadbac"
+    },
+    {
+      "path": "extension/src/view/launcher.ts",
+      "sha256": "6faf6583332680055c1a20906a91f2efc8e4798c12f4ecd508f5400355134ba0"
+    },
+    {
+      "path": "extension/src/view/projectspend.ts",
+      "sha256": "dbb2b77136ae2a1271fa4a57d472951895dc46134348278b8b1ecc8e18c015dc"
+    },
+    {
+      "path": "extension/src/view/rail.ts",
+      "sha256": "fa693b025870fc4f7619f5f682b67359b21fe14e23dc5c059feb32949ea1de47"
+    },
+    {
+      "path": "extension/src/view/session-query.ts",
+      "sha256": "e3c23093284ab0cd013fcf8e1b94bf242941f737ea2ad56f0443cc76807c4731"
+    },
+    {
+      "path": "extension/src/view/stat-detail.ts",
+      "sha256": "e72c0dae01d4424fb7270434e2274aa73a75d28bf36e8003fd232cdacd90dd76"
+    },
+    {
+      "path": "extension/src/view/time.ts",
+      "sha256": "785d5b1ffc03793fa78657dffcff2a01b6d01698a0c0e0b7a9537a8bf8a0950a"
+    },
+    {
+      "path": "extension/src/view/timeline-layout.ts",
+      "sha256": "27acc86d92c62e1ea325b3cd70aa74a3949d7fb1d2b0702beb7fe182327e5e0a"
+    },
+    {
+      "path": "extension/src/view/tokens.ts",
+      "sha256": "6887780d668c42e1cd55838745ab267308eebebb3e779ec74a7d8ae1f0bc1ba3"
+    },
+    {
+      "path": "extension/src/view/usage.ts",
+      "sha256": "a5792a2d53a693de368b36ddb1fbd33183453ea706e1385a786402b5d71b4bbd"
+    },
+    {
+      "path": "extension/src/webview/card-rows.ts",
+      "sha256": "ad637c5f324a81b6693105d91542d941f3916da6889802b100cd6babbc088f7b"
+    },
+    {
+      "path": "extension/src/webview/inline-text.ts",
+      "sha256": "f83caa14202573b3ad1bbc033be641ffaf16f4884ce79e787c76ee5f23a5dd25"
+    },
+    {
+      "path": "extension/src/webview/payload-contracts.ts",
+      "sha256": "252f7f3f97f7b6da2dd934fb5449310a73473746ed6aaa47cf39be7ab7cf6ce2"
+    },
+    {
+      "path": "extension/src/webview/protocol.ts",
+      "sha256": "76f429d38357446afabf0a6520c0c2cf6f207a2ba5dbc1d91d2a6be1226528a0"
+    },
+    {
+      "path": "extension/src/webview/stat-chip.ts",
+      "sha256": "9e7c8037cc68703941624bd214f38b1adae52d8b28ab6ad0942787406d1a7322"
+    },
+    {
+      "path": "extension/src/webview/stat-detail.ts",
+      "sha256": "8a368a33f096f8db0144cd65b9c1270ec38b7bbae4b07836216fc04123d63f5d"
+    },
+    {
+      "path": "runtime.cjs",
+      "sha256": "6068e42dfe68a17da95b1c977f0b0b3769ab7cefaad8966cb6f67daab666b9dc"
+    }
+  ],
+  "prompt_sha256": "faa045b4ac031daa75870ad65d5b6cd72d060d710978f7e14b1023d394dc1e17",
+  "diff_sha256": "66b1b70e84f0d6219a4230d21c412a74b56c7827218ba01265395d0033bbb615",
+  "keys": [
+    {
+      "id": "finding-26",
+      "severity": "medium",
+      "summary": "The first child selection lacks its reader parent.",
+      "scenario": "Start a session with the same labels from the session menu, including pending model recovery. Its first selection publishes before the parent relationship exists.",
+      "paths": ["extension/src/panelhost.ts"]
+    }
+  ],
+  "audit": "Production regression extracted outside assigned inputs. Ordinary and boundary checks, source closure and relocation qualification are required by the cohort."
+}

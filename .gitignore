@@ -1,0 +1,28 @@
+node_modules/
+*.vsix
+release/
+extension/dist/
+cli/dist/
+extension/shots/
+.DS_Store
+.env
+.env.*
+!.env.example
+.claude/plans/
+
+# Stray logs left in the tree by whatever was run in it. The packaging ignore spells this
+# `**/*.log`, because vsce matches with minimatch, where `*` does not cross a `/`.
+*.log
+
+# Scratch that a session creates inside the tree: its worktrees, its dispatched runs, and its
+# review artifacts. The globs cover `.tmp/` and whichever `.tmp-` name a session picks.
+.tmp-*
+.tmp/
+.worktrees/
+.test-logs/
+.scratch-*/
+.claude/worktrees/
+.claude/plan-worktrees/
+.claude/dispatch/
+.claude/reviews/
+evals/agent-review/.runs/

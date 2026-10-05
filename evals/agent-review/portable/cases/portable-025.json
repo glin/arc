@@ -1,0 +1,229 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-025",
+  "revision": 1,
+  "family": "padded-incremental-checkpoint",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Incremental indexing",
+  "provenance": {
+    "classification": "historical",
+    "base": "d18471c90e26b5f0de03b9835e193d891811a9a3",
+    "candidate": "935b3d7ce6bee2be37f6ac55c51c2574a176ccb8",
+    "correction": "d4d9893613ed1c9bd033d2eb72b018cfd1052d44",
+    "change_origin": "reconstructed-causal-introduction",
+    "limitations": "Historical production bytes and dependency closure. Original review prompt is unavailable. Runtime bundles erase TypeScript types and use a minimal VS Code host stub.",
+    "candidate_origin": "recovered-commit-snapshot",
+    "diff_origin": "reconstructed-source-diff",
+    "original_review_evidence": "unavailable",
+    "base_origin": "historical-source-snapshot-parent-not-review-base",
+    "review_base_origin": "candidate-snapshot-with-two-production-padding-branches"
+  },
+  "inputs": [
+    {
+      "path": "extension/src/activitydetail.ts",
+      "sha256": "81fca8315bd76daa34d120f090b607af9e42216099315f13cf09a8d524914c0d"
+    },
+    {
+      "path": "extension/src/agentpaths.ts",
+      "sha256": "6ca92dc295a23e35678de430b12873e2b7ac815771c4b00437770092ef65f8d9"
+    },
+    {
+      "path": "extension/src/agentspend.ts",
+      "sha256": "c70ff516c5077e420b3486b64207bdd2f0eef31c912997f78208beab1e8bd906"
+    },
+    {
+      "path": "extension/src/agentwire.ts",
+      "sha256": "c8562ed1711d521c3008ec4d4eae85ebe13cd64783a02c94e58e1de9806beff6"
+    },
+    {
+      "path": "extension/src/atomicfile.ts",
+      "sha256": "7e24d743fdc3a36d83e44d307edeffe981b5d38857627dd5fb9423d8c6be2c97"
+    },
+    {
+      "path": "extension/src/childartifacts.ts",
+      "sha256": "284a5fa97e601ddd3bafaa2f75e8fbe237280a8e3335984aa1ca4926a9659cd3"
+    },
+    {
+      "path": "extension/src/codex.ts",
+      "sha256": "8515b87757565d780a7ee3aa558e43d4894cb82ed5688893491d7a60ee221b46"
+    },
+    {
+      "path": "extension/src/codexreply.ts",
+      "sha256": "2ef3caa242c2fe9c1b1284a69191cc4255831b126ece69ab3b4705785f428a25"
+    },
+    {
+      "path": "extension/src/domain/commit-sha.ts",
+      "sha256": "fde6d659c60e1e6d7aa8b80c19a45b9c2c3330a8fa73fd6f5cd0cd32212734a7"
+    },
+    {
+      "path": "extension/src/domain/labels.ts",
+      "sha256": "c0cb8b2c843922f95d8f7fd3d77e9edd02b42e6b0aacc0272b92f25830f25db1"
+    },
+    {
+      "path": "extension/src/domain/link-path.ts",
+      "sha256": "f501cad077c87fad030a6922546108d107c9f42932fba9fe5b17c8b63a936826"
+    },
+    {
+      "path": "extension/src/domain/prompt-assets.ts",
+      "sha256": "d95abd7225b81bf117c3d1916408c930c99d24a558dd201e4b34c87fd29aadbb"
+    },
+    {
+      "path": "extension/src/domain/rail-filters.ts",
+      "sha256": "beecf6a38279ca5a5983b7d4af85a9b1183b47cf7dcde99d424bc25a6ec5b91a"
+    },
+    {
+      "path": "extension/src/domain/rail-sort.ts",
+      "sha256": "cfd00a780ecd66092d9911d8c22309f2c86daa936f13baea077b2d9ef47b9416"
+    },
+    {
+      "path": "extension/src/domain/read.ts",
+      "sha256": "41cc05107148c8868a50240c3e1b71dbcf41999da7e4830836afe6090fffc143"
+    },
+    {
+      "path": "extension/src/domain/session-query.ts",
+      "sha256": "99ad25d54052b32bd7e8e8da7482bf7f399f6ff24043ab9bf8cb37d75e701fa3"
+    },
+    {
+      "path": "extension/src/domain/text.ts",
+      "sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4"
+    },
+    {
+      "path": "extension/src/domain/views.ts",
+      "sha256": "93a6ca5ddde8f8c27725aeb5b8c7b835419f3a2d80545e390da7a061761d8f35"
+    },
+    {
+      "path": "extension/src/fileicons.ts",
+      "sha256": "500e8b5d25d6bdc0424b244713e2b5d6bdc0d09154ffb16bc146f7de9acb6152"
+    },
+    {
+      "path": "extension/src/identity.ts",
+      "sha256": "c1da045e80561e63cc4e3744d8247b486c4c35b67dadc6646e71a821c94e919c"
+    },
+    {
+      "path": "extension/src/parserstate.ts",
+      "sha256": "9139923725955cac08e9bf6ff1690bb5757b968e1f093a0f68d22ea1bf6b9a28"
+    },
+    {
+      "path": "extension/src/pricing.ts",
+      "sha256": "e8a6833c98f6b7785517d5663520fa9f013607cd34b1dc474a01468219dd9f23"
+    },
+    {
+      "path": "extension/src/projectspend.ts",
+      "sha256": "1e92d2c82f0237ffef729c2f867fee1eddf91c7aff5f01ac5f1b3a8ac5e8a437"
+    },
+    {
+      "path": "extension/src/projectspendstate.ts",
+      "sha256": "b1289833a612cd8089b243c39fdad66de99479195393aa693b9d22e7dbf45079"
+    },
+    {
+      "path": "extension/src/promptassets.ts",
+      "sha256": "1c8b2baf0550c86890e6520f1aee1a5ab09dedd91501d5ba3796843e69557c9e"
+    },
+    {
+      "path": "extension/src/richtext.ts",
+      "sha256": "e0327d27436297c136d4754b4ef701c0c8bd9dcea04bc990aa2070ac43dbd1cf"
+    },
+    {
+      "path": "extension/src/store.ts",
+      "sha256": "babc5d910f8e499bb1a64c4be09aa855d3818777b0f84c1bd9146eb467a29c1e"
+    },
+    {
+      "path": "extension/src/transcript.ts",
+      "sha256": "233b25080969f424b91d3968129f3d367a93b28750ca0eed1a993328394fdf06"
+    },
+    {
+      "path": "extension/src/turncard.ts",
+      "sha256": "48386ad709a49436caee77901bed0e580bc497205b3185e5e5992054e419d050"
+    },
+    {
+      "path": "extension/src/turncomments.ts",
+      "sha256": "fcef8357d42267a267355917e088c4955a2a51cb54d09351f681c9966612ff5f"
+    },
+    {
+      "path": "extension/src/turnformat.ts",
+      "sha256": "86387b847154f2f337423ba97ec581e7fcbac49f1e40a313e79a00af4d9c1fce"
+    },
+    {
+      "path": "extension/src/turnlabels.ts",
+      "sha256": "4b37798ac2bf1134ce3b41b024040eb95b60169a01302915e08594d48ecf6663"
+    },
+    {
+      "path": "extension/src/turnrail.ts",
+      "sha256": "693f96b38daca3430e807339ebea9762da53670117a7858eebcccf2aea2e744b"
+    },
+    {
+      "path": "extension/src/turnread.ts",
+      "sha256": "7033b6fd8c6a1af534a62de4c6385af65b40210644c1fbc80db020c1ea6d4b03"
+    },
+    {
+      "path": "extension/src/turnsearch.ts",
+      "sha256": "baff7f0c27254534a5cd7edf24ae428a3c4934bd640a08d79c2f53bc7e8dbba6"
+    },
+    {
+      "path": "extension/src/turnview.ts",
+      "sha256": "9f01184f8966949a509a4b9fd2e1038c943fad76a7e9d20778be2e5536f899a2"
+    },
+    {
+      "path": "extension/src/view/card-menu.ts",
+      "sha256": "bf9972d226a0608b8b264d15ff403525b8c3f711f54fb7d09f7ee2aad9a976b1"
+    },
+    {
+      "path": "extension/src/view/card-presentation.ts",
+      "sha256": "297c2ddc6cdae7a21baf452e6d8968b55da008fd01cd8a1a47d86d62bae05b78"
+    },
+    {
+      "path": "extension/src/view/card-words.ts",
+      "sha256": "8dba17b361f5dba76d860940a6fb3aa46be902831a20c24928413befde4de307"
+    },
+    {
+      "path": "extension/src/view/comments.ts",
+      "sha256": "2317e56c28118322a4900608964c47ff3b4430d9239954e1ef776ea6064741be"
+    },
+    {
+      "path": "extension/src/view/composer-size.ts",
+      "sha256": "2c30a8c5a852403c882972148a6d637617f5e2195a5bc68934bad5aae0ae9cba"
+    },
+    {
+      "path": "extension/src/view/cost.ts",
+      "sha256": "695c79e163b4cc43d47c822cb84b4a24e7b916f0fe5e2e04c163d3511acadbac"
+    },
+    {
+      "path": "extension/src/view/rail.ts",
+      "sha256": "6404ac30315a86bced33a621f935d71ff2e0a07d2e7a0b6deb787d1630c2e8e9"
+    },
+    {
+      "path": "extension/src/view/session-query.ts",
+      "sha256": "e3c23093284ab0cd013fcf8e1b94bf242941f737ea2ad56f0443cc76807c4731"
+    },
+    {
+      "path": "extension/src/view/stat-detail.ts",
+      "sha256": "e72c0dae01d4424fb7270434e2274aa73a75d28bf36e8003fd232cdacd90dd76"
+    },
+    {
+      "path": "extension/src/view/time.ts",
+      "sha256": "785d5b1ffc03793fa78657dffcff2a01b6d01698a0c0e0b7a9537a8bf8a0950a"
+    },
+    {
+      "path": "extension/src/view/tokens.ts",
+      "sha256": "6887780d668c42e1cd55838745ab267308eebebb3e779ec74a7d8ae1f0bc1ba3"
+    },
+    {
+      "path": "runtime.cjs",
+      "sha256": "72255abbcd9828d6c68e740ffd1c0040e5aebe37bdebb4b35dea5112b12f1c3d"
+    }
+  ],
+  "prompt_sha256": "b65d470f982a9925b97382fd8a9b861d6a48d52ecca7fb64dfadc6f6e3cd0748",
+  "diff_sha256": "187084e3124842fc8b197ccf002d0cb172fa2b7ec76a161c02ae875e7939ff66",
+  "keys": [
+    {
+      "id": "finding-25",
+      "severity": "medium",
+      "summary": "Padding joins an appended request to an incomplete incremental line.",
+      "scenario": "Index a newline-terminated record with NUL padding, save and load its checkpoint, then append another request. Incremental parsing rejects or omits that request while a rebuild reads it.",
+      "paths": ["extension/src/projectspend.ts"]
+    }
+  ],
+  "audit": "Production regression extracted outside assigned inputs. Ordinary and boundary checks, source closure and relocation qualification are required by the cohort."
+}

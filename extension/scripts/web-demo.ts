@@ -1,0 +1,84 @@
+import * as esbuild from 'esbuild';
+import { DEMO_SHELL } from './web-demo-shell.ts';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { BROWSER_BUILD, browserBundle, browserStylesheet } from '../src/panelbundle.ts';
+import { fillPanelText, panelValues } from '../src/paneltext.ts';
+import { DARK_MODERN_THEME, LIGHT_MODERN_THEME, ONE_DARK_PRO_DARKER_THEME } from '../src/panelfixture.ts';
+import { CARD_ACTIONS } from '../src/view/card-words.ts';
+import {
+  CAPTURE_RAIL_WIDTH,
+  CAPTURE_TIME,
+  DEMO_LABELS,
+  DEMO_RAIL_FOLDS,
+  DEMO_SESSION_IDS,
+  demoPayload,
+  demoContextSample,
+} from './readme-fixture.ts';
+import { DEMO_MENU_COMMANDS, manifestMenu } from './web-demo-menu.ts';
+
+const destination = path.resolve(process.argv[2] ?? path.join(__dirname, '../../.scratch-web-demo/site'));
+const theme = (css: string, name: string) =>
+  css.replaceAll(':root', `:root[data-theme="${name}"]`).replaceAll('body{', `body[data-theme="${name}"]{`);
+// The production label and read rules, built for the page. The adapter edits labels with them, so a
+// name typed in the demo is cleaned and counted the way the extension cleans and counts it.
+// A session's unread state follows its turns' read marks by the rule the extension's list uses.
+// The context menu comes with them, and its entries come from the extension's manifest.
+const labelRules = esbuild.buildSync({
+  stdin: {
+    contents: `import { labelCounts, labelEditorReply, labelsOf, railLabelFields, setSessionLabels } from './src/turnlabels.ts';
+import { newBySession } from './src/domain/read.ts';
+import { applyComment, normalizeComments } from './src/turncomments.ts';
+import { isSendChord } from './src/domain/composer-editing.ts';
+import { installMenu } from './scripts/web-demo-menu.ts';
+import { demoHost } from './scripts/web-demo-host.ts';
+window.__ARC_DEMO_SAMPLES__.host = demoHost;
+window.__ARC_DEMO_SAMPLES__.labelRules = { labelCounts, labelEditorReply, labelsOf, railLabelFields, setSessionLabels };
+window.__ARC_DEMO_SAMPLES__.readRules = { newBySession };
+window.__ARC_DEMO_SAMPLES__.commentRules = { applyComment, normalizeComments };
+window.__ARC_DEMO_SAMPLES__.isSendChord = isSendChord;
+window.__ARC_DEMO_SAMPLES__.installMenu = installMenu;`,
+    resolveDir: path.join(__dirname, '..'),
+    loader: 'ts',
+  },
+  ...BROWSER_BUILD,
+}).outputFiles[0].text;
+const samples = {
+  clock: CAPTURE_TIME,
+  contexts: Object.fromEntries(DEMO_SESSION_IDS.map((id) => [id, demoContextSample(id)])),
+  railWidth: CAPTURE_RAIL_WIDTH,
+  railFolds: DEMO_RAIL_FOLDS,
+  labels: DEMO_LABELS,
+  labelWords: { labelled: CARD_ACTIONS.railLabelled, heading: CARD_ACTIONS.labelHeading },
+  menuEntries: manifestMenu(
+    JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8')),
+    new Set([...DEMO_MENU_COMMANDS, 'arc.renameView', 'arc.deleteView']),
+  ),
+  payloads: Object.fromEntries(DEMO_SESSION_IDS.map((id) => [id, demoPayload(id)])),
+};
+const assets: Record<string, string> = {
+  'panel.js': fillPanelText(browserBundle().text, panelValues()),
+  'panel.css': fillPanelText(browserStylesheet(), panelValues()),
+  'themes.css': [
+    theme(ONE_DARK_PRO_DARKER_THEME, 'onedark'),
+    theme(DARK_MODERN_THEME, 'dark'),
+    theme(LIGHT_MODERN_THEME, 'light'),
+  ].join('\n'),
+  'demo.css': ['web-demo.css', 'web-demo-shell.css', 'web-demo-menu.css']
+    .map((name) => fs.readFileSync(path.join(__dirname, name), 'utf8'))
+    .join('\n'),
+  'adapter.js': labelRules + fs.readFileSync(path.join(__dirname, 'web-demo-adapter.js'), 'utf8'),
+  'samples.js': `window.__ARC_DEMO_SAMPLES__ = ${JSON.stringify(samples)};\n`,
+  'index.html': `<!DOCTYPE html>
+<html lang="en" data-theme="onedark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'"><title>Arc demo</title><link rel="stylesheet" href="./themes.css"><link rel="stylesheet" href="./panel.css"><link rel="stylesheet" href="./demo.css"></head>
+<body class="vscode-dark" data-theme="onedark"><header class="demo-header"><div class="demo-heading"><strong>Arc demo</strong><span>Explore sample sessions and add comments. Changes stay on this page.</span></div><div class="demo-tools"><label for="demo-theme">Theme</label><select id="demo-theme"><option value="onedark">One Dark Pro Darker</option><option value="dark">VS Code dark</option><option value="light">VS Code light</option></select></div></header>${DEMO_SHELL}<h1 class="sr-only">Arc demo</h1><main id="list" aria-label="Timeline"><p class="empty" data-startup-status role="status" aria-live="polite">Loading sample sessions…</p></main><script src="./samples.js" defer></script><script src="./adapter.js" defer></script><script src="./panel.js" defer></script></body></html>`,
+};
+for (const [name, content] of Object.entries(assets).filter(([name]) => name === 'panel.js' || name === 'panel.css')) {
+  if (/__ARC_[A-Z0-9_]+__/.test(content)) throw new Error(`${name} has an unresolved panel token`);
+}
+fs.mkdirSync(destination, { recursive: true });
+for (const [name, content] of Object.entries(assets)) fs.writeFileSync(path.join(destination, name), content);
+console.log(destination);
+console.log(
+  'Model catalog uses provider snapshots. Check freshness from extension with node --import tsx scripts/demo-catalog-check.ts --cwd <launch-folder>.',
+);

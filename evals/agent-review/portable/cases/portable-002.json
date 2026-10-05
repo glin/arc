@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-002",
+  "revision": 1,
+  "family": "repository-discovery",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Partial folder lookup failure",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/repositoryscope.ts @ a0abf6e",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/repositoryscope.mjs",
+      "sha256": "06640d0133c54ca1d334f82ab1d00185edd4abfbc941a2a09f3b3d1fea12c07b"
+    },
+    {
+      "path": "src/workspace-catalog.mjs",
+      "sha256": "6f95db5eb4d6f72fce247d3569cbe306bf445dc3ed21bb9a4e452d0505445276"
+    }
+  ],
+  "prompt_sha256": "2f0f0e0b5f159c699fa4fc9a641e16b858bd4f0bbb36060b7d05f38705379443",
+  "diff_sha256": "f5fd78496f18312d38d90b15313b67ef40eeec1aeb78aef4b1a7bf93900f9074",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "One failed folder lookup freezes successful topology changes.",
+      "paths": ["src/repositoryscope.mjs"],
+      "scenario": "Two workspace folders are open. One lookup fails after the other gains a worktree."
+    }
+  ],
+  "audit": "Adapted two-folder topology. It checks retention of the failed folder and progress of the successful folder."
+}

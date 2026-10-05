@@ -1,0 +1,1131 @@
+diff --git a/extension/src/composerview.ts b/extension/src/composerview.ts
+index 1cc9856a..08eda6b8 100644
+--- a/extension/src/composerview.ts
++++ b/extension/src/composerview.ts
+@@ -700,6 +700,9 @@ export interface ComposerContext {
+ type ComposerPromptEntry = PromptEntry | (Omit<PromptEntry, 'kind'> & { kind?: 'command' });
+ 
+ export interface ComposerState {
++  submittedRecoveryId?: string;
++  submittedComments?: readonly TurnComment[];
++  submittedDraftRevision?: number;
+   // Present only while this session is still a local draft. The profile is the whole of
+   // what the draft will start on, so every control the composer draws for it reads from here
+   // and a press changes this alone. Nothing on a draft's row reaches the live session
+@@ -1003,6 +1006,7 @@ export interface ComposerDraftTag {
+ }
+ 
+ export interface ComposerView {
++  recoverySetup?: SessionProfile;
+   agent: string;
+   // The session the box is aimed at. It rides the view because the panel files the
+   // draft under it and names it on every message about the box: without it the panel aimed
+@@ -2998,6 +3002,7 @@ export function attachedComments(state: ComposerState): TurnComment[] {
+ // Comments available to the active box. Waiting records keep their claims while Claude
+ // accepts a later prompt through its own mid-turn queue.
+ export function commentsForActiveSubmission(state: ComposerState): TurnComment[] {
++  if (state.submittedComments) return [...state.submittedComments];
+   const queued = new Set(state.queued.flatMap((entry) => entry.commentIds));
+   const draft = new Set(state.draftCommentIds ?? []);
+   return state.comments
+@@ -3884,6 +3889,7 @@ export function queueRecoverySubmission(
+   const request = clearRequest(agent, text);
+   return {
+     id: marker.id,
++    ...(marker.recoveryId ? { recoveryId: marker.recoveryId } : {}),
+     text: text.trim(),
+     commentIds: [...commentIds],
+     assets: assets.map((asset) => ({ ...asset })),
+@@ -4663,6 +4669,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
+   return {
+     agent: state.agent,
+     sessionId: state.sessionId,
++    ...(state.profile ? { recoverySetup: state.profile } : {}),
+     draft: state.draft,
+     targetName: `The prompt goes to ${session}, a ${name} session`,
+     origin: state.origin
+diff --git a/extension/src/panelhost.ts b/extension/src/panelhost.ts
+index 57bccfc4..4f40b462 100644
+--- a/extension/src/panelhost.ts
++++ b/extension/src/panelhost.ts
+@@ -1064,6 +1064,7 @@ interface ClearSettlement {
+   request: 'clear' | 'new';
+   resetId: string;
+   preservePayload: boolean;
++  recoveryId?: string;
+   delivery: PromptDelivery | null;
+ }
+ 
+@@ -1072,7 +1073,18 @@ interface ClearRoute {
+   hosts: Map<PanelHost, number | null>;
+ }
+ 
++import { mergeSubmittedPrompts, type SubmittedPrompt } from './webview/state';
++
+ export class PanelProvider implements vscode.Disposable {
++  private submissionWrites: Promise<void> = Promise.resolve();
++  private submissionsInFlight = new Set<string>();
++  private submittingDrafts = new Map<
++    string,
++    { revision: number; commentIds: readonly string[]; assets: readonly StoredPromptAsset[] }
++  >();
++  private draftRevisions = new Map<string, number>();
++  private clearingDraftRevision: { session: string; revision: number } | null = null;
++  private panelRecoveryWaiters = new Map<string, { resolve(): void; reject(error: unknown): void }>();
+   private disposed = false;
+   private attachmentHandoffs = new Set<AbortController>();
+   // Every host the panel is currently drawn in. A list rather than one: a tab restored
+@@ -2226,9 +2238,20 @@ export class PanelProvider implements vscode.Disposable {
+   // this machine: the stored options carried `retainContextWhenHidden` and no
+   // `enableFindWidget` at all.
+   //
+-  // Replacing the tab is the only way to give an option to one that already exists. Nothing is
+-  // lost with it: what the reader had open is kept by the extension, not by the panel.
+-  revivePanel(panel: vscode.WebviewPanel): void {
++  // Replacing the tab applies the current options. Submitted text reaches workspace storage
++  // before replacement removes the browser copy.
++  async revivePanel(panel: vscode.WebviewPanel, state?: unknown): Promise<void> {
++    if (state && typeof state === 'object' && 'submittedPrompts' in state) {
++      try {
++        await this.importPromptRecovery(state.submittedPrompts);
++      } catch {
++        void vscode.window.showInformationMessage(
++          'Arc: the saved prompts could not be retained. Keep this tab open and copy them before closing it.',
++        );
++        this.adoptPanel(panel, 'serializer');
++        return;
++      }
++    }
+     const matches = (Object.keys(PANEL_OPTIONS) as (keyof typeof PANEL_OPTIONS)[]).every(
+       (key) => panel.options[key] === PANEL_OPTIONS[key],
+     );
+@@ -2249,6 +2272,27 @@ export class PanelProvider implements vscode.Disposable {
+   // built when the reader looks at it, and a created one is built when the command runs, so a
+   // measured start means nothing until the log says which one it timed.
+   adoptPanel(panel: vscode.WebviewPanel, origin: PanelOrigin): void {
++    if (this.editorPanel && this.editorPanel !== panel) {
++      const previous = this.editorPanel;
++      const previousHost = this.hosts?.find((host) => host.webview === previous.webview);
++      if (previousHost) {
++        void this.capturePanelRecovery(previousHost)
++          .then(() => {
++            if (this.editorPanel !== previous) return;
++            previous.dispose();
++            if (this.editorPanel === previous) this.editorPanel = null;
++            this.adoptPanel(panel, origin);
++          })
++          .catch(() => {
++            this.attach(panelHost(panel));
++            panel.reveal();
++            void vscode.window.showInformationMessage(
++              'Arc: the recent prompts could not be saved. Keep this tab open and copy them before closing it.',
++            );
++          });
++        return;
++      }
++    }
+     this.diagnostics.log('panelAdopted', { origin });
+     if (this.editorPanel && this.editorPanel !== panel) {
+       this.editorPanel.dispose();
+@@ -2526,10 +2570,10 @@ export class PanelProvider implements vscode.Disposable {
+     message: unknown,
+     measured?: (serializedBytes: number | null) => void,
+   ): Thenable<boolean> {
+-    if (!this.readyHosts.has(host)) {
++    const type = (message as { type?: unknown })?.type;
++    if (!this.readyHosts.has(host) && type !== 'requestPromptRecovery') {
+       return Promise.resolve(false);
+     }
+-    const type = (message as { type?: unknown })?.type;
+     const kind = typeof type === 'string' ? type : 'unknown';
+     // The post first, then the count. Only budgeted messages carry a byte measurement.
+     // Other messages retain their count without paying for a second serialization.
+@@ -3306,8 +3350,13 @@ export class PanelProvider implements vscode.Disposable {
+     return true;
+   }
+ 
+-  private adoptDraft(provisional: string, actual: string): void {
+-    const draft = this.newDrafts[provisional];
++  private adoptDraft(
++    provisional: string,
++    actual: string,
++    submitted?: NewSessionDraft,
++    submittedSettings?: ComposerState['settings'],
++  ): void {
++    const draft = submitted ?? this.newDrafts[provisional];
+     if (!draft) {
+       throw new Error(`session ${provisional} is not a fresh draft`);
+     }
+@@ -3322,8 +3371,8 @@ export class PanelProvider implements vscode.Disposable {
+         assets: this.assets,
+         queues: this.queues,
+         live: this.live,
+-        settings: this.picks,
+-        profiles: this.draftProfiles,
++        settings: submittedSettings ? { ...this.picks, [provisional]: submittedSettings } : this.picks,
++        profiles: submitted ? { ...this.draftProfiles, [provisional]: submitted.profile } : this.draftProfiles,
+         origins: this.sessionOrigins,
+         sent: this.sentPrompts,
+         boxText: this.boxText,
+@@ -3356,7 +3405,11 @@ export class PanelProvider implements vscode.Disposable {
+         this.hostPreviousSessions.set(host, actual);
+       }
+     }
+-    this.sessionRows = this.sessionRows.map((row) => (row.id === provisional ? { ...row, id: actual } : row));
++    this.sessionRows = this.sessionRows.map((row) =>
++      row.id === provisional
++        ? { ...row, id: actual, agentKey: draft.profile.agent, agent: AGENT_NAMES[draft.profile.agent] }
++        : row,
++    );
+     this.pinnedTop = new Set(next.pinned ?? []);
+     this.hidden = new Set(next.archived ?? []);
+     this.saved.pinnedTop = [...this.pinnedTop];
+@@ -3412,6 +3465,10 @@ export class PanelProvider implements vscode.Disposable {
+       void this.post({ type: 'fileStaging', session: actual, pending: true, token });
+       void this.post({ type: 'fileStaging', session: provisional, pending: false, token });
+     }
++    if (this.draftRevisions?.has(provisional)) {
++      this.draftRevisions.set(actual, this.draftRevisions.get(provisional) ?? 0);
++      this.draftRevisions.delete(provisional);
++    }
+     delete this.newDrafts[provisional];
+     // The labels follow the session onto the id it actually gets. A reader who files a
+     // session while it is starting puts the label on the draft's own id, and the agent
+@@ -3772,6 +3829,8 @@ export class PanelProvider implements vscode.Disposable {
+         this.hostPreviousSessions.set(host, successor);
+       }
+     }
++    for (const entry of this.queues[successor] ?? [])
++      if (entry.recoveryId) this.confirmPromptOwner(entry.recoveryId, successor);
+     this.awaitingSessionRecords[successor] = {
+       sessionId: successor,
+       createdAt: Date.now(),
+@@ -4096,7 +4155,9 @@ export class PanelProvider implements vscode.Disposable {
+     }
+     // An explicit recovery is written at once. Removing the card before a delayed write
+     // would leave a window close between the two with no retained copy of the prompt.
+-    this.holdDraft(session, press.text, true);
++    const revision =
++      Math.max(this.draftRevisions?.get(session) ?? 0, this.submittingDrafts?.get(session)?.revision ?? 0) + 1;
++    this.holdDraft(session, press.text, true, revision);
+     void this.post({ type: 'takeDraft', session: session, text: press.text });
+     const left = held.filter((one) => one !== press);
+     if (left.length) {
+@@ -4548,7 +4609,15 @@ export class PanelProvider implements vscode.Disposable {
+   // One way to change the words held in a session's box. Persistence can wait for
+   // ordinary typing, while an explicit recovery is written before its failed card leaves.
+   // The rail moves only when meaningful text appears or disappears, never once per letter.
+-  private holdDraft(session: string, text: string, immediate: boolean = false): boolean {
++  private holdDraft(session: string, text: string, immediate: boolean = false, revision?: number): boolean {
++    if (revision !== undefined) {
++      this.draftRevisions ??= new Map();
++      this.draftRevisions.set(session, Math.max(this.draftRevisions.get(session) ?? 0, revision));
++      this.typedRenames?.delete(session);
++    }
++    const clearing = this.clearingDraftRevision;
++    if (text === '' && clearing?.session === session && (this.draftRevisions?.get(session) ?? 0) > clearing.revision)
++      return false;
+     const moved = hasUnsentPrompt(this.drafts[session]) !== hasUnsentPrompt(text);
+     this.drafts[session] = text;
+     // Every caller but the reader's own keystrokes puts the same words in both, and this is
+@@ -4596,6 +4665,147 @@ export class PanelProvider implements vscode.Disposable {
+     void this.memento?.update(STATE_KEY, this.saved);
+   }
+ 
++  private importPromptRecovery(snapshot: unknown): Promise<void> {
++    const merged = mergeSubmittedPrompts(this.saved.submittedPrompts, snapshot);
++    this.saved.submittedPrompts = merged;
++    void this.post({ type: 'promptRecovery', submittedPrompts: merged });
++    const write = (this.submissionWrites ?? Promise.resolve())
++      .catch(() => undefined)
++      .then(async () => {
++        await this.memento?.update(STATE_KEY, this.saved);
++        await this.post({ type: 'promptRecovery', submittedPrompts: this.saved.submittedPrompts ?? [] });
++      });
++    this.submissionWrites = write;
++    return write;
++  }
++
++  private capturePanelRecovery(host: PanelHost): Promise<void> {
++    const request = crypto.randomUUID();
++    return new Promise<void>((resolve, reject) => {
++      const timer = setTimeout(() => {
++        this.panelRecoveryWaiters.delete(request);
++        reject(new Error('The panel did not return its saved prompts.'));
++      }, 10_000);
++      this.panelRecoveryWaiters.set(request, {
++        resolve: () => {
++          clearTimeout(timer);
++          resolve();
++        },
++        reject: (error) => {
++          clearTimeout(timer);
++          reject(error);
++        },
++      });
++      void Promise.resolve(this.sendToHost(host, { type: 'requestPromptRecovery', request })).catch(reject);
++    });
++  }
++
++  private confirmPromptOwner(id: string | undefined, owner: string, accepted = false): void {
++    const attempt = this.saved.submittedPrompts?.find((entry) => entry.id === id);
++    if (!attempt) return;
++    void this.importPromptRecovery([
++      { ...attempt, owner, accepted: attempt.accepted || accepted, ownerRevision: (attempt.ownerRevision ?? 0) + 1 },
++    ]).catch(() => {
++      void vscode.window.showInformationMessage(
++        'Arc: the prompt remains available, but its destination could not be saved.',
++      );
++    });
++  }
++
++  private async acceptSubmission(
++    text: string,
++    session: string,
++    revision: number,
++    source: string,
++    host: PanelHost,
++    supplied?: SubmittedPrompt,
++  ): Promise<void> {
++    const state = this.stateFor(session);
++    const draft = this.newDrafts[session];
++    const cwd = state ? this.cwdForSession(state.agent, session) : null;
++    const captured = state
++      ? {
++          ...state,
++          comments: state.comments.slice(),
++          submittedComments: commentsForActiveSubmission(state),
++          submittedDraftRevision: revision,
++          assets: state.assets?.slice(),
++          draftCommentIds: state.draftCommentIds?.slice(),
++          queued: state.queued.slice(),
++          settings: { ...state.settings },
++        }
++      : null;
++    const assets = (this.assets[session] ?? []).slice();
++    const attempt = supplied ?? {
++      id: crypto.randomUUID(),
++      source,
++      revision,
++      text,
++      order: (this.saved.submittedPrompts?.at(-1)?.order ?? 0) + 1,
++    };
++    const restore = () => {
++      void this.post({ type: 'restoreDraft', session: source, text, revision });
++    };
++    this.submissionsInFlight ??= new Set();
++    if (this.submissionsInFlight.has(session)) {
++      restore();
++      return;
++    }
++    this.submissionsInFlight.add(session);
++    this.submittingDrafts ??= new Map();
++    if (captured)
++      this.submittingDrafts.set(session, {
++        revision,
++        commentIds: captured.submittedComments.map((comment) => comment.id),
++        assets,
++      });
++    for (const asset of assets) this.assetIdsInHandoff.add(asset.id);
++    try {
++      const validated = mergeSubmittedPrompts([attempt]);
++      if (validated.length !== 1 || attempt.text !== text || attempt.source !== source || attempt.revision !== revision)
++        throw new Error('The prompt could not be retained.');
++      await this.importPromptRecovery(validated);
++      if (
++        !captured ||
++        !this.hosts.includes(host) ||
++        this.panelSession(source, host) !== session ||
++        !this.stateFor(session) ||
++        this.cwdForSession(captured.agent, session) !== cwd
++      ) {
++        restore();
++        return;
++      }
++      const previous = this.promptOriginHost;
++      this.promptOriginHost = host;
++      this.clearingDraftRevision = { session, revision };
++      try {
++        const current = this.stateFor(session);
++        if (!current) {
++          restore();
++          return;
++        }
++        const ready = {
++          ...captured,
++          submittedRecoveryId: attempt.id,
++          running: current.running,
++          clearing: current.clearing,
++          queued: current.queued,
++          queueHandoffs: current.queueHandoffs,
++        };
++        this.sendPrompt(text, session, revision, source, ready, assets, draft, attempt.id);
++      } finally {
++        this.promptOriginHost = previous;
++        this.clearingDraftRevision = null;
++      }
++    } catch {
++      restore();
++    } finally {
++      this.submissionsInFlight.delete(session);
++      this.submittingDrafts.delete(session);
++      for (const asset of assets) if (!this.assetHandoffs.has(session)) this.assetIdsInHandoff.delete(asset.id);
++    }
++  }
++
+   private writeDrafts(): Promise<void> {
+     this.saved.drafts = normalizeDrafts(this.drafts);
+     this.saved.sentPrompts = sentPromptsToSave(this.sentPrompts, this.promptsBySession);
+@@ -4607,8 +4817,17 @@ export class PanelProvider implements vscode.Disposable {
+ 
+   // A press on Send, or an Enter. Whether that sends or queues is decided in
+   // `composerview.ts`, because a rule this file made would be one no test could reach.
+-  private sendPrompt(text: string, session: string, revision: number, browserSession: string = session): void {
+-    const state = this.stateFor(session);
++  private sendPrompt(
++    text: string,
++    session: string,
++    revision: number,
++    browserSession: string = session,
++    captured?: ComposerState,
++    capturedAssets?: StoredPromptAsset[],
++    capturedDraft?: NewSessionDraft,
++    recoveryId?: string,
++  ): void {
++    const state = captured ?? this.stateFor(session);
+     if (!state) {
+       void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+       return;
+@@ -4633,7 +4852,7 @@ export class PanelProvider implements vscode.Disposable {
+       void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+       return;
+     }
+-    const heldAssets = this.assets[state.sessionId] ?? [];
++    const heldAssets = capturedAssets ?? this.assets[state.sessionId] ?? [];
+     const unsupported = unsupportedPromptAsset(state.agent, heldAssets);
+     if (unsupported) {
+       this.setAttachmentNotice(state.sessionId, attachmentRefusal('unsupported', unsupported.name));
+@@ -4642,7 +4861,7 @@ export class PanelProvider implements vscode.Disposable {
+     }
+     if (this.attachmentStorageDir && heldAssets.length > 0) {
+       try {
+-        resolvePromptAssets(this.attachmentStorageDir, this.assets[state.sessionId]);
++        resolvePromptAssets(this.attachmentStorageDir, heldAssets);
+       } catch (error) {
+         this.setAttachmentNotice(
+           state.sessionId,
+@@ -4690,11 +4909,15 @@ export class PanelProvider implements vscode.Disposable {
+       if (!restored) {
+         return;
+       }
++      if (recoveryId) restored.recoveryId = recoveryId;
+       this.queues[state.sessionId] = state.queued.map((entry) => (entry === recovery ? restored : entry));
+       this.holdDraft(state.sessionId, '');
+-      delete this.draftCommentIds[state.sessionId];
++      this.releaseSubmittedCommentClaims(state);
+       if (heldAssets.length) {
+-        delete this.assets[state.sessionId];
++        const carriedIds = new Set(heldAssets.map((asset) => asset.id));
++        const remaining = (this.assets[state.sessionId] ?? []).filter((asset) => !carriedIds.has(asset.id));
++        if (remaining.length) this.assets[state.sessionId] = remaining;
++        else delete this.assets[state.sessionId];
+       }
+       this.answerOpenAsks(state.sessionId, 'queue');
+       void this.writeDrafts().then(() => this.flushQueue(state.sessionId));
+@@ -4711,7 +4934,7 @@ export class PanelProvider implements vscode.Disposable {
+     if (compaction) {
+       if (compaction === 'queue') {
+         const queuedCommentIds = commentsForActiveSubmission(state).map((comment) => comment.id);
+-        const queuedAssets = this.assets[state.sessionId] ?? [];
++        const queuedAssets = heldAssets;
+         const queued =
+           queuedCommentIds.length || queuedAssets.length
+             ? queueSubmissionAfter(
+@@ -4736,10 +4959,15 @@ export class PanelProvider implements vscode.Disposable {
+           return;
+         }
+         this.holdDraft(state.sessionId, '');
+-        this.queues[state.sessionId] = queued;
+-        delete this.draftCommentIds[state.sessionId];
++        this.queues[state.sessionId] = recoveryId
++          ? queued.map((entry, index) => (index === queued.length - 1 ? { ...entry, recoveryId } : entry))
++          : queued;
++        this.releaseSubmittedCommentClaims(state);
+         if (queuedAssets.length) {
+-          delete this.assets[state.sessionId];
++          const carriedIds = new Set(heldAssets.map((asset) => asset.id));
++          const remaining = (this.assets[state.sessionId] ?? []).filter((asset) => !carriedIds.has(asset.id));
++          if (remaining.length) this.assets[state.sessionId] = remaining;
++          else delete this.assets[state.sessionId];
+         }
+         void this.writeDrafts();
+         this.answerOpenAsks(state.sessionId, compaction);
+@@ -4756,7 +4984,7 @@ export class PanelProvider implements vscode.Disposable {
+       const request = clearRequest(state.agent, text);
+       if (clear === 'queue' || request?.command === 'new') {
+         const queuedCommentIds = commentsForActiveSubmission(state).map((comment) => comment.id);
+-        const queuedAssets = this.assets[state.sessionId] ?? [];
++        const queuedAssets = heldAssets;
+         const queued =
+           queuedCommentIds.length || queuedAssets.length
+             ? queueSubmissionAfter(
+@@ -4781,10 +5009,15 @@ export class PanelProvider implements vscode.Disposable {
+           return;
+         }
+         this.holdDraft(state.sessionId, '');
+-        this.queues[state.sessionId] = queued;
+-        delete this.draftCommentIds[state.sessionId];
++        this.queues[state.sessionId] = recoveryId
++          ? queued.map((entry, index) => (index === queued.length - 1 ? { ...entry, recoveryId } : entry))
++          : queued;
++        this.releaseSubmittedCommentClaims(state);
+         if (queuedAssets.length) {
+-          delete this.assets[state.sessionId];
++          const carriedIds = new Set(heldAssets.map((asset) => asset.id));
++          const remaining = (this.assets[state.sessionId] ?? []).filter((asset) => !carriedIds.has(asset.id));
++          if (remaining.length) this.assets[state.sessionId] = remaining;
++          else delete this.assets[state.sessionId];
+         }
+         void this.writeDrafts();
+         this.answerOpenAsks(state.sessionId, clear);
+@@ -4808,7 +5041,7 @@ export class PanelProvider implements vscode.Disposable {
+       return;
+     }
+     if (meant === 'queue') {
+-      const queuedAssets = this.assets[state.sessionId] ?? [];
++      const queuedAssets = heldAssets;
+       const queued = queueSubmissionAfter(
+         state.queued,
+         crypto.randomUUID(),
+@@ -4827,10 +5060,15 @@ export class PanelProvider implements vscode.Disposable {
+         return;
+       }
+       this.holdDraft(state.sessionId, '');
+-      this.queues[state.sessionId] = queued;
+-      delete this.draftCommentIds[state.sessionId];
++      this.queues[state.sessionId] = recoveryId
++        ? queued.map((entry, index) => (index === queued.length - 1 ? { ...entry, recoveryId } : entry))
++        : queued;
++      this.releaseSubmittedCommentClaims(state);
+       if (queuedAssets.length) {
+-        delete this.assets[state.sessionId];
++        const carriedIds = new Set(heldAssets.map((asset) => asset.id));
++        const remaining = (this.assets[state.sessionId] ?? []).filter((asset) => !carriedIds.has(asset.id));
++        if (remaining.length) this.assets[state.sessionId] = remaining;
++        else delete this.assets[state.sessionId];
+       }
+       void this.writeDrafts();
+       this.answerOpenAsks(state.sessionId, meant);
+@@ -4839,7 +5077,7 @@ export class PanelProvider implements vscode.Disposable {
+     }
+     this.holdDraft(state.sessionId, '');
+     this.answerOpenAsks(state.sessionId, meant);
+-    this.send(state, text);
++    this.send(state, text, null, capturedDraft, capturedAssets, recoveryId);
+   }
+ 
+   // Every request this session is waiting on, answered because the reader typed instead
+@@ -4860,7 +5098,14 @@ export class PanelProvider implements vscode.Disposable {
+   // The one place a prompt leaves for an agent. The reader's text goes with the comments
+   // they left on this session's turns, assembled in `composerview.ts`, and those
+   // comments then go.
+-  private send(state: ComposerState, text: string, queued: QueuedSubmission | null = null): void {
++  private send(
++    state: ComposerState,
++    text: string,
++    queued: QueuedSubmission | null = null,
++    capturedDraft?: NewSessionDraft,
++    capturedAssets?: StoredPromptAsset[],
++    recoveryId?: string,
++  ): void {
+     // A queued command reaches this method after the turn ahead of it ends, so command
+     // recognition belongs here as well as on the first press. It must happen before prompt
+     // assembly, which would attach the reader's comments and hand the text to the model.
+@@ -4882,7 +5127,10 @@ export class PanelProvider implements vscode.Disposable {
+     // it out of the reader's hands unsent.
+     const carried = commentsForActiveSubmission(state);
+     const going = agentPromptToSend({ ...state, draft: text });
+-    const carriedAssets = storedAssetsForPrompt(queued?.assets ?? this.assets[state.sessionId] ?? [], going.assets);
++    const carriedAssets = storedAssetsForPrompt(
++      queued?.assets ?? capturedAssets ?? this.assets[state.sessionId] ?? [],
++      going.assets,
++    );
+     const assetHandoff = carriedAssets.length ? this.assetCompletions.begin() : null;
+     if (carriedAssets.length) {
+       this.assetHandoffs.add(state.sessionId);
+@@ -4899,7 +5147,7 @@ export class PanelProvider implements vscode.Disposable {
+       this.livePressHosts.set(state.sessionId + '\0' + pressed, this.promptOriginHost);
+     }
+     this.clearAttachmentNotice(state.sessionId);
+-    const draft = this.newDrafts[state.sessionId];
++    const draft = capturedDraft ?? this.newDrafts[state.sessionId];
+     const went = draft
+       ? this.onSendDraftPrompt?.(draft, going)
+       : this.onSendPrompt?.(state.agent, state.sessionId, this.cwdForSession(state.agent, state.sessionId), going);
+@@ -4913,11 +5161,13 @@ export class PanelProvider implements vscode.Disposable {
+           delivered: false,
+           reason: 'No agent handoff is available. Restore this prompt and try again.',
+         };
++        if (delivery.delivered && (recoveryId ?? queued?.recoveryId))
++          this.confirmPromptOwner(recoveryId ?? queued?.recoveryId, delivery.session || state.sessionId, true);
+         let adopted = false;
+         let assetSession = state.sessionId;
+         if (draft && delivery.delivered && delivery.session) {
+           try {
+-            this.adoptDraft(draft.draftId, delivery.session);
++            this.adoptDraft(draft.draftId, delivery.session, draft, state.settings);
+           } catch (error) {
+             delivery.delivered = false;
+             delivery.reason = error instanceof Error ? error.message : 'The new session could not be adopted.';
+@@ -4953,9 +5203,7 @@ export class PanelProvider implements vscode.Disposable {
+           void this.writeDrafts();
+         }
+         if (!queued && delivery.delivered) {
+-          if (this.draftCommentIds[state.sessionId]?.length) {
+-            delete this.draftCommentIds[state.sessionId];
+-          }
++          if (this.draftCommentIds[assetSession]?.length) this.releaseSubmittedCommentClaims(state, assetSession);
+           this.queues[state.sessionId] = queueAfterAcceptedRecovery(this.queues[state.sessionId] ?? []);
+           if (!this.queues[state.sessionId].length) {
+             delete this.queues[state.sessionId];
+@@ -4995,6 +5243,18 @@ export class PanelProvider implements vscode.Disposable {
+     void this.post({ type: 'usage', usage: this.usagePayload() });
+   }
+ 
++  private releaseSubmittedCommentClaims(state: ComposerState, session = state.sessionId): void {
++    if (
++      state.submittedDraftRevision !== undefined &&
++      (this.draftRevisions?.get(session) ?? 0) > state.submittedDraftRevision
++    )
++      return;
++    const submitted = new Set(state.draftCommentIds ?? []);
++    const left = (this.draftCommentIds[session] ?? []).filter((id) => !submitted.has(id));
++    if (left.length) this.draftCommentIds[session] = left;
++    else delete this.draftCommentIds[session];
++  }
++
+   // What a delivered prompt takes with it. Taken away rather than marked: a comment that has
+   // gone out was said and the agent has it, and a card still drawing it would leave the reader
+   // working out which of their own marks are outstanding. The marks on the cards clear with
+@@ -5205,6 +5465,8 @@ export class PanelProvider implements vscode.Disposable {
+     if (delivery.delivered && settlement.session === settlement.source) {
+       return;
+     }
++    if (delivery.delivered && settlement.recoveryId)
++      this.confirmPromptOwner(settlement.recoveryId, settlement.session, true);
+     this.clearSettlements.delete(settlement.session);
+     const session = settlement.session;
+     const held = this.queues[session] ?? [];
+@@ -5271,6 +5533,9 @@ export class PanelProvider implements vscode.Disposable {
+       preservePayload:
+         request.command === 'new' || Boolean(queued && (queued.commentIds.length || queued.assets.length)),
+       delivery: null,
++      ...((state.submittedRecoveryId ?? queued?.recoveryId)
++        ? { recoveryId: state.submittedRecoveryId ?? queued?.recoveryId }
++        : {}),
+     };
+     this.clearSettlements.set(state.sessionId, settlement);
+     const settle = (delivery: PromptDelivery): void => {
+@@ -5366,19 +5631,26 @@ export class PanelProvider implements vscode.Disposable {
+     if (!wanted) {
+       return;
+     }
+-    const activeCommentIds = commentsForActiveSubmission(state).map((comment) => comment.id);
+-    const activeAssets = this.assets[state.sessionId] ?? [];
++    const submitting = this.submittingDrafts?.get(state.sessionId);
++    const activeText =
++      submitting && (this.draftRevisions?.get(state.sessionId) ?? 0) <= submitting.revision ? '' : state.draft;
++    const activeCommentIds = commentsForActiveSubmission(state)
++      .map((comment) => comment.id)
++      .filter((id) => !submitting?.commentIds.includes(id));
++    const activeAssets = (this.assets[state.sessionId] ?? []).filter(
++      (asset) => !submitting?.assets?.some((reserved) => reserved.id === asset.id),
++    );
+     const [replacement] = queueSubmissionAfter(
+       [],
+       crypto.randomUUID(),
+-      state.draft,
++      activeText,
+       activeCommentIds,
+       activeAssets,
+       Date.now(),
+       false,
+       { agent: state.agent, owner: state.sessionId },
+     );
+-    const activeHasContent = state.draft.trim().length > 0 || activeCommentIds.length > 0 || activeAssets.length > 0;
++    const activeHasContent = activeText.trim().length > 0 || activeCommentIds.length > 0 || activeAssets.length > 0;
+     if (activeHasContent && !replacement) {
+       void vscode.window.showInformationMessage(
+         'Arc: the active draft cannot be retained while editing this waiting prompt. Shorten it and try again.',
+@@ -5449,19 +5721,26 @@ export class PanelProvider implements vscode.Disposable {
+     // into the queue in the place the edited prompt came out of, because overwriting the box
+     // destroyed whatever was typed there: a reader editing a second waiting prompt lost the
+     // first one outright, since it had already left the queue and the box was its only copy.
+-    const activeCommentIds = commentsForActiveSubmission(state).map((comment) => comment.id);
+-    const activeAssets = this.assets[state.sessionId] ?? [];
++    const submitting = this.submittingDrafts?.get(state.sessionId);
++    const activeText =
++      submitting && (this.draftRevisions?.get(state.sessionId) ?? 0) <= submitting.revision ? '' : state.draft;
++    const activeCommentIds = commentsForActiveSubmission(state)
++      .map((comment) => comment.id)
++      .filter((id) => !submitting?.commentIds.includes(id));
++    const activeAssets = (this.assets[state.sessionId] ?? []).filter(
++      (asset) => !submitting?.assets?.some((reserved) => reserved.id === asset.id),
++    );
+     const [replacement] = queueSubmissionAfter(
+       [],
+       crypto.randomUUID(),
+-      state.draft,
++      activeText,
+       activeCommentIds,
+       activeAssets,
+       Date.now(),
+       false,
+       { agent: state.agent, owner: state.sessionId },
+     );
+-    const activeHasContent = state.draft.trim().length > 0 || activeCommentIds.length > 0 || activeAssets.length > 0;
++    const activeHasContent = activeText.trim().length > 0 || activeCommentIds.length > 0 || activeAssets.length > 0;
+     if (activeHasContent && !replacement) {
+       void this.sendToHost(host, {
+         type: 'restoreDraft',
+@@ -5492,7 +5771,7 @@ export class PanelProvider implements vscode.Disposable {
+     } else {
+       delete this.draftCommentIds[state.sessionId];
+     }
+-    this.holdDraft(state.sessionId, wanted.text);
++    this.holdDraft(state.sessionId, wanted.text, false, currentRevision);
+     void this.writeDrafts().then(() => this.flushQueue(state.sessionId));
+     // The box is a real element the panel owns and never rebuilds, so its value is set over
+     // there rather than drawn from a payload.
+@@ -5609,7 +5888,7 @@ export class PanelProvider implements vscode.Disposable {
+   // failure puts the typed line back only when the box has not changed since the Send, and
+   // says why in an editor message, because the Composer has no rename editor to hold it. A
+   // box typed into and emptied again reads the same as an untouched one, so the Send's
+-  // revision stands for the untouched box until `setDraft` or a later rename replaces it.
++  // revision stands for the untouched box until typing, recovery, queue editing, or a later rename replaces it.
+   private async renameFromComposer(
+     sessionId: string,
+     name: string,
+@@ -5840,8 +6119,10 @@ export class PanelProvider implements vscode.Disposable {
+     ]);
+     const acceptedComments = this.saved.comments.filter((comment) => acceptedCommentIds.has(comment.id));
+     const readerParents = this.saved.readerParents;
++    const submittedPrompts = this.saved.submittedPrompts;
+     this.saved = normalizePanelState(null);
+     this.saved.readerParents = readerParents;
++    this.saved.submittedPrompts = submittedPrompts;
+     // Forgetting is starting over, and starting over in a workspace means what opening one
+     // for the first time means: what is already there is not new.
+     this.saved.since = Date.now();
+@@ -9899,7 +10180,7 @@ export class PanelProvider implements vscode.Disposable {
+       console.warn('Arc: a message from the panel was not understood, so nothing was done.', named);
+       return;
+     }
+-    if (message.type !== 'ready' && !this.readyHosts.has(host)) {
++    if (message.type !== 'ready' && message.type !== 'importPromptRecovery' && !this.readyHosts.has(host)) {
+       return;
+     }
+     // The three messages that name a card. A key the list no longer draws answers nothing,
+@@ -10011,6 +10292,8 @@ export class PanelProvider implements vscode.Disposable {
+       },
+       // What the composer does. Each needs a child, which this file has none of.
+       draft: (msg) => {
++        this.draftRevisions ??= new Map();
++        if (msg.revision !== undefined) this.draftRevisions.set(msg.session, msg.revision);
+         this.setDraft(msg.text, msg.keep, msg.session);
+       },
+       pathCompletion: async (msg) => {
+@@ -10100,15 +10383,22 @@ export class PanelProvider implements vscode.Disposable {
+       removeFile: async (msg) => {
+         await this.removeFile(msg.session, msg.value);
+       },
+-      sendPrompt: (msg) => {
+-        const previousOrigin = this.promptOriginHost;
+-        this.promptOriginHost = host;
++      importPromptRecovery: async (msg) => {
+         try {
+-          this.sendPrompt(msg.text, msg.session, msg.revision, browserSession ?? msg.session);
+-        } finally {
+-          this.promptOriginHost = previousOrigin;
++          await this.importPromptRecovery(msg.submittedPrompts);
++          if (msg.request) {
++            this.panelRecoveryWaiters.get(msg.request)?.resolve();
++            this.panelRecoveryWaiters.delete(msg.request);
++          }
++        } catch (error) {
++          if (msg.request) {
++            this.panelRecoveryWaiters.get(msg.request)?.reject(error);
++            this.panelRecoveryWaiters.delete(msg.request);
++          }
+         }
+       },
++      sendPrompt: (msg) =>
++        this.acceptSubmission(msg.text, msg.session, msg.revision, browserSession ?? msg.session, host, msg.attempt),
+       compact: (msg) => {
+         this.compact(msg.session);
+       },
+@@ -10435,6 +10725,7 @@ export class PanelProvider implements vscode.Disposable {
+     // only place a send is gathered, so a host saving its folds would wipe a prompt no
+     // transcript has recorded yet.
+     const sentPrompts = this.saved.sentPrompts;
++    const submittedPrompts = this.saved.submittedPrompts;
+     const draftCommentIds = this.saved.draftCommentIds;
+     // Browser saves can arrive after a provisional draft has adopted its durable id. The
+     // provider-owned membership sets already made that move, so an older browser copy must
+@@ -10483,6 +10774,7 @@ export class PanelProvider implements vscode.Disposable {
+     this.saved.since = since;
+     this.saved.drafts = drafts;
+     this.saved.sentPrompts = sentPrompts;
++    this.saved.submittedPrompts = submittedPrompts;
+     this.saved.draftCommentIds = draftCommentIds;
+     this.saved.started = started;
+     this.saved.labels = labels;
+@@ -10581,8 +10873,8 @@ export function registerPanel(
+     // Without this the tab is gone after a window reload, with no way back but the command.
+     // The editor restores the tab itself and hands the webview back here to be wired up.
+     vscode.window.registerWebviewPanelSerializer(PANEL_TYPE, {
+-      deserializeWebviewPanel: async (panel) => {
+-        provider.revivePanel(panel);
++      deserializeWebviewPanel: async (panel, state) => {
++        await provider.revivePanel(panel, state);
+       },
+     }),
+   );
+diff --git a/extension/src/turnview.ts b/extension/src/turnview.ts
+index b4658c41..a1f346e7 100644
+--- a/extension/src/turnview.ts
++++ b/extension/src/turnview.ts
+@@ -174,6 +174,7 @@ export type QueueDelivery =
+   | { phase: 'successor-recovery'; owner: string; source: string; successor: string; resetId: string; reason: string };
+ 
+ export interface QueuedSubmission {
++  recoveryId?: string;
+   id: string;
+   text: string;
+   commentIds: string[];
+@@ -183,8 +184,11 @@ export interface QueuedSubmission {
+   delivery: QueueDelivery;
+ }
+ 
++import { mergeSubmittedPrompts, type SubmittedPrompt } from './webview/state';
++
+ export interface PanelState {
+   readerParents: Record<string, string>;
++  submittedPrompts?: SubmittedPrompt[];
+   open: string[];
+   // The sessions a build with a fold on its heading had folded away. Nothing reads it:
+   // the panel draws one session at a time, so folding it left a heading over an empty
+@@ -459,6 +463,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
+     // The one field holding records rather than ids, so it is rebuilt record by record and
+     // cut by its own count as well as by a ceiling on each string inside it.
+     comments: normalizeComments(src.comments),
++    ...(src.submittedPrompts === undefined ? {} : { submittedPrompts: mergeSubmittedPrompts(src.submittedPrompts) }),
+     drafts: normalizeDrafts(src.drafts),
+     sentPrompts: normalizeSentPrompts(src.sentPrompts),
+     draftCommentIds: normalizeDraftCommentIds(src.draftCommentIds),
+@@ -754,6 +759,7 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
+         at,
+         ...(reason ? { reason } : {}),
+         delivery,
++        ...(typeof entry.recoveryId === 'string' ? { recoveryId: entry.recoveryId } : {}),
+       });
+       if (delivery.phase === 'queued' && delivery.resetId && !delivery.barrier) {
+         precedingReset = delivery.resetId;
+diff --git a/extension/src/webview/protocol.ts b/extension/src/webview/protocol.ts
+index fb869daf..250b4bd2 100644
+--- a/extension/src/webview/protocol.ts
++++ b/extension/src/webview/protocol.ts
+@@ -23,6 +23,7 @@ import type {
+   PromptEntryView,
+   QueuedPrompt,
+ } from '../composerview.ts';
++import { mergeSubmittedPrompts, type SubmittedPrompt } from './state.ts';
+ import type { LauncherRequest } from '../view/launcher.ts';
+ import type { PinSetupRequest } from '../view/launcher.ts';
+ import type { SessionLauncherView } from '../view/launcher.ts';
+@@ -227,6 +228,8 @@ export type HostToPanel =
+   | { type: 'openPick'; control: string }
+   | { type: 'takeDraft'; session: string; text: string }
+   | { type: 'takeQueuedDraft'; session: string; text: string; revision: number; value: string }
++  | { type: 'promptRecovery'; submittedPrompts: SubmittedPrompt[] }
++  | { type: 'requestPromptRecovery'; request: string }
+   | { type: 'restoreDraft'; session: string; text: string; revision: number }
+   | { type: 'notes'; comments: TurnComment[] }
+   | { type: 'openComment'; key: string }
+@@ -265,6 +268,8 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+   openPick: true,
+   takeDraft: true,
+   takeQueuedDraft: true,
++  promptRecovery: true,
++  requestPromptRecovery: true,
+   restoreDraft: true,
+   notes: true,
+   openComment: true,
+@@ -295,7 +300,7 @@ export type PanelToHost =
+   | { type: 'openControl'; control: string; session: string }
+   | { type: 'requestDefaults'; agent: 'claude' | 'codex'; model: string }
+   | { type: 'pick'; control: string; agent: string; session: string; model: string; value: string }
+-  | { type: 'draft'; text: string; keep: string; session: string }
++  | { type: 'draft'; text: string; keep: string; session: string; revision?: number }
+   | { type: 'pathCompletion'; session: string; request: number; token: string; caret: number }
+   | { type: 'answerAsk'; session: string; id: string; answer: AskAnswer }
+   | { type: 'beginFileStaging'; session: string; token: string }
+@@ -303,7 +308,8 @@ export type PanelToHost =
+   | { type: 'fileReadError'; session: string; token: string; name: string }
+   | { type: 'fileRejected'; session: string; code: string; name: string; size: number; rejected: number }
+   | { type: 'removeFile'; session: string; value: string }
+-  | { type: 'sendPrompt'; text: string; session: string; revision: number }
++  | { type: 'sendPrompt'; text: string; session: string; revision: number; attempt?: SubmittedPrompt }
++  | { type: 'importPromptRecovery'; submittedPrompts: unknown; request?: string }
+   | { type: 'compact'; session: string }
+   | { type: 'dismissLive'; session: string; kind: string }
+   | { type: 'restoreLive'; session: string; kind: string }
+@@ -709,6 +715,14 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
+             value: m.value,
+           }
+         : null;
++    case 'promptRecovery':
++      try {
++        return { type: 'promptRecovery', submittedPrompts: mergeSubmittedPrompts(m.submittedPrompts) };
++      } catch {
++        return null;
++      }
++    case 'requestPromptRecovery':
++      return isString(m.request) ? { type: 'requestPromptRecovery', request: m.request } : null;
+     case 'restoreDraft':
+       return isString(m.session) && isString(m.text) && typeof m.revision === 'number'
+         ? {
+@@ -851,6 +865,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
+             text: m.text,
+             keep: textOr(m.keep, m.text),
+             session: m.session,
++            ...(Number.isSafeInteger(m.revision) ? { revision: m.revision as number } : {}),
+           }
+         : null;
+     case 'pathCompletion':
+@@ -902,6 +917,12 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
+       return isString(m.session) && isString(m.value)
+         ? { type: 'removeFile', session: m.session, value: m.value }
+         : null;
++    case 'importPromptRecovery':
++      return {
++        type: 'importPromptRecovery',
++        submittedPrompts: m.submittedPrompts,
++        ...(isString(m.request) ? { request: m.request } : {}),
++      };
+     case 'sendPrompt':
+       // A revision that is not a whole number at or above zero counts as the first one, the
+       // way the host has always read it. The panel only ever sends one it issued itself.
+@@ -910,6 +931,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
+             type: 'sendPrompt',
+             text: m.text,
+             session: m.session,
++            ...(m.attempt && typeof m.attempt === 'object' ? { attempt: m.attempt as SubmittedPrompt } : {}),
+             revision:
+               typeof m.revision === 'number' && Number.isSafeInteger(m.revision) && m.revision >= 0 ? m.revision : 0,
+           }
+@@ -1130,6 +1152,10 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
+       return handlers.takeDraft(message);
+     case 'takeQueuedDraft':
+       return handlers.takeQueuedDraft(message);
++    case 'promptRecovery':
++      return handlers.promptRecovery(message);
++    case 'requestPromptRecovery':
++      return handlers.requestPromptRecovery(message);
+     case 'restoreDraft':
+       return handlers.restoreDraft(message);
+     case 'notes':
+@@ -1211,6 +1237,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
+       return handlers.fileRejected(message);
+     case 'removeFile':
+       return handlers.removeFile(message);
++    case 'importPromptRecovery':
++      return handlers.importPromptRecovery(message);
+     case 'sendPrompt':
+       return handlers.sendPrompt(message);
+     case 'compact':
+diff --git a/extension/src/webview/state.ts b/extension/src/webview/state.ts
+index 3132ded7..4054b4b2 100644
+--- a/extension/src/webview/state.ts
++++ b/extension/src/webview/state.ts
+@@ -1,7 +1,93 @@
+ import type { BrowserStatePort, PanelHost } from './host.ts';
++import type { SessionProfile } from '../view/launcher.ts';
+ import type { QueryMatch } from '../domain/session-query.ts';
+ 
++export interface SubmittedPrompt {
++  id: string;
++  order: number;
++  source: string;
++  revision: number;
++  text: string;
++  setup?: SessionProfile;
++  owner?: string;
++  ownerRevision?: number;
++  accepted?: boolean;
++}
++
++export const SUBMITTED_PROMPT_LIMIT = 5;
++export const SUBMITTED_PROMPT_CHARS = 20_000;
++
++export function mergeSubmittedPrompts(...snapshots: unknown[]): SubmittedPrompt[] {
++  const entries = new Map<string, SubmittedPrompt>();
++  for (const snapshot of snapshots) {
++    if (!Array.isArray(snapshot)) continue;
++    for (const value of snapshot) {
++      if (!value || typeof value !== 'object') continue;
++      const p = value as SubmittedPrompt;
++      if (
++        typeof p.id !== 'string' ||
++        !p.id ||
++        p.id.length > 200 ||
++        typeof p.source !== 'string' ||
++        p.source.length > 200 ||
++        typeof p.text !== 'string' ||
++        p.text.length > SUBMITTED_PROMPT_CHARS ||
++        !Number.isSafeInteger(p.order) ||
++        p.order < 1 ||
++        !Number.isSafeInteger(p.revision) ||
++        p.revision < 0
++      )
++        continue;
++      const next: SubmittedPrompt = { id: p.id, order: p.order, source: p.source, revision: p.revision, text: p.text };
++      if (
++        typeof p.owner === 'string' &&
++        p.owner.length <= 200 &&
++        Number.isSafeInteger(p.ownerRevision) &&
++        p.ownerRevision! > 0
++      ) {
++        next.owner = p.owner;
++        next.ownerRevision = p.ownerRevision;
++        if (p.accepted === true) next.accepted = true;
++      }
++      if (
++        p.setup &&
++        (p.setup.agent === 'claude' || p.setup.agent === 'codex') &&
++        ['model', 'effort', 'permissionMode'].every(
++          (key) => typeof p.setup![key as 'model'] === 'string' && p.setup![key as 'model'].length <= 200,
++        )
++      )
++        next.setup = {
++          agent: p.setup.agent,
++          model: p.setup.model,
++          effort: p.setup.effort,
++          permissionMode: p.setup.permissionMode,
++          source: p.setup.source === 'inherited' || p.setup.source === 'recent' ? p.setup.source : 'custom',
++        };
++      const prior = entries.get(p.id);
++      if (
++        prior &&
++        (prior.order !== next.order ||
++          prior.source !== next.source ||
++          prior.revision !== next.revision ||
++          prior.text !== next.text ||
++          (prior.setup &&
++            next.setup &&
++            (['agent', 'model', 'effort', 'permissionMode', 'source'] as const).some(
++              (key) => prior.setup![key] !== next.setup![key],
++            )))
++      ) {
++        throw new Error('The saved prompt conflicts with another copy.');
++      }
++      if (!prior || (next.ownerRevision ?? 0) > (prior.ownerRevision ?? 0)) entries.set(p.id, next);
++    }
++  }
++  return [...entries.values()]
++    .sort((a, b) => a.order - b.order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
++    .slice(-SUBMITTED_PROMPT_LIMIT);
++}
++
+ export interface SavedPanelState {
++  submittedPrompts?: SubmittedPrompt[];
+   open: unknown[];
+   showing: string;
+   railFilter: string;
+@@ -57,6 +143,11 @@ export interface SavedStateValues {
+ 
+ export interface SavedStateService {
+   readonly initial: Record<string, unknown>;
++  recovery(): SubmittedPrompt[];
++  submit(source: string, revision: number, text: string, setup?: SessionProfile): SubmittedPrompt;
++  importRecovery(snapshot: unknown): void;
++  publishRecovery(): void;
++  onRecovery(callback: () => void): void;
+   save(values: SavedStateValues): SavedPanelState;
+ }
+ 
+@@ -92,14 +183,27 @@ export function savedPanelState(values: SavedStateValues): SavedPanelState {
+   };
+ }
+ 
+-// The shared host copy wins when it is present, matching the script order in the page. The
+-// browser copy is the fallback used when VS Code recreates this page without an injected copy.
++// Reader layout uses the host copy. Submitted text joins both lifetimes by attempt identity.
+ export function createSavedState(
+   sharedState: unknown,
+   browserState: BrowserStatePort,
+   host: PanelHost,
+ ): SavedStateService {
+-  const initial = stateObject(sharedState) ?? stateObject(browserState.read()) ?? {};
++  const browser = stateObject(browserState.read());
++  const shared = stateObject(sharedState);
++  const initial = { ...(shared ?? browser ?? {}) };
++  let recovery = mergeSubmittedPrompts(browser?.submittedPrompts, shared?.submittedPrompts);
++  if (recovery.length) initial.submittedPrompts = recovery;
++  let latest: Record<string, unknown> = initial;
++  const listeners: (() => void)[] = [];
++  const writeRecovery = (next: SubmittedPrompt[]) => {
++    const state = { ...latest, submittedPrompts: next };
++    browserState.write(state);
++    latest = state;
++    recovery = next;
++    if (unsent) unsent.submittedPrompts = next;
++    for (const callback of listeners) callback();
++  };
+   // The newest state not yet sent to the extension. Every saved state is whole, so the newest
+   // one carries everything the ones before it did.
+   let unsent: SavedPanelState | null = null;
+@@ -112,13 +216,43 @@ export function createSavedState(
+   };
+   return {
+     initial,
++    recovery: () => recovery.slice(),
++    submit(source, revision, text, setup) {
++      if (text.length > SUBMITTED_PROMPT_CHARS)
++        throw new Error('This prompt exceeds the 20,000-character recovery limit. Shorten it before sending.');
++      const order = (recovery.at(-1)?.order ?? 0) + 1;
++      if (!Number.isSafeInteger(order)) throw new Error('This prompt could not be saved. Copy it before trying again.');
++      const attempt = {
++        id: Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join(
++          '',
++        ),
++        source,
++        revision,
++        text,
++        order,
++        ...(setup ? { setup: { ...setup } } : {}),
++      };
++      writeRecovery(mergeSubmittedPrompts(recovery, [attempt]));
++      return attempt;
++    },
++    importRecovery(snapshot) {
++      writeRecovery(mergeSubmittedPrompts(recovery, snapshot));
++    },
++    publishRecovery() {
++      host.send({ type: 'importPromptRecovery', submittedPrompts: recovery });
++    },
++    onRecovery(callback) {
++      listeners.push(callback);
++    },
+     save(values) {
+       const state = savedPanelState(values);
++      if (recovery.length) state.submittedPrompts = recovery;
+       // These writes have different lifetimes. Neither replaces the other. The browser copy is
+       // written at once. The extension copy goes once the current task ends, so one render that
+       // marks several cards read sends one state, and the extension words the rail for it once.
+       // A task always runs its microtasks before the page can unload, so no state is lost.
+       browserState.write(state);
++      latest = state as unknown as Record<string, unknown>;
+       if (unsent === null) {
+         queueMicrotask(sendNewest);
+       }

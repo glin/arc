@@ -1,0 +1,93 @@
+{
+  "note": "Shared by plugins/arc-hooks/scripts/lib.test.js and extension/src/transcript.test.ts. The snapshot hook and the turn timeline must agree on which files are the agent's own scratch, or a turn's file list and its pending diffs disagree. The runners set the vendor variables to absolute paths with dot segments, then expand {claudeHome} and {codexHome} to their normalized forms. Other templates are {tmp} for os.tmpdir(), {home} for os.homedir(), and {arcHome} for ARC_HOME or {home}/.arc.",
+  "ignoreRoots": [
+    "{tmp}",
+    "{claudeHome}",
+    "{codexHome}",
+    "{arcHome}"
+  ],
+  "cases": [
+    {
+      "path": "{tmp}/scratch/probe.py",
+      "ephemeral": true,
+      "why": "agent scratch under the temp root"
+    },
+    {
+      "path": "{tmp}",
+      "ephemeral": true,
+      "why": "the root itself"
+    },
+    {
+      "path": "{claudeHome}/memory/note.md",
+      "ephemeral": true,
+      "why": "agent memory"
+    },
+    {
+      "path": "{claudeHome}/settings.json",
+      "ephemeral": true,
+      "why": "agent configuration"
+    },
+    {
+      "path": "{codexHome}/sessions/2026/08/25/rollout.jsonl",
+      "ephemeral": true,
+      "why": "a second agent's own session records"
+    },
+    {
+      "path": "{codexHome}/config.toml",
+      "ephemeral": true,
+      "why": "a second agent's configuration"
+    },
+    {
+      "path": "{codexHome}-elsewhere/x.md",
+      "ephemeral": false,
+      "why": "a sibling of the second agent's root that merely shares the prefix"
+    },
+    {
+      "path": "{claudeHome}-elsewhere/x.md",
+      "ephemeral": false,
+      "why": "a sibling that merely shares the prefix"
+    },
+    {
+      "path": "{home}/repo/src/a.ts",
+      "ephemeral": false,
+      "why": "the user's own file"
+    },
+    {
+      "path": "{home}/other-repo/README.md",
+      "ephemeral": false,
+      "why": "another repo the agent was asked to touch"
+    },
+    {
+      "path": "{claudeHome}",
+      "ephemeral": true,
+      "why": "a root that is not the temp directory, named exactly"
+    },
+    {
+      "path": "{claudeHome}-elsewhere",
+      "ephemeral": false,
+      "why": "a directory that merely shares a root's prefix, where a bare startsWith would say yes"
+    },
+    {
+      "path": "{arcHome}/snapshots/session/baseline/abc123",
+      "ephemeral": true,
+      "why": "the store the hook writes, which the panel moved out of the Claude directory"
+    },
+    {
+      "path": "{arcHome}",
+      "ephemeral": true,
+      "why": "the Arc home itself"
+    },
+    {
+      "path": "{home}/other-repo",
+      "ephemeral": false,
+      "why": "a plain directory, so the trailing-slash shape tests the false answer too"
+    }
+  ],
+  "shapesNote": "Every case is run in each of these path shapes, and must give the same answer in all of them. One side normalising a shape that the other compares raw is exactly how the two rules drift apart, and a fixture that only ever tests the native shape cannot see it. The trailing-slash shape is skipped for a case that names a file, because a file path does not take one; keep at least one directory case on each side of the answer so that shape still tests both.",
+  "shapes": [
+    "native",
+    "forward-slash",
+    "lower-drive",
+    "trailing-slash"
+  ]
+}

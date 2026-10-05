@@ -1,0 +1,35 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-029",
+  "revision": 1,
+  "family": "cross-platform-diagnostics",
+  "split": "holdout",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Diagnostic capture",
+  "provenance": {
+    "classification": "historical",
+    "base": "9f27f61d0b9f1bd8ed63d13819217301a1c61048",
+    "candidate": "fe00298b948a685411681c201e1a7ab1727db865",
+    "correction": "fe00298b948a685411681c201e1a7ab1727db865",
+    "change_origin": "independent-legitimate-change",
+    "limitations": "Legitimate feature selected independently of bug corrections. Offline checks do not exercise installed npm launchers or real system commands.",
+    "candidate_origin": "recovered-commit-snapshot",
+    "diff_origin": "historical-git-diff-scoped-to-exported-source",
+    "original_review_evidence": "unavailable"
+  },
+  "inputs": [
+    {
+      "path": "scripts/capture-panel-diagnostics.js",
+      "sha256": "fcb4fc152d619c4535eb18653af0edeafc2ae8a16da81488169a82d2446d7551"
+    },
+    {
+      "path": "scripts/capture-panel-diagnostics.ps1",
+      "sha256": "33a27d5b838d53ea5ae0c89e2d5e2b0c86168bc6fe05afe0bbc1cf5ab8c822c3"
+    }
+  ],
+  "prompt_sha256": "c99173d2ee2709f0c2de7c719027ecbb70a69fa5e9741d1abdfc534d939b263b",
+  "diff_sha256": "3dfcb56e76d7707a2fc4e7e953c403c6b68aa71b33a58ac7df546dea4af63a27",
+  "keys": [],
+  "audit": "Independent feature contract and exported dependency closure. Ordinary and boundary behavior passes without repairing a known bug."
+}

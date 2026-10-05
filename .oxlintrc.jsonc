@@ -1,0 +1,77 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "oxc", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+  },
+  "options": {
+    "typeAware": true,
+  },
+  "rules": {
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    // Vendor payload readers validate values after parsing, so deliberate String coercion remains the compatibility fallback.
+    "typescript/no-base-to-string": "off",
+    // Callback ports are unbound by design and never depend on an object receiver.
+    "typescript/unbound-method": "off",
+    // Browser evaluations narrow values returned across the Playwright serialization boundary.
+    "typescript/no-unsafe-type-assertion": "off",
+    // Browser evaluations interpolate values whose serializable shape is checked by their receiving assertion.
+    "typescript/restrict-template-expressions": "off",
+    // Existing lexical sorts intentionally use JavaScript's string ordering.
+    "typescript/require-array-sort-compare": "off",
+    // Oxlint resolves Buffer as an error type when it scans the repository's separate TypeScript projects together.
+    "typescript/no-redundant-type-constituents": "off",
+    // Default values and code-point spreads are readable compatibility code in the current Node target.
+    "typescript/no-useless-default-assignment": "warn",
+    "typescript/no-misused-spread": "warn",
+    "no-unused-vars": "error",
+    // Source-text contracts assert through the helpers in extension/test/source-contract.ts.
+    "vitest/expect-expect": [
+      "error",
+      { "assertFunctionNames": ["expect", "assert", "sourceMatch", "sourceDoesNotMatch"] },
+    ],
+    // Nested domain callbacks intentionally reuse short local names from their outer builders.
+    "no-shadow": "off",
+    // Promise executors use concise timer callbacks whose return values are ignored by the Promise constructor.
+    "no-promise-executor-return": "off",
+    // Oxfmt preserves readable adjacent string segments when one literal would exceed the configured line width.
+    "no-useless-concat": "off",
+    // Injected panel tokens and private element connections use stable underscore-delimited names.
+    "no-underscore-dangle": "off",
+    // Test fixtures contain JavaScript and regular-expression source text where the escape belongs to the embedded program.
+    "no-useless-escape": "warn",
+    // Unicode and control ranges are intentional sanitizers, not user-authored matching expressions.
+    "no-misleading-character-class": "off",
+    "no-control-regex": "off",
+    "no-constant-binary-expression": "error",
+    "no-unsafe-optional-chaining": "error",
+  },
+  "overrides": [
+    {
+      "files": ["extension/src/startup.test.ts", "extension/src/panel.webview.test.ts"],
+      "rules": {
+        // These tests execute isolated browser-source functions because panelhost.ts cannot load outside VS Code.
+        "typescript/no-implied-eval": "off",
+      },
+    },
+    {
+      "files": ["extension/src/webview/card.ts"],
+      "rules": {
+        // Indexed boolean state is undefined before its first write, despite its legacy record type.
+        "typescript/no-unnecessary-type-conversion": "off",
+      },
+    },
+  ],
+  "ignorePatterns": [
+    ".claude/**",
+    ".tmp-*/**",
+    "**/dist/**",
+    "**/node_modules/**",
+    "**/shots/**",
+    "**/test/fixtures/**",
+    "evals/agent-review/fixtures/**",
+    "extension/src/webview/panel.d.ts",
+  ],
+}

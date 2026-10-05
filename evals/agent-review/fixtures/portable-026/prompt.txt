@@ -1,0 +1,1 @@
+Review the candidate change and its surrounding source. A reader-started session retains navigation to its source parent. Ordinary New does not request that relationship. Report material defects with their trigger and consequence. The runtime artifact bundles the supplied TypeScript for Node execution.

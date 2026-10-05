@@ -1,0 +1,8 @@
+diff --git a/src/timeline.mjs b/src/timeline.mjs
+--- a/src/timeline.mjs
++++ b/src/timeline.mjs
+@@ -1,3 +1,3 @@
+ export function sendSelectedText(hosts, source, text) {
+-  hosts[0]?.createDraft(text);
++  for (const host of hosts) host.createDraft(text);
+ }

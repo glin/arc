@@ -1,0 +1,3 @@
+Review the text-sizing guard. Font and line-height declarations must reject absolute units under CSS syntax rules.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

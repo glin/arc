@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-004",
+  "revision": 1,
+  "family": "repository-discovery",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Recorded cwd survives later read failure",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/timeline.ts @ a0abf6e",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/timeline.mjs",
+      "sha256": "321e0200d180db205c76255f857966256fc2b70cf9b775d5cb31cb91bca904aa"
+    },
+    {
+      "path": "src/resume-session.mjs",
+      "sha256": "fcdd5797f2c9c18780ad972d311cb364623f613527030526db8988a33f5958e5"
+    }
+  ],
+  "prompt_sha256": "2f0f0e0b5f159c699fa4fc9a641e16b858bd4f0bbb36060b7d05f38705379443",
+  "diff_sha256": "d2cceef9478f87d2a735141b79c34501c912d93dfd6b4a6cdfb981a740eef29b",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "A failed transcript reread erases a known session directory.",
+      "paths": ["src/timeline.mjs"],
+      "scenario": "A growing transcript reread fails after its first valid cwd was stored."
+    }
+  ],
+  "audit": "Adapted cache update. It checks an already known cwd through a transient read failure."
+}

@@ -1,0 +1,9 @@
+diff --git a/src/claudehistory.mjs b/src/claudehistory.mjs
+--- a/src/claudehistory.mjs
++++ b/src/claudehistory.mjs
+@@ -1,3 +1,5 @@
+ export function childState(child, fileModifiedAt) {
++  if (fileModifiedAt > (child.processEndedAt ?? 0)) return 'running';
++  if (child.processEndedAt != null) return 'finished';
+   return fileModifiedAt - child.lastEventAt < 30_000 ? 'running' : 'unknown';
+ }

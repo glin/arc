@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-015",
+  "revision": 1,
+  "family": "cost-order-contract",
+  "split": "holdout",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Equal-cost fixture misses reordered categories",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/turncard.test.ts @ d1602cd",
+    "limitations": "Focused adaptation of recorded Arc behavior. This public holdout is a selection split, not a secret benchmark."
+  },
+  "inputs": [
+    {
+      "path": "src/turncard.mjs",
+      "sha256": "d4f60ee7db1f68061c954d28ad9a94cc6c74c3bb56d95251e35e97758148aa44"
+    },
+    {
+      "path": "src/cost-detail.mjs",
+      "sha256": "beeb8ab8c611aa852ccaeaf452180c95252c0f82edc959bbeab5a0ec65b70ceb"
+    }
+  ],
+  "prompt_sha256": "574fef5fe7064fc812d9733f39a28533817fe15dd352d51aaf32bbd50d84fdcf",
+  "diff_sha256": "0587d77e791f950ebffa736a54e54b5dd922d26886b6c93f68955030dc1091f0",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "Cost categories reorder when their values differ.",
+      "paths": ["src/turncard.mjs"],
+      "scenario": "Two contribution categories have unequal costs and the display must keep canonical category order."
+    }
+  ],
+  "audit": "Adapted renderer contract. A tied normal case mirrors the weak historical fixture. The unequal case exposes the drift."
+}

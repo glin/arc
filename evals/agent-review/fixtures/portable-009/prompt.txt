@@ -1,0 +1,3 @@
+Review the proposed history-page refresh. A page read must present the latest admitted child records when it completes.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

@@ -1,0 +1,3 @@
+Review the proposed workspace-root union. The caller supplies canonical folder paths. Successful lookups add registered worktrees. A failed lookup must retain its folder path. This case covers one refresh call.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

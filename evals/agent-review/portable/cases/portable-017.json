@@ -1,0 +1,29 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-017",
+  "revision": 2,
+  "family": "repository-discovery",
+  "split": "development",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Workspace root set with partial lookup",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/repositoryscope.ts",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/repositoryscope.mjs",
+      "sha256": "a57141460143a97a9cfa73f66bfb1a7dbfff831ab4b1bf2181902109362f52ca"
+    },
+    {
+      "path": "src/window-discovery.mjs",
+      "sha256": "b81b25ad8ba3b444d39dd6accf6eab80ed023fbafdf13c2411780fc3bae65afd"
+    }
+  ],
+  "prompt_sha256": "6f624d7836bbedfaef4a6ef75accb487628df9f1cd11a647952ecc18d2d08c20",
+  "diff_sha256": "818afed706719743c1ede73bc1675a05eec3af6baa1fc56523280411a5f66184",
+  "keys": [],
+  "audit": "Bounded audit of folder retention, successful lookup, and partial failure. It excludes asynchronous refresh races."
+}

@@ -1,0 +1,9 @@
+diff --git a/src/style-guard.mjs b/src/style-guard.mjs
+--- a/src/style-guard.mjs
++++ b/src/style-guard.mjs
+@@ -1,1 +1,4 @@
+-export function textSizesAreRelative(css) { return true; }
++export function textSizesAreRelative(css) {
++  const declarations=[...css.matchAll(/(?:font-size|line-height)\s*:\s*([^;}]+)/gi)];
++  return declarations.every(([,value]) => !/\d+(?:\.\d+)?\s*(?:px|pt|pc|in|cm|mm|q)\b/i.test(value));
++}

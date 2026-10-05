@@ -1,0 +1,1110 @@
+diff --git a/extension/src/agenthost.ts b/extension/src/agenthost.ts
+index bb1c34a0..754a8f66 100644
+--- a/extension/src/agenthost.ts
++++ b/extension/src/agenthost.ts
+@@ -1,3 +1,4 @@
++import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+ // The agents this window is driving, and the child processes behind them.
+ //
+ // `claudewire.ts` and `codexwire.ts` know their protocols and nothing else; this file
+@@ -217,6 +218,7 @@ export interface Driver {
+   // and is asked of the same idle child the figures are asked of, because the list turns
+   // over on a release rather than on a turn.
+   models?(): Promise<ModelList | null>;
++  appliedDefaults?(): Promise<AppliedDefaults>;
+   // How much the agent asks before it acts, changed while the child is running. The two
+   // mechanisms are nothing alike and the difference stays here: Claude takes a control
+   // request that applies at once, and Codex takes a field on the next prompt, so this
+@@ -339,6 +341,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
+         async rateLimits() {
+           return readUsage(await wire.usage(), Date.now());
+         },
++        appliedDefaults: () => wire.appliedDefaults(),
+         async models() {
+           return readClaudeModels(await wire.listModels(), Date.now());
+         },
+@@ -447,6 +450,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan
+         async rateLimits(refreshAuthentication) {
+           return readRateLimits(await wire.rateLimits(refreshAuthentication), Date.now());
+         },
++        appliedDefaults: () => wire.appliedDefaults(options.cwd, 'model' in options ? (options.model ?? '') : ''),
+         async models() {
+           return readCodexModels(await wire.models(), Date.now());
+         },
+@@ -474,11 +478,14 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan
+ // not to persist a session, and the Codex one never starts a thread. That is the whole
+ // difference from the plans above, and it is why the panel can read either figure with no
+ // turn running and leave nothing behind on disk.
+-export function claudeIdlePlan(launch: Launch, cwd: string): AgentPlan {
+-  return claudePlan(launch, { cwd, persistSession: false });
++export function claudeIdlePlan(launch: Launch, cwd: string, model = ''): AgentPlan {
++  return claudePlan(launch, { cwd, persistSession: false, ...(model ? { model } : {}) });
+ }
+ 
+-export function codexIdlePlan(launch: Launch, options: { cwd: string; clientInfo: ClientInfo }): AgentPlan {
++export function codexIdlePlan(
++  launch: Launch,
++  options: { cwd: string; clientInfo: ClientInfo; model?: string },
++): AgentPlan {
+   return {
+     agent: 'codex',
+     sessionId: null,
+@@ -507,6 +514,7 @@ export function codexIdlePlan(launch: Launch, options: { cwd: string; clientInfo
+         async rateLimits(refreshAuthentication) {
+           return readRateLimits(await wire.rateLimits(refreshAuthentication), Date.now());
+         },
++        appliedDefaults: () => wire.appliedDefaults(options.cwd, 'model' in options ? (options.model ?? '') : ''),
+         async models() {
+           return readCodexModels(await wire.models(), Date.now());
+         },
+@@ -1107,6 +1115,12 @@ export class AgentSession {
+   }
+ 
+   // The models this agent will run, or nothing when the agent has no way to be asked.
++  async appliedDefaults(): Promise<AppliedDefaults> {
++    return this.driver.appliedDefaults
++      ? this.driver.appliedDefaults()
++      : unavailableDefaults('This agent did not report its settings.');
++  }
++
+   async models(): Promise<ModelList | null> {
+     return this.driver.models ? await this.driver.models() : null;
+   }
+@@ -2022,7 +2036,8 @@ export function pickedEffort(picked: string, list: ModelList | null, model: stri
+   if (!picked || !list) {
+     return picked;
+   }
+-  return effortChoices(list.models, model).some((e) => e.value === picked) ? picked : '';
++  const choices = model ? effortChoices(list.models, model) : list.models.flatMap((item) => item.efforts);
++  return choices.some((e) => e.value === picked) ? picked : '';
+ }
+ 
+ // What a model change leaves behind for one session.
+@@ -2951,3 +2966,22 @@ export function liveMcpTarget(
+   const state = states.find((candidate) => Boolean(candidate.sessionId) && !provisionalKeys.has(candidate.key));
+   return state?.sessionId ? { state, owner: state.sessionId } : null;
+ }
++
++export async function askIdleDefaults(plan: AgentPlan, spawner: Spawner): Promise<AppliedDefaults> {
++  const session = new AgentSession(
++    'defaults',
++    plan,
++    spawner,
++    () => {},
++    () => {},
++  );
++  try {
++    await session.start();
++    if (session.state().lastError) return unavailableDefaults('The agent could not report its settings.');
++    return await session.appliedDefaults();
++  } catch {
++    return unavailableDefaults('The agent could not report its settings.');
++  } finally {
++    await session.dispose();
++  }
++}
+diff --git a/extension/src/agentwire.ts b/extension/src/agentwire.ts
+index 3013d664..19f9ea59 100644
+--- a/extension/src/agentwire.ts
++++ b/extension/src/agentwire.ts
+@@ -1,3 +1,5 @@
++import type { ModelChoice } from './domain/model-catalog';
++export type { ModelChoice, EffortChoice } from './domain/model-catalog';
+ // The vocabulary both agents are described in.
+ //
+ // Claude Code and the Codex CLI speak nothing like each other: one is a stream of tagged
+@@ -155,24 +157,6 @@ export interface SpendCap {
+ // One reasoning effort a model offers, with whatever the CLI says about it. Neither agent
+ // is asked to translate: `label` and `description` are the agent's own words, and an agent
+ // that gives no description leaves it empty rather than having one written for it.
+-export interface EffortChoice {
+-  value: string;
+-  label: string;
+-  description: string;
+-}
+-
+-// One model the reader can pick, as the agent describes itself. `value` is what goes back
+-// on the wire. `resolvedModel` is the exact model identity when the agent supplies one, so
+-// pricing never has to infer a generation from `label` or `description`. `efforts` is empty
+-// for a model that takes no effort setting, which is how the panel knows to offer none.
+-export interface ModelChoice {
+-  value: string;
+-  resolvedModel?: string;
+-  label: string;
+-  description: string;
+-  efforts: EffortChoice[];
+-}
+-
+ // Everything one agent answered about the models it will run. Read once and cached, since
+ // the list changes on a release rather than on a turn.
+ export interface ModelList {
+diff --git a/extension/src/claudewire.ts b/extension/src/claudewire.ts
+index 8a9e56c6..de19adf6 100644
+--- a/extension/src/claudewire.ts
++++ b/extension/src/claudewire.ts
+@@ -1,3 +1,4 @@
++import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+ // The client half of Claude Code's headless protocol.
+ //
+ // The CLI speaks newline-delimited JSON on stdin and stdout when it is started with
+@@ -719,6 +720,14 @@ export class ClaudeWire {
+   // everything, so a refusal comes back as no list rather than as a failure. The picker
+   // then offers nothing, which is what it does before the answer arrives anyway, and the
+   // reader is not shown an error about a control they never pressed.
++  async appliedDefaults(): Promise<AppliedDefaults> {
++    try {
++      return readAppliedDefaults(await this.request({ subtype: 'get_settings' }));
++    } catch {
++      return unavailableDefaults('Claude did not report its settings.');
++    }
++  }
++
+   async listModels(): Promise<Json | null> {
+     try {
+       return await this.request({ subtype: 'list_models' });
+@@ -1184,3 +1193,12 @@ export class ClaudeWire {
+     this.send(JSON.stringify(message) + '\n');
+   }
+ }
++
++export function readAppliedDefaults(payload: unknown): AppliedDefaults {
++  const applied = obj(obj(payload)?.applied);
++  const model = str(applied?.model);
++  const effort = applied?.effort;
++  return model && (typeof effort === 'string' || effort === null)
++    ? { status: 'ready', model, effort, reason: '' }
++    : unavailableDefaults('Claude did not report its applied model and effort.');
++}
+diff --git a/extension/src/codexwire.ts b/extension/src/codexwire.ts
+index 44779a5f..d8d911a2 100644
+--- a/extension/src/codexwire.ts
++++ b/extension/src/codexwire.ts
+@@ -1,3 +1,4 @@
++import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+ // The client half of the Codex app-server protocol.
+ //
+ // `codex app-server` speaks JSON-RPC 2.0 over stdio, one object per line, with the
+@@ -432,6 +433,8 @@ export class CodexWire {
+ 
+   // The handshake. The server rejects everything sent before it, and the `initialized`
+   // notification after it is what opens the rest of the surface.
++  private defaultsQualified = false;
++
+   async initialize(): Promise<Json> {
+     const result = await this.request('initialize', {
+       clientInfo: this.clientInfo,
+@@ -439,6 +442,7 @@ export class CodexWire {
+       // app-server rejects that field unless the client opted into experimental fields.
+       capabilities: { experimentalApi: true },
+     });
++    this.defaultsQualified = /\b0\.159\.2\b/.test(str(result.userAgent) ?? '');
+     this.notify('initialized', {});
+     return result;
+   }
+@@ -741,12 +745,31 @@ export class CodexWire {
+   // answers nothing, so a refusal comes back as no list rather than as a failure. The
+   // picker then offers nothing, which is what it does before the answer arrives anyway, and
+   // the reader is not shown an error about a control they never pressed.
++  async appliedDefaults(cwd: string, model: string): Promise<AppliedDefaults> {
++    if (!this.defaultsQualified)
++      return unavailableDefaults('This Codex version has no confirmed default-settings behavior.');
++    try {
++      const [configuration, catalog, policy] = await Promise.all([
++        this.request('config/read', { includeLayers: false, cwd }),
++        this.models(),
++        this.request('configRequirements/read', {}),
++      ]);
++      return readAppliedDefaults(configuration, catalog, policy, model);
++    } catch {
++      return unavailableDefaults('Codex did not report its configuration or policy.');
++    }
++  }
++
+   async models(): Promise<Json | null> {
+     const data: unknown[] = [];
+     let cursor: string | null = null;
+     try {
+       do {
+-        const result = await this.request('model/list', cursor ? { cursor } : {});
++        const result = await this.request('model/list', {
++          limit: 100,
++          includeHidden: true,
++          ...(cursor ? { cursor } : {}),
++        });
+         data.push(...arr(result.data));
+         cursor = str(result.nextCursor);
+       } while (cursor);
+@@ -1758,7 +1781,7 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
+   for (const entry of arr(obj(payload)?.data)) {
+     const model = obj(entry);
+     const value = model && str(model.id);
+-    if (!model || !value || model.hidden === true) {
++    if (!model || !value) {
+       continue;
+     }
+     const efforts: EffortChoice[] = [];
+@@ -1773,6 +1796,10 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
+     }
+     models.push({
+       value,
++      resolvedModel: str(model.model) ?? value,
++      hidden: model.hidden === true,
++      isDefault: model.isDefault === true,
++      ...(str(model.defaultReasoningEffort) ? { defaultReasoningEffort: str(model.defaultReasoningEffort)! } : {}),
+       // A model that named itself nothing is drawn under the id that goes back on the wire,
+       // which is at least something the reader can recognise again.
+       label: str(model.displayName) ?? value,
+@@ -1827,3 +1854,48 @@ export function turnOutcome(turn: Json | null): TurnOutcome {
+     deniedTools: [],
+   };
+ }
++
++export function readAppliedDefaults(
++  configuration: unknown,
++  catalog: unknown,
++  policy: unknown,
++  selected = '',
++): AppliedDefaults {
++  const config = obj(obj(configuration)?.config);
++  const requirements = obj(policy);
++  if (
++    !config ||
++    !requirements ||
++    !('requirements' in requirements) ||
++    (requirements.requirements !== null && !obj(requirements.requirements))
++  ) {
++    return unavailableDefaults('Codex did not report its configuration or policy.');
++  }
++  const models = readModels(catalog, 0)?.models ?? [];
++  const configured = config.model;
++  const configuredEffort = config.model_reasoning_effort;
++  if (
++    (configured !== undefined && configured !== null && typeof configured !== 'string') ||
++    (configuredEffort !== undefined && configuredEffort !== null && typeof configuredEffort !== 'string')
++  ) {
++    return unavailableDefaults('Codex reported incomplete settings.');
++  }
++  const model = selected || str(configured) || models.find((item) => item.isDefault)?.value || models[0]?.value;
++  const choice = models.find((item) => item.value === model || item.resolvedModel === model);
++  const effort = str(configuredEffort) || choice?.defaultReasoningEffort;
++  if (!model) {
++    return unavailableDefaults('Codex did not report supported model and effort defaults.');
++  }
++  const effortKnown = choice
++    ? effort
++      ? choice.efforts.some((item) => item.value === effort)
++      : choice.efforts.length === 0
++    : Boolean(effort);
++  return {
++    status: 'ready',
++    model: choice?.resolvedModel || choice?.value || model,
++    effort: effortKnown ? (effort ?? null) : null,
++    ...(effortKnown ? {} : { effortStatus: 'unavailable' as const }),
++    reason: effortKnown ? '' : 'Codex did not report an effort for this model.',
++  };
++}
+diff --git a/extension/src/composerview.ts b/extension/src/composerview.ts
+index e0f61b34..2f87f451 100644
+--- a/extension/src/composerview.ts
++++ b/extension/src/composerview.ts
+@@ -1,3 +1,15 @@
++import {
++  modelPicks,
++  selectedModelPick,
++  resolvedChoice,
++  effortPicks,
++  modelLabel,
++  effortLabel,
++  defaultsForModel,
++  modelAfterPick,
++  effortAfterPick,
++  type DefaultContext,
++} from './view/model-picks';
+ // What the composer shows and what the reader's answer means.
+ //
+ // The prompt box, the picker that answers an agent's question and the words on the
+@@ -539,6 +551,7 @@ export interface MenuItem {
+ }
+ 
+ export interface Menu {
++  revision?: number;
+   // Which control this menu belongs to.
+   control: string;
+   agent: string;
+@@ -701,6 +714,7 @@ export interface ComposerState {
+   session: string;
+   // Empty until the agent has been asked what it runs.
+   models: readonly ModelChoice[];
++  defaults?: DefaultContext;
+   // Every command this session's agent publishes, in the agent's own order. Empty
+   // until the agent has been asked, and empty for good on one that publishes none. Claude
+   // answers it on `initialize`; Codex has no slash menu to mirror, so its skills are what
+@@ -1258,8 +1272,7 @@ export function clearAction(agent: string, text: string, running: boolean): 'cle
+ }
+ 
+ // What the model control says while nothing has been picked and nothing is known to pick.
+-const DEFAULT_MODEL_LABEL = 'Default model';
+-const DEFAULT_EFFORT_LABEL = 'Default effort';
++const DEFAULT_EFFORT_LABEL = 'Effort not reported';
+ 
+ // What the effort control says when there is no effort to set. It says that rather than
+ // going blank, because a blank control that cannot be pressed is a question the reader is
+@@ -1269,7 +1282,9 @@ const NO_EFFORT_LABEL = 'No effort setting';
+ // The model the session will run on, or null for the agent's own default and for a
+ // stored pick this version of the agent no longer lists.
+ export function chosenModel(models: readonly ModelChoice[], model: string | undefined): ModelChoice | null {
+-  return models.find((m) => m.value === model) ?? null;
++  return (
++    models.find((m) => m.value === model) ?? (model ? models.find((m) => m.resolvedModel === model) : undefined) ?? null
++  );
+ }
+ 
+ // The listed model a recorded model id names, when exactly one names it.
+@@ -1412,35 +1427,45 @@ function launchValue(value: string, label: string, detail: string = ''): Launche
+   return { value, label, detail, name: [label, detail].filter(Boolean).join('. ') };
+ }
+ 
+-function launchAgents(models: Readonly<Record<string, readonly ModelChoice[]>>): LauncherAgent[] {
++function launchAgents(
++  models: Readonly<Record<string, readonly ModelChoice[]>>,
++  defaults: Readonly<Record<string, DefaultContext>> = {},
++): LauncherAgent[] {
+   return LAUNCH_AGENTS.map((agent) => {
+     const name = agentName(agent);
+-    const modelRows: LauncherModel[] = [
+-      { ...launchValue('', DEFAULT_MODEL_LABEL), efforts: [launchValue('', DEFAULT_EFFORT_LABEL)] },
+-      ...(models[agent] ?? []).map((model) => ({
+-        ...launchValue(model.value, model.label, model.description),
+-        efforts: [
+-          launchValue('', DEFAULT_EFFORT_LABEL),
+-          ...model.efforts.map((effort) => launchValue(effort.value, effort.label, effort.description)),
+-        ],
++    const catalog = models[agent] ?? [];
++    const context = defaults[agent] ?? {};
++    const modelRows: LauncherModel[] = modelPicks(catalog, context).map((model) => ({
++      ...launchValue(model.value, model.label, model.description),
++      identity: model.identity,
++      aliases: model.aliases,
++      configuredDefault: model.configuredDefault,
++      efforts: effortPicks(catalog, model.value, context).map((effort) => ({
++        ...launchValue(effort.value, effort.label, effort.description),
++        configuredDefault: effort.configuredDefault,
+       })),
+-    ];
+-    const permissions = permissionModes(agent).map((mode) => launchValue(mode.value, mode.label, mode.description));
++    }));
+     return {
+       ...launchValue(agent, name, `Start a new ${name} session`),
+       models: modelRows,
+-      permissions,
++      catalog,
++      defaults: context,
++      supportedModels: [
++        { value: '', efforts: [{ value: '' }, ...catalog.flatMap((model) => model.efforts)] },
++        ...catalog.flatMap((model) =>
++          [...new Set([model.value, model.resolvedModel].filter((value): value is string => Boolean(value)))].map(
++            (value) => ({ value, efforts: [{ value: '' }, ...model.efforts] }),
++          ),
++        ),
++      ],
++      permissions: permissionModes(agent).map((mode) => launchValue(mode.value, mode.label, mode.description)),
+       defaultPermission: defaultAskMode(agent).value,
+     };
+   });
+ }
+ 
+ function launcherProfileAvailable(profile: SessionProfile, agents: readonly LauncherAgent[]): boolean {
+-  const agent = agents.find((one) => one.value === profile.agent);
+-  const model = agent?.models.find((one) => one.value === profile.model);
+-  const effort = model?.efforts.find((one) => one.value === profile.effort);
+-  const permission = agent?.permissions.find((one) => one.value === profile.permissionMode);
+-  return Boolean(agent && model && effort && permission);
++  return missingSetupValue(profile, agents) === null;
+ }
+ 
+ // What separates one fact from the next wherever a setup is said in a line.
+@@ -1452,14 +1477,16 @@ const PROFILE_FACT_SEPARATOR = ' · ';
+ // for one this version of the agent no longer lists, and only then the word for making no
+ // choice. Written once because a launcher row, a draft's tag and a draft's controls all say
+ // the same setup, and three copies of the fallbacks would drift into three answers.
+-function profileFacts(profile: SessionProfile, catalog: readonly ModelChoice[]): string[] {
+-  const model = chosenModel(catalog, profile.model);
+-  const effort = model?.efforts.find((one) => one.value === profile.effort);
++function profileFacts(
++  profile: SessionProfile,
++  catalog: readonly ModelChoice[],
++  defaults: DefaultContext = {},
++): string[] {
+   const permission = profileAskMode(profile.agent, profile.permissionMode);
+   return [
+     agentName(profile.agent),
+-    model?.label || profile.model || DEFAULT_MODEL_LABEL,
+-    effort?.label || profile.effort || DEFAULT_EFFORT_LABEL,
++    modelLabel(catalog, profile.model, defaults),
++    effortLabel(catalog, profile.model, profile.effort, defaults),
+     permission.label,
+   ];
+ }
+@@ -1477,9 +1504,10 @@ function launchProfileRow(
+   profile: SessionProfile,
+   models: Readonly<Record<string, readonly ModelChoice[]>>,
+   missing: SetupValueName | null = null,
++  defaults: DefaultContext = {},
+ ): LauncherProfileRow {
+   const stored = missing ? profile[missing === 'permission' ? 'permissionMode' : missing] : '';
+-  const facts = profileFacts(profile, models[profile.agent] ?? []).map((fact, index) =>
++  const facts = profileFacts(profile, models[profile.agent] ?? [], defaults).map((fact, index) =>
+     stored && SETUP_FACT_FIELDS[index] === missing ? stored : fact,
+   );
+   const reason = missing ? MISSING_SETUP_REASONS[missing] : '';
+@@ -1501,12 +1529,15 @@ function launchProfileRow(
+ // Default model offers only the Default effort.
+ function inheritedProfile(state: ComposerState): SessionProfile {
+   const stored = state.askMode;
+-  const model = settledModel(state)?.value ?? state.settings.selectedModel;
++  const model = state.profile ? state.profile.model : (settledModel(state)?.value ?? state.settings.selectedModel);
+   const effort = state.settings.selectedEffort || state.settings.confirmedEffort || '';
+   return {
+     agent: state.agent,
+     model,
+-    effort: effortChoices(state.models, model).some((one) => one.value === effort) ? effort : '',
++    effort:
++      !model && !state.profile && !state.settings.selectedEffort
++        ? ''
++        : pickedProfileEffort(state.models, model, effort, state.defaults),
+     permissionMode:
+       stored === undefined
+         ? defaultAskMode(state.agent).value
+@@ -1524,11 +1555,21 @@ export function sessionLauncherView(
+   recent: readonly SessionProfile[],
+   models: Readonly<Record<string, readonly ModelChoice[]>>,
+   pinned: readonly PinnedSetup[] = [],
++  defaults: Readonly<Record<string, DefaultContext>> = {},
+ ): SessionLauncherView {
+-  const agents = launchAgents(models);
+-  const inherited = current ? launchProfileRow('current', 'inherited', inheritedProfile(current), models) : null;
++  const agents = launchAgents(models, defaults);
++  const inherited = current
++    ? launchProfileRow('current', 'inherited', inheritedProfile(current), models, null, current.defaults)
++    : null;
+   const recentRow = (profile: SessionProfile, index: number) =>
+-    launchProfileRow(`recent:${index}`, 'recent', { ...profile, source: 'recent' }, models);
++    launchProfileRow(
++      `recent:${index}`,
++      'recent',
++      { ...profile, source: 'recent' },
++      models,
++      null,
++      defaults[profile.agent],
++    );
+   // Each entry keeps its index into the stored history, so hiding a duplicate or a row past
+   // the display cap never renumbers the key of a row the reader sees.
+   const shown = visibleRecents(
+@@ -1547,7 +1588,7 @@ export function sessionLauncherView(
+       source: 'recent',
+     };
+     const missingValue = missingSetupValue(setup, agents);
+-    const row = launchProfileRow(`pin:${setup.id}`, 'pinned', profile, models, missingValue);
++    const row = launchProfileRow(`pin:${setup.id}`, 'pinned', profile, models, missingValue, defaults[profile.agent]);
+     return { ...row, id: setup.id, available: missingValue === null, missingValue };
+   });
+   // Quick New takes the latest valid setup before any pin hides it from the list, so pinning
+@@ -1569,7 +1610,11 @@ export function sessionLauncherView(
+           ? 'New session with the most recent setup'
+           : 'New session. Choose a setup',
+       primaryDetail: primary
+-        ? profileFacts(primary.profile, models[primary.profile.agent] ?? []).join(PROFILE_FACT_SEPARATOR)
++        ? profileFacts(
++            primary.profile,
++            models[primary.profile.agent] ?? [],
++            inherited ? current?.defaults : defaults[primary.profile.agent],
++          ).join(PROFILE_FACT_SEPARATOR)
+         : 'Agent, model, effort, and permissions',
+       menuName: 'Choose a setup for a new session',
+       menuHeading: 'New session',
+@@ -1607,7 +1652,7 @@ export function launcherProfile(view: SessionLauncherView, request: LauncherRequ
+     return found && launcherProfileAvailable(found.profile, view.agents) ? { ...found.profile } : null;
+   }
+   const agent = view.agents.find((one) => one.value === request.agent);
+-  const model = agent?.models.find((one) => one.value === request.model);
++  const model = (agent?.supportedModels ?? agent?.models)?.find((one) => one.value === request.model);
+   const effort = model?.efforts.find((one) => one.value === request.effort);
+   const permission = agent?.permissions.find((one) => one.value === request.permissionMode);
+   if (!agent || !model || !effort || !permission) {
+@@ -1691,12 +1736,30 @@ export function responseLinkDraftText(link: string): string | null {
+ // draft is filed in it under its own provisional id so the panel has one shape to read. The
+ // effort's model is recorded only where an effort was chosen, because an effort belongs to
+ // a model and naming one under no effort would claim a choice nobody made.
+-export function sessionSettingsForProfile(profile: SessionProfile): SessionSettingSelection {
++function pickedProfileEffort(
++  models: readonly ModelChoice[],
++  model: string,
++  effort: string,
++  defaults: DefaultContext = {},
++): string {
++  const chosen = resolvedChoice(models, model, defaults);
++  const choices = chosen?.efforts ?? (!model ? models.flatMap((item) => item.efforts) : []);
++  return choices.some((item) => item.value === effort) ? effort : '';
++}
++
++export function sessionSettingsForProfile(
++  profile: SessionProfile,
++  models: readonly ModelChoice[] = [],
++  defaults: DefaultContext = {},
++): SessionSettingSelection {
++  const supporting =
++    resolvedChoice(models, profile.model, defaults) ??
++    (!profile.model ? models.find((item) => item.efforts.some((one) => one.value === profile.effort)) : null);
+   return {
+     selectedModel: profile.model,
+     selectedEffort: profile.effort,
+     permissionMode: profile.permissionMode,
+-    effortModel: profile.effort ? profile.model : '',
++    effortModel: profile.effort ? profile.model || supporting?.value || '' : '',
+     // Nothing is pending on a draft. There is no turn to confirm a value, and the child is
+     // started on whatever the profile holds when the first prompt goes.
+     pendingModel: null,
+@@ -1719,6 +1782,7 @@ export function draftProfileAfterPick(
+   control: string,
+   value: string,
+   models: Readonly<Record<string, readonly ModelChoice[]>>,
++  defaults: DefaultContext = {},
+ ): SessionProfile | null {
+   const catalog = models[profile.agent] ?? [];
+   if (control === 'agent') {
+@@ -1743,25 +1807,18 @@ export function draftProfileAfterPick(
+     };
+   }
+   if (control === 'model') {
+-    if (!draftModelChoices(catalog).some((one) => one.value === value)) {
+-      return null;
+-    }
+-    if (value === profile.model) {
+-      return { ...profile };
+-    }
+-    // The effort goes with the model that offered it. A level the new model does not take
+-    // would be sent to a child that refuses it, so it falls back to that model's default.
+-    const kept = effortChoices(catalog, value).some((one) => one.value === profile.effort);
+-    return { ...profile, model: value, effort: kept ? profile.effort : '', source: 'custom' };
++    const next = modelAfterPick(catalog, profile.model, profile.effort, value, defaults);
++    if (!next) return null;
++    return {
++      ...profile,
++      ...next,
++      source: next.model === profile.model && next.effort === profile.effort ? profile.source : 'custom',
++    };
+   }
+   if (control === 'effort') {
+-    if (!draftEffortChoices(catalog, profile.model).some((one) => one.value === value)) {
+-      return null;
+-    }
+-    if (value === profile.effort) {
+-      return { ...profile };
+-    }
+-    return { ...profile, effort: value, source: 'custom' };
++    const effort = effortAfterPick(catalog, profile.model, profile.effort, value, defaults);
++    if (effort === null) return null;
++    return { ...profile, effort, source: effort === profile.effort ? profile.source : 'custom' };
+   }
+   if (control === 'askmode') {
+     const mode = permissionModes(profile.agent).find((one) => one.value === value);
+@@ -2484,28 +2541,45 @@ function effortEmpty(model: ModelChoice | null, name: string): string {
+ }
+ 
+ function modelMenu(state: ComposerState, name: string): Menu {
+-  const chosen = chosenModel(state.models, state.settings.selectedModel);
++  const chosen = selectedModelPick(
++    state.models,
++    settledModel(state)?.value || state.settings.selectedModel,
++    state.defaults,
++    true,
++  );
+   return {
++    revision: state.defaults?.revision,
+     control: 'model',
+     agent: state.agent,
+     session: state.sessionId,
+     head: `Which model should ${name} run this session on?`,
+     // No row here is a caution: which model answers is a different question from how much it
+     // asks before it acts, and none of these widens anything.
+-    items: state.models.map((model) => menuItem(model, model === chosen)),
++    items: modelPicks(state.models, state.defaults, true).map((model) =>
++      menuItem(
++        model,
++        model.identity === chosen?.identity ||
++          model.aliases.includes(settledModel(state)?.value || state.settings.selectedModel),
++      ),
++    ),
+     empty: state.models.length === 0 ? modelEmpty(name) : '',
+   };
+ }
+ 
+ function effortMenu(state: ComposerState, name: string): Menu {
+   const model = settledModel(state);
+-  const efforts = model?.efforts ?? [];
++  const efforts = model ? effortPicks(state.models, model.value, state.defaults) : [];
+   // Ticked by what the next turn will run at: the reader's level where they set one, and
+   // otherwise the level the last turn recorded itself running at. A menu that ticked nothing
+   // over a session visibly running at high says the setting is unset when it is not.
+-  const at = state.settings.selectedEffort || state.settings.confirmedEffort || '';
++  const at =
++    state.settings.selectedEffort ||
++    state.settings.confirmedEffort ||
++    defaultsForModel(state.models, model?.value ?? '', state.defaults)?.effort ||
++    '';
+   const chosen = efforts.find((effort) => effort.value === at) ?? null;
+   return {
++    revision: state.defaults?.revision,
+     control: 'effort',
+     agent: state.agent,
+     session: state.sessionId,
+@@ -2548,34 +2622,6 @@ function askModeMenu(
+ // child behind it. Read here, each one would answer with the source session's setup, and
+ // picking a row would change that session rather than the draft in front of the reader.
+ 
+-// The rows a draft's model menu offers: the agent's own default first, then its catalog.
+-//
+-// A draft runs on the agent's default until the reader picks a model, so that row is a
+-// choice like any other and has to be tickable. An agent that has not said what it runs
+-// offers no rows at all, because a menu holding the default row alone offers no choice, and
+-// the control in front of it is drawn unpressable for the reason the live one is.
+-function draftModelChoices(
+-  models: readonly ModelChoice[],
+-): readonly { value: string; label: string; description: string }[] {
+-  if (models.length === 0) {
+-    return [];
+-  }
+-  return [{ value: '', label: DEFAULT_MODEL_LABEL, description: '' }, ...models];
+-}
+-
+-// The same rule for effort, which is the settled model's business: the model's own default
+-// first, then the levels it takes. A model that takes none offers nothing here either.
+-function draftEffortChoices(
+-  models: readonly ModelChoice[],
+-  model: string,
+-): readonly { value: string; label: string; description: string }[] {
+-  const efforts = effortChoices(models, model);
+-  if (efforts.length === 0) {
+-    return [];
+-  }
+-  return [{ value: '', label: DEFAULT_EFFORT_LABEL, description: '' }, ...efforts];
+-}
+-
+ // Which agent starts the draft. The choice exists on a draft alone: a session with a
+ // child behind it is that agent's session and cannot become another agent's.
+ function draftAgentMenu(state: ComposerState, profile: SessionProfile): Menu {
+@@ -2594,23 +2640,27 @@ function draftAgentMenu(state: ComposerState, profile: SessionProfile): Menu {
+ }
+ 
+ function draftModelMenu(state: ComposerState, profile: SessionProfile, name: string): Menu {
+-  const rows = draftModelChoices(state.models);
++  const rows = modelPicks(state.models, state.defaults);
++  const chosen = selectedModelPick(state.models, profile.model, state.defaults);
+   return {
++    revision: state.defaults?.revision,
+     control: 'model',
+     agent: profile.agent,
+     session: state.sessionId,
+     head: `Which model should ${name} run this draft on?`,
+     // Ticked by value rather than by identity, because the default row is written here and
+     // is in no agent's catalog to be identical to.
+-    items: rows.map((model) => menuItem(model, model.value === profile.model)),
++    items: rows.map((model) => menuItem(model, model.identity === chosen?.identity)),
+     empty: rows.length === 0 ? modelEmpty(name) : '',
+   };
+ }
+ 
+ function draftEffortMenu(state: ComposerState, profile: SessionProfile, name: string): Menu {
+-  const model = chosenModel(state.models, profile.model);
+-  const rows = draftEffortChoices(state.models, profile.model);
++  const model = selectedModelPick(state.models, profile.model, state.defaults);
++  const rows = effortPicks(state.models, profile.model, state.defaults);
++  const at = profile.effort || defaultsForModel(state.models, profile.model, state.defaults)?.effort;
+   return {
++    revision: state.defaults?.revision,
+     control: 'effort',
+     agent: profile.agent,
+     session: state.sessionId,
+@@ -2619,7 +2669,7 @@ function draftEffortMenu(state: ComposerState, profile: SessionProfile, name: st
+     // come from the profile rather than from the state beside it, whose model and levels
+     // belong to a child this draft has not started.
+     head: `How much should ${model ? model.label : 'the model'} work on a turn?`,
+-    items: rows.map((effort) => menuItem(effort, effort.value === profile.effort)),
++    items: rows.map((effort) => menuItem(effort, effort.value === at)),
+     empty: rows.length === 0 ? effortEmpty(model, name) : '',
+   };
+ }
+@@ -2699,7 +2749,13 @@ function modelPick(state: ComposerState, name: string): ComposerPick {
+   // The reader's own pick comes before anything read off a transcript. A pick outlives a
+   // reload while the model list does not, so a stored pick with no list to name it was being
+   // drawn over by whatever the last turn happened to run on.
+-  const label = (readConfirmed ? running?.label || recorded : chosen?.label || selected) || DEFAULT_MODEL_LABEL;
++  const baseLabel =
++    (readConfirmed ? running?.label || recorded : chosen?.label || selected) ||
++    modelLabel(state.models, selected, state.defaults);
++  const projected = modelPicks(state.models, state.defaults, true).find(
++    (item) => item.aliases.includes(selected) || item.identity === (running?.resolvedModel || running?.value),
++  );
++  const label = projected?.configuredDefault ? projected.label : baseLabel;
+   const menu = modelMenu(state, name);
+   const waiting = menu.items.length === 0;
+   // Read off the last turn only where nothing has been picked. Said over a stored pick, the
+@@ -2744,7 +2800,9 @@ function effortPick(state: ComposerState, name: string): ComposerPick {
+     (!state.settings.selectedEffort || (!pending && state.settings.pendingEffort !== null)) &&
+     Boolean(state.settings.confirmedEffort);
+   const label = read
+-    ? state.settings.confirmedEffort || DEFAULT_EFFORT_LABEL
++    ? menu.items.find((item) => item.value === state.settings.confirmedEffort)?.label ||
++      state.settings.confirmedEffort ||
++      DEFAULT_EFFORT_LABEL
+     : chosen?.label || state.settings.selectedEffort || DEFAULT_EFFORT_LABEL;
+   const application = pending ? ', selected for the next turn' : read ? ', which is what the last turn ran at' : '';
+   return {
+@@ -4486,7 +4544,7 @@ const DRAFT_STARTING = 'It is starting and its setup cannot change now.';
+ // because a draft is the one state in which the answer can still change.
+ function draftProfilePicks(state: ComposerState, profile: SessionProfile): ComposerPick[] {
+   const name = agentName(profile.agent);
+-  const model = chosenModel(state.models, profile.model);
++  const model = selectedModelPick(state.models, profile.model, state.defaults);
+   const effort = model?.efforts.find((one) => one.value === profile.effort);
+   const mode = profileAskMode(profile.agent, profile.permissionMode);
+   const agents = draftAgentMenu(state, profile);
+@@ -4496,7 +4554,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
+   // The catalog's word for the value, then the value itself, then the word for the agent's
+   // own default: the fallbacks the tag and the launcher rows use, which is why they are
+   // taken off one builder rather than written again here.
+-  const [, modelLabel, effortLabel] = profileFacts(profile, state.models);
++  const [, modelLabel, effortLabel] = profileFacts(profile, state.models, state.defaults);
+   // Unpressable exactly where the menu behind it has no rows, which is the live rule, and
+   // everywhere once the draft has started.
+   const noModel = models.items.length === 0;
+@@ -4515,7 +4573,11 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
+   // different values to name. A settled model that takes no effort setting has answered the
+   // question and says so. A draft with no model settled has not reached it, and its effort is
+   // the agent's own default, which is what the tag above the row already calls it.
+-  const noEffortToSet = noEffort && !!model;
++  const applied = defaultsForModel(state.models, profile.model, state.defaults);
++  const noEffortToSet =
++    noEffort &&
++    !!resolvedChoice(state.models, profile.model, state.defaults) &&
++    (!applied || (applied.status === 'ready' && !applied.effortStatus && applied.effort === null));
+   return [
+     {
+       control: 'agent',
+@@ -4529,7 +4591,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
+       control: 'model',
+       label: modelLabel,
+       name: `Model: ${modelLabel}${DRAFT_SCOPE} ${nameEnding('Press to start it on another model.', models.empty)}`,
+-      detail: model?.description || `Which model ${name} runs this draft on`,
++      detail: state.defaults?.base?.reason || model?.description || `Which model ${name} runs this draft on`,
+       disabled: starting || noModel,
+       caution: false,
+     },
+@@ -4540,7 +4602,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
+       label: noEffortToSet ? NO_EFFORT_LABEL : effortLabel,
+       name: `Effort: ${noEffortToSet ? 'none to set' : effortLabel}${DRAFT_SCOPE} ${nameEnding('Press to start it at another effort.', efforts.empty)}`,
+       detail: noEffort
+-        ? efforts.empty
++        ? defaultsForModel(state.models, profile.model, state.defaults)?.reason || efforts.empty
+         : effort?.description || `How much ${model?.label ?? 'the model'} works on a turn`,
+       disabled: starting || noEffort,
+       caution: false,
+@@ -4567,7 +4629,7 @@ const DRAFT_TAG_WORD = 'New draft';
+ function draftTag(state: ComposerState, profile: SessionProfile): ComposerDraftTag {
+   return {
+     word: DRAFT_TAG_WORD,
+-    detail: profileFacts(profile, state.models).join(PROFILE_FACT_SEPARATOR),
++    detail: profileFacts(profile, state.models, state.defaults).join(PROFILE_FACT_SEPARATOR),
+   };
+ }
+ 
+diff --git a/extension/src/domain/model-catalog.ts b/extension/src/domain/model-catalog.ts
+new file mode 100644
+index 00000000..0fd68735
+--- /dev/null
++++ b/extension/src/domain/model-catalog.ts
+@@ -0,0 +1,20 @@
++export interface EffortChoice {
++  value: string;
++  label: string;
++  description: string;
++}
++
++// One model the reader can pick, as the agent describes itself. `value` is what goes back
++// on the wire. `resolvedModel` is the exact model identity when the agent supplies one, so
++// pricing never has to infer a generation from `label` or `description`. `efforts` is empty
++// for a model that takes no effort setting, which is how the panel knows to offer none.
++export interface ModelChoice {
++  value: string;
++  resolvedModel?: string;
++  hidden?: boolean;
++  isDefault?: boolean;
++  defaultReasoningEffort?: string;
++  label: string;
++  description: string;
++  efforts: EffortChoice[];
++}
+diff --git a/extension/src/domain/session-setups.ts b/extension/src/domain/session-setups.ts
+index 6c1af039..007d014b 100644
+--- a/extension/src/domain/session-setups.ts
++++ b/extension/src/domain/session-setups.ts
+@@ -85,6 +85,7 @@ export interface SetupCatalogAgent {
+   value: string;
+   models: readonly { value: string; efforts: readonly { value: string }[] }[];
+   permissions: readonly { value: string }[];
++  supportedModels?: readonly { value: string; efforts: readonly { value: string }[] }[];
+ }
+ 
+ export type SetupValueName = 'agent' | 'model' | 'effort' | 'permission';
+@@ -94,7 +95,7 @@ export function missingSetupValue(values: SetupValues, agents: readonly SetupCat
+   if (!agent) {
+     return 'agent';
+   }
+-  const model = agent.models.find((one) => one.value === values.model);
++  const model = (agent.supportedModels ?? agent.models).find((one) => one.value === values.model);
+   if (!model) {
+     return 'model';
+   }
+diff --git a/extension/src/view/launcher.ts b/extension/src/view/launcher.ts
+index 7a08bad7..a58b63f7 100644
+--- a/extension/src/view/launcher.ts
++++ b/extension/src/view/launcher.ts
+@@ -1,3 +1,5 @@
++import type { ModelChoice } from '../domain/model-catalog';
++import { effortLabel, modelLabel, type DefaultContext } from './model-picks';
+ import type { CompleteSetupValues, SetupValueName } from '../domain/session-setups';
+ 
+ export const UNREADY_LAUNCHER_WORDS = {
+@@ -33,14 +35,20 @@ export interface LauncherValue {
+   label: string;
+   detail: string;
+   name: string;
++  configuredDefault?: boolean;
+ }
+ 
+ export interface LauncherModel extends LauncherValue {
++  identity?: string;
++  aliases?: string[];
+   efforts: LauncherValue[];
+ }
+ 
+ export interface LauncherAgent extends LauncherValue {
+   models: LauncherModel[];
++  catalog?: ModelChoice[] | readonly ModelChoice[];
++  defaults?: DefaultContext;
++  supportedModels?: readonly { value: string; efforts: readonly { value: string }[] }[];
+   permissions: LauncherValue[];
+   // The permission value a setup with no remembered choice preselects.
+   defaultPermission: string;
+@@ -116,7 +124,7 @@ export function launcherCustomRequest(
+   choice: LauncherChoice,
+ ): Extract<LauncherRequest, { kind: 'custom' }> | null {
+   const agent = view.agents.find((one) => one.value === choice.agent);
+-  const model = agent?.models.find((one) => one.value === choice.model);
++  const model = (agent?.supportedModels ?? agent?.models)?.find((one) => one.value === choice.model);
+   const effort = model?.efforts.find((one) => one.value === choice.effort);
+   const permission = agent?.permissions.find((one) => one.value === choice.permissionMode);
+   if (!agent || !model || !effort || !permission) {
+@@ -138,15 +146,19 @@ export function customValuesName(
+   request: Extract<LauncherRequest, { kind: 'custom' }>,
+ ): string {
+   const agent = view.agents.find((one) => one.value === request.agent);
+-  const model = agent?.models.find((one) => one.value === request.model);
+-  const effort = model?.efforts.find((one) => one.value === request.effort);
++  const model = agent?.catalog
++    ? modelLabel(agent.catalog, request.model, agent.defaults)
++    : agent?.models.find((one) => one.value === request.model)?.label;
++  const effort = agent?.catalog
++    ? effortLabel(agent.catalog, request.model, request.effort, agent.defaults)
++    : agent?.models.find((one) => one.value === request.model)?.efforts.find((one) => one.value === request.effort)
++        ?.label;
+   const permission = agent?.permissions.find((one) => one.value === request.permissionMode);
+-  if (!agent || !model || !effort || !permission) {
+-    return '';
+-  }
++  if (!agent || !permission) return '';
++
+   return (
+-    `${view.words.agentLabel}: ${agent.label}. ${view.words.modelLabel}: ${model.label}. ` +
+-    `${view.words.effortLabel}: ${effort.label}. ${view.words.permissionLabel}: ${permission.label}`
++    `${view.words.agentLabel}: ${agent.label}. ${view.words.modelLabel}: ${model ?? 'Model not reported'}. ` +
++    `${view.words.effortLabel}: ${effort ?? 'Effort not reported'}. ${view.words.permissionLabel}: ${permission.label}`
+   );
+ }
+ 
+diff --git a/extension/src/view/model-picks.ts b/extension/src/view/model-picks.ts
+new file mode 100644
+index 00000000..bd6eb49c
+--- /dev/null
++++ b/extension/src/view/model-picks.ts
+@@ -0,0 +1,170 @@
++import type { ModelChoice } from '../domain/model-catalog';
++export type { ModelChoice } from '../domain/model-catalog';
++
++export interface AppliedDefaults {
++  status: 'loading' | 'ready' | 'unavailable';
++  model: string | null;
++  effort: string | null;
++  effortStatus?: 'unavailable';
++  reason: string;
++}
++
++export interface DefaultContext {
++  revision?: number;
++  base?: AppliedDefaults;
++  models?: Readonly<Record<string, AppliedDefaults>>;
++}
++
++export const LOADING_DEFAULTS: AppliedDefaults = { status: 'loading', model: null, effort: null, reason: '' };
++export function unavailableDefaults(reason: string): AppliedDefaults {
++  return { status: 'unavailable', model: null, effort: null, reason };
++}
++
++export function modelIdentity(model: ModelChoice): string {
++  return model.resolvedModel || model.value;
++}
++export function resolvedChoice(
++  models: readonly ModelChoice[],
++  value: string,
++  context: DefaultContext = {},
++): ModelChoice | null {
++  const identity = value || (context.base?.status === 'ready' ? context.base.model : null);
++  return (
++    models.find((item) => item.value === identity) ?? models.find((item) => modelIdentity(item) === identity) ?? null
++  );
++}
++
++export interface ModelPick extends ModelChoice {
++  identity: string;
++  aliases: string[];
++  configuredDefault: boolean;
++}
++export function modelPicks(models: readonly ModelChoice[], context: DefaultContext = {}, live = false): ModelPick[] {
++  const rows = new Map<string, ModelPick>();
++  const defaultModel = context.base?.status === 'ready' ? context.base.model : null;
++  for (const item of models) {
++    const identity = modelIdentity(item);
++    const held = rows.get(identity);
++    if (held) {
++      held.aliases.push(item.value);
++      if (held.value === 'default' && item.value !== 'default') {
++        Object.assign(held, item, { label: `${item.label}${identity === defaultModel ? ' (default)' : ''}` });
++      }
++      continue;
++    }
++    if (item.hidden || (item.value === 'default' && !item.resolvedModel)) continue;
++    const label = item.value === 'default' ? identity : item.label;
++    rows.set(identity, {
++      ...item,
++      identity,
++      aliases: [item.value],
++      configuredDefault: identity === defaultModel,
++      label: `${label}${identity === defaultModel ? ' (default)' : ''}`,
++    });
++  }
++  if (defaultModel && !rows.has(defaultModel) && !live) {
++    const known = models.find((item) => modelIdentity(item) === defaultModel);
++    rows.set(defaultModel, {
++      value: defaultModel,
++      resolvedModel: defaultModel,
++      identity: defaultModel,
++      aliases: known ? [known.value] : [],
++      label: `${known?.label ?? defaultModel} (default)`,
++      description: known?.description ?? '',
++      efforts: known?.efforts ?? [],
++      configuredDefault: true,
++    });
++  }
++  return [...rows.values()];
++}
++
++export function selectedModelPick(
++  models: readonly ModelChoice[],
++  value: string,
++  context: DefaultContext = {},
++  live = false,
++): ModelPick | null {
++  const choice = resolvedChoice(models, value, context);
++  const identity = choice ? modelIdentity(choice) : value || context.base?.model;
++  return (
++    modelPicks(models, context, live).find((item) => item.identity === identity || item.aliases.includes(value)) ?? null
++  );
++}
++
++export function defaultsForModel(
++  models: readonly ModelChoice[],
++  model: string,
++  context: DefaultContext = {},
++): AppliedDefaults | undefined {
++  if (!model) return context.base;
++  const choice = resolvedChoice(models, model, context);
++  const identity = choice ? modelIdentity(choice) : model;
++  return (
++    context.models?.[model] ??
++    context.models?.[identity] ??
++    (context.base?.model === identity ? context.base : undefined)
++  );
++}
++
++export function effortPicks(models: readonly ModelChoice[], model: string, context: DefaultContext = {}) {
++  const chosen = resolvedChoice(models, model, context) ?? selectedModelPick(models, model, context);
++  const defaults = defaultsForModel(models, model, context);
++  return (chosen?.efforts ?? []).map((item) => ({
++    ...item,
++    configuredDefault: defaults?.status === 'ready' && defaults.effort === item.value,
++    label: `${item.label}${defaults?.status === 'ready' && defaults.effort === item.value ? ' (default)' : ''}`,
++  }));
++}
++
++export function modelLabel(models: readonly ModelChoice[], model: string, context: DefaultContext = {}): string {
++  return (
++    selectedModelPick(models, model, context)?.label ??
++    (model || (context.base?.status === 'loading' ? 'Loading model' : 'Model not reported'))
++  );
++}
++export function effortLabel(
++  models: readonly ModelChoice[],
++  model: string,
++  effort: string,
++  context: DefaultContext = {},
++): string {
++  const defaults = defaultsForModel(models, model, context);
++  const value = effort || (defaults?.status === 'ready' ? defaults.effort : null);
++  return (
++    effortPicks(models, model, context).find((item) => item.value === value)?.label ??
++    (effort ||
++      (value
++        ? `${value} (default)`
++        : defaults?.status === 'ready' && !defaults.effortStatus && defaults.effort === null
++          ? 'No effort setting'
++          : defaults?.status === 'loading'
++            ? 'Loading effort'
++            : 'Effort not reported'))
++  );
++}
++
++export function modelAfterPick(
++  models: readonly ModelChoice[],
++  model: string,
++  effort: string,
++  value: string,
++  context: DefaultContext = {},
++) {
++  const row = modelPicks(models, context).find((item) => item.value === value);
++  if (!row) return null;
++  if (selectedModelPick(models, model, context)?.identity === row.identity) return { model, effort };
++  if (row.configuredDefault) return { model: '', effort: '' };
++  return { model: row.value, effort: row.efforts.some((item) => item.value === effort) ? effort : '' };
++}
++export function effortAfterPick(
++  models: readonly ModelChoice[],
++  model: string,
++  effort: string,
++  value: string,
++  context: DefaultContext = {},
++) {
++  const row = effortPicks(models, model, context).find((item) => item.value === value);
++  if (!row) return null;
++  const current = effort || defaultsForModel(models, model, context)?.effort;
++  return current === row.value ? effort : row.configuredDefault ? '' : row.value;
++}

@@ -1,0 +1,41 @@
+{
+  "schema": "arc-portable-experiment-v1",
+  "cases": [
+    "portable-001",
+    "portable-002",
+    "portable-003",
+    "portable-004",
+    "portable-005",
+    "portable-006",
+    "portable-007",
+    "portable-008",
+    "portable-009",
+    "portable-010",
+    "portable-011",
+    "portable-012",
+    "portable-013",
+    "portable-014",
+    "portable-015",
+    "portable-016",
+    "portable-017",
+    "portable-018",
+    "portable-019",
+    "portable-020"
+  ],
+  "models": ["gpt-6-sol"],
+  "efforts": ["medium", "high"],
+  "repeats": 2,
+  "seed": "arc-portable-effort-20260927",
+  "reservation_usd": 0.5,
+  "timeout_seconds": 300,
+  "max_cells": 80,
+  "extra_instructions": [],
+  "required_tools": [],
+  "rate_snapshot": {
+    "source": "extension/src/pricing.ts OpenAI list-price rows",
+    "date": "2026-09-27",
+    "rates": {
+      "gpt-6-sol": { "input": 2, "cacheRead": 0.2, "output": 10, "maxPricedContext": 272000 }
+    }
+  }
+}

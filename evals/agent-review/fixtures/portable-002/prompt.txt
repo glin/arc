@@ -1,0 +1,3 @@
+Review the proposed workspace discovery change. Session roots must remain complete and current across foldered and folderless windows, on all supported platforms.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

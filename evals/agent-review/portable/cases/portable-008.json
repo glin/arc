@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-008",
+  "revision": 1,
+  "family": "transcript-parsing",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Malformed text block aborts parsing",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/transcript.ts @ 141b708",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/transcript.mjs",
+      "sha256": "fb356886dac44304d48bf041769e695f91dcd046e454d77cc3cf9d33081379db"
+    },
+    {
+      "path": "src/turn-reader.mjs",
+      "sha256": "06b4434f2d8714404ea2fefaacd4a624dbf85ea854275e379b86fb399c3d484c"
+    }
+  ],
+  "prompt_sha256": "706077ee8872dcc11f991459fb895eb78d1baa1a54d14fc90390e6a6dec031ef",
+  "diff_sha256": "10b769a338aebdb01e786e9e4cc1cf49b80c6b41accad131b154404ce2982fe7",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "One malformed text block aborts the whole transcript parse.",
+      "paths": ["src/transcript.mjs"],
+      "scenario": "A transcript contains a malformed text block followed by a valid response."
+    }
+  ],
+  "audit": "Adapted parser slice. It checks continuation after a non-string block, not full transcript fidelity."
+}

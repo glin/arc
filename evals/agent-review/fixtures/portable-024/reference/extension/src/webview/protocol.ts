@@ -1,0 +1,1313 @@
+// The message contract between the extension host and the panel, in one file both sides
+// read. Each direction is a discriminated union with a parser that takes the raw value the
+// other process sent and answers with a variant or with null. A caller that receives null
+// ignores the message and says so once. Nothing here throws.
+//
+// The parsers also normalize fields whose wire semantics allow an omitted value. Handlers
+// receive the normalized type, which keeps one copy of each rule at the boundary.
+//
+// These are the wire shapes the panel and host use. The parsers refuse malformed values
+// without changing a well-formed message in either direction.
+import type {
+  ComposerAnnotations,
+  ComposerDraftTag,
+  ComposerFile,
+  ComposerLive,
+  ComposerNextTurn,
+  ComposerOrigin,
+  ComposerView,
+  Menu,
+  NextTurnFace,
+  NextTurnWords,
+  PathEntry,
+  PromptEntryView,
+  QueuedPrompt,
+} from '../composerview.ts';
+import { mergeSubmittedPrompts, type SubmittedPrompt } from './state.ts';
+import type { LauncherRequest } from '../view/launcher.ts';
+import type { PinSetupRequest } from '../view/launcher.ts';
+import type { SessionLauncherView } from '../view/launcher.ts';
+import { normalizeSetupValues, SETUP_ID_LIMIT } from '../domain/session-setups.ts';
+import type { SavedView } from '../domain/views.ts';
+import { isStoredRailLens, type SavedRailFilter } from '../domain/rail-filters.ts';
+import type { TurnComment } from '../view/comments.ts';
+import type { UsageBar } from '../view/usage.ts';
+import type { ProjectSpend } from '../view/projectspend.ts';
+import { RAIL_SORTS, type RailSort } from '../domain/rail-sort.ts';
+import { isQueryMatch } from '../domain/session-query.ts';
+import {
+  isCardLayout,
+  isPromptPosition,
+  type CardLayout,
+  type TimelineLayout,
+  type PromptPosition,
+} from '../view/timeline-layout.ts';
+import type { CardView, RailCardView } from './payload-contracts.ts';
+
+export interface AskQuestionAnswer {
+  labels: string[];
+  written: string;
+}
+
+export type AskAnswer =
+  | { decision: 'allow' }
+  | { decision: 'deny'; reason: string }
+  | { decision: 'answer'; answers: Record<string, AskQuestionAnswer> };
+
+export type {
+  ComposerAnnotations,
+  ComposerDraftTag,
+  ComposerFile,
+  ComposerLive,
+  ComposerNextTurn,
+  ComposerOrigin,
+  ComposerView,
+  Menu,
+  NextTurnFace,
+  NextTurnWords,
+  PathEntry,
+  PromptEntryView,
+  QueuedPrompt,
+};
+
+export interface PanelUsage {
+  bar: UsageBar | null;
+  composer: ComposerView | null;
+  menus: Record<string, Menu>;
+  launcher: SessionLauncherView | null;
+}
+
+export interface PanelHistoryControl {
+  kind: 'load' | 'busy' | 'retry' | 'beginning' | 'failed';
+  label: string;
+  name?: string;
+  auto?: boolean;
+  token?: string;
+  session?: string;
+}
+
+export type PanelOlderHistory = PanelHistoryControl | null;
+
+// Cards and rail rows cross the host boundary in the complete shapes their browser owners
+// consume. Sharing those contracts makes the coordinator prove that every accepted payload
+// satisfies its renderer without widening through `unknown`.
+export type PanelCard = CardView;
+
+export interface PanelSessionRow {
+  id: string;
+  label: string;
+  fullLabel?: string;
+  persisted?: boolean;
+  agent: string;
+  // The agent the session belongs to, keyed rather than named. The panel words the resume
+  // command from this and the id.
+  agentKey: string;
+  at: number;
+  relative: string;
+  when: string;
+  // The reader-started or delegated parent. Present only on the shown session's row,
+  // and only when the host has a row for the parent.
+  parent?: { id: string; label: string; relation: 'dispatched' | 'subagent' | 'reader' };
+}
+
+export type PanelRailCard = RailCardView;
+
+export interface PanelStat extends Record<string, unknown> {
+  kind: string;
+  label: string;
+}
+
+export interface PanelDiagnosis {
+  message: string;
+}
+
+export interface SearchHit {
+  key: string;
+  sessionId: string;
+  sessionTitle: string;
+  agent: string;
+  when: string;
+  where: 'prompt' | 'summary';
+  snippet: string;
+  ranges?: readonly (readonly [number, number])[];
+}
+
+interface LabelRow {
+  name: string;
+  count: number;
+  countName: string;
+}
+
+type LabelEditorRow = LabelRow & { applied: boolean };
+
+// The whole render payload, which the panel adopts as `latest` and reads dozens of fields
+// from. It is the one message the parser hands back untouched rather than rebuilding: the
+// panel keeps the object and writes onto it, and a rebuilt copy would drop every field this
+// file does not name. The payload stays open because the card, rail and composer fields are
+// owned by their subject modules.
+export interface RenderMessage extends Record<string, unknown> {
+  type: 'render';
+  cards: PanelCard[];
+  sessions: PanelSessionRow[];
+  rail: PanelRailCard[];
+  stats: Record<string, PanelStat[]>;
+  hidden: string[];
+  pinnedTop: string[];
+  comments: TurnComment[];
+  labels: LabelRow[];
+  views: SavedView[];
+  railFilters: SavedRailFilter[];
+  iconFonts: string[];
+  showing: string | null;
+  sessionAdoptions: PanelSessionAdoption[];
+  maxSessions: number;
+  olderHistory: PanelOlderHistory;
+  projectSpend: ProjectSpend | null;
+  diagnosis: PanelDiagnosis | null;
+  usage: PanelUsage | null;
+  startup: { generation: number; complete: boolean } | null;
+  // The reader's Timeline layout settings. A new panel reads them here, then receives changes
+  // through layout messages from the same configuration listener as the dialog.
+  timelineLayout: TimelineLayout;
+}
+
+export interface SelectionMessage {
+  type: 'selection';
+  // The previous and current identities bound this replacement. A missing row removes an
+  // abandoned draft from the complete lists retained from the last render.
+  replaces: string[];
+  cards: PanelCard[];
+  sessions: PanelSessionRow[];
+  rail: PanelRailCard[];
+  stats: Record<string, PanelStat[]>;
+  showing: string | null;
+  olderHistory: PanelOlderHistory;
+  diagnosis: PanelDiagnosis | null;
+  usage: PanelUsage | null;
+  startup: { generation: number; complete: boolean } | null;
+}
+
+export interface PanelSessionAdoption {
+  provisional: string;
+  durable: string;
+}
+
+export type HostToPanel =
+  | { type: 'focusProjectSpend' }
+  | { type: 'openLauncher'; custom: boolean }
+  | { type: 'labelEditor'; session: string; heading: string; rows: LabelEditorRow[] }
+  | { type: 'labelsChanged'; session: string }
+  | { type: 'openLabelEditor'; session: string }
+  | { type: 'showSessionDetails'; session: string }
+  | { type: 'openViewEditor'; view: string; mode: 'rename' | 'delete' }
+  | { type: 'openSessionRename'; session: string; title: string }
+  // `request` is the id the panel sent with the rename it answers.
+  | { type: 'sessionRenameResult'; session: string; request: number; title: string; error: string }
+  | { type: 'focusComposer'; session: string }
+  | { type: 'pathCompletion'; session: string; request: number; token: string; caret: number; rows: PathEntry[] }
+  | { type: 'fileStaging'; session: string; token: string; pending: boolean }
+  | { type: 'fileStagingRejected'; session: string; token: string }
+  | { type: 'usage'; usage: PanelUsage | null }
+  | { type: 'askRejected'; session: string; id: string }
+  | { type: 'projectSpend'; projectSpend: ProjectSpend | null }
+  | { type: 'layout'; layout: TimelineLayout }
+  | { type: 'live'; session: string; live: ComposerLive[] }
+  | { type: 'activity'; session: string; card: PanelCard }
+  | SelectionMessage
+  | {
+      type: 'rail';
+      rail: PanelRailCard[];
+      stats: Record<string, PanelStat[]>;
+      labels: LabelRow[];
+      views: SavedView[];
+      railFilters: SavedRailFilter[];
+      sessionAdoptions: PanelSessionAdoption[];
+      hidden: string[];
+      pinnedTop: string[];
+    }
+  | { type: 'openPick'; control: string }
+  | { type: 'takeDraft'; session: string; text: string }
+  | { type: 'takeQueuedDraft'; session: string; text: string; revision: number; value: string }
+  | { type: 'promptRecovery'; submittedPrompts: SubmittedPrompt[] }
+  | { type: 'requestPromptRecovery'; request: string }
+  | { type: 'restoreDraft'; session: string; text: string; revision: number }
+  | { type: 'notes'; comments: TurnComment[] }
+  | { type: 'openComment'; key: string }
+  | { type: 'sendSelectedText'; key: string; copyLabels: boolean }
+  | { type: 'setRead'; key: string; read: boolean }
+  | { type: 'forgetState'; since: number }
+  | { type: 'setSessionRead'; session: string; read: boolean }
+  | { type: 'setSessionArchived'; session: string; archived: boolean }
+  | { type: 'setSessionPinned'; session: string; pinned: boolean }
+  | { type: 'setComposerHidden'; hidden: boolean }
+  | { type: 'results'; query: string; hits: SearchHit[]; scope: string }
+  | RenderMessage;
+
+const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+  focusProjectSpend: true,
+  openLauncher: true,
+  labelEditor: true,
+  labelsChanged: true,
+  openLabelEditor: true,
+  showSessionDetails: true,
+  openViewEditor: true,
+  openSessionRename: true,
+  sessionRenameResult: true,
+  focusComposer: true,
+  pathCompletion: true,
+  fileStaging: true,
+  fileStagingRejected: true,
+  usage: true,
+  askRejected: true,
+  projectSpend: true,
+  layout: true,
+  live: true,
+  activity: true,
+  selection: true,
+  rail: true,
+  openPick: true,
+  takeDraft: true,
+  takeQueuedDraft: true,
+  promptRecovery: true,
+  requestPromptRecovery: true,
+  restoreDraft: true,
+  notes: true,
+  openComment: true,
+  sendSelectedText: true,
+  setRead: true,
+  forgetState: true,
+  setSessionRead: true,
+  setSessionArchived: true,
+  setSessionPinned: true,
+  setComposerHidden: true,
+  results: true,
+  render: true,
+};
+
+export type PanelToHost =
+  | { type: 'ready' }
+  | { type: 'painted'; generation: number; stage: 'railReady' | 'firstCard' | 'completeRender' }
+  | { type: 'initialize' }
+  | { type: 'developmentReload' }
+  | { type: 'refresh' }
+  | { type: 'perf'; kind: string; ms: number }
+  | { type: 'goBack' }
+  | { type: 'goForward' }
+  | { type: 'newSession'; request?: LauncherRequest }
+  | { type: 'pinSetup'; request: PinSetupRequest }
+  | { type: 'unpinSetup'; id: string }
+  | { type: 'refreshUsage'; agent: string | null; force: boolean }
+  | { type: 'openControl'; control: string; session: string }
+  | { type: 'requestDefaults'; agent: 'claude' | 'codex'; model: string }
+  | { type: 'pick'; control: string; agent: string; session: string; model: string; value: string }
+  | { type: 'draft'; text: string; keep: string; session: string; revision?: number }
+  | { type: 'pathCompletion'; session: string; request: number; token: string; caret: number }
+  | { type: 'answerAsk'; session: string; id: string; answer: AskAnswer }
+  | { type: 'beginFileStaging'; session: string; token: string }
+  | { type: 'attachFiles'; session: string; token: string; clipboard: boolean; files: unknown }
+  | { type: 'fileReadError'; session: string; token: string; name: string }
+  | { type: 'fileRejected'; session: string; code: string; name: string; size: number; rejected: number }
+  | { type: 'removeFile'; session: string; value: string }
+  | { type: 'sendPrompt'; text: string; session: string; revision: number; attempt?: SubmittedPrompt }
+  | { type: 'importPromptRecovery'; submittedPrompts: unknown; request?: string }
+  | { type: 'compact'; session: string }
+  | { type: 'dismissLive'; session: string; kind: string }
+  | { type: 'restoreLive'; session: string; kind: string }
+  | { type: 'stopTurn'; session: string }
+  | { type: 'dequeue'; value: string; session: string }
+  | { type: 'editQueued'; value: string; session: string; revision: number }
+  | {
+      type: 'acceptQueuedEdit';
+      value: string;
+      session: string;
+      revision: number;
+      currentRevision: number;
+      accepted: boolean;
+    }
+  | { type: 'copy'; text: string }
+  | { type: 'note'; note: unknown }
+  | { type: 'armSelectedText'; session: string; key: string }
+  | { type: 'selectedTextHandoff'; session: string; key: string; text: string; copyLabels: boolean }
+  | { type: 'armSessionDetails'; session: string }
+  | { type: 'armComposer' }
+  | { type: 'showReaderParent'; session: string }
+  | { type: 'showSession'; session: string }
+  | { type: 'labelEditor'; session: string }
+  | { type: 'setLabels'; session: string; names: string[] }
+  | { type: 'setViews'; views: SavedView[] }
+  // `request` names this rename, so the panel can tell its answer from an earlier one's.
+  | { type: 'renameSession'; session: string; request: number; title: string }
+  | { type: 'setRailFilters'; railFilters: SavedRailFilter[] }
+  | { type: 'sessionMembership'; action: 'unarchiveAll' }
+  | { type: 'sessionMembership'; action: 'archive' | 'unarchive' | 'unpin'; session: string }
+  | { type: 'sessionMembership'; action: 'pin'; session: string; openPinned?: boolean }
+  | { type: 'setLayout'; key: 'cardLayout'; value: CardLayout }
+  | { type: 'setLayout'; key: 'promptPosition'; value: PromptPosition }
+  | { type: 'saveState'; state: unknown }
+  | { type: 'search'; text: string }
+  | { type: 'loadOlder'; session: string; token: string }
+  | { type: 'openLink'; href: string; beside: boolean }
+  | { type: 'openVisualization'; path: string }
+  | { type: 'openImage'; path: string; beside: boolean }
+  | { type: 'openTurnDiff'; key: string; beside: boolean }
+  | { type: 'openCommit'; key: string; sha: string; dir: string | null; beside: boolean }
+  | { type: 'openFile'; key: string; path: string; beside: boolean; sourceSessionId?: string }
+  | { type: 'openSkill'; key: string; path: string; beside: boolean };
+
+function record(raw: unknown): Record<string, unknown> | null {
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function hostToPanelKind(value: unknown): value is HostToPanel['type'] {
+  return isString(value) && Object.prototype.hasOwnProperty.call(HOST_TO_PANEL_KINDS, value);
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || isString(value);
+}
+
+function records(value: unknown): value is Record<string, unknown>[] {
+  return Array.isArray(value) && value.every((entry) => record(entry) !== null);
+}
+
+function strings(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isString);
+}
+
+function labelCount(value: unknown): value is LabelRow {
+  const row = record(value);
+  return !!row && isString(row.name) && isFiniteNumber(row.count) && isString(row.countName);
+}
+
+function labelEditorRow(value: unknown): value is LabelEditorRow {
+  const row = record(value);
+  return labelCount(value) && typeof row?.applied === 'boolean';
+}
+
+// One saved view as it crosses the wire. The shape alone is checked here. The extension
+// normalizes every list it receives, so this refuses a message that cannot be read rather
+// than deciding what a readable one means.
+function savedViewRow(value: unknown): value is SavedView {
+  const row = record(value);
+  return (
+    !!row &&
+    isString(row.id) &&
+    row.id !== '' &&
+    isString(row.name) &&
+    isString(row.query) &&
+    isQueryMatch(row.match) &&
+    typeof row.archived === 'boolean'
+  );
+}
+
+function savedViews(value: unknown): value is SavedView[] {
+  return Array.isArray(value) && value.every(savedViewRow);
+}
+
+function savedRailFilterRow(value: unknown): value is SavedRailFilter {
+  const row = record(value);
+  return (
+    !!row &&
+    isString(row.id) &&
+    row.id !== '' &&
+    isString(row.name) &&
+    isString(row.query) &&
+    isQueryMatch(row.match) &&
+    RAIL_SORTS.includes(row.sort as RailSort) &&
+    (row.lens === undefined || row.lens === null || isStoredRailLens(row.lens))
+  );
+}
+
+function savedRailFilters(value: unknown): value is SavedRailFilter[] {
+  return Array.isArray(value) && value.every(savedRailFilterRow);
+}
+
+function sessionAdoption(value: unknown): value is PanelSessionAdoption {
+  const adoption = record(value);
+  return !!adoption && isString(adoption.provisional) && isString(adoption.durable);
+}
+
+function composerFile(value: unknown): value is ComposerFile {
+  const file = record(value);
+  return (
+    !!file &&
+    isString(file.id) &&
+    isString(file.label) &&
+    isString(file.name) &&
+    isFiniteNumber(file.size) &&
+    (file.preview === null || isString(file.preview)) &&
+    isString(file.kind) &&
+    isString(file.stem) &&
+    isString(file.ext) &&
+    isString(file.sizeLabel) &&
+    isOptionalString(file.removeLabel) &&
+    isOptionalString(file.removeName) &&
+    isOptionalString(file.removeControl)
+  );
+}
+
+function pathEntry(value: unknown): value is PathEntry {
+  const entry = record(value);
+  return (
+    !!entry &&
+    isString(entry.name) &&
+    typeof entry.directory === 'boolean' &&
+    isString(entry.label) &&
+    isString(entry.accessibleName) &&
+    isString(entry.completion)
+  );
+}
+
+function composerLive(value: unknown): value is ComposerLive {
+  const live = record(value);
+  return (
+    !!live &&
+    (live.kind === 'prompt' || live.kind === 'compact') &&
+    (live.state === 'sent' || live.state === 'running' || live.state === 'failed') &&
+    (live.tone === 'running' || live.tone === 'failed') &&
+    isString(live.relative) &&
+    isString(live.absolute) &&
+    isString(live.agent) &&
+    isString(live.model) &&
+    isString(live.label) &&
+    isString(live.headline) &&
+    isString(live.status) &&
+    isString(live.reply) &&
+    isFiniteNumber(live.at) &&
+    (live.since === null || isFiniteNumber(live.since)) &&
+    isString(live.dismissLabel) &&
+    isString(live.dismissName) &&
+    isString(live.dismissControl) &&
+    isString(live.restoreLabel) &&
+    isString(live.restoreName) &&
+    isString(live.restoreControl) &&
+    isString(live.reason) &&
+    Array.isArray(live.files) &&
+    live.files.every(composerFile)
+  );
+}
+
+/** A string field the reader of the message treated as empty when it was missing. */
+function textOr(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+// The launcher request names a row the host offered or a setup made of values the host
+// offered. The host checks the choice against its current view.
+function launcherRequest(raw: unknown): LauncherRequest | null {
+  const m = record(raw);
+  if (!m) {
+    return null;
+  }
+  if (m.kind === 'row' && isString(m.key)) {
+    return { kind: 'row', key: m.key };
+  }
+  if (
+    m.kind === 'custom' &&
+    isString(m.agent) &&
+    isString(m.model) &&
+    isString(m.effort) &&
+    isString(m.permissionMode)
+  ) {
+    return {
+      kind: 'custom',
+      agent: m.agent,
+      model: m.model,
+      effort: m.effort,
+      permissionMode: m.permissionMode,
+    };
+  }
+  return null;
+}
+
+// How the reader answered an ask. The answer to a question is the labels it offered and the
+// reader took, beside whatever the reader wrote instead, so both halves of every value are
+// checked rather than the outer object alone.
+function askAnswer(raw: unknown): AskAnswer | null {
+  const m = record(raw);
+  if (!m) {
+    return null;
+  }
+  if (m.decision === 'allow') {
+    return { decision: 'allow' };
+  }
+  if (m.decision === 'deny' && isString(m.reason)) {
+    return { decision: 'deny', reason: m.reason };
+  }
+  if (m.decision === 'answer') {
+    const answers = record(m.answers);
+    if (!answers) {
+      return null;
+    }
+    const picked: Record<string, AskQuestionAnswer> = {};
+    for (const [id, value] of Object.entries(answers)) {
+      const given = record(value);
+      if (!given || !Array.isArray(given.labels) || !given.labels.every(isString)) {
+        return null;
+      }
+      if (!isString(given.written)) {
+        return null;
+      }
+      picked[id] = { labels: [...given.labels], written: given.written };
+    }
+    return { decision: 'answer', answers: picked };
+  }
+  return null;
+}
+
+export function parseHostToPanel(raw: unknown): HostToPanel | null {
+  const m = record(raw);
+  if (!m) {
+    return null;
+  }
+  switch (m.type) {
+    case 'focusProjectSpend':
+      return { type: 'focusProjectSpend' };
+    case 'openLauncher':
+      return { type: 'openLauncher', custom: m.custom === true };
+    case 'labelEditor':
+      return isString(m.session) && isString(m.heading) && Array.isArray(m.rows) && m.rows.every(labelEditorRow)
+        ? {
+            type: 'labelEditor',
+            session: m.session,
+            heading: m.heading,
+            rows: m.rows,
+          }
+        : null;
+    case 'labelsChanged':
+      return isString(m.session) ? { type: 'labelsChanged', session: m.session } : null;
+    case 'openLabelEditor':
+      return isString(m.session) ? { type: 'openLabelEditor', session: m.session } : null;
+    case 'showSessionDetails':
+      return isString(m.session) && m.session.length > 0 ? { type: 'showSessionDetails', session: m.session } : null;
+    case 'openViewEditor':
+      return isString(m.view) && (m.mode === 'rename' || m.mode === 'delete')
+        ? { type: 'openViewEditor', view: m.view, mode: m.mode }
+        : null;
+    case 'openSessionRename':
+      return isString(m.session) && m.session.length > 0 && isString(m.title)
+        ? { type: 'openSessionRename', session: m.session, title: m.title }
+        : null;
+    case 'sessionRenameResult':
+      return isString(m.session) &&
+        m.session.length > 0 &&
+        Number.isSafeInteger(m.request) &&
+        isString(m.title) &&
+        isString(m.error)
+        ? {
+            type: 'sessionRenameResult',
+            session: m.session,
+            request: m.request as number,
+            title: m.title,
+            error: m.error,
+          }
+        : null;
+    case 'focusComposer':
+      return isString(m.session) ? { type: 'focusComposer', session: m.session } : null;
+    case 'pathCompletion':
+      return isString(m.session) &&
+        isFiniteNumber(m.request) &&
+        isString(m.token) &&
+        isFiniteNumber(m.caret) &&
+        Array.isArray(m.rows) &&
+        m.rows.every(pathEntry)
+        ? {
+            type: 'pathCompletion',
+            session: m.session,
+            request: m.request,
+            token: m.token,
+            caret: m.caret,
+            rows: m.rows,
+          }
+        : null;
+    case 'fileStaging':
+      return isString(m.session)
+        ? {
+            type: 'fileStaging',
+            session: m.session,
+            token: textOr(m.token, ''),
+            pending: m.pending === true,
+          }
+        : null;
+    case 'fileStagingRejected':
+      return isString(m.session) && isString(m.token)
+        ? { type: 'fileStagingRejected', session: m.session, token: m.token }
+        : null;
+    case 'usage':
+      return { type: 'usage', usage: m.usage as PanelUsage | null };
+    case 'askRejected':
+      return isString(m.session) && isString(m.id) ? { type: 'askRejected', session: m.session, id: m.id } : null;
+    case 'projectSpend':
+      return { type: 'projectSpend', projectSpend: m.projectSpend as ProjectSpend | null };
+    case 'layout': {
+      const layout = record(m.layout);
+      return layout && isCardLayout(layout.cardLayout) && isPromptPosition(layout.promptPosition)
+        ? { type: 'layout', layout: { cardLayout: layout.cardLayout, promptPosition: layout.promptPosition } }
+        : null;
+    }
+    case 'live':
+      return isString(m.session) && Array.isArray(m.live) && m.live.every(composerLive)
+        ? { type: 'live', session: m.session, live: m.live }
+        : null;
+    case 'activity':
+      return isString(m.session) ? { type: 'activity', session: m.session, card: m.card as PanelCard } : null;
+    case 'selection':
+      return records(m.cards) &&
+        records(m.sessions) &&
+        records(m.rail) &&
+        record(m.stats) !== null &&
+        strings(m.replaces)
+        ? (m as unknown as SelectionMessage)
+        : null;
+    case 'rail': {
+      const stats = record(m.stats);
+      const sessionAdoptions = m.sessionAdoptions === undefined ? [] : m.sessionAdoptions;
+      return records(m.rail) &&
+        stats !== null &&
+        Array.isArray(m.labels) &&
+        m.labels.every(labelCount) &&
+        savedViews(m.views) &&
+        savedRailFilters(m.railFilters) &&
+        Array.isArray(sessionAdoptions) &&
+        sessionAdoptions.every(sessionAdoption) &&
+        strings(m.hidden) &&
+        strings(m.pinnedTop)
+        ? {
+            type: 'rail',
+            rail: m.rail as PanelRailCard[],
+            stats: stats as Record<string, PanelStat[]>,
+            labels: m.labels,
+            views: m.views,
+            railFilters: m.railFilters,
+            sessionAdoptions,
+            hidden: m.hidden,
+            pinnedTop: m.pinnedTop,
+          }
+        : null;
+    }
+    case 'openPick':
+      return isString(m.control) ? { type: 'openPick', control: m.control } : null;
+    case 'takeDraft':
+      return isString(m.session) && isString(m.text) ? { type: 'takeDraft', session: m.session, text: m.text } : null;
+    case 'takeQueuedDraft':
+      return isString(m.session) &&
+        isString(m.text) &&
+        Number.isSafeInteger(m.revision) &&
+        (m.revision as number) >= 0 &&
+        isString(m.value)
+        ? {
+            type: 'takeQueuedDraft',
+            session: m.session,
+            text: m.text,
+            revision: m.revision as number,
+            value: m.value,
+          }
+        : null;
+    case 'promptRecovery':
+      try {
+        return { type: 'promptRecovery', submittedPrompts: mergeSubmittedPrompts(m.submittedPrompts) };
+      } catch {
+        return null;
+      }
+    case 'requestPromptRecovery':
+      return isString(m.request) ? { type: 'requestPromptRecovery', request: m.request } : null;
+    case 'restoreDraft':
+      return isString(m.session) && isString(m.text) && typeof m.revision === 'number'
+        ? {
+            type: 'restoreDraft',
+            session: m.session,
+            text: m.text,
+            revision: m.revision,
+          }
+        : null;
+    case 'notes':
+      return { type: 'notes', comments: m.comments as TurnComment[] };
+    case 'openComment':
+      return isString(m.key) ? { type: 'openComment', key: m.key } : null;
+    case 'sendSelectedText':
+      return isString(m.key) && m.key.length > 0 && typeof m.copyLabels === 'boolean'
+        ? { type: 'sendSelectedText', key: m.key, copyLabels: m.copyLabels }
+        : null;
+    case 'setRead':
+      return isString(m.key) ? { type: 'setRead', key: m.key, read: m.read === true } : null;
+    case 'forgetState':
+      return typeof m.since === 'number' ? { type: 'forgetState', since: m.since } : null;
+    case 'setSessionRead':
+      return isString(m.session) ? { type: 'setSessionRead', session: m.session, read: m.read === true } : null;
+    case 'setSessionArchived':
+      return isString(m.session)
+        ? { type: 'setSessionArchived', session: m.session, archived: m.archived === true }
+        : null;
+    case 'setSessionPinned':
+      return isString(m.session) ? { type: 'setSessionPinned', session: m.session, pinned: m.pinned === true } : null;
+    case 'setComposerHidden':
+      return { type: 'setComposerHidden', hidden: m.hidden === true };
+    case 'results':
+      return isString(m.query) && isString(m.scope)
+        ? { type: 'results', query: m.query, hits: m.hits as SearchHit[], scope: m.scope }
+        : null;
+    case 'render': {
+      // Handed back rather than rebuilt, for the reason above the interface.
+      const adoptions = m.sessionAdoptions;
+      return records(m.cards) &&
+        records(m.sessions) &&
+        records(m.rail) &&
+        record(m.stats) !== null &&
+        strings(m.hidden) &&
+        strings(m.pinnedTop) &&
+        records(m.comments) &&
+        Array.isArray(m.labels) &&
+        m.labels.every(labelCount) &&
+        savedViews(m.views) &&
+        savedRailFilters(m.railFilters) &&
+        Array.isArray(m.iconFonts) &&
+        m.iconFonts.every(isString) &&
+        Array.isArray(adoptions) &&
+        adoptions.every(sessionAdoption)
+        ? (m as RenderMessage)
+        : null;
+    }
+    default:
+      return null;
+  }
+}
+
+export function parsePanelToHost(raw: unknown): PanelToHost | null {
+  const m = record(raw);
+  if (!m) {
+    return null;
+  }
+  switch (m.type) {
+    case 'ready':
+      return { type: 'ready' };
+    case 'painted':
+      return Number.isSafeInteger(m.generation) &&
+        (m.generation as number) >= 0 &&
+        (m.stage === 'railReady' || m.stage === 'firstCard' || m.stage === 'completeRender')
+        ? { type: 'painted', generation: m.generation as number, stage: m.stage }
+        : null;
+    case 'initialize':
+      return { type: 'initialize' };
+    case 'developmentReload':
+      return { type: 'developmentReload' };
+    case 'refresh':
+      return { type: 'refresh' };
+    case 'perf':
+      return hostToPanelKind(m.kind) && isFiniteNumber(m.ms) && m.ms >= 0
+        ? { type: 'perf', kind: m.kind, ms: m.ms }
+        : null;
+    case 'goBack':
+      return { type: 'goBack' };
+    case 'goForward':
+      return { type: 'goForward' };
+    case 'newSession': {
+      // A press on the plus carries no request at all, and a press on a launcher row
+      // carries one. A request that is present and malformed is refused, because dropping
+      // the field instead would start the agent on a setup nobody chose.
+      if (m.request === undefined) {
+        return { type: 'newSession' };
+      }
+      const request = launcherRequest(m.request);
+      return request ? { type: 'newSession', request } : null;
+    }
+    case 'pinSetup': {
+      const request = launcherRequest(m.request);
+      if (!request) return null;
+      if (request.kind === 'custom') return { type: 'pinSetup', request };
+      const values = normalizeSetupValues(record(m.request)?.values);
+      return values ? { type: 'pinSetup', request: { ...request, values } } : null;
+    }
+    case 'unpinSetup':
+      return isString(m.id) && m.id.trim().length > 0 && m.id.length <= SETUP_ID_LIMIT
+        ? { type: 'unpinSetup', id: m.id }
+        : null;
+    case 'refreshUsage':
+      return {
+        type: 'refreshUsage',
+        agent: isString(m.agent) ? m.agent : null,
+        force: m.force === true,
+      };
+    case 'requestDefaults':
+      return (m.agent === 'claude' || m.agent === 'codex') && isString(m.model) && m.model.length <= 200
+        ? { type: 'requestDefaults', agent: m.agent, model: m.model }
+        : null;
+    case 'openControl':
+      return isString(m.control) && isString(m.session)
+        ? { type: 'openControl', control: m.control, session: m.session }
+        : null;
+    case 'pick':
+      return isString(m.agent) && isString(m.value) && isString(m.session)
+        ? {
+            type: 'pick',
+            control: String(m.control),
+            agent: m.agent,
+            session: m.session,
+            model: textOr(m.model, ''),
+            value: m.value,
+          }
+        : null;
+    case 'draft':
+      return isString(m.text) && isString(m.session)
+        ? {
+            type: 'draft',
+            text: m.text,
+            keep: textOr(m.keep, m.text),
+            session: m.session,
+            ...(Number.isSafeInteger(m.revision) ? { revision: m.revision as number } : {}),
+          }
+        : null;
+    case 'pathCompletion':
+      return isString(m.session) && isFiniteNumber(m.request) && isString(m.token) && isFiniteNumber(m.caret)
+        ? { type: 'pathCompletion', session: m.session, request: m.request, token: m.token, caret: m.caret }
+        : null;
+    case 'answerAsk': {
+      if (!isString(m.session) || !isString(m.id)) {
+        return null;
+      }
+      const answer = askAnswer(m.answer);
+      return answer ? { type: 'answerAsk', session: m.session, id: m.id, answer } : null;
+    }
+    case 'beginFileStaging':
+      return isString(m.session) ? { type: 'beginFileStaging', session: m.session, token: textOr(m.token, '') } : null;
+    case 'attachFiles':
+      // The files stay unread here. A batch that is not a list is a refusal the reader is
+      // told about, so the host still sees the message and answers it.
+      return isString(m.session)
+        ? {
+            type: 'attachFiles',
+            session: m.session,
+            token: textOr(m.token, ''),
+            clipboard: m.clipboard === true,
+            files: m.files,
+          }
+        : null;
+    case 'fileReadError':
+      return isString(m.session)
+        ? {
+            type: 'fileReadError',
+            session: m.session,
+            token: textOr(m.token, ''),
+            name: textOr(m.name, ''),
+          }
+        : null;
+    case 'fileRejected':
+      return isString(m.session)
+        ? {
+            type: 'fileRejected',
+            session: m.session,
+            code: textOr(m.code, 'read'),
+            name: textOr(m.name, ''),
+            size: numberOr(m.size, 0),
+            rejected: numberOr(m.rejected, 0),
+          }
+        : null;
+    case 'removeFile':
+      return isString(m.session) && isString(m.value)
+        ? { type: 'removeFile', session: m.session, value: m.value }
+        : null;
+    case 'importPromptRecovery':
+      return {
+        type: 'importPromptRecovery',
+        submittedPrompts: m.submittedPrompts,
+        ...(isString(m.request) ? { request: m.request } : {}),
+      };
+    case 'sendPrompt':
+      // A revision that is not a whole number at or above zero counts as the first one, the
+      // way the host has always read it. The panel only ever sends one it issued itself.
+      return isString(m.text) && isString(m.session)
+        ? {
+            type: 'sendPrompt',
+            text: m.text,
+            session: m.session,
+            ...(m.attempt && typeof m.attempt === 'object' ? { attempt: m.attempt as SubmittedPrompt } : {}),
+            revision:
+              typeof m.revision === 'number' && Number.isSafeInteger(m.revision) && m.revision >= 0 ? m.revision : 0,
+          }
+        : null;
+    case 'compact':
+      return isString(m.session) ? { type: 'compact', session: m.session } : null;
+    case 'dismissLive':
+      return isString(m.session) ? { type: 'dismissLive', session: m.session, kind: textOr(m.kind, '') } : null;
+    case 'restoreLive':
+      return isString(m.session) ? { type: 'restoreLive', session: m.session, kind: textOr(m.kind, '') } : null;
+    case 'stopTurn':
+      return isString(m.session) ? { type: 'stopTurn', session: m.session } : null;
+    case 'dequeue':
+      return isString(m.value) && isString(m.session) ? { type: 'dequeue', value: m.value, session: m.session } : null;
+    case 'editQueued':
+      return isString(m.value) && isString(m.session) && Number.isSafeInteger(m.revision) && (m.revision as number) >= 0
+        ? { type: 'editQueued', value: m.value, session: m.session, revision: m.revision as number }
+        : null;
+    case 'acceptQueuedEdit':
+      return isString(m.value) &&
+        isString(m.session) &&
+        Number.isSafeInteger(m.revision) &&
+        (m.revision as number) >= 0 &&
+        Number.isSafeInteger(m.currentRevision) &&
+        (m.currentRevision as number) >= 0 &&
+        typeof m.accepted === 'boolean'
+        ? {
+            type: 'acceptQueuedEdit',
+            value: m.value,
+            session: m.session,
+            revision: m.revision as number,
+            currentRevision: m.currentRevision as number,
+            accepted: m.accepted,
+          }
+        : null;
+    case 'copy':
+      return isString(m.text) ? { type: 'copy', text: m.text } : null;
+    case 'note':
+      return { type: 'note', note: m.note };
+    case 'armSelectedText':
+      return isString(m.session) && m.session.length > 0 && isString(m.key) && m.key.length > 0
+        ? { type: 'armSelectedText', session: m.session, key: m.key }
+        : null;
+    case 'selectedTextHandoff':
+      return isString(m.session) &&
+        m.session.length > 0 &&
+        isString(m.key) &&
+        m.key.length > 0 &&
+        isString(m.text) &&
+        m.text.trim().length > 0 &&
+        typeof m.copyLabels === 'boolean'
+        ? {
+            type: 'selectedTextHandoff',
+            session: m.session,
+            key: m.key,
+            text: m.text,
+            copyLabels: m.copyLabels,
+          }
+        : null;
+    case 'armSessionDetails':
+      return isString(m.session) && m.session.length > 0 ? { type: 'armSessionDetails', session: m.session } : null;
+    case 'armComposer':
+      return { type: 'armComposer' };
+    case 'showReaderParent':
+      return isString(m.session) && m.session.length > 0 ? { type: 'showReaderParent', session: m.session } : null;
+    case 'showSession':
+      return isString(m.session) ? { type: 'showSession', session: m.session } : null;
+    case 'labelEditor':
+      return isString(m.session) ? { type: 'labelEditor', session: m.session } : null;
+    case 'setLabels':
+      // The whole list arrives each time. A name that is not text is dropped here, where the
+      // host used to drop it, and the rest of the list still reaches the record.
+      return isString(m.session) && Array.isArray(m.names)
+        ? { type: 'setLabels', session: m.session, names: m.names.filter(isString) }
+        : null;
+    case 'setViews':
+      // The whole list arrives each time, the way a session's labels do. A list holding
+      // an entry this cannot read is refused whole rather than part way through: the panel
+      // posts what it drew, so a dropped entry would delete a view the reader can still see.
+      return savedViews(m.views) ? { type: 'setViews', views: m.views } : null;
+    case 'renameSession':
+      return isString(m.session) && m.session.length > 0 && Number.isSafeInteger(m.request) && isString(m.title)
+        ? { type: 'renameSession', session: m.session, request: m.request as number, title: m.title }
+        : null;
+    case 'setRailFilters':
+      return savedRailFilters(m.railFilters) ? { type: 'setRailFilters', railFilters: m.railFilters } : null;
+    case 'sessionMembership':
+      if (m.action === 'unarchiveAll') {
+        return { type: 'sessionMembership', action: m.action };
+      }
+      if (!isString(m.session)) {
+        return null;
+      }
+      if (m.action === 'pin') {
+        if (m.openPinned !== undefined && typeof m.openPinned !== 'boolean') {
+          return null;
+        }
+        return {
+          type: 'sessionMembership',
+          action: m.action,
+          session: m.session,
+          ...(m.openPinned === true ? { openPinned: true } : {}),
+        };
+      }
+      return m.action === 'archive' || m.action === 'unarchive' || m.action === 'unpin'
+        ? { type: 'sessionMembership', action: m.action, session: m.session }
+        : null;
+    case 'setLayout':
+      if (m.key === 'cardLayout' && isCardLayout(m.value)) {
+        return { type: 'setLayout', key: 'cardLayout', value: m.value };
+      }
+      if (m.key === 'promptPosition' && isPromptPosition(m.value)) {
+        return { type: 'setLayout', key: 'promptPosition', value: m.value };
+      }
+      return null;
+    case 'saveState':
+      // `normalizePanelState` is the one reader of this field and it takes anything.
+      return { type: 'saveState', state: m.state };
+    case 'search':
+      return { type: 'search', text: textOr(m.text, '') };
+    case 'loadOlder':
+      return isString(m.session) ? { type: 'loadOlder', session: m.session, token: textOr(m.token, '') } : null;
+    case 'openLink':
+      return isString(m.href) ? { type: 'openLink', href: m.href, beside: m.beside === true } : null;
+    case 'openVisualization':
+      return isString(m.path) ? { type: 'openVisualization', path: m.path } : null;
+    case 'openImage':
+      return isString(m.path) ? { type: 'openImage', path: m.path, beside: m.beside === true } : null;
+    case 'openTurnDiff':
+      return isString(m.key) ? { type: 'openTurnDiff', key: m.key, beside: m.beside === true } : null;
+    case 'openCommit':
+      // The directory is null where the commit landed somewhere this workspace cannot name,
+      // and the host tells the reader so. That is why it is kept rather than required.
+      return isString(m.key) && isString(m.sha)
+        ? {
+            type: 'openCommit',
+            key: m.key,
+            sha: m.sha,
+            dir: isString(m.dir) ? m.dir : null,
+            beside: m.beside === true,
+          }
+        : null;
+    case 'openFile':
+      return isString(m.key) && isString(m.path)
+        ? {
+            type: 'openFile',
+            key: m.key,
+            path: m.path,
+            beside: m.beside === true,
+            ...(isString(m.sourceSessionId) ? { sourceSessionId: m.sourceSessionId } : {}),
+          }
+        : null;
+    case 'openSkill':
+      return isString(m.key) && isString(m.path)
+        ? { type: 'openSkill', key: m.key, path: m.path, beside: m.beside === true }
+        : null;
+    default:
+      return null;
+  }
+}
+
+// One handler per variant, named by the variant. A variant added to the union above and not
+// named here is a compile error rather than a message that falls through.
+type Handlers<M extends { type: string }, R> = {
+  [K in M['type']]: (message: Extract<M, { type: K }>) => R;
+};
+
+export type HostToPanelHandlers = Handlers<HostToPanel, void>;
+export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
+
+// The `never` assignment in each default branch is what makes the switch exhaustive. A new
+// variant reaches it as itself rather than as `never`, and the typecheck fails there.
+export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
+  switch (message.type) {
+    case 'focusProjectSpend':
+      return handlers.focusProjectSpend(message);
+    case 'openLauncher':
+      return handlers.openLauncher(message);
+    case 'labelEditor':
+      return handlers.labelEditor(message);
+    case 'labelsChanged':
+      return handlers.labelsChanged(message);
+    case 'openLabelEditor':
+      return handlers.openLabelEditor(message);
+    case 'showSessionDetails':
+      return handlers.showSessionDetails(message);
+    case 'openViewEditor':
+      return handlers.openViewEditor(message);
+    case 'openSessionRename':
+      return handlers.openSessionRename(message);
+    case 'sessionRenameResult':
+      return handlers.sessionRenameResult(message);
+    case 'focusComposer':
+      return handlers.focusComposer(message);
+    case 'pathCompletion':
+      return handlers.pathCompletion(message);
+    case 'fileStaging':
+      return handlers.fileStaging(message);
+    case 'fileStagingRejected':
+      return handlers.fileStagingRejected(message);
+    case 'usage':
+      return handlers.usage(message);
+    case 'askRejected':
+      return handlers.askRejected(message);
+    case 'projectSpend':
+      return handlers.projectSpend(message);
+    case 'layout':
+      return handlers.layout(message);
+    case 'live':
+      return handlers.live(message);
+    case 'activity':
+      return handlers.activity(message);
+    case 'rail':
+      return handlers.rail(message);
+    case 'openPick':
+      return handlers.openPick(message);
+    case 'takeDraft':
+      return handlers.takeDraft(message);
+    case 'takeQueuedDraft':
+      return handlers.takeQueuedDraft(message);
+    case 'promptRecovery':
+      return handlers.promptRecovery(message);
+    case 'requestPromptRecovery':
+      return handlers.requestPromptRecovery(message);
+    case 'restoreDraft':
+      return handlers.restoreDraft(message);
+    case 'notes':
+      return handlers.notes(message);
+    case 'openComment':
+      return handlers.openComment(message);
+    case 'sendSelectedText':
+      return handlers.sendSelectedText(message);
+    case 'setRead':
+      return handlers.setRead(message);
+    case 'forgetState':
+      return handlers.forgetState(message);
+    case 'setSessionRead':
+      return handlers.setSessionRead(message);
+    case 'setSessionArchived':
+      return handlers.setSessionArchived(message);
+    case 'setSessionPinned':
+      return handlers.setSessionPinned(message);
+    case 'setComposerHidden':
+      return handlers.setComposerHidden(message);
+    case 'results':
+      return handlers.results(message);
+    case 'selection':
+      return handlers.selection(message);
+    case 'render':
+      return handlers.render(message);
+    default: {
+      const missing: never = message;
+      return missing;
+    }
+  }
+}
+
+export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHostHandlers<R>): R {
+  switch (message.type) {
+    case 'ready':
+      return handlers.ready(message);
+    case 'painted':
+      return handlers.painted(message);
+    case 'initialize':
+      return handlers.initialize(message);
+    case 'developmentReload':
+      return handlers.developmentReload(message);
+    case 'refresh':
+      return handlers.refresh(message);
+    case 'perf':
+      return handlers.perf(message);
+    case 'goBack':
+      return handlers.goBack(message);
+    case 'goForward':
+      return handlers.goForward(message);
+    case 'newSession':
+      return handlers.newSession(message);
+    case 'pinSetup':
+      return handlers.pinSetup(message);
+    case 'unpinSetup':
+      return handlers.unpinSetup(message);
+    case 'refreshUsage':
+      return handlers.refreshUsage(message);
+    case 'requestDefaults':
+      return handlers.requestDefaults(message);
+    case 'openControl':
+      return handlers.openControl(message);
+    case 'pick':
+      return handlers.pick(message);
+    case 'draft':
+      return handlers.draft(message);
+    case 'pathCompletion':
+      return handlers.pathCompletion(message);
+    case 'answerAsk':
+      return handlers.answerAsk(message);
+    case 'beginFileStaging':
+      return handlers.beginFileStaging(message);
+    case 'attachFiles':
+      return handlers.attachFiles(message);
+    case 'fileReadError':
+      return handlers.fileReadError(message);
+    case 'fileRejected':
+      return handlers.fileRejected(message);
+    case 'removeFile':
+      return handlers.removeFile(message);
+    case 'importPromptRecovery':
+      return handlers.importPromptRecovery(message);
+    case 'sendPrompt':
+      return handlers.sendPrompt(message);
+    case 'compact':
+      return handlers.compact(message);
+    case 'dismissLive':
+      return handlers.dismissLive(message);
+    case 'restoreLive':
+      return handlers.restoreLive(message);
+    case 'stopTurn':
+      return handlers.stopTurn(message);
+    case 'dequeue':
+      return handlers.dequeue(message);
+    case 'editQueued':
+      return handlers.editQueued(message);
+    case 'acceptQueuedEdit':
+      return handlers.acceptQueuedEdit(message);
+    case 'copy':
+      return handlers.copy(message);
+    case 'note':
+      return handlers.note(message);
+    case 'armSelectedText':
+      return handlers.armSelectedText(message);
+    case 'selectedTextHandoff':
+      return handlers.selectedTextHandoff(message);
+    case 'armSessionDetails':
+      return handlers.armSessionDetails(message);
+    case 'armComposer':
+      return handlers.armComposer(message);
+    case 'showReaderParent':
+      return handlers.showReaderParent(message);
+    case 'showSession':
+      return handlers.showSession(message);
+    case 'labelEditor':
+      return handlers.labelEditor(message);
+    case 'setLabels':
+      return handlers.setLabels(message);
+    case 'setViews':
+      return handlers.setViews(message);
+    case 'renameSession':
+      return handlers.renameSession(message);
+    case 'setRailFilters':
+      return handlers.setRailFilters(message);
+    case 'sessionMembership':
+      return handlers.sessionMembership(message);
+    case 'setLayout':
+      return handlers.setLayout(message);
+    case 'saveState':
+      return handlers.saveState(message);
+    case 'search':
+      return handlers.search(message);
+    case 'loadOlder':
+      return handlers.loadOlder(message);
+    case 'openLink':
+      return handlers.openLink(message);
+    case 'openVisualization':
+      return handlers.openVisualization(message);
+    case 'openImage':
+      return handlers.openImage(message);
+    case 'openTurnDiff':
+      return handlers.openTurnDiff(message);
+    case 'openCommit':
+      return handlers.openCommit(message);
+    case 'openFile':
+      return handlers.openFile(message);
+    case 'openSkill':
+      return handlers.openSkill(message);
+    default: {
+      const missing: never = message;
+      return missing;
+    }
+  }
+}

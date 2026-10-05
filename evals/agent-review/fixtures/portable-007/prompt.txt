@@ -1,0 +1,3 @@
+Review the proposed child-session projection. A child must remain attached to its owning turn, and durable process completion must govern its live state.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

@@ -1,0 +1,6279 @@
+/* The panel's stylesheet.
+
+   It is served inline, inside the page `shell` in panelhost.ts writes, so the nonce policy
+   there covers it and nothing is fetched. esbuild reads this file and substitutes it, which
+   is why a change here needs a build before the panel shows it.
+
+   `__ARC_<name>__` is a value the extension side fills in. Those are the figures that also
+   decide behaviour in turnview.ts, so the stylesheet asks for them by name rather than
+   keeping a second copy that could drift. `panelValues` in paneltext.ts is the table. */
+:root {
+  /* A finished turn: its border, its glyph, and the word wherever it reads as one.
+     testing.iconPassed is an icon token. It keeps one hex in every theme kind. A
+     token here would draw this same pale green on a white panel. The literal below
+     picks its own green for each theme kind. */
+  --ok: #73c991;
+  /* A failed turn: its border, its glyph, and the word wherever it reads as one.
+     testing.iconFailed is an icon token, meant for a few pixels of chrome rather
+     than for words on this background. An icon token carries no promise of
+     contrast as text, so the literal below is picked to read on its own. */
+  --bad: #f88070;
+  /* Caution and nothing else: a figure near its ceiling, a pick that needs care, and the
+     control that stops a turn. Running wore this tone once and gave it back, so a reader who
+     meets it is being warned rather than told that work is under way. A yellow, and never a
+     brown, because --busy below is the brown and the two must not meet. The worst ground it
+     sits on is the context chip, whose own ground is an 18% wash of this same colour: the word
+     and the thing behind it move together there, so the tone is picked against that wash and
+     never against the panel. Warming the tone closes that gap, which is what holds caution
+     short of a true orange, and an orange would walk into --need as well. This one clears that
+     chip with room over the bar, where the mustard it replaced sat just above it. */
+  --warn: #ffc107;
+  /* Work under way, on every surface that says so: a running turn card, its glyph,
+     the live activity line, and a running session's border and word on the
+     rail. A brown, a step cooler and darker than --need, so one glance at the rail
+     separates work that is moving from work that is stopped on the reader.
+     editorWarning.foreground stood here once and could not: it is the same name
+     --warn reads, so on a theme that answers it with a brown the two states drew
+     one colour, and on a theme that answers it with a yellow this one did. */
+  --busy: #d19a66;
+  /* A session that cannot continue until the reader answers: the rail card's
+     border and word, and the ask card at the composer's foot. charts.orange is a
+     graph token and carries alpha in its own registry entry, so a token here draws
+     a wash instead of a word. The literal below is opaque and a step warmer than
+     --busy. One glance at the rail still separates work that is moving from work
+     that is stopped on the reader. */
+  --need: #ffa657;
+  /* A notice carried in words rather than in a mark: the badge on a session heading, a
+     pinned rail control, and a context figure that has begun to fill. The tone the editor
+     uses for links, which is the one blue that reads as text on this background. */
+  --notice: var(--vscode-textLink-foreground, #4daafc);
+  /* The same idea as --bad, for text rather than for a glyph, and the one tone hotter than
+     --warn. A failed-test icon's colour is meant for a few pixels of chrome and is hard to
+     read as words on this background, so the tone that carries the hottest band in words is
+     the one the editor already uses for error text. */
+  --full: var(--vscode-errorForeground, #f85149);
+  /* The mark on anything holding turns nobody has opened: the dot at the head of a rail
+     card, and the tint over an unread turn card. Its own tone rather than one of the
+     status ones, because unread is not a status and a card can wear both at once. */
+  --unread: var(--vscode-charts-blue, #4fc1ff);
+  /* The same tone at the strength a whole card can be washed in. Faint on purpose: it has
+     to be read as a row that has not been opened and never as a status, which the left
+     border of every card is already saying in full strength. */
+  --unread-wash: color-mix(in srgb, var(--unread) 7%, transparent);
+  /* The ground a stat chip is drawn on. Mixed from the theme's own text colour rather than
+     written as a colour, so the pill lifts off a dark panel and shades a light one, and
+     neither theme needs a value written for it. */
+  --chipbg: color-mix(in srgb, var(--vscode-foreground) 9%, transparent);
+  /* The tone the words a comment was left on are tinted in. Its own tone rather than one of
+     the status ones or the unread blue, for the reason unread has one: a comment is neither a
+     state of the turn nor a row nobody has opened, and all three can land on one card at once.
+     A chart colour, because those are the set every theme fills in for something that is not a
+     status, and the light themes give a darker amber that reads on a pale ground the way this
+     one reads on a dark one. */
+  --comment: var(--vscode-charts-yellow, #d18616);
+  /* Mixed into the ground the card is drawn on rather than laid over it, so the result is a
+     solid colour. Two translucent tints overlapping go darker where they meet, and depth of
+     colour would start saying how many comments are here: that is the failure the flat tint
+     exists to avoid, and it has to be impossible rather than merely avoided. */
+  --cmark: color-mix(
+    in srgb,
+    var(--comment) 16%,
+    var(--vscode-editorWidget-background, var(--vscode-editor-background, #252526))
+  );
+  --cmark-lit: color-mix(
+    in srgb,
+    var(--comment) 34%,
+    var(--vscode-editorWidget-background, var(--vscode-editor-background, #252526))
+  );
+  --idle: var(--vscode-descriptionForeground);
+  --add: var(--vscode-gitDecoration-addedResourceForeground, #3fb950);
+  --del: var(--vscode-gitDecoration-deletedResourceForeground, #f85149);
+  --mod: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d);
+  --edge: var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+  /* How far to the left of a card's body a comment mark hangs. Written once because two rules
+     depend on it: the mark's own offset, and the room a bounded block has to keep clear on its
+     left so the mark is not clipped away with the text under the cut. */
+  --markgutter: 25px;
+}
+/* The five status tones again, picked for a pale ground instead of the dark one :root
+   sets. The editor puts the theme kind on the body as a class. That class is the only
+   signal the panel has to answer with the right five. High contrast light joins the plain
+   light rule because raising contrast further never breaks a value already picked at 4.5. */
+body.vscode-light,
+body.vscode-high-contrast-light {
+  --ok: #116329;
+  --bad: #b01011;
+  /* Caution, warmed to match the amber :root draws. On a pale ground every warm tone turns
+     into a dark brown, so warming caution walks it towards --busy below and spends most of
+     the room between the two. It is the warmest light caution this panel can hold, and a
+     further step would put the stopped work and the moving work in one colour. */
+  --warn: #6b4a00;
+  --busy: #7d4e14;
+  --need: #9a4f00;
+}
+* {
+  box-sizing: border-box;
+}
+.timeline-root,
+.timeline-owner,
+.timeline-foreign,
+.timeline-tree,
+.timeline-footer,
+.transientcards,
+.sessionsection,
+.sessionheading,
+.cardheading,
+.sectionheading {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font: inherit;
+}
+/* The session heading, a card's head row and a file row are buttons, so they can be
+   reached and opened without a mouse. A button brings a background, a border, a font and
+   centred text with it, and each of these has to go on looking like the row it is. Held at
+   near-zero weight with :where so every rule below still wins: each of the three keeps its
+   own padding, and the head row keeps the rule under it. */
+button:where(.session, .head, .row, .result, .railcard) {
+  appearance: none;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  background: none;
+  /* A button does not let a drag select the text inside it, and these rows hold the one
+     copy of a filename, a session title and a timestamp the reader has. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* The reader has to be able to see where they are. Both themes carry a focus colour. */
+:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #0078d4);
+  outline-offset: 2px;
+}
+/* A session heading is the full width of the panel, so a ring outside it is cut off at
+   both ends. This one is drawn inside. */
+.session:focus-visible {
+  outline-offset: -2px;
+}
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  /* The panel's type scale. Two steps under the editor's own size and nothing between them,
+     so a panel that reads too small is one edit here rather than sixty scattered decimals.
+
+     Everything used to carry its own number, from 0.72em to 0.88em, and the spread was not a
+     scale: it was sixty separate judgements made at sixty different moments. The smallest of
+     them were unreadable at the width this panel is usually docked to. */
+  --t-small: 0.86em;
+  --t-body: 0.92em;
+  /* The body step again, measured against the editor's own size rather than against the box
+     that reads it. A figure that sits inside a box the card has already stepped down, such as
+     a row in the Activity log, would otherwise take the step twice and draw under every other
+     figure on the card. */
+  --t-figure: calc(0.92 * var(--vscode-font-size));
+  /* How far a section heading's word stands above the card's own text. The step lives here
+     because the word carries it while the spacing around the whole heading still follows it. */
+  --heading-step: 1.06;
+  color: var(--vscode-foreground);
+  background: transparent;
+}
+.empty {
+  padding: 12px 14px;
+  color: var(--vscode-foreground);
+  line-height: 1.5;
+}
+.empty p {
+  margin: 0 0 8px;
+}
+.empty .dim {
+  color: var(--idle);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+/* The heading row: the heading itself, and the action that hides the session beside
+   it. The action is a sibling rather than something inside the heading, because a button
+   inside a button is markup no browser will build and the inner one cannot be reached from
+   the keyboard.
+
+   Sticky, so a long session can be folded away without scrolling back to find its
+   heading. The row and the group it controls are siblings, so the next heading reaches the
+   sticky line exactly as the group above it leaves, and paints over it: no wrapper is
+   needed and no heading is left hanging over the wrong turns. It sits below the control
+   bar rather than under it, at an offset the bar is measured for, because the bar's height
+   moves with the note it sometimes draws. */
+/* Sticky, and it carries its own background or the cards scroll through it. Two lines now:
+   the heading on the first, the session's figures on the second. The offset it sticks
+   at is measured from the control bar rather than written down, so a taller row costs
+   layout and nothing else. */
+.sessionrow {
+  position: sticky;
+  top: var(--session-top, 0px);
+  z-index: 1;
+  margin-top: 6px;
+  border-top: 1px solid var(--edge);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+/* The rail query is longer than a label and its sidebar is narrow. The wrapper anchors the
+   clear control inside the box's right edge. */
+.filterwrap {
+  position: relative;
+  margin-bottom: 6px;
+}
+/* The rail's box fills the available width and leaves room for its clear control. A stated
+   line height and vertical padding size the box now, in place of what font metrics alone gave
+   it. That moves its rendered height, and holds it level with the New control beside it, which
+   takes its height from the same kind of value. The room for the clear control keeps the
+   pixel width of the control that stands in it. */
+.railfilter {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.256em 22px 0.256em 6px;
+  font: inherit;
+  font-size: 0.9em;
+  line-height: 1.4;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--edge));
+  border-radius: 2px;
+}
+.railfilter:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.railfilterbox {
+  position: relative;
+  min-width: 0;
+}
+.railfilterbox .railfilter {
+  min-width: 0;
+}
+.railfiltersbutton {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 26px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--idle);
+  cursor: pointer;
+}
+.railfiltersbutton:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -3px;
+}
+.railfiltersicon {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+  transform: translateY(0.1em);
+}
+.railfiltersicon.active {
+  fill: currentColor;
+}
+/* Room for the cross and the funnel, which stand over the box's right end while it is open. */
+.railfilterbox .railfilter {
+  padding-right: 4.3em;
+}
+/* The rail head's region: the action row, any notes and the save-view offer under the box, then
+   the filter buttons on their own row. */
+.railfilterrow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+}
+.railfilterrow > .railhead,
+.railfilterrow > .railcounts,
+.railfilterrow > .railviewnotes,
+.railfilterrow > .railviewsave {
+  flex: none;
+  width: 100%;
+  min-width: 0;
+}
+/* The action row at rest: the Sessions heading, then the two tools and the New split at the
+   right. The tools and the split align to the top, so a taller neighbour never moves them. */
+.railhead {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+}
+.railheadlabel {
+  font-size: var(--t-small);
+  font-weight: 600;
+  margin-right: auto;
+  white-space: nowrap;
+}
+.railhead > .railfiltertools {
+  margin-left: auto;
+  align-self: start;
+}
+.railhead > .railnewsplit {
+  align-self: start;
+}
+/* The open box takes the heading's place in a grid cell, and spans the tools' column too, so the
+   cross and the funnel stand inside its right end. The New split keeps a column of its own
+   outside the box. */
+.railhead.boxopen {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: start;
+  column-gap: 0.4em;
+}
+.railhead.boxopen > .railheadlabel {
+  display: none;
+}
+.railhead.boxopen > .railfilterbox {
+  grid-area: 1 / 1 / 2 / 3;
+}
+.railhead.boxopen > .railfiltertools {
+  grid-area: 1 / 2;
+  margin-left: 0;
+}
+.railhead.boxopen > .railnewsplit {
+  grid-area: 1 / 3;
+}
+/* A narrow rail keeps the heading and the New split on the first line and opens the box on a line
+   of its own under them. Two tracks, so no empty third track leaves a gap at the right edge. The
+   breakpoint is where the box beside the split leaves less room to type than the whole head gives
+   it at the default 220px rail, 150px between its left padding and the cross. Measured in Verdana,
+   the wider face, that is 288px at the 13px panel font, so the query holds from 22.5em down. */
+@container (max-width: 22.5em) {
+  .railhead.boxopen {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 0.3em;
+  }
+  .railhead.boxopen > .railheadlabel {
+    display: block;
+    grid-area: 1 / 1;
+    align-self: center;
+  }
+  .railhead.boxopen > .railnewsplit {
+    grid-area: 1 / 2;
+  }
+  .railhead.boxopen > .railfilterbox {
+    grid-area: 2 / 1 / 3 / 3;
+  }
+  .railhead.boxopen > .railfiltertools {
+    grid-area: 2 / 2;
+    justify-self: end;
+  }
+}
+/* The heading leaves a rail too narrow to hold it beside the actions. */
+@container (max-width: 14.8em) {
+  .railhead > .railheadlabel,
+  .railhead.boxopen > .railheadlabel {
+    display: none;
+  }
+}
+/* The tools take the search box's line height, padding and border. Narrow search places the
+   box and its tools on a separate action line. */
+.railfiltertools {
+  grid-area: 1 / 2;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  font-size: 0.9em;
+  height: calc(1.912em + 2px);
+}
+.railfiltertools > button {
+  position: static;
+  width: 2em;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  border: 0;
+  background: transparent;
+  color: var(--idle);
+  cursor: pointer;
+}
+.railfiltertools > .filterclear,
+.railfiltertools > .railsearchbutton {
+  width: 1.9em;
+}
+.railfiltertools > .railfiltersbutton {
+  width: 2.2em;
+}
+/* Filter buttons wrap at their boundaries under the action row. */
+.railcounts {
+  display: flex;
+  flex: none;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 0.5em;
+  font-size: var(--t-small);
+}
+.railcounts:empty {
+  display: none;
+}
+.railcount {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 2.18em;
+  gap: 0.3em;
+  margin: 0;
+  padding: 0.1em 0.15em;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.railcount:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.railcount:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+/* A count reads pressed while the query holds its words. The View menu's checked Sort by and
+   Match values share this rule, so a checked value reads with the same ground the pressed
+   count wears instead of a second tint the reader has to learn separately. */
+.railcount[aria-pressed='true'],
+.railfiltermatch .railfilterlabel[aria-checked='true'] {
+  background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
+  border-color: var(--vscode-focusBorder);
+}
+.railcountfig {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.railcount[data-control='railcount:input'] .railcountfig {
+  color: var(--need);
+}
+.railcount[data-control='railcount:running'] .railcountfig {
+  color: var(--busy);
+}
+/* The Active count's cache bolt. An outline in the foreground colour while some Active session
+   has a warm cache, filled in the needs-you colour while any has one about to go. */
+.railcache.railcountcache {
+  width: 1em;
+  height: 1em;
+  color: var(--vscode-foreground);
+}
+.railcache.railcountcache.is-nearly-gone {
+  color: var(--need);
+  fill: currentColor;
+}
+/* The counts refuse presses while the reader names a view. */
+.railcount:disabled {
+  cursor: default;
+}
+.railcount:disabled:hover {
+  background: none;
+}
+/* The same hover chip `.railact:hover` and `.sessionmenu:hover` wear, so the tools read as
+   buttons under the pointer instead of just changing ink. */
+.railfiltersbutton:hover,
+.railfiltersbutton[aria-expanded='true'],
+.railsearchbutton:hover,
+.railfiltertools > .filterclear:hover {
+  color: var(--vscode-foreground);
+  background-color: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+  border-radius: 4px;
+}
+.railsearchbutton:focus-visible,
+.railfiltertools > .filterclear:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -3px;
+}
+.railsearchbutton svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* The cross that clears the rail query and closes the box. */
+.filterclear:hover {
+  color: var(--vscode-foreground);
+}
+/* What the search matched inside a snippet, in the editor's own find-match tone. */
+.resultsnippet .hl {
+  background: var(--vscode-editor-findMatchHighlightBackground, rgba(226, 182, 0, 0.35));
+  border-radius: 2px;
+}
+/* Offered over a selection, and following it rather than sitting in the list, which a
+   repaint empties every few seconds while a turn runs. The box a comment is written in opens
+   in the same element, so it lands where the reader is already looking.
+
+   The offer passes under sticky chrome as the selection scrolls. The editor moves above that
+   chrome because placement can overlap a heading near the top of the panel, and its controls
+   must stay visible there. The fixed composer, status bar and menus keep higher layers. */
+.quotefloat {
+  position: fixed;
+  z-index: 0;
+  max-width: 92vw;
+}
+.quotefloat.commenting {
+  z-index: 3;
+  overflow-y: auto;
+}
+.quotefloat[hidden] {
+  display: none;
+}
+.quotebar {
+  display: flex;
+  gap: 1px;
+}
+.quotebar[hidden] {
+  display: none;
+}
+.quoteact {
+  padding: 2px 8px;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  color: var(--vscode-button-foreground, #fff);
+  background: var(--vscode-button-background, #0e639c);
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 3px;
+}
+.quoteact[hidden] {
+  display: none;
+}
+.quoteact:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+/* The key that opens the same box, drawn beside the word as a small bordered pill. It is
+   inside the button, so a press landing on it is the same press, and it takes its edge and its
+   text from the word's own colour rather than from a colour of its own: the bar is drawn in
+   the theme's button colours and a pill in any other would read as a second control. Held back
+   a little, because it is the second thing on the word and not the first. */
+.quotekey {
+  /* Nudged up off the baseline, which is the whole of what makes it look centred. The word
+     beside it opens on a capital, so its letters run from the cap height down to the baseline
+     and their middle is high. The key is one lowercase letter, so its middle is the x height
+     and sits low. Aligned by the baseline the two middles are two pixels apart, which the eye
+     reads as a pill hanging under the word. The lift is in ems, so it holds at any size the
+     theme asks for. */
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: var(--t-small);
+  line-height: 1.4;
+  vertical-align: 0.18em;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  opacity: 0.8;
+}
+/* The box, floating. It carries a ground, an edge and a lift of its own, because nothing
+   behind it is going to move out of its way. */
+.quoteslot {
+  width: 30em;
+  max-width: 92vw;
+  padding: 8px 10px;
+  border-radius: 3px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-editorWidget-border, var(--edge));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+}
+.quoteslot[hidden] {
+  display: none;
+}
+.quoteslot .noteedit {
+  margin-top: 0;
+}
+/* The line the comment is being written against, kept short. It is there to say what the
+   comment will be attached to, not to be read through a second time. */
+/* The way back to the top of a long session. Fixed over the foot of the panel rather
+   than drawn at the end of the list, because a reader a long way down needs it where they
+   are standing and not where the cards run out. It clears the panel's own foot, measured
+   rather than written down, so it never covers the status bar or the composer's controls. */
+.totop {
+  position: fixed;
+  right: 12px;
+  bottom: calc(var(--foot-height, 0px) + 12px);
+  z-index: 4;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  color: var(--vscode-button-foreground, #fff);
+  background: var(--vscode-button-background, #0e639c);
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 3px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+/* Hidden rather than faded out, which also takes it out of the tab order: a control that
+   would do nothing must not be a press a reader has to get past. */
+.totop[hidden] {
+  display: none;
+}
+.totop:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+/* What a content search found. Its own list rather than a filtered timeline: most of what a
+   search finds is in sessions the panel has not parsed and cannot draw as cards. */
+.resultcount {
+  padding: 6px 10px 2px;
+  font-size: var(--t-body);
+  color: var(--idle);
+}
+/* The way into a search for a reader who has not met the word that starts one. Drawn as a
+   result row, because that is what pressing it produces. */
+.searchoffer .resultname {
+  color: var(--vscode-textLink-foreground);
+}
+.result {
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--edge);
+}
+.result:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.resulthead {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.resultname {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+}
+.resultwhen {
+  margin-left: auto;
+  flex: none;
+  font-size: var(--t-body);
+  color: var(--idle);
+  white-space: nowrap;
+}
+.resultmeta {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+  font-size: var(--t-small);
+  color: var(--idle);
+}
+/* Three lines at most: a snippet is there to be recognised, not read. */
+.resultsnippet {
+  margin-top: 3px;
+  font-size: var(--t-body);
+  color: var(--vscode-foreground);
+  opacity: 0.85;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* At the weight and colour of the turn count beside it, which is what the eye skips unless
+   it is looking for it. These are figures to find, not figures to be told. */
+.sessionstats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2em 0.4em;
+  padding: 0 10px 8px calc(0.8em + 16px);
+  color: var(--idle);
+  font-variant-numeric: tabular-nums;
+}
+/* The heading row: the title button, the pin and the menu button beside it, and the layout gear
+   at the end. A button cannot hold a button, so the pin and the menu are siblings here rather
+   than something drawn inside the title. Padded clear of the panel's right edge, where the host
+   draws an overlay scrollbar over the column's last pixels. The padding sits on the row
+   itself rather than on any one child's margin, so the gear and whatever follows it share it. */
+.sessionheading {
+  display: flex;
+  align-items: center;
+  padding-right: 0.8em;
+}
+/* The title button is the only part of the row a press toggles. It sizes to its own content,
+   so a mouse landing past the title falls through to the row rather than pressing it.
+   `width: auto` overrides the `:where` reset's `width: 100%` at the class's higher
+   specificity. So the button's flex basis comes from its content rather than the row.
+   `flex: 0 1 auto` is needed alongside it. A flex-grow of zero is what stops the button
+   claiming whatever room its neighbours leave, regardless of how small its own basis is.
+   `min-width: 0` then lets the button shrink below that content width when the row runs out
+   of room. That is what keeps the title the one part drawn with an ellipsis. The title's own
+   height sets the row's height. Its padding is even top to bottom, so the row's center falls
+   on the text, which the menu button is centered against. */
+.session {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  min-width: 0;
+  flex: 0 1 auto;
+  width: auto;
+  padding: 8px 4px 8px 10px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+  font-size: 0.95em;
+}
+/* The first heading begins the timeline. Later headings keep their separators to distinguish
+   adjacent sessions. */
+.timeline-root .sessionsection:first-child > .sessionrow {
+  margin-top: 0;
+  border-top: 0;
+}
+/* The compact control bar leaves a narrow visual gap below itself. The heading's sticky line
+   includes that gap, so the first heading stays in place from its first frame. */
+.controls:not([hidden]) + .timeline-root .sessionrow {
+  top: calc(var(--session-top, 0px) + 2px);
+}
+.session:hover {
+  color: var(--vscode-textLink-foreground);
+}
+.session .twist {
+  flex: none;
+  width: 0.8em;
+  color: var(--idle);
+  font-size: var(--t-body);
+}
+.session .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The gear that opens the Timeline layout dialog. It is the one item pushed to the row's right
+   end, by its own margin, and it never shrinks. The title is the one thing that gives way, so
+   nothing overlaps in a narrow sidebar. The session's age is not drawn here: the rail row and
+   the newest card head draw it. */
+.sessionheading > .sessionlayout {
+  margin-left: auto;
+}
+/* The session's own menu, always visible rather than shown on hover. A control found
+   only by a reader who already hovers there is the right-click problem again, and this button
+   exists to answer it. The pin before it and the layout gear after it share this rule. All three
+   take the idle colour at rest and the same hover pair `.railact:hover` uses below. */
+.sessionmenu {
+  flex: none;
+  width: 1.9em;
+  height: 1.7em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-body);
+  color: var(--idle);
+  background: none;
+}
+.sessionmenu:hover {
+  color: var(--vscode-foreground);
+  background-color: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+/* The pin and the dots reset the button's own browser-default padding. The gear keeps it,
+   because the gear's icon still depends on it to size itself, so it is named out of this
+   selector rather than reset alongside the other two. */
+.sessionmenu:not(.sessionlayout) {
+  padding: 0;
+}
+/* Drawn inside, at -1px: the button sits at the panel's right edge, where an outside ring is
+   cut off the way `.session`'s own focus ring is. */
+.sessionmenu:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #0078d4);
+  outline-offset: -1px;
+}
+/* Nudged down against the box the flex row centers it in. A line of text does not fill its
+   own box evenly: the box reserves descent under the baseline, so the ink sits high in it and
+   an icon centered on the box reads high beside the words. Measured on this row, the dots
+   landed 2 pixels over the title's ink. The shift is in `em` because the
+   gap it answers is a fraction of the font, not a count of pixels.
+
+   The icon narrowed because the button never reset its own browser-default padding
+   (`1px 6px`), not because the heading row outside the button squeezed it: the button is
+   `box-sizing: border-box`, so that padding ate into the box the icon had to draw in, on the
+   width alone (`6px` a side against `1px` top and bottom). Resetting the padding above fixes
+   the room directly. `flex: none` here on the icon itself keeps that fix even if the button's
+   own width and the icon's declared size are ever tuned out of step again, without which the
+   icon's default flex-shrink would silently absorb a future mismatch instead of overflowing
+   where it would be noticed. Scoped away from the gear below, whose own `svg.sessionlayouticon`
+   rule sets a larger declared size than its unreset padding leaves room for and depends on the
+   default shrink to fit it back down. The gear still takes the fill and the nudge below,
+   through the unscoped rule: only the size and the shrink lock are scoped away from it. */
+.sessionmenu svg {
+  fill: currentColor;
+  transform: translateY(0.1em);
+}
+.sessionmenu:not(.sessionlayout) svg {
+  width: 1.17em;
+  height: 1.17em;
+  flex: none;
+}
+/* A gear at the dots' size reads as a speck beside them and makes a small target. Its button
+   and its icon are both drawn larger, and the icon is stroked. The focus ring and the hover fill
+   sit on the button, so they grow with it. The button stays shorter than the title's line, so
+   the title still sets the row's height. */
+.sessionmenu.sessionlayout {
+  width: 2.2em;
+  height: 2em;
+}
+.sessionmenu svg.sessionlayouticon {
+  width: 1.6em;
+  height: 1.6em;
+  fill: none;
+  stroke: currentColor;
+}
+.sessionlayout[aria-expanded='true'] {
+  color: var(--vscode-foreground);
+  background-color: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+/* The pin on the session heading. The rail's pin glyph is stroked, not filled, so it undoes
+   the dots' fill. A set pin keeps the notice tone under the pointer too, the way the rail's
+   pinned pin does, because the tone is the heading's only pinned mark. */
+.sessionmenu.sessionpin svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.sessionmenu.sessionpin.is-pinned {
+  color: var(--notice);
+}
+/* What is left of the hidden ones: a count, and the word that brings them all back. */
+.hidden-note {
+  padding: 10px 12px;
+  font-size: var(--t-body);
+  color: var(--idle);
+}
+.hidden-note button {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  margin-left: 4px;
+  font: inherit;
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+  text-decoration: underline;
+}
+/* The panel's one control bar holds the session picker. It stays visible because which
+   session is on screen matters while the reader scrolls a long list. */
+.controls {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 6px 7px;
+  margin-bottom: 2px;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--edge);
+}
+.controls[hidden] {
+  display: none;
+}
+.controls select {
+  flex: 1 1 auto;
+  width: 0;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.92em;
+  padding: 3px 4px;
+  color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+  background: var(--vscode-dropdown-background, transparent);
+  border: 1px solid var(--vscode-dropdown-border, var(--edge));
+  border-radius: 3px;
+}
+/* The frame holds the two buttons below. Those read at the small step, not at the panel's
+   size, so the frame states their height through the same token they take it from. The two
+   hairlines it draws around them are added on top. Frame and contents then grow together, and
+   a change to the token moves both. */
+.compactnewsplit {
+  display: flex;
+  flex: none;
+  height: calc(1.968 * var(--t-small) + 2px);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  overflow: hidden;
+}
+/* Every box here is written in em against its own text. The control then grows with the
+   editor font size the way the word inside it does. */
+.compactnew,
+.compactnewmenu {
+  height: 1.968em;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+.compactnew {
+  padding: 0 0.537em;
+  font-size: var(--t-small);
+  font-weight: 600;
+}
+.compactnewmenu {
+  width: 1.789em;
+  border-left: 1px solid var(--edge);
+  font-size: var(--t-small);
+}
+.compactnew:hover,
+.compactnewmenu:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.compactnew:focus-visible,
+.compactnewmenu:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+.compactnew[disabled],
+.compactnewmenu[disabled] {
+  cursor: default;
+  opacity: 0.5;
+}
+/* Positioned, because the control that sets the read state is laid over the card's top
+   right corner. */
+.turn {
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--idle);
+  margin: 8px 6px;
+  padding: 8px 10px 10px;
+  background: var(--vscode-editorWidget-background, transparent);
+  border-radius: 0 5px 5px 0;
+}
+/* An open card is the one being read, so it gets the stronger frame. */
+.turn.is-open {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+}
+.turn.done {
+  border-left-color: var(--ok);
+}
+.turn.failed {
+  border-left-color: var(--bad);
+}
+/* A card the reader stopped wears the resting grey rather than a status tone. Its head row
+   already says stopped by you, and the warm tones now mean running and needs input. */
+.turn.interrupted {
+  border-left-color: var(--idle);
+}
+.turn.running {
+  border-left-color: var(--busy);
+}
+/* The rule under the time row is always drawn. Adding it only on an open card shifted
+   everything below the moment one was expanded. */
+/* The row wraps rather than letting its runs paint over each other. Every fact on it refuses
+   to break inside itself, so a row too narrow for all of them shrank each box below its own
+   text and the text carried on past the edge: at 340px a running card read
+   `running for 20mClaude`. Wrapped, the agent and its model drop to a second line and the
+   row grows by one line at exactly the widths where it did not fit. */
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 9px;
+  width: 100%;
+  cursor: default;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--edge);
+}
+button.head {
+  cursor: pointer;
+}
+button.head:hover .when,
+button.head:hover .durationfact {
+  color: var(--vscode-textLink-foreground);
+}
+.compaction {
+  border: 1px dashed var(--edge);
+  margin: 14px 6px;
+  padding: 8px 10px 10px;
+  border-radius: 5px;
+  background: transparent;
+}
+.compaction .glyph {
+  color: var(--idle);
+}
+.compaction .headline {
+  color: var(--idle);
+  font-weight: 400;
+}
+.glyph {
+  flex: none;
+  font-weight: 700;
+  width: 1em;
+  text-align: center;
+}
+.done .glyph {
+  color: var(--ok);
+}
+.failed .glyph {
+  color: var(--bad);
+}
+.interrupted .glyph {
+  color: var(--idle);
+}
+.running .glyph {
+  color: var(--busy);
+}
+.stopped .glyph {
+  color: var(--idle);
+}
+/* Wrapping for the same reason, one level down. The two facts inside it never break either,
+   so a width that fits neither of them beside the other stacks them instead of overlapping
+   them. */
+.timing {
+  display: inline-flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 8px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.durationfact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35em;
+  white-space: nowrap;
+  color: var(--idle);
+}
+.when,
+.durationvalue {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.dim {
+  color: var(--idle);
+}
+/* The agent takes the gap that used to push the model to the right, so the two read as one
+   run: which agent, then which of its models. */
+.agent {
+  margin-left: auto;
+  color: var(--idle);
+  font-size: var(--t-body);
+  white-space: nowrap;
+}
+.model {
+  margin-left: 0.4em;
+  color: var(--idle);
+  font-size: var(--t-body);
+  white-space: nowrap;
+}
+/* Sized with the model it sits beside, not with the body. The agent carries the margin
+   that pushes the run right, so this one follows it. */
+.effort {
+  color: var(--idle);
+  font-size: var(--t-body);
+  white-space: nowrap;
+}
+.headline[hidden] {
+  display: none;
+}
+.headline {
+  margin: 7px 0 0 calc(1em + 6px);
+  cursor: default;
+  line-height: 1.4;
+  font-weight: 500;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* What the agent is doing now, under the headline of a folded running card. One line, and
+   one that never wraps: it sits between the timeline and everything below the card, so a
+   line that grew would move every card under it while the reader was reading one.
+
+   Hidden on an open card, where the log itself is on screen a few lines further down. */
+.doing[hidden] {
+  display: none;
+}
+.doing {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: 5px 0 0 calc(1em + 6px);
+  font-size: var(--t-small);
+  color: var(--idle);
+}
+.doing .actglyph {
+  color: var(--busy);
+}
+
+/* One row of the log, and the line under the headline, share their pieces: a glyph column
+   that says how the call ended, a line that gives way, and a figure that does not. */
+.actglyph {
+  flex: none;
+  width: 1em;
+  text-align: center;
+}
+.actverb {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* What the agent handed the tool, in the editor's own face. A command is read character by
+   character and the prose face closes the gaps between them, so the half a reader has to
+   read that way is set the way the editor would set it and the words around it are not.
+   No tinted ground behind it: a box on every row would draw the eye down the column, and
+   the rows are meant to be read across.
+
+   It shrinks, and so does the line in front of it. Neither may push the row past the card,
+   and a path has no wrapping point in it, so the row would run off the edge if either held
+   its width. */
+/* The editor's own code face, one step smaller: shared with a skill's file path in its own
+   popover row, the other place raw text reads better set the way the editor sets it. */
+.actcode,
+.chippoppath {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.92em;
+}
+.actcode {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.actfig {
+  flex: none;
+  margin-left: auto;
+  padding-left: 0.5em;
+  font-variant-numeric: tabular-nums;
+  color: var(--idle);
+}
+
+/* The word opens the log. Its counts filter the rows without hiding the tool mix. */
+.acthead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4em;
+  width: 100%;
+  margin: 0 0 0.3em;
+}
+button.acthead,
+.acthead button.actword {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.acthead .actword,
+.acthead .sec-title {
+  margin: 0;
+  flex: none;
+}
+button.acthead:hover .actword,
+button.acthead:focus-visible .actword,
+.acthead button.actword:hover .sec-title,
+.acthead button.actword:focus-visible .sec-title {
+  color: var(--vscode-textLink-foreground);
+}
+/* The tool mix, on the Activity head and again on a run row in the log. Its size lives with the
+   other figures near `.sec-title`, because the card draws every figure at one size. */
+.actmix {
+  color: var(--idle);
+  margin-left: 0.35em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.activitysec .acthead .actmix {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  white-space: pre;
+  overflow: visible;
+}
+.actsummarypart {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+.actcount {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  flex: none;
+}
+.actcount:hover {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
+}
+.actcount[aria-pressed='true'] {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+/* The two counts that open a popover rather than filtering the log. Both are the same control,
+   so both wear the same dotted edge that says there is more under them. */
+.acttool,
+.actskills {
+  border-bottom: 1px dotted currentColor;
+}
+.acttool:hover,
+.acttool:focus-visible,
+.acttool.detail-pinned,
+.actskills:hover,
+.actskills:focus-visible,
+.actskills.detail-pinned {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: none;
+}
+.actview {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75em;
+  margin: 0 0 0.35em;
+  color: var(--idle);
+  font-size: var(--t-small);
+}
+.actviewaction {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--vscode-textLink-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+.actviewaction:hover {
+  text-decoration: underline;
+}
+.actempty {
+  margin: 0.25em 0 0.4em;
+  color: var(--idle);
+}
+
+.actlist[hidden] {
+  display: none;
+}
+.actrow {
+  display: flex;
+  gap: 0.5em;
+  align-items: baseline;
+  padding: 0.17em 0.33em;
+  border-radius: 3px;
+  font-size: 0.92em;
+}
+.actfull {
+  margin: 0.3em 0 0.5em 1.7em;
+  padding: 0.4em 0.55em;
+  color: var(--vscode-foreground);
+  background: var(--vscode-editorHoverWidget-background);
+  border: 1px solid var(--vscode-editorHoverWidget-border);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.actfull[hidden] {
+  display: none;
+}
+button.actrow.hasmore {
+  appearance: none;
+  width: 100%;
+  margin: 0;
+  border: 0;
+  font-family: inherit;
+  color: inherit;
+  text-align: left;
+  background: none;
+  cursor: pointer;
+}
+button.actrow.hasmore:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.actrow .actglyph {
+  color: var(--idle);
+}
+.actrow.step .actverb {
+  flex: none;
+  max-width: 100%;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+.actrow.step .actcode {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.actrow.commentary .actverb,
+.actrow.reasoning .actverb {
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.actrow.commentary .actglyph {
+  position: relative;
+  height: 1em;
+}
+.actrow.commentary .actglyph::before {
+  content: '';
+  position: absolute;
+  left: 0.15em;
+  top: 0.2em;
+  width: 0.8em;
+  height: 0.55em;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+.actrow.commentary .actglyph::after {
+  content: '';
+  position: absolute;
+  left: 0.22em;
+  top: 0.83em;
+  width: 0.17em;
+  height: 0.17em;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: -0.14em 0.16em 0 -0.03em currentColor;
+}
+/* The reader's own row in the log, told apart by a rule down its left edge, the way a quote
+   is. The words on it already open with "You asked", so the rule is the second signal and
+   never the only one. */
+.actrow.ask {
+  border-left: 2px solid var(--vscode-textBlockQuote-border, var(--idle));
+  padding-left: 0.33em;
+  margin-left: -0.5em;
+}
+.actrow.ask .actverb {
+  color: var(--vscode-foreground);
+}
+
+/* The label over a prompt the reader sent after the turn had started, and the clock time it
+   was sent at. Drawn over the text rather than beside it, because the text below is a block
+   that wraps and a label sharing its line would be pushed off the card. */
+.asklabel {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+  margin: 0.7em 0 0.2em;
+  font-size: var(--t-small);
+}
+.asklabelword {
+  color: var(--idle);
+}
+.askwhen {
+  font-variant-numeric: tabular-nums;
+}
+.actrow.done .actglyph {
+  color: var(--ok);
+}
+.actrow.run.done .actglyph {
+  color: var(--idle);
+}
+.actrow.failed .actglyph {
+  color: var(--bad);
+}
+.actrow.interrupted .actglyph {
+  color: var(--idle);
+}
+.actrow.failed .actfig {
+  color: var(--bad);
+}
+.actrow.running .actglyph {
+  color: var(--busy);
+}
+/* The steps the card is not showing, said rather than left to be inferred from a count that
+   does not match the rows above it. */
+.actmore {
+  color: var(--idle);
+  font-size: var(--t-small);
+  padding: 0.25em 0.33em 0 calc(1em + 0.5em);
+}
+/* The row is what a comment mark on a message line hangs off, so the mark sits in the same
+   column as every other mark on the card, left of the bubble. `--saidlead` is how far the
+   words stand in from the row's left edge: the row's padding, the bubble, and the gap after it. */
+.actrow.message {
+  position: relative;
+  font-size: 1em;
+  padding: 0.25em 0.3em;
+  align-items: flex-start;
+  --saidlead: calc(0.3em + 1em + 0.5em);
+}
+/* Center the complete bubble, including its dots or tail, within the first 1.5em text line. */
+.actrow.message .actglyph {
+  position: relative;
+  top: 0.085em;
+  width: 1em;
+  height: 1em;
+  flex: none;
+}
+.actrow.message.answer .actglyph {
+  top: 0.125em;
+}
+.actrow.message:not(.answer) .actglyph {
+  color: inherit;
+}
+.acttext {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.actrow.message .summary {
+  line-height: 1.5;
+}
+.actrow.message .summary > :first-child {
+  margin-top: 0;
+}
+.actrow.message .summary > :last-child {
+  margin-bottom: 0;
+}
+.actrow.message .more {
+  margin-top: 0.15em;
+}
+.actrow.answer .actglyph {
+  color: var(--vscode-foreground);
+}
+.actrow.answer .actglyph::before {
+  left: 0.17em;
+  top: 0.25em;
+  width: 0.75em;
+  height: 0.5em;
+  border-radius: 0.25em;
+  background: currentColor;
+}
+.actrow.answer .actglyph::after {
+  left: 0.33em;
+  top: 0.7em;
+  width: 0.3em;
+  height: 0.3em;
+  border-radius: 0;
+  transform: skew(-25deg);
+  box-shadow: none;
+}
+button.actrow.run {
+  appearance: none;
+  width: 100%;
+  margin: 0;
+  border: 0;
+  font: inherit;
+  color: var(--idle);
+  text-align: left;
+  background: none;
+  cursor: pointer;
+}
+button.actrow.run:hover {
+  background: var(--vscode-list-hoverBackground);
+  color: var(--vscode-textLink-foreground);
+}
+.actrow.run.failed,
+.actrow.run.running {
+  color: var(--vscode-foreground);
+}
+.actbad {
+  color: var(--bad);
+}
+.actrows {
+  margin-left: calc(1em + 0.5em);
+}
+.actrows[hidden] {
+  display: none;
+}
+.actrows .actfig {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.actrows .actmore {
+  padding: 0.25em 0.33em 0 calc(1em + 0.5em);
+}
+.actrow.earlier {
+  color: var(--idle);
+}
+.actrow.earlier .actglyph {
+  width: 1em;
+  flex: none;
+}
+
+/* A turn whose summary has been opened at least once, drawn at the weight of ordinary text
+   while one still to be read keeps its heavier one. Weight rather than colour, because
+   every colour on a card is already spoken for: the left border carries the status and a
+   grey headline is what a compaction has, so a read turn painted grey would read as one. */
+.turn.is-read .headline {
+  font-weight: 400;
+}
+/* `.summary strong, .headline strong` below sets its own font-weight directly on a `strong`
+   inside the headline, which the rule above cannot reach since it only sets the weight of the
+   `.headline` element itself and a strong child's own explicit weight does not inherit from
+   it. This rule targets the `strong` the same way, so a read turn's bold text drops to the
+   same 400 the rest of its headline does. */
+.turn.is-read .headline strong {
+  font-weight: 400;
+}
+/* A turn nobody has opened is washed in the unread tone, the way an unread row is in a mail
+   list, and keeps the heavier headline with it; a read one drops to plain text on the
+   panel's own background. The whole card rather than a dot beside it: a dot is six pixels
+   to find in a list, and the tone has to survive being scrolled past.
+
+   Painted as an image over the card's background rather than as a colour, because a colour
+   would take the widget background off the card and leave the unread ones sitting on the
+   page. Nothing else on the card is touched by it: the left border still carries the
+   status at full strength, and the shadow an open card wears is drawn over the top. */
+.turn:not(.is-read) {
+  background-image: linear-gradient(var(--unread-wash), var(--unread-wash));
+}
+/* Every row under a card's head row is indented by the same expression: this one, the
+   headline and the body. The expression only means the same thing in all three while the
+   row is at the card's own font size, so the figures carry the smaller size themselves
+   rather than the row carrying it and quietly shrinking the em the row is measured in.
+   The top margin matches the first section's margin, which centres the figures between
+   the heading rule and the next section's rule. */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2em 0.4em;
+  margin: 0.75em 0 0 calc(1em + 6px);
+  color: var(--idle);
+  font-variant-numeric: tabular-nums;
+}
+/* Each figure is a pill rather than a run of text, and the same pill on a card's two rows,
+   the session heading, and the Rail. Every chip carries the border, transparent until the
+   chip has a hover to offer: drawn only on the ones that do, the border would change their
+   size and the row would move as the figures change. */
+.chips > .statchip,
+.sessionstats > .statchip,
+.railstatchip {
+  background: var(--chipbg);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0.1em 0.5em;
+  font-size: var(--t-body);
+  line-height: 1.3;
+}
+button.statchip {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  line-height: inherit;
+}
+/* The chip owns the type scale. The button reset above removes browser defaults without
+   taking the card's stat size from an interactive chip. */
+.chips > button.statchip,
+.sessionstats > button.statchip {
+  font-size: var(--t-body);
+  line-height: 1.3;
+}
+button.statchip:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+/* The session that dispatched this one, at the end of the heading's figures. On a narrow row
+   it wraps with the figures, then cuts its name short rather than break inside a word. The
+   hint carries the whole name. */
+.sessionstats > button.sessionparent {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* The word keeps the row's quiet tone and the name takes the foreground, so the press reads as
+   a name among figures. The pointer and the keyboard turn the name the link colour, the pair
+   the Dispatched row's name uses. */
+.sessionparenttitle {
+  color: var(--vscode-foreground);
+}
+button.sessionparent:hover .sessionparenttitle,
+button.sessionparent:focus-visible .sessionparenttitle {
+  color: var(--vscode-textLink-foreground);
+}
+.statwarningsign {
+  color: var(--warn);
+  display: inline-block;
+  margin-inline-end: 0.3em;
+}
+.chippopwarning {
+  color: var(--warn);
+}
+/* A chip that has crossed a threshold carries its tone in the pill as well as in the text.
+   Mixed from the same token the text takes, so the two cannot disagree, and a chip well
+   under its threshold stays as quiet as every other figure in the row. */
+.chips .warn,
+.sessionstats .warn {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+}
+/* The context chip's three toned bands, in the editor's own informational, caution and error
+   colours, in temperature order. The text is always the pure token and only the ground is
+   mixed, and the ground grows heavier band by band, so the order survives in grayscale and
+   under the common colour deficiencies even where two hues converge. The middle band is
+   pixel-identical to the warn chip above on purpose: caution is one look on this row, not a
+   second one the reader has to learn beside it. */
+.chips .ctx-filling,
+.sessionstats .ctx-filling {
+  color: var(--notice);
+  background: color-mix(in srgb, var(--notice) 12%, transparent);
+}
+.chips .ctx-getting-full,
+.sessionstats .ctx-getting-full {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+}
+.chips .ctx-nearly-full,
+.sessionstats .ctx-nearly-full {
+  color: var(--full);
+  background: color-mix(in srgb, var(--full) 26%, transparent);
+}
+/* The hover is marked on the pill's own border alone. A dotted underline inside a pill usually
+   reads as damage to the pill rather than as an offer of more. */
+.chips .has-detail,
+.sessionstats .has-detail {
+  cursor: help;
+  border-color: var(--edge);
+}
+/* Almost every figure on the subagent row opens a record, so the drawn border no longer
+   tells one figure from another and only adds weight. The row keeps the help cursor and
+   the pill's own transparent border width, so no figure moves or changes size. */
+.agentfacts .has-detail {
+  cursor: help;
+}
+/* A figure holding a record takes the keyboard as well as the pointer, so it wears the panel's
+   own focus ring. It keeps the help cursor of the rule above, because a press on a card's own
+   figure opens the same kind of record and one offer reads as one cursor. */
+.agentfacts .has-detail:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+/* A card with no figures at all draws no row, and the row's own top margin would leave a
+   gap where it stood. The hidden attribute alone cannot do it: the rule above lays the row
+   out with flex, which beats the user agent's own rule for a hidden element. */
+.chips[hidden] {
+  display: none;
+}
+.add {
+  color: var(--add);
+}
+.del {
+  color: var(--del);
+}
+/* The open subagent count on a turn's agents figure, in the tone of work still under way. */
+.statbusy {
+  color: var(--busy);
+}
+/* Positioned so the marks on commented lines hang off it. Each mark is absolute and takes its
+   vertical place from where it would have stood in the line, so it rides the block through
+   every reflow with nothing measuring anything. Positioning the body is what puts the marks
+   in the indent it already leaves on the left, and what carries them out of the clipping that
+   a code block and a clamped prompt each do to their own contents. */
+.body {
+  position: relative;
+  margin: 10px 0 2px calc(1em + 6px);
+}
+.body[hidden] {
+  display: none;
+}
+/* The mark itself: a speech bubble in the indent beside the line, with the count of comments
+   inside it. The whole shape is drawn here and none of it is text in the document, because the
+   walk that decides which line a comment belongs to reads the line's own contents back, and a
+   word inside the block would join the quote and the mark would erase itself.
+
+   A bubble rather than a disc, and the idle grey until it is touched. A coloured dot is what
+   every other panel in the editor already uses for something else, so it says only that
+   something is here; a bubble says what.
+
+   The box stays in pixels for two reasons. The mark is placed inside whichever quote block it
+   marks, and those blocks do not share a font size. An em here would resolve to a different
+   length on each one. It also hangs in the fixed gutter named by `--markgutter`, which a
+   guard holds to pixels, and its tail below is drawn from pixel borders. */
+.linemark {
+  position: absolute;
+  left: calc(var(--markgutter) * -1);
+  top: auto;
+  appearance: none;
+  cursor: pointer;
+  background: none;
+  border: 1px solid currentColor;
+  border-radius: 3px 3px 3px 0;
+  padding: 0 3px;
+  margin: 0;
+  min-width: 13px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: inherit;
+  font-size: var(--t-small);
+  line-height: 1;
+  color: var(--idle);
+}
+/* The bubble's tail, hanging off its square corner. */
+.linemark::before {
+  content: '';
+  position: absolute;
+  left: -1px;
+  top: 100%;
+  border: 0 solid transparent;
+  border-width: 5px 5px 0 0;
+  border-top-color: currentColor;
+}
+.linemark::after {
+  content: attr(data-count);
+  font-variant-numeric: tabular-nums;
+}
+.linemark:hover,
+.linemark:focus-visible,
+.linemark[aria-expanded='true'] {
+  color: var(--vscode-textLink-foreground);
+}
+.linemark:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+/* The words a comment was left on, tinted where they stand.
+   The mark says a comment is here; this says which words it is about, which is the one
+   question a mark beside the line cannot answer by being looked at.
+
+   One class however many comments cover the run, because the script hands over runs that are
+   already flat: two comments on the same words are two ids on one span, never a span inside a
+   span. Nothing pressable about it. The bubble is the opener and the only way in from the
+   keyboard, and a tint that carried a pointer would be offering a second one that is not
+   there. */
+.cmark {
+  background: var(--cmark);
+  border-radius: 2px;
+}
+/* One comment's own words, lit from the entry the reader is pointing at or standing on in the
+   float, with the rest of the tint stepped back to nothing. This is where overlapping comments
+   are told apart, and it is what lets the tint stay flat at rest. */
+.cmark.lit {
+  background: var(--cmark-lit);
+  outline: 1px solid color-mix(in srgb, var(--comment) 55%, transparent);
+}
+.cmark.dulled {
+  background: transparent;
+}
+/* The words a comment is being written about, held visibly selected while the box is open.
+   Focusing the text box collapses the page's own selection, so the panel paints the range
+   itself on the way in. The editor's selection colour rather than the comment tint, because
+   these are words the reader still has hold of rather than a comment already left on them. */
+.csel {
+  background: var(--vscode-editor-selectionBackground, #264f78);
+  border-radius: 2px;
+}
+/* The one mark that is words: the comments on this turn belonging to no line it draws now.
+   At the top of the body, because there is no line for it to sit beside. */
+.offline {
+  margin-bottom: 8px;
+}
+.offlinemark {
+  position: static;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  height: auto;
+  min-width: 0;
+  font-size: var(--t-body);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.offlinemark::before,
+.offlinemark::after {
+  content: none;
+}
+/* What a mark opens: the comments on that line, with the two controls that act on each. It
+   carries a ground, an edge and a lift for the reason the comment box does, and it is placed by
+   the same rules.
+
+   It takes the pointer whether or not it is pinned, because Edit and Delete are in it and a
+   reader who hovered a mark to see what is there wants to act on it without pressing first.
+   What keeps it from closing under them is the wait the script starts when the pointer leaves
+   the mark, which reaching the float cancels. It shares the comment editor's layer so a sticky
+   heading cannot cover its text or controls. */
+.markfloat {
+  position: fixed;
+  z-index: 3;
+  width: 20em;
+  max-width: 92vw;
+  padding: 7px 9px;
+  border-radius: 3px;
+  font-size: var(--t-body);
+  line-height: 1.45;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-editorWidget-border, var(--edge));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+}
+.markfloat[hidden] {
+  display: none;
+}
+.marknote + .marknote {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--edge);
+}
+.markfloat .noteacts {
+  margin-top: 4px;
+}
+.markfloat .notequote {
+  max-height: 4.4em;
+  overflow: hidden;
+  margin-bottom: 3px;
+}
+.sec {
+  margin-top: 1.4em;
+  padding-top: 0.9em;
+  border-top: 1px solid var(--edge);
+}
+.sec:first-child {
+  margin-top: 0.75em;
+}
+/* Two columns: the prose on the left and the record in a 30em column on the right. The card is
+   the container, so the grid applies only where the card holds both columns, and a narrower
+   card stacks the record under Activity the way One column draws it. The width is where two
+   columns stop drawing the long fixture turn shorter than One column does, which
+   `panel.layout.cards.test.ts` measures. */
+.turn:has(.cardcols) {
+  container-type: inline-size;
+}
+/* Stacked, Two columns draws every section where One column does. The container is the card
+   rather than the wrapper, because a container stops the margins inside it from collapsing
+   into the body's own, and the card's padding stops that already. The first record section
+   follows Activity, so it keeps the gap of a section after another. */
+.cardmain:not(:empty) + .cardrecord > .sec:first-child {
+  margin-top: 1.4em;
+}
+@container (min-width: 49.5em) {
+  .cardcolsgrid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 30em;
+    gap: 0 2.5em;
+    align-items: start;
+  }
+  .cardrecord {
+    margin-top: 0.75em;
+    padding-left: 1.5em;
+    border-left: 1px solid var(--edge);
+  }
+  .cardrecord > .sec {
+    margin-top: 1.1em;
+    padding-top: 0;
+    border-top: 0;
+  }
+  .cardrecord > .sec:first-child {
+    margin-top: 0;
+  }
+}
+/* The tracking and the gap under the head follow the heading step, because the head reads as one
+   line of type even though only the word inside it takes the larger size. */
+.sec-title {
+  font-weight: 600;
+  letter-spacing: calc(0.01em * var(--heading-step));
+  color: var(--vscode-foreground);
+}
+/* The word a section head reads, and the only part of the head the heading step lifts. The step
+   sits here rather than on `.sec-title` so the counted total beside the word keeps the card's
+   own em and draws at the size every other figure draws at. */
+.sec-word {
+  font-size: calc(1em * var(--heading-step));
+}
+.sectionheading > .sec-title {
+  display: block;
+  margin-bottom: calc(0.5em * var(--heading-step));
+}
+.sec-title .count {
+  font-weight: 400;
+  color: var(--idle);
+}
+/* One home for every figure a card writes outside a pill. The Activity head draws its figures in
+   `.actmix`, a run row in the log draws its tool mix in the same class and its failed count in
+   `.actbad`, a Files, Subagents or Commits head draws its total in `.count`, and a Commits head
+   with one branch draws its branch fact and merged word in `.commitheadfact`. All of them are
+   one role, so one rule gives them the size every pill on the card draws at. The size is the
+   figure step rather than the body step, because a run row draws its own text smaller than the
+   card and the body step inside it would run smaller again. A second rule that sizes one of them
+   puts the card back on figures that disagree. `.commitheadfact` is scoped to `.recordcommits`,
+   the card's Commits heading, because the stat popover's own heading reuses the same class for
+   its branch fact and must keep drawing at the popover's own size. */
+.actmix,
+.actbad,
+.sec-title .count,
+.recordcommits .commitheadfact {
+  font-size: var(--t-figure);
+}
+/* A single message can run to thousands of characters, and several of them would push the
+   log and the files off the bottom of the card. So a long one opens bounded and offers the
+   rest. No inner scroll region: a scrollbar inside a scrolling panel hides what it holds.
+   A narration opens at six lines, which is 9em at the summary's line height, and a reply
+   keeps 36em. The block measures where the last whole line above the bound ends and writes
+   that into `--saidcut`. So the cut never runs through a line, a row or a picture. It is
+   unset until then, and the bare bound stands for the one frame that takes. */
+/* The gutter a comment mark hangs in, held open inside the block rather than beside it.
+   `overflow: hidden` clips both axes, and there is no way to ask for one: `overflow-x:
+   visible` beside `overflow-y: hidden` computes to `auto`, which is a scrollbar. So the block
+   takes the mark's own offset, plus the lead of its words inside the row, as padding on its
+   left and gives the same back as margin. The mark then lands inside what is clipped, the text
+   stays exactly where it was drawn, and the bound measures what it measured before, because
+   horizontal padding is no part of a height. */
+.saidtext {
+  padding-left: calc(var(--markgutter) + var(--saidlead));
+  margin-left: calc((var(--markgutter) + var(--saidlead)) * -1);
+}
+.saidtext:not(.is-full) {
+  max-height: var(--saidcut, 9em);
+  overflow: hidden;
+}
+.actrow.answer .saidtext:not(.is-full) {
+  max-height: var(--saidcut, 36em);
+}
+/* The gap between the parts of a row is half the row's own text size. The subagent row's
+   figures part by the figure gap instead, which is the gap a card's own chips keep. */
+.row {
+  display: flex;
+  gap: 0.5em;
+  align-items: baseline;
+  padding: 3px 4px;
+  border-radius: 3px;
+  font-size: var(--t-body);
+}
+.row + .row {
+  margin-top: 1px;
+}
+.row.click {
+  cursor: pointer;
+}
+.row.click:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.row .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A file no open folder holds is drawn by its whole path, and the row truncates on the
+   right, so a single string would cut the filename off and leave the reader the half of
+   the path they could already guess. The path arrives in two pieces instead: the directory
+   is the piece that shrinks and ellipsizes, and the filename keeps its width whatever the
+   panel's is. No gap between them, because together they are one path. */
+.row .name.path {
+  display: flex;
+}
+.row .name.path .lead {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row .name.path .base {
+  flex: none;
+}
+/* The file-type badge. A fixed width so the filenames line up down the column whatever
+   their type, and the panel's own dim tone for a type with no colour of its own. */
+.row .ficon {
+  flex: none;
+  width: 2.6em;
+  text-align: center;
+  font-size: var(--t-small);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--idle);
+  font-variant-numeric: normal;
+}
+/* An icon out of the reader's own icon theme, in the badge's column. The box keeps the row's
+   font size so the filenames stay lined up whatever the theme asks for, and the glyph inside
+   it is drawn at the size the theme's font declares. 2.03em is the badge's own width.
+
+   It is centred against the row rather than sat on its baseline, and centres its own
+   contents. An icon font has no baseline worth aligning to: a glyph fills a box of its own,
+   so the row's baseline rule lines up the bottom of that box with the bottom of the
+   filename's letters and hangs the icon below the text. The theme also asks for a size of
+   its own, 150% in Seti's case, which is taller than the line it sits on, so the box is
+   kept to about the height of the line beside it, so a tall glyph spills a little above and
+   below rather than pushing every file row further apart. It spills evenly, because it is
+   centred. */
+.row .ficon.themed {
+  width: 2.03em;
+  height: 1.2em;
+  font-size: 1em;
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: 1;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.row .ficon.themed img {
+  height: 1.15em;
+  width: auto;
+  max-width: 100%;
+}
+.row .nums {
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* A file row ends with the pair of figures and the word new. The row builder writes one text
+   space after the pair, the same width as the space inside the pair, so both parts read as one
+   run. Half the row's own text size on top of that space parts them, and it grows with the
+   editor font size the way the words on either side of it do. */
+.row .nums > .dim {
+  margin-left: 0.5em;
+}
+/* A subagent row is two lines wherever it is drawn. The state mark holds the first column, one
+   em wide, and both lines share the second, so the name, the facts under it and every wrapped
+   line start on one left edge rather than on an indent that has to be kept in step by hand.
+   Line one is the name, which wraps rather than ending in an ellipsis because the name is what
+   the row answers, and the model run, which keeps the right end of the line while the name
+   wraps inside its own box. Line two is the facts at the row's own size, one rank under the
+   name in the tint `.chippoppath` mixes. The state word keeps the state's tone.
+   The row sets its own row gap to zero, because `.row` sets a half-em gap on both axes and a
+   grid honours the vertical one, which parts the two lines by half a line of empty space. The
+   figures line is no taller than a text line, because the pill on this row drops the vertical
+   padding it wears elsewhere and takes a 1.2 leading. */
+.row.agentrow {
+  display: grid;
+  grid-template-columns: 1em minmax(0, 1fr);
+  gap: 0 0.5em;
+  align-items: baseline;
+}
+.agentrow > .glyph {
+  grid-column: 1;
+  grid-row: 1;
+}
+.agentrow .agenthead {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0 0.4em;
+  align-items: baseline;
+}
+/* The model and its reasoning effort are one run, because `Opus` alone on a line and `· high`
+   alone on the next read as two facts. The run holds the right end of line one and never
+   yields its width, so a long name wraps inside its own box instead of pushing the run onto a
+   line of its own. The head's own gap parts the run from the name, so the model drops the
+   margin it carries on the card head, where it has no such gap to sit in. */
+.agentrow .agentmodelrun {
+  flex: none;
+  white-space: nowrap;
+  margin-left: auto;
+}
+.agentrow .agentmodelrun .model {
+  margin-left: 0;
+}
+.agentrow .agenthead .name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: visible;
+  white-space: normal;
+  text-overflow: clip;
+}
+/* The name is the row's one press, into the child session. It reads as the row's text at rest
+   and takes the link colour under the pointer or the keyboard, the way the session heading
+   does. It sizes to its words, so the press and the focus ring fit the name rather than the
+   column, and the model run holds the right end of line one by its own margin. */
+.agentrow .agenthead .namelink {
+  appearance: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  flex: 0 1 auto;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.agentrow .namelink:hover,
+.agentrow .namelink:focus-visible {
+  color: var(--vscode-textLink-foreground);
+}
+/* Line two starts where line one starts. The figure's ground reaches left of its own words by
+   the padding it wears, so the row pulls the run back by a quarter em and the first figure's
+   text lands under the name's first letter, as a card's chip row lands under its head. The
+   pull stays inside the second grid column, clear of the mark's own column. */
+.agentrow .agentfacts {
+  grid-column: 2;
+  grid-row: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2em 0.4em;
+  align-items: baseline;
+  margin: 0.2em 0 0 -0.25em;
+  color: var(--idle);
+  font-variant-numeric: tabular-nums;
+}
+/* A figure on this row wears the same padding and line height as the pill on a card's own
+   chip row and on the rail, so its text no longer crowds the pill. Its own text still sets
+   the size: `font-size: 1em` holds the figure at the row's own type scale rather than the
+   shared pill's `var(--t-body)`, which reads smaller than the row here. Dropping this line
+   looks like a no-op but shrinks the figure's text against the row around it. It still keeps
+   whatever width its own numbers need: the rail's figures share the pill face and yield their
+   width to the rail's one line, which would cut a five-digit count here, so
+   `display: inline-block` and `flex: none` hold the pill at its own size in the row's wrapping
+   flex line, and `overflow: visible`, `text-overflow: clip` and `white-space: nowrap` keep the
+   count whole rather than clipped or wrapped. */
+.agentrow .agentfacts .railstatchip {
+  font-size: 1em;
+  display: inline-block;
+  flex: none;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+.agentrow .agentstate {
+  white-space: nowrap;
+}
+/* The row's own state sets its mark's tone. It rides on `data-state`, and the rules outrank
+   `.stopped .glyph` and its peers, which the card around the row matches by its own status. An
+   open child has an unfinished record Arc cannot place as live, so its running dot takes the
+   idle tone. */
+.agentrow[data-state='done'] .glyph {
+  color: var(--ok);
+}
+.agentrow[data-state='running'] .glyph {
+  color: var(--busy);
+}
+.agentrow[data-state='failed'] .glyph {
+  color: var(--bad);
+}
+.agentrow[data-state='interrupted'] .glyph,
+.agentrow[data-state='stopped'] .glyph,
+.agentrow[data-state='open'] .glyph,
+.agentrow[data-state='open'] .agentstate {
+  color: var(--idle);
+}
+.agentrow[data-state='running'] .agentstate {
+  color: var(--busy);
+}
+.agentrow[data-state='failed'] .agentstate {
+  color: var(--bad);
+}
+/* A commit row is a three-column grid wherever it is drawn. Line one is the hash, the subject
+   and the line counts. The subject ends in an ellipsis rather than wrapping, so every row is one
+   line, and the full subject rides in the row's hover and its spoken name. Line two is drawn only
+   for a subagent's row, the words made by and the subagent's name, and for a landing no branch
+   explains, which reads merged in. It starts under the subject's first character, in the tint
+   `.chippoppath` mixes. The gap between two rows is what parts one commit from the next.
+
+   The line counts hold one cell with a floor of 12ch, and the figures sit at its right edge with
+   one space between them, the way a file row draws the same pair. Two signed four-digit counts
+   are eleven characters, and the two signs and the space are not digit width in every font, so
+   the floor takes one character more than that to keep room around them. Every pair of four
+   digits or fewer sits inside the floor, so the counts stand in one column down a section. A
+   pair of five-digit counts is wider than the floor, and the cell grows to hold it at the cost
+   of that row's subject. A row that reports no counts draws the cell empty. */
+.row.commitrow {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+  column-gap: 0.5em;
+  row-gap: 0;
+  align-items: baseline;
+}
+.commitrow > .sha {
+  grid-column: 1;
+  grid-row: 1;
+}
+/* The one rule that truncates the subject. Wrapping again means changing these four values here
+   and nowhere else. */
+.commitrow .name {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+}
+.commitrow .commitnums {
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 12ch;
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.commitrow .commitfacts {
+  grid-column: 2 / 4;
+  grid-row: 2;
+  display: block;
+  min-width: 0;
+}
+.commitrow .commitwords {
+  display: block;
+  min-width: 0;
+}
+.commitrow .commitmaker {
+  display: flex;
+  gap: 0.3em;
+  min-width: 0;
+  white-space: nowrap;
+}
+.commitmakerword {
+  color: var(--idle);
+}
+/* The one rule that truncates the maker's name. Wrapping again means deleting the last four
+   declarations and making the button display: inline, here and nowhere else. */
+.commitrow .commitmakerlink,
+.commitrow .commitmakername {
+  display: block;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+}
+/* The button holds its hidden words. They sit after the full name, past the clipped edge, and a
+   button that did not hold them would carry them out of the panel and scroll it sideways. */
+button.commitmakerlink {
+  position: relative;
+  font: inherit;
+  color: var(--vscode-textLink-foreground);
+  text-align: left;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+button.commitmakerlink:hover {
+  text-decoration: underline;
+}
+button.commitmakerlink:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+/* One branch in one repository: a heading and its rows behind a hairline. The heading pads 4px
+   like a row, so the branch name starts over the hash column. */
+.commitgroups {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+.commitgroup {
+  margin-left: 0.35em;
+  padding-left: 0.5em;
+  border-left: 1px solid color-mix(in srgb, var(--vscode-foreground) 22%, transparent);
+}
+.commitgrouphead {
+  padding: 1px 4px 2px;
+  font-size: 0.92em;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.commitgroupname {
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+.commitgrouprepo,
+.commitgroupfact,
+.commitheadfact {
+  font-weight: 400;
+  color: var(--idle);
+}
+/* Sits beside the Commits heading's collapse button rather than inside it, so a long branch
+   name wraps onto its own line instead of running past the card's edge. */
+.commitheadfact {
+  overflow-wrap: anywhere;
+}
+.commitgroupfact {
+  white-space: nowrap;
+}
+.sha {
+  font-family: var(--vscode-editor-font-family);
+  color: var(--vscode-textLink-foreground);
+}
+button.sha {
+  font: inherit;
+  font-family: var(--vscode-editor-font-family);
+  color: var(--vscode-textLink-foreground);
+  text-align: left;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+button.sha:hover {
+  text-decoration: underline;
+}
+button.sha:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.summary {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.summary > *:first-child {
+  margin-top: 0;
+}
+.summary h1,
+.summary h2 {
+  font-size: 1.08em;
+  font-weight: 600;
+  margin: 1.14em 0 0.427em;
+}
+.summary h3,
+.summary h4 {
+  font-size: 1em;
+  font-weight: 600;
+  margin: 1.077em 0 0.385em;
+}
+.summary p {
+  margin: 0.615em 0;
+}
+.summary ul,
+.summary ol {
+  margin: 0.615em 0;
+  padding-left: 1.538em;
+}
+.summary li {
+  margin: 0.231em 0;
+}
+.summary li > ul,
+.summary li > ol {
+  margin: 0.231em 0;
+}
+.summary hr {
+  border: 0;
+  border-top: 1px solid var(--edge);
+  margin: 1.077em 0;
+}
+.summary blockquote {
+  margin: 0.615em 0;
+  padding-left: 0.692em;
+  color: var(--idle);
+  border-left: 2px solid var(--edge);
+}
+.summary strong,
+.headline strong {
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+.summary code,
+.headline code {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.9em;
+  background: var(--vscode-textCodeBlock-background);
+  padding: 0 3px;
+  border-radius: 3px;
+}
+.summary pre {
+  overflow-x: auto;
+  background: var(--vscode-textCodeBlock-background);
+  padding: 0.615em;
+  border-radius: 4px;
+  margin: 0.615em 0;
+}
+.codeblock {
+  position: relative;
+}
+.codeblock .copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  font: inherit;
+  font-size: var(--t-small);
+  padding: 1px 7px;
+  cursor: pointer;
+  opacity: 0;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  background: var(--vscode-button-secondaryBackground, var(--vscode-editorWidget-background));
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  transition: opacity 0.1s;
+}
+.codeblock:hover .copy,
+.codeblock .copy:focus {
+  opacity: 1;
+}
+.summary pre code {
+  background: none;
+  padding: 0;
+}
+/* A table a response wrote. The cell grid stays, because it is what separates a table from
+   the prose around it. The table is its own scroll box, so one too wide for the panel slides
+   sideways rather than squeezing every column. `width: max-content` is what makes that box
+   only as wide as the table asks for, and `max-width` hands the rest back to the card. The
+   mark that opens a comment hangs in the gutter left of the card, and its containing block is
+   the card, so this scroll box does not clip it.
+   A head takes the alignment of the column under it unless the response asked for another
+   one. A cell breaks a word only when the word cannot fit. `.summary` sets `anywhere`, which
+   drops a column's smallest width to one character and draws the narrowest panel as columns
+   of single letters. */
+.summary table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow: auto;
+  border-collapse: collapse;
+  font-size: 0.9em;
+  margin: 0.615em 0;
+}
+.summary th,
+.summary td {
+  border: 1px solid var(--edge);
+  padding: 0.5em 1.1em;
+  overflow-wrap: break-word;
+}
+.summary th:not([align]) {
+  text-align: left;
+}
+.summary tbody tr:nth-child(2n) {
+  background: var(--vscode-textCodeBlock-background);
+}
+.summary a {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: none;
+  cursor: pointer;
+}
+.summary a:hover {
+  text-decoration: underline;
+}
+/* Named so it cannot collide with the card's expanded state. A bare .open selector also
+   matched the turn element once it was expanded, painting the whole card in link colour
+   and underlining all of it on hover. */
+.editor-link {
+  margin-top: 10px;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+  background: none;
+  border: 0;
+  padding: 2px 0;
+}
+.editor-link:hover {
+  text-decoration: underline;
+}
+.summary .visualization-link {
+  margin: 4px 0;
+}
+/* A picture a response named. The height bound is what keeps a screenshot from pushing the
+   rest of the card off the screen, and width and height stay automatic inside it so the
+   picture keeps its own shape. Written against the picture and not against the button
+   around it, because a picture the response wrote as a link is drawn without one. */
+.summary img {
+  display: block;
+  margin: 8px 0;
+  max-width: 100%;
+  max-height: 22em;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+}
+/* The button carries no link colour: it holds a picture, and the alt text it falls back to
+   is read as words rather than offered as a link. */
+.summary .image-link {
+  display: block;
+  margin: 8px 0;
+  padding: 0;
+  max-width: 100%;
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.summary .image-link img {
+  margin: 0;
+}
+.summary .image-link:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+/* A row of the buttons a section offers. Wraps for the same reason the chips do: the panel
+   gets narrow, and a row that breaks once reads better than labels each breaking into
+   ragged lines. The space above the row belongs to the row, not to each button, or a
+   wrapped line would carry the button's own margin on top of the row gap. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 10px;
+}
+.actions .editor-link {
+  margin-top: 0;
+}
+.prompt {
+  border-left: 2px solid var(--edge);
+  padding: 1px 0 1px 8px;
+  margin-top: 4px;
+  color: var(--idle);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+/* A long prompt is longer than the answer to it and pushes everything off screen, so it
+   opens clamped and says so. */
+.prompt:not(.is-full) {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* The prompt drawn before the response. The question is read before the answer, so it is
+   clamped to two lines, and what the reader typed while the turn ran folds to one press. */
+.promptlead {
+  margin-top: 0.75em;
+}
+.promptlead .prompt:not(.is-full) {
+  -webkit-line-clamp: 2;
+}
+.promptlead .more:not([hidden]) {
+  display: block;
+}
+.more {
+  margin-top: 0.33em;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  padding: 0.08em 0;
+  color: var(--vscode-textLink-foreground);
+  background: none;
+  border: 0;
+}
+.more:hover {
+  text-decoration: underline;
+}
+/* What one of the reader's own comments looks like wherever it is drawn: in the float a mark
+   opens, and above the box one is being written in. */
+.notequote {
+  color: var(--idle);
+  font-size: 0.9em;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.notetext {
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* The row of words under a note, and under the box a note is written in. Wraps the way the
+   card's other action row does, because the panel gets narrow. */
+.noteacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 4px;
+  justify-content: flex-end;
+}
+.noteact {
+  appearance: none;
+  border: 0;
+  background: none;
+  margin: 0;
+  padding: 1px 0;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+}
+.noteact:hover {
+  text-decoration: underline;
+}
+/* Saving is what the box is for, so it is drawn as a button and not as another line of text. */
+.notesave {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 2px 12px;
+  border-radius: 2px;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  color: var(--vscode-button-foreground, #fff);
+  background: var(--vscode-button-background, #0e639c);
+}
+.notesave:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+/* The box a comment is written in. Kept as slim as it goes: the name is said and not drawn,
+   the line being commented on is not printed back at the reader, and the way out is a cross
+   in the corner rather than a row of its own. */
+.noteedit {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+/* In the page and off the screen. Read by a screen reader, and never drawn or focused. */
+.saidonly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+/* Over the text box's own corner, so it costs the box no height at all. The text box is
+   padded to match, or a long first line runs under it. */
+.noteclose {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 1;
+  appearance: none;
+  border: 0;
+  background: none;
+  margin: 0;
+  padding: 0 4px;
+  font: inherit;
+  font-size: 1.05em;
+  line-height: 1.4;
+  cursor: pointer;
+  color: var(--idle);
+}
+.noteclose:hover {
+  color: var(--vscode-foreground);
+}
+.notearea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 22px 4px 6px;
+  min-height: 5.2em;
+  resize: vertical;
+  font: inherit;
+  font-size: 0.92em;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--edge));
+  border-radius: 2px;
+}
+.noteedit .noteacts {
+  margin-top: 0;
+}
+.corigin {
+  appearance: none;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  margin: 0;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  background: var(--vscode-button-secondaryBackground, transparent);
+}
+.corigin:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.corigin:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.corigin {
+  align-self: flex-start;
+  margin: 0 0 5px;
+}
+.costline {
+  color: var(--idle);
+  font-size: 0.92em;
+  padding: 2px 4px;
+}
+/* The end of the list, outside every group, so folding a session away cannot take it too.
+   It reads as one more line of the list rather than as an action on any card, so it takes
+   the list's own left edge and not a card's. */
+.deeper {
+  display: block;
+  width: 100%;
+  margin: 14px 0 4px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: var(--t-body);
+  text-align: left;
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+  background: none;
+  border: 0;
+}
+.deeper:hover {
+  text-decoration: underline;
+}
+.deeper-note {
+  margin: 14px 10px 4px;
+  font-size: var(--t-body);
+  line-height: 1.45;
+  color: var(--idle);
+  overflow-wrap: anywhere;
+}
+/* The panel's foot: the composer over the session column, the status bar across the
+   window's own bottom edge under it.
+
+   Two budgets, two places, and the difference is where they sit rather than how they are
+   worded. A window belongs to the session, so its figure rides the composer's target
+   line beside the session's name. A plan belongs to the account, across every
+   session and every terminal, so it sits on the window's own bottom edge. A figure
+   inside the box is about what you are typing into; a figure on the window's edge is about
+   your account, and no wording has to explain that.
+
+   The composer stops where the session column starts, so the rail is never covered.
+   The rail is the way between sessions, and a box for typing into one of them has no
+   business over the list of the others. The offset is measured from the rail rather than
+   written down, because the reader drags the rail's width.
+
+   Both are fixed rather than laid out. As flex items they would have to be full-width ones,
+   which means wrapping the body, and a wrapping body puts the list on its own line under the
+   rail: the list sizes from its content, so its base width is far wider than what is left
+   beside the rail. The reader then gets the rail's empty column for a whole viewport and the
+   timeline a screen further down. Out of flow, the three columns are laid out as though
+   neither were there, and the page reserves the height. */
+#composer {
+  position: fixed;
+  z-index: 5;
+  left: var(--list-left, 0px);
+  right: 0;
+  bottom: var(--statusbar-height, 0px);
+  padding: 7px 10px 9px;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  border-top: 1px solid var(--edge);
+}
+#composer.composer-hidden {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  min-height: 2em;
+  padding: 0 2.7em 0 0.5em;
+  border-top: 0;
+}
+#composer.composer-hidden > :not(#footsash, #composer-restore) {
+  display: none;
+}
+#composer.composer-hidden #footsash {
+  flex: 1 1 auto;
+  margin: 0;
+}
+#composer[hidden] {
+  display: none;
+}
+#footsash {
+  height: 5px;
+  cursor: row-resize;
+  margin: -7px -10px 2px;
+  touch-action: none;
+}
+#footsash:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+#composer-collapse,
+#composer-restore {
+  font: inherit;
+  font-size: var(--t-small);
+  color: var(--idle);
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+}
+#composer-collapse {
+  position: absolute;
+  z-index: 1;
+  top: 0.5em;
+  right: 0.7em;
+  width: 1.7em;
+  height: 1.7em;
+  padding: 0;
+}
+#composer-restore {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  right: 0.5em;
+  transform: translateY(-50%);
+  width: 1.7em;
+  height: 1.7em;
+  padding: 0;
+}
+#composer-collapse:hover,
+#composer-restore:hover {
+  color: var(--vscode-foreground);
+  border-color: var(--edge);
+}
+#composer-collapse:focus-visible,
+#composer-restore:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+/* Requests that stop the current session. They share the fixed foot with the prompt,
+   so the action stays beside the session it resumes. A long set of questions scrolls
+   within its own area rather than pushing the prompt and its controls out of the window.
+
+   The area may take over half the panel, because answering is the only thing the reader can
+   do while the agent is blocked. At the old cap the second of two questions was cut off with
+   nothing on the card to say that it was there. */
+.casks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(60vh, 520px);
+  margin-bottom: 7px;
+  overflow-y: auto;
+}
+/* The turn card's own frame, ground and corner, so a request reads as a card of the
+   session it belongs to. The left border alone carries the state, in the tone the rail
+   gives a session that needs the reader.
+
+   It was a full-strength frame on all four sides over a wash of the same colour. That drew
+   the eye to the loudest thing on the screen, and two stacked requests read as one box. The
+   colour is worth exactly one line. */
+.cask {
+  padding: 8px 12px 10px;
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--need);
+  border-radius: 0 5px 5px 0;
+  background: var(--vscode-editorWidget-background);
+}
+/* The head row, which is also the fold. A button, stripped back to the row it draws, so the
+   whole row is one tab stop and one press.
+
+   The title, how far the reader got and what the card is waiting on sit on it. Neither figure
+   gives any width and the title takes the rest, so at the sidebar width the title gives way
+   and both keep their full text: a number cut short is worse than a title cut short. */
+/* One line height for the whole row, inherited by all four of its parts. Left to itself the
+   twist takes the metrics of whichever font the machine draws its glyph in, and the row is
+   then a different height on every machine. */
+.caskhead {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  line-height: 1.35;
+  color: inherit;
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.cask .twist {
+  flex: none;
+  width: 0.9em;
+  color: var(--idle);
+  font-size: var(--t-body);
+}
+.caskhead:hover .twist {
+  color: var(--vscode-foreground);
+}
+.casktitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.caskcount {
+  flex: none;
+  color: var(--idle);
+  font-size: var(--t-small);
+  font-weight: 400;
+}
+.caskstate {
+  flex: none;
+  color: var(--need);
+  font-size: var(--t-small);
+  font-weight: 600;
+}
+/* Shut, the card is its head row and the room around it, and nothing inside it is drawn. */
+.cask.is-shut {
+  padding-bottom: 8px;
+}
+/* Once the answer has gone the word reports rather than asks, so it stops wearing a colour
+   the reader has to act on. */
+.cask.is-sending .caskstate {
+  color: var(--idle);
+}
+.cask.is-sending .caskaction {
+  opacity: 0.55;
+}
+.cask.is-sending .caskchoice {
+  opacity: 0.7;
+}
+.caskdetail {
+  margin-top: 2px;
+  color: var(--idle);
+  font-size: var(--t-small);
+  overflow-wrap: anywhere;
+}
+.caskcode {
+  margin-top: 6px;
+  margin-bottom: 0;
+  padding: 7px 8px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 3px;
+}
+.caskactions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.caskaction {
+  min-width: 70px;
+  padding: 4px 12px;
+  font: inherit;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: 1px solid transparent;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.caskaction:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+.caskaction.deny,
+.caskaction.decline {
+  color: var(--vscode-foreground);
+  background: transparent;
+  border-color: var(--edge);
+}
+.caskaction[disabled] {
+  cursor: default;
+  opacity: 0.55;
+}
+/* Which question the reader is on, beside the action. The card draws one question at a time,
+   so without it the reader has only the strip to count from. */
+.caskwait {
+  margin-left: 4px;
+  color: var(--idle);
+  font-size: var(--t-small);
+}
+.caskquestion {
+  min-width: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 0;
+}
+.casklegend {
+  padding: 0;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.caskmarkdown {
+  font-weight: 400;
+}
+.caskmarkdown > :last-child {
+  margin-bottom: 0;
+}
+.summary details {
+  margin: 0.6em 0;
+}
+.summary summary {
+  cursor: pointer;
+}
+.summary summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+/* The tab strip, under the head row. One button per question, wearing the agent's own short
+   label for it. No colour of its own: the chosen tab takes the theme's foreground and the
+   focus border, the way an open picker does, and an answered tab reports its value in --ok. */
+.casktabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+  margin-top: 0.7em;
+}
+.casktab {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5em;
+  max-width: 100%;
+  padding: 0.25em 0.8em;
+  font: inherit;
+  font-size: var(--t-small);
+  cursor: pointer;
+  color: var(--idle);
+  background: var(--chipbg);
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+.casktab:hover {
+  color: var(--vscode-foreground);
+  border-color: var(--edge);
+}
+.casktab[aria-selected='true'] {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-focusBorder);
+  font-weight: 600;
+}
+.casktab[disabled] {
+  cursor: default;
+  opacity: 0.55;
+}
+/* The name is the one thing that gives way, the way a rail row's title gives way to its
+   figures. The answer gives way second, and only once the name has run out. */
+.casktabname {
+  flex: 0 1 auto;
+  min-width: 2.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* What the reader already answered, so a strip of five tabs still reports the whole form.
+   Both this and the mark are drawn on every answered tab and the strip shows one of them, so
+   dropping the values past the second row moves nothing in the document. The tab's own name
+   reads the whole answer either way, so neither ever carries the meaning alone. */
+.casktabpick {
+  display: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ok);
+}
+.casktabtick {
+  display: none;
+  flex: none;
+  color: var(--ok);
+}
+.casktab.is-answered .casktabpick {
+  display: block;
+}
+/* A secret answer is never read back on the face of its tab, so the mark is all it has. */
+.casktab.is-answered.is-secret .casktabtick {
+  display: block;
+}
+.casktabs.is-marked {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.casktabs.is-marked .casktab.is-answered .casktabpick {
+  display: none;
+}
+.casktabs.is-marked .casktab.is-answered .casktabtick {
+  display: block;
+}
+/* The box that takes an answer the agent did not offer. It is the composer's own input,
+   indented under the choice row that opened it. */
+.caskwritten {
+  box-sizing: border-box;
+  width: calc(100% - 1.9em);
+  margin: 0.3em 0 0 1.9em;
+  padding: 0.3em 0.55em;
+  font: inherit;
+  font-size: 0.95em;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: 2px;
+}
+textarea.caskwritten {
+  display: block;
+  line-height: 1.35;
+  resize: vertical;
+}
+/* The agent's own short label for a question, drawn the way a stat chip is. It sits inside
+   the legend, so it is read out with the question rather than as a line of its own. */
+.caskkey {
+  display: inline-block;
+  margin-right: 7px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--chipbg);
+  font-size: var(--t-small);
+  font-weight: 400;
+  color: var(--idle);
+  vertical-align: 1px;
+}
+.caskhint {
+  margin: 7px 0 5px;
+  color: var(--idle);
+  font-size: var(--t-small);
+}
+.caskchoice {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.caskchoice:hover {
+  border-color: var(--edge);
+  background: var(--chipbg);
+}
+/* The row the reader took keeps the ground the hover gives, so the choice still stands out
+   once the pointer has left it. */
+.caskchoice.is-picked {
+  background: var(--chipbg);
+}
+.caskchoice input {
+  flex: none;
+  margin: 3px 0 0;
+  accent-color: var(--vscode-focusBorder);
+}
+.caskchoicewords {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+.caskchoicelabel {
+  overflow-wrap: anywhere;
+}
+.caskchoicedetail {
+  color: var(--idle);
+  font-size: var(--t-small);
+  overflow-wrap: anywhere;
+}
+/* A radio and a checkbox are the browser's own controls, and the browser draws them in its
+   light scheme unless the page says otherwise. The editor publishes no colour for them, so
+   the only signal the panel has is the theme class the editor puts on the body. Nothing here
+   can check it: every guard dresses the page itself, so only the real panel proves this. */
+body.vscode-dark #composer,
+body.vscode-high-contrast #composer {
+  color-scheme: dark;
+}
+body.vscode-light #composer,
+body.vscode-high-contrast-light #composer {
+  color-scheme: light;
+}
+/* The window figure, and the control that compacts the session. It is the whole row
+   now: the session's name stood beside it and the rail already carries that name at the
+   top of the panel, so the line said twice what the reader was looking at once.
+
+   Pressing it compacts, which is where both agents put the same action in their own
+   interfaces, and the reason to compact is the figure itself filling up. It is drawn as a
+   button and toned as text, because a control styled like a control here would read as the
+   fourth setting on a row of three. */
+/* Last on the picker row, immediately after the servers control, so the controls stay one
+   run and the row gap separates them. */
+.cctx {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.38em;
+  font: inherit;
+  font-size: var(--t-small);
+  color: var(--idle);
+  background: none;
+  border: 0;
+  padding: 0;
+}
+/* The bar is drawn rather than written, so the line's accessible name carries the
+   percentage in words as well. */
+.cctxbar {
+  flex: none;
+  width: 2em;
+  height: 0.31em;
+  border-radius: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+}
+.cctxbar i {
+  display: block;
+  height: 100%;
+  background: var(--idle);
+}
+.cctxpct {
+  font-variant-numeric: tabular-nums;
+  color: var(--vscode-foreground);
+}
+.cctx.ctx-filling .cctxbar i {
+  background: var(--notice);
+}
+.cctx.ctx-filling .cctxpct {
+  color: var(--notice);
+}
+.cctx.ctx-getting-full .cctxbar i {
+  background: var(--warn);
+}
+.cctx.ctx-getting-full .cctxpct {
+  color: var(--warn);
+}
+.cctx.ctx-nearly-full .cctxbar i {
+  background: var(--full);
+}
+.cctx.ctx-nearly-full .cctxpct {
+  color: var(--full);
+}
+/* Model, effort, and how much the agent asks. One press apiece on the input surface. */
+.cpicks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.23em;
+  padding: 0.35em 0.45em 0.45em;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+}
+.cpick,
+button.cctx {
+  font: inherit;
+  font-size: var(--t-small);
+  line-height: 1.2;
+  cursor: pointer;
+  padding: 0.15em 0.38em;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+}
+.cpick {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: inherit;
+  white-space: nowrap;
+}
+.cpick:hover,
+button.cctx:hover {
+  color: var(--vscode-foreground);
+  border-color: var(--edge);
+}
+.cpick[aria-expanded='true'] {
+  color: var(--vscode-foreground);
+  border-color: var(--edge);
+}
+.cpick[disabled] {
+  cursor: default;
+  opacity: 0.6;
+}
+.cpick[disabled]:hover {
+  color: inherit;
+  border-color: transparent;
+}
+/* A control with something amiss under it, in the same tone the rows of its own menu use so
+   that the shut control and the open menu read as one thing. It sits after the quiet rules
+   above on purpose: these controls go grey until they are hovered, and a caution that went
+   quiet with them would be a warning the reader only sees once they have already found it. */
+.cpick.caution {
+  color: var(--warn);
+}
+.cpick.caution:hover,
+.cpick.caution[aria-expanded='true'] {
+  border-color: var(--warn);
+}
+.cchev {
+  font-size: var(--t-small);
+  margin-left: 0.15em;
+}
+
+/* The tag over a draft's box: one chip saying what this session is. The four controls
+   under it each say one setting, so the tag says none of them. */
+.cdrafttag {
+  margin: 0 0 6px;
+  font-size: var(--t-small);
+}
+/* The chip naming the state. It takes the tone the editor gives a changed file, because a
+   draft is the one session on the rail that has not run. It is only as wide as its two
+   words, which never split over two lines at the width a sidebar gives them. */
+.cdraftword {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 7px;
+  color: var(--mod);
+  background: color-mix(in srgb, var(--mod) 18%, transparent);
+}
+
+/* What the reader types into. It starts tall enough for a short prompt and grows with its
+   contents until it shows ten lines. Longer prompts scroll inside the box. */
+#prompt {
+  display: block;
+  width: 100%;
+  resize: none;
+  overflow-y: auto;
+  min-height: var(--prompt-floor, 4.2em);
+  max-height: calc(14.5em + 12px);
+  margin: 0;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 0.95em;
+  line-height: 1.45;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+#prompt::placeholder {
+  color: var(--vscode-input-placeholderForeground, var(--idle));
+}
+#prompt:focus {
+  outline: none;
+}
+.cwrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.cskilllayer,
+.cselectionlayer {
+  position: absolute;
+  z-index: 1;
+  inset: 0 auto 0 0;
+  overflow: hidden;
+  pointer-events: none;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 0.95em;
+  line-height: 1.45;
+  color: transparent;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.cselectionlayer {
+  z-index: 2;
+}
+.cselected {
+  color: var(--vscode-input-foreground, var(--vscode-foreground, #000));
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.3));
+}
+.cskilltoken {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--vscode-focusBorder) 24%, transparent);
+}
+.cskilltoken.is-hovered {
+  background: color-mix(in srgb, var(--vscode-focusBorder) 36%, transparent);
+}
+#prompt.is-over-skill {
+  cursor: pointer;
+}
+.cskilltoken:focus {
+  outline: 1px solid var(--vscode-focusBorder, #0078d4);
+  outline-offset: 1px;
+}
+.cinput {
+  overflow: hidden;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--edge));
+  border-radius: 6px;
+}
+.cinput:focus-within {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* What rides out with the prompt: the comments the reader left on this session's turns.
+   Counted rather than listed, because the reader wrote them and needs to know they are still
+   attached, not to read them again. */
+.cchips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 5px;
+}
+.cchip {
+  font: inherit;
+  font-size: var(--t-small);
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  padding: 1px 7px;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: var(--chipbg);
+}
+.cchip:hover {
+  border-color: var(--vscode-focusBorder);
+}
+
+.cfiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 5px;
+  min-width: 0;
+}
+.cfile {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 6px 2px 3px;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: var(--chipbg);
+  font-size: var(--t-small);
+}
+/* The thumbnail and the type badge stand in the same place at the head of the chip, so they
+   are the same box. Both are written against the chip's own text, but each one's em is its
+   own: the badge reads at nine tenths of the chip, so its 2em by 2.8em is 1.8em by 2.52em of
+   the chip, which is what the thumbnail takes. Move the badge's font size alone and the two
+   part company. */
+.cthumb {
+  flex: none;
+  height: 1.8em;
+  width: 2.52em;
+  object-fit: cover;
+  object-position: top left;
+  border-radius: 5px;
+}
+.ckind {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 2em;
+  min-width: 2.8em;
+  padding: 0 0.5em;
+  border-radius: 5px;
+  color: var(--idle);
+  font-size: 0.9em;
+  background: color-mix(in srgb, var(--vscode-foreground) 14%, transparent);
+}
+.cname {
+  display: inline-flex;
+  min-width: 0;
+}
+.cstem {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cext {
+  flex: none;
+}
+.csize {
+  flex: none;
+  color: var(--idle);
+  font-variant-numeric: tabular-nums;
+}
+.cfileremove {
+  flex: none;
+  margin: 0;
+  padding: 0 3px;
+  border: 0;
+  background: none;
+  color: var(--idle);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.cfileremove:hover {
+  color: var(--vscode-foreground);
+}
+.cfilepending {
+  border-style: dashed;
+  color: var(--idle);
+  padding-left: 7px;
+}
+.cnotice {
+  margin: 0 0 5px;
+  font-size: var(--t-small);
+  color: var(--warn);
+}
+/* What the next turn costs before the reader types a word, on the line directly above the box.
+   Every turn re-presents the whole session, so that price is fixed before the prompt
+   exists, and this is where the reader decides whether to send.
+
+   Always drawn and always quiet. A line that appears only when something is wrong is a good
+   warning and leaves the warm figure with no home at all, and a line dressed as a warning
+   every turn stops being read. The words carry the state, so no face takes a tone.
+
+   Chip height, in the muted foreground, with open space before the box, so it reads as chrome
+   rather than as another paragraph of the reader's own message. */
+.cnextturn {
+  display: grid;
+  align-items: center;
+  width: 100%;
+  min-height: 2em;
+  margin: 0 0 0.75em;
+  padding: 0 10px;
+  font-size: var(--t-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--idle);
+}
+/* Every face this session can wear, stacked in one grid cell. The line then holds the
+   height of the longest of them at every width, so the cache going cold rewords the line and
+   never pushes the box down under a reader who is typing into it. */
+.cnextturnface {
+  display: inline-flex;
+  grid-area: 1 / 1;
+  align-items: center;
+}
+.cnextturnface.is-off {
+  visibility: hidden;
+}
+/* The only pressable part of the line. The words beside it are ordinary text, so what the
+   reader presses is the figure and nothing else. The dotted rule carries the affordance,
+   which survives every tone the theme puts under it. */
+.cnextturnprice {
+  margin: 0 0 0 0.25em;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  color: var(--vscode-foreground);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.cnextturnprice:hover {
+  background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+}
+.cnextturnprice:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.chippopage.is-underlined[title] {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+#composer.dropping #prompt {
+  outline: 1px dashed var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* The temporary card shares the turn frame. Its head opens the response while the recorded turn is being read. */
+.clive .headline {
+  cursor: default;
+}
+.clive .head:hover .when {
+  color: inherit;
+}
+.liveheading {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--edge);
+}
+.liveheading > .head {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.cliveresponse {
+  white-space: pre-wrap;
+}
+/* The reply as it is written, anchored to its end so the words that have just arrived are the
+   words on screen. It sits where a recorded turn draws its log, and what is different is
+   which end gets clipped. A reply clipped at its end would fill the line once and then stop
+   moving, and a line that stopped moving is what the card exists to disprove.
+
+   The anchoring is the flex row: the text is pushed to the far end and what will not fit runs
+   off the near one, where the row's overflow cuts it. That overflow is also what keeps a reply
+   longer than the panel from widening it, and the whitespace rule on the line is what keeps a
+   long one from wrapping and taking the card down the panel with it.
+
+   The row takes no width of its own, so a reply that has just started sits against the line
+   that says what is happening and grows away from it, rather than beginning at the far end of
+   an empty row with a gap where the words are about to be. It is indented by the expression
+   every other row under the head row is indented by. */
+.clivereply {
+  display: flex;
+  justify-content: flex-end;
+  overflow: hidden;
+  width: max-content;
+  margin: 4px 0 0 calc(1em + 6px);
+  max-width: calc(100% - 1em - 6px);
+  font-size: var(--t-small);
+  color: var(--idle);
+}
+.clivereplytext {
+  white-space: pre;
+}
+/* The ways out of a press that never reached the agent, at the end of the head row, where a
+   card that had gone anywhere would be carrying its duration. Restore is the safe first
+   action; Dismiss is the explicit discard. */
+.cliveact {
+  font: inherit;
+  font-size: var(--t-body);
+  color: var(--idle);
+  cursor: pointer;
+  flex: none;
+  margin: 0;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  text-decoration: underline;
+}
+.cliverestore {
+  color: var(--vscode-textLink-foreground);
+}
+.cliveact:hover {
+  color: var(--vscode-foreground);
+}
+.clivereason {
+  margin: 4px 0 0 calc(1em + 6px);
+  color: var(--idle);
+  font-size: var(--t-small);
+}
+.clive .cfiles {
+  margin: 6px 0 0 calc(1em + 6px);
+}
+
+/* A submission held by Arc until the agent can accept it. It uses the temporary
+   turn-card frame because that is where the accepted turn will appear. Its dashed edge keeps
+   local ownership visible, while its header and activity row follow the output-card hierarchy. */
+.cwaiting {
+  border-style: dashed;
+}
+.cwaiting > .cqopen {
+  margin: 7px 0 0 calc(1em + 6px);
+  width: calc(100% - 1em - 6px);
+  font-weight: 500;
+  line-height: 1.4;
+}
+.cwaiting > .cqfull {
+  margin: 6px 0 0 calc(1em + 6px);
+  max-width: calc(100% - 1em - 6px);
+  box-sizing: border-box;
+}
+.cwaiting > .cfiles {
+  margin: 6px 0 0 calc(1em + 6px);
+}
+.cqopen {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: 1 1 0;
+  min-width: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+}
+.cqchev {
+  flex: none;
+}
+.cqtext {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+}
+/* The reader's own words, wrapped and kept as they typed them. Their line breaks are the
+   shape of the prompt, so they are drawn rather than folded away. */
+.cqfull {
+  flex: 1 1 100%;
+  order: 1;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow-y: auto;
+  color: var(--vscode-foreground);
+  margin: 2px 0 0;
+  padding: 4px 6px;
+  border-left: 2px solid var(--edge);
+}
+.cqacts {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  flex: none;
+}
+.cqact {
+  font: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+  margin: 0;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  text-decoration: underline;
+}
+.cqact:hover {
+  color: var(--vscode-foreground);
+}
+
+/* Send, or Stop while a turn runs. The compact mark keeps an inset on the input surface. */
+.csend {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 2.15em;
+  height: 2.15em;
+  margin-left: auto;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 6px;
+  color: var(--vscode-button-foreground, #fff);
+  background: var(--vscode-button-background, #0e639c);
+}
+.csend svg {
+  width: 1.15em;
+  height: 1.15em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.csend.stop svg {
+  fill: currentColor;
+  stroke: none;
+}
+/* What the press will do to the requests waiting above the box, beside the control it is
+   about. The control's own name carries the same sentence, so a reader who reaches Send
+   hears it as well. */
+/* It takes the room the row has left rather than a margin of its own, so the sentence sits
+   against Send at the editor width and takes a line of its own at the sidebar width, where
+   Send keeps the end of the row it wraps onto. */
+.csendover {
+  flex: 1 1 auto;
+  margin-right: 0.4em;
+  text-align: right;
+  color: var(--idle);
+  font-size: var(--t-small);
+}
+.csend:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+.csend[disabled] {
+  cursor: default;
+  opacity: 0.5;
+}
+.csend[disabled]:hover {
+  background: var(--vscode-button-background, #0e639c);
+}
+.csend.stop {
+  color: var(--warn);
+  background: none;
+  border-color: var(--warn);
+}
+.csend.stop:hover {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+/* Said once, quietly, under the controls. A reader who already knows it stops reading it. */
+
+/* The status bar: what the reader's own account has left, for every agent this folder has
+   sessions from rather than only the one on screen. A Claude session is often
+   where a Codex run gets dispatched from, so following the selected session would hide
+   a figure at the moment it is being spent. The cost is that two agents can wrap onto a
+   second line in a narrow sidebar, which is why the row wraps rather than scrolls.
+
+   It is lifted off the panel's own ground rather than drawn in the dim tone the rest of the
+   chrome uses. A figure the reader is meant to catch out of the corner of an eye has to be
+   legible without being looked for. */
+#statusbar {
+  position: fixed;
+  z-index: 6;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  border-top: 1px solid var(--edge);
+  background: color-mix(
+    in srgb,
+    var(--vscode-foreground) 7%,
+    var(--vscode-sideBar-background, var(--vscode-editor-background))
+  );
+}
+#statusbar[hidden] {
+  display: none;
+}
+/* At rest the bar draws no bars. Colour carries the caution band, and one line is what makes
+   it a status bar rather than a panel. */
+.sbrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 14px;
+  width: 100%;
+  margin: 0;
+  padding: 4px 10px 5px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-body);
+  color: var(--vscode-foreground);
+  text-align: left;
+}
+.sbrow:hover,
+.sbrow:focus-visible {
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+.sbagent {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.sbwho {
+  font-weight: 600;
+}
+.sbpct {
+  font-variant-numeric: tabular-nums;
+}
+.sbunit {
+  color: var(--idle);
+}
+.sbsep {
+  color: var(--edge);
+}
+.sbage {
+  color: var(--idle);
+}
+.sbtwist {
+  margin-left: auto;
+  font-size: var(--t-body);
+  color: var(--idle);
+}
+/* The caution bands, from the same table and in the same tones as the context chip and the
+   composer's window figure. The panel keeps one vocabulary for getting full: a scale of its
+   own here would be a second thing the reader has to learn to read the same warning. */
+.sbpct.ctx-filling {
+  color: var(--notice);
+}
+.sbpct.ctx-getting-full {
+  color: var(--warn);
+}
+.sbpct.ctx-nearly-full {
+  color: var(--full);
+}
+
+/* Every limit each agent reported, shown over the panel rather than inside it.
+   A popover, not a section of the bar: a bar that grows upward pushes the reader's place in
+   the list around under them every time they glance at it, and a glance is what this is for.
+   Floating, it costs the page nothing, so the reservation below the list never moves.
+
+   Two ways in, because the two are asked by different questions. A hover or a focus is
+   "what is it now", and it goes away by itself. A press is "let me read this", and it stays
+   until it is pressed again or Escape is struck. */
+.pop {
+  /* Above the fixed composer, so a menu opened from its controls is never covered by it. */
+  position: fixed;
+  z-index: 9;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-widget-border, var(--edge));
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.36);
+}
+.pop[hidden] {
+  display: none;
+}
+/* Both figure popovers, the card's own and the one a subagent row's figure opens over it.
+   The second instance draws `#chippopnested` and comes later in the body than the first, so it
+   draws on top of it. The hint box draws over both from a layer of its own.
+
+   Stat details keep the line structure the extension sent instead of being flattened into
+   the browser's narrow native title bubble. A detail that draws the turn's record takes the
+   pointer, so the reader crosses the gap from the chip onto a row. Every other detail ignores
+   the pointer until a press pins it, so the control under it stays pressable where the drawing
+   lands over its own anchor. A press pins either one and lets the reader select its text. */
+.chippop {
+  width: min(520px, calc(100vw - 12px));
+  padding: 10px 12px;
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  pointer-events: none;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.chippop.chippop-rows,
+.chippop.pinned {
+  pointer-events: auto;
+}
+/* The hint box has a layer of its own above every popover, so a hint whose control sits inside
+   one never draws under it, whatever their order in the body. No other z-index in this sheet
+   reaches it, and the box stays a direct child of the body, where the layer ranks. A Node test
+   in `panel.webview.test.ts` holds both. */
+#hintpop {
+  z-index: 10;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 12px));
+  padding: 6px 10px 7px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.hinttitle {
+  font-weight: 600;
+}
+.hintkey {
+  font-weight: 400;
+  color: var(--idle);
+}
+.hintdetail {
+  margin-top: 1px;
+  color: var(--idle);
+}
+/* A detail drawn as several lines, which the anchor asks for with `data-hint-lines`. Every
+   other detail is one line of the panel's own words, and a detail carrying a reader's text
+   could hold a break the reader never meant as one. */
+.hintdetail.lines {
+  white-space: pre-line;
+}
+/* The card a compact rail row shows on hover, drawn into the hint box in place of its title
+   and detail. Wider than a plain hint so a name wraps at a readable measure, and never wider
+   than the chip popover. */
+#hintpop.hintcard {
+  min-width: 16em;
+  max-width: min(24em, calc(100vw - 12px));
+  padding: 0.55em 0.9em 0.7em;
+  overflow-wrap: anywhere;
+}
+.hintbody[hidden] {
+  display: none;
+}
+.hintname {
+  font-weight: 600;
+}
+/* The meta line, the figure line and the labels sit under the name at the gaps a comfortable
+   rail card uses, with no rule between them, so the card reads as the row it stands in for. */
+.hintmeta {
+  margin-top: 2px;
+  font-size: var(--t-small);
+  color: var(--idle);
+}
+.hintnote {
+  margin-top: 0.35em;
+  color: var(--idle);
+}
+/* The card has a set width, so its figure line wraps rather than cutting a figure. */
+.hintcard .railstats {
+  flex-wrap: wrap;
+}
+/* A context figure keeps the hint box's own foreground over its level wash. The tone carries
+   the ground alone, so the word clears 4.5 to 1 on every theme's widget background. */
+.hintcard .railstats .ctx-filling,
+.hintcard .railstats .ctx-getting-full,
+.hintcard .railstats .ctx-nearly-full {
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+}
+.hintlabels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.hintlabels .raillabel {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+.chippopline {
+  white-space: pre-wrap;
+}
+.chippopline:first-child {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+.chippopline.gap {
+  height: 6px;
+}
+.chippophead,
+.chippopitemhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.chippophead {
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--edge);
+  font-weight: 600;
+}
+/* A figure the head carries about work still moving wears the tone the panel gives that
+   work everywhere else, so a running count reads as running without a word for it. */
+.chippopvalue.is-busy {
+  color: var(--busy);
+}
+.chippoplist {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+.chippopitem {
+  padding: 3px 0 5px;
+}
+.chippopitem::marker,
+.chippopsubitem::marker {
+  color: var(--idle);
+}
+.chippoplabel {
+  min-width: 0;
+  font-weight: 600;
+}
+.chippopvalue {
+  flex: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.chippopsublist {
+  margin: 3px 0 0;
+  padding-left: 18px;
+  color: var(--idle);
+}
+.chippopsubitem {
+  padding: 1px 0;
+}
+.chippopsubitem.chippopcost {
+  color: var(--vscode-foreground);
+}
+.chippopscale {
+  color: var(--idle);
+}
+.chippopcachehit.is-warning {
+  color: var(--warn);
+}
+.chippopmuted {
+  color: var(--idle);
+}
+.chippopfoot {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--edge);
+  color: var(--idle);
+}
+/* Nothing sits between the heading and a footer drawn this way, so it takes the same ordinary
+   top margin an entry list would have opened with, and neither the border nor the padding a
+   footer otherwise wears to part itself from a list above it. */
+.chippopfoot.chippopfoot-flush {
+  margin-top: 8px;
+  padding-top: 0;
+  border-top: none;
+}
+/* The bound the reader is not paying, parted from the facts about the state they are in. */
+.chippopbound {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--edge);
+}
+/* The next-turn working reads as a short sequence. Its values stay beside the labels that
+   explain them, while ordinary stat popovers keep their two-column scan. */
+.chippop.chippop-stacked .chippophead,
+.chippop.chippop-stacked .chippopitemhead {
+  justify-content: flex-start;
+  gap: 0.35em;
+}
+.chippop.chippop-stacked .chippopitemhead .chippoplabel::after {
+  content: ':';
+}
+.chippop.chippop-stacked .chippopitemhead .chippoplabel {
+  flex: none;
+}
+.chippop.chippop-stacked .chippopitemhead .chippopvalue {
+  flex-shrink: 1;
+  min-width: 0;
+  white-space: normal;
+}
+.chippop.chippop-stacked .chippoplist,
+.chippop.chippop-stacked .chippopsublist {
+  list-style: none;
+  padding-left: 0;
+}
+.chippop.chippop-stacked .chippoplist {
+  margin: 0.7em 0;
+}
+.chippop.chippop-stacked .chippopfoot-flush {
+  margin-top: 0.7em;
+}
+.chippop.chippop-stacked .chippopitem {
+  padding: 0.2em 0 0.4em;
+}
+/* A separated entry starts a distinct part of the working while retaining its value and
+   supporting detail in the same list item. */
+.chippop .chippopitem.is-separated {
+  margin-top: 0.4em;
+  padding-top: 0.7em;
+  border-top: 1px solid var(--edge);
+}
+.chippop.chippop-tools {
+  width: max-content;
+  max-width: min(320px, calc(100vw - 12px));
+}
+.chippop.chippop-tools .chippophead {
+  justify-content: flex-start;
+}
+.chippop.chippop-tools .chippoplist {
+  list-style: none;
+  margin: 7px 0;
+  padding: 0;
+}
+.chippop.chippop-tools .chippopitem {
+  padding: 1px 0;
+}
+.chippop.chippop-tools .chippopitemhead {
+  justify-content: flex-start;
+  gap: 0.8em;
+}
+.chippop.chippop-tools .chippopitem .chippoplabel {
+  font-family: var(--vscode-editor-font-family);
+  font-weight: 400;
+}
+/* The skills a turn loaded. One row reads as one skill: its name and how well the record
+   proves the load on the first line, then what that proof means and where the file is. The row
+   is one rule, so a row with a description, a row with none and a row whose file has gone all
+   sit on the same grid. */
+.chippop.chippop-skills {
+  width: min(32em, calc(100vw - 12px));
+}
+.chippop.chippop-skills .chippoplist {
+  list-style: none;
+  margin: 0.6em 0 0;
+  padding: 0;
+}
+.chippop.chippop-skills .chippopitem {
+  padding: 0.45em 0;
+}
+.chippop.chippop-skills .chippopitem + .chippopitem {
+  border-top: 1px solid var(--edge);
+}
+/* Reset from the sublist's own idle tone so the description below can read at the row's
+   foreground weight. Scoped to the skills popover: every other list keeps its sublist idle,
+   the tone a cost breakdown and a cache-hit note both still rely on. */
+.chippop.chippop-skills .chippopsublist {
+  list-style: none;
+  margin: 0.2em 0 0;
+  padding: 0;
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+}
+/* The row's description: the foreground tone above, clamped to two lines so a long sentence
+   never pushes the file below it out of view. The row's native title still carries the whole
+   sentence for a reader who rests the pointer on the cut. */
+.chippopdesc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+/* The row's file: back down from the description's foreground weight above, a tint mixed from
+   whatever that foreground already is rather than a second theme color, so it recedes even in
+   a theme whose own idle tone lands on the same value as its foreground. Mixed at 78%, the
+   floor a theme table in panelfixture.ts holds it to for text at this size against the
+   popover's own background. Selectable text like every other line here, so a reader can copy
+   it. */
+.chippoppath,
+.commitrow .commitfacts {
+  color: color-mix(in srgb, var(--vscode-editorWidget-foreground, var(--vscode-foreground)) 78%, transparent);
+}
+/* The row's own name turned into its one press, where a list declares one and the row's file
+   was recorded. Drawn as a link because it leaves the panel for an editor tab, the way a file
+   row does. The button reset leaves `font-weight` alone, so the bold weight every label keeps
+   still comes from `.chippoplabel` rather than being reset by a shorthand here. */
+.chippopnamelink {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  text-align: left;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+}
+.chippopnamelink:hover,
+.chippopnamelink:focus-visible {
+  text-decoration: underline;
+}
+/* The record the chips index. A chip popover draws the file, subagent and commit rows the
+   card body draws, from the same components, so a press reaches the same editor tab from
+   either surface. */
+.chippoprows {
+  margin-top: 0.6em;
+}
+.chippoprows .actions {
+  margin-top: 0.6em;
+}
+.chips .detail-pinned,
+.sessionstats .detail-pinned,
+.agentfacts .detail-pinned {
+  border-color: var(--vscode-focusBorder);
+}
+/* Held to the width its own rows need rather than stretched across the panel. Stretched, the
+   reset time is pushed out to the far edge and the reader has to track across an empty gap to
+   read it against the figure it belongs to. */
+#usagepop {
+  left: 6px;
+  bottom: calc(var(--statusbar-height, 0px) + 6px);
+  width: min(300px, calc(100vw - 12px));
+}
+.sbopen {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 9px 10px 8px;
+}
+.sbgroup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sbhead {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--t-small);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--idle);
+}
+.sbplan {
+  margin-left: auto;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.sbline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 7px;
+  row-gap: 2px;
+  font-size: var(--t-small);
+  color: var(--idle);
+}
+.sblabel {
+  flex: none;
+  width: 6em;
+  color: var(--vscode-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sbbar {
+  flex: none;
+  width: 34px;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+}
+.sbbar i {
+  display: block;
+  height: 100%;
+  background: var(--idle);
+}
+.sbbar.ctx-filling i {
+  background: var(--notice);
+}
+.sbbar.ctx-getting-full i {
+  background: var(--warn);
+}
+.sbbar.ctx-nearly-full i {
+  background: var(--full);
+}
+.sbreset {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.sbdetail {
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* A figure is only as fresh as the last answer, so the press that reads it again says when
+   it last did. */
+.sbread {
+  align-self: flex-start;
+  font: inherit;
+  font-size: var(--t-small);
+  color: var(--idle);
+  cursor: pointer;
+  padding: 1px 5px;
+  margin-left: -5px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+}
+.sbread:hover {
+  color: var(--vscode-foreground);
+  border-color: var(--edge);
+}
+
+/* The panel's own picker, drawn where the control is rather than where the editor puts its
+   own widgets. One row per choice, the current one ticked, and the agent's own sentence
+   under a choice it describes. */
+#pickpop {
+  width: min(320px, calc(100vw - 12px));
+}
+.pickhead {
+  padding: 8px 11px 6px;
+  font-size: var(--t-body);
+  color: var(--idle);
+  border-bottom: 1px solid var(--edge);
+}
+.pickempty {
+  padding: 9px 11px;
+  font-size: var(--t-body);
+  color: var(--idle);
+  line-height: 1.45;
+}
+.pickrow {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  margin: 0;
+  padding: 7px 11px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-body);
+  color: var(--vscode-foreground);
+}
+.pickrow:hover,
+.pickrow:focus-visible {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 10%, transparent));
+}
+.pickrow.status {
+  cursor: default;
+}
+.pickrow.status:hover {
+  background: none;
+}
+.picktick {
+  flex: none;
+  width: 0.9em;
+  color: var(--idle);
+  font-size: var(--t-body);
+}
+.pickbody {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.pickname {
+  font-weight: 600;
+}
+.pickrow.caution .pickname {
+  color: var(--warn);
+}
+.pickwhy {
+  color: var(--idle);
+  font-size: var(--t-body);
+  line-height: 1.4;
+}
+
+/* New session setup. The same dialog lists setups to start from and holds a labelled form
+   for a custom one. It stays inside the webview when opened from the rail or narrow panel
+   bar. Its height is the viewport less the 6px margin above and below, capped at a height
+   that still reads as a menu on a tall screen. The list of pinned and recent setups takes
+   the room the other rows leave, and it is the part that shrinks first. */
+#launcher {
+  width: min(360px, calc(100vw - 12px));
+  max-height: min(calc(100vh - 12px), 44em);
+  display: flex;
+  flex-direction: column;
+}
+#launcher[hidden] {
+  display: none;
+}
+#launcher > * {
+  flex: none;
+}
+/* Never less than one row in a short viewport. A row is a name line, a detail line at 1.4,
+   the 1px gap and the 7px padding above and below. The rows scale their own text, so the
+   bound counts lines at that scale. */
+#launcher > .launchlist {
+  flex: 0 1 auto;
+  min-height: calc(2.6 * var(--t-body) + 15px);
+  overflow-y: auto;
+  border-top: 1px solid var(--vscode-widget-border, var(--edge));
+  border-bottom: 1px solid var(--vscode-widget-border, var(--edge));
+}
+/* A list row lights as one, the way a session row in the rail does. The apply button and
+   the pin are siblings inside it, and the apply button paints no ground of its own, so the
+   pointer anywhere on the row lights the whole row with the pin in it. The pin adds the rail
+   action's hover chip over the lit row, so the pointer also shows the pin's own target.
+   Keyboard focus lights the row too, and the focused button keeps its own ring inside the
+   row. A row that cannot start never lights, so it never reads as one that can. */
+#launcher .launchentry {
+  display: flex;
+  align-items: center;
+  padding-right: 4px;
+}
+#launcher .launchentry:not(.is-unavailable):hover,
+#launcher .launchentry:not(.is-unavailable):has(> :focus-visible) {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 10%, transparent));
+}
+#launcher .launchentry > .launchrow {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+  background: none;
+}
+/* Long values cut at the edge, and the pin keeps its width. */
+#launcher .launchentry .launchname,
+#launcher .launchentry .launchdetail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#launcher .launchentry > .launchrow[disabled] {
+  cursor: default;
+}
+/* The line that names why a row cannot start wraps rather than cutting the reason off. */
+#launcher .launchentry.is-unavailable .launchdetail {
+  color: var(--warn);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+#launcher .launchnote {
+  padding: 2px 10px 7px;
+  font-size: var(--t-body);
+  color: var(--idle);
+  line-height: 1.4;
+}
+/* The pin, and Edit, which shares its class, draw the rail's stroked glyph in the rail's
+   tones: idle at rest, the foreground and the `.railact:hover` chip under the pointer, and the
+   notice tone when set. */
+#launcher .launchpin {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 2em;
+  height: 2em;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--idle);
+  cursor: pointer;
+}
+#launcher .launchpin svg {
+  width: 1.17em;
+  height: 1.17em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* The ground is the translucent toolbar tone alone, laid over the lit row beneath it. The
+   rail layers the same tone over an opaque ground, which this pin does not have. A pinned pin
+   keeps its tone under the pointer and wears the same chip. */
+#launcher .launchpin:hover {
+  color: var(--vscode-foreground);
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+#launcher .launchpin.is-pinned {
+  color: var(--notice);
+}
+#launcher .launchentry > :focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+/* Each setup field keeps one line as its value changes. */
+#launcher .launchfield {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.6em;
+  padding: 0.25em 0.8em;
+}
+#launcher .launchfieldname {
+  flex: none;
+  width: 6.5em;
+}
+.choice-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5em;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.25em 0.55em;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  color: var(--vscode-foreground);
+  background: var(--vscode-input-background, transparent);
+  font: inherit;
+  font-size: var(--t-body);
+  cursor: pointer;
+}
+.choice-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.choice-trigger:focus-visible,
+#launcher .launchactions > .launchpin:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.choice-trigger:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+.choicepop {
+  width: min(25em, calc(100vw - 12px));
+  max-height: min(24em, calc(100vh - 12px));
+  overflow-y: auto;
+  z-index: 9;
+}
+.choiceoption.is-active {
+  background: var(--vscode-list-focusBackground, var(--vscode-list-hoverBackground));
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.choiceoption:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.choiceoption[aria-selected='true'] .picktick {
+  color: var(--vscode-foreground);
+}
+
+/* The held values the catalog no longer offers, named under the fields that stand in for them. */
+#launcher .launchcaution {
+  padding: 2px 10px;
+  color: var(--warn);
+  font-size: var(--t-body);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+#launcher .launchactions {
+  align-items: center;
+}
+/* The field pin waits for an agent. It answers no pointer then, so it wears no hover chip. */
+#launcher .launchpin:disabled {
+  cursor: default;
+  opacity: 0.5;
+  color: var(--idle);
+  background: none;
+}
+.launchhead {
+  padding: 7px 10px 5px;
+  color: var(--idle);
+  font: inherit;
+  font-size: var(--t-body);
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.launchrow {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  margin: 0;
+  padding: 7px 10px;
+  border: 0;
+  background: none;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: var(--t-body);
+  text-align: left;
+  cursor: pointer;
+}
+.launchrow:hover,
+.launchrow:focus-visible {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 10%, transparent));
+}
+.launchname {
+  font-weight: 600;
+}
+.launchdetail {
+  color: var(--idle);
+  font: inherit;
+  line-height: 1.4;
+}
+
+/* One session's labels. It borrows the setup popover's heading and row rules rather than
+   repeating them, so the two popovers stay one shape, and adds only what a list of checkboxes
+   needs. Narrower than the setup form: every row is a short name and a figure. The view and
+   session rename editors are forms of the same size, so they share the width. */
+#labelpop,
+#viewpop,
+#sessionrenamepop {
+  width: min(20.75em, calc(100vw - 12px));
+  padding-bottom: 0.333em;
+}
+/* The name a reader typed, on the row that offers to make it. A checkbox row cuts a long name
+   because the count beside it has to stay readable; this row has a whole line, so the name
+   wraps onto the next one instead. Pasted without a space in it, a name that did neither would
+   run past the popover's edge and turn its own scroll into a horizontal one. */
+.labelcreate .launchname {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* The find box has no clear control, so it takes the padding the rail's own query box keeps
+   for one back as room for the name. */
+.labelsearch {
+  padding: 2px 10px 6px;
+}
+.labelfind {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 0.9em;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--edge));
+  border-radius: 2px;
+}
+.labelfind:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+/* What the name in the box will do that the reader cannot see it doing. Under the box and
+   above the rows, because it is about what they are typing rather than about the list. */
+.labelnote {
+  padding: 0 10px 6px;
+  color: var(--idle);
+  font-size: var(--t-small);
+  line-height: 1.4;
+}
+/* The key that takes the offer, at the end of the line the offer is on. */
+.labelkey {
+  float: right;
+  margin-left: 12px;
+  font: inherit;
+  font-size: var(--t-small);
+  font-weight: 400;
+  color: var(--idle);
+}
+.labelrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: var(--t-body);
+  cursor: pointer;
+}
+.labelrow:hover,
+.labelrow:has(.labelbox:focus-visible) {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 10%, transparent));
+}
+.labelbox {
+  flex: none;
+  margin: 0;
+}
+/* A name longer than the popover is cut rather than allowed to push the count off the row. */
+.labelname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The figure sits at the right-hand edge, in a font whose digits are one width, so a column
+   of counts reads as a column. */
+.labelcount {
+  flex: none;
+  margin-left: auto;
+  color: var(--idle);
+  font-size: var(--t-small);
+  font-variant-numeric: tabular-nums;
+}
+.labelempty {
+  padding: 4px 10px 8px;
+  color: var(--idle);
+  font-size: var(--t-body);
+  line-height: 1.4;
+}
+/* One saved view's name, and the way to delete it. It borrows the setup popover's heading,
+   field and action rules the way the label editor borrows its heading and rows, so the three
+   popovers stay one shape. Only the delete button is its own, because it sits at the end the
+   two safe buttons are not on. */
+#viewpop .launchactions {
+  justify-content: flex-start;
+}
+#viewpop .railviewdelete {
+  margin-right: auto;
+}
+#railfilterpop {
+  width: min(23em, calc(100vw - 12px));
+  max-height: calc(100vh - 12px);
+  padding-bottom: 0.333em;
+  overflow-y: auto;
+}
+/* The Timeline layout dialog borrows the View menu's head, sections and radio rows. */
+#layoutpop {
+  width: min(23em, calc(100vw - 12px));
+  padding-bottom: 0.333em;
+}
+#layoutpop .railfiltersection:last-child {
+  border-bottom: 0;
+}
+.layoutchoices {
+  display: flex;
+  flex-direction: column;
+}
+#railfilterpop .launchhead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+}
+.railfilterpicklist .launchrow {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+}
+.railfilterpicklist .launchdetail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-small);
+}
+.railfilterchoice {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+.railfilterchoice[aria-checked='true'] {
+  background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
+}
+.railfilterchoice .launchname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.railfiltersection {
+  padding: 5px 0;
+  border-bottom: 1px solid var(--edge);
+}
+.railfiltersectionname {
+  padding: 0 10px 3px;
+  color: var(--idle);
+  font-size: var(--t-small);
+  font-weight: 600;
+}
+.railfiltermatch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 10px;
+}
+/* Labels as toggle chips, most used first. The outlined label chip rule below draws the box,
+   and this rule lays out the name and its count inside it. A long name is cut by the ellipsis
+   and the count beside it never is. */
+.railfilterlabels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 10px 6px;
+}
+.railfilterlabels .railfilterlabel {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35em;
+  max-width: 100%;
+  margin: 0;
+  line-height: 1.5;
+}
+.railfilterlabels .railfilterlabel[aria-pressed='true'] {
+  border-color: var(--vscode-focusBorder);
+  color: var(--vscode-foreground);
+  background: var(--chipbg);
+}
+.railfilterlabelname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.railfilterlabelcount {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+.railfilterlabels .railfilterlabelsmore {
+  border-style: dashed;
+}
+/* The Quick filters line under the Filter pills: its name on one line, then the three
+   checkboxes of the Show rows' shape laid out on one line of their own. */
+.railfiltersectionname.railheadlensname {
+  padding: 0.55em 0.9em 0;
+}
+.railheadlensline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.15em 0.75em;
+  padding: 0.15em 0.75em;
+}
+.railheadlensline > .labelrow {
+  gap: 0.33em;
+  padding: 0.17em 0;
+}
+.railfilternamefield .labelnote {
+  padding: 4px 0 0;
+}
+.railfilteractions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+.launchfield {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px 10px;
+}
+.launchfieldname {
+  color: var(--idle);
+  font: inherit;
+  font-size: var(--t-body);
+}
+.launchselect {
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: var(--t-body);
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--edge));
+}
+.launchselect:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.launchactions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 10px 10px;
+}
+.launchback,
+.launchcreate {
+  padding: 4px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font: inherit;
+  font-size: var(--t-body);
+}
+.launchback {
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+}
+.launchcreate {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+.launchcreate[disabled] {
+  cursor: default;
+  opacity: 0.5;
+}
+.launchback:focus-visible,
+.launchcreate:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+/* The completion menu stands over the box and lines up with the text it completes. */
+#slashpop {
+  max-height: min(40vh, 320px);
+}
+.slashrow {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 11px;
+  cursor: pointer;
+  font-size: var(--t-body);
+  color: var(--vscode-foreground);
+}
+.slashhead {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  min-width: 0;
+}
+.slashname {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.slashhint {
+  color: var(--idle);
+  font-size: var(--t-small);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* One line of the agent's own sentence. The menu is a way to the command rather than its
+   documentation, and a row per paragraph would push the rest of the list off the top. */
+.slashwhy {
+  color: var(--idle);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The highlight the arrow keys move. It is drawn rather than focused: the caret stays in the
+   box, so no row ever takes focus and a focus ring would never appear on one. */
+.slashrow.on,
+.slashrow:hover {
+  background: var(
+    --vscode-list-activeSelectionBackground,
+    color-mix(in srgb, var(--vscode-foreground) 14%, transparent)
+  );
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+.slashrow.on .slashhint,
+.slashrow.on .slashwhy {
+  color: inherit;
+  opacity: 0.8;
+}
+
+/* The list the rail's filter box offers while a term is being typed. It stands under the box
+   and takes its width from it in placeFilterPop, so it lines up with the text it is
+   completing however wide the rail is dragged. Shorter than the command menu, because it sits
+   over the cards it is about to narrow. */
+#filterpop {
+  max-height: min(34vh, 260px);
+}
+/* No gap between the axis and the name: the two are one word once the row is taken, and a
+   space between them reads as two things the reader has to join up. */
+.filterrow {
+  display: flex;
+  align-items: baseline;
+  padding: 5px 11px;
+  cursor: pointer;
+  font-size: var(--t-body);
+  color: var(--vscode-foreground);
+}
+/* The axis the row writes, ahead of the name. Quieter than the name, because the name is what
+   the reader is looking for and the axis is the same word on every row of the list. */
+.filteraxis {
+  flex: none;
+  color: var(--idle);
+}
+/* A name longer than the rail is cut rather than allowed to push the count off the row. */
+.filtername {
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The figure sits at the right-hand edge, in a font whose digits are one width, the way the
+   label editor's counts are drawn. */
+.filtercount {
+  flex: none;
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--idle);
+  font-size: var(--t-small);
+  font-variant-numeric: tabular-nums;
+}
+/* The highlight the arrow keys move. Drawn rather than focused: the caret stays in the box,
+   so no row ever takes focus and a focus ring would never appear on one. */
+.filterrow.on,
+.filterrow:hover {
+  background: var(
+    --vscode-list-activeSelectionBackground,
+    color-mix(in srgb, var(--vscode-foreground) 14%, transparent)
+  );
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+.filterrow.on .filteraxis,
+.filterrow.on .filtercount {
+  color: inherit;
+  opacity: 0.8;
+}
+/* The session rail: one card per session, in a column of its own beside the list.
+   The width it appears at is RAIL_MIN_WIDTH in turnrail.ts, interpolated here and into
+   the script's own matchMedia, so the stylesheet and the script cannot disagree; the
+   script also refuses to draw a collapsed rail at all, so the arrow-key walk never holds
+   controls this rule has made invisible. The sidebar host sits below the width and keeps
+   today's single list; the editor tab is where the rail earns its column. Sticky against
+   the page scroll and scrolling on its own past the viewport, the way the control bar
+   and the session headings already hold their ground. */
+body {
+  display: flex;
+  align-items: flex-start;
+}
+/* The fixed foot takes no space of its own. Reserve it in the timeline column so the last
+   card remains reachable without shortening the sticky rail's containing block when the
+   page reaches its end. The four-pixel reserve keeps the rail's containing block unchanged. */
+#list {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 0 calc(var(--foot-height, 0px) + 28px);
+}
+#rail {
+  box-sizing: border-box;
+  flex: 0 0 __ARC_RAIL_WIDTH_DEFAULT__px;
+  position: sticky;
+  top: 0;
+  container-type: inline-size;
+  height: calc(100vh - var(--statusbar-height, 0px));
+  overflow-y: auto;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  border-right: 1px solid var(--edge);
+  display: flex;
+  flex-direction: column;
+  scroll-padding-top: var(--rail-top, 0px);
+  padding: 0;
+}
+#rail[hidden] {
+  display: none;
+}
+/* The session list separator resizes through pointer movement or keyboard presses. */
+#railsash {
+  flex: none;
+  width: 5px;
+  cursor: col-resize;
+  position: sticky;
+  top: 0;
+  height: calc(100vh - var(--statusbar-height, 0px));
+}
+.sash:hover,
+.sash:focus-visible {
+  background: var(--edge);
+}
+#railsash:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+#railsash[hidden] {
+  display: none;
+}
+@media (max-width: __ARC_RAIL_MIN_WIDTH_LESS_ONE__px) {
+  #rail,
+  #railsash {
+    display: none;
+  }
+}
+/* The rail's launcher and filter stay over its cards. Neither is rebuilt, so the reader's
+   focus and the filter caret survive every redraw. Over the bucket headings by the rule
+   rather than by where each one sits in the markup, the way the list's control bar is
+   over its session headings. */
+.railtop {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: none;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+/* The list never shrinks, so `#rail` stays the scroll owner and its scroll position is the one the
+   panel saves. The padding under the list keeps the last row reachable. */
+.raillist {
+  flex: 1 0 auto;
+  padding-bottom: 24px;
+}
+.railgrouplist {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.railnewsplit {
+  display: flex;
+  flex: none;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  overflow: hidden;
+}
+/* The boxes are written in em against their own text. That text reads at the small step
+   rather than at the panel's size. The control grows with the editor font size the way its
+   label does. */
+.railnew,
+.railnewmenu {
+  height: 1.968em;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: var(--t-small);
+  cursor: pointer;
+}
+.railnew {
+  padding: 0.089em 0.537em;
+  font-weight: 600;
+}
+.railnewmenu {
+  width: 1.878em;
+  padding: 1px;
+  border-left: 1px solid var(--edge);
+}
+.railnew:hover,
+.railnewmenu:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.railnew:focus-visible,
+.railnewmenu:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+.railbox {
+  position: relative;
+  margin-bottom: 0;
+  padding: 6px;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--edge);
+}
+/* The offer to keep the query, under the box it was typed into. It borrows the launcher
+   popover's row rules, so one press in the rail looks like one press in a popover, and takes
+   back the side padding the popover needs and the rail box already has. */
+.railbox .railviewsave {
+  padding: 0.308em 0 0;
+  font-size: var(--t-small);
+}
+.railbox .railviewsave .launchname {
+  font-weight: 400;
+  color: var(--vscode-textLink-foreground, var(--vscode-focusBorder));
+}
+.railbox .railviewsave:hover,
+.railbox .railviewsave:focus-visible {
+  background: none;
+}
+.railbox .railviewsave:hover .launchname {
+  text-decoration: underline;
+}
+/* The note and the key hint under the name box, in the rail's own padding rather than the
+   popover's. */
+.railbox .labelnote {
+  padding: 0.333em 0 0;
+}
+
+.projectspendhost[hidden] {
+  display: none;
+}
+.projectspendbutton {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: var(--t-body);
+  text-align: left;
+  cursor: pointer;
+  color: var(--vscode-foreground);
+  background: transparent;
+}
+.projectspendbutton:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.projectspendbutton:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+.projectspendname {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+.projectspendamount,
+.projectspendtwist {
+  flex: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.projectspendtwist {
+  color: var(--idle);
+}
+/* The period rides with the figure and reads as its unit. The dim colour sets it apart where
+   a space would break the pair up. A whole value the panel cannot price takes that colour. */
+.projectspendwhen,
+.projectspendamount.quiet {
+  color: var(--idle);
+}
+.projectspendpop {
+  width: min(340px, calc(100vw - 12px));
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+}
+.projectspendpophead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 9px;
+}
+.projectspendpoptitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+.projectspendcalculating {
+  margin: 4px 0;
+  color: var(--idle);
+}
+/* Every period at once, one column each, with the agents and their total down the side. The
+   pressed column heading tints the column under it. */
+.projectspendgrid {
+  width: 100%;
+  margin: 0 0 8px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.projectspendgrid th,
+.projectspendgrid td {
+  padding: 4px 6px;
+  text-align: right;
+  white-space: nowrap;
+}
+.projectspendgrid thead th {
+  padding: 0 2px 6px;
+}
+.projectspendgrid tbody th {
+  padding-left: 0;
+  text-align: left;
+  font-weight: 600;
+}
+.projectspendtotal th,
+.projectspendtotal td {
+  border-top: 1px solid var(--edge);
+  font-weight: 600;
+}
+.projectspendcell.selected {
+  background: color-mix(in srgb, var(--vscode-focusBorder) 16%, transparent);
+}
+.projectspendgrid tbody tr:last-child .projectspendcell.selected {
+  border-radius: 0 0 3px 3px;
+}
+.projectspendcell.lower {
+  text-decoration: underline dotted;
+  text-decoration-color: var(--idle);
+  text-underline-offset: 3px;
+}
+.projectspendperiod {
+  width: 100%;
+  margin: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: none;
+  color: var(--idle);
+  font: inherit;
+  font-size: var(--t-small);
+  cursor: pointer;
+}
+.projectspendperiod[aria-pressed='true'] {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-list-activeSelectionBackground, transparent);
+}
+/* The narrowest panel cannot hold the table's own words. A column of cells reading Unknown
+   asks for more than the box has, and every cell refuses to wrap, so the table would be drawn
+   past the edge of the dialog and read sideways. The cells and the period controls give up
+   their side padding here, which costs the eye some air and keeps every column on screen. */
+@media (max-width: 360px) {
+  .chippop.chippop-economics .chippopitemhead,
+  .chippop.chippop-economics .chippophead {
+    display: block;
+  }
+  .chippop.chippop-economics .chippopvalue {
+    display: block;
+    margin-top: 0.2em;
+    text-align: left;
+  }
+  .projectspendgrid th,
+  .projectspendgrid td {
+    padding-left: 3px;
+    padding-right: 3px;
+  }
+  .projectspendgrid thead th {
+    padding-left: 1px;
+    padding-right: 1px;
+  }
+  .projectspendgrid tbody th {
+    padding-left: 0;
+  }
+  .projectspendperiod {
+    padding-left: 3px;
+    padding-right: 3px;
+  }
+}
+/* The words under the table and inside Pricing details read at the panel's own size. They
+   carry why a figure is a lower bound and which rates built it. A reader reads them rather
+   than glancing at them. */
+.projectspendrate {
+  margin: 3px 0 0;
+  color: var(--idle);
+  line-height: 1.4;
+}
+/* One row of running text, so the two facts share a line rather than each holding one. The
+   dot between them is written into the text, behind a space that cannot break, so no line can
+   open with it. */
+.projectspendmeta {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--edge);
+  color: var(--idle);
+  line-height: 1.4;
+}
+/* The indexing word stands in the place of the update age, and one is shorter than the other.
+   Held to one width, the row is the same width whichever of them is in it, so it wraps at the
+   same point and the box keeps its height as the index starts and stops. The two sit at the
+   end of the row, so the slack behind the shorter one falls where nothing follows it. The
+   width takes the longest age the ladder writes, `Updated 12mo ago`, and a little air. */
+.projectspendupdated,
+.projectspendupdating {
+  display: inline-block;
+  min-width: 9.5em;
+}
+.projectspendpricing,
+.context-measurement {
+  margin-top: 8px;
+  color: var(--idle);
+}
+.projectspendpricing summary,
+.context-measurement summary {
+  cursor: pointer;
+}
+/* One rate to a line. The order on screen is the order the pricing tries. No word between
+   two lines carries it. */
+.projectspendratelist {
+  margin: 3px 0 0;
+  padding-left: 18px;
+  line-height: 1.4;
+}
+.projectspendrailhost {
+  border-bottom: 1px solid var(--edge);
+}
+/* The rail narrows to 160px, and the label is one phrase that must not break. Where the label
+   and the figure cannot share the line, the figure takes a line of its own. The caret leaves
+   the flow to stay out of that wrap, and the padding keeps the label clear of it. The compact
+   bar wraps for nothing, so none of this reaches it. */
+.projectspendrailhost .projectspendbutton {
+  position: relative;
+  flex-wrap: wrap;
+  row-gap: 1px;
+  padding-right: 24px;
+}
+.projectspendrailhost .projectspendname {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.projectspendrailhost .projectspendamount {
+  margin-left: auto;
+}
+.projectspendrailhost .projectspendtwist {
+  position: absolute;
+  right: 8px;
+  top: 6px;
+}
+.projectspendcompacthost {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+}
+.projectspendcompacthost.projectspendonly {
+  flex: 1 1 auto;
+  max-width: none;
+}
+.projectspendcompacthost .projectspendbutton {
+  width: auto;
+  padding: 3px 4px;
+  border-radius: 3px;
+}
+.projectspendcompacthost.projectspendonly .projectspendbutton {
+  width: 100%;
+}
+.projectspendcompacthost .projectspendname {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.projectspendcompacthost .projectspendamount {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.projectspendcompacthost {
+  position: static;
+}
+.railempty {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: var(--t-body);
+  color: var(--idle);
+}
+/* Bucket headings stick below the measured rail head. Their background covers passing cards. */
+.railbucket {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 9px 10px 3px;
+  text-align: left;
+  font: inherit;
+  font-size: 1em;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--idle);
+  position: sticky;
+  top: var(--rail-top, 0px);
+  z-index: 1;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+.railbucket.railviewheading {
+  padding-right: 2.85em;
+}
+.railviewfold {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: inherit;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-small);
+  font-weight: 600;
+  text-align: left;
+  text-transform: inherit;
+  letter-spacing: inherit;
+}
+.railviewfold:hover {
+  color: var(--vscode-foreground);
+}
+.railviewfold:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+.railcard:focus-visible,
+.railact:focus-visible {
+  outline-offset: -2px;
+}
+.railviewheading > .railviewmenu {
+  position: absolute;
+  right: 0.714em;
+  top: 0.35em;
+  opacity: 0;
+}
+.railviewheading:hover > .railviewmenu,
+.railviewheading:focus-within > .railviewmenu {
+  opacity: 1;
+}
+.railbucket .twist {
+  flex: none;
+  width: 0.9em;
+  letter-spacing: 0;
+}
+/* The label is the one thing that gives way, the way a card's title gives way to the figures
+   beside it. Every heading has to be the same height: they rest at the same line and the
+   newer one covers the one before it, so a label wrapped to two lines leaves a strip of the
+   words underneath showing around it. A raised editor font at the rail's narrowest wrapped
+   the longest of them. */
+.railbucketname {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.railbucketcount {
+  flex: none;
+  font-weight: 400;
+  letter-spacing: 0;
+  opacity: 0.75;
+}
+/* The line under a view whose query reaches nothing. It sits where the cards would be. */
+.railsectionempty {
+  padding-top: 0.333em;
+  padding-bottom: 0.833em;
+}
+/* The press under a section that draws its next rows. It sits where the next card would be,
+   in the rail's muted tone, and reads as text until the pointer or the focus reaches it. It is
+   the full width of the rail, so its focus ring is drawn inside. */
+.railmore {
+  appearance: none;
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0.5em 0.833em 0.833em;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  text-align: left;
+  font: inherit;
+  font-size: var(--t-body);
+  color: var(--idle);
+  cursor: pointer;
+}
+.railmore:hover {
+  color: var(--vscode-foreground);
+  text-decoration: underline;
+}
+.railmore:focus-visible {
+  outline-offset: -2px;
+}
+/* The mark that tells a saved view's section from a bucket the clock made, down the left edge
+   of every card under the heading. The heading itself carries none: it is upper-cased and
+   spaced apart already, and a bar behind a folded section would mark a run of nothing.
+   Provisional: the owner rejected indented cards in another candidate, and this rule is the
+   whole of it. */
+.railviewedge {
+  box-shadow: inset 2px 0 0 var(--vscode-focusBorder);
+}
+/* A shut bucket, hidden by the panel rather than by the browser's own default for the
+   attribute, so a stylesheet loaded on its own still folds. One selector per bucket, which
+   is what lets a test hold the list against the fold table. */
+.railpinnedwrap[hidden],
+.railtodaywrap[hidden],
+.railyesterdaywrap[hidden],
+.railweekwrap[hidden],
+.railolderwrap[hidden],
+.railagentwrap[hidden],
+.railarchivedwrap[hidden] {
+  display: none;
+}
+/* One session row: the card, and over its top right corner the archive and pin
+   controls. The controls are siblings of the card, because a button inside a button is
+   markup no browser will build; they appear on hover and on focus, the way the heading's
+   hide does, except a set pin, which stays visible so the state can be seen without
+   hovering. The row owns the separator so the controls sit inside it.
+
+   The card takes the whole width and the controls are drawn over it, rather than each
+   row keeping a strip of column for two buttons that are invisible most of the time: at
+   the rail's own width those two targets were a fifth of it, and the name and the meta
+   line under it wrapped to pay for them. The tint the row is painted in is passed down
+   from here, because the controls have to be painted on whatever the row is. */
+.railrow {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--edge);
+  --railtint: transparent;
+}
+.railrow .railcard {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-bottom: 0;
+}
+/* A target big enough to hit: a finger's width square, in the row's top right corner the
+   way the mockup draws it, with its own rounded ground under the pointer so the reader
+   can see which of the two they are about to press. The pin takes the corner as a visible
+   status when set, and the archive sits one target to its left. Each is placed by a rule
+   of its own: a box around the pair
+   would put a third element between the row and the controls, which the in-place rewrite,
+   the arrow-key walk and the focus restore all reach as the card's own siblings.
+
+   A control drawn over the card needs a ground of its own, or the name under it runs
+   through the glyph. The row is three different colours, its own, the hover tint over it
+   and the shown session's tint over it, so the ground is painted the way an unread
+   turn card's wash is: an opaque colour with the row's tint drawn over it as an image. A
+   single flat colour reads as a hole punched in a lit row. The two grounds meet with no
+   gap between them, or a long name shows a sliver of a letter through it.
+
+   The opaque colour is the one the rail's own filter box sits on, named in the same order.
+   The panel body is transparent, so what is behind a row is whatever the host paints, and
+   the two hosts do not paint the same thing: a control naming the editor background is a
+   pair of lighter squares over the row in a side bar wide enough to show the rail, and a
+   pinned card makes them permanent rather than something only a hover brings out.
+
+   The box stays in pixels while the glyph inside it follows the editor font size. It is laid
+   over the card's own rows rather than in them. The two controls beside it are placed by its
+   width, so a box that grew would cover the metadata line under it. It would also ride over
+   its own neighbours on the narrowest rail. */
+.railact {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  height: 22px;
+  appearance: none;
+  border: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 0.9em;
+  color: var(--idle);
+  opacity: 0;
+  background-color: var(--vscode-sideBar-background, var(--vscode-editor-background, #1f1f1f));
+  background-image: linear-gradient(var(--railtint), var(--railtint));
+}
+.railact.railhide {
+  right: 28px;
+}
+.railact.raillabelact {
+  right: 50px;
+}
+.railrow:hover .railact,
+.railact:focus-visible {
+  opacity: 1;
+}
+/* The chip under the pointer is a third layer over the same ground, not a background of
+   its own: the toolbar tone a theme gives is translucent in some of them, and written as
+   the whole background it would take the opaque colour off with it. */
+.railact:hover {
+  color: var(--vscode-foreground);
+  background-image:
+    linear-gradient(
+      var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2)),
+      var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2))
+    ),
+    linear-gradient(var(--railtint), var(--railtint));
+}
+.railact.railpin.is-pinned {
+  opacity: 1;
+  color: var(--notice);
+}
+.railact svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* The left padding holds the unread dot, so it is there on every card and a card that
+   gains one does not shift. It is wider than the dot needs by more than the dot's own
+   width: at the 7px the dot ended a hair from the title and the two read as one mark. */
+.railcard {
+  --rail-status-border: 0px;
+  position: relative;
+  display: block;
+  padding: 7px 10px 7px 26px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--edge);
+}
+/* Three states earn a border and no others. A colour on every card made green the resting
+   state, which reads as a claim rather than as silence. Running, waiting and failed are the
+   ones a reader wants to catch at a glance, and finished is the quiet default. Each reads
+   its own token: --busy for work under way, --need for a session stopped on the reader,
+   and --bad for one that failed. Running and waiting shared one tone once, and the rail then
+   answered the only question a colour is there to answer with the same colour twice. The
+   padding shrinks by the border's width, so the text stays on the same line as its
+   neighbours'. The word beside the time says the same thing, because a colour reads out as
+   nothing. */
+.railcard.running {
+  border-left: 3px solid var(--busy);
+  padding-left: 23px;
+  --rail-status-border: 3px;
+}
+/* A session whose background subagents still work, or whose agent waits on a background
+   command, wears the running edge. It sorts and filters with running sessions, so it looks like
+   one at a glance, and its word says which. */
+.railcard.subagents,
+.railcard.background {
+  border-left: 3px solid var(--busy);
+  padding-left: 23px;
+  --rail-status-border: 3px;
+}
+.railcard.waiting {
+  border-left: 3px solid var(--need);
+  padding-left: 23px;
+  --rail-status-border: 3px;
+}
+.railcard.failed {
+  border-left: 3px solid var(--bad);
+  padding-left: 23px;
+  --rail-status-border: 3px;
+}
+/* A session holding turns nobody has opened, marked the way an unread message is.
+   Drawn by the stylesheet in the card's own left padding, so it carries no hover of its
+   own; the accessible name says how many in words, and so does the badge on the
+   session's own heading beside the list. */
+.railcard.is-unread::before {
+  content: '';
+  position: absolute;
+  left: calc(8px - var(--rail-status-border));
+  top: 12px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--unread);
+}
+/* The shown session, marked the way an explorer marks the open file, and the row
+   under the pointer. Both light the whole row rather than the card alone, so the card and
+   the two controls over it read as one block. The hover rule is written at the weight
+   of the rule above it and after it, so pointing at the shown session still answers
+   instead of being outweighed by the mark saying it is shown. Each states its tint twice,
+   once as its own background and once as the value the controls over it are painted with,
+   so a control can never be left sitting on a colour the row no longer wears. */
+.railrow:has(> .railcard.is-current) {
+  background: var(--vscode-list-inactiveSelectionBackground, rgba(128, 128, 128, 0.14));
+  --railtint: var(--vscode-list-inactiveSelectionBackground, rgba(128, 128, 128, 0.14));
+}
+.railrow:hover:has(> .railcard) {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+  --railtint: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+/* A name at the weight of ordinary text, until the session has something in it the
+   reader has not opened. */
+.railname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The name gives way while the controls are drawn over it, and takes the room back the moment
+   they go. Three of them reach a third of the way across the narrowest rail the sash allows,
+   and a title cut by the card's own edge runs under them instead of ending where it can be
+   read. The room is taken only when there is something to make room for, so a card nobody is
+   pointing at keeps its whole width for its name. The two selectors mirror the rule that
+   shows the controls, or the name would give way to controls that are not there. */
+.railrow:hover .railname,
+.railrow:has(.railact:focus-visible) .railname {
+  padding-right: 64px;
+}
+.railcard.is-unread .railname {
+  font-weight: 600;
+  color: var(--vscode-settings-headerForeground, var(--vscode-foreground));
+}
+/* An archived card, inside the bucket that holds it. Dimmer than a live one, because the
+   reader who opened that bucket is looking for one session rather than reading the
+   rail, and a run of cards at full weight reads as a second rail under the first. The
+   whole card dims rather than the name alone: an unread archived session still wears
+   its dot and its weight, and dimming only the name would leave the two fighting. */
+.railcard.is-archived {
+  opacity: 0.62;
+}
+.railcard.is-archived:hover,
+.railrow:hover > .railcard.is-archived {
+  opacity: 1;
+}
+/* One line, whatever it is holding, and never wider than the card. The name above it was
+   given nowrap and an ellipsis when it was written and this line was not, so each of its
+   spans shrank to its longest word and then wrapped inside it: the agent's name over two
+   lines with the time under it over two more.
+
+   Which one gives way is set by the shrink weights rather than left to the browser, which
+   would take the same share off each and cut the time first, since the time is the widest
+   of the three. The agent's name goes first and almost alone, because it is the one a
+   reader can still place from a letter or two. The time gives way only once the name is
+   spent, which at the narrowest the sash allows is a pixel or so. The status word never
+   does. It can be a phrase rather than a single word, `needs input` beside `running` and
+   `failed`, and none of the three survives a cut. */
+.railmeta {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: baseline;
+  margin-top: 2px;
+  font-size: var(--t-small);
+  color: var(--idle);
+}
+.railmeta > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.railagent {
+  flex-shrink: 100;
+}
+.railwhen {
+  flex-shrink: 1;
+}
+.railstatus,
+.railunsent {
+  flex: none;
+}
+.railcache {
+  flex: none;
+  align-self: center;
+  width: 12px;
+  height: 12px;
+  overflow: visible;
+  color: inherit;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.railcache.is-nearly-gone {
+  color: var(--need);
+  fill: currentColor;
+}
+/* The status and unsent words sit in the meta line whether or not the card has one to say,
+   so either can move while the card is kept under the reader. An empty one is taken out of
+   the flex flow, or it would leave a gap where a word never was. */
+.railstatus:empty,
+.railunsent:empty {
+  display: none;
+}
+.railstatus.running {
+  color: var(--busy);
+}
+.railstatus.subagents,
+.railstatus.background {
+  color: var(--busy);
+}
+.railfor {
+  font-variant-numeric: tabular-nums;
+}
+.railstatus.waiting {
+  color: var(--need);
+  font-weight: 600;
+}
+.railstatus.failed {
+  color: var(--bad);
+}
+/* Unsent input and a new session draft are both unfinished work owned by the reader.
+   They share the editor's modified-resource tone, while the visible word and accessible
+   name keep the meaning independent of colour. */
+.railunsent {
+  color: var(--mod);
+}
+/* Cost and current context keep their own line under the card metadata. The figures are
+   plain spans inside the session button, so the card remains the rail's only action
+   and the arrow-key walk keeps one stop per session. */
+.railstats {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+  margin-top: 5px;
+  color: var(--idle);
+  font-variant-numeric: tabular-nums;
+}
+.railstats[hidden] {
+  display: none;
+}
+.railstatchip {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Keep the figure that answered a cost filter whole at the rail's minimum width. The
+   turn and context figures can still yield the remaining line space. */
+.railstatchip[data-metric='cost'] {
+  flex-shrink: 0;
+}
+.railstats .ctx-filling {
+  color: var(--notice);
+  background: color-mix(in srgb, var(--notice) 12%, transparent);
+}
+.railstats .ctx-getting-full {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+}
+.railstats .ctx-nearly-full {
+  color: var(--full);
+  background: color-mix(in srgb, var(--full) 26%, transparent);
+}
+
+/* The labels the reader put on the session, on their own line under the figures.
+   Outlined rather than filled, because the figures above them are filled chips of the same
+   size and shape: two filled runs on one card would read as a single line of chips, and the
+   eye would have to read the words to tell which of them the reader wrote. They are plain
+   spans inside the session button, like the figures, so the card remains the rail's
+   only action.
+
+   One line and never two. A card wearing labels is taller than one without by exactly that
+   line, whatever the labels say, and no label can make it taller again. A label too long for
+   the room it has is cut where it stands, and its own hover carries the whole of it. The
+   folded count is held at its full width, because it is the piece that says the line is
+   showing less than the card carries. */
+.raillabels {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 4px;
+  overflow: hidden;
+}
+/* A flex row draws through the hidden attribute, whose own rule this one outranks, so a card
+   with no label needs the line taken out here as well. */
+.raillabels[hidden] {
+  display: none;
+}
+/* Compact rows: each card on one line, the name then the state slot, the age and the cache
+   mark. The card markup is the same in both densities, so the figure line, the label line and
+   the agent word leave the drawing here. The accessible name still says them, and the renderer
+   gives a compact card a hover that says them too. The state slot never shrinks, so the name
+   gives way to a running phrase. The controls cover the metadata rather than the name. While
+   they are drawn, the hidden metadata keeps at least the room the comfortable name gives up
+   for them, so a short age and a cache mark still leave the name ending before the controls
+   rather than under them. A pinned card draws its pin at rest,
+   so the card keeps the pin's box and its right inset clear, and the metadata ends before it. */
+#rail[data-density='compact'] .railstats,
+#rail[data-density='compact'] .raillabels,
+#rail[data-density='compact'] .railagent {
+  display: none;
+}
+#rail[data-density='compact'] .railcard {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  padding-top: 0.4em;
+  padding-bottom: 0.4em;
+}
+#rail[data-density='compact'] .railname {
+  flex: 1 1 auto;
+}
+#rail[data-density='compact'] .railmeta {
+  flex: none;
+  margin-top: 0;
+}
+#rail[data-density='compact'] .railstatus {
+  flex: none;
+}
+#rail[data-density='compact'] .railcard.is-unread::before {
+  top: 50%;
+  margin-top: -3.5px;
+}
+#rail[data-density='compact'] .railact {
+  top: 2px;
+}
+#rail[data-density='compact'] .railrow:has(.railpin.is-pinned) .railcard {
+  padding-right: 32px;
+}
+#rail[data-density='compact'] .railrow:hover .railname,
+#rail[data-density='compact'] .railrow:has(.railact:focus-visible) .railname {
+  padding-right: 0;
+}
+#rail[data-density='compact'] .railrow:hover .railmeta,
+#rail[data-density='compact'] .railrow:has(.railact:focus-visible) .railmeta {
+  visibility: hidden;
+  min-width: 64px;
+}
+/* One outlined chip, drawn the same wherever a label is shown: on a rail card, on the
+   session heading's own line, and in the View menu. Two rules would let one grow a border, a radius or a tone the
+   other does not, and the reader would then have to read the words to tell that the two
+   lines are saying the same thing. Each cuts itself where it stands, because both lines are
+   drawn in a column the reader can narrow. */
+.raillabel,
+.sessionlabel,
+.railfilterlabel {
+  min-width: 0;
+  padding: 0 6px;
+  border: 1px solid var(--edge);
+  border-radius: 7px;
+  font-size: var(--t-small);
+  color: var(--idle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The same chip when it is a control: on the session heading, where a press files the rail
+   under that label, and in the View menu, where a press adds or removes the label in the rail
+   query. It keeps the box the rule above draws and takes only what a button needs
+   to stop looking like one: the browser's own ground, border and font go, and the pointer
+   says the chip can be pressed. The border it shares is what carries the hover, so a chip
+   answers the pointer with the colour the label editor's own button uses.
+
+   The rail's chips never match this. They sit inside the card's button and a button cannot
+   hold another one, so a press there has nowhere to go. */
+button.sessionlabel,
+button.railfilterlabel {
+  appearance: none;
+  background: none;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+button.sessionlabel:hover,
+button.railfilterlabel:hover:not(:disabled) {
+  border-color: var(--vscode-focusBorder);
+  color: var(--vscode-foreground);
+}
+button.sessionlabel:focus-visible,
+button.railfilterlabel:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+/* The folded count, held at its full width while a label beside it gives way. Named for the
+   element and not for the state, because `.more` in this sheet is the prompt box's own
+   control: a chip wearing it takes that rule's colour, spacing and top margin, and the count
+   then sits below the labels it belongs beside. */
+.raillabelmore {
+  flex: none;
+}
+
+/* The labels the reader put on the session the panel is showing, under the figures on
+   the session heading, with the one way into the label editor that this view offers at the
+   end of the line.
+
+   It wraps where the rail's own line refuses to. A card is only as wide as the reader
+   dragged the rail, so its line folds what it cannot draw into a count. This line has the
+   width of the panel, so it draws every label the session carries and takes a second
+   row where it needs one. Indented to the figures above it, so the heading reads as one
+   block down the same edge. */
+.sessionlabels {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 5px;
+  padding: 0 10px 8px calc(0.8em + 16px);
+}
+.sessionlower {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+  padding: 0 10px 8px calc(0.8em + 16px);
+  gap: 3px 5px;
+}
+.sessionlower .sessionlabels {
+  padding: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sessiondetailscopy,
+.sessiondetailsclose {
+  appearance: none;
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: none;
+  color: var(--vscode-textLink-foreground);
+  font: inherit;
+  font-size: var(--t-small);
+  line-height: inherit;
+  cursor: pointer;
+  padding: 0 0.5em;
+  flex: none;
+  white-space: nowrap;
+}
+.sessiondetails {
+  position: fixed;
+  width: 32em;
+  max-width: calc(100vw - 2em);
+  max-height: calc(100vh - 2em);
+  overflow: auto;
+  padding: 0.8em 1em;
+}
+.sessiondetails[hidden] {
+  display: none;
+}
+.sessiondetailshead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5em;
+}
+.sessiondetails h2 {
+  margin: 0 0 0.6em;
+  font-size: var(--t-body);
+}
+.sessiondetails dl {
+  margin: 0;
+}
+.sessiondetails dt {
+  margin-top: 0.5em;
+  color: var(--idle);
+  font-size: var(--t-small);
+}
+.sessiondetails dd {
+  display: flex;
+  gap: 0.5em;
+  align-items: start;
+  margin: 0.1em 0 0;
+}
+.sessiondetailsvalue {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  user-select: text;
+}
+.sessiondetailscopy:focus-visible,
+.sessiondetailsclose:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+@media (max-width: 360px) {
+  .sessiondetails {
+    width: auto;
+    left: 6px;
+    right: 6px;
+    max-width: none;
+  }
+  .sessiondetails dd {
+    flex-wrap: wrap;
+  }
+  .sessiondetailscopy {
+    margin-left: auto;
+  }
+}
+/* The press that opens the editor, at the size and shape of the chips beside it so the line
+   reads as one run. Drawn in the link colour rather than the resting grey, because it is the
+   one thing on the line that does something. */
+.sessionlabelact {
+  appearance: none;
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--edge);
+  border-radius: 7px;
+  background: none;
+  color: var(--vscode-textLink-foreground);
+  font: inherit;
+  font-size: var(--t-small);
+  line-height: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sessionlabelact:hover {
+  border-color: var(--vscode-focusBorder);
+}
+.sessionlabelact:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.context-detail {
+  width: 24.62em;
+  max-width: calc(100% - 0.92em);
+  pointer-events: auto;
+}
+.context-bound {
+  align-items: center;
+}
+.context-bound .cpick {
+  flex: none;
+  margin-left: auto;
+}
+.context-remaining {
+  white-space: nowrap;
+}
+.context-remaining-label {
+  color: var(--vscode-foreground);
+}
+.context-notes {
+  margin: 0.7em 0;
+  padding-left: 1.2em;
+  list-style: disc;
+}
+.context-note {
+  margin: 0.3em 0;
+  color: var(--vscode-foreground);
+}
+.context-notes.context-caveats {
+  margin: 0.6em 0 0;
+  font-size: var(--t-small);
+}
+.context-caveats .context-note {
+  margin: 0.1em 0;
+}
+.context-breakdown {
+  margin-top: 0.6em;
+}
+.context-columns {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding-bottom: 0.3em;
+}
+.context-columns > span {
+  font-size: var(--t-small);
+  color: var(--vscode-foreground);
+  white-space: nowrap;
+}
+.context-columns > span + span {
+  text-align: right;
+}
+.context-categories {
+  display: grid;
+  gap: 0.6em;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: inherit;
+  line-height: inherit;
+}
+.context-categories li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 0.9em;
+  align-items: baseline;
+  row-gap: 0.1em;
+  overflow-wrap: anywhere;
+  color: var(--vscode-foreground);
+}
+.context-category-label {
+  min-width: 0;
+}
+.context-meter {
+  width: 100%;
+  grid-column: 1 / -1;
+}
+.context-share {
+  color: var(--vscode-foreground);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.context-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5em 0 0;
+  font: inherit;
+}
+.context-table th,
+.context-table td {
+  padding: 0.26em 0;
+  vertical-align: top;
+  text-align: left;
+  border: 0;
+}
+.context-table thead th {
+  font-weight: 400;
+  color: var(--vscode-foreground);
+  padding-bottom: 0.42em;
+  font-size: var(--t-small);
+}
+.context-table tbody th {
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.context-table th:nth-child(2),
+.context-table td:nth-child(2) {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  padding-left: 0.9em;
+}
+.context-table th:first-child {
+  width: 100%;
+}

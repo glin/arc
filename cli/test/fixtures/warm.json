@@ -1,0 +1,50 @@
+{
+  "model": {
+    "id": "claude-opus-5",
+    "display_name": "Opus"
+  },
+  "effort": {
+    "level": "high"
+  },
+  "cwd": "C:/Users/dev/Projects/work/sample-repo",
+  "session_id": "session-123",
+  "session_name": "Status line POC",
+  "workspace": {
+    "current_dir": "C:/Users/dev/Projects/work/sample-repo",
+    "project_dir": "C:/Users/dev/Projects/work/sample-repo",
+    "repo": {
+      "host": "github.com",
+      "owner": "example",
+      "name": "arc"
+    }
+  },
+  "cost": {
+    "total_cost_usd": 0.1234,
+    "total_duration_ms": 45000
+  },
+  "context_window": {
+    "total_input_tokens": 15500,
+    "total_output_tokens": 1200,
+    "context_window_size": 200000,
+    "used_percentage": 8,
+    "remaining_percentage": 92
+  },
+  "prompt_cache": {
+    "warm": true,
+    "caching_observed": true,
+    "ttl": "1h",
+    "expires_at": 1738429200,
+    "hit_ratio": 0.91,
+    "recache_tokens_if_cold": 45000
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 23.5,
+      "resets_at": 1738432500
+    },
+    "seven_day": {
+      "used_percentage": 41.2,
+      "resets_at": 1738774500
+    }
+  }
+}

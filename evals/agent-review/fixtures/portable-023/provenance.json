@@ -1,0 +1,102 @@
+{
+  "input": [
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/rail-filters.ts",
+      "original_sha256": "2993d8bb982a87a93f4087b87d3ac73f4b912d1a5cbefa73aba49285f12ce86c",
+      "output_path": "src/domain/rail-filters.mjs",
+      "output_sha256": "d9657dff79a49866166b6a11c52e9e73eb2b331fc184991d2cbc5fdb7eeee2f7",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes; control adaptation removes opposite-polarity lens words and incompatible read/running statuses"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/labels.ts",
+      "original_sha256": "c0cb8b2c843922f95d8f7fd3d77e9edd02b42e6b0aacc0272b92f25830f25db1",
+      "output_path": "src/domain/labels.mjs",
+      "output_sha256": "9511d8a8d20ab047141ab04ad82f6d12c8ba9b70173d17aaa604960ba92c3e9b",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/rail-sort.ts",
+      "original_sha256": "cfd00a780ecd66092d9911d8c22309f2c86daa936f13baea077b2d9ef47b9416",
+      "output_path": "src/domain/rail-sort.mjs",
+      "output_sha256": "5c3a72b1d84473ab4ce57052b13799d247d8dacefbffe35109d86b0ebdc6dc01",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/session-query.ts",
+      "original_sha256": "99ad25d54052b32bd7e8e8da7482bf7f399f6ff24043ab9bf8cb37d75e701fa3",
+      "output_path": "src/domain/session-query.mjs",
+      "output_sha256": "6a0e2092d8737501c11384a57136c462ead91c959bf6491edbb0613c0b27973e",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/text.ts",
+      "original_sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4",
+      "output_path": "src/domain/text.mjs",
+      "output_sha256": "6d3166b9aadb27186d7a0dce2a9672c1372575432a7b005a6865bd47f5e23ea8",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/views.ts",
+      "original_sha256": "93a6ca5ddde8f8c27725aeb5b8c7b835419f3a2d80545e390da7a061761d8f35",
+      "output_path": "src/domain/views.mjs",
+      "output_sha256": "523f92be03a6abf178d94df53f7d2ed9299a3985f2392a0ddbe752c6d03fb17f",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    }
+  ],
+  "reference": [
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/rail-filters.ts",
+      "original_sha256": "2993d8bb982a87a93f4087b87d3ac73f4b912d1a5cbefa73aba49285f12ce86c",
+      "output_path": "src/domain/rail-filters.mjs",
+      "output_sha256": "d9657dff79a49866166b6a11c52e9e73eb2b331fc184991d2cbc5fdb7eeee2f7",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes; control adaptation removes opposite-polarity lens words and incompatible read/running statuses"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/labels.ts",
+      "original_sha256": "c0cb8b2c843922f95d8f7fd3d77e9edd02b42e6b0aacc0272b92f25830f25db1",
+      "output_path": "src/domain/labels.mjs",
+      "output_sha256": "9511d8a8d20ab047141ab04ad82f6d12c8ba9b70173d17aaa604960ba92c3e9b",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/rail-sort.ts",
+      "original_sha256": "cfd00a780ecd66092d9911d8c22309f2c86daa936f13baea077b2d9ef47b9416",
+      "output_path": "src/domain/rail-sort.mjs",
+      "output_sha256": "5c3a72b1d84473ab4ce57052b13799d247d8dacefbffe35109d86b0ebdc6dc01",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/session-query.ts",
+      "original_sha256": "99ad25d54052b32bd7e8e8da7482bf7f399f6ff24043ab9bf8cb37d75e701fa3",
+      "output_path": "src/domain/session-query.mjs",
+      "output_sha256": "6a0e2092d8737501c11384a57136c462ead91c959bf6491edbb0613c0b27973e",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/text.ts",
+      "original_sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4",
+      "output_path": "src/domain/text.mjs",
+      "output_sha256": "6d3166b9aadb27186d7a0dce2a9672c1372575432a7b005a6865bd47f5e23ea8",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    },
+    {
+      "source_commit": "d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+      "source_path": "extension/src/domain/views.ts",
+      "original_sha256": "93a6ca5ddde8f8c27725aeb5b8c7b835419f3a2d80545e390da7a061761d8f35",
+      "output_path": "src/domain/views.mjs",
+      "output_sha256": "523f92be03a6abf178d94df53f7d2ed9299a3985f2392a0ddbe752c6d03fb17f",
+      "transformation": "esbuild TypeScript transform removes types and comments; relative imports gain .mjs suffixes"
+    }
+  ]
+}

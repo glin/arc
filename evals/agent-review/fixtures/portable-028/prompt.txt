@@ -1,0 +1,1 @@
+Review the command alias change. Both published command names must reach the same CLI. Preserve existing statusline and cost arguments.

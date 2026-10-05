@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-010",
+  "revision": 1,
+  "family": "interaction-routing",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Selected text creates duplicate drafts",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/timeline.ts @ e86a7f7",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/timeline.mjs",
+      "sha256": "b24b3d0e2988b837b18e14e1c3f2d7eb3f5e5d58300d9f8e1d945478e8b5540e"
+    },
+    {
+      "path": "src/panel-registry.mjs",
+      "sha256": "235e77e0452560f23f9f63307992afe9d780b86a127a4c908063a32d1dbcc207"
+    }
+  ],
+  "prompt_sha256": "9f4ac7dcf59ad1790ee65aeedcc0970ad5e608e399c86ac8646c734f147ef2ee",
+  "diff_sha256": "33b082330e8a8152de2ac629f4d6c38b3dc3a6de98f6079557ad7c8aae920d42",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "medium",
+      "summary": "One selected-text command creates a draft in every open panel.",
+      "paths": ["src/timeline.mjs"],
+      "scenario": "Two panel hosts are open when the reader sends one selected-text handoff."
+    }
+  ],
+  "audit": "Adapted host routing. It checks two open hosts and the selected source host."
+}

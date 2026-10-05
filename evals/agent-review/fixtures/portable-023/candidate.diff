@@ -1,0 +1,59 @@
+diff --git a/src/domain/rail-filters.mjs b/src/domain/rail-filters.mjs
+index 2105c787..bce697f9 100644
+--- a/src/domain/rail-filters.mjs
++++ b/src/domain/rail-filters.mjs
+@@ -166,7 +166,8 @@ function railQueryLenses(query) {
+   return RAIL_LENSES.filter((lens) => railLensKeys(lens).every((key) => held.has(key)));
+ }
+ function railQueryHeldLens(query) {
+-  return railQueryLenses(query)[0] ?? null;
++  const lenses = railQueryLenses(query);
++  return lenses.length === 1 ? lenses[0] : null;
+ }
+ function railQueryLens(query) {
+   if (queryWords(query).some((word) => word.key === null)) {
+@@ -180,17 +181,9 @@ function railLensKeys(lens) {
+ function withoutWords(query, drop) {
+   return queryWords(query).filter((word) => word.key === null || !drop.has(word.key)).map((word) => word.text).join(" ");
+ }
+-function withoutOtherRailLenses(query, kept) {
+-  const held = railQueryLenses(query).filter((lens) => lens !== kept);
+-  if (!held.length) {
+-    return query;
+-  }
+-  const keep = new Set(kept === null ? [] : railLensKeys(kept));
+-  const drop = new Set(held.flatMap((lens) => railLensKeys(lens)).filter((key) => !keep.has(key)));
+-  return withoutWords(query, drop);
+-}
+ function withoutRailLenses(query) {
+-  return withoutOtherRailLenses(query, null);
++  const held = railQueryHeldLens(query);
++  return held === null ? query : withoutWords(query, new Set(railLensKeys(held)));
+ }
+ function withRailLensWords(query, lens) {
+   const held = new Set(queryWords(query).map((word) => word.key));
+@@ -198,10 +191,22 @@ function withRailLensWords(query, lens) {
+   return [...words, query.trim()].filter(Boolean).join(" ");
+ }
+ function withRailLens(query, lens) {
+-  return lens === null ? withoutRailLenses(query) : withRailLensWords(withoutOtherRailLenses(query, lens), lens);
++  if (lens === null) {
++    return withoutWords(query, new Set(railQueryLenses(query).flatMap((held) => railLensKeys(held))));
++  }
++  const written = withRailLensWords(query, lens);
++  const keep = new Set(railLensKeys(lens));
++  const opposites = [...keep].map((key) => key.startsWith("-") ? key.slice(1) : `-${key}`);
++  const incompatible = lens === "unread" ? ["status:read"] : lens === "input" ? ["status:running"] : [];
++  const drop = new Set([
++    ...opposites,
++    ...incompatible,
++    ...railQueryLenses(written).filter((other) => other !== lens).flatMap((other) => railLensKeys(other)).filter((key) => !keep.has(key))
++  ]);
++  return drop.size ? withoutWords(written, drop) : written;
+ }
+ function pressRailLens(query, lens) {
+-  return railQueryHoldsLens(query, lens) ? withoutRailLenses(query) : withRailLens(query, lens);
++  return railQueryHeldLens(query) === lens ? withoutRailLenses(query) : withRailLens(query, lens);
+ }
+ function termNames(term, field, value) {
+   return term.field === field && labelKey(term.needle) === labelKey(value);

@@ -1,0 +1,3 @@
+Review the usage-detail formatter. Exact detail must communicate token amounts and the number of requests represented.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

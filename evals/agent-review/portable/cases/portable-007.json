@@ -1,0 +1,37 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-007",
+  "revision": 1,
+  "family": "transcript-lifecycle",
+  "split": "development",
+  "kind": "bug",
+  "source_mode": "fixed",
+  "title": "Finished child resurrected by trailing write",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/claudehistory.ts @ 8195ad2",
+    "limitations": "Focused adaptation of recorded Arc behavior, not an exact historical replay."
+  },
+  "inputs": [
+    {
+      "path": "src/claudehistory.mjs",
+      "sha256": "6088abb5159230972bb9a3423e2884d22558887536ff11228c18bc4354b00766"
+    },
+    {
+      "path": "src/child-status.mjs",
+      "sha256": "7d959bad5208a8f97618e020bf330274dd3214bd100d39b525e9b689eeac7f4f"
+    }
+  ],
+  "prompt_sha256": "5fab6b0eced33b03ddd7e072a26bbf5b822f17b6843e77c7705671791b140ffb",
+  "diff_sha256": "d33214975703d1037b8fea5c04f773b313c0b1519c25e5f091b594538407cab0",
+  "keys": [
+    {
+      "id": "finding-001",
+      "severity": "high",
+      "summary": "A trailing transcript write makes a finished child appear live.",
+      "paths": ["src/claudehistory.mjs"],
+      "scenario": "A child has a durable process end and a later filesystem modification time."
+    }
+  ],
+  "audit": "Adapted lifecycle reducer. It checks durable end precedence over file activity."
+}

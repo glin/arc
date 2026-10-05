@@ -1,0 +1,14 @@
+diff --git a/src/projectspend.mjs b/src/projectspend.mjs
+--- a/src/projectspend.mjs
++++ b/src/projectspend.mjs
+@@ -1,4 +1,8 @@
+ export class SpendIndex {
+-  constructor(recompute) { this.recompute = recompute; }
+-  onFile(file) { this.recompute(file); }
++  constructor(recompute) { this.recompute = recompute; this.stamp = null; }
++  onFile(file) {
++    const stamp = file.path + ':' + file.size + ':' + file.modifiedAt;
++    this.stamp = stamp;
++    this.recompute(file);
++  }
+ }

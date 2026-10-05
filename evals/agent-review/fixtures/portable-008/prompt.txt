@@ -1,0 +1,3 @@
+Review the transcript parser change. Valid records after a malformed content block must remain available to the reader.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

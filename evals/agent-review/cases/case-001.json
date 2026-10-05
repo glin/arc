@@ -1,0 +1,37 @@
+{
+  "schema": "arc-review-case-v1",
+  "id": "case-001",
+  "source_kind": "deferred_candidate",
+  "family": "rail-layout",
+  "case_revision": 1,
+  "key_revision": 1,
+  "source": {
+    "base": "bec96564baeaa26cb655f7e60287291fdd5f19b9",
+    "candidate": "847ba5811696e7b9b02eb0468de1f958c47ca371",
+    "correction": "ef8d8d62f236f23188ee2c9fcf0f3ca8b1779e37"
+  },
+  "key_state": "historical-partial",
+  "historical_context": {
+    "original_prompt": null,
+    "plan": null
+  },
+  "fixture_paths": ["extension/src/webview/rail.ts"],
+  "keys": [
+    {
+      "id": "defect-001",
+      "severity": "medium",
+      "summary": "Fixed rail head count widths wrap the row at common panel widths.",
+      "paths": ["extension/src/webview/rail.ts"],
+      "evidence": {
+        "scope": "Fixed rail head count widths wrap the row at common panel widths.",
+        "reach": "correction",
+        "mode": "review",
+        "disposition": "deferred",
+        "source": "Private evaluation handoff, rail-width disposition and Arc correction commit ef8d8d62f236f23188ee2c9fcf0f3ca8b1779e37",
+        "sha256": "07a5f2e6f0f5bee186fb67fb367afb24a5883d0a2f5728db8864fc54f50e83fc",
+        "source_attempt_identity": "unresolved",
+        "exclude_attempt_ids": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "source": {
+    "base": "9f27f61d0b9f1bd8ed63d13819217301a1c61048",
+    "candidate": "fe00298b948a685411681c201e1a7ab1727db865",
+    "correction": "fe00298b948a685411681c201e1a7ab1727db865",
+    "change_origin": "independent-legitimate-change"
+  },
+  "source_files": [
+    {
+      "path": "scripts/capture-panel-diagnostics.js",
+      "candidate_blob": "ff4fc5162e9d38dfb086001dbac949d5f4efe16c",
+      "candidate_sha256": "fcb4fc152d619c4535eb18653af0edeafc2ae8a16da81488169a82d2446d7551",
+      "reference_sha256": "fcb4fc152d619c4535eb18653af0edeafc2ae8a16da81488169a82d2446d7551",
+      "reference_blob": "ff4fc5162e9d38dfb086001dbac949d5f4efe16c"
+    },
+    {
+      "path": "scripts/capture-panel-diagnostics.ps1",
+      "candidate_blob": "6048a811c082517a9fc3e3c6658656f355820b99",
+      "candidate_sha256": "33a27d5b838d53ea5ae0c89e2d5e2b0c86168bc6fe05afe0bbc1cf5ab8c822c3",
+      "reference_sha256": "33a27d5b838d53ea5ae0c89e2d5e2b0c86168bc6fe05afe0bbc1cf5ab8c822c3",
+      "reference_blob": "6048a811c082517a9fc3e3c6658656f355820b99"
+    }
+  ],
+  "generated_files": [],
+  "compiler": null,
+  "transformations": [
+    "Production collector and PowerShell delegation retained without edits. Existing regression tests register under an offline test shim.",
+    "Original prompts, correction messages, source tests, personal transcripts and prior reviews are excluded from assigned inputs."
+  ],
+  "qualification_test": "scripts/capture-panel-diagnostics.test.js",
+  "original_review_evidence": "Unavailable. Historical candidate commits and scoped source diffs are recovered. The neutral review task is reconstructed.",
+  "generic_source_examples": [
+    "C:/Users/dev/.agents/skills",
+    "C:/Users/dev/...",
+    "C:\\Users\\dev",
+    "C:\\Users\\dev\\..."
+  ],
+  "runtime_node_requirement": "Node 22.18+",
+  "dependency_runtime": "Bundled dependencies. No package install, source checkout or historical Git objects at runtime."
+}

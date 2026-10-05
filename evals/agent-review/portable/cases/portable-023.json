@@ -1,0 +1,45 @@
+{
+  "schema": "arc-portable-review-case-v1",
+  "id": "portable-023",
+  "revision": 1,
+  "family": "rail-lens",
+  "split": "holdout",
+  "kind": "clean",
+  "source_mode": "fixed",
+  "title": "Corrected rail lens domain",
+  "provenance": {
+    "classification": "adapted",
+    "reference": "extension/src/domain/rail-filters.ts @ d84f6d8b7374c38935ba4838312d7f7449e5de9c",
+    "limitations": "Whole domain runtime modules are transpiled without TypeScript types. The rail-filters control is adapted to remove opposite-polarity terms and incompatible read/running statuses of the requested lens. The review boundary omits UI wiring and captured historical instructions."
+  },
+  "inputs": [
+    {
+      "path": "src/domain/labels.mjs",
+      "sha256": "9511d8a8d20ab047141ab04ad82f6d12c8ba9b70173d17aaa604960ba92c3e9b"
+    },
+    {
+      "path": "src/domain/rail-filters.mjs",
+      "sha256": "d9657dff79a49866166b6a11c52e9e73eb2b331fc184991d2cbc5fdb7eeee2f7"
+    },
+    {
+      "path": "src/domain/rail-sort.mjs",
+      "sha256": "5c3a72b1d84473ab4ce57052b13799d247d8dacefbffe35109d86b0ebdc6dc01"
+    },
+    {
+      "path": "src/domain/session-query.mjs",
+      "sha256": "6a0e2092d8737501c11384a57136c462ead91c959bf6491edbb0613c0b27973e"
+    },
+    {
+      "path": "src/domain/text.mjs",
+      "sha256": "6d3166b9aadb27186d7a0dce2a9672c1372575432a7b005a6865bd47f5e23ea8"
+    },
+    {
+      "path": "src/domain/views.mjs",
+      "sha256": "523f92be03a6abf178d94df53f7d2ed9299a3985f2392a0ddbe752c6d03fb17f"
+    }
+  ],
+  "prompt_sha256": "2670a109f3760df5592251c65f43d270f8d6a57d9af49d9d9af82845a3e9483d",
+  "diff_sha256": "b5da040174445f611eb424a698d2cbadb5fd7ad5ccf3bf07c51e783d0ccc835e",
+  "keys": [],
+  "audit": "Changed rail domain behavior covers typed and complete status lenses, quoted and negated terms, opposite-polarity words, read/unread and running/input conflicts, combined terms, partial lenses, and ambiguous stored lenses. Browser state and UI wiring are outside this domain boundary."
+}

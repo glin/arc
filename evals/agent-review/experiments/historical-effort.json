@@ -1,0 +1,20 @@
+{
+  "schema": "arc-portable-experiment-v1",
+  "cases": ["portable-021", "portable-022", "portable-023"],
+  "models": ["gpt-6-sol"],
+  "efforts": ["medium", "high", "xhigh"],
+  "repeats": 3,
+  "seed": "arc-historical-challenge-20260927",
+  "reservation_usd": 1,
+  "timeout_seconds": 600,
+  "max_cells": 27,
+  "extra_instructions": [],
+  "required_tools": [],
+  "rate_snapshot": {
+    "source": "extension/src/pricing.ts OpenAI list-price rows",
+    "date": "2026-09-27",
+    "rates": {
+      "gpt-6-sol": { "input": 2, "cacheRead": 0.2, "output": 10, "maxPricedContext": 272000 }
+    }
+  }
+}

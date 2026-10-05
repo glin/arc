@@ -1,0 +1,236 @@
+{
+  "source": {
+    "base": "605ef0c8cc61e2b8580fa1ab4c68faed3726392f",
+    "candidate": "3715b6d2517f2f5e1c6bb8cc888de30e204745e3",
+    "correction": "3715b6d2517f2f5e1c6bb8cc888de30e204745e3",
+    "change_origin": "independent-legitimate-change"
+  },
+  "source_files": [
+    {
+      "path": "cli/src/main.ts",
+      "candidate_blob": "35122c57a97cc5c7115bfaefd554abde25f44e6c",
+      "candidate_sha256": "5e0e31f5baa3cafab2876eeddccefb96e71c8f5316693df3fa1aa40d5de1994e",
+      "reference_sha256": "5e0e31f5baa3cafab2876eeddccefb96e71c8f5316693df3fa1aa40d5de1994e",
+      "reference_blob": "35122c57a97cc5c7115bfaefd554abde25f44e6c"
+    },
+    {
+      "path": "cli/src/cost.ts",
+      "candidate_blob": "63798e013afe30bd10c9cf2f9a5ddd2a498a3fc1",
+      "candidate_sha256": "41ad56307d0d4e9c41b7fd948e530f107fa20d8aff7d3f5eacfad8db089d7799",
+      "reference_sha256": "41ad56307d0d4e9c41b7fd948e530f107fa20d8aff7d3f5eacfad8db089d7799",
+      "reference_blob": "63798e013afe30bd10c9cf2f9a5ddd2a498a3fc1"
+    },
+    {
+      "path": "cli/src/status.ts",
+      "candidate_blob": "32ac6b26b57fca5e2ad95cda0215a2ab238491f3",
+      "candidate_sha256": "24bbdc93f08f72a15a6b07a8a70b556214228d4a355ffb8785d32c2057f6092b",
+      "reference_sha256": "24bbdc93f08f72a15a6b07a8a70b556214228d4a355ffb8785d32c2057f6092b",
+      "reference_blob": "32ac6b26b57fca5e2ad95cda0215a2ab238491f3"
+    },
+    {
+      "path": "extension/src/sessioncost.ts",
+      "candidate_blob": "9f8cf8b1186d689883ec711fbd359b8ed95f8672",
+      "candidate_sha256": "8ee37512ee9e3d7edc9cc1c439ff6872defc2cf53dc745111de0a5dba1cfc8e4",
+      "reference_sha256": "8ee37512ee9e3d7edc9cc1c439ff6872defc2cf53dc745111de0a5dba1cfc8e4",
+      "reference_blob": "9f8cf8b1186d689883ec711fbd359b8ed95f8672"
+    },
+    {
+      "path": "extension/src/turnformat.ts",
+      "candidate_blob": "cb96abdbe88b8be848e95f5ae262aaa469ebb548",
+      "candidate_sha256": "86387b847154f2f337423ba97ec581e7fcbac49f1e40a313e79a00af4d9c1fce",
+      "reference_sha256": "86387b847154f2f337423ba97ec581e7fcbac49f1e40a313e79a00af4d9c1fce",
+      "reference_blob": "cb96abdbe88b8be848e95f5ae262aaa469ebb548"
+    },
+    {
+      "path": "extension/src/pricing.ts",
+      "candidate_blob": "a0faa2707e2e7c33c99b9e25ca89a03406d9f8e9",
+      "candidate_sha256": "14b584bebf08a3a643d1f8a58ae19a9672843460b9e6c75f3e6689c91de2c21b",
+      "reference_sha256": "14b584bebf08a3a643d1f8a58ae19a9672843460b9e6c75f3e6689c91de2c21b",
+      "reference_blob": "a0faa2707e2e7c33c99b9e25ca89a03406d9f8e9"
+    },
+    {
+      "path": "extension/src/view/tokens.ts",
+      "candidate_blob": "b62d1c2743a068728c6f3f181ff5ccb8552b915e",
+      "candidate_sha256": "6887780d668c42e1cd55838745ab267308eebebb3e779ec74a7d8ae1f0bc1ba3",
+      "reference_sha256": "6887780d668c42e1cd55838745ab267308eebebb3e779ec74a7d8ae1f0bc1ba3",
+      "reference_blob": "b62d1c2743a068728c6f3f181ff5ccb8552b915e"
+    },
+    {
+      "path": "extension/src/view/time.ts",
+      "candidate_blob": "0a8c50df146acffdd9573e5a867c8a130c7cb2ad",
+      "candidate_sha256": "785d5b1ffc03793fa78657dffcff2a01b6d01698a0c0e0b7a9537a8bf8a0950a",
+      "reference_sha256": "785d5b1ffc03793fa78657dffcff2a01b6d01698a0c0e0b7a9537a8bf8a0950a",
+      "reference_blob": "0a8c50df146acffdd9573e5a867c8a130c7cb2ad"
+    },
+    {
+      "path": "extension/src/view/cost.ts",
+      "candidate_blob": "e166b97ce5f6fe90ea9cad969572f6ead01d5dd4",
+      "candidate_sha256": "695c79e163b4cc43d47c822cb84b4a24e7b916f0fe5e2e04c163d3511acadbac",
+      "reference_sha256": "695c79e163b4cc43d47c822cb84b4a24e7b916f0fe5e2e04c163d3511acadbac",
+      "reference_blob": "e166b97ce5f6fe90ea9cad969572f6ead01d5dd4"
+    },
+    {
+      "path": "extension/src/codex.ts",
+      "candidate_blob": "56fe1a8f5d2f1022abcff89bef4103e096eb79b4",
+      "candidate_sha256": "f12a56704d352ff72062a8eeed14ae03ce6aed26cd67699420a74ff9840f1ea5",
+      "reference_sha256": "f12a56704d352ff72062a8eeed14ae03ce6aed26cd67699420a74ff9840f1ea5",
+      "reference_blob": "56fe1a8f5d2f1022abcff89bef4103e096eb79b4"
+    },
+    {
+      "path": "extension/src/agentspend.ts",
+      "candidate_blob": "a120525f2a227502f8dea9b3f06603d01aee8e58",
+      "candidate_sha256": "b12887c723faedf11dd1794e5facb3c40e551ba94840464f63d445bebbfaa65c",
+      "reference_sha256": "b12887c723faedf11dd1794e5facb3c40e551ba94840464f63d445bebbfaa65c",
+      "reference_blob": "a120525f2a227502f8dea9b3f06603d01aee8e58"
+    },
+    {
+      "path": "extension/src/transcript.ts",
+      "candidate_blob": "5dc3349b4eb670cf00eeb5abcf12bfcb976eb5c7",
+      "candidate_sha256": "1fd72556b23f9d6bec5c52debf6160f2b411ada21a5f74e51910c458e609b5d4",
+      "reference_sha256": "1fd72556b23f9d6bec5c52debf6160f2b411ada21a5f74e51910c458e609b5d4",
+      "reference_blob": "5dc3349b4eb670cf00eeb5abcf12bfcb976eb5c7"
+    },
+    {
+      "path": "extension/src/projectspend.ts",
+      "candidate_blob": "55153fae7e9a62f53cefea25c26a4e1a4a46a563",
+      "candidate_sha256": "57b1df8c24dece80e2f678041adec3b776bd7e77b32f2ca80de24165ad682849",
+      "reference_sha256": "57b1df8c24dece80e2f678041adec3b776bd7e77b32f2ca80de24165ad682849",
+      "reference_blob": "55153fae7e9a62f53cefea25c26a4e1a4a46a563"
+    },
+    {
+      "path": "extension/src/atomicfile.ts",
+      "candidate_blob": "2749265f50d24eb1cf95b72475b6d08c315d42cd",
+      "candidate_sha256": "7e24d743fdc3a36d83e44d307edeffe981b5d38857627dd5fb9423d8c6be2c97",
+      "reference_sha256": "7e24d743fdc3a36d83e44d307edeffe981b5d38857627dd5fb9423d8c6be2c97",
+      "reference_blob": "2749265f50d24eb1cf95b72475b6d08c315d42cd"
+    },
+    {
+      "path": "extension/src/projectspendstate.ts",
+      "candidate_blob": "4650c8223e235c446c465fb4e3fae7d0c4beecf7",
+      "candidate_sha256": "b1289833a612cd8089b243c39fdad66de99479195393aa693b9d22e7dbf45079",
+      "reference_sha256": "b1289833a612cd8089b243c39fdad66de99479195393aa693b9d22e7dbf45079",
+      "reference_blob": "4650c8223e235c446c465fb4e3fae7d0c4beecf7"
+    },
+    {
+      "path": "extension/src/parserstate.ts",
+      "candidate_blob": "db678035e87e312c037e4689b685066690cb11b4",
+      "candidate_sha256": "d65ab74834beab67f8ea80128b0d12655a0c66f090fc472cc16018841c42cfb1",
+      "reference_sha256": "d65ab74834beab67f8ea80128b0d12655a0c66f090fc472cc16018841c42cfb1",
+      "reference_blob": "db678035e87e312c037e4689b685066690cb11b4"
+    },
+    {
+      "path": "extension/src/childartifacts.ts",
+      "candidate_blob": "d2dea6978bc78ee8598a77d90cfde2cfc8ad9f46",
+      "candidate_sha256": "284a5fa97e601ddd3bafaa2f75e8fbe237280a8e3335984aa1ca4926a9659cd3",
+      "reference_sha256": "284a5fa97e601ddd3bafaa2f75e8fbe237280a8e3335984aa1ca4926a9659cd3",
+      "reference_blob": "d2dea6978bc78ee8598a77d90cfde2cfc8ad9f46"
+    },
+    {
+      "path": "extension/src/identity.ts",
+      "candidate_blob": "982a506da34ce7143f52734c91c89a14a09067e0",
+      "candidate_sha256": "72f2fb4b07e370c3c564b8853e3e8e88328dfd6f9dbd4cb229f4ddfbc4ca6853",
+      "reference_sha256": "72f2fb4b07e370c3c564b8853e3e8e88328dfd6f9dbd4cb229f4ddfbc4ca6853",
+      "reference_blob": "982a506da34ce7143f52734c91c89a14a09067e0"
+    },
+    {
+      "path": "extension/src/codexreply.ts",
+      "candidate_blob": "36a8df7f35343fa7a8daf1ae5d846af60377022a",
+      "candidate_sha256": "2ef3caa242c2fe9c1b1284a69191cc4255831b126ece69ab3b4705785f428a25",
+      "reference_sha256": "2ef3caa242c2fe9c1b1284a69191cc4255831b126ece69ab3b4705785f428a25",
+      "reference_blob": "36a8df7f35343fa7a8daf1ae5d846af60377022a"
+    },
+    {
+      "path": "extension/src/agentpaths.ts",
+      "candidate_blob": "dbb51fd47a1f65a4280b061f146aaed2a9ab1340",
+      "candidate_sha256": "6ca92dc295a23e35678de430b12873e2b7ac815771c4b00437770092ef65f8d9",
+      "reference_sha256": "6ca92dc295a23e35678de430b12873e2b7ac815771c4b00437770092ef65f8d9",
+      "reference_blob": "dbb51fd47a1f65a4280b061f146aaed2a9ab1340"
+    },
+    {
+      "path": "extension/src/domain/commit-sha.ts",
+      "candidate_blob": "6fad689e65c178d3f870eb69cad9d8a20d6e5338",
+      "candidate_sha256": "fde6d659c60e1e6d7aa8b80c19a45b9c2c3330a8fa73fd6f5cd0cd32212734a7",
+      "reference_sha256": "fde6d659c60e1e6d7aa8b80c19a45b9c2c3330a8fa73fd6f5cd0cd32212734a7",
+      "reference_blob": "6fad689e65c178d3f870eb69cad9d8a20d6e5338"
+    },
+    {
+      "path": "extension/src/activitydetail.ts",
+      "candidate_blob": "5dadb6f07674b2494f3aeff9df2aaee3e888a36b",
+      "candidate_sha256": "81fca8315bd76daa34d120f090b607af9e42216099315f13cf09a8d524914c0d",
+      "reference_sha256": "81fca8315bd76daa34d120f090b607af9e42216099315f13cf09a8d524914c0d",
+      "reference_blob": "5dadb6f07674b2494f3aeff9df2aaee3e888a36b"
+    },
+    {
+      "path": "extension/src/domain/model-identity.ts",
+      "candidate_blob": "5eb85495de7acac5a880e5552c581ea642b32113",
+      "candidate_sha256": "77b3b6dfabe255909bb1213b321a0a71443ca483a71c652c1f8744b6229c597e",
+      "reference_sha256": "77b3b6dfabe255909bb1213b321a0a71443ca483a71c652c1f8744b6229c597e",
+      "reference_blob": "5eb85495de7acac5a880e5552c581ea642b32113"
+    },
+    {
+      "path": "extension/src/domain/text.ts",
+      "candidate_blob": "f3f17c981bbb6f61af72ec1c0162b71a86e0d76a",
+      "candidate_sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4",
+      "reference_sha256": "24545c093c6baa5c05a20baf5d1f91aacba69d63a9bad665fc22c12d1575e8b4",
+      "reference_blob": "f3f17c981bbb6f61af72ec1c0162b71a86e0d76a"
+    },
+    {
+      "path": "extension/src/richtext.ts",
+      "candidate_blob": "0e40f8eceba20273dc6e35f3dafecaab7c11786b",
+      "candidate_sha256": "e0327d27436297c136d4754b4ef701c0c8bd9dcea04bc990aa2070ac43dbd1cf",
+      "reference_sha256": "e0327d27436297c136d4754b4ef701c0c8bd9dcea04bc990aa2070ac43dbd1cf",
+      "reference_blob": "0e40f8eceba20273dc6e35f3dafecaab7c11786b"
+    },
+    {
+      "path": "extension/src/store.ts",
+      "candidate_blob": "ecf282c0a8a9b4c3c70e303de4797417ddddfcf7",
+      "candidate_sha256": "babc5d910f8e499bb1a64c4be09aa855d3818777b0f84c1bd9146eb467a29c1e",
+      "reference_sha256": "babc5d910f8e499bb1a64c4be09aa855d3818777b0f84c1bd9146eb467a29c1e",
+      "reference_blob": "ecf282c0a8a9b4c3c70e303de4797417ddddfcf7"
+    },
+    {
+      "path": "extension/src/domain/link-path.ts",
+      "candidate_blob": "96f7621d913fabec27cae2613a2fe19c2768829f",
+      "candidate_sha256": "f501cad077c87fad030a6922546108d107c9f42932fba9fe5b17c8b63a936826",
+      "reference_sha256": "f501cad077c87fad030a6922546108d107c9f42932fba9fe5b17c8b63a936826",
+      "reference_blob": "96f7621d913fabec27cae2613a2fe19c2768829f"
+    },
+    {
+      "path": "cli/package.json",
+      "candidate_blob": "3f493a1a36e37018906f3caaf9195fbc6785ccf5",
+      "candidate_sha256": "937157e0a1ab4348ccaebdf132c3248dc2cfaec296f45d66798d1b8156f14e31",
+      "reference_sha256": "937157e0a1ab4348ccaebdf132c3248dc2cfaec296f45d66798d1b8156f14e31",
+      "reference_blob": "3f493a1a36e37018906f3caaf9195fbc6785ccf5"
+    }
+  ],
+  "generated_files": [
+    {
+      "path": "runtime.cjs",
+      "candidate_sha256": "96a9f429bf95a7b291f3ba86f4c86e665b2b2f81a9cea743c31b3de1229eafdc",
+      "reference_sha256": "96a9f429bf95a7b291f3ba86f4c86e665b2b2f81a9cea743c31b3de1229eafdc"
+    }
+  ],
+  "compiler": "0.21.5",
+  "transformations": [
+    "CommonJS bundle of production CLI source. Original source bytes retained. Version is defined from the package manifest.",
+    "Original prompts, correction messages, source tests, personal transcripts and prior reviews are excluded from assigned inputs."
+  ],
+  "qualification_test": "CLI manifest aliases, help, version, status JSON and invalid arguments",
+  "original_review_evidence": "Unavailable. Historical candidate commits and scoped source diffs are recovered. The neutral review task is reconstructed.",
+  "generic_source_examples": [
+    "C:/Users/dev/.agents/skills",
+    "C:/Users/dev/...",
+    "C:\\Users\\dev",
+    "C:\\Users\\dev\\..."
+  ],
+  "runtime_node_requirement": "Node 22.18+",
+  "dependency_runtime": "Bundled dependencies. No package install, source checkout or historical Git objects at runtime.",
+  "dependencies": [
+    {
+      "name": "marked",
+      "version": "4.3.0",
+      "license": "MIT",
+      "license_sha256": "8e3a3f82f59a60958f56ca08f445647c32a4733dc7ca6c2c46f6eb898471ab9c"
+    }
+  ]
+}

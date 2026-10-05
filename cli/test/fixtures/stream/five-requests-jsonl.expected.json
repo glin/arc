@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "kind": "claude-stream",
+    "sessionId": "00000000-0000-4000-8000-000000000012"
+  },
+  "parent": {
+    "requests": 5,
+    "subagentRequests": 0,
+    "toolCalls": 5,
+    "tools": {
+      "Grep": 3,
+      "Bash": 1,
+      "Read": 1
+    },
+    "costUsd": 0.37184,
+    "inputTokens": {
+      "uncached": 10,
+      "cacheWrite5m": 50000,
+      "cacheWrite1h": 0,
+      "cacheRead": 329000,
+      "total": 379010
+    },
+    "outputTokens": 2800,
+    "reasoningOutputTokens": 1600,
+    "avgInputPerRequest": 75802,
+    "cacheReadShare": 0.8680509749083137,
+    "contextFirst": 50002,
+    "contextMax": 89002,
+    "cache": {
+      "writeShare": 0.13192264056357353,
+      "writeUsd": 0.25,
+      "writeWarning": false,
+      "expiryReturns": null,
+      "returnInputTokens": null,
+      "returnInputUsd": null,
+      "longestExpiryGapSeconds": null
+    },
+    "models": [
+      {
+        "id": "claude-opus-5-5",
+        "canonical": "claude-opus-5-5",
+        "requests": 5,
+        "inputTokens": {
+          "uncached": 10,
+          "cacheWrite5m": 50000,
+          "cacheWrite1h": 0,
+          "cacheRead": 329000,
+          "total": 379010
+        },
+        "outputTokens": 2800,
+        "reasoningOutputTokens": 1600,
+        "costUsd": 0.37184,
+        "clientCostUsd": 0.37184,
+        "priceMultiplier": 1,
+        "priced": true,
+        "contextWindow": 1000000,
+        "costByType": {
+          "uncached": 0.00004,
+          "cacheWrite5m": 0.25,
+          "cacheWrite1h": 0,
+          "cacheRead": 0.0658,
+          "output": 0.056
+        }
+      }
+    ]
+  },
+  "children": [],
+  "combined": {
+    "requests": 5,
+    "subagentRequests": 0,
+    "toolCalls": 5,
+    "tools": {
+      "Grep": 3,
+      "Bash": 1,
+      "Read": 1
+    },
+    "costUsd": 0.37184,
+    "inputTokens": {
+      "uncached": 10,
+      "cacheWrite5m": 50000,
+      "cacheWrite1h": 0,
+      "cacheRead": 329000,
+      "total": 379010
+    },
+    "outputTokens": 2800,
+    "reasoningOutputTokens": 1600,
+    "avgInputPerRequest": 75802,
+    "cacheReadShare": 0.8680509749083137,
+    "contextFirst": 50002,
+    "contextMax": 89002,
+    "cache": {
+      "writeShare": 0.13192264056357353,
+      "writeUsd": 0.25,
+      "writeWarning": false,
+      "expiryReturns": null,
+      "returnInputTokens": null,
+      "returnInputUsd": null,
+      "longestExpiryGapSeconds": null
+    },
+    "models": [
+      {
+        "id": "claude-opus-5-5",
+        "canonical": "claude-opus-5-5",
+        "requests": 5,
+        "inputTokens": {
+          "uncached": 10,
+          "cacheWrite5m": 50000,
+          "cacheWrite1h": 0,
+          "cacheRead": 329000,
+          "total": 379010
+        },
+        "outputTokens": 2800,
+        "reasoningOutputTokens": 1600,
+        "costUsd": 0.37184,
+        "clientCostUsd": 0.37184,
+        "priceMultiplier": 1,
+        "priced": true,
+        "contextWindow": 1000000,
+        "costByType": {
+          "uncached": 0.00004,
+          "cacheWrite5m": 0.25,
+          "cacheWrite1h": 0,
+          "cacheRead": 0.0658,
+          "output": 0.056
+        }
+      }
+    ]
+  },
+  "run": {
+    "turns": 5,
+    "durationMs": 1000,
+    "durationApiMs": 900,
+    "ttftMs": 100,
+    "isError": false,
+    "error": null,
+    "denials": {},
+    "subagents": {
+      "spawned": 0,
+      "completed": 0,
+      "failed": 0,
+      "byType": {}
+    },
+    "clientCostUsd": 0.37184
+  }
+}

@@ -1,0 +1,3 @@
+Review the proposed child-session projection. A child belongs to a turn when it starts at or after that turn starts and before the next turn starts. An inferred endedAt is a display estimate, not a child ownership boundary. Durable process completion must govern the child live state.
+
+Review the attached diff and source files for concrete correctness defects. Give each finding a file path, failure scenario, and severity.

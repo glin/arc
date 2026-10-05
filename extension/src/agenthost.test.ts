@@ -1,0 +1,5900 @@
+import { afterEach, test, vi } from 'vitest';
+import assert from 'node:assert';
+import { CONTEXT_FRAME_BYTES, contextFrameId } from './contextframe';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { runInNewContext } from 'node:vm';
+import {
+  AgentHost,
+  AgentHostTimer,
+  AgentPlan,
+  AgentSession,
+  IdleAnswers,
+  LineReader,
+  ChildLike,
+  MODELS_FRESH_MS,
+  McpBook,
+  McpPendingRefreshes,
+  ModelBook,
+  SessionEvent,
+  SessionState,
+  UsageReadQueue,
+  askIdle,
+  askIdleMcpChange,
+  childEnv,
+  claudeAskMode,
+  claudeIdlePlan,
+  claudePlan,
+  claudeRenamePlan,
+  codexAskMode,
+  codexIdlePlan,
+  codexPlan,
+  codexRenamePlan,
+  modelChange,
+  openDraftMcp,
+  pickedEffort,
+  pickedModel,
+  renameAgentSession,
+  spawnCli,
+  unstartable,
+  withDeadline,
+  existingHostKey,
+  freshHostKey,
+  retireDraftProfile,
+  liveMcpTarget,
+  STOP_ENDING_GRACE_MS,
+} from './agenthost.ts';
+
+test('measurement windows refuse agent processes before launch', () => {
+  const previous = process.env.ARC_MEASURE_BLOCK_AGENTS;
+  process.env.ARC_MEASURE_BLOCK_AGENTS = '1';
+  try {
+    assert.throws(() => spawnCli('measurement-must-never-launch', [], '.', {}), /disabled in this measurement window/);
+  } finally {
+    if (previous === undefined) delete process.env.ARC_MEASURE_BLOCK_AGENTS;
+    else process.env.ARC_MEASURE_BLOCK_AGENTS = previous;
+  }
+});
+import { ClaudeWire, type PermissionMode } from './claudewire.ts';
+import { sandboxPolicy } from './codexwire.ts';
+import { McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
+import {
+  CLAUDE_ASK_MODES,
+  CODEX_ASK_MODES,
+  SessionProfile,
+  askMode,
+  defaultAskMode,
+  acceptedPermissionMode,
+  sessionSettings,
+  sessionSettingsForProfile,
+  draftProfileAfterPick,
+  newSessionDraft,
+  withSessionSettings,
+} from './composerview.ts';
+import { USAGE_FRESH_MS } from './usageview.ts';
+import { tempDir } from './temproot.ts';
+import { statementFrom } from '../test/source-contract.ts';
+
+const CLAUDE = { command: 'C:\\claude.exe', leadingArgs: [], env: {} };
+const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
+const WS = 'C:\\ws';
+const CODEX_CLIENT = { name: 'arc', title: 'Arc', version: '0.1.0' };
+
+// A fake-timer block left real timers swapped out when an assertion inside it threw, and
+// every later test then advanced a clock that never moved. Restoring after each test keeps
+// one failure from cascading into every test that runs after it.
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+// How a control-channel Stop really ends the turn it abandoned. `claudewire.test.ts` holds the
+// same payload from the CLI, and `readOutcome` reads `aborted_streaming` as `interrupted`. The
+// session tells that ending from a later prompt's by exactly that word, so a test that invents
+// another `terminal_reason` proves nothing about the wire the panel actually reads.
+const ABORTED_RESULT =
+  JSON.stringify({
+    type: 'result',
+    subtype: 'error_during_execution',
+    is_error: true,
+    terminal_reason: 'aborted_streaming',
+    result: '',
+  }) + '\n';
+const COMPLETED_RESULT =
+  JSON.stringify({
+    type: 'result',
+    is_error: false,
+    terminal_reason: 'completed',
+    result: 'done',
+  }) + '\n';
+
+// A child process that never was. It records what was written to stdin and lets a test
+// hand back whatever the real CLI would have written, one chunk at a time, including
+// chunks that split a line down the middle.
+class FakeChild implements ChildLike {
+  written: string[] = [];
+  killed = false;
+  ended = false;
+  endCalls = 0;
+  private outListener: ((chunk: string) => void) | null = null;
+  private errListener: ((chunk: string) => void) | null = null;
+  private exitListeners: ((code: number | null, signal: string | null) => void)[] = [];
+  private closeListeners: (() => void)[] = [];
+  private errorListener: ((error: Error) => void) | null = null;
+
+  stdin = {
+    write: (chunk: string) => {
+      this.written.push(chunk);
+    },
+    end: () => {
+      this.ended = true;
+      this.endCalls += 1;
+    },
+  };
+
+  stdout = {
+    setEncoding: () => undefined,
+    on: (_event: 'data', listener: (chunk: string | Buffer) => void) => {
+      this.outListener = listener;
+    },
+  };
+
+  stderr = {
+    setEncoding: () => undefined,
+    on: (_event: 'data', listener: (chunk: string | Buffer) => void) => {
+      this.errListener = listener;
+    },
+  };
+
+  kill(): void {
+    this.killed = true;
+  }
+
+  on(event: 'exit' | 'close' | 'error', listener: never): void {
+    if (event === 'exit') {
+      this.exitListeners.push(listener);
+    } else if (event === 'close') this.closeListeners.push(listener);
+    else this.errorListener = listener;
+  }
+
+  say(chunk: string): void {
+    this.outListener?.(chunk);
+  }
+  complain(chunk: string): void {
+    this.errListener?.(chunk);
+  }
+  exit(code: number | null, signal: string | null = null): void {
+    for (const listener of this.exitListeners) listener(code, signal);
+  }
+  close(): void {
+    for (const listener of this.closeListeners) listener();
+  }
+  fail(error: Error): void {
+    this.errorListener?.(error);
+  }
+
+  // Everything this fake was asked to send, parsed. The wire adds the newline, so a test
+  // that reads these is reading exactly what went down the pipe.
+  sent(): Record<string, unknown>[] {
+    return this.written.map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  // Answers whichever JSON-RPC request went out last, so a test can walk a Codex
+  // session through its opening chain.
+  reply(result: unknown): void {
+    const requests = this.sent().filter((m) => typeof m.id === 'number' && typeof m.method === 'string');
+    const last = requests[requests.length - 1];
+    if (!last) throw new Error('nothing to reply to');
+    this.say(JSON.stringify({ id: last.id, result }) + '\n');
+  }
+
+  replyError(code: number, message: string): void {
+    const requests = this.sent().filter((m) => typeof m.id === 'number' && typeof m.method === 'string');
+    const last = requests[requests.length - 1];
+    if (!last) throw new Error('nothing to reply to');
+    this.say(JSON.stringify({ id: last.id, error: { code, message } }) + '\n');
+  }
+
+  // Answers whichever JSON-RPC request named this method, whatever has gone out since. Two
+  // questions ride one idle child, so the last request is no longer the one a test means.
+  replyTo(method: string, result: unknown): void {
+    const found = this.sent().find((m) => m.method === method && typeof m.id === 'number');
+    if (!found) throw new Error(`nothing asked ${method}`);
+    this.say(JSON.stringify({ id: found.id, result }) + '\n');
+  }
+
+  // Answers the handshake the session sends on start, so a test can get past it.
+  answerHandshake(commands: { name: string; description: string; argumentHint: string }[] = []): void {
+    const first = this.sent()[0];
+    this.say(
+      JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: first.request_id, response: { commands } },
+      }) + '\n',
+    );
+  }
+
+  // Answers whichever control request carried this subtype, for the same reason.
+  answerControl(subtype: string, response: unknown): void {
+    const found = this.sent().find((m) => (m.request as { subtype?: string } | undefined)?.subtype === subtype);
+    if (!found) throw new Error(`nothing asked ${subtype}`);
+    this.say(
+      JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: found.request_id, response },
+      }) + '\n',
+    );
+  }
+
+  rejectControl(subtype: string, message: string): void {
+    const found = this.sent().find((m) => (m.request as { subtype?: string } | undefined)?.subtype === subtype);
+    if (!found) throw new Error(`nothing asked ${subtype}`);
+    this.say(
+      JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'error', request_id: found.request_id, error: message },
+      }) + '\n',
+    );
+  }
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+// Rigs this child's next stdin write to throw, so the driver call that reaches it rejects
+// the way a live pipe failure would. The rig removes itself after the one throw, so a fix
+// under test can still write to the child once the refusal it caused has been handled.
+function failNextWrite(child: FakeChild, message: string): void {
+  const original = child.stdin.write;
+  child.stdin.write = (_chunk: string) => {
+    child.stdin.write = original;
+    throw new Error(message);
+  };
+}
+
+class FakeAgentHostTimer implements AgentHostTimer {
+  readonly tasks: { callback: () => void; delayMs: number; cleared: boolean }[] = [];
+
+  set(callback: () => void, delayMs: number): unknown {
+    const task = { callback, delayMs, cleared: false };
+    this.tasks.push(task);
+    return task;
+  }
+
+  clear(timer: unknown): void {
+    (timer as { cleared: boolean }).cleared = true;
+  }
+
+  activeCount(): number {
+    return this.tasks.filter((task) => !task.cleared).length;
+  }
+
+  fire(index: number, includeCleared = false): void {
+    const task = this.tasks[index];
+    if (!task) {
+      throw new Error(`timer ${index} was not scheduled`);
+    }
+    if (!task.cleared || includeCleared) {
+      task.callback();
+    }
+  }
+}
+
+async function answerCodexHandshake(
+  child: FakeChild,
+  skills: Array<{ name: string; description: string }> = [],
+): Promise<void> {
+  child.reply({ userAgent: 'codex' });
+  await tick();
+  child.reply({ data: [{ cwd: WS, skills }] });
+  await tick();
+}
+
+function fakeHost(
+  openingDeadlineMs?: number,
+  now?: () => number,
+  lifecycle: { idleDurationMs?: number; timer?: AgentHostTimer; exitGraceMs?: number } = {},
+): {
+  host: AgentHost;
+  children: FakeChild[];
+  events: SessionEvent[];
+  states: SessionState[];
+  commands: string[][];
+  envs: Record<string, string>[];
+} {
+  const children: FakeChild[] = [];
+  const events: SessionEvent[] = [];
+  const states: SessionState[] = [];
+  const commands: string[][] = [];
+  const envs: Record<string, string>[] = [];
+  const host = new AgentHost({
+    openingDeadlineMs,
+    now,
+    idleDurationMs: lifecycle.idleDurationMs ?? 60_000,
+    timer: lifecycle.timer,
+    exitGraceMs: lifecycle.exitGraceMs,
+    spawner: (_command, args, _cwd, env) => {
+      commands.push(args);
+      envs.push(env);
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    onEvent: (event) => events.push(event),
+    onStateChange: (state) => states.push(state),
+  });
+  return { host, children, events, states, commands, envs };
+}
+
+function settle(host: AgentHost, key: string): void {
+  host.settled(host.beginHousekeeping(key));
+}
+
+test('LineReader keeps a line whole across the chunks it arrives in', () => {
+  const lines: string[] = [];
+  const reader = new LineReader((line) => lines.push(line));
+  reader.push('{"a":1}\n{"b":');
+  assert.deepEqual(lines, ['{"a":1}'], 'the half line is held, not handed on');
+  reader.push('2}\n{"c":3}\n');
+  assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}']);
+});
+
+test('identified split context frames discard only overflow and preserve following traffic and EOF', () => {
+  const lines: string[] = [];
+  const rejected: string[] = [];
+  const reader = new LineReader((line) => lines.push(line), {
+    identify: (text) => (contextFrameId(text) === 'ctx' ? 'ctx' : null),
+    overflow: (id) => rejected.push(id),
+  });
+  reader.push('{ "ty');
+  reader.push('pe": "control_response", "response": { "subtype":"success", "request_');
+  reader.push('id":"c\\u0074x", "response":{"large":"');
+  reader.push('x'.repeat(CONTEXT_FRAME_BYTES));
+  reader.push('"}}}\n{"type":"assistant","message":{}}\n{"type":"result"}');
+  reader.flush();
+  assert.deepEqual(rejected, ['ctx']);
+  assert.ok(!lines.some((line) => line.includes('large')));
+  assert.equal(lines.at(-2), '{"type":"assistant","message":{}}');
+  assert.equal(lines.at(-1), '{"type":"result"}');
+  const unrelated = '{"type":"assistant","text":"' + 'x'.repeat(CONTEXT_FRAME_BYTES + 1) + '"}';
+  reader.push(unrelated);
+  reader.flush();
+  assert.equal(lines.at(-1), unrelated);
+});
+
+test('LineReader drops the carriage return a Windows pipe adds', () => {
+  const lines: string[] = [];
+  new LineReader((line) => lines.push(line)).push('{"a":1}\r\n');
+  assert.deepEqual(lines, ['{"a":1}']);
+});
+
+test('LineReader hands on a last line the CLI never terminated', () => {
+  const lines: string[] = [];
+  const reader = new LineReader((line) => lines.push(line));
+  reader.push('{"a":1}');
+  assert.deepEqual(lines, []);
+  reader.flush();
+  assert.deepEqual(lines, ['{"a":1}']);
+});
+
+test('a session sends the handshake before anything else and keeps the command list', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  assert.equal(child.sent()[0].type, 'control_request');
+  child.answerHandshake([{ name: 'compact', description: 'Compact', argumentHint: '' }]);
+  const session = await starting;
+  assert.deepEqual(
+    session.state().commands.map((c) => c.name),
+    ['compact'],
+  );
+});
+
+test('a listener told a session is ready can read its commands off it there and then', async () => {
+  // What `extension.ts` does with the event. `ready` is the one message that says a child has
+  // a list, and the list it publishes is read off the sessions, so that one agent answering
+  // does not drop what the others already said.
+  //
+  // The event is emitted from inside the opening handshake, and the session recorded the list
+  // only from what that handshake returned, which is after every listener has already run. So
+  // this read came back empty every time, the composer was handed a list with nothing in it,
+  // and the command menu never opened however much the reader typed. Nothing above catches
+  // it: the test before this one reads the same field after the handshake has settled, which
+  // is the one moment it is right.
+  const children: FakeChild[] = [];
+  const seen: string[][] = [];
+  let host: AgentHost | null = null;
+  host = new AgentHost({
+    idleDurationMs: 60_000,
+    spawner: () => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    onEvent: ({ key, event }) => {
+      if (event.kind !== 'ready') {
+        return;
+      }
+      seen.push((host?.get(key)?.state().commands ?? []).map((c) => c.name));
+    },
+    onStateChange: () => undefined,
+  });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake([{ name: 'compact', description: 'Compact', argumentHint: '' }]);
+  await starting;
+  assert.deepEqual(
+    seen,
+    [['compact']],
+    'the session carried no commands at the moment it reported being ready, so everything ' +
+      'reading the list off that event is handed an empty one',
+  );
+});
+
+test('a session resuming a session says which one before its child speaks', async () => {
+  // Everything the panel keys on the session reads this: which session counts as
+  // running, which rail card wears a status, and whether the card a press opened stays up.
+  // The CLI names no session in its answer to the handshake and a resumed child writes
+  // nothing else until the first prompt produces output, so the panel used to know nothing
+  // for the whole of that first press.
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  assert.equal(
+    session.state().sessionId,
+    'sess-1',
+    'a child whose session is unknown is left out of the running set, so no turn is ' +
+      'drawn in flight and the press card comes down the moment the handoff answers',
+  );
+});
+
+test('the same key reuses its child rather than starting a second one', async () => {
+  const { host, children } = fakeHost();
+  const first = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  await first;
+  const second = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  await second;
+  assert.equal(children.length, 1, 'a second child would mean two agents answering one session');
+});
+
+test('a key whose child has exited starts a fresh one', async () => {
+  const { host, children } = fakeHost();
+  const first = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  await first;
+  children[0].exit(0);
+  const second = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[1].answerHandshake();
+  await second;
+  assert.equal(children.length, 2);
+});
+
+test('a resumed session passes its id to the CLI', async () => {
+  const { host, children, commands } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, resume: 'abc-123' }));
+  children[0].answerHandshake();
+  await starting;
+  assert.equal(commands[0][commands[0].indexOf('--resume') + 1], 'abc-123');
+});
+
+test('a session is busy from the prompt until the turn ends', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  assert.equal(session.state().busy, false);
+  const delivery = session.prompt('hello');
+  assert.equal(session.state().busy, true);
+  await delivery;
+  children[0].say(
+    JSON.stringify({ type: 'result', is_error: false, terminal_reason: 'completed', result: 'hi' }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+});
+
+test('a Claude effort change waits for the running turn and never ends it', async () => {
+  const { host, children, events, states } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  const promptTurn = await session.prompt('hello');
+  const lines = children[0].sent().length;
+  await session.setEffort('low');
+  assert.equal(
+    children[0].sent().length,
+    lines,
+    'the change went out mid-turn, where nothing has sampled what the CLI does with it',
+  );
+  assert.equal(session.state().busy, true);
+
+  // The reader's turn ends on its own result, and the held pick goes out after it.
+  const published = states.length;
+  children[0].say(COMPLETED_RESULT);
+  assert.equal(
+    events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId,
+    promptTurn,
+    'the effort command closed the turn the reader was waiting on',
+  );
+  assert.deepEqual(effortSends(children[0]), ['/effort low']);
+  assert.equal(session.state().busy, true, 'the command owes a result, so the session is not idle yet');
+  assert.ok(
+    states.slice(published).every((state) => state.busy),
+    'the panel was told the session was idle in the moment between the two turns',
+  );
+
+  // The command books its turn one step after the write, and its result must wait for that.
+  const written = states.length;
+  await vi.waitFor(() => assert.ok(states.length > written, 'the effort command booked no turn'));
+  children[0].say(COMPLETED_RESULT);
+  assert.equal(session.state().busy, false);
+  assert.equal(
+    events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId,
+    promptTurn + 1,
+    "the command result ended a turn of its own rather than the reader's",
+  );
+});
+
+const A_MODEL_LIST: ModelList = {
+  models: [
+    {
+      value: 'opus',
+      label: 'Opus',
+      description: 'The one that thinks hardest',
+      efforts: [{ value: 'high', label: 'high', description: '' }],
+    },
+  ],
+  readAt: 0,
+};
+
+// Every `/effort` line written to a child, in the order it was written. A pick that reaches
+// the child twice, or reaches it with no level, costs a turn the reader did not ask for, so
+// the tests below count the sends rather than reading only the last one.
+function effortSends(child: FakeChild): string[] {
+  return sentTexts(child).filter((text) => text.startsWith('/effort'));
+}
+
+// The text of every user message written to a child, in the order it was written.
+function sentTexts(child: FakeChild): string[] {
+  return child
+    .sent()
+    .map((line) => (line.message as { content?: { text?: string }[] } | undefined)?.content?.[0]?.text ?? '')
+    .filter((text) => text !== '');
+}
+
+test('a prompt sent while a Claude effort pick waits runs at the picked level', async () => {
+  const { host, children, events } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+  const lastEnded = () => events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId;
+
+  const firstTurn = await session.prompt('hello');
+  await session.setEffort('low');
+  const second = session.prompt('again');
+  child.say(COMPLETED_RESULT);
+  assert.equal(lastEnded(), firstTurn);
+  const secondTurn = await second;
+
+  // Written ahead of the command, the prompt queues in the child and runs at the old level.
+  assert.deepEqual(
+    sentTexts(child).slice(-2),
+    ['/effort low', 'again'],
+    'the prompt reached the child before the level the reader picked for it',
+  );
+  child.say(COMPLETED_RESULT);
+  assert.notEqual(lastEnded(), secondTurn, "the command result closed the prompt's turn");
+  assert.equal(session.state().busy, true);
+  child.say(COMPLETED_RESULT);
+  assert.equal(lastEnded(), secondTurn);
+  assert.equal(session.state().busy, false);
+});
+
+test('a Claude effort pick sent after a turn failed keeps the failure on the session', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('hello');
+  await session.setEffort('low');
+  child.say('not json\n');
+  assert.match(session.state().lastError ?? '', /unreadable line/);
+  child.say(COMPLETED_RESULT);
+
+  assert.deepEqual(effortSends(child), ['/effort low']);
+  assert.match(
+    session.state().lastError ?? '',
+    /unreadable line/,
+    'the held pick went out and erased the diagnostic the failed turn left',
+  );
+});
+
+test('a second Claude effort pick replaces the one waiting rather than queueing behind it', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  await session.prompt('hello');
+  await session.setEffort('low');
+  await session.setEffort('high');
+  children[0].say(COMPLETED_RESULT);
+
+  assert.deepEqual(
+    effortSends(children[0]),
+    ['/effort high'],
+    'a reader who picks twice paid a turn to pass through the level they replaced',
+  );
+});
+
+test('a Claude effort pick waiting through a Stop reaches the child', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('hello');
+  await session.setEffort('low');
+  // A Stop ends the work without ending a turn. The pick would otherwise read as pending on
+  // the control for the life of the child, with nothing left to carry it out.
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  await stopping;
+
+  assert.deepEqual(effortSends(child), ['/effort low']);
+  assert.equal(session.state().busy, true, 'the command owes a result, so the session is not idle yet');
+});
+
+test('a Claude effort pick waiting when the child exits reaches nothing', async () => {
+  const { host, children, states } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  await session.prompt('hello');
+  await session.setEffort('low');
+  children[0].exit(1);
+  await vi.waitFor(() => assert.equal(session.state().exited, true));
+
+  assert.deepEqual(effortSends(children[0]), [], 'the level was written to the stdin of a child that had already gone');
+  // The exit throws the pick away with the rest of the session's work. A pick left behind
+  // would be cleared by the next empty level, which the panel sends whenever a model change
+  // drops a level, and that clearing would redraw a session nothing can change.
+  const published = states.length;
+  await session.setEffort('');
+  assert.equal(states.length, published, 'the session still held a pick for a child that had gone');
+  // The refusal carries the exit's own reason. A session that kept that diagnostic is the
+  // only thing able to say why the level never went.
+  await assert.rejects(session.setEffort('high'), /the agent stopped with code 1/);
+});
+
+test('a model change keeps a level the new model offers and drops one it does not', () => {
+  const kept = modelChange('claude', 'opus', 'high', A_MODEL_LIST, true);
+  assert.equal(kept.effort, 'high');
+  assert.equal(kept.tellChild, false, 'the child already runs at the level that survived');
+  assert.deepEqual(
+    kept.settings,
+    {
+      selectedModel: 'opus',
+      selectedEffort: 'high',
+      effortModel: 'opus',
+      pendingModel: null,
+    },
+    'a level the change did not move was stored with a standing it had not earned',
+  );
+
+  const dropped = modelChange('claude', 'opus', 'low', A_MODEL_LIST, true);
+  assert.equal(dropped.effort, '', 'the new model offers no low level');
+  assert.equal(dropped.tellChild, true, 'the child kept a pick waiting under a level the new model has no name for');
+  assert.deepEqual(dropped.settings, {
+    selectedModel: 'opus',
+    selectedEffort: '',
+    effortModel: '',
+    pendingModel: null,
+    pendingEffort: null,
+  });
+
+  const noChild = modelChange('claude', 'opus', 'low', A_MODEL_LIST, false);
+  assert.equal(noChild.tellChild, false, 'there is no child to tell');
+  assert.equal(
+    noChild.settings.pendingModel,
+    'opus',
+    'a session with no child has its model recorded by the turn that runs on it',
+  );
+
+  const codex = modelChange('codex', 'opus', 'high', A_MODEL_LIST, true);
+  assert.equal(codex.tellChild, false);
+  assert.equal(codex.settings.pendingModel, 'opus', 'Codex applies the model to the next turn');
+  assert.equal(
+    'pendingEffort' in codex.settings,
+    false,
+    'a surviving level was marked pending again, which draws a settled level as unsettled',
+  );
+});
+
+test('a model change carries the effort level the new model offers and drops the one it does not', async () => {
+  const { host, children, states } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  await session.prompt('hello');
+  await session.setEffort('high');
+  const changing = session.setModel('opus');
+  children[0].answerControl('set_model', {});
+  await changing;
+
+  // `pickedEffort` is the rule the panel applies to the stored level on a model change. The
+  // session is told the same answer, so the level it holds cannot drift from the stored one.
+  assert.equal(pickedEffort('high', A_MODEL_LIST, 'opus'), 'high');
+  await session.setEffort('high');
+  children[0].say(COMPLETED_RESULT);
+  assert.deepEqual(effortSends(children[0]), ['/effort high']);
+  // The command books its turn one step after the write. Its own result cannot reach a
+  // session that has not booked it, so the test waits for the booking to be published.
+  const written = states.length;
+  await vi.waitFor(() => assert.ok(states.length > written, 'the effort command booked no turn'));
+  children[0].say(COMPLETED_RESULT);
+  assert.equal(session.state().busy, false);
+
+  await session.prompt('again');
+  await session.setEffort('low');
+  assert.equal(
+    pickedEffort('low', A_MODEL_LIST, 'opus'),
+    '',
+    'the model offers no low level, so the panel stores none and has none to ask for',
+  );
+  await session.setEffort('');
+  children[0].say(COMPLETED_RESULT);
+  await vi.waitFor(() => assert.equal(session.state().busy, false));
+
+  assert.deepEqual(
+    effortSends(children[0]),
+    ['/effort high'],
+    'a dropped level went out anyway, as itself or as a bare `/effort`',
+  );
+  assert.equal(
+    session.state().lastError,
+    null,
+    'the dropped level was sent and refused, which puts a failure on a card over a pick the panel handled',
+  );
+});
+
+test('Claude compaction sends only its command and stays busy until the command ends', async () => {
+  const { host, children, events } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  const turnId = await session.compact();
+  const sent = children[0].sent().at(-1);
+  assert.deepEqual(sent?.message, {
+    role: 'user',
+    content: [{ type: 'text', text: '/compact' }],
+  });
+  assert.equal(session.state().busy, true);
+
+  children[0].say(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      terminal_reason: 'completed',
+      result: '',
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+  assert.equal(events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, turnId);
+});
+
+test('Claude clear sends only its command and stays busy until the command ends', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  await session.clear();
+  assert.deepEqual(children[0].sent().at(-1)?.message, {
+    role: 'user',
+    content: [{ type: 'text', text: '/clear' }],
+  });
+  assert.equal(session.state().busy, true);
+});
+
+test('a refused Claude clear still drains a held effort pick and lets its prompt through', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('hello');
+  await session.setEffort('low');
+  const second = session.prompt('again');
+
+  failNextWrite(child, 'the pipe closed while the session was clearing');
+  const clearing = session.clear();
+  // The turn the pick was waiting on ends while the clear is still in flight.
+  // Only the clear's own bookkeeping stands between the held pick and the child.
+  child.say(COMPLETED_RESULT);
+  assert.deepEqual(
+    effortSends(child),
+    [],
+    'the pick went out before the clear standing in front of it had even failed',
+  );
+
+  await assert.rejects(clearing, /the pipe closed while the session was clearing/);
+  await second;
+
+  assert.match(
+    session.state().lastError ?? '',
+    /the pipe closed while the session was clearing/,
+    'the clear refusal lost its diagnostic once the drain behind it ran',
+  );
+  assert.deepEqual(effortSends(child), ['/effort low'], 'the pick reached the child once, not zero or twice');
+  assert.deepEqual(
+    sentTexts(child).slice(-2),
+    ['/effort low', 'again'],
+    'a refused clear left the pick and the prompt waiting behind it stuck for good',
+  );
+  child.say(COMPLETED_RESULT);
+  assert.equal(session.state().busy, true, "the queued prompt's own turn is still open");
+  child.say(COMPLETED_RESULT);
+  assert.equal(session.state().busy, false);
+});
+
+test('a Claude prompt refusal keeps its diagnostic through a held-pick drain', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  failNextWrite(child, 'the pipe closed before the prompt reached the agent');
+  const delivery = session.prompt('hello');
+  // Held in the same tick the prompt starts, so the drain the refusal below triggers finds
+  // a pick already waiting rather than racing it into place.
+  void session.setEffort('low');
+  await assert.rejects(delivery, /would not take the prompt/);
+
+  assert.match(
+    session.state().lastError ?? '',
+    /would not take the prompt/,
+    'the pick that drained behind the refusal overwrote the reason the prompt gave',
+  );
+  assert.deepEqual(effortSends(child), ['/effort low'], 'the refusal never drained the pick it owed a release to');
+  assert.equal(session.state().busy, true, 'the drained pick still owes its own result');
+});
+
+test('a Claude command refusal keeps its diagnostic through a held-pick drain', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  failNextWrite(child, 'the pipe closed before the command reached the agent');
+  const compacting = session.compact();
+  void session.setEffort('low');
+  await assert.rejects(compacting, /the pipe closed before the command reached the agent/);
+
+  assert.match(
+    session.state().lastError ?? '',
+    /would not compact the session/,
+    'the pick that drained behind the refusal overwrote the reason the compaction gave',
+  );
+  assert.deepEqual(effortSends(child), ['/effort low'], 'the refusal never drained the pick it owed a release to');
+  assert.equal(session.state().busy, true, 'the drained pick still owes its own result');
+});
+
+test('a busy Claude session accepts another prompt and stays busy through both turns', async () => {
+  const { host, children, events } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  const firstTurnId = await session.prompt('first');
+  const secondTurnId = await session.prompt('second');
+  assert.equal(
+    children[0].sent().filter((message) => message.type === 'user').length,
+    2,
+    'the second prompt never reached the busy Claude child',
+  );
+  children[0].say(
+    JSON.stringify({ type: 'result', is_error: false, terminal_reason: 'completed', result: 'first' }) + '\n',
+  );
+  assert.equal(session.state().busy, true, 'the first result hid the second queued Claude turn');
+  assert.equal(events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, firstTurnId);
+  children[0].say(
+    JSON.stringify({ type: 'result', is_error: false, terminal_reason: 'completed', result: 'second' }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+  assert.equal(events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, secondTurnId);
+});
+
+test('Claude turn identity follows wire acceptance when a later prompt is accepted first', async () => {
+  const accepts: (() => void)[] = [];
+  let emit: (event: WireEvent) => void = () => undefined;
+  const plan: AgentPlan = {
+    agent: 'claude',
+    sessionId: 'session',
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: (_send, report) => {
+      emit = report;
+      return {
+        receive: () => undefined,
+        open: () => Promise.resolve([]),
+        prompt: () => new Promise<void>((resolve) => accepts.push(resolve)),
+        compact: () => Promise.resolve(),
+        clear: () => Promise.resolve(),
+        answer: () => false,
+        interrupt: () => Promise.resolve(),
+        sessionId: () => 'session',
+        close: () => undefined,
+      };
+    },
+  };
+  const ended: number[] = [];
+  const child = new FakeChild();
+  const session = new AgentSession(
+    'ordered',
+    plan,
+    () => child,
+    (event, turnId) => {
+      if (event.kind === 'turnEnd' && turnId !== undefined) {
+        ended.push(turnId);
+      }
+    },
+    () => undefined,
+  );
+  await session.start();
+
+  const first = session.prompt('attachment prompt');
+  const second = session.prompt('text prompt');
+  accepts[1]();
+  const secondTurnId = await second;
+  emit({
+    kind: 'turnEnd',
+    outcome: {
+      status: 'ok',
+      text: '',
+      costUsd: null,
+      turns: null,
+      deniedTools: [],
+    },
+  });
+  assert.deepEqual(ended, [secondTurnId]);
+  assert.equal(session.state().busy, true, 'the earlier prompt is still preparing');
+
+  accepts[0]();
+  const firstTurnId = await first;
+  emit({
+    kind: 'turnEnd',
+    outcome: {
+      status: 'ok',
+      text: '',
+      costUsd: null,
+      turns: null,
+      deniedTools: [],
+    },
+  });
+  assert.deepEqual(ended, [secondTurnId, firstTurnId]);
+  assert.equal(session.state().busy, false);
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+test('stopping Claude clears prompts canceled from its queue', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('first');
+  await session.prompt('second');
+  const stopping = session.interrupt();
+  const interrupt = child.sent().find((message) => (message.request as { subtype?: string })?.subtype === 'interrupt');
+  assert.deepEqual(interrupt?.request, { subtype: 'interrupt', cancel_queued: true });
+  child.answerControl('interrupt', {});
+  await stopping;
+
+  assert.equal(
+    session.state().busy,
+    false,
+    'prompts canceled without their own result left the session permanently busy',
+  );
+  child.say(ABORTED_RESULT);
+  assert.equal(session.state().busy, false, 'the active prompt ending reopened a cleared queue');
+});
+
+test('stopping Claude keeps a preparing prompt from becoming an open turn afterward', async () => {
+  let accept: (() => void) | undefined;
+  const plan: AgentPlan = {
+    agent: 'claude',
+    sessionId: 'session',
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: () => ({
+      receive: () => undefined,
+      open: () => Promise.resolve([]),
+      prompt: () =>
+        new Promise<void>((resolve) => {
+          accept = resolve;
+        }),
+      compact: () => Promise.resolve(),
+      clear: () => Promise.resolve(),
+      answer: () => false,
+      interrupt: () => Promise.resolve(),
+      sessionId: () => 'session',
+      close: () => undefined,
+      interruptClearsOpenTurns: true,
+    }),
+  };
+  const child = new FakeChild();
+  const session = new AgentSession(
+    'preparing-stop',
+    plan,
+    () => child,
+    () => undefined,
+    () => undefined,
+  );
+  await session.start();
+
+  const prompt = session.prompt('attachment prompt');
+  const refused = assert.rejects(prompt, /stopped before it reached the agent/);
+  assert.equal(session.state().busy, true);
+  await session.interrupt();
+  assert.equal(session.state().busy, false);
+  accept?.();
+  await refused;
+  assert.equal(session.state().busy, false, 'the canceled preparation reopened the turn');
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+test('a late ending from Claude Stop does not clear a prompt sent afterward', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('first');
+  await session.prompt('second');
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  await stopping;
+  await session.prompt('after stop');
+  assert.equal(session.state().busy, true);
+
+  child.say(ABORTED_RESULT);
+  assert.equal(session.state().busy, true, 'the interrupted prompt ending consumed the prompt sent after Stop');
+  child.say(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      terminal_reason: 'completed',
+      result: 'done',
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+});
+
+test('accepted response ownership survives Stop and a late interrupted ending', async () => {
+  const { host, children, events } = fakeHost();
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await opening;
+  const first = await session.prompt('first');
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  assert.deepEqual(await stopping, [first]);
+  const second = await session.prompt('second');
+  const delta = (text: string) =>
+    child.say(
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+      }) + String.fromCharCode(10),
+    );
+  delta('Second');
+  child.say(ABORTED_RESULT);
+  delta(' continues');
+  assert.deepEqual(
+    events.filter(({ event }) => event.kind === 'delta').map(({ turnId }) => turnId),
+    [second, second],
+  );
+  assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, undefined);
+  assert.equal(session.state().busy, true);
+});
+
+test('Codex native turn identity binds early and obsolete response events to accepted submissions', async () => {
+  let emit!: (event: WireEvent) => void;
+  let accept!: (id: string) => void;
+  const plan: AgentPlan = {
+    agent: 'codex',
+    sessionId: 'session',
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: (_send, report) => {
+      emit = report;
+      return {
+        receive: () => undefined,
+        open: () => Promise.resolve([]),
+        prompt: () =>
+          new Promise<string>((resolve) => {
+            accept = resolve;
+          }),
+        compact: () => Promise.resolve(),
+        clear: () => Promise.resolve(),
+        answer: () => false,
+        interrupt: () => Promise.resolve(),
+        sessionId: () => 'session',
+        close: () => undefined,
+        hasOpenTurns: () => true,
+      };
+    },
+  };
+  const child = new FakeChild();
+  const reported: Array<{ event: WireEvent; turnId?: number }> = [];
+  const session = new AgentSession(
+    'native-owned',
+    plan,
+    () => child,
+    (event, turnId) => reported.push({ event, turnId }),
+    () => undefined,
+  );
+  await session.start();
+  let submitted: number | undefined;
+  const pending = session.prompt('first', (turnId) => {
+    submitted = turnId;
+  });
+  assert.equal(typeof submitted, 'number');
+  emit({ kind: 'text', text: 'Early completed response', sourceId: 'first-response', nativeTurnId: 'native-first' });
+  accept('native-first');
+  const first = await pending;
+  assert.equal(submitted, first);
+  assert.equal(reported.at(-1)?.turnId, first);
+  const next = session.prompt('second');
+  accept('native-second');
+  const second = await next;
+  emit({ kind: 'delta', text: 'Second', nativeTurnId: 'native-second' });
+  emit({
+    kind: 'turnEnd',
+    outcome: { status: 'interrupted', text: '', costUsd: null, turns: null, deniedTools: [] },
+    nativeTurnId: 'native-first',
+  });
+  emit({ kind: 'text', text: 'Late first response', sourceId: 'first-response', nativeTurnId: 'native-first' });
+  emit({ kind: 'delta', text: ' continues', nativeTurnId: 'native-second' });
+  assert.deepEqual(
+    reported.slice(-4).map(({ turnId }) => turnId),
+    [second, first, first, second],
+  );
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+test('repeated Claude Stops share the ending still owed by the active turn', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('first');
+  await session.prompt('second');
+  const firstStop = session.interrupt();
+  child.answerControl('interrupt', {});
+  await firstStop;
+  await session.prompt('third');
+
+  const secondStop = session.interrupt();
+  const interrupts = child
+    .sent()
+    .filter((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'interrupt');
+  const secondRequest = interrupts[1];
+  child.say(
+    JSON.stringify({
+      type: 'control_response',
+      response: { subtype: 'success', request_id: secondRequest.request_id, response: {} },
+    }) + '\n',
+  );
+  await secondStop;
+
+  child.say(ABORTED_RESULT);
+  await session.prompt('fourth');
+  child.say(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      terminal_reason: 'completed',
+      result: 'done',
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, false, 'two Stops charged two endings to the one active turn');
+});
+
+test('an ending a Stop never produced stops being owed', async () => {
+  // Claude answers an accepted Stop in about a second. An ending still owed a minute later is
+  // one that never came, and charging a later turn's ending to it leaves that turn open. The
+  // session then calls itself busy for the rest of its life, and the rail says `running`
+  // about a session whose transcript closed hours before.
+  let clock = 1_000;
+  const { host, children } = fakeHost(undefined, () => clock);
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('first');
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  await stopping;
+  assert.equal(session.state().busy, false);
+
+  clock += STOP_ENDING_GRACE_MS + 1;
+  await session.prompt('second');
+  child.say(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      terminal_reason: 'completed',
+      result: 'done',
+    }) + '\n',
+  );
+  assert.equal(
+    session.state().busy,
+    false,
+    'the second prompt paid for a Stop a minute earlier and its own turn stayed open',
+  );
+});
+
+test('a prompt that finishes seconds after a silent Stop keeps its own ending', async () => {
+  // The reader stops the agent, corrects it, and the correction answers in seconds, well
+  // inside the grace. Charging that ending to the Stop leaves the correction's turn open with
+  // nothing left to close it, and the session calls itself busy for the life of the
+  // child. The word the CLI puts on the ending is what tells the two apart.
+  let clock = 1_000;
+  const { host, children } = fakeHost(undefined, () => clock);
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('first');
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  await stopping;
+  assert.equal(session.state().busy, false);
+
+  clock += 2_000;
+  await session.prompt('second');
+  child.say(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      terminal_reason: 'completed',
+      result: 'done',
+    }) + '\n',
+  );
+  assert.equal(
+    session.state().busy,
+    false,
+    'the correction paid for a Stop seconds earlier and its own turn stayed open',
+  );
+});
+
+test('a turn the reader is waiting on is never charged for a silent Stop', async () => {
+  // The mirror of the test above, and the more costly way to be wrong. A Stop that does answer
+  // answers after the correction was sent, so its ending arrives while a real turn is running.
+  // Closing that turn tells the reader the agent is idle while it is still working.
+  let clock = 1_000;
+  const { host, children } = fakeHost(undefined, () => clock);
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = children[0];
+  child.answerHandshake();
+  const session = await starting;
+
+  await session.prompt('first');
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  await stopping;
+
+  clock += 2_000;
+  await session.prompt('second');
+  clock += 2_000;
+  child.say(ABORTED_RESULT);
+  assert.equal(session.state().busy, true, 'the abandoned turn ending closed the correction the reader is waiting on');
+
+  child.say(
+    JSON.stringify({
+      type: 'result',
+      is_error: false,
+      terminal_reason: 'completed',
+      result: 'done',
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+});
+
+test('an ask is held on the session until it is answered', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  children[0].say(
+    JSON.stringify({
+      type: 'control_request',
+      request_id: 'ask-1',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' },
+    }) + '\n',
+  );
+  assert.equal(session.state().asks.length, 1);
+  assert.deepEqual(
+    host.waiting().map((w) => w.key),
+    ['one'],
+  );
+  assert.equal(session.answer('ask-1', { decision: 'allow' }), true);
+  assert.equal(session.state().asks.length, 0);
+  assert.deepEqual(host.waiting(), []);
+});
+
+test('a child that dies badly leaves its reason on the session', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  children[0].complain('Not logged in.\n');
+  children[0].exit(1);
+  const state = session.state();
+  assert.equal(state.exited, true);
+  assert.match(state.lastError ?? '', /code 1/);
+  assert.match(state.lastError ?? '', /Not logged in/, 'the CLI said why on stderr, so the panel says it too');
+});
+
+test('a child that exits cleanly is not reported as an error', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  children[0].exit(0);
+  assert.equal(session.state().lastError, null);
+  assert.equal(session.state().exited, true);
+});
+
+test('a child that never started says so instead of hanging the handshake', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].fail(new Error('spawn ENOENT'));
+  const session = await starting;
+  assert.match(session.state().lastError ?? '', /could not start/);
+});
+
+test('a failed spawn closes without an exit event and settles disposal', async () => {
+  const { host, children } = fakeHost(undefined, undefined, { exitGraceMs: 20 });
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].fail(new Error('spawn ENOENT'));
+  const session = await opening;
+  let disposed = false;
+  const disposal = session.dispose().then(() => {
+    disposed = true;
+  });
+  await tick();
+  assert.equal(disposed, false, 'an error alone released a child that had not reported terminal closure');
+  children[0].close();
+  const outcome = await Promise.race([
+    disposal.then(() => 'disposed'),
+    new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 10)),
+  ]);
+  assert.equal(outcome, 'disposed', 'the failed-spawn close left disposal waiting for an exit that never comes');
+  assert.equal(disposed, true);
+});
+
+test('a busy session stops being busy when its child dies mid-turn', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  await session.prompt('hello');
+  children[0].exit(1);
+  assert.equal(session.state().busy, false, 'a dead agent shown as working would never clear');
+});
+
+test('disposing the host ends every child it started', async () => {
+  const { host, children } = fakeHost();
+  const a = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  await a;
+  const b = host.session('two', claudePlan(CLAUDE, { cwd: WS }));
+  children[1].answerHandshake();
+  await b;
+  host.dispose();
+  // Closed rather than killed. Which of the two it is matters: the CLI writes its settings
+  // out as it shuts down, so a child taken away outright loses whatever the reader last
+  // changed. `dispose` kills only what closing the input did not end.
+  assert.deepEqual(
+    children.map((c) => c.ended),
+    [true, true],
+  );
+  assert.deepEqual(host.states(), []);
+});
+
+test('a settled idle session retires when its timer fires', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 120, timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  await session.prompt('finish this');
+  children[0].say(COMPLETED_RESULT);
+
+  settle(host, 'one');
+  assert.equal(timer.tasks.at(-1)?.delayMs, 120);
+  timer.fire(timer.tasks.length - 1);
+  assert.equal(host.get('one'), null);
+  assert.equal(children[0].ended, true);
+});
+
+test('an older turn cannot settle a newer turn housekeeping batch', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  await starting;
+
+  let finishAUsage: () => void = () => undefined;
+  let finishAMcp: () => void = () => undefined;
+  const aUsage = new Promise<void>((resolve) => {
+    finishAUsage = resolve;
+  });
+  const aMcp = new Promise<void>((resolve) => {
+    finishAMcp = resolve;
+  });
+  const a = host.beginHousekeeping('one');
+  const aCompletion = Promise.allSettled([aUsage, aMcp]).then(() => host.settled(a));
+
+  let finishBUsage: () => void = () => undefined;
+  let finishBMcp: () => void = () => undefined;
+  const bUsage = new Promise<void>((resolve) => {
+    finishBUsage = resolve;
+  });
+  const bMcp = new Promise<void>((resolve) => {
+    finishBMcp = resolve;
+  });
+  const b = host.beginHousekeeping('one');
+  const bCompletion = Promise.allSettled([bUsage, bMcp]).then(() => host.settled(b));
+
+  finishAUsage();
+  finishAMcp();
+  await aCompletion;
+  assert.equal(timer.activeCount(), 0);
+  finishBUsage();
+  await tick();
+  assert.equal(timer.activeCount(), 0);
+  finishBMcp();
+  await bCompletion;
+  assert.equal(timer.activeCount(), 1);
+});
+
+test('canceling prompt selection starts a fresh idle window', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' });
+  const starting = host.session('one', plan);
+  children[0].answerHandshake();
+  const session = await starting;
+
+  let cancelPrompt: () => void = () => undefined;
+  const selection = host.withActivity('one', (live) => {
+    assert.strictEqual(live, session);
+    return new Promise<void>((resolve) => {
+      cancelPrompt = resolve;
+    });
+  });
+  assert.equal(timer.tasks[0].cleared, true);
+  timer.fire(0, true);
+  assert.strictEqual(host.get('one'), session);
+  cancelPrompt();
+  await selection;
+  assert.equal(timer.tasks[1].delayMs, 60_000);
+  timer.fire(1);
+  assert.equal(host.get('one'), null);
+});
+
+test('a pending agent usage read holds the child until both controls settle', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 80, timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+
+  const usage = host.withActivity('one', (live) => live.usage());
+  timer.fire(0, true);
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(children[0].ended, false);
+  children[0].answerControl('get_usage', { five_hour: { utilization: 1 } });
+  children[0].answerControl('get_context_usage', { used_percentage: 10 });
+  await usage;
+  assert.equal(timer.tasks[1].delayMs, 80);
+  timer.fire(1);
+  assert.equal(host.get('one'), null);
+});
+
+test('archiving during an MCP change keeps every target through the final status read', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const firstOpening = host.session('first', claudePlan(CLAUDE, { cwd: WS, sessionId: 'first-session' }));
+  children[0].answerHandshake();
+  await firstOpening;
+  const secondOpening = host.session('second', claudePlan(CLAUDE, { cwd: WS, sessionId: 'second-session' }));
+  children[1].answerHandshake();
+  await secondOpening;
+
+  const changing = host.changeMcp(['first', 'second'], [{ serverName: 'docs', enabled: false }]);
+  host.setArchived(['first-session', 'second-session']);
+  assert.ok(
+    children[0]
+      .sent()
+      .some((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'mcp_toggle'),
+  );
+  const secondHeld = host.get('second')?.state().sessionId;
+
+  children[0].answerControl('mcp_toggle', {});
+  await tick();
+  const secondChanged = children[1]
+    .sent()
+    .some((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'mcp_toggle');
+  if (secondChanged) {
+    children[1].answerControl('mcp_toggle', {});
+  }
+  await tick();
+  const statusRead = children[0]
+    .sent()
+    .some((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'mcp_status');
+  if (statusRead) {
+    children[0].answerControl('mcp_status', { mcpServers: [] });
+  }
+
+  const result = await changing;
+  assert.equal(
+    secondHeld,
+    'second-session',
+    'archiving retired the later target while the first toggle response was delayed',
+  );
+  assert.equal(secondChanged, true, 'the later target never received the MCP change');
+  assert.equal(statusRead, true, 'retirement skipped the final MCP status read');
+  assert.deepEqual(result, { failures: [], servers: [] });
+  assert.equal(host.get('first'), null);
+  assert.equal(host.get('second'), null);
+});
+
+test('a delayed permission target cannot let a later target retire before its control starts', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const firstOpening = host.session('first', claudePlan(CLAUDE, { cwd: WS, sessionId: 'first-session' }));
+  children[0].answerHandshake();
+  const first = await firstOpening;
+  const secondOpening = host.session('second', claudePlan(CLAUDE, { cwd: WS, sessionId: 'second-session' }));
+  children[1].answerHandshake();
+  const second = await secondOpening;
+  let book = {};
+
+  const changing = host.withActivities(['first', 'second'], async (sessions) => {
+    await acceptedPermissionMode(
+      () => book,
+      async (updated) => {
+        book = updated;
+      },
+      [
+        { session: 'first-session', accept: () => sessions.get('first')!.setAskMode(CLAUDE_ASK_MODES[2]) },
+        { session: 'second-session', accept: () => sessions.get('second')!.setAskMode(CLAUDE_ASK_MODES[2]) },
+      ],
+      'plan',
+    );
+    return true;
+  });
+  timer.fire(1, true);
+  assert.strictEqual(
+    host.get('second'),
+    second,
+    'the second child retired while the first child still held the permission request',
+  );
+  children[0].answerControl('set_permission_mode', {});
+  await tick();
+  assert.strictEqual(host.get('first'), first);
+  assert.ok(
+    children[1]
+      .sent()
+      .some((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'set_permission_mode'),
+    'the second permission control never started after the first one completed',
+  );
+  children[1].answerControl('set_permission_mode', {});
+  assert.equal(await changing, true);
+  assert.equal(sessionSettings(book, 'first-session').permissionMode, 'plan');
+  assert.equal(sessionSettings(book, 'second-session').permissionMode, 'plan');
+});
+
+test('a stale timer cannot retire a session that became busy', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  settle(host, 'one');
+
+  await session.prompt('new work');
+  timer.fire(timer.tasks.length - 1);
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(children[0].ended, false);
+});
+
+test('an open ask blocks retirement when an idle timer fires', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  settle(host, 'one');
+  children[0].say(
+    JSON.stringify({
+      type: 'control_request',
+      request_id: 'ask-1',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'dir' }, tool_use_id: 'tu1' },
+    }) + '\n',
+  );
+
+  timer.fire(timer.tasks.length - 1);
+  assert.equal(session.state().asks.length, 1);
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(children[0].ended, false);
+});
+
+test('archiving an eligible idle session retires it immediately', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  await starting;
+
+  host.setArchived(['sess-1']);
+  assert.equal(host.get('one'), null);
+  assert.equal(children[0].ended, true);
+  assert.equal(timer.tasks[0].cleared, true);
+});
+
+test('a prompt can open an archived session before retirement follows its release', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  host.setArchived(['sess-1']);
+  const delivery = host.withSessionActivity('one', claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1' }), (session) =>
+    session.prompt('continue'),
+  );
+  children[0].answerHandshake();
+  const turnId = await delivery;
+  assert.equal(typeof turnId, 'number');
+  assert.strictEqual(
+    host.get('one')?.state().sessionId,
+    'sess-1',
+    'opening retirement removed the child before the prompt acquired its activity lease',
+  );
+  children[0].say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.equal(host.get('one'), null, 'the archived child stayed open after the prompt and housekeeping released it');
+});
+
+test('compaction can open an archived session before retirement follows its release', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  host.setArchived(['sess-1']);
+  const delivery = host.withSessionActivity('one', claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1' }), (session) =>
+    session.compact(),
+  );
+  children[0].answerHandshake();
+  const turnId = await delivery;
+  assert.equal(typeof turnId, 'number');
+  assert.strictEqual(
+    host.get('one')?.state().sessionId,
+    'sess-1',
+    'opening retirement removed the child before compaction acquired its activity lease',
+  );
+  children[0].say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.equal(host.get('one'), null, 'the archived child stayed open after compaction and housekeeping released it');
+});
+
+test('an archived busy session retires only after housekeeping settles', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  await session.prompt('finish this');
+
+  host.setArchived(['sess-1']);
+  assert.strictEqual(host.get('one'), session);
+  children[0].say(COMPLETED_RESULT);
+  assert.strictEqual(host.get('one'), session);
+  settle(host, 'one');
+  assert.equal(host.get('one'), null);
+  assert.equal(children[0].ended, true);
+});
+
+test('archiving after turn end still waits for its control reads to settle', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  await session.prompt('finish this');
+  children[0].say(COMPLETED_RESULT);
+  const housekeeping = host.beginHousekeeping('one');
+
+  host.setArchived(['sess-1']);
+  assert.strictEqual(host.get('one'), session);
+  host.settled(housekeeping);
+  assert.equal(host.get('one'), null);
+  assert.equal(children[0].ended, true);
+});
+
+test('unarchiving cancels deferred archive retirement', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  await session.prompt('finish this');
+  host.setArchived(['sess-1']);
+
+  host.setArchived([]);
+  children[0].say(COMPLETED_RESULT);
+  settle(host, 'one');
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(children[0].ended, false);
+  assert.equal(timer.activeCount(), 1);
+});
+
+test('retirement removes the host entry and disposes its child once', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  await starting;
+
+  timer.fire(0);
+  timer.fire(0, true);
+  host.dispose();
+  assert.deepEqual(host.states(), []);
+  assert.equal(children[0].endCalls, 1);
+});
+
+test('a prompt after retirement starts one child with the stored resume identifier', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children, commands } = fakeHost(undefined, undefined, { timer });
+  const firstStart = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const first = await firstStart;
+  const stored = first.state().sessionId;
+  assert.equal(stored, 'sess-1');
+  timer.fire(0);
+
+  const resumed = host.session('one', claudePlan(CLAUDE, { cwd: WS, resume: stored ?? undefined }));
+  assert.equal(children.length, 1);
+  children[0].exit(0);
+  await tick();
+  assert.equal(children.length, 2);
+  assert.equal(commands[1][commands[1].indexOf('--resume') + 1], 'sess-1');
+  children[1].answerHandshake();
+  await resumed;
+  assert.equal(children.length, 2);
+});
+
+test('a permission accepted while replacement waits for shutdown reaches the new child', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children, commands } = fakeHost(undefined, undefined, { timer });
+  const first = host.session(
+    'fresh',
+    claudePlan(CLAUDE, {
+      cwd: WS,
+      sessionId: 'sess-1',
+      permissionMode: 'acceptEdits',
+    }),
+  );
+  children[0].answerHandshake();
+  await first;
+  timer.fire(0);
+
+  let permissionMode: PermissionMode = 'acceptEdits';
+  const delivery = host.withSessionActivity(
+    'existing',
+    () => claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1', permissionMode }),
+    (session) => session.prompt('continue'),
+  );
+  assert.equal(children.length, 1);
+  permissionMode = 'plan';
+  children[0].exit(0);
+  await tick();
+
+  const launchedMode = commands[1][commands[1].indexOf('--permission-mode') + 1];
+  children[1].answerHandshake();
+  assert.equal(typeof (await delivery), 'number');
+  assert.equal(launchedMode, 'plan', 'the replacement launched with the permission captured before shutdown');
+});
+
+test('a retired Claude session resumes with its accepted draft setup', async () => {
+  const profile: SessionProfile = {
+    agent: 'claude',
+    model: 'sonnet',
+    effort: 'low',
+    permissionMode: 'plan',
+    source: 'custom',
+  };
+  const accepted = sessionSettings(
+    withSessionSettings({}, 'sess-plan', sessionSettingsForProfile(profile)),
+    'sess-plan',
+  );
+  const timer = new FakeAgentHostTimer();
+  const { host, children, commands } = fakeHost(undefined, undefined, { timer });
+  const first = host.session(
+    'fresh',
+    claudePlan(CLAUDE, {
+      cwd: WS,
+      sessionId: 'sess-plan',
+      permissionMode: claudeAskMode(askMode('claude', profile.permissionMode)),
+      model: profile.model,
+      effort: profile.effort,
+    }),
+  );
+  children[0].answerHandshake();
+  await first;
+  timer.fire(0);
+
+  const replacement = host.session(
+    'existing',
+    claudePlan(CLAUDE, {
+      cwd: WS,
+      resume: 'sess-plan',
+      permissionMode: claudeAskMode(askMode('claude', accepted.permissionMode) ?? defaultAskMode('claude')),
+      model: accepted.selectedModel,
+      effort: accepted.selectedEffort,
+    }),
+  );
+  children[0].exit(0);
+  await tick();
+  children[1].answerHandshake();
+  await replacement;
+
+  const launchSettings = (args: string[]) =>
+    Object.fromEntries(
+      ['--model', '--effort', '--permission-mode'].map((flag) => [flag, args[args.indexOf(flag) + 1]]),
+    );
+  assert.deepEqual(launchSettings(commands[1]), launchSettings(commands[0]));
+  assert.deepEqual(launchSettings(commands[1]), {
+    '--model': 'sonnet',
+    '--effort': 'low',
+    '--permission-mode': 'plan',
+  });
+});
+
+test('a resumed Codex writer waits for the retired fresh-key child to exit', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const firstStart = host.session(
+    freshHostKey('codex', 'draft-1'),
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+    }),
+  );
+  await answerCodexHandshake(children[0]);
+  children[0].reply({ thread: { id: 'thread-7' } });
+  await firstStart;
+  timer.fire(0);
+
+  const resumed = host.session(
+    existingHostKey('codex', 'thread-7'),
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      resume: 'thread-7',
+    }),
+  );
+  assert.equal(children.length, 1);
+  children[0].exit(0);
+  await tick();
+  assert.equal(children.length, 2);
+  await answerCodexHandshake(children[1]);
+  children[1].reply({ thread: { id: 'thread-7' } });
+  await resumed;
+});
+
+test('a retired Codex session resumes with its accepted draft setup', async () => {
+  const profile: SessionProfile = {
+    agent: 'codex',
+    model: 'gpt-5-codex',
+    effort: 'xhigh',
+    permissionMode: 'untrusted',
+    source: 'custom',
+  };
+  const accepted = sessionSettings(withSessionSettings({}, 'thread-7', sessionSettingsForProfile(profile)), 'thread-7');
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const pickedMode = askMode('codex', profile.permissionMode);
+  assert.ok(pickedMode);
+  const firstMode = codexAskMode(pickedMode);
+  const first = host.session(
+    freshHostKey('codex', 'draft-1'),
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      ...firstMode,
+      model: profile.model,
+      effort: profile.effort,
+    }),
+  );
+  await answerCodexHandshake(children[0]);
+  children[0].reply({ thread: { id: 'thread-7' } });
+  await first;
+  timer.fire(0);
+
+  const resumedMode = codexAskMode(askMode('codex', accepted.permissionMode) ?? defaultAskMode('codex'));
+  const replacement = host.session(
+    existingHostKey('codex', 'thread-7'),
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      resume: 'thread-7',
+      ...resumedMode,
+      model: accepted.selectedModel,
+      effort: accepted.selectedEffort,
+    }),
+  );
+  children[0].exit(0);
+  await tick();
+  await answerCodexHandshake(children[1]);
+  children[1].reply({ thread: { id: 'thread-7' } });
+  const session = await replacement;
+
+  const delivery = session.prompt('continue');
+  await tick();
+  const turn = children[1].sent().find((message) => message.method === 'turn/start');
+  const params = turn?.params as {
+    approvalPolicy?: string;
+    approvalsReviewer?: string;
+    sandboxPolicy?: unknown;
+    model?: string;
+    effort?: string;
+  };
+  assert.deepEqual(params, {
+    threadId: 'thread-7',
+    input: [{ type: 'text', text: 'continue' }],
+    approvalPolicy: 'on-request',
+    approvalsReviewer: 'user',
+    sandboxPolicy: sandboxPolicy('workspace-write'),
+    model: 'gpt-5-codex',
+    effort: 'xhigh',
+  });
+  children[1].reply({ turn: { id: 'turn-1' } });
+  await delivery;
+});
+
+test('a replacement writer waits for confirmed exit after the kill backstop', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, {
+    timer,
+    idleDurationMs: 20,
+    exitGraceMs: 10,
+  });
+  const first = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  await first;
+  vi.useFakeTimers();
+  timer.fire(0);
+
+  const replacement = host.session('one', claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1' }));
+  await vi.advanceTimersByTimeAsync(30);
+  vi.useRealTimers();
+  assert.equal(children[0].killed, true, 'the shutdown backstop never asked the old child to stop');
+  assert.equal(children.length, 1, 'calling kill was treated as confirmed exit and started a second writer');
+
+  children[0].exit(0);
+  await tick();
+  assert.equal(children.length, 2, 'confirmed exit did not release the replacement writer');
+  children[1].answerHandshake();
+  await replacement;
+});
+
+test('disposing the host prevents a replacement waiting on shutdown from starting', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const first = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  await first;
+  timer.fire(0);
+
+  const replacement = host.session('one', claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1' }));
+  const rejectedReplacement = assert.rejects(replacement, /host is no longer running/);
+  host.dispose();
+  children[0].exit(0);
+  await tick();
+  if (children[1]) {
+    children[1].exit(0);
+  }
+  assert.equal(children.length, 1, 'a replacement spawned after host disposal released its shutdown wait');
+  await rejectedReplacement;
+  await assert.rejects(
+    host.session('two', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-2' })),
+    /host is no longer running/,
+  );
+  assert.equal(children.length, 1, 'host disposal allowed a pending or later child to spawn');
+  assert.deepEqual(host.states(), []);
+});
+
+test('disposing the host prevents any later session from opening', async () => {
+  const { host, children } = fakeHost();
+  host.dispose();
+
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  if (children[0]) {
+    children[0].exit(0);
+  }
+  await assert.rejects(opening, /host is no longer running/);
+  assert.equal(children.length, 0, 'a disposed host opened another child');
+});
+
+test('an idle-duration change reschedules eligible sessions from the change time', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 100, timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  await starting;
+  assert.equal(timer.tasks[0].delayMs, 100);
+  host.setIdleDuration(90);
+  assert.equal(timer.tasks[0].cleared, true);
+  assert.equal(timer.tasks[1].delayMs, 90);
+
+  const housekeeping = host.beginHousekeeping('one');
+
+  host.setIdleDuration(250);
+  assert.equal(timer.activeCount(), 0, 'a duration change bypassed pending turn housekeeping');
+  host.settled(housekeeping);
+  assert.equal(timer.tasks[2].delayMs, 250);
+  timer.fire(1, true);
+  assert.notEqual(host.get('one'), null);
+  timer.fire(2);
+  assert.equal(host.get('one'), null);
+});
+
+test('an idle-duration change keeps archived retirement behind pending housekeeping', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 100, timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  const housekeeping = host.beginHousekeeping('one');
+  host.setArchived(['sess-1']);
+
+  host.setIdleDuration(25);
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(timer.activeCount(), 0);
+  host.settled(housekeeping);
+  assert.equal(host.get('one'), null);
+});
+
+test('host disposal clears timers and disposes remaining children once', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  for (const [key, id] of [
+    ['one', 'sess-1'],
+    ['two', 'sess-2'],
+  ]) {
+    const starting = host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId: id }));
+    children[children.length - 1].answerHandshake();
+    await starting;
+  }
+
+  host.dispose();
+  assert.deepEqual(
+    timer.tasks.map((task) => task.cleared),
+    [true, true],
+  );
+  assert.deepEqual(
+    children.map((child) => child.endCalls),
+    [1, 1],
+  );
+  timer.fire(0, true);
+  timer.fire(1, true);
+  assert.deepEqual(
+    children.map((child) => child.endCalls),
+    [1, 1],
+  );
+});
+
+test('the session id the CLI settled on is what the panel would resume by', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  children[0].say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-9' }) + '\n');
+  assert.equal(session.state().sessionId, 'sess-9');
+});
+
+test('a Codex session runs the package script under Node, with no shell', async () => {
+  const { host, children, commands } = fakeHost();
+  const starting = host.session(
+    'cx',
+    codexPlan(
+      { command: 'node', leadingArgs: ['C:\\codex\\bin\\codex.js'], env: {} },
+      {
+        cwd: WS,
+        clientInfo: CODEX_CLIENT,
+      },
+    ),
+  );
+  assert.deepEqual(commands[0], ['C:\\codex\\bin\\codex.js', 'app-server']);
+  const child = children[0];
+  // Handshake, skills, then the thread: each waits on the one before it.
+  await answerCodexHandshake(child, [{ name: 'polish', description: 'Tidy the wording' }]);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  assert.equal(session.agent, 'codex');
+  assert.equal(session.state().sessionId, 'thread-7');
+  assert.deepEqual(
+    session.state().commands.map((command) => command.name),
+    ['compact', 'clear', 'new', 'rename', 'polish'],
+  );
+});
+
+test('a partial Codex permission setup does not invent a reader pick', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session(
+    'cx',
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      approvalPolicy: 'never',
+    }),
+  );
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const delivery = session.prompt('use the configured permissions');
+  await tick();
+  const turn = child.sent().find((message) => message.method === 'turn/start');
+  const params = turn?.params as Record<string, unknown>;
+  for (const setting of ['approvalPolicy', 'approvalsReviewer', 'sandboxPolicy']) {
+    assert.equal(setting in params, false, `an incomplete pick invented ${setting}`);
+  }
+  child.reply({ turn: { id: 'turn-1' } });
+  await delivery;
+});
+
+test('a Codex plan without a permission pick leaves the thread and turn unconfigured', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  const opening = child.sent().find((message) => message.method === 'thread/start');
+  const openingParams = opening?.params as Record<string, unknown>;
+  for (const setting of ['approvalPolicy', 'approvalsReviewer', 'sandbox']) {
+    assert.equal(setting in openingParams, false, `an unpicked plan sent ${setting} at thread start`);
+  }
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const delivery = session.prompt('use the configured permissions');
+  await tick();
+  const turn = child.sent().find((message) => message.method === 'turn/start');
+  const turnParams = turn?.params as Record<string, unknown>;
+  for (const setting of ['approvalPolicy', 'approvalsReviewer', 'sandbox', 'sandboxPolicy']) {
+    assert.equal(setting in turnParams, false, `an unpicked plan sent ${setting} on its turn`);
+  }
+  child.reply({ turn: { id: 'turn-1' } });
+  await delivery;
+});
+
+test('a live Codex session replaces its commands after a skill change', async () => {
+  const { host, children, events, states } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child, [{ name: 'polish', description: 'Tidy the wording' }]);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  child.say(JSON.stringify({ method: 'skills/changed', params: {} }) + '\n');
+  assert.deepEqual(child.sent().at(-1), {
+    id: 4,
+    method: 'skills/list',
+    params: { cwds: [WS], forceReload: true },
+  });
+  child.reply({
+    data: [{ cwd: WS, skills: [{ name: 'summarize', description: 'Summarize the text' }] }],
+  });
+  await vi.waitFor(() => {
+    assert.deepEqual(
+      session.state().commands.map((command) => command.name),
+      ['compact', 'clear', 'new', 'rename', 'summarize'],
+    );
+  });
+
+  assert.strictEqual(host.get('cx'), session);
+  assert.equal(children.length, 1);
+  assert.equal(child.sent().filter((message) => message.method === 'thread/start').length, 1);
+  assert.equal(events.at(-1)?.event.kind, 'commands');
+  assert.deepEqual(
+    states.at(-1)?.commands.map((command) => command.name),
+    ['compact', 'clear', 'new', 'rename', 'summarize'],
+  );
+});
+
+test('a Codex skill change during thread startup remains after opening completes', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child, [{ name: 'stale', description: 'Opening version' }]);
+  const threadRequest = child.sent().find((message) => message.method === 'thread/start');
+  assert.equal(typeof threadRequest?.id, 'number');
+
+  child.say(JSON.stringify({ method: 'skills/changed', params: {} }) + '\n');
+  const refreshRequest = child
+    .sent()
+    .filter((message) => message.method === 'skills/list')
+    .at(-1);
+  assert.equal(typeof refreshRequest?.id, 'number');
+  child.say(
+    JSON.stringify({
+      id: refreshRequest?.id,
+      result: { data: [{ cwd: WS, skills: [{ name: 'current', description: 'Current version' }] }] },
+    }) + '\n',
+  );
+  await vi.waitFor(() => {
+    assert.deepEqual(
+      host
+        .get('cx')
+        ?.state()
+        .commands.map((command) => command.name),
+      ['compact', 'clear', 'new', 'rename', 'current'],
+    );
+  });
+
+  child.say(JSON.stringify({ id: threadRequest?.id, result: { thread: { id: 'thread-7' } } }) + '\n');
+  const session = await starting;
+  assert.deepEqual(
+    session.state().commands.map((command) => command.name),
+    ['compact', 'clear', 'new', 'rename', 'current'],
+  );
+});
+
+test('Codex compaction stays pending through its reported turn and sends no prompt turn', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const compacting = session.compact();
+  assert.equal(session.state().busy, true);
+  const request = child.sent().at(-1);
+  assert.deepEqual(request?.params, { threadId: 'thread-7' });
+  assert.equal(request?.method, 'thread/compact/start');
+  assert.equal(
+    child.sent().some((message) => message.method === 'turn/start'),
+    false,
+  );
+
+  child.reply({});
+  await tick();
+  assert.equal(session.state().busy, true, 'the request acknowledgement ended the compaction');
+  child.say(
+    JSON.stringify({
+      method: 'turn/started',
+      params: { threadId: 'thread-7', turn: { id: 'compact-turn', status: 'inProgress', items: [] } },
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, true);
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-7', turn: { id: 'compact-turn', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+  await compacting;
+  assert.equal(session.state().busy, false);
+});
+
+test('Codex clear starts a replacement thread and reports the previous session', async () => {
+  const { host, children, events } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const clearing = session.clear();
+  const request = child.sent().at(-1);
+  assert.equal(request?.method, 'thread/start');
+  assert.equal(
+    child.sent().some((message) => message.method === 'turn/start'),
+    false,
+  );
+  child.reply({ thread: { id: 'thread-8' } });
+  await clearing;
+  assert.equal(session.state().sessionId, 'thread-8');
+  assert.deepEqual(events.filter((entry) => entry.event.kind === 'session').at(-1)?.event, {
+    kind: 'session',
+    sessionId: 'thread-8',
+    previous: 'thread-7',
+  });
+});
+
+test('Codex new names its replacement thread without starting a model turn', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const replacing = session.clear('follow-up');
+  assert.equal(child.sent().at(-1)?.method, 'thread/start');
+  child.reply({ thread: { id: 'thread-8' } });
+  await tick();
+  assert.deepEqual(child.sent().at(-1), {
+    id: child.sent().at(-1)?.id,
+    method: 'thread/name/set',
+    params: { threadId: 'thread-8', name: 'follow-up' },
+  });
+  assert.equal(
+    child.sent().some((message) => message.method === 'turn/start'),
+    false,
+  );
+  child.reply({});
+  await replacing;
+  assert.equal(session.state().sessionId, 'thread-8');
+});
+
+test('a refused Codex new name keeps the adopted replacement usable', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const replacing = session.clear('follow-up');
+  child.reply({ thread: { id: 'thread-8' } });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/name/set'));
+  child.replyError(-32000, 'name refused');
+  await replacing;
+  assert.equal(session.state().sessionId, 'thread-8');
+  assert.match(session.state().lastError ?? '', /new session opened.*name was not saved.*name refused/);
+
+  const following = session.prompt('continue');
+  const request = child.sent().at(-1);
+  assert.equal(request?.method, 'turn/start');
+  assert.equal((request?.params as { threadId?: string } | undefined)?.threadId, 'thread-8');
+  child.reply({ turn: { id: 'turn-9' } });
+  await following;
+});
+
+test('a Codex clear keeps the current Default model for its replacement thread', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session(
+    'cx',
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      model: 'gpt-5.6-sol',
+    }),
+  );
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  await session.setModel('');
+  const clearing = session.clear();
+  const clear = child.sent().at(-1);
+  assert.equal(clear?.method, 'thread/start');
+  assert.equal(
+    (clear?.params as { model?: string } | undefined)?.model,
+    undefined,
+    'the replacement thread restored the explicit launch model after the reader selected Default',
+  );
+  child.reply({ thread: { id: 'thread-8' } });
+  await clearing;
+
+  void session.prompt('continue');
+  await tick();
+  const prompt = child.sent().at(-1);
+  assert.equal(prompt?.method, 'turn/start');
+  assert.equal(
+    (prompt?.params as { model?: string } | undefined)?.model,
+    undefined,
+    'the first prompt after clear overrides the replacement thread with the retired model',
+  );
+});
+
+test('a rejected native compaction clears the running state and keeps the reason', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const compacting = session.compact();
+  await tick();
+  child.replyError(-32600, 'compaction is unavailable while a turn is running');
+  // The server's own sentence, with nothing wrapped around it. The panel says that the
+  // compaction did not happen. The only thing left for this to carry is why.
+  await assert.rejects(compacting, (error: Error) => {
+    assert.equal(error.message, 'compaction is unavailable while a turn is running');
+    return true;
+  });
+  assert.equal(session.state().busy, false);
+  assert.match(session.state().lastError ?? '', /compaction is unavailable/);
+  assert.match(
+    session.state().lastError ?? '',
+    /would not compact the session/,
+    'the session diagnostic names the operation, because nothing reading it later can tell',
+  );
+});
+
+test('a compaction the agent gave no reason for leaves no dangling colon behind', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const compacting = session.compact();
+  await tick();
+  child.reply({});
+  await tick();
+  child.say(
+    JSON.stringify({
+      method: 'turn/started',
+      params: { threadId: 'thread-7', turn: { id: 'compact-turn' } },
+    }) + '\n',
+  );
+  await tick();
+  child.say(
+    JSON.stringify({
+      method: 'turn/failed',
+      params: { threadId: 'thread-7', turnId: 'compact-turn' },
+    }) + '\n',
+  );
+  await assert.rejects(compacting, (error: Error) => {
+    assert.equal(error.message, '', 'an empty message is how the panel knows to say so itself');
+    return true;
+  });
+  assert.equal(session.state().lastError, 'the agent would not compact the session and gave no reason');
+});
+
+test('a rejected Codex skill list does not stop the session from opening', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  child.reply({ userAgent: 'codex' });
+  await tick();
+  child.replyError(-32601, 'Method not found');
+  await tick();
+  assert.equal(child.sent()[3].method, 'thread/start');
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await opening;
+  assert.deepEqual(
+    session.state().commands.map((command) => command.name),
+    ['compact', 'clear', 'new', 'rename'],
+  );
+  assert.equal(session.state().sessionId, 'thread-7');
+});
+
+test('a resumed Codex session keeps Approve for me without and with a stored choice', async () => {
+  for (const stored of [undefined, 'on-request']) {
+    const { host, children } = fakeHost();
+    const approval = codexAskMode(askMode('codex', stored) ?? defaultAskMode('codex'));
+    const starting = host.session(
+      'cx',
+      codexPlan(CODEX, {
+        cwd: WS,
+        clientInfo: CODEX_CLIENT,
+        resume: 'thread-7',
+        ...approval,
+      }),
+    );
+    const child = children[0];
+    await answerCodexHandshake(child);
+    const asked = child
+      .sent()
+      .filter((m) => typeof m.method === 'string')
+      .map((m) => m.method);
+    assert.ok(asked.includes('thread/resume'), 'starting a new thread would abandon the session');
+    assert.ok(!asked.includes('thread/start'));
+    child.reply({ thread: { id: 'thread-7' } });
+    const session = await starting;
+
+    const delivery = session.prompt('carry on');
+    await tick();
+    const turn = child.sent().find((m) => m.method === 'turn/start');
+    const params = turn?.params as {
+      approvalPolicy?: string;
+      approvalsReviewer?: string;
+      sandboxPolicy?: unknown;
+      sandbox?: string;
+    };
+    assert.equal(params.approvalPolicy, 'on-request');
+    assert.equal(params.approvalsReviewer, 'auto_review');
+    assert.deepEqual(params.sandboxPolicy, sandboxPolicy(approval.sandbox));
+    assert.equal(params.sandbox, undefined);
+    child.reply({ turn: { id: 'turn-1' } });
+    await delivery;
+  }
+});
+
+test('a Codex continuation keeps its accepted setup through retirement and reopening', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const profile: SessionProfile = {
+    agent: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'high',
+    permissionMode: 'untrusted',
+    source: 'custom',
+  };
+  let book = withSessionSettings({}, 'source', sessionSettingsForProfile(profile));
+  const approval = codexAskMode(
+    askMode('codex', sessionSettings(book, 'source').permissionMode) ?? defaultAskMode('codex'),
+  );
+  const starting = host.session(
+    'codex:fork:source:1',
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      fork: 'source',
+      ...approval,
+      model: profile.model,
+      effort: profile.effort,
+    }),
+  );
+  const child = children[0];
+  await answerCodexHandshake(child);
+  const methods = child
+    .sent()
+    .filter((m) => typeof m.method === 'string')
+    .map((m) => m.method);
+  assert.ok(methods.includes('thread/fork'));
+  assert.ok(!methods.includes('thread/resume'));
+  assert.ok(!methods.includes('thread/start'));
+  const fork = child.sent().find((m) => m.method === 'thread/fork');
+  const forkParams = fork?.params as {
+    approvalPolicy?: string;
+    approvalsReviewer?: string;
+    sandbox?: string;
+    sandboxPolicy?: unknown;
+  };
+  assert.equal(forkParams.approvalPolicy, approval.approvalPolicy);
+  assert.equal(forkParams.approvalsReviewer, approval.approvalsReviewer);
+  assert.equal(forkParams.sandbox, approval.sandbox);
+  assert.equal(forkParams.sandboxPolicy, undefined);
+  child.reply({ thread: { id: 'continued' } });
+  const session = await starting;
+  book = withSessionSettings(book, 'continued', sessionSettingsForProfile(profile));
+  assert.equal(host.find('codex', 'continued'), session, 'a later send by the fork id would start a second writer');
+  assert.deepEqual(
+    sessionSettings(book, 'source'),
+    sessionSettingsForProfile(profile),
+    'saving the fork setup removed the resumable source setup',
+  );
+
+  const delivery = session.prompt('carry on');
+  await tick();
+  const turn = child.sent().find((m) => m.method === 'turn/start');
+  const turnParams = turn?.params as {
+    threadId?: string;
+    approvalPolicy?: string;
+    approvalsReviewer?: string;
+    sandboxPolicy?: unknown;
+    sandbox?: string;
+    model?: string;
+    effort?: string;
+  };
+  assert.equal(turnParams.threadId, 'continued');
+  assert.equal(turnParams.approvalPolicy, approval.approvalPolicy);
+  assert.equal(turnParams.approvalsReviewer, approval.approvalsReviewer);
+  assert.deepEqual(turnParams.sandboxPolicy, sandboxPolicy(approval.sandbox));
+  assert.equal(turnParams.sandbox, undefined);
+  assert.equal(turnParams.model, profile.model);
+  assert.equal(turnParams.effort, profile.effort);
+  child.reply({ turn: { id: 'turn-1' } });
+  await delivery;
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'continued', turn: { id: 'turn-1', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+  timer.fire(0);
+  assert.equal(host.get('codex:fork:source:1'), null);
+
+  const stored = sessionSettings(book, 'continued');
+  const reopened = host.session(
+    existingHostKey('codex', 'continued'),
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      resume: 'continued',
+      ...codexAskMode(askMode('codex', stored.permissionMode) ?? defaultAskMode('codex')),
+      model: stored.selectedModel,
+      effort: stored.selectedEffort,
+    }),
+  );
+  child.exit(0);
+  await tick();
+  await answerCodexHandshake(children[1]);
+  children[1].reply({ thread: { id: 'continued' } });
+  const replacement = await reopened;
+  const next = replacement.prompt('next turn');
+  await tick();
+  const resumedTurn = children[1].sent().find((message) => message.method === 'turn/start');
+  assert.deepEqual(
+    resumedTurn?.params,
+    {
+      threadId: 'continued',
+      input: [{ type: 'text', text: 'next turn' }],
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      sandboxPolicy: sandboxPolicy('workspace-write'),
+      model: profile.model,
+      effort: profile.effort,
+    },
+    'the retired fork reopened with different workspace approval settings',
+  );
+  children[1].reply({ turn: { id: 'turn-2' } });
+  await next;
+});
+
+test('a Codex approval reaches the panel as the same kind of ask a Claude one does', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  child.say(
+    JSON.stringify({
+      id: 0,
+      method: 'item/commandExecution/requestApproval',
+      params: { itemId: 'exec-1', command: 'echo hi', cwd: WS },
+    }) + '\n',
+  );
+  assert.equal(session.state().asks.length, 1);
+  assert.equal(session.state().asks[0].kind, 'permission');
+  assert.equal(session.answer('exec-1', { decision: 'allow' }), true);
+  const answered = child.sent().find((m) => m.id === 0 && m.result);
+  assert.deepEqual(answered?.result, { decision: 'accept' });
+  assert.equal(session.state().asks.length, 0);
+});
+
+test('a Codex async question stays open after its turn ends, and answering it starts a new turn', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  const prompting = session.prompt('check the rail');
+  child.reply({ turn: { id: 'turn-1' } });
+  await prompting;
+  const item = {
+    type: 'agentMessage',
+    id: 'call-ask',
+    text: 'Does it work?\n- Yes',
+    phase: 'final_answer',
+    delivery: 'async',
+    questions: [{ title: 'Does it work?', options: ['Yes', 'No'] }],
+  };
+  child.say(
+    JSON.stringify({ method: 'item/completed', params: { item, threadId: 'thread-7', turnId: 'turn-1' } }) + '\n',
+  );
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-7', turn: { id: 'turn-1', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+  assert.deepEqual(
+    session.state().asks.map((ask) => ask.id),
+    ['call-ask'],
+    'the question waits on no request, so its turn ending leaves it for the reader to answer',
+  );
+  assert.equal(session.state().busy, false);
+
+  const questionId = JSON.stringify(['request_user_input_async', 'call-ask', 0]);
+  assert.equal(
+    session.answer('call-ask', { decision: 'answer', answers: { [questionId]: { labels: ['Yes'], written: '' } } }),
+    true,
+  );
+  assert.equal(session.state().asks.length, 0);
+  assert.equal(
+    session.state().busy,
+    true,
+    'with the ask gone and the prompt not yet accepted, an idle session could retire mid-delivery',
+  );
+  const start = child.sent().at(-1);
+  assert.equal(start?.method, 'turn/start');
+  assert.match(JSON.stringify(start?.params), /send_user_message_question_reply/);
+  child.reply({ turn: { id: 'turn-2' } });
+  await vi.waitFor(() =>
+    assert.equal(session.state().busy, true, 'the answer started a turn, so the session is working'),
+  );
+});
+
+test('a Codex async answer whose steer and prompt are both refused leaves the session idle', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  const prompting = session.prompt('check the rail');
+  child.reply({ turn: { id: 'turn-1' } });
+  await prompting;
+  const item = {
+    type: 'agentMessage',
+    id: 'call-ask',
+    text: 'Does it work?',
+    phase: 'final_answer',
+    delivery: 'async',
+    questions: [{ title: 'Does it work?', options: ['Yes', 'No'] }],
+  };
+  child.say(
+    JSON.stringify({
+      method: 'item/completed',
+      params: { item, threadId: 'thread-7', turnId: 'turn-1' },
+    }) + '\n',
+  );
+  const questionId = JSON.stringify(['request_user_input_async', 'call-ask', 0]);
+  session.answer('call-ask', {
+    decision: 'answer',
+    answers: { [questionId]: { labels: ['Yes'], written: '' } },
+  });
+  assert.equal(child.sent().at(-1)?.method, 'turn/steer');
+  child.replyError(-32600, 'expected turn is not active');
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+  // The asking turn ends while the fallback prompt waits to be accepted.
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-7',
+        turn: { id: 'turn-1', status: 'completed', items: [] },
+      },
+    }) + '\n',
+  );
+  child.replyError(-32600, 'thread is busy');
+  await vi.waitFor(() =>
+    assert.deepEqual(
+      session.state().asks.map((ask) => ask.id),
+      ['call-ask'],
+    ),
+  );
+  assert.equal(session.state().busy, false, 'no turn is open, so the session must not stay busy');
+  assert.match(session.state().lastError ?? '', /thread is busy/);
+});
+
+test('a prompt the agent will not take clears the running state and says why', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  const delivery = session.prompt('hello');
+  await tick();
+  child.replyError(-32600, 'the server refused this turn');
+  await assert.rejects(
+    delivery,
+    /would not take the prompt/,
+    'the composer must not be told delivery succeeded when Codex rejected the turn',
+  );
+  assert.equal(session.state().busy, false, 'a prompt that never went out must not leave the panel saying it did');
+  assert.match(session.state().lastError ?? '', /would not take the prompt/);
+});
+
+test('a Codex resume refusal closes the unusable child and keeps the refusal', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session(
+    'cx',
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      resume: 'thread-7',
+    }),
+  );
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.replyError(-32600, 'thread thread-7 already has an active writer');
+
+  const session = await opening;
+  assert.equal(session.state().exited, true, 'a child that adopted no session is kept as though it can take a prompt');
+  assert.equal(child.ended, true, 'the refused child stdin is left open');
+  assert.equal(child.ended, true, 'the refused child process is left running');
+  assert.match(
+    session.state().lastError ?? '',
+    /already has an active writer/,
+    'the reason Codex gave is replaced by a later no-session error',
+  );
+
+  const sentBefore = child.sent().length;
+  await assert.rejects(
+    session.prompt('hello'),
+    /active writer/,
+    'prompting the refused session loses the opening reason',
+  );
+  assert.equal(child.sent().length, sentBefore, 'a turn was sent to a child that adopted no session');
+});
+
+test('a Codex prompt is not reported delivered before the app server accepts the turn', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const delivery = session.prompt('hello');
+  let delivered = false;
+  void delivery.then(() => {
+    delivered = true;
+  });
+  await tick();
+  assert.equal(delivered, false, 'the turn/start request has not been answered yet');
+
+  child.reply({ turn: { id: 'turn-8' } });
+  await delivery;
+  assert.equal(delivered, true);
+});
+
+test('Codex prompts accepted into one server turn share its Stop and completion', async () => {
+  const { host, children, events } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+
+  const delivery = session.prompt('first');
+  await tick();
+  child.reply({ turn: { id: 'turn-8' } });
+  await delivery;
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-7', turn: { id: 'turn-old', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, true, 'a stale ending took the Stop control away from the active turn');
+  assert.equal(
+    events.some((entry) => entry.event.kind === 'turnEnd'),
+    false,
+    'the stale ending escaped the wire as the active turn ending',
+  );
+
+  const queued = session.prompt('second');
+  await tick();
+  const starts = child.sent().filter((message) => message.method === 'turn/start');
+  assert.equal(starts.length, 2, 'the second prompt never reached the busy Codex child');
+  child.reply({ turn: { id: 'turn-8' } });
+  await queued;
+  const stopping = session.interrupt();
+  await tick();
+  const interrupt = child.sent().find((message) => message.method === 'turn/interrupt');
+  assert.deepEqual(interrupt?.params, { threadId: 'thread-7', turnId: 'turn-8' });
+  child.reply({});
+  await stopping;
+
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-7', turn: { id: 'turn-8', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+  assert.equal(
+    events.filter((entry) => entry.event.kind === 'turnEnd').length,
+    1,
+    'one server turn emitted an ending for each accepted prompt',
+  );
+  const interruptsBefore = child.sent().filter((message) => message.method === 'turn/interrupt').length;
+  await session.interrupt();
+  assert.equal(
+    child.sent().filter((message) => message.method === 'turn/interrupt').length,
+    interruptsBefore,
+    'Stop reused the id after its server turn completed',
+  );
+});
+
+test('a prompt sent to a Claude session whose child has died is reported, not shown as running', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  children[0].exit(1);
+  await assert.rejects(
+    session.prompt('are you there'),
+    /stopped with code 1/,
+    'prompting a dead child replaces the reason it died with a generic stopped message',
+  );
+  const state = session.state();
+  assert.equal(state.busy, false, 'a turn shown as running on a dead child never clears and cannot be stopped');
+  assert.match(state.lastError ?? '', /stopped with code 1/);
+});
+
+test('two callers racing for one session wait on the same opening, not on two', async () => {
+  const { host, children } = fakeHost();
+  const first = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  let secondSettled = false;
+  const second = host.session('one', claudePlan(CLAUDE, { cwd: WS })).then((s) => {
+    secondSettled = true;
+    return s;
+  });
+  assert.equal(children.length, 1, 'the second caller must not start a second child');
+
+  // The handshake has not been answered yet, so neither caller can have a usable session.
+  // Handing the second one back now is the bug: it would get a session with no command
+  // list, and on the Codex side no session to send a turn on.
+  await tick();
+  assert.equal(secondSettled, false, 'the second caller was handed a session mid-handshake');
+
+  children[0].answerHandshake([{ name: 'compact', description: 'Compact', argumentHint: '' }]);
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a, b);
+  assert.deepEqual(
+    b.state().commands.map((c) => c.name),
+    ['compact'],
+  );
+});
+
+test('a batch shim is refused with a message, not with a throw from inside a constructor', () => {
+  // Windows resolves a bare npm command to a `.cmd`, and Node throws EINVAL for one given
+  // arguments with no shell. The throw happens where no caller expects it, so the command
+  // does nothing and says nothing.
+  assert.match(unstartable('C:\\Users\\g\\AppData\\Roaming\\npm\\claude.cmd', 'win32') ?? '', /batch shim/);
+  assert.match(unstartable('C:\\tools\\claude.BAT', 'win32') ?? '', /batch shim/);
+  assert.equal(unstartable('C:\\Users\\g\\.local\\bin\\claude.exe', 'win32'), null);
+  assert.equal(unstartable('claude', 'win32'), null);
+  assert.equal(
+    unstartable('/home/g/.local/bin/claude.cmd', 'linux'),
+    null,
+    'nothing outside Windows runs batch shims, and refusing one there would be nonsense',
+  );
+});
+
+test('an opening that never answers gives up, rather than waiting for ever', async () => {
+  const never = new Promise<string[]>(() => undefined);
+  await assert.rejects(withDeadline(never, 20), /within/);
+});
+
+test('a child that starts and then says nothing does not hold the send button for ever', async () => {
+  // The case a dead child does not cover: an unauthenticated CLI comes up and waits on a
+  // terminal it does not have, so it never answers the handshake and never exits either.
+  const { host, children } = fakeHost(20);
+  const session = await host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  assert.equal(children.length, 1);
+  assert.match(
+    session.state().lastError ?? '',
+    /opening/,
+    'without a deadline this call never returns and the reader is told nothing',
+  );
+});
+
+test('an opening that answers in time keeps its answer, and its deadline is dropped', async () => {
+  assert.deepEqual(await withDeadline(Promise.resolve(['a']), 10_000), ['a']);
+});
+
+test('an ask left open when the turn ends is dropped, not left waiting on the reader', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  const session = await starting;
+  await session.prompt('do something');
+  children[0].say(
+    JSON.stringify({
+      type: 'control_request',
+      request_id: 'ask-1',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' },
+    }) + '\n',
+  );
+  assert.equal(session.state().asks.length, 1);
+
+  // The reader stops the turn instead of answering it.
+  children[0].say(
+    JSON.stringify({
+      type: 'result',
+      is_error: true,
+      terminal_reason: 'aborted_streaming',
+      permission_denials: [],
+    }) + '\n',
+  );
+  assert.deepEqual(
+    session.state().asks,
+    [],
+    'the agent has stopped waiting, so an ask left here would remain on the request card',
+  );
+  assert.deepEqual(host.waiting(), []);
+});
+
+// The read for a panel nobody is running a turn for: a child started, asked both of the
+// questions that cost no model tokens, and closed again.
+function idleProbe(plan: AgentPlan): { children: FakeChild[]; answers: Promise<IdleAnswers> } {
+  const children: FakeChild[] = [];
+  const answers = askIdle(plan, () => {
+    const child = new FakeChild();
+    children.push(child);
+    return child;
+  });
+  return { children, answers };
+}
+
+// A plan whose two idle answers can be made to fail one at a time. Both wires swallow their
+// own refusals, so a real CLI cannot be made to fail one question and answer the other,
+// which is the case the rule is about.
+function answeringPlan(answers: {
+  usage(refreshAuthentication?: boolean): Promise<UsageReading | null>;
+  models(): Promise<ModelList | null>;
+}): AgentPlan {
+  return {
+    agent: 'claude',
+    sessionId: null,
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: () => ({
+      receive: () => undefined,
+      open: () => Promise.resolve([]),
+      prompt: () => Promise.resolve(),
+      compact: () => Promise.resolve(),
+      clear: () => Promise.resolve(),
+      answer: () => false,
+      interrupt: () => Promise.resolve(),
+      sessionId: () => null,
+      close: () => undefined,
+      rateLimits: answers.usage,
+      models: answers.models,
+    }),
+  };
+}
+
+test('an explicit limits refresh reaches the running agent driver', async () => {
+  let refreshAuthentication = false;
+  const reading: UsageReading = {
+    plan: 'pro',
+    limits: [],
+    complete: true,
+    spend: null,
+    creditResetsAtSeconds: null,
+    readAt: 7,
+  };
+  const child = new FakeChild();
+  const session = new AgentSession(
+    'one',
+    answeringPlan({
+      usage: (refresh) => {
+        refreshAuthentication = refresh ?? false;
+        return Promise.resolve(reading);
+      },
+      models: () => Promise.resolve(A_MODEL_LIST),
+    }),
+    () => child,
+    () => {},
+    () => {},
+  );
+  await session.start();
+  assert.deepEqual(await session.rateLimits(true), reading);
+  assert.equal(refreshAuthentication, true);
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+test('the environment a launch asks for is added to what the child would have inherited', () => {
+  const merged = childEnv({ PATH: '/bin', HOME: '/home/g' }, { CODEX_MANAGED_BY_NPM: '1' });
+  assert.equal(merged.PATH, '/bin', 'a child started with only the extra variables loses its PATH');
+  assert.equal(merged.HOME, '/home/g');
+  assert.equal(merged.CODEX_MANAGED_BY_NPM, '1');
+  assert.equal(merged.ELECTRON_RUN_AS_NODE, '1', 'the script the panel starts runs under a binary that needs this');
+});
+
+test('a launch that asks for no environment of its own adds nothing to the child', () => {
+  assert.deepEqual(childEnv({ PATH: '/bin' }, {}), { PATH: '/bin', ELECTRON_RUN_AS_NODE: '1' });
+});
+
+test('what a launch asks for in the environment reaches the child it starts', async () => {
+  const { host, children, envs } = fakeHost();
+  const managed = { command: 'node', leadingArgs: ['codex.js'], env: { CODEX_MANAGED_BY_NPM: '1' } };
+  const first = host.session('one', claudePlan(managed, { cwd: WS }));
+  children[0].answerHandshake();
+  await first;
+  assert.deepEqual(
+    envs[0],
+    { CODEX_MANAGED_BY_NPM: '1' },
+    'the agent is otherwise told nothing about how it was installed',
+  );
+
+  const second = host.session('two', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  await answerCodexHandshake(children[1]);
+  children[1].reply({ thread: { id: 'thread-env' } });
+  await second;
+  assert.deepEqual(envs[1], {}, 'a launch that asks for nothing must not have a variable invented for it');
+});
+
+test('without an opt-in no child of any plan carries an inherited entrypoint', () => {
+  const codexClient = { cwd: WS, clientInfo: CODEX_CLIENT };
+  const plans: [string, AgentPlan][] = [
+    ['claudePlan', claudePlan(CLAUDE, { cwd: WS })],
+    ['claudeRenamePlan', claudeRenamePlan(CLAUDE, { cwd: WS, resume: 'session-1', title: 'Named' })],
+    ['claudeIdlePlan', claudeIdlePlan(CLAUDE, WS)],
+    ['codexPlan', codexPlan(CODEX, codexClient)],
+    ['codexIdlePlan', codexIdlePlan(CODEX, codexClient)],
+    ['codexRenamePlan', codexRenamePlan(CODEX, { ...codexClient, threadId: 'thread-1', title: 'Named' })],
+  ];
+  // An editor started from a Claude session carries `cli`, and one running Anthropic's own
+  // extension carries `claude-vscode`. spawnCli hands the child exactly this merge, and
+  // childEnv removes the inherited value before any plan's own environment is added.
+  for (const editorEntrypoint of [undefined, 'cli', 'claude-vscode']) {
+    for (const [name, plan] of plans) {
+      const env = childEnv({ PATH: '/bin', CLAUDE_CODE_ENTRYPOINT: editorEntrypoint }, plan.env);
+      assert.equal(
+        'CLAUDE_CODE_ENTRYPOINT' in env,
+        false,
+        `${name} under an editor entrypoint of ${editorEntrypoint} started its child with CLAUDE_CODE_ENTRYPOINT=${env.CLAUDE_CODE_ENTRYPOINT}`,
+      );
+    }
+  }
+
+  // Windows environment names are case-insensitive, so an inherited name that differs only
+  // in case from CLAUDE_CODE_ENTRYPOINT must be removed too.
+  for (const [name, plan] of plans) {
+    const env = childEnv({ PATH: '/bin', Claude_Code_Entrypoint: 'cli' }, plan.env);
+    assert.equal(
+      'CLAUDE_CODE_ENTRYPOINT' in env,
+      false,
+      `${name} under a mixed-case inherited entrypoint started its child with CLAUDE_CODE_ENTRYPOINT=${env.CLAUDE_CODE_ENTRYPOINT}`,
+    );
+    assert.equal(
+      'Claude_Code_Entrypoint' in env,
+      false,
+      `${name} under a mixed-case inherited entrypoint kept the inherited name Claude_Code_Entrypoint=${env.Claude_Code_Entrypoint}`,
+    );
+  }
+
+  // `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_AGENT_SDK_CLIENT_APP`, `CLAUDE_CODE_REMOTE_SESSION_ID`,
+  // `CLAUDE_CODE_CHILD_SESSION`, and `CLAUDE_CODE_CONTAINER_ID` name another Claude client, tie
+  // a child to a session running elsewhere, or mark the child itself as a spawned subagent.
+  // childEnv removes them the same way it removes CLAUDE_CODE_ENTRYPOINT.
+  const removedIdentityNames = [
+    'CLAUDE_AGENT_SDK_VERSION',
+    'CLAUDE_AGENT_SDK_CLIENT_APP',
+    'CLAUDE_CODE_REMOTE_SESSION_ID',
+    'CLAUDE_CODE_CHILD_SESSION',
+    'CLAUDE_CODE_CONTAINER_ID',
+  ];
+  for (const [name, plan] of plans) {
+    const env = childEnv(
+      {
+        PATH: '/bin',
+        CLAUDE_AGENT_SDK_VERSION: '1.2.3',
+        CLAUDE_AGENT_SDK_CLIENT_APP: 'other-client',
+        CLAUDE_CODE_REMOTE_SESSION_ID: 'session-9',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_CONTAINER_ID: 'container-9',
+      },
+      plan.env,
+    );
+    for (const removed of removedIdentityNames) {
+      assert.equal(removed in env, false, `${name} started its child with ${removed}=${env[removed]}`);
+    }
+  }
+
+  // Windows environment names are case-insensitive, so an inherited name that differs only in
+  // case from one of these names must be removed too.
+  for (const [name, plan] of plans) {
+    const env = childEnv(
+      {
+        PATH: '/bin',
+        Claude_Agent_Sdk_Version: '1.2.3',
+        CLAUDE_AGENT_SDK_CLIENT_APP: 'other-client',
+        CLAUDE_CODE_REMOTE_SESSION_ID: 'session-9',
+        Claude_Code_Child_Session: '1',
+        CLAUDE_CODE_CONTAINER_ID: 'container-9',
+      },
+      plan.env,
+    );
+    assert.equal(
+      'Claude_Agent_Sdk_Version' in env,
+      false,
+      `${name} under a mixed-case inherited name kept Claude_Agent_Sdk_Version=${env.Claude_Agent_Sdk_Version}`,
+    );
+    assert.equal(
+      'Claude_Code_Child_Session' in env,
+      false,
+      `${name} under a mixed-case inherited name kept Claude_Code_Child_Session=${env.Claude_Code_Child_Session}`,
+    );
+    for (const removed of [
+      'CLAUDE_AGENT_SDK_CLIENT_APP',
+      'CLAUDE_CODE_REMOTE_SESSION_ID',
+      'CLAUDE_CODE_CONTAINER_ID',
+    ]) {
+      assert.equal(removed in env, false, `${name} under a mixed-case inherited name kept ${removed}=${env[removed]}`);
+    }
+  }
+});
+
+test('empty and invalid billing labels preserve inherited attribution and launch variables', () => {
+  for (const label of [undefined, '', '   ', 'cli', 'sdk-ts', 'CLAUDE-VSCODE', 'unknown']) {
+    const inherited = {
+      ARC_CLAUDE_BILLING_LABEL: label,
+      CLAUDE_CODE_ENTRYPOINT: 'cli',
+      Claude_Code_Entrypoint: 'claude-vscode',
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+      Claude_Code_Attribution_Header: '0',
+      PATH: '/bin',
+    };
+    for (const agent of ['claude', 'codex'] as const) {
+      const wanted = { CLAUDE_CODE_ENTRYPOINT: 'package-label', ARC_CLAUDE_BILLING_LABEL: 'claude-vscode' };
+      assert.deepEqual(
+        childEnv(inherited, wanted, agent),
+        {
+          CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+          Claude_Code_Attribution_Header: '0',
+          PATH: '/bin',
+          ...wanted,
+          ELECTRON_RUN_AS_NODE: '1',
+        },
+        `${agent}: ${String(label)}`,
+      );
+    }
+  }
+});
+
+test('recognized billing labels reach every Claude child and preserve Codex environments', () => {
+  const launch = {
+    ...CLAUDE,
+    env: {
+      CLAUDE_CODE_ENTRYPOINT: 'package-label',
+      Claude_Code_Entrypoint: 'package-other-label',
+      CLAUDE_CODE_ATTRIBUTION_HEADER: 'package-attribution',
+      Claude_Code_Attribution_Header: 'package-other-attribution',
+      PACKAGE_VALUE: 'kept',
+    },
+  };
+  const codexClient = { cwd: WS, clientInfo: CODEX_CLIENT };
+  const plans = [
+    claudePlan(launch, { cwd: WS, permissionMode: 'manual' }),
+    claudePlan(launch, { cwd: WS, resume: 'resumed', permissionMode: 'manual' }),
+    claudePlan(launch, { cwd: WS, sessionId: 'draft', permissionMode: 'manual' }),
+    claudeRenamePlan(launch, { cwd: WS, resume: 'renamed', title: 'Named', permissionMode: 'manual' }),
+    claudeIdlePlan(launch, WS),
+    claudeIdlePlan(launch, WS, 'haiku'),
+    codexPlan(launch, codexClient),
+    codexIdlePlan(launch, codexClient),
+    codexRenamePlan(launch, { ...codexClient, threadId: 'thread', title: 'Named' }),
+  ];
+  for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
+    for (const selectorKey of ['ARC_CLAUDE_BILLING_LABEL', 'Arc_Claude_Billing_Label']) {
+      const inherited = {
+        [selectorKey]: ` ${label} `,
+        CLAUDE_CODE_ENTRYPOINT: 'cli',
+        Claude_Code_Entrypoint: 'inherited-other-label',
+        CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+        Claude_Code_Attribution_Header: 'inherited-other-attribution',
+        Claude_Agent_Sdk_Version: 'other-version',
+        CLAUDE_AGENT_SDK_CLIENT_APP: 'other-client',
+        Claude_Code_Remote_Session_Id: 'other-session',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        Claude_Code_Container_Id: 'other-container',
+        PATH: '/bin',
+      };
+      for (const plan of plans) {
+        let finalEnv: ReturnType<typeof childEnv> = {};
+        const session = new AgentSession(
+          'env',
+          plan,
+          (command, args, cwd, env, agent) => {
+            assert.equal(command, launch.command);
+            assert.deepEqual(args, plan.args);
+            assert.equal(cwd, WS);
+            assert.equal(agent, plan.agent);
+            finalEnv = childEnv(inherited, env, agent);
+            return new FakeChild();
+          },
+          () => {},
+          () => {},
+        );
+        assert.equal(session.agent, plan.agent);
+        assert.equal(finalEnv.PATH, '/bin');
+        assert.equal(finalEnv.PACKAGE_VALUE, 'kept');
+        assert.equal(finalEnv.ELECTRON_RUN_AS_NODE, '1');
+        for (const key of Object.keys(finalEnv)) {
+          assert.ok(!/^CLAUDE_(AGENT_SDK|CODE_(REMOTE_SESSION_ID|CHILD_SESSION|CONTAINER_ID))/i.test(key));
+        }
+        if (plan.agent === 'codex') {
+          assert.deepEqual(finalEnv, childEnv(inherited, launch.env));
+          continue;
+        }
+        assert.equal(finalEnv.CLAUDE_CODE_ENTRYPOINT, label === 'claude-vscode' ? label : 'sdk-cli');
+        assert.equal(finalEnv.CLAUDE_CODE_ATTRIBUTION_HEADER, label === 'omit' ? '0' : '1');
+        assert.equal('Claude_Code_Entrypoint' in finalEnv, false);
+        assert.equal('Claude_Code_Attribution_Header' in finalEnv, false);
+        assert.ok(plan.args.includes('-p'));
+        assert.ok(plan.args.includes('--permission-prompt-tool'));
+        if (plan.args.includes('--permission-mode')) {
+          assert.equal(plan.args[plan.args.indexOf('--permission-mode') + 1], 'manual');
+        }
+      }
+    }
+  }
+});
+
+test('Claude billing selection reads only the local selector and preserves editor precedence', () => {
+  const cwd = tempDir('billing-file-');
+  const file = path.join(cwd, '.env');
+  const inherited = { PATH: '/bin', CLAUDE_CODE_ATTRIBUTION_HEADER: '0' };
+  const baseline = childEnv(inherited, {}, 'claude');
+  assert.deepEqual(childEnv(inherited, {}, 'claude', cwd), baseline);
+  for (const label of ['sdk-cli', 'claude-vscode', 'omit', '', 'unknown']) {
+    fs.writeFileSync(
+      file,
+      `# Local billing selection\r\nexport Arc_Claude_Billing_Label=" ${label} " # selection\r\nPATH=secret\r\nCLAUDE_CODE_ENTRYPOINT=secret\r\n`,
+    );
+    const env = childEnv(inherited, {}, 'claude', cwd);
+    assert.equal(env.PATH, '/bin');
+    assert.equal(env.Arc_Claude_Billing_Label, undefined);
+    assert.equal(
+      env.CLAUDE_CODE_ENTRYPOINT,
+      label === 'claude-vscode' ? label : label === 'sdk-cli' || label === 'omit' ? 'sdk-cli' : undefined,
+    );
+    assert.equal(env.CLAUDE_CODE_ATTRIBUTION_HEADER, label === 'sdk-cli' || label === 'claude-vscode' ? '1' : '0');
+    assert.deepEqual(childEnv(inherited, {}, 'codex', cwd), childEnv(inherited, {}, 'codex'));
+    for (const editorLabel of ['omit', '', 'unknown']) {
+      const editor = { ...inherited, Arc_Claude_Billing_Label: editorLabel };
+      assert.deepEqual(childEnv(editor, {}, 'claude', cwd), childEnv(editor, {}, 'claude'));
+    }
+  }
+  fs.unlinkSync(file);
+  fs.mkdirSync(file);
+  assert.throws(() => childEnv(inherited, {}, 'claude', cwd));
+  assert.deepEqual(childEnv(inherited, {}, 'codex', cwd), childEnv(inherited, {}, 'codex'));
+});
+
+test('spawnCli reads changed billing files for fresh Claude children without loading other variables', async () => {
+  const cwd = tempDir('billing-spawn-file-');
+  const file = path.join(cwd, '.env');
+  try {
+    vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', undefined);
+    vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
+    for (const [label, agent] of [
+      ['claude-vscode', 'claude'],
+      ['omit', 'claude'],
+      ['claude-vscode', 'codex'],
+    ] as const) {
+      fs.writeFileSync(file, `ARC_CLAUDE_BILLING_LABEL=${label}\nARC_ENV_FILE_ONLY=secret\n`);
+      const script =
+        'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER, process.env.ARC_ENV_FILE_ONLY]))';
+      const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);
+      let output = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        output += chunk;
+      });
+      let code: number | null = null;
+      await new Promise<void>((resolve, reject) => {
+        child.on('error', reject);
+        child.on('exit', (value) => {
+          code = value;
+        });
+        child.on('close', resolve);
+      });
+      assert.equal(code, 0);
+      assert.deepEqual(
+        JSON.parse(output),
+        agent === 'claude'
+          ? [label === 'omit' ? 'sdk-cli' : label, label === 'omit' ? '0' : '1', null]
+          : [null, '0', null],
+      );
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('spawnCli applies the host billing label to the actual Claude child environment', async () => {
+  try {
+    vi.stubEnv('CLAUDE_CODE_ENTRYPOINT', 'cli');
+    vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
+    for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
+      vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', label);
+      for (const agent of ['claude', 'codex'] as const) {
+        const script =
+          'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER]))';
+        const child = spawnCli(process.execPath, ['-e', script], tempDir('billing-env-'), {}, agent);
+        let output = '';
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+          output += chunk;
+        });
+        let code: number | null = null;
+        await new Promise<void>((resolve, reject) => {
+          child.on('error', reject);
+          child.on('exit', (value) => {
+            code = value;
+          });
+          child.on('close', resolve);
+        });
+        assert.equal(code, 0);
+        assert.deepEqual(
+          JSON.parse(output),
+          agent === 'claude'
+            ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'omit' ? '0' : '1']
+            : [null, '0'],
+        );
+      }
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a reused Claude child keeps its billing label after the host environment changes', async () => {
+  const children: FakeChild[] = [];
+  const envs: ReturnType<typeof childEnv>[] = [];
+  const host = new AgentHost({
+    idleDurationMs: 0,
+    spawner: (_command, _args, _cwd, env, agent) => {
+      envs.push(childEnv(process.env, env, agent));
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    onEvent: () => {},
+    onStateChange: () => {},
+  });
+  try {
+    vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', 'claude-vscode');
+    const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'draft' });
+    const opening = host.session('draft', plan);
+    children[0].answerHandshake();
+    const first = await opening;
+    vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', 'omit');
+    assert.equal(await host.session('draft', plan), first);
+    assert.equal(children.length, 1);
+    assert.equal(children[0].ended, false);
+    assert.equal(children[0].killed, false);
+    assert.equal(envs[0].CLAUDE_CODE_ENTRYPOINT, 'claude-vscode');
+    assert.equal(envs[0].CLAUDE_CODE_ATTRIBUTION_HEADER, '1');
+  } finally {
+    vi.unstubAllEnvs();
+    host.dispose();
+    for (const child of children) child.exit(0);
+  }
+});
+
+test('a mode meant for the other agent is refused rather than turned into a default', () => {
+  assert.equal(claudeAskMode(CLAUDE_ASK_MODES[1]), CLAUDE_ASK_MODES[1].claude);
+  assert.deepEqual(codexAskMode(CODEX_ASK_MODES[2]), CODEX_ASK_MODES[2].codex);
+  // Sending a default in its place would put the child in a state nobody picked, while the
+  // panel went on drawing the one that was.
+  assert.throws(() => claudeAskMode(CODEX_ASK_MODES[0]), /Claude Code/);
+  assert.throws(() => codexAskMode(CLAUDE_ASK_MODES[0]), /Codex/);
+});
+
+test('Claude launch plans omit the permission flag only for the agent default', () => {
+  const inherited = claudePlan(CLAUDE, { cwd: WS }).args;
+  const explicit = claudePlan(CLAUDE, { cwd: WS, permissionMode: 'manual' }).args;
+  assert.equal(inherited.includes('--permission-mode'), false);
+  assert.equal(explicit[explicit.indexOf('--permission-mode') + 1], 'manual');
+});
+
+test('how much an agent asks reaches each CLI the way that CLI takes it', { timeout: 5000 }, async () => {
+  const h = fakeHost();
+  const opening = h.host.session('claude:ws', claudePlan(CLAUDE, { cwd: WS }));
+  const claudeChild = h.children[0];
+  claudeChild.answerHandshake();
+  const claude = await opening;
+  // Not awaited yet: the CLI has to answer the control request before this settles, which
+  // is the difference between the two agents that this test exists to hold.
+  const changed = claude.setAskMode(CLAUDE_ASK_MODES[2]);
+  // Claude takes it at once, as its own control request, so a turn already running feels
+  // the change.
+  const asked = claudeChild.sent().find((m) => (m.request as { subtype: string }).subtype === 'set_permission_mode');
+  assert.equal((asked?.request as { mode?: string } | undefined)?.mode, CLAUDE_ASK_MODES[2].claude);
+  claudeChild.answerControl('set_permission_mode', {});
+  await changed;
+
+  const openingCodex = h.host.session('codex:ws', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = h.children[1];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-1' } });
+  const codex = await openingCodex;
+  await codex.setAskMode(CODEX_ASK_MODES[3]);
+  // Codex takes nothing at all here: its whole mechanism is two fields on the next send, so
+  // a call of its own would be a request the server has no method for.
+  assert.equal(
+    child.sent().some((m) => String(m.method).includes('approval')),
+    false,
+  );
+  void codex.prompt('go');
+  await tick();
+  const turn = child.sent().find((m) => m.method === 'turn/start');
+  const params = turn?.params as {
+    approvalPolicy?: string;
+    approvalsReviewer?: string;
+    sandboxPolicy?: unknown;
+    sandbox?: string;
+  };
+  assert.equal(params.approvalPolicy, CODEX_ASK_MODES[3].codex?.approvalPolicy);
+  assert.equal(params.approvalsReviewer, CODEX_ASK_MODES[3].codex?.approvalsReviewer);
+  // The sandbox travels with the policy, or a reader who picked full access was promised
+  // the machine and given a folder. It travels under the name and the shape a turn reads,
+  // which is not the pair a thread reads.
+  assert.deepEqual(params.sandboxPolicy, sandboxPolicy(CODEX_ASK_MODES[3].codex!.sandbox));
+  assert.equal(params.sandbox, undefined);
+});
+
+test('an untouched Codex draft opens and sends with Approve for me', async () => {
+  const draft = newSessionDraft('draft-codex', WS, null, 0, {
+    agent: 'codex',
+    model: 'gpt-5',
+    effort: '',
+    permissionMode: defaultAskMode('codex').value,
+    source: 'inherited',
+  });
+  const mode = askMode(draft.profile.agent, draft.profile.permissionMode);
+  assert.ok(mode);
+  assert.equal(mode.label, 'Approve for me');
+  const { host, children } = fakeHost();
+  const starting = host.session(
+    'cx',
+    codexPlan(CODEX, {
+      cwd: draft.cwd,
+      clientInfo: CODEX_CLIENT,
+      model: draft.profile.model,
+      ...codexAskMode(mode),
+    }),
+  );
+  const child = children[0];
+  await answerCodexHandshake(child);
+  const start = child.sent().find((m) => m.method === 'thread/start');
+  const params = start?.params as {
+    approvalPolicy?: string;
+    approvalsReviewer?: string;
+    sandbox?: string;
+    model?: string;
+  };
+  assert.equal(params.approvalPolicy, 'on-request');
+  assert.equal(params.approvalsReviewer, 'auto_review');
+  assert.equal(params.sandbox, 'workspace-write');
+  assert.equal(params.model, 'gpt-5', 'a session has to open the way the reader left it');
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  void session.prompt('go');
+  await tick();
+  const turn = child.sent().find((m) => m.method === 'turn/start');
+  const turnParams = turn?.params as { approvalPolicy?: string; approvalsReviewer?: string };
+  assert.equal(turnParams.approvalPolicy, 'on-request');
+  assert.equal(turnParams.approvalsReviewer, 'auto_review');
+});
+
+test(
+  'a model pick reaches a live Claude child, and a Codex one waits for the next session',
+  { timeout: 5000 },
+  async () => {
+    const h = fakeHost();
+    const opening = h.host.session('claude:ws', claudePlan(CLAUDE, { cwd: WS }));
+    h.children[0].answerHandshake();
+    const claude = await opening;
+    const changed = claude.setModel('opus');
+    const asked = h.children[0].sent().find((m) => (m.request as { subtype: string }).subtype === 'set_model');
+    assert.equal((asked?.request as { model?: string } | undefined)?.model, 'opus');
+    h.children[0].answerControl('set_model', {});
+    await changed;
+
+    const openingCodex = h.host.session('codex:ws', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+    const child = h.children[1];
+    await answerCodexHandshake(child);
+    child.reply({ thread: { id: 'thread-1' } });
+    const codex = await openingCodex;
+    const before = child.sent().length;
+    await codex.setModel('gpt-5');
+    // Codex sends nothing here. Its whole mechanism is a field on the next turn, which the
+    // server reads for that turn and the ones after it, so a call of its own would be a
+    // request the server has no method for.
+    assert.equal(child.sent().length, before);
+    void codex.prompt('go');
+    await tick();
+    const turn = child.sent().find((m) => m.method === 'turn/start');
+    assert.equal((turn?.params as { model?: string } | undefined)?.model, 'gpt-5');
+  },
+);
+
+test('a model pick in one live Codex session leaves its sibling unchanged', { timeout: 5000 }, async () => {
+  const h = fakeHost();
+  const firstOpening = h.host.session('codex:first', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  await answerCodexHandshake(h.children[0]);
+  h.children[0].reply({ thread: { id: 'thread-1' } });
+  const first = await firstOpening;
+
+  const siblingOpening = h.host.session('codex:sibling', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  await answerCodexHandshake(h.children[1]);
+  h.children[1].reply({ thread: { id: 'thread-2' } });
+  const sibling = await siblingOpening;
+
+  await first.setModel('gpt-5.6-sol');
+  void first.prompt('first');
+  void sibling.prompt('sibling');
+  await tick();
+  const firstTurn = h.children[0].sent().find((m) => m.method === 'turn/start');
+  const siblingTurn = h.children[1].sent().find((m) => m.method === 'turn/start');
+  assert.equal((firstTurn?.params as { model?: string } | undefined)?.model, 'gpt-5.6-sol');
+  assert.equal(
+    (siblingTurn?.params as { model?: string } | undefined)?.model,
+    undefined,
+    'changing one session changed another live child of the same agent',
+  );
+});
+
+test('a failed Claude model control rejects the setting change', async () => {
+  const h = fakeHost();
+  const opening = h.host.session('claude:session', claudePlan(CLAUDE, { cwd: WS }));
+  h.children[0].answerHandshake();
+  const claude = await opening;
+  const changed = claude.setModel('sonnet');
+  h.children[0].rejectControl('set_model', 'model unavailable');
+  await assert.rejects(changed, /model unavailable/);
+});
+
+test('an effort pick reaches each agent by the only door that agent has', { timeout: 5000 }, async () => {
+  // Claude takes a level when its child is started, and changes it afterwards through the
+  // CLI's own command on the same input a prompt uses, because the control channel has no
+  // subtype for one. Codex takes it on the turn.
+  assert.equal(claudePlan(CLAUDE, { cwd: WS }).args.includes('--effort'), false);
+  const started = claudePlan(CLAUDE, { cwd: WS, model: 'opus', effort: 'xhigh' }).args;
+  assert.equal(started[started.indexOf('--effort') + 1], 'xhigh');
+
+  const h = fakeHost();
+  const opening = h.host.session('claude:ws', claudePlan(CLAUDE, { cwd: WS }));
+  h.children[0].answerHandshake();
+  const claude = await opening;
+  const controls = () => h.children[0].sent().filter((message) => message.type === 'control_request').length;
+  const asked = controls();
+  await claude.setEffort('high');
+  assert.deepEqual(
+    h.children[0].sent().at(-1)?.message,
+    {
+      role: 'user',
+      content: [{ type: 'text', text: '/effort high' }],
+    },
+    'the level change reached the live child as something other than its own command',
+  );
+  assert.equal(
+    controls(),
+    asked,
+    'the CLI answers no control request for an effort level, so one sent would hang or be refused',
+  );
+  assert.equal(claude.state().busy, true, 'the command ends with a result, so it owes the session a turn');
+  h.children[0].say(
+    JSON.stringify({ type: 'result', is_error: false, terminal_reason: 'completed', result: '' }) + '\n',
+  );
+  assert.equal(claude.state().busy, false);
+
+  const openingCodex = h.host.session(
+    'codex:ws',
+    codexPlan(CODEX, {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      model: 'gpt-5',
+      effort: 'medium',
+    }),
+  );
+  const child = h.children[1];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-1' } });
+  const codex = await openingCodex;
+  const openingPrompt = codex.prompt('opening');
+  await tick();
+  const opened = child.sent().find((m) => m.method === 'turn/start');
+  assert.deepEqual(
+    opened?.params,
+    {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'opening' }],
+      model: 'gpt-5',
+      effort: 'medium',
+    },
+    'a thread carries no effort field at all, so the pick has nowhere to go but the turn',
+  );
+  child.reply({ turn: { id: 'turn-opening' } });
+  await openingPrompt;
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-opening', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+
+  await codex.setEffort('xhigh');
+  void codex.prompt('after');
+  await tick();
+  const after = child.sent().filter((m) => m.method === 'turn/start')[1];
+  assert.equal((after?.params as { effort?: string } | undefined)?.effort, 'xhigh');
+});
+
+test(
+  'an effort pick reaches a resumed Codex thread, which was opened by somebody else',
+  { timeout: 5000 },
+  async () => {
+    const h = fakeHost();
+    const opening = h.host.session(
+      'codex:ws',
+      codexPlan(CODEX, {
+        cwd: WS,
+        clientInfo: CODEX_CLIENT,
+        resume: 'thread-7',
+        effort: 'high',
+      }),
+    );
+    const child = h.children[0];
+    await answerCodexHandshake(child);
+    child.reply({ thread: { id: 'thread-7' } });
+    const codex = await opening;
+    void codex.prompt('go');
+    await tick();
+    const turn = child.sent().find((m) => m.method === 'turn/start');
+    assert.equal(
+      (turn?.params as { effort?: string } | undefined)?.effort,
+      'high',
+      'a thread asked for by id is told nothing about the level the reader picked',
+    );
+  },
+);
+
+test('one idle child answers both the figures and the model list', { timeout: 5000 }, async () => {
+  const plan = claudeIdlePlan(CLAUDE, WS);
+  // The one difference from a plan that will be prompted, and the reason a read costs
+  // nothing on disk: the CLI is told not to keep the session it would otherwise write.
+  assert.ok(plan.args.includes('--no-session-persistence'));
+  assert.equal(plan.args.includes('--resume'), false);
+
+  const probe = idleProbe(plan);
+  await tick();
+  const child = probe.children[0];
+  child.answerHandshake();
+  await tick();
+  // The handshake, then the three questions, and nothing else. No prompt is ever sent, which
+  // is what makes the answers free; one child rather than three, because the process start is
+  // the only cost any of the questions has.
+  //
+  // The servers joined the other two once the composer grew a control for them: read from
+  // session children alone, that control could not exist until after a prompt had been
+  // sent, and the reader opens it by typing the agent's own `/mcp`.
+  const asked = child.sent().map((m) => (m.request as { subtype: string }).subtype);
+  // The MCP servers are deliberately not among them. The CLI answers `mcp_status` only once
+  // it has tried every server, and one measured here timed out after 30 seconds, so asking
+  // for them on this child would put that wait in front of the figures the bar is opening to
+  // draw. A reader who asks for them outright pays it instead.
+  assert.deepEqual(asked, ['initialize', 'get_usage', 'list_models']);
+  child.answerControl('get_usage', {
+    subscription_type: 'max',
+    rate_limits_available: true,
+    rate_limits: { five_hour: { utilization: 24, resets_at: '2026-08-28T08:59:59.500Z' } },
+  });
+  child.answerControl('list_models', {
+    models: [{ value: 'opus', displayName: 'Opus', description: 'Thinks hardest' }],
+  });
+  const answers = await probe.answers;
+  assert.equal(answers.usage?.plan, 'max');
+  assert.equal(answers.usage?.limits[0].utilization, 0.24);
+  assert.deepEqual(
+    answers.models?.models.map((m) => m.label),
+    ['Opus'],
+  );
+  assert.equal(child.ended, true, 'the read left its child running');
+});
+
+test('the idle child brings back the command list, which is the only way a quiet panel gets one', async () => {
+  // The composer's menu opens on a slash and has nothing to offer until some child has
+  // answered the handshake. A session child is started by the first prompt, so a panel
+  // gathering commands from those alone cannot have a list until after the reader has sent a
+  // prompt without the menu they wanted it for. This child is the one a quiet panel does
+  // start, it answers the handshake like any other, and the list came back on it and was
+  // dropped on the floor.
+  const probe = idleProbe(claudeIdlePlan(CLAUDE, WS));
+  await tick();
+  const child = probe.children[0];
+  child.answerHandshake([
+    { name: 'compact', description: 'Compact the session', argumentHint: '' },
+    { name: 'commit', description: 'Write a commit', argumentHint: '<message>' },
+  ]);
+  await tick();
+  child.answerControl('get_usage', { subscription_type: 'max', rate_limits_available: false, rate_limits: {} });
+  child.answerControl('list_models', { models: [] });
+  const answers = await probe.answers;
+  assert.deepEqual(
+    answers.commands.map((c) => c.name),
+    ['compact', 'commit'],
+    'the child answered the handshake with a command list and the read did not carry it back',
+  );
+  // The argument hint rides with it. The menu draws it, so a list that arrived stripped of it
+  // would look right and say less than the agent did.
+  assert.deepEqual(
+    answers.commands.map((c) => c.argumentHint),
+    ['', '<message>'],
+  );
+});
+
+test('an agent that publishes no commands answers with none rather than failing the read', async () => {
+  const probe = idleProbe(claudeIdlePlan(CLAUDE, WS));
+  await tick();
+  const child = probe.children[0];
+  child.answerHandshake();
+  await tick();
+  child.answerControl('get_usage', { subscription_type: 'max', rate_limits_available: false, rate_limits: {} });
+  child.answerControl('list_models', { models: [] });
+  const answers = await probe.answers;
+  assert.deepEqual(answers.commands, [], 'an agent with no commands is not an agent that failed');
+});
+
+test('a Codex idle child answers both questions and still starts no thread', { timeout: 5000 }, async () => {
+  const probe = idleProbe(codexIdlePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  await tick();
+  const child = probe.children[0];
+  await answerCodexHandshake(child, [{ name: 'polish', description: 'Clean the writing' }]);
+  // The skills list, but no thread: autocomplete needs the first and the second would leave
+  // a session on disk the reader never asked for.
+  const methods = child.sent().map((m) => m.method);
+  assert.deepEqual(methods, ['initialize', 'initialized', 'skills/list', 'account/rateLimits/read', 'model/list']);
+  child.replyTo('account/rateLimits/read', {
+    rateLimits: {
+      planType: 'plus',
+      primary: { usedPercent: 3, windowDurationMins: 300, resetsAt: 1787924682 },
+      secondary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1788470887 },
+    },
+  });
+  child.replyTo('model/list', {
+    data: [
+      {
+        id: 'gpt-5',
+        displayName: 'GPT-5',
+        supportedReasoningEfforts: [{ reasoningEffort: 'high', description: 'Thinks for longer' }],
+      },
+    ],
+  });
+  const answers = await probe.answers;
+  assert.deepEqual(
+    answers.commands.map((command) => command.name),
+    ['compact', 'clear', 'new', 'rename', 'polish'],
+  );
+  assert.equal(answers.usage?.plan, 'plus');
+  assert.deepEqual(
+    answers.usage?.limits.map((l) => l.window),
+    ['five_hour', 'seven_day'],
+  );
+  assert.deepEqual(
+    answers.models?.models.map((m) => m.value),
+    ['gpt-5'],
+  );
+  assert.deepEqual(
+    answers.models?.models[0].efforts.map((e) => e.description),
+    ['Thinks for longer'],
+  );
+  assert.equal(child.ended, true, 'the read left its child running');
+});
+
+test('a rejected Codex skill list leaves the idle usage and models available', { timeout: 5000 }, async () => {
+  const probe = idleProbe(codexIdlePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  await tick();
+  const child = probe.children[0];
+  child.reply({ userAgent: 'codex' });
+  await tick();
+  child.replyError(-32601, 'Method not found');
+  await tick();
+  assert.deepEqual(
+    child.sent().map((message) => message.method),
+    ['initialize', 'initialized', 'skills/list', 'account/rateLimits/read', 'model/list'],
+  );
+  child.replyTo('account/rateLimits/read', {
+    rateLimits: {
+      planType: 'plus',
+      primary: { usedPercent: 3, windowDurationMins: 300, resetsAt: 1787924682 },
+      secondary: null,
+    },
+  });
+  child.replyTo('model/list', {
+    data: [{ id: 'gpt-5', displayName: 'GPT-5', supportedReasoningEfforts: [] }],
+  });
+  const answers = await probe.answers;
+  assert.deepEqual(
+    answers.commands.map((command) => command.name),
+    ['compact', 'clear', 'new', 'rename'],
+  );
+  assert.equal(answers.usage?.plan, 'plus');
+  assert.deepEqual(
+    answers.models?.models.map((model) => model.value),
+    ['gpt-5'],
+  );
+});
+
+test('a model list that will not come back leaves the figures alone', async () => {
+  const reading: UsageReading = {
+    plan: 'max',
+    limits: [],
+    complete: true,
+    spend: null,
+    creditResetsAtSeconds: null,
+    readAt: 7,
+  };
+  const answers = await askIdle(
+    answeringPlan({
+      usage: () => Promise.resolve(reading),
+      models: () => Promise.reject(new Error('the CLI does not know list_models')),
+    }),
+    () => new FakeChild(),
+  );
+  assert.deepEqual(answers.usage, reading, 'the process start was paid for and its answer thrown away');
+  assert.equal(answers.models, null);
+});
+
+test('figures that will not come back leave the model list alone', async () => {
+  const answers = await askIdle(
+    answeringPlan({
+      usage: () => Promise.reject(new Error('rate limits are not available')),
+      models: () => Promise.resolve(A_MODEL_LIST),
+    }),
+    () => new FakeChild(),
+  );
+  assert.equal(answers.usage, null);
+  assert.equal(answers.usageFailure, 'rate limits are not available');
+  assert.deepEqual(answers.models, A_MODEL_LIST);
+});
+
+test('an explicit usage read waits behind an automatic read without losing its force', async () => {
+  const queue = new UsageReadQueue();
+  const calls: boolean[] = [];
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const automatic = queue.run('codex', false, async (force) => {
+    calls.push(force);
+    await gate;
+  });
+  await tick();
+  const explicit = queue.run('codex', true, async (force) => {
+    calls.push(force);
+  });
+  assert.deepEqual(calls, [false]);
+  release();
+  await Promise.all([automatic, explicit]);
+  assert.deepEqual(calls, [false, true]);
+});
+
+test('same-agent usage reads share only when they target the same MCP owner', async () => {
+  const queue = new UsageReadQueue();
+  const calls: string[] = [];
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const first = queue.run(
+    'claude',
+    false,
+    async () => {
+      calls.push('session-1');
+      await gate;
+    },
+    'session-1',
+  );
+  await tick();
+  const second = queue.run(
+    'claude',
+    false,
+    async () => {
+      calls.push('session-2');
+    },
+    'session-2',
+  );
+  const shared = queue.run(
+    'claude',
+    false,
+    async () => {
+      calls.push('duplicate session-2');
+    },
+    'session-2',
+  );
+
+  assert.deepEqual(calls, ['session-1']);
+  release();
+  await Promise.all([first, second, shared]);
+  assert.deepEqual(calls, ['session-1', 'session-2']);
+});
+
+test('same-owner usage reads do not share across an MCP profile generation', async () => {
+  const queue = new UsageReadQueue();
+  const calls: string[] = [];
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const older = queue.run(
+    'claude',
+    false,
+    async () => {
+      calls.push('claude profile');
+      await gate;
+    },
+    'draft-1:0',
+  );
+  await tick();
+  const replacement = queue.run(
+    'claude',
+    false,
+    async () => {
+      calls.push('codex replacement');
+    },
+    'draft-1:2',
+  );
+
+  release();
+  await Promise.all([older, replacement]);
+  assert.deepEqual(
+    calls,
+    ['claude profile', 'codex replacement'],
+    'the replacement profile shared the stale owner request and received no discovery',
+  );
+});
+
+test('an explicit usage read remains pending until a busy agent is idle', async () => {
+  const queue = new UsageReadQueue();
+  assert.equal(queue.waitUntilIdle('codex', false), null);
+  let read = false;
+  const explicit = queue.run('codex', true, async (force) => {
+    const waiting = queue.waitUntilIdle('codex', force);
+    if (waiting) {
+      await waiting;
+    }
+  });
+  await tick();
+  const resumed = queue.resumeDeferred('codex', async () => {
+    read = true;
+  });
+  assert.notEqual(resumed, null);
+  await resumed;
+  await explicit;
+  assert.equal(read, true);
+  assert.equal(
+    queue.resumeDeferred('codex', async () => {}),
+    null,
+  );
+});
+
+test('a busy agent that exits rejects its deferred explicit usage read', async () => {
+  const queue = new UsageReadQueue();
+  const explicit = queue.run('codex', true, async (force) => {
+    const waiting = queue.waitUntilIdle('codex', force);
+    if (waiting) {
+      await waiting;
+    }
+  });
+  await tick();
+  assert.equal(queue.failDeferred('codex', new Error('the agent stopped')), true);
+  await assert.rejects(explicit, /the agent stopped/);
+});
+
+test('an idle child that never comes up is reported, not left hanging', { timeout: 5000 }, async () => {
+  const probe = idleProbe(claudeIdlePlan(CLAUDE, WS));
+  await tick();
+  probe.children[0].exit(1, null);
+  await assert.rejects(probe.answers, /stopped with code 1/);
+});
+
+test('an agent that could not answer for its models is not asked again until the reader asks', () => {
+  const book = new ModelBook();
+  assert.deepEqual(book.toAsk(['claude', 'codex'], 0, false), ['claude', 'codex']);
+  book.noteSilent('codex');
+  assert.deepEqual(
+    book.toAsk(['claude', 'codex'], 0, false),
+    ['claude'],
+    'a machine with one CLI installed would pay a failed start every time a picker opened',
+  );
+  assert.deepEqual(book.toAsk(['claude', 'codex'], 0, true), ['claude', 'codex']);
+  assert.deepEqual(
+    book.toAsk(['claude', 'codex'], 0, false),
+    ['claude', 'codex'],
+    'the reader asking outright is somebody saying to try again',
+  );
+});
+
+test('catalogs stay pending only before their first answer or failure', () => {
+  const book = new ModelBook();
+  assert.equal(book.pending('claude'), true);
+  assert.equal(book.pending('codex'), true);
+  book.note('claude', A_MODEL_LIST);
+  assert.equal(book.pending('claude'), false);
+  assert.equal(book.pending('codex'), true);
+  book.noteSilent('codex');
+  assert.equal(book.pending('codex'), false);
+  book.toAsk(['codex'], 0, true);
+  assert.equal(book.pending('codex'), true);
+  book.note('codex', { ...A_MODEL_LIST, models: [] });
+  assert.equal(book.pending('codex'), false);
+  book.noteSilent('claude');
+  assert.equal(book.pending('claude'), false);
+});
+
+test('a model list is kept far longer than a usage figure, because it turns over on a release', () => {
+  const book = new ModelBook();
+  book.note('claude', A_MODEL_LIST);
+  assert.ok(MODELS_FRESH_MS > USAGE_FRESH_MS * 10);
+  assert.deepEqual(
+    book.toAsk(['claude'], USAGE_FRESH_MS * 10, false),
+    [],
+    'a list read this morning names the same models this afternoon',
+  );
+  assert.deepEqual(book.toAsk(['claude'], MODELS_FRESH_MS + 1, false), ['claude']);
+  assert.deepEqual(book.lists(), { claude: A_MODEL_LIST.models });
+});
+
+const SOME_SERVERS: McpServer[] = [
+  {
+    name: 'probeGood',
+    status: 'connected',
+    error: '',
+    tools: ['probe_echo'],
+    scope: 'dynamic',
+    title: 'probe-server',
+  },
+];
+
+test('the MCP servers kept for an agent are whatever it last said, and none for one nobody asked', () => {
+  const book = new McpBook();
+  assert.equal(
+    book.get('claude'),
+    null,
+    'an agent nobody has read reads as an agent with no servers, which is a different answer',
+  );
+  book.note('claude', SOME_SERVERS);
+  assert.deepEqual(book.get('claude'), SOME_SERVERS);
+  // The next reading replaces the last outright, however recently the last one arrived.
+  // This is where a model list would still be inside its window and be left alone, and it
+  // is why there is no window here: a server falls down between one press and the next.
+  book.note('claude', []);
+  assert.deepEqual(book.get('claude'), [], 'a reading that found nothing is still an answer');
+  book.note('codex', SOME_SERVERS);
+  assert.deepEqual(book.lists(), { claude: [], codex: SOME_SERVERS });
+});
+
+test('an unanswered initial MCP read is retried, while an answer or launch failure settles it', () => {
+  const book = new McpBook();
+  const first = book.beginInitialRead('claude');
+  assert.notEqual(first, null);
+  assert.equal(book.beginInitialRead('claude'), null, 'a read in flight allowed a duplicate process start');
+
+  book.finishInitialRead('claude', first!, false);
+  assert.equal(book.needsInitialRead('claude'), true, 'a missing answer prevented the next view from retrying');
+  const second = book.beginInitialRead('claude');
+  assert.notEqual(second, null);
+  book.note('claude', [], second!);
+  assert.equal(book.needsInitialRead('claude'), false, 'an empty server list was not treated as an answer');
+
+  const codex = book.beginInitialRead('codex');
+  book.noteSilent('codex', codex!);
+  assert.equal(book.needsInitialRead('codex'), false, 'a launch failure would retry on every view');
+});
+
+test('an older initial MCP completion cannot release its replacement request', () => {
+  const book = new McpBook();
+  const older = book.beginInitialRead('draft-1')!;
+  book.forget('draft-1');
+  const replacement = book.beginInitialRead('draft-1')!;
+
+  book.finishInitialRead('draft-1', older, false);
+
+  assert.equal(
+    book.beginInitialRead('draft-1'),
+    null,
+    'the older completion released the replacement request and allowed duplicate traffic',
+  );
+  book.finishInitialRead('draft-1', replacement, false);
+  assert.notEqual(
+    book.beginInitialRead('draft-1'),
+    null,
+    'the replacement completion did not release its own unanswered request',
+  );
+});
+
+test('closing MCP surfaces lets reopened discovery replace an unfinished read', () => {
+  const book = new McpBook();
+  const closedSurfaceRead = book.beginInitialRead('session-1')!;
+
+  book.invalidateInitialReads();
+  const reopenedSurfaceRead = book.beginInitialRead('session-1');
+  assert.notEqual(
+    reopenedSurfaceRead,
+    null,
+    'reopening Servers could not replace the read invalidated when every panel closed',
+  );
+
+  book.finishInitialRead('session-1', closedSurfaceRead, false);
+  assert.equal(
+    book.beginInitialRead('session-1'),
+    null,
+    'the closed surface read released the reopened surface request',
+  );
+  book.finishInitialRead('session-1', reopenedSurfaceRead!, false);
+  assert.notEqual(
+    book.beginInitialRead('session-1'),
+    null,
+    'the reopened surface request did not release its own unanswered read',
+  );
+});
+
+test('a later MCP status request wins when an earlier request answers last', () => {
+  const book = new McpBook();
+  const earlier = book.change('session-1');
+  const later = book.change('session-1');
+  const connected = [{ ...SOME_SERVERS[0], status: 'connected' }];
+  const failed = [{ ...SOME_SERVERS[0], status: 'failed' }];
+
+  assert.equal(book.note('session-1', connected, later), true);
+  assert.equal(book.note('session-1', failed, earlier), false, 'a slower earlier request replaced the newer status');
+  assert.deepEqual(book.get('session-1'), connected);
+});
+
+test('an MCP reading begun before a server change cannot replace the result of that change', async () => {
+  const book = new McpBook();
+  const staleRevision = book.revision('claude');
+  let finishRead!: (servers: McpServer[]) => void;
+  const staleAnswer = new Promise<McpServer[]>((resolve) => {
+    finishRead = resolve;
+  });
+  const staleRead = staleAnswer.then((servers) => book.note('claude', servers, staleRevision));
+
+  const changedRevision = book.change('claude');
+  const changed = [{ ...SOME_SERVERS[0], status: 'disabled' }];
+  assert.equal(book.note('claude', changed, changedRevision), true);
+  finishRead(SOME_SERVERS);
+
+  assert.equal(await staleRead, false, 'the older reading was allowed to publish after the switch');
+  assert.deepEqual(book.get('claude'), changed);
+});
+
+test('draft MCP state moves to the actual session owner and rejects the provisional in-flight read', () => {
+  const book = new McpBook();
+  const revision = book.revision('draft-1');
+  assert.equal(book.note('draft-1', SOME_SERVERS, revision), true);
+
+  book.adopt('draft-1', 'session-1');
+
+  assert.equal(book.get('draft-1'), null);
+  assert.deepEqual(book.get('session-1'), SOME_SERVERS);
+  assert.equal(
+    book.note('draft-1', [], revision),
+    false,
+    'a read owned by the provisional id published after adoption',
+  );
+  assert.deepEqual(book.lists(), { 'session-1': SOME_SERVERS });
+});
+
+test('an MCP live target belongs to the requested owner and ownerless discovery excludes drafts', () => {
+  const states = [
+    {
+      key: 'claude:fresh:draft-1',
+      agent: 'claude',
+      sessionId: 'provisional-session',
+      busy: false,
+      ready: true,
+      exited: false,
+    },
+    { key: 'claude:existing-1', agent: 'claude', sessionId: 'existing-1', busy: false, ready: true, exited: false },
+    { key: 'claude:existing-2', agent: 'claude', sessionId: 'existing-2', busy: false, ready: true, exited: false },
+  ] as SessionState[];
+  const drafts = new Map([['draft-1', 'claude:fresh:draft-1']]);
+
+  assert.equal(liveMcpTarget(states, 'existing-2', drafts)?.state.key, 'claude:existing-2');
+  assert.equal(
+    liveMcpTarget(states, 'missing', drafts),
+    null,
+    'another Claude session was allowed to answer for the requested owner',
+  );
+  assert.deepEqual(liveMcpTarget(states, undefined, drafts), {
+    state: states[1],
+    owner: 'existing-1',
+  });
+});
+
+test('the production draft MCP factory rebuilds one captured random session identity', async () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const planAt = source.indexOf('const freshPlanForDraft =');
+  const planSource = statementFrom(source, planAt);
+  assert.match(
+    planSource,
+    /const sessionId = [^;]*randomUUID\(\)[\s\S]*return \(\) =>/,
+    'the production draft factory creates a new session identity each time AgentHost asks for a plan',
+  );
+  const draft = newSessionDraft('draft-1', WS, null, 1, {
+    agent: 'claude',
+    model: '',
+    effort: '',
+    permissionMode: '',
+    source: 'recent',
+  });
+  const sessionId = `session-${Math.random()}`;
+  let built = 0;
+  const factory = () => {
+    built++;
+    return claudePlan(CLAUDE, { cwd: draft.cwd, sessionId });
+  };
+  assert.notEqual(factory(), factory(), 'the production-shaped factory does not build a new plan');
+  const callbackAt = source.indexOf('panel.onPanelCommand =');
+  const callback = statementFrom(source, callbackAt);
+  assert.match(
+    callback,
+    /const plan = freshPlanForDraft\(draft\);[\s\S]*openDraftMcp\(host, key, plan,/,
+    'the production boundary can evaluate the random plan again while AgentHost waits',
+  );
+
+  const { host, children } = fakeHost();
+  built = 0;
+  const opening = host.withSessionActivity(freshHostKey('claude', draft.draftId), factory, (session) =>
+    session.mcpStatus(),
+  );
+  children[0].answerHandshake();
+  await tick();
+  children[0].answerControl('mcp_status', { mcpServers: [] });
+  assert.deepEqual(await opening, []);
+  assert.equal(built, 2, 'AgentHost did not exercise the production factory rebuild boundary');
+});
+
+test('a new Claude draft keeps one child while pending MCP servers settle and through its first prompt', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer, idleDurationMs: 60_000 });
+  const key = freshHostKey('claude', 'draft-1');
+  const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1' });
+  const published: McpServer[][] = [];
+  const refreshes = new McpPendingRefreshes({
+    timer,
+    now: () => 0,
+    delayMs: 25,
+    deadlineMs: 100,
+  });
+  const opening = openDraftMcp(host, key, plan, refreshes, 'draft-1', (servers) => {
+    published.push(servers);
+    return true;
+  });
+  children[0].answerHandshake();
+  await tick();
+  children[0].answerControl('mcp_status', {
+    mcpServers: [{ name: 'notes', status: 'pending', tools: [] }],
+  });
+  assert.equal(await opening, true);
+  assert.equal(children[0].ended, false, 'the initial server reading disposed the draft child');
+
+  timer.fire(timer.tasks.length - 1);
+  await tick();
+  const status = children[0]
+    .sent()
+    .filter((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'mcp_status')
+    .at(-1)!;
+  children[0].say(
+    JSON.stringify({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: status.request_id,
+        response: { mcpServers: [{ name: 'notes', status: 'connected', tools: [] }] },
+      },
+    }) + '\n',
+  );
+  await tick();
+
+  assert.deepEqual(
+    published.map((servers) => servers[0]?.status),
+    ['pending', 'connected'],
+  );
+  const same = await host.session(key, plan);
+  await same.prompt('use notes');
+  assert.equal(children.length, 1, 'the first prompt started a second child after MCP startup');
+  assert.equal(timer.activeCount(), 1, 'settled servers left a pending refresh timer');
+});
+
+test('an MCP change waits for an opening child and reuses it after the handshake', async () => {
+  const { host, children } = fakeHost();
+  const key = freshHostKey('claude', 'draft-1');
+  const opening = host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1' }));
+  assert.equal(host.states()[0]?.ready, false);
+  const target = liveMcpTarget(host.states(), 'draft-1', new Map([['draft-1', key]]));
+  assert.equal(target?.state.key, key);
+  const changed = host.changeMcp([key], [{ serverName: 'notes', enabled: true }]);
+  assert.equal(
+    children[0]
+      .sent()
+      .some((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'mcp_toggle'),
+    false,
+    'an opening child received a server control before its handshake completed',
+  );
+
+  children[0].answerHandshake();
+  await opening;
+  assert.equal(host.states()[0]?.ready, true);
+  await tick();
+  children[0].answerControl('mcp_toggle', {});
+  await tick();
+  children[0].answerControl('mcp_status', { mcpServers: [] });
+  assert.deepEqual(await changed, { failures: [], servers: [] });
+  assert.equal(children.length, 1, 'the server change started another child instead of reusing the opening one');
+});
+
+test('targeted retirement waits for a draft MCP read and closes its child once', async () => {
+  const { host, children } = fakeHost();
+  const key = freshHostKey('claude', 'draft-1');
+  const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1' });
+  const reading = host.withSessionActivity(key, plan, (session) => session.mcpStatus());
+  children[0].answerHandshake();
+  await tick();
+  const firstRetirement = host.retireSession(key);
+  const secondRetirement = host.retireSession(key);
+  assert.equal(children[0].ended, false, 'retirement closed the child during its server read');
+  children[0].answerControl('mcp_status', { mcpServers: [] });
+  await reading;
+  await tick();
+  assert.equal(children[0].endCalls, 1);
+  assert.equal(host.get(key), null);
+  children[0].exit(0);
+  await Promise.all([firstRetirement, secondRetirement]);
+});
+
+test('a permission transition blocks a concurrent prompt and rebuilds its launch plan', async () => {
+  const { host, children, commands } = fakeHost();
+  let permissionMode: PermissionMode = 'acceptEdits';
+  const plan = () =>
+    claudePlan(CLAUDE, {
+      cwd: WS,
+      resume: 'session-1',
+      permissionMode,
+    });
+  const opening = host.session('one', plan);
+  children[0].answerHandshake();
+  await opening;
+
+  let releasePersistence: () => void = () => undefined;
+  const persistence = new Promise<void>((resolve) => {
+    releasePersistence = resolve;
+  });
+  const changing = host.withRetiringActivities(['one'], async () => {
+    permissionMode = 'manual';
+    await persistence;
+    return true;
+  });
+  const delivery = (async () => {
+    const existing = host.find('claude', 'session-1');
+    if (existing) {
+      const delivered = await host.withActivity(existing.key, (session) => session.prompt('after change'));
+      if (delivered !== null) {
+        return delivered;
+      }
+    }
+    return await host.withSessionActivity('one', plan, (session) => session.prompt('after change'));
+  })();
+  await tick();
+  assert.equal(
+    children[0].sent().filter((message) => message.type === 'user').length,
+    0,
+    'the prompt reached the child with the old permission override',
+  );
+
+  releasePersistence();
+  await vi.waitFor(() => assert.equal(children[0].ended, true));
+  assert.equal(children.length, 1, 'the replacement started before the old child closed');
+  children[0].exit(0);
+  await vi.waitFor(() => assert.equal(children.length, 2));
+  children[1].answerHandshake();
+  assert.equal(typeof (await delivery), 'number');
+  assert.equal(await changing, true);
+  assert.equal(commands[1][commands[1].indexOf('--permission-mode') + 1], 'manual');
+  assert.equal(commands[1].includes('acceptEdits'), false, 'the replacement kept the old permission override');
+  assert.equal(children[1].sent().filter((message) => message.type === 'user').length, 1);
+});
+
+test('a permission transition waits for an earlier prompt lease before retiring its child', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session(
+    'one',
+    claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1', permissionMode: 'acceptEdits' }),
+  );
+  children[0].answerHandshake();
+  await opening;
+
+  let releasePrompt: () => void = () => undefined;
+  const promptLease = host.withActivity('one', async () => {
+    await new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+  });
+  let transitionStarted = false;
+  const changing = host.withRetiringActivities(['one'], async () => {
+    transitionStarted = true;
+    return true;
+  });
+  host.cancelSessionRetirement('one');
+  await vi.waitFor(() => assert.equal(transitionStarted, false));
+  assert.equal(children[0].ended, false, 'the transition closed a child whose earlier prompt still held a lease');
+
+  releasePrompt();
+  await promptLease;
+  await vi.waitFor(() => assert.equal(transitionStarted, true));
+  await vi.waitFor(() => assert.equal(children[0].ended, true));
+  children[0].exit(0);
+  assert.equal(await changing, true);
+});
+
+test('a busy permission transition retires when the turn ends before housekeeping settles', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session(
+    'one',
+    claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1', permissionMode: 'acceptEdits' }),
+  );
+  children[0].answerHandshake();
+  const session = await opening;
+  await session.prompt('finish this');
+
+  let transitionWorkFinished = false;
+  const changing = host.withRetiringActivities(['one'], async () => {
+    transitionWorkFinished = true;
+    return true;
+  });
+  await vi.waitFor(() => assert.equal(transitionWorkFinished, true));
+  await Promise.resolve();
+  assert.equal(children[0].ended, false, 'the transition closed the child while its turn was running');
+  children[0].say(COMPLETED_RESULT);
+
+  await vi.waitFor(() => assert.equal(children[0].ended, true));
+  children[0].exit(0);
+  assert.equal(await changing, true);
+});
+
+test('a rejected permission transition keeps queued delivery on the old child', async () => {
+  const { host, children } = fakeHost();
+  const plan = () =>
+    claudePlan(CLAUDE, {
+      cwd: WS,
+      resume: 'session-1',
+      permissionMode: 'acceptEdits',
+    });
+  const opening = host.session('one', plan);
+  children[0].answerHandshake();
+  await opening;
+
+  let rejectPersistence: (error: Error) => void = () => undefined;
+  const persistence = new Promise<never>((_resolve, reject) => {
+    rejectPersistence = reject;
+  });
+  const changing = host.withRetiringActivities(['one'], async () => await persistence);
+  const rejected = assert.rejects(changing, /settings write failed/);
+  const delivery = (async () => {
+    const existing = host.find('claude', 'session-1');
+    if (existing) {
+      const delivered = await host.withActivity(existing.key, (session) => session.prompt('after failure'));
+      if (delivered !== null) {
+        return delivered;
+      }
+    }
+    return await host.withSessionActivity('one', plan, (session) => session.prompt('after failure'));
+  })();
+
+  rejectPersistence(new Error('settings write failed'));
+  await rejected;
+  await vi.waitFor(() => {
+    assert.equal(children.length, 1, 'the failed transition opened a replacement child');
+    assert.equal(children[0].sent().filter((message) => message.type === 'user').length, 1);
+  });
+  assert.equal(children[0].ended, false, 'the failed transition retired the old child');
+  assert.equal(typeof (await delivery), 'number');
+});
+
+test('a permission transition bars an opening child before its handshake settles', async () => {
+  const { host, children } = fakeHost();
+  const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1', permissionMode: 'acceptEdits' });
+  const opening = host.session('one', plan);
+  const changing = host.withRetiringActivities(['one'], async () => true);
+  const activity = host.withActivity('one', async () => 'old child');
+  await tick();
+  assert.equal(await Promise.race([activity, Promise.resolve('blocked')]), 'blocked');
+  assert.equal(children[0].ended, false, 'the transition closed the child before its handshake settled');
+
+  children[0].answerHandshake();
+  await opening;
+  await vi.waitFor(() => assert.equal(children[0].ended, true));
+  children[0].exit(0);
+  assert.equal(await changing, true);
+  assert.equal(await activity, null);
+});
+
+test('targeted retirement blocks reuse as soon as an opening child is abandoned', async () => {
+  const { host, children } = fakeHost();
+  const key = freshHostKey('claude', 'draft-1');
+  const opening = host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1', model: 'old-model' }));
+  const retirement = host.retireSession(key);
+  const replacement = host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-2', model: 'new-model' }));
+  await tick();
+  assert.equal(children.length, 1, 'a prompt joined or replaced the opening child after retirement was requested');
+
+  children[0].answerHandshake();
+  await opening;
+  await tick();
+  assert.equal(children[0].endCalls, 1, 'the abandoned opening child remained alive after its handshake');
+  children[0].exit(0);
+  await retirement;
+  await tick();
+  assert.equal(children.length, 2, 'the replacement did not open after the abandoned child exited');
+  children[1].answerHandshake();
+  assert.equal((await replacement).state().sessionId, 'session-2');
+});
+
+test('a replacement draft plan waits for the provisional child to retire', async () => {
+  const { host, children, commands } = fakeHost();
+  const key = freshHostKey('claude', 'draft-1');
+  const oldPlan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-1', model: 'old-model' });
+  const reading = host.withSessionActivity(key, oldPlan, (session) => session.mcpStatus());
+  children[0].answerHandshake();
+  await tick();
+
+  const retirement = host.retireSession(key);
+  const replacement = host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId: 'session-2', model: 'new-model' }));
+  await tick();
+  assert.equal(children.length, 1, 'the changed profile opened another child before the old read settled');
+
+  children[0].answerControl('mcp_status', { mcpServers: [] });
+  await reading;
+  await tick();
+  children[0].exit(0);
+  await retirement;
+  await tick();
+  assert.equal(children.length, 2, 'the first prompt reused the child built from the previous profile');
+  children[1].answerHandshake();
+  await replacement;
+  assert.ok(commands[1].includes('new-model'));
+});
+
+test('a pending MCP deadline cancels an in-flight refresh before it can publish', async () => {
+  const timer = new FakeAgentHostTimer();
+  let resolveRead!: (servers: McpServer[]) => void;
+  const read = new Promise<McpServer[]>((resolve) => {
+    resolveRead = resolve;
+  });
+  const published: McpServer[][] = [];
+  const refreshes = new McpPendingRefreshes({ timer, delayMs: 25, deadlineMs: 100 });
+  refreshes.follow(
+    'draft-1',
+    [{ ...SOME_SERVERS[0], status: 'pending' }],
+    () => read,
+    (servers) => published.push(servers),
+  );
+
+  timer.fire(1);
+  await tick();
+  timer.fire(0);
+  resolveRead([{ ...SOME_SERVERS[0], status: 'connected' }]);
+  await tick();
+
+  assert.deepEqual(published, []);
+  assert.equal(timer.activeCount(), 0);
+});
+
+test('an older rejected MCP refresh cannot cancel its replacement', async () => {
+  const timer = new FakeAgentHostTimer();
+  let rejectOlder!: (reason: Error) => void;
+  const older = new Promise<McpServer[]>((_resolve, reject) => {
+    rejectOlder = reject;
+  });
+  const connected = [{ ...SOME_SERVERS[0], status: 'connected' }];
+  const published: McpServer[][] = [];
+  const refreshes = new McpPendingRefreshes({ timer, delayMs: 25, deadlineMs: 100 });
+
+  refreshes.follow(
+    'draft-1',
+    [{ ...SOME_SERVERS[0], status: 'pending' }],
+    () => older,
+    () => undefined,
+  );
+  timer.fire(1);
+  await tick();
+  refreshes.follow(
+    'draft-1',
+    [{ ...SOME_SERVERS[0], status: 'pending' }],
+    async () => connected,
+    (servers) => published.push(servers),
+  );
+
+  rejectOlder(new Error('older refresh failed'));
+  await tick();
+  timer.fire(3);
+  await tick();
+
+  assert.deepEqual(
+    published,
+    [connected],
+    'the older rejected refresh canceled the replacement request for the same owner',
+  );
+  assert.equal(timer.activeCount(), 0);
+});
+
+test(
+  'a press on an MCP server reaches the Claude child, and its reading comes back in the panel words',
+  { timeout: 5000 },
+  async () => {
+    const h = fakeHost();
+    const opening = h.host.session('claude:ws', claudePlan(CLAUDE, { cwd: WS }));
+    h.children[0].answerHandshake();
+    const claude = await opening;
+
+    const reading = claude.mcpStatus();
+    h.children[0].answerControl('mcp_status', {
+      mcpServers: [
+        {
+          name: 'probeGood',
+          status: 'connected',
+          scope: 'dynamic',
+          serverInfo: { name: 'probe-server', version: '0.0.1' },
+          tools: [{ name: 'probe_echo', annotations: {} }],
+        },
+      ],
+    });
+    assert.deepEqual(await reading, SOME_SERVERS);
+
+    const switching = claude.mcpToggle('probeGood', true);
+    const asked = h.children[0]
+      .sent()
+      .find((m) => (m.request as { subtype?: string } | undefined)?.subtype === 'mcp_toggle');
+    assert.deepEqual(
+      asked?.request,
+      { subtype: 'mcp_toggle', serverName: 'probeGood', enabled: true },
+      'the CLI answers success whatever the fields are called, so a wrong one moves nothing and says nothing',
+    );
+    h.children[0].answerControl('mcp_toggle', {});
+    await switching;
+
+    const retrying = claude.mcpReconnect('probeBad');
+    const retried = h.children[0]
+      .sent()
+      .find((m) => (m.request as { subtype?: string } | undefined)?.subtype === 'mcp_reconnect');
+    assert.deepEqual(retried?.request, { subtype: 'mcp_reconnect', serverName: 'probeBad' });
+    h.children[0].answerControl('mcp_reconnect', {});
+    await retrying;
+  },
+);
+
+test('an agent with no MCP servers to report answers none, and a press on one does nothing', async () => {
+  // Only Claude Code answers for its servers. The panel draws no such control for an agent
+  // that cannot be asked, so a call arriving anyway is nothing to put in front of a reader.
+  const { host } = fakeHost();
+  const session = await host.session(
+    'bare',
+    answeringPlan({
+      usage: () => Promise.resolve(null),
+      models: () => Promise.resolve(null),
+    }),
+  );
+  assert.equal(await session.mcpStatus(), null);
+  await assert.doesNotReject(session.mcpToggle('probeGood', false));
+  await assert.doesNotReject(session.mcpReconnect('probeGood'));
+});
+
+test('Claude can change MCP servers while Codex reports status only', () => {
+  const claude = claudePlan(CLAUDE, { cwd: WS }).driver(
+    () => undefined,
+    () => undefined,
+  );
+  assert.deepEqual(
+    [typeof claude.mcpStatus, typeof claude.mcpToggle, typeof claude.mcpReconnect],
+    ['function', 'function', 'function'],
+  );
+  const codex = codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }).driver(
+    () => undefined,
+    () => undefined,
+  );
+  assert.deepEqual(
+    [typeof codex.mcpStatus, codex.mcpToggle, codex.mcpReconnect],
+    ['function', undefined, undefined],
+    'the Codex app server reports its servers but does not expose Claude-style switches',
+  );
+});
+
+test('a pick the agent has dropped is not passed to a child, and one made before any list is read is kept', () => {
+  assert.equal(pickedModel('opus', A_MODEL_LIST), 'opus');
+  assert.equal(
+    pickedModel('sonnet-2', A_MODEL_LIST),
+    '',
+    'a child started on a model the CLI no longer has does not run at all',
+  );
+  assert.equal(
+    pickedModel('sonnet-2', null),
+    'sonnet-2',
+    'nothing has answered yet, so the pick stands rather than falling back to a default nobody chose',
+  );
+
+  assert.equal(pickedEffort('high', A_MODEL_LIST, 'opus'), 'high');
+  assert.equal(
+    pickedEffort('low', A_MODEL_LIST, 'opus'),
+    '',
+    'effort belongs to a model, so a level this one does not offer is not sent with it',
+  );
+  assert.equal(pickedEffort('low', null, 'opus'), 'low');
+  assert.equal(pickedEffort('high', A_MODEL_LIST, ''), 'high');
+  assert.equal(pickedEffort('retired', A_MODEL_LIST, ''), '');
+});
+
+test('a streamed chunk of the reply is passed on and wakes nothing else', async () => {
+  // It arrives many times a second and says nothing about the child that is not already
+  // known: no busier, nothing asked, nothing failed. Everything a state change wakes, the
+  // status bar and the stored session id among them, would otherwise run hundreds of times
+  // in a turn to report what the first chunk reported.
+  const { host, children, events, states } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  await starting;
+  const before = states.length;
+  for (const text of ['one, ', 'two, ', 'three']) {
+    children[0].say(
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+      }) + '\n',
+    );
+  }
+  assert.deepEqual(
+    events.filter((e) => e.event.kind === 'delta').map((e) => [e.key, e.event]),
+    [
+      ['one', { kind: 'delta', text: 'one, ' }],
+      ['one', { kind: 'delta', text: 'two, ' }],
+      ['one', { kind: 'delta', text: 'three' }],
+    ],
+    'the chunks never reach the panel, so the card has nothing to draw',
+  );
+  assert.equal(states.length, before, 'every chunk redraws the status bar and writes the session id back');
+
+  // The turn ending is a state change, and stays one.
+  children[0].say(
+    JSON.stringify({ type: 'result', is_error: false, terminal_reason: 'completed', result: 'hi' }) + '\n',
+  );
+  assert.ok(states.length > before, 'a turn that ended is reported no more loudly than a chunk of it');
+});
+
+test('live activity is passed on without waking session state', async () => {
+  const { host, children, events, states } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[0].answerHandshake();
+  await starting;
+  const before = states.length;
+  children[0].say(
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        stop_reason: 'tool_use',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_fast',
+            name: 'Bash',
+            input: { command: 'npm test', description: 'Run tests' },
+          },
+        ],
+      },
+    }) + '\n',
+  );
+  assert.deepEqual(
+    events.filter((entry) => entry.event.kind === 'activity').map((entry) => entry.key),
+    ['one'],
+  );
+  assert.equal(states.length, before, 'activity redraws shared session state instead of only updating the live card');
+});
+
+test('a child that ends when its input closes is never killed, and one that does not is', async () => {
+  // The reason this matters is not tidiness. The CLI writes its settings out as it shuts down,
+  // so a child killed in the same tick as the close loses whatever the reader last changed:
+  // a server switched off in the panel came back on in the next child. A real two-child
+  // check reproduced the behavior.
+  const wellBehaved = new FakeChild();
+  vi.useFakeTimers();
+  const polite = new AgentSession(
+    'a',
+    claudeIdlePlan(CLAUDE, WS),
+    () => wellBehaved,
+    () => {},
+    () => {},
+    1000,
+    20,
+  );
+  const politeDisposal = polite.dispose();
+  assert.equal(wellBehaved.ended, true, 'the child was never asked to stop');
+  // Ending on its own is what a real CLI does when its input closes.
+  wellBehaved.exit(0);
+  await politeDisposal;
+  await vi.advanceTimersByTimeAsync(60);
+  vi.useRealTimers();
+  assert.equal(wellBehaved.killed, false, 'a child that had already gone was killed anyway');
+
+  // The backstop. A child that ignores the close is still taken away, so nothing is left
+  // running behind a panel the reader has closed.
+  const stubborn = new FakeChild();
+  vi.useFakeTimers();
+  const rude = new AgentSession(
+    'b',
+    claudeIdlePlan(CLAUDE, WS),
+    () => stubborn,
+    () => {},
+    () => {},
+    1000,
+    20,
+  );
+  const rudeDisposal = rude.dispose();
+  assert.equal(stubborn.killed, false, 'the child was killed before it had a chance to stop');
+  await vi.advanceTimersByTimeAsync(60);
+  vi.useRealTimers();
+  assert.equal(stubborn.killed, true, 'a child that would not stop was left running');
+  stubborn.exit(null, 'SIGTERM');
+  await rudeDisposal;
+});
+
+test('disposing an exited child completes without another grace period', async () => {
+  const child = new FakeChild();
+  const session = new AgentSession(
+    'gone',
+    claudeIdlePlan(CLAUDE, WS),
+    () => child,
+    () => {},
+    () => {},
+  );
+  child.exit(1);
+
+  const first = session.dispose();
+  assert.strictEqual(session.dispose(), first, 'repeated disposal started another shutdown wait');
+  await first;
+  assert.equal(child.killed, false, 'an exited child was killed again');
+});
+
+test('a child whose input cannot be closed is still killed after the grace period', async () => {
+  const child = new FakeChild();
+  child.stdin.end = () => {
+    throw new Error('pipe refused to close');
+  };
+  const session = new AgentSession(
+    'blocked-pipe',
+    claudeIdlePlan(CLAUDE, WS),
+    () => child,
+    () => {},
+    () => {},
+    1000,
+    20,
+  );
+
+  vi.useFakeTimers();
+  const disposing = session.dispose();
+  await vi.advanceTimersByTimeAsync(60);
+  vi.useRealTimers();
+  assert.equal(child.killed, true, 'a failed input close disabled the shutdown backstop');
+  child.exit(null, 'SIGTERM');
+  await disposing;
+});
+
+test('a press on the servers switch works with no session running', async () => {
+  // The composer draws the servers control as soon as the panel has counted them, which is
+  // before any prompt has been sent. So a press has to work with no session child, and
+  // this is the child it gets: one of its own, told the change and then asked what the
+  // servers are now.
+  const children: FakeChild[] = [];
+  const done = askIdleMcpChange(
+    claudeIdlePlan(CLAUDE, WS),
+    () => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    [{ serverName: 'notes', enabled: false }],
+  );
+  await tick();
+  const child = children[0];
+  child.answerHandshake();
+  await tick();
+  const read = () => child.sent().map((m) => m.request as { subtype: string; serverName?: string; enabled?: boolean });
+  // Both fields, every time. `mcp_toggle` sets a value despite its name, and the value left
+  // off means false, so a press meaning "switch it back on" that sent the name alone would
+  // switch it off again.
+  assert.equal(read()[1].serverName, 'notes');
+  assert.equal(read()[1].enabled, false);
+  child.answerControl('mcp_toggle', {});
+  await tick();
+  // The reading is taken after the change and not worked out from it. A toggle answers with
+  // an empty body, so what the servers are now is knowable only by asking.
+  assert.deepEqual(
+    read().map((r) => r.subtype),
+    ['initialize', 'mcp_toggle', 'mcp_status'],
+  );
+  child.answerControl('mcp_status', { mcpServers: [{ name: 'notes', status: 'disabled', tools: [] }] });
+  await tick();
+  assert.equal(child.ended, true, 'the press left its child running');
+  child.exit(0);
+  const result = await done;
+  assert.deepEqual(result.failures, []);
+  assert.deepEqual(
+    result.servers?.map((s) => s.status),
+    ['disabled'],
+  );
+  // Closed, not killed, which is what makes the change outlast the child that made it.
+  assert.equal(child.killed, false, 'the child was killed instead of allowed to close');
+});
+
+test('a press that could not start a child says so rather than doing nothing quietly', async () => {
+  // The live path throws when a server refuses. This path had nothing to throw: a child that
+  // would not come up returned no servers and no failures, `setMcpFor` found nothing to
+  // report, and the reader who pressed a switch got silence. That is the one outcome this
+  // work refuses everywhere else.
+  const children: FakeChild[] = [];
+  const done = askIdleMcpChange(
+    claudeIdlePlan(CLAUDE, WS),
+    () => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    [{ serverName: 'notes', enabled: true }],
+  );
+  await tick();
+  children[0].exit(1);
+  const result = await done;
+  assert.equal(result.servers, null);
+  assert.deepEqual(result.failures, []);
+  assert.ok(result.refusal, 'a child that never came up was reported as nothing at all');
+});
+
+test('a change waits for its child to go, because that is when the change is written', async () => {
+  // The CLI writes the setting out as it shuts down. Returning before the child has gone lets
+  // the reader's next prompt start a session that reads the state they just changed
+  // away from, so the wait is the guarantee rather than tidiness.
+  const children: FakeChild[] = [];
+  let settled = false;
+  const done = askIdleMcpChange(
+    claudeIdlePlan(CLAUDE, WS),
+    () => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    [{ serverName: 'notes', enabled: true }],
+    1000,
+  ).then((r) => {
+    settled = true;
+    return r;
+  });
+  await tick();
+  const child = children[0];
+  child.answerHandshake();
+  await tick();
+  child.answerControl('mcp_toggle', {});
+  await tick();
+  child.answerControl('mcp_status', { mcpServers: [{ name: 'notes', status: 'connected', tools: [] }] });
+  await tick();
+  await tick();
+  assert.equal(settled, false, 'the change was reported done while its child was still writing');
+  assert.equal(child.ended, true, 'the child was never asked to stop');
+  child.exit(0);
+  const result = await done;
+  assert.equal(settled, true);
+  assert.deepEqual(
+    result.servers?.map((s) => s.name),
+    ['notes'],
+  );
+});
+
+test('an existing session host key is stable and names its actual id', () => {
+  assert.equal(existingHostKey('claude', 'session-1'), 'claude:session-1');
+  assert.equal(existingHostKey('codex', 'thread-7'), 'codex:thread-7');
+});
+
+test('a rejected first Codex prompt uses the changed effort on its next send', async () => {
+  const { host, children } = fakeHost();
+  const draft = newSessionDraft('retry', WS, null, 0, {
+    agent: 'codex',
+    model: 'gpt-5-codex',
+    effort: 'retired-effort',
+    permissionMode: '',
+    source: 'recent',
+  });
+  const key = freshHostKey('codex', draft.draftId);
+  const plan = (effort: string) =>
+    codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, model: draft.profile.model, effort });
+  const opening = host.session(key, plan(draft.profile.effort));
+  await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'initialize'));
+  children[0].reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'skills/list'));
+  children[0].reply({ data: [] });
+  await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'thread/start'));
+  children[0].reply({ thread: { id: 'first' } });
+  const first = await opening;
+  const rejected = assert.rejects(first.prompt('go'), /unsupported effort/);
+  await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'turn/start'));
+  children[0].replyError(-32602, 'unsupported effort');
+  await rejected;
+  retireDraftProfile(host, draft, new McpBook(), new McpPendingRefreshes(), new Map(), new Set());
+  const next = host.session(key, plan('high'));
+  let reused = false;
+  void next.then(() => {
+    reused = true;
+  });
+  await vi.waitFor(() => assert.ok(children[0].ended || reused));
+  if (children[0].ended) {
+    children[0].exit(0);
+    await vi.waitFor(() => assert.equal(children.length, 2));
+    children[1].reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(children[1].sent().at(-1)?.method, 'skills/list'));
+    children[1].reply({ data: [] });
+    await vi.waitFor(() => assert.equal(children[1].sent().at(-1)?.method, 'thread/start'));
+    children[1].reply({ thread: { id: 'second' } });
+  }
+  const second = await next;
+  const child = children.at(-1)!;
+  const sent = second.prompt('go');
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+  const turn = child.sent().at(-1);
+  assert.ok(turn);
+  assert.equal((turn.params as { effort: string }).effort, 'high');
+  child.reply({ turn: { id: 'accepted' } });
+  await sent;
+  child.exit(0);
+});
+
+test('an accepted Claude prompt leaves a rejected Codex child free to retry with changed effort', async () => {
+  const { host, children } = fakeHost();
+  const draft = newSessionDraft('cross-agent', WS, null, 0, {
+    agent: 'claude',
+    model: '',
+    effort: '',
+    permissionMode: '',
+    source: 'recent',
+  });
+  const claudeKey = freshHostKey('claude', draft.draftId);
+  const claudePlanSource = claudePlan(CLAUDE, { cwd: WS, sessionId: 'accepted' });
+  const openingClaude = host.session(claudeKey, claudePlanSource);
+  children[0].answerHandshake();
+  const claude = await openingClaude;
+  const accepted = new Set<string>();
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const acceptance = statementFrom(source, source.indexOf('acceptedDrafts.add('));
+  const delivery = claude.prompt('go').then(() => {
+    runInNewContext(acceptance, { acceptedDrafts: accepted, draft, live: claude });
+    throw new Error('recent-profile save failed');
+  });
+  await assert.rejects(delivery, /recent-profile save failed/);
+  children[0].say(COMPLETED_RESULT);
+  await vi.waitFor(() => assert.equal(claude.state().busy, false));
+  const mcpKeys = new Map([[draft.draftId, claudeKey]]);
+  retireDraftProfile(host, draft, new McpBook(), new McpPendingRefreshes(), mcpKeys, accepted);
+  assert.equal(await host.session(claudeKey, claudePlanSource), claude);
+  assert.equal(children[0].ended, false);
+
+  const codexDraft = { ...draft, profile: { ...draft.profile, agent: 'codex' as const, effort: 'low' } };
+  const codexKey = freshHostKey('codex', draft.draftId);
+  const plan = (effort: string) => codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, effort });
+  const openingCodex = host.session(codexKey, plan('low'));
+  await vi.waitFor(() => assert.equal(children[1].sent().at(-1)?.method, 'initialize'));
+  children[1].reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(children[1].sent().at(-1)?.method, 'skills/list'));
+  children[1].reply({ data: [] });
+  await vi.waitFor(() => assert.equal(children[1].sent().at(-1)?.method, 'thread/start'));
+  children[1].reply({ thread: { id: 'rejected' } });
+  const first = await openingCodex;
+  const rejected = assert.rejects(first.prompt('go'), /unsupported effort/);
+  await vi.waitFor(() => assert.equal(children[1].sent().at(-1)?.method, 'turn/start'));
+  const rejectedTurn = children[1].sent().at(-1);
+  assert.ok(rejectedTurn);
+  assert.equal((rejectedTurn.params as { effort: string }).effort, 'low');
+  children[1].replyError(-32602, 'unsupported effort');
+  await rejected;
+  retireDraftProfile(host, codexDraft, new McpBook(), new McpPendingRefreshes(), mcpKeys, accepted);
+  const next = host.session(codexKey, plan('high'));
+  let reused = false;
+  void next.then(() => {
+    reused = true;
+  });
+  await vi.waitFor(() => assert.ok(children[1].ended || reused));
+  if (children[1].ended) {
+    children[1].exit(0);
+    await vi.waitFor(() => assert.equal(children.length, 3));
+    children[2].reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(children[2].sent().at(-1)?.method, 'skills/list'));
+    children[2].reply({ data: [] });
+    await vi.waitFor(() => assert.equal(children[2].sent().at(-1)?.method, 'thread/start'));
+    children[2].reply({ thread: { id: 'retry' } });
+  }
+  const second = await next;
+  const child = children.at(-1)!;
+  const sent = second.prompt('go');
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+  const retriedTurn = child.sent().at(-1);
+  assert.ok(retriedTurn);
+  const effort = (retriedTurn.params as { effort: string }).effort;
+  child.reply({ turn: { id: 'accepted' } });
+  await sent;
+  const claudeEnded = children[0].ended;
+  const claudeKept = host.get(claudeKey) === claude;
+  for (const child of children) child.exit(0);
+  assert.equal(effort, 'high');
+  assert.equal(claudeEnded, false);
+  assert.equal(claudeKept, true);
+});
+
+test('an accepted first prompt keeps its child when later delivery work fails', async () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const { host, children } = fakeHost();
+    const draft = newSessionDraft('accepted', WS, null, 0, {
+      agent,
+      model: '',
+      effort: '',
+      permissionMode: '',
+      source: 'recent',
+    });
+    const key = freshHostKey(agent, draft.draftId);
+    const opening = host.session(
+      key,
+      agent === 'claude'
+        ? claudePlan(CLAUDE, { cwd: WS, sessionId: 'accepted' })
+        : codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }),
+    );
+    if (agent === 'claude') children[0].answerHandshake();
+    else {
+      children[0].reply({ userAgent: 'codex' });
+      await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'skills/list'));
+      children[0].reply({ data: [] });
+      await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'thread/start'));
+      children[0].reply({ thread: { id: 'accepted' } });
+    }
+    const session = await opening;
+    const prompt = session.prompt('go');
+    if (agent === 'codex') {
+      await vi.waitFor(() => assert.equal(children[0].sent().at(-1)?.method, 'turn/start'));
+      children[0].reply({ turn: { id: 'accepted' } });
+    }
+    await prompt;
+    if (agent === 'claude') children[0].say(COMPLETED_RESULT);
+    else
+      children[0].say(
+        JSON.stringify({
+          method: 'turn/completed',
+          params: { threadId: 'accepted', turn: { id: 'accepted', status: 'completed' } },
+        }) + '\n',
+      );
+    await vi.waitFor(() => assert.equal(session.state().busy, false));
+    const keys = new Map([[draft.draftId, key]]);
+    retireDraftProfile(host, draft, new McpBook(), new McpPendingRefreshes(), keys, new Set([key]));
+    let kept = false;
+    void host
+      .session(
+        key,
+        agent === 'claude'
+          ? claudePlan(CLAUDE, { cwd: WS, sessionId: 'accepted' })
+          : codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }),
+      )
+      .then((next) => {
+        kept = next === session;
+      });
+    await vi.waitFor(() => assert.ok(kept || children[0].ended));
+    assert.equal(children[0].ended, false);
+    assert.equal(children[0].killed, false);
+    assert.equal(host.get(key), session);
+    assert.equal(keys.size, 0);
+    children[0].exit(0);
+  }
+});
+
+test('a draft profile change retires each distinct fresh and MCP child once', () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const draft = { draftId: 'changed', profile: { agent } };
+    const fresh = freshHostKey(agent, draft.draftId);
+    for (const mcpKey of [fresh, 'another-child']) {
+      const keys = new Map([[draft.draftId, mcpKey]]);
+      const retired: string[] = [];
+      const host = {
+        retireSession: async (key: string) => {
+          retired.push(key);
+        },
+      } as unknown as AgentHost;
+      const mcp = new McpBook();
+      mcp.note(draft.draftId, SOME_SERVERS);
+      retireDraftProfile(host, draft, mcp, new McpPendingRefreshes(), keys, new Set());
+      assert.deepEqual(retired.sort(), [...new Set([fresh, mcpKey])].sort());
+      assert.equal(keys.size, 0);
+      assert.equal(mcp.get(draft.draftId), null);
+    }
+  }
+});
+
+test('fresh host keys are unique when the draft ids differ', () => {
+  assert.equal(freshHostKey('claude', 'draft-a'), 'claude:fresh:draft-a');
+  assert.notEqual(freshHostKey('codex', 'draft-a'), freshHostKey('codex', 'draft-b'));
+});
+
+test('a fresh host key cannot collide with an existing session key', () => {
+  assert.notEqual(freshHostKey('codex', 'thread-7'), existingHostKey('codex', 'thread-7'));
+});
+
+// What each agent published, cut to what a draft's pickers need: the model the setup was
+// copied on, and a second one the reader can move to with an effort level of its own.
+const DRAFT_MODELS = {
+  claude: [
+    { value: 'opus', label: 'Opus 5', description: '', efforts: [{ value: 'high', label: 'high', description: '' }] },
+    {
+      value: 'sonnet',
+      label: 'Sonnet 4.5',
+      description: '',
+      efforts: [
+        { value: 'low', label: 'low', description: '' },
+        { value: 'high', label: 'high', description: '' },
+      ],
+    },
+  ],
+  codex: [
+    {
+      value: 'gpt-5',
+      label: 'GPT-5',
+      description: '',
+      efforts: [{ value: 'medium', label: 'medium', description: '' }],
+    },
+    {
+      value: 'gpt-5-codex',
+      label: 'GPT-5 Codex',
+      description: '',
+      efforts: [{ value: 'xhigh', label: 'xhigh', description: '' }],
+    },
+  ],
+};
+
+// A draft as the panel holds it after three presses: the setup it inherited from the
+// session beside it, a model change, an effort change, then a permission change. The
+// frozen value this returns is what `send` hands over, and the whole of what a fresh child is
+// started from.
+//
+// Permissions are here because they are the part of the setup that reaches each CLI its own
+// way. Claude takes one word at spawn and Codex takes a policy and a sandbox together, so a
+// value that travelled for one agent says nothing about the other.
+function draftAfterPicks(agent: 'claude' | 'codex', model: string, effort: string, permission: string) {
+  const catalog = DRAFT_MODELS[agent];
+  const inherited: SessionProfile = {
+    agent,
+    model: catalog[0].value,
+    effort: catalog[0].efforts[0].value,
+    permissionMode: defaultAskMode(agent).value,
+    source: 'inherited',
+  };
+  const onModel = draftProfileAfterPick(inherited, 'model', model, DRAFT_MODELS);
+  assert.ok(onModel, `the model menu refused ${model}, so the press this test is about never happened`);
+  const onEffort = draftProfileAfterPick(onModel, 'effort', effort, DRAFT_MODELS);
+  assert.ok(onEffort, `the effort menu refused ${effort}, so the press this test is about never happened`);
+  // A press that lands on the value already held changes nothing, and a test written on one
+  // would pass on a child started from the setup nobody touched.
+  assert.notEqual(
+    permission,
+    inherited.permissionMode,
+    `${permission} is what this draft already asks for, so the press this test is about changes nothing`,
+  );
+  const onPermission = draftProfileAfterPick(onEffort, 'askmode', permission, DRAFT_MODELS);
+  assert.ok(onPermission, `the permission menu refused ${permission}, so the press this test is about never happened`);
+  // Three picks made this profile, so the draft records the reader's own work. The field
+  // reaches no spawn argument, and a fixture saying otherwise describes a draft nobody made.
+  return newSessionDraft(`draft-${agent}`, WS, 's1', 0, onPermission, null, true);
+}
+
+test('a draft the reader changed starts its child on the setup it now holds', { timeout: 5000 }, async () => {
+  // Both halves build the spawn plan the way a fresh session is started: off the frozen
+  // draft alone. A press that changed the stored setup and left the draft holding the old one
+  // would start the child on the setup the reader replaced, and every word on screen would
+  // still say the new one.
+  const claude = draftAfterPicks('claude', 'sonnet', 'low', 'plan');
+  const claudeMode = askMode(claude.profile.agent, claude.profile.permissionMode);
+  assert.ok(claudeMode);
+  const args = claudePlan(CLAUDE, {
+    cwd: claude.cwd,
+    sessionId: 'c0ffee',
+    permissionMode: claudeAskMode(claudeMode),
+    model: claude.profile.model,
+    effort: claude.profile.effort,
+  }).args;
+  assert.equal(
+    args[args.indexOf('--model') + 1],
+    'sonnet',
+    'the Claude child is started on a model the reader moved away from',
+  );
+  assert.equal(
+    args[args.indexOf('--effort') + 1],
+    'low',
+    'the Claude child is started at a level the reader moved away from',
+  );
+  // Permissions are the one part of the setup the other two presses never move. A child
+  // started on the wrong one edits files the reader asked it to plan first.
+  assert.equal(
+    args[args.indexOf('--permission-mode') + 1],
+    'plan',
+    'the Claude child is started on a permission the reader moved away from',
+  );
+
+  const codex = draftAfterPicks('codex', 'gpt-5-codex', 'xhigh', 'never');
+  const codexMode = askMode(codex.profile.agent, codex.profile.permissionMode);
+  assert.ok(codexMode);
+  const h = fakeHost();
+  const opening = h.host.session(
+    freshHostKey('codex', codex.draftId),
+    codexPlan(CODEX, {
+      cwd: codex.cwd,
+      clientInfo: CODEX_CLIENT,
+      ...codexAskMode(codexMode),
+      model: codex.profile.model,
+      effort: codex.profile.effort,
+    }),
+  );
+  const child = h.children[0];
+  await answerCodexHandshake(child);
+  // The policy and the sandbox travel together and open the thread. A reader who picked full
+  // access and got the workspace sandbox was promised the machine and given a folder.
+  const start = child.sent().find((m) => m.method === 'thread/start');
+  assert.deepEqual(
+    {
+      approvalPolicy: (start?.params as { approvalPolicy?: string })?.approvalPolicy,
+      sandbox: (start?.params as { sandbox?: string })?.sandbox,
+    },
+    { approvalPolicy: 'never', sandbox: 'danger-full-access' },
+    'the Codex thread opens on a permission the reader moved away from',
+  );
+  child.reply({ thread: { id: 'thread-1' } });
+  const session = await opening;
+  // Not awaited. The server's reply is not what is under test, and what the child was sent is
+  // written before any reply comes back.
+  void session.prompt('go');
+  await tick();
+  const turn = child.sent().find((m) => m.method === 'turn/start');
+  assert.deepEqual(
+    { model: (turn?.params as { model?: string })?.model, effort: (turn?.params as { effort?: string })?.effort },
+    { model: 'gpt-5-codex', effort: 'xhigh' },
+    'a Codex thread carries no effort field, so a level the reader changed rides the turn or reaches nothing',
+  );
+});
+
+// What Arc sends a Claude child for a rename. Claude Code answers it on the control channel
+// and writes no `result`, so the turn the reader is watching is untouched either way.
+const RENAME_REQUEST = { subtype: 'rename_session', title: 'Complete name', source: 'host', session_id: 'session-7' };
+const renameRequests = (child: FakeChild) =>
+  child.sent().filter((message) => (message.request as { subtype?: string } | undefined)?.subtype === 'rename_session');
+
+// Answers one rename by its place in the line, because a session can send a second rename
+// while the first is still waiting, and `answerControl` always finds the first.
+function answerRename(child: FakeChild, index = 0, error?: string): void {
+  const found = renameRequests(child)[index];
+  if (!found) {
+    throw new Error('no rename to answer');
+  }
+  child.say(
+    JSON.stringify({
+      type: 'control_response',
+      response: error
+        ? { subtype: 'error', request_id: found.request_id, error }
+        : { subtype: 'success', request_id: found.request_id, response: {} },
+    }) + '\n',
+  );
+}
+const MODEL_TURN = (message: Record<string, unknown>) =>
+  message.method === 'turn/start' || message.method === 'thread/start' || message.method === 'thread/resume';
+const NO_IDLE_PLAN = (): AgentPlan => {
+  throw new Error('a live rename started a rename-only child');
+};
+const claudeRenameChild = () => claudeRenamePlan(CLAUDE, { cwd: WS, resume: 'session-7', title: 'Complete name' });
+const codexRenameChild = () =>
+  codexRenamePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, threadId: 'thread-7', title: 'Complete name' });
+
+async function liveClaude(
+  host: AgentHost,
+  children: FakeChild[],
+): Promise<{ session: AgentSession; child: FakeChild }> {
+  const opening = host.session('claude', claudePlan(CLAUDE, { cwd: WS, resume: 'session-7' }));
+  const child = children.at(-1)!;
+  child.answerHandshake();
+  return { session: await opening, child };
+}
+
+test('a live Claude session renames through its child with no model turn and no timeline event', async () => {
+  const { host, children, events } = fakeHost();
+  const { session, child } = await liveClaude(host, children);
+  const before = events.length;
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN);
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  assert.deepEqual(renameRequests(child)[0].request, RENAME_REQUEST);
+  assert.deepEqual(
+    child.sent().filter((message) => message.type === 'user'),
+    [],
+    'the rename went out as a typed command',
+  );
+  assert.equal(session.state().busy, false, 'a rename drew the session as working');
+  answerRename(child);
+  await renamed;
+  assert.deepEqual(
+    events
+      .slice(before)
+      .map(({ event }) => event.kind)
+      .filter((kind) => kind !== 'session'),
+    [],
+    'the command reply reached the timeline',
+  );
+  assert.equal(children.length, 1, 'a live rename started another child');
+});
+
+test('a second rename of one live Claude session waits for the first to settle', async () => {
+  const { host, children } = fakeHost();
+  const { child } = await liveClaude(host, children);
+  const first = host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN);
+  const second = host.renameSession('claude', 'session-7', 'Second name', NO_IDLE_PLAN);
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  // Both renames read the same transcript end, so the session would keep whichever record
+  // the CLI wrote last.
+  for (let i = 0; i < 5; i += 1) {
+    await tick();
+  }
+  assert.equal(renameRequests(child).length, 1, 'the second rename went out beside the first');
+  answerRename(child, 0);
+  await first;
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 2));
+  assert.equal((renameRequests(child)[1].request as { title?: string }).title, 'Second name');
+  answerRename(child, 1);
+  await second;
+});
+
+test('a Claude rename goes out while a turn runs, and a refusal leaves that turn alone', async () => {
+  const { host, children, events } = fakeHost();
+  const { session, child } = await liveClaude(host, children);
+  await session.prompt('working');
+  assert.equal(session.state().busy, true);
+  const refused = session.rename('session-7', 'Complete name');
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  answerRename(child, 0, 'title must be non-empty');
+  await assert.rejects(refused, /title must be non-empty/);
+  assert.equal(session.state().busy, true, 'a refused rename ended the running turn');
+  const renamed = session.rename('session-7', 'Complete name');
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 2));
+  answerRename(child, 1);
+  await renamed;
+  assert.equal(session.state().busy, true, 'the rename ended the running turn');
+  child.say(COMPLETED_RESULT);
+  assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').length, 1);
+  assert.equal(session.state().busy, false);
+});
+
+test('a live rename carries the session id the host resolved, not the one its child moved to', async () => {
+  const { host, children } = fakeHost();
+  // A child that reports another session id once the host has looked this one up, the way a
+  // Claude child reports a fork of the session it resumed. The CLI refuses a rename whose
+  // session id is not the one its own process holds, and a rename that reads the id back off
+  // the child asks for the session the child moved to, so the refusal never fires.
+  const ordinary = claudePlan(CLAUDE, { cwd: WS, resume: 'session-7' });
+  let watching = false;
+  let lookedUp = false;
+  const plan: AgentPlan = {
+    ...ordinary,
+    driver(send, emit) {
+      const child = ordinary.driver(send, emit);
+      return {
+        ...child,
+        sessionId: () => {
+          if (!watching) {
+            return child.sessionId();
+          }
+          if (!lookedUp) {
+            lookedUp = true;
+            return child.sessionId();
+          }
+          return 'session-9';
+        },
+      };
+    },
+  };
+  const opening = host.session('claude', plan);
+  const child = children.at(-1)!;
+  child.answerHandshake();
+  await opening;
+  watching = true;
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN);
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  assert.deepEqual(renameRequests(child)[0].request, RENAME_REQUEST);
+  answerRename(child);
+  await renamed;
+});
+
+test('a rename right after Stop goes out at once and never takes the stopped turn ending', async () => {
+  const { host, children, events } = fakeHost();
+  const { session, child } = await liveClaude(host, children);
+  await session.prompt('first');
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  await stopping;
+  assert.equal(session.state().busy, false);
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN);
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  answerRename(child);
+  await renamed;
+  assert.deepEqual(
+    events.filter(({ event }) => event.kind === 'turnEnd'),
+    [],
+    'the rename was read as the stopped turn ending',
+  );
+  child.say(ABORTED_RESULT);
+  assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').length, 1);
+  assert.equal(session.state().busy, false);
+});
+
+test('a live Claude rename with no answer fails and leaves the session and its child running', async () => {
+  const { host, children, events } = fakeHost();
+  const plan: AgentPlan = {
+    ...claudePlan(CLAUDE, { cwd: WS, resume: 'session-7' }),
+    driver(send, emit) {
+      const wire = new ClaudeWire({ send, emit, sessionId: 'session-7', deadlineMs: 1 });
+      return {
+        receive: (line) => wire.receive(line),
+        open: () => wire.initialize(),
+        prompt: (input) => wire.prompt(input),
+        compact: () => Promise.reject(new Error('not used')),
+        clear: () => Promise.reject(new Error('not used')),
+        answer: (id, answer) => wire.answer(id, answer),
+        interrupt: () => wire.interrupt(true),
+        sessionId: () => wire.sessionId(),
+        close: (reason) => wire.close(reason),
+        rename: (sessionId, title) => wire.renameSession(sessionId, title),
+      };
+    },
+  };
+  const opening = host.session('claude', plan);
+  const child = children[0];
+  child.answerHandshake();
+  const session = await opening;
+  const keepAlive = setTimeout(() => {}, 1_000);
+  try {
+    await assert.rejects(host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN), /did not answer/);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+  assert.equal(session.state().exited, false, 'a rename that went unanswered took the session down');
+  assert.equal(child.ended, false, 'a rename that went unanswered ended the child');
+  assert.equal(host.find('claude', 'session-7'), session);
+  await session.prompt('a real prompt');
+  child.say(COMPLETED_RESULT);
+  assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').length, 1);
+});
+
+test('an idle Claude session renames through a rename-only child that sends no prompt and lists no session', async () => {
+  const { host, children, commands } = fakeHost();
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', claudeRenameChild);
+  const child = children[0];
+  child.answerHandshake();
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  assert.deepEqual(renameRequests(child)[0].request, RENAME_REQUEST);
+  assert.ok(
+    commands[0].includes('--resume') && commands[0].includes('session-7'),
+    'the child did not resume the session it renames',
+  );
+  assert.deepEqual(host.states(), [], 'the rename-only child drew as a running session');
+  answerRename(child);
+  await vi.waitFor(() => assert.equal(child.ended, true));
+  child.exit(0);
+  await renamed;
+  assert.deepEqual(
+    child.sent().filter((message) => message.type === 'user'),
+    [],
+    'the rename child sent a user message',
+  );
+});
+
+test('an idle Claude rename rejects with the refusal Claude Code reported', async () => {
+  const { host, children } = fakeHost();
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', claudeRenameChild);
+  const child = children[0];
+  child.answerHandshake();
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  answerRename(child, 0, 'rename denied');
+  await vi.waitFor(() => assert.equal(child.ended, true));
+  child.exit(0);
+  await assert.rejects(renamed, /rename denied/);
+});
+
+test('a rename during the session opening renames through the opened child', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session('claude', claudePlan(CLAUDE, { cwd: WS, resume: 'session-7' }));
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN);
+  await tick();
+  assert.equal(children.length, 1, 'a rename started a second writer beside the opening one');
+  children[0].answerHandshake();
+  await opening;
+  await vi.waitFor(() => assert.equal(renameRequests(children[0]).length, 1));
+  answerRename(children[0]);
+  await renamed;
+  assert.equal(children.length, 1);
+});
+
+test('a session opening waits for a rename-only child to exit before it starts its writer', async () => {
+  const { host, children } = fakeHost();
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', claudeRenameChild);
+  children[0].answerHandshake();
+  await vi.waitFor(() => assert.equal(renameRequests(children[0]).length, 1));
+  const opening = host.session('claude', claudePlan(CLAUDE, { cwd: WS, resume: 'session-7' }));
+  answerRename(children[0]);
+  await vi.waitFor(() => assert.equal(children[0].ended, true));
+  await tick();
+  assert.equal(children.length, 1, 'the writer started while the rename-only child was still running');
+  children[0].exit(0);
+  await renamed;
+  await vi.waitFor(() => assert.equal(children.length, 2));
+  children[1].answerHandshake();
+  await opening;
+});
+
+test('a rename waits for a retiring writer to exit before its rename-only child starts', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  await liveClaude(host, children);
+  settle(host, 'claude');
+  timer.fire(timer.tasks.length - 1);
+  assert.equal(children[0].ended, true, 'the idle child did not retire');
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', claudeRenameChild);
+  await tick();
+  assert.equal(children.length, 1, 'the rename-only child started beside a writer that had not exited');
+  children[0].exit(0);
+  await vi.waitFor(() => assert.equal(children.length, 2));
+  children[1].answerHandshake();
+  await vi.waitFor(() => assert.equal(renameRequests(children[1]).length, 1));
+  answerRename(children[1]);
+  await vi.waitFor(() => assert.equal(children[1].ended, true));
+  children[1].exit(0);
+  await renamed;
+});
+
+test('host disposal ends a rename-only child and fails its rename', async () => {
+  const { host, children } = fakeHost();
+  const renamed = host.renameSession('claude', 'session-7', 'Complete name', claudeRenameChild);
+  const refused = assert.rejects(renamed);
+  host.dispose();
+  assert.equal(children[0].ended, true, 'host disposal left the rename-only child running');
+  children[0].exit(0);
+  await refused;
+  await assert.rejects(
+    host.renameSession('claude', 'session-7', 'Complete name', claudeRenameChild),
+    /no longer running/,
+  );
+});
+
+// The saved title file Claude Code writes beside a transcript, for the confirmation to read.
+function renamedTranscript(saved: string | null): string {
+  const dir = tempDir('rename-');
+  const file = path.join(dir, 'session-7.jsonl');
+  fs.writeFileSync(file, '');
+  if (saved !== null) {
+    fs.mkdirSync(path.join(dir, 'session-7'));
+    fs.writeFileSync(path.join(dir, 'session-7', 'custom-title.json'), JSON.stringify({ customTitle: saved }));
+  }
+  return file;
+}
+
+async function renameAndConfirm(saved: string | null, title = 'Complete name'): Promise<void> {
+  const { host, children } = fakeHost();
+  const { child } = await liveClaude(host, children);
+  const renamed = renameAgentSession(
+    host,
+    {
+      agent: 'claude',
+      sessionId: 'session-7',
+      title,
+      file: renamedTranscript(saved),
+      idlePlan: NO_IDLE_PLAN,
+    },
+    { attempts: 2, pause: async () => undefined },
+  );
+  await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
+  answerRename(child);
+  await renamed;
+}
+
+test('a Claude rename counts only when the saved title file holds the whole requested name', async () => {
+  await renameAndConfirm('Complete name');
+  await assert.rejects(renameAndConfirm('Old name'), /did not save/);
+  await assert.rejects(renameAndConfirm(null), /did not save/);
+  const long = 'x'.repeat(200);
+  await assert.rejects(
+    renameAndConfirm(`${long}y`, long),
+    /did not save/,
+    'an unchanged saved title that starts with the requested name confirmed it',
+  );
+});
+
+test('a live Codex session renames through thread/name/set while its turn runs, with no model turn of its own', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, resume: 'thread-7' }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  await tick();
+  const session = await opening;
+  // The server names a thread while it is working on it, so the rename rides the open turn.
+  // Nothing answers the turn, so this promise settles when the host takes the child down
+  // after the test. Its failure is caught here, where it cannot be read as another test's.
+  const working = session.prompt('working');
+  working.catch(() => undefined);
+  await tick();
+  assert.equal(session.state().busy, true);
+  const before = child.sent().length;
+  const renamed = renameAgentSession(host, {
+    agent: 'codex',
+    sessionId: 'thread-7',
+    title: 'Complete name',
+    file: 'unused.jsonl',
+    idlePlan: NO_IDLE_PLAN,
+  });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/name/set'));
+  const request = child.sent().at(-1);
+  assert.deepEqual(request, {
+    id: request?.id,
+    method: 'thread/name/set',
+    params: { threadId: 'thread-7', name: 'Complete name' },
+  });
+  child.reply({});
+  await renamed;
+  assert.equal(child.sent().slice(before).some(MODEL_TURN), false);
+  assert.equal(session.state().busy, true, 'the rename ended the running turn');
+});
+
+test('an idle Codex session renames through a handshake-only child and never opens the thread', async () => {
+  const { host, children } = fakeHost();
+  const renamed = host.renameSession('codex', 'thread-7', 'Complete name', codexRenameChild);
+  const child = children[0];
+  child.reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/name/set'));
+  assert.deepEqual(child.sent().at(-1)?.params, { threadId: 'thread-7', name: 'Complete name' });
+  child.reply({});
+  await vi.waitFor(() => assert.equal(child.ended, true));
+  child.exit(0);
+  await renamed;
+  assert.equal(child.sent().some(MODEL_TURN), false);
+});
+
+test('an idle Codex rename rejects with the server refusal', async () => {
+  const { host, children } = fakeHost();
+  const renamed = host.renameSession('codex', 'thread-7', 'Complete name', codexRenameChild);
+  const child = children[0];
+  child.reply({ userAgent: 'codex' });
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/name/set'));
+  child.replyError(-32000, 'name refused');
+  await vi.waitFor(() => assert.equal(child.ended, true));
+  child.exit(0);
+  await assert.rejects(renamed, /name refused/);
+  assert.equal(child.sent().some(MODEL_TURN), false);
+});
