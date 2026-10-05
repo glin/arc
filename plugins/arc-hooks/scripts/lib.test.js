@@ -9,7 +9,7 @@ const { writeFileAtomically } = require('./persistence.js');
 function tmpRoot() {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-'));
   process.env.ARC_HOME = d;
-  process.env.ARC_IGNORE_ROOTS = ''; // tests use temp-dir workspaces; don't treat them as scratch
+  process.env.ARC_IGNORE_ROOTS = ''; // Capture edits in temporary test workspaces.
   const snapshots = path.join(d, 'snapshots');
   fs.mkdirSync(snapshots);
   return snapshots;
@@ -128,7 +128,7 @@ test('recordBaseline copies existing file content on first touch only', () => {
   assert.equal(r1.skipped, false);
   assert.equal(r1.isNew, false);
 
-  // mutate file, then second touch must NOT overwrite the baseline
+  // A second touch after an edit must preserve the first baseline.
   fs.writeFileSync(file, 'CHANGED');
   const r2 = lib.recordBaseline('sess1', file, work);
   assert.equal(r2.skipped, true);
@@ -863,9 +863,7 @@ test('isEphemeral matches the shared ephemeral-paths fixture', () => {
         assert.equal(lib.isEphemeral(shape(fill(c.path), kind)), c.ephemeral, `${c.path} as ${kind}: ${c.why}`);
       }
     }
-    // The same answers again, against the list the hook ships rather than the one the fixture
-    // hands it. Without this pass the fixture only says how a path is compared, and a root
-    // dropped from a default would leave every case still answering correctly.
+    // Test the default roots too. Explicit fixture roots alone cannot detect a missing default.
     delete process.env.ARC_IGNORE_ROOTS;
     for (const c of fixture.cases) {
       assert.equal(lib.isEphemeral(fill(c.path)), c.ephemeral, `${c.path} against the shipped roots: ${c.why}`);

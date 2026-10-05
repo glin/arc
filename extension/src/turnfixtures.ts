@@ -1,13 +1,5 @@
-// extension/src/turnfixtures.ts
-//
-// The turns, notes and sessions the panel's tests are written against.
-//
-// Test support only. Nothing the extension ships imports this, and imports.test.ts holds it
-// that way: a value written here would settle how the panel behaves somewhere no test looks.
-//
-// A builder belongs here once a second test file needs it, or once one that is already here
-// is built out of it. One that a single test file reads and nothing here needs stays in that
-// file, so a fixture is read beside the tests that use it wherever it can be.
+// Shared turn and session fixtures for tests. Production code must not import this module.
+// Keep a builder in its test file until another test file or shared builder needs it.
 import { Compaction, ToolCounts, Turn, TurnAgent, TurnCommit, TurnLanding, TurnSkillUse } from './transcript.ts';
 
 export function claudeCostState(modelUsage: Record<string, Record<string, number>>, startTime = 1, sessionId = 's') {
@@ -143,24 +135,17 @@ export const subagentCommitTurn = (): Turn => {
   return turn({ agents: [child], commits: [shared] });
 };
 
-// The repository the commit fixtures below stand in, and the open folder that holds it. Every
-// commit a real turn records carries its repository, so a fixture that leaves it out weighs and
-// groups a row no real card sends.
+// Commit fixtures include repository identity so grouping and payload-size checks use complete rows.
 export const COMMIT_FOLDERS = ['c:/repo'];
 const OWN_REPOSITORY = { key: 'c:/repo/.git', root: 'c:/repo', own: true };
 
-// The heavy fixture's repository, at the depth a real checkout sits. The key rides on every
-// commit row, so a short one would weigh a row lighter than a real card sends it.
+// Representative repository path length for the heavy fixture's payload-size checks.
 const HEAVY_ROOT = 'c:/users/developer/source/repos/agent-diff-review';
 const HEAVY_REPOSITORY = { key: `${HEAVY_ROOT}/.git`, root: HEAVY_ROOT, own: true };
 
-// A turn carrying several subagents, each with enough commits and files behind it to weigh
-// what one subagent row's own figures cost: the per-figure record, its paths and its shas.
-// `commitsPerAgent` defaults to 13, which is what one real implementer left behind on this
-// project. `subagentCount` and `filesPerAgent` are chosen to make a heavy turn, because this
-// fixture exists to weigh a row rather than to describe an average one. Every sha is the full
-// 40 characters git prints, which is what a row and a commits record both carry. Each subagent
-// commits on a branch of its own and has a session to open, the way a real implementer does.
+// Builds a large subagent turn for per-figure payload-size checks.
+// Each subagent has files, full 40-character commit hashes, its own branch, and a linked session.
+// The defaults exercise a heavy turn rather than estimate an average turn.
 export const heavySubagentTurn = (subagentCount = 4, commitsPerAgent = 13, filesPerAgent = 5): Turn => {
   const agents: TurnAgent[] = [];
   for (let a = 0; a < subagentCount; a++) {
@@ -226,10 +211,9 @@ export const heavySubagentTurn = (subagentCount = 4, commitsPerAgent = 13, files
   return turn({ agents, commits: [] });
 };
 
-// The commits record's fixture matrix: one turn for each case the record draws differently.
-// The subjects, the branches and the maker names are real ones where a case turns on a length.
-// A repository nested inside the open folder. Its tree is inside the folder, so git gives it no
-// place of its own, and only its key tells it apart from the folder's repository.
+// Nested repository identity for commit-record cases.
+// Length-sensitive cases use representative subjects, branches, and subagent names.
+// The repository key distinguishes this nested repository from the open folder's repository.
 const PLANS_REPOSITORY = { key: 'c:/repo/.claude/plans/.git', root: 'c:/repo/.claude/plans', own: false };
 const RECORD_AT = new Date(2026, 7, 23, 16, 0).getTime();
 
@@ -484,9 +468,7 @@ export const livePress = (over: Partial<LivePress> = {}): LivePress => ({
   ...over,
 });
 
-// One skill load, as a reader of either agent's records produces it. Defaults to the shape
-// with the most in it, a recorded Claude load with a path, so a test names only the field it
-// is about.
+// Builds a recorded Claude skill use with a path. Fields can be overridden for either agent.
 export const skillUse = (over: Partial<TurnSkillUse> = {}): TurnSkillUse => ({
   sourceId: 'call-skill',
   name: 'polish',
@@ -524,8 +506,7 @@ export const entry = (over: Partial<Parameters<typeof searchTurns>[0][0]> = {}) 
   ...over,
 });
 
-// A note the reader left, with everything a stored one carries. The turn it hangs on is the
-// one the fixture turn above uses, so a card built from that turn and a note about it line up.
+// Shared turn timestamp used by the turn and comment fixtures.
 export const TURN_AT = new Date(2026, 7, 23, 14, 32).getTime();
 
 export const comment = (over: Partial<TurnComment> = {}): TurnComment => ({
@@ -542,9 +523,8 @@ export const comment = (over: Partial<TurnComment> = {}): TurnComment => ({
   ...over,
 });
 
-// A forward checkpoint as the progressive worker receives it. That boundary copies a
-// checkpoint with structured clone, which keeps only enumerable string-keyed properties, and
-// the worker entry rewraps the two buffers on arrival and restores nothing else.
+// A forward checkpoint after structured cloning at the progressive worker boundary.
+// Structured clone keeps enumerable string-keyed properties. This helper rewraps two buffers. The worker also rewraps optional `skippedFragment`.
 export function throughStructuredClone<
   Checkpoint extends {
     lineFragment: Buffer;
@@ -557,10 +537,9 @@ export function throughStructuredClone<
   return copy;
 }
 
-// A finished single-prompt sdk-cli transcript that wrote one file: an entrypoint the SDK
-// file-change exception excuses, and the shape a read-only dispatch run leaves behind when
-// it writes a plan or a report. `padding` pushes the transcript past a 256 KB read window,
-// to exercise the whole-file scan reader alongside the tail reader.
+// Finished `sdk-cli` transcript with one prompt and a file change.
+// The classifier permits this entrypoint's file change in an agent run.
+// Large `padding` exercises whole-file classification beyond a 256 KB tail.
 export function sdkFileChangeTranscript(padding = 'ok'): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
@@ -598,10 +577,9 @@ export function sdkFileChangeTranscript(padding = 'ok'): object[] {
   ];
 }
 
-// A finished sdk-cli transcript whose one prompt is a slash command with no origin, the shape
-// `claude -p "/hello"` leaves behind: a command record, the `isMeta` record Claude Code
-// expands it into, an unattended `stop_hook_summary`, and a tool call padded past a 256 KB
-// read window to exercise the whole-file scan reader alongside the tail reader.
+// A finished sdk-cli transcript from `claude -p "/hello"`. Its slash command has no origin.
+// Claude Code adds an `isMeta` expansion and an unattended `stop_hook_summary`.
+// Padding above 256 KB exercises whole-file and tail readers.
 export function sdkSlashCommandTranscript(padding = 'ok'): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
@@ -651,10 +629,9 @@ export function sdkSlashCommandTranscript(padding = 'ok'): object[] {
   ];
 }
 
-// A finished background-session transcript, the shape `claude --bg` leaves behind: a first
-// prompt carrying `sessionKind: 'bg'` beside a human origin, Claude Code's own remote-control
-// `bridge-session` record, an unattended `turn_duration`, and a changed file, padded past a
-// 256 KB read window to exercise the whole-file scan reader alongside the tail reader.
+// A finished `claude --bg` transcript. Its first prompt has `sessionKind: 'bg'` and a human origin.
+// It includes a remote-control `bridge-session` record, an unattended `turn_duration`, and a changed file.
+// Padding above 256 KB exercises whole-file and tail readers.
 export function bgSessionTranscript(padding = 'ok'): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
@@ -707,12 +684,10 @@ export function bgSessionTranscript(padding = 'ok'): object[] {
   ];
 }
 
-// A finished background-session transcript with a second prompt the dispatching agent sent to
-// the worker, the shape a `claude --bg` session dispatched from another agent leaves behind: a
-// human-origin first prompt, a `bridge-session` record, an `automode-blocked` tool denial, and
-// a follow-up carrying `entrypoint: 'sdk-cli'` and `promptSource: 'sdk'` with no origin at all.
-// `padding` pushes the transcript past a 256 KB read window, to exercise the whole-file scan
-// reader alongside the tail reader.
+// A finished background session with a second prompt from its dispatching agent.
+// The first prompt has a human origin. A `bridge-session` record and an `automode-blocked` denial follow.
+// The follow-up has `entrypoint: 'sdk-cli'` and `promptSource: 'sdk'`, with no origin.
+// Padding above 256 KB exercises whole-file and tail readers.
 export function bgWorkerFollowUpTranscript(padding = 'ok'): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
@@ -778,10 +753,9 @@ export function bgWorkerFollowUpTranscript(padding = 'ok'): object[] {
   ];
 }
 
-// A finished background-session transcript that ends with Claude Code's own `away_summary`
-// recap instead of a plain answer, the shape a session left unattended past the stop hook
-// leaves behind. `padding` pushes the transcript past a 256 KB read window, to exercise the
-// whole-file scan reader alongside the tail reader.
+// A finished background session that remained unattended past the stop hook.
+// Its answer is Claude Code's `away_summary` recap.
+// Padding above 256 KB exercises whole-file and tail readers.
 export function bgAwaySummaryTranscript(padding = 'ok'): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
@@ -828,9 +802,8 @@ export function bgAwaySummaryTranscript(padding = 'ok'): object[] {
   ];
 }
 
-// A finished sdk-cli transcript with two typed prompts and no human origin on either, the
-// shape a resumed `claude -p --resume` review leaves behind, with a tool call padded past a
-// 256 KB read window to exercise the whole-file scan reader alongside the tail reader.
+// A finished `claude -p --resume` transcript with two typed prompts. Neither prompt has a human origin.
+// Padding above 256 KB exercises whole-file and tail readers.
 export function resumedSdkTranscript(padding = 'ok'): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
@@ -884,13 +857,9 @@ export function resumedSdkTranscript(padding = 'ok'): object[] {
   ];
 }
 
-// An sdk-cli transcript still inside its first turn, the shape `claude -p` leaves while it
-// works: one typed prompt with `promptSource: 'sdk'` and no origin, a tool call, its result,
-// and no finished turn. `entrypoint` names the entrypoint every record carries. The prompt
-// carries `promptSource: 'sdk'` only under an SDK entrypoint, because that is the only place
-// Claude Code writes it. `origin` puts an origin on the prompt. `padding` pushes the
-// transcript past a 256 KB read window, to exercise the whole-file scan reader alongside the
-// tail reader.
+// An sdk-cli transcript inside its first turn. It contains a typed prompt, tool call, and tool result, with no finished turn.
+// `entrypoint` sets the entrypoint on every record. SDK entrypoints add `promptSource: 'sdk'` to the prompt.
+// `origin` sets the prompt's origin. Padding above 256 KB exercises whole-file and tail readers.
 export function runningSdkTranscript(
   options: { padding?: string; entrypoint?: string; origin?: { kind: string } } = {},
 ): object[] {
@@ -970,12 +939,11 @@ export function claudeDispatchTranscript(command: string, output: string, toolUs
   ];
 }
 
-// Claude compaction requests with a measured cost, each beside the last main request before it.
-// That request sent 2 uncached tokens, read `previousRead` from the cache, wrote `previousWrite`
-// to it at the `lifetime` it bought, and ran `idleMinutes` before the compaction. `firstRead` is
-// the cache read of the transcript's first request, where the row is cold. `summaryChars` is the
-// length of the stored summary text, and `postTokens` the summary size its boundary recorded
-// where one was matched. `realCost` prices the measured request at the published rates.
+// Claude compaction requests with measured costs, each beside its preceding main request.
+// The main request sends 2 uncached tokens. It reads `previousRead` and writes `previousWrite` at the supplied `lifetime`.
+// It precedes compaction by `idleMinutes`. `firstRead` is the first request's cache read, when the row is cold.
+// `summaryChars` gives the stored summary length. `postTokens` gives the recorded size when a boundary matches.
+// `realCost` prices the measured request at published rates.
 export interface CompactionCalibrationRow {
   name: string;
   model: string;
@@ -1201,8 +1169,7 @@ export function claudeCompactionTranscript(
       compactMetadata: {
         trigger: row.trigger,
         preTokens: previousContextOf(row),
-        // A row with no matched size records one unlike the summary text's estimate, so a test can
-        // tell which of the two priced the output.
+        // Missing measured `postTokens` uses `summaryChars / 4`, deliberately differing from pricing's `summaryChars / 2.2` to distinguish the output source.
         postTokens: row.postTokens ?? Math.round(row.summaryChars / 4),
         ...(durationMs === undefined ? {} : { durationMs }),
       },

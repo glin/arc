@@ -20,18 +20,11 @@ async function post(page: Page, payload: unknown): Promise<void> {
   await page.evaluate(SETTLED);
 }
 
-// Advance the page's own clock, so the panel's repeating tick fires the way it does for a
-// reader watching a turn run. Paused at the page's current instant first, so the advance is
-// exact however long the setup took. No frame wait afterwards: a paused clock never runs an
-// animation frame, and the tick writes its text synchronously.
-//
-// Reading the instant and pausing at it are two separate round trips, and the clock keeps
-// running between them. A slow round trip lands the pause behind the instant it was told to
-// stop at, and Playwright refuses to fast-forward a paused clock backward. Retrying the pair
-// on that one error reads a fresh instant each time, so the retry costs no fixed wait and the
-// advance stays exact. A bounded attempt count catches a round trip that keeps losing the race.
+// Limit retries when the page clock advances between reading and pausing it.
 const MAX_PAUSE_ATTEMPTS = 5;
 
+// Pause at a freshly read instant, then advance the page clock by an exact duration.
+// Retry only Playwright's backward-time error. The synchronous tick needs no animation-frame wait.
 async function runFor(page: Page, ms: number): Promise<void> {
   let lastError: Error | undefined;
   for (let attempt = 0; attempt < MAX_PAUSE_ATTEMPTS; attempt += 1) {
@@ -122,8 +115,7 @@ test('a tick leaves a selection inside a figure whose wording has not moved', as
     })()`)) as string;
     assert.equal(selected, '5m');
 
-    // One second, which is a whole tick and no part of a minute. The figure the reader is
-    // holding must not be rewritten for it.
+    // One second fires a tick without changing the minute figure's wording.
     await runFor(page, 1_000);
 
     assert.equal(
@@ -154,8 +146,7 @@ test('a clock-only card change updates the accessible name in place', async (t) 
     assert.ok(before, 'the head carries no accessible name to begin with');
     await page.evaluate(`window.__head = document.querySelector(${JSON.stringify(head)})`);
 
-    // The card's spoken name carries its age, and the age is not one of the fields the
-    // content print compares. So the card is not drawn again and this is the only writer.
+    // Changing only the spoken name leaves the content fingerprint unchanged and avoids a redraw.
     await post(page, {
       type: 'activity',
       session: card.sessionId,
@@ -179,7 +170,7 @@ test('the clock writes nothing into a card that has left the page', async (t) =>
   const { page } = held;
   try {
     const payload = renderPayload() as Payload;
-    // Both ages five minutes old, so a minute on the clock moves the wording of either.
+    // Set both ages to five minutes so advancing a minute changes both figures.
     const staying = payload.cards[1];
     const going = payload.cards[6];
     staying.endedAt = FIXTURE_CLOCK - 300_000;

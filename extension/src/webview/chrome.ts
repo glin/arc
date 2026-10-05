@@ -54,22 +54,19 @@ interface CompactState {
 
 type LauncherAction = ((request: LauncherRequest) => void) | null;
 
-// Where focus goes once the host answers a pin or unpin press. The view alone proves the
-// result, because the message that carries it says nothing about the press.
+// Track focus after a setup pin or unpin request. Host view changes establish the result.
 interface PinFocusMove {
   pressed: HTMLElement;
-  // A pin is proved by a pinned row with these values under an id the pressing view lacked.
+  // A new pinned ID with these values confirms the pin.
   values: CompleteSetupValues | null;
   known: ReadonlySet<string>;
-  // An unpin is proved when this id is gone.
+  // This ID's absence confirms the unpin.
   id: string | null;
-  // The pin buttons of the rows after the pressed one, then of the rows before it, nearest
-  // first, in the order the pressing view drew them.
+  // Pin controls after the pressed row, then preceding controls in reverse order.
   neighbors: string[];
 }
 
-// One list row's controls in order: the apply button when the row can apply, then Edit and
-// the pin.
+// List enabled row controls in apply, Edit and pin order.
 function rowControls(row: HTMLElement): HTMLElement[] {
   return [...row.querySelectorAll<HTMLElement>('button[data-control]:not([disabled])')];
 }
@@ -326,13 +323,11 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
   };
   let setLauncherState: ((state: LauncherState) => void) | null = null;
   let pendingFocus: string | null = null;
-  // The setup list's one Tab stop, as a control name, and the row keys of the last draw in
-  // order, so a stop whose row went away moves to its neighbor.
+  // Track the list's Tab stop and previous row order to restore focus when a row disappears.
   let listStop: string | null = null;
   let listOrder: string[] = [];
   let pinMove: PinFocusMove | null = null;
-  // A focus target that Edit or a custom opening asks for, as a radio group prefix. It wins
-  // over the passive restore in `pendingFocus`, because the pressed control survives the draw.
+  // An explicit field-control target from Edit or custom opening takes priority over `pendingFocus`.
   let focusRequest: string | null = null;
 
   const placeLauncher = () => {
@@ -387,10 +382,9 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
     compactRender();
   };
 
-  // The list's one Tab stop. It stays on the control that last held focus. A stop whose
-  // button went away moves to the same kind of button in its row when the row stays, else in
-  // the next row of the last draw, else the previous row, and to the row's pin when the row
-  // lacks that kind. A list with no stop yet starts on its first row's first button.
+  // Retain the list's focused control when available.
+  // Otherwise keep its button kind on the surviving row, next row or previous row, falling back to the pin.
+  // With no retained stop, select the first row's first control.
   const resolveListStop = (view: SessionLauncherView): string | null => {
     const rows = [
       ...view.pinned.map((row) => ({ key: row.key, apply: row.available })),
@@ -423,8 +417,7 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
     return listStop;
   };
 
-  // Every launcher control that can take focus, by name, read once per draw. A disabled
-  // button is left out, so focus never lands on one.
+  // Index launcher controls by name, excluding disabled controls.
   const focusableControls = (): Map<string, HTMLElement> => {
     const found = new Map<string, HTMLElement>();
     for (const node of launcherNode?.querySelectorAll<HTMLElement>('[data-control]') ?? []) {
@@ -436,9 +429,8 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
     return found;
   };
 
-  // Settles an armed pin focus move against a fresh view, and says whether it decided focus.
-  // A view that proves nothing keeps focus on the pressed button, or hands it to the nearest
-  // surviving neighbor when that button is gone.
+  // Resolve a pending pin focus move against the new view.
+  // Keep the pressed button until the result arrives, or focus a surviving neighbor if it disappears.
   const settlePinMove = (view: SessionLauncherView, node: HTMLElement): boolean => {
     const move = pinMove;
     if (!move) {
@@ -556,9 +548,8 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
       commitLauncher({ ...state, choice: setupValues(row) });
       options.sendToHost({ type: 'requestDefaults', agent: row.profile.agent, model: row.profile.model });
     };
-    // The list's own walk. Up and Down keep the button kind across rows, Home and End go to
-    // the first and last row, and Left and Right move across one row's buttons and stop at its
-    // ends. A row without the kind lands on its pin.
+    // Up and Down wrap across rows, retaining the button kind or falling back to the pin.
+    // Home and End select boundary rows. Left and Right move within the current row without wrapping.
     const listKeydown = (event: KeyboardEvent) => {
       const list = event.currentTarget as HTMLElement;
       const rows = [...list.querySelectorAll<HTMLElement>('.launchentry')].filter((row) => rowControls(row).length);
@@ -592,9 +583,8 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
       next?.focus();
       event.preventDefault();
     };
-    // Focus that leaves the pressed pin ends its move, so a later result never pulls focus
-    // back. A pressed pin that a redraw removes is not a departure: the move then settles on
-    // a neighbor. The check waits a microtask, because focus is still in flight here.
+    // Cancel a pending move when focus leaves the pressed pin so a later result does not pull focus back.
+    // Defer the check one microtask. Removing the pressed pin preserves the neighbor fallback.
     const listFocusOut = (event: FocusEvent) => {
       const move = pinMove;
       if (!move || event.target !== move.pressed) {
@@ -877,8 +867,7 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
       }
       rows.push(
         h('div', { class: 'launchactions', key: 'actions' }, [
-          // The pin for the values the fields show. It reads pressed while a pinned setup holds
-          // them, and the next view decides that, so a refused or failed change shows as such.
+          // The custom-field pin reads its pressed state from matching pinned values in the host view.
           h(
             'button',
             {
@@ -999,9 +988,8 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
     launcherOpen: () => launcherSnapshot.open,
     launcherAnchor: () => launcherSnapshot.anchor,
     openLauncher(anchor = null, action = null, custom = false) {
-      // Every opening starts the fields from the quick New setup. The list's stop starts on
-      // its first row again, and the layout effect picks the inherited row, else that stop,
-      // else the Agent field. A custom opening goes to the Agent field.
+      // Start fields from the quick New setup and reset the list's Tab stop.
+      // Focus the inherited row, first setup or Agent field. Custom openings focus the Agent field.
       const choice = launcherView ? defaultLauncherChoice(launcherView) : null;
       listStop = null;
       pinMove = null;

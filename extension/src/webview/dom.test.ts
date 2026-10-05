@@ -144,8 +144,7 @@ test('a float keeps its place when its anchor is off the page, and opens under a
   assert.deepEqual([float.style.left, float.style.top], ['320px', '124px']);
 });
 
-// A float 200 wide and 100 tall, placed under an anchor in a view 800 wide. The view's height
-// decides whether it fits below.
+// The float measures 200 by 100 in an 800-wide viewport. Viewport height determines whether it fits below.
 function floatAt(
   height: number,
   anchor: { top: number; left: number },

@@ -1,12 +1,6 @@
-// The development log the owner turns on to watch the panel work without attaching a
-// profiler. It knows nothing about VS Code: a caller hands it a directory, an identity and a
-// clock, and it appends one JSON object per line.
-//
-// One file per host process, never one shared file. Several windows and several editor
-// instances run Arc at once, each with its own extension host, and appends from processes
-// that do not coordinate interleave into something nobody can read back. Each host writes its
-// own file and stamps every line with the same instance identity, so a reader merges the
-// files by time or splits them by window.
+// Writes per-host JSON-line diagnostics from a directory, host identity, and clock.
+// Each host writes its own file to avoid interleaved appends across editor windows and instances.
+// Instance identity on each line supports sorting by time and grouping by host.
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -15,26 +9,23 @@ import type { StartupMilestone } from './performancediagnostics';
 // The directory this module owns, under the Arc home directory.
 export const DIAGNOSTICS_LOG_DIRECTORY = 'logs';
 
-// How much one file holds before the writer stops, and how many files the directory keeps.
+// Byte threshold for stopping ordinary log lines, and retained log file count.
 export const DIAGNOSTICS_LOG_MAXIMUM_BYTES = 8 * 1024 * 1024;
 export const DIAGNOSTICS_LOG_KEPT_FILES = 20;
 
-// Exactly what this module names its own files. The prune deletes a name that matches this
-// and nothing else, so anything else sharing the directory stays where it is.
+// Matches owned log filenames. Pruning leaves other names untouched.
 const LOG_FILE_NAME = /^arc-\d{8}-\d{6}-\d+\.jsonl$/;
 
 export type DiagnosticsRecord = Record<string, unknown>;
 
 export interface DiagnosticsLog {
-  // Writes a line while the setting is on, and returns at once while it is off.
+  // Writes a line when detailed logging is enabled. Returns immediately when disabled.
   log(event: string, record?: DiagnosticsRecord): void;
-  // Writes a line whatever the setting says. A startup threshold breach uses this, because a
-  // signal nobody enables reaches nobody.
+  // Writes regardless of the detailed logging setting, including startup threshold warnings.
   warn(event: string, record?: DiagnosticsRecord): void;
-  // The file this log has written to, or null while it has written nothing.
+  // Selected log file path, or null before the first successful directory setup.
   file(): string | null;
-  // Whether `log` writes anything. A caller asks this before it builds a record, so an
-  // operation the panel counts thousands of times pays nothing while the log is off.
+  // Reports whether detailed logging is enabled so callers can skip building records.
   enabled(): boolean;
 }
 
@@ -43,12 +34,12 @@ export interface DiagnosticsLogOptions {
   enabled: boolean;
   // The directory this log owns. It prunes and writes here, and nowhere else.
   directory: string;
-  // The window a reader is looking at, carried on every line.
+  // Workspace identifier included on every line.
   workspace: string;
   pid: number;
-  // When the extension host started, which stamps the file name and the identity.
+  // Host start time used in the filename and instance identity.
   startedAt: number;
-  // The clock every line reads. A caller passes one so a test can hold time still.
+  // Clock used for each line, injectable for tests.
   now?: () => number;
   maximumBytes?: number;
   keptFiles?: number;
@@ -59,8 +50,7 @@ function twoDigits(value: number): string {
   return value < 10 ? `0${value}` : `${value}`;
 }
 
-// UTC, so the names of two files sort in the order they were written. A local stamp orders
-// them wrongly for the hour a clock goes back, and the prune deletes by that order.
+// UTC timestamps keep filename sorting stable when local clocks move backward.
 function stamp(at: number): string {
   const when = new Date(at);
   return (
@@ -73,16 +63,12 @@ export function diagnosticsLogFileName(startedAt: number, pid: number): string {
   return `arc-${stamp(startedAt)}-${pid}.jsonl`;
 }
 
-// Two windows of one editor instance get two process ids, and one process restarted gets two
-// start times. The pair therefore names one host process run, which is what a reader merging
-// files by time needs to tell the lines apart.
+// Combines process id and start time to distinguish host runs across windows and restarts.
 export function diagnosticsInstanceIdentity(startedAt: number, pid: number): string {
   return `${pid}-${startedAt.toString(36)}`;
 }
 
-// Keeps the newest files and deletes the rest. It reads one directory, matches the exact name
-// this module writes, and unlinks. It never recurses, never follows a link, and never removes
-// a directory.
+// Keeps the newest matching regular files. Pruning neither recurses nor removes directories or symbolic links.
 export function pruneDiagnosticsLogs(directory: string, keep: number): string[] {
   let entries: fs.Dirent[];
   try {
@@ -100,7 +86,7 @@ export function pruneDiagnosticsLogs(directory: string, keep: number): string[] 
       fs.unlinkSync(path.join(directory, name));
       removed.push(name);
     } catch {
-      // A file another process holds open stays. The next start tries again.
+      // Failed deletion leaves the file for a later prune attempt.
     }
   }
   return removed;
@@ -121,7 +107,7 @@ class FileDiagnosticsLog implements DiagnosticsLog {
   }
 
   log(event: string, record?: DiagnosticsRecord): void {
-    // The whole cost of a log nobody turned on. No string, no stat, no handle.
+    // Disabled logging skips serialization and filesystem operations.
     if (!this.options.enabled) {
       return;
     }
@@ -144,9 +130,8 @@ class FileDiagnosticsLog implements DiagnosticsLog {
     if (this.stopped) {
       return;
     }
-    // A record holding a circular reference or a BigInt has no JSON form, and the panel must
-    // survive one. The whole body sits in here so that no failure of the log reaches the
-    // operation being counted.
+    // Logging failures must not interrupt the measured operation.
+    // Circular references and BigInt values fail JSON serialization.
     try {
       const line = this.line(event, record);
       const bytes = Buffer.byteLength(line, 'utf8');
@@ -162,7 +147,7 @@ class FileDiagnosticsLog implements DiagnosticsLog {
         this.written += bytes;
       }
     } catch {
-      // The line is lost and the panel carries on.
+      // Drops the failed line without interrupting the caller.
     }
   }
 
@@ -207,7 +192,7 @@ class FileDiagnosticsLog implements DiagnosticsLog {
       fs.appendFileSync(this.target, line, 'utf8');
       return true;
     } catch {
-      // A full disk or a directory somebody removed stops the log. The panel carries on.
+      // Append failure stops logging without interrupting the caller.
       this.stopped = true;
       return false;
     }
@@ -233,8 +218,7 @@ export async function readStartupArtifact(directory: string): Promise<unknown> {
   }
 }
 
-// A log that writes nothing, whatever it is asked for. The panel holds this until something
-// hands it a directory, so a test that builds a panel writes no file anywhere.
+// Returns a no-op log until a caller supplies a diagnostics directory.
 export function silentDiagnosticsLog(): DiagnosticsLog {
   return {
     log() {},
@@ -382,9 +366,7 @@ export class StartupHistory {
   }
 }
 
-// How long each startup milestone takes before the owner hears about it. Only the milestone
-// the reader feels carries a threshold: `firstCard` is the number that matched the owner's
-// report of a panel that would not draw.
+// Startup milestone limits for warning messages. Only the first card has a threshold.
 export const STARTUP_THRESHOLDS_MS: Partial<Record<StartupMilestone, number>> = {
   firstCard: 30_000,
 };
@@ -409,19 +391,11 @@ function seconds(ms: number): string {
   return (ms / 1000).toFixed(1).replace(/\.0$/, '');
 }
 
-// The milestone that ends the first draw. Once the panel reports it, Arc has drawn
-// everything it had, and a milestone that lands later measures the wait for work that did not
-// exist yet.
+// Ends startup measurement when the panel reports its complete render.
 const FIRST_DRAW_DONE: StartupMilestone = 'completeRender';
 
-// Reports a milestone that took longer than its threshold, once per milestone. The host asks
-// this on every milestone, and reports whatever comes back.
-//
-// A reader who opens an empty workspace sees the whole first draw finish in seconds, and
-// gains a first card hours later when an agent runs. That first card is the reader's own
-// wait, not a slow start, so the watch stops measuring once the first draw is done. A panel
-// that is still drawing has reported no `completeRender`, and its late first card is the case
-// this threshold exists for.
+// Reports each startup threshold breach once before the first complete render.
+// A card that arrives after an empty workspace finishes rendering does not count as slow startup.
 export class StartupThresholdWatch {
   private readonly reported = new Set<StartupMilestone>();
   private firstDrawDone = false;

@@ -10,16 +10,12 @@ export interface SessionRenameWords {
   sessionRenamePending: string;
 }
 
-// The session the rename editor is open over, and the control it was opened from. A rail
-// card or a session heading opens it. The section and control find that control again after
-// a redraw, because a session two views match draws two rail rows.
+// Rename state and opener identity. Section and control distinguish rows in multiple matching views.
 export interface OpenRename {
   session: string;
   title: string;
   error: string;
-  // The id of the rename sent and not yet answered, or null. While a rename waits, the box,
-  // Save, and Cancel hold still, so one press sends one rename and Cancel never claims to
-  // take back a name the agent may already have saved.
+  // Pending request id, or null. Disable edits, Save, and Cancel until its answer arrives.
   request: number | null;
   section: string | null;
   anchor: HTMLElement | null;
@@ -33,8 +29,7 @@ export interface SessionRenameAnswer {
   error: string;
 }
 
-// The editor once the typed name is sent under `request`, or null when nothing may be sent:
-// a rename already waits, or the box is empty.
+// Set the request id unless a rename is pending or the name is empty.
 export function submittedRename(open: OpenRename, request: number): OpenRename | null {
   if (open.request !== null || !open.title.trim()) {
     return null;
@@ -42,10 +37,8 @@ export function submittedRename(open: OpenRename, request: number): OpenRename |
   return { ...open, request, error: '' };
 }
 
-// What one answer does to the editor. Only the answer to the rename the editor waits on
-// counts. An answer to a rename the reader walked away from, before they opened the editor
-// again and saved another name, changes nothing. Success closes the editor. A failure keeps
-// the text the reader typed beside the reason.
+// Accept only the pending session and request. Success closes the editor.
+// Failure restores the answer's title and displays its error.
 export function answeredRename(open: OpenRename | null, answer: SessionRenameAnswer): 'ignore' | 'close' | OpenRename {
   if (!open || open.session !== answer.session || open.request === null || open.request !== answer.request) {
     return 'ignore';
@@ -56,9 +49,7 @@ export function answeredRename(open: OpenRename | null, answer: SessionRenameAns
   return { ...open, title: answer.title, error: answer.error, request: null };
 }
 
-// One session's name. The box starts from the full name, not the shortened one the card
-// draws, so the reader edits what the agent saved. Enter saves and Escape closes, as in the
-// view editor.
+// Edit the full session name. Enter submits it. The caller handles dismissal.
 export function SessionRenameEditor({
   open,
   words,

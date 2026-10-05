@@ -38,12 +38,9 @@ export interface ActivityRow {
   steps?: ActivityRow[];
 }
 
-// The figure a subagent row draws, as it arrives over the wire. It extends the shared
-// declaration instead of intersecting with it, so a field written again here with a type the
-// shared declaration does not allow fails at this `extends` clause.
+// Extending shared figure facts rejects incompatible field redeclarations.
 export interface WireAgentFigure extends AgentFigureFacts {
-  // The record behind this figure, widened to the rows a commits or a files record draws, so the
-  // extension sends the shas and the paths rather than a second copy of the card's own arrays.
+  // Optional files or commits detail carries paths or SHAs for this figure.
   record?: Record<string, unknown>;
 }
 
@@ -94,8 +91,7 @@ export interface CardView extends Record<string, unknown> {
     icon: CardIcon;
     path: string;
     shownPath: string;
-    // What the row hovers with, where a row has more to say than its path. A row a subagent
-    // changed names that subagent here.
+    // Additional hover detail, including the subagent that changed the file.
     detail?: string;
     added: number;
     removed: number;
@@ -169,8 +165,7 @@ export interface CardView extends Record<string, unknown> {
   at?: number;
 }
 
-// One figure drawn on a rail card. A message carries a session's figures once, keyed by
-// session id under `stats`, and the rail takes the three it draws out of that record.
+// A session list figure selected from the per-session stats payload.
 export interface RailStat {
   metric: string;
   compactLabel: string;
@@ -188,9 +183,7 @@ export interface RailCardView extends Record<string, unknown> {
   id: string;
   persisted: boolean;
   label: string;
-  // The card's own drawn name, present only where it differs from `label`. A reader draws
-  // `name ?? label`, so a session whose name never grew past the sixty-character label costs
-  // nothing extra on the wire.
+  // Full display name when it differs from the shortened label. Renderers use name ?? label.
   name?: string;
   agent: string;
   agentWord: string;
@@ -201,9 +194,8 @@ export interface RailCardView extends Record<string, unknown> {
   pinnedTop: boolean;
   archived: boolean;
   agentRun?: boolean;
-  // The same fact `agentRun` names, apart from which bucket the card sits in. Declared
-  // beside it so a card built for the panel cannot drop it and still satisfy this type:
-  // `railCounts` and `is:warm` read it straight through archiving, where `agentRun` does not.
+  // Agent-run identity independent of the displayed bucket, including archived sessions.
+  // The host must supply it for agent-run counts and filters.
   runByAgent?: boolean;
   status: 'background' | 'done' | 'failed' | 'interrupted' | 'running' | 'stopped' | 'subagents' | 'waiting' | null;
   subagents: number | null;
@@ -219,11 +211,9 @@ export interface RailCardView extends Record<string, unknown> {
   indicator: string | null;
   costDollars: number | null;
   costAtLeast: boolean;
-  // The exact cache-expiry return count `cache-expiry:` matches on. Declared beside the cost
-  // fields it is read the same way as, though no rail stat draws it.
+  // Known cache-expiry return count for cache-expiry queries. Session list figures do not display it.
   cacheExpiryCount: number | null;
-  // Whether that count is a floor rather than the whole answer, read the same way `costAtLeast`
-  // is.
+  // Whether the cache-expiry count is a lower bound.
   cacheExpiryAtLeast: boolean;
   labels: string[];
   labelChips: string[];

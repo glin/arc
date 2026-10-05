@@ -1,4 +1,4 @@
-// Saved rail filters and saved views: the picker, the naming box, the view editor, and view sections.
+// Saved filters and views, their pickers, naming fields, editors, and session list sections.
 // Shared helpers live in `../test/rail.ts`.
 
 import { test } from 'vitest';
@@ -118,8 +118,8 @@ test(
         },
       );
       await page.keyboard.press('Escape');
-      // A value the query already drops has no row. A press on one would write the term
-      // beside its own negation, and the rail would empty with nothing saying why.
+      // Hide choices already negated by the query to prevent contradictory terms.
+
       await page.locator('.railfilter').fill('-is:input -label:composer');
       await page.evaluate(SETTLED);
       await page.locator('[data-control="railfilters"]').click();
@@ -483,10 +483,8 @@ test('the saved rail filter picker searches and follows native keyboard focus', 
     const page = await browser.newPage();
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
-    // A waiting session gives the row's Active count something to press further down,
-    // where the test moves off the popover preset onto the row itself. The explicit empty
-    // filter, rather than the file's default one-space seed, keeps the row on its count:
-    // the seed's own typed clear would otherwise leave the box open on nothing to type into.
+    // Use a waiting session and an empty query so the header exposes an Active count with the filter box closed.
+
     const waiting = payload([], [], [], [], [], [], new Map([['s2', 'waiting']]));
     await openPage(page, waiting, undefined, { railFilter: '' });
     const active = async () => await page.evaluate(`document.activeElement?.dataset?.control ?? null`);
@@ -634,8 +632,8 @@ test('a session two views match draws two rows that answer to different ids', { 
 // The empty saved view keeps its heading so the reader can edit or delete it.
 const EMPTY_VIEW = 'railgroup:view:v3';
 
-// The list the fixture ships, read back as the records the panel posts rather than as the
-// opaque payload field. Every guard over a `setViews` message compares whole records.
+// Return the fixture views as complete SavedView records for message comparisons.
+
 function savedViews(): SavedView[] {
   return payload().views as SavedView[];
 }
@@ -646,24 +644,23 @@ async function viewMessages(page: Page): Promise<SavedView[][]> {
     .map((message) => message.views)`)) as SavedView[][];
 }
 
-// The right-click the editor waits for. The rename and delete commands reach every open panel
-// host, so a host that saw no press on the heading opens nothing: without that, a right-click in
-// the sidebar pulls the reader's focus into a name box in a tab they are not looking at.
+// Only a panel that received the matching heading right-click opens the view editor.
+
 async function armViewHeading(page: Page, view: string): Promise<void> {
   await page.locator(`[data-bucket="${VIEW_FOLD_PREFIX}${view}"]`).click({ button: 'right' });
   await page.evaluate(SETTLED);
 }
 
-// The whole path to the editor, walked the way a reader walks it: right-click the view's
-// heading, then the command the menu on it offers.
+// Open the view editor through its heading context menu and host reply.
+
 async function openViewEditor(page: Page, view: string, mode: 'rename' | 'delete'): Promise<void> {
   await armViewHeading(page, view);
   await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'openViewEditor', view, mode })}, '*')`);
   await page.evaluate(SETTLED);
 }
 
-// The rail's own naming box, reached the way a reader reaches it: type a query, then press the
-// row that grows under the box.
+// Type a query and press Save as view to open its name field.
+
 async function startNaming(page: Page, query: string): Promise<void> {
   const box = page.locator('.railfilter');
   await box.focus();
@@ -784,10 +781,8 @@ test('the filter box offers no completion while it is taking a view name', { tim
     const box = page.locator('.railfilter');
     await startNaming(page, 'label:composer');
 
-    // One box, two jobs, and the combobox belongs to only one of them. A name is not a query,
-    // so the wiring that promises offers comes off while the box is taking a name: the role,
-    // the autocomplete and the list the box would point at. The box also reports no open list
-    // for as long as it holds a name, because the attribute comes off with the roles.
+    // Naming mode removes query-completion roles, attributes, and offers from the shared input.
+
     assert.deepEqual(
       await page.evaluate(`(() => {
       const input = document.querySelector('.railfilter');
@@ -811,8 +806,8 @@ test('the filter box offers no completion while it is taking a view name', { tim
       },
     );
 
-    // `lab` is the one word the filter always has an offer for, since `label:` is an axis. The
-    // offers stay away all the same, because the box is holding a name.
+    // Typing lab must produce no query offers while the input takes a view name.
+
     await box.pressSequentially('lab');
     await page.evaluate(SETTLED);
     assert.deepEqual(
@@ -826,8 +821,8 @@ test('the filter box offers no completion while it is taking a view name', { tim
       { value: 'lab', hidden: true, rows: 0, active: null, open: false },
     );
 
-    // Enter files the view. Were an offer live under the box, this press would write `label:`
-    // over the name and the reader would still be naming.
+    // Enter saves the typed view name without accepting a query suggestion.
+
     await page.evaluate(`window.__posted = []`);
     await box.press('Enter');
     await page.evaluate(SETTLED);
@@ -884,8 +879,8 @@ test('the save row refuses a query that narrows nothing', { timeout: 60_000 }, a
       return { drawn: true, disabled: row.disabled, name: row.textContent };
     })()`)) as Record<string, unknown>;
 
-    // A `find:` or an `in:` word leaves the grammar no term, so the section a view of it drew
-    // would hold every session under a name. The row stays hidden because it offers no action.
+    // Search-only words add no filtering term, so Save as view stays hidden.
+
     for (const query of ['find:needle', 'in:prompt', 'find:needle in:prompt']) {
       await box.fill(query);
       await page.evaluate(SETTLED);
@@ -925,9 +920,8 @@ test('deleting a view leaves the focus inside the rail', { timeout: 60_000 }, as
     return;
   }
   try {
-    // Where the reader is left, and what put them there. The section the popover hung off is
-    // gone with the view, so a close that hands focus back to its anchor hands it to nothing
-    // and the document takes it. A reader on the body has lost the rail and every key with it.
+    // Deleting the anchor view returns focus to the session list instead of the disconnected heading.
+
     const landed = `(() => {
       const active = document.activeElement;
       return { pop: document.getElementById('viewpop').hidden,
@@ -1009,8 +1003,8 @@ test(
       const at = async () => await page.evaluate(`document.activeElement.dataset.control`);
       assert.equal(await at(), 'view-name');
 
-      // Down through the form and back up it. The walk stops at each end rather than wrapping,
-      // which is what the label editor beside it does.
+      // Arrow navigation stops at either end of the view editor controls.
+
       for (const control of ['view-order']) {
         await page.keyboard.press('ArrowDown');
         assert.equal(await at(), control);
@@ -1034,9 +1028,8 @@ test(
       await page.keyboard.press('Home');
       assert.equal(await at(), 'view-name');
 
-      // Inside the box the same two keys belong to the caret. The fixture's view is named
-      // Composer, so the caret starts in the middle of eight characters and must reach both
-      // ends of the name without the form taking the press.
+      // Home and End move the caret within the Composer name field.
+
       await page.evaluate(`(() => {
         const input = document.querySelector('[data-control="view-name"]');
         input.focus();
@@ -1332,8 +1325,8 @@ test('a view section that matches nothing writes no aria-controls', { timeout: 6
         rows: document.querySelectorAll('.railrow[data-rail-bucket="${EMPTY_VIEW}"]').length };
     })()`);
 
-    // A view whose query reaches nothing keeps its heading and starts shut. It mounted no row,
-    // so it names none. An empty string is neither a list nor an absence.
+    // An empty view retains its heading and omits aria-controls because no rows are mounted.
+
     assert.deepEqual(await heading(), { there: true, has: false, controls: null, expanded: 'false', rows: 0 });
     await page.locator(`[data-control="${EMPTY_VIEW}"]`).click();
     await page.evaluate(SETTLED);
@@ -1409,11 +1402,8 @@ test('a view heading carries the panel hint and no native title', { timeout: 60_
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
-    // A view's heading carries the reader's own words, which the rail cuts at whatever width it
-    // has been dragged to, so it wears the panel's own hover: the hint carries the name and its
-    // detail carries the whole line, the name and the count together. A heading the
-    // panel named itself carries no hint at all, because a hint there repeats what the heading
-    // already draws. Neither wears the browser's native hover, which is a defect on a button.
+    // Saved view headings use a hint with their full name and count. Built-in headings omit repeated hints. Neither button has a native title.
+
     const heads = (await page.evaluate(`[...document.querySelectorAll('#rail .railfold')].map((head) => ({
       bucket: head.closest('[data-bucket]').dataset.bucket,
       hint: head.getAttribute('data-hint'),
@@ -1468,8 +1458,8 @@ test('saving, renaming and deleting a view each post the whole list', { timeout:
     await openPage(page);
     const fixture = savedViews();
 
-    // Saving. The list the host receives is every view the panel holds, not the one just made,
-    // because the host stores what it is sent and a partial list deletes the rest.
+    // Save posts the complete view list because the host replaces its stored list.
+
     await startNaming(page, 'label:perf');
     await page.locator('.railfilter').fill('Perf');
     await page.evaluate(SETTLED);
@@ -1525,9 +1515,8 @@ test('the right-click on a view heading is what opens its editor', { timeout: 60
       return { hidden: pop.hidden, name: box ? box.value : null };
     })()`);
 
-    // The rename and delete commands reach every open panel host. A host that saw no press
-    // opens nothing, or a right-click in the sidebar drops a name box into an editor tab the
-    // reader is not looking at and takes their focus with it.
+    // A view editor command without the matching heading context-menu request opens nothing.
+
     await page.evaluate(`window.postMessage({ type: 'openViewEditor', view: 'v1', mode: 'rename' }, '*')`);
     await page.evaluate(SETTLED);
     assert.deepEqual(
@@ -1710,9 +1699,8 @@ test('the editor walk steps over a Save the name has disabled', { timeout: 60_00
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
     await openViewEditor(page, 'v1', 'rename');
-    // Empty the name, which is what disables Save. The editor opens on a name the record
-    // already holds, so a walk measured before this reaches an enabled button and proves
-    // nothing about the one the reader cannot press.
+    // Empty the name to disable Save before checking keyboard navigation.
+
     const name = page.locator('[data-control="view-name"]');
     await name.focus();
     await name.fill('');
@@ -1726,8 +1714,8 @@ test('the editor walk steps over a Save the name has disabled', { timeout: 60_00
       { disabled: true, focused: 'view-name' },
       'an empty name leaves Save pressable, so this guard measures an enabled button',
     );
-    // Out of the box first. It keeps Home and End for the caret, which is the rule beside this
-    // one, so a walk measured from inside it would measure that rule instead.
+    // Leave the name field before checking Home and End navigation between controls.
+
     await page.keyboard.press('ArrowDown');
     await page.evaluate(SETTLED);
     assert.equal(
@@ -1736,9 +1724,8 @@ test('the editor walk steps over a Save the name has disabled', { timeout: 60_00
       'the name box no longer reaches the native Order control',
     );
     await page.locator('[data-control="view-delete"]').focus();
-    // End walks to the last stop the reader can press. Save is last in the form and answers
-    // no press, and focus on a disabled button is a no-op, so a walk that kept it in the list
-    // would leave the reader exactly where End found them.
+    // End reaches the last enabled control, skipping disabled Save.
+
     await page.keyboard.press('End');
     await page.evaluate(SETTLED);
     assert.equal(
@@ -1760,10 +1747,8 @@ test('the editor walk steps over a Save the name has disabled', { timeout: 60_00
   }
 });
 
-// A view saved from a typed `is:warm` query stores that query, and the rail runs every saved
-// view over the same cards its own query reads. Warmth is read against the browser's clock
-// rather than carried on the card, so a view that asks about the cache has to reach cards
-// carrying it whatever the text box holds.
+// Saved views evaluate cache queries against the browser clock independently of the filter box text.
+
 test(
   'a view saved from a typed is:warm query keeps its sessions with the box empty',
   { timeout: 60_000 },

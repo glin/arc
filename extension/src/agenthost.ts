@@ -1,17 +1,9 @@
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from './contextframe';
-// The agents this window is driving, and the child processes behind them.
-//
-// `claudewire.ts` and `codexwire.ts` know their protocols and nothing else; this file
-// knows about processes: which session owns which child, how a line off stdout gets
-// framed, and what happens when a child dies. It imports `node:child_process` and not
-// `vscode`, so the tests drive it with a fake spawner and never start a real CLI.
-//
-// One child serves one session, for the life of that session. The alternative,
-// one child per turn, would pay the CLI's start-up and prompt-cache warming on every
-// prompt the reader sends, which the capture showed to be most of the cost of a short
-// turn.
+// Owns this window's agent children, stdout framing, session ownership, and shutdown.
+// Wire adapters handle each provider's protocol. Process operations use an injected spawner.
+// A live child serves successive turns until retirement, shutdown, or a session reset.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -58,9 +50,7 @@ import { confirmClaudeRename } from './sessionrename';
 import { readCustomTitleSidecar } from './transcript';
 import { ARC_IDENTITY } from './identity';
 
-// The part of a child process this file uses. Narrowed to these members so a test can
-// supply a plain object, and so nothing here can reach for a process feature that a fake
-// would have to grow to match.
+// The child-process methods used by the host. Tests supply these methods without starting a CLI.
 export interface ChildLike {
   stdin: { write(chunk: string): void; end(): void };
   stdout: { on(event: 'data', listener: (chunk: string | Buffer) => void): void; setEncoding(encoding: string): void };
@@ -79,17 +69,8 @@ export type Spawner = (
   agent?: AgentName,
 ) => ChildLike;
 
-// Starting a child is the one place this file can throw rather than report, and on Windows
-// it throws in two ways worth naming. A `.cmd` or `.bat` given arguments with no shell
-// throws `EINVAL` synchronously, out of a constructor, where no caller is expecting it; and
-// a bare name resolves only against `.com` and `.exe`, so an agent installed by npm, whose
-// entry is a `.cmd` shim, is not found at all. Both are turned into a message naming the
-// setting that fixes them, because "nothing happened" is the worst answer the panel can
-// give somebody who pressed send.
-// Why a command cannot be started, or nothing when it can. `composerview.ts` avoids this
-// case where it can, by running the package script the shim points at; this is what catches
-// the one it cannot. Split out from the spawn so the rule is testable on any machine rather
-// than only on the one it applies to.
+// Returns a refusal for Windows batch shims, which cannot be spawned directly without a shell.
+// `composerview.ts` resolves a shim's package script or executable before launch.
 export function unstartable(command: string, platform: string): string | null {
   const lower = command.toLowerCase();
   if (platform !== 'win32') {
@@ -104,30 +85,11 @@ export function unstartable(command: string, platform: string): string | null {
   );
 }
 
-// The environment a child is started in: this window's own, then the one variable the panel
-// always sets, then whatever the launch rule asked for.
-//
-// The Codex server is a script, and the thing that runs it is whatever was handed in. In
-// the extension host that is VS Code's own binary, which behaves as Node only while
-// `ELECTRON_RUN_AS_NODE` is set. It is set explicitly rather than inherited, so the
-// dependency is visible and does not leak into every command the agent then runs.
-//
-// A launch's own variables follow identity removal, because they are what the launcher this panel is
-// standing in for would have told the child. A package started through its own script never
-// sees the shim that would have said where it was installed, and an agent told nothing
-// about that answers questions about itself wrongly.
-//
-// `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_AGENT_SDK_CLIENT_APP`,
-// `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, and `CLAUDE_CODE_CONTAINER_ID`
-// are never inherited. An editor started from a Claude session, or one running another Claude
-// client in the same window, carries these names, and the CLI reads them to label a request as
-// coming from that other client, to tie it to a session running elsewhere, or to treat the
-// child itself as a subagent spawned by that session: a generated title in place of one taken
-// from the first typed prompt, an extra token on the outgoing request's identification, a link
-// to a session this panel did not start, or a run that skips the checks and warnings a
-// top-level session gets. Identity removal leaves the CLI's own defaults in effect unless
-// launch variables or an explicit Claude billing label select another entrypoint.
-// Windows environment names are case-insensitive, so inherited case variants are removed too.
+// Inherited Claude client identity variables are removed before launch variables are applied.
+// These variables affect request attribution, session links, generated titles, and child-session behavior.
+// Every case variant is removed, including on Windows.
+// `childEnv` sets `ELECTRON_RUN_AS_NODE` so VS Code's Electron executable can run a package script.
+// Launch variables restore package-specific settings. An explicit Claude billing label can override attribution.
 const HOST_IDENTITY_ENV_NAMES = [
   'CLAUDE_CODE_ENTRYPOINT',
   'CLAUDE_AGENT_SDK_VERSION',
@@ -196,9 +158,8 @@ export const spawnCli: Spawner = (command, args, cwd, env, agent) => {
 
 export type AgentName = 'claude' | 'codex';
 
-// What the panel shows about a running agent. `busy` is what the interrupt affordance and
-// the "still working" wording read; `asks` is what the reader has to answer before the
-// turn can go on.
+// The running agent state displayed by the panel. Stop and running-state wording use `busy`.
+// The panel displays pending requests from `asks`.
 export interface SessionState {
   key: string;
   agent: AgentName;
@@ -219,17 +180,13 @@ export interface SessionEvent {
   turnId?: number;
 }
 
-// What a session needs of whichever protocol is behind it. Both wires are wrapped to this
-// shape rather than being made to share a base class: their protocols have nothing in
-// common, and the session names only the operations both expose.
+// The shared operations an agent session calls. Each wire adapter implements its provider's operations without a common base class.
 export interface Driver {
   contextUsage?(): Promise<unknown>;
   contextFrame?(text: string): string | null;
   contextOverflow?(id: string): void;
   receive(line: string): void;
-  // Everything that has to happen before a prompt can go out, ending in the command list.
-  // On the Claude side that is one handshake; on the Codex side it is a handshake, a skill
-  // listing and a thread.
+  // Completes initialization. Session plans also open a Codex thread after reading skills.
   open(): Promise<PromptEntry[]>;
   prompt(prompt: AgentPromptInput): Promise<void | string>;
   compact(): Promise<void>;
@@ -250,92 +207,61 @@ export interface Driver {
   // waiting on when the turn ends. A Codex async question holds none, and the reader can
   // answer it later.
   outlivesTurn?(id: string): boolean;
-  // What the CLI itself reports about spend and context. Optional because only Claude
-  // Code answers one: the Codex server volunteers the same figures as notifications
-  // instead, and a method every agent had to pretend to have would hide that difference
-  // rather than state it.
+  // Requested spend and context reads. Claude exposes these controls. Codex reports these figures through notifications.
   usage?(): Promise<{ usage: unknown; context: unknown }>;
-  // What the reader's account has left, already in the panel's vocabulary. Both agents
-  // answer this one, and both answer it with no session open and no prompt ever
-  // sent, so the bar that draws it costs no model tokens on either.
+  // Normalized account usage. Both providers answer without a session or model request.
   rateLimits?(refreshAuthentication?: boolean): Promise<UsageReading | null>;
-  // The models this agent will run, in the agent's own words. Costs no model tokens either,
-  // and is asked of the same idle child the figures are asked of, because the list turns
-  // over on a release rather than on a turn.
+  // The provider's model catalog. The control read uses no model tokens.
   models?(): Promise<ModelList | null>;
   appliedDefaults?(): Promise<AppliedDefaults>;
-  // How much the agent asks before it acts, changed while the child is running. The two
-  // mechanisms are nothing alike and the difference stays here: Claude takes a control
-  // request that applies at once, and Codex takes a field on the next prompt, so this
-  // returns once the change has been made or accepted rather than once it has been seen.
+  // Changes the session's permission mode. Claude applies a control request immediately.
+  // Codex stores approval fields for the next prompt. Completion acknowledges the setting rather than a recorded turn.
   setAskMode?(mode: AskMode): Promise<void>;
-  // The model this session runs on, changed under a live child. Both agents take one
-  // and take it differently: Claude Code as a control request that lands at once, Codex as a
-  // field on the next turn, which the server reads for that turn and the ones after it.
+  // Changes the session model. Claude applies a control request immediately. Codex sends the model on the next turn.
   setModel?(model: string): Promise<void>;
-  // How hard the model is asked to think, changed under a live child. Both agents take one
-  // and take it differently: Codex as a field on the next turn, beside the model, and Claude
-  // Code as its own `/effort` command on the stream-json input, because the control channel
-  // has no subtype for a level.
+  // Changes reasoning effort. Codex sends the level beside the model on the next turn.
+  // Claude uses `/effort` because its control channel has no effort-level subtype.
   setEffort?(effort: string): Promise<void>;
-  // Whether the change above costs a turn. Claude's command makes the CLI answer with a
-  // `result` event, which the wire reads as an ending, so the session books an open turn for
-  // it the way it does for compaction. Codex's field ends nothing of its own.
+  // Whether changing effort starts a command turn. Claude emits a `result` ending for `/effort`.
+  // Codex stores a field without starting a turn.
   effortStartsTurn?: boolean;
-  // What this agent's MCP servers are doing, in the panel's vocabulary. Optional because an
-  // agent integration may have no status request. Claude and Codex both answer, though only
-  // Claude exposes the calls below that change a server.
-  //
-  // Asked for every time it is wanted. Claude pushes no status changes; Codex startup
-  // notifications are joined to the next list reading rather than sent through this driver.
+  // Reads normalized MCP status when the adapter exposes that operation.
+  // Claude and Codex both answer. Only Claude exposes the server-changing controls below.
+  // Each call requests status. Codex startup notifications join the next list reading.
   mcpStatus?(): Promise<McpServer[] | null>;
-  // Switches one server off, or back on. `enabled` says which outright rather than flipping
-  // whatever state the server was found in, so a press cannot land on the opposite of what
-  // the reader saw when they pressed it.
+  // Sets one server's enabled state explicitly. The request preserves the state the reader selected.
   mcpToggle?(serverName: string, enabled: boolean): Promise<void>;
-  // Tries a failed server again, and fails with whatever it failed on. That sentence is the
-  // only useful thing to say to somebody who just asked for another go, so it travels up
-  // rather than being swallowed here.
+  // Retries a failed server and returns its connection failure to the caller.
   mcpReconnect?(serverName: string): Promise<void>;
-  // Names the session through the agent's own request, which runs no model turn and is
-  // answered beside a turn rather than inside it. Claude Code takes the `rename_session`
-  // control request, and Codex takes `thread/name/set`.
+  // Renames a session without a model turn. Claude uses `rename_session`. Codex uses `thread/name/set`.
   rename?(sessionId: string, title: string): Promise<void>;
 }
 
 // What to start, and how to talk to it once it is running.
 export interface AgentPlan {
   agent: AgentName;
-  // The provider session this child will resume. A fresh child has no identity until
-  // its opening exchange assigns one.
+  // The provider session identity supplied by the launch plan. A fresh Codex child receives its identity during opening.
   sessionId: string | null;
   command: string;
   args: string[];
   cwd: string;
-  // What this agent has to be told through the environment. Added to what the child would
-  // have inherited rather than replacing it.
+  // Launch-specific environment values applied after inherited client identity variables are removed.
   env: Record<string, string>;
   driver(send: (line: string) => void, emit: (event: WireEvent) => void): Driver;
 }
 
 export type AgentPlanSource = AgentPlan | (() => AgentPlan);
 
-// What starts an agent: the program, whatever comes before the CLI's own flags, and
-// whatever its own launcher would have put in the environment. The second part is empty for
-// an executable and holds a script for a package that runs under Node.
-// `composerview.ts` works out all three, because those rules are testable and this is not.
+// The executable, leading arguments, and environment resolved by `composerview.ts`.
+// Leading arguments identify a package script when the launcher uses Node.
 export interface Launch {
   command: string;
   leadingArgs: string[];
   env: Record<string, string>;
 }
 
-// The agent's own half of a mode the reader picked.
-//
-// A mode carries an entry for the agent whose menu it came from and none for the other, so
-// a mode reaching the wrong agent is a wiring fault rather than something a reader did. It
-// is refused here rather than turned into a default: a default sent in its place would put
-// the child in a state nobody chose, and the panel would draw the state that was picked.
+// Returns the provider-specific permission fields selected by the reader.
+// Reject a mode for another provider instead of applying an unselected default.
 export function claudeAskMode(mode: AskMode): PermissionMode {
   if (!mode.claude) {
     throw new Error(`${mode.label} is not a setting Claude Code can be put in`);
@@ -364,9 +290,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
     cwd: options.cwd,
     env: launch.env,
     driver(send, emit) {
-      // The session goes in with the child rather than being read back off it. The CLI
-      // names no session until the first prompt produces output, and a panel that does not
-      // know which session a child is in cannot draw it as running.
+      // Seed Claude's session identity before the first prompt. A resumed CLI can defer reporting it until output begins.
       const wire = new ClaudeWire({ send, emit, sessionId: options.resume ?? options.sessionId });
       return {
         receive: (line) => wire.receive(line),
@@ -430,10 +354,7 @@ export function claudeRenamePlan(launch: Launch, options: SpawnOptions & { resum
   };
 }
 
-// How a Codex session opens. The approval policy and the sandbox travel together, here
-// and everywhere else: a policy on its own says when the reader is asked and says nothing
-// about what happens when nobody is, so a reader who picked full access and got a
-// workspace-write sandbox was promised the machine and given a folder.
+// Codex thread-opening settings. Approval policy, approval reviewer, and sandbox must preserve the reader's selected permission mode.
 export interface CodexPlanOptions {
   cwd: string;
   model?: string;
@@ -446,14 +367,8 @@ export interface CodexPlanOptions {
   sandbox?: SandboxMode;
 }
 
-// Codex: one app-server child per session. The protocol allows one server to hold
-// every thread, and the official extension uses it that way; a child apiece is taken here
-// because a single server would need every event tagged back to its thread, and the panel
-// would carry that bookkeeping for a reader who has one session open.
-//
-// The server is started as the package's own script under the Node already on this
-// machine, rather than through the `.cmd` shim, which keeps a shell and its quoting out of
-// the way on Windows.
+// Starts one Codex app-server child per session through the resolved launch executable and arguments.
+// Per-session children keep thread ownership in the host's session map.
 export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan {
   return {
     agent: 'codex',
@@ -474,9 +389,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
           } else if (options.resume) {
             await wire.resumeThread(options.resume);
           } else await wire.startThread(options);
-          // The reader's picks then ride the turns. Effort has no other way in, and a
-          // resumed thread was opened by whoever opened it, so the picks would not reach one
-          // that was only asked for by id.
+          // Apply the reader's settings to later turns, including settings for a resumed thread.
           if (options.approvalPolicy && options.approvalsReviewer && options.sandbox) {
             await wire.setApproval(options.approvalPolicy, options.sandbox, options.approvalsReviewer);
           }
@@ -519,13 +432,9 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
   };
 }
 
-// A child started to be asked, and then closed.
-//
-// Both CLIs answer for the reader's rate limits and for the models they will run after
-// nothing but a handshake, so neither of these opens a session: the Claude one is told
-// not to persist a session, and the Codex one never starts a thread. That is the whole
-// difference from the plans above, and it is why the panel can read either figure with no
-// turn running and leave nothing behind on disk.
+// Starts a Claude child for control reads without persisting a session.
+// The Codex idle plan initializes its server without starting a thread.
+// Both plans read account usage and model catalogs without sending prompts.
 export function claudeIdlePlan(launch: Launch, cwd: string, model = ''): AgentPlan {
   return claudePlan(launch, { cwd, persistSession: false, ...(model ? { model } : {}) });
 }
@@ -614,7 +523,7 @@ export function codexRenamePlan(
 }
 
 // One session rename, from the panel. The host picks the running child or a rename-only
-// child. Claude Code reports success for a rename it could not save, so a Claude rename
+// child. Claude Code can report success after failing to save, so a Claude rename
 // counts only once the saved title file holds the name.
 export interface SessionRenameRequest {
   agent: AgentName;
@@ -645,14 +554,11 @@ export interface HostOptions {
   // How long shutdown waits before asking the operating system to terminate the child.
   // Injected so lifecycle tests do not wait on the production grace period.
   exitGraceMs?: number;
-  // How long a session's opening exchange may take. Injected so a test can prove the
-  // deadline is applied without waiting a real minute for it.
+  // The opening-exchange deadline. Tests inject a shorter duration.
   openingDeadlineMs?: number;
-  // The clock every session reads. Injected for the same reason as the deadline above: a
-  // test can age an owed ending without waiting a real minute for it.
+  // The session clock. Tests control Stop-ending expiry through this value.
   now?: () => number;
-  // Told about everything, so the panel can repaint. One listener, because the panel is
-  // the only thing that listens and a list of them would only invite a second owner.
+  // Publishes events and state changes to the panel.
   onEvent(event: SessionEvent): void;
   onStateChange(state: SessionState): void;
 }
@@ -677,10 +583,7 @@ const AGENT_HOST_TIMER: AgentHostTimer = {
   clear: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 };
 
-// Splits a stream into whole lines. Both CLIs write one JSON object per line, but a chunk
-// off the pipe is whatever the operating system handed over: half a line, three lines, or
-// a line split across two chunks. A reader that treats a chunk as a line drops messages
-// the moment one gets big, and the messages that get big are exactly the interesting ones.
+// Frames complete JSON lines from arbitrary stdout chunks. Chunks can contain partial lines or several complete lines.
 export class LineReader {
   private buffer = '';
   private bytes = 0;
@@ -749,23 +652,16 @@ export class LineReader {
   }
 }
 
-// How long the opening exchange may take before the panel gives up on it. Generous, because
-// a cold CLI on a large repository reads settings, plugins and memory files before it
-// answers, and a deadline that fires on a slow machine is worse than none.
+// The opening-exchange deadline. A cold CLI reads settings, plugins, and memory files before it answers.
 export const OPENING_DEADLINE_MS = 60_000;
 
 // How long a child being let go has to end on its own before termination is requested.
 // This gives the CLI time to write its settings before a replacement waits for confirmed exit.
 export const EXIT_GRACE_MS = 2_000;
 
-// How long the ending owed by an accepted Stop stays owed. Claude answers a Stop in about a
-// second, so a debt older than this is one it never paid: the reply was unreadable, or the
-// child dropped it.
-//
-// This is the outer bound and not the rule. Which ending pays the debt is decided by the
-// ending's own outcome, in `handle`. The bound exists so that a debt no ending ever claims
-// cannot be claimed years later by an unrelated interrupted turn, which would leave that
-// turn open and the session busy for the rest of the child's life.
+// The expiry period for an ending owed by an accepted Stop.
+// `handle` consumes the debt only for an interrupted outcome within this period.
+// Expiry prevents an unrelated later interrupted turn from consuming the abandoned turn's debt.
 export const STOP_ENDING_GRACE_MS = 60_000;
 
 export function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -784,8 +680,7 @@ export function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// Unique for this extension-host process. Cleanup state is also process-local, so a
-// monotonically increasing value cannot collide across live or restarted sessions.
+// Unique submission sequence within this extension-host process. Cleanup state uses the same process lifetime.
 let sessionTurnSequence = 0;
 
 // One session and the child running it.
@@ -804,8 +699,7 @@ export class AgentSession {
   // as busy until each settles, so the child is not retired while an answer is on its way.
   private readonly delivering = new Set<string>();
   // The effort level a reader picked while a turn was running, waiting for that turn to end.
-  // One value, not a queue: a reader who picks twice wants the second level, and sending both
-  // would cost two turns to reach it.
+  // A second pick replaces the held level, avoiding an extra command turn.
   private heldEffort: string | null = null;
   // What a prompt sent while a pick is held waits on: the held level reaching the child, or
   // the pick being dropped. It exists only while a pick is held and a prompt waits for it.
@@ -841,7 +735,7 @@ export class AgentSession {
     private readonly changed: () => void,
     private readonly openingDeadlineMs: number = OPENING_DEADLINE_MS,
     private readonly exitGraceMs: number = EXIT_GRACE_MS,
-    // Injected so a test can age an owed ending without waiting a real minute for it.
+    // Tests inject the clock to control Stop-ending expiry.
     private readonly now: () => number = Date.now,
   ) {
     this.key = key;
@@ -865,9 +759,7 @@ export class AgentSession {
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk) => out.push(String(chunk)));
 
-    // The CLI's stderr is where a start-up failure explains itself: a bad executable path,
-    // a session id that does not exist. Only the tail is kept, because a chatty run would
-    // otherwise grow without limit for text nobody reads unless something went wrong.
+    // Keep the last 4000 stderr characters for startup and exit failures.
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', (chunk) => {
       this.stderrTail = (this.stderrTail + String(chunk)).slice(-4000);
@@ -880,9 +772,8 @@ export class AgentSession {
       const how = signal ? `signal ${signal}` : `code ${code}`;
       this.finish(code === 0 || signal ? null : `the agent stopped with ${how}. ${this.stderrTail.trim()}`.trim());
     });
-    // A failed spawn emits `error` and then `close`, with no `exit`. Closure is terminal in
-    // that sequence, while the error alone is not: a running child can report an error and
-    // still own its session until either `exit` or `close` confirms termination.
+    // A failed spawn emits `error` then `close`, without `exit`.
+    // Error alone does not confirm termination. A running child retains its session until `exit` or `close`.
     this.child.on('close', () => {
       this.childTerminated = true;
     });
@@ -903,17 +794,11 @@ export class AgentSession {
     };
   }
 
-  // The opening exchange, which has to finish before a prompt can go out. Its failure is
-  // kept rather than thrown: a window that cannot reach the CLI should say so in the panel,
-  // not tear down the command the reader ran. A child that failed here is closed at once.
-  // It adopted no session, so keeping it would hand the next prompt to a wire that can
-  // only replace the useful opening refusal with "no session has been started yet".
+  // Completes the opening exchange before prompts. Failure is retained in session state and closes the child.
+  // `startOrThrow` exposes that failure as an exception.
   async start(): Promise<void> {
     try {
-      // The opening exchange gets a deadline. A child that dies is reported by its own exit
-      // handler, but one that starts and then says nothing, which is what an unauthenticated
-      // CLI waiting on a terminal does, would otherwise leave the reader's send button
-      // waiting for ever with nothing on screen to say why.
+      // Bound an opening that starts but never answers, including a CLI waiting for terminal authentication.
       const commandVersion = this.commandVersion;
       const commands = await withDeadline(this.driver.open(), this.openingDeadlineMs);
       if (this.commandVersion === commandVersion) {
@@ -937,14 +822,8 @@ export class AgentSession {
     }
   }
 
-  // Renames this session through its running child. Each agent answers the rename beside
-  // its turns rather than inside one, so a session with a turn running renames like any
-  // other, and the turn is left alone whether the rename succeeds or fails.
-  //
-  // The caller passes the session id it resolved. An agent refuses a rename whose session
-  // id is not the one its process holds, and that refusal reaches the reader only when the
-  // id comes from the host: a child that has moved to another session reads its own id back
-  // as the one being asked for, and renames the session it moved to.
+  // Renames the caller's resolved session without changing a running turn.
+  // Passing the requested id lets the provider reject a child that has switched sessions.
   async rename(sessionId: string, title: string): Promise<void> {
     if (this.exited) {
       throw new Error(this.lastError ?? 'the agent is no longer running');
@@ -955,17 +834,11 @@ export class AgentSession {
     await this.driver.rename(sessionId, title);
   }
 
-  // Sends a prompt. The turn is marked as running straight away, while the returned promise
-  // waits for the CLI to accept it. The composer can move immediately and still learn when
-  // a request never reached the session.
-  // A child that has already gone is reported instead: the reader can have a prompt box
-  // open across the moment its agent dies, and a turn shown as running on a dead child
-  // never clears and cannot be interrupted.
+  // Marks the session busy while the CLI accepts a prompt. The returned id identifies that submission.
+  // An exited child rejects the prompt and retains the failure in session state.
   async prompt(prompt: AgentPromptInput, onSubmitted?: (turnId: number) => void): Promise<number> {
     if (this.exited) {
-      // An opening refusal is more useful than the generic fact that its child has now been
-      // closed. Preserve it so a caller that held this session cannot erase the one answer
-      // the agent gave about why the prompt could not go.
+      // Retain the opening refusal when its failed child has already closed.
       this.lastError = this.lastError ?? 'the agent is no longer running, so the prompt was not sent';
       this.changed();
       throw new Error(this.lastError);
@@ -978,9 +851,7 @@ export class AgentSession {
     }
     this.busy = true;
     this.changed();
-    // A prompt sent while a pick is held waits for that pick, so the turn it starts runs at
-    // the level the reader chose. Written straight away, the prompt would queue in the child
-    // ahead of the command and run at the old level.
+    // Prompts waiting on a held effort pick must follow its command, so they run at the selected level.
     const behindEffort = this.effortSent !== null;
     if (behindEffort) {
       this.promptsBehindEffort.add(submitted);
@@ -1033,9 +904,7 @@ export class AgentSession {
       const refusal = `the agent would not take the prompt: ${(error as Error).message}`;
       this.lastError = refusal;
       this.changed();
-      // A refused prompt can leave the session with nothing running, so a pick waiting on
-      // the work goes out from here too, after the publication above. The send keeps this
-      // diagnostic in place.
+      // A prompt refusal can leave the session idle. A successful held effort send retains this diagnostic.
       this.drainHeldEffort();
       throw new Error(refusal, { cause: error });
     }
@@ -1053,15 +922,9 @@ export class AgentSession {
     });
   }
 
-  // The running and refusal state that a driver operation costing a turn shares with a
-  // prompt. Compaction and a Claude effort change both end through a result the wire reads
-  // as a turn ending, so each books an open turn before the send. Without that booking the
-  // ending closes a turn the reader is waiting on, and the panel draws the session idle
-  // while it is still working.
-  //
-  // A command the reader sent clears the last diagnostic, the way a prompt does. A held pick
-  // going out keeps it: the pick drains right after a refusal or an `error` event, and
-  // clearing there would erase the diagnostic before anything could read it.
+  // Shares prompt running-state and refusal handling with operations that start a command turn.
+  // Book the command's turn so its result cannot close a prompt's turn.
+  // Reader commands clear the diagnostic. A successful held effort change retains the refusal that left the session idle.
   private async commandTurn(
     run: () => Promise<void>,
     words: { gone: string; lost: string; refused: string },
@@ -1102,18 +965,13 @@ export class AgentSession {
         this.preparingTurns.delete(submitted);
         this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
       }
-      // Two readers, two sentences. `lastError` is this session's own diagnostic and names
-      // the operation, because whatever reads it later has no other way to know which one
-      // failed. The thrown error goes to the panel, which already says the operation did
-      // not happen and needs only the cause, so it is passed on exactly as it arrived. A
-      // wrapper here put four restatements of the same fact on one card and no cause at all.
+      // Session state names the failed operation. The thrown error retains the provider's cause for the panel's operation-specific message.
       const cause = (error as Error).message;
       this.lastError = cause
         ? `the agent would not ${words.refused}: ${cause}`
         : `the agent would not ${words.refused} and gave no reason`;
       this.changed();
-      // On the rule the prompt refusal follows. A held pick is never the command that
-      // failed here, because a pick on its way out is cleared before the send.
+      // Send a held effort pick after a refusal. The failed send has already cleared its own pick.
       this.drainHeldEffort();
       throw error;
     }
@@ -1158,9 +1016,7 @@ export class AgentSession {
         ? `the agent would not clear the session: ${cause}`
         : 'the agent would not clear the session and gave no reason';
       this.changed();
-      // A refused clear can leave the session with nothing running. A pick waiting on the
-      // work goes out from here too, the same rule the prompt and command refusals follow.
-      // The send keeps this diagnostic in place.
+      // A clear refusal can leave the session idle. A successful held effort send retains this diagnostic.
       this.drainHeldEffort();
       throw error;
     }
@@ -1227,13 +1083,12 @@ export class AgentSession {
     return this.driver.contextUsage ? this.driver.contextUsage() : null;
   }
 
-  // What the reader's account has left. Costs no model tokens on either agent, so the
-  // status bar may ask at the end of every turn.
+  // Reads account usage without model tokens.
   async rateLimits(refreshAuthentication = false): Promise<UsageReading | null> {
     return this.driver.rateLimits ? await this.driver.rateLimits(refreshAuthentication) : null;
   }
 
-  // The models this agent will run, or nothing when the agent has no way to be asked.
+  // Reads applied CLI settings or returns an unavailable result when the driver exposes no settings read.
   async appliedDefaults(): Promise<AppliedDefaults> {
     return this.driver.appliedDefaults
       ? this.driver.appliedDefaults()
@@ -1258,19 +1113,10 @@ export class AgentSession {
     }
   }
 
-  // How hard this session's model is asked to think, from now on.
-  //
-  // An agent whose change costs a turn waits for this session to go idle. Nothing has
-  // sampled what a mid-turn change does, and the two plausible answers, an immediate change
-  // and a message that becomes the next prompt, are both wrong for a reader watching a turn
-  // run. The pick stays selected on the control until a turn records the new level. A
-  // prompt sent while the pick waits goes to the child after the command, so its turn runs
-  // at the picked level.
-  //
-  // An empty level is one the chosen model does not offer. It reaches no child, because the
-  // command needs a level to name and a bare `/effort` costs a turn to ask the CLI nothing.
-  // A held pick goes with it, so a model change that drops a level drops the pick waiting to
-  // be sent under it.
+  // Changes effort through the driver. An effort command that starts a turn waits until existing work ends.
+  // Prompts submitted during that wait follow the command, so they run at the selected level.
+  // An empty level drops a held pick without sending a bare `/effort` command.
+  // Non-command effort changes reach the driver immediately.
   async setEffort(effort: string): Promise<void> {
     if (!this.driver.setEffort) {
       return;
@@ -1312,9 +1158,7 @@ export class AgentSession {
     sent?.release();
   }
 
-  // The send behind the pick above, which books its own turn. It stands apart because the
-  // drain sends a held level while the session is already marked busy on that level's
-  // behalf, so it cannot go back through the waiting rule.
+  // Sends an effort command through `commandTurn`. A drained pick is already marked busy and must bypass the waiting rule.
   private async sendEffort(effort: string, clearsDiagnostic = true): Promise<number> {
     return this.commandTurn(
       () => this.driver.setEffort!(effort),
@@ -1327,24 +1171,9 @@ export class AgentSession {
     );
   }
 
-  // The pick a reader made while the session was working, sent once the session has nothing
-  // left to work on. Every path that leaves a session idle calls this: a turn ending, an
-  // accepted Stop, and a refused prompt or command. A Stop ends the work without ending a
-  // turn, and a refusal ends it without ever starting one. The pick would otherwise read as
-  // pending on the control for the life of the child.
-  //
-  // The session is marked busy here rather than left to the send. The callers publish their
-  // own state change next, and that publication would draw the session idle for the moment
-  // between the work ending and the command booking its turn.
-  //
-  // A prompt sent while the pick was held counts as nothing running. It waits for this send,
-  // and goes to the child once the command is written, so the turn it starts runs at the
-  // picked level. The command books its turn before the prompt books its own, so the
-  // command's result closes the command's turn.
-  //
-  // The send is not awaited: the callers are the child's own line reader and its Stop, and
-  // the send books its own turn and records its own failure. It keeps the last diagnostic,
-  // because a refusal or an `error` event is often what left the session idle.
+  // Sends a held effort pick once no other work remains. Endings, accepted Stop requests, and refused submissions all drain it.
+  // Mark the session busy before publishing state. Prompts waiting on the pick follow the effort command.
+  // A successful send retains the prior diagnostic. A failed send replaces it with the effort refusal.
   private drainHeldEffort(): void {
     const held = this.heldEffort;
     if (held === null || this.exited || this.runningBesideHeldPrompts()) {
@@ -1372,26 +1201,20 @@ export class AgentSession {
     return [...this.preparingTurns].some((turn) => !this.promptsBehindEffort.has(turn));
   }
 
-  // What this agent's MCP servers are doing, or nothing when the agent has no way to be
-  // asked. Nothing is not the same as an empty list, and the panel draws the two
-  // differently: one is an agent that cannot be asked, the other is an agent with no
-  // servers configured.
+  // Returns MCP status or null when the driver exposes no status operation.
+  // Null means unavailable. An empty list means the agent reported no servers.
   async mcpStatus(): Promise<McpServer[] | null> {
     return this.driver.mcpStatus ? await this.driver.mcpStatus() : null;
   }
 
-  // Switches one of this agent's servers off, or back on. An agent that has no servers to
-  // switch does nothing here, on the same rule as the effort level above: the panel offers
-  // no such button for that agent, so a call that arrives anyway is nothing to complain to
-  // the reader about.
+  // Sets one server's enabled state when the driver exposes a toggle operation.
   async mcpToggle(serverName: string, enabled: boolean): Promise<void> {
     if (this.driver.mcpToggle) {
       await this.driver.mcpToggle(serverName, enabled);
     }
   }
 
-  // Tries one of this agent's failed servers again. Whatever the connection failed on comes
-  // back up as a failure, because the reader pressed this and is owed the reason.
+  // Retries one failed server and propagates its connection failure.
   async mcpReconnect(serverName: string): Promise<void> {
     if (this.driver.mcpReconnect) {
       await this.driver.mcpReconnect(serverName);
@@ -1407,22 +1230,15 @@ export class AgentSession {
       this.disposePromise = Promise.resolve();
       return this.disposePromise;
     }
-    // Killed only if closing its input did not end it.
-    //
-    // The CLI writes settings out as it shuts down, and a kill in the same tick takes that
-    // away. A real two-child check found that a server switched off in one child was back on
-    // in the next when the first was killed outright, and stayed off when it was allowed to
-    // exit. So whether a reader's press on the servers switch lasted came down to how the
-    // panel ended a process they never saw.
-    //
-    // A replacement waits on this promise so two children cannot write the same session.
-    // Other callers can ignore it because the session state finished above.
+    // Close input first so the CLI can persist settings during orderly shutdown.
+    // Request termination after the grace period if the child remains alive.
+    // Replacement waits for this promise, preventing two children from writing the same session.
     this.disposePromise = new Promise<void>((resolve) => {
       const stop = setTimeout(() => {
         try {
           this.child.kill();
         } catch {
-          /* it ended on its own, which is the point */
+          // Wait for exit or close even when the termination request fails.
         }
       }, this.exitGraceMs);
       (stop as { unref?: () => void }).unref?.();
@@ -1457,25 +1273,13 @@ export class AgentSession {
         if (event.sourceId && endedTurnId !== undefined) this.responseOwners.set(event.sourceId, endedTurnId);
       }
     }
-    // A chunk of the reply is reported and nothing else. It says nothing about the child
-    // that is not already known: it is no busier, it has asked nothing and it has not
-    // failed. Everything below wakes the status bar, the stored session id and a repaint,
-    // and this arrives many times a second, so a turn's worth of them would run that work
-    // hundreds of times to say what the first one said.
+    // Reply deltas and activity do not change session state. Report them without triggering repeated state publication.
     if (event.kind === 'delta' || event.kind === 'activity') {
       this.report(event, endedTurnId);
       return;
     }
-    // The command list, taken off the event rather than waited for.
-    //
-    // `ready` is emitted from inside the opening handshake, so the assignment in `start`,
-    // which records what that handshake returned, runs after every listener has already had
-    // the event. Recorded only there, the session answers with an empty list for the whole of
-    // the moment anything is listening to the one message that says a list exists. The
-    // composer was handed nothing on every start, and its command menu never opened.
-    //
-    // `start` keeps its own assignment. A driver is free to answer `open` with a list and
-    // emit nothing, and that one is still the session's.
+    // Publish command catalogs before event listeners read session state.
+    // `start` also accepts the opening result when the driver emits no catalog event.
     if (event.kind === 'ready' || event.kind === 'commands') {
       this.commands = event.commands;
       this.commandVersion += 1;
@@ -1486,9 +1290,8 @@ export class AgentSession {
     if (event.kind === 'askResolved') {
       this.asks.delete(event.id);
     }
-    // An answer that outlived its turn settles with `askResolved` once it is sent, or with
-    // the ask offered again when it could not be. A late answer goes out as a new prompt the
-    // wire starts on its own, so the session reads the open turns from the wire here.
+    // A late answer settles through `askResolved` after sending, or through a repeated ask after failure.
+    // The wire starts its new prompt and supplies the open-turn state.
     if (
       (event.kind === 'ask' && this.delivering.delete(event.ask.id)) ||
       (event.kind === 'askResolved' && this.delivering.delete(event.id))
@@ -1505,18 +1308,12 @@ export class AgentSession {
         this.interruptedTurnEnds > 0 &&
         this.now() - this.interruptedTurnEndAt <= STOP_ENDING_GRACE_MS
       ) {
-        // The ending the Stop owes is an abandoned turn's, and the CLI says so: a
-        // control-channel interrupt ends the turn with `aborted_streaming`, which the wire
-        // reads as `interrupted`. A prompt sent after the Stop ends with `ok` instead. So the
-        // debt is paid by the ending that carries the Stop's own word, whatever order the two
-        // arrive in, and a turn the reader is waiting on is never charged for it.
+        // Claude marks an interrupted Stop ending as `aborted_streaming`, which the wire translates to `interrupted`.
+        // Consume that ending's debt without closing a later prompt's turn.
         this.interruptedTurnEnds -= 1;
         this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
       } else {
-        // A debt older than the grace is one the Stop never produced. Drop it. It is dropped
-        // only on age, because an ending that is not the Stop's proves nothing about whether
-        // the Stop's is still coming, and a debt cleared early charges a later turn's ending
-        // to nothing and leaves that turn open for the life of the child.
+        // Expire old Stop-ending debt. An unrelated outcome does not establish that the interrupted ending will never arrive.
         if (this.now() - this.interruptedTurnEndAt > STOP_ENDING_GRACE_MS) {
           this.interruptedTurnEnds = 0;
         }
@@ -1527,10 +1324,8 @@ export class AgentSession {
         }
         this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
       }
-      // A turn cannot end with a request still open: the CLI has stopped waiting for the
-      // answer. Left behind, the request card would remain in the panel, and answering it
-      // would write a reply for a request the agent has already abandoned. An ask the driver
-      // says outlives its turn has no such request behind it, and it stays.
+      // Remove asks whose driver no longer waits for an answer after the turn ends.
+      // Keep asks that the driver identifies as outliving their turn.
       for (const id of [...this.asks.keys()]) {
         if (!this.driver.outlivesTurn?.(id)) {
           this.asks.delete(id);
@@ -1576,16 +1371,9 @@ export class AgentSession {
   }
 }
 
-// The MCP servers one idle child reports, for a reader who asked for them outright.
-//
-// Kept apart from `askIdle` because the wait is different in kind. That one runs when the
-// panel comes into view and nobody asked for anything, so it must be quick; this one runs
-// because the reader typed the agent's own `/mcp`, and a reader who asked a question will
-// wait for its answer. The CLI answers only once it has tried every server, and a server that
-// is down is one it waits out.
-//
-// Null for an agent that could not be started, and for one whose CLI answers no such request.
-// Neither is the same as an agent with no servers, which answers with an empty list.
+// Reads MCP status through one idle child for an explicit reader request.
+// The CLI waits for server connections before answering this status request.
+// Returns null for an opening failure, a status failure, or an unavailable status operation.
 export async function askIdleMcp(
   plan: AgentPlan,
   spawner: Spawner,
@@ -1620,31 +1408,14 @@ export interface McpChange {
   enabled: boolean | null;
 }
 
-// One short-lived child, told to change some servers and then asked what the servers are now.
-//
-// This exists because the reader can press the switch with no session running. The panel
-// counts the servers as it comes into view, so the control is on the row long before the first
-// prompt, and a press that answered "start a session first" would be a control that draws
-// itself and then refuses.
-//
-// The change outlives this child because the CLI writes it out as it shuts down, which is why
-// `dispose` lets a child go rather than killing it. A real two-child check confirmed that the
-// second child reads the setting written by the first.
-//
-// The reading and the trouble come back together rather than one of them being thrown,
-// because both are owed to the reader. A server that would not answer is the reason their
-// press did nothing, and the reading beside it is what every other server did instead.
+// The resulting MCP status, per-server failures, and whole-operation refusal from an idle change request.
+// The idle child applies changes before reading status and completing orderly shutdown.
 export interface McpChangeResult {
-  // What the servers are now, or null where the reading could not be taken.
+  // Current server status, or null when the read fails.
   servers: McpServer[] | null;
   // One line per server that refused, empty where all of them answered.
   failures: string[];
-  // Why nothing could be changed at all, or empty where a child came up.
-  //
-  // Held apart from `failures`, which name servers. This one names the agent, and the two
-  // read differently to somebody who pressed a switch: one says which server would not
-  // answer, and the other says that nothing was asked. Reported either way, because the
-  // silent version of this is the one outcome a press must never have.
+  // A startup or operation refusal, separate from failures naming individual servers. Empty when the exchange succeeds.
   refusal: string;
 }
 
@@ -1668,9 +1439,7 @@ export async function askIdleMcpChange(
     if (refusal) {
       return { servers: null, failures: [], refusal };
     }
-    // Gathered rather than thrown at the first one, the same way the live path gathers them.
-    // One press stands for several servers, and a server that will not come back must not
-    // take with it the ones that would.
+    // Collect individual server failures so remaining requested changes still run.
     const failures: string[] = [];
     for (const change of changes) {
       try {
@@ -1688,9 +1457,7 @@ export async function askIdleMcpChange(
   } catch (error) {
     return { servers: null, failures: [], refusal: (error as Error).message };
   } finally {
-    // Awaited, unlike everywhere else this is called. The change is only written as the child
-    // shuts down, so returning while it is still going lets the reader's next prompt start a
-    // session that reads the state they just changed away from.
+    // Wait for shutdown before returning so the next child reads the CLI's persisted changes.
     await session.dispose();
   }
 }
@@ -1700,40 +1467,13 @@ export interface IdleAnswers {
   usage: UsageReading | null;
   usageFailure: string;
   models: ModelList | null;
-  // The agent's slash commands, which the opening handshake answers with whether or not
-  // anybody asked. They come back with the rest because this child is the only one a panel
-  // that has sent no prompt ever starts: a session child is started by the first prompt,
-  // so a list gathered only from those is a list the composer cannot have until after the
-  // reader has typed a prompt without the menu they wanted it for.
-  //
-  // Empty for an agent that publishes none, and for one that could not be reached.
+  // Commands returned by the opening handshake, available before the reader sends a prompt.
+  // Empty when the completed handshake publishes none.
   commands: PromptEntry[];
-  // The MCP servers the agent can call tools on, for the same reason the commands ride here.
-  // The control that draws them is on the composer, and the reader reaches it by typing the
-  // agent's own `/mcp`; read only from session children, that control could not exist
-  // until after a prompt had been sent.
-  //
-  // Null for an agent whose CLI answers no such request, which is not the same as an agent
-  // with no servers: one cannot be asked and the other answered with none.
 }
 
-// Asks an agent what the reader's account has left and what models it will run, with no
-// session opened and no prompt sent, and closes the child again.
-//
-// This is the read for a panel nobody is running a turn for. It is deliberately not a
-// session on the host: a child adopted as a session would be resumed by the next
-// prompt, and the reader would find themselves talking to the child that was started to
-// read a percentage.
-//
-// Both questions ride one child because neither costs model tokens but the child itself
-// costs a process start, and a second child for the second question would double the only
-// price there is. Neither question can sink the other: a CLI old enough to refuse one of
-// them still answers the other, and an answer thrown away because its neighbour failed is
-// a process start paid for nothing.
-//
-// A child that will not start leaves the panel showing what it already had rather than
-// emptying it. The figures it holds are old, which they say; no figures at all would say
-// the reader has no limits.
+// Reads account usage and model catalogs through one idle child, then closes it.
+// Usage and model requests handle failures independently. Opening or spawner failure rejects the exchange.
 export async function askIdle(
   plan: AgentPlan,
   spawner: Spawner,
@@ -1753,28 +1493,10 @@ export async function askIdle(
     if (failed) {
       throw new Error(failed);
     }
-    // Read before the two requests rather than after, because it costs nothing and it is
-    // already true: the handshake that `start` just finished is what answered with it.
+    // The completed handshake has already supplied commands.
     const commands = session.state().commands;
-    // The MCP servers are deliberately not asked for here.
-    //
-    // The other three cost a round trip each and answer at once. `mcp_status` does not: the
-    // CLI answers it only once it has tried every server, and a server that is down is a
-    // server the CLI waits out. One measured in this repository timed out after 30 seconds.
-    // Asked here, that wait would sit in front of the figures the status bar is opening to
-    // draw, so a panel with one broken server would come up empty for half a minute.
-    //
-    // They are read from a child that is already running instead, which is where a wait costs
-    // the reader nothing they were waiting on anyway.
-    // All three ride the one child, because the process start is the only price any of them
-    // has. None can sink the others: a CLI old enough to refuse one still answers the rest,
-    // and an answer thrown away because its neighbour failed is a process start paid for
-    // nothing.
-    // The MCP servers are deliberately not asked for here. The CLI answers `mcp_status` only
-    // once it has tried every server, and a server that is down is one it waits out: one
-    // measured in this repository timed out after 30 seconds. Asked on this child, that wait
-    // would sit in front of the figures the status bar opened to draw. A reader who types the
-    // agent's own `/mcp` pays it instead, because they asked.
+    // Exclude MCP status here because that read waits for server connections.
+    // Account usage and model requests run independently through the same child.
     let usageFailure = '';
     const [usage, models] = await Promise.all([
       session.rateLimits().catch((error: Error) => {
@@ -1876,22 +1598,13 @@ export class UsageReadQueue {
   }
 }
 
-// How long a model list is kept before it is worth asking again.
-//
-// Far longer than a usage figure, because the two answer different questions. A rate limit
-// moves with every turn the reader runs; a model list turns over when the CLI is updated.
-// Half a day means a reader who works through one pays a single read, and an update
-// installed over lunch is on offer by the evening.
+// The model catalog's refresh interval. CLI releases change catalogs less often than turns change account usage.
 export const MODELS_FRESH_MS = 12 * 60 * 60 * 1000;
 
-// The model list each agent last answered with. Shaped like `UsageBook`, and for the same
-// reasons: reading costs no model tokens but does cost a process start, and an agent that
-// cannot answer must not be asked again every time the panel comes back into view.
+// Keeps each agent's latest model catalog and suppresses repeated failed automatic reads.
 export class ModelBook {
   private readonly byAgent = new Map<string, ModelList>();
-  // The agents that could not answer. A machine with only one of the two CLIs installed
-  // would otherwise pay a failed process start for the other every time a picker opened.
-  // Cleared when the reader asks outright, because that is somebody saying to try again.
+  // Agents whose catalog read failed. An explicit refresh clears this suppression.
   private readonly silent = new Set<string>();
 
   note(agent: string, list: ModelList): void {
@@ -1899,8 +1612,7 @@ export class ModelBook {
     this.silent.delete(agent);
   }
 
-  // An agent that was asked and did not answer. Whatever list it has already given stays:
-  // an old list still names models the CLI will run, and an empty picker names none.
+  // Suppress automatic retries while retaining the existing catalog.
   noteSilent(agent: string): void {
     this.silent.add(agent);
   }
@@ -1920,9 +1632,7 @@ export class ModelBook {
     return out;
   }
 
-  // Which of the agents to actually ask. A list still inside its window is left alone, an
-  // agent that has already failed to answer is not asked again, and the reader asking
-  // outright overrides both, exactly as the usage figures work.
+  // Selects agents whose catalogs need a refresh. Force clears failure suppression and bypasses the age check.
   toAsk(agents: readonly string[], now: number, force: boolean): string[] {
     if (force) {
       for (const agent of agents) this.silent.delete(agent);
@@ -1938,19 +1648,9 @@ export class ModelBook {
   }
 }
 
-// The MCP servers each draft or recorded session last reported, in the shape the panel draws from.
-//
-// Modelled on `ModelBook` above and deliberately without its clock. A model list is kept
-// for half a day because it turns over when the CLI is updated, and a list read this
-// morning still names the models the CLI will run this afternoon. A server list is nothing
-// like that: it turns over the moment a server falls down, and a reading held back as
-// still fresh is exactly the reading that is now wrong. There is no freshness window or
-// freshness-based `toAsk`. The book keeps whatever the agent last said. It reads again after
-// every toggle and reconnect, which are the moments the answer can have changed.
-//
-// Initial idle reads have a separate gate. A missing answer reopens that gate, so the next
-// view can retry a server that held the first request open. A child that cannot start closes
-// the gate because retrying it on every view would pay for the same launch failure each time.
+// Keeps each draft or recorded session's last MCP status without a freshness timer.
+// Revisions reject outdated readings. Toggle and reconnect operations trigger another read.
+// An unanswered initial read can retry. A child-start failure suppresses automatic initial retries.
 export class McpBook {
   private readonly byAgent = new Map<string, McpServer[]>();
   private readonly revisions = new Map<string, number>();
@@ -2033,9 +1733,7 @@ export class McpBook {
     this.initialReadsInFlight.delete(owner);
   }
 
-  // Nothing for an agent nobody has read, which is not the same answer as an empty list. An
-  // empty list is an agent that was asked and has no servers; nothing is a question that has
-  // not been put yet, and the panel says so rather than claiming the agent has none.
+  // Returns null before an accepted reading. An empty list means the agent reported no servers.
   get(agent: string): McpServer[] | null {
     return this.byAgent.get(agent) ?? null;
   }
@@ -2156,13 +1854,8 @@ export class McpPendingRefreshes {
   }
 }
 
-// The model to actually start a child with: the reader's own pick, unless the agent's list
-// says it has gone. A pick outlives an update, and a child started on a model the CLI no
-// longer has does not run at all.
-//
-// An agent whose list has not been read yet is trusted with whatever was stored. The pick
-// was true when it was made, and dropping it because nothing has answered yet would quietly
-// move the reader onto a default they never chose.
+// Keeps the reader's stored model unless a loaded catalog excludes it.
+// A missing catalog preserves the pick until the agent's models are known.
 export function pickedModel(picked: string, list: ModelList | null): string {
   if (!picked || !list) {
     return picked;
@@ -2170,9 +1863,8 @@ export function pickedModel(picked: string, list: ModelList | null): string {
   return chosenModel(list.models, picked) ? picked : '';
 }
 
-// The effort to run that model at, on the same rule. Effort belongs to a model rather than
-// to an agent, so a level the picked model does not offer is dropped rather than carried
-// onto it.
+// Keeps the picked effort when the loaded catalog offers it.
+// With a model, check that model's levels. Without one, check levels across the catalog.
 export function pickedEffort(picked: string, list: ModelList | null, model: string): string {
   if (!picked || !list) {
     return picked;
@@ -2185,27 +1877,16 @@ export function pickedEffort(picked: string, list: ModelList | null, model: stri
 export interface ModelChange {
   // The level that survives the change. Empty when the new model offers no such level.
   effort: string;
-  // Whether the live child hears the surviving level. It is told only when the level
-  // changed, which is only ever a drop, because a level the new model offers is the level
-  // the child is already running at.
+  // Whether to tell the live child that its selected effort changed. Unsupported effort drops trigger that notification.
   tellChild: boolean;
   // The fields the session stores. A field left out keeps the standing it had.
   settings: Partial<SessionSettingSelection>;
 }
 
-// The whole of what a model change decides, for one session on one agent.
-//
-// The level belongs to the model, so `pickedEffort` names the level that survives. A level
-// the new model does not offer is dropped, and the drop still reaches a live child, which
-// throws away a pick waiting to go out under the old level. The child keeps running at the
-// last level it heard, because the CLI's command needs a level to name and the new model
-// has no name for the old one.
-//
-// A Claude model reaches a live child on the control channel and is confirmed there, so it
-// is stored outright. Codex applies the model to the next turn, and so does a session with
-// no child yet, so both leave the model pending until a turn records it. A surviving level
-// moved nothing and keeps whatever standing it had, and a dropped level has nothing left
-// for a turn to record.
+// Resolves selected and pending settings after a model change.
+// Live Claude sessions leave no pending model. Codex and sessions without a live child retain a pending model.
+// An effort drop clears pending effort and requests a live-child notification.
+// Surviving effort retains its existing pending state.
 export function modelChange(
   agent: AgentName,
   model: string,
@@ -2226,14 +1907,10 @@ export function modelChange(
   return { effort, tellChild: live && effort !== held, settings };
 }
 
-// Every session this window drives. A window owns the children it spawned and no
-// others: a second window looking at the same folder reads those turns through the
-// transcript on disk, the way it already reads turns from a terminal session.
+// Owns children started by this window. Other windows read their work from disk.
 export class AgentHost {
   private readonly sessions = new Map<string, AgentSession>();
-  // The opening exchange of each session that is still in it. A second caller for the same
-  // key waits on the same promise rather than being handed a session whose handshake has
-  // not finished, which on the Codex side would be one with no session to prompt.
+  // Opening promises shared by callers for the same host key.
   private readonly starting = new Map<string, Promise<AgentSession>>();
   private readonly startingSessions = new Map<string, Promise<AgentSession>>();
   private readonly spawner: Spawner;
@@ -2269,9 +1946,7 @@ export class AgentHost {
     this.idleDurationMs = options.idleDurationMs;
   }
 
-  // The session under `key`, started if this window has not started it yet. A plan
-  // carrying a resume id is what takes a session across a window reload: the child is
-  // gone, but the transcript on disk is not, and both CLIs pick one up by id.
+  // Returns or starts the child under `key`. A resume id reconnects the session from its saved record after a window reload.
   async session(key: string, source: AgentPlanSource): Promise<AgentSession> {
     this.assertActive();
     const requestedRetirement = this.targetedRetirements.get(key);
@@ -2408,9 +2083,8 @@ export class AgentHost {
     return null;
   }
 
-  // Renames a session through its running child, or through a rename-only child when none
-  // runs. An opening, a retiring writer, or another rename of the same session settles
-  // first, so a rename-only child is never a second writer on the transcript.
+  // Renames through the running child or a rename-only child.
+  // Wait for opening, retirement, and earlier renames of the session before starting another writer.
   async renameSession(agent: AgentName, sessionId: string, title: string, idlePlan: () => AgentPlan): Promise<void> {
     const identity = this.sessionIdentity(agent, sessionId);
     for (;;) {
@@ -2464,10 +2138,7 @@ export class AgentHost {
     });
   }
 
-  // Holds the session's rename slot for one rename, live child or rename-only child alike.
-  // The wait above reads that slot, so a second rename of the same session starts only once
-  // this one settles. Two renames that ran together would both read the same transcript end
-  // and the session would keep whichever record the agent wrote last.
+  // Reserves the rename slot until the operation settles. Another rename waits instead of competing for the same transcript end.
   private async whileRenaming(identity: string, work: () => Promise<void>): Promise<void> {
     const renaming = work();
     const settled = renaming.then(
@@ -2800,8 +2471,7 @@ export class AgentHost {
     requested.resolve();
   }
 
-  // Every ask waiting on the reader, across sessions, so one command can offer all of
-  // them without the reader first having to work out which agent is blocked.
+  // Lists all asks waiting on the reader across this window's sessions.
   waiting(): { key: string; ask: Ask }[] {
     const out: { key: string; ask: Ask }[] = [];
     for (const session of this.sessions.values()) {
@@ -3063,9 +2733,8 @@ export class AgentHost {
   }
 }
 
-// Existing sessions have a stable key because reopening them must find the same child.
-// Fresh drafts instead carry their provisional id in the key, so two New actions can never
-// share a process before either one has an actual session id.
+// Existing sessions use stable host keys so reopening finds the same child.
+// Fresh-draft keys include their provisional id to keep simultaneous drafts on separate children.
 export function existingHostKey(agent: AgentName, session: string): string {
   return `${agent}:${session}`;
 }

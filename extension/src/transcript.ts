@@ -56,18 +56,11 @@ import { claudeConfigHome, codexHome } from './agentpaths';
 export { describeToolInput } from './activitydetail';
 export { shortenTo } from './domain/text.ts';
 
-// Reads Claude Code session transcripts (JSONL under ~/.claude/projects/<slug>/) and
-// groups them into turns. Read-only: nothing here writes to a transcript.
-//
-// Transcripts reach hundreds of megabytes, and this runs on the shared extension-host
-// event loop, so a whole-file read is never an option. Only a tail window is read, and
-// lines are prefiltered by substring before being handed to JSON.parse. A turn that
-// starts before the window is dropped, because its opening prompt is not in view.
+// Reads Claude JSONL transcripts without changing them and reduces records into shared turns.
+// Bounded tail reads prefilter lines before JSON parsing.
+// Turns whose opening prompts lie before the tail are excluded. Selected reads can recover the newest turn.
 
-// Which coding agent recorded a session. The panel draws one timeline out of two readers,
-// so every session and every turn says which one it came from: the card's badge reads it,
-// and so does anything that has to know what a source could not record. It sits here rather
-// than in a module of its own because `Turn` and `SessionFile` are what it annotates.
+// Source agent for a session or turn, used by badges and source-specific readers.
 export type AgentKind = 'claude' | 'codex';
 
 // One hunk of a Claude Code edit result, as the `diff` package's structuredPatch writes
@@ -92,14 +85,10 @@ export interface EditRecord {
   patchInvalid?: true;
 }
 
-// Why a row carries `countsUnknown`, kept beside the flag so the files figure can name the
-// real cause instead of a single guess. The card keeps it on a row that later settles to a
-// partial count, where it says why that count is a floor. `shell` is a Bash result that named the path in
-// `changedFiles` without its hunks. `write` is a Write over a path whose earlier lines the
-// call never sent. `replaceAll` is an Edit whose replacement ran on every match without
-// saying how many. `notebook` is a NotebookEdit that replaced or deleted a cell without its
-// old content. `zero` is an edit whose two sides left nothing a line count can see, such as a
-// change to a trailing newline alone.
+// Cause of unknown or partial file counts, retained for the files record.
+// `shell` names a path without hunks. `write` omits the previous file contents.
+// `replaceAll` omits the replacement count. `notebook` omits the replaced or deleted cell contents.
+// `zero` names an edit with no counted lines, such as a trailing-newline change.
 export type FileCountReason = 'shell' | 'write' | 'replaceAll' | 'notebook' | 'zero';
 
 export interface TurnFileChange {
@@ -107,19 +96,15 @@ export interface TurnFileChange {
   added: number;
   removed: number;
   isNew: boolean;
-  // The recorded patch text for each edit of this file, in the order the results arrived,
-  // so a turn's own diff can be shown without reading the file as it stands now. The
-  // memory this costs is bounded by the tail window that produced it, not by the
-  // transcript, which is the constraint that governs everything here. Ordinary and
-  // explicitly older reads remain bounded. The selected session can reach farther
-  // only when its newest turn starts before that window, and only that turn is admitted.
+  // Recorded edits in result order, used for per-turn diffs without reading the current file.
+  // Ordinary and older reads have bounded byte windows.
+  // Newest-turn recovery admits the selected turn beyond its ordinary window.
   edits: EditRecord[];
   // Set when a Bash result named this path in `changedFiles` without carrying its hunks.
   // The CLI caps the shell diff at five detailed files, so a wider change still names
   // every path it touched, and this flag keeps that row from claiming a zero-line change.
   countsUnknown?: true;
-  // Why `countsUnknown` is set. Absent where a caller built the row without recording a cause,
-  // which the files figure reads as a plain fact with no cause to name.
+  // Cause of unknown counts. Absent when the source or caller supplied none.
   unknownReason?: FileCountReason;
 }
 
@@ -137,8 +122,7 @@ export interface TurnAgent {
   // The parent tool call id, kept as non-enumerable metadata so activity steps can pair
   // with the agent row without changing the serialized card shape.
   toolUseId?: string;
-  // The stable child session identity used by the existing session navigation protocol.
-  // It exists only after provider evidence resolves this launch to a readable child.
+  // Child session identity, available after provider evidence resolves a readable child.
   childSessionId?: string;
   description: string;
   agentType: string | null;
@@ -161,11 +145,9 @@ export interface TurnAgent {
   durationMs: number | null;
   tokens: number | null;
   toolUses: number | null;
-  // Set whenever `toolUses` came from the child's own tool calls rather than from a result or
-  // a task notification. It marks a figure that a later, better read is free to replace, and
-  // it is cleared the moment a genuine count arrives so that count is never replaced again. It
-  // stays enumerable for the same reason `closedAt` does: the retained turns cross structured
-  // clone to the worker and back between reads, and the worker copies each agent row by spread.
+  // True when the tool count came from child artifacts instead of a result or notification.
+  // A recorded count replaces this estimate and clears the flag.
+  // The flag stays enumerable across worker structured clones and agent-row spreads.
   toolUsesFromArtifacts?: boolean;
   status: string;
   // The parent record time that closed this child. It stays enumerable because the host
@@ -173,20 +155,11 @@ export interface TurnAgent {
   closedAt?: number;
 }
 
-// Where one call's commits landed, as far as the command that made them can say.
-//
-// Five answers, and one field rather than two, because a directory beside a foreign flag
-// carries a combination that cannot exist. `named` is another repository, which the row draws
-// by name. `worktree` is a linked worktree of this one, which shares its object store and its
-// branch refs, so a commit made there is this project's own work on a branch the reader will
-// merge. `maintree` is that same relation from the other side, for a reader whose open folder
-// is itself a worktree. `unnamed` is a call that committed outside
-// the open folders in more than one repository, so no directory can be given for any of its
-// commits. `null` claims nothing at all.
-//
-// A path test cannot tell these apart, because all of them sit outside every open folder.
-// Only the repository can, and only `gitcommits.ts` asks it. A commit read out of git output
-// therefore starts as `named` and is corrected once that answer arrives.
+// Commit location relative to the open folders.
+// `named` identifies another repository. `worktree` identifies a linked checkout of an open repository.
+// `maintree` identifies the main checkout when the open folder is its worktree.
+// `unnamed` identifies multiple external repositories without a unique directory. `null` supplies no extra location label for in-project locations or unresolved evidence.
+// Printed commits start `named` for one resolved external target, `unnamed` for multiple known external targets, or null otherwise. `gitcommits.ts` resolves common Git directory identity and corrects the location.
 export type CommitPlace =
   | { kind: 'named'; dir: string }
   | { kind: 'worktree'; dir: string }
@@ -194,9 +167,7 @@ export type CommitPlace =
   | { kind: 'unnamed' }
   | null;
 
-// The ref Git printed when it made the commit. A detached checkout is distinct from a
-// named branch because an isolated replay often creates a short-lived commit before its
-// final branch commit is made.
+// Ref printed by Git, distinguishing a named branch from a detached checkout.
 export type CommitHead = { kind: 'branch'; name: string } | { kind: 'detached' } | null;
 
 export interface TurnCommit {
@@ -231,22 +202,11 @@ export interface CommitRepository {
 // the same way.
 export { HEX_SHA, sameCommitSha };
 
-// A call that ran `git commit` and printed no commit line to take. `-q` and `--quiet` do
-// that, and they are the common reason a commit never reaches a card.
-//
-// The transcript keeps what it knows: the one repository the command named, how many times
-// the command said `git commit`, and the window the call ran in. `gitcommits.ts` asks the
-// repository for the rest.
-//
-// The window is the attribution, so it is kept as tight as the records allow. `from` is the
-// later of the record that issued the call and the previous result, so two calls issued by
-// different records cannot share a window.
-//
-// Two calls issued by one record keep that record's own time instead. They are stamped alike
-// and can run at the same time, so an earlier result does not prove the later call had not
-// started. Narrowing them would put a call's own commit outside its own window and leave the
-// room for somebody else's. Their windows overlap instead, and the count rule refuses what
-// the overlap holds.
+// A commit command whose result printed no commit identity, including quiet commits.
+// The command supplies its repository, expected commit count, and execution window. `gitcommits.ts` recovers matching identities.
+// `from` uses the later call-record or previous-result time when records distinguish their starts.
+// Calls issued by one record share its timestamp because they can run concurrently.
+// Their windows overlap. Repository recovery rejects a window whose candidate count differs from `expected`.
 export interface CommitIntent {
   dir: string; // the one repository the command named
   from: number;
@@ -255,19 +215,14 @@ export interface CommitIntent {
   witnessedSha?: string; // the abbreviated sha printed by a trailing success log
 }
 
-// A branch the turn moved a tree onto, without making a commit of its own.
-//
-// `git merge --ff-only` is the shape that produces one. The turn did not write the commit, so
-// it is not a commit of the turn's, but it is what the turn did to the repository and the card
-// showed nothing for it before. `from` is the name the merge command named.
-//
-// A landing changes no files, so it carries no counts.
+// A fast-forward landing performed by the turn, separate from commits the turn wrote.
+// `from` names the merge target. A landing carries no edit counts.
 export interface TurnLanding {
   id: string; // the merge invocation and reflog event that produced this landing
   sha: string;
   subject: string; // the subject of the commit the tree landed on
   from: string; // the branch or ref the merge command named
-  head?: CommitHead; // the branch that moved, where the directory could be asked
+  head?: CommitHead; // Branch that moved, when the repository resolves it.
   at: number; // git's own committer time for the commit the tree landed on
   place: CommitPlace;
   dir: string | null; // repository directory, for opening the commit in the editor
@@ -296,8 +251,7 @@ export interface ToolFailure {
   message: string;
 }
 
-// Everything the turn was billed for. Kept as raw counts so the price table stays in one
-// place, and split by cache tier because the four tiers are priced very differently.
+// Request input band used by models with different short-context and long-context prices.
 export type UsageContextBand = 'short' | 'long';
 
 export interface UsageCounts {
@@ -393,9 +347,7 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
   });
 }
 
-// The cache lifetimes a provider sells, spelled the way the records spell them. Named here
-// rather than in the price table, because a record either states one or does not, and what it
-// costs is a later question.
+// Recorded prompt-cache lifetime spellings. Pricing resolves their rates separately.
 export const CACHE_LIFETIMES = ['5m', '30m', '1h'] as const;
 export type CacheLifetime = (typeof CACHE_LIFETIMES)[number];
 
@@ -408,16 +360,13 @@ export interface ContextRequest {
   // When that request was recorded. The turn's own end moves with a tool result, an
   // interruption and a background notification, so it dates the turn and not this request.
   at: number;
-  // The lifetime that request bought, or null where it recorded none. A price fallback is not
-  // a recorded lifetime: `claudeUsage` charges an unsplit write at the hour because that is
-  // what this harness asks for, and nothing may report that choice back as evidence.
+  // Cache-write lifetime recorded by this request or the latest prior request, or null when neither recorded one.
+  // `claudeUsage` prices an unsplit write as an hour write. That fallback establishes no recorded lifetime.
   lifetime: CacheLifetime | null;
-  // What that request was billed under, so a later quote is taken at the rate it actually ran
-  // at rather than at the standard public one.
+  // Recorded pricing class used for subsequent request quotes.
   inferenceClass: UsageInferenceClass;
   serviceTier: string | null;
-  // Whether that request read anything back. A cache written and not yet read is warm and
-  // reports nothing read, which is what the first request of a session looks like.
+  // True when the request reported cached input reads. A cache write alone leaves this false.
   readBack: boolean;
   // The answer this request produced. Its input figure stops before that answer, while the
   // next request and a compaction both have to read it back as part of the session.
@@ -465,11 +414,8 @@ export interface UsageEvent {
   compactionEstimate?: true;
 }
 
-// One compaction a usage reducer recorded, in the order its source holds them.
-//
-// The ordinal is carried rather than implied by position. A compaction whose record has no
-// usable clock still counts, so pairing a bounded list of times against a total by position
-// would date the wrong compaction.
+// Compaction fact in source order, with an explicit ordinal independent of its timestamp.
+// A record without a usable clock still counts, so positions cannot pair bounded timestamps with the total.
 export interface ReducerCompaction {
   ordinal: number;
   // When the record says the compaction happened, or null where it names no usable time.
@@ -487,8 +433,7 @@ export interface ReducerCompaction {
   requestContextWindow: number | null;
 }
 
-// What the turn spent its tool calls on. Reading the mix is the quickest way to tell a
-// research turn from an editing one without opening the session.
+// Tool-call totals grouped by category.
 export interface ToolCounts {
   edits: number; // Edit, Write, MultiEdit, NotebookEdit
   reads: number; // Read, NotebookRead
@@ -530,9 +475,7 @@ export function responseAnswerIndex(turn: Pick<Turn, 'answers' | 'summary'>): nu
   return -1;
 }
 
-// One thing the reader typed after the prompt that started the turn, and when. The same two
-// fields as `TurnAnswer` and a name of its own on purpose: a card that mixed the two would
-// draw the agent's words under the reader's heading.
+// Reader submission after the opening prompt, with its call position and timestamp.
 export interface TurnAsk {
   text: string;
   stepsBefore: number;
@@ -558,21 +501,13 @@ export interface TurnUpdate {
   status: TurnStepStatus;
 }
 
-// How many of them one turn carries. A reader can type as often as they like while an agent
-// works, and the card draws every one of these at full length, so the list is bounded the way
-// the step list is. Over this workspace's own transcripts the most any turn took was four.
+// Maximum later prompts retained on one turn.
 export const TURN_ASK_LIMIT = 12;
 
-// One thing a turn did, in the order it did it.
-//
-// A turn already reports how many tools it ran and in what mix. That is a tally, and a
-// reader watching a turn run wants the order: what it is doing now, and what it did to get
-// there. A skill needs no separate reading, because a skill load is an ordinary tool call
-// carrying the skill's name in its input.
+// Tool call in recorded order, separate from aggregate tool totals.
 export interface TurnStep {
   ordinal: number;
-  // The tool as the agent named it, drawn as the agent named it. The panel writes no
-  // vocabulary of its own here: a tool the panel has never heard of still reads correctly.
+  // Tool name as recorded by the source. Unknown names retain their spelling.
   name: string;
   // The source call id, when the transcript provides one. Launch rows use it to pick up
   // the outcome recorded later for the same subagent.
@@ -588,8 +523,7 @@ export interface TurnStep {
   // never rides in the card payload or its JSON comparison string.
   fullDetail?: string;
   at: number;
-  // Whether the call came back, and how. A step still running is the one the agent is on,
-  // which is what a reader watching a live turn is looking for.
+  // Call outcome. Calls start running and settle when results or later activity establish an outcome.
   status: TurnStepStatus;
 }
 
@@ -619,55 +553,31 @@ export interface TurnSkillUse {
   evidence: SkillEvidence;
 }
 
-// How many skill uses one turn carries. Distinct skills per turn are few, so this bound is
-// never reached in practice. It exists so one long turn cannot grow the payload without end.
+// Maximum skill-use records retained on one turn, independent of the total use count.
 export const TURN_SKILL_USE_LIMIT = 60;
 
-// What a skill load counts as in `Turn.stepKinds`. `stepKinds` is read by ordinal against
-// the step list, so a skill load has to occupy its slot, and every count built from those
-// kinds has to leave this one out: a skill is not a tool the agent ran, and bucketing it
-// with the unrecognized tools names a skill load an unknown call.
+// Skill-load category retained in `stepKinds` at its call ordinal.
+// Tool-category totals exclude this category.
 export const SKILL_STEP_KIND = 'skill';
 
-// How many steps of one turn are carried.
-//
-// Measured over this workspace's own transcripts, 98 turns: the median turn runs 11 tools,
-// the ninetieth centile runs 108 and the longest ran 211. So the common turn is carried
-// whole and the long one is not, and carrying every step of every turn would put a fifth of
-// a megabyte of tool calls into a payload that is 64 KB today.
-//
-// The newest are kept, because the end of the list is where a running turn is and where a
-// finished one was left. `Turn.stepCount` is the true total, so the panel can say what it
-// is not showing rather than quietly showing less.
+// Maximum retained tool steps per turn. The newest calls remain visible.
+// `Turn.stepCount` retains the full total for truncated Activity runs.
 export const TURN_STEP_LIMIT = 60;
 
 // Pairing state is wider than the visible card so late results for long turns still update
 // hidden recent calls without allowing one unresolved turn to grow a checkpoint indefinitely.
 const CLAUDE_TOOL_ASSOCIATION_LIMIT_PER_TURN = TURN_STEP_LIMIT * 4;
 
-// How much of a step's detail is carried.
-//
-// The card draws one line and clips it, and a wide panel fits about this many characters,
-// so the rest is bytes nobody reads. Measured against this workspace's own transcripts:
-// uncut, the shell commands alone took the payload for four turns from 64 KB to 211 KB,
-// because a heredoc written into a command is the whole of a script.
+// Maximum characters in a one-line tool-detail preview. Full details remain available separately.
 export const STEP_DETAIL_LIMIT = 120;
 
-// The step detail's own cut, spelled here because a step is not a note and the panel's
-// other cuts belong to modules this one sits under.
+// Suffix used when a tool-detail preview is shortened.
 export const STEP_CUT = '...';
 
-// How much of a narration block is drawn.
-//
-// Prose is not a command. A narration row wraps, so this bounds the payload rather than a
-// line. The 120 characters a one-line step row holds cut almost every Codex block and a
-// quarter of Claude's. Measured on this workspace: at 600 the cut reaches 0.5% of Claude
-// blocks and 0.4% of Codex ones, and no recorded Codex block passes 954.
+// Maximum characters in a wrapped narration preview.
 export const NARRATION_DETAIL_LIMIT = 600;
 
-// The same thing, cut to what a step row can hold. Whitespace goes first: a command written
-// as a heredoc arrives with a whole script inside it, and a line of that is mostly the gaps
-// between its lines.
+// Tool-input preview with collapsed whitespace and the step-detail character bound.
 export function stepDetail(input: Record<string, unknown>): string {
   return shortenTo(describeToolInput(input).replace(/\s+/g, ' ').trim(), STEP_DETAIL_LIMIT, STEP_CUT);
 }
@@ -712,19 +622,13 @@ export interface Turn {
   processEndedAt?: number; // epoch ms when the Claude process invocation ended
   prompt: string; // what the user typed, with IDE and command wrappers stripped
   delegation?: TurnDelegation;
-  // The prompts that text was built from, oldest first, each with the time it was typed. A
-  // prompt that got no response of its own is carried into the next turn and joined to its
-  // prompt, so `prompt` is one string holding two of them. Anything offering the reader
-  // their prompts back has to hand them one at a time, or a press of Up puts two in the box
-  // and Enter sends both. The times are what put them in order against `laterPrompts`, which
-  // a carried turn contributes to and which are older than the prompt that carried it.
+  // Original prompt submissions in time order, retained separately when unanswered prompts join a successor turn.
+  // Prompt recall returns one submission at a time. Timestamps order these submissions against `laterPrompts`.
   promptParts?: readonly TurnAsk[];
   summary: string; // final assistant text of the turn, as markdown
-  // Every answer the turn closed, oldest first. On a finished turn the newest entry without
-  // `notResponse` is the summary; on one still running, the summary can be a newer text no
-  // response has closed yet. The marks, the closing rows and the waiting signal keep reading the
-  // summary alone: the format's rule is that the last answer stands alone and repeats
-  // what is still open, so a union would mark resolved asks as open.
+  // Completed answers in source order. The newest eligible answer supplies the summary after completion.
+  // While running, the summary can contain newer text without a completed answer.
+  // Marks and waiting state read the summary alone, excluding resolved requests in earlier answers.
   answers: TurnAnswer[];
   model: string | null; // the model that ran the turn, from its last real reply
   // The newest `model` attachment before that reply, kept only when it names the same model.
@@ -745,13 +649,9 @@ export interface Turn {
   usage: TurnUsage;
   usageParts?: TurnUsagePart[];
   contextTokens: number; // input plus cache of the turn's last real assistant message
-  // The request that established the figure above. A turn sums every request it made and ends
-  // on whichever record came last, so neither its usage nor its clock answers for that one
-  // request, and anything forward-looking needs exactly that one.
+  // Request that established `contextTokens`, separate from aggregate usage and the turn end time.
   contextRequest?: ContextRequest;
-  // The window the turn actually ran against, where the source recorded one, and null
-  // where it did not. It is the better of two answers: a published figure is what a model
-  // is advertised with, while this is what the session was given, and the two differ.
+  // Recorded runtime context window, or null when absent. It can differ from the published model window.
   contextWindow: number | null;
   toolUses: number;
   toolCounts: ToolCounts;
@@ -785,12 +685,8 @@ export interface Turn {
   error: string | null; // text of an API error that ended the turn, if any
 }
 
-// Records one skill load on the turn that loaded it, for either reader.
-//
-// The source id and the name are the identity. A reader that reads one record twice, which
-// the byte window makes ordinary, must not report the same load as two: the later copy
-// replaces the earlier one and the count stands still. A second load of the same skill under
-// a different call id is a second use, because the turn really did load it twice.
+// Records a skill load by source ID and name. Repeated reads replace its earlier copy without increasing the total.
+// A different source ID records another use of the same skill.
 export function addTurnSkillUse(turn: Pick<Turn, 'skillUses' | 'skillUseCount'>, use: TurnSkillUse): void {
   const held = turn.skillUses.findIndex((earlier) => earlier.sourceId === use.sourceId && earlier.name === use.name);
   if (held >= 0) {
@@ -799,8 +695,7 @@ export function addTurnSkillUse(turn: Pick<Turn, 'skillUses' | 'skillUseCount'>,
   }
   turn.skillUses.push(use);
   turn.skillUseCount++;
-  // The newest are kept, the way the step window keeps them: a turn past this bound is one
-  // whose recent loads are what a reader is still reading about.
+  // Retain the newest skill loads while the total stays uncapped.
   if (turn.skillUses.length > TURN_SKILL_USE_LIMIT) {
     turn.skillUses.shift();
   }
@@ -819,15 +714,13 @@ export interface SessionFile {
   sessionId: string;
   mtimeMs: number;
   size: number;
-  // The file system's own number for the file, from the stat that listed it. An append keeps
-  // it and a new file at the same path takes another, so a name held for one transcript is
-  // never kept for the next one. A host that answers no number leaves it out.
+  // Filesystem inode from the listing stat, when available.
+  // Cache identity compares it to detect another file at the same path.
   ino?: number;
   // Where the session ran, when its opening record says. Continuation uses this instead
   // of moving a session into whichever worktree the current editor window opened.
   cwd?: string;
-  // Whether this file is a headless run that belongs outside the reader's day buckets.
-  // Claude decides this from its transcript; Codex records it in the opening metadata.
+  // Headless-run classification. Claude derives it from records. Codex supplies opening metadata.
   agentRun?: boolean;
   // Claude marks every record in a native child transcript as sidechain content.
   childTranscript?: boolean;
@@ -897,24 +790,9 @@ export function sameSessionRevision(
   return cached.mtimeMs === current.mtimeMs && cached.size === current.size;
 }
 
-// The catalog the last walk produced, brought up to date for one session alone.
-//
-// Selecting a session cannot add a transcript, remove one, or grow one, so a refresh a
-// selection drove has no reason to read the filesystem for the whole workspace again. That
-// walk is measured at 20.8 ms median and 32.4 ms p95 over a workspace of about 1,300
-// sessions, which is more than a click can be asked to pay for an answer it holds.
-//
-// What a selection does need is the current revision of the one session it is about to
-// read. The tail read is bounded by the recorded size, so a stale size hides the newest turn
-// of the very session the reader just asked for. One stat answers that.
-//
-// Answers null when there is nothing shown, when the shown session is not in the held
-// list, or when its file has gone. The caller walks in each of those cases: a selection
-// landing on something the held catalog cannot account for is the case a held catalog must
-// not be trusted for.
-//
-// The order is the caller's. Growing a session moves the activity it is ranked by, and
-// only the caller can read that.
+// Updates one selected session revision in a held catalog without changing its order.
+// The selected tail needs its current size to include new records.
+// Returns null for a missing selection, catalog row, or file.
 export function revalidatedCatalog(
   sessions: readonly SessionFile[],
   showing: string | null,
@@ -969,12 +847,9 @@ export function revalidatedCatalogPaths(
   return out;
 }
 
-// Which listed revisions the Project cost offer may trust in place of stating each file itself.
-//
-// A walk read every one of them a moment ago, so a walk's list stands whole. A reused catalog
-// read one file. Handing the offer the rest would let it compare a transcript that has grown
-// against the size the last walk saw, answer that nothing changed, and leave that source out
-// of the index until a later walking pass offered it again.
+// Listed revisions available to Project cost without another stat.
+// A complete walk supplies every row. A reused catalog supplies the selected row alone.
+// Other rows need their own current revisions before unchanged-source checks.
 export function trustedListedRevisions(
   sessions: readonly SessionFile[],
   walked: boolean,
@@ -984,10 +859,7 @@ export function trustedListedRevisions(
   return new Map(trusted.map((session) => [session.file, { mtimeMs: session.mtimeMs, size: session.size }]));
 }
 
-// A point where the session was replaced by a summary of itself, either because it
-// ran out of context or because the user asked for it. Everything before it left the
-// agent's memory, so it is the one boundary in a session that changes what the agent
-// knows, and it belongs on the timeline beside the turns.
+// Context replacement boundary shown between turns. Retained summary content remains available when recorded.
 export interface Compaction {
   sessionId: string;
   at: number; // epoch ms
@@ -999,8 +871,7 @@ export interface Compaction {
   trigger: string; // 'manual' when asked for, 'auto' when the context ran out
   model: string | null; // the model that ran, for pricing the summarising call
   summary: string; // the summary that carried over, as markdown
-  // Recent Codex records preserve the request-level usage for the compaction itself. This is
-  // optional because Claude metadata and older Codex records do not contain an equivalent.
+  // Compaction request usage when recorded. Claude records none.
   usage?: TurnUsage;
   provider?: string | null;
   contextWindow?: number | null;
@@ -1016,8 +887,7 @@ export interface Compaction {
   firstRequestCacheRead?: number;
 }
 
-// What Claude Code records about a compaction it has just run, on a `system` line beside
-// the summary itself.
+// Compaction metadata from a Claude system record.
 interface CompactMetadata {
   trigger?: string;
   preTokens?: number;
@@ -1034,17 +904,12 @@ export interface SessionRead {
   readBytes: number;
   // True when the parser discarded at least one older turn at maxTurns.
   turnLimitReached: boolean;
-  // Present only when a selected tail ended inside its newest turn. The provider hands
-  // this opaque byte cursor back to the source adapter; it does not inspect transcript
-  // records itself.
+  // Byte cursor for selected-tail recovery when the newest turn starts before the tail.
   newestTurnCursor?: BackwardLineCursor;
   newestTurnState?: unknown;
 }
 
-// The transcript facts needed by the rail's cost and context figures. Kept smaller than a
-// Turn because this value is persisted for every listed session. New rail metrics add
-// their source facts here rather than caching a formatted chip or forcing the session
-// through the full parse budget.
+// Persisted source facts for session-list cost and context projections, without formatted figures.
 export interface SessionStatTurnFacts {
   startedAt: number;
   endedAt: number;
@@ -1060,8 +925,7 @@ export interface SessionStatTurnFacts {
   usageParts?: TurnUsagePart[];
   contextTokens: number;
   contextWindow: number | null;
-  // The request behind that level lets a rail row state whether its prompt cache is still
-  // warm without reading the session outside the parse cut.
+  // Request behind the context level, used for session-list cache estimates.
   contextRequest?: ContextRequest | null;
   // The metadata pass deliberately does not read child transcripts. Their presence makes
   // the parent-only cost a floor until the ordinary parser supplies the complete figure.
@@ -1145,11 +1009,8 @@ export function sessionOutcomeOf(read: SessionRead): TurnOutcome | null {
       newest = turn;
     }
   }
-  // A background row stays open across typed prompts until its notice lands, so every turn in
-  // the read counts, in launch order. A background row takes its id from its launch result,
-  // and a foreground row from its final result, so an open row with an id is a background
-  // child.
-  // A recorded process end ends every child launched before it, so the list starts again.
+  // Track background children across loaded turns in launch order until their results or completion notices close them.
+  // A recorded process end clears the tracked children.
   for (const turn of [...read.turns].sort((a, b) => a.startedAt - b.startedAt)) {
     for (const agent of turn.agents) {
       if (!agent.id) {
@@ -1198,8 +1059,7 @@ function projectDirectoryMatches(name: string, slug: string): boolean {
   return name === slug || name.startsWith(slug.endsWith('-') ? slug : `${slug}-`);
 }
 
-// The cwd a session ran in, read from the head of its transcript. Every line carries it,
-// so only the first few need looking at.
+// Recorded working directory from the first 64 KiB of the transcript.
 export function readSessionCwd(file: string): string | null {
   return scanSessionCwd(file);
 }
@@ -1237,17 +1097,8 @@ function scanSessionCwd(file: string, onUnreadable?: () => void): string | null 
   return null;
 }
 
-// Whether a run of complete transcript lines holds a prompt a human typed.
-//
-// A cross-session coordination message wakes a session whose activity becomes a session
-// file with no human prompt in it, and such a file drew as a "Session <hash>" card with
-// no title and no drawable turn. A human prompt is a typed prompt whose origin, where
-// one is recorded, is not a machine's: the peer message itself arrives as a meta user
-// line, which `isTypedPrompt` already refuses, and the origin check is the belt on top
-// for a peer prompt written without the flag. Only the known machine kind is refused,
-// and a prompt with no origin at all counts as human, because transcripts from before
-// the field existed have none: the rule fails open the way the Codex internal-thread
-// rule does, so a kind added later cannot silently hide a user's sessions.
+// True when complete lines contain a typed prompt without a known peer origin.
+// Meta user records do not count. Missing and unknown origin kinds remain eligible.
 export function holdsHumanPrompt(text: string): boolean {
   for (const line of text.split('\n')) {
     if (humanPromptIn(line, true)) {
@@ -1257,14 +1108,8 @@ export function holdsHumanPrompt(text: string): boolean {
   return false;
 }
 
-// The rule above, for one line, answering with the record so a caller can read its time.
-//
-// Two callers ask nearly the same question of a line and one clause separates them, so it is
-// a parameter rather than a second spelling. Listing refuses a peer prompt, because a session
-// woken by another session and never prompted by a human is not a session. Counting what
-// is new must not, because `readSession` opens a turn on a peer prompt and draws a card for
-// it: a glance that refused one would count fewer turns than the panel then shows, and would
-// word an exact answer as a floor because the turn the reader had read was invisible to it.
+// Returns a typed prompt record so callers can read its timestamp.
+// Listing excludes known peer origins. Turn counting includes them to match the turns drawn by `readSession`.
 function humanPromptIn(line: string, refusePeer: boolean): Record<string, unknown> | null {
   if (line.indexOf('"type":"user"') < 0) {
     return null;
@@ -1287,18 +1132,7 @@ function humanPromptIn(line: string, refusePeer: boolean): Record<string, unknow
   return o;
 }
 
-// How much of a transcript's end is read to find out what has happened in it lately.
-//
-// A turn begins at a typed human prompt, so counting what is new in a session needs
-// only those, which is far cheaper than parsing it. Measured over the sessions a rail
-// actually lists, a 1 MB window finds a turn in 93.9% of this workspace's 49 and 99.2% of
-// the largest project's 130, against 85.7% and 96.2% at 256 KB, and costs 0.44 ms per file
-// against 0.37 ms. The wider window is worth its cost: a session the window misses
-// says nothing at all, which is the answer the reader complained about.
-//
-// Do not read this figure as coverage over every transcript on a machine. Over a sample of
-// all 1,670 here, most of them old and abandoned, a 1 MB window finds a turn in 28.7%. Those
-// files are not on a rail, and the population that matters is the one the rail lists.
+// Initial tail size for turn-start discovery.
 export const TURN_START_BYTES = 1024 * 1024;
 
 // The farthest a default turn-start glance reads when its first window finds no start.
@@ -1306,23 +1140,14 @@ export const TURN_START_BYTES = 1024 * 1024;
 // window scales the ceiling by the same ratio so small fixtures exercise the complete rule.
 export const TURN_START_MAX_BYTES = 16 * 1024 * 1024;
 
-// When each turn in the window began, and whether the window reached the start of the file.
-//
-// The second half is not decoration. A count taken from a window and presented as a total is
-// wrong in the direction that looks right, so the caller is told what it is holding and words
-// it as a floor where it has to.
+// Turn-start timestamps and whether the read reached byte zero. Partial counts remain lower bounds.
 export interface TurnStarts {
   starts: number[];
   whole: boolean;
 }
 
-// Reads a widening tail through one file handle until the source finds a turn start.
-//
-// Growing does not by itself make the answer partial. Where the window stopped decides that. A
-// read that reached byte zero holds every start the file has, however many times it grew to get
-// there. A read that stopped short leaves older starts unseen. The rail words a partial count
-// as a floor, so calling a complete count partial would say `at least 1 new` about a
-// session whose every turn was counted.
+// Widens one tail read until it finds a turn start or reaches the ceiling.
+// Only reaching byte zero makes the returned count complete.
 export function readTurnStartsFromTail(
   file: string,
   startsIn: (lines: string[]) => number[],
@@ -1354,11 +1179,8 @@ export function readTurnStartsFromTail(
       body = Buffer.concat([chunk, body]);
       start = nextStart;
 
-      // The first line is offered to the scanner rather than dropped. A read that began part
-      // way through a line hands over a fragment, and both scanners parse a line as JSON before
-      // they believe it, so a fragment finds nothing. Dropping it instead would throw away a
-      // complete record that begins on the byte the read began on, and at the ceiling that is
-      // the last chance the session has to report a turn at all.
+      // Include the first line so a record starting exactly at the window boundary remains eligible.
+      // The scanners reject partial JSON records.
       const lines = body.toString('utf8').split('\n');
       const starts = startsIn(lines);
       if (starts.length) {
@@ -1386,10 +1208,7 @@ export function readTurnStartsFromTail(
   }
 }
 
-// The turn starts in the tail of one session transcript, oldest first.
-//
-// A file that cannot be read answers with nothing found and a window that did not reach the
-// start, which is the silence an unread session gets rather than a claim of zero.
+// Turn starts in oldest-first order. Read failures return an empty, incomplete result.
 export function readSessionTurnStarts(file: string, bytes = TURN_START_BYTES, childTranscript = false): TurnStarts {
   return readTurnStartsFromTail(file, (lines) => sessionTurnStartsIn(lines, childTranscript), bytes);
 }
@@ -1397,8 +1216,7 @@ export function readSessionTurnStarts(file: string, bytes = TURN_START_BYTES, ch
 function sessionTurnStartsIn(lines: string[], childTranscript = false): number[] {
   const starts: number[] = [];
   for (const line of lines) {
-    // Not refusing a peer prompt, because `readSession` does not: this counts the turns the
-    // panel would draw, and the peer-wake cut is the listing's question, not this one.
+    // Include peer prompts to count the same turns as `readSession`.
     if (line.indexOf('"type":"user"') < 0) {
       continue;
     }
@@ -1417,8 +1235,7 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
     if (!o) {
       continue;
     }
-    // Not through `stamp`, which answers 0 for a time it cannot read: a 0 is a real epoch
-    // time and would sort as the oldest turn the session ever had.
+    // Skip unreadable timestamps. `stamp` returns zero, which is a valid epoch time.
     const at = Date.parse(String(o.timestamp));
     if (Number.isNaN(at)) {
       continue;
@@ -1428,21 +1245,15 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
   return starts;
 }
 
-// The scan's cursor over one session file: how many bytes hold only complete lines
-// already looked at, and whether a human prompt has been seen. Found is sticky, because
-// a prompt does not unhappen, and the cursor is what makes the scan incremental: each
-// byte of a file that holds no human prompt is read once ever, and a wake file joins the
-// list the moment a human prompts it, because the prompt lands in the unread bytes.
+// Complete-line byte cursor and whether a human prompt has been found.
+// A found prompt remains found. Unread bytes are scanned on subsequent appends.
 export interface HumanPromptScan {
   bytes: number;
   found: boolean;
 }
 
-// Reads only what the previous scan has not, stopping at the first human prompt. Lines
-// are split at the byte level and decoded one at a time, because a chunk boundary can
-// fall inside a multi-byte character; an unterminated final line is left for the next
-// scan, when it will be complete. A file that shrank was rewritten, so it is read from
-// the start again.
+// Resumes from the complete-line cursor until the first human prompt.
+// Preserve UTF-8 bytes across chunks and incomplete trailing lines. Shrinkage restarts scanning.
 export function scanForHumanPrompt(file: string, size: number, prev?: HumanPromptScan): HumanPromptScan {
   if (prev?.found) {
     return prev;
@@ -1453,15 +1264,11 @@ export function scanForHumanPrompt(file: string, size: number, prev?: HumanPromp
   return { bytes, found };
 }
 
-// Hands the complete lines between `from` and `size` to `visit`, one chunk of lines at a
-// time, and answers with the byte after the last complete line handed over. A visitor that
-// answers true stops the read. The bytes after the last newline in a chunk are copied,
-// because the next read overwrites the buffer they sit in. Lines split at byte 0x0A, which
-// never appears inside a UTF-8 sequence, so a multi-byte character split across two chunks
-// always reaches `visit` whole. An unterminated final line waits for the next read, when it
-// will be complete. `rest` holds that line when the read reached `size`, and is empty when
-// the file ends at a newline. It is null when the read stopped short: a visitor stopped it,
-// or the file could not be read to the end.
+// Visits complete lines between `from` and `size`, returning the exclusive complete-line byte cursor.
+// Split UTF-8 bytes at newlines and preserve trailing fragments across buffer reuse.
+// A true visitor result stops the read.
+// `rest` contains the final fragment, or an empty buffer after a newline, only when the read reaches `size`.
+// Stopped or unreadable scans return null `rest`.
 export function readCompleteLines(
   file: string,
   from: number,
@@ -1501,7 +1308,7 @@ export function readCompleteLines(
       return { bytes, rest: carry ?? Buffer.alloc(0) };
     }
   } catch {
-    /* unreadable; answered from what was read */
+    /* unreadable. Return collected lines. */
   } finally {
     if (fd >= 0) {
       try {
@@ -1514,14 +1321,7 @@ export function readCompleteLines(
   return { bytes, rest: null };
 }
 
-// What to call a session in a list of them, without parsing it.
-//
-// A name the owner gave the session, in Arc or with `/rename` or `--name`, comes first,
-// then the title Claude Code generates, then the first thing the user typed. The CLI writes
-// the `custom-title` and `ai-title` records again every few turns with the same value, so the
-// newest of each sits near the end and a small tail finds it. The first prompt comes from
-// the head of the file, which never changes, so a session without a recorded title keeps
-// one name however far the file grows.
+// Source of a recorded session title. Custom names rank above generated names.
 export type RecordedTitleSource = 'custom' | 'generated';
 
 export interface RecordedTitlePair {
@@ -1537,10 +1337,8 @@ export function readSessionRecordedTitlePair(file: string, bytes = 256 * 1024): 
   return recordedTitlePairIn(read.lines, read.offset);
 }
 
-// The name a `custom-title` record gives, or null when it clears the custom name. An empty or
-// blank value clears it for this read, which then falls back to the generated title or the
-// first prompt. A panel that already holds a custom name for the session goes on drawing it,
-// because a held name never moves down the ranking in `sessionnames.ts`.
+// Normalized custom title, or null for a missing or blank value.
+// Held session names follow the ranking in `sessionnames.ts` separately.
 export function customTitleOf(o: { customTitle?: unknown }): string | null {
   return typeof o.customTitle === 'string' ? normalizeSessionTitle(o.customTitle) : null;
 }
@@ -1634,13 +1432,10 @@ function recordedTitlePairIn(lines: string[], offset?: number): RecordedTitlePai
   return generated?.short ? generated : { short: null, full: null, source: null };
 }
 
-// How much of a transcript's head the first typed prompt is looked for in. Over 1,129 local
-// transcripts, the first typed prompt ends inside 128 KB in 99 percent of them. A session
-// whose first prompt ends past the window has no prompt name.
+// Head window for fallback names from the first typed prompt. A prompt beyond it supplies no name.
 export const SESSION_HEAD_BYTES = 128 * 1024;
 
-// How much of a transcript's head names the file when a title already names the session.
-// The first record of a Claude transcript fits inside it.
+// Head window used for the file fingerprint when a recorded title already names the session.
 export const HEAD_KEY_BYTES = 4096;
 
 // A short fingerprint of a file's first record. An append-only transcript keeps it for life,
@@ -1733,31 +1528,10 @@ function sessionTitleOf(
   };
 }
 
-// When a session was last active, as the session itself recorded it, or null when nothing
-// in the tail window carries a time.
-//
-// Not the file's mtime. An agent appends bookkeeping to a transcript that is not the
-// session moving: a title, a mode, a snapshot of file history, the records written as
-// a session is closed. Taking the mtime therefore sent a session nobody had touched
-// back to the top of the list reading `just now`. Across the transcripts on
-// this machine, 392 files' mtimes stood more than a minute past their newest recorded
-// time, 147 more than a day, and the worst by 56 days.
-//
-// The rule is deliberately not a list of record types. New types arrive with each release,
-// so the answer is the newest time any record in the window actually carries: a type added
-// later either carries one and counts, or does not and is ignored, and there is no table to
-// keep in step. The maximum rather than the last one found, because records are not
-// strictly ordered and a sidechain's line can land after a newer one.
-//
-// A time that will not parse is skipped rather than counted, which is why this does not go
-// through `stamp`: that answers 0 for an unreadable time, and a 0 is a real epoch time that
-// would win against nothing and lose against everything.
-//
-// The window is the 256 KB tail `readSessionMeta` already takes. Over the 1,602
-// transcripts here that hold a timestamped record, the newest one sits a median 4.6 KB from
-// the end of the file and 25 KB at the 99th percentile, and 256 KB reaches it in all of
-// them. Codex rollouts answer to the same reader: every line of one carries a top-level
-// `timestamp` written the same way.
+// Newest usable timestamp in the tail, or null when none exists.
+// Bookkeeping can advance file modification time without recording activity.
+// Records can arrive out of timestamp order, so the reader takes their maximum timestamp.
+// Unreadable timestamps are excluded rather than replaced with epoch zero.
 export function readSessionActivity(file: string, bytes = 256 * 1024): number | null {
   return activityIn(tailLines(file, bytes));
 }
@@ -1970,9 +1744,7 @@ export interface SessionMeta {
   stats?: SessionStatFacts | null;
 }
 
-// A session's name, its last activity and whether anyone was in it, off one read of the
-// tail. All three are wanted for every session the panel lists, and they come out of the
-// same window, so reading it again would be the whole cost of the later answers.
+// Reads metadata and optional stats through a shared tail window. A separate head read supplies title fallback and fingerprinting when needed.
 export function readSessionMeta(
   file: string,
   bytes = 256 * 1024,
@@ -2003,63 +1775,16 @@ export function readSessionMeta(
   };
 }
 
-// Whether a session was run by an agent rather than had by a person, or null where
-// this window cannot say.
-//
-// A session another agent started by shelling out to the CLI records nothing naming
-// the agent that started it. The session id it inherits is overwritten before anything can
-// read it, the entrypoint field carries whatever shell it was spawned from, and the
-// session registry files record the same kind for both. There is no positive link to read,
-// so this reads the absence of a person instead.
-//
-// These things only a person leaves behind, under every entrypoint. A follow-up the reader
-// typed while the agent worked, which arrives as a queued attachment. An editor selection or
-// an opened file, which arrive as attachments on a prompt and only from an editor. A slash
-// command whose record carries a human origin, which is what Arc's own panel writes. A `<ide_`
-// tag on a prompt. A remote-control bridge record, when no record anywhere in the file names
-// `sessionKind: 'bg'`. A system record outside `UNATTENDED_SYSTEM_SUBTYPES`. A tool call the reader refused
-// themselves, marked `toolDenialKind: 'user-rejected'`. And a question the agent stopped to
-// put to the reader, which it asks only where somebody is expected to choose.
-//
-// A non-SDK entrypoint and a human-origin typed prompt are each read the moment they arrive,
-// and a `sessionKind: 'bg'` record excuses one only when it carried `bg` itself or an earlier
-// record already did. A `bg` record arriving later never undoes a sign already read that way.
-//
-// Three more signs step back once every record that names an entrypoint names an SDK one, or
-// once `sessionKind: 'bg'` has arrived anywhere in the file by the time the whole tally is
-// read: a changed file, a tool call Claude Code refused on its own (`toolDenialKind:
-// 'permission-rule'`, what read-only dispatch gets under `--permission-mode dontAsk` when the
-// model tries a command that is not read-only), and the unattended system subtypes. Both can
-// happen with nobody watching, and `claude --bg` runs unattended by design. A slash command
-// with no origin steps back only in an SDK-only transcript, read there as the run's own prompt
-// rather than a second one. Under any other entrypoint and with no `sessionKind: 'bg'`
-// anywhere in the file, each of these still marks the session a person's, so it stays in the
-// list rather than folding away.
-//
-// A single typed prompt with no human origin, and a turn that finished, is the base case
-// every other sign narrows. An SDK-only transcript with no `sessionKind: 'bg'` does not wait
-// for the finish, as `agentRunOfTally` sets out. A second typed prompt is ordinarily a person
-// too, because a run of the CLI in print mode takes one prompt and stops. That bends twice. A
-// background session allows its one prompt a human origin, typed or a slash command, because
-// `claude --bg` sends one on the request that starts it. A second prompt of either form there
-// is still a person when it carries a human origin. A follow-up the dispatching agent sends
-// carries `promptSource: 'sdk'` and no human origin. That prompt is not counted at all. A
-// background session whose only prompt is shaped that way reads as the owner's, not a run. An SDK-only transcript
-// never counts a typed prompt with no origin toward the second prompt either. That is what
-// lets a resumed `claude -p --resume` review carry more than one prompt without reading as
-// somebody's session. A typed prompt with a human origin is still a person there.
-//
-// `lines` is the window split at each newline, so its last entry is whatever follows the last
-// newline. A transcript an agent is still appending to often ends in half a record there. That
-// entry is skipped when it will not parse, and the next read takes it once it is whole.
-// `scanForAgentRun` skips the same half-written last line, so the two readers agree.
-//
-// Null when the window did not reach the start of the file, because the signs may sit
-// outside it. Null too when a complete line will not parse, because it could hold any of the
-// signs. The caller reads null as a person, and `scanForAgentRun` answers for a file
-// larger than the window. Erring towards a person is the only direction this may be wrong
-// in: the cost of missing a run is a row in a list, and the cost of hiding a session
-// somebody had is their own work filed under somebody else's name.
+// Classifies a complete transcript as an agent run, a reader session, or unknown.
+// A partial window or malformed complete record leaves classification unknown. An unfinished last line is excluded.
+// Non-SDK entrypoints and human-origin prompts establish a reader session unless background mode is already recorded.
+// Later background metadata cannot undo those immediate reader signs.
+// Editor content, reader-queued follow-ups, explicit tool rejection, and reader questions supply additional reader signs.
+// SDK-only and background transcripts can contain edits, automatic denials, and unattended system records without a reader.
+// SDK-only transcripts accept repeated originless prompts without requiring completion.
+// Background transcripts require a completed turn and exactly one counted prompt, including their human-origin launch prompt.
+// Originless SDK follow-ups in background mode do not count.
+// Other transcripts require one prompt and a completed turn. Missing reader evidence alone does not establish ownership.
 export function agentRunIn(lines: string[], whole: boolean): boolean | null {
   if (!whole) {
     return null;
@@ -2084,7 +1809,7 @@ export function agentRunIn(lines: string[], whole: boolean): boolean | null {
     try {
       parsed = JSON.parse(line);
     } catch {
-      // The rule of `lastLineWhole` in childartifacts.ts, inline so each line parses once.
+      // An unfinished final JSON record waits for the next read. A malformed complete record leaves classification unknown.
       if (i === last) {
         break;
       }
@@ -2097,14 +1822,8 @@ export function agentRunIn(lines: string[], whole: boolean): boolean | null {
   return agentRunOfTally(tally);
 }
 
-// The system records Claude Code writes with nobody present. They are no sign of a person
-// only in a transcript whose records carry an SDK entrypoint, or one that carries
-// `sessionKind: 'bg'` anywhere in it. Under every other entrypoint, and in a transcript that
-// names none, each of them is a person, because an older editor or terminal build writes no
-// human origin and a long single-prompt session there often shows nothing else. Every other
-// subtype, a `local_command` among them and any subtype this list does not know, reads as a
-// person under every entrypoint. `away_summary` is the recap Claude Code writes when it
-// stops with nobody watching, and it carries a summary of the work rather than a status word.
+// System subtypes permitted without reader evidence in SDK-only or background transcripts.
+// Other subtypes establish a reader session. Under other entrypoints, these subtypes also count as reader evidence.
 const UNATTENDED_SYSTEM_SUBTYPES = new Set([
   'stop_hook_summary',
   'compact_boundary',
@@ -2114,15 +1833,9 @@ const UNATTENDED_SYSTEM_SUBTYPES = new Set([
   'away_summary',
 ]);
 
-// What the rule carries from one record to the next. `unattended` is whether a record of
-// `UNATTENDED_SYSTEM_SUBTYPES` was seen. `changedFile` is whether an assistant record asked to
-// change a file, and `deniedTool` is whether a tool call was refused for a reason short of the
-// reader saying no. `command` is whether a slash command with no human origin was seen, read
-// as the run's own prompt in an SDK-only transcript. `bridgeSession` is whether Claude Code's
-// own remote-control `bridge-session` record was seen. `bg` is whether any record so far
-// carried `sessionKind: 'bg'`, which is sticky once seen even if an earlier record in the same
-// file did not carry it. `entrypoint` is `sdk` while every record that names an entrypoint
-// names an SDK one, such as `sdk-cli`, and `other` once any record names another.
+// Evidence accumulated across records for agent-run classification.
+// `entrypoint` stays `sdk` only while every named entrypoint is SDK-based. `bg` stays true once recorded.
+// Other fields retain prompt, completion, system, edit, denial, command, and bridge evidence.
 interface AgentRunTally {
   prompts: number;
   finished: boolean;
@@ -2138,18 +1851,12 @@ interface AgentRunTally {
 // The rule for one parsed record. True when the record is a sign of a person, and otherwise
 // it adds what the record says to the tally.
 function personSignIn(parsed: unknown, tally: AgentRunTally): boolean {
-  // `null` parses. Reading a field off it would throw out of `readSessionMeta` and take
-  // down the whole refresh, since every listed session goes through it.
+  // JSON null and primitive values provide no classification fields.
   if (!parsed || typeof parsed !== 'object') {
     return false;
   }
   const o = parsed as Record<string, unknown>;
-  // A subagent writes its own file and the harness writes its own assistant records,
-  // so neither shape reaches a main transcript today and both of these are the belt
-  // rather than the fix. They are here because the rule below claims to take the same
-  // reading `readSession` takes, and `readSession` skips both: without them a
-  // subagent's answer or a harness line would close the first turn on a session
-  // a person is still sitting in, which is the worst answer this rule has.
+  // Exclude sidechain and synthetic replies, matching the main turn reader.
   if (o.isSidechain) {
     return false;
   }
@@ -2164,19 +1871,13 @@ function personSignIn(parsed: unknown, tally: AgentRunTally): boolean {
   if (o.sessionKind === 'bg') {
     tally.bg = true;
   }
-  // A non-SDK entrypoint is a final person sign at once, unless `sessionKind: 'bg'` already
-  // arrived on this record or an earlier one. Checking on every record, inside the rule both
-  // readers call, keeps the whole-file tally and the incremental scan agreeing for any order
-  // a real transcript can put these two fields in. Checked after the sidechain and harness
-  // skips above, so a subagent's own entrypoint never speaks for the session it runs inside.
+  // A non-SDK entrypoint establishes a reader session unless background mode is already known.
+  // Sidechain and synthetic records cannot supply entrypoint evidence.
   if (tally.entrypoint === 'other' && !tally.bg) {
     return true;
   }
   const type = o.type;
-  // Claude Code's own remote-control record sits beside a session's `sessionKind: 'bg'`
-  // records, so it is no sign of a person there. Tallied rather than decided here because the
-  // record naming the session background may not have arrived yet, and unlike the entrypoint
-  // and human-origin signs above, this one is never read before the whole tally is in.
+  // Defer bridge evidence until the final tally so later background metadata can qualify it.
   if (type === 'bridge-session') {
     tally.bridgeSession = true;
     return false;
@@ -2210,11 +1911,7 @@ function personSignIn(parsed: unknown, tally: AgentRunTally): boolean {
     }
     return false;
   }
-  // A follow-up typed while the agent works arrives as a queued attachment, not a prompt
-  // record. `isReaderQueued` is the rule the turn reader tells the reader's own apart with, so
-  // another session's message and a background task's notice do not count. Somebody attached
-  // and typed while the agent was already going, which a resumed SDK call or a background
-  // dispatch never does on its own, so this is decided here rather than left to the tally.
+  // Reader-queued follow-ups count as reader evidence. Peer messages and task notices do not.
   if (type === 'attachment') {
     const attachment = o.attachment as Record<string, unknown> | undefined;
     if (!isReaderQueued(attachment) || !cleanPrompt(textOf(attachment?.prompt))) {
@@ -2225,20 +1922,14 @@ function personSignIn(parsed: unknown, tally: AgentRunTally): boolean {
   if (type !== 'user') {
     return false;
   }
-  // Anything the editor added to a prompt, not only a selection or an opened file: every
-  // one of them arrives from an editor a person is sitting in.
+  // Editor tags supply reader evidence.
   const said = textOf((o.message as { content?: unknown } | undefined)?.content);
   if (said.includes('<ide_')) {
     return true;
   }
   if (said.includes('<command-name>')) {
-    // Arc's own panel marks a slash command with a human origin (`HUMAN_ORIGIN` in
-    // claudewire.ts), so that one is still a person under every entrypoint. The one exception
-    // is a background session, which reads it as it reads a typed prompt with a human origin:
-    // `claude --bg` sends its launch prompt with that origin, so the prompt joins the shared
-    // count, and a second prompt of either form fails it. A command with no origin is tallied
-    // instead of decided here, because whether every entrypoint in this file names an SDK one
-    // is not known until `agentRunOfTally` reads the whole tally.
+    // A human-origin command establishes reader evidence outside background mode.
+    // Background commands share the prompt count with typed prompts. Originless commands await the final SDK classification.
     if ((o.origin as { kind?: unknown } | undefined)?.kind === 'human') {
       if (!tally.bg) {
         return true;
@@ -2250,25 +1941,16 @@ function personSignIn(parsed: unknown, tally: AgentRunTally): boolean {
     tally.prompts += 1;
     return false;
   }
-  // Through the same rule the turn reader counts prompts with, rather than a fourth
-  // answer to the same question. It already drops tool results, meta records, compaction
-  // summaries and sidechains, and it does not need a prompt id to be present.
+  // Use the turn reader's typed-prompt classification.
   if (!isTypedPrompt(o)) {
     return false;
   }
-  // A human origin is a final person sign at once, the same order rule the entrypoint check
-  // above applies: `sessionKind: 'bg'` excuses it only when it already arrived on this record
-  // or an earlier one, the shape of a background session's own first prompt. Deferred past
-  // that point, a typed prompt with no origin only ever adds to the shared count.
+  // A human-origin prompt establishes reader evidence unless background mode is already known.
   const origin = o.origin as { kind?: unknown } | null | undefined;
   if (!tally.bg && origin?.kind === 'human') {
     return true;
   }
-  // A background session's own dispatching agent sends a worker its follow-ups with
-  // `promptSource: 'sdk'` and no human origin, the shape `bridge-session` and `stop_hook_summary`
-  // arrive beside. That one never reaches the shared count, so it cannot fail the background
-  // branch's exactly-one-prompt check below. A follow-up with a human origin, what `claude
-  // attach` plus typing writes, still falls through to `tallyTypedPrompt` and still counts.
+  // Exclude originless SDK follow-ups in background mode from the prompt count.
   if (tally.bg && origin?.kind !== 'human' && o.promptSource === 'sdk') {
     return false;
   }
@@ -2276,10 +1958,7 @@ function personSignIn(parsed: unknown, tally: AgentRunTally): boolean {
   return false;
 }
 
-// A queued follow-up with a human origin is a person, decided the moment it is read. Any
-// other one adds to the shared prompt count, and a second typed prompt of any kind, whatever
-// its own origin or the one before it, is a person too: the exceptions below excuse a
-// resumed SDK call or a background dispatch's own prompt, never somebody attaching mid-turn.
+// A human-origin queued prompt establishes reader evidence. Other queued prompts do so after the first counted prompt.
 function queuedPromptIsPerson(origin: unknown, tally: AgentRunTally): boolean {
   if ((origin as { kind?: unknown } | null | undefined)?.kind === 'human') {
     return true;
@@ -2288,25 +1967,13 @@ function queuedPromptIsPerson(origin: unknown, tally: AgentRunTally): boolean {
   return tally.prompts > 1;
 }
 
-// Tallies a typed prompt that reached here with no human origin, or with one already excused
-// by a `sessionKind: 'bg'` seen at or before it: one more toward the count.
+// Count a typed prompt admitted by the per-record classifier.
 function tallyTypedPrompt(tally: AgentRunTally): void {
   tally.prompts += 1;
 }
 
-// Whether the tally's typed prompts read as one worth counting. A background session allows
-// exactly one counted prompt, whatever its origin, because `claude --bg` sends a human origin
-// on the request that starts it. Once `bg` has arrived, a later human-origin prompt is excused
-// from the immediate per-record check above and falls through to `tallyTypedPrompt` instead,
-// so the count itself, not that check, is what rejects a background session's second
-// human-origin prompt. A dispatched follow-up with no human origin never reaches the count at
-// all. Checked before the SDK case, because a background session's entrypoint is often
-// `sdk-cli` too, and unlike the SDK branch it allows exactly one counted prompt, never more. An
-// SDK-only transcript with no `bg` allows any number of prompts with no origin at all, because
-// a resumed `claude -p --resume` review adds one per call, and `agentRunOfTally` accepts them
-// there before any turn finishes. Every other transcript allows exactly one, because a run of
-// the CLI in print mode takes one prompt and stops, and every prompt that reaches this count
-// already had no human origin.
+// Background mode permits exactly one counted prompt. SDK-only mode permits one or more.
+// Other transcripts permit exactly one prompt.
 function promptsOk(tally: AgentRunTally): boolean {
   if (tally.bg) {
     return tally.prompts === 1;
@@ -2317,34 +1984,11 @@ function promptsOk(tally: AgentRunTally): boolean {
   return tally.prompts === 1;
 }
 
-// A set of typed prompts `promptsOk` accepts, and a turn that finished. A file holding no
-// prompt at all is not a session anybody had. A terminal or editor entrypoint reaches a
-// person sign in `personSignIn` on its first record, so the finish requirement never decides
-// that case. It matters only for a file that names no entrypoint and for a background
-// session, where a session still inside its first turn is the shape this rule cannot tell
-// from a run at all, because every sign of a person arrives later than the first prompt: the
-// reader asks a question, the agent reads and greps its way through an answer, and until it
-// edits something or the reader types again the transcript is indistinguishable from a
-// print-mode run. Marking that one is the worst thing this can do, because it takes the
-// session the reader is sitting in out of the panel.
-//
-// An SDK-only transcript with no `sessionKind: 'bg'` needs no finished turn. That rests on one
-// assumption: the panel is the SDK host with a person at the keyboard, it sends every Claude
-// prompt with a human origin, and `personSignIn` reads that as a person at once. So an
-// SDK-only prompt with no human origin came from another program. Once its turn finished,
-// that transcript reads as a run anyway, and waiting for the finish only files a running
-// reviewer or worker under Today. A person in another Agent SDK host that sends no human
-// origin files under Run by agents during the first turn, as it already did once the turn
-// finished. Every later sign of a person still ends the answer. A background session keeps
-// the finish requirement, because its first prompt carries a human origin by design.
-//
-// `lenient` names the two conditions that step three more signs back: an SDK-only transcript,
-// and one that carries `sessionKind: 'bg'` anywhere in it. Under either, the unattended system
-// subtypes, a changed file, and a tool denial short of the reader saying no are not a person.
-// A slash command with no origin is excused only in the SDK-only case, read there as the run's
-// own prompt. The remote-control `bridge-session` record is excused only in the background
-// case. Both of these read the tally's final state, unlike the entrypoint and human-origin
-// signs `personSignIn` already read and settled per record.
+// Resolve accumulated run evidence after immediate reader signs have been excluded.
+// SDK-only transcripts do not require a completed turn. Background and other transcripts do.
+// SDK-only and background modes permit unattended system, edit, and automatic-denial evidence.
+// Only SDK entrypoints permit originless commands. Only background mode permits bridge-session evidence.
+// An SDK host that omits human origins can classify a reader session as an agent run.
 function agentRunOfTally(tally: AgentRunTally): boolean {
   const lenient = tally.entrypoint === 'sdk' || tally.bg;
   const sdkOnly = tally.entrypoint === 'sdk' && !tally.bg;
@@ -2359,9 +2003,7 @@ function agentRunOfTally(tally: AgentRunTally): boolean {
   );
 }
 
-// The whole-file form of `agentRunIn`: its cursor, the tally so far, and whether a sign of a
-// person has been seen. A person is sticky, because a sign does not unhappen, so a file once
-// answered that way is never read for this again.
+// Incremental agent-run cursor and tally. A recorded reader sign stops later classification reads.
 export interface AgentRunScan extends AgentRunTally {
   bytes: number;
   person: boolean;
@@ -2370,15 +2012,8 @@ export interface AgentRunScan extends AgentRunTally {
   end?: number;
 }
 
-// Whether a scan that covered `size` bytes reads as an agent run. Only a transcript from an
-// SDK caller, or one that carries `sessionKind: 'bg'` anywhere in it by the time the scan
-// reaches the end, gets a run answer here. `personSignIn` already turned a non-SDK entrypoint
-// arriving with no `bg` seen yet into a sticky person, so a `bg` record later in the same file
-// never reaches this check. A file larger than the metadata tail under any other entrypoint
-// reads as a person, the answer it gets with no further reasoning. A scan that stopped short
-// of the end left bytes unread, and they could hold a sign of a person. A half-written last
-// line is the exception, as it is for `agentRunIn`: the scan answers from the lines before
-// it, and the next scan reads it once it is whole.
+// Classifies an EOF-covered SDK or background transcript through its retained tally.
+// An unfinished last line permits classification from preceding complete records. Other unread bytes prevent an agent-run result.
 export function agentRunOfScan(scan: AgentRunScan, size: number): boolean {
   return (
     !scan.person &&
@@ -2388,13 +2023,8 @@ export function agentRunOfScan(scan: AgentRunScan, size: number): boolean {
   );
 }
 
-// Reads only what the previous scan has not, through the rule `agentRunIn` applies, and stops
-// at the first sign of a person. A complete line that will not parse is a person, which is
-// the reading `agentRunIn` gives it. `personSignIn` itself ends the scan with a person on
-// a non-SDK entrypoint, unless that record or an earlier one already carried `sessionKind:
-// 'bg'`, the same order rule the whole-file tail reader applies, so the two readers agree for
-// every order a real transcript can put these two fields in. A file that shrank was rewritten,
-// so it is read from the start again.
+// Resumes classification from the complete-line cursor and stops at the first reader sign.
+// Malformed complete lines establish reader evidence. Shrinkage restarts the tally.
 export function scanForAgentRun(file: string, size: number, prev?: AgentRunScan): AgentRunScan {
   if (prev?.person) {
     return prev;
@@ -2445,31 +2075,13 @@ export function scanForAgentRun(file: string, size: number, prev?: AgentRunScan)
   return scan;
 }
 
-// Whether a person spoke in a dispatched session. A dispatch edge files a session under Run by
-// agents on a positive fact, so only a positive sign of a person moves it back. This reads a
-// narrower set of signs than `agentRunIn`, whose guess of false also covers a first turn that
-// has not finished.
-//
-// These count. A slash command or a typed prompt with a human origin, except the first prompt
-// of a background session, which `claude --bg` sends with a human origin itself whatever its
-// content. A follow-up queued while the agent worked, by the rule of `isReaderQueued`, because
-// a queued follow-up always comes after the prompt the agent was working on. A tool call the
-// reader refused. A `<ide_` tag on a typed prompt after the first, because the first is the
-// launch prompt the dispatching agent wrote. A prompt the dispatching agent sends with
-// `promptSource: 'sdk'`, a message from another session, a background task's notice, and a
-// question the agent puts to the reader are no sign. `prompts` counts the prompts read so far,
-// so the launch prompt is told apart from a later one. A person is sticky, so a file once
-// answered that way is never read for this again.
-//
-// A `start` above 0 reads only the bytes from there on, for a session still running. That scan
-// cannot see the prompts or the `sessionKind: 'bg'` record written before `start`, so it counts
-// no typed prompt and reads no editor tag. It takes a queued follow-up, a refused tool call,
-// and a slash command with a human origin. `userBefore` notes whether the bytes before `start`
-// hold a user record. When they hold none, the first prompt the scan reads is the launch
-// prompt and no sign, when that prompt is a slash command in a background session. A slash
-// command that follows an earlier prompt in the same scan counts as a person's. A line cut
-// at `start` does not parse and is skipped. The whole-file read takes every sign, and `readClaudeAgentSpend` makes it
-// once the session is quiet.
+// Incremental reader-evidence scan for a session with an established dispatch edge.
+// Explicit tool rejection and reader-queued follow-ups establish reader evidence.
+// Human-origin commands also count, except a background launch command with no preceding user record.
+// A complete scan also counts human-origin prompts and editor tags after the launch prompt.
+// Partial scans cannot establish earlier prompt counts, so they exclude typed-prompt and editor-tag evidence.
+// Peer messages, task notices, SDK follow-ups, and reader-question calls do not establish reader evidence here.
+// Once reader evidence is found, subsequent scans retain it.
 export interface PersonScan {
   bytes: number;
   person: boolean;
@@ -2516,9 +2128,7 @@ export function scanForPerson(file: string, size: number, prev?: PersonScan, sta
   return scan;
 }
 
-// Whether the first `size` bytes of a transcript hold a user record, a cut last line included.
-// The read goes in small steps and stops at the first one, which in a running child is its
-// launch prompt near the head, so a running child still costs about its metadata.
+// Checks raw bytes for a user-record marker, including fragments, and stops on the first match.
 function holdsUserRecord(file: string, size: number): boolean {
   const mark = Buffer.from('"type":"user"');
   let fd = -1;
@@ -2541,7 +2151,7 @@ function holdsUserRecord(file: string, size: number): boolean {
       pos += Math.max(1, read - mark.length + 1);
     }
   } catch {
-    /* unreadable; answered as no user record */
+    /* unreadable. No user marker found. */
   } finally {
     if (fd >= 0) {
       try {
@@ -2591,10 +2201,7 @@ function personSpokeIn(parsed: unknown, scan: PersonScan): boolean {
   }
   const said = textOf((o.message as { content?: unknown } | undefined)?.content);
   const human = (o.origin as { kind?: unknown } | null | undefined)?.kind === 'human';
-  // The slash command rule of `personSignIn`, meta records included, with the launch
-  // exception the typed-prompt branch below also carries. A slash command is the launch
-  // prompt only in a background session, when it is the first prompt this scan counts and
-  // no user record came before it, including the bytes a partial scan skipped.
+  // Human-origin commands count except a background launch command with no earlier user record.
   if (said.includes('<command-name>')) {
     scan.prompts += 1;
     if (!human) {
@@ -2625,41 +2232,21 @@ function calledATool(record: Record<string, unknown>, wanted: (name: string) => 
   });
 }
 
-// Whether an assistant record holds a call that asks to write to a file, read through the
-// same table the turn's tool mix is counted with, so a tool that starts editing is known to
-// both at once.
-//
-// The request, not the result. An edit that failed still says somebody meant to change this
-// tree, and reading the result would mean carrying a second rule about what each tool calls
-// success. Both readings err the same way, towards calling the session a person's.
+// Checks edit-tool requests using the shared tool-category table.
+// A failed edit request still supplies classification evidence.
 function askedToChangeAFile(record: Record<string, unknown>): boolean {
   return calledATool(record, (name) => TOOL_KIND[name] === 'edits');
 }
 
-// The tools that stop the turn and put a choice to the reader. A call to one of them says
-// the agent expected somebody to be there, and a first turn otherwise says nothing about
-// that either way.
-//
-// Print mode is not the line. The panel's own composer drives `claude -p` and puts these
-// asks to the reader. `claudewire.ts` reads the same name to tell a question from an
-// ordinary permission ask. A bare run with no permission tool allows every tool without
-// asking. What earns a name its place here is that an agent working alone has no reason to
-// call it.
-//
-// Measured over every transcript of this workspace: none of the sessions this rule
-// calls a run holds one of these calls, and twelve that it calls a person's do.
+// Tool names whose calls supply reader-question evidence for run classification.
 const ASKS_THE_READER = new Set(['AskUserQuestion']);
 
-// Whether an assistant record holds a call that puts a question to the reader. The request
-// again and not the answer, for the reason above: a question that came back an error still
-// says the agent expected somebody to be there.
+// Checks reader-question calls, regardless of their eventual results.
 function askedTheReader(record: Record<string, unknown>): boolean {
   return calledATool(record, (name) => ASKS_THE_READER.has(name));
 }
 
-// Whether an assistant record closed a turn. A response that stopped to call a tool has not
-// finished anything; anything else it stopped for ended the turn. This is the same reading
-// `readSession` takes when it decides which turn is the one still running.
+// True for a nonempty recorded stop reason other than `tool_use`.
 export function finishedATurn(record: Record<string, unknown>): boolean {
   const stop = (record.message as { stop_reason?: unknown } | undefined)?.stop_reason;
   return typeof stop === 'string' && stop.length > 0 && stop !== 'tool_use';
@@ -2690,28 +2277,9 @@ function answeredATurn(record: Record<string, unknown>): boolean {
 // The id of the call a raw tool_result line answers, without parsing the line.
 const RESULT_ID = /"tool_use_id"\s*:\s*"([^"]+)"/;
 
-// Tool results are the bulk of a transcript. A cheap substring keeps a line out of
-// JSON.parse unless it carries something the timeline reports.
-//
-// `gitOperation` is written by the CLI when it recognizes a commit in the output, not when
-// the command asked for one. Measured over this project's transcripts, it is on nearly every
-// result that printed a commit line and on almost none that printed none. So a quiet
-// commit's result is skipped here, and every reader downstream sees a turn that committed
-// nothing.
-//
-// A fast-forward merge is the same problem. It prints `Updating a..b` and `Fast-forward`, and
-// no `gitOperation` is written for it either.
-//
-// `wrote` is what fixes both. The caller passes the call ids whose command said `git commit`
-// or `git merge`, which it already knows by the time the result arrives, and a result
-// answering one of them is read whatever it printed. A caller with no such set keeps the
-// behavior it had.
-//
-// A read of a child's own transcript passes two more kinds of id: its Edit, Write and
-// NotebookEdit calls, and every call that ran git. A child's record carries none of the
-// fields named above, not even `gitOperation`, so without those ids its edits and its
-// commits reach no reader at all. The change of an edit lives in the call's own input, and
-// the commit lives in the text the result printed.
+// Skip ordinary tool-result lines that contain no fields used by the timeline.
+// `wrote` admits results by call ID, including quiet commits and fast-forward merges.
+// Child reads also admit edit calls and Git commands whose results lack the parent transcript's structured fields.
 function skipsOrdinaryToolResult(line: string, isUser: boolean, wrote?: ReadonlySet<string>): boolean {
   if (!isUser || line.indexOf('"tool_result"') < 0) {
     return false;
@@ -2759,13 +2327,8 @@ export function claudeProcessEndedAt(record: unknown): number | null {
 
 const LOCAL_COMMAND_OUTPUT = /<local-command-(?:stdout|stderr)>/;
 
-// The answer Claude Code records for a command it runs by itself, such as `/rename` or
-// `/usage`. The typed command opened a turn, and no assistant record follows it. `parent` is
-// the id of the record the answer replies to. A reader withdraws a turn for this answer only
-// when `parent` names the typed record that opened the turn, because an answer to a harness
-// command such as `/effort` can follow a prompt that is still waiting for the model.
-//
-// A `local_command` record without an output tag holds a command, not an answer.
+// CLI command answer with a parent record ID and local stdout or stderr tag.
+// A command turn is withdrawn only when that ID matches its unanswered opening prompt.
 export function claudeLocalAnswer(record: unknown): { at: number; parent: string } | null {
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
     return null;
@@ -2784,8 +2347,7 @@ export function claudeLocalAnswer(record: unknown): { at: number; parent: string
   return { at: stamp(value.timestamp), parent };
 }
 
-// Whether an assistant record is the model answering: an error, a tool call, reply text, or
-// any output at all.
+// Assistant record with an API error, visible reply or tool call, or positive output usage.
 function claudeModelAnswered(record: Record<string, unknown>): boolean {
   const message = record.message as { content?: unknown; usage?: ClaudeUsage } | undefined;
   const content = message?.content;
@@ -2816,11 +2378,8 @@ function claudeModelWorks(record: Record<string, unknown>): boolean {
   return (record.message as { model?: unknown } | undefined)?.model !== '<synthetic>' && claudeModelAnswered(record);
 }
 
-// A prompt the model never answered, put back as the newest turn by a local command answer. Arc
-// takes the answer as a sign that the CLI is idle, so nothing works on the prompt and it reads
-// stopped. The stop is stamped at the prompt's own last record, so a command typed hours later
-// does not stretch the prompt's duration. Model work after the answer makes the command a turn
-// again, which replaces this outcome as the newest turn in every reader.
+// Marks an unanswered prompt stopped at its own last-record time after a local command answer.
+// Terminal outcomes retain their recorded state. Later model work restores the command turn.
 function stoppedByLocalAnswer(outcome: TurnOutcome): TurnOutcome {
   if (outcome.finished || outcome.error || outcome.interrupted || outcome.processEndedAt !== undefined) {
     return outcome;
@@ -3063,14 +2622,8 @@ export function isInside(target: string, folders: string[]): boolean {
   });
 }
 
-// Transcript directories belonging to the given workspace folders.
-//
-// The directory name is a *hint*, never the answer. The slug replaces every
-// non-alphanumeric character with a dash, so `~/work/a_b` and `~/work/a-b` produce the
-// same name, and a prefix match can lie in the same way (`~/a/b` prefixes `~/a/b-c`). A
-// name that matches, exactly or as a prefix, only earns the cost of reading the cwd the
-// session actually recorded; that cwd decides. Getting this wrong would show one
-// project's prompts and summaries in another project's window.
+// Project transcript directories whose sampled working directory belongs to an open folder.
+// Slug matches admit a sample read but cannot establish membership because punctuation and prefixes collide.
 export function transcriptDirsFor(root: string, folders: string[]): string[] {
   if (folders.length === 0) {
     return [];
@@ -3092,9 +2645,7 @@ export function transcriptDirsFor(root: string, folders: string[]): string[] {
     const full = path.join(root, d);
     const sample = listSessionFiles(full)[0];
     const cwd = sample ? readSessionCwd(sample.file) : null;
-    // With a cwd to read, it decides, whatever the name suggested. With none to read the
-    // directory holds nothing to show anyway, and an exact name match is kept only so the
-    // panel can say it found the directory and it was empty.
+    // A missing sampled cwd permits only an exact slug match.
     if (cwd ? isInside(cwd, folders) : exact) {
       out.push(full);
     }
@@ -3102,41 +2653,16 @@ export function transcriptDirsFor(root: string, folders: string[]): string[] {
   return out;
 }
 
-// Every session belonging to these workspace folders, newest first.
-//
-// One directory can hold sessions from two different folders, because the slug collapses
-// every non-alphanumeric character to a dash. So the cwd decides per *file*, not per
-// directory: sampling one transcript accepts the whole directory when the sample matches
-// and rejects it when the sample does not, and both answers are wrong for every session
-// the sample does not speak for. One shows another project's work in this window; the
-// other hides this project's own.
-//
-// `cwdOf` is injected because a session's cwd never moves once written, so the panel can
-// read it once per file instead of once per poll. Directories are re-listed every call:
-// caching that answer freezes a directory out of the panel when a session appears inside
-// one that was empty when it was first scanned.
-// A path relative to the workspace folder holding it, with the folder's own name in front when
-// there is more than one open, and with forward slashes throughout. Forward slashes because
-// the result goes into a message or a config file, which want them on either platform.
-//
-// The comparison goes through `normalizeFsPath` like every other path rule here, because the
-// two readers record a path in different shapes and the folder comes from a third place again.
-// But the *result* is cut out of the original string rather than out of the normalized one:
-// normalizing lower-cases the whole path on Windows, and a relative path pasted into a message
-// or a terminal has to be the case the disk actually holds or it names nothing.
-//
-// A path outside every folder has no relative form, so the absolute one is returned. That is
-// what the explorer does too, and it is the honest answer: a scratch file under the temp
-// directory is not "../../../AppData/Local/Temp/...", it is where it is.
+// Workspace-relative display path, preserving case and using forward slashes inside an open folder.
+// Multiple open folders add the owning folder name. The nearest enclosing folder wins.
+// A path outside every open folder is returned unchanged.
 export function relativePath(target: string, folders: string[]): string {
   const t = normalizeFsPath(target);
   // Longest first, so a folder nested inside another names the file by the nearer of the two.
   const sorted = [...folders].sort((a, b) => normalizeFsPath(b).length - normalizeFsPath(a).length);
   for (const folder of sorted) {
     const base = normalizeFsPath(folder).replace(/\/$/, '');
-    // The same test `isInside` makes, including the equal case: a path that is the folder is
-    // in it. Two slightly different definitions of inside a folder, in one file, is the shape
-    // that goes wrong later even where it cannot go wrong now.
+    // An exact folder match displays that folder's name.
     if (t === base) {
       return folder.replace(/\\/g, '/').replace(/\/$/, '').split('/').pop() || folder;
     }
@@ -3153,11 +2679,8 @@ export function relativePath(target: string, folders: string[]): string {
   return target;
 }
 
-// The file a summary link names, with any line anchor stripped, or null when the link is
-// not a file at all. The two anchor shapes are the ones links actually carry: `#L42` or
-// `#L42-L51` from an @-mention, and a trailing `:42` or `:42:7` the way a compiler writes
-// a location. A scheme with `//` after it is a URL, which is a link with no file to copy;
-// a Windows drive letter is a colon without the slashes and stays a file.
+// Local link target after removing `#L` or trailing line and column anchors.
+// Schemes followed by double slashes return null. Drive-letter paths remain eligible.
 export function linkTarget(href: string): string | null {
   if (!href || /^[a-z][a-z0-9+.-]*:\/\//i.test(href)) {
     return null;
@@ -3174,10 +2697,7 @@ export function linkTargetIsMarkdown(target: string): boolean {
   return /\.(?:md|markdown)$/i.test(target);
 }
 
-// Where a link's file is on disk: an absolute target is itself, and a relative one joins
-// the folder that actually holds it. When none does, the first folder's join is returned
-// anyway, because that is where opening the link would have looked, and a copied path that
-// says where the file was expected beats copying nothing with no explanation.
+// Returns an absolute target, the first existing workspace-relative target, or the first joined fallback.
 export function resolveLink(target: string, folders: string[], exists: (p: string) => boolean): string | null {
   if (!target) {
     return null;
@@ -3214,8 +2734,7 @@ export function sessionFilesFor(
     }
     for (const f of listSessionFiles(path.join(root, d))) {
       const cwd = cwdOf(f.file, f);
-      // With a cwd to read, it decides. With none the file says nothing about where it
-      // ran, and only a directory whose name matches exactly is trusted to hold it.
+      // Recorded cwd decides membership. Without it, require an exact allowed fallback slug.
       if (cwd ? isInside(cwd, folders) : missingCwdSlugs.includes(name)) {
         out.push(cwd ? { ...f, cwd } : f);
       }
@@ -3267,15 +2786,9 @@ export function readClaudeChildSessionReferences(
   return scanClaudeChildSessionReferences(parent).references;
 }
 
-// A subagent's own transcript records an `Agent` result as text alone, with no
-// `toolUseResult`, so the text is the only sign that a nested launch returned. A background
-// launch returns at once with text that opens "Async agent launched" and names the child on its
-// `agentId:` line. It closes through its completion notice. A foreground launch returns when
-// the nested agent stops. Its text then usually ends with an `agentId:` line and a `<usage>`
-// block of the figures the main transcript records in `toolUseResult`. The id counts only
-// with the `<usage>` block after it, because the report above can end on an `agentId:` line
-// of its own. The reader and the child reference scan both read the text here, so they pair
-// a launch with the same child.
+// Text-only child Agent results identify nested launches without `toolUseResult`.
+// Async results begin with "Async agent launched" and carry an `agentId:` line.
+// Foreground IDs require the trailing `<usage>` block to avoid matching report text.
 const ASYNC_AGENT_RESULT = /^\s*Async agent launched/;
 const ASYNC_AGENT_ID = /\nagentId: ([A-Za-z0-9-]+)/;
 const FOREGROUND_AGENT_TAIL = /(?:^|\n)agentId: ([A-Za-z0-9-]+)[^\n]*\n?<usage>([\s\S]*?)<\/usage>\s*$/;
@@ -3652,10 +3165,8 @@ interface ClaudeShellLaunch {
 
 export type ClaudeShellDialect = 'bash' | 'powershell';
 
-// A command that resumes a session anywhere in it launches nothing, because its output can
-// name the resumed session and the reader cannot tell whose line that is. Opted-in launches
-// read together, because each receipt names its own session. An opted-in launch beside a
-// direct one launches nothing, because the direct launch prints no receipt.
+// Reject resumed or mixed launch kinds. Homogeneous opted-in wrappers count each launch for receipt validation.
+// Without a known shell, launch kinds and source positions must agree under Bash and PowerShell.
 export function claudeLaunchKind(command: string, shell?: ClaudeShellDialect): ClaudeShellLaunch | null {
   const classified = shellLaunchKind(command, shell ?? 'bash');
   if (!classified) return null;
@@ -3673,7 +3184,7 @@ export function claudeLaunchKind(command: string, shell?: ClaudeShellDialect): C
   return { kind: classified.kind, count: classified.offsets.length };
 }
 
-// Unknown shell context accepts only launches with matching identities in both grammars.
+// Classifies launches and source positions under one shell grammar.
 function shellLaunchKind(
   command: string,
   shell: ClaudeShellDialect,
@@ -3873,16 +3384,7 @@ interface ClaudeDispatchLaunch {
   owned: boolean;
 }
 
-// The receipt lines an opted-in wrapper prints, one for each session it started, so one
-// command that chains two launches links both. `owned` is optional and can only be `true`: the
-// wrapper writes it when the reader asked for the session, and any other value rejects the
-// receipt, the way an unknown key does. One rejected line rejects every receipt in the result.
-// So do two receipts that name one session, and more receipts than the command has opted-in
-// launches, because output relayed from another command can quote that command's receipts. A
-// short id is a prefix of the full one, so two ids that share their first eight characters
-// count as one session. A result with more than `MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT`
-// receipts links nothing, whatever the launch count, so one command cannot fill the references
-// a parent file keeps.
+// Maximum accepted dispatch receipts in one tool result, also bounded by the command's opted-in launch count.
 export const MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT = 16;
 
 // The most references one parent file keeps. The derived session cache drops a larger entry,
@@ -4223,13 +3725,8 @@ export function discoverClaudeChildSessionFiles(
   return discoverClaudeChildSessions(parents, repositoryRoots, referencesOf).children;
 }
 
-// Locations an agent writes to for itself: scratch scripts, memory, internal state. The
-// snapshot hook skips them (plugins/arc-hooks/scripts/lib.js `ignoreRoots`) and the timeline hides them for
-// the same reason, so both views of a turn agree on which files are the user's. Keep the
-// two lists in step.
-//
-// One root per agent the panel reads, because each hides its own state the same way and a
-// turn that rewrote its own configuration is not a change the user asked to review.
+// Scratch and agent-state roots excluded from timeline file changes.
+// Snapshot hooks apply the corresponding ignore-root rule. Explicit environment roots replace these defaults.
 function ephemeralRoots(): string[] {
   const env = process.env[`${ARC_IDENTITY.environmentPrefix}IGNORE_ROOTS`];
   if (env !== undefined) {
@@ -4246,9 +3743,8 @@ export function isEphemeralPath(target: string): boolean {
   });
 }
 
-// A path in a form two sources can be compared by. Transcripts write Windows paths with
-// forward slashes and a lower-case drive letter; the snapshot store writes them with
-// backslashes and whatever case the session's cwd had.
+// Filesystem comparison spelling with forward slashes. Windows drive paths use lowercase on every platform.
+// Other paths use lowercase only on Windows.
 export function normalizeFsPath(target: string): string {
   const unified = target.replace(/\\/g, '/');
   const drive = /^([a-zA-Z]):\//.exec(unified);
@@ -4256,20 +3752,7 @@ export function normalizeFsPath(target: string): string {
   return drive || process.platform === 'win32' ? cased.toLowerCase() : cased;
 }
 
-// A Windows absolute path in the one spelling Windows itself writes: upper-case drive
-// letter, backslashes throughout. Anything else comes back untouched.
-//
-// The two readers record the same file in four spellings, so a path copied from one turn
-// and the same path copied from the next were not the same string. Counting the
-// `file_path` values that start with a drive letter across every transcript under the
-// Claude projects directory on this machine: `c:\` 50657, `C:\` 11868, `D:/` 2162, `c:/`
-// 1300, `D:\` 809, `C:/` 403, `d:\` 269, `d:/` 34. The lower-case drive letter is the
-// common case and the backslash is the common separator, but neither is the whole corpus,
-// and 510 of the 6752 distinct files are written more than one of those ways.
-//
-// The gate is the shape of the string, never `process.platform`. A drive letter followed
-// by a separator is a Windows absolute path and is not an absolute path on any POSIX
-// system, so both normalizers apply Windows case rules to that shape on every platform.
+// Windows drive-absolute path with uppercase drive letter and backslashes. Other path shapes remain unchanged.
 export function nativePath(target: string): string {
   if (!/^[A-Za-z]:[\\/]/.test(target)) {
     return target;
@@ -4283,13 +3766,7 @@ export function tailLines(file: string, bytes: number): string[] {
   return tailOf(file, bytes).lines;
 }
 
-// The same read, saying as well whether it reached the start of the file.
-//
-// The size comes from the open descriptor rather than from a stat of the path, so the size
-// and the bytes are one answer. Two calls could disagree: a file that crossed the window
-// between them would be read as a window and reported as a whole file, which is a count
-// drawn as a total when it is a floor. That is the one direction this reader must not be
-// wrong in, and it also saves a syscall on every read.
+// Opened source revision used to reject replaced or changed files during backward reads.
 export interface FileRevision {
   size: number;
   mtimeMs: number;
@@ -4517,45 +3994,20 @@ export async function discoverBackwardBoundary(
   return { kind: 'beginning' };
 }
 
-// Context the harness wraps around a prompt: IDE state, injected reminders, and the name it
-// repeats back around a command. None of it is what the user typed.
-//
-// `command-name` and `command-args` are deliberately not in this list. They hold the command
-// the reader invoked and what they typed after it, which is the whole prompt in a
-// session opened with one. Deleting them left such a session with no typed prompt
-// at all, so `holdsHumanPrompt` answered false and the rail never listed it. The generic tag
-// strip in `cleanPrompt` takes their tags off and keeps what is between them.
+// Prompt wrappers removed from displayed text.
+// Command name and argument tags remain outside this list so their contents survive prompt cleaning.
 const WRAPPED =
   /<(ide_opened_file|ide_selection|ide_diagnostics|system-reminder|local-command-stdout|local-command-caveat|command-message|command-contents|task-notification)>[\s\S]*?<\/\1>/g;
 
-// The harness's own commands, which act on the session rather than ask for work. The name
-// and its argument are a setting, not something the reader typed to be read back, so a
-// session holding nothing else is not one anybody had.
-//
-// Measured over the 113 most recently written transcripts on this machine, six of these
-// names cover every such prompt: `/compact` 213, `/model` 47, `/context` 15, `/clear` 4,
-// `/config` 2, `/plugin` 2. Every other name in that corpus is a skill the reader invoked,
-// and its arguments are the request. `/effort` changes the session's effort level rather
-// than asking for work, so it belongs beside them on the same reasoning.
-//
-// Whether a command carries arguments does not separate the two, which is the rule to reach
-// for first. `/model` carries one on 45 of its 47 prompts, so that rule is the one to refuse.
-//
-// A name this code has never seen counts as work. A command added to the harness later
-// reads oddly as a prompt until this list names it too. That is the direction this list
-// gets wrong. The other direction leaves a reader's own session off the rail, with nothing
-// anywhere saying it existed.
+// Session-setting commands excluded from typed work prompts.
+// Unknown command names remain eligible as work, including reader-invoked skills.
 const HARNESS_COMMANDS = new Set(['/clear', '/compact', '/config', '/context', '/effort', '/model', '/plugin']);
 
 const COMMAND_NAMED = /<command-name>\s*(\/[^\s<]*)/;
 const COMMAND_SCAFFOLD = /<(command-name|command-args)>[\s\S]*?<\/\1>/g;
 
-// A command and its arguments, rejoined the way the reader typed them: one line, one space
-// between the two. The transcript writes them as separate tags on separate lines, and the
-// composer holds the single line that was sent. The panel drops its own copy of a mid-turn
-// prompt only when the two compare equal, so a newline here drew the reader's prompt twice
-// on the card until the turn stopped. Newlines inside the arguments are the reader's own and
-// are kept.
+// Command name and arguments joined with one space to match submitted prompt text.
+// Newlines inside arguments remain unchanged.
 const COMMAND_INVOCATION = /<command-name>\s*([^<]*?)\s*<\/command-name>\s*<command-args>([\s\S]*?)<\/command-args>/g;
 
 function textOf(content: unknown): string {
@@ -4571,10 +4023,7 @@ function textOf(content: unknown): string {
     .join('\n');
 }
 
-// What the user typed, with the harness's wrappers removed. Line structure is kept: a
-// prompt is often a list, and folding it into one run-on line is most of why the panel
-// keeps its line structure rather than folding into one run-on line. Runs of blank lines
-// collapse to one.
+// Removes prompt wrappers and tag syntax while preserving line structure. Multiple blank lines collapse to one blank line.
 export function cleanPrompt(raw: string): string {
   const named = COMMAND_NAMED.exec(raw);
   const body = named && HARNESS_COMMANDS.has(named[1]) ? raw.replace(COMMAND_SCAFFOLD, ' ') : raw;
@@ -4588,12 +4037,7 @@ export function cleanPrompt(raw: string): string {
     .trim();
 }
 
-// A queued command the reader typed, told apart from the two other things written on the
-// same kind of line: a message from another session, and a background task reporting back.
-// Measured over the 25 most recent transcripts of this workspace, 172 of these records: a
-// `commandMode` of `prompt` with an origin that is not a peer picks out the reader's own,
-// and the shape of the prompt agrees with it on every one. An absent origin counts as the
-// reader, which is how a `user` line is read here too.
+// Reader-queued prompt with prompt mode and no peer origin. Missing origin remains eligible.
 export function isReaderQueued(attachment: Record<string, unknown> | null | undefined): boolean {
   if (!attachment || attachment.type !== 'queued_command') {
     return false;
@@ -4602,10 +4046,7 @@ export function isReaderQueued(attachment: Record<string, unknown> | null | unde
     return false;
   }
   const origin = attachment.origin;
-  // An absent origin is the reader, which is what the records written before the field
-  // existed carry. Anything present that is not a plain object with a name on it is not a
-  // record this understands, and guessing at it would put another session's message under
-  // the reader's own heading.
+  // Missing origin remains eligible. Present origins require an object with a string kind other than `peer`.
   if (origin === undefined || origin === null) {
     return true;
   }
@@ -4630,13 +4071,8 @@ function readerQueuedAsk(record: Record<string, unknown>): { text: string; at: n
   return text ? { text, at: stamp(attachment?.timestamp ?? record.timestamp) } : null;
 }
 
-// A background agent's completion notice, in either of the two shapes Claude Code records,
-// returned as the raw text that carries its tags. A notice written while the main agent
-// works lands as a queued attachment with no origin at all, and its text sits in
-// `attachment.prompt`. A notice written while the main agent waits lands as a `user` record
-// with a `task-notification` origin, and its text sits in `message.content`. Every reader
-// that acts on a completion calls this one rule. Two copies of the test are how the second
-// shape stayed unread, and 42 percent of the completions in this project came in it.
+// Raw task-notification text from a user record's content or a queued attachment's prompt.
+// The origin or command mode must identify a task notification.
 export function taskNotificationText(record: Record<string, unknown> | null | undefined): string | null {
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
     return null;
@@ -4661,10 +4097,7 @@ export function taskNotificationText(record: Record<string, unknown> | null | un
   return null;
 }
 
-// The text of a notice, whatever shape its content block takes. The caller reads tags out of
-// it with a regular expression, so a block the reader has no name for still has to reach it
-// whole. `textOf` keeps text blocks alone, and a notice recorded in any other block shape
-// would otherwise arrive as `[object Object]` with the child id lost.
+// Retains text blocks or serializes other notice content so tag readers can inspect it.
 function noticeTags(content: unknown): string {
   if (typeof content === 'string') {
     return content;
@@ -4696,18 +4129,7 @@ function claudeRecordAt(record: Record<string, unknown>): number {
   return stamp(record.timestamp);
 }
 
-// A prompt-derived title's Markdown syntax, reduced to the text a reader would see.
 //
-// Titles stay plain text in every display path, so a prompt opening with a link shows its
-// syntax verbatim, target and all: a quoted skill link such as `[$name]\(path)` put the
-// whole address into the picker and the headings. Conservative on purpose. Only syntax
-// whose visible text is beyond doubt is converted, and anything unbalanced, malformed or
-// intraword (`foo_bar`, `a*b`, a lone backtick) is left exactly as typed: a title that
-// keeps stray syntax is readable, and one that lost real characters is not.
-//
-// The private stripMarkdown below is not this rule. It removes a stray backtick outright,
-// misses the escaped `\(` the wrapper writes, and leaves an image's `!` in front of its
-// text; headlines read that way, titles do not.
 
 // An emphasis run: not opened mid-word, not empty, not holding its own marker, and not
 // closed against a space. The tripled marker is matched before the doubled one and the
@@ -4740,10 +4162,7 @@ function stripEmphasisMarkersOnce(text: string): string {
     .replace(EM_LOW, '$1');
 }
 
-// Repeat the pass above until nothing changes, so a run nested inside another one of the
-// same marker character comes off from the inside out, same as marked reads it. Real text
-// nests emphasis at most a few levels deep, so this is a handful of linear passes, not a
-// pass per character.
+// Repeats emphasis removal until the text stops changing, including nested runs that share a marker.
 function stripEmphasisMarkers(text: string): string {
   let current = text;
   for (;;) {
@@ -4759,11 +4178,8 @@ function plainTitlePiece(text: string): string {
   return stripEmphasisMarkers(text.replace(IMAGE, '$1').replace(LINK, '$1'));
 }
 
-// Split a line on balanced backtick pairs, run `transform` on the text outside a code
-// span, and put a code span back exactly as written. A code span's text is shown as it
-// stands: `*x*` inside one renders literally, and a transform run over it would eat
-// characters the reader can see. Shared by `plainTitle` and `stripMarkdown`, which differ
-// only in what they do to the text outside a code span.
+// Transforms text outside balanced code spans. Code-span contents stay literal while their delimiting backticks are removed.
+// Title and headline readers supply different transforms.
 function withCodeSpansPreserved(line: string, transform: (piece: string) => string): string {
   return line
     .split(/(`[^`\n]+`)/g)
@@ -4775,21 +4191,13 @@ export function plainTitle(line: string): string {
   return withCodeSpansPreserved(line, plainTitlePiece);
 }
 
-// A session name is plain text on every surface. Reduce Markdown whose visible text is
-// unambiguous, remove host-only rich content, flatten whitespace, and apply the title limit
-// once so the rail card's own actions, the timeline heading, search results and saved
-// comments receive one value. The rail card's drawn name is a wider, separate cut of the
-// unbounded source below, built where the host assembles the rail's name.
+// Short plain-text session title after removing rich content, normalizing Markdown, and flattening whitespace.
 export function normalizeSessionTitle(text: string | null | undefined): string | null {
   const full = normalizeFullSessionTitle(text);
   return full ? shortenTo(full, 60, '...') : null;
 }
 
-// Compact surfaces use the shortened value above. The rename editor and the Details dialog
-// read this unbounded source directly, so callers must not try to reconstruct it from the
-// display title. The rail card reads its own bounded copy, built where the host assembles
-// the rail's name, not here: bounding it in this shared function would also cut what the
-// rename editor and Details show.
+// Unshortened plain-text title used by rename and Details. Session-list display applies its own separate bound.
 export function normalizeFullSessionTitle(text: string | null | undefined): string | null {
   if (!text) {
     return null;
@@ -4808,15 +4216,10 @@ const ORDERED = /^\s*\d+\.\s+/;
 // it. It belongs to that item, so it is not the end of the list it sits in.
 const CONTINUATION = /^\s+\S/;
 
-// A fence around a block of code. The line carrying it is punctuation, not content: stripped
-// of its backticks it reads as the bare language tag, for example "markdown", which is not
-// what the turn said. Skip the fence line itself; the lines it encloses are read as before.
+// Code-fence marker excluded from headline content. Enclosed lines remain eligible.
 const FENCE = /^\s*(```|~~~)/;
 
-// Bullet, heading, and ordered-item markers, taken off the true start of the raw line. They
-// run once here rather than per code-span piece: a plain-text piece that happens to follow a
-// code span, such as the " - rest" in `` `code` - rest ``, is not a bullet just because it
-// starts with a dash once split out on its own.
+// Removes structural Markdown at the raw line start, before splitting code spans.
 function stripStructuralMarkdown(line: string): string {
   return line
     .replace(BULLET, '') // bullet
@@ -4836,11 +4239,7 @@ function stripMarkdown(line: string): string {
   return stripInlineMarkdown(stripStructuralMarkdown(line));
 }
 
-// The raw line `headlineOf` and `headlineMarkdownOf` agree on, with its structural markers
-// gone and its inline markup untouched, or null where no line in the summary carries
-// content. One finder for both, so they always pick the same line: a fence or a section
-// heading is skipped the same way whether the caller wants the line plain or with its
-// markup kept.
+// First content-bearing summary line with structural markers removed and inline Markdown retained.
 function headlineLine(summary: string): string | null {
   for (const raw of summary.split('\n')) {
     if (FENCE.test(raw)) {
@@ -4863,23 +4262,13 @@ export function headlineOf(summary: string): string {
   return line === null ? '' : stripInlineMarkdown(line);
 }
 
-// The same line as `headlineOf`, with its inline Markdown kept: a code span's backticks, an
-// emphasis run's stars or underscores, and a link's target. The folded card's headline draws
-// this, since the open card already renders the response as Markdown and the folded line
-// should read the same way.
+// Same headline line with inline Markdown retained for folded-card rendering.
 export function headlineMarkdownOf(summary: string): string {
   const line = headlineLine(summary);
   return line === null ? '' : line.trim();
 }
 
-// The lines of the list a summary opens with, one line each for what the turn did, with
-// their markdown taken off.
-//
-// It stops at the end of that first list, and the reason is the reason it is worth having.
-// A summary closes with a list too, and those rows are written whether or not they hold
-// anything: every summary carries a row for what the reader has to do and a row for open
-// questions. Reading the whole summary would find those on every turn and say the same
-// thing about all of them.
+// Plain-text items in the summary's opening list, ending before its later sections.
 export function openingLines(summary: string): string[] {
   const lines: string[] = [];
   for (const raw of summary.split('\n')) {
@@ -4899,9 +4288,7 @@ export function openingLines(summary: string): string[] {
       lines.push(stripped);
       continue;
     }
-    // A wrapped or nested line carries no symbol of its own, and ending the list on it
-    // would drop every item under it while leaving the ones above, which reads on a card as
-    // a turn that said less than it did.
+    // Ignore continuation lines without ending the opening list.
     if (lines.length && CONTINUATION.test(raw)) {
       continue;
     }
@@ -4910,34 +4297,16 @@ export function openingLines(summary: string): string[] {
   return lines;
 }
 
-// The rows a summary closes with, as the text each one carries, or null for a row that is
-// not written. `openingLines` reads the list a summary opens with and stops before these on
-// purpose; this reads only these, and the two never overlap.
-//
-// The rows are the reader's half of the summary: what only they can do, and what is waiting
-// on an answer from them. A row is omitted when it has nothing to say, so the text being
-// there is most of the signal. Every turn recorded before that rule wrote both rows
-// regardless, filling an empty one with "none", which is why what counts as empty is
-// decided on the card rather than here.
-//
-// The newer format writes one "Waiting on you" section instead of the two rows, and it
-// arrives here as `actions` with no questions beside it, so everything reading these rows
-// keeps working unchanged. `WAITING_LABEL` below says what that section is.
+// Closing action and question text, or null when absent.
+// Named rows support inline text and following lists. A Waiting on you section supplies `actions` and clears `questions`.
+// The card separately identifies placeholder text with no waiting state.
 export interface ClosingRows {
   actions: string | null;
   questions: string | null;
 }
 
-// A row is taken only where one can begin: at the start of a line, behind nothing but the
-// symbol it opens with, and split from its text by a colon or by a dash with a space on
-// each side. A summary that discusses the format in its own prose names these rows in
-// passing, mid sentence and behind a comma, and that is what the guards keep out.
-//
-// The spaces around the dash are not decoration, and they are why the dash needs one on
-// each side. The questions row is written "Open questions / follow-ups", so a separator
-// that may sit against a letter finds the hyphen inside "follow-ups" first, and the row on
-// every turn then reads as beginning with the word "ups". Either space alone keeps that
-// out, which is why the test that proves it takes both away.
+// Named closing rows begin at the line start after nonletter decoration.
+// Inline text requires a colon or a spaced dash, avoiding the hyphen within "follow-ups".
 const CLOSING_ROW_NAME = {
   actions: /^[^\p{L}]*your actions\b/iu,
   questions: /^[^\p{L}]*open questions\b/iu,
@@ -4946,21 +4315,11 @@ const CLOSING_ROW_NAME = {
 // The text of a row written as one line, taken from whatever follows its name.
 const ROW_TEXT = /^[^:\n]{0,30}?(?::|\s[–—-])\s+(.+)$/u;
 
-// How much may sit between the name and nothing at all before the line stops reading as a
-// row's heading. "Open questions / follow-ups" is the only qualifier in use, and a line
-// carrying more than that is a sentence the row's name happens to start.
+// Maximum qualifier length after a named heading without inline text. Longer prose does not introduce a following list.
 const ROW_QUALIFIER = 20;
 
-// The label the newer summary format closes with. That format carries no symbols and no
-// named rows: everything the reader has to do or still has to decide, open questions
-// included, is folded into one "Waiting on you" section, whose label sits on a line of its
-// own above a flat list. Both shapes are on disk, so both are read, and the section maps
-// onto the actions row, which is the half the card's waiting signal fires on.
-//
-// It is matched against the line as written rather than against its stripped text, because
-// the bold is the only thing telling the label apart from the same four words in a
-// sentence, and stripping the markdown first takes it away. The colon is written on either
-// side of the bold by hand, so it is allowed in both places and belongs to neither.
+// Bold Waiting on you label for a following list, with an optional colon inside or outside the bold markers.
+// Match raw Markdown so ordinary prose with the same words remains distinct.
 const WAITING_LABEL = /^\*\*waiting on you:?\*\*:?$/i;
 
 export function closingRows(summary: string): ClosingRows {
@@ -4977,12 +4336,7 @@ export function closingRows(summary: string): ClosingRows {
     }
     if (WAITING_LABEL.test(lines[i].trim())) {
       const section = waitingSection(lines, i);
-      // A label with no list under it is not a section: the format never writes one, and
-      // reading it as an empty section would wipe out a real row found earlier. What is
-      // found obeys the same last-wins rule as the named rows, across both shapes, since a
-      // summary holding one of each is quoting the shape it is not using. The section holds
-      // what the questions row used to, so it takes that row with it rather than leaving an
-      // older one standing beside it.
+      // Accept only a nonempty waiting list. It replaces earlier action text and clears earlier question text.
       if (section) {
         found.actions = section.text;
         found.questions = null;
@@ -4993,10 +4347,7 @@ export function closingRows(summary: string): ClosingRows {
     const line = stripMarkdown(lines[i]);
     for (const name of Object.keys(CLOSING_ROW_NAME) as (keyof ClosingRows)[]) {
       const text = rowTextAt(name, line, lines, i);
-      // The last row with something in it wins. The rows close the summary, so an earlier
-      // one that got this far is prose about them rather than the row itself. A later line
-      // that starts with the name and holds nothing does not overwrite a real row with
-      // nothing: a sentence beginning "Your actions are done" is not the row going empty.
+      // The last nonempty matching row wins. Empty matches preserve earlier text.
       if (text) {
         found[name] = text;
       }
@@ -5019,15 +4370,7 @@ function rowTextAt(name: keyof ClosingRows, line: string, lines: string[], i: nu
   return rest.trim().length <= ROW_QUALIFIER ? listUnder(lines, i) : null;
 }
 
-// Whether a line is one of the named rows itself, which is where the list under the row
-// above it ends.
-//
-// A row, not a line that begins with a row's name: "Your actions here decide the release
-// date" is an ordinary item of the list it sits in, and both names are ordinary English for
-// the very thing these rows hold. Reading one as a row ends the list on it and throws away
-// that item and everything under it, which is the feature failing in the direction nobody
-// would notice: a turn that really is waiting shows no badge and drops out of the filter.
-// So a row has to look like one, by the same two shapes `rowTextAt` accepts.
+// Recognizes inline and heading rows using the same shapes as `rowTextAt`, to end the preceding list.
 function startsARow(line: string): boolean {
   const text = stripMarkdown(line);
   return Object.values(CLOSING_ROW_NAME).some((name) => {
@@ -5040,17 +4383,12 @@ function startsARow(line: string): boolean {
   });
 }
 
-// The list under a row written as a heading with nothing on its own line. Two shapes of
-// summary are on disk: the row and its text on one line, and the older one where the name
-// is a heading of its own and what it holds is the bullets below it. Both are real rows,
-// and reading only the first shape leaves every older turn looking as though it asked for
-// nothing.
+// Reads list text under a named heading. Inline rows are read separately.
 function listUnder(lines: string[], from: number): string | null {
   const parts: string[] = [];
   for (let i = from + 1; i < lines.length; i += 1) {
     const raw = lines[i];
-    // One blank line may sit between the heading and its list. A second means the list is
-    // over, and so does anything that is not an item of it.
+    // Skip blank lines before the first item. A blank line after an item ends the list.
     if (!raw.trim()) {
       if (parts.length) {
         break;
@@ -5061,9 +4399,7 @@ function listUnder(lines: string[], from: number): string | null {
     if (!BULLET.test(raw) && !ORDERED.test(raw) && !CONTINUATION.test(raw)) {
       break;
     }
-    // The rows are bullets themselves, so the next row looks exactly like another item of
-    // this one. Without this a heading row swallows every row below it, and an empty one
-    // takes the next row's text and claims the reader is needed.
+    // A following named row ends this list even when it has a bullet marker.
     if (startsARow(raw)) {
       break;
     }
@@ -5075,15 +4411,8 @@ function listUnder(lines: string[], from: number): string | null {
   return parts.length ? parts.join(' ') : null;
 }
 
-// The list under a "Waiting on you" label, one item to a line, or null where the label
-// stands alone. Blank lines sit anywhere inside the section, and anything that is not an
-// item of it ends it. A named row of the older shape ends it too: that row is a bullet like
-// any item, so a section written above one would otherwise swallow it, and the row it holds
-// is the later of the two and the one the turn meant.
-//
-// `end` is the last line the section took, so the caller can carry on past it and no item is
-// read a second time as a row of its own. Items are ordinary sentences, and both of the
-// older row names are ordinary English for the very thing an item says.
+// Reads a Waiting on you list and returns its text and last consumed line.
+// Blank lines remain allowed. A named row or nonitem ends the section.
 function waitingSection(lines: string[], from: number): { text: string; end: number } | null {
   const parts: string[] = [];
   let end = from;
@@ -5095,11 +4424,7 @@ function waitingSection(lines: string[], from: number): { text: string; end: num
     if (startsARow(raw)) {
       break;
     }
-    // The same item shapes the older heading reader takes: a numbered item is an item,
-    // and a line set in under one is the rest of it rather than one of its own. The
-    // convention writes each item flat on one line, but an item that wrapped anyway
-    // still belongs to the section, and ending it there would silently drop every item
-    // after the wrap.
+    // Accept bullet and numbered items. Append indented continuation text to the preceding item.
     if (BULLET.test(raw) || ORDERED.test(raw)) {
       const text = stripMarkdown(raw);
       if (text) {
@@ -5121,9 +4446,7 @@ function waitingSection(lines: string[], from: number): { text: string; end: num
   return parts.length ? { text: parts.join('\n'), end } : null;
 }
 
-// A row wrapped over several lines is one row. Its later lines are set in under the first,
-// which is what tells them apart from the row below, and they carry the rest of the text:
-// stopping at the first line would drop questions three and four of four.
+// Joins a row's indented continuation lines with spaces.
 function joinWrapped(first: string, lines: string[], from: number): string {
   const parts = [first.trim()];
   for (let i = from + 1; i < lines.length; i += 1) {
@@ -5138,9 +4461,7 @@ function joinWrapped(first: string, lines: string[], from: number): string {
   return parts.join(' ');
 }
 
-// A compaction summary opens with a fixed note to the next agent saying the session ran
-// out of context. The panel says that already in its own heading, so the summary starts
-// where the content does.
+// Claude continuation preamble removed before displaying retained compaction text.
 const COMPACT_PREAMBLE = /^[\s\S]{0,400}?covers the earlier portion of the conversation\.\s*(?:Summary:)?\s*/;
 
 export function stripCompactPreamble(text: string): string {
@@ -5211,11 +4532,7 @@ export function tallyToolName(tally: Record<string, number>, name: string): void
   });
 }
 
-// What a shell call ran, and where it was standing when it started. The transcript keeps
-// no working directory on the tool call itself; the record carrying the call has a
-// top-level `cwd`, and that one is the directory *before* the command ran, which is what a
-// relative `cd` inside it resolves against. The record carrying the result has the
-// directory after, which is the wrong one.
+// Shell command and its starting working directory, taken from the tool-call record rather than its result.
 export interface CommandCall {
   id?: string; // source tool call id, when the reader records one
   command: string;
@@ -5224,37 +4541,19 @@ export interface CommandCall {
   at: number; // epoch ms of the record that issued the call, which opens its window
 }
 
-// What a reader knows about the call whose output is being read for commits.
-//
-// A `CommandCall` is the command that ran, and it decides. `null` is a reader that records
-// the command behind a result and recorded none for this one: nothing says git ran, so
-// nothing is read. `'unreadable'` is a source that cannot pair a command with the output in
-// front of it, and its output is read the way every result was read before the rule. One Codex
-// outer call runs a JavaScript program that can complete several commands, so that output has
-// no safe command pairing. A completed Codex command carries its own command, directory,
-// result, output, and execution window, so it supplies a readable `CommandCall` instead.
+// Command evidence for reading printed commits.
+// A readable call constrains eligibility. `null` rejects output with no paired command.
+// `unreadable` permits output inspection when command pairing is unavailable.
 export type CommitCall = CommandCall | null | 'unreadable';
 
-// Stands in for quoted text and heredoc bodies while a command is being read. It is not
-// whitespace and not an operator, so a `;` inside a commit message and the words
-// `git commit` inside a heredoc both disappear before anything is split or matched.
+// Nonoperator filler for masked quoted text and heredoc bodies.
 const FILL = '\u0001';
 
-// A copy of the command with quoted interiors and heredoc bodies replaced by the filler,
-// the same length as the original, so an index into one is an index into the other and a
-// path can be read back out of the text at the position the masked copy matched at.
-//
-// One pass reads the command as bash nests it, and reads each character once. `open` holds
-// the quotes, command substitutions `$(`, arithmetic expansions `$((` and parentheses that
-// enclose the current character. Everything inside a quoted string is masked, nested
-// constructs included, and the quote that closes the outermost string is not, so
-// `commandWords` finds where that argument ends. A command substitution is a script of its
-// own even inside double quotes, so a quote, a heredoc or another substitution in it nests.
-// A `<<` opener in a script queues its heredoc. The queued bodies follow the next newline of
-// a script, in the order their openers came. Each body ends at a line that is exactly its
-// delimiter, after leading tabs are removed for `<<-`, or at the end of the command.
-// Arithmetic reads `<<` as a shift, and `<<<` passes a string, so neither opens a heredoc.
-// Launch discovery also tracks parameter expansions and words around these frames for comments.
+// Same-length command copy with quoted text and heredoc bodies masked. Original indexes still identify path text.
+// Quoted command substitutions retain their nested script boundaries.
+// Heredoc bodies follow the next script newline in opener order and end at their delimiters or command end.
+// `<<-` allows leading delimiter tabs. Arithmetic shifts and `<<<` do not open heredocs.
+// Launch discovery also tracks comments, parameter expansions, and conditional operands.
 function maskQuoted(command: string, shell?: ClaudeShellDialect): string {
   const launchSyntax = shell !== undefined;
   const out = command.split('');
@@ -5491,15 +4790,8 @@ function maskQuoted(command: string, shell?: ClaudeShellDialect): string {
       i = pass(i, i + 1);
       continue;
     }
-    // PowerShell's here-strings, `@'` and `@"`. An opener counts only when nothing but
-    // whitespace follows it up to the end of its line, and a terminator only when its quote
-    // and `@` are the first two characters of a line, because PowerShell accepts them
-    // nowhere else; the end-of-line test is what keeps an ordinary `user@'host'` argument
-    // from opening one. The terminator is masked along with the body, since its quote would
-    // otherwise open a quoted run of its own in the scan that carries on after it. Without
-    // the mask an apostrophe in the body puts that scan out of step, and the `git add` and
-    // `git commit` written after the here-string read as text inside a string rather than
-    // as calls.
+    // PowerShell here-string openers require only whitespace before the newline. Terminators begin a line with the quote and `@`.
+    // Mask the body and terminator so their contents cannot supply later command boundaries.
     if (
       c === '@' &&
       (open.length === 0 || (launchSyntax && top !== '${')) &&
@@ -5628,10 +4920,8 @@ function heredocOpener(
   return { delim: j > start ? delim : null, tabs, after: j };
 }
 
-// The commands in one call, split on the `&&`, `||`, `;` and newlines that are real
-// operators rather than characters inside a quoted string or a heredoc. Each command is
-// carried in both spellings: the original, which the paths are read out of, and the
-// masked copy, which everything is matched against.
+// Segments split on unquoted logical operators, semicolons, and newlines.
+// Each segment retains original text, masked text, and source offset.
 function commandSegments(
   command: string,
   shell?: ClaudeShellDialect,
@@ -5658,11 +4948,8 @@ function commandSegments(
   return parts;
 }
 
-// Git Bash writes `/c/x`, WSL writes `/mnt/c/x` and Cygwin writes `/cygdrive/c/x`, and all
-// three name a Windows drive. Left alone they read as absolute paths under the root, which
-// is inside nothing and outside everything.
-// A drive with nothing after it keeps its slash: `C:` on its own is not an absolute path,
-// and a path built on it is joined onto wherever the call started instead.
+// Converts Git Bash, WSL, and Cygwin drive prefixes to Windows drive-absolute paths.
+// Bare drive prefixes retain a slash so they do not become drive-relative paths.
 function driveForm(p: string): string {
   let m = /^\/mnt\/([a-zA-Z])(\/|$)/.exec(p) || /^\/cygdrive\/([a-zA-Z])(\/|$)/.exec(p);
   if (m) {
@@ -5703,11 +4990,7 @@ function normalizeDir(p: string): string {
   return (root + '/' + parts.join('/')).replace(/\/$/, '') || root + '/';
 }
 
-// What a backslash outside quotes takes out of the shell's hands. It is how a space or a
-// quote is written into a path that is not quoted, and it is nothing else: every other
-// backslash is a character of the path itself, which is how Windows spells every path it
-// writes. Dropping those turns `C:\Users\dev` into `C:Usersdev`, which is no longer
-// absolute and is joined onto the current directory as though it were relative.
+// Unquoted argument escapes recognized by this path reader. Other backslashes remain path characters.
 const ESCAPABLE = /[\s'"]/;
 
 // One argument with its quotes taken off, read from the start of `rest`. The original text
@@ -5751,9 +5034,7 @@ function firstArg(rest: string, shell?: ClaudeShellDialect): string | null {
   return shell && quote ? null : out;
 }
 
-// The directory an argument names, or null when nothing here can say. A target built from
-// a variable is the common unresolvable one: `cd "$REPO"` names a directory this reader
-// has no way to expand, and guessing would be worse than saying nothing.
+// Resolves a literal directory against the current directory and home. Unexpanded variables leave the directory unknown.
 function resolveDir(arg: string, cur: string | null, homeDir: string): string | null {
   let t = arg
     .replace(/\\/g, '/')
@@ -5769,28 +5050,19 @@ function resolveDir(arg: string, cur: string | null, homeDir: string): string | 
   return cur ? normalizeDir(cur + '/' + t) : null;
 }
 
-// The commands that move the shell, in both shells the panel reads. `cd`, `Set-Location`
-// and `chdir` are one command under three names; `pushd` and `Push-Location` also change
-// the directory, and the stack they push is not tracked, so `popd` is the shape below.
+// Directory-changing command names. Directory stacks are not tracked.
 const CHANGE_DIR = /^(cd|chdir|set-location|pushd|push-location)(\s|$)/i;
-// A move the reader cannot follow. Where the shell went is then unknown rather than
-// unchanged, and an unknown directory attributes nothing, which is the safe answer.
+// Directory-stack commands that leave the tracked directory unknown.
 const UNTRACKED_DIR = /^(popd|pop-location)(\s|$)/i;
 
-// The parameter PowerShell names the destination with. `-Path` and `-LiteralPath` are the
-// two spellings of it, and either may be joined to its value by a colon or an equals sign.
+// PowerShell destination parameter names, optionally followed by a colon or equals sign.
 const DIR_PARAM = /^-(?:Path|LiteralPath)(?=[\s:=]|$)/i;
 
 // A switch in front of the destination that this reader cannot read past, which is not the
 // same answer as a command naming no destination at all.
 const UNREADABLE = Symbol('unreadable switch');
 
-// The destination a move names, read past any parameter written in front of it. PowerShell
-// writes `Set-Location -Path <dir>` as readily as it writes the directory bare, and the
-// PowerShell tool makes about one commit in nine in this data, so a reader that takes the
-// first token whatever it is records `-Path` as the directory and joins it onto the current
-// one. A switch this reader does not know could be hiding the destination behind it, so it
-// answers `UNREADABLE` and the shell's directory stops being tracked rather than guessed.
+// Reads a directory target after recognized parameters. Unknown switches return `UNREADABLE`, distinct from an absent destination.
 function moveTarget(rest: string, shell?: ClaudeShellDialect): string | null | typeof UNREADABLE {
   let s = rest.trim();
   // `-` on its own is the previous directory, which is a destination and not a switch.
@@ -5804,11 +5076,7 @@ function moveTarget(rest: string, shell?: ClaudeShellDialect): string | null | t
   return firstArg(s, shell) ?? (s ? UNREADABLE : null);
 }
 
-// A `git commit`, with any `-C` git was given in front of it. `-C` names the directory for
-// that one call and does not move the shell, and it is how eight of the nine foreign
-// commits measured over the real transcripts were made, so a rule reading `cd` alone
-// misses them. Matched against the masked copy, where a quoted argument is a run of filler
-// and therefore still one token.
+// Git commit command with optional repeated `-C` directory arguments, matched against masked text.
 const COMMIT_CALL = /(^|[\s(])git((?:\s+-C\s+\S+)*)\s+commit(?=\s|$)/g;
 
 // A `git merge`, read the same way. A merge makes no commit of its own when it fast-forwards,
@@ -5816,11 +5084,8 @@ const COMMIT_CALL = /(^|[\s(])git((?:\s+-C\s+\S+)*)\s+commit(?=\s|$)/g;
 const MERGE_CALL = /(^|[\s(])git((?:\s+-C\s+\S+)*)\s+merge(?=\s|$)/g;
 
 /**
- * The directory each `git commit` in one call was made in, in the order the call makes
- * them, with null wherever the directory cannot be worked out.
- *
- * `cwd` is the directory the call started in, which is the `cwd` of the record carrying
- * the tool call. An empty answer means the call makes no commit this reader can see.
+ * Directories for recognized commit commands in call order, with null for unresolved targets.
+ * `cwd` supplies the starting directory. Incomplete inspection retains an unresolved target.
  */
 export function commitDirs(command: string, cwd: string | null, home: string = os.homedir()): (string | null)[] {
   const inspection = inspectCommitCommand(command, cwd, undefined, home);
@@ -6206,10 +5471,7 @@ export function inspectCommitCommand(
   return out;
 }
 
-/**
- * The same answer for each `git merge` in one call. A fast-forward landing is attributed the
- * way a commit is: the command says which repository, and the repository says what landed.
- */
+/** Directories for merge commands in call order, with null for unresolved targets. */
 export function mergeDirs(command: string, cwd: string | null, home: string = os.homedir()): (string | null)[] {
   return gitCallDirs(command, cwd, home, MERGE_CALL);
 }
@@ -6270,31 +5532,12 @@ function gitCallDirs(
   return out;
 }
 
-// A segment that runs git: its command word is `git`, behind nothing but the environment
-// assignments a shell allows in front of one. Matched against the masked copy of the
-// segment, so the word `git` inside a quoted string, a commit message or a heredoc body is
-// a run of filler by the time it reaches here and cannot qualify on its own.
-//
-// A command word begins at the start of the segment or behind one of the characters a
-// shell opens a command with. `commandSegments` splits on the operators that separate
-// commands, and a guarded commit keeps the whole
-// `if ((git rev-parse --short HEAD) -eq "abc1234") { git commit -F msg.txt }` in one
-// segment; three commits in one measured run of the real transcripts were made that way,
-// and a rule reading only the head of a segment loses all of them.
+// Git command boundary with optional environment assignments, matched against masked text.
 const GIT_CALL = /(?:^|[({|&])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*git(?:\s|$)/;
 
 /**
- * Whether one call ran git as a command.
- *
- * It is not narrowed to `git commit`. A revert and a cherry-pick print the same line for a
- * commit they really made, measured against git itself, and so do a rebase and a pull; all
- * of them are the turn's own work. `git merge` prints no such line: the line for a merge
- * comes from the `git commit` that closes a conflicted one.
- *
- * The cost is a commit made by a script that calls git for itself, a release task or a
- * hook, which stops being drawn. That is the trade: git's line reaches a transcript as the
- * output of a call that ran git, and anything else printing that shape is quoting a commit
- * somebody else made.
+ * Checks whether the script contains a recognized Git command.
+ * Literal nested shell scripts are inspected within bounded depth. Opaque scripts do not establish a Git call.
  */
 export function ranGit(command: string, shell?: ClaudeShellDialect): boolean {
   if (!NESTED_SHELL.test(command)) return commandSegments(command, shell).some((seg) => GIT_CALL.test(seg.masked));
@@ -6333,32 +5576,15 @@ const BACKGROUND = /(^|[^&>])&([^&]|$)/;
 const NEGATED = /(^|[\s({;])!\s/;
 
 /**
- * Whether the call's exit status stands for the commit it made.
- *
- * This decides whether a call that printed nothing is read back from the repository at
- * all. `A && B` qualifies: a skipped B leaves the whole call non-zero, and a call that
- * failed is refused already. An or-else, a semicolon, a newline and a conditional block do
- * not. Each one exits zero with the commit never made, so the window around it holds only
- * what another session landed, and the card would draw that as this turn's work. A pipe is
- * allowed because the repository count and head log still identify the commit.
- *
- * An or-else disqualifies a command wherever it sits, not only after the commit. It skips
- * the commit when it comes before one, and it hides the failure when it comes after.
- *
- * The guarded shape
- * `[[ "$(git rev-parse --short HEAD)" == "abc1234" ]] && git commit -F msg.txt || echo aborting`
- * is what the reader's own instructions teach, so it is the shape most likely to arrive
- * rather than a corner case.
+ * Checks whether successful call status permits repository recovery for a quiet commit.
+ * Conditional blocks, or-else branches, early exits, and ambiguous separators prevent recovery.
+ * Trailing pipes remain eligible under repository count and head-log checks.
  */
 export function commitStatusIsReadable(command: string): boolean {
   return gitStatusIsReadable(command, COMMIT_CALL);
 }
 
-/**
- * The same question for `git merge`. A fast-forward is read out of the head log inside the
- * call's window, so a call whose exit status does not stand for its merge would take whatever
- * another session landed in that window.
- */
+/** Checks whether successful call status permits head-log recovery for a merge. */
 export function mergeStatusIsReadable(command: string): boolean {
   return gitStatusIsReadable(command, MERGE_CALL);
 }
@@ -6368,9 +5594,8 @@ function gitStatusIsReadable(command: string, call: RegExp): boolean {
   if (CONDITIONAL.test(masked) || masked.includes('||')) {
     return false;
   }
-  // These three read the command as written as well as the masked copy. Quoting an option
-  // changes nothing about what git does with it, and masking would hide it. A commit message
-  // holding the same words costs a commit that would have been drawn, and claims none.
+  // Dry-run and committer-date checks inspect raw and masked commands. Negation checks inspect masked commands alone.
+  // Quoted matching text can therefore reject a command without establishing another commit.
   if (DRY_RUN.test(masked) || OWN_DATE.test(masked) || NEGATED.test(masked)) {
     return false;
   }
@@ -6388,11 +5613,7 @@ function gitStatusIsReadable(command: string, call: RegExp): boolean {
   if (m === null) {
     return false;
   }
-  // From the first commit rather than the last. A separator between two commits hides the
-  // first one's failure exactly as one after the last hides that one's, and a command making
-  // two commits is read as making two whether or not the first happened. Reading from the
-  // first costs nothing before it: a separator there sits ahead of every commit the command
-  // makes, and the status still ends up being git's.
+  // Reject ambiguous separators after the first matched command, including separators between multiple commits.
   const after = masked.slice(m.index + m[0].length);
   if (after.includes(';') || after.includes('\n') || BACKGROUND.test(after)) {
     return false;
@@ -6521,26 +5742,9 @@ function everyCallIsACommand(command: string, call: RegExp): boolean {
 }
 
 /**
- * Where a call's commits landed, when that is somewhere other than this workspace, and
- * null in every other case.
- *
- * Pairing a directory with a single commit is not safe: the count of commit-making calls
- * in a command does not match the number of commit lines git printed, on 4% of calls
- * measured, and in both directions. A commit that finds nothing staged prints no line, and
- * one measured call printed four lines for six calls. So the whole call is answered or
- * none of it is.
- *
- * Every commit naming the same directory is the named answer. Directories that disagree
- * were once no answer at all, which lost six commits across three measured calls, each of
- * them committing to two different foreign repositories in one command. Where every one of
- * those directories is outside the workspace, the call is marked and no directory is given:
- * that cannot name the wrong repository, because it names none, and it cannot touch a
- * commit made here, because one directory inside the workspace stops the whole call.
- *
- * Marking a commit made in this workspace as foreign is the failure that must not happen,
- * because the reader would go looking for work that is on the card in front of them.
- * Missing a foreign one only leaves the row as it was.
- *
+ * Commit location outside the open folders, or null when no external location is established.
+ * A shared target supplies its directory. Multiple known external targets supply an unnamed location.
+ * Unresolved targets or a mixture of internal and external targets leave location unknown.
  */
 export function commitPlaceOf(call: CommandCall | null, folders: string[], home: string = os.homedir()): CommitPlace {
   if (!call || folders.length === 0) {
@@ -6550,9 +5754,7 @@ export function commitPlaceOf(call: CommandCall | null, folders: string[], home:
   if (agreed !== null) {
     return isInside(agreed, folders) ? null : { kind: 'named', dir: agreed };
   }
-  // An agreed directory is not available when the call used more than one repository.
-  // Re-read the individual directories only to preserve the existing safe `unnamed`
-  // wording for a call whose every target is foreign.
+  // Multiple known targets supply an unnamed location only when every target lies outside the open folders.
   const dirs = commitDirs(call.command, call.cwd, home);
   if (!dirs.length || dirs.some((d) => d === null)) {
     return null;
@@ -6594,20 +5796,8 @@ function theOneDir(dirs: (string | null)[]): string | null {
   const first = dirs[0] as string;
   return dirs.every((d) => normalizeFsPath(d as string) === normalizeFsPath(first)) ? first : null;
 }
-// `git commit` prints "[<branch> <sha>] <subject>" on the first line it writes for the
-// new commit. Reading it back is how a turn can say what it actually landed.
-//
-// What sits before the sha is not one token. A repository's first commit is
-// "[main (root-commit) 049b47a]" and a commit made off a branch is
-// "[detached HEAD cac66e9]", so a rule that allows a single token drops both: the first
-// commit of every repository, ever, and every commit made during a bisect or a rebase.
-//
-// The two extra tokens are named rather than allowed for as "any number of tokens". This
-// runs against the stdout of every tool call, not only `git commit`, so what it accepts is
-// what it will read out of unrelated command output: a bracketed log line such as
-// "[2026-08-26 10:23:45 deadbeef] service started" is three tokens and a hex-shaped word,
-// and a rule counting tokens draws it on a card as a commit that never happened. Only the
-// two things git actually writes are allowed, so nothing wider than git's own output gets in.
+// Printed Git commit identity, with optional branch, detached HEAD, and root-commit fields.
+// Named optional tokens avoid accepting arbitrary bracketed log headers as commits.
 const COMMIT_LINE = /^\[(?:(detached HEAD|\S+)\s+)?(?:\(root-commit\)\s+)?([0-9a-f]{7,40})\]\s*(.*)$/;
 
 // git's stat line, printed directly under the commit line. "file"/"files",
@@ -6635,18 +5825,9 @@ export function parseStatLine(line: string): { files: number; added: number; rem
   };
 }
 
-// `call` is what the tool ran and where it was standing. It says two things: whether git
-// printed this output at all, and, once a commit line has been found in it, which
-// repository the commits landed in.
-//
-// The first is the gate. This runs against the stdout of every tool call, so without it
-// anything quoting git's line is drawn on a card as a commit the turn made: a session that
-// surveyed other agents' transcripts printed one of their commit lines as sample output,
-// and the card claimed that commit as its own work.
-//
-// `window` is what the reader knows about the call itself, and only a reader that can supply
-// it gets an intent recorded. Without one, output that printed no commit line is read exactly
-// as it was read before this rule.
+// Reads printed commit identities only from eligible Git commands or explicitly unpaired command output.
+// Repository candidates retain the command's directory evidence.
+// A successful readable execution window also permits quiet-commit and landing recovery intents.
 export function recordCommits(
   turn: { commits: TurnCommit[]; commitIntents?: CommitIntent[]; landingIntents?: LandingIntent[] },
   stdout: string,
@@ -6659,8 +5840,7 @@ export function recordCommits(
   if (call === null || (call !== 'unreadable' && !ranGit(call.command, call.shell))) {
     return;
   }
-  // A source whose command cannot be read supplies no place wording. It may still supply a
-  // default directory for opening the commit, while its commits remain unmarked.
+  // Unpaired commands supply no location label. Their caller can still provide a default navigation directory.
   const ran = call === 'unreadable' ? null : call;
   const lines = stdout.split('\n');
   let place: CommitPlace | undefined;
@@ -6697,10 +5877,7 @@ export function recordCommits(
       } else if (ran && dir !== null && !duplicate.candidates) duplicate.dir = dir;
       continue;
     }
-    // The stat line is usually the next line, but git writes its own headers in between
-    // whenever the author or the author date differs from the committer's, which is every
-    // amend and every cherry-pick. Reading only the next line loses those commits' figures.
-    // A commit that changed nothing prints no stat line at all, so the scan has to give up.
+    // Inspect nearby stat lines through Git headers, stopping at another commit identity. Missing stats leave counts unknown.
     let stat: { files: number; added: number; removed: number } | null = null;
     for (let j = i + 1; j < lines.length && j <= i + STAT_LOOKAHEAD; j++) {
       const next = lines[j].trim();
@@ -6730,15 +5907,8 @@ export function recordCommits(
   recordLandingIntent(turn, ran, mergeDirOf(ran, folders), window, at);
 }
 
-// What is left when the output held no commit line: the fact that the call committed, and
-// the window it committed in.
-//
-// A call that failed records nothing. Its own commit did not happen, so a window that holds
-// one holds somebody else's, and claiming it is the failure this whole path exists to avoid.
-// A call whose shape hides that failure records nothing either, for the same reason.
-//
-// A call whose command named more than one repository records nothing either. There is no
-// single directory to ask, and asking the wrong one answers about the wrong repository.
+// Records quiet-commit recovery only with a successful window and one resolved repository.
+// Require readable status or a witnessed commit hash. Printed identities take precedence.
 function recordCommitIntent(
   turn: { commitIntents?: CommitIntent[] },
   ran: CommandCall | null,
@@ -6769,12 +5939,7 @@ function recordCommitIntent(
   });
 }
 
-// The same record for a call that merged. A fast-forward prints no identity at all, so there
-// is no printed answer to prefer and nothing to suppress the record.
-//
-// The refusals are the commit's refusals, and for the same reason. A call that failed made no
-// landing, and a call whose shape hides that failure proves nothing about the one in its
-// window. A command that named more than one repository has no single directory to ask.
+// Records merge recovery only with a successful readable window and one resolved repository.
 function recordLandingIntent(
   turn: { landingIntents?: LandingIntent[] },
   ran: CommandCall | null,
@@ -6902,16 +6067,12 @@ export interface ReadOptions {
   recoveredModelAttachment?: string | null;
   tailBytes?: number;
   maxTurns?: number;
-  // Prepare a byte cursor when this tail begins inside the newest turn. Only the selected
-  // session asks for one; background sessions keep their ordinary bounded read.
+  // Prepare newest-turn backward recovery for selected reads. Other reads retain their ordinary tail.
   prepareNewestTurnDiscovery?: boolean;
   sessionTitle?: string | null;
-  // The open workspace folders. A commit made inside one of them is this workspace's own
-  // work and carries no directory; with none given, nothing is outside anything and no
-  // commit is marked.
+  // Open workspace folders used for external commit location labels. An empty list leaves locations unmarked.
   folders?: string[];
-  // The child transcript behind an id the parent recorded. The panel supplies a cached
-  // filesystem lookup; tests and callers that only need the parent can omit it.
+  // Optional child-spend lookup for the identity recorded by a parent launch.
   agentSpendOf?: AgentSpendLookup;
   // Resolves a paired launch and result to a child session after the provider adapter
   // verifies the child's transcript and recorded working directory.
@@ -6940,13 +6101,10 @@ export type ClaudeUsage = {
 // after the extension host restarts.
 export interface ClaudeUsageReducerState {
   costState?: ClaudeCostCapture;
-  // Every request a parent read has billed, oldest first, and the newest of them in a child
-  // read. This is the saved form, so it stays an array.
+  // First-seen request keys, oldest first. Parent reads retain every key.
+  // Child reads retain the newest keys unless retainAllRequests is set. Snapshots keep an array.
   seenRequestKeys: string[];
-  // The same keys as a set, which answers membership without a scan. A parent transcript
-  // holds thousands of requests and repeats each one, so a scan for every record turns a read
-  // into a stall. Built from the saved queue on the first record after a restore, and left
-  // out of the saved form.
+  // Runtime request-key set, rebuilt from the saved queue and omitted from snapshots.
   seenRequests?: Set<string>;
   closedTurns: number;
   openTurn: boolean;
@@ -6980,8 +6138,7 @@ export interface ClaudeUsageReducerState {
   currentTurnStartedAt: number | null;
   currentTurnEndedAt: number | null;
   currentTurnOutcome: TurnOutcome | null;
-  // The id of the typed record that opened the current turn. A local command answer that names
-  // it as its parent withdraws the turn. Absent in a state saved before the field existed.
+  // Opening record ID used to pair a local command answer.
   currentTurnCommand?: string | null;
   // The turn the current typed prompt followed, as it stood when that prompt arrived. A local
   // command answer withdraws the command's turn and puts this one back as the newest turn.
@@ -6998,14 +6155,12 @@ export interface ClaudeUsageReducerState {
   // The index behind currentTurnOutcome.closedChildren. It is rebuilt once after a restore
   // and omitted from snapshots, like seenRequests above.
   closedChildIndex?: Map<string, number>;
-  // The last event for each of the newest request keys, kept so that a later line revising one
-  // of them can remove what it replaces. Only a child read fills this. `RETAINED_REQUESTS`
-  // bounds this map and the child read's queue alike, so every request that queue calls
-  // counted keeps its event here.
+  // Latest usage event for each retained child request key.
+  // A revised request removes its previous event before adding its replacement.
+  // RETAINED_REQUESTS bounds events and keys unless retainAllRequests is set.
+  // Parent reads deduplicate requests without retaining their events.
   requestEvents?: Record<string, UsageEvent>;
-  // The model id the newest `model` attachment names, such as `us.anthropic.claude-opus-5-5[1m]`.
-  // Claude Code writes one at the start of a session and one at each `/model` switch. On Amazon
-  // Bedrock the id carries the inference profile, which sets the request's price.
+  // Model id from the newest model attachment. Bedrock request pricing reads its inference profile prefix.
   modelProfile?: string | null;
 }
 
@@ -7089,8 +6244,7 @@ function copyUnsizedCompaction(value: ClaudeUnsizedCompaction | null | undefined
   return value ? { ...value, previous: value.previous ? { ...value.previous } : null } : null;
 }
 
-// The length of a compaction summary's stored text, the continuation preamble included. The
-// compaction estimate's characters per output token were measured on this count.
+// Stored compaction summary character count, including the continuation preamble.
 export function compactSummaryChars(record: Record<string, unknown>): number {
   const content = (record.message as { content?: unknown } | undefined)?.content;
   return (typeof content === 'string' ? content : textOf(content)).length;
@@ -7250,10 +6404,8 @@ function reduceClaudeTurnRecord(
   const withdrawn = state.currentTurnWithdrawn;
   const queued = withdrawn ? readerQueuedAsk(record) : null;
   if (queued) {
-    // A prompt queued behind the withdrawn command waits on a card of its own in the full
-    // reader, so it opens a turn. A later one joins that turn, even after a process end, as the
-    // full reader keeps every queued prompt on the command's one card. The command stays
-    // withdrawn, so model work still makes the command the turn.
+    // Queued prompts after a withdrawn command share an unanswered turn until model work restores the command turn.
+    // Later queued prompts join the same turn, including after a process end.
     if (state.openTurn && state.currentTurnQueued) {
       state.currentTurnEndedAt = Math.max(state.currentTurnEndedAt ?? 0, queued.at);
       if (state.currentTurnOutcome) {
@@ -7286,9 +6438,7 @@ function reduceClaudeTurnRecord(
     return;
   }
   if (withdrawn && claudeModelWorks(record)) {
-    // Model work after the answer makes the command a turn again, the same step a typed
-    // prompt takes. The record below then answers it. A turn a queued prompt opened gives way
-    // to the command, because the full reader puts that prompt on the command's card.
+    // Model work restores the withdrawn command turn and carries any queued turn's process end.
     state.currentTurnWithdrawn = null;
     if (state.openTurn && state.openTurnAnswered && !state.currentTurnQueued) {
       state.closedTurns++;
@@ -7310,9 +6460,7 @@ function reduceClaudeTurnRecord(
       state.currentTurnCommand &&
       localAnswer.parent === state.currentTurnCommand
     ) {
-      // The CLI answered the command itself, so the command is no turn and the turn before it
-      // is the newest again. `visibleTurns` keeps its step, because it only names turns apart.
-      // The command is held, finished, as the full reader holds it.
+      // Withdraw the unanswered command turn. Preserve its visible-turn sequence number for request identity.
       const previous = state.currentTurnPrevious ?? null;
       const outcome: TurnOutcome = {
         ...state.currentTurnOutcome,
@@ -7333,8 +6481,7 @@ function reduceClaudeTurnRecord(
       if (previous?.open && !previous.answered && state.currentTurnOutcome) {
         state.currentTurnOutcome = stoppedByLocalAnswer(state.currentTurnOutcome);
       }
-      // A prompt that got no reply before the command keeps a turn of its own, as the full reader
-      // gives it a card, so the next typed prompt counts it rather than taking it in.
+      // An unanswered prompt restored by the local answer keeps its own turn for the next prompt count.
       state.openTurnAnswered = state.openTurn;
       state.currentTurnWithdrawn = withdrawn;
     }
@@ -7426,9 +6573,7 @@ function reduceClaudeTurnRecord(
   }
 }
 
-// One Claude response's usage in the common turn shape. Kept here for both the parent and
-// child readers, so a cache tier cannot be priced one way on the card and another in its
-// per-agent breakdown.
+// Recorded Claude response usage in shared token categories.
 export function claudeUsage(usage: ClaudeUsage): TurnUsage {
   const created = usage.cache_creation as
     | { ephemeral_1h_input_tokens?: number; ephemeral_5m_input_tokens?: number }
@@ -7439,8 +6584,7 @@ export function claudeUsage(usage: ClaudeUsage): TurnUsage {
     requests: 1,
     input: usage.input_tokens || 0,
     cacheRead: usage.cache_read_input_tokens || 0,
-    // Older transcripts have the total but not the split; charge those at the 1-hour rate,
-    // which is what this harness asks for.
+    // An unsplit cache-creation total uses the one-hour pricing category without establishing a recorded cache lifetime.
     cacheWrite1h: total1h || (total5m ? 0 : usage.cache_creation_input_tokens || 0),
     cacheWrite5m: total5m,
     cacheWrite30m: 0,
@@ -7449,20 +6593,14 @@ export function claudeUsage(usage: ClaudeUsage): TurnUsage {
   };
 }
 
-// Which lifetime a Claude response bought, or null where the record named none.
-//
-// `claudeUsage` charges an unsplit write at the hour, which is what this harness asks for.
-// That is a price fallback, and a reader told "bought for 1 hour" on the strength of it is
-// being shown an assumption as evidence. Both read the same field, so neither can drift.
+// Recorded single cache-write lifetime, or null for no write, unsplit writes, or mixed tiers.
 export function claudeCacheLifetime(usage: ClaudeUsage): CacheLifetime | null {
   const created = usage.cache_creation as
     | { ephemeral_1h_input_tokens?: number; ephemeral_5m_input_tokens?: number }
     | undefined;
   const hour = created?.ephemeral_1h_input_tokens;
   const short = created?.ephemeral_5m_input_tokens;
-  // A request that wrote both has no single lifetime, and picking either one prices part of
-  // the context at a rate it was never bought at. Neither the larger write nor the longer one
-  // is the answer, so the answer is that there is none.
+  // Mixed cache-write tiers establish no single lifetime.
   if (hour && short) {
     return null;
   }
@@ -7479,11 +6617,7 @@ function numericUsageField(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-// Reads the tier a Claude request billed at, carrying a non-standard speed through the same
-// channel as service_tier. pricing.ts prices a `fast` tier at the model's fast-mode rate where
-// the model publishes one, and refuses any other speed the way it refuses a tier it has no rate
-// for. An absent speed reads as standard, matching an older transcript that recorded no such
-// field.
+// Nonstandard recorded speed takes precedence over `service_tier`. Standard or absent speed leaves the service tier unchanged.
 function claudeServiceTier(usage: ClaudeUsage): string | null {
   const speed = typeof usage.speed === 'string' && usage.speed ? usage.speed : null;
   if (speed && speed !== 'standard') {
@@ -7509,11 +6643,7 @@ function claudeInferenceClass(value: unknown): UsageInferenceClass {
   return geo ? 'geo' : null;
 }
 
-// Amazon Bedrock writes a `msg_bdrk_` message id and names the first-party model, so the id is the
-// only mark of a Bedrock request. Bedrock bills every inference profile except `global.` at 1.1
-// times list. A request with no profile read pays the charge too, because Claude Code's Bedrock
-// default is a `us.` profile. The Bedrock class replaces the in-region one, and a `global.` Bedrock
-// request takes no class at all, so it pays list whatever its `inference_geo` says.
+// Message-ID prefix identifying a Claude request billed through Amazon Bedrock.
 const BEDROCK_MESSAGE_PREFIX = 'msg_bdrk_';
 
 function claudeRequestInferenceClass(
@@ -7580,8 +6710,7 @@ export interface ClaudeUsageReadOptions {
   emitRepeats?: boolean;
 }
 
-// The set behind the saved queue, built on first use. Every replacement path updates the
-// queue and the set together, so membership checks stay constant-time across long child runs.
+// Builds the membership set from saved request keys on first use and reuses it afterward.
 function seenRequestIndex(state: ClaudeUsageReducerState): Set<string> {
   if (state.seenRequests instanceof Set) {
     return state.seenRequests;
@@ -7620,10 +6749,7 @@ export function reduceClaudeUsageRecord(
   const timestamp = Date.parse(String(record.timestamp ?? ''));
   const requestKey = `claude:${messageId ?? uuid ?? `${Number.isNaN(timestamp) ? '' : timestamp}:${String(message.model ?? '')}`}`;
   if (opts.emitRepeats !== true) {
-    // Claude Code writes one assistant record for each content block of a response, and each
-    // one repeats the whole usage. Thousands of other requests can separate the first of those
-    // records from the last, so this queue keeps every request the file has billed. A window
-    // over it bills the response again as soon as the window has moved past it.
+    // Parent reads retain every billed request key because content-block repeats can follow many unrelated requests.
     const seen = seenRequestIndex(state);
     if (seen.has(requestKey)) {
       return null;
@@ -7635,8 +6761,7 @@ export function reduceClaudeUsageRecord(
   const inferenceClass = claudeRequestInferenceClass(messageId, state.modelProfile, usage.inference_geo);
   const serviceTier = claudeServiceTier(usage);
   const model = typeof message.model === 'string' && message.model ? message.model : null;
-  // A request that only reads the prefix back names no lifetime, and still sits inside the one
-  // the session bought last.
+  // A request without a recorded cache-write lifetime retains the preceding request's lifetime for compaction estimates.
   state.firstRequestCacheRead ??= counted.cacheRead;
   state.lastRequest = {
     tokens: counted.input + counted.cacheRead + counted.cacheWrite1h + counted.cacheWrite5m,
@@ -7732,10 +6857,7 @@ function acceptsClaudeUsageLine(line: string): boolean {
   const isCompactionBoundary = /"subtype"\s*:\s*"compact_boundary"/.test(line);
   const isToolDelta = /"type"\s*:\s*"deferred_tools_delta"/.test(line);
   const isModelAttachment = line.indexOf(MODEL_ATTACHMENT_MARK) >= 0;
-  // A prompt queued behind a command the CLI answered by itself opens a turn. A background
-  // agent that finishes while the main agent works reports back as an attachment, not as a
-  // user record. That report can be the turn's last event. Both lines have to reach the turn
-  // reducer, and their scans run only over lines this gate would drop.
+  // Queued prompts and task notifications also reach the turn reducer through attachment records.
   if (
     !isUser &&
     !isAssistant &&
@@ -7800,10 +6922,7 @@ function copyTurnOutcome(outcome: TurnOutcome | null): TurnOutcome | null {
     : null;
 }
 
-// Child responses are cumulative records: a later line for one request replaces the earlier
-// one. The project index is append-only, so the child reducer removes the prior event and adds
-// the new one. Its snapshot keeps the prior event beside the byte cursor, including every field
-// that selects a daily bucket.
+// Negates each usage category to remove a prior request event during child-response replacement.
 function negativeUsage(usage: TurnUsage): TurnUsage {
   return {
     requests: -(usage.requests ?? 0),
@@ -7890,9 +7009,7 @@ export function createClaudeUsageLineReducer(
             currentTurnWithdrawn: copyPreviousTurn(restored.currentTurnWithdrawn),
             ...(restored.currentTurnQueued ? { currentTurnQueued: true } : {}),
             currentTurnOutcome: copyTurnOutcome(restored.currentTurnOutcome),
-            // Only a child read removes what a revision replaces, so only a child read carries the
-            // events forward. A parent read drops a repeat outright and reads no event. Carrying
-            // the events forward would save a map that nothing can pair with the queue.
+            // Only child reads retain request events for replacement. Parent reads discard repeated request keys.
             ...(opts.childTranscript && restored.requestEvents
               ? {
                   requestEvents: {
@@ -7979,23 +7096,11 @@ export function createClaudeUsageLineReducer(
   };
 }
 
-// All billed requests in one Claude child transcript, grouped by the model each response
-// names. A response is written more than once, and only its last record carries the whole
-// output and thinking count. Each request therefore keeps its last record, not its first.
-//
-// Each compaction the usage reducer can estimate joins the usage parts as its own estimated
-// part, so this figure and the session total price the same requests. The model totals keep
-// recorded usage only.
-//
-// A dispatched session is read with `childTranscript` false. Its figure counts the inline
-// sidechain requests, but its own session total sizes a compaction from the last main request.
-// A second reducer state therefore follows the requests the spend index reads, with the spend
-// index's options, and only that state pairs and sizes compactions.
-//
-// The figure includes the spend of every subagent this transcript launched, and of theirs in
-// turn. Commits and artifacts stay the transcript's own. The figure is partial when a launch has
-// no meta file, when a descendant transcript cannot be read, or when a descendant's last turn is
-// still open.
+// Reads a Claude source's usage and verified descendants, keeping the latest record for each request.
+// Estimated compactions join usage parts. Recorded model totals exclude those estimates.
+// Dispatched-source compactions use a separate main-request reducer to match lifetime pricing.
+// Descendants contribute spend alone. Artifacts and commits remain the source's own.
+// Missing launch metadata, unreadable descendants, and unfinished descendant turns keep spend partial.
 export function readClaudeAgentSpend(
   file: string,
   folders: string[] = [],
@@ -8126,12 +7231,8 @@ export function childSpendVersion(
   return agent === 'claude' ? claudeAgentSpendVersion(file, true, metas) : spendFileVersion(file);
 }
 
-// The key over every child spend figure some turns show. The worker files it with each window
-// it reads. The host builds it again from the files on disk, and a different key marks those
-// figures stale. Both sides build it here, so the two keys agree until a child or one of its
-// nested subagents writes. `versionOf` lets a caller read each file once for several keys.
-// `now` decides whether a running child has gone quiet. A caller that stores a key for spend
-// read on a trip passes the clock reading the trip used.
+// Dependency key for child spend shown by the supplied turns, including structural Codex descendants.
+// `versionOf` supplies source revisions. `now` supplies the clock used for running-child refresh bands.
 export function agentSpendDependencyKey(
   turns: readonly Pick<Turn, 'agents'>[],
   agentFile: (ref: AgentSpendRef) => string | null,
@@ -8150,9 +7251,7 @@ export function agentSpendDependencyKey(
         toolUseId: agent.toolUseId,
       };
       const file = agentFile(ref);
-      // A running child writes many times a minute. Its band moves at most once a band, so its
-      // cost so far stays current and its parent repaints at that rate. A running child that has
-      // gone quiet for a band keys on its exact version, as a finished child does.
+      // Running children use refresh bands. After a band of silence, their exact source versions apply.
       return file
         ? `${file}:${childSpendRevisionKey(ref.status, versionOf(file), now)}`
         : `${ref.id || ref.path || ref.name}:${agentSpendIsOpen(ref.status) ? 'open:none' : 'missing'}`;
@@ -8179,8 +7278,7 @@ interface ClaudeOwnSpend {
   found: boolean;
   byModel: [string | null, TurnUsage][];
   usageParts: TurnUsagePart[];
-  // Each launch that started a subagent or may have. A launch whose tool result is an error
-  // started nothing, so it leaves no meta file to find.
+  // Retained subagent launch IDs. Failed launch results remove their IDs before metadata matching.
   launches: string[];
   partial: boolean;
   effort: string | null;
@@ -8207,8 +7305,7 @@ function readClaudeOwnSpend(
     claudeOwnSpends.set(key, held);
     return held;
   }
-  // The reducer takes a state object for its window of seen requests. This read keeps every
-  // repeat, so nothing on this path reads or writes that window.
+  // Emit repeated usage records so replacement retains the latest cumulative counts per request.
   const usageState = emptyClaudeUsageReducerState();
   const launches = new Set<string>();
   const failedToolUses = new Set<string>();
@@ -8218,8 +7315,7 @@ function readClaudeOwnSpend(
   const estimates: UsageEvent[] = [];
   const compactionState = emptyClaudeUsageReducerState();
   const compactionOptions: ClaudeUsageReadOptions = childTranscript ? { countSidechain: true, emitRepeats: true } : {};
-  // A session's own transcript is read whole here, so the person fact rides on this read and
-  // a dispatched session pays no second read for it.
+  // Collect dispatched-session reader evidence during the same complete source scan.
   const person: PersonScan | null =
     withRecord && !childTranscript
       ? { bytes: 0, person: false, prompts: 0, bg: false, start: 0, userBefore: false }
@@ -8329,10 +7425,7 @@ function readClaudeOwnSpend(
   if (withRecord) {
     const span = childTurnSpan(childTurns);
     const startedAt = span.startedAt ?? null;
-    // This read's own rule sits on top of the shared span: the first turn's own endedAt is
-    // folded in even where its process ended earlier, so a process end recorded before that
-    // turn's last record never pulls a dispatched session's shown span earlier than the turn
-    // itself. A later turn keeps the shared rule, its process end where one was recorded.
+    // Keep the first turn's last activity within the displayed span, even when its process ended earlier.
     const firstEndedAt = childTurns[0]?.endedAt;
     const endedAt = firstEndedAt ? Math.max(span.endedAt ?? firstEndedAt, firstEndedAt) : (span.endedAt ?? null);
     const toolUses = childTurns.reduce((total, turn) => total + turn.stepCount, 0);
@@ -8427,8 +7520,7 @@ function readClaudeSpendTree(
     usageParts: usageParts.filter((part) => part.model === spend.model),
   }));
   const record = own.record ? structuredClone(own.record) : {};
-  // A subagent's parent records no result for a background launch, so a descendant counts as
-  // running until its own last turn closes.
+  // Descendant spend remains partial until its own record supplies a closed last turn.
   return { spend: { models, found: true, partial, effort: own.effort, ...record }, finished: own.finished };
 }
 
@@ -8449,14 +7541,9 @@ interface FirstRequestRead {
 const firstRequestReads = new Map<string, FirstRequestRead>();
 const FIRST_REQUEST_READS_KEPT = 512;
 
-// The cache read of the first request a Claude transcript billed, read from the head of the file
-// the way the spend reducer reads it, or null where the file holds no request. The scan stops at
-// that request, so it reads no further than the first answer.
-//
-// A transcript only grows, so its first request never changes and each file is read from its head
-// once. The held answer stands while the file keeps its device and inode and is no smaller than it
-// was when the read began. A file that changed identity or shrank was replaced, and is read again.
-// A file that held no request is read again once it grows.
+// First request's cache-read count, scanned with the shared usage reducer.
+// Reuse an answer while device and inode match and the file has not shrunk.
+// A missing-request answer is read again after growth. Other same-identity rewrites are not detected by these checks.
 export function claudeFirstRequestCacheRead(file: string, childTranscript = false): number | null {
   let stat: fs.Stats;
   try {
@@ -8564,27 +7651,24 @@ export interface ClaudeSessionParserState {
   compactionValueSources: Array<{
     context: { start: number; end: number } | null;
     model: { start: number; end: number } | null;
-    // Where the previous request came from. Absent in a checkpoint saved before it existed.
+    // Source range of the previous request, when retained in the checkpoint.
     previous?: { start: number; end: number } | null;
   }>;
   turnLimitReached: boolean;
   // The newest discarded prompt proves whether advancing the tail removed every overflow.
   turnLimitStart: number | null;
   lastContext: number;
-  // The last lifetime this session recorded, which a later request that wrote nothing
-  // still sits inside. A request that only reads the prefix back names none of its own, and
-  // reporting no lifetime there would leave a live cache described as unknown for good.
+  // Latest recorded cache-write lifetime, retained across subsequent requests without a new lifetime.
   lastLifetime: CacheLifetime | null;
   lastContextSource: { start: number; end: number } | null;
   // The request that set lastContext, for the compaction that follows it.
   lastContextRequest?: ContextRequest | null;
-  // What that request read from and wrote to the cache. Absent in a checkpoint saved before it existed.
+  // Cached-read and cache-write counts for the context request, when retained in the checkpoint.
   lastContextCache?: { read: number; write: number } | null;
   lastModel: string | null;
   lastModelSource: { start: number; end: number } | null;
   currentModelSource: { start: number; end: number } | null;
-  // The newest `model` attachment this read has applied, until a reply names another model or
-  // a read skips bytes that could hold a newer one.
+  // Latest applied model attachment, cleared by a different reply model or skipped source bytes.
   modelAttachment: string | null;
   attachmentBoundary: { open: boolean; model: string | null; turns: number[] };
   compactMeta: Array<{ at: number; data: CompactMetadata; start: number; end: number }>;
@@ -8595,25 +7679,13 @@ export interface ClaudeSessionParserState {
   // Two records revise one: a result that came back as an error withdraws the load, and the
   // record carrying the skill's own instructions supplies the file it read them from.
   skillUseById: Map<string, { use: TurnSkillUse; owner: Turn | SourcedBuilding }>;
-  // A typed command record naming a skill, held for exactly one more record. Claude Code
-  // writes the base-directory line that proves it as the very next record when the command
-  // loaded a skill, and writes something else when it did not. Whatever arrives next either
-  // resolves this into a `TurnSkillUse` or clears it; nothing in between is ever proof.
+  // Typed skill command awaiting the next admitted record.
+  // A meta user record with the skill base directory establishes the load. Any other admitted record clears it.
   pendingTypedSkill: { name: string; sourceId: string; at: number } | null;
-  // The subagents anywhere in the session whose handback already woke the agent, by the id
-  // the handback names as its sender. That id is the `<task-id>` of the subagent's completion
-  // notice. The value is true once a reply closed after the handback, and it stays true
-  // across a typed prompt: a notice for the same id is a repeat in any later turn, not only
-  // the one that closed the reply. `repeatNotice` holds whether the newest wake was a
-  // completion notice for a subagent whose handback a reply already answered, with no tool
-  // call since that reply closed. A notice that arrives before that reply, or after a tool
-  // call the agent made since, repeats nothing: the reply that follows answers the work
-  // rather than the notice. A peer message, a prompt, another notice and a tool call each
-  // clear `repeatNotice`. A closed reply ends it too, but Claude Code writes the blocks of
-  // one message as separate lines that share the message id, so `repeatReplyId` holds the id
-  // of the reply that closed under the repeat, and the flag clears when a line of another
-  // message arrives. `workedSinceReply` tracks whether a tool call happened since the last
-  // closed reply, so a notice queued after that work never marks the reply that follows it.
+  // Handback sender IDs retained across turns, with whether a completed reply answered each one.
+  // A later completion notice repeats only after such a reply and without intervening tool work.
+  // `repeatNotice` tracks that wake. `repeatReplyId` joins blocks of its completed message until another message arrives.
+  // Prompts, peer messages, notices, and tool work clear the active repeat state as applicable.
   handbacks: Map<string, boolean>;
   // Whether this agent, as a subagent, delivered its report through a `SubagentHandback`
   // call since the newest prompt, peer message or coordinator message. A reply it writes after
@@ -8630,11 +7702,7 @@ export interface ClaudeSessionParserState {
   narrationOrdinals: Map<string, number>;
   awaited: TurnStep[];
   calls: Map<string, CommandCall>;
-  // What an Edit, Write or NotebookEdit call asked for, by call id, held until its result
-  // says the call went through. Only a child read fills this, because only a child record
-  // reaches this reader with no `toolUseResult` to read the change from. An entry holds the
-  // figures the input came to and never its text, so a `Write` of a whole file costs a path
-  // and three numbers rather than the file.
+  // Child edit-call figures retained until the result arrives. Input text is not retained.
   editCalls: Map<string, PendingFileEdit>;
   // The newest tool result seen so far, and the record that issued the call it answered. A
   // result closes the window of a call issued before its own call, and of no other.
@@ -8767,9 +7835,7 @@ function emitClaudeTurn(state: ClaudeSessionParserState, turn: SourcedBuilding, 
       state.toolOwnerById.set(id, emitted);
     }
   }
-  // The emitted turn is a shallow copy, so its skill count is a figure of its own. A load
-  // withdrawn by a result that arrives after the turn closed has to reach that figure, or
-  // the card counts a load the list no longer holds.
+  // Move skill associations to the emitted turn so late failed results also update its copied use count.
   for (const held of state.skillUseById.values()) {
     if (held.owner === turn) {
       held.owner = emitted;
@@ -9018,11 +8084,7 @@ function recordClaudeSkillUse(
   name: string,
   at: number,
 ): void {
-  // A typed invocation of this same skill may already have resolved on this turn, from the
-  // command record that opened it. That use and this one name the same load: the reader
-  // typed a skill and the model also named it, not two loads. A second `Skill` call for a
-  // name an earlier `Skill` call already recorded is a second load, not this case, so the
-  // skip only fires for a use the typed path itself recorded.
+  // A typed-path load suppresses a same-name Skill call. Other repeated Skill calls retain their own use records.
   if (
     turn.skillUses.some((existing) => existing.name === name && (existing as MarkedTurnSkillUse)[TYPED_SKILL_ORIGIN])
   ) {
@@ -9037,12 +8099,7 @@ function recordClaudeSkillUse(
   state.skillUseById.set(id, { use, owner: turn });
 }
 
-// A skill the reader loaded by typing its command, proven by the base-directory line the
-// command record's immediate successor carries. The command record itself names the skill,
-// and the successor supplies the file, the same two facts a `Skill` tool call and its own
-// base-directory record supply for the other path. This resolves on the second record of a
-// turn the command record itself just opened, before any `Skill` tool call for this turn has
-// run, so `turn.skillUses` is always empty here and no dedupe check runs on this path.
+// Records a typed skill command after its admitted successor supplies the base-directory path.
 function recordTypedClaudeSkillUse(
   state: ClaudeSessionParserState,
   turn: SourcedBuilding,
@@ -9074,11 +8131,7 @@ function withdrawClaudeSkillUse(state: ClaudeSessionParserState, id: string): vo
   held.owner.skillUseCount = Math.max(0, held.owner.skillUseCount - 1);
 }
 
-// What a completion notice changes on the row its launch drew. Both recorded shapes reach
-// this with the same raw text, so the status, the child id and the reported figures follow
-// one rule. A notice that names no launched row changes nothing: the same task can report
-// twice, and a second report carries the id of the message that woke the agent rather than
-// the id of its launch. A second row for a resumed agent would count its cost twice.
+// Applies completion status, child ID, and usage figures to the row identified by its launch call. Unknown launch IDs create no row.
 function applyClaudeTaskNotification(state: ClaudeSessionParserState, raw: string, at: number): void {
   const id = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(raw);
   const task = /<task-id>([^<]+)<\/task-id>/.exec(raw);
@@ -9093,9 +8146,7 @@ function applyClaudeTaskNotification(state: ClaudeSessionParserState, raw: strin
       agent.closedAt = at;
     }
   }
-  // A subagent that ran in the background reports what it spent here, and nowhere else the
-  // reader can see: its own lines are written to a separate file, not into this transcript.
-  // Without this its row shows a description and no figures.
+  // Read reported tokens, tools, and duration from the completion notice when present.
   if (agent) {
     agent.id = task ? task[1] : agent.id;
     const tokens = /<subagent_tokens>(\d+)<\/subagent_tokens>/.exec(raw);
@@ -9112,11 +8163,7 @@ function applyClaudeTaskNotification(state: ClaudeSessionParserState, raw: strin
       agent.durationMs = Number(took[1]);
     }
   }
-  // Only the call that launched the agent ends here. A notice that names no launched row
-  // carries some other id: the same task reports twice, and the second report arrives under
-  // the id of the message that woke the agent. `finishClaudeTool` drops the name, the step,
-  // the owner and the call held for an id, so ending an unknown one cuts a message that is
-  // still in flight loose from its own result.
+  // Finish tool pairing only for a recognized launched row with a nonrunning status.
   if (agent && id && status && status[1] !== 'running') {
     finishClaudeTool(state, id[1], true);
   }
@@ -9398,11 +8445,7 @@ function reduceClaudeSessionLine(
     }
     return;
   }
-  // What the reader typed while the agent was already working. Claude Code writes that as
-  // an attachment rather than as a user line, so the filter below would never see it, and
-  // the agent answers it inside the running turn. Tested by the rarest substring on the
-  // line: the same file holds thousands of other attachments, and parsing to reject them
-  // would put back the cost this filter exists to avoid.
+  // Prefilter queued attachments before reading later prompts, peer messages, and task notifications.
   if (line.indexOf('"queued_command"') >= 0) {
     let attachmentLine = false;
     try {
@@ -9423,10 +8466,7 @@ function reduceClaudeSessionLine(
       if (attachmentLine && !o.isSidechain && attachment?.commandMode === 'prompt' && state.cur) {
         applyClaudePeerMessage(state, attachment.origin);
       }
-      // A background agent that finishes while the main agent works reports back on this
-      // same line rather than as a user record. The row keeps the status its launch wrote
-      // without this, and the child id never arrives, so the child's cost stays out of the
-      // turn total. The notice is still not a prompt, and nothing above draws it as one.
+      // Queued task notifications update the background child and turn timing without adding a prompt.
       const notice = attachmentLine && !o.isSidechain ? taskNotificationText(o) : null;
       if (notice !== null && state.cur) {
         const at = claudeRecordAt(o);
@@ -9437,9 +8477,7 @@ function reduceClaudeSessionLine(
     } catch {
       /* skip malformed line */
     }
-    // Only a real attachment is taken out of the stream here. Those two words are a
-    // substring away from any prompt or tool argument that happens to hold them, and a
-    // user or assistant line dropped in passing takes its whole turn with it.
+    // Consume parsed attachment records only. Other records containing the same text continue through the reducer.
     if (attachmentLine) {
       return;
     }
@@ -9469,9 +8507,7 @@ function reduceClaudeSessionLine(
     }
     return;
   }
-  // The answer to a command the CLI ran by itself, such as `/rename`. No assistant record
-  // follows that command, and the answer makes the command no turn. A user or assistant line
-  // that merely mentions the subtype goes on to the readers below.
+  // Local command answers can withdraw unanswered command turns. Other records merely naming the subtype continue below.
   if (line.indexOf('"local_command"') >= 0) {
     let systemLine = false;
     try {
@@ -9495,8 +8531,7 @@ function reduceClaudeSessionLine(
           const held = carried.turn as SourcedBuilding;
           setSourceRange(held, carried.start, carried.end);
           setMembershipStart(held, carried.membership);
-          // Arc takes the answer as a sign that the CLI is idle, so nothing works on the prompt.
-          // The stop keeps the prompt's own end, as stoppedByLocalAnswer does.
+          // Infer an unanswered carried prompt stopped at its own end time. Later command model work can revoke this stop.
           if (
             !claudeTurnAnswered(held) &&
             !held.finished &&
@@ -9519,13 +8554,11 @@ function reduceClaudeSessionLine(
           const start = cur[MEMBERSHIP_START] ?? sourceStart;
           setSourceRange(cur, start, Math.max(cur[SOURCE_END] ?? start, start));
         }
-        // The command stays open, finished, so model work that follows it has a turn to land on
-        // and makes it a card again, as in every reader. `closeClaudeTurn` drops it otherwise, at
-        // the next prompt or the end of the read.
+        // Keep the answered command for later model work. Without that work, closure omits its card.
         cur.finished = true;
         cur.endedAt = Math.max(cur.endedAt, answer.at);
         state.curLocalAnswer = true;
-        // The answer proves the command named no skill.
+        // The local answer clears pending typed-skill evidence.
         state.pendingTypedSkill = null;
         extendSourceRange(cur, sourceStart, sourceEnd);
       }
@@ -9554,9 +8587,7 @@ function reduceClaudeSessionLine(
   } catch {
     return;
   }
-  // A subagent writes its own transcript to a separate file, so nothing of its work
-  // reaches this one except the launch and the result. This guard is the belt on top of
-  // that: it costs nothing and keeps the rule true if the format ever changes.
+  // Main reads exclude sidechain records. Child reads include them.
   if (o.isSidechain && !opts.childTranscript) {
     return;
   }
@@ -9569,9 +8600,7 @@ function reduceClaudeSessionLine(
     }
     state.curInferredStop = null;
   }
-  // A typed command waits exactly one record for proof it named a skill. This is that
-  // record, whatever it turns out to be: it either carries the base-directory line and
-  // resolves the load, or it carries something else and the command named no skill.
+  // Resolve pending typed-skill evidence on the next admitted meta user record with a base-directory line, or clear it.
   if (state.pendingTypedSkill) {
     const pendingSkill = state.pendingTypedSkill;
     state.pendingTypedSkill = null;
@@ -9650,9 +8679,7 @@ function reduceClaudeSessionLine(
     const at = stamp(o.timestamp);
     // A held prompt got no reply of its own, so it belongs to this turn.
     const carried = state.pending.held;
-    // Whatever was typed into the held turn comes with it. Those words were the reader's
-    // and the turn they were sent into never answered, so dropping them here is the card
-    // saying less than it was asked, which is the same fault on a different line.
+    // Carry later prompts from the unanswered turn into its successor.
     const carriedAsks: TurnAsk[] = carried ? carried.laterPrompts : [];
     // Its parts rather than its prompt. A turn carried forward can itself be carrying
     // one, and its joined prompt handed on whole puts two of them in one part again.
@@ -9720,9 +8747,7 @@ function reduceClaudeSessionLine(
         }
       : null;
     state.currentModelSource = null;
-    // A command names a skill only when it is not one of the harness's own controls. The
-    // very next record either proves it with a base-directory line or proves it did not,
-    // so nothing is recorded yet.
+    // Nonsetting commands await a base-directory record before reporting a skill load.
     const commandNamed = COMMAND_NAMED.exec(rawText);
     const commandName = commandNamed ? commandNamed[1] : null;
     state.pendingTypedSkill =
@@ -9758,7 +8783,7 @@ function reduceClaudeSessionLine(
   }
   if (!state.cur) {
     return;
-  } // a turn that began before the window; no prompt to attach it to
+  } // no opening prompt in this read
   const cur = state.cur;
   extendSourceRange(cur, sourceStart, sourceEnd);
 
@@ -9778,12 +8803,8 @@ function reduceClaudeSessionLine(
       cur.endedAt = Math.max(cur.endedAt, stamp(o.timestamp));
       return;
     }
-    // The record carrying a loaded skill's own instructions, which is where the file the
-    // client read is recorded. It names the call it belongs to, so the path reaches that
-    // load and no other. Nothing looser would do: a successful `Skill` result is filtered
-    // out before this reader sees it, so the load and this record are not neighbours in
-    // anything the reader reads, and a client that re-invokes a loaded skill writes a note
-    // of its own between them.
+    // Pair skill instructions through `sourceToolUseID` and retain their base-directory path.
+    // Intervening filtered results and re-invocation notices prevent pairing by adjacency.
     const loaded = typeof o.sourceToolUseID === 'string' ? state.skillUseById.get(o.sourceToolUseID) : undefined;
     if (loaded) {
       const directory = claudeSkillBaseDirectory(textOf((o.message as { content?: unknown }).content));
@@ -9796,12 +8817,8 @@ function reduceClaudeSessionLine(
     const completedToolIds: string[] = [];
     let failed = false;
     const result = o.toolUseResult as Record<string, unknown> | undefined;
-    // Whether this record's own structured result holds the evidence. A Claude child
-    // records nearly every result as text alone, and the few that carry a `toolUseResult`
-    // carry neither the output nor a patch inside it, so the call and its text stay the
-    // only source for those too. An array is typed as an object and holds neither field,
-    // which is why the shape is read rather than its type. The two sources never both run
-    // for one result.
+    // Structured stdout or patch fields supply result evidence when present.
+    // Child results without those fields use their paired call input and result text instead.
     const structuredEvidence =
       !!result &&
       typeof result === 'object' &&
@@ -9886,8 +8903,7 @@ function reduceClaudeSessionLine(
         toolUses: typeof result.totalToolUseCount === 'number' ? result.totalToolUseCount : null,
         status: String(result.status || 'completed'),
       };
-      // The launch already added a row for this subagent; fill it in rather than
-      // listing the same run twice.
+      // Update the existing launched child row rather than adding another row.
       const existing = state.launched.get(toolUseIdOf(o.message));
       if (existing) {
         Object.assign(existing, row);
@@ -9936,14 +8952,11 @@ function reduceClaudeSessionLine(
       delete cur.modelAttachment;
     }
   }
-  // Sits beside `type` and `message` on the line, not inside `message`. Taken from the
-  // last reply that recorded one rather than from the last reply, because roughly one
-  // line in twenty carries none and the turn's effort did not change when it did.
+  // Retain the latest nonempty top-level `effort` field. A reply without one leaves the held value unchanged.
   if (typeof o.effort === 'string' && o.effort) {
     cur.effort = o.effort;
   }
-  // The turn is over once a reply stops for any reason other than calling a tool. A
-  // turn still in flight always ends on a tool call, which is what tells the two apart.
+  // A recorded stop reason updates completion. Missing stop reasons leave the held state unchanged.
   if (message.stop_reason) {
     cur.finished = finishedATurn(o);
   }
@@ -9997,8 +9010,7 @@ function reduceClaudeSessionLine(
   let closedReply = false;
   const content = message.content;
   if (Array.isArray(content)) {
-    // Everything the agent asked for before this line has come back, or it could not be
-    // writing this one.
+    // Settle awaited steps when subsequent assistant content implies the agent resumed.
     settleClaudeSteps(state);
     let answeredLine = false;
     const narrationBase =
@@ -10014,15 +9026,11 @@ function reduceClaudeSessionLine(
       input?: Record<string, unknown>;
     }[]) {
       if (block.type === 'tool_use') {
-        // The skill this call loaded, where it named one. A call that named none loaded
-        // nothing this reader can report, and the panel says nothing rather than naming a
-        // skill it made up.
+        // Record only a Skill call with a nonempty skill name.
         const loadedSkill =
           block.name === 'Skill' && typeof block.input?.skill === 'string' ? block.input.skill.trim() : '';
         cur.toolUses++;
-        // A skill load is in neither tool category table, so counted here it would land in
-        // `other` and the mix would name a skill load an unrecognized call. The raw tool
-        // total above still counts it, because the call happened.
+        // Skill calls retain raw tool totals and tally rows but remain outside tool-category totals.
         if (block.name !== 'Skill') {
           cur.toolCounts[TOOL_KIND[block.name || ''] ?? 'other']++;
         }
@@ -10055,8 +9063,7 @@ function reduceClaudeSessionLine(
             ...(description ? { headline: description } : {}),
             detail: presented.detail,
             at: stamp(o.timestamp),
-            // Until a result comes back, which for the call the agent is on now never
-            // happens while the panel is reading.
+            // The call starts running until a result or later activity settles it.
             status: 'running',
           };
           if (presented.fullDetail !== undefined) {
@@ -10079,10 +9086,7 @@ function reduceClaudeSessionLine(
           if (cur.steps.length > TURN_STEP_LIMIT) {
             cur.steps.shift();
           }
-          // Recorded beside the step and kept outside the step window, so a long turn still
-          // says which skills it loaded after the calls that loaded them scroll out of it.
-          // The call id is the identity a reread deduplicates by and the one the path and a
-          // failed result both arrive under, so a call without one records no load.
+          // Record skill uses outside the step window. Call IDs pair rereads, paths, and failed results.
           if (loadedSkill && block.id) {
             recordClaudeSkillUse(state, cur, block.id, loadedSkill, stamp(o.timestamp));
           }
@@ -10102,27 +9106,18 @@ function reduceClaudeSessionLine(
           if (commitDirs(block.input.command, cwd).length > 0 || mergeDirs(block.input.command, cwd).length > 0) {
             state.wrote.add(block.id);
           }
-          // A child's result record carries no `gitOperation` and no recorded output, so
-          // this set is the only way its text reaches the reader. `git commit` is too
-          // narrow for it: a revert, a cherry-pick, a rebase and a pull each print a
-          // commit line for a commit they really made, and a commit run through `git -c`
-          // prints one too. `ranGit` is the set `recordCommits` itself accepts a commit
-          // line from, so widening to it admits exactly the results that reader can use
-          // and leaves every other command's result skipped.
+          // Child reads admit results from any recognized Git command, matching printed-commit eligibility.
           else if (opts.childTranscript === true && ranGit(block.input.command)) {
             state.wrote.add(block.id);
           }
         }
-        // A child record carries no patch, so what an edit changed is only ever in the
-        // call's own input. The result still has to come back before the change is real,
-        // so the figures wait here for it.
+        // Child edit figures wait for successful results before applying retained input counts.
         if (block.id && block.name && opts.childTranscript === true) {
           const pending = pendingFileEdit(block.name, block.input ?? {});
           if (pending) {
             state.editCalls.delete(block.id);
             state.editCalls.set(block.id, pending);
-            // A child's edit result carries no field the line gate recognizes, so without
-            // this the result never reaches JSON.parse and the change is never read.
+            // Admit the child edit result through the call-ID prefilter.
             state.wrote.add(block.id);
           }
         }
@@ -10147,16 +9142,9 @@ function reduceClaudeSessionLine(
           state.launched.set(block.id, row);
           cur.agents.push(row);
         }
-        // A subagent in auto mode delivers its report as this call's message, and what it
-        // writes after the call is a receipt. The report is therefore the turn's response.
-        // The call closes no reply of this agent's own, so it settles no handback here.
-        //
-        // Some subagents write the report as a closing reply first and send it again after a
-        // reminder that it was not delivered. When one of the two texts contains the other, the
-        // turn keeps one answer with the longer text, so the card and the search text hold the
-        // report once. Two texts that differ in any other way are both kept. Only the closing
-        // reply in `closingReply` counts, so an earlier report, or a reply to an earlier wake,
-        // is never merged.
+        // A nonempty SubagentHandback message supplies the response and marks subsequent replies as nonresponses until another prompt or message.
+        // Compare only the latest eligible closing reply. Containing texts keep the longer answer, with the report winning ties.
+        // Different texts remain separate answers.
         if (
           block.name === 'SubagentHandback' &&
           typeof block.input?.message === 'string' &&
@@ -10206,14 +9194,8 @@ function reduceClaudeSessionLine(
         if (!notResponse) {
           cur.summary = text;
         }
-        // A text on a line whose response stopped for anything but a tool call closes
-        // an answer. The line itself says so: measured over every transcript in this
-        // workspace's store, every text line carries a stop_reason, so no reading of
-        // the user lines between answers is needed, which matters because a skill
-        // load arrives as a meta line mid-work exactly like the peer message that
-        // wakes a finished response. Two text blocks on one line close one answer,
-        // the last text winning the way it wins the summary. A later block that is not a
-        // response closes its own answer, so the block before it keeps its answer.
+        // A text block with a stop reason closes an answer. Ordinary later blocks replace an answer already closed by this line.
+        // A newly marked nonresponse preserves the preceding eligible response as a separate answer.
         if (closes) {
           const answer: TurnAnswer = { text, at: stamp(o.timestamp), stepsBefore: cur.stepCount };
           if (notResponse) {
@@ -10450,8 +9432,7 @@ function claudeHiddenSlots(state: ClaudeSessionParserState) {
   return { turns: state.turns, open: state.cur, pending: state.pending.held };
 }
 
-// The snapshot a caller may send across the progressive worker boundary, where a structured
-// clone drops every symbol key and non-enumerable field the reducer hangs on its turns.
+// Worker-transfer snapshot with symbol keys and non-enumerable turn metadata lifted into plain state.
 function claudeSnapshot(state: ClaudeSessionParserState): ClaudeSessionParserState {
   const copy = cloneParserState(state);
   const retained = new Set(copy.turnRanges.map((range) => range.start));
@@ -10651,9 +9632,7 @@ function readSessionLines(
   return reducer.finish(readBytes);
 }
 
-// A compaction's figures are written on a line of their own, a few milliseconds either
-// side of the summary, so each is given to the nearest compaction. The window is wide
-// enough to survive a slow write and far narrower than the gap between two compactions.
+// Maximum timestamp gap when pairing compaction summaries with their nearest metadata record.
 export const COMPACT_META_WINDOW_MS = 10_000;
 
 function attachCompactMetadata(compactions: Compaction[], meta: { at: number; data: CompactMetadata }[]): void {
@@ -10822,9 +9801,7 @@ function editedLineCounts(oldText: string, newText: string): { added: number; re
   return { added: after.length - head - tail, removed: before.length - head - tail };
 }
 
-// A path an input named, or null where it named none this reader can read. A field of any
-// other type is a shape this reader does not know, and turning it into text invents a path
-// out of it, such as the one an object gives.
+// Nonempty string path outside excluded roots, or null for unsupported input.
 function editInputPath(value: unknown): string | null {
   if (typeof value !== 'string' || !value || isEphemeralPath(value)) {
     return null;
@@ -10832,9 +9809,7 @@ function editInputPath(value: unknown): string | null {
   return value;
 }
 
-// The text an input field held, or null for a field of any other type. A missing field is
-// empty text, which is what a call that supplies no before side or no content means. An
-// array joined into text reads as one line that nobody wrote.
+// Input text, treating absent values as empty. Other nonstring values return null.
 function editInputText(value: unknown): string | null {
   if (value === undefined || value === null) {
     return '';
@@ -10857,10 +9832,7 @@ function countedFileEdit(path: string, added: number, removed: number): PendingF
     : { path, added, removed, countsUnknown: false };
 }
 
-// The change one edit call asked for, or null for a call that changes no file this reader can
-// read. Read from the input because a child's record holds no patch for any of these three
-// tools. A count taken from an input is a floor on a file row, so an input whose lines a
-// floor cannot describe yields a row with no counts at all.
+// File figures from supported child edit inputs. Write, replace-all Edit, and notebook replacements or deletions leave counts unknown.
 function pendingFileEdit(name: string, input: Record<string, unknown>): PendingFileEdit | null {
   if (name === 'Edit') {
     const target = editInputPath(input.file_path);
@@ -10872,10 +9844,7 @@ function pendingFileEdit(name: string, input: Record<string, unknown>): PendingF
     if (before === null || after === null) {
       return null;
     }
-    // `replace_all` runs the same replacement wherever it matches, and the input does not say
-    // how many times that was. The lines of one application are a floor on the file, but a
-    // row that carries them says every other application moved nothing, so the row says the
-    // file changed and not by how much.
+    // A replace-all input omits its match count, so its file row keeps no line counts.
     if (input.replace_all === true) {
       return uncountedFileEdit(target, 'replaceAll');
     }
@@ -10887,10 +9856,7 @@ function pendingFileEdit(name: string, input: Record<string, unknown>): PendingF
     if (target === null || editInputText(input.content) === null) {
       return null;
     }
-    // A Write carries the whole after side and nothing of the before side. Over a path that
-    // already held those lines, the content's line count is a ceiling and not a floor, and
-    // the input does not say whether the path existed. So the row says the file changed, and
-    // it does not call the file new either.
+    // Write input supplies no previous content or existence fact, so line counts and new-file status remain unknown.
     return uncountedFileEdit(target, 'write');
   }
   if (name === 'NotebookEdit') {
@@ -10902,9 +9868,7 @@ function pendingFileEdit(name: string, input: Record<string, unknown>): PendingF
     if (source === null) {
       return null;
     }
-    // An insert adds the cell it carries. A replace and a delete each need the cell as it
-    // stood, which the input does not hold, so the row says the file changed and not by how
-    // much.
+    // Notebook inserts count their supplied cell text. Replacements and deletions lack prior content and leave counts unknown.
     return String(input.edit_mode || 'replace') === 'insert'
       ? countedFileEdit(target, countLines(source), 0)
       : uncountedFileEdit(target, 'notebook');
@@ -10912,18 +9876,11 @@ function pendingFileEdit(name: string, input: Record<string, unknown>): PendingF
   return null;
 }
 
-// One file a child changed, from the call that changed it. It merges into the same map
-// `recordEdit` fills, so a path an edit and a shell command both reached keeps one row. No
-// edit record joins the row, because no patch exists to draw: the diff view already falls
-// back for a row that carries none.
+// Adds child input figures to the normalized file map without a patch record. Diff views use their fallback for these rows.
 function recordEditFromCall(turn: Building, edit: PendingFileEdit): void {
   const key = normalizeFsPath(edit.path);
   const entry = turn.files.get(key) || { path: edit.path, added: 0, removed: 0, isNew: false, edits: [] };
-  // The mark stays once any call on this path arrived without countable lines, whichever
-  // order the calls came in. The lines the counted calls moved stay on the row beside it, so
-  // the row's totals are a floor and the row says so. The cause follows the call that most
-  // recently left the row uncounted, which is true of that call even where an earlier one on
-  // the same path had a different cause.
+  // Preserve counted lines alongside unknown-count evidence. The latest uncounted edit supplies its recorded cause.
   if (edit.countsUnknown) {
     entry.countsUnknown = true;
     if (edit.unknownReason) {
@@ -10935,10 +9892,7 @@ function recordEditFromCall(turn: Building, edit: PendingFileEdit): void {
   turn.files.set(key, entry);
 }
 
-// A child's evidence for one result, from the call's input and the result's own text. A
-// Claude child transcript records no `toolUseResult`, so the files come from what an edit
-// call asked for, and the commits come from what a shell call printed. That text is the
-// command's own output, which is what `recordCommits` reads out of `stdout` elsewhere.
+// Reads child result evidence from its paired edit input or shell output when structured evidence is absent.
 function recordCallAndTextEvidence(
   state: ClaudeSessionParserState,
   turn: Building,
@@ -10959,8 +9913,7 @@ function recordCallAndTextEvidence(
   if (call === null) {
     return;
   }
-  // No commit window is supplied, so output that printed no commit line records no intent,
-  // exactly as output whose own call a reader cannot place reads elsewhere.
+  // Without a call window, printed commits are recorded but quiet-commit recovery intents are excluded.
   recordCommits(turn, textOf(content), at, call, folders, null, null);
 }
 
@@ -10993,8 +9946,7 @@ function recordEdit(turn: Building, result: Record<string, unknown>): void {
   }
   const key = normalizeFsPath(filePath);
   const entry = turn.files.get(key) || { path: filePath, added: 0, removed: 0, isNew: false, edits: [] };
-  // A row's countsUnknown flag says the file carries zero real hunks. This one just gained
-  // some, so the flag goes, whether an earlier shell record named this same file with none.
+  // A structured edit result clears earlier unknown-count evidence, including when its parsed hunk list is empty.
   delete entry.countsUnknown;
   delete entry.unknownReason;
   entry.added += added;
@@ -11002,9 +9954,7 @@ function recordEdit(turn: Building, result: Record<string, unknown>): void {
   if (created) {
     entry.isNew = true;
   }
-  // A whole-file diff can only start from the turn's first sight of the file, so the copy a
-  // later edit records is of the file part-way through the turn and is never read. Dropping
-  // it keeps a file edited many times in one turn from holding a copy per edit.
+  // Keep `originalFile` only for the first recorded edit. Later whole-file content remains available as each edit's after side.
   const first = entry.edits.length === 0;
   entry.edits.push({
     hunks,
@@ -11016,11 +9966,8 @@ function recordEdit(turn: Building, result: Record<string, unknown>): void {
   turn.files.set(key, entry);
 }
 
-// A Bash result's own record of the files a shell command changed inside a git repository.
-// Its hunks are the same shape `structuredPatch` writes, so they cross `patchHunks` unchanged,
-// and its rows merge into the same map `recordEdit` fills, so a file touched by both an edit
-// tool and a shell command in one turn keeps one row. The CLI caps `files` at five entries;
-// every other changed path still appears in `changedFiles` and becomes a row with no counts.
+// Shell file changes reduce into the shared normalized file map through `patchHunks`.
+// Detailed entries supply line counts. Other named paths get uncounted rows unless an existing edit record already covers them.
 function recordBashEdit(turn: Building, result: Record<string, unknown>): void {
   const diff = result.bashEditDiff;
   if (!diff || typeof diff !== 'object' || Array.isArray(diff)) {
@@ -11057,8 +10004,7 @@ function recordBashEdit(turn: Building, result: Record<string, unknown>): void {
     const created = hunks.length === 1 && hunks[0].oldStart === 0 && hunks[0].oldLines === 0;
     const key = normalizeFsPath(filePath);
     const entry = turn.files.get(key) || { path: filePath, added: 0, removed: 0, isNew: false, edits: [] };
-    // Same rule as `recordEdit`: a row that just gained real hunks is never left marked as
-    // carrying none, whichever record reached it first.
+    // A detailed shell entry clears earlier unknown-count evidence, including when its parsed hunk list is empty.
     delete entry.countsUnknown;
     delete entry.unknownReason;
     entry.added += added;
@@ -11084,11 +10030,7 @@ function recordBashEdit(turn: Building, result: Record<string, unknown>): void {
     if (named.has(key) || isEphemeralPath(candidate)) {
       continue;
     }
-    // The rule that keeps both processing orders on one answer: a row carries countsUnknown
-    // only while it holds zero real hunks. A file this turn already detailed, through an edit
-    // tool or another shell record's own `files` entry, keeps its real counts here rather than
-    // being downgraded back to unknown, so the row this candidate resolves to is the same
-    // whether the detailed record or this unlisted mention was read first.
+    // Keep existing rows with edit records when an unlisted shell path supplies no detail.
     const existing = turn.files.get(key);
     if (existing && existing.edits.length > 0) {
       continue;
@@ -11108,28 +10050,15 @@ function recordBashEdit(turn: Building, result: Record<string, unknown>): void {
   }
 }
 
-// A subagent launched in the background whose completion has not arrived yet.
+// True for recorded `running` or `async_launched` child status.
 export function agentIsRunning(agent: TurnAgent): boolean {
   return agent.status === 'running' || agent.status === 'async_launched';
 }
 
-// How long a burst of appends is gathered for before the panel reads again.
-//
-// Both CLIs append to the transcript as each message lands, which is what makes the file a
-// live feed rather than a record written at the end. Measured on a running turn: seven
-// writes in twenty-five seconds, arriving in pairs a few milliseconds apart. A fifth of a
-// second folds a pair into one read and is still far below what a reader notices.
+// Quiet interval for gathering transcript append events before refreshing the panel.
 export const TRANSCRIPT_WAKE_MS = 200;
 
-// The directories to watch for those appends, one entry per directory whatever it holds.
-//
-// Directories rather than files: a session started while the panel is open writes a
-// file that did not exist when the watch was set up, and a per-file watch would never see
-// it. Both agents keep a workspace's transcripts in a handful of directories, so this is a
-// short list however many sessions it covers.
-//
-// Sorted, and with no duplicates, so two calls over the same sessions answer the same thing
-// and the caller can tell whether the set has actually moved.
+// Sorted unique parent directories for the supplied source files, excluding bare filenames without a directory.
 export function watchDirs(files: { file: string }[]): string[] {
   const dirs = new Set<string>();
   for (const one of files) {

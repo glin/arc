@@ -1,8 +1,4 @@
-// scripts/typecheck-parallel.js
-//
-// Runs every project's type check at the same time instead of one after another. Each check
-// keeps its own output buffered so two checks running together never interleave their lines,
-// and the run fails if any check fails, naming which one.
+// Runs project type checks concurrently. Buffers each result and reports failures by project.
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -11,8 +7,7 @@ const root = path.join(__dirname, '..');
 const extensionDir = path.join(root, 'extension');
 const cliDir = path.join(root, 'cli');
 
-// Resolves a package's own binary the same way tool-scope.test.js does, so a check runs the
-// exact executable its package installed instead of whatever a shell would find on PATH.
+// Resolves the executable installed by the requested package in its project directory.
 function toolBin(packageName, binName, baseDir) {
   const packageFile = require.resolve(`${packageName}/package.json`, { paths: [baseDir] });
   const manifest = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
@@ -64,10 +59,7 @@ function runCheck(check, spawnFn) {
   });
 }
 
-// Runs every check at the same time and reports each one's outcome once every check has
-// finished, so a fast check's output never interleaves with a slow one's. Returns the failed
-// labels instead of exiting directly, so a caller can assert on the outcome without a real
-// process exit getting in the way.
+// Reports buffered results after all checks finish and returns the failed labels.
 async function runChecks(checksToRun, { spawnFn = spawn, log = console.log, logError = console.error } = {}) {
   const results = await Promise.all(checksToRun.map((check) => runCheck(check, spawnFn)));
   const failed = [];

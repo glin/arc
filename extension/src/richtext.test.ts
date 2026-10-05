@@ -240,20 +240,16 @@ test('renderInlineMarkdown draws a picture as its alt text with no img', () => {
 });
 
 test('renderInlineMarkdown draws the same headline twice when it carries an email address', () => {
-  // marked 4 defaults mangle: true, which encodes an autolinked email address behind random
-  // numeric character references, so the same text renders different HTML on every call.
-  // headlineHtml sits in the payload that decides whether a card redraws, so an unstable
-  // render there would redraw the card on every refresh with nothing visibly changed.
+  // Disable random email encoding so identical headline text produces identical HTML and does not trigger a card redraw.
+
   const text = 'Reach the on-call at oncall@example.com for the rest.';
   assert.equal(renderInlineMarkdown(text), renderInlineMarkdown(text));
   assert.match(renderInlineMarkdown(text), /oncall@example\.com/);
 });
 
 test('renderRichMarkdown draws the same response twice when it carries an email address', () => {
-  // The same marked 4 default, left unset on this renderer: a response with an email address
-  // rendered different HTML on every build, so its card redrew on every refresh with nothing
-  // visibly changed. Reproduced with
-  // `npx vitest run richtext.test.ts -t "draws the same response twice"`.
+  // Response rendering must retain literal email addresses and produce identical HTML on repeated calls.
+
   const text = 'Reach the on-call at oncall@example.com for the rest.';
   assert.equal(renderRichMarkdown(text), renderRichMarkdown(text));
   assert.match(renderRichMarkdown(text), /oncall@example\.com/);
@@ -300,8 +296,8 @@ test('a plain-text surface removes rich-content records without interpreting the
   assert.equal(withoutRichContent('Keep \uE200visualize\uE202truncated'), 'Keep  ');
 });
 
-// The open folder these tests draw pictures out of, and the host's half of the rule: a file
-// inside it reaches this webview at a URI only this webview may load.
+// The host converts images inside the open folder to webview URIs.
+
 const folder = path.resolve('fixtures');
 const shot = path.join(folder, 'shot.png');
 const markdownShot = shot.replace(/\\/g, '/');

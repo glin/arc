@@ -77,9 +77,7 @@ export interface StartedPanel {
   dispose(): void;
 }
 
-// A cost guard's only way in. A real VS Code webview never defines this, so the check and
-// the call it guards cost one property read and nothing else. A browser test defines it
-// before the panel starts, to count how many full draws each renderer performs.
+// Browser tests supply this optional callback to count full timeline and session list draws.
 declare global {
   interface Window {
     __arcOnDraw?: (renderer: 'timeline' | 'rail') => void;
@@ -89,21 +87,18 @@ function drawCounter(renderer: 'timeline' | 'rail'): (() => void) | undefined {
   return typeof window === 'undefined' || !window.__arcOnDraw ? undefined : () => window.__arcOnDraw!(renderer);
 }
 
-// Importing this module has no side effects. The composition root starts one page lifetime.
+// Starts one panel page lifetime from the supplied browser ports.
 export function startPanel(kernel: PanelKernel): StartedPanel {
   const list = kernel.dom.list;
   const startupStatus = list.querySelector<HTMLElement>('[data-startup-status]');
   const savedState = kernel.savedState;
-  // Compatibility name for the narrow posting port while rendering remains in this file.
-  // This is not the object returned by acquireVsCodeApi, which stays inside host.ts.
+  // This posting port wraps kernel.sendToHost. The acquired VS Code API remains inside host.ts.
   const vscode = Object.freeze({ postMessage: kernel.sendToHost });
   const onDocument = kernel.events.document;
   const onWindow = kernel.events.window;
-  // One clock for the whole panel. Every age, every duration and the next-turn face move on the
-  // same second, so a figure and the working behind it can never disagree by one.
+  // All subscribed ages and durations share one panel clock.
   const clock = createClock({ document });
-  // The content search: its pending query, the reply it accepts, and the list it draws. Held
-  // here only so the message handlers and the timeline can reach it.
+  // Shares the content-search owner between host-message dispatch and timeline rendering.
   const searchRenderer = createSearchRenderer({
     document,
     sendToHost(message) {
@@ -169,10 +164,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     });
   }
 
-  // The shared copy first, this webview's own second. They differ exactly once: a host
-  // attaching for the first time has no state of its own, and the shared copy is how an editor
-  // tab opens showing what the sidebar was showing rather than an unread list. Injected into
-  // the page rather than posted, so it is there before the first render and there is no race.
+  // The saved-state owner selects the shared host state, falling back to this webview's browser state.
+  // Bootstrap supplies it before the first render.
   const saved = savedState.initial;
   let composerHidden = saved.composerHidden === true;
   const sessionState = createPanelSessionState({
@@ -204,12 +197,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const initialRailHeadLenses = sessionState.initialRail.headLenses;
   const initialRailGroupBy = sessionState.initialRail.groupBy;
   const initialRailDensity = sessionState.initialRail.density;
-  // The cross this panel draws on a control that gets rid of something: the comment box's way
-  // out, and the two boxes that clear a filter. The multiplication sign rather than the letter x,
-  // which is narrower and sits off centre.
-  //
-  // Drawn for the eye alone. Every button wearing it carries its own word as its name, which is
-  // what a screen reader announces, so nothing is lost to a reader who cannot see it.
+  // Clear and close controls use a multiplication sign. Each button supplies its own accessible name.
   const CROSS = String.fromCharCode(215);
   const GLYPH = CARD_GLYPHS;
   const TWIST = { open: '\u25BE', shut: '\u25B8' };
@@ -239,8 +227,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     placeFloatInView(window, host, target, bottomLimit, topLimit);
   };
 
-  // The state service writes this to the browser copy and the shared host copy. Neither copy
-  // stands in for the other because their lifetimes differ.
+  // Save browser state and shared host state. Their separate lifetimes require both copies.
   const saveOpen = () => sessionState.save();
 
   const hints = createHints({
@@ -260,27 +247,13 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   });
   const pageStyle = createPageStyleOwner(document);
 
-  // What the head row's hover says. The status is a glyph, the read state is a tint the
-  // stylesheet paints, and the marks are drawn nowhere on the card at all, so not one of the
-  // three can carry a hover of its own and all three ride here. The marks come last and in
-  // the order the card carries them, which is the order turnview.ts decided and tested.
-  // What the context menu's two entries do. Marking read is the same call opening the card makes.
-  //
-  // Marking unread has a step before it: paint records any open card as read, so unmarking
-  // one whose body is open would be undone by the repaint on the very next line, and the
-  // press would look like it did nothing. So the body is shut first, which is also what the
-  // reader means by putting a turn back: they are done looking at it for now.
-  // What a note is called on the two controls that act on it: its own words, run together and
-  // cut to a line. A card draws a pair of controls per note, so a bare "Delete this note" is
-  // the same name several times over and a reader who cannot see the strip has no way to tell
-  // which one they are on.
+  // Synchronizes compact controls with current sessions and session list visibility.
   function syncCompactControls(sessions: PanelSessionRow[], showing: string | null, railUp?: boolean) {
     const shown = railUp === undefined ? railRenderer.visible() : railUp;
     chrome.updateResponsive(sessions || [], showing, shown, latest?.rail ?? [], railRenderer.snapshot().sort);
   }
 
-  // The typed renderer keeps timeline parents and controls alive. This final pass only updates
-  // page-wide layout state and assigns the initial roving stop when none exists yet.
+  // Refresh page layout and queued cards, then retain the existing roving stop or select the first reachable control.
   function finishTimelineRender() {
     timelineRenderer.refreshLayout();
     queueLiveRenderer.update(usageState && usageState.composer);
@@ -329,8 +302,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       delete projectedStats[durable.id];
     }
     return {
-      // The projected row keeps the provisional id the host has no saved record under, so it
-      // offers no rename until the rail names the durable id.
+      // Projected provisional rows offer no rename until the session list names their durable identity.
       rail: rail.map((row) => (row === durable ? { ...row, id: provisional, persisted: false } : row)),
       stats: projectedStats,
     };
@@ -350,8 +322,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     const retained = transient ? { cards: [], sessions: [], transient: transient, showing: showing } : undefined;
     syncCompactControls(sessions, showing);
     const footers = history.footers(olderHistory);
-    // The search owner answers whether it has anything to draw. Its root is one node that
-    // outlives every repaint, so a result row the reader is standing on survives a poll.
+    // The search root survives redraws, preserving focus on unchanged result rows.
     if (searchRenderer.draw(showing || '')) {
       timelineRenderer.showForeign([searchRenderer.element], footers, retained, showing);
       finishTimelineRender();
@@ -377,8 +348,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   function sessionLabelsOf(id: string): string[] {
     return sessionLabelIndex.labels(latest?.rail, id);
   }
-  // Kept per rail list, which every message replaces whole, so a draw over many rows reads each
-  // row's labels once rather than once per row.
+  // Cache labeled-session membership for each complete session list payload.
   let labeledMemo: { rail: readonly PanelRailCard[]; sessions: Set<string> } | null = null;
   function labeledSessions(): Set<string> {
     const rail = (latest && latest.rail) || [];
@@ -390,10 +360,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   function sessionLabeled(id: string): boolean {
     return labeledSessions().has(id);
   }
-  // A card whose print held keeps the menu context it was drawn with, so a rail message that
-  // gives a session its first label or takes its last one rewrites that session's cards here.
-  // A render or a selection needs none of this: repaint hands the comments over again, and that
-  // rewrites every drawn card's context. Headings and rail cards take the fact from their own redraws.
+  // Refresh retained card contexts when a session gains its first label or loses its last.
+  // Full renders already refresh these contexts. Headings and session list cards update through their own renderers.
   function refreshLabeledCards(before: Set<string>): void {
     const after = labeledSessions();
     const moved = new Set([...before].filter((id) => !after.has(id)));
@@ -405,12 +373,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     commentsRenderer.refreshSessionContexts(moved);
   }
 
-  // Which direction the session heading's Mark as read entry offers, from the same read
-  // marks and watermark the rail's own unread dot answers from. Undefined for a session with
-  // nothing markable, the heading's answer to the rail's third, plain section: an entry
-  // offered on nothing markable would toggle nothing. A word rather than a boolean, because
-  // the manifest's when clause cannot tell a real `false` from a context key VS Code treats
-  // as absent the same way.
+  // Returns read or unread for sessions with markable turns. Sessions without markable turns receive no menu entry.
+  // String values distinguish unread from an absent context key in VS Code when clauses.
   function sessionReadState(session: string): 'read' | 'unread' | undefined {
     const cards = (latest ? latest.cards : []).filter((card) => card.kind === 'turn' && card.sessionId === session);
     const markable = cards.filter((card) => readState.canMark(card));
@@ -472,9 +436,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     labeled: (session) => sessionLabeled(session),
   });
 
-  // The record a subagent row's figure opens, drawn over the popover the row itself sits in.
-  // Declared before the outer instance so the outer one's row rendering can hand it to a figure,
-  // and assigned below, because the nested instance pins the outer one when it is pressed.
+  // Nested figure details require the outer popover for pinning. Assign them after creating that outer instance.
   let figureDetails: StatDetailRenderer | undefined;
 
   const statDetails = createStatDetailRenderer({
@@ -519,9 +481,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         vscode.postMessage(message);
       });
     },
-    // A pressed figure pins the record over it and the popover holding it together, so a pinned
-    // child does not die when its hover-only parent's grace fires. A figure the card body draws
-    // stands in no popover, so it pins its own record and nothing else.
+    // Pin the containing popover with the nested record so its hover grace cannot close the child.
+    // Figures in card bodies have no containing popover.
     onPin(figure) {
       if (statDetails.element.contains(figure)) {
         statDetails.pinCurrent();
@@ -530,8 +491,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   });
   statDetails.attachNested(figureDetails);
 
-  // The reader's Timeline layout, taken from each render. The extension owns the setting, so
-  // this is only the copy the last render carried.
+  // Retain the Timeline layout from the latest host render.
   let layout: TimelineLayout = DEFAULT_TIMELINE_LAYOUT;
   const layoutDialog = createLayoutDialog({
     document,
@@ -614,8 +574,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         preventDefaultContextMenuItems: true,
         sessionLabeled: sessionLabeled(session),
       }),
-    // The rail takes its width from the session beside it, so a drag changes the room the
-    // request card has without a resize event of any kind.
+    // Session list sash changes alter request-card width without a viewport resize event.
     onLayoutChange() {
       composerPresentation?.place();
       composerRenderer?.layout();
@@ -637,8 +596,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         );
       }
     },
-    // The rail is built before the timeline is, and it reports its label-editor state as it
-    // starts. There is no heading to reword until the timeline owner exists.
+    // Initial label-editor state arrives before the timeline owner exists.
     onLabelEditorChange() {
       if (timelineRenderer) timelineRenderer.refreshHeadings();
     },
@@ -711,12 +669,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       return railRenderer.visible() ? railRenderer.newButton() : list.querySelector('.compactnew');
     },
   );
-  // The host records which panel opened the native menu. The command then returns only to that
-  // host, so another panel cannot open the same dialog from a stale browser-side arm.
-  //
-  // The row also keeps the control the press landed on, the way rail.ts keeps rename and label
-  // arms: a rail card names a session the timeline may not be showing, so there is no
-  // `.sessionrow` to place the dialog against or to send focus back to when it closes.
+  // The host routes the native-menu command to the panel that armed it.
+  // Retain the pressed control for dialog placement and focus return, including session list rows outside the selected timeline.
   const DETAILS_ARM_MS = 30_000;
   let detailsArm: { session: string; node: HTMLElement; at: number } | null = null;
   onDocument('contextmenu', function (event) {
@@ -742,12 +696,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     detailsArm = { session, node, at: Date.now() };
     vscode.postMessage({ type: 'armSessionDetails', session });
   });
-  // The panel's foot: the composer over the session column, the status bar across the
-  // window's bottom edge, and two popovers drawn over the panel rather than inside it. Built
-  // once and rewritten whenever what they say changes, which is at the end of a turn, when a
-  // turn finishes anywhere in the folder, when the panel becomes visible, and on the press.
-  // Every word in them, and the band each is drawn in, arrive already decided: this only puts
-  // them on screen and sends the press back.
+  // The prompt box owner mounts stable controls and routes their actions to the host.
   composerRenderer = createComposerRenderer({
     words: ACTIONS,
     recovery: savedState,
@@ -860,16 +809,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     rovingControls,
     setRoving,
   });
-  // The command menu the box opens on a slash. It is a listbox rather than a menu: the reader
-  // stays in the box and the arrow keys move a highlight, so the rows are options and never
-  // tab stops of their own.
-  // One live region for the whole panel. It is present and empty before any request arrives,
-  // then changes only for a request id this host has not seen before. Putting a populated live
-  // region inside every rebuilt card is announced unreliably on insertion and can repeat the
-  // same request whenever an unrelated usage figure redraws the foot.
-  // Where the box says which earlier prompt it has just put back. Its own region rather than
-  // the one above, because writing into that one would take the place of a request waiting to
-  // be read out, and a reader walking back through their prompts would never hear it.
+  // The request owner uses the prompt box's stable mounts and separate history announcer.
+  // A persistent request live region avoids repeated announcements during unrelated updates.
   requestRenderer = createRequestRenderer({
     document,
     mount: composerRenderer.slots.asks,
@@ -907,12 +848,9 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   composerControlsRenderer.setHidden(composerHidden);
   const statusBar = composerControlsRenderer.statusBar;
   mountComposerPresentation(document, composerRenderer, composerControlsRenderer, requestRenderer);
-  // What the foot was last told, kept apart from the render payload so a usage message can
-  // arrive before the first render and still be drawn.
+  // Retain usage independently so it can arrive before the first render.
   let usageState: PanelUsage | null = null;
-  // What is on screen now, so a repaint that changes nothing leaves the control the reader is
-  // standing on alone. The age wording is part of it, so a figure growing stale still
-  // redraws itself, and so is the state of both popovers.
+  // Project cost owns both faces and their shared dialog state.
 
   const projectSpend = createProjectSpendRenderer({
     document: document,
@@ -969,9 +907,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         sessionRead: sessionReadState(session),
         sessionLabeled: sessionLabeled(session),
       }),
-    // The heading's pin reads and writes the same set the rail's pin and the menu's Pin rows do.
-    // Local membership changes redraw their contexts and pins. Rail replies reconcile mounted
-    // headings from current membership, including headings held behind a replacement view.
+    // Heading pins share session-state membership with session list pins and native menus.
+    // Membership changes refresh mounted headings, including headings retained behind a replacement view.
     pinned: (session) => (sessionState.hidden.has(session) ? null : sessionState.pinnedTop.has(session)),
     setPinned: (session, pinned) => sessionState.setPinned(session, pinned),
     labels: sessionLabelsOf,
@@ -1051,9 +988,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     if (chrome.launcherOpen()) chrome.placeLauncher();
   });
 
-  // One recorded card whose temporary child activity moved. The host has already rebuilt the
-  // card from the tested turn projection, so Preact updates that keyed card in place while the
-  // list, rail and composer stay untouched.
+  // Replace one recorded card's temporary child activity in place, leaving the session list and prompt box intact.
   function applyActivityCard(session: string, card: PanelCard) {
     if (!latest || !card || card.sessionId !== session) return;
     const at = activityCardIndexes.get(card.key);
@@ -1073,20 +1008,13 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   function repaint() {
     if (!latest) return;
     composerRenderer.prune(latest.sessions);
-    // The extension decides which sessions are hidden, because the cut it drives happens
-    // before the parse and on that side. Adopting it here is what keeps two hosts from
-    // disagreeing about what is away, and what stops one of them explaining an empty list as
-    // empty transcripts when the real answer is that everything is hidden.
+    // Adopt host-owned archive and pin state before rendering sessions.
     sessionState.adopt(latest.hidden ?? [], latest.pinnedTop ?? [], latest.showing, latest.sessionAdoptions);
-    // The notes travel the same way, and this is the path that catches a host attaching after
-    // they were written: its own stored copy is whatever it last saw, and the extension's is
-    // the answer. The timeline renderer holds structural changes while a comment editor is open.
+    // Adopt host-owned comments, including changes from other panels. The timeline defers structure changes during comment editing.
     if (latest.comments) commentsRenderer.adopt(latest.comments);
-    // The heading figures the host worked out, adopted before the draw that reads them. A rail
-    // message writes them onto the last render as well, so this cannot put a stale copy back.
+    // Adopt heading figures before drawing. Session list updates also replace these retained figures.
     timelineRenderer.applyStats(latest.stats || {});
-    // Before the list, because the page reserves the foot's height at the bottom, and a
-    // list laid out against last render's height would leave a gap or hide its last card.
+    // Measure the prompt box before laying out the timeline, so its final card has the correct bottom clearance.
     composerPresentation.update(usageState);
     layout = timelineLayout(latest.timelineLayout);
     render(latest.cards, latest.diagnosis, latest.sessions, latest.showing, latest.olderHistory);
@@ -1099,8 +1027,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       latest.stats,
       workspaceCatalogAvailable,
     );
-    // The rail's popovers can hang from a timeline heading, which the draw above can remount or
-    // resize, so they are placed after both draws.
+    // Place session list popovers after both owners draw because their timeline-heading anchors can move.
     railRenderer.place();
     projectSpend.update(latest.projectSpend);
     clock.tick();
@@ -1162,18 +1089,11 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     };
   }
 
-  // Everything this webview remembers, emptied, because the reader asked the extension to
-  // forget it. Every field it holds goes: the stored copy has already been emptied,
-  // and a set left standing here would be written straight back by the next save.
-  //
-  // The two sets the extension holds as well are emptied on the render that follows, but the
-  // copy carried on the last one is what a repaint before it would adopt, so that goes too.
+  // Clear local saved state and retained host-owned sets. Otherwise the next save or repaint restores discarded values.
   function forgetEverything(freshSince: number) {
     open.clear();
     readState.reset(typeof freshSince === 'number' ? freshSince : 0);
-    // The notes go with the rest. They are the most expensive thing the reader can make
-    // here, and leaving them behind would mean a control that says it forgets everything
-    // keeps the one thing worth keeping, on disk, with nothing on screen saying so.
+    // Clear saved comments with the other panel state.
     commentsRenderer.reset();
     sessionState.reset();
     setComposerHidden(false, false);
@@ -1184,19 +1104,14 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       latest.hidden = [];
       latest.pinnedTop = [];
     }
-    // The results on screen answered a query that has just gone, and the box that would ask
-    // for them again is empty.
+    // Clear results from the discarded search query.
     searchRenderer.reset();
     saveOpen();
     repaint();
   }
 
-  // Everything the extension sends, read by `parseHostToPanel` before any of it is drawn. A
-  // message this side cannot read draws nothing and says so once, because a panel that acted on
-  // half a message would leave the reader looking at a state the extension never sent.
-  //
-  // The handlers below are named by the message they answer, and `dispatchHostToPanel` names
-  // every one of them. A message kind added to the contract and left out here does not compile.
+  // Parses host messages before dispatch. Unreadable messages produce a warning and no update.
+  // The typed dispatch requires a handler for every message kind.
   function receiveHostMessage(data: unknown) {
     const startedAt = performance.now();
     const message = parseHostToPanel(data);
@@ -1239,41 +1154,30 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       labelEditor: function (msg) {
         railRenderer.receiveLabelEditor(msg.session, msg.heading, msg.rows);
       },
-      // Another host wrote a label onto some other session, so an editor open here is
-      // looking at counts the write moved and a label it does not name at all. It asks again for
-      // its own session rather than being sent one: this side is the only one that knows
-      // which session each host has open.
+      // Refresh an open label editor after workspace label counts change. Its owner knows which session needs fresh rows.
       labelsChanged: function (msg) {
         railRenderer.labelsChanged(msg.session);
       },
-      // The label editor, asked for from a rail card's or a session heading's context menu.
-      // Every host is told for the reason the comment box is, and the arm is what answers which
-      // one saw the press.
+      // Open the label editor only in the panel whose native-menu arm matches the session.
       openLabelEditor: function (msg) {
         railRenderer.openArmedLabelEditor(msg.session);
       },
-      // The command was selected from the native menu over this session heading. The extension
-      // routes it back only to the host that reported opening the menu.
+      // Open session details in the panel that armed the native menu.
       showSessionDetails: function (msg) {
         const arm = detailsArm;
         detailsArm = null;
         const anchor = arm && arm.session === msg.session && Date.now() - arm.at <= DETAILS_ARM_MS ? arm.node : null;
         sessionDetails.openById(composerRenderer.sessionIdentity(msg.session), anchor);
       },
-      // The rename and delete commands on a view section's heading. Both open the same small
-      // editor, and the mode says which of the two the reader pressed. Every host is told, for
-      // the reason the label editor is, and the rail answers only for a view it draws.
+      // Opens the requested view editor in rename or delete mode.
       openViewEditor: function (msg) {
         railRenderer.openViewEditor(msg.view, msg.mode);
       },
-      // Rename session, asked for from a saved session's rail row or heading context menu. Every
-      // host is told for the reason the label editor is, and the rail answers only on the row or
-      // heading it saw pressed.
+      // Opens the rename editor for the session whose native menu this panel armed.
       openSessionRename: function (msg) {
         railRenderer.openSessionRename(msg.session, msg.title);
       },
-      // The answer to the rename the editor sent. The rail and the heading already carry a new
-      // name, so this only closes the editor or shows why the rename failed.
+      // Finishes the matching rename request or displays its error.
       sessionRenameResult: function (msg) {
         railRenderer.receiveSessionRenameResult(msg);
       },
@@ -1293,10 +1197,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       fileStagingRejected: function (msg) {
         attachmentRenderer.rejected(msg.session, msg.token);
       },
-      // What the reader's account has left, and how much each agent asks before it acts. Its
-      // own message because it moves on its own clock: a turn ending, the panel coming back
-      // into view, or the press on the strip itself, none of which is a reason to draw the
-      // list again.
+      // Updates account usage and prompt controls independently of the full render payload.
       usage: function (msg) {
         const before = transientSessionOf(usageState);
         usageState = usageAcrossSessionAdoption(usageState, msg.usage);
@@ -1331,20 +1232,14 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         timelineRenderer.refresh();
         layoutDialog.sync();
       },
-      // The live card alone, which is the one thing on the foot that moves while a turn runs.
-      // Its own message because it arrives eight times a second: the usage message rebuilds
-      // every control under the card, and the box among them is the one the reader may be
-      // typing their next prompt into.
+      // Updates temporary live cards through their owner without rebuilding prompt controls.
       live: function (msg) {
         queueLiveRenderer.applyLive(msg.session, msg.live);
       },
       activity: function (msg) {
         applyActivityCard(msg.session, msg.card);
       },
-      // The session-state update, reworded after the read set moved: the rail's cards, in one
-      // message, so nothing else on screen changes and nothing else is rebuilt. Kept on latest
-      // so the next repaint draws the reworded state rather than the stale copy the render
-      // carried.
+      // Retain session list updates on latest so later repaints keep the current workspace state.
       rail: function (msg) {
         sessionState.adopt(msg.hidden, msg.pinnedTop, sessionState.showing(), msg.sessionAdoptions);
         const projected = railAcrossSessionAdoption(msg.rail, msg.stats, msg.sessionAdoptions);
@@ -1366,25 +1261,19 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           projected.stats,
           workspaceCatalogAvailable,
         );
-        // The rail's rows carry the reader's labels and the heading's figures, so the heading
-        // over the session on screen is reworded from the same message its card is.
+        // Refresh timeline headings from the same labels and figures as the session list.
         timelineRenderer.refreshHeadings(projected.stats, history.footers(latest?.olderHistory ?? null));
         if (labeledBefore) {
           refreshLabeledCards(labeledBefore);
         }
         railRenderer.place();
       },
-      // A command the extension answered itself, by opening one of the composer's own menus. The
-      // reader typed it and pressed send, so focus goes into the menu the way a press on the
-      // control puts it there: they asked for this list and the keyboard is where they are.
+      // Open the prompt setting menu requested by a submitted panel command.
       openPick: function (msg) {
         composerRenderer.openSlash();
         composerControlsRenderer.openPick(msg.control);
       },
-      // A waiting prompt taken back into the box to be changed. The box is a real element this
-      // side owns and never rebuilds, so its value is set here rather than drawn from a payload:
-      // rebuilding it would take the caret, the selection and the undo history with it, which
-      // are the whole reason the prompt comes back to the box instead of to an editor of its own.
+      // Returns a queued prompt to the existing text field.
       takeDraft: function (msg) {
         const selected = composerRenderer.sessionIdentity(msg.session) === composerRenderer.session();
         const target = composerRenderer.takeDraft(msg.session, msg.text);
@@ -1431,27 +1320,17 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       restoreDraft: function (msg) {
         composerRenderer.restoreDraft(msg.session, msg.text, msg.revision);
       },
-      // The reader's notes as the extension holds them, after any host changed one. Adopted
-      // rather than merged, for the reason the hidden set is: this side keeps a copy so it can
-      // draw, and the other side keeps the answer. A note written in the sidebar reaches an
-      // editor tab through here and nowhere else.
+      // Adopts the host's comments as the complete current set.
       notes: function (msg) {
         commentsRenderer.adopt(msg.comments);
-        // Onto the last render as well, the way the rail update is. A repaint re-adopts the
-        // notes from there, and a repaint runs without a fresh render whenever a held one is
-        // released or a search reply lands, so without this the note the reader just wrote
-        // disappears off the card until some transcript happens to move.
+        // Retain comments on latest so deferred and search-triggered repaints cannot restore an older set.
         if (latest) {
           latest.comments = commentsRenderer.snapshot().slice();
         }
-        // The panel's own stored copy moves with it, or a reload would restore the set from
-        // before the note the reader just wrote in the other host.
+        // Save the updated browser copy for panel reloads.
         saveOpen();
       },
-      // The comment box, asked for from a card's context menu. Every host is told, because the
-      // extension cannot tell which one the menu was drawn over, and the arm is what answers
-      // that: only the host that saw the press holds anything to open the box on, and a host
-      // whose arm names another turn has nothing to do with this press.
+      // Opens a comment editor only for the turn this panel armed from the native menu.
       openComment: function (msg) {
         commentsRenderer.openArmed(msg.key);
       },
@@ -1460,35 +1339,25 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       sendSelectedText: function (msg) {
         commentsRenderer.handoffArmed(msg.key, msg.copyLabels);
       },
-      // The read state a right-click on a card set. The set lives in here, so the command in the
-      // extension can only say which turn and which way; the card itself does the rest, through
-      // the same press the panel has always used.
+      // Applies the requested turn read state through the shared read owner.
       setRead: function (msg) {
         readState.set(msg.key, msg.read);
       },
-      // Everything this panel remembers, thrown away. The extension has already emptied the
-      // stored copy, and each host has to empty its own or the next save writes it back.
+      // Clear this panel's state after the host clears its saved copy.
       forgetState: function (msg) {
-        // The floor is stamped again on that side, because forgetting is starting over and
-        // starting over means what opening the workspace for the first time meant.
+        // Reset the read-state floor to the host's fresh timestamp.
         forgetEverything(msg.since);
       },
-      // A whole session's read state, set from the menu over its rail card. The set and
-      // the watermarks live in here, so the command can only say which session and which
-      // way; the two presses below are where the rest of it is written.
+      // Applies the requested session read state and its watermarks through the read owner.
       setSessionRead: function (msg) {
         readState.setSession(msg.session, msg.read);
       },
-      // Archiving, from the menu over a session heading. The hidden set lives in here and is
-      // posted back from the two presses below, so the command can only say which session
-      // and which way.
+      // Applies session archive membership through the session-state owner.
       setSessionArchived: function (msg) {
         if (msg.archived) sessionState.hide(msg.session);
         else sessionState.unarchive(msg.session);
       },
-      // Pinning, from the menu over a session heading. The pinned set lives in here and is
-      // posted back from the press below, so the command can only say which session and
-      // which way.
+      // Applies session pin membership through the session-state owner.
       setSessionPinned: function (msg) {
         sessionState.setPinned(msg.session, msg.pinned);
       },
@@ -1498,17 +1367,12 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         if (!msg.hidden && session) composerRenderer.focus(session);
       },
       results: function (msg) {
-        // The owner refuses a reply that no longer answers the pending query, and one the
-        // reader has already dismissed by choosing a session.
+        // Accept only replies to the pending query that the reader has not dismissed.
         if (!searchRenderer.accept(msg.query, msg.scope, msg.hits)) return;
-        // Through the hold, like a render: a reply can land more than a second after the
-        // press, long enough for the reader to be mid-selection in a card, and the results
-        // draw themselves the moment the selection lets go.
+        // Timeline selection defers result drawing until the reader releases it.
         repaint();
       },
-      // A selection keeps the workspace-owned fields from the last render. The host sends
-      // only the values choosing another session can change, and this merge gives the shared
-      // repaint path one complete view again.
+      // Replace session-specific values while preserving workspace state from the latest render.
       selection: function (msg) {
         if (msg.startup) applySessionLoading(msg.startup);
         latest ??= firstSelection();

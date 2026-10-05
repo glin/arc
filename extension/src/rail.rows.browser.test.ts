@@ -1,4 +1,4 @@
-// The rail rows and their controls: identity, order, folds, buckets, updates, the View menu, hotkeys, and the sash.
+// Session list row identity, order, grouping, menus, keyboard controls, and resizing.
 // Shared helpers live in `../test/rail.ts`.
 
 import { test } from 'vitest';
@@ -377,9 +377,8 @@ test(
       page.on('pageerror', (error) => failures.push(String(error)));
       const initial = payload();
       await openPage(page, initial);
-      // Two cards the fixture draws exactly one of, each named by its own section. s1 is under
-      // the Composer view and s2 is under the Release 0.4 view, so the reorder below moves s2
-      // ahead of s1 inside a section the reader saved rather than inside a time bucket.
+      // s1 starts in Composer and s2 in Release 0.4. Reordering moves s2 ahead of s1 in the saved view.
+
       await page.evaluate(`(() => {
       window.__railS1 = document.querySelector('${inSection(COMPOSER_VIEW, 'rail:s1')}');
       window.__railS2 = document.querySelector('${inSection(RELEASE_VIEW, 'rail:s2')}');
@@ -836,8 +835,8 @@ test('rail cache bolts show both faces and leave when the lifetime ends', { time
     await page.evaluate(SETTLED);
     assert.equal(
       await page.evaluate(`document.querySelector('[data-control="rail:s1"]').getAttribute('aria-label')`),
-      // `railCardName` leads with `name` itself now, so the literal's own name rides at the
-      // front once rather than being folded into the `nameBeforeAge` clauses that follow it.
+      // railCardName starts with name once, followed by nameBeforeAge clauses.
+
       `stale host name, cache warm, just now, Claude, just now, labelled cache nearly gone, just now, Last activity ${literal[0].absolute}`,
       'cache-like title and label words disappear when the browser rewrites a card name by pattern',
     );
@@ -866,8 +865,8 @@ test('folded rows are omitted and removed focus follows its bucket context', { t
     // the fixture, or the buckets below drift with the hour the suite happens to run at.
     const pageNow = (await page.evaluate('Date.now()')) as number;
     assert.ok(Math.abs(pageNow - FIXTURE_CLOCK) < 1000, 'the page clock is not pinned to the fixture clock');
-    // A heading carries the fold id its section writes, and the Archived section writes
-    // `railarchived`. The bare bucket word it used to carry names nothing on the page now.
+    // The Archived heading uses its section fold id, railarchived.
+
     assert.deepEqual(
       await page.evaluate(`(() => {
       const archived = document.querySelector('[data-bucket="railarchived"]');
@@ -917,9 +916,8 @@ test('folded rows are omitted and removed focus follows its bucket context', { t
     })()`);
     assert.equal(await page.evaluate(`document.activeElement.dataset.bucket`), 'railarchived');
 
-    // The removed row sits under a saved view's section, which is where the fixture files s2.
-    // Focus falls back to the heading of the section the row was drawn under, so the guard
-    // reads the view's fold id rather than a time bucket's.
+    // Removing the focused s2 row returns focus to its saved view heading.
+
     await page.locator('[data-control="rail:s2"]').focus();
     const removed = initial.rail.filter((card) => card.id !== 's2');
     await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, removed))}, '*')`);
@@ -1072,8 +1070,8 @@ test('rail archive hotkeys follow the host platform', { timeout: 60_000 }, async
       })`);
       await openPage(page);
       assert.equal(await page.evaluate(`navigator.platform`), current.platform);
-      // The Composer view's card for s1. Two saved views match that session, so it draws
-      // a card under each of their sections and the hotkey is pressed on one named card.
+      // Press the platform shortcut on s1's row in the Composer view.
+
       const card = page.locator(inSection(COMPOSER_VIEW, 'rail:s1'));
       await card.focus();
       await page.evaluate(`window.__posted = []`);
@@ -1269,8 +1267,8 @@ test('a session change nobody asked for keeps the rows under a live drag', { tim
       'the rail does not mark the session the fixture is showing',
     );
 
-    // The composer, a reveal command and another host window all change the shown session.
-    // None of them is the reader, and a drag under the pointer owns the rows it covers.
+    // Selection defers session list replacement during a session change from the prompt box, a reveal command, or another host window.
+
     const selected = inSection(COMPOSER_VIEW, 'rail:s1');
     await page.evaluate(`(() => {
       const name = document.querySelector('${selected} .railname');
@@ -1306,9 +1304,8 @@ test('a session change nobody asked for keeps the rows under a live drag', { tim
   }
 });
 
-// The two Show rows are not filters. Each one takes a whole bucket out of the rail, and the
-// figures on the head row have to fall with it, because a figure that counts a session the
-// list leaves out is a figure the reader cannot act on.
+// Show settings remove whole groups and update header figures to match the visible session list.
+
 test('the Show rows take a bucket out of the rail and out of every figure', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1391,9 +1388,8 @@ test('the Show rows take a bucket out of the rail and out of every figure', { ti
       'a panel loaded with Run by agents off lost s2 from the Running count',
     );
 
-    // Forgetting everything is a reader asking for the rail they started with, and that
-    // rail draws every bucket. A switch left off would keep a whole bucket of sessions
-    // away from a panel that says it has forgotten what hid them.
+    // Forget State restores both Show settings and their groups.
+
     await page.evaluate(`window.postMessage({ type: 'forgetState', since: 0 }, '*')`);
     await page.evaluate(SETTLED);
     await page.locator('[data-control="railfilters"]').click();
@@ -1410,10 +1406,8 @@ test('the Show rows take a bucket out of the rail and out of every figure', { ti
   }
 });
 
-// The Quick filters choice is rail state: a panel loaded with every lens unticked draws no
-// count, and Forget State returns to the default lenses so the head draws its counts. A choice stored
-// before the Running lens existed loads with Running ticked, because that build drew a running
-// figure on every rail.
+// Quick filters choices persist. Forget State restores defaults. Legacy choices without Running enable it during normalization.
+
 test(
   'a restored panel keeps its unticked head lenses and Forget State ticks them again',
   { timeout: 60_000 },
@@ -1463,8 +1457,8 @@ test(
   },
 );
 
-// The Group by row is view state the panel wires by hand: the press, the redraw, the saved word
-// and the agent word each row leaves out under an agent heading.
+// Group by persists the grouping choice and removes redundant agent labels beneath agent headings.
+
 test('a Group by press regroups the rail and a restored panel opens grouped', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1542,8 +1536,8 @@ test(
         [],
         new Map([['s7', 2]]),
       );
-      // The hovered session's cost is a lower bound with a warning, so its figure carries the
-      // long sentence about the usage it could not price, which the hover must leave out.
+      // The lower-bound cost fixture has a warning and a detailed explanation. Its hover omits the explanation.
+
       const partialDetail = 'Some usage could not be priced in 2 of 41 turns, so the estimated total may be low.';
       shown.stats = {
         ...shown.stats,
@@ -1605,9 +1599,8 @@ test(
 
       const comfortable = await read();
       assert.equal(comfortable.density, 'comfortable');
-      // A comfortable card carries no dropped words, so a subagents card's state explanation
-      // is the whole of what the name leaves out. `railCardHint` returns no separate
-      // description for it, and the link falls back to the visible detail node.
+      // Full rows link the visible subagent-state detail when no words are hidden.
+
       const comfortableSubagents = await described('s7');
       assert.deepEqual(
         comfortableSubagents.ids,
@@ -1640,16 +1633,12 @@ test(
       }
       assert.ok(compact.hint, 'a compact card had no hover for the figures, labels and agent word it drops');
 
-      // A compact card's accessible description must never repeat what its accessible name
-      // already says. A plain card's whole hover is words the name already carries, so it
-      // gets no linked description at all. A subagents card's hover adds a state explanation
-      // the name never says, and only that explanation stays linked.
+      // Compact rows link only descriptions absent from their accessible names. Plain rows have none. Subagent rows retain their state explanation.
+
       const plainCard = await described('s2');
       assert.equal(plainCard.described, null, 'a compact card with only dropped words kept a linked description');
-      // The focused compact card opens its hover card in the hint box, built from the card and
-      // figures the rail drew, in place of the plain title. The figures are the row's own figure
-      // line, one figure for each the row carries, and the cost keeps its warning sign but none
-      // of its long sentence.
+      // Compact row hints show the row's figures and cost warning without the detailed cost explanation.
+
       const hoverCard = (await page.evaluate(`(() => {
         const pop = document.getElementById('hintpop');
         const card = document.querySelector('[data-control="rail:s2"]');
@@ -1693,9 +1682,8 @@ test(
       assert.equal(busyCard.described, subagentsHintDetail(2), busyCard.described ?? '');
       assert.ok(!(busyCard.described ?? '').includes('Claude'), busyCard.described ?? '');
 
-      // Moving the hint by pointer from a card whose description links the hidden node to a
-      // control that links its own visible detail carries the description link along, and
-      // leaves the hidden node empty rather than showing the previous card's stale text.
+      // Moving the hint to another control moves its description link. The hidden detail node clears when the new control uses visible detail.
+
       await page.evaluate(`(() => {
         const from = document.querySelector('[data-control="rail:s7"]');
         const to = document.querySelector('[data-control="railfilters"]');
@@ -1776,7 +1764,7 @@ test(
         assert.equal(await checked(expected, restored), 'true');
       }
 
-      // Forgetting everything puts the rows back to comfortable with the rest of the rail.
+      // Forget State restores Full rows.
       await page.evaluate(`window.postMessage({ type: 'forgetState', since: 0 }, '*')`);
       await page.evaluate(SETTLED);
       assert.equal((await read()).density, 'comfortable', 'a forgotten panel kept compact rows');
@@ -1792,8 +1780,8 @@ test(
   },
 );
 
-// The New split closes the head, so a reader tabbing through the rail meets the filters before
-// the launcher, and the split still answers the new-session shortcut.
+// Header keyboard order reaches filters before the New split. The split retains the new-session shortcut.
+
 test('the head tabs from the tools through the New split to the counts', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1880,8 +1868,8 @@ test('a count press keeps the order the reader chose in the View menu', { timeou
         pressed: document.querySelector('[data-control="railcount:active"]').getAttribute('aria-pressed'),
         filter: document.querySelector('[data-control="railfilters"]').getAttribute('aria-label'),
       }))()`);
-    // The order is chosen under a typed query, so it is that query's own order and the rail
-    // default stays Latest update.
+    // Sort changes under a typed query leave the default session list order unchanged.
+
     await page.locator('[data-control="railsearch"]').click();
     await page.evaluate(SETTLED);
     await page.locator('.railfilter').fill('is:running');
@@ -1916,9 +1904,8 @@ test('a count press keeps the order the reader chose in the View menu', { timeou
   }
 });
 
-// A section past 200 sessions draws a page of rows at a time under its Show more press. The
-// rail head holds Project cost over the list, so the press a reader keeps and the last row the
-// final press focuses must both land below it.
+// Sections above 200 sessions reveal rows in pages. Show more and the final focused row must remain below the header.
+
 test('Show more keeps its focus in view below the rail head', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

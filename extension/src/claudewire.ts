@@ -1,20 +1,13 @@
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
-// The client half of Claude Code's headless protocol.
+// Adapts Claude Code's headless protocol to panel events.
 //
-// The CLI speaks newline-delimited JSON on stdin and stdout when it is started with
-// `--input-format stream-json --output-format stream-json`. Two streams share that one
-// pipe: the session itself (user messages in, assistant and result messages out)
-// and a control channel that carries permission asks, interrupts and the usage figures.
-//
-// Nothing here spawns a process or imports `vscode`. The transport arrives as a `send`
-// callback and every inbound line is handed in through `receive`, so the tests drive the
-// whole state machine from the captures recorded off a real CLI.
+// The CLI uses newline-delimited JSON with `--input-format stream-json --output-format stream-json`.
+// Session messages and control requests share stdin and stdout.
+// The transport supplies `send` and forwards inbound lines to `receive`.
 
 import * as fs from 'node:fs';
 
-// The vocabulary is shared with the Codex wire, in `agentwire.ts`, so the composer never
-// learns which agent it is talking to. It is re-exported here because this file is what a
-// reader looking for the Claude protocol opens.
+// Re-export the shared `agentwire.ts` types for Claude protocol callers.
 export {
   PromptEntry,
   PermissionAsk,
@@ -109,31 +102,21 @@ export async function claudePromptContent(
   return content;
 }
 
-// The one reduction this file does not do for itself. `readCommands` above and the usage
-// reader below both live here because nothing else wants them, and the server reading is the
-// exception: `mcpview.ts` owns the whole `McpServer` vocabulary, decides every word drawn
-// from it, and is where the reading is tested. A second copy here read the same fields the
-// same way, which is the arrangement that stays correct until the day one of them is taught
-// about a field and the other is not.
+// `mcpview.ts` owns MCP server decoding and presentation.
 import { readMcpServers } from './mcpview';
 import { activityDetail } from './activitydetail';
 import { contextFrameId, CONTEXT_FRAME_BYTES, CONTEXT_DEADLINE_MS, CONTEXT_PENDING_LIMIT } from './contextframe';
 import { sessionRenameTitle } from './sessionrename';
 
-// The modes `--permission-mode` accepts. Six of them are the choices the CLI's own help
-// lists; `default` is not among them and is accepted anyway, which is why it is spelled out
-// here rather than left as an empty string. Re-read `claude --help` on a version bump: an
-// unrecognised mode is rejected at start-up, so a stale entry here is a child that will not
-// run.
+// The modes `--permission-mode` accepts include `default`, which the CLI help omits.
+// Check the accepted values when updating the CLI. An unsupported mode prevents child startup.
 export type PermissionMode = 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'manual' | 'dontAsk' | 'plan';
 
 export interface SpawnOptions {
   cwd: string;
   model?: string;
-  // How hard the model is asked to think, one of the levels the model advertised through
-  // `list_models`. This is the level the child starts on. The control channel carries no
-  // request that changes it, so a later change goes out as the CLI's own `/effort` command
-  // through `effortCommand`.
+  // The initial effort level comes from the model's `list_models` entry.
+  // Later changes use the CLI's `/effort` command through `effortCommand`.
   effort?: string;
   permissionMode?: PermissionMode;
   resume?: string;
@@ -142,18 +125,10 @@ export interface SpawnOptions {
   settings?: string;
 }
 
-// The arguments a working child needs, in one place so the wiring and the tests agree on
-// them. Three of them are not optional and one is not documented:
-//
-// `--verbose` is required: without it the CLI refuses `--output-format stream-json` and
-// exits. `--permission-prompt-tool stdio` is the flag that turns asks on at all, and it
-// does not appear in `claude --help`; without it the CLI silently allows every tool in
-// headless mode and the reader is never asked. `-p` puts the CLI in print mode, which is
-// what makes it read stdin as a stream rather than draw a terminal UI.
-//
-// `--include-partial-messages` is what turns the reply into something the panel can show
-// while it is still being written. Without it the CLI says nothing between the press and
-// the end of the turn, which is minutes of silence on any real piece of work.
+// `-p` enables print mode and streamed stdin.
+// `--verbose` is required for stream-json output.
+// `--permission-prompt-tool stdio` enables permission asks in headless mode, although the CLI help omits it.
+// `--include-partial-messages` enables response deltas while the model works.
 export function spawnArgs(o: SpawnOptions): string[] {
   const args = [
     '-p',
@@ -208,10 +183,8 @@ function readCommands(v: unknown): PromptEntry[] {
   return out;
 }
 
-// The `skills` array on the `init` system message. Each entry is a plain name, or a plugin
-// name with its skill joined by a colon, such as `plain-language:plain-language`. It carries
-// no other field, so a name is all this reads. Null means the message carried no `skills`
-// key at all, which is not an answer. An explicit empty array is a real answer: no skills.
+// Reads skill names from the `init` system message, including plugin-qualified names such as `plain-language:plain-language`.
+// A missing or non-array value returns null. An empty array reports no skills.
 function readSkills(v: unknown): string[] | null {
   if (!Array.isArray(v)) {
     return null;
@@ -219,27 +192,12 @@ function readSkills(v: unknown): string[] | null {
   return v.map((entry) => str(entry)).filter((name): name is string => !!name);
 }
 
-// The `/usage` answer, in the panel's vocabulary.
-//
-// Two conversions happen here rather than at the reader. The CLI reports utilisation as a
-// whole number on this call and as a fraction on the `rate_limit_event` it volunteers
-// mid-turn, so the fraction wins and the whole number is divided; and the reset time is an
-// ISO string here and epoch seconds there, so the string is parsed. One unit and one clock
-// reach the strip, which is why it can fold a figure from either source into the same row.
-//
-// `rate_limits_available` false is an account the CLI has no limits for, which is not the
-// same as an account at zero, so nothing is returned rather than a row of noughts.
-//
-// The limits arrive two ways in the one object. `rate_limits.limits` is an array with one
-// entry per limit, and it is the only shape that says which clock a limit runs on and which
-// model it covers, so it is what the panel reads. Beside it sit windows named for
-// themselves, and those are all the fallback reads when an answer carries no array.
-//
-// Nothing here iterates the keys of `rate_limits`. Several of them are codenames for limits
-// that are not offered, `seven_day_opus`, `nimbus_quill`, `tangelo` and `iguana_necktie`
-// among them; they hold null, they come and go between releases, and a loop over every key
-// would draw a row the moment one of them held an object, under whatever name it was
-// carrying that week. Two windows are read, and they are read by name.
+// Converts the `get_usage` response to the panel's usage values.
+// Account percentages become fractions, matching live rate-limit events. Reset times become epoch seconds.
+// `rate_limits_available: false` reports unavailable limits, rather than zero usage.
+// A nonempty decoded `rate_limits.limits` list supplies window groups and model scopes.
+// Otherwise, only the named `five_hour` and `seven_day` windows supply limits.
+// Other window keys stay unread because they do not establish supported windows.
 export function readUsage(payload: unknown, readAt: number): UsageReading | null {
   const m = obj(payload);
   if (!m) {
@@ -265,15 +223,8 @@ export function readUsage(payload: unknown, readAt: number): UsageReading | null
   };
 }
 
-// The `limits` array, one `RateLimit` per entry. `kind` is the limit's own name, `group` is
-// the clock it runs on, and a limit tied to one model carries that model under
-// `scope.model.display_name`; a limit covering every model has no scope at all.
-//
-// `severity` and `is_active` ride along on every entry and neither is read. Only "normal"
-// severity has ever been seen, so what any other value means is unknown, and nothing says
-// what makes a limit inactive: the weekly limits report themselves inactive while still
-// carrying the share the reader has spent. Drawing on either would be a guess about a field
-// nobody has explained.
+// Reads each limit's `kind`, `group`, and optional `scope.model.display_name`.
+// `severity` and `is_active` do not filter limits. Inactive weekly limits still carry reported usage.
 function readLimitList(value: unknown): RateLimit[] {
   const out: RateLimit[] = [];
   for (const entry of arr(value)) {
@@ -295,8 +246,7 @@ function readLimitList(value: unknown): RateLimit[] {
   return out;
 }
 
-// The standard windows the CLI names in its own right, for a payload that carries no
-// `limits` array. Each group comes from the window name and covers every model.
+// Reads named windows when the decoded `limits` list is empty. Each window's name determines its group, with no model scope.
 function readNamedWindows(windows: Json | null): RateLimit[] {
   const out: RateLimit[] = [];
   for (const window of ['five_hour', 'seven_day']) {
@@ -317,8 +267,7 @@ function readNamedWindows(windows: Json | null): RateLimit[] {
   return out;
 }
 
-// The account's money cap, from the `spend` object the CLI reports beside the rate windows.
-// A disabled cap, or one with no positive limit, is not a budget the reader can spend from.
+// Reads the account's money cap from `spend`. Disabled caps and nonpositive limits return null.
 function readSpendCap(value: unknown): SpendCap | null {
   const spend = obj(value);
   if (!spend || spend.enabled === false || (spend.disabled_reason !== null && spend.disabled_reason !== undefined)) {
@@ -339,13 +288,11 @@ function readSpendCap(value: unknown): SpendCap | null {
   };
 }
 
-// Which clock a window named for itself runs on. The `limits` array says so outright; a
-// window that arrives under its own name does not. Anything else stays ungrouped rather
-// than being filed under a clock nobody named.
+// Maps named windows to their groups. Unknown window names stay ungrouped.
 const WINDOW_GROUPS: Record<string, string> = {
   five_hour: 'session',
   seven_day: 'weekly',
-  // Grouped and passed on, and drawn nowhere. `isModelBucketWindow` in `usageview.ts` says why.
+  // `usageview.ts` excludes this window from the account usage bar through `isModelBucketWindow`.
   seven_day_overage_included: 'weekly-overage',
 };
 
@@ -353,8 +300,7 @@ function windowGroup(window: string): string {
   return Object.prototype.hasOwnProperty.call(WINDOW_GROUPS, window) ? WINDOW_GROUPS[window] : '';
 }
 
-// Every active window Claude attached to one model response. Newer CLIs send this set
-// beside the older single-window fields.
+// Reads the `unifiedWindows` set attached to a model response.
 function readUnifiedWindows(value: unknown): RateLimit[] {
   const windows = obj(value);
   if (!windows) {
@@ -379,9 +325,7 @@ function readUnifiedWindows(value: unknown): RateLimit[] {
   return out;
 }
 
-// The `list_models` answer, in the panel's vocabulary. A model with no `value` is skipped:
-// the value is what goes back on `set_model`, and a row the panel could not act on is worse
-// than one it never drew.
+// Decodes `list_models` for the panel. A model needs a nonempty `value` for `set_model`.
 export function readModels(payload: unknown, readAt: number): ModelList | null {
   const models: ModelChoice[] = [];
   for (const entry of arr(obj(payload)?.models)) {
@@ -392,9 +336,7 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
     }
     const resolvedModel = str(model.resolvedModel)?.trim() || null;
     const efforts: EffortChoice[] = [];
-    // Claude names its effort levels and says nothing else about them, so each level is its
-    // own label and the description stays empty. A sentence written here would read on
-    // screen as the CLI's own words about a level nobody described.
+    // Each advertised effort level supplies its own label. The CLI supplies no effort description.
     if (model.supportsEffort === true) {
       for (const level of arr(model.supportedEffortLevels)) {
         const name = str(level);
@@ -406,8 +348,7 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
     models.push({
       value,
       ...(resolvedModel ? { resolvedModel } : {}),
-      // A model that named itself nothing is drawn under the value that goes back on the
-      // wire, which is at least something the reader can recognise again.
+      // Use the protocol value when `displayName` is not a string.
       label: str(model.displayName) ?? value,
       description: str(model.description) ?? '',
       efforts,
@@ -419,9 +360,7 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
   return { models, readAt };
 }
 
-// The reset time as epoch seconds, from whichever of the two shapes the CLI used. An
-// unparsable one is no reset time at all: a window drawn with a reset the panel invented
-// would say the limit rolls over at a moment nobody reported.
+// Converts numeric seconds or a parseable date string to epoch seconds. Invalid values return null.
 function readResetTime(value: unknown): number | null {
   const seconds = num(value);
   if (seconds !== null) {
@@ -464,9 +403,7 @@ function readQuestions(v: unknown): Question[] {
   return out;
 }
 
-// The CLI reports an interrupt as a failed result, so the outcome is read from
-// `terminal_reason` first and only falls back to the error flag. `aborted_streaming` is
-// what a control-channel interrupt produces; anything else that failed really did fail.
+// Claude reports interrupts as failed results. `aborted_streaming` and `aborted` take precedence over `is_error`.
 function readOutcome(m: Json): TurnOutcome {
   const terminal = str(m.terminal_reason);
   const failed = m.is_error === true;
@@ -489,9 +426,7 @@ function readOutcome(m: Json): TurnOutcome {
   };
 }
 
-// A control request this client sent and is still waiting on. The CLI answers on the same
-// id, and an answer that arrives after the child died would otherwise leave the caller
-// hanging for ever, so every one of these is settled when the wire closes.
+// Holds a pending control request. Responses, deadlines, transport errors, and wire closure settle its promise.
 interface Waiting {
   resolve(value: Json): void;
   reject(error: Error): void;
@@ -499,36 +434,25 @@ interface Waiting {
   timer: ReturnType<typeof setTimeout> | null;
 }
 
-// How long one control request is waited on before it is given up as unanswered.
-//
-// The CLI answers every subtype it knows and refuses every subtype it does not, so a
-// request that goes quiet means the child is wedged rather than slow. Without a clock the
-// caller waits for ever: the panel's model read holds its agent in the map of reads already
-// running, and every later read for that agent joins the same promise, so one silent
-// request stops the agent being asked again for the life of the window.
-//
-// A minute, which is the same budget a child gets to open. A turn can run far longer than
-// this and is not affected: a turn is a stream of events, not a control request.
+// Control requests expire after one minute so unanswered reads do not block later reads indefinitely.
+// Turn events have no control-request deadline.
 export const CONTROL_DEADLINE_MS = 60_000;
 
 // The origin Claude Code writes on a prompt a person typed. See `ClaudeWire.prompt`.
 const HUMAN_ORIGIN = { kind: 'human' } as const;
 
 export interface WireOptions {
-  // Where outbound lines go. The caller appends nothing: a newline is added here, because
-  // the framing belongs to the protocol rather than to whoever owns the pipe.
+  // Receives each outbound JSON line with its terminating newline.
   send(line: string): void;
   // Every event the panel acts on.
   emit(event: WireEvent): void;
-  // Overridden in tests so the recorded request ids can be replayed exactly.
+  // Supplies request ids. Tests override the generated ids.
   nextId?(): string;
-  // How long a control request is waited on. Overridden in tests, which cannot wait a
-  // minute to prove that the wait ends.
+  // Overrides the control-request deadline.
   deadlineMs?: number;
-  // The session this child was started against, when there is one. A resumed child is
-  // told which session to open, so the panel knows the answer before the child does.
+  // Seeds the session id from the launch options before the CLI reports it.
   sessionId?: string;
-  // Overridden by the attachment tests so a Stop can land while file preparation is open.
+  // Supplies attachment bytes. Tests override the reader to control file preparation.
   readFile?(filePath: string): Promise<Uint8Array>;
 }
 
@@ -538,8 +462,7 @@ function claudeToolActivity(block: Json): WireActivity | null {
     return null;
   }
   const name = str(block.name) ?? 'Tool';
-  // The live question card owns this text. Emitting the tool as well would draw the same
-  // question twice while the reader is deciding how to answer it.
+  // The question card displays this tool's text. Suppress duplicate tool activity.
   if (name === 'AskUserQuestion') {
     return null;
   }
@@ -582,17 +505,8 @@ export class ClaudeWire {
     this.take(id)?.reject(new Error('context response exceeds its limit'));
   }
 
-  // The session the CLI settled on. It starts as the session the child was asked to
-  // resume, and the first message that names a different one replaces it. The id stays the
-  // same for the life of the child, and it is what a later window resumes by.
-  //
-  // Seeded rather than waited for. The CLI names no session in its answer to the handshake,
-  // and a resumed child writes nothing else until the first prompt produces output, so a
-  // panel that waits knows nothing about which session the child is in for the whole of
-  // the first press. Everything keyed on that answer is then wrong at once: no session
-  // counts as running, the rail draws nothing, and the card the press opened is taken down
-  // the moment the handoff comes back. A compaction shows it plainly, because it writes no
-  // turn for the transcript to draw in the card's place.
+  // Seeds the launch session id and follows later `session_id` changes, including `/clear` successors.
+  // The initialize reply names no session, so the seed identifies resumed work before the first prompt produces output.
   private session: string | null = null;
 
   constructor(options: WireOptions) {
@@ -608,13 +522,8 @@ export class ClaudeWire {
     return this.session;
   }
 
-  // The handshake. It has to go before the first prompt: the CLI answers it with the
-  // slash-command list, and a client that never sends it is one the CLI does not consider
-  // able to answer anything.
-  //
-  // `supportedDialogKinds` is left empty on purpose. The CLI only sends a dialog kind a
-  // client has declared, and answering a kind this panel cannot draw is worse than
-  // letting the CLI fall back to its own behaviour.
+  // Initializes the control channel before the first prompt and reads the command list.
+  // Empty `supportedDialogKinds` leaves unsupported dialogs to the CLI.
   async initialize(): Promise<PromptEntry[]> {
     const response = await this.request({ subtype: 'initialize', supportedDialogKinds: [] });
     const commands = readCommands(response.commands);
@@ -622,13 +531,8 @@ export class ClaudeWire {
     return commands;
   }
 
-  // Sends a prompt. It throws on a wire whose child has gone, rather than writing into a
-  // dead pipe and returning: the reader typed something and pressed send, and a prompt that
-  // quietly went nowhere leaves the panel saying a turn is running that never started.
-  //
-  // Every prompt carries a human origin. The CLI copies it onto the prompt record, and the
-  // transcript rule in `agentRunIn` reads it as a person, so a session driven from the panel
-  // does not file under Run by agents in a window that did not start it.
+  // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
+  // Every prompt carries a human origin. The transcript's `agentRunIn` rule uses it to identify reader-owned sessions across windows.
   prompt(input: AgentPromptInput): Promise<void> {
     if (this.closed) {
       throw new Error('the agent is no longer running');
@@ -654,15 +558,10 @@ export class ClaudeWire {
     });
   }
 
-  // Renames the session with Claude Code's `rename_session` control request. The CLI answers
-  // it on the control channel rather than as a turn, so the rename applies while a turn is
-  // running, writes the transcript record and the saved title file, and reports no result
-  // and no cost. `source` says that a person renamed the session in the application hosting
-  // the CLI, which the CLI counts as a rename the reader made. `sessionId` is the session
-  // the caller resolved, and the CLI refuses the request once its process has moved to
-  // another session, which is the case this argument exists to catch. The caller cleans the
-  // name, and this sends it as given. A name with nothing visible is refused here, as the
-  // CLI refuses it too.
+  // Renames the session through a control request, including while a turn runs.
+  // The CLI writes the transcript and saved title without producing a turn result or cost.
+  // `source: 'host'` marks a reader rename. `session_id` prevents renaming a different session after the child changes sessions.
+  // The caller cleans the title. This method rejects invisible titles and sends valid titles unchanged.
   async renameSession(sessionId: string, title: string): Promise<void> {
     if (this.closed) {
       throw new Error('the agent is no longer running');
@@ -673,21 +572,14 @@ export class ClaudeWire {
     await this.request({ subtype: 'rename_session', title, source: 'host', session_id: sessionId });
   }
 
-  // Changes how hard the model works, under the child that is already running.
-  //
-  // The control channel has no subtype for an effort level, so this goes out as the CLI's
-  // own `/effort` command on the same user-message line a prompt uses. The CLI handles the
-  // command itself rather than passing it to the model, and answers with a `result` event,
-  // which the host books as its own turn.
-  //
-  // The origin is the human one for the same reason a prompt's is: a reader pressed the
-  // control, and the transcript rule in `agentRunIn` reads the record it writes.
+  // Changes effort through the CLI's `/effort` command because the control channel has no effort subtype.
+  // The CLI handles the command and emits a `result`, which the host books as a separate turn.
+  // The human origin identifies the command as a reader action.
   async effortCommand(effort: string): Promise<void> {
     if (this.closed) {
       throw new Error('the agent is no longer running');
     }
-    // The command names a level or it asks nothing. A bare `/effort` still costs the round
-    // trip, and the CLI answers it with a menu no reader opened.
+    // A bare `/effort` opens a CLI menu. Require a level for this setting change.
     if (!effort) {
       throw new Error('the effort command needs a level to set');
     }
@@ -698,8 +590,7 @@ export class ClaudeWire {
     });
   }
 
-  // Stops the turn in flight. `cancelQueued` also drops prompts the reader queued behind
-  // it, which is what a stop button means when several are waiting.
+  // Stops the active turn. `cancelQueued` also cancels queued prompts and prevents pending attachments from reaching the child.
   async interrupt(cancelQueued = false): Promise<void> {
     if (cancelQueued) {
       this.promptGeneration += 1;
@@ -715,25 +606,18 @@ export class ClaudeWire {
     await this.request({ subtype: 'set_permission_mode', mode });
   }
 
-  // The two figures the panel already treats as first class, straight from the CLI rather
-  // than added up from turn results. `get_usage` is what `/usage` draws, rate limits and
-  // all, and `get_context_usage` is what `/context` draws.
+  // Reads account usage through `get_usage`, the source for `/usage`.
   async usage(): Promise<Json> {
     return await this.request({ subtype: 'get_usage' });
   }
 
+  // Reads context through `get_context_usage`, the source for `/context`.
   async contextUsage(): Promise<Json> {
     if (this.contextRequests.size >= CONTEXT_PENDING_LIMIT) throw new Error('context responses remain undrained');
     return await this.request({ subtype: 'get_context_usage', detail: 'summary' }, CONTEXT_DEADLINE_MS, true);
   }
 
-  // The models this child will run, with the words the CLI uses for them. Asked once per
-  // child: the list turns over on a release rather than on a turn.
-  //
-  // A CLI that does not know the subtype refuses it, and a child that has gone refuses
-  // everything, so a refusal comes back as no list rather than as a failure. The picker
-  // then offers nothing, which is what it does before the answer arrives anyway, and the
-  // reader is not shown an error about a control they never pressed.
+  // Reads applied settings through `get_settings`. A failed request returns unavailable defaults.
   async appliedDefaults(): Promise<AppliedDefaults> {
     try {
       return readAppliedDefaults(await this.request({ subtype: 'get_settings' }));
@@ -742,6 +626,7 @@ export class ClaudeWire {
     }
   }
 
+  // Reads the model catalog. A failed request returns null.
   async listModels(): Promise<Json | null> {
     try {
       return await this.request({ subtype: 'list_models' });
@@ -750,19 +635,8 @@ export class ClaudeWire {
     }
   }
 
-  // What the MCP servers behind this child are doing, read on demand.
-  //
-  // On demand is the only way it can be read. The CLI volunteers nothing about its servers:
-  // a child holding one healthy server and one that would not start said nothing about
-  // either over fifteen seconds, so there is no message to listen for and the panel has to
-  // ask every time it wants to know. That matters more than it sounds, because a server
-  // that falls over takes its tools with it quietly, and the agent simply stops being able
-  // to do something it could do an hour ago.
-  //
-  // A refusal comes back as no reading rather than as a failure, the way the model list
-  // does. An older CLI that has never heard of the subtype refuses it, and a child that has
-  // gone refuses everything; in both cases the reader pressed nothing and asked nothing, so
-  // the panel is left with no servers to draw rather than an error to explain.
+  // Reads MCP server status on demand because the CLI sends no unsolicited server-status updates.
+  // A failed request returns null.
   async mcpStatus(): Promise<McpServer[] | null> {
     try {
       return readMcpServers(await this.request({ subtype: 'mcp_status' }));
@@ -771,29 +645,13 @@ export class ClaudeWire {
     }
   }
 
-  // Switches one server off, or back on.
-  //
-  // Both fields have to go out and neither is guessable from the CLI's help, which is why
-  // they are spelled out here rather than left to a caller. The server is named under
-  // `serverName`, not `server` and not `name`: a request under the wrong key is not
-  // refused, it is answered with a complaint that no such server exists, and on screen the
-  // button the reader pressed looks like it did nothing at all. `enabled` decides the state
-  // outright rather than flipping whatever the server was in, and leaving it off is not the
-  // same as leaving the server alone: the CLI reads a missing `enabled` as false, so a
-  // request without it can only ever switch a server off, and a reader who switched one off
-  // could never switch it on again. Sending the same value twice is harmless.
-  //
-  // The failure is passed on rather than swallowed, which is the difference between this
-  // and the reading above. The reader pressed this, and a press that quietly did nothing is
-  // worse than one that says why it could not.
+  // Sets a server's enabled state. The CLI requires `serverName` and treats an omitted `enabled` as false.
+  // Sending the same value twice preserves the state. Request failures reach the caller.
   async mcpToggle(serverName: string, enabled: boolean): Promise<void> {
     await this.request({ subtype: 'mcp_toggle', serverName, enabled });
   }
 
-  // Tries a failed server again. It answers once the CLI has the connection up, and fails
-  // with whatever the connection failed on, "Connection closed" among them, which is the
-  // sentence worth putting in front of somebody who just asked for another go. Passed on
-  // for the same reason the toggle passes its own on.
+  // Reconnects a failed server. The request resolves when the CLI connects and rejects with the connection error on failure.
   async mcpReconnect(serverName: string): Promise<void> {
     await this.request({ subtype: 'mcp_reconnect', serverName });
   }
@@ -806,9 +664,7 @@ export class ClaudeWire {
     return [...this.asks.values()];
   }
 
-  // Answers an ask. The CLI is blocked until this goes out, so an unknown id is reported
-  // rather than dropped: a silently ignored answer looks to the reader like the agent
-  // hung, which is the one failure this whole channel exists to prevent.
+  // Answers a pending ask to unblock the CLI. An unknown id returns false without sending a response.
   answer(id: string, answer: AskAnswer): boolean {
     const ask = this.asks.get(id);
     if (!ask) {
@@ -819,11 +675,8 @@ export class ClaudeWire {
     if (answer.decision === 'deny') {
       response = { behavior: 'deny', message: answer.reason };
     } else if (answer.decision === 'answer') {
-      // An answered question is an allowed tool call whose input has grown an `answers`
-      // map, keyed by the question text. Several picks on one question go back as one
-      // string, which is what the tool reads, and an answer the reader wrote themselves
-      // joins that string beside them. The rest of the input is passed back untouched,
-      // because the CLI hands the whole thing to the tool.
+      // Allow the question tool with an `answers` map keyed by question text.
+      // Join selected labels and written text into one string per question. Preserve the remaining input.
       const answers: Record<string, string> = {};
       for (const [id, picked] of Object.entries(answer.answers)) {
         answers[id] = [...picked.labels, ...(picked.written ? [picked.written] : [])].join(', ');
@@ -837,9 +690,7 @@ export class ClaudeWire {
     return true;
   }
 
-  // One line off the child's stdout. Anything unparsable is reported and skipped: the CLI
-  // writes the odd non-JSON line when something goes wrong underneath it, and one bad line
-  // must not take the session down with it.
+  // Reads one stdout line. Report invalid JSON and continue receiving later lines.
   receive(line: string): void {
     const contextId = this.contextFrame(line);
     if (contextId && Buffer.byteLength(line, 'utf8') > CONTEXT_FRAME_BYTES) {
@@ -866,8 +717,7 @@ export class ClaudeWire {
 
     const session = str(m.session_id);
     if (session && session !== this.session) {
-      // Read before the field moves. What the panel needs is the session being left,
-      // and after the assignment both names are the same one.
+      // Preserve the previous session id for the session-change event.
       const previous = this.session;
       this.session = session;
       this.emit({ kind: 'session', sessionId: session, previous });
@@ -897,11 +747,8 @@ export class ClaudeWire {
         if (subtype === 'thinking_tokens') {
           this.emit({ kind: 'thinking' });
         }
-        // The `init` message arrives only once its session has taken a first prompt, well
-        // after the `initialize` control reply this wire already read the command list from.
-        // It is the only place the CLI names its skills, so a later `init` on a resumed or
-        // cleared session still updates what this wire knows. A message with no `skills` key
-        // emits nothing, rather than reporting an empty list the CLI never sent.
+        // The CLI sends `init` after the first prompt and repeats it for local commands.
+        // Read its skill catalog whenever present. A missing or non-array `skills` value emits no catalog event.
         const skills = subtype === 'init' ? readSkills(m.skills) : null;
         if (skills !== null) {
           this.emit({ kind: 'skills', skills });
@@ -917,8 +764,7 @@ export class ClaudeWire {
     }
   }
 
-  // Settles every caller waiting on a reply and stops the wire answering anything else.
-  // Called when the child exits, however it exited.
+  // Rejects pending control requests and clears asks when the child exits.
   close(reason: string): void {
     this.contextRequests.clear();
     if (this.closed) {
@@ -1003,20 +849,13 @@ export class ClaudeWire {
     }
   }
 
-  // A chunk of the reply as it is written, from the stream `--include-partial-messages`
-  // turns on. Recorded off a real child on 2026-08-29, so a reader here does not have to
-  // guess at the shape:
+  // Reads stream events enabled by `--include-partial-messages`.
   //
   //   {"type":"stream_event","event":{"type":"content_block_delta","index":1,
   //     "delta":{"type":"text_delta","text":"one, two, three"}}}
   //
-  // Three facts from that capture decide what this does. `stream_event` is the only new
-  // top-level type the flag adds, so nothing already in the switch above can mistake a
-  // partial for a finished message. The `assistant` message still arrives once per content
-  // block, exactly as it did before the flag, so `text` events are unchanged and joining
-  // these deltas is not a second copy of them. And the same event carries `thinking_delta`
-  // for the model's reasoning, which is not the reply and is not drawn as one: the panel
-  // already learns that a model is thinking from its own event.
+  // Message starts supply the response id. Message deltas classify buffered assistant text using the stop reason.
+  // Only text deltas become response deltas. Thinking deltas do not become response text.
   private partial(event: Json | null): void {
     if (!event) {
       return;
@@ -1100,19 +939,15 @@ export class ClaudeWire {
         utilization,
         resetsAtSeconds: num(info.resetsAt),
         status: str(info.status) ?? '',
-        // The event names one window and says nothing about a clock or a model, so the
-        // group comes from the name and the limit covers every model, which is what an
-        // empty scope means.
+        // The event has no group or model scope. Derive the group from the window name and leave the scope empty.
         group: windowGroup(window),
         scope: '',
       },
     });
   }
 
-  // A control request the CLI sent us. Only the permission channel is answered here.
-  // Anything else is refused with an error rather than left hanging, so the CLI can fall
-  // back to whatever it does without a capable client, except for the dialog channel,
-  // where the protocol says an undeclared kind must go unanswered.
+  // Answers `can_use_tool` requests and rejects unsupported control requests.
+  // Leave `request_user_dialog` unanswered because this client declares no supported dialog kinds.
   private incoming(m: Json): void {
     const id = str(m.request_id);
     const request = obj(m.request);
@@ -1167,8 +1002,7 @@ export class ClaudeWire {
     } else waiting.reject(new Error(str(response.error) ?? 'the agent refused the request'));
   }
 
-  // Takes one request out of the map and stops its clock. Every path that settles a request
-  // goes through here, so no timer outlives the request it belongs to.
+  // Removes one pending control request and clears its deadline timer.
   private take(id: string): Waiting | null {
     const waiting = this.waiting.get(id);
     if (!waiting) {
@@ -1194,14 +1028,12 @@ export class ClaudeWire {
           late.reject(new Error('the agent did not answer'));
         }
       }, deadline);
-      // The extension host outlives any one request, and a pending timer that keeps the
-      // host awake is a cost the reader pays for a question they did not ask.
+      // The deadline timer must not keep the extension host process running.
       if (typeof timer === 'object' && typeof timer.unref === 'function') {
         timer.unref();
       }
       this.waiting.set(id, { resolve, reject, timer });
-      // A send that throws leaves nothing to answer this request, so it fails here rather
-      // than holding an entry and a timer until the deadline.
+      // Reject a failed send immediately and remove its pending request and deadline timer.
       try {
         this.write({ type: 'control_request', request_id: id, request });
       } catch (error) {

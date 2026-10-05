@@ -8,7 +8,7 @@ const { execFileSync } = require('node:child_process');
 function runHook(script, payload, root) {
   return execFileSync(process.execPath, [path.join(__dirname, `${script}.cjs`)], {
     input: JSON.stringify(payload),
-    // tests run in the OS temp dir, which is ignored by default; opt out so capture runs
+    // Disable ignored roots so the hook captures edits in temporary test workspaces.
     env: { ...process.env, ARC_HOME: root, ARC_IGNORE_ROOTS: '' },
   });
 }

@@ -138,8 +138,8 @@ export function launcherCustomRequest(
   };
 }
 
-// Each field and its value, as the accessible names of Create and the field pin read them.
-// Empty when the catalog lacks a value.
+// Name each setup field and value for Create and the field pin.
+// Return empty text when the agent or permission is missing. Use fallback labels for missing model and effort values.
 export function customValuesName(
   view: SessionLauncherView,
   request: Extract<LauncherRequest, { kind: 'custom' }>,

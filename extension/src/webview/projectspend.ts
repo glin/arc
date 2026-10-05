@@ -36,7 +36,7 @@ interface ProjectSpendOptions {
   events: ProjectSpendEvents;
   twist: string;
   selectionWithin(node: HTMLElement | null): boolean;
-  // The limits keep the rail dialog in the viewport below its button.
+  // The limits constrain the Project cost dialog to the viewport.
   placeFloat(popover: HTMLElement, anchor: DOMRect, bottomLimit?: number, topLimit?: number): void;
   fallbackFocus(): HTMLElement | null;
 }
@@ -579,7 +579,7 @@ export function createProjectSpendRenderer(options: ProjectSpendOptions): Projec
         return;
       }
       const rect = anchor.getBoundingClientRect();
-      // The rail dialog opens below its button when that space fits a control.
+      // The session list dialog opens below its button when that space fits a control.
       if (currentFace() === faces.rail) {
         const style = getComputedStyle(dialog);
         const controls = Array.from(dialog.querySelectorAll<HTMLElement>('button, summary'));

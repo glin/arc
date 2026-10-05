@@ -13,9 +13,8 @@ import {
 } from './codexwire.ts';
 import { WireEvent, Ask, RateLimit } from './agentwire.ts';
 
-// Captured off codex-cli 0.146.0 running `app-server`, trimmed to the fields this module
-// reads. The ids are the real ones, including the server request id of 0, which is the
-// value a client that treats ids as truthy gets wrong.
+// App-server fixtures retain protocol fields, including request ID 0. A truthiness check must not discard that ID.
+
 const THREAD = '01a04792-145f-7c01-9dd6-f3234c381e7e';
 const TURN = '01a04792-152f-72f1-b738-f4b20621e59a';
 
@@ -362,9 +361,8 @@ test('a native compaction reports its terminal failure', async () => {
   });
 });
 
-// Three shapes, one sentence. A compaction that failed because the reader's provider sign-in
-// had expired told them nothing at all, because the server put the sentence naming the
-// sign-in in a field this file did not read and an invented fallback stood in its place.
+// Compaction failures retain the server message across string, turn-error, and error-message envelopes.
+
 test('a compaction carries the reason the server gave, in whichever field it arrives', async () => {
   const shapes = [
     {
@@ -427,9 +425,8 @@ test('a compaction the server named no reason for rejects with nothing to say', 
       params: { threadId: THREAD, turnId: TURN },
     }),
   );
-  // Empty, and not a sentence of this file's own invention. The panel already says that the
-  // compaction did not happen, so a stand-in cause here only stacks a second telling of it,
-  // and the panel cannot tell an invented one from a real one.
+  // When the server supplies no compaction reason, reject with an empty message rather than inventing a cause.
+
   await assert.rejects(compacting, (error: Error) => {
     assert.equal(error.message, '');
     return true;
@@ -903,8 +900,8 @@ test('the rate-limit share is converted to the fraction the panel speaks in', ()
     utilization: 0.03,
     resetsAtSeconds: 1787924682,
     status: '',
-    // The clock comes from the same length the name does, and every limit this wire reports
-    // covers every model, which is what an empty scope means.
+    // This account limit derives its clock group from its duration. Its empty scope covers all models.
+
     group: 'session',
     scope: '',
   });
@@ -1220,9 +1217,8 @@ test('an error response reaches the caller as the failure it is', async () => {
   await assert.rejects(pending, /bad params/);
 });
 
-// Codex's own version of a model asking the reader something. Shapes taken from
-// `ToolRequestUserInputParams` and `ToolRequestUserInputResponse` in the schema that
-// `codex app-server generate-ts` emits for 0.146.0.
+// The question fixture uses ToolRequestUserInputParams and ToolRequestUserInputResponse from the app-server protocol.
+
 const USER_INPUT_REQUEST = JSON.stringify({
   id: 4,
   method: 'item/tool/requestUserInput',
@@ -1336,9 +1332,8 @@ test('an approval still takes a verdict, so the two shapes do not get crossed', 
 });
 
 test('a permissions-profile approval is refused rather than answered with a verdict', () => {
-  // `item/permissions/requestApproval` answers with a granted-permission profile and a
-  // scope. Sending it `{"decision":"accept"}` would be the wrong shape, and if the server
-  // read it loosely it would grant something the reader was never shown.
+  // Permission-profile approvals require a profile and scope. A command-approval verdict cannot answer that request.
+
   const h = harness();
   h.wire.receive(
     JSON.stringify({
@@ -1357,8 +1352,8 @@ test('a permissions-profile approval is refused rather than answered with a verd
 });
 
 test('both windows the server volunteers reach the panel, shorter first', () => {
-  // The strip decides which window binds, so a wire that reported only one would be making
-  // that decision here, out of sight of the file where it is tested.
+  // Publish both limit windows so the usage bar can display each one.
+
   const h = harness();
   h.wire.receive(RATE_LIMITS);
   const limits = h.events.flatMap((e) => (e.kind === 'rateLimit' && e.limit !== null ? [e.limit] : []));
@@ -1409,8 +1404,8 @@ test('a server that reports no window at all is reported as nothing', () => {
 });
 
 test('the rate-limit request goes out on a bare server, before any thread', async () => {
-  // This is what makes the refresh path free: no thread means no rollout file and no
-  // session the reader did not ask for.
+  // Read rate limits without creating a thread or rollout.
+
   const h = harness();
   void h.wire.rateLimits();
   assert.equal(h.parsed()[0].method, 'account/rateLimits/read');
@@ -1441,7 +1436,7 @@ test('how much Codex asks rides the next prompt, because that is the only place 
   reply(h, { thread: { id: THREAD } });
   await started;
   const sink = () => {
-    /* the reply the server would send is not what is under test */
+    /* Discard rejection when the wire closes the pending turn. */
   };
   h.wire.prompt('before').catch(sink);
   const before = h.parsed().filter((m) => m.method === 'turn/start');
@@ -1459,15 +1454,14 @@ test('how much Codex asks rides the next prompt, because that is the only place 
 });
 
 test('the sandbox travels with the approval, because one choice sets both', async () => {
-  // A reader who picks full access and gets a workspace-write sandbox was told one thing
-  // and given another: the policy says when they are asked, the sandbox says what happens
-  // when they are not, and a turn carrying only the first keeps neither promise.
+  // The selected permission mode carries both the approval policy and sandbox on the turn.
+
   const h = harness();
   const started = h.wire.startThread({ cwd: 'C:ws' });
   reply(h, { thread: { id: THREAD } });
   await started;
   const sink = () => {
-    /* the reply the server would send is not what is under test */
+    /* Discard rejection when the wire closes the pending turn. */
   };
   await h.wire.setApproval('never', 'danger-full-access', 'user');
   h.wire.prompt('go').catch(sink);
@@ -1487,17 +1481,14 @@ test('the sandbox travels with the approval, because one choice sets both', asyn
 });
 
 test('a turn names its sandbox the way turn/start reads it, not the way a thread does', async () => {
-  // The two calls take different spellings of one choice, and the wrong one fails quietly:
-  // the server accepts a turn carrying `sandbox` and leaves the sandbox exactly as it was,
-  // which is the whole fault this control exists to fix. Every mode the panel offers is
-  // checked, because a table with one wrong row reads like a working one from three modes
-  // away.
+  // Send turn sandbox overrides as sandboxPolicy. Check every sandbox mode against its protocol object type.
+
   const h = harness();
   const started = h.wire.startThread({ cwd: 'C:ws' });
   reply(h, { thread: { id: THREAD } });
   await started;
   const sink = () => {
-    /* the reply the server would send is not what is under test */
+    /* Discard rejection when the wire closes the pending turn. */
   };
   const shapes: [SandboxMode, string][] = [
     ['read-only', 'readOnly'],
@@ -1526,8 +1517,8 @@ test('a turn names its sandbox the way turn/start reads it, not the way a thread
 
 test('a thread opens with every permission setting the reader left it on', async () => {
   const h = harness();
-  // The server's answer is not what is under test, so nothing waits on it and the start is
-  // settled by closing the wire.
+  // Inspect thread/start before a response arrives. Closing the wire settles the pending start.
+
   h.wire
     .startThread({
       cwd: 'C:\\ws',
@@ -1583,7 +1574,7 @@ test('the model and the effort level the reader picked ride every turn', async (
   await started;
 
   const sink = () => {
-    /* the reply the server would send is not what is under test */
+    /* Discard rejection when the wire closes the pending turn. */
   };
   h.wire.prompt('unpicked').catch(sink);
   const bare = h.parsed().filter((m) => m.method === 'turn/start')[0];
@@ -1704,8 +1695,8 @@ test('a non-account update without a readable name cannot replace an account win
   );
 });
 
-// The `model/list` answer, as the server gave it. Each model carries the words the picker
-// draws, and a sentence for each reasoning effort it will run at.
+// The model/list fixture includes model labels and supported reasoning-effort descriptions.
+
 const MODEL_ANSWER = {
   data: [
     {
@@ -1788,8 +1779,8 @@ test('the model list follows the server cursor so every offered model reaches th
 });
 
 test('a server that will not list its models leaves the panel with no list, not an error', async () => {
-  // The reader pressed nothing: the panel asked on their behalf, and a server that refuses
-  // the method is a picker with nothing in it rather than a failure.
+  // An unavailable model list returns null without reporting a turn failure.
+
   const h = harness();
   const listing = h.wire.models();
   h.wire.receive(JSON.stringify({ id: h.parsed()[0].id, error: { code: -32601, message: 'unknown method' } }));
@@ -1797,9 +1788,8 @@ test('a server that will not list its models leaves the panel with no list, not 
 });
 
 test('a request nobody answers gives up rather than waiting for ever', async () => {
-  // The same clock the Claude wire keeps. A server that goes quiet held its caller open with
-  // nothing to end the wait, so the child started to answer was never disposed and the panel
-  // joined every later read for that agent to the dead promise.
+  // An unanswered request expires so later reads can proceed.
+
   const h = harness(10);
   await assert.rejects(waitForDeadline(h.wire.rateLimits()), /did not answer/);
   // The wire is still usable. The request that timed out is gone rather than left behind to
@@ -1810,8 +1800,8 @@ test('a request nobody answers gives up rather than waiting for ever', async () 
 });
 
 test('a model list nobody answers is no list, and a late answer changes nothing', async () => {
-  // The panel asked on the reader's behalf and they pressed nothing, so a server that will
-  // not answer leaves the picker with nothing in it rather than raising a failure.
+  // An unanswered model read leaves the picker empty without reporting a turn failure.
+
   const h = harness(10);
   assert.equal(await waitForDeadline(h.wire.models()), null);
   // The late answer names a request the wire no longer holds. Reading it throws nothing and
@@ -1819,9 +1809,8 @@ test('a model list nobody answers is no list, and a late answer changes nothing'
   reply(h, MODEL_ANSWER);
 });
 
-// Three chunks of one reply, in the shape the server sent them on 2026-08-28. The whole
-// payload is the piece of text, under a key of its own, beside the ids of the thread, the
-// turn and the item it belongs to.
+// Reply chunks carry delta text with thread, turn, and item IDs.
+
 const REPLY_CHUNKS = ['Running', ' the', ' requested command.'].map((delta) =>
   JSON.stringify({
     method: 'item/agentMessage/delta',
@@ -1831,8 +1820,8 @@ const REPLY_CHUNKS = ['Running', ' the', ' requested command.'].map((delta) =>
 );
 
 test('the reply reaches the panel a chunk at a time, in the shape Claude sends', () => {
-  // The server has always sent these and the panel dropped them on the floor, which is why a
-  // Codex turn was as silent as a Claude one. One case in the switch is the whole of it.
+  // Translate each reply chunk into a shared delta event.
+
   const h = harness();
   for (const chunk of REPLY_CHUNKS) h.wire.receive(chunk);
   assert.deepEqual(
@@ -1845,8 +1834,8 @@ test('the reply reaches the panel a chunk at a time, in the shape Claude sends',
     'the chunks arrive in a shape of their own, so the card would need a branch per agent',
   );
 
-  // A chunk with no text in it is nothing to draw. The server sends the ids on every one of
-  // these, so a missing delta is a shape that changed rather than a quiet moment.
+  // A message with no delta text emits no reply chunk.
+
   const quiet = harness();
   quiet.wire.receive(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: THREAD } }));
   assert.deepEqual(quiet.events, []);

@@ -1,11 +1,7 @@
-// The card a compact rail row opens on hover, drawn into the shared hint box.
-//
-// The row cuts its agent word, its figures and its labels, and a long name ends in an
-// ellipsis, so the card says all of them in full. The figures are the comfortable row's own
-// figure line, drawn by the same component, and they open no popover because the hint box
-// takes no pointer. The card is built when the hover opens, from the card and the figures the
-// rail last drew, and never held inside a row: the rail draws up to a thousand rows, and one
-// card is on screen at a time.
+// Compact session list rows open one hover card in the shared hint box.
+// It shows the full name, agent, figures, and labels from the last drawn row.
+// RailStats supplies the same figures as Full rows. The hint box accepts no pointer actions.
+// Build only the open hover card rather than storing one inside every row.
 
 import { h, render } from 'preact';
 import { contextClass } from '../view/card-presentation.ts';
@@ -17,9 +13,8 @@ function metaPart(document: Document, part: RailHoverPart): HTMLElement {
   if (part.kind === 'state') {
     const node = element(document, 'span', part.className ?? '');
     if (part.runningSince !== undefined) {
-      // The panel clock rewrites the duration span's whole text as the minutes pass. The span
-      // holds `for` and the duration, and is empty in the first minute, so the word `running`
-      // sits outside it.
+      // The clock replaces the duration span's text. Keep the state word outside it.
+      // The span contains the lead and duration, and stays empty during the first minute.
       const lead = part.lead ?? '';
       const clocked = part.duration ? `${lead}${part.duration}` : '';
       node.append(document.createTextNode(part.text.slice(0, part.text.length - clocked.length)));
@@ -60,8 +55,7 @@ export function railHoverCard(
     root.append(element(document, 'div', 'hintnote', lines.note));
   }
   if (stats.length) {
-    // The context figure takes the hint box's own foreground over its level wash, which
-    // `panel.css` scopes to the figure line inside the card.
+    // panel.css gives context figures the hint box foreground over their level background.
     const figures = element(document, 'div');
     render(h(RailStats, { stats, contextClass }), figures);
     root.append(figures);

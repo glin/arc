@@ -94,9 +94,7 @@ export function createComposerAction(
       });
     }
     node.classList.toggle('stop', view.box.actionKind === 'stop');
-    // The button reads the box's own live text, not `view.draft`: the host sends that field
-    // once per session and never again, so it would hold whatever the reader had typed before
-    // this session was last opened rather than the Codex `/rename` they are typing now.
+    // Read the live prompt text field for the staging decision. The host's `view.draft` does not track each edit.
     const waits = sendWaitsForStaging(view.agent, composer.prompt.value, attachments.isStaging(view.sessionId));
     node.disabled = !view.box.actionEnabled || waits;
     const sends = !waits && view.box.actionKind !== 'stop' && view.box.actionEnabled;
@@ -465,8 +463,7 @@ export function createComposerPresentation(options: ComposerPresentationOptions)
     let finishing = false;
     const apply = (clientY: number) => {
       floorEm = clampPromptFloor(startDrawnFloor + (fromY - clientY) / promptFontSize(), ceilingEm);
-      // The first draw applies the requested floor for the ceiling measurement. The final
-      // draw in measure() performs the one skill-layer layout needed for this frame.
+      // Apply the requested floor before measuring the ceiling. measure() then calls composer.layout() once for the frame.
       drawFloor(floorEm, false);
       measure();
     };
@@ -549,11 +546,8 @@ export function createComposerPresentation(options: ComposerPresentationOptions)
     options.save();
   });
   prompt.addEventListener('input', measure);
-  // The host redraws the send button only when a full usage payload arrives, and it holds
-  // that back until the box crosses empty or a queued prompt moves, so most keystrokes reach
-  // no farther than the box itself. A file already staging is the one case where a keystroke
-  // changes whether the button waits, because it can turn a plain draft into a Codex
-  // `/rename`, so this redraws the button alone for that case rather than waiting on the host.
+  // During file staging, edits can switch a Codex draft to `/rename`, which bypasses staging.
+  // Redraw the button locally because host updates do not arrive on every keystroke.
   const redrawWhileStaging = () => {
     const view = composer.view();
     if (view && attachments.isStaging(view.sessionId)) {
@@ -561,8 +555,7 @@ export function createComposerPresentation(options: ComposerPresentationOptions)
     }
   };
   prompt.addEventListener('input', redrawWhileStaging);
-  // The composer sets the draft without an input event on every path that goes through its
-  // draft setter, so the renderer reports those here.
+  // Draft setters do not dispatch input events. Subscribe to them so programmatic edits also refresh the staging decision.
   composer.onDraftSet(redrawWhileStaging);
   options.events.window('resize', measure);
   options.events.window('scroll', measure, { passive: true });

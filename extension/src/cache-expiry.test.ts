@@ -203,10 +203,7 @@ const NOTHING = {
   truncated: false,
 };
 
-// ## The reported symptom
-//
-// A reader left a session idle across the prompt cache's whole life, came back, typed a new
-// prompt, and the first request paid for input the previous request had already cached.
+// A new prompt after the cache lifetime records an idle return with cold input.
 
 test('a 30-minute cache crossed by a 31-minute gap reports one exact return', () => {
   const record = indexed(
@@ -303,8 +300,7 @@ test('a 1-hour cache returned to after 59 minutes reports nothing', () => {
 
 // ## What must never count
 //
-// Each of these crosses the lifetime. None of them is a reader who walked away and came back
-// to a new prompt, so none of them may add to the exact count.
+// These lifetime-crossing gaps do not represent idle returns to a new visible turn.
 
 test('a long tool execution inside one visible turn is not an idle return', () => {
   const record = indexed(
@@ -612,7 +608,7 @@ test('a byte-budgeted scan resumed across a line boundary gives the same answer'
   assert.deepEqual(summary(record), summary(whole));
 });
 
-// ## Compaction facts kept for a later economic reading
+// Retained compaction usage and context facts.
 
 test('a compaction retains its recorded time, both context sizes, and its later requests', () => {
   const record = indexed(
@@ -946,8 +942,8 @@ test('a ledger written by an older parser generation rebuilds instead of loading
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
   const current = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
 
-  // One generation back, whatever the current one is. A rebase onto a branch that already
-  // bumped the generation would otherwise leave this change sharing another change's bump.
+  // Use the preceding parser generation to check invalidation independently of its current value.
+
   const stale: SpendFileIndex = {
     ...current,
     parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1,

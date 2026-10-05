@@ -1,16 +1,11 @@
 import assert from 'node:assert';
 import ts from 'typescript';
 
-// Source-text assertions that hold in any formatter layout.
-//
-// A pattern is written against the source as it reads today. `sourceMatch` passes when the
-// pattern matches that text, or when a layout-free reading of the pattern matches the
-// layout-free reading of the source. `sourceDoesNotMatch` fails when either reading matches, so
-// a forbidden call that the formatter wraps over several lines still trips it.
-//
-// The layout-free reading of a source keeps the exact text of every token, string, template,
-// regular expression and comment. It drops whitespace between two tokens, except for one space
-// between two word characters, and it drops a trailing comma before a closing bracket.
+// Source-text assertions accept formatter changes to whitespace and trailing commas.
+// sourceMatch accepts literal or normalized matches unless the pattern reads line structure.
+// sourceDoesNotMatch rejects either form.
+// Normalization preserves tokens, literals, and comments. It removes trailing commas before closing brackets.
+// Inter-token whitespace becomes one space between word characters and disappears otherwise.
 
 const WORD = /^[\p{ID_Continue}$]$/u;
 const CLOSERS = new Set([
@@ -56,8 +51,7 @@ function readLayout(source: string): Layout {
   if (cached !== undefined) return cached;
   let text = '';
   const offsets: number[] = [];
-  // The last character written, kept apart because reading it back from the growing string
-  // flattens that string on every piece and makes a large file cost quadratic time.
+  // Cache the last character to avoid repeatedly flattening the growing string.
   let last = '';
   let space = false;
   let comma = -1;
@@ -124,17 +118,14 @@ function readLayout(source: string): Layout {
   return layout;
 }
 
-/** The layout-free reading of TypeScript source. Every token, string, template, regular
-    expression and comment keeps its exact text. Whitespace between two pieces becomes one space
-    when both sides are word characters and disappears otherwise. A comma directly before a
-    closing bracket disappears. */
+/** Normalizes TypeScript whitespace and trailing commas while preserving token and comment text.
+ * Whitespace becomes one space between word characters and disappears otherwise.
+ * Commas before closing brackets disappear. */
 export function sourceLayout(source: string): string {
   return readLayout(source).text;
 }
 
-/** The source offset where `code` first starts at or after `from`, compared in the
-    layout-free reading of both, or -1. A statement the formatter wraps over several lines is
-    found by its one-line text. */
+/** Finds the first normalized code match at or after `from` and returns its source offset, or -1. */
 export function layoutIndexOf(source: string, code: string, from = 0): number {
   const { text, offsets } = readLayout(source);
   let start = 0;
@@ -143,11 +134,10 @@ export function layoutIndexOf(source: string, code: string, from = 0): number {
   return found === -1 ? -1 : offsets[found];
 }
 
-/** Each source text parsed once, because a test file reads the same source many times. */
+/** Caches parsed source across repeated queries. */
 const parsed = new Map<string, ts.SourceFile>();
 
-/** The text of every node of TypeScript source that `select` accepts, in source order. A node
-    inside an accepted node is still visited. */
+/** Returns accepted nodes in source order, including accepted descendants of accepted nodes. */
 export function sourceNodes(source: string, select: (node: ts.Node) => boolean): string[] {
   const file = parse(source);
   const found: string[] = [];
@@ -166,8 +156,7 @@ function parse(source: string): ts.SourceFile {
   return file;
 }
 
-/** Whether a node is a class member, or a statement directly inside the body of a function
-    declared at the top of the file. */
+/** Identifies class elements or direct body statements of top-level function declarations. */
 function isMember(node: ts.Node): boolean {
   if (ts.isClassElement(node)) return ts.isClassLike(node.parent);
   const body = node.parent;
@@ -180,8 +169,7 @@ function isMember(node: ts.Node): boolean {
   );
 }
 
-/** The outermost node that holds offset `at`, counting its leading trivia, and that `select`
-    accepts. */
+/** Finds an accepted node containing `at`, including leading trivia. `innermost` selects the deepest match instead of the outermost. */
 function holderOf(source: string, at: number, select: (node: ts.Node) => boolean, innermost: boolean) {
   const file = parse(source);
   let found: ts.Node | undefined;
@@ -194,10 +182,8 @@ function holderOf(source: string, at: number, select: (node: ts.Node) => boolean
   return found;
 }
 
-/** The text of TypeScript source from offset `from` to the end of the class member that holds
-    it. Outside a class, the text ends with the statement that holds `from` directly inside a
-    function declared at the top of the file. It fails when `from` is -1 or nothing holds it, so
-    a guard never reads an empty or runaway slice. */
+/** Returns source from `from` through its containing class element or direct body statement of a top-level function.
+ * Fails for a missing offset or containing element. */
 export function memberFrom(source: string, from: number): string {
   assert.ok(from >= 0, 'The source lacks the marker, so the guard cannot read the member that holds it.');
   const member = holderOf(source, from, isMember, false);
@@ -205,8 +191,7 @@ export function memberFrom(source: string, from: number): string {
   return source.slice(from, member.end);
 }
 
-/** The text of TypeScript source from offset `from` to the end of the innermost statement that
-    holds it. It fails when `from` is -1 or no statement holds it. */
+/** Returns source from `from` through the innermost containing non-block statement. Fails for a missing offset or statement. */
 export function statementFrom(source: string, from: number): string {
   assert.ok(from >= 0, 'The source lacks the marker, so the guard cannot read the statement that holds it.');
   const statement = holderOf(source, from, (node) => ts.isStatement(node) && !ts.isBlock(node), true);
@@ -214,9 +199,7 @@ export function statementFrom(source: string, from: number): string {
   return source.slice(from, statement.end);
 }
 
-/** The text of the first function, method, accessor, property or variable declared as `name`
-    in TypeScript source. It fails when the source declares no such name, so a guard never
-    reads an empty slice. */
+/** Returns the first function, method, accessor, property, or variable declaration named `name`. Fails when no declaration matches. */
 export function declarationSource(source: string, name: string): string {
   const [found] = sourceNodes(
     source,
@@ -236,8 +219,7 @@ export function declarationSource(source: string, name: string): string {
   return found;
 }
 
-/** The text of every call in TypeScript source whose callee reads `callee`, such as
-    `readState.subscribe`, and whose first argument, when `first` is given, is that string. */
+/** Returns calls whose callee text matches `callee`. If supplied, `first` must match the first argument's string value. */
 export function callSources(source: string, callee: string, first?: string): string[] {
   return sourceNodes(
     source,
@@ -251,9 +233,8 @@ export function callSources(source: string, callee: string, first?: string): str
   );
 }
 
-/** Whether a pattern reads line structure: `.` without the `s` flag, a `\n` or `\r` escape,
-    a literal line break, or `^` and `$` under the `m` flag. The layout-free reading has no
-    lines, so such a pattern has no layout-free form. */
+/** Detects newline escapes, literal line breaks, dots without `s`, and line anchors under `m`.
+ * sourceMatch excludes these patterns from normalized matching. */
 export function readsLines(pattern: RegExp): boolean {
   const source = pattern.source;
   let inClass = false;
@@ -274,8 +255,7 @@ export function readsLines(pattern: RegExp): boolean {
   return false;
 }
 
-/** The character a pattern matches literally at `at`, or undefined for a class, an anchor or
-    any other construct. */
+/** Returns the literal character at a pattern offset, or undefined for classes, anchors, and other constructs. */
 function literalAt(source: string, at: number): string | undefined {
   const character = source[at];
   if (character === '\\') return /[^\w\s]/.test(source[at + 1] ?? 'a') ? source[at + 1] : undefined;
@@ -288,10 +268,9 @@ function quantifierAt(source: string, at: number): string {
   return '*+?'.includes(source[at] ?? '\0') ? source[at] : '';
 }
 
-/** The layout-free form of a pattern. Whitespace written in the pattern, as spaces or as `\s`,
-    becomes optional, except between two word characters, where the layout-free reading keeps
-    one space. Whitespace inside a quoted string in the pattern stays exact, because a formatter
-    never changes the inside of a string. */
+/** Normalizes pattern whitespace outside quoted strings.
+ * Whitespace becomes optional except between word characters, where required whitespace becomes one space.
+ * Quoted-string whitespace stays exact. */
 export function layoutPattern(pattern: RegExp): RegExp {
   const source = pattern.source;
   let text = '';
@@ -344,8 +323,7 @@ function stateless(pattern: RegExp): RegExp {
   return new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ''));
 }
 
-/** Assert that TypeScript source text matches a pattern in any formatter layout. A pattern that
-    reads line structure is matched only against the source as written. */
+/** Asserts a literal or normalized source match. Patterns that read line structure receive only a literal check. */
 export function sourceMatch(actual: string, expected: RegExp, message?: string | Error): void {
   const literal = stateless(expected);
   if (literal.test(actual)) return;
@@ -360,9 +338,8 @@ export function sourceMatch(actual: string, expected: RegExp, message?: string |
   );
 }
 
-/** Assert that TypeScript source text matches a pattern in no formatter layout. The source as
-    written and its layout-free reading must both miss the pattern. The layout-free reading is
-    one line, so a pattern that reads line structure is stricter there than in the source. */
+/** Rejects both literal and normalized source matches.
+ * The normalized form removes source line breaks even when the pattern reads line structure. */
 export function sourceDoesNotMatch(actual: string, expected: RegExp, message?: string | Error): void {
   const literal = stateless(expected);
   assert.doesNotMatch(actual, literal, message);
@@ -372,7 +349,7 @@ export function sourceDoesNotMatch(actual: string, expected: RegExp, message?: s
   }
 }
 
-/** One style rule of a stylesheet, with whitespace in one canonical shape. */
+/** A CSS rule with normalized whitespace. */
 export interface CssRule {
   /** The enclosing at-rule preludes and parent selectors, outermost first. */
   conditions: string[];
@@ -382,11 +359,9 @@ export interface CssRule {
   declarations: string[];
 }
 
-/** Whitespace brought to one shape outside CSS strings: one space between words, `, ` between
-    list items and no space just inside parentheses. A selector gets one space around the `>`,
-    `+` and `~` combinators outside parentheses. An at-rule prelude gets `: ` inside
-    parentheses. A declaration gets `: ` after its property name. `!important` is written in
-    lower case with one space before it. */
+/** Normalizes whitespace outside CSS strings and spaces around commas and selector combinators.
+ * Parentheses have no inner padding. Prelude colons receive a following space.
+ * Declarations receive a space after the first colon. `!important` becomes lowercase with a preceding space. */
 function canonicalCss(text: string, kind: 'selector' | 'prelude' | 'declaration'): string {
   const parts = text.trim().split(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/);
   const result = parts
@@ -408,8 +383,7 @@ function canonicalCss(text: string, kind: 'selector' | 'prelude' | 'declaration'
   return colon === -1 ? result : `${result.slice(0, colon).trim()}: ${result.slice(colon + 1).trim()}`;
 }
 
-/** Every style rule of a stylesheet, with comments removed and whitespace in one canonical
-    shape outside strings, so a rule reads the same however a formatter wraps or indents it. */
+/** Returns stylesheet rules with comments removed and whitespace normalized outside strings. */
 export function cssContract(source: string): CssRule[] {
   const rules: CssRule[] = [];
   const frames: { prelude: string; rule?: CssRule }[] = [];
@@ -451,9 +425,8 @@ export function cssContract(source: string): CssRule[] {
   return rules;
 }
 
-/** The declarations of every rule whose selector list is exactly `selector` and whose enclosing
-    at-rules and parent selectors are exactly `conditions`. `.chips` never reads `.x .chips` or
-    `.chips .warn`, and a top-level query never reads a rule inside `@media`. */
+/** Returns declarations matching the complete selector list and enclosing condition chain.
+ * `.chips` excludes `.x .chips` and `.chips .warn`. Top-level queries exclude rules inside `@media`. */
 export function cssDeclarations(source: string, selector: string, conditions: string[] = []): string[] {
   const wanted = canonicalCss(selector, 'selector');
   const within = conditions.map((condition) =>
@@ -469,8 +442,7 @@ export function cssDeclarations(source: string, selector: string, conditions: st
     .flatMap((rule) => rule.declarations);
 }
 
-/** Each selector of a list, cut at the commas outside brackets and parentheses, so
-    `:is(.a, .b) .c, .d` gives `:is(.a, .b) .c` and `.d`. */
+/** Splits a selector list at commas outside brackets and parentheses. */
 export function cssSelectors(list: string): string[] {
   const parts = [''];
   let depth = 0;
@@ -483,10 +455,8 @@ export function cssSelectors(list: string): string[] {
   return parts.map((part) => part.trim());
 }
 
-/** The compound each selector of a list styles: the part after its last combinator, with the
-    contents of every bracket and parenthesis taken out. `.a > .b:hover` gives `.b:hover`, and
-    `.a :is(.b, .c)` gives `:is()`, so a subject written only inside a function reads as a
-    compound that names nothing. */
+/** Returns each selector's final compound without bracket or parenthesis contents.
+ * `.a > .b:hover` gives `.b:hover`. `.a :is(.b, .c)` gives `:is()`. */
 export function cssSubjects(list: string): string[] {
   return cssSelectors(list).map((selector) => {
     let flat = '';
@@ -500,15 +470,7 @@ export function cssSubjects(list: string): string[] {
   });
 }
 
-/** Every word the TypeScript sources can write into a `class` or an `id`: each word of every
-    string, and of every fixed piece of a template. A word that runs into a `${}` substitution,
-    or ends in `-`, is a prefix, and stands for every name that starts with it. A value a source
-    substitutes into a template, or writes where a class goes, adds each string its type can
-    hold. A value whose type holds any string adds nothing, so `values` names a type alias whose
-    strings join the set: the host types of fields the webview reads as plain strings, such as
-    the turn status in `turn ${card.status}`. The set holds more words than the sources ever
-    write as a class, and misses only a name built from a value whose type holds any string and
-    that `values` leaves out. */
+/** Candidate class and ID names, including prefixes for names completed by substitutions. */
 export interface ClassWords {
   words: Set<string>;
   prefixes: string[];
@@ -526,9 +488,7 @@ const CLASS_PROGRAM: ts.CompilerOptions = {
   noEmit: true,
 };
 
-/** Whether an expression sits where a class goes: the value of a `class` or `className`
-    property, the right side of a `className` assignment, or an argument to `classList.add`,
-    `toggle` or `replace`. */
+/** Identifies class and className property values, className assignment values, and arguments to classList.add, toggle, or replace. */
 function writesClass(node: ts.Node): node is ts.Expression {
   const parent = node.parent;
   if (!parent) return false;
@@ -555,14 +515,16 @@ function writesClass(node: ts.Node): node is ts.Expression {
   return false;
 }
 
+/** Collects candidate names from string literals, fixed template text, and string-literal types in templates and class assignments.
+ * Trailing hyphens and adjacent substitutions identify prefixes. General string types contribute no candidates.
+ * `values` adds a named string-union alias for fields with general string types. */
 export function classWords(files: string[], values?: { file: string; type: string }): ClassWords {
   const words = new Set<string>();
   const prefixes = new Set<string>();
   const name = /^-?[_a-zA-Z][\w-]*$/;
   const program = ts.createProgram(values ? [...files, values.file] : files, CLASS_PROGRAM);
   const checker = program.getTypeChecker();
-  // Each string a type can hold. `glued` is set when text follows the value with no space
-  // between, so the value starts a longer name and stands as a prefix.
+  // Add string-literal type members. Adjacent suffix text makes the last word a prefix.
   const addType = (type: ts.Type, glued: boolean): void => {
     for (const member of type.isUnion() ? type.types : [type]) {
       if (!member.isStringLiteral()) continue;
@@ -606,16 +568,14 @@ export function classWords(files: string[], values?: { file: string; type: strin
   return { words, prefixes: [...prefixes].sort() };
 }
 
-/** Whether a selector, or an at-rule and parent chain joined with it, names a class or an id
-    that `classWords` found, as the whole name or after a prefix. */
+/** Checks whether a selector names a collected class or ID, including prefix matches. */
 export function namesClassWord(selector: string, found: ClassWords): boolean {
   return [...selector.matchAll(/[.#](-?[_a-zA-Z][\w-]*)/g)].some(
     ([, name]) => found.words.has(name) || found.prefixes.some((prefix) => name.startsWith(prefix)),
   );
 }
 
-/** Whether the compound a selector styles names no class and no id: a bare tag, `*`, or a
-    compound whose only class sits inside `:is()` or `:where()`. */
+/** Checks whether the first selector's final compound has no class or ID outside brackets and parentheses. */
 export function bareSubject(selector: string): boolean {
   return !/[.#]/.test(cssSubjects(selector)[0] ?? '');
 }

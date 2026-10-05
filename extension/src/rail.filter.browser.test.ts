@@ -1,4 +1,4 @@
-// The rail filter box and its query: typing, completion, cost queries, and the head count and lens that write it.
+// Session list queries, completion, cost filters, header counts, and lenses.
 // Shared helpers live in `../test/rail.ts`.
 
 import { test } from 'vitest';
@@ -619,8 +619,8 @@ test('the query field holds its clear cross and the funnel, and completes status
     assert.deepEqual(await page.locator('.filtername').allTextContents(), ['is:unread']);
     await box.press('Enter');
     assert.equal(await box.inputValue(), 'is:unread');
-    // A whole value the reader types and enters stays the value they typed. A value that
-    // begins another one would offer the longer word first and take it on the press.
+    // Entering a complete status value must preserve it, even when it prefixes another status.
+
     for (const status of IS_VALUES) {
       await box.fill(`is:${status}`);
       await page.evaluate(SETTLED);
@@ -683,9 +683,8 @@ test(
         'perf',
         'worktree parallel sessions and the rails',
       ]);
-      // The row a narrowing keeps, held by its element. It is the last of the four and the
-      // second of the two, so a row keyed by its position cannot pass this: reuse by index
-      // would leave the reader's own choice pointing at a name they never typed towards.
+      // Retain the suggestion's DOM identity when narrowing changes its position.
+
       await page.evaluate(`(() => {
         window.__suggestion = [...document.querySelectorAll('.filterrow')]
           .find((row) => row.querySelector('.filtername').textContent
@@ -747,8 +746,8 @@ test(
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on('pageerror', (error) => failures.push(String(error)));
-      // A rail nobody has filtered rests on its count, so this page keeps its own empty query
-      // rather than the open box the rest of the file loads.
+      // Open this fixture with an empty query and a closed filter box.
+
       await openPage(page, payload(), undefined, { railFilter: '' });
       const head = `(() => {
         const counts = document.querySelector('.railcounts');
@@ -769,8 +768,8 @@ test(
         { boxes: 0, counts: 2, clear: null, focus: null },
         'the resting head is not the count and the two tools',
       );
-      // The magnifying glass is an icon, so its name and its hint are the only words a reader
-      // meets on it.
+      // The search icon exposes its accessible name and hint.
+
       assert.deepEqual(
         await page.evaluate(`(() => {
           const button = document.querySelector('[data-control="railsearch"]');
@@ -858,8 +857,8 @@ test(
       await openBox();
       assert.equal(await page.locator('.railfilter').inputValue(), '', 'the cross kept the query');
 
-      // Forgetting everything is a reader asking for the rail they started with, and that
-      // rail rests on its count however the box was opened.
+      // Forget State restores header counts and closes the filter box.
+
       await page.evaluate(`window.postMessage({ type: 'forgetState', since: 17 }, '*')`);
       await page.evaluate(SETTLED);
       const forgotten = (await page.evaluate(head)) as { boxes: number; counts: number; clear: string | null };
@@ -1033,9 +1032,8 @@ test(
   },
 );
 
-// Running is a lens like the other counts. Its press keeps the running, subagents and background
-// sessions, and it does not keep what it drew: a payload that ends the last running session
-// empties the list and removes its zero-match shortcut.
+// The Running lens includes running, subagent, and background sessions. Ending the last matching session removes its zero-count shortcut.
+
 test('the Running count keeps working sessions and leaves the rail at zero', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1107,8 +1105,8 @@ test('View clears a selected zero-match filter after its rail shortcut disappear
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     const initial = payload([], [], [], [], [], [], new Map());
-    // s1 and s2 sit inside the Active window at the fixture clock, the same fact `the Active
-    // count names what its press keeps` reads. Archiving both empties the lens.
+    // s1 and s2 are Active at the fixture clock. Archiving both empties the lens.
+
     const archived = payload([], [], [], [], [], [], new Map());
     archived.rail = archived.rail.map((card) =>
       card.id === 's1' || card.id === 's2' ? { ...card, archived: true } : card,
@@ -1229,9 +1227,8 @@ test('the funnel fill and name follow the lens a count press writes', { timeout:
   }
 });
 
-// The Active figure names the sessions its press keeps, with the expiring clause after it. At
-// the fixture clock `s1` sits ten minutes in and `s2` seventy minutes in with a live, nearly
-// gone cache, so both hold the lens and every other session is at least two hours in.
+// s1 is recent. s2 has a live, nearly-gone cache. All other fixture sessions are outside the Active window.
+
 test(
   'the Active count names what its press keeps and drops a session on the tick it leaves the window',
   { timeout: 60_000 },
@@ -1298,9 +1295,8 @@ test(
       );
       assert.equal(await active.getAttribute('aria-pressed'), 'true');
 
-      // The clock takes `s2` out of the window. The figure and the pressed list fall together,
-      // because the tick that redraws the row redraws the list from the same clock.
-      // The box stays open while the clock moves, and the counts under it stay live.
+      // Advancing the clock removes s2 from the Active count and list while the filter box remains open.
+
       await page.locator('[data-control="railsearch"]').click();
       await page.evaluate(SETTLED);
       await page.clock.setFixedTime(FIXTURE_CLOCK + 20 * 60_000);
@@ -1387,9 +1383,8 @@ test(
   },
 );
 
-// A count press writes words the reader could have typed. The box shows them, the reader edits
-// them beside other words, the count reads pressed while the query holds them, a saved filter
-// keeps them in its query, and a panel an older build saved on a lens opens on its words.
+// Lens presses update query words. Saved filters retain those words, and legacy stored lenses load through their compatibility mappings.
+
 test(
   'a count press writes its words into the query, which the reader edits in the box, and a saved filter keeps them',
   { timeout: 60_000 },
@@ -1495,8 +1490,8 @@ test(
       await page.evaluate(SETTLED);
       assert.deepEqual([await shown(), await pressed()], [every, { active: 'false', boxes: 0 }]);
 
-      // A filter stored with the retired Needs you lens loads with no lens: its own words, and
-      // no count pressed.
+      // A legacy Needs you saved filter loads its query with no count pressed.
+
       await page.locator('[data-control="railfilters"]').click();
       await page.locator('[data-control="railfilterpick:f3"]').click();
       await page.evaluate(SETTLED);
@@ -1563,10 +1558,8 @@ test(
         'selecting the saved filter again did not restore the words Save changes stored',
       );
 
-      // A panel saved on the old Needs you filter id opens on All sessions with its stored words
-      // and no count pressed. Those words hold the Unread and Needs input lenses both, so they
-      // hold no lens. One saved on the old Warm words, or on a lens kept as rail state, opens on
-      // the Active words with the count pressed.
+      // Legacy Needs you state retains its query without selecting a count. Legacy Warm and Active lens state select Active.
+
       for (const [state, lens, cards] of [
         [
           { railFilterId: 'needs-you', railFilter: 'is:input is:unread -is:archived -is:agentrun' },
@@ -1753,10 +1746,8 @@ test(
   },
 );
 
-// The pressed ground and border the stylesheet gives a pressed count, read back through the
-// same variables the rule writes, so the guard tracks the rule in each theme. The press changes
-// no weight, so the label keeps its width. `themed` carries Dark Modern, Light Modern and One
-// Dark Pro Darker.
+// The selected count uses theme ground and focus-border variables without changing font weight.
+
 test(
   'a pressed count wears the checked pill ground and the focus border in light, dark and One Dark Pro Darker',
   { timeout: 60_000 },
@@ -1822,11 +1813,8 @@ test(
         (await page.evaluate(
           `[...new Set([...document.querySelectorAll('.railcard')].map((node) => node.dataset.session))]`,
         )) as string[];
-      // `s1` sits 10 minutes into the fixture at open, inside the hour-long window, and `s2`
-      // sits 70 minutes in but keeps a live, nearly-gone cache, so both hold `is:active` at
-      // open. Both caches, and `s1`'s window, run out well before an hour passes, and every
-      // other fixture session is at least two hours in with no cache, so `is:active` keeps
-      // exactly these two at open.
+      // Only s1 and s2 are Active at the opening clock. After an hour, their recency and cache windows have expired.
+
       assert.deepEqual(await cardsShown(), ['s1', 's2'], 'is:active drew a different set of sessions at open');
 
       await page.clock.setFixedTime(FIXTURE_CLOCK + 61 * 60_000);
@@ -1891,8 +1879,8 @@ test(
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on('pageerror', (error) => failures.push(String(error)));
-      // The query comes from stored panel state, not a keystroke, the way a reopened panel
-      // restores what the reader typed. The panel opens with the count on the head.
+      // Stored panel state restores the query with the filter box closed.
+
       await openPage(
         page,
         payload(

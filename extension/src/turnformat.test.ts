@@ -1,8 +1,5 @@
-// extension/src/turnformat.test.ts
-//
-// The tests for turnformat.ts. One that reads a second seam's names lives in turnview.test.ts
-// instead, because neither file owns it. The builders a test is written against are here
-// while only this file needs them, and in turnfixtures.ts once a second file does.
+// Turn value formatting. Cross-module wording checks live in turnview.test.ts.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import {
@@ -58,10 +55,8 @@ test('formatRelative counts up through minutes, hours, days, weeks, months and y
   assert.equal(formatRelative(secondsAgo(23 * 3600), now), '23 hours ago');
   assert.equal(formatRelative(secondsAgo(24 * 3600), now), '1 day ago');
   assert.equal(formatRelative(secondsAgo(2 * day), now), '2 days ago');
-  // Each boundary written out from the ladder by hand: days give way at a week, weeks at
-  // 5 (35 days is 1 of the 30-day months), months at 12 (360 days, exactly 1 of the
-  // 360-day years). The point of the upper tiers is that an old session never reads as
-  // "57 weeks ago" or "400 days ago".
+  // Age units change at seven days, thirty-five days, and twelve thirty-day months.
+
   assert.equal(formatRelative(secondsAgo(6 * day), now), '6 days ago');
   assert.equal(formatRelative(secondsAgo(7 * day), now), '1 week ago');
   assert.equal(formatRelative(secondsAgo(13 * day), now), '1 week ago');
@@ -104,23 +99,23 @@ test('the clock is 12-hour, and the day appears only when the turn is not from t
 test('a byte count is said in the units the setting is written in', () => {
   assert.equal(formatMegabytes(4 * MB), '4 MB');
   assert.equal(formatMegabytes(24 * MB), '24 MB');
-  // A reader who set a tail of their own gets what they set, not a rounded lie: half a
-  // megabyte must not read as 0 MB.
+  // A half-megabyte value must retain its fractional size.
+
   assert.equal(formatMegabytes(MB / 2), '0.5 MB');
   assert.equal(formatMegabytes(1_500_000), '1.4 MB');
-  // Nothing reads as zero but zero. A tail under a tenth of a megabyte keeps enough of a
-  // decimal to say what it is, which is the same lie one step smaller.
+  // Nonzero byte counts must not display as zero.
+
   assert.equal(formatMegabytes(0), '0 MB');
   assert.equal(formatMegabytes(50 * 1024), '0.05 MB');
   for (const bytes of [1, 100, 1000, 20_000, 52_000, 53_000]) {
     assert.notEqual(formatMegabytes(bytes), '0 MB', `${bytes} bytes reads as nothing at all`);
   }
-  // The tail is a setting with no ceiling, so a size past 1024 megabytes is said in the
-  // unit above. The last megabyte before the boundary keeps its own unit.
+  // Convert sizes at or above 1024 MiB to gigabytes.
+
   assert.equal(formatMegabytes(1023 * MB), '1023 MB');
   assert.equal(formatMegabytes(1024 * MB), '1 GB');
-  // The unit is picked after the rounding. A size that is not a whole megabyte, and that
-  // rounds up to a whole gigabyte, is the only input that tells the two orders apart.
+  // Choose the unit after rounding so 1023.6 MiB displays as 1 GB.
+
   assert.equal(formatMegabytes(1023.6 * MB), '1 GB');
   assert.equal(formatMegabytes(1536 * MB), '1.5 GB');
   assert.equal(formatMegabytes(4096 * MB), '4 GB');

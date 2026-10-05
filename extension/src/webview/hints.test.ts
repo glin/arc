@@ -2,8 +2,7 @@ import { afterEach, test, vi } from 'vitest';
 import assert from 'node:assert';
 import { createHints, HINT_BODY_DELAY_MAC_MS, HINT_BODY_DELAY_MS, HINT_DELAY_MS } from './hints.ts';
 
-// The few element members the hint service touches. An anchor stays out of the document, so
-// the service skips placing the box and the test reads only what the box holds.
+// Implements the element members the hint service uses. Disconnected anchors skip placement, leaving only hint contents under test.
 class FakeElement {
   className = '';
   id = '';
@@ -122,8 +121,7 @@ function anchor(dataset: Record<string, string>): FakeElement {
   return node;
 }
 
-// An anchor that names a body shows the drawn body in place of its title and detail. The next
-// plain anchor gets the plain box back, with no trace of the body.
+// A body anchor replaces title and detail. A subsequent plain anchor restores both without retaining the body.
 test('the hint box shows a drawn body for an anchor that names one, and the plain box after it', () => {
   const { hints, popover, title, detail, hintBody, focus } = service();
   const drawn = new FakeElement();
@@ -146,8 +144,7 @@ test('the hint box shows a drawn body for an anchor that names one, and the plai
   assert.equal(detail.hidden, false);
 });
 
-// A redraw draws the open body again from what its owner now holds, and leaves a hint open on
-// any other control alone.
+// Redraw updates only an open body of the requested kind.
 test('a redraw rebuilds an open body of its kind and nothing else', () => {
   const { hints, focus } = service();
   let draws = 0;
@@ -166,8 +163,7 @@ test('a redraw rebuilds an open body of its kind and nothing else', () => {
   assert.equal(draws, 2, 'a redraw drew a card over a plain hint');
 });
 
-// A body whose subject is gone closes the box, and the anchor stops pointing at a description
-// nobody can see.
+// A missing subject closes the hint and removes its anchor's accessible description.
 test('a body drawn for a subject that is gone closes the box', () => {
   const { hints, popover, focus } = service();
   let gone = false;
@@ -181,8 +177,7 @@ test('a body drawn for a subject that is gone closes the box', () => {
   assert.equal(card.getAttribute('aria-describedby'), null);
 });
 
-// A service driven by pointer and focus events on a fake clock. A cleared delay never runs, and
-// `advance` runs every delay that falls due, in the order it falls due.
+// Pointer and focus events use a fake clock. Cleared delays never run. Advance runs due delays in order.
 function pointerService(platform: string) {
   class FakePointerEvent {
     target: unknown = null;
@@ -250,10 +245,7 @@ function pointerService(platform: string) {
   return { hints, popover, hintBody, timers, advance, pointer, focus, row, drawn };
 }
 
-// A pointer sweeping down the rail crosses a row in tens of milliseconds. Each compact row names
-// a hover card, so a card that chained at once from the open one would open on every row the
-// pointer crossed. The open card closes as the pointer leaves it, and only the row the pointer
-// rests on opens its card, after its own delay.
+// Each compact row waits its own hover delay. Passing rows closes the previous card without opening intermediate cards.
 test('a pointer sweeping down compact rows from an open card opens no card until it rests', () => {
   const { popover, hintBody, advance, pointer, row, drawn } = pointerService('Win32');
   const rows = Array.from({ length: 40 }, (_, index) => row({ hint: `Session ${index}`, hintBody: 'railcard' }));
@@ -274,8 +266,7 @@ test('a pointer sweeping down compact rows from an open card opens no card until
   assert.deepEqual(drawn, ['Session 0', 'Session 39'], 'the sweep drew a card for a row it only crossed');
 });
 
-// Keyboard focus opens a card at once. When the pointer then comes to rest on another row, that
-// card closes, so it never covers the rows or names the wrong session during the wait.
+// Pointer entry closes another row's keyboard-opened card during the hover delay.
 test('a pointer entering a compact row closes the card keyboard focus opened on another row', () => {
   const { popover, hintBody, advance, pointer, focus, row } = pointerService('Win32');
   focus(row({ hint: 'Fix login', hintBody: 'railcard' }));
@@ -289,8 +280,7 @@ test('a pointer entering a compact row closes the card keyboard focus opened on 
   assert.equal(hintBody.textContent, 'Ship the rail');
 });
 
-// A rail update redraws an open card. During the wait for the pointer's row, that redraw must
-// not bring back the focused row's card or cancel the wait.
+// Session list updates during a hover delay preserve the pending pointer target and keep the previous card closed.
 test('a rail update during the wait still opens the card the pointer rests on', () => {
   const { hints, popover, hintBody, advance, pointer, focus, row, drawn } = pointerService('MacIntel');
   focus(row({ hint: 'Fix login', hintBody: 'railcard' }));
@@ -304,8 +294,7 @@ test('a rail update during the wait still opens the card the pointer rests on', 
   assert.deepEqual(drawn, ['Fix login', 'Ship the rail']);
 });
 
-// A drawn card waits the editor's own hover delay for the platform, which is longer than a plain
-// hint's. A plain hint keeps its shorter delay on every platform.
+// Hover cards wait 500 ms on Windows and Linux, or 1500 ms on macOS. Plain hints use the shorter shared delay.
 test('a rail card waits the editor hover delay of each platform, and a plain hint waits less', () => {
   for (const [platform, cardDelay] of [
     ['Win32', 500],

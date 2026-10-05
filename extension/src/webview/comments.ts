@@ -52,17 +52,14 @@ interface OpenMark {
   pinned: boolean;
 }
 
-// Where a list of comments hung: the card, the comments its mark carried, and the height the
-// mark stood at. A card drawn again carries new marks, and the place finds the one that took
-// over.
+// The source card and comment IDs identify a replacement mark. The saved position guides focus fallback after a redraw.
 interface MarkPlace {
   host: HTMLElement | null;
   ids: string[];
   top: number | null;
 }
 
-// A list the card took away while it was drawn again. The list opens again on the new mark, and
-// the keyboard goes back to the control it was on.
+// The comment list and focused control to restore after a card redraw.
 interface ListToReopen {
   place: MarkPlace;
   pinned: boolean;
@@ -114,8 +111,7 @@ export interface CommentRenderer {
   renderAnnotations(body: HTMLElement, card: CommentCard): void;
   beforeCardDraw(node: HTMLElement): void;
   refreshSelection(): void;
-  // Rewrites the menu context of every drawn card in the named sessions, after their labels
-  // change.
+  // Refreshes menu contexts for drawn cards in sessions whose labels changed.
   refreshSessionContexts(sessions: ReadonlySet<string>): void;
   closeMarkFloat(refocus?: boolean): void;
   noteBeingWritten(): boolean;
@@ -130,17 +126,13 @@ export interface CommentRenderer {
 const SAID_ROW = '.actrow.message[data-message]';
 const PROMPT_LEAD_LABEL = '.promptlead > .sectionheading';
 
-// The Activity log holds rows a comment has no name for, such as a run or a step. A message
-// the agent wrote is a message whether or not it closed a reply, and each one carries the id
-// that names its own part.
+// Only answer blocks and messages with commentable IDs accept Activity log comments.
 export function outsideCommentMarks(node: Element | null): boolean {
-  // The You asked heading over a prompt drawn before the response is a label, not what anyone
-  // said. Counted as response text, it would shift every stored response offset below it.
+  // Exclude the prompt heading before the response so it does not shift stored response offsets.
   if (node?.closest(PROMPT_LEAD_LABEL)) {
     return true;
   }
-  // A message whose id no saved comment can keep takes no comment. An empty id would save it on
-  // the final response.
+  // Reject messages with IDs that saved comments cannot retain. An empty ID would attach the comment to the final response.
   const said = node?.closest<HTMLElement>(SAID_ROW);
   return (
     !!node?.closest('.actlist') && !node.closest('.answer') && !(said && commentableMessageId(said.dataset.message))
@@ -165,11 +157,9 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   let markFloat: HTMLDivElement | null = null;
   let markOpen: OpenMark | null = null;
   let markLeaving: ReturnType<typeof setTimeout> | null = null;
-  // The pointer went down inside the open list and has not come up. A redraw in that time takes
-  // the pressed control away, and the release then reaches nothing.
+  // Hold card redraws until the pointer press ends so the pressed list control receives the click.
   let pressingList = false;
-  // Keyboard focus the panel moves itself. A mark that takes it stays shut, so Escape and a
-  // delete leave no list open behind them.
+  // Suppress list opening when the panel restores focus after Escape or deletion.
   let quietFocus = false;
   let listToReopen: ListToReopen | null = null;
   let selecting = false;
@@ -199,9 +189,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       listener();
     }
   };
-  // The card bodies whose marks a sweep could not draw, because the reader held the list over
-  // them. Each one is swept when the reader lets go. A text selection live in its card holds the
-  // sweep until the next release, so a sweep never rewrites the words under a drag.
+  // Card bodies awaiting annotation redraw after comment list interaction. Text selection keeps the redraw deferred until release.
   const heldSweeps = new Set<HTMLElement>();
 
   const sweepHeldCards = () => {
@@ -256,8 +244,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     if (answer) {
       return answerPart(Number(answer.dataset.answer || 0));
     }
-    // A reply keeps the answer name it was written under, so every comment saved before
-    // messages were commentable still resolves to the same text.
+    // Answer blocks keep their `answer:` part even inside a message. Other messages use their own `said:` part.
     const said = node.closest<HTMLElement>(SAID_ROW);
     return said?.dataset.message ? saidPart(said.dataset.message) : 'summary';
   };
@@ -291,8 +278,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     return block && card.contains(block) ? block : null;
   };
 
-  // The lines a stored offset counts, in the card head and in the body alike. Saving and
-  // drawing both count these, so an offset names the same line at both ends.
+  // Saving and drawing offsets count the same blocks in the card heading and body.
   const countedBlocks = (card: Element): Element[] =>
     Array.from(card.querySelectorAll(QUOTE_BLOCKS)).filter(
       (node) => !node.closest('.notesec') && !outsideCommentMarks(node),
@@ -363,7 +349,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     };
   };
 
-  // Every drawn card, live or not. The card map names the ones that carry a menu context.
+  // Refresh menu contexts for connected cards, including live cards, registered in the card map.
   const writeContextsWhere = (matches: (host: HTMLElement, card: CommentCard) => boolean) => {
     for (const host of Array.from(document.querySelectorAll<HTMLElement>('.turn, .compaction'))) {
       const card = cards.get(host);
@@ -500,7 +486,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     top: mark.isConnected ? mark.getBoundingClientRect().top : null,
   });
 
-  // The mark that now carries a comment the old mark carried.
+  // Find a replacement mark by a shared comment ID.
   const markAt = (place: MarkPlace): CommentMark | null => {
     if (!place.host?.isConnected) {
       return null;
@@ -512,7 +498,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     );
   };
 
-  // Between the sticky heading and the fixed composer, where the reader can see it.
+  // Check visibility between the sticky heading and fixed Prompt box.
   const onScreen = (node: HTMLElement): boolean => {
     const box = node.getBoundingClientRect();
     if (!box.width && !box.height) {
@@ -547,9 +533,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     }
   };
 
-  // The keyboard goes back to the line the list hung from when its mark is on screen. Otherwise
-  // it goes to the nearest mark on the card that is on screen, and then to the nearest control on
-  // screen. Every candidate is in view, so the panel never scrolls to show it.
+  // Return focus to the original visible mark, then the nearest visible mark, then the nearest visible control. Prevent scrolling during focus restoration.
   const returnFocus = (place: MarkPlace) => {
     const top = place.top ?? floatBounds().top;
     const host = place.host?.isConnected ? place.host : null;
@@ -570,9 +554,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     }
   };
 
-  // The card the list hung in, swept now rather than on the redraw the change causes. A live
-  // text selection in the card holds the sweep for the next release, the way it holds every
-  // held sweep.
+  // Redraw the source card's annotations immediately unless text selection requires deferral.
   const sweepPlace = (place: MarkPlace) => {
     const body = place.host?.isConnected ? place.host.querySelector<HTMLElement>('.body') : null;
     const card = place.host ? cards.get(place.host) : undefined;
@@ -586,8 +568,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     renderAnnotations(body, card);
   };
 
-  // Shuts the list. With `settle`, held sweeps and held redraws run, and the keyboard returns
-  // to the line when the reader asked for that or was inside the list.
+  // Close the list. With `settle`, release deferred redraws and restore focus when requested or when focus was inside the list.
   const shutMarkFloat = (refocus: boolean, settle: boolean): MarkPlace | null => {
     const previous = markOpen;
     const inside = !!(markFloat && document.activeElement && markFloat.contains(document.activeElement));
@@ -619,8 +600,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     shutMarkFloat(refocus, true);
   };
 
-  // A sweep or a rewrite of the card takes the mark the list hangs from. The list is shut
-  // without settling, because the card is mid-draw, and opens again once the card is drawn.
+  // Detach the list before replacing its mark. Preserve its location and focused control without releasing redraws mid-draw.
   const takeListOff = (node: Element) => {
     if (!markOpen?.mark || !node.contains(markOpen.mark)) {
       return;
@@ -677,8 +657,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     markFloat.setAttribute('role', 'region');
     markFloat.setAttribute('aria-label', 'Comments');
     markFloat.addEventListener('mouseenter', holdMarkOpen);
-    // A primary press inside the list pins it and holds its card until the press ends. Pinned,
-    // the list outlasts the blur of a mark that opened it on focus.
+    // A primary press pins the list through mark blur and holds card redraws until the press ends.
     markFloat.addEventListener('mousedown', (event) => {
       if (event.button !== 0 || !markOpen) {
         return;
@@ -1071,8 +1050,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     actionable(remove, `${COMMENT_ACTIONS.delete}: ${noteName(note)}`, `notedel:${note.id}`, (event) => {
       event.stopPropagation();
       comments = comments.filter((candidate) => candidate.id !== note.id);
-      // The card is swept once here, before the change goes round. Every later redraw the
-      // change causes finds the marks already drawn and leaves them.
+      // Redraw annotations before notifying subscribers so subsequent card draws reuse the updated marks.
       closeMarkFloat(true);
       change({ op: 'delete', id: note.id });
     });
@@ -1081,8 +1059,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     return row;
   };
 
-  // The comments a mark carries, read from the store when the list opens, so a list never shows
-  // a comment as it stood when the mark was drawn.
+  // Read the mark's comments from current state when opening the list.
   const notesOf = (mark: CommentMark): TurnComment[] =>
     (mark._ids ?? [])
       .map((id) => comments.find((note) => note.id === id))
@@ -1094,7 +1071,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     if (markOpen && markOpen.mark !== mark) {
       const place = placeOf(mark);
       closeMarkFloat();
-      // Shutting the other list can sweep this card, which replaces the mark the reader pressed.
+      // Closing another list can redraw this card and replace the pressed mark.
       if (!mark.isConnected) {
         const rebuilt = markAt(place);
         if (!rebuilt) {
@@ -1203,10 +1180,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     block.insertBefore(lineMark(notes, quote), block.firstChild);
   };
 
-  // What the last sweep of each card body was drawn from. The words of every counted line, the
-  // part each line belongs to, the prompt labels, and each comment's part, quote, offset and
-  // text decide where the marks go and what their lists say. The counts of drawn marks and
-  // tints say the marks of that sweep are still on the card.
+  // Annotation redraw inputs include counted text, card parts, prompt headings, and comment values. Mark and tint counts detect missing annotation elements.
   const drawnFrom = new WeakMap<HTMLElement, string>();
 
   const sweepSource = (host: Element, body: HTMLElement, mine: readonly TurnComment[]): string =>
@@ -1219,8 +1193,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   const drawnMarks = (body: HTMLElement): string =>
     `${body.querySelectorAll('.offline, .linemark').length}:${body.querySelectorAll('.cmark').length}`;
 
-  // One rule holds a card for the list over it: the reader is writing in the list or pressing
-  // inside it. A sweep and a rewrite of the card both ask it.
+  // Defer annotation and card redraws during a pointer press or editing in the open comment list.
   const listHolds = (node: Element): boolean =>
     !!markOpen?.mark && node.contains(markOpen.mark) && (pressingList || noteBeingWritten());
 
@@ -1252,8 +1225,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       return;
     }
     const sides = new Map<CommentPart, Element[]>();
-    // A saved offset counts the lines in the card head ahead of the body, such as the card
-    // heading under `summary`. Each part's count starts past them.
+    // Include card heading text in each part's offset before counting its body blocks.
     const lead = new Map<CommentPart, number>();
     for (const node of countedBlocks(host)) {
       const part = partOfNode(node);
@@ -1267,11 +1239,8 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     }
     const within = (note: TurnComment): number | undefined =>
       note.offset === undefined ? undefined : note.offset - (lead.get(note.part || 'summary') ?? 0);
-    // After the response, the You asked heading is drawn text and takes comments under
-    // `summary`. Before the response it is read and not drawn, and it holds no offset. A summary
-    // comment is looked for on it only when no other line holds its quote, so the heading's
-    // words elsewhere in the card keep their comments. A comment found on it draws on the prompt
-    // it names.
+    // A prompt heading displayed before the response does not contribute to response offsets.
+    // A `summary` comment on that heading draws on its prompt only when no other block matches its quote.
     const labels = Array.from(body.querySelectorAll(PROMPT_LEAD_LABEL));
     const located = new Map<Element, TurnComment[]>();
     const away: TurnComment[] = [];
@@ -1279,12 +1248,8 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       .filter((part) => part.startsWith('answer:'))
       .sort((one, other) => Number(one.slice(7)) - Number(other.slice(7)));
     const saidParts = Array.from(sides.keys()).filter((part) => part.startsWith('said:'));
-    // The part a comment names can move. A reply written before messages carried their own
-    // name resolves under `summary`, and a message id carries an ordinal among the messages
-    // sharing its timestamp, which a later read of the transcript renumbers. A reply that is
-    // not a response leaves the response to an earlier reply, which renumbers the replies
-    // and moves the response. The quote finds the line the reader wrote on in
-    // every case.
+    // Transcript changes can move quotes between summary and answer parts or renumber message IDs.
+    // Search summary and answer parts together. Keep message fallback searches within `said:` parts.
     const elsewhere = (note: TurnComment): CommentPart[] => {
       if (note.part === 'summary') {
         return answerParts;
@@ -1388,7 +1353,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     const at = event.target instanceof Element ? event.target : null;
     const host = at?.closest<HTMLElement>('.turn');
     const card = host ? cards.get(host) : undefined;
-    // Any card names the panel that drew the menu, for New session with the same labels.
+    // Arm the source session for New session with the same labels from turn or compaction menus.
     const menuCard = at?.closest<HTMLElement>('.turn, .compaction');
     const armed = menuCard ? cards.get(menuCard) : undefined;
     if (armed) {
@@ -1439,7 +1404,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     true,
   );
   options.events.document('mouseup', () => {
-    // After the click the release makes, so the pressed control is still there to take it.
+    // Release deferred redraws after the click so the pressed control remains available to receive it.
     if (pressingList) {
       setTimeout(() => {
         if (!pressingList) {
@@ -1455,7 +1420,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     selecting = false;
     setTimeout(refreshSelection, 0);
   });
-  // A press that ends without a mouseup, such as a native drag out of the list, lets go here.
+  // Release a held pointer press when dragend, pointercancel, or window blur ends it without mouseup.
   const pressEnded = () => {
     if (pressingList) {
       pressingList = false;
@@ -1582,8 +1547,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
       }
     },
     renderAnnotations,
-    // The timeline asks `cardRewriteWaits` first, so a card reaches here only when the list
-    // over it does not hold it. The list comes off before the rewrite and goes back after it.
+    // Save the list's location and focus before replacing the card. Annotation rendering restores pinned lists after the draw.
     beforeCardDraw(node) {
       takeListOff(node);
       const pending = listToReopen;

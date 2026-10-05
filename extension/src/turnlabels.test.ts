@@ -1,9 +1,5 @@
-// extension/src/turnlabels.test.ts
-//
-// The tests for turnlabels.ts. Every one of them is written against what the reader sees on a
-// card or in a list of labels, because the record behind those is state that outlives the
-// code and a rule proved only on the function that wrote it proves nothing about what comes
-// back.
+// Stored label normalization, adoption, display limits, and editor projections.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import {
@@ -26,9 +22,8 @@ import {
 } from './turnlabels.ts';
 
 test('stored labels come back usable when the record holding them is junk', () => {
-  // Everything a state file can hold that a label record must survive, in one record: a key
-  // written as a number, a key that names nothing, a bare name where a list belongs, an empty
-  // name, a name of only spaces, a name past the ceiling, and values that are not text.
+  // Malformed stored values include empty IDs, non-list labels, blank names, oversized names, and non-text entries.
+
   const kept = normalizeSessionLabels({
     3: ['perf'],
     '': ['composer'],
@@ -48,9 +43,8 @@ test('stored labels come back usable when the record holding them is junk', () =
   assert.equal(kept.s3[0].length, LABEL_NAME_LIMIT, 'a name past the ceiling was not cut to it');
   assert.equal(kept.s6[0].endsWith(' '), false, 'a cut that landed on a space left the chip a trailing gap');
   assert.ok(kept.s6[0].length <= LABEL_NAME_LIMIT);
-  // A name that is not a string at all, and a record that is not a record: both answer with
-  // the empty thing rather than throwing, because a panel that throws reading its own state
-  // draws nothing at all.
+  // Non-text names and non-object stored values return empty results.
+
   assert.equal(labelName(42), '');
   assert.equal(labelName(undefined), '');
   assert.equal(labelName('  spaced   out  '), 'spaced out');
@@ -73,8 +67,8 @@ test('one label keeps one spelling wherever the reader typed it', () => {
     ['perf'],
     'one session naming a label in two cases is filed under both',
   );
-  // The first spelling seen is what wins, so the same record written the other way round
-  // keeps the capitals the reader typed first.
+  // The first spelling encountered wins across sessions.
+
   const capital = normalizeSessionLabels({ s1: ['Perf'], s2: ['perf'] });
   assert.deepEqual(capital.s2, ['Perf'], 'the spelling that arrived first lost to a later one');
 });
@@ -92,13 +86,8 @@ test('a session past the label ceiling keeps the labels it was given first', () 
   );
 });
 
-// A name cut at the ceiling is cut between characters, not between the halves of one. A
-// plain slice keeps a high surrogate whose pair it just dropped, and the chip then draws the
-// replacement box that says the panel mangled the reader's own word.
-// The same visible word reaches storage two ways: with its accent as one character, or as a
-// letter and a combining mark. They are different strings to every comparison in this module,
-// so a reader would end up carrying two labels that draw identically on every card and cannot
-// be told apart by any control.
+// Normalize composed and decomposed accents to one visible label. Truncation must preserve complete Unicode characters.
+
 test('one visible label is one label however its accents arrived', () => {
   const composed = 'rélease';
   const decomposed = 'rélease';
@@ -145,15 +134,15 @@ test('labelling one session leaves every other session alone', () => {
     'a spelling the workspace already carries lost to the capitals the reader typed',
   );
   assert.deepEqual(before.s2, ['perf'], 'the record handed in was edited in place');
-  // Retyping the only holder's label is how its spelling changes, so this session's own
-  // names must not be read back over the edit the reader just made.
+  // The sole holder can change a label's spelling without its previous spelling replacing the edit.
+
   assert.deepEqual(
     setSessionLabels(before, 's1', ['Release 0.4']).s1,
     ['Release 0.4'],
     'the reader respelled the only session carrying a label and got the old spelling back',
   );
-  // What `labelsOf` hands back belongs to the caller, so pushing to it cannot reach the state
-  // and leave the screen and the storage disagreeing until the next reload.
+  // labelsOf returns a copy that cannot mutate stored state.
+
   labelsOf(after, 's1').push('mine');
   assert.deepEqual(labelsOf(after, 's1'), ['composer', 'release 0.4']);
   assert.deepEqual(labelsOf(after, 'nobody'), [], 'a session with no labels answered with something');
@@ -166,8 +155,8 @@ test('a label disappears from the workspace once no session carries it', () => {
   const off = setSessionLabels(before, 's2', []);
   assert.ok(!('s2' in off), 'a session with no labels left is still filed under an empty list');
   const gone = setSessionLabels(off, 's1', ['composer']);
-  // The record is the whole answer to which labels exist, so a label no session carries
-  // is a label the workspace does not have. Nothing has to clean one up.
+  // A label exists only while a session carries it.
+
   assert.deepEqual(
     Object.values(gone).flat().sort(),
     ['composer', 'composer'],
@@ -182,17 +171,16 @@ test('a session the reader labelled while it was starting keeps its labels', () 
   assert.deepEqual(moved.abc, ['composer', 'perf'], 'the labels did not reach the id the agent gave back');
   assert.ok(!('new:1' in moved), 'the session is filed twice, once under an id no card can show');
   assert.deepEqual(moved.s9, ['docs'], 'an unrelated session moved with the adoption');
-  // And the session lands at the newest end of the record, so the next cut takes an
-  // older entry rather than the one the reader filed seconds ago.
+  // Adoption moves the durable entry to the newest position.
+
   const held = normalizeSessionLabels({ abc: ['docs'], s9: ['perf'], 'new:1': ['composer'] });
   assert.equal(
     Object.keys(adoptLabelSession(held, 'new:1', 'abc')).pop(),
     'abc',
     'the merged session kept the position it had before the reader filed it',
   );
-  // The id the agent gave back already carries labels, so the draft's lead and the one they
-  // share is drawn once. The draft's lead because they are the newest thing the reader said,
-  // and because the row draws the front of the list.
+  // Adoption places draft labels first and includes shared labels once.
+
   const both = normalizeSessionLabels({ 'new:1': ['composer', 'perf'], abc: ['perf', 'release 0.4'] });
   assert.deepEqual(
     adoptLabelSession(both, 'new:1', 'abc').abc,
@@ -206,11 +194,8 @@ test('a session the reader labelled while it was starting keeps its labels', () 
 });
 
 test('a session that never got an id of its own leaves no label behind it', () => {
-  // The panel files a session it started under a provisional id held in memory alone.
-  // Nothing brings that id back, so every entry under one is dead by the time the record is
-  // read again: no card draws it, no control takes it off, and it holds a place under the
-  // record ceiling for ever. Its labels also stand in the workspace catalogue with a count
-  // beside them, so the filter box would offer a label that files nothing a reader can open.
+  // Stored provisional IDs represent abandoned drafts. Sweeping them removes their labels from workspace counts.
+
   const stored = normalizeSessionLabels({
     [`${DRAFT_SESSION_PREFIX}a1b2`]: ['composer'],
     s9: ['docs', 'composer'],
@@ -219,8 +204,8 @@ test('a session that never got an id of its own leaves no label behind it', () =
   const swept = sweepDraftLabels(stored);
   assert.deepEqual(Object.keys(swept), ['s9'], 'an abandoned draft kept its place in the record');
   assert.deepEqual(swept.s9, ['docs', 'composer'], 'a real session lost labels to the sweep');
-  // The catalogue is counted off the record, so a label the sweep left with nothing carrying
-  // it is a label the workspace no longer has.
+  // Counts exclude labels left with no holder after the sweep.
+
   assert.deepEqual(
     labelCounts(swept).map((row) => row.name),
     ['composer', 'docs'],
@@ -229,31 +214,26 @@ test('a session that never got an id of its own leaves no label behind it', () =
     labelCounts(stored).map((row) => row.name),
     ['composer', 'docs', 'perf'],
   );
-  // The text a stored record actually holds, spelled out here rather than built back out of
-  // the constant. Every record a shipped panel wrote carries `draft:` at the front of a
-  // provisional id, so a constant edited on its own leaves all of them standing with nothing
-  // able to reach them. The places panelhost.ts builds one are held to the same constant in
-  // panel.webview.test.ts.
+  // Use the stored draft: prefix literally so changing the constant cannot leave saved provisional entries behind.
+
   assert.deepEqual(Object.keys(sweepDraftLabels({ 'draft:a1b2': ['composer'], s9: ['docs'] })), ['s9']);
-  // A session whose real id merely holds the word is kept. The prefix opens the id or it
-  // means nothing.
+  // The draft prefix must start the session ID.
+
   assert.deepEqual(Object.keys(sweepDraftLabels({ 'session-draft:1': ['perf'] })), ['session-draft:1']);
-  // The lists come back as copies, so a caller that sorts what it was handed does not edit
-  // the record it came out of.
+  // Copied label lists cannot mutate the source.
+
   const source = { s1: ['perf'] };
   const copy = sweepDraftLabels(source);
   copy.s1.push('composer');
   assert.deepEqual(source.s1, ['perf'], 'the sweep handed back the record it was given');
-  // The keys and values a stored record can hold that no code wrote are refused here the way
-  // they are everywhere else, because this reads storage that outlives the code.
+  // Sweeping rejects malformed stored keys and values.
+
   const junk = JSON.parse('{"__proto__": ["perf"], "s2": "perf", "s3": ["docs"]}') as Record<string, string[]>;
   assert.deepEqual(sweepDraftLabels(junk), { s3: ['docs'] });
 });
 
-// Normalization runs on every write, and a draft the reader is looking at right now is a live
-// session. Its labels have to survive one, or a label put on a session while it was
-// starting would be gone by the next keystroke and the adoption onto its real id would have
-// nothing left to move.
+// Normalization retains live draft labels because it runs on writes before adoption.
+
 test('normalizing a record keeps the labels of a draft the reader is still looking at', () => {
   const live = normalizeSessionLabels({ [`${DRAFT_SESSION_PREFIX}a1b2`]: ['composer'], s9: ['docs'] });
   assert.deepEqual(
@@ -267,10 +247,8 @@ test('normalizing a record keeps the labels of a draft the reader is still looki
   assert.deepEqual(adoptLabelSession(written, `${DRAFT_SESSION_PREFIX}a1b2`, 'abc').abc, ['composer', 'perf']);
 });
 
-// A session already filed under its full complement of labels, adopting a draft that
-// carries one more. Something has to give at the ceiling, and it must not be the label the
-// reader put on the draft seconds before: that is the whole promise of the adoption, and a
-// merge that walked the older list first would swallow the ceiling and drop it silently.
+// At the session label limit, adoption retains draft labels ahead of older labels.
+
 test('a draft label survives adoption onto a session already filed to its ceiling', () => {
   const full = [...Array(LABELS_PER_SESSION).keys()].map((i) => `label ${i}`);
   const both = normalizeSessionLabels({ 'new:1': ['fresh'], abc: full });
@@ -281,9 +259,8 @@ test('a draft label survives adoption onto a session already filed to its ceilin
   assert.ok(!('new:1' in moved), 'the provisional entry outlived the id it was replaced by');
 });
 
-// The ceiling on one session stops the walk rather than cutting its result, so a name
-// past it teaches the workspace no spelling. A spelling that no card carries would rewrite a
-// later session's label to a word the reader can see nowhere.
+// Labels beyond a session's limit cannot establish spelling for later sessions.
+
 test('a label past a session ceiling teaches the workspace no spelling', () => {
   const full = [...Array(LABELS_PER_SESSION).keys()].map((i) => `label ${i}`);
   const kept = normalizeSessionLabels({ s1: [...full, 'Perf'], s2: ['perf'] });
@@ -295,10 +272,8 @@ test('a label past a session ceiling teaches the workspace no spelling', () => {
   );
 });
 
-// The record's own ceiling holds while the window is open, not only on the way back from
-// storage, and the session just filed goes to the newest end. Without both, a workspace
-// at the ceiling grows past it all session, the newest filing keeps the oldest position, and
-// the cut on the next reload throws away the entry the reader had just written.
+// Writes enforce the stored session limit and place the newly labelled session last.
+
 test('filing a session holds the record to its ceiling and puts it at the newest end', () => {
   const src: Record<string, string[]> = {};
   for (let i = 0; i < LABELLED_SESSION_LIMIT; i += 1) {
@@ -310,16 +285,14 @@ test('filing a session holds the record to its ceiling and puts it at the newest
   assert.equal(Object.keys(added).length, LABELLED_SESSION_LIMIT, 'filing a session grew the record past its ceiling');
   assert.ok('fresh' in added, 'the session the reader just filed is the one that was dropped');
   assert.ok(!('s0' in added), 'the cut took the newest entry rather than the oldest');
-  // Refiling a session that already had an entry moves it to the newest end, so the next
-  // reload's cut cannot take the one the reader touched last.
+  // Refiling moves an existing entry to the newest position.
+
   const refiled = setSessionLabels(added, 's1', ['release 0.4']);
   assert.equal(Object.keys(refiled).pop(), 's1', 'a refiled session kept the position it had when it was oldest');
 });
 
-// A session id is never `__proto__`, and stored state comes back from outside this code.
-// A plain assignment under that key replaces the record's prototype instead of adding an
-// entry, so the entry is lost and every later reader is handed an object shaped like whatever
-// arrived.
+// Reject __proto__ keys to preserve the returned object's prototype.
+
 test('a stored key naming no session cannot reshape the record it arrives in', () => {
   const hostile = JSON.parse('{"__proto__": ["perf"], "s1": ["docs"]}');
   const kept = normalizeSessionLabels(hostile);
@@ -328,7 +301,7 @@ test('a stored key naming no session cannot reshape the record it arrives in', (
   const set = setSessionLabels(kept, '__proto__', ['perf']);
   assert.deepEqual(set, { s1: ['docs'] }, 'the setter filed a key naming no session');
   assert.equal(Object.getPrototypeOf(set), Object.prototype, 'the setter reshaped the record it returned');
-  // And the third writer, which is the one that takes an id straight off the wire.
+  // Adoption also rejects __proto__ as its destination.
   const adopted = adoptLabelSession({ 'new:1': ['perf'], s1: ['docs'] }, 'new:1', '__proto__');
   assert.deepEqual(
     adopted,
@@ -338,9 +311,8 @@ test('a stored key naming no session cannot reshape the record it arrives in', (
   assert.equal(Object.getPrototypeOf(adopted), Object.prototype, 'adoption reshaped the record it returned');
 });
 
-// The ceiling on the record drops the oldest entries, and it must drop them before any
-// spelling is read. An entry the cut throws away owning the spelling of a label leaves every
-// card that survived drawing a word the reader can see nowhere in the workspace.
+// Discard oldest entries before collecting label spellings.
+
 test('a labelled session the record ceiling drops teaches no spelling to the ones it keeps', () => {
   const src: Record<string, string[]> = { oldest: ['Perf'] };
   for (let i = 0; i < LABELLED_SESSION_LIMIT; i += 1) {
@@ -356,11 +328,11 @@ test('a labelled session the record ceiling drops teaches no spelling to the one
   );
 });
 
-// The same rule where a session is filed rather than read back. The entry being written
-// takes one of the ceiling's places, and the rest are cut before their spellings are read.
+// A write reserves space for its new entry before collecting surviving spellings.
+
 test('filing a session reads its spellings off the entries that survive the ceiling', () => {
-  // The oldest entry is the only holder of its label, so it is the only thing that could
-  // teach that label's spelling, and the write is what drops it.
+  // The write drops the only holder of the capitalized Solo spelling.
+
   const src: Record<string, string[]> = { oldest: ['Solo'] };
   for (let i = 0; i < LABELLED_SESSION_LIMIT - 1; i += 1) {
     src[`s${i}`] = ['perf'];
@@ -383,19 +355,16 @@ test('filing a session reads its spellings off the entries that survive the ceil
   );
 });
 
-// A name made only of characters that draw nothing is not a name. The whitespace rules cover
-// the space characters and none of these, so without the strip the card draws an outlined
-// chip with a border around nothing, the accessible name closes with a label nobody can read,
-// and no control can take it off because the entry is a label like any other.
+// Names containing only invisible characters are empty labels.
+
 test('a name that draws nothing at all is not a label', () => {
   const invisible = [0x0, 0x200b, 0x200e, 0xad, 0x2060, 0xfe0f].map((code) => String.fromCodePoint(code));
   for (const ch of invisible) {
     assert.equal(labelName(ch), '', `a name made of code point ${ch.codePointAt(0)} was filed as a label`);
   }
   assert.equal(labelName(invisible.join('')), '', 'a name made only of invisible characters was filed');
-  // And one inside a real name goes without leaving a gap where it stood, because it drew
-  // none. Taking it out from between a letter and its accent leaves two characters that
-  // compose, which is why the name is put into NFC again after the strip.
+  // Remove invisible characters without adding spaces, then normalize newly adjacent accents to NFC.
+
   assert.equal(
     labelName('re' + invisible[1] + 'lease'),
     'release',
@@ -410,10 +379,8 @@ test('a name that draws nothing at all is not a label', () => {
   assert.deepEqual(kept, { s2: ['docs'] }, 'a session filed under nothing keeps an entry');
 });
 
-// A tab and a line break are control characters as well as spaces, so the strip has to run
-// after the whitespace collapse. The other way round it deletes them and joins the words
-// either side into one, which is what a paste out of a browser table gives: the reader ends
-// up with `release0.4` beside `release 0.4` and no control that puts the two together.
+// Collapse tabs and line breaks into spaces before removing other control characters.
+
 test('a tab or a line break in a name is a space, not a deletion', () => {
   const tab = String.fromCodePoint(9);
   const feed = String.fromCodePoint(10);
@@ -421,15 +388,15 @@ test('a tab or a line break in a name is a space, not a deletion', () => {
   assert.equal(labelName('release' + tab + '0.4'), 'release 0.4', 'a tab joined the words either side of it');
   assert.equal(labelName('perf' + feed + 'release 0.4'), 'perf release 0.4', 'a line break joined two words');
   assert.equal(labelName('a' + carriage + feed + 'b'), 'a b', 'a carriage return and a line feed joined two words');
-  // The next-line character is a line break that the JavaScript shorthand for whitespace
-  // leaves out, so the strip would delete it and join the words either side.
+  // U+0085 separates words even though JavaScript whitespace shorthand excludes it.
+
   assert.equal(
     labelName('release' + String.fromCodePoint(0x85) + '0.4'),
     'release 0.4',
     'a next-line character joined the words either side of it',
   );
-  // And the byte order mark is not a space at all, whatever that shorthand says. Collapsed
-  // to one it would leave a gap the reader cannot account for in the middle of a name.
+  // Remove the byte order mark without inserting a space.
+
   assert.equal(
     labelName('release' + String.fromCodePoint(0xfeff) + '0.4'),
     'release0.4',
@@ -437,9 +404,8 @@ test('a tab or a line break in a name is a space, not a deletion', () => {
   );
 });
 
-// The strip takes out what draws nothing and nothing else. The two joiners hold one glyph
-// together out of several characters, a private-use code point is a glyph the reader's own
-// font theme draws, and a combining mark sits on the letter before it.
+// Preserve joiners, private-use glyphs, and combining marks that contribute to visible names.
+
 test('a name keeps every character a reader can see', () => {
   const zwj = String.fromCodePoint(0x200d);
   const family = String.fromCodePoint(0x1f468) + zwj + String.fromCodePoint(0x1f4bb);
@@ -448,7 +414,7 @@ test('a name keeps every character a reader can see', () => {
     family + ' work',
     'the joiner went, so one glyph the reader typed was drawn as two',
   );
-  // A run of joiners, so a rule that kept only the first would be caught.
+  // Preserve every joiner in the family sequence.
   const four = [0x1f468, 0x1f469, 0x1f467, 0x1f466].map((c) => String.fromCodePoint(c)).join(zwj);
   assert.equal(labelName(four), four, 'a joiner after the first went, so one glyph became several');
   // A joiner that follows a variation selector rather than the emoji itself.
@@ -469,18 +435,18 @@ test('a name keeps every character a reader can see', () => {
   assert.equal(labelName(glyph), glyph, 'a name that is only a font-theme glyph was refused');
   const heart = String.fromCodePoint(0x2764) + String.fromCodePoint(0xfe0f);
   assert.equal(labelName(heart), heart, 'the variation selector went, so the glyph changed shape');
-  // A subdivision flag is a black flag and a run of tag characters. The tags are format
-  // characters like the zero-width spaces, and taking them out leaves a plain black flag.
+  // Subdivision flags require their tag sequence to retain the flag glyph.
+
   const scotland =
     String.fromCodePoint(0x1f3f4) +
     [0xe0067, 0xe0062, 0xe0073, 0xe0063, 0xe0074, 0xe007f].map((c) => String.fromCodePoint(c)).join('');
   assert.equal(labelName(scotland), scotland, 'the flag tags went, so one glyph became another');
-  // An unassigned code point draws a box. A box is a poor name and it is still something on
-  // the card, which is more than the panel can say about what the reader meant.
+  // Preserve an unassigned code point rather than rejecting the supplied name.
+
   const unassigned = String.fromCodePoint(0x378);
   assert.equal(labelName(unassigned), unassigned, 'a name that draws a box was refused');
-  // And the non-joiner stays wherever it is, because it is a letter-level character in the
-  // scripts that use it and taking it out of a word changes the word.
+  // Preserve non-joiners because they affect letter forms.
+
   const zwnj = String.fromCodePoint(0x200c);
   assert.equal(
     labelName('mi' + zwnj + 'shavad'),
@@ -489,13 +455,8 @@ test('a name keeps every character a reader can see', () => {
   );
 });
 
-// The cut runs before the check for anything visible, because the cut is what can take the
-// only visible character a name had. A name of variation selectors with one letter at its
-// end passes a check made first, and what reaches the card is the variation selectors.
-// The cut counts UTF-16 units and knows nothing about where a sequence ends, so a ceiling
-// that falls inside a family emoji leaves a joiner with nothing after it to join. That name
-// draws exactly like the same name without it and folds to a different key, which is one
-// label the reader can see twice on the rail.
+// Truncate before checking for visible content. Remove a trailing joiner left without its following character.
+
 test('a joiner the ceiling cut loose is not left on the end of the name', () => {
   const zwj = String.fromCodePoint(0x200d);
   const pair = String.fromCodePoint(0x1f468) + zwj + String.fromCodePoint(0x1f4bb);
@@ -522,9 +483,8 @@ test('a name the ceiling cut down to nothing visible is not a label', () => {
   assert.equal(labelName(name), '', 'the cut left a name with nothing in it a reader can see');
 });
 
-// The three record helpers are as narrow as the writers beside them. A record whose own
-// `__proto__` names a list arrives only from state nobody normalized, and a plain assignment
-// under that key replaces the returned record's prototype rather than adding an entry.
+// All record helpers reject __proto__ keys even when the input has not been normalized.
+
 test('a record nobody normalized cannot reshape what the helpers return', () => {
   const hostile = JSON.parse('{"__proto__": ["perf"], "s1": ["docs"]}');
   const set = setSessionLabels(hostile, 's2', ['rail']);
@@ -546,9 +506,8 @@ test('a card with more labels than it can draw folds the rest into a count', () 
   assert.deepEqual(three.chips, ['composer', 'release 0.4'], 'the card drew the wrong labels');
   assert.equal(three.chips.length, RAIL_LABELS_SHOWN, 'the fold drew a number of chips of its own');
   assert.equal(three.more, '+1', 'the labels the card left out are not counted anywhere on it');
-  // And the count comes back beside the labels it stands for, so the chip drawn from it can
-  // carry the whole of what it hides. One split answers both, or the number and the names
-  // behind it could disagree.
+  // Return hidden labels beside their count so the fold figure and its accessible detail share one split.
+
   assert.deepEqual(three.rest, ['perf'], 'the count came back without the labels it stands for');
   const two = railLabelChips(['composer', 'perf']);
   assert.deepEqual(two.chips, ['composer', 'perf']);
@@ -563,10 +522,8 @@ test('a card with more labels than it can draw folds the rest into a count', () 
   );
 });
 
-// The record is the whole answer to which labels a workspace has, so the list the editor
-// draws is counted off it. A count read a second way would say a label two sessions
-// carry is carried by one, and the reader would tick a box that says the wrong thing about
-// the workspace they are filing.
+// Workspace counts derive from session label membership.
+
 test('the list of labels says how many sessions carry each of them, most used first', () => {
   const counts = labelCounts(
     normalizeSessionLabels({
@@ -576,9 +533,8 @@ test('the list of labels says how many sessions carry each of them, most used fi
       s4: ['composer'],
     }),
   );
-  // Every row carries the spoken form of its own count. The editor's checkboxes and the
-  // filter box's suggestions are handed one shape, so neither the extension nor the browser
-  // words a count a second way.
+  // Count rows carry shared spoken wording for editor checkboxes and filter suggestions.
+
   assert.deepEqual(
     counts,
     [
@@ -588,8 +544,8 @@ test('the list of labels says how many sessions carry each of them, most used fi
     ],
     'the label the most sessions carry is counted wrong or drawn below a rarer one',
   );
-  // Two labels the same number of sessions carry are ordered by name, so the list the
-  // reader reads twice reads the same way both times.
+  // Equal counts sort by label name.
+
   assert.deepEqual(
     labelCounts({ s1: ['beta', 'alpha'], s2: ['alpha', 'beta'] }),
     [
@@ -598,10 +554,8 @@ test('the list of labels says how many sessions carry each of them, most used fi
     ],
     'two labels nothing separates by count come back in an order of their own',
   );
-  // A record nobody normalized: a key naming no session, a key naming nothing at all, a
-  // bare name where a list belongs, a name of only spaces, and one session naming a
-  // label twice. The last is the one that reads wrong on screen: counted twice it would tell
-  // the reader two sessions carry a label one does.
+  // Ignore invalid stored entries and count repeated case variants once per session.
+
   const hostile = JSON.parse(
     '{"__proto__": ["perf"], "": ["ghost"], "s1": ["docs", "Docs"], "s2": "docs", "s3": ["   ", "docs"]}',
   );
@@ -610,8 +564,8 @@ test('the list of labels says how many sessions carry each of them, most used fi
     [{ name: 'docs', count: 2, countName: 'carried by 2 sessions' }],
     'a label counted off a record nobody normalized stands for the wrong sessions',
   );
-  // And two cases of one name are one label with one count, in the spelling that arrived
-  // first, which is the spelling every card already draws.
+  // Case variants share a count and retain the first spelling.
+
   assert.deepEqual(
     labelCounts({ s1: ['Perf'], s2: ['perf'] }),
     [{ name: 'Perf', count: 2, countName: 'carried by 2 sessions' }],
@@ -620,9 +574,8 @@ test('the list of labels says how many sessions carry each of them, most used fi
   assert.deepEqual(labelCounts({}), []);
 });
 
-// The editor draws one list, and the reader reads it as two things at once: what this
-// session carries, and what the workspace has to offer it. Applied first is what makes
-// the first of those readable without a second control.
+// The editor lists applied labels before the remaining workspace labels.
+
 test('the editor lists what the session carries before what the workspace has', () => {
   const labels = normalizeSessionLabels({
     s1: ['release 0.4', 'composer'],
@@ -631,9 +584,8 @@ test('the editor lists what the session carries before what the workspace has', 
     s4: ['perf', 'composer'],
   });
   const rows = labelEditorRows(labels, 's1');
-  // The reader applied `release 0.4` first and one session carries it, while three
-  // carry `perf`. The order the reader wrote is what leads, so the count cannot pull a label
-  // out of it.
+  // Applied labels keep their session order regardless of workspace counts.
+
   assert.deepEqual(
     rows.map((row) => row.name),
     ['release 0.4', 'composer', 'perf'],
@@ -644,8 +596,8 @@ test('the editor lists what the session carries before what the workspace has', 
     [true, true, false],
     'a row does not say which of the two groups it came from',
   );
-  // The count is said in words beside the box, because a figure read out after a name says
-  // nothing about what it counts.
+  // Count wording identifies how many sessions carry the label.
+
   assert.equal(rows[0].countName, 'carried by one session');
   assert.equal(rows[2].countName, 'carried by 3 sessions');
   assert.deepEqual(
@@ -663,11 +615,11 @@ test('the editor lists what the session carries before what the workspace has', 
     [false, false, false],
     'a session nobody filed is drawn carrying a label',
   );
-  // The rows are settled by the record and the session alone, so the list the reader is
-  // looking at cannot reorder itself between one press and the next.
+  // The same label state and session return the same editor rows.
+
   assert.deepEqual(labelEditorRows(labels, 's1'), rows, 'one record drew two different lists');
-  // Ticking a box is a write, and the label the reader just applied joins the end of what
-  // this session carries rather than sorting itself into the counts.
+  // Newly applied labels follow labels already applied to the session.
+
   const ticked = labelEditorRows(setSessionLabels(labels, 's2', ['perf', 'composer']), 's2');
   assert.deepEqual(
     ticked.filter((row) => row.applied).map((row) => row.name),
@@ -681,9 +633,8 @@ test('the editor lists what the session carries before what the workspace has', 
   );
 });
 
-// The two things a name can do that the reader cannot see from the box. Nothing else on
-// screen says either, and both are wrong only after the name is stored, which is too late to
-// tell them.
+// Typing notes explain comma interpretation and name truncation before storage.
+
 test('the reader is told what a comma or a name past the ceiling does to the label they type', () => {
   assert.deepEqual(labelTypedNotes('release 0.4'), [], 'an ordinary name is answered with a note');
   assert.deepEqual(labelTypedNotes('perf, docs'), ['comma']);
@@ -696,15 +647,15 @@ test('the reader is told what a comma or a name past the ceiling does to the lab
   );
   // A name exactly at the ceiling loses nothing, so there is nothing to say about it.
   assert.deepEqual(labelTypedNotes('a'.repeat(LABEL_NAME_LIMIT)), []);
-  // And the spaces around a name go before it is stored, so they cannot be what carries it
-  // past the ceiling.
+  // Surrounding whitespace does not count toward the name limit.
+
   assert.deepEqual(
     labelTypedNotes('  ' + 'a'.repeat(LABEL_NAME_LIMIT) + '  '),
     [],
     'the spaces the reader typed around a name were counted against the ceiling',
   );
-  // Every note names words the editor can draw, and the ceiling is read from the rule rather
-  // than written into the sentence twice.
+  // Every note has text and the limit note includes LABEL_NAME_LIMIT.
+
   for (const note of labelTypedNotes(past + ',')) {
     assert.match(LABEL_NOTES[note], /\S/, 'a note the reader is shown has nothing in it to read');
   }

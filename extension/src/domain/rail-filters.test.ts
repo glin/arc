@@ -106,9 +106,7 @@ test('saved rail filters reserve every visible built-in name', () => {
   }
 });
 
-// A reader could name a saved filter Active before Active was a lens. The filter, its query and
-// its order survive the load, under a name no built-in and no other stored filter holds, and a
-// second load leaves the list as the first one left it.
+// Built-in names cannot collide with saved filters. Renaming preserves the query, order, and subsequent normalization.
 test('a saved filter the reader named Active keeps its query under a name that does not collide', () => {
   const stored = [
     { id: 'f1', name: 'Active', query: 'is:warm label:ui', sort: 'cost-desc' },
@@ -123,7 +121,7 @@ test('a saved filter the reader named Active keeps its query under a name that d
   assert.equal(normalizeRailFilterId('f1', kept), 'f1');
 });
 
-// Running joined the Filter row after a reader could have named a saved filter Running.
+// Running is reserved even when a saved filter already uses that name.
 test('a saved filter the reader named Running keeps its query under a name that does not collide', () => {
   const kept = normalizeSavedRailFilters([
     { id: 'f1', name: 'Running', query: 'is:running label:ui' },

@@ -14,9 +14,8 @@ import {
   RateLimit,
 } from './claudewire.ts';
 
-// The older lines below were captured off Claude Code 2.1.241 running the headless protocol.
-// The unified-window line follows the relay contract in the installed official extension.
-// Each fixture is trimmed to the fields this module reads.
+// Protocol fixtures retain the fields consumed by the wire adapter, including the unified context window.
+
 const SESSION = 'c0129cee-9323-4aea-a448-ec90642971ea';
 
 const INIT_LINE = JSON.stringify({
@@ -422,13 +421,8 @@ test('a non-string skill entry is dropped rather than carried as a name', () => 
 });
 
 test('a resumed session is named before the child has written a line', async () => {
-  // The captured handshake answer above names no session, and a resumed child writes nothing
-  // else until its first prompt produces output. So the answer used to arrive after the press
-  // rather than before it, and for the whole of that gap the panel could not say which
-  // session the child was in: nothing counted as a turn in flight, the rail wore no
-  // status, and the card the press opened came down as soon as the handoff answered. A
-  // compaction is where a reader sees it, because it writes no turn for the transcript to
-  // draw in the card's place.
+  // A resumed session is identified from its launch seed before the child produces output.
+
   const h = harness(undefined, SESSION);
   const ready = h.wire.initialize();
   h.wire.receive(INIT_RESPONSE);
@@ -442,16 +436,13 @@ test('a resumed session is named before the child has written a line', async () 
 });
 
 test('a child that names a different session replaces the one it was started for', () => {
-  // The seed is what the child was asked to open, not a promise about what it opened. A CLI
-  // that answers with another session is the one that decides, and everything keyed on
-  // the answer has to follow it.
+  // An announced session ID replaces the launch seed when the child opens a different session.
+
   const h = harness(undefined, 'a7b1c0de-0000-4000-8000-000000000000');
   h.wire.receive(INIT_LINE);
   assert.equal(h.wire.sessionId(), SESSION);
-  // The session being left is named beside the one being joined. `/clear` is what makes
-  // this worth carrying: the child keeps its process and moves to a new session, and the
-  // panel has to take everything it was holding for the old one across with it. Read before
-  // the field moves, or both names are the same one and the panel has nothing to move from.
+  // Session events retain the previous ID before updating it, so the panel can transfer state across /clear.
+
   assert.deepEqual(
     h.events.filter((e) => e.kind === 'session'),
     [{ kind: 'session', sessionId: SESSION, previous: 'a7b1c0de-0000-4000-8000-000000000000' }],
@@ -909,8 +900,8 @@ test('a prompt goes out as one user message line', async () => {
   });
 });
 
-// How Claude Code 2.1.278 answers a `rename_session` control request: a success on the
-// control channel, with no response body and no `result` event of any kind.
+// A rename_session success settles on the control channel without requiring a result event.
+
 function renameAnswer(error?: string): string {
   return JSON.stringify({
     type: 'control_response',
@@ -1282,11 +1273,8 @@ test('interrupt and usage go out on the control channel with their own ids', asy
   assert.notEqual(interrupt.request_id, usage.request_id);
 });
 
-// The `/usage` answer, exactly as Claude Code 2.1.241 gave it to an idle child with no
-// prompt ever sent. Two shapes here differ from the `rate_limit_event` the CLI volunteers
-// mid-turn, and both differences are the reader's whole job: the share is a whole number
-// rather than a fraction, and the reset time is an ISO string rather than epoch seconds.
-// It carries no list of limits, so it is what the fallback reads.
+// The named-window usage response supplies whole-number utilization and ISO reset timestamps. It omits the explicit limits array.
+
 const USAGE_ANSWER = {
   session: { total_cost_usd: 0.0908, total_api_duration_ms: 3745 },
   subscription_type: 'max',
@@ -1304,18 +1292,16 @@ test('a usage answer that names its windows one by one still reaches the panel',
   assert.equal(reading.complete, true);
   assert.equal(reading.readAt, 1_700_000_000_000);
   assert.deepEqual(reading.limits, [
-    // The share is the fraction the mid-turn event speaks in, so a figure from either
-    // source folds into the same row without the panel knowing which it came from. Neither
-    // window says which clock it runs on, so the clock comes from the name.
+    // Normalize utilization to a fraction and derive each clock group from its window name.
+
     { window: 'five_hour', utilization: 0.24, resetsAtSeconds: 1787907600, status: '', group: 'session', scope: '' },
     { window: 'seven_day', utilization: 0.93, resetsAtSeconds: 1788253200, status: '', group: 'weekly', scope: '' },
   ]);
 });
 
 test('the two sources of one figure agree once the wire has read them', () => {
-  // The whole reason the conversion lives in the wire: the same 91% arrives as 91 on the
-  // request and as 0.91 on the event, and a panel holding both units would draw one of
-  // them a hundred times too full.
+  // Usage responses report 91 for 91 percent. Rate-limit events report the equivalent fraction, 0.91.
+
   const asked = readUsage(
     { subscription_type: 'max', rate_limits_available: true, rate_limits: { seven_day: { utilization: 91 } } },
     1,
@@ -1476,9 +1462,8 @@ test('a window with an unreadable reset time keeps its figure and loses only the
   assert.equal(empty?.spend, null);
 });
 
-// The same `/usage` call answered by a CLI that lists its limits outright. Every field the
-// reader touches is here as it arrived: the array beside the named windows, the group each
-// limit runs on, the model a scoped limit covers, and the codenamed keys that hold nothing.
+// This usage fixture combines named windows, an explicit limits array, model scope, and null unsupported windows.
+
 const USAGE_ANSWER_WITH_LIMITS = {
   session: { total_cost_usd: 0.0908 },
   subscription_type: 'max',
@@ -1543,9 +1528,8 @@ test('a usage answer that lists its limits is read from the list, clock and mode
 });
 
 test('a limit under a codename is not drawn, however much it looks like a real one', () => {
-  // The keys beside the list are codenames for limits that are not offered. They hold null
-  // today and their names turn over between releases, so a reader that walked every key
-  // would put a row on screen under whatever an unshipped limit was called that week.
+  // Only supported named windows or explicit list entries become limits. Other response keys must not add rows.
+
   const codenamed = {
     subscription_type: 'max',
     rate_limits_available: true,
@@ -1608,7 +1592,7 @@ test('a listed limit with no share is dropped, and a list of nothing usable fall
   );
 });
 
-// The `list_models` answer, as the CLI gave it for a child running on the default model.
+// A list_models fixture includes the default model and its resolved model ID.
 const MODEL_ANSWER = {
   models: [
     {
@@ -1691,8 +1675,8 @@ test('the model list is asked for on the control channel and answered from there
 });
 
 test('a CLI that will not list its models leaves the panel with no list, not an error', async () => {
-  // The reader pressed nothing: the panel asked on their behalf, and a child that refuses
-  // the subtype or has already gone is a picker with nothing in it rather than a failure.
+  // An unavailable model list returns null without raising a turn failure.
+
   const h = harness();
   const listing = h.wire.listModels();
   h.wire.receive(
@@ -1705,9 +1689,8 @@ test('a CLI that will not list its models leaves the panel with no list, not an 
 });
 
 test('a control request nobody answers gives up rather than waiting for ever', async () => {
-  // A child that goes quiet used to hold the caller open with no clock on it. The panel
-  // keeps one read per agent in flight and joins every later read to it, so one unanswered
-  // request stopped that agent being asked again for the life of the window.
+  // Unanswered control requests expire so later reads can proceed.
+
   const h = harness(10);
   await assert.rejects(waitForDeadline(h.wire.usage()), /did not answer/);
   // And the wire is still usable: the request that timed out is gone, not left behind to
@@ -1722,12 +1705,8 @@ test('a control request nobody answers gives up rather than waiting for ever', a
   assert.deepEqual(await again, USAGE_ANSWER);
 });
 
-// The `mcp_status` answer, as the CLI gave it for a child with three servers configured:
-// one up, one that would not start, and one switched off. The failed entry carries the
-// reason and no `serverInfo` and no `tools`, because a server's tools are only known once
-// its connection is; the disabled entry carries none of the three. `config` rides along on
-// every entry and is not read: it is how the server is started, which is a matter for
-// whoever wrote the settings file rather than for a panel drawing the state of the world.
+// The MCP status fixture includes connected, failed, and disabled servers. Failed and disabled entries omit unavailable server metadata and tools.
+
 const MCP_ANSWER = {
   mcpServers: [
     {
@@ -1800,9 +1779,8 @@ test('a server with no name is skipped, and a state this panel has no word for i
 });
 
 test('a CLI that will not report its MCP servers leaves the panel with no reading, not an error', async () => {
-  // The reader pressed nothing: the panel asked on their behalf, and a child that refuses
-  // the subtype or has already gone leaves the list empty rather than putting a failure in
-  // front of somebody who asked no question.
+  // An unavailable MCP status response returns null without raising a turn failure.
+
   const h = harness();
   const reading = h.wire.mcpStatus();
   h.wire.receive(
@@ -1815,18 +1793,13 @@ test('a CLI that will not report its MCP servers leaves the panel with no readin
 });
 
 test('a switch names the server under serverName and says which state it is asking for', async () => {
-  // Neither field is in the CLI's help, and getting either wrong fails without a sound.
-  // `serverName` was found by sending a marker word under each candidate spelling and
-  // reading which one came back in the CLI's own error; a request under `server` or `name`
-  // is not refused but answered with a complaint about a server that does not exist, and on
-  // screen the switch simply does not move. `enabled` fails the same way: the CLI reads a
-  // missing one as false, so a request that leaves it out can only ever turn a server off,
-  // and a reader who turned one off would never get it back.
+  // mcp_toggle requests use serverName and an explicit enabled value. Both true and false must reach the CLI.
+
   const h = harness();
   const off = h.wire.mcpToggle('probeGood', false);
   assert.deepEqual(h.parsed()[0].request, { subtype: 'mcp_toggle', serverName: 'probeGood', enabled: false });
-  // Success with nothing to say carries no payload at all, which is the shape of every
-  // answer to a press.
+  // A successful toggle settles without a response payload.
+
   h.wire.receive(
     JSON.stringify({
       type: 'control_response',
@@ -1860,9 +1833,8 @@ test('a reconnect names the server the same way, and answers once the connection
 });
 
 test('a switch or a reconnect that failed says why, because the reader pressed it', async () => {
-  // The reading above swallows its refusals, and these two must not. Nobody asked for the
-  // reading; somebody pressed these, and a press that quietly did nothing leaves them
-  // pressing it again.
+  // Toggle and reconnect failures reject with the reported error so the reader receives the action result.
+
   const h = harness();
   const switching = h.wire.mcpToggle('probeBad', true);
   h.wire.receive(
@@ -1896,9 +1868,8 @@ test('a model list nobody answers is no list, and a late answer changes nothing'
   );
 });
 
-// The lines a real child wrote on 2026-08-29 when it was asked to count to eight, with the
-// partial-message flag on. They are here whole rather than abbreviated: the shape of the
-// stream is the thing under test, and a fixture written from memory tests the memory.
+// Partial-message fixtures preserve stream_event text and thinking delta envelopes.
+
 const PARTIAL_TEXT = JSON.stringify({
   type: 'stream_event',
   event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'one, two, three' } },
@@ -1917,8 +1888,8 @@ const PARTIAL_THINKING = JSON.stringify({
 });
 
 test('spawnArgs asks for the reply as it is written', () => {
-  // Without it the CLI says nothing at all between the press and the end of the turn, which
-  // is minutes of silence on any real piece of work, and the composer has nothing to draw.
+  // The partial-message flag supplies reply chunks before the turn ends.
+
   assert.ok(
     spawnArgs({ cwd: 'C:ws' }).includes('--include-partial-messages'),
     'the child is started without the flag, so no reply reaches the panel until the turn ends',
@@ -1933,8 +1904,8 @@ test('a streamed chunk of the reply is its own event, and thinking is not one', 
     { kind: 'delta', text: 'one, two, three' },
   ]);
 
-  // The same event carries the model reasoning, which is not the reply and is not drawn as
-  // one. The panel already learns that a model is thinking from an event of its own.
+  // Thinking deltas must not enter the reply delta stream.
+
   const quiet = harness();
   quiet.wire.receive(PARTIAL_THINKING);
   assert.deepEqual(
@@ -1945,10 +1916,8 @@ test('a streamed chunk of the reply is its own event, and thinking is not one', 
 });
 
 test('the flag adds a message type and duplicates none of the ones already read', () => {
-  // The trap this branch was written around. Every message type the parser already switches
-  // on goes on arriving with the flag set: the finished assistant message still comes once
-  // per content block, exactly as it did before, so joining the chunks is not a second copy
-  // of the reply. Both were checked against a child running with the flag.
+  // Partial and completed messages emit separate delta and text events.
+
   const h = harness();
   h.wire.receive(PARTIAL_TEXT);
   h.wire.receive(
@@ -1964,8 +1933,8 @@ test('the flag adds a message type and duplicates none of the ones already read'
     'a partial and a finished message are read as the same thing, so the reply is drawn twice',
   );
 
-  // The rest of what the flag adds is framing, and none of it is the reply. Five of these
-  // arrive per turn beside the text, one of them carrying the reason the turn stopped.
+  // Message framing events must not emit reply text, including the stop reason event.
+
   const quiet = harness();
   for (const event of [
     { type: 'message_start' },

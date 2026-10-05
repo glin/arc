@@ -19,10 +19,7 @@ const DATE_SUFFIX = /-(\d{4}-\d{2}-\d{2}|\d{8})$/;
 // `global.anthropic.claude-opus-5-5[1m]`.
 const BEDROCK_PREFIX = /^(?:[a-z-]+\.)?anthropic\./;
 
-// Strips the CLI's window suffix and a dated snapshot tail so two spellings of the same
-// priced model compare equal: the id a pick resolves to, and the id a transcript recorded.
-// Claude's snapshot tail is eight digits; Codex's is a dashed calendar date. Left in, either
-// tail would make one priced model's id fail to match its own recorded snapshot.
+// Removes CLI window suffixes and snapshot dates before model comparison.
 export function normalizeModelIdentity(id: string | null | undefined): string {
   return (id ?? '').toLowerCase().replace(WINDOW_SUFFIX, '').replace(DATE_SUFFIX, '').trim();
 }

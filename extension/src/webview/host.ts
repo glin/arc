@@ -20,8 +20,7 @@ export interface HostPorts {
   browserState: BrowserStatePort;
 }
 
-// The object supplied by VS Code stays in this closure. Browser rendering receives only the
-// operations it needs, so it cannot publish the privileged object through the page.
+// Keeps the VS Code API inside this closure. Renderers receive only host messaging and browser state operations.
 export function createHost(api: VsCodeWebviewApi): HostPorts {
   return {
     host: {

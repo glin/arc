@@ -1,11 +1,7 @@
 import type { ComponentChild } from 'preact';
 
-// Joins semantic siblings without changing their structure. Callers decide which parts belong
-// together, so this does not inspect nested content or invent a wrapper around it. The
-// separator defaults to a plain space, which is how most compound text reads, but a caller
-// whose parts read as a list rather than as running prose passes its own, such as a comma, so
-// the mark is a literal DOM text node and never a styled span a reader could copy the wrong
-// tone from.
+// Joins supplied siblings with the chosen separator and no wrapper. The default separator is a space.
+// Callers choose other separators, such as commas, when the text forms a list.
 export function inlineText<T extends ComponentChild | Node>(
   parts: readonly T[],
   separator: T | string = ' ',

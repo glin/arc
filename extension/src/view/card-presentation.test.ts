@@ -71,12 +71,10 @@ test("groups of the card's own repository lead, whichever repository committed f
   assert.deepEqual(
     grouping.groups.map((group) => [group.repository.name, group.rows.map((row) => row.sha)]),
     [
-      // The own repository's groups lead in their own time order, though every row of theirs
-      // arrived after both foreign repositories' rows.
+      // The card's repository sorts first, even when its commits follow the other repositories' commits.
       ['repo', ['4444ddd']],
       ['repo', ['3333ccc']],
-      // The foreign repositories follow, each one's groups kept together and the repositories
-      // themselves ordered by whichever committed first.
+      // Other repositories follow by earliest commit. Each repository keeps its groups together.
       ['.claude/plans', ['1111aaa']],
       ['other', ['2222bbb']],
     ],
@@ -88,15 +86,14 @@ test('a landing no branch explains is a row under the branch that moved', () => 
   assert.deepEqual(
     grouping.groups.map((group) => [group.repository.own, group.branch, group.rows.map((row) => row.sha)]),
     [
-      // Both groups of the card's own repository lead, in their own time order, ahead of the
-      // nested repository's group though its one commit landed between them.
+      // The card's repository keeps both groups first, despite the nested repository's intervening commit.
       [true, 'ship/commit-record-repairs', ['184751b0']],
       [true, 'main', ['c36e7b5b']],
       [false, 'main', ['5e0c1d2a']],
     ],
   );
   assert.ok(grouping.groups.every((group) => group.arrival === null));
-  // A merged branch the turn wrote nothing on explains nothing on the card either.
+  // A landing without a matching commit group remains a row.
   const stranger = groupCommitRows([landing('c36e7b5b', 3, 'topic')]);
   assert.equal(stranger.single, true);
   assert.deepEqual(

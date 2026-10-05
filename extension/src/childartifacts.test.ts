@@ -210,8 +210,8 @@ test('a tool name the agent chose stays a count, and a child with no failure car
   assert.deepEqual(Object.entries(artifacts.failed?.byTool ?? {}), [['__proto__', 1]]);
   assert.deepEqual([artifacts.tools, artifacts.startedAt, artifacts.endedAt], [{ Bash: 3 }, 10, 40]);
   assert.equal('failed' in reduceChildArtifacts({ turns: [tallied('Read', 1)] }, options), false);
-  // Two turns count, the way a Codex child's follow-up prompt would. One turn carries no count
-  // at all, the way every Claude child's single turn reads.
+  // Report turnCount for multiple child turns. A single turn omits the field.
+
   assert.equal(artifacts.turnCount, 2);
   assert.equal('turnCount' in reduceChildArtifacts({ turns: [tallied('Read', 1)] }, options), false);
 });
@@ -234,9 +234,8 @@ test('a path a child both counted and mentioned keeps its floor, in one turn or 
   });
   const options = { revision: 'r1', complete: true, pathKey: normalizeFsPath, sameCommit: sameCommitSha };
   for (const turns of [
-    // The shape one child turn reaches the reducer in. A child transcript normally holds one
-    // turn, and a turn that edits a path and then writes it whole records both on one entry, so
-    // the entry carries the counted lines and the mark together.
+    // One entry can carry measured edit counts and an uncounted whole-file write together.
+
     [{ files: [change(3, 1, true)], commits: [] }],
     [
       { files: [change(3, 1)], commits: [] },
@@ -249,9 +248,8 @@ test('a path a child both counted and mentioned keeps its floor, in one turn or 
   ]) {
     const artifacts = reduceChildArtifacts({ turns }, options);
     const totals = childFileTotals(artifacts.files);
-    // The record that says nothing about its size takes away no line the other record measured,
-    // so the row holds what was counted and says that count is a floor. A row marked as holding
-    // no counts at all draws blank under a figure that adds those lines into its own total.
+    // An uncounted write preserves measured edit counts and marks them partial.
+
     assert.deepEqual([artifacts.files.length, totals.added, totals.removed, artifacts.complete], [1, 3, 1, true]);
     assert.deepEqual(
       [artifacts.files[0].countsPartial ?? null, artifacts.files[0].countsUnknown ?? null],
@@ -304,7 +302,7 @@ test('a commit and a path the parent turn recorded as well count once on the chi
   );
 });
 
-// A child whose record carries no structured results at all, which is every Claude child:
+// A child fixture with result text and no structured toolUseResult values.
 // one Write, one Edit, a commit and a command that committed nothing.
 function textOnlyChildRecord(): string {
   const lines = [
@@ -410,8 +408,8 @@ test('a notebook cell a child replaced counts as a file with no line counts', ()
 test("a child's input that does not say how many lines moved draws a file with no counts", () => {
   const artifacts = childArtifactsOf('child-uncounted-inputs-', [
     prompt('rename the helper', 0),
-    // A Write holds the whole after side and nothing of the before side, so its line count is
-    // a ceiling over a path that already held lines.
+    // A whole-file Write does not identify the old lines, so it cannot establish added or removed counts.
+
     tool('w1', 'Write', { file_path: 'c:/repo/src/whole.ts', content: 'one\ntwo\nthree\n' }, 1),
     textResult('w1', 'File updated successfully.', 2),
     // A `replace_all` edit ran its replacement an unrecorded number of times.
@@ -457,10 +455,8 @@ test("a child's counted edit keeps the mark another call left on the same file, 
     textResult('e1', 'The file c:/repo/src/a.ts has been updated.', 4),
     answer('Patched.', 5),
   ]);
-  // One turn, one path, two records of it, which is the shape a child's single turn reaches Arc
-  // in. The Write says nothing about the lines the path held, and the Edit moved one line in and
-  // two out. The row keeps what the Edit measured, and its mark says that count is a floor rather
-  // than saying the path carries no count at all.
+  // The Write leaves old lines unknown. The Edit measures one added line and two removed lines, which the file retains as partial counts.
+
   assert.deepEqual(fileRows(artifacts), [['c:/repo/src/a.ts', 1, 2, false]]);
   assert.equal(artifacts?.files[0].countsPartial, true);
 });

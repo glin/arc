@@ -1,6 +1,6 @@
 // Browser-safe money wording for a cost estimate.
 
-// Below a cent, the exact figure says nothing; past ten dollars, the cents do not either.
+// Show values below one cent as <$0.01. Round values of at least ten dollars to whole dollars.
 export function formatCost(dollars: number | null): string | null {
   if (dollars == null || dollars <= 0) {
     return null;

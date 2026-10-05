@@ -11,8 +11,8 @@ test('a known type gets its own badge and colour', () => {
 });
 
 test('a path arrives in either separator shape, and in any case', () => {
-  // The store writes backslashes and the transcript writes forward slashes, and a
-  // transcript writes a lower-case drive letter, so neither may decide the answer.
+  // Icon lookup accepts both path separators and ignores extension case.
+  // Drive-letter case must not affect the result.
   assert.equal(iconFor('c:\\repo\\src\\Store.TS').label, 'TS');
   assert.equal(iconFor('C:/Repo/README.MD').label, 'MD');
 });
@@ -37,8 +37,8 @@ test('a dotfile has no extension, so its name decides or nothing does', () => {
 });
 
 test('a type the table has never heard of still says what it is', () => {
-  // The point of the fallback: coverage can be partial without a row going blank. The
-  // extension itself is the badge, in the panel's own neutral tone.
+  // Unknown extensions use a shortened extension label rather than an empty badge.
+  // An empty colour selects the panel's neutral tone.
   assert.deepEqual(iconFor('notes.rst'), { label: 'RST', colour: '' });
   assert.deepEqual(iconFor('thing.parquet'), { label: 'PARQ', colour: '' });
   assert.equal(iconFor('thing.parquet').label.length, 4, 'a long extension is cut, not drawn in full');
@@ -51,16 +51,16 @@ test('a name with no extension at all still gets a mark', () => {
 });
 
 test('a file named after something on the object prototype gets a badge like any other', () => {
-  // Both tables are asked about with a piece of a filename. On a plain object `constructor`
-  // answers with the `Object` constructor and `__proto__` with `Object.prototype`, and both
-  // are truthy, so both come back where an icon is expected and the row draws `undefined`.
+  // Filename and extension lookups must exclude inherited object properties.
+  // constructor and __proto__ name truthy values on Object.prototype.
+  // Neither inherited value supplies an icon label or colour.
   // The lookup lower-cases first, so these two are the names that can reach it.
   assert.deepEqual(iconFor('constructor'), { label: '•', colour: '' });
   assert.deepEqual(iconFor('c:/repo/__proto__'), { label: '•', colour: '' });
   assert.deepEqual(iconFor('notes.constructor'), { label: 'CONS', colour: '' });
   assert.deepEqual(iconFor('notes.__proto__'), { label: '__PR', colour: '' });
-  // Named on their own, because a function passes `assert.ok` and reads as an icon until
-  // something asks it for a label.
+  // Truthiness alone does not establish that the returned value contains icon fields.
+  // Check the label and colour types separately.
   for (const p of ['constructor', '__proto__', 'notes.constructor', 'notes.__proto__']) {
     assert.equal(typeof iconFor(p).label, 'string', `${p} came back with no label of its own`);
     assert.equal(typeof iconFor(p).colour, 'string', `${p} came back with no colour of its own`);

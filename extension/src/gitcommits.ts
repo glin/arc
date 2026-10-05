@@ -1,23 +1,7 @@
-// Commits and landings read back from the repository, for the calls whose git output printed
-// neither.
-//
-// `git commit -q` prints nothing at all, and a quiet flag is the common reason a commit
-// never reaches a card. The transcript still says that a turn ran `git commit` and which
-// directory it ran in, so the command stays the attribution and the repository supplies the
-// identity: the sha, the subject, the branch and the counts.
-//
-// A fast-forward merge writes no commit and prints no full identity. The head log's
-// `merge <name>: Fast-forward` entry carries the full sha and the name the command named.
-//
-// Every read is bounded. One `git log` per call that committed is limited to the window
-// between the call and its result. A known sha can use an exact, non-walking log when its
-// directory stops answering. One `git rev-parse` runs per directory. Which repository a
-// directory belongs to cannot change, so that answer is kept for good. Which branch it is on
-// can change, so that one is read again with each batch of work.
-//
-// The reads are asynchronous and nothing waits for them. A render draws what is already
-// known and asks for the rest. The answers arrive on a later render, because a filled turn
-// asks the panel to draw itself again.
+// Recover commit identities and fast-forward landings from Git when printed output omits them. The recorded command supplies attribution.
+// Commit windows use bounded logs, exact hashes use non-walking logs, and landings use the worktree's HEAD reflog.
+// Cache repository identities by directory. Read branch names again for each batch.
+// Apply retained answers synchronously. Fetch missing answers in the background and request a render when the batch finishes.
 import { execFile } from 'node:child_process';
 import { withRecoveredCommits } from './childartifacts';
 import {
@@ -34,45 +18,29 @@ import {
   sameCommitSha,
 } from './transcript';
 
-// One git read. `dir` is where git runs. The answer is stdout, or null when git failed,
-// which covers a directory that no longer exists, a directory that is not a repository, and
-// a read that ran out of time.
+// Run Git in `dir` and return stdout. Failed or timed-out reads return null.
 export interface GitRunner {
   run(dir: string, args: string[]): Promise<string | null>;
   identity?(dir: string): Promise<{ stdout: string | null; outsideGit: boolean }>;
 }
 
-// Long enough for a cold repository on a slow disk, short enough that a hung read gives up
-// while the reader is still looking at the same session.
+// Bound each Git process, including cold-disk reads and hung commands.
 const GIT_TIMEOUT_MS = 5000;
 
-// A single call cannot have made more commits than this, and a window that returns more is
-// answering about something other than the call. The read asks for one more than the limit,
-// so a window holding too many is refused rather than trimmed: a trimmed answer drops the
-// call's own oldest commit and can leave a stranger behind in its place.
+// Accept at most twenty commits per call. Request one extra so an oversized window is rejected instead of losing its oldest commit.
 const LOG_LIMIT = 20;
 
-// How often one question is put to git before the reader stops asking. A repository that is
-// briefly unreachable answers on a later try. One that is gone never answers, and a panel
-// that refreshes every few seconds would spawn a process every few seconds for the life of
-// the window.
+// Allow three total read attempts per query. Stop automatic retries after the limit.
 const READ_ATTEMPTS = 3;
 
-// `git log` takes a date and compares it against whole seconds. The query asks for a wider
-// span than the window so that rounding at either edge cannot drop the commit, and the
-// window itself is applied by `chooseCommits`.
+// Widen Git's whole-second date query around the call window. `chooseCommits` applies the window after parsing.
 const WINDOW_SLACK_MS = 2000;
 
 const RECORD = '\x1e';
 const FIELD = '\x00';
 
-// A commit message can hold any byte except NUL, so the fields inside a record are separated
-// by one and cannot be split by their own contents.
-//
-// A record separator has no such byte to use, because NUL is spent, so the subject is written
-// last. A subject holding the record separator then cuts its own record short instead of
-// taking the next commit's fields with it: the sha and the time are already read, and the
-// fragment left behind fails the sha test rather than becoming a commit of its own.
+// Separate fields with NUL, which commit messages cannot contain. Write the subject last.
+// A subject containing the record separator truncates its own record without consuming the next commit's identity fields.
 const LOG_FORMAT = '%x1e%H%x00%cI%x00%s';
 
 export const IDENTITY_ARGS: readonly string[] = [
@@ -85,8 +53,7 @@ export const IDENTITY_ARGS: readonly string[] = [
 const BRANCH_ARGS: readonly string[] = ['rev-parse', '--abbrev-ref', 'HEAD'];
 const HEAD_LOG_FORMAT = '%gs%x00%H%x00%gD';
 
-// How many head movements to read for one commit window. A directory that moved more than
-// this in a few seconds is not answering about the call.
+// Limit the HEAD reflog entries inspected for a commit window.
 const REFLOG_LIMIT = 40;
 
 export function nodeGitRunner(timeoutMs: number = GIT_TIMEOUT_MS): GitRunner {
@@ -123,8 +90,7 @@ export function nodeGitRunner(timeoutMs: number = GIT_TIMEOUT_MS): GitRunner {
   };
 }
 
-// One commit as the repository reports it. `at` is git's own committer time, which is what
-// places the commit inside a call's window.
+// Use Git's committer time to place each reported commit inside the call window.
 export interface RepositoryCommit {
   sha: string;
   subject: string;
@@ -134,12 +100,7 @@ export interface RepositoryCommit {
   removed: number | null;
 }
 
-// What this directory's own head did inside the window.
-//
-// Every worktree keeps its own head log, and only the directory that made a commit records
-// it. A commit another worktree made in the same window is reachable from a branch this one
-// later checks out, and would otherwise stand in for the commit this call really made. The
-// head log cannot be borrowed that way.
+// Read the worktree's own HEAD reflog. A commit reachable from another worktree's branch does not establish that this call created it.
 export function reflogArgs(from: number, to: number): string[] {
   return [
     'log',
@@ -154,9 +115,7 @@ export function reflogArgs(from: number, to: number): string[] {
   ];
 }
 
-// A landing also needs every later checkout fact that connects its head movement to the
-// branch that moved. The time-bounded tail starts at the call and reaches the current head.
-// A count limit would drop an old landing after enough later head movements.
+// Read later checkout entries alongside a landing to identify the branch that moved. Omit a count limit that discards those connecting entries.
 export function landingReflogArgs(from: number): string[] {
   return [
     'log',
@@ -168,13 +127,8 @@ export function landingReflogArgs(from: number): string[] {
   ];
 }
 
-// The commits the head log says this directory made. Git writes `commit:` for an ordinary
-// commit, and `commit (amend):` and `commit (initial):` for the other two. Every other entry
-// is a head that moved to a commit somebody else made, which is what a fast-forward landing
-// and a checkout are. `landingsInHeadLog` reads the landings out of the same answer.
-//
-// A directory whose head log has been turned off or has expired names none, so nothing is
-// drawn. That loses a commit and never claims one.
+// Accept reflog entries whose subject starts with `commit`. Other head movements establish no commit creation here.
+// An absent or expired HEAD reflog supplies no attributable commits.
 export function commitsInHeadLog(stdout: string): Set<string> {
   const made = new Set<string>();
   for (const line of stdout.split('\n')) {
@@ -187,13 +141,7 @@ export function commitsInHeadLog(stdout: string): Set<string> {
   return made;
 }
 
-// What git writes when a merge moved the head without making a commit. The name after the
-// word is what the merge command named, which is the only place that name survives: git's own
-// output says `Updating a..b` and `Fast-forward`, and neither carries it.
-//
-// A merge that made a merge commit writes `Merge made by the 'ort' strategy` instead, and is
-// no landing. It is left out here, so a call that made one names nothing at all rather than
-// naming the wrong thing.
+// Match fast-forward merge entries and retain the merge command's source name. Merge-commit entries do not count as landings.
 const LANDING_ENTRY = /^merge (.+): Fast-forward$/;
 
 export interface RepositoryLanding {
@@ -209,8 +157,7 @@ function namedHead(name: string): CommitHead {
   return HEX_SHA.test(name) ? { kind: 'detached' } : { kind: 'branch', name };
 }
 
-// The trees this directory fast-forwarded, oldest first. Walking the log backwards also
-// walks checkout entries backwards, so each landing keeps the branch that moved then.
+// Read checkout entries backward to recover each landing's destination branch. Return landings oldest first.
 export function landingsInHeadLog(stdout: string, currentHead: CommitHead): RepositoryLanding[] {
   const found: RepositoryLanding[] = [];
   let head = currentHead;
@@ -237,12 +184,8 @@ export function pointsAtArgs(sha: string): string[] {
   return ['for-each-ref', '--points-at', sha, '--format=%(refname:short)', 'refs/heads'];
 }
 
-// The branch a landing brought in. A ref name the merge command named is that branch. A hash
-// is answered by the branches pointing at the commit, taking the first that is not the branch
-// the merge moved, because that branch points at the commit too once it has moved. None is null.
-//
-// The answer is read when the landing is recorded and kept. Asked later it answers wrong,
-// because branches move on and are deleted, and a later branch can come to point at the commit.
+// Use the merge command's ref name directly. For a hash, select the first pointing branch other than the destination branch.
+// Capture that branch when recording the landing because refs move or disappear later.
 export function mergedBranchOf(from: string, pointsAt: string | null, head: CommitHead): string | null {
   if (!HEX_SHA.test(from)) {
     return from;
@@ -256,8 +199,7 @@ export function mergedBranchOf(from: string, pointsAt: string | null, head: Comm
   );
 }
 
-// The subject of one commit, for a landing. A landing knows its sha from the head log and
-// nothing else, and a row carrying a sha alone says nothing a reader can use.
+// Read the subject of the landed commit for its display row.
 export function subjectArgs(sha: string): string[] {
   return ['log', '-n', '1', '--format=%s', sha, '--'];
 }
@@ -274,14 +216,12 @@ export function logArgs(from: number, to: number): string[] {
   ];
 }
 
-// One commit whose identity the transcript already supplied. The exact revision keeps this
-// fallback from searching an open folder for a commit that the command directory did not prove.
+// Read the exact printed commit identity without walking a folder's history.
 export function exactCommitArgs(sha: string): string[] {
   return ['log', '--no-walk', `--format=${LOG_FORMAT}`, '--shortstat', sha, '--'];
 }
 
-// git writes the commits newest first. They are turned around here because a turn that made
-// several made them in the other order, and the card lists them the way they happened.
+// Reverse Git's newest-first output so turn commits appear in creation order.
 export function parseCommitLog(stdout: string): RepositoryCommit[] {
   const found: RepositoryCommit[] = [];
   for (const chunk of stdout.split(RECORD)) {
@@ -298,8 +238,7 @@ export function parseCommitLog(stdout: string): RepositoryCommit[] {
     if (!Number.isFinite(at)) {
       continue;
     }
-    // A commit that changed nothing prints no stat block, and git writes a blank line before
-    // the one it does print, so the search runs over the whole record.
+    // Search all remaining record lines for shortstat. Empty commits have no shortstat block.
     let stat: { files: number; added: number; removed: number } | null = null;
     for (let i = 1; i < lines.length; i++) {
       stat = parseStatLine(lines[i].trim());
@@ -319,16 +258,8 @@ export function parseCommitLog(stdout: string): RepositoryCommit[] {
   return found.reverse();
 }
 
-// What one `git rev-parse` says about a directory.
-//
-// `commonDir` identifies the repository. A linked worktree and the tree it came from report
-// the same one, whatever their paths look like.
-//
-// `linked` tells the two apart. Git gives the main tree the same directory for its own state
-// as for the state it shares, and gives a linked worktree one of its own underneath it.
-//
-// `root` is the top of the tree the directory sits in, so a commit made in a subdirectory is
-// still drawn against the tree that holds it rather than against the subdirectory's name.
+// Describe repository identity from `rev-parse`. Linked worktrees share `commonDir` and have a distinct Git directory.
+// `root` names the worktree root even when the command runs in a subdirectory.
 export interface RepositoryPlace {
   commonDir: string | null;
   linked: boolean;
@@ -348,40 +279,21 @@ export function parseIdentity(stdout: string | null): RepositoryPlace {
 
 const UNKNOWN_PLACE: RepositoryPlace = { commonDir: null, linked: false, root: null };
 
-// The repository a commit is in, by the directory git answered for. A directory git could not
-// name has none. The repository is the open folder's own when its key is an open folder's key,
-// so a repository nested inside an open folder is not, while a linked worktree of it is.
+// Match repository ownership by common Git directory. Linked worktrees share ownership with open folders. Nested independent repositories do not.
 export function repositoryOf(dir: string, place: RepositoryPlace, folderIdentities: string[]): CommitRepository | null {
   return place.commonDir === null
     ? null
     : { key: place.commonDir, root: place.root ?? dir, own: folderIdentities.includes(place.commonDir) };
 }
 
-// The branch a directory is on, for a commit read back from it.
-//
-// Every commit this reader returns was found by walking that directory's own `HEAD`, so it
-// is on that branch. A detached head names no branch, and saying so would claim the commit
-// was made outside one, which is a claim about how it was made rather than where it sits.
+// Read the current branch name. A detached HEAD or missing answer supplies no branch name.
 export function parseBranch(stdout: string | null): CommitHead {
   const line = (stdout ?? '').split('\n')[0]?.trim();
   return !line || line === 'HEAD' ? null : { kind: 'branch', name: line };
 }
 
-// Which commits in the window belong to the call, or none.
-//
-// `made` is what the directory's own head log recorded. A commit outside it belongs to
-// another tree, however reachable it is from the branch this one is on now.
-//
-// Git stores a commit time as whole seconds, and a window's bounds carry milliseconds, so
-// the window is widened to the second before it is applied. A commit the call made always
-// survives that widening, because its own second cannot fall outside the seconds its window
-// began and ended in. A commit somebody else made in the same second survives it too.
-//
-// `expected` is what separates the two. It is how many times the command said `git commit`,
-// so a window holding exactly that many is the call's own work. Any other count means the
-// window is answering about something else, and nothing is named. Naming another session's
-// commit as this turn's work is the failure this exists to prevent, and missing a commit
-// only leaves the card as it was.
+// Select commits inside the whole-second call window and the worktree's commit reflog. Reject windows over the log limit.
+// Require the selected count to match the command's expected commit count. A witnessed hash must identify the sole selected commit.
 export function chooseCommits(
   found: RepositoryCommit[],
   from: number,
@@ -402,13 +314,8 @@ export function chooseCommits(
   return inWindow.length === expected ? inWindow : [];
 }
 
-// Where a commit made in `dir` landed, once the repository has been asked.
-//
-// A directory inside an open folder says nothing extra, the way it always has: the card it
-// is on already says where it is. A directory outside every open folder is decided by the
-// repository rather than by the path. A linked worktree shares the object store and the
-// branch refs of the folder it came from, so a commit made there is this project's work on a
-// branch the reader will merge. Only a different repository is somebody else's.
+// Omit a place label inside an open folder. Otherwise classify a shared repository as a worktree or main tree.
+// An independent or unknown repository uses the command directory as its named place.
 export function placeOf(
   dir: string,
   place: RepositoryPlace,
@@ -421,9 +328,7 @@ export function placeOf(
   if (place.commonDir === null || !folderIdentities.includes(place.commonDir)) {
     return { kind: 'named', dir };
   }
-  // Both trees report the same common directory, so the test is symmetric and the reader can
-  // be standing in either one. The row names the tree the commit was made in rather than the
-  // directory the command ran in, which is often a subdirectory of it.
+  // Name the worktree root when available, even if the command ran in a subdirectory.
   const named = place.root ?? dir;
   return place.linked ? { kind: 'worktree', dir: named } : { kind: 'maintree', dir: named };
 }
@@ -432,14 +337,12 @@ export function intentKey(intent: CommitIntent): string {
   return `${normalizeFsPath(intent.dir)}|${intent.from}|${intent.to}|${intent.expected}|${intent.witnessedSha ?? ''}`;
 }
 
-// One call can commit and merge in the same window, in the same directory, the same number of
-// times. The two questions are told apart by what they ask for rather than by their window.
+// Distinguish commit and landing queries even when their directory, time window, and expected count match.
 export function landingKey(intent: LandingIntent): string {
   return `landing|${intent.id ?? ''}|${intentKey(intent)}`;
 }
 
-// What one call's window answered: the commits, and the branch the directory was on when the
-// answer was read.
+// Retain selected commits and the branch reported when reading the window.
 interface Answer {
   found: RepositoryCommit[];
   head: CommitHead;
@@ -455,20 +358,13 @@ interface CandidateQuery {
   folders: string[];
 }
 
-// The same for a call that merged: what the tree landed on, and the branch that moved.
+// Retain selected landings with their subjects and merged branch names.
 interface LandingAnswer {
   found: Array<RepositoryLanding & { subject: string; mergedBranch: string | null }>;
 }
 
-// Which landings in the window belong to the call, or none.
-//
-// The head log is already this directory's own, so nothing another tree did can appear in it.
-// What can appear is a second session merging in the same tree, and `expected` is what refuses
-// that: it is how many times the command said `git merge`, so a window holding any other
-// number is answering about something else.
-//
-// A merge that made a merge commit is no landing and writes no entry this reads, so a command
-// that made one holds fewer landings than it expected and names nothing.
+// Select landings inside the whole-second call window. Require their count to match the expected merges.
+// Merge commits produce no matching landing entry, so a mixed or incomplete count is rejected.
 export function chooseLandings<T extends { at: number }>(found: T[], from: number, to: number, expected: number): T[] {
   if (expected <= 0) {
     return [];
@@ -479,11 +375,7 @@ export function chooseLandings<T extends { at: number }>(found: T[], from: numbe
   return inWindow.length === expected ? inWindow : [];
 }
 
-// Fills in what the printed output did not carry, and corrects what a path test alone got
-// wrong.
-//
-// `apply` is synchronous and draws only from answers already held. Work it has no answer for
-// is asked for in the background, and `onFilled` says that a later render has more to draw.
+// Fill missing commit identities and classify their repositories. Apply held answers immediately and fetch missing answers asynchronously.
 export class RepositoryCommits {
   private readonly answers = new Map<string, Answer>();
   private readonly exactAnswers = new Map<string, ExactAnswer>();
@@ -546,9 +438,7 @@ export class RepositoryCommits {
           }
           this.adopt(owner, answer, intent.dir, folderIdentities, folders);
         }
-        // A printed commit says where it landed from its path alone, which reads a linked
-        // worktree of this repository as somebody else's. Correcting it here keeps one answer
-        // for a place, whether the commit was printed or read back.
+        // Classify printed commits by repository identity as well as path, so linked worktrees retain their project's ownership.
         for (const commit of owner.commits) {
           if (commit.candidates) {
             const evidence = commit.candidates;
@@ -604,8 +494,7 @@ export class RepositoryCommits {
           commit.repository = repositoryOf(dir, place, folderIdentities);
         }
       }
-      // A commit read back for a child joins the child's figures, which its own record left
-      // without it.
+      // Add recovered commits to the subagent's artifact figures.
       for (const agent of turn.agents) {
         if (agent.artifacts && agent.commits?.length) {
           agent.artifacts = withRecoveredCommits(agent.artifacts, agent.commits, sameCommitSha);
@@ -638,9 +527,7 @@ export class RepositoryCommits {
       if (cleared) this.onFilled();
       return;
     }
-    // A question is marked as asked here rather than where it is put, because a batch waits
-    // for the batch before it. A listing calls `apply` for each session it draws, and every
-    // one of those would queue the same question again while the first was still waiting.
+    // Mark queries in flight before queuing the batch. Repeated session renders then cannot queue the same unanswered query.
     const keys = [
       ...dirs.map(normalizeFsPath),
       ...wanted.map(intentKey),
@@ -651,23 +538,17 @@ export class RepositoryCommits {
     for (const key of keys) {
       this.asking.add(key);
     }
-    // One batch at a time. Unqueued batches would start a process apiece.
-    //
-    // The chain swallows what a batch throws. A rejected chain answers every later batch
-    // without running it, and the questions those batches marked as asked would stay marked,
-    // so one failed repaint would stop the reader from ever asking anything again.
+    // Serialize batches. Catch batch failures so one rejected batch cannot block subsequent reads.
     this.work = this.work.then(() => this.ask(wanted, merged, dirs, shas, folders, keys, candidates)).catch(() => {});
     if (cleared) this.onFilled();
   }
 
-  // Whether a question is worth putting to git: not already in flight, and not one that has
-  // failed as often as this reader is willing to ask.
+  // Accept queries that are not in flight and have not reached the retry limit.
   private wants(key: string): boolean {
     return !this.asking.has(key) && (this.attempts.get(key) ?? 0) < READ_ATTEMPTS;
   }
 
-  // One directory, however it is spelled. The two spellings of one folder are one question,
-  // and raw string equality would put it twice.
+  // Deduplicate directory queries by normalized filesystem path.
   private want(dir: string, dirs: string[]): void {
     const key = normalizeFsPath(dir);
     if (this.identities.has(key) || !this.wants(key) || dirs.some((d) => normalizeFsPath(d) === key)) {
@@ -731,18 +612,13 @@ export class RepositoryCommits {
       });
       added = true;
     }
-    // A printed commit carries the time its output was read and a read-back one carries
-    // git's own, so a card holding both would list them out of order without this.
+    // Sort printed and recovered commits together because their timestamps come from different sources.
     if (added) {
       turn.commits.sort((a, b) => a.at - b.at);
     }
   }
 
-  // The landings one call made, once the head log has answered.
-  //
-  // A landing is stamped with the end of the call's own window rather than with the commit's
-  // time. The commit was written earlier, often in another tree and on another day, and what
-  // this row reports is when the turn moved the tree onto it.
+  // Record landing time as the call's end time. The landed commit's creation time does not describe when this turn moved the branch.
   private adoptLandings(
     turn: Turn,
     answer: LandingAnswer,
@@ -775,9 +651,7 @@ export class RepositoryCommits {
     }
   }
 
-  // Every read goes through this, so a runner that rejects counts as a read that failed. A
-  // rejection reaching the loop instead would leave the attempt uncounted, and the ceiling on
-  // asking would not hold for it.
+  // Treat runner rejections as failed reads so they count toward the retry limit.
   private read(dir: string, args: readonly string[]): Promise<string | null> {
     return this.runner.run(dir, [...args]).catch(() => null);
   }
@@ -869,18 +743,11 @@ export class RepositoryCommits {
         if (answer && !inconclusive) this.exactAnswers.set(key, answer);
         else this.giveUp(key, 'exact');
       }
-      // The branch is read beside the commits rather than kept, because a directory changes
-      // branch and a card must not name the one it was on last time. Several calls in one
-      // directory share the one read, because they are answered in the same pass.
-      //
-      // It is read first. A branch read that fails answers the same as a detached head, so
-      // recording the commits without it would keep a wrong silence for good. A failed read
-      // is no answer at all, and the whole call is asked about again.
+      // Read the branch before each directory's commit log and reuse it within the batch. Retry the window if the branch read fails.
       const branches = new Map<string, string | null>();
       for (const intent of intents) {
         const key = intentKey(intent);
-        // The head log is read first, because a window this directory made no commit in needs
-        // no other read at all.
+        // Read the HEAD reflog before the branch and commit log. An empty commit set needs neither additional read.
         const moves = await this.read(intent.dir, reflogArgs(intent.from, intent.to));
         if (moves === null) {
           this.giveUp(key, 'window');
@@ -928,11 +795,7 @@ export class RepositoryCommits {
           this.landed.set(key, { found: [] });
           continue;
         }
-        // The head log carries the sha and the name the command named, and no subject. A row
-        // holding a sha and nothing else says nothing a reader can use, so the subject is read
-        // before anything is drawn.
-        //
-        // The branch the merge brought in is read here too, once, while the branches still say it.
+        // Read landing subjects and merged branch names before publishing the rows. Capture current pointing branches for hash-based merge sources.
         const named: LandingAnswer['found'] = [];
         for (const one of found) {
           const subject = await this.read(intent.dir, subjectArgs(one.sha));
@@ -960,15 +823,11 @@ export class RepositoryCommits {
         this.asking.delete(key);
       }
     }
-    // A batch runs only where there was a question, and every answer changes what a render
-    // can draw: what the reader learned, or what it has settled for after asking too often.
-    // An idle panel repaints on a change alone, so the batch has to ask for one.
+    // Request a render after the batch settles so the panel displays new answers or exhausted retries.
     this.onFilled();
   }
 
-  // A read that failed is not an answer, so the next render asks again. A directory that is
-  // gone never answers, so the asking stops after a few tries. A failed window settles as
-  // empty, a directory settles as unknown, and an exact sha remains unavailable.
+  // Retry failed reads up to the limit. Then commit and landing windows settle empty, directories settle unknown, and exact identities remain unavailable.
   private giveUp(key: string, asked: 'window' | 'directory' | 'exact' | 'landing'): void {
     const tried = (this.attempts.get(key) ?? 0) + 1;
     this.attempts.set(key, tried);

@@ -1,22 +1,4 @@
-// The panel, laid out by a real browser.
-//
-// Unit tests cover imported behavior and static ownership. They cannot catch a wrong layout,
-// because nothing in them measures rendered geometry.
-//
-// That shipped once: the usage strip was added as a full-width flex item, which meant the
-// body had to wrap, and a wrapping body drops `#list` onto a line of its own under the rail
-// because the list sizes from its content. The panel opened on the rail's empty column and
-// the turns were a screen further down. Every check in this repo stayed green.
-//
-// This file takes the packaged page from `panelfixture.ts`, hands it one render, and measures
-// the result.
-//
-// It drives a browser already on the machine rather than downloading one, and **skips
-// itself when there is none**, so a machine or a CI box without one still runs a green
-// suite rather than a red one it cannot fix.
-//
-// Fixtures and measurement helpers shared across the sibling `panel.layout.*.test.ts` files
-// live in `../test/layout.ts`. This file carries the tests that do not fit one of those subjects.
+// Browser tests measure the packaged panel page. Shared fixtures and helpers live in `../test/layout.ts`. Tests skip without an installed supported browser.
 
 import { test } from 'vitest';
 import assert from 'node:assert';
@@ -66,7 +48,7 @@ import {
   subagentRows,
 } from '../test/layout.ts';
 
-// The mark a finished row draws, named once because two fixture rows are finished.
+// Finished fixture rows share the same state mark.
 const DONE_MARK = '\u2713';
 
 test(
@@ -117,7 +99,7 @@ test(
     }
   },
 );
-// The tone each row state draws its mark in, whatever the status of the card around the row.
+// Row-state tones are independent of the surrounding card's status.
 const MARK_TONES = {
   done: '--ok',
   running: '--busy',
@@ -127,7 +109,7 @@ const MARK_TONES = {
   stopped: '--idle',
 };
 
-// What a reader sees and hears of each subagent row under one root.
+// Read visible and accessible subagent row values under one root.
 const SUBAGENT_ROWS = `((root) => {
   const probe = (css) => {
     const node = document.createElement('span');
@@ -325,28 +307,23 @@ type SubagentRow = {
   figures: SubagentFigure[];
 };
 
-// Every visible rule the corrected row keeps, wherever it is drawn and at whatever width. Each
-// one is measured against the row's own text size, so a reader's editor font moves them all
-// together and none of them is pinned to a pixel count this file chose.
-// The row's height in its own text size, which is the one measure the reader judges by eye. A
-// two-line row of a one-line name over a one-line facts run stands 3.82 of its own ems, with
-// the figures at the pill height every other figure in the panel stands at. Half an em of row
-// gap carries it past this.
+// Two single-line text runs use a height bound in the row's own em units.
+
 const PLAIN_ROW_EMS = 3.9;
 
 function readsAsTheApprovedRow(rows: SubagentRow[], where: string): void {
   let sharedLine = 0;
   let plain = 0;
   for (const row of rows) {
-    // The row is two lines of text and nothing more. A gap between them, a padded figure or a
-    // margin between rows each read as the loose column the owner asked to have back.
+    // Apply the height bound to rows whose name and facts each occupy one line.
+
     if (row.nameLines === 1 && row.factsLines === 1) {
       plain += 1;
       const ems = row.height / row.size;
       assert.ok(ems <= PLAIN_ROW_EMS, `${row.text} in the ${where} is ${ems}em tall over two lines of its own text`);
     }
-    // Three tenths of an em, not the fifth the facts margin asks for: the state mark's box is
-    // taller than the head beside it, so the first grid track hangs a sliver below the head.
+    // The taller state mark slightly increases the gap below the first grid track.
+
     assert.ok(
       row.factsGap <= 0.3,
       `${row.text} in the ${where} leaves ${row.factsGap}em between its name and its figures`,
@@ -362,11 +339,8 @@ function readsAsTheApprovedRow(rows: SubagentRow[], where: string): void {
       row.markBaseline <= 1,
       `${row.text} in the ${where} drops its name ${row.markBaseline}px off its state mark`,
     );
-    // Where the figure run starts against the name above it. `lineRects` returns the first
-    // figure's border box, so this reads the pill's own left edge and not its ink, which
-    // sits a quarter em further right under the padding the pill wears. The run is pulled
-    // back by that quarter em, which puts the edge a sliver left of the name's first letter
-    // and holds the whole measure inside a third of an em either way.
+    // `lineRects` measures figure border boxes. The indentation assertion allows for the chip's text padding.
+
     if (row.factsIndent !== null) {
       assert.ok(
         row.factsIndent >= 0.05 * row.size && row.factsIndent <= 0.35 * row.size,
@@ -386,9 +360,8 @@ function readsAsTheApprovedRow(rows: SubagentRow[], where: string): void {
     }
     if (row.modelOnNameLine) {
       sharedLine += 1;
-      // The name sizes to its words and the model run holds the right end of line one, so
-      // the gap between them is the head's own gap at its narrowest and the leftover width
-      // wherever the name is short of the column.
+      // A shared name-and-model line retains at least the head's minimum gap.
+
       assert.ok(
         (row.modelGap as number) >= 0.4 - 0.08,
         `${row.text} in the ${where} parts its name and its model by ${row.modelGap}em`,
@@ -406,15 +379,14 @@ function readsAsTheApprovedRow(rows: SubagentRow[], where: string): void {
   assert.ok(plain > 0, `no row in the ${where} draws one line of name over one line of figures`);
 }
 
-// The card section and the chip popover draw one component, so the same row measures the same
-// in both. The two sit in different containers, so this compares what the row itself owns.
+// Compare dimensions owned by the shared row across the card and popover.
+
 function sameGeometry(card: SubagentRow[], pop: SubagentRow[], where: string): void {
   assert.equal(card.length, pop.length, `the card and the popover drew different row counts ${where}`);
   for (const [index, row] of card.entries()) {
     const held = pop[index];
-    // Not which line the model run takes: the popover is narrower than the card body it sits
-    // over, so a long name shares its line in one surface and fills it in the other. Every
-    // measure below is in CSS pixels, so one tolerance covers all three.
+    // Container widths can change which line holds the model. The comparisons below use CSS pixels.
+
     assert.deepEqual(
       [row.figures, row.modelRunLines, row.modelMargin],
       [held.figures, held.modelRunLines, held.modelMargin],
@@ -613,8 +585,8 @@ test('a dispatched session uses the child row in its section and figure', { time
   }
 });
 
-// How a nested record draws each of its parts: the popover, its heading, an entry's head, its
-// label and value, a line under an entry, and the rule that parts one block from the next.
+// Read nested popover styles for headings, entries, values, supporting lines, and separators.
+
 const NESTED_RECORD_STYLE = `(() => {
   const pop = document.querySelector('#chippopnested');
   const pick = (selector, props) => {
@@ -656,7 +628,7 @@ test("a subagent's duration record draws like its cost record", { timeout: 60_00
     await page.evaluate(SETTLED);
     const card = page.locator('#list .turn').first();
     await card.locator('.head').click();
-    // The finished child that recorded its calls, its failures and when it ran.
+    // The finished child fixture includes tool counts, failures, and runtime.
     const row = card.locator('.recordagents .agentrow').nth(1);
     const open = async (metric: string) => {
       await page.keyboard.press('Escape');
@@ -688,8 +660,8 @@ test("a subagent's duration record draws like its cost record", { timeout: 60_00
   }
 });
 
-// A running child with recorded spend draws its cost so far, marked as a lower bound, and its
-// record says the child is still running. It draws no commits and no files until it ends.
+// A running child displays partial cost and its running state, without completed file or commit figures.
+
 test('a running subagent row draws its cost so far and the record that says so', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -803,12 +775,11 @@ test(
       }
       await card.locator('.statchip[data-metric="agents"]').click();
       await page.evaluate(SETTLED);
-      // The page clock holds still from here, so the running figures move only when the test says.
-      // It pauses a second ahead, because a pause cannot move the clock back to an instant the
-      // page has already passed.
+      // Pause the page clock ahead of its current time so later advances control elapsed figures.
+
       await page.clock.pauseAt(Number(await page.evaluate('Date.now()')) + 1_000);
-      // The rows are measured while the popover is open. A popover that shut first leaves its
-      // rows unlaid, and every rectangle read from them is zero.
+      // An open popover is required because hidden rows have zero rectangles.
+
       assert.equal(
         await page.locator('#chippop').isHidden(),
         false,
@@ -837,8 +808,8 @@ test(
         ],
       );
       for (const row of pop) {
-        // The figures read in the idle tone every card, heading and rail figure takes, not in
-        // the tint the popover's own paths take.
+        // Figures use the shared idle tone independently of path-link colors.
+
         assert.deepEqual(
           [row.markTone, row.factsTone, row.factsSize, row.underline, row.twoLines, row.label],
           [true, true, true, false, true, null],
@@ -850,7 +821,7 @@ test(
         pop.map((row) => row.wordTone),
         [null, true, true, true, true, true, true, null],
       );
-      // A running word under a minute holds no space the time has not filled.
+      // A running duration below one minute omits an empty time suffix.
       assert.deepEqual(
         pop.map((row) => row.word),
         [null, 'failed', 'running 21m', 'running', 'interrupted', 'stopped', 'running', null],
@@ -859,9 +830,8 @@ test(
         pop.map((row) => row.ticks),
         [false, false, true, true, false, false, false, false],
       );
-      // The row opens nothing, so its hover is headed by the words that name a record rather
-      // than an action. The name beside it carries the press and the same record, and no row
-      // carries a native tooltip.
+      // The row hint describes its run. The name link also opens its session.
+
       assert.deepEqual(
         pop.map((row) => [row.hint, row.detail, row.title]),
         [
@@ -881,7 +851,7 @@ test(
           [CARD_ACTIONS.openSubagentSession, REVIEW_CHILD_HINT],
           [CARD_ACTIONS.openSubagentSession, '2 tools'],
           [CARD_ACTIONS.openSubagentSession, null],
-          // The child with no session to open draws a plain name and no press at all.
+          // A child without a session has a plain name and no session action.
           [null, null],
           [CARD_ACTIONS.openSubagentSession, null],
           [CARD_ACTIONS.openSubagentSession, null],
@@ -889,19 +859,18 @@ test(
           [CARD_ACTIONS.openSubagentSession, '412 tools'],
         ],
       );
-      // A row is one keyboard stop whatever its figures come to. The first figure holding a
-      // record takes it, the arrow keys cross to the rest, and a figure with nothing behind it is
-      // plain text the keyboard passes by.
+      // Figures share one keyboard stop. Arrow keys reach other actionable figures.
+
       assert.deepEqual(pop[0].figureStops, [true, false, false, false]);
       assert.deepEqual(
         pop.map((row) => row.rowStop),
         [false, false, false, true, false, false, false, false],
       );
 
-      // The spoken names carry what the rows draw, the state a finished row leaves unsaid, and
-      // the running time.
-      // Chrome parts a visually hidden span from the text before it with a space, which a screen
-      // reader does not voice before a comma.
+      // Accessible names include state and elapsed runtime.
+
+      // Normalize Chrome's hidden-text space before commas in the accessibility snapshot.
+
       const names = (await page.locator('#chippop .chippoprows').ariaSnapshot()).replace(/ ,/g, ',');
       for (const name of [
         'button "Open Review child session,"',
@@ -910,13 +879,13 @@ test(
       ]) {
         assert.ok(names.includes(name), `the rows are not announced as ${name}:\n${names}`);
       }
-      // The row with no session draws no press, so its name reads as the row's own text.
+      // A row without a session link announces its session as unavailable.
       assert.ok(
         names.includes('Quiet child, haiku-4-5 running, session unavailable'),
         `a row with no session to open does not say so: ${names}`,
       );
 
-      // The name says what its press does and carries the run line the figures do not own.
+      // The name link's hint includes the run details.
       const name = page.locator('#chippop .namelink').first();
       await name.focus();
       await page.clock.runFor(1_000);
@@ -930,9 +899,8 @@ test(
         [CARD_ACTIONS.openSubagentSession, REVIEW_CHILD_HINT, 'hintdetail'],
       );
 
-      // A figure answers for its own total in a popover of its own, drawn over the popover the
-      // figure sits in. `#chippop` is one element with one anchor, so a record drawn into it
-      // would take away the row the figure belongs to.
+      // Figure details use a nested popover so they preserve the enclosing subagent list.
+
       const cost = page.locator('#chippop .agentrow .railstatchip[data-metric="cost"]').first();
       await cost.hover();
       await page.clock.runFor(1_000);
@@ -941,8 +909,8 @@ test(
         false,
         'the cost figure opened no record of its own',
       );
-      // The record wears the shape the card's own records wear: a heading, the value in a second
-      // column, and the lines indented under it. The hint box held one run of plain text.
+      // Nested cost details use structured heading, value, and supporting lines.
+
       assert.deepEqual(
         await page.evaluate(`(() => {
       const pop = document.querySelector('#chippopnested');
@@ -962,8 +930,8 @@ test(
         ['$0.31 spent', 'Cost by usage · opus-5', '$0.31', true, 'Output: $0.11', true],
         'the cost record is not drawn in the shape the card draws its own',
       );
-      // Both popovers stand at the same z-index, so the later one in the body draws over the
-      // earlier one.
+      // Equal z-index values place the later body-mounted popover above the earlier one.
+
       assert.deepEqual(
         await page.evaluate(`(() => {
       const nested = document.querySelector('#chippopnested');
@@ -980,9 +948,8 @@ test(
         [true, true, true],
         'the figure record drew under the Subagents popover',
       );
-      // A figure wears the mark while its own record stands, the way a chip wears it while its
-      // popover stands, and `.agentfacts .detail-pinned` draws it lit. The figure beside it
-      // holds no record, so it is never marked.
+      // The pinned-detail class marks only the figure with open details.
+
       const pinned = async (metric: string): Promise<boolean> =>
         (
           (await page
@@ -992,9 +959,8 @@ test(
         )
           .split(' ')
           .includes('detail-pinned');
-      // A press pins the record and the figure wears the mark while it stands, the way a chip
-      // wears it while its popover stands. A second press on the same figure closes the record.
-      // The figure beside it holds no record, so it is never marked.
+      // A second figure press closes its pinned detail.
+
       await cost.dispatchEvent('click');
       assert.deepEqual(
         [await pinned('cost'), await pinned('tokens')],
@@ -1007,8 +973,8 @@ test(
         true,
         'a second press on the figure left its record open',
       );
-      // Away from a figure the row answers for itself with the run line alone, and the record
-      // over it goes with the pointer.
+      // Hovering the row closes figure details and displays the run hint.
+
       await page
         .locator('#chippop .agentrow')
         .first()
@@ -1023,11 +989,11 @@ test(
         [true, CARD_ACTIONS.subagentRecord, REVIEW_CHILD_HINT],
         'the row repeats a record a figure owns',
       );
-      // The mark follows the record, so the figure goes dark as soon as the record closes.
+      // Closing details clears the figure's pinned mark.
       assert.equal(await pinned('cost'), false, 'the cost figure stayed lit after its record closed');
 
-      // The name reads as the row's own text until the reader reaches it, and takes the link
-      // colour under the pointer and under the keyboard alike.
+      // The name uses link color during pointer hover and keyboard focus.
+
       const linkTone = (await page.evaluate(`(() => {
       const node = document.createElement('span');
       node.style.color = 'var(--vscode-textLink-foreground)';
@@ -1049,9 +1015,8 @@ test(
       assert.notEqual(await nameTone(), linkTone, 'the name reads as a link before the reader reaches it');
       await page.locator('#chippop .namelink').first().hover();
       assert.equal(await nameTone(), linkTone, 'the name takes no link colour under the pointer');
-      // Reached by the Tab key rather than by a script, because the ring and the colour a
-      // keyboard earns are drawn on `:focus-visible`. The figure beside the name is the next
-      // stop, so the name is the one behind it.
+      // Use Shift+Tab to exercise `:focus-visible` on the name link.
+
       await page.mouse.move(0, 0);
       await cost.focus();
       await page.keyboard.press('Shift+Tab');
@@ -1061,10 +1026,10 @@ test(
       );
       assert.equal(await nameTone(), linkTone, 'the name takes no link colour from the keyboard');
 
-      // The name is the row's one press. A press beside it opens nothing, which is what leaves
-      // every figure a hover of its own.
-      // The clock is paused here, so each press is dispatched rather than pointed at: a real
-      // press waits for the element to settle, and nothing settles while the clock stands.
+      // Only the name link opens the session. The row body leaves it closed.
+
+      // Dispatch clicks while the clock is paused to avoid waiting for actionability animations.
+
       const opened = () => page.evaluate(`window.__posted.filter((message) => message.type === 'showSession').length`);
       const before = (await opened()) as number;
       await page.locator('#chippop .agentrow').first().dispatchEvent('click');
@@ -1075,9 +1040,8 @@ test(
         { type: 'showSession', session: 'child-session' },
       );
 
-      // The row with no session to open is a focus stop of its own, and the Tab key reaches its
-      // record through the same hint. That record was in a native tooltip, which opens for a
-      // pointer and for nothing else.
+      // A row without a session link exposes its run hint through keyboard focus.
+
       const quiet = page.locator('#chippop .agentrow[tabindex="0"]');
       await quiet.focus();
       assert.deepEqual(
@@ -1092,21 +1056,20 @@ test(
         'the row with no session to open keeps its record from the keyboard',
       );
 
-      // The running figures move with the panel clock, and one under a minute reaches its first.
+      // Advancing the controlled page clock updates running durations, including the first minute.
       await page.clock.runFor(60_000);
       const later = (await page.evaluate(`${SUBAGENT_ROWS}('#chippop')`)) as SubagentRow[];
       assert.deepEqual(
         later.slice(2, 4).map((row) => row.word),
         ['running 22m', 'running 1m'],
       );
-      // An open child outside a running turn draws no time and never gains one.
+      // An open child outside a running turn has no elapsed clock.
       assert.deepEqual([later[6].word, later[6].ticks], ['running', false]);
-      // The first Escape closes the hint the focused row opened. The popover under it stays, and
-      // the second closes that, so the next press of the chip opens the popover rather than
-      // shutting one that was never closed.
+      // The first Escape closes the focused row's hint while preserving the enclosing popover.
+
       await page.keyboard.press('Escape');
-      // The page clock runs again from here. A render settles on a frame, and a paused clock
-      // never reaches one.
+      // Resume the page clock before waiting for render animation frames.
+
       await page.clock.resume();
       await page.evaluate(SETTLED);
       assert.equal(
@@ -1114,10 +1077,8 @@ test(
         false,
         'Escape closed the Subagents popover rather than the row hint over it',
       );
-      // The widest panel draws the same row. Every name has room to share its line with its model
-      // run there, so the gap between the two is measured at this width as well as at the narrow
-      // one, where a long name takes the whole line and pushes the run under it. The popover is
-      // still the one opened above: rows measured in a shut popover have no rectangles at all.
+      // Measure the still-open popover at wide width, including shared name-and-model lines.
+
       await page.setViewportSize({ width: 1350, height: 900 });
       await page.evaluate(SETTLED);
       assert.equal(
@@ -1127,9 +1088,8 @@ test(
       );
       const widePop = (await page.evaluate(`${SUBAGENT_ROWS}('#chippop')`)) as SubagentRow[];
       readsAsTheApprovedRow(widePop, 'popover at 1350px');
-      // The rail's figure and the session heading's are one pill face. The subagent row draws the
-      // same pill rule and then tightens it, because its two lines sit inside one card row. Each
-      // box is read in the pill's own text size, so an editor font moves none of these numbers.
+      // Normalize figure measurements to each figure's own font size.
+
       const pills =
         (await page.evaluate(`['#chippop .agentrow .railstatchip', '#rail .railstats .railstatchip', '.sessionstats .statchip']
       .map((one) => {
@@ -1141,12 +1101,12 @@ test(
           .map((value) => Math.round((Number.parseFloat(value) / size) * 100) / 100);
       })`)) as Array<string | number[]>;
       const [rowPill, railPill, sessionPill] = pills;
-      // The shared pill's own face. Without these numbers a flattened shared rule would leave
-      // all three equal to one another at a face none of them was drawn at.
+      // Check the shared figure dimensions before comparing rendered peers.
+
       assert.deepEqual(railPill, [0.1, 0.1, 0.5, 0.5, 1.3], 'the rail figure lost the shared pill face');
       assert.deepEqual(sessionPill, railPill, 'the rail figure and the session figure part company');
-      // The row's own face takes the shared pill's padding and leading unchanged, the same as the
-      // rail figure and the session figure above.
+      // Subagent figures retain the same shared dimensions.
+
       assert.deepEqual(rowPill, railPill, 'the subagent row figure did not take the shared pill face');
       await page.keyboard.press('Escape');
       await page.evaluate(SETTLED);
@@ -1156,7 +1116,7 @@ test(
         'the Subagents popover stayed open after its row hint closed',
       );
 
-      // The card's Subagents section draws the same component, so the two markups match.
+      // The card's Subagents section uses the shared row renderer.
       Object.assign(payload, { timelineLayout: { cardLayout: 'one-column', promptPosition: 'above' } });
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
@@ -1184,8 +1144,8 @@ test(
       );
       readsAsTheApprovedRow(body, 'card at 340px');
       sameGeometry(body, pop, 'at 340px');
-      // The card carries its own status as a class, and every row still draws its mark in its own
-      // state's tone, in the card section and in the popover, whatever that status is.
+      // Subagent state-mark tones remain independent of the containing card's status.
+
       for (const status of ['done', 'running', 'stopped', 'interrupted', 'failed']) {
         turn.status = status;
         await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
@@ -1282,7 +1242,7 @@ test(
         const payload = renderPayload();
         const rows = payload.sessions as Array<Record<string, unknown>>;
         rows[0].fullLabel = 'A complete session name that is longer than the compact heading value';
-        // The command the panel words for this row. Nothing on the wire carries one.
+        // The expected resume command is formed from the session row.
         const command = 'claude --resume s1';
         await page.setViewportSize({ width, height: 900 });
         await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
@@ -1653,9 +1613,8 @@ test(
           false,
           `the ${rowCount}-row rail is hidden at the wide width`,
         );
-        // Sessions rather than cards. A session two saved views both match draws a
-        // card under each of their sections, which is the rule, so a count of cards would read
-        // that as a rail holding more sessions than it was sent.
+        // Count distinct session identities because saved views can repeat session list cards.
+
         assert.equal(
           await page
             .locator('#rail .railcard')
@@ -1755,9 +1714,8 @@ test(
           const prompt = page.locator('#prompt');
           await prompt.fill('kept across widths');
           await prompt.focus();
-          // The session marked as current, and not the cards marking it. A session two
-          // saved views both match draws a card under each of their sections, which is the rule,
-          // so a count of cards would read one selected session as several.
+          // Count selected session identities independently of repeated matching cards.
+
           assert.deepEqual(
             await page
               .locator('#rail .railcard.is-current')
@@ -1788,7 +1746,7 @@ test(
           false,
           `the ${rowCount}-row rail did not return after widening`,
         );
-        // Sessions rather than cards again, for the reason given at the first count above.
+        // The restored session list retains its distinct-session count.
         assert.equal(
           await page
             .locator('#rail .railcard')
@@ -2317,7 +2275,7 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
 
-    // An editor tab, where the rail is drawn. This is the width the wrapping body broke.
+    // The wide viewport displays the session list beside the timeline.
     const wide = await layoutAt(page, 1350);
     assert.deepEqual(failures, [], 'the panel threw while drawing');
     assert.ok(wide.rail, `the rail is not drawn at 1350px, so this measures nothing`);
@@ -2325,17 +2283,16 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
       wide.list.left >= wide.rail.right - 1,
       `the list starts at ${wide.list.left} and the rail ends at ${wide.rail.right}: they overlap`,
     );
-    // Beside the rail, which means starting above where the rail ends. A wrapped list starts
-    // below the whole of it. Not "the same top as the rail": the rail is sticky, so once the
-    // page is scrolled its top is its own offset and says nothing about which line it is on.
+    // Compare timeline top with session list bottom because sticky positioning can change the session list's top.
+
     assert.ok(
       wide.list.top < wide.rail.bottom,
       `the list starts at ${Math.round(wide.list.top)} and the rail ends at ${Math.round(wide.rail.bottom)}: ` +
         'the list wrapped onto a line of its own below the rail',
     );
 
-    // The list has to begin inside the first screenful. This is the symptom the reader saw:
-    // a blank panel, and the turns a whole viewport down.
+    // The timeline begins within the initial viewport.
+
     assert.ok(
       wide.list.top < 200,
       `the top of the timeline is ${Math.round(wide.list.top)}px down the page, so the panel opens blank`,
@@ -2350,9 +2307,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
       'the first wide session heading adds a separator above the timeline',
     );
 
-    // And nothing visible sits above the first card at this width. The compact bar stays
-    // connected so its native controls keep their identity, but the rail is the chooser here
-    // and the bar takes no space.
+    // The narrow control bar remains mounted but occupies no space at wide width.
+
     assert.deepEqual(
       wide.controls,
       { top: 0, left: 0, right: 0, bottom: 0 },
@@ -2366,8 +2322,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
       `the list opens on "${firstCard}" rather than on the timeline itself`,
     );
 
-    // The status bar is pinned to the panel's own bottom edge and spans it, because what it
-    // carries belongs to the account rather than to any one session.
+    // The account status bar spans the panel's bottom edge.
+
     assert.ok(
       wide.statusbar.bottom >= 899,
       `the status bar ends ${Math.round(900 - wide.statusbar.bottom)}px above the panel bottom edge`,
@@ -2377,9 +2333,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
       'the status bar does not span the panel',
     );
 
-    // The composer sits on the bar and stops where the session column starts. The rail
-    // is the way between sessions, and a box for typing into one has no business over
-    // the list of the others.
+    // The Prompt box sits above the status bar within the session view.
+
     assert.ok(
       wide.composer.bottom <= wide.statusbar.top + 1,
       `the composer ends at ${Math.round(wide.composer.bottom)} with the bar starting at ` +
@@ -2392,17 +2347,16 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
     );
     assert.ok(wide.composer.right > wide.viewportWidth - 20, 'the composer stops short of the panel right edge');
 
-    // The rail scrolls on its own past the viewport, so its foot has to stop above the bar
-    // or its last card is drawn behind it. It clears the bar alone, since the composer is
-    // never drawn over it.
+    // The independently scrolling session list ends above the status bar.
+
     assert.ok(
       wide.rail.bottom <= wide.statusbar.top + 1,
       `the rail ends at ${Math.round(wide.rail.bottom)} with the bar starting at ` +
         `${Math.round(wide.statusbar.top)}: the rail runs behind the status bar`,
     );
 
-    // Scrolled, which is the only state that shows whether the sticky rows and the foot are
-    // still where they belong. At rest a wrong offset looks exactly like a right one.
+    // Scroll the panel before measuring sticky offsets.
+
     const scrolled = await scrolledLayout(page, 400);
     for (const [what, top] of Object.entries(scrolled.tops)) {
       assert.ok(
@@ -2415,21 +2369,16 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
           'so the bar covers it once the reader scrolls',
       );
     }
-    // The rail scrolls with the page and holds its own column, so its foot has to clear the
-    // bar wherever the reader is. The list's last card is measured further down instead: at
-    // this scroll it is still a screenful below the viewport, where every layout looks the
-    // same.
+    // The scrolled session list still clears the status bar.
+
     assert.ok(
       scrolled.bottoms['the rail'] <= scrolled.barTop + 1,
       `the rail ends at ${Math.round(scrolled.bottoms['the rail'])} with the status bar starting at ` +
         `${Math.round(scrolled.barTop)}, so its last card is behind it`,
     );
 
-    // The foot takes no space of its own, so the page has to reserve it or the last card is
-    // drawn behind it where the reader cannot reach it. Measured at the bottom of the page,
-    // which is the only place the reservation shows: a card the reader has not scrolled to
-    // clears the foot whether anything was reserved or not. This is the bottom-edge twin of
-    // the fault the top strip shipped, and the check the old one did not have.
+    // Scroll to the document bottom to check that the last card clears the fixed footer.
+
     const atBottom = await scrolledLayout(page, 1_000_000);
     assert.ok('the last card' in atBottom.bottoms, 'the list drew no last card, so this measures nothing');
     assert.ok(
@@ -2452,9 +2401,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
         `${Math.round(atBottom.barTop)} at the bottom of the page, so an empty gap opens under it`,
     );
 
-    // Below the rail's width the picker is the chooser, so the bar is there and holds it. The
-    // measurement above is only worth anything beside this one: a bar that is never drawn
-    // anywhere would pass it and take the narrow reader's only way between sessions.
+    // Below the session list width boundary, the narrow bar exposes its session picker.
+
     const narrow = await layoutAt(page, RAIL_MIN_WIDTH - 60);
     assert.equal(narrow.rail, null, 'the rail is drawn below its own width, so this measures nothing');
     assert.ok(narrow.controls, 'no control bar below the rail width, so nothing chooses a session there');
@@ -2463,8 +2411,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
     )) as number;
     assert.equal(picker, 32, 'the picker does not list one option per session and nothing else');
 
-    // A choice changes the host immediately while the browser still owns the focused select.
-    // Keep that choice drawn through the confirming render without adopting unrelated option text.
+    // A picker change posts immediately and remains selected through the confirming render.
+
     const chosen = await page.evaluate(`(() => {
       const current = document.querySelector('#list .controls select');
       window.__heldPicker = current;
@@ -2495,10 +2443,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
       'the focused compact picker reverted the session the reader chose',
     );
 
-    // A native select's open menu belongs to the browser, not to the page. Replacing the
-    // select or rewriting its options dismisses that menu. Hold the real node focused while
-    // another session's activity wording changes, then verify the live repaint leaves
-    // both the control and its options alone until the reader leaves it.
+    // Retain the focused native select and its option text during background updates.
+
     const refresh = renderPayload();
     const refreshedSessions = refresh.sessions as Array<Record<string, unknown>>;
     refreshedSessions[1] = { ...refreshedSessions[1], when: '2:33 PM', relative: 'just now', at: NOW + 60_000 };
@@ -2529,9 +2475,8 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
     )) as boolean;
     assert.equal(updatedAfterBlur, true, 'the picker did not adopt deferred session changes after blur');
 
-    // An empty selected session always rebuilds the timeline, even when no card changed.
-    // That state needs the same guarantee or a newly started session loses its picker whenever
-    // work elsewhere updates. Change the option again so this also exercises deferred writing.
+    // Also retain the focused picker when the selected session has no cards.
+
     const emptyRefresh = renderPayload();
     emptyRefresh.cards = [];
     const emptySessions = emptyRefresh.sessions as Array<Record<string, unknown>>;
@@ -2586,7 +2531,7 @@ test('the panel lays out with the rail beside the list, not above it', { timeout
       'returning from the rail replaced the compact session picker',
     );
 
-    // And the panel never scrolls sideways, at either width it is drawn at.
+    // The tested panel widths leave no horizontal page overflow.
     for (const width of [1350, RAIL_MIN_WIDTH - 60, 340]) {
       const at = await layoutAt(page, width);
       assert.ok(
@@ -2673,9 +2618,8 @@ test('the composer clears the status bar when the reader narrows the panel', { t
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
-    // Rendered once, wide enough that the account figures fit one row. Every width after this
-    // one only moves the viewport, which is what dragging the sidebar does: no render follows
-    // it, and the panel used to keep the height it measured when it last drew.
+    // Render once, then resize without new payloads to exercise footer measurement.
+
     await layoutAt(page, 640);
     for (const width of [340, 380, 420, 1350, 340]) {
       await page.setViewportSize({ width, height: 900 });
@@ -2917,9 +2861,8 @@ test('agent questions stay above the prompt and submit only complete answers', {
         /waiting for you/,
         `the question arrival is not announced at ${width}px`,
       );
-      // The walk's own region, in the real page. The browser copy of the wording is checked
-      // against a fake in `panel.webview.test.ts`, which says nothing about whether the
-      // element reaches the document or stays off screen once it does.
+      // Check that the history announcement region is mounted and visually hidden.
+
       const walkRegion = (await page.evaluate(`(() => {
         const r = document.querySelector('#walk-announcer');
         if (!r || !document.body.contains(r)) { return null; }
@@ -2933,8 +2876,8 @@ test('agent questions stay above the prompt and submit only complete answers', {
         { role: 'status', live: 'polite', atomic: 'true', cls: 'sr-only', hidden: true },
         `the walk has no live region of its own in the page at ${width}px`,
       );
-      // What a press on Send will do to the requests waiting above the box. The host words it
-      // only for a press that will really send, so nothing is said over an empty box.
+      // An empty Prompt box omits wording that promises to answer waiting requests.
+
       assert.equal(
         await page.evaluate(`!!document.querySelector('.csendover')`),
         false,
@@ -2947,9 +2890,8 @@ test('agent questions stay above the prompt and submit only complete answers', {
       ).usage;
       typedUsage.composer.draft = 'neither of those, keep the gap where it is';
       typedUsage.composer.sendOverAsk = 'Send answers the request above with this prompt.';
-      // The host words the sentence only for a press that will really send, so a payload
-      // carrying one and a disabled button is a state it never sends. The panel draws the
-      // sentence beside the button it describes, and a hand-built payload has to agree.
+      // The manual usage payload enables Send when it supplies answer-request wording.
+
       (typedUsage.composer.box as Record<string, unknown>).actionEnabled = true;
       await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'usage', usage: typedUsage })}, '*')`);
       await page.evaluate(SETTLED);
@@ -2993,20 +2935,18 @@ test('agent questions stay above the prompt and submit only complete answers', {
         'status polite sr-only',
         `the send banner has no live region of its own at ${width}px`,
       );
-      // A request arriving while the reader is typing changes what Send does, and the sentence
-      // beside the button changes in silence. This is the region that says so.
+      // The Send announcement region reports the updated request-answer wording.
+
       assert.equal(
         overAsk.spoken,
         'Send answers the request above with this prompt.',
         `the sentence beside Send changed under the reader with nothing saying so at ${width}px`,
       );
-      // A file still being attached disables Send in the browser and nowhere else, so the host
-      // cannot take the sentence away for it. A promise to answer the request, beside a button
-      // that will not act, is the one thing the sentence must never be.
+      // Browser file staging disables Send and removes its request-answer wording.
+
       const stagingToken = 'action-stage';
-      // Staging keeps the action kind at send, so the button is retained rather than rebuilt.
-      // It is the one path that reaches the removal. A shortcut left on a button that will not
-      // act announces a key the reader cannot use.
+      // Staging retains the Send button while removing its unusable keyboard shortcut.
+
       const keysBeforeStaging = (await page.evaluate(
         `document.querySelector('.csend').getAttribute('aria-keyshortcuts')`,
       )) as string | null;
@@ -3088,9 +3028,8 @@ test('agent questions stay above the prompt and submit only complete answers', {
       })()`);
       assert.equal(visibleAnswer, true, `the Answer control cannot be reached in the question area at ${width}px`);
 
-      // The head row. The state word has to stay inside the card and clear of the title at
-      // both widths: it gives no width of its own, so a title that took the whole row would
-      // push it over the card's edge where the reader cannot read it.
+      // The request state word stays within the card without overlapping its title.
+
       const headRow = (await page.evaluate(`(() => {
         const card = document.querySelector('.cask');
         const title = card.querySelector('.casktitle');
@@ -3124,9 +3063,7 @@ test('agent questions stay above the prompt and submit only complete answers', {
         },
         `the request card opens on the wrong action at ${width}px`,
       );
-      // One question on screen, and a tab for each of them. The card drew every question and
-      // every choice of every question at once, which is what took the room the reader needed
-      // to read the response the request was about.
+      // The card shows one question and provides a tab for each question.
       assert.deepEqual(
         (await drawnQuestions(page)).map((question) => question.trim()),
         ['Which implementation approach should the agent take?'],
@@ -3140,18 +3077,18 @@ test('agent questions stay above the prompt and submit only complete answers', {
         ],
         `the strip does not report the two questions at ${width}px`,
       );
-      // Which question the reader is on, beside the action, because the card no longer draws
-      // the others for them to count.
+      // The action row identifies the current question and total.
+
       assert.equal(
         await page.evaluate(`document.querySelector('.cask .caskwait').textContent`),
         'Question 1 of 2',
         `the card does not say which question the reader is on at ${width}px`,
       );
-      // Pressed by name rather than by position. The card moves under the press, so a
-      // position resolved a second time is a control on the question that replaced it.
+      // Address the choice by its control identity because answering changes the visible question.
+
       await page.locator('[data-control="ask:layout-ask:approach:Small change"]').click();
-      // A single choice is the whole of its question's answer, so the card goes on to the
-      // question after it and takes the reader's focus with it.
+      // A single-choice answer advances to the next unanswered question and moves focus.
+
       assert.deepEqual(
         (await drawnQuestions(page)).map((question) => question.trim()),
         ['Which additional checks should run before the agent continues?'],
@@ -3170,12 +3107,12 @@ test('agent questions stay above the prompt and submit only complete answers', {
         'asktab:layout-ask:checks',
         `the automatic move left the reader's focus off the page at ${width}px`,
       );
-      // The move changes what is on screen under the reader, so it is said in the walk's own
-      // region rather than in the one an arriving request uses.
-      // requests.ts batches the words onto the announcer on its own zero-delay timer, so the
-      // clock must still run forward past it before the text this assertion compares is there.
+      // Question navigation uses its own announcement region.
+
+      // Advance the controlled clock through the announcement's zero-delay timer.
+
       await page.clock.fastForward(0);
-      // Keep the page clock running in real time for the request timers later in this test.
+      // Resume real-time clock progression for later request timers.
       await page.clock.resume();
       assert.equal(
         (await page.locator('#walk-announcer').textContent()) ?? '',
@@ -3240,15 +3177,15 @@ test('agent questions stay above the prompt and submit only complete answers', {
         `returning to a pending request forgot its unfinished answer at ${width}px`,
       );
       await page.locator('[data-control="ask:layout-ask:checks:Browser layout"]').click();
-      // A multi-select question never moves by itself: nothing can tell that the reader has
-      // finished ticking boxes.
+      // Multi-select answers remain on the question until the reader advances.
+
       assert.deepEqual(
         (await drawnQuestions(page)).map((question) => question.trim()),
         ['Which additional checks should run before the agent continues?'],
         `a multi-select answer moved the card off the question at ${width}px`,
       );
-      // The card is built again from nothing on a foot repaint, so the mark is written on the
-      // build as well as on the press.
+      // Selected choices retain their marks.
+
       assert.deepEqual(
         await pickedRows(page),
         [true, false, false],
@@ -3415,9 +3352,8 @@ test('agent questions stay above the prompt and submit only complete answers', {
         'BODY',
         `an old request submission focused the prompt after the reader moved elsewhere at ${width}px`,
       );
-      // Requests reach the panel one host message at a time. The second request arrives just
-      // after the first was written into the region, and the third arrives with it in the same
-      // task. A screen reader can still be about to read the first when the others arrive.
+      // Deliver rapid requests through separate messages and a shared task to exercise announcement ordering.
+
       const rapid = (count: number) =>
         (
           renderPayload([], [], [], [], RAPID_PERMISSION_ASKS.slice(0, count)) as {
@@ -3479,8 +3415,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       [true, false, false],
       'the strip does not open on the first question',
     );
-    // The strip took the question's short label over, so the legend under it does not draw the
-    // same word a second time.
+    // The tab holds the short question label without repeating it in the legend.
+
     assert.equal(
       await page.evaluate(`document.querySelectorAll('.cask .caskkey').length`),
       0,
@@ -3492,8 +3428,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       'the strip does not carry the short label the legend gave up',
     );
 
-    // The arrow keys move inside the strip and the move shows that question, which is the
-    // whole reason the strip is a tab widget rather than three buttons.
+    // Arrow navigation changes the selected question.
+
     await page.locator('[data-control="asktab:layout-three:scope"]').focus();
     await page.keyboard.press('ArrowRight');
     assert.deepEqual(
@@ -3518,8 +3454,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       [true, false, false],
       'Home did not reach the first question',
     );
-    // One stop for the whole strip, so Tab enters it once and leaves it once. Reached from
-    // the fold above it, which is the stop before it.
+    // The strip shares one Tab stop after the fold control.
+
     await page.locator('[data-control="askfold:layout-three"]').focus();
     await page.keyboard.press('Tab');
     assert.equal(
@@ -3534,8 +3470,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       'Tab out of the strip stops on a second tab rather than reaching the question',
     );
 
-    // The answer none of the offered choices fit. `Other` is the last choice on every
-    // question and opens the composer's own input under the row.
+    // Other opens a written-answer field below its choice row.
+
     await page.locator('[data-control="ask:layout-three:scope:Other"]').click();
     const box = page.locator('[data-control="askwritten:layout-three:scope"]');
     assert.equal(await box.count(), 1, 'taking Other opened no box to answer in');
@@ -3551,9 +3487,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       false,
       'the action stayed off after the reader typed their own answer',
     );
-    // The box is built again on every foot repaint, and live activity forces one every few
-    // seconds. Restoring the text alone puts the reader's next keystroke at the end of a
-    // sentence they were typing into the middle of.
+    // Usage updates retain the written answer's caret position.
+
     await box.focus();
     for (let back = 0; back < 5; back++) {
       await page.keyboard.press('ArrowLeft');
@@ -3577,8 +3512,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       LONG_WRITTEN_ANSWER.length - 5,
       'a repaint moved the caret to the end of what the reader had typed',
     );
-    // The value gives way on the face and stays whole in the name, so a reader who cannot see
-    // the strip is told the answer the reader who can see it has to hover for.
+    // The tab can clip a written answer visually while retaining it in its accessible name.
+
     const written = (await page.evaluate(`(() => {
       const tab = document.querySelector('[data-control="asktab:layout-three:scope"]');
       const pick = tab.querySelector('.casktabpick');
@@ -3588,17 +3523,16 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
     assert.equal(written.face, LONG_WRITTEN_ANSWER, 'the tab reports an answer the reader did not give');
     assert.equal(written.name, `Scope, answered ${LONG_WRITTEN_ANSWER}`, 'the tab name drops what the face cut off');
 
-    // Enter takes the visible `Next` action. It sends nothing and goes to the next question
-    // with no answer.
+    // Enter invokes Next without submitting and selects the next unanswered question.
+
     await box.press('Enter');
     assert.deepEqual(
       (await drawnQuestions(page)).map((question) => question.trim()),
       ['How should the strip behave once the questions no longer fit across one row?'],
       'Next did not reach the next question with no answer',
     );
-    // The question Next moved to has no answer, so the button is drawn again disabled and the
-    // browser drops focus to the body. It goes to that question's own tab instead, which is
-    // where a single-choice answer leaves it too.
+    // Focus moves to the next question's tab when its disabled action cannot receive focus.
+
     assert.equal(
       await page.evaluate(`document.activeElement && document.activeElement.dataset.control`),
       'asktab:layout-three:strip',
@@ -3611,8 +3545,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
     );
     await page.locator('[data-control="ask:layout-three:strip:Wrap to a second row"]').click();
 
-    // A question takes the offered labels or an answer in the reader's own words, never both.
-    // The host refuses a question carrying both, so the card cannot let the reader build one.
+    // Questions accept either offered choices or a written answer, never both.
+
     await page.locator('[data-control="ask:layout-three:checks:Browser layout"]').click();
     await page.locator('[data-control="ask:layout-three:checks:Other"]').click();
     assert.deepEqual(await pickedRows(page), [false, false, true], 'taking Other left the boxes the reader had ticked');
@@ -3658,9 +3592,8 @@ test('one question is on screen and the strip carries the rest', { timeout: 60_0
       ],
       'the written answer did not reach the host as the reader typed it',
     );
-    // Once the press has gone, the head row says so, and the head row is a button, so its name
-    // takes the place of what it draws. A state word written onto the row alone leaves a
-    // reader who cannot see it hearing that the card still wants an answer they have sent.
+    // The request fold's accessible name includes its sending state.
+
     await page.evaluate(SETTLED);
     const sendingFold = (await page.evaluate(`(() => {
       const head = document.querySelector('.cask.question .caskfold');
@@ -3693,17 +3626,16 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
     const page = await browser.newPage();
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
-    // Dressed, because this measures a height in pixels. The plain page has no editor font
-    // size and falls back to the browser's own, which is three points larger than anything a
-    // reader sees.
+    // Use the theme fixture for the pixel-height comparison.
+
     await page.setContent(themed(pageHtml()));
-    // The sidebar width, which is where six answered tabs run out of room.
+    // The narrow viewport forces the six answered tabs to share limited space.
     await layoutAt(page, 340, [], [], [], [], [SIX_QUESTION_ASK, PERMISSION_ASK]);
     assert.deepEqual(failures, [], 'the six-question card threw while drawing');
     const six = SIX_QUESTION_ASK.questions;
     const secret = six[six.length - 1];
     await answerSixQuestions(page);
-    // A secret answer is typed where nobody behind the reader can read it.
+    // A secret written answer uses a password field.
     assert.equal(
       await page.evaluate(`document.querySelector('[data-control="askwritten:layout-six:${secret.id}"]').type`),
       'password',
@@ -3734,10 +3666,8 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
       ['', '', '', '', '', ''],
       'a tab still draws its value on a strip that ran past the second row',
     );
-    // The mark never carries the meaning alone. Every value the face dropped is still in the
-    // name a screen reader reads.
-    // The one the reader typed, the four they took off the list, and the secret one, which
-    // reports that it is answered and never reports what it says.
+    // Accessible tab names retain omitted answers but disclose only answered state for secret questions.
+
     assert.deepEqual(
       await page.evaluate(
         `[...document.querySelectorAll('.cask .casktab')].map((tab) => tab.getAttribute('aria-label'))`,
@@ -3757,9 +3687,8 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
     })()`)) as string;
     assert.equal(told.includes('the-secret-answer'), false, 'the strip draws a secret answer on the face of its tab');
 
-    // Shut, the card is its head row and the room around it, and nothing inside it is drawn.
-    // The permission is shut as well, because an open card draws no count whatever its words
-    // hold, so a count read off an open one cannot report anything.
+    // Fold both requests before measuring closed height and question counts.
+
     await page.locator('[data-control="askfold:layout-six"]').click();
     await page.locator('[data-control="askfold:layout-permission"]').click();
     const shut = (await page.evaluate(`(() => {
@@ -3797,12 +3726,12 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
         count: '6 of 6 answered',
         state: 'needs input',
         drawn: 0,
-        // A permission has nothing to count, so its own shut row carries no count.
+        // A folded permission request has no question count.
         shutPermissionCount: false,
       },
       'the shut request card is drawn wrong',
     );
-    // Nothing inside a shut card keeps a tab stop, so Tab off the fold leaves the card.
+    // Tab leaves a folded request without entering hidden controls.
     await page.locator('[data-control="askfold:layout-six"]').focus();
     await page.keyboard.press('Tab');
     assert.equal(
@@ -3812,7 +3741,7 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
       false,
       'a control inside the shut card still holds a tab stop',
     );
-    // The fold gives the card back with the reader where they left it.
+    // Reopening retains the selected question.
     await page.locator('[data-control="askfold:layout-six"]').click();
     assert.deepEqual(
       (await drawnQuestions(page)).map((question) => question.trim()),
@@ -3866,11 +3795,11 @@ test('a single question needs no strip and keeps its own short label', { timeout
       await page.evaluate(read),
       {
         strips: 0,
-        // Nothing else carries that word on a card with no strip, so the chip keeps it.
+        // A single-question card keeps its short label because it has no tab strip.
         key: ONE_QUESTION_ASK.questions[0].header,
         role: null,
-        // There is no next question to go to, and the line beside the button counts nothing, so
-        // both go back to what a single request always said.
+        // A single unanswered question uses Answer and its incomplete-answer explanation.
+
         label: 'Answer',
         name: 'Choose an answer first',
         disabled: true,
@@ -3902,8 +3831,8 @@ test('a single question needs no strip and keeps its own short label', { timeout
         label: 'Answer',
         name: 'Answer the agent question',
         disabled: false,
-        // Emptied rather than taken out, so the row keeps the height it had while the reader
-        // was still choosing.
+        // The completed-answer explanation becomes empty while its row remains mounted.
+
         wait: '',
       },
       'the answered one-question card still says why its action is off',
@@ -3982,12 +3911,12 @@ test('a question named by its own words still reaches its panel', { timeout: 60_
       false,
       'an id built from what the agent sent carries a space, so the reference holding it resolves to nothing',
     );
-    // One panel is in the document at a time, so only the chosen tab has one to point at.
+    // Only the selected question has a mounted panel for its tab to reference.
     assert.equal(wired.pointing.filter(Boolean).length, 1, 'a tab points at a question panel that was never drawn');
     assert.equal(wired.pointing[0] !== null, true, 'the chosen tab points at no panel at all');
     assert.equal(wired.reaches, true, 'the chosen tab points at something other than the question on screen');
-    // `role="tabpanel"` takes the fieldset's own naming away, so the panel is named by the
-    // legend or it is named by nothing.
+    // The tabpanel uses its legend as the accessible name.
+
     assert.equal(wired.legend, 'casklegend', 'the question panel reaches no name of its own');
     await page.close();
   } finally {
@@ -4031,8 +3960,8 @@ test('a request holding no questions still draws the way out of it', { timeout: 
         questions: 0,
         answers: 0,
         actions: ['Decline'],
-        // The throw took the rest of the foot with it, so the reader lost the prompt box as well
-        // as the card.
+        // A request without questions still leaves the Prompt box available.
+
         prompt: true,
       },
       'a request with nothing to answer leaves the reader no way out of it',
@@ -4043,9 +3972,8 @@ test('a request holding no questions still draws the way out of it', { timeout: 
   }
 });
 
-// One array stands behind the card body, the card's own record popovers, and the record a
-// subagent row's figure opens. A press in any of the three reaches the same editor tab, and a
-// child's record holds only the shas and the paths that child touched.
+// Body and popover file and commit actions use shared card rows. Subagent details include only that child's artifacts.
+
 test(
   'a subagent figure record draws the card rows the child touched, and one press opens one tab',
   { timeout: 60_000 },
@@ -4083,7 +4011,7 @@ test(
         return [file, await posted('openCommit')];
       };
 
-      // The card body, where the record sections draw the rows under their own headings.
+      // Read file and commit actions from the card body.
       const fromBody = await openedFrom('#list');
       assert.deepEqual(fromBody[0], { type: 'openFile', key: turn.key, path: REVIEW_PATHS[0], beside: false });
       assert.deepEqual(fromBody[1], {
@@ -4094,7 +4022,7 @@ test(
         beside: false,
       });
 
-      // The card's own Files and Commits popovers.
+      // Read the same actions from the card's Files and Commits popovers.
       await card.locator('.statchip[data-metric="files"]').click();
       await page.evaluate(SETTLED);
       await page.locator(`#chippop ${filePress}`).first().click();
@@ -4109,16 +4037,15 @@ test(
         'the card popovers and the card body open different tabs for one row',
       );
 
-      // The record a subagent row's figure opens, over the Subagents popover.
+      // Read child artifact actions from a nested subagent figure popover.
       await card.locator('.statchip[data-metric="agents"]').click();
       await page.evaluate(SETTLED);
       const figure = (metric: string) =>
         page.locator(`#chippop .agentrow .railstatchip[data-metric="${metric}"]`).first();
       await figure('commits').dispatchEvent('click');
       await page.evaluate(SETTLED);
-      // A record of rows is a dialog the reader walks into, not a bubble read where they stand.
-      // The popover says which it is and takes its name from the heading, and the figure says it
-      // opens it rather than describing it.
+      // Artifact rows use a named dialog controlled by their figure.
+
       assert.deepEqual(
         await page.evaluate(`(() => {
       const pop = document.querySelector('#chippopnested');
@@ -4129,9 +4056,8 @@ test(
         ['dialog', '2 commits', 'chippopnested', 'true'],
         'the record of rows does not announce itself as a dialog the reader walks into',
       );
-      // The commits record draws the card's own commit rows, each with its sha and its subject,
-      // rather than a run of plain text. It holds the child's two shas and not the third the
-      // turn itself carries.
+      // The nested commit rows include the child's hashes and subjects without the turn's unrelated commit.
+
       assert.deepEqual(
         await page.evaluate(`[...document.querySelectorAll('#chippopnested .commitrow')]
       .map((row) => [row.querySelector('.sha').textContent, row.querySelector('.name').textContent])`),
@@ -4141,7 +4067,7 @@ test(
         ],
         "the commits record is not the card's own rows, or it names a commit the child never made",
       );
-      // A press inside the record leaves it open, and leaves the popover under it open too.
+      // An artifact-row press keeps both nested and enclosing popovers open.
       await page.locator(`#chippopnested ${commitPress}`).first().click();
       const nestedCommit = await posted('openCommit');
       assert.deepEqual(
@@ -4152,8 +4078,8 @@ test(
 
       await figure('files').dispatchEvent('click');
       await page.evaluate(SETTLED);
-      // The files record draws the card's own file rows, each with its icon and its line counts,
-      // and offers no whole-turn diff, because it holds one child's share of the turn.
+      // Child file details include shared rows and omit the whole-turn diff.
+
       assert.deepEqual(
         await page.evaluate(`(() => {
       const pop = document.querySelector('#chippopnested');
@@ -4175,8 +4101,8 @@ test(
         'a press in the figure record opens a different tab from the card body',
       );
 
-      // The first Escape closes the record only, and focus lands on the figure it was about. The
-      // second closes the Subagents popover, and focus lands on the chip that opened it.
+      // Escape closes nested details before the enclosing popover and restores each anchor's focus.
+
       await page.keyboard.press('Escape');
       assert.deepEqual(
         [
@@ -4201,10 +4127,8 @@ test(
         'the second Escape left the Subagents popover open or lost the reader',
       );
 
-      // Tab out of the last row of the record closes it and carries the reader on into the
-      // popover the figure stands in. The files figure is not its row's one keyboard stop, so a
-      // walk that reads only the stops loses the figure it starts from and sends the reader back
-      // to it. A press opened this record, and the walk out of it is the same either way.
+      // Tab leaves the nested record through the enclosing row's controls, even when its anchor is outside the shared Tab stop.
+
       await card.locator('.statchip[data-metric="agents"]').click();
       await page.evaluate(SETTLED);
       await figure('files').dispatchEvent('click');
@@ -4223,16 +4147,12 @@ test(
         [true, true, false],
         'Tab out of the record left it open, sent the reader back to the figure, or landed outside the Subagents popover',
       );
-      // A second press on the chip shuts the popover it opened.
+      // A second anchor press closes its popover.
       await card.locator('.statchip[data-metric="agents"]').click();
       await page.evaluate(SETTLED);
 
-      // The other walk: out of the Subagents popover while the record stands over it. The rule
-      // only bites where the chip the popover is about is the last stop the page itself holds, so
-      // every later page stop is put out of the walk here and the stops left after the chip are
-      // the two popovers' own. A walk that skipped only its own popover would drop the reader
-      // inside the record they were walking away from. The walk ends with both of them off the
-      // page, which is where the press above left them.
+      // Hide later page controls to exercise leaving an enclosing popover while nested details remain open.
+
       await card.locator('.statchip[data-metric="agents"]').click();
       await page.evaluate(SETTLED);
       await figure('files').dispatchEvent('click');
@@ -4275,9 +4195,8 @@ test(
       );
       await page.evaluate(`window.walkHidden.forEach((stop) => { stop.hidden = false; })`);
 
-      // A press on a figure the card body draws opens that figure's record and pins nothing else.
-      // The figure stands in no popover, and a popover left standing over another chip would have
-      // no pointer left to close it.
+      // Opening a card-body figure detail does not pin an unrelated hovered popover.
+
       await card.locator('.statchip[data-metric="files"]').hover();
       await page.evaluate(SETTLED);
       await page.locator('#list .agentrow .railstatchip[data-metric="cost"]').first().dispatchEvent('click');

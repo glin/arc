@@ -544,13 +544,8 @@ import {
 } from './progressiveworker';
 import { panelShell } from './paneldevelopment';
 
-// A read-only panel showing what each agent turn did, newest first, so the session
-// never has to be scrolled to find out where the work stands. Everything shown comes from
-// the session transcript and the snapshot store; nothing is written back to either.
-//
-// This is a webview rather than a TreeView because a tree row is one line of fixed height.
-// The panel is narrow, and the figures worth seeing (files, lines, tokens, tool mix,
-// subagents, commits) do not fit on one line at that width.
+// The panel presents the session list and timeline. File views read recorded edits
+// and first-touch snapshots. The webview supports variable-height turn cards.
 
 interface CacheEntry {
   key: string;
@@ -582,23 +577,15 @@ const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const SEARCH_TAIL_BYTES = 16 * 1024 * 1024;
 const POLL_INTERVAL_MILLISECONDS = 5 * 1000;
 
-// Where the next older page starts. Each source adapter owns its own state inside the
-// cursor, and the provider never reads it: it holds one, hands it back to the adapter that
-// made it, and drops it when the adapter says the revision moved.
+// Each source adapter owns the cursor for its next older page. The provider passes
+// it back to that adapter and drops it when the source revision changes.
 type HistoryCursor = ClaudeHistoryCursor | CodexHistoryCursor;
 
-// The panel draws two kinds of item in one stream: a turn, and the compaction that wiped
-// the session before it. Both carry a summary, so both render the same markdown.
+// Turns and compactions share the timeline. Both render their summary as Markdown.
 type RenderCard = (TurnCard | CompactionCard) & { summaryHtml: string };
 
-// JSON on its way into a `<script>` block in the page.
-//
-// `JSON.stringify` escapes what JSON needs escaped, and HTML is not JSON: a string holding
-// `</script>` closes the tag early and everything after it is parsed as markup. Nothing on
-// this path can carry one today, since the values are session ids and turn keys, and the
-// content policy would refuse to run anything injected. Both of those are arguments about the
-// values, and this is an argument about the shape, which is the half that stays true when
-// somebody sends a different value through.
+// Escape less-than signs in JSON embedded in a script element. An unescaped
+// closing script tag ends the element even when it occurs inside a JSON string.
 function scriptJson(value: unknown): string {
   return JSON.stringify(value).replace(/</g, '\\u003c');
 }
@@ -616,33 +603,25 @@ function messageBytes(value: unknown): Uint8Array | null {
   return null;
 }
 
-// How much recorded diff text the panel keeps for the diffs it has opened, across the
-// window's lifetime. One diff is a small fraction of it, so the budget is only reached by
-// opening many turns in one window.
+// Retained diff text budget across the window. keepSides preserves every side of
+// the current diff, so a single diff can exceed this budget.
 const PATCH_BUDGET_BYTES = 8 * 1024 * 1024;
 const TRANSCRIPT_WAKE_MAX_MS = 1_000;
 const DERIVED_CACHE_CHECKPOINT_MS = 5 * 60 * 1000;
 
-// Whether the editor is set to navigate on the mouse's fourth and fifth buttons. The editor
-// answers for its own surfaces and cannot answer for the panel, which draws in a frame its
-// listener never reaches, so the panel asks the same question of the same setting.
+// Read the editor's mouse-navigation setting for the webview. The workbench's
+// mouse listener does not receive events inside this frame.
 function mouseNavigates(): boolean {
   return vscode.workspace.getConfiguration('workbench.editor').get<boolean>('mouseBackForwardToNavigate', true);
 }
 
-// Direct activity arrives in bursts while an agent streams a message. Rebuilding a card for
-// every text fragment makes the panel fight the reader's scroll and selection, so fragments
-// received close together share one refresh.
+// Batch direct activity updates received within this interval into one post.
 const LIVE_ACTIVITY_POST_MS = 150;
 const LIVE_ACTIVITY_LIMIT = 60;
 const LIVE_ACTIVITY_STALE_MS = 30 * 60 * 1000;
 
-// The rail card's own drawn name. `clampRailWidth` in view/rail.ts bounds only how narrow
-// the reader can drag the rail, not how wide, so the rail has no maximum width to size this
-// from. 200 characters fills a rail of about 1,300px at the panel's own type size (an
-// estimate from the font size, not a measured width), which is far wider than a normal
-// rail, so a longer name still fills the row and ends in an ellipsis rather than growing
-// what every render and every rail post carries.
+// Bound the session list's displayed name because every row travels in each
+// render and session list post. Other surfaces retain their separate labels.
 const RAIL_NAME_LIMIT = 200;
 
 interface HeldActivity extends TimedWireActivity {
@@ -664,11 +643,8 @@ function pendingIn(manifest: Manifest | null, filePath: string): ManifestEntry |
   return entry;
 }
 
-// A link target from a summary: a URL, or a workspace path that may name a line.
-// `column` is the editor group the file should land in, decided by the same rule every other
-// thing the panel opens goes through. Without one, `showTextDocument` opens wherever focus
-// happens to be, and once the panel is an editor tab of its own that is the panel's own
-// group: the reader's editor splits in two and the file lands where the panel was.
+// Open a summary URL or workspace path with an optional line range. The supplied
+// column keeps file navigation in the selected editor group.
 async function openLink(href: string, column: vscode.ViewColumn): Promise<void> {
   if (/^https?:\/\//i.test(href)) {
     await vscode.env.openExternal(vscode.Uri.parse(href));
@@ -684,12 +660,8 @@ async function openLink(href: string, column: vscode.ViewColumn): Promise<void> 
   }
 
   const folders = vscode.workspace.workspaceFolders ?? [];
-  // A summary is written by the agent and quotes what it read, so a path in one is not
-  // trusted to point anywhere it likes. A path is followed only when it lands inside an
-  // open folder, and it is resolved before that is decided: a target that keeps its `..`
-  // segments passes a prefix test on the unresolved string, and the filesystem then walks
-  // out of the folder when it opens the file. Relative targets are checked after joining,
-  // for the same reason.
+  // Resolve each path before checking open-folder containment. Unresolved parent
+  // segments can pass a prefix check while naming a file outside the folder.
   const inWorkspace = (p: string) =>
     folders.some((f) => {
       const base = normalizeFsPath(f.uri.fsPath).replace(/\/$/, '');
@@ -716,9 +688,7 @@ async function openLink(href: string, column: vscode.ViewColumn): Promise<void> 
         await vscode.commands.executeCommand('revealInExplorer', uri);
         return;
       }
-      // A picture goes to the editor's own viewer. The text editor refuses one, and that
-      // refusal is thrown from the same call a missing file throws from, so a link to a
-      // picture that is there told the reader there was no file at all.
+      // Open images in the editor's image viewer because showTextDocument rejects them.
       if (uri.scheme === 'file' && linkTargetIsImage(uri.fsPath)) {
         await vscode.commands.executeCommand('vscode.open', uri, { viewColumn: column });
         return;
@@ -745,21 +715,14 @@ async function openLink(href: string, column: vscode.ViewColumn): Promise<void> 
       await vscode.window.showTextDocument(uri, { selection, preview: true, viewColumn: column });
       return;
     } catch {
-      /* not this folder; try the next */
+      /* Try the next workspace folder when this candidate cannot open. */
     }
   }
   void vscode.window.showInformationMessage(`Arc: no file at ${target} in this workspace.`);
 }
 
-// A picture the reader pressed in a response, opened full size in the editor's own viewer.
-// The panel draws no viewer of its own.
-//
-// The path is tested again here. The card carried a path this rule already accepted, and a
-// message is still only a message: a second reading costs nothing and keeps the one rule
-// that decides which file the panel opens in one place.
-//
-// `imagePathFor` reads a path and not a Markdown target, so a per-cent sign in a file name
-// stays part of the name.
+// Open a response image in the editor's viewer. imagePathFor checks the path
+// against open folders again and preserves literal percent signs in filenames.
 async function openImage(target: string, column: vscode.ViewColumn): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   const file = imagePathFor(target, folders);
@@ -824,15 +787,13 @@ function languageContributions(): LanguageContribution[] {
         contributions.push(...languages);
       }
     } catch {
-      /* an extension with an unreadable manifest simply contributes nothing */
+      /* Skip extensions whose manifests cannot be read. */
     }
   }
   return contributions;
 }
 
-// Where the icon theme the reader is using keeps its files. Found through `vscode.extensions`
-// rather than by path, because the editor keeps each of its versions in a directory named
-// after a hash.
+// Resolve the configured icon theme through its installed extension contribution.
 function locateIconTheme(): { file: vscode.Uri; dir: vscode.Uri; root: vscode.Uri } | null {
   const configured = vscode.workspace.getConfiguration().get<string | null>('workbench.iconTheme');
   // Unset means the default. Set to nothing means the reader turned file icons off, and the
@@ -862,20 +823,14 @@ function locateIconTheme(): { file: vscode.Uri; dir: vscode.Uri; root: vscode.Ur
   return null;
 }
 
-// The icon theme the reader's explorer is drawing, read once and kept until it changes.
-//
-// Every step of this can come up empty: the theme may name an extension that is not
-// installed, its JSON may not parse, it may declare a font whose file is missing, or the
-// reader may have turned file icons off. Each of those leaves `iconFor` returning nothing,
-// and the row keeps the lettered badge `fileicons.ts` works out from the filename. Nothing
-// here throws, and no path through it leaves a row with an empty icon column.
+// Cache the configured icon theme until it changes. Unavailable themes, invalid
+// JSON, and missing fonts leave files with their lettered badges.
 class IconThemeSource {
   private read = false;
   private theme: IconTheme | null = null;
   private themeDir: vscode.Uri | null = null;
   private themeRoot: vscode.Uri | null = null;
-  // Built from every installed extension's manifest, which does not move while the window
-  // is open, so this outlives a change of icon theme.
+  // Cache installed language contributions separately from the selected icon theme.
   private languages: LanguageTable | null = null;
 
   // Called when the reader picks a different icon theme. The language table is left alone.
@@ -899,15 +854,13 @@ class IconThemeSource {
       if (!found) {
         return;
       }
-      // A theme file written with a byte-order mark parses as nothing without this.
+      // Remove a byte-order mark before parsing the theme JSON.
       const text = fs.readFileSync(found.file.fsPath, 'utf8').replace(/^\uFEFF/, '');
       const theme = parseIconTheme(JSON.parse(text));
       if (!theme) {
         return;
       }
-      // A theme names its font files and nothing else checks them. One stat per declared
-      // file, here, is what keeps the promise that a font whose file has gone falls back to
-      // the badge instead of emptying the whole column.
+      // Exclude missing font sources so unresolved glyphs retain the lettered badge.
       const dir = found.dir.fsPath;
       this.theme = {
         ...theme,
@@ -927,10 +880,7 @@ class IconThemeSource {
     return this.themeRoot ? [this.themeRoot] : [];
   }
 
-  // The `@font-face` rules the panel needs. Where the font lives is only known once the
-  // theme has been found, so this cannot be part of the baked stylesheet. The rules
-  // themselves are built in `icontheme.ts`, which is where they can be tested: everything
-  // the editor has to answer is the one line below that turns a path into an address.
+  // Build font-face rules with webview URIs after resolving the theme's font files.
   fontFaces(webview: vscode.Webview): FontFaceRule[] {
     this.load();
     const dir = this.themeDir;
@@ -976,12 +926,8 @@ class IconThemeSource {
   }
 }
 
-// The editor tab's own type and title. The type is what the editor writes into its layout
-// so a restored tab can be handed back to the serializer, so it is as fixed as a view id:
-// changing it orphans whatever tab a reader had open.
-// How to put focus in each editor group, by index. `vscode.changes` has no options argument,
-// so focusing first is the only way to say where its editor should open. The editor offers
-// these for the first eight groups and no more, which is far past what anyone splits into.
+// Focus commands for the editor's first eight groups. vscode.changes has no
+// column option, so the target group must receive focus before it opens.
 const FOCUS_GROUP = [
   'workbench.action.focusFirstEditorGroup',
   'workbench.action.focusSecondEditorGroup',
@@ -998,9 +944,7 @@ const PANEL_TYPE = ARC_IDENTITY.panelType;
 // keys and folds all name things in this workspace, and a global copy would carry one
 // project's folded sessions into another's list.
 const STATE_KEY = ARC_IDENTITY.panelStateKey;
-// How long the panel waits before an unsent prompt reaches storage. One write a second while
-// a reader types, rather than one a letter, and short enough that the gap between the last
-// keystroke and a window closing is almost always longer than it.
+// Delay before an unsent prompt is saved to workspace storage.
 const DRAFT_SAVE_MS = 1000;
 const PANEL_TITLE = ARC_IDENTITY.productName;
 const PANEL_OPTIONS = {
@@ -1008,23 +952,12 @@ const PANEL_OPTIONS = {
   enableFindWidget: true,
 } satisfies vscode.WebviewPanelOptions;
 
-// Where a panel tab came from. `created` is one this extension opened with `createWebviewPanel`.
-// `serializer` is one the editor restored after a window reload and handed back.
-// `serializer-replaced` is a reload whose restored tab carried stale options: the serializer did
-// fire, the restored tab went, and the panel in front of the reader is a fresh one. Without the
-// third value that reload reads as a plain open, and a startup measured across it names the wrong
-// panel.
+// Identify a newly created tab, a restored tab, or a replacement for a restored
+// tab with stale panel options. Startup diagnostics retain this origin.
 type PanelOrigin = 'created' | 'serializer' | 'serializer-replaced';
 
-// Where the panel can be drawn, behind one shape.
-//
-// The editor area takes a `WebviewPanel` and nothing else, and a panel goes anywhere the
-// reader drags it, the editor column and the side panes alike. That is why the tab is the
-// only host: a `WebviewView` reaches the sidebars and the bottom panel and no further.
-//
-// The interface stays even with one implementation. Everything below `attach()` is written
-// against it, so it is the line between a host and the list of turns, and a second host
-// would arrive here rather than throughout the class.
+// The provider accesses its webview tab through this interface. WebviewPanel
+// supports tabs in the editor area and the editor's side and bottom panes.
 interface PanelHost {
   readonly webview: vscode.Webview;
   active(): boolean;
@@ -1087,10 +1020,8 @@ type HeldStatFacts = {
   readonly compactions: readonly Readonly<SessionStatCompactionFacts>[];
 } | null;
 
-// One session's share of the lifetime figures.
-// A session's held figures: its lifetime figures, which the rail and the heading read, and the
-// contributions of the dispatched sessions it started, which only turn cards read. Either can be
-// absent, because a session whose own sources are not whole still has contributions.
+// Hold lifetime figures for the session list and heading separately from dispatched
+// contributions used by turn cards. Either set can be absent independently.
 interface SessionHeldFigures {
   lifetime?: SessionLifetimeFigures;
   dispatched?: Record<string, HeldDispatchedCost>;
@@ -1145,9 +1076,7 @@ export class PanelProvider implements vscode.Disposable {
   private panelRecoveryWaiters = new Map<string, { resolve(): void; reject(error: unknown): void }>();
   private disposed = false;
   private attachmentHandoffs = new Set<AbortController>();
-  // Every host the panel is currently drawn in. A list rather than one: a tab restored
-  // after a window reload can arrive while another is already up, and everything from
-  // `attach()` down is written to work over whatever is there.
+  // Attached panel hosts, including tabs restored while another panel is open.
   private hosts: PanelHost[] = [];
   private readonly hostSessions = new Map<PanelHost, string>();
   private readonly hostPreviousSessions = new Map<PanelHost, string>();
@@ -1176,12 +1105,10 @@ export class PanelProvider implements vscode.Disposable {
   private selectionWorks = new Map<string, SelectionWork>();
   private earlySelectedSources = new Map<string, SelectedSource>();
   private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
-  // The native session menu belongs to the host that reported opening it. Keep one recent
-  // arm because a command has no webview identity, and a newer menu supersedes an older one.
+  // The newest session menu's host. Native commands carry no webview identity.
   private detailsMenuArm: { host: PanelHost; session: string; browserSession: string; at: number } | null = null;
   private composerMenuArm: { host: PanelHost; at: number } | null = null;
-  // The selected-text menu has the same missing host identity. Its arm advances from the
-  // host that opened the menu to the exact host that can answer the selected command.
+  // Native selected-text commands carry no host identity. The armed host supplies the selected text.
   private selectedTextMenuArm: {
     host: PanelHost;
     session: string;
@@ -1189,31 +1116,21 @@ export class PanelProvider implements vscode.Disposable {
     at: number;
     copyLabels?: boolean;
   } | null = null;
-  // The editor tab, while one is open. Kept apart from `hosts` because it is the one that
-  // can be asked for again: a second press of the command brings this one forward rather
-  // than opening another copy of the same list.
+  // The editor tab that the open command reveals on subsequent presses.
   private editorPanel: vscode.WebviewPanel | null = null;
-  // Where the tab above came from, written down when it is adopted. A reveal adopts nothing, so
-  // this is the only place the origin of the panel in front of the reader survives.
+  // The tab's adoption origin. Revealing the tab preserves this value.
   private editorPanelOrigin: PanelOrigin | null = null;
-  // The column the last ctrl-opened diff split off, so a repeat press lands in the same
-  // group instead of splitting again. A position, not an identity: besideColumn in
-  // turnview.ts decides when it still answers.
+  // The column used by the last beside-opened diff. `besideColumn` checks whether it remains usable.
   private lastBeside: number | null = null;
-  // The built-in commit viewer is newer than the extension's minimum VS Code version, so
-  // its presence is checked once before the first commit link is opened.
+  // Cache commit-viewer command availability on the first commit-opening request.
   private canOpenCommit: boolean | null = null;
   private cache = new Map<string, CacheEntry>();
-  // Commits the agent made quietly, which its output never printed. The reads run in the
-  // background and a filled turn refreshes the panel, so the first render never waits for
-  // git.
+  // Background commit reads refresh affected turns without delaying the initial render.
   private repositoryCommits = new RepositoryCommits(nodeGitRunner(), () => void this.refresh(true));
   private readonly repositoryScope: RepositoryScope;
   private repositoryScopeReady = false;
   private repositoryScopeRoots: string[] = [];
-  // Child transcripts are read only when a parsed parent names them. Their compact usage
-  // totals survive later parent turns, so an old child is not read again whenever its parent
-  // grows. Codex discovery fills the structural links without statting the child files.
+  // Codex child links from discovery. Cached child usage survives parent transcript growth.
   private codexSubagents: CodexSubagentFile[] = [];
   private claudeSpendSources: SessionSpendSource[] = [];
   private codexSpendSources: { file: string }[] = [];
@@ -1221,65 +1138,38 @@ export class PanelProvider implements vscode.Disposable {
   private readonly sessionSpendSourceIndex = new SessionSpendSourceIndex();
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
-  // Which folder each session ran in, by transcript path. A recorded cwd is immutable
-  // and remains cached. A missing cwd may mean the opening record was incomplete, so it
-  // is retried when that file's revision changes rather than on every poll.
+  // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
   private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number }>();
-  // The same answer for a Codex rollout, which carries its cwd in an opening record tens of
-  // kilobytes long. It is read once per file for the same reason, and it costs more to read,
-  // so this map is what keeps a listing of every rollout on the machine affordable.
+  // Cached Codex opening metadata, including each rollout's working directory.
   private codexMetas = new CodexMetaCache();
   // Saves `codexMetas` into the machine's shared opening records.
   private codexOpenings: CodexOpeningsWriter | null = null;
-  // The opening records the first catalog refresh reads before it walks, so `allSessions` finds
-  // each one in `codexMetas` and never reads a cold rollout on the main thread. The refresh
-  // takes this once. Refresh triggers that arrive during the reads wait behind them in
-  // `pendingRefresh`, and a search waits in `waitingSearch`, so the first catalog is still one
-  // complete walk.
+  // The first catalog refresh primes opening metadata before listing sessions. Refresh and search requests wait for this pass.
   private codexColdReads: (() => Promise<ColdOpeningPass>) | null = () =>
     coldOpeningPass(this.codexMetas, codexSessionsRoot());
   private codexPriming: Promise<ColdOpeningPass> | null = null;
-  // The rollout list the cold pass walked, held only for the `allSessions` call right after it,
-  // so the first catalog walks the tree once.
+  // The cold pass's rollout paths, consumed by the next `allSessions` call.
   private codexWalk: string[] | null = null;
   // The latest search query that arrived during the cold pass. Only it is answered after.
   private waitingSearch: string | null = null;
-  // Naming a session means reading a slice of it, and so does asking when it was last
-  // active, so both come off one read and are kept together against the file revision.
-  // Either its mtime or its size moving invalidates this. `activityMs` is null for a file
-  // whose window carries no recorded time.
+  // Titles and activity times share a revisioned read. Size or mtime changes invalidate the entry.
   private titles = new Map<string, DerivedTitleEntry>();
   private metadataRevision = 0;
   private drawnMetadataRevision = 0;
-  // The last name of each session whose entry a derived cache version bump dropped, until a
-  // metadata read stores a new entry for it. Only `sessionLabel` reads it. It never reaches
-  // `titles` or the held names, so no fresh read weighs it and no stored turn copies it.
+  // Names retained after cache invalidation until metadata supplies replacements. Only `sessionLabel` reads these fallback names.
   private carriedNames = new Map<string, CarriedName>();
-  // A parsed Claude tail can hold a generated title outside metadata's smaller window.
-  // Keep its short and full values together until the same refresh builds the session rows.
-  // The one name each Claude session draws on every surface.
+  // Retain short and full Claude names from parsed tails, including titles outside the metadata window.
   private sessionNames = new SessionNames();
-  // The first complete metadata pass is useful on the next reload even when VS Code ends
-  // the extension host without disposing this provider. Yield before the checkpoint so the
-  // render reaches the webview first. Later revisions are checkpointed at a bounded rate,
-  // and shutdown writes any remaining state when it gets the chance.
+  // Defer the first metadata checkpoint until after rendering. Later checkpoints use a bounded rate, with a final write during disposal.
   private derivedCacheCheckpointTick: ReturnType<typeof setTimeout> | null = null;
   private derivedCacheCheckpointState = new DerivedCacheCheckpointState(Date.now());
   private metadataRecoverySession: string | null = null;
   private metadataRecoveryQueue: string[] = [];
-  // The names Codex has given its threads, for every session on the machine at once. Kept
-  // apart from `titles` because it cannot be keyed the same way: `titles` is invalidated by
-  // the rollout's mtime, and a thread is named after its rollout has gone quiet, so a name
-  // cached against the rollout would never be looked for again.
+  // Codex session names have a separate index. Renaming a quiet session does not change its rollout revision.
   private threadNames: ThreadNames = { stamp: '', names: new Map(), fullNames: new Map() };
-  // The human-prompt scan's cursor per transcript, for the peer-wake cut. Found is
-  // sticky and the cursor makes the scan incremental, so a quiet file costs no read at
-  // all and a growing one costs only its new bytes.
+  // Incremental human-prompt scan cursors for peer-wake filtering. A found prompt remains cached.
   private humanScans = new Map<string, HumanPromptScan>();
-  // Every Claude transcript the last listing walked, before the peer-wake cut. The
-  // caches above are trimmed against this rather than against the filtered list, or the
-  // cut would evict the very entries that keep it cheap and every poll would read every
-  // wake file's head again.
+  // All listed Claude transcripts before peer-wake filtering. Cache trimming uses this list to retain filtered sessions' scan state.
   private walkedClaude: string[] = [];
   private claudeParents: SessionFile[] = [];
   private dispatchDiscoveryPending = false;
@@ -1299,44 +1189,29 @@ export class PanelProvider implements vscode.Disposable {
   private discoveryCheckpoint?: import('./progressiveworker').DiscoveryCheckpoint;
   private discoveryCompleted?: Set<string>;
   private claudeChildReferences: ClaudeChildSessionReference[] = [];
-  // Child id to the session that started it and how, built from the dispatch references, the
-  // resolved Claude subagent files and the Codex subagent listing when one of them is
-  // replaced. A selection never rebuilds it.
+  // Parent relationships rebuilt when dispatch references or Claude or Codex children change. Selection reuses the index.
   private sessionParents: {
     references: readonly ClaudeChildSessionReference[];
     children: readonly ClaudeChildSessionFile[];
     codex: readonly CodexSubagentFile[];
     parents: ReadonlyMap<string, SessionParentEdge>;
   } | null = null;
-  // The index above cut to the edges whose ends both have a session row, with its dispatched
-  // part and its refresh key. Rebuilt when the index or the catalog's ids move, so a
-  // selection reuses it.
+  // Parent edges whose endpoints have catalog rows. Rebuilt when the parent index or catalog IDs change.
   private sessionParentEdgeSet: SessionParentEdgeSet | null = null;
   private dispatchFacts = new Map<string, DispatchSessionFacts>();
   private dispatchFiguresRevision = 0;
   private drawnDispatchFiguresRevision = 0;
   private claudeChildReferenceEntries = new Map<string, ClaudeChildReferenceCacheEntry>();
   private claudeChildren: ClaudeChildSessionFile[] = [];
-  // Whether a child discovery has answered since the provider started. Until then a catalog
-  // walk holds no Claude child transcript.
+  // Defer child-sensitive cache pruning until the first Claude child discovery completes.
   private claudeChildrenDiscovered = false;
-  // Which session is on screen, by id. The panel draws one at a time, so this is the
-  // whole of what the reader is looking at, and `pickShowing` keeps it standing on a live
-  // session: it is null only in a workspace that has none. Restored below, so a reload
-  // opens on the session the reader left.
+  // The selected session ID, restored from panel state and reconciled by `pickShowing`.
   private showing: string | null = null;
-  // Which sessions the reader has hidden, by id. Held here rather than only in the
-  // panel because hiding has to happen before the list is cut to the few sessions that get
-  // parsed, and that cut is made here. The panel keeps its own copy so a reload can hand it
-  // back, and hiding deletes nothing: a hidden session keeps its pending changes, its
-  // baselines and its manifest.
+  // Archived session IDs filter host reads. Panel state persists the set without deleting session data.
   private hidden = new Set<string>();
   // Pinned session ids control rail placement independently from selected turn reads.
   private pinnedTop = new Set<string>();
-  // The older pages each session has loaded past its ordinary tail, and the cursor the
-  // next page starts from. Only the selected session reads a page. A session the
-  // reader moved away from keeps its pages under the budget in `historypages.ts`, so
-  // stepping back to it restores what was on screen without another read.
+  // Retained older pages and their next cursors. Only the selected session reads pages, within the `historypages.ts` budget.
   private history = new Map<string, SessionHistory<HistoryCursor>>();
   // Child-only changes leave the parent transcript revision untouched. This stamp decides
   // when retained Codex pages need their child rows and spend projected again.
@@ -1345,27 +1220,16 @@ export class PanelProvider implements vscode.Disposable {
   // whose session, transcript or provider moved while it ran.
   private historyRequest: { sessionId: string; controller: AbortController; generation: number } | null = null;
   private historyGeneration = 0;
-  // Where the reader has been. Held here rather than in the panel because the extension is
-  // the authority on which session is open, so the trail outlives the tab that made it and
-  // a second panel opened beside the first walks the same one. A window reload ends the host
-  // and starts a new trail from whatever session the panel opens on.
+  // The navigation trail shared by this provider's hosts. A window reload starts a new trail.
   private trail: Trail = emptyTrail();
-  // What each agent last reported about the reader's own rate limits, and how much each
-  // one asks before it acts. Both are handed in from `extension.ts`, which owns the
-  // children that answer for them; this only draws them. Held as the readings rather than
-  // as the rows, because a row carries how old its figure is and that has to be worked out
-  // at the moment it is drawn.
+  // Account usage and permission readings supplied by `extension.ts`. Rendering computes each reading's age.
   private usage: AgentUsage[] = [];
   private askLevels: Record<string, string> = {};
   private codexEffectiveModes: Record<string, CodexEffectiveMode> = {};
   private claudeEffectiveModes: Record<string, string> = {};
-  // Blocking requests held by live children, filed by the session they belong to.
-  // They are host state rather than transcript state, so they travel with the composer's
-  // control payload and disappear as soon as the host accepts an answer.
+  // Live agent requests by session. Composer payloads retain them until the host accepts an answer.
   private asks: { session: string; ask: Ask }[] = [];
-  // What each agent said about the models it will run, and which model and effort the
-  // reader picked for each session. The catalog belongs to the installation; a pick
-  // belongs to the session whose composer made it.
+  // Model catalogs by agent and prompt settings by session.
   private models: Record<string, ModelChoice[]> = {};
   private pendingModels: readonly string[] = [];
   private appliedDefaults = new Map<string, AppliedDefaults>();
@@ -1433,36 +1297,22 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
   private picks: SessionSettingBook = {};
-  // The commands each agent published, filed under the agent's key. Per agent rather than
-  // per session: the list is what the CLI found in this folder, so every session
-  // one agent holds here offers the same one, and the two agents in a folder do not.
+  // Published prompt commands by agent. Sessions using one agent share its catalog in this folder.
   private commandLists: Record<string, PromptEntry[]> = {};
   // The last-seen Claude skill list for each working directory, as a normalized path key.
   // `extension.ts` owns loading, persisting, and replacing it.
   private skillLists: Record<string, readonly string[]> = {};
-  // Where a Claude skill's `SKILL.md` was found on disk, keyed by the session directory a
-  // command list is drawn for and the command name. Claude's own catalog carries no path, so
-  // this is filled by a disk lookup the first time a name is drawn for a directory, and never
-  // invalidated within a run: a `SKILL.md` a session already found does not move while the
-  // panel is open, the same assumption a Codex-reported path already carries.
+  // Claude skill paths by working directory and command name. The first lookup, including a missing path, remains cached for this provider.
   private claudeSkillPaths = new Map<string, string | null>();
-  // What each draft or recorded session last said about the MCP servers it can call tools on.
-  // `extension.ts` owns the children that answer and files each reading by its owner.
+  // MCP server readings by draft or session. `extension.ts` owns their agent processes.
   private mcpServers: Record<string, McpServer[]> = {};
-  // What the foot's presses do. Set by `extension.ts`, because every one of them needs a
-  // child and this file has none: the panel says which agent, and the caller does the rest.
-  // `force` is the reader asking outright, which asks whatever the age of what is on screen
-  // and clears an agent marked silent. Carried from the press rather than worked out from
-  // the agent: with it inferred, no path ever set it, and a silenced agent could not be
-  // asked again for the life of the window.
+  // Requests account usage through `extension.ts`. An explicit refresh carries `force` to retry an agent marked silent.
   private refreshUsageHandler:
     | ((agent: string | null, force: boolean, owner?: string, ownerAgent?: string, ownerCwd?: string) => void)
     | null = null;
   private initialCatalogRefreshPending = false;
   private initialCatalogRefreshRequested = false;
-  // A command the panel answered itself, and the control it opened. The control is already
-  // open by the time this runs. It exists so that whatever fills the control can be asked
-  // for, which always needs a child this file does not own.
+  // Requests data for a control the panel command already opened.
   public onPanelCommand:
     | ((owner: string, agent: string, control: string, draft: NewSessionDraft | null, cwd: string | null) => void)
     | null = null;
@@ -1472,20 +1322,11 @@ export class PanelProvider implements vscode.Disposable {
   public onSelectionChanged: ((session: string | null, agent?: AgentKind | null, cwd?: string | null) => void) | null =
     null;
   public onPanelsClosed: (() => void) | null = null;
-  // What the reader picked, from the panel's own menu: which agent, which control, and the
-  // value the menu carried on that row.
+  // Delivers a prompt-settings menu choice with its agent, session, control, and selected value.
   public onPicked:
     | ((agent: string, session: string, control: string, value: string, model: string, cwd: string | null) => void)
     | null = null;
-  // What the composer does. Sending needs a child and stopping needs the one that is
-  // running, so both are passed straight out; this file only decides which of the two a
-  // press means, and it asks `composerview.ts` even that.
-  // The session goes with the prompt, and it is not optional. Without it the folder
-  // holds one session per agent, so a prompt reaches whatever that agent last resumed
-  // rather than the session the composer names above the box.
-  // It answers whether the prompt reached an agent and why not, because the comments it
-  // carried are taken away only on delivery and a failed card must tell the reader what to
-  // resolve before a retry.
+  // Sends to the named session and returns delivery status. Successful delivery removes submitted comments, while failure retains them for retry.
   public onSendPrompt:
     | ((
         agent: string,
@@ -1604,9 +1445,7 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
   public onCompact: ((agent: string, session: string, cwd: string | null) => Promise<PromptDelivery>) | null = null;
-  // Renames a session through its agent. It resolves only once the agent confirmed the
-  // saved name, and it rejects with the reason the reader reads otherwise. The folder is the
-  // one the session recorded, or null.
+  // Renames through the session's agent. Resolution confirms the saved name, while rejection supplies the failure reason.
   public onRenameSession:
     | ((agent: AgentKind, session: string, cwd: string | null, title: string, file: string) => Promise<void>)
     | null = null;
@@ -1633,14 +1472,7 @@ export class PanelProvider implements vscode.Disposable {
   public archivedSessions(): ReadonlySet<string> {
     return new Set(this.hidden);
   }
-  // What the reader has typed and what they have queued, per session, so switching
-  // sessions never carries a half-written prompt into the wrong one. The draft is held
-  // here rather than in the panel because whether the send control is pressable is decided
-  // in `composerview.ts`, and a decision cannot be made from a value only the panel has.
-  // It survives a reload as well as a change of session. The prompts ride in the
-  // panel's stored state, seeded from there in the constructor and written back through
-  // `rememberDrafts`, because a half-written prompt is words the reader typed and closing a
-  // window is not always a choice.
+  // Unsent text by session, persisted in panel state. Host composer decisions read this copy.
   private drafts: Record<string, string> = {};
   private assets: Record<string, StoredPromptAsset[]> = {};
   private attachmentNotices: Record<string, string> = {};
@@ -1659,25 +1491,16 @@ export class PanelProvider implements vscode.Disposable {
   // A draft exists only in this window until its first accepted prompt gives it an actual id.
   // Opening Servers can start its provisional Claude child without creating a transcript.
   private newDrafts: Record<string, NewSessionDraft> = {};
-  // The CLI can name a started session before its transcript or rollout is discoverable.
-  // Keep a synthetic row under the actual id through that gap so refresh cannot discard the
-  // selected session. This is separate from newDrafts because another send must resume
-  // the started child rather than start a second fresh session.
+  // Started sessions without discoverable records retain a row under their actual ID. Later sends resume the existing child.
   private awaitingSessionRecords: Record<string, AwaitingSessionRecord> = {};
-  // The sessions this workspace started from the panel, by the ids the CLIs gave them.
-  // A fresh session reads exactly like a run another agent shelled out for, so this is
-  // the positive fact `agentRunFor` answers with. It is stored beside the notes and the
-  // unsent prompts, because the transcript it argues with does not become any more readable
-  // with age, and a reload would file the reader's own session under Run by agents.
+  // Persisted IDs of sessions the reader started here. `agentRunFor` uses them to distinguish reader-started sessions from agent runs.
   private startedHere = new Set<string>();
   private draftProfiles: Record<string, SessionProfile> = {};
   private sessionOrigins: Record<string, DraftOrigin> = {};
   private recentProfiles: SessionProfile[] = [];
   private pinnedSetups: PinnedSetup[] = [];
   private pinnedSetupWrites: Promise<unknown> = Promise.resolve();
-  // The wait before the drafts reach storage. Set on the first keystroke of a burst and
-  // never reset by the ones after it, so a reader holding a key down writes once a second
-  // rather than once a letter, and the letter they stopped on is still what gets written.
+  // Draft saves begin on the first keystroke of a burst. Later keystrokes do not reset the timer.
   private draftSave: ReturnType<typeof setTimeout> | null = null;
   private queues: Record<string, QueuedSubmission[]> = {};
   private draftCommentIds: Record<string, string[]> = {};
@@ -1685,26 +1508,13 @@ export class PanelProvider implements vscode.Disposable {
   // Queues restored from storage or paused while their session is outside repository
   // scope. Each gets one drain attempt after its row and handoff callback are available.
   private pendingQueueDrains = new Set<string>();
-  // What this panel has submitted in each session, newest first, so the Up arrow can
-  // offer the prompt just sent. Claude Code writes a queued prompt to the file when the
-  // agent picks it up rather than when it is sent, so the transcript answer arrives up to a
-  // minute late, and that gap covers the commonest recall there is.
-  //
-  // Not stored, and not the whole history either. The transcript is the record and `collect`
-  // reads it back. This holds only what the record does not have yet.
+  // Recently submitted prompts not yet available in the parsed record. This temporary history is not persisted.
   private sentPrompts: Record<string, string[]> = {};
-  // What the box on screen holds for each session, which is the copy the send control
-  // reads. It differs from the stored draft only while the reader walks back through earlier
-  // prompts, and it is not written to storage: a reload starts from the stored draft.
+  // Current prompt text by session. History navigation changes this copy without replacing the saved draft.
   private boxText: Record<string, string> = {};
-  // The Send revision of each typed Codex `/rename` still waiting on its answer, while the
-  // box has stayed as that Send left it. A refused rename puts its line back only then.
+  // Pending typed rename revisions. A failed rename restores text only while that revision still owns the draft.
   private typedRenames = new Map<string, number>();
-  // The presses each session is still waiting on, oldest first, kept from the press
-  // until the transcript catches up. Per session for the reason `LivePress` gives: one
-  // agent runs several at once, and a press filed under the agent draws its card over the
-  // wrong one. More than one only while a prompt waits behind a compaction; `pressesAfter`
-  // is the rule for what the list becomes.
+  // Pending prompt and compaction activity by session, ordered oldest first. `pressesAfter` reconciles it with recorded turns.
   private live: Record<string, LivePress[]> = {};
   // A clear is complete only after the agent accepts it and names its successor. Claude
   // reports those in separate events. Codex names the successor before its request resolves.
@@ -1719,8 +1529,7 @@ export class PanelProvider implements vscode.Disposable {
   private liveActivity: Record<string, HeldActivity[]> = {};
   private activityPost: ReturnType<typeof setTimeout> | null = null;
   private activitySessions = new Set<string>();
-  // The wait before a streamed reply is sent on, so a turn's chunks reach the panel as a
-  // handful of messages a second rather than as one per word.
+  // Batches streamed reply chunks before posting them to the panel.
   private replyPost: ReturnType<typeof setTimeout> | null = null;
   // One watcher per directory a transcript is written to, so an append wakes the panel in
   // step with the agent rather than at the next poll.
@@ -1730,49 +1539,28 @@ export class PanelProvider implements vscode.Disposable {
   private refreshReason = 'direct';
   private targetedRefreshPaths: string[] | null = null;
   private watching = false;
-  // The sessions with a turn in flight, told by `extension.ts`, which owns the children.
-  // Named by session rather than by agent, as `runningKey` spells it.
+  // Sessions running in children owned by `extension.ts`, keyed by `runningKey`.
   private running = new Set<string>();
-  // When each of those sessions became busy, under the same keys. The rail bounds a busy
-  // claim against it, so a child that keeps calling itself busy after its work is recorded as
-  // over stops answering for the card. See `sessionStatusOf`.
+  // Running start times bound live status claims against recorded completion. See `sessionStatusOf`.
   private runningSinceKeys = new Map<string, number>();
-  // When each hosted session's process last exited, under the same keys. A key stays after
-  // the host forgets the process until its session leaves the listing. The rail reads it only
-  // against a turn that began before the exit, so a session resumed later is not held by an
-  // old exit. `exitedNow` holds the keys the host last reported exited, so a second exit
-  // after a resume replaces the first.
+  // Latest child exit times by running key. Status checks apply each exit only to turns that began before it.
   private exitedSinceKeys = new Map<string, number>();
   private exitedNow = new Set<string>();
-  // The write time of each Claude child transcript, by file, as `claudeChildRevisions`
-  // last read it. The rail reads it to tell a live open child from a dead one. A file leaves
-  // it when child discovery no longer references it.
+  // Claude child transcript write times used to determine live child status. Discovery trims unreferenced files.
   private claudeChildStatWrites = new Map<string, number>();
-  // The live open children the cards were last built against, as `openChildrenKey` spells
-  // them. A child that goes quiet moves this with no file change, so the refresh compares it.
+  // Live child state used by the last card render. Clock-driven expiry can change it without a file revision.
   private drawnOpenChildren = '';
-  // Which agents gained a finished turn, told once per parse.
-  //
-  // The status bar is otherwise fed only by a child this window started, and the turns the
-  // reader watches mostly come from a terminal. So the figure would move on the press and
-  // at no other time. The parse is the one moment the panel knows a turn has ended for an
-  // agent it has no child for, which is exactly when the figure has changed.
+  // Reports agents whose parsed turns finished, including sessions started outside this window.
   public onTurnsFinished: ((agents: string[]) => void) | null = null;
-  // Every turn the last parse produced, as the little the refresh rule needs of one, and
-  // the ids already counted. The set is what makes a turn count once: an unfinished turn
-  // is left out of both, so it counts on the parse that finds it finished.
+  // Parsed turn completion markers and IDs already reported. Unfinished turns remain eligible for later completion.
   private turnMarks: TurnMark[] = [];
   private seenTurns: ReadonlySet<string> = new Set<string>();
-  // The newest turn in each session, by session id. What the composer's window figure
-  // is kept apart from, because an empty failed turn still owns the newest card and outcome.
+  // The newest turn owns timeline outcome even when it has no usable composer figures.
   private newestBySession = new Map<string, Turn>();
   // The latest usable runtime fact for each Composer field. These are projected from the
   // accepted window without replacing the newest turn used by every timeline consumer.
   private composerRuntime = new Map<string, ComposerRuntimeFacts>();
-  // What the reader typed in each session, newest first, taken from the turns the last
-  // parse produced. It is what the Up arrow walks back through, so it survives a reload and
-  // carries prompts written in a terminal. `promptsAcross` bounds it as it is built, since
-  // a parse can produce far more turns than an arrow key reaches.
+  // Bounded recorded prompt history by session. `promptsAcross` includes prompts submitted outside the panel.
   private promptsBySession = new Map<string, string[]>();
   // The clock the cards were last built against. A turn's status can move on the clock alone,
   // so the refresh compares that reading with this one; see `statusMoved` below.
@@ -1781,10 +1569,7 @@ export class PanelProvider implements vscode.Disposable {
   // card down, while its resulting context decides whether the composer has a current level.
   private newestCompactionBySession = new Map<string, Compaction>();
   private cards: RenderCard[] = [];
-  // The selected read's actual reach and whether its parser discarded an older turn. The
-  // sentinel must answer for the one session on screen, not other retained windows.
-  // `loadedTurns` counts the ordinary tail and every retained older page together, which is
-  // the scope the sentinel reports and the reader can see.
+  // Selected-window byte coverage and turn limits. The history sentinel counts the tail and retained older pages together.
   private readWindows = new Map<
     string,
     {
@@ -1796,32 +1581,19 @@ export class PanelProvider implements vscode.Disposable {
   // Turn references from the selected window, before the card budget limits its payload.
   // Performance diagnostics use these references. Rail unread counts use independent turn starts.
   private parsedRefs: { key: string; sessionId: string; startedAt: number; kind: string }[] = [];
-  // The turn behind each card, by the card's own key. A card carries only what it draws,
-  // and a turn's diff needs the recorded patches. These are references into `cache`, so
-  // the map itself costs nothing.
+  // Cached turn references by card key. Diff views use their recorded patches.
   private turnsByKey = new Map<string, Turn>();
-  // What each session came to, by session id. Worked out in `turnview.ts` over the
-  // turns that were read, so the panel draws figures rather than working them out: a sum
-  // written inside `SCRIPT` is the one kind of code in this repo nothing can check.
+  // Session figures computed from parsed turns by `turnview.ts`.
   private statsBySession: Record<string, SessionStatChip[]> = {};
-  // Figures recovered from each file's bounded metadata tail. Accepted window facts replace
-  // these where available. Other rail rows need no selected-window read.
-  // Read-only for the session rows' reason.
+  // Immutable figures from bounded metadata reads supply session-list rows without selected-window reads.
   private metadataStatsBySession: Readonly<Record<string, readonly Readonly<SessionStatChip>[]>> = {};
-  // The figures and cache marks above, held against each session's metadata facts, so a refresh
-  // derives them again only for the sessions whose facts changed. The facts are read-only for the
-  // session rows' reason.
+  // Cache figures and cache marks against immutable session metadata facts.
   private readonly metadataStatFigures = new SessionFactFigures<HeldStatFacts, readonly Readonly<SessionStatChip>[]>();
   private readonly metadataCacheFigures = new SessionFactFigures<HeldStatFacts, ReturnType<typeof railCacheMarkOf>>();
   private parsedRailCaches: Record<string, RevisionedRailCacheMark> = {};
   private metadataRailCaches: Readonly<Record<string, ReturnType<typeof railCacheMarkOf>>> = {};
   private railSourceRevisions: Record<string, Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>> = {};
-  // The sessions the last render listed, in the shape the rail reads. Kept so a change of
-  // the read set can reword it without listing anything again. `at` and `relative` are the
-  // session's last activity for the heading; the unread count is the rail's own, read off
-  // `counts` fresh rather than carried on this row.
-  // Read-only, because a rail post holds the rows by identity: a row edited in place would
-  // leave the panel on a stale rail. Replace the list to change it.
+  // Immutable rows from the last catalog render. Replace the list to update an identity-cached session-list payload.
   private sessionRows: readonly Readonly<{
     id: string;
     persisted: boolean;
@@ -1835,68 +1607,46 @@ export class PanelProvider implements vscode.Disposable {
     relative: string;
     agentRun: boolean;
   }>[] = [];
-  // The order the current set of hosts first drew the rail in. Kept apart from sessionRows,
-  // whose newest-activity order decides the default session and
-  // the picker. Each refresh reconciles this list against those rows, so activity changes
-  // update a card in place and newly found sessions join at the foot of their bucket.
+  // Session-list placement order, separate from activity-sorted catalog rows. Reconciliation preserves placement and appends newly discovered sessions.
   private railOrder: string[] = [];
   // The latest delivery that carried the rail, and its largest serialized message across
   // ready hosts. Complete renders can differ by host, while rail-only updates reuse one string.
   private lastRailMessageType: 'render' | 'rail' | null = null;
   private lastRailMessageSerializedBytes: number | null = null;
   private lastRailAdoptionsJson = '';
-  // Rail-owned state advances this value before it asks for a post. The last settled value
-  // lets a repeat request leave before it gathers the remaining payload inputs.
+  // Session-list state increments this revision. An unchanged settled revision skips payload collection.
   private railRevision = 0;
   private lastRailRevision = -1;
   private lastRailDay = '';
   private lastRailCountsJson = '';
-  // What that rail was worded from, the clock's day included. A rail post whose inputs match
-  // it leaves before wording the rail.
+  // Inputs for the last session-list payload, including the local day. Matching inputs skip rebuilding it.
   private lastRailKey: RailInputKey | null = null;
-  // The dispatched-source answers the figures in that rail were read with. A selection render
-  // reads the figures too, so the cache's own last answers can move past what the rail drew.
+  // Pending-source state used by the last session-list payload. A selection render can advance the figure cache independently.
   private railPendingAnswers: SpendPendingAnswers | null = null;
-  // The selection whose render still owes the rail, and whether a read save has chosen to
-  // ride on it. A save skips its own rail only while that render is still coming, and the
-  // settle below posts one if the render never did.
+  // Selection render that owes a session-list update. A skipped save update is posted when that render settles without supplying it.
   private railSeedOwedFor: number | null = null;
   private railSeedSkipped = false;
   private sessionOutcomes = new Map<string, TurnOutcome | null>();
   // Selection-independent turn starts, projected from accepted metadata and lifetime facts.
   private windows = new Map<string, TurnStarts>();
-  // Every turn in the workspace, reduced to what a reader would search: an id, where it came
-  // from, when, and the prompt and the summary. Held per session and keyed on the file's
-  // mtime, so a second search re-reads only what has moved, which while a turn is running is
-  // one file.
-  //
-  // Small on purpose. Measured on this machine: 32 MB of transcript in this workspace comes to
-  // 308 KB here, and the largest project, 642 MB across 107 files, comes to 4.5 MB. A
-  // transcript is almost entirely tool results and none of them are in this.
+  // Search entries by session file revision. Entries contain prompts and summaries without tool-result bodies.
   private corpus = new Map<string, { mtimeMs: number; size: number; entries: SearchEntry[] }>();
   private disposables: vscode.Disposable[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private lastSignature = '';
   private lastSpendSourceSignature = '';
-  // The held catalog and the folders it was walked for. Read only by a refresh that says a
-  // selection drove it, and overwritten by every refresh that walks, so the newest it can
-  // ever be is one refresh old. The poll and the transcript watchers both walk, which bounds
-  // how stale a click can find it without anything having to invalidate it.
+  // Catalog and folder identity retained for selection refreshes. Filesystem refreshes replace this snapshot.
   private catalog: { folders: string; sessions: SessionFile[] } | null = null;
   // The existing-session list from the last payload that completed discovery and required
   // metadata. A working catalog can move while that work is still in flight. Local drafts
   // compose with this accepted list, or with no existing rows before the first publication.
   private authoritativeCatalog: SessionFile[] | null = null;
-  // Whether the last listing walked the filesystem or reused the held catalog. The
-  // Project cost offer needs the answer, because it trusts a listed revision in place of
-  // stating the file and only a walk read every one of them.
+  // Whether the latest catalog refresh read filesystem revisions. Project cost reuses those revisions only after a filesystem walk.
   private catalogWalked = true;
-  // One side of one file's turn diff, keyed by the URI it opens under. In the order it was
-  // written, so the panel can drop what it wrote longest ago once it is over budget.
+  // Diff sides by URI, in insertion order. The byte budget evicts the oldest entries.
   readonly patches = new Map<string, string>();
   private patchBytes = 0;
-  // The reader's own file icons. Read on first use and kept, because a file row is drawn
-  // every few seconds and the theme changes about once a year.
+  // File icon theme cached until the editor reports a theme change.
   private icons = new IconThemeSource();
   private projectSpendWorkspace: string | null = null;
   // The workspace identity is available for the first render. Its persisted ledger is not
@@ -1904,9 +1654,7 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendHydrated = false;
   private projectSpendHydrationReady = false;
   private projectSpendHydrationTick: ReturnType<typeof setTimeout> | null = null;
-  // The broad source check is an integrity pass, not a poll. A moved listing offers its
-  // sources immediately; this clock catches child files and missed watcher events without
-  // statting every spend source every few seconds while the workspace is quiet.
+  // Periodic spend-source checks supplement watcher events. Changed listings offer their sources immediately.
   private projectSpendLastOfferAt = 0;
   private projectSpendRevision = 0;
   private lifetimeFigures = new SessionFiguresCache<SessionHeldFigures, LifetimeFigures>();
@@ -1926,14 +1674,10 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendRailOwed = false;
   private projectSpendIndexing = false;
   private projectSpendCostQueue: string[] | null = null;
-  // Every counted operation goes to the diagnostics log as well as to the counters, so the
-  // log reports what the snapshot reports without a second measurement. The counters ask the
-  // log whether it reads anything before they build a record.
+  // Performance counters share measurements with diagnostics. Disabled logging skips record construction.
   private readonly performanceCounters = new PanelPerformanceCounters(Date.now(), this.performanceSink());
   private readonly startupThresholds = new StartupThresholdWatch();
-  // When the panel began loading, on the clock the startup milestones read. A milestone
-  // carries `performance.now()`, which counts from the extension host process and is as old
-  // as the editor window, so the startup threshold subtracts this.
+  // Panel loading's start time on the `performance.now()` clock. Startup thresholds measure elapsed time from this value.
   private panelStartedAt: number | null = null;
   private startupHistory?: StartupHistory;
   private startupCache: Record<string, unknown> = {};
@@ -1945,9 +1689,7 @@ export class PanelProvider implements vscode.Disposable {
   private readonly warnedMessageBudgets = new Set<string>();
   private performanceOutput: vscode.OutputChannel | null = null;
 
-  // What the panel last remembered, shared by every host. Held here as well as written to
-  // the memento so a host attaching mid-session gets the live answer rather than the one on
-  // disk, which is the same reason the hidden set is held here.
+  // Live panel state shared by attached hosts and persisted through the memento.
   private saved: PanelState = normalizePanelState(null);
 
   constructor(
@@ -2021,7 +1763,7 @@ export class PanelProvider implements vscode.Disposable {
       const openings = codexOpeningsAtStartup(this.codexOpeningsFile, cached?.codexMetas);
       this.codexMetas.load(openings.rows);
       this.codexOpenings = new CodexOpeningsWriter(this.codexOpeningsFile, this.codexMetas, openings.seeded);
-      // A seed owes the shared file a save even when the first walk reads nothing new.
+      // Save seeded opening records even when the first walk finds no new entries.
       if (openings.seeded) {
         this.derivedCacheCheckpointState.markChanged(true);
       }
@@ -2030,28 +1772,11 @@ export class PanelProvider implements vscode.Disposable {
       process.env[MEASUREMENT_ENVIRONMENT.blockAgents] === '1' && process.env[MEASUREMENT_ENVIRONMENT.state]
         ? JSON.parse(fs.readFileSync(process.env[MEASUREMENT_ENVIRONMENT.state]!, 'utf8'))
         : this.memento?.get(STATE_KEY);
-    // The labels of every session that never got an id of its own, dropped, and dropped
-    // before the record is normalized.
-    //
-    // A session the panel starts is filed under a provisional id held in memory alone,
-    // so every entry under one belongs to a window that has gone. Swept here, where the
-    // stored record is first read, and nowhere else: normalization runs on every write, and a
-    // draft the reader is looking at right now has to keep the label they just put on it.
-    // `withSweptDraftLabels` carries why the sweep runs first.
+    // Remove abandoned provisional-session labels before normalization.
+    // Normalization also runs during writes, when active drafts must retain their labels.
     this.saved = normalizePanelState(withSweptDraftLabels(stored));
-    // The first time this workspace draws the panel, everything already in it counts as
-    // read. A reader opening a project is handed every turn every agent has ever run there
-    // otherwise, all of it unread, and the panel's one job is saying what is new.
-    //
-    // Stamped from the absence of stored state rather than from the floor being zero, so a
-    // reader who was here before the floor existed keeps the read state they built and is
-    // not handed a floor that would hide turns they had left unread on purpose.
-    //
-    // Written at once rather than left for the first press. Every other save here rides one:
-    // a reader who opens a project, looks, and presses nothing would leave the floor
-    // unwritten, so the next window stamps a later one and every turn that ran in between
-    // falls under it, counted read and never offered. That is this field's own harm, pointed
-    // the other way.
+    // Initialize the unread floor only when the workspace has no saved state. Existing work then starts as read.
+    // Save the floor immediately so reopening the window does not mark intervening turns as read.
     if (stored === undefined) {
       this.saved.since = Date.now();
       void this.memento?.update(STATE_KEY, this.saved);
@@ -2061,12 +1786,9 @@ export class PanelProvider implements vscode.Disposable {
     this.pinnedTop = new Set(this.saved.pinnedTop);
     // Restore the selected session before a ready host requests its first window.
     this.showing = this.saved.showing || null;
-    // The prompts the reader had typed and not sent, back where they were typed. Copied
-    // rather than aliased: the live record is written on every keystroke, and the stored one
-    // must move only when `rememberDrafts` says so.
+    // Copy restored drafts so typing does not mutate saved state before rememberDrafts runs.
     this.drafts = { ...this.saved.drafts };
-    // The prompts a reload could otherwise lose: sent from this panel, and not yet caught
-    // up with by any transcript on disk. Copied for the reason the drafts are.
+    // Restore submitted prompts that the transcript has not recorded yet.
     this.sentPrompts = restoredSentPrompts(this.saved);
     // Restore sessions started here before metadata classifies their agent runs.
     this.startedHere = new Set(this.saved.started);
@@ -2116,8 +1838,7 @@ export class PanelProvider implements vscode.Disposable {
     this.initialCatalogRefreshPending = false;
     this.stopPolling();
     this.repositoryScope.dispose();
-    // A page read outlives the provider unless it is stopped, and its result would commit
-    // state onto a disposed panel.
+    // Abort the page read before its result updates a disposed provider.
     this.historyRequest?.controller.abort();
     this.historyRequest = null;
     this.history.clear();
@@ -2142,9 +1863,7 @@ export class PanelProvider implements vscode.Disposable {
     this.cancelProjectSpendOffers();
     this.flushProjectSpendSave();
     this.cancelProjectSpendSaveRetry();
-    // Whatever the wait was still holding. Without it the last second of typing before a
-    // window closes is the second that never reaches storage, which is the one the reader
-    // would miss.
+    // Save pending draft text when disposal cancels its timer.
     if (this.draftSave) {
       clearTimeout(this.draftSave);
       this.draftSave = null;
@@ -2166,10 +1885,7 @@ export class PanelProvider implements vscode.Disposable {
     this.disposables = [];
   }
 
-  // The store's trigger file fires once per turn end, which is not enough on its own: it
-  // lives outside the workspace, and a turn that is still running never fires it at all.
-  // While the panel is on screen it therefore also looks for itself. The check is a stat
-  // per session file, and a render is posted only when one of them has actually moved.
+  // Poll while the panel is visible to detect transcript changes without a watcher event.
   private startPolling(): void {
     this.watching = true;
     if (this.poll) {
@@ -2178,8 +1894,7 @@ export class PanelProvider implements vscode.Disposable {
     this.poll = setInterval(() => this.refreshFrom('poll'), POLL_INTERVAL_MILLISECONDS);
   }
 
-  // A hidden panel opens no watcher, so nothing reports a rollout write while it waits. The
-  // held stats go with the poll, and the next reader stats each rollout itself.
+  // Clear held rollout stats when polling stops. The next read must obtain fresh file revisions.
   private stopPolling(): void {
     if (this.poll) {
       clearInterval(this.poll);
@@ -2193,18 +1908,10 @@ export class PanelProvider implements vscode.Disposable {
     this.pendingWatch.clear();
   }
 
-  // Watches exactly the directories named, and nothing else. Called after every listing, so
-  // a session started in a directory nobody was watching is picked up on the next read.
-  //
-  // The poll stays. It covers what a watcher does not see: a file written across a network
-  // share or by a sync client, and the stretch between the panel coming back on screen and
-  // the first append after it. What the watcher adds is the wait: five seconds becomes a
-  // fifth of one, which is the difference between a card that appears and a card that has
-  // already appeared. A Codex rollout idle beyond `CODEX_STAT_ACTIVE_MS` reuses its held stat,
-  // so the poll sees an unreported write to it only once that stat reaches
-  // `CODEX_STAT_REVALIDATE_MS`.
-  //
-  // A closed watcher reports nothing more, so closing one clears the held rollout stats.
+  // Watch the listed transcript directories and close watchers outside that list.
+  // Polling also detects writes without watcher events, including network and synchronized files.
+  // Idle Codex rollouts retain cached stats until CODEX_STAT_REVALIDATE_MS.
+  // Clear held rollout stats when closing a watcher because it will report no further writes.
   private watchDirectories(dirs: string[]): void {
     for (const [dir, watcher] of this.watchers) {
       if (dirs.includes(dir)) {
@@ -2226,10 +1933,7 @@ export class PanelProvider implements vscode.Disposable {
         const watcher = fs.watch(dir, { persistent: false }, (kind, name) => {
           this.wakeFromWatch(dir, kind, name);
         });
-        // A watched directory can be removed underneath the handle, and on Windows the
-        // handle then errors rather than closing. Left in the map it is a watcher that
-        // has stopped reporting, which is worse than none: the panel would be back on the
-        // poll with nothing saying so.
+        // Remove a failed watcher and request a broad refresh. Windows can report an error when its directory disappears.
         watcher.on('error', () => {
           try {
             watcher.close();
@@ -2250,9 +1954,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // One read per burst of appends. Both CLIs write a turn a message at a time, so the
-  // events arrive in pairs and clusters, and reading on each one would parse the same file
-  // several times to learn the same thing.
+  // Schedule watcher refreshes in batches to avoid parsing the same file for each append.
   private wakeFromWatch(directory: string, kind: string, filename: unknown): void {
     if (!this.watching) {
       return;
@@ -2292,29 +1994,17 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  // Open the panel as a tab in the editor area, or bring the one that is already open
-  // back to the front. One tab at most: a second copy of the same list is nothing to read
-  // and everything to keep in step.
+  // Reveal the existing editor tab, or create and adopt one when none is held.
   openInEditor(column: vscode.ViewColumn = vscode.ViewColumn.Active, origin: PanelOrigin = 'created'): void {
     if (this.editorPanel) {
-      // Nothing is adopted here, and the panel on screen keeps the origin it was adopted under.
-      // `origin` names the panel this call would have made, so the line carries the origin of the
-      // panel being revealed instead. A reveal of a restored panel recorded as `created` reads as
-      // an open that never happened.
+      // Log the revealed panel's original adoption source. This call does not adopt a panel.
       this.diagnostics.log('panelRevealed', { origin: this.editorPanelOrigin });
       this.editorPanel.reveal(column);
       return;
     }
-    // A tab restored after a window reload is not built until the reader looks at it, so this
-    // can run while a restored one still waits in a background group. That is the one way a
-    // second panel gets made, and the guards in `adoptPanel` are what stop the older of the
-    // two from clearing the pointer to the newer one when it closes.
+    // A restored tab can arrive after this call creates a panel. adoptPanel handles the competing tabs.
     const panel = vscode.window.createWebviewPanel(
-      // The find widget is the editor's own, and it is the only way the reader can search
-      // what is on screen: a webview takes Ctrl or Cmd with F for the editor before the page
-      // sees it, so the browser's find never runs. The rail's box filters sessions and
-      // `find:` searches transcripts, and neither one searches the words in front of the
-      // reader.
+      // Enable the editor's find widget through PANEL_OPTIONS. Session filters and transcript search do not search the displayed text.
       PANEL_TYPE,
       PANEL_TITLE,
       column,
@@ -2330,16 +2020,13 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'focusProjectSpend' });
   }
 
-  // The first panel of this host process, on the milestone clock. A second panel opened later
-  // joins the start the first one recorded, because the milestones are recorded once for the
-  // whole host process.
+  // Retain the first panel-open time for this provider's startup milestones.
   private notePanelStart(): void {
     this.panelStartedAt ??= performance.now();
     this.startupHistory?.stage('panelOpened', this.panelStartedAt);
   }
 
-  // What the counters hand each counted operation to. They ask `enabled` before they build a
-  // record, so a log that is off costs one call to a function that returns false.
+  // Supply the diagnostics setting and event handler to the performance counters.
   private performanceSink(): PerformanceEventSink {
     return {
       enabled: () => this.diagnostics.enabled(),
@@ -2347,12 +2034,8 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // Every counted operation, on its way to the log. The counters decide what each event is
-  // called and what it carries, and the log decides whether anything reaches disk.
-  //
-  // A milestone the reader waited far too long for reaches them whatever the setting says. A
-  // panel that took 89 seconds to draw its first card recorded every counter it has and told
-  // nobody, which is the whole reason this line exists.
+  // Route counted operations to diagnostics and startup history.
+  // Report startup threshold breaches even when diagnostic logging is disabled.
   private routePerformanceEvent(event: string, record: Record<string, unknown>): void {
     if (event === 'startup' && typeof record.milestone === 'string' && typeof record.elapsedMs === 'number') {
       this.startupHistory?.stage(record.milestone, record.elapsedMs);
@@ -2361,16 +2044,11 @@ export class PanelProvider implements vscode.Disposable {
       this.diagnostics.log(event, record);
       return;
     }
-    // `elapsedMs` counts from the extension host process, so a panel opened an hour into an
-    // editor window reports an hour. The threshold reads the time since the panel opened, and
-    // the log carries both: the saved snapshot and the measurement harness read `elapsedMs`
-    // as it stands.
+    // Convert the host-relative milestone time to time since the panel opened.
+    // Preserve elapsedMs for saved diagnostics and include panelElapsedMs when logging is enabled.
     const startedAt = this.panelStartedAt;
     if (startedAt === null) {
-      // Nothing recorded when the panel opened, so the wait the threshold reads is unknown.
-      // The host-relative number is as old as the editor window, and reporting it is how the
-      // reader hears that a panel opened an hour ago took an hour to draw. The milestone still
-      // reaches the log, and no threshold runs against a number that means something else.
+      // Skip thresholds without a panel-open time. The host-relative clock does not measure the panel's wait.
       if (this.diagnostics.enabled()) {
         this.diagnostics.log(event, record);
       }
@@ -2380,7 +2058,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.diagnostics.enabled()) {
       this.diagnostics.log(event, { ...record, panelElapsedMs });
     }
-    // A milestone name the counters do not know carries no threshold, and the watch says so.
+    // Ignore milestones without a configured startup threshold.
     const breach = this.startupThresholds.check(record.milestone as StartupMilestone, panelElapsedMs);
     if (!breach) {
       return;
@@ -2409,9 +2087,7 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  // The command answers with the file it wrote, so a caller that ran it can read the snapshot
-  // back without watching a folder. `target` names that file, and the directory variable stands
-  // in for it when nothing is passed.
+  // Return the saved snapshot path so callers can read the capture without watching its directory.
   async savePerformanceDiagnostics(target?: string): Promise<string | null> {
     this.performanceCounters.recordCapture();
     const capturedAt = Date.now();
@@ -2433,10 +2109,7 @@ export class PanelProvider implements vscode.Disposable {
       },
       write: (file, contents) =>
         Promise.resolve(vscode.workspace.fs.writeFile(vscode.Uri.file(file), Buffer.from(contents, 'utf8'))),
-      // A run with no reader at the window reads the diagnostics log, so the reason goes there as
-      // well. It goes through `warn`, which writes whatever the setting says: the setting is off
-      // until a reader turns it on and reloads the window, and an automated capture cannot tell a
-      // failed write from a closed dialog without this line.
+      // Log capture failures regardless of the diagnostics setting so unattended callers can identify a failed write.
       report: (failure) => {
         this.diagnostics.warn('performanceCaptureFailed', { file: failure.file, reason: failure.reason });
         void vscode.window.showErrorMessage(failure.message);
@@ -2514,19 +2187,8 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // A tab handed back after a window reload, which is not always the tab this version would
-  // have made.
-  //
-  // The editor stores the options a panel was created with and hands those same options back
-  // for the life of that tab. It never asks the extension again, and the extension cannot set
-  // them on a panel it did not create. So a tab opened before this version asked for the find
-  // widget comes back without one, through every reload and every reinstall, and Ctrl or Cmd
-  // with F answers with nothing on a panel that looks current in every other way. Measured on
-  // this machine: the stored options carried `retainContextWhenHidden` and no
-  // `enableFindWidget` at all.
-  //
-  // Replacing the tab applies the current options. Submitted text reaches workspace storage
-  // before replacement removes the browser copy.
+  // Restore tabs whose saved options match PANEL_OPTIONS. Replace other tabs to apply the current options.
+  // Retain submitted prompts in workspace storage before disposing the restored browser.
   async revivePanel(panel: vscode.WebviewPanel, state?: unknown): Promise<void> {
     if (state && typeof state === 'object' && 'submittedPrompts' in state) {
       try {
@@ -2548,16 +2210,11 @@ export class PanelProvider implements vscode.Disposable {
     }
     const column = panel.viewColumn ?? vscode.ViewColumn.Active;
     panel.dispose();
-    // The replacement carries the reload with it. A panel adopted as `created` here would tell a
-    // reader that the serializer never fired on a window that had just restored a tab.
+    // Identify the new tab as a serializer replacement in diagnostics.
     this.openInEditor(column, 'serializer-replaced');
   }
 
-  // Also the way a tab restored after a window reload rejoins, through the serializer.
-  //
-  // The origin is logged because a panel reaches this from more than one place. A restored tab is
-  // built when the reader looks at it, and a created one is built when the command runs, so a
-  // measured start means nothing until the log says which one it timed.
+  // Adopt a created or restored editor tab and log its source for startup diagnostics.
   adoptPanel(panel: vscode.WebviewPanel, origin: PanelOrigin): void {
     if (this.editorPanel && this.editorPanel !== panel) {
       const previous = this.editorPanel;
@@ -2586,8 +2243,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.editorPanel = panel;
     this.editorPanelOrigin = origin;
-    // Only when this is still the tab being held. Closing an older panel must not clear the
-    // pointer to a newer one, or the next press of the command opens a third.
+    // Clear the editor-tab reference only when the disposed panel still owns it.
     panel.onDidDispose(() => {
       if (this.editorPanel === panel) {
         this.editorPanel = null;
@@ -2597,18 +2253,9 @@ export class PanelProvider implements vscode.Disposable {
     this.attach(panelHost(panel));
   }
 
-  // The two listeners that are about the editor rather than about a host. Registered once,
-  // in the constructor, because an editor tab can be opened and closed as often as the reader
-  // likes: registered per host they would pile up, one pair per open, released only when the
-  // extension shuts down, and one theme change would then repaint the panel once per tab the
-  // reader had ever opened. Both bodies already work over `hosts`, so one registration serves
-  // every host there will ever be.
+  // Register editor listeners once per provider. Each listener operates on the current hosts.
   private wireEditorListeners(): void {
-    // A different icon theme means a different set of icons, a different font and a
-    // different folder to load it out of. Applied to whichever hosts are current, never to
-    // one captured here: a host that has gone throws as soon as its webview is assigned to,
-    // and the throw lands before the repaint, so the survivors would keep every icon broken
-    // until the window was reloaded.
+    // Apply configuration changes to the current hosts. Icon-theme changes also replace their allowed theme files.
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((change) => {
         if (change.affectsConfiguration(settingName('projectCost.historyDays'))) {
@@ -2641,11 +2288,9 @@ export class PanelProvider implements vscode.Disposable {
         void this.refresh(true);
       }),
     );
-    // A theme's `light` block only applies under a light colour theme, so the same file
-    // resolves to a different icon on either side of this.
+    // Refresh icon variants when the editor switches between light and dark themes.
     this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => void this.refresh(true)));
-    // The open folders decide which files the webview may read. A folder added after a host
-    // opened is not in that list, so a picture under it draws nothing until this runs.
+    // Update permitted webview resource roots when workspace folders change.
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.workspaceFoldersChanged()));
   }
 
@@ -2665,7 +2310,7 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryAcknowledgment = undefined;
     this.claudeChildReferenceEntries = new Map();
     this.enumeratedSpendSources = undefined;
-    // A catalog listed under the previous folders cannot render the current workspace.
+    // Cancel catalog work started for different workspace folders.
     this.abandonCatalogRefresh();
     this.repositoryScope.snapshot(this.folders());
     for (const open of this.hosts) {
@@ -2675,8 +2320,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // Everything a host needs doing to it, whichever of the two it is. One function rather than
-  // one per host: each half of this went wrong quietly when it was written twice.
+  // Register a panel host, its listeners, and its initial document.
   private attach(host: PanelHost): void {
     this.notePanelStart();
     this.hosts.push(host);
@@ -2686,9 +2330,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.performanceCounters.registerPanel(host);
     this.allowThemeFiles(host.webview);
-    // This host's own listeners, held together so they go when it does. An editor tab is
-    // opened and closed at will, and anything of its own left in the provider's list would
-    // outlive it until the extension shut down.
+    // Dispose these listeners with their host instead of retaining them until provider shutdown.
     const mine: vscode.Disposable[] = [
       host.webview.onDidReceiveMessage((msg) => void this.onMessage(msg, host)),
       host.onDidChangeVisibility(() => {
@@ -2696,15 +2338,11 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
-        // Polling runs while any host is on screen and stops when none is. Asked of the hosts
-        // rather than of the one that just changed: a host going out of sight must not stop
-        // the poll another one is still watching.
+        // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.
         if (this.anyVisible()) {
           void this.refresh(true);
           this.startPolling();
-          // The strip's figures age while nobody is looking at them, and reading them again
-          // costs no model tokens, so coming back into view is what keeps a stale reading
-          // the rare case rather than the normal one.
+          // Request account and catalog updates when a ready host becomes visible.
           if (!this.requestInitialCatalogRefresh()) {
             this.refreshSelectedCatalogs();
           }
@@ -2741,8 +2379,7 @@ export class PanelProvider implements vscode.Disposable {
         for (const gone of mine) {
           gone.dispose();
         }
-        // The box goes with the view that held it. What it was showing lives only in this
-        // window, and a view opened again builds its box from the stored draft.
+        // Discard temporary prompt history selections when the last host closes. Stored drafts remain available.
         if (!this.hosts.length) {
           this.railOrder = [];
           this.boxText = {};
@@ -2854,8 +2491,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // One message to every host, so a search run in one is drawn in both. Contact every host
-  // before waiting: two updates posted close together must reach each host in call order.
+  // Start delivery to every host before awaiting completion to preserve message call order.
   private async post(message: unknown, measured?: (serializedBytes: number | null) => void): Promise<void> {
     await Promise.all(
       this.hosts.map((host) => {
@@ -2884,25 +2520,22 @@ export class PanelProvider implements vscode.Disposable {
       return Promise.resolve(false);
     }
     const kind = typeof type === 'string' ? type : 'unknown';
-    // The post first, then the count. Only budgeted messages carry a byte measurement.
-    // Other messages retain their count without paying for a second serialization.
+    // Post before measuring the message. Serialize only message kinds with a byte budget.
+    // Count other message kinds without byte measurements.
     const posted = host.webview.postMessage(message);
     const budget = messageByteBudget(kind);
     const serializedBytes = budget === null ? null : serializedMessageBytes(message);
     this.performanceCounters.recordMessage(kind, serializedBytes, host);
     measured?.(serializedBytes);
     if (serializedBytes !== null && budget !== null && serializedBytes > budget) {
-      // Every breach reaches the log, because a message that goes over budget on every
-      // refresh is the shape a reader needs to see. The output channel keeps one line for
-      // each kind, and that line carries the field breakdown.
+      // Log each budget breach when diagnostics are enabled. Warn once per message kind with its largest field sizes.
       if (this.diagnostics.enabled()) {
         this.diagnostics.log('budgetBreach', { kind, bytes: serializedBytes, budgetBytes: budget });
       }
       if (!this.warnedMessageBudgets.has(kind)) {
         this.warnedMessageBudgets.add(kind);
         this.performanceOutput ??= vscode.window.createOutputChannel('Arc');
-        // Render and rail measurements above already serialize their rail data. Inspecting that
-        // field again would repeat the largest part of the work that this warning reports.
+        // Exclude session list fields because render and session list measurements already serialize them.
         const excludesRail = kind === 'render' || kind === 'rail';
         const excludes = excludesRail ? new Set(['rail']) : undefined;
         const fields = messageFieldBytes(message, excludes)
@@ -2918,9 +2551,7 @@ export class PanelProvider implements vscode.Disposable {
     return posted;
   }
 
-  // What the foot draws, worked out at the moment it is asked for. The age on a figure
-  // moves with the clock and nothing else does, so the bar is never stored: keeping it
-  // would mean a repaint to make a figure grow old.
+  // Build the usage status bar with the current clock so reading ages and reset times stay current.
   private usagePayload(webview?: vscode.Webview): unknown {
     const state = this.composerState(webview);
     return this.usagePayloadFromState(state);
@@ -2932,13 +2563,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private usagePayloadFromState(state: ComposerState | null): unknown {
-    // The menus travel with the composer rather than being asked for on the press. Every
-    // word in one is decided from the same state the controls are drawn from, so a menu
-    // that disagrees with the control that opens it is not a thing that can happen, and
-    // the press costs no round trip.
-    //
-    // Agent is a draft's control alone. `pickMenu` answers nothing for it on a live
-    // session, so the loop asks for all five and a live render carries four.
+    // Build menus from the same prompt box state as their controls and include them in the payload.
+    // Only provisional drafts receive an agent menu.
     const menus: Record<string, unknown> = {};
     if (state) {
       for (const control of ['agent', 'model', 'effort', 'askmode', 'mcp']) {
@@ -2964,10 +2590,7 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // The session the composer is aimed at, and everything known about typing into it.
-  // The session on screen, because that is the only one drawn, and the newest listed
-  // where a render has not yet named one. Every word the composer draws is decided from this
-  // in `composerview.ts`; nothing here writes one.
+  // Build prompt box state for the selected session, or the first shown row when no session is selected.
   private composerState(webview?: vscode.Webview): ComposerState | null {
     if (!this.repositoryScopeReady) {
       return null;
@@ -2984,10 +2607,8 @@ export class PanelProvider implements vscode.Disposable {
     return row ? this.stateForRow(row, webview) : null;
   }
 
-  // The same, for a session named outright rather than the one the box is aimed at. A
-  // turn ending is about the session it ended in, and that is often not the session
-  // on screen: a queue drained through `composerState` alone waited for the reader to look
-  // back at it, which is exactly when they are not looking.
+  // Build prompt box state for a specified session, including sessions outside the current view.
+  // Reject early selected sources until catalog discovery accepts them, except locally started sessions.
   private stateFor(session: string): ComposerState | null {
     if (!this.repositoryScopeReady) {
       return null;
@@ -3049,9 +2670,8 @@ export class PanelProvider implements vscode.Disposable {
     return this.ownCwdForSession(agent, sessionId) ?? this.folders()[0] ?? null;
   }
 
-  // The same, without the default-folder fallback. A per-directory skill list is keyed by a
-  // session's own recorded directory, so a row that has not reported one must draw no list
-  // rather than the first workspace folder's list.
+  // Resolve the session's working directory without a workspace-folder fallback.
+  // Claude skill lists use this directory to avoid displaying another project's skills.
   private ownCwdForSession(agent: string, sessionId: string): string | null {
     const session = this.catalog?.sessions.find(
       (candidate) => candidate.agent === agent && candidate.sessionId === sessionId,
@@ -3066,11 +2686,9 @@ export class PanelProvider implements vscode.Disposable {
     return session?.cwd ?? null;
   }
 
-  // Claude's published commands, each carrying a `SKILL.md` path where a project or the
-  // reader's own Claude installation has one. Codex marks its own catalog entries with a path
-  // before Arc ever sees them; Claude's `init` message never does, so this looks one up for
-  // every entry a command list carries, the same lookup composer.ts's slash match would
-  // otherwise have to trigger from inside the webview, which never touches disk.
+  // Preserve published command paths and add available Claude skill definition paths.
+  // Search project skills before Claude's configured home when a command has no published path.
+  // Cache lookup results by session directory and command name, including missing definitions.
   private claudeCommandsFor(cwd: string | null): PromptEntry[] {
     const commands = this.commandLists.claude ?? [];
     if (commands.length === 0) {
@@ -3097,10 +2715,7 @@ export class PanelProvider implements vscode.Disposable {
     const runtime = this.composerRuntime?.get(row.id) ?? null;
     const pick = sessionSettings(this.picks, row.id);
     const newDraft = this.newDrafts[row.id] ?? null;
-    // The composer draws the profile off the frozen draft, because that copy is the one
-    // `send` hands to the callback that starts the child. `draftProfiles` carries the same
-    // values, and a write that reached one book and not the other would draw one setup here
-    // and start the child on another.
+    // Render the frozen draft profile that `send` supplies to the child-launch callback.
     const profile = newDraft?.profile ?? null;
     const permissionMode = storedAskValue(
       row.agentKey,
@@ -3132,15 +2747,9 @@ export class PanelProvider implements vscode.Disposable {
         this.cwdForSession(row.agentKey, row.id),
         profile?.model ?? pick.selectedModel,
       ),
-      // A Claude row carries a path on every command whose `SKILL.md` this session's directory
-      // or the reader's own Claude installation has, looked up fresh per row because a
-      // worktree session and its parent report different project folders. A Codex row keeps
-      // the list the CLI answered, since Codex already marked its own skills with a path.
+      // Claude commands include skill paths resolved for this working directory. Codex supplies paths in its catalog.
       commands: row.agentKey === 'claude' ? this.claudeCommandsFor(claudeCwd) : (this.commandLists[row.agentKey] ?? []),
-      // Null when this row's working directory has never reported a list, which is the
-      // fallback state. `??` rather than a default array, because a reported empty list is a
-      // real answer and must not read the same as one that never arrived. A Codex row never
-      // draws a Claude skill list, because Codex flags its own skills on its catalog entries.
+      // Null means no Claude skill list has arrived. A reported empty list remains distinct from that fallback.
       claudeSkills:
         row.agentKey === 'claude'
           ? claudeCwd
@@ -3157,30 +2766,25 @@ export class PanelProvider implements vscode.Disposable {
       askMode: permissionMode,
       effectiveMode: this.codexEffectiveModes?.[row.id] ?? null,
       effectivePermissionMode: this.claudeEffectiveModes?.[row.id] ?? null,
-      // A session with no recorded window figure gets none drawn. The window is the
-      // model's rather than a constant, so it is read off the turn and never assumed.
+      // Draw context only when the accepted runtime includes a model window size.
       contextGeneration: this.contextGenerations?.get(row.id) ?? 0,
       context: runtime?.context?.window ? { used: runtime.context.tokens, max: runtime.context.window } : null,
-      // What the next turn costs before the reader types. The accepted window supplies it,
-      // and the shared projection retains compaction precedence.
+      // The accepted runtime supplies estimated next-turn cost, retaining compaction precedence.
       nextTurn: runtime?.nextTurn ?? null,
-      // What this session is still waiting on, and empty between presses. Every word
-      // the cards say is decided from it in `composerview.ts`.
+      // Pending live activity for this session, projected into cards by `composerview.ts`.
       live: this.live[row.id] ?? [],
       asks: this.asks.filter((entry) => entry.session === row.id).map((entry) => entry.ask),
     };
   }
 
-  // What the agents last said about the reader's account. Posted on its own rather than
-  // through a render, because nothing else on screen has changed and a render reads
-  // transcripts.
+  // Update account figures without reading transcripts.
   public setUsage(usage: AgentUsage[]): void {
     this.usage = usage;
     void this.post({ type: 'usage', usage: this.usagePayload() });
     this.postProjectSpend();
   }
 
-  // How much each agent asks before it acts. Travels the same way and for the same reason.
+  // Update permission levels through the account and composer payload.
   public setAskLevels(levels: Record<string, string>): void {
     this.askLevels = levels;
     void this.post({ type: 'usage', usage: this.usagePayload() });
@@ -3204,8 +2808,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // The requests every live child is waiting on. One update redraws the selected
-  // session's forms and rewords every affected rail card without parsing transcripts.
+  // Update request forms and affected session-list statuses without reading transcripts.
   public setAsks(asks: readonly { session: string; ask: Ask }[]): void {
     const next = asks.map((entry) => ({ session: entry.session, ask: entry.ask }));
     if (JSON.stringify(next) === JSON.stringify(this.asks)) {
@@ -3216,16 +2819,14 @@ export class PanelProvider implements vscode.Disposable {
     this.postRail(true);
   }
 
-  // The models each agent will run, read once from an idle child and cached, since the
-  // list changes on a release rather than on a turn.
+  // Replace model catalogs and their pending state, then refresh the panel.
   public setModels(models: Record<string, ModelChoice[]>, pending: readonly string[] = []): void {
     this.models = models;
     this.pendingModels = pending;
     void this.refresh();
   }
 
-  // The MCP servers each draft or recorded session last reported. A server can fall over on
-  // its own, so the owner receives another reading whenever its answer can have moved.
+  // Update MCP server readings for each draft or session.
   public setMcpServers(servers: Record<string, McpServer[]>): void {
     this.mcpServers = servers;
     void this.post({ type: 'usage', usage: this.usagePayload() });
@@ -3371,10 +2972,7 @@ export class PanelProvider implements vscode.Disposable {
     return { owner, state, view };
   }
 
-  // The command, the rail's primary button, and every setup row end here. With no current
-  // session, the primary command opens the setup menu because there is nothing honest
-  // to inherit. A chosen setup creates only local draft state and asks the existing box for
-  // focus; the agent still starts on the first accepted prompt.
+  // A chosen setup creates a local draft and focuses the prompt box. Without a usable setup, open the setup menu.
   public newSession(request?: LauncherRequest, host?: PanelHost, ownership?: { owner?: string }): boolean {
     if (ownership && ownership.owner !== this.setupOwner) return false;
     const { owner, state, view } = this.launcherFor(host);
@@ -3572,9 +3170,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The empty draft asked for from the native menu over a turn card, a session heading, or a
-  // rail card. Each of those right-clicks arms the same record Show session details reads, so
-  // the draft opens only in the panel that drew the menu.
+  // Open a labelled draft in the host that armed the native session menu.
   public newSessionWithLabels(session: string): void {
     const arm = this.detailsMenuArm;
     this.detailsMenuArm = null;
@@ -3600,9 +3196,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The launcher supplies the id and the snapshotted profile. Keeping creation here makes an
-  // untouched draft a local view state change: no extension callback, child, transcript, or
-  // thread exists until `send` calls the fresh-delivery callback.
+  // Create local draft state from the launcher's ID and captured profile.
   public createDraft(
     draftId: string,
     cwd: string,
@@ -3641,8 +3235,7 @@ export class PanelProvider implements vscode.Disposable {
     this.previousSelection = this.showing;
     this.showing = draftId;
     this.onSelectionChanged?.(draftId, profile.agent, draft.cwd);
-    // Opening a draft is another chance to fill its agent's server control. A missing
-    // initial MCP answer leaves that read eligible, while settled books make this free.
+    // Retry eligible account and server reads for the draft's agent.
     this.refreshUsageHandler?.(profile.agent, false, draftId, profile.agent, draft.cwd);
     void this.refresh(true, true, true, true);
     return draft;
@@ -3653,9 +3246,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!removed) {
       return false;
     }
-    // Only the draft itself knows whether the reader worked on its setup. Its profile reads
-    // custom the moment the launcher's own form makes it, before anyone has pressed one of
-    // its controls, so a rule reading the profile keeps that draft on the rail for good.
+    // `handChanged` records reader changes. A custom launch profile alone does not retain an untouched draft.
     const next = abandonSessionDraft(
       {
         drafts: this.drafts,
@@ -3693,10 +3284,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.readerParents = abandonReaderParents(this.saved.readerParents ?? {}, draftId);
     delete this.mcpServers[draftId];
     this.onDraftRemoved?.(removed);
-    // The labels go with the draft. A session that never started has no card to draw
-    // them on and no id any control can reach, so an entry left behind is filing that exists
-    // only in storage: it would hold a slot under the record's ceiling, and the label itself
-    // would be offered by every list built from the record while matching nothing.
+    // Remove labels for the abandoned draft so they occupy no stored session slot.
     if (labelsOf(this.saved.labels, draftId).length) {
       this.saved.labels = setSessionLabels(this.saved.labels, draftId, []);
       void this.post({ type: 'labelsChanged', session: draftId });
@@ -3792,8 +3380,7 @@ export class PanelProvider implements vscode.Disposable {
       this.draftCommentIds[actual] = draftCommentIds;
     }
     delete this.draftCommentIds[provisional];
-    // The invented id stops existing here. A place still holding it would be pruned on the
-    // next refresh, and the reader would lose the session they had just started.
+    // Replace the provisional ID in navigation before catalog reconciliation removes it.
     this.trail = renamePlace(this.trail, provisional, actual);
     this.awaitingSessionRecords[actual] = {
       sessionId: actual,
@@ -3801,9 +3388,7 @@ export class PanelProvider implements vscode.Disposable {
       agent: draft.profile.agent,
       cwd: draft.cwd,
     };
-    // The awaiting record above goes as soon as the disk record arrives, and this one does
-    // not. It answers a different question, and the transcript that ends the wait is the
-    // very thing that would file this session under Run by agents.
+    // Persist reader-started ownership after the temporary awaiting-record row disappears.
     this.rememberStarted(actual);
     rememberSessionAlias(this.sessionAliases, provisional, actual);
     const notice = this.attachmentNotices[provisional];
@@ -3828,13 +3413,7 @@ export class PanelProvider implements vscode.Disposable {
       this.draftRevisions.delete(provisional);
     }
     delete this.newDrafts[provisional];
-    // The labels follow the session onto the id it actually gets. A reader who files a
-    // session while it is starting puts the label on the draft's own id, and the agent
-    // hands back an id of its choosing a moment later. A label left on the old id belongs to
-    // nothing, so it would disappear off a card the reader had labelled seconds earlier.
-    //
-    // Written before `writeDrafts` below, which is what puts this state on disk. The draft's
-    // id is gone by the end of this method, so the move cannot wait for the next save.
+    // Move labels to the actual session ID before persisting draft adoption.
     if (labelsOf(this.saved.labels, provisional).length) {
       this.saved.labels = adoptLabelSession(this.saved.labels, provisional, actual);
       void this.post({ type: 'labelsChanged', session: actual });
@@ -3846,27 +3425,18 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // A press on one of a draft's own controls. It changes that draft and reaches nothing else.
-  //
-  // The frozen draft is rebuilt beside the profile. `send` hands that value to the callback
-  // that starts a fresh session, and the spawn plan is built from the profile inside
-  // it, so a draft left holding the old profile starts its child on the setup the reader
-  // replaced.
+  // Rebuild the frozen draft with its changed profile. Child launch reads this same profile.
   private pickOnDraft(session: string, control: string, value: string): void {
     const profile = this.draftProfiles[session];
     const draft = this.newDrafts[session];
     if (!profile || !draft) {
       return;
     }
-    // A draft whose first prompt has gone is starting its child, and the spawn plan is built
-    // from the copy `send` already handed over. A press taken after that leaves the panel
-    // naming a setup the running child never had. The rule is `draftStarted` in
-    // `composerview.ts`, where it is tested, and it catches a press that raced the redraw.
+    // Reject setup changes after the first prompt starts delivery. The launch callback already holds its profile.
     if (draftStarted(this.live[session] ?? [])) {
       return;
     }
-    // A value no menu offered is refused. The rule is `draftProfileAfterPick` in
-    // `composerview.ts`, where it is tested, so nothing here decides what a press means.
+    // `draftProfileAfterPick` validates values against the available prompt settings.
     const next = draftProfileAfterPick(
       profile,
       control,
@@ -3884,10 +3454,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.draftProfiles[session] = next;
-    // Only a press that moved a value is the reader's own work, and the rebuilt draft carries
-    // that fact so the rail keeps the draft when they look at another session. Pressing
-    // the row already ticked resolves and changes nothing, and a draft marked by that press
-    // would refuse to leave over a setup the reader never chose. An earlier change stands.
+    // Retain a draft after an actual setup change. Selecting the current value leaves `handChanged` unchanged.
     const changed =
       profile.agent !== next.agent ||
       profile.model !== next.model ||
@@ -3916,11 +3483,7 @@ export class PanelProvider implements vscode.Disposable {
       delete this.mcpServers[session];
       this.refreshUsageHandler?.(next.agent, false, session, next.agent, draft.cwd);
     }
-    // The rail row takes its name and its agent key from the draft, and that agent key
-    // chooses the model catalog, so an agent change needs the rail rebuilt. Every other
-    // press changes the composer alone, and the composer, its tag, its labels and its menus
-    // all come back through the usage payload. A full refresh for one of those lists
-    // sessions, refreshes metadata and parses transcripts to redraw a row that has not moved.
+    // Agent changes require a new session-list row. Other setup changes update only the composer payload.
     if (next.agent !== profile.agent) {
       void this.refresh(true);
       return;
@@ -3928,30 +3491,23 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // The commands each agent published, for the menu the composer opens on a slash. Travels
-  // the same way the model list does, and for the same reason: it is read off a child this
-  // file does not own.
+  // Replace published prompt commands for the slash menu.
   public setCommands(commands: Record<string, PromptEntry[]>): void {
     this.commandLists = commands;
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // The per-directory Claude skill list, for the Composer highlight. Travels the same way the
-  // command list does, and for the same reason: it is read off a child this file does not own.
+  // Replace per-directory Claude skill lists used by prompt highlighting.
   public setSkills(skills: Record<string, readonly string[]>): void {
     this.skillLists = skills;
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // Which sessions have a turn in flight, as `runningKey` spells them. Sessions
-  // rather than agents: one agent runs several at once, and a set of agent names drew Stop
-  // over every session of a busy agent, including the quiet one the box was aimed at.
+  // Update running sessions by `runningKey`. An agent can run several sessions simultaneously.
   public setRunning(keys: readonly string[]): void {
     const next = new Set(keys);
     const moved = next.size !== this.running.size || [...next].some((key) => !this.running.has(key));
-    // When each session became busy, kept as the set moves: the moment a key arrives is
-    // the press it arrived for, and a key that leaves takes its time with it, so the next
-    // press is timed from its own arrival rather than from an older one.
+    // New running keys receive a start time. Removed keys discard it before a later run.
     const now = Date.now();
     for (const key of next) {
       if (!this.runningSinceKeys.has(key)) {
@@ -3964,24 +3520,17 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     this.running = next;
-    // Busy changes what the card says and whether Stop is available, but it does not prove
-    // delivery. AgentSession reports busy before the CLI answers the handoff, so only that
-    // answer records that this press started a turn. Marked before anything is swept: a press
-    // the agent has taken and not begun is not one that stopped when the session went
-    // quiet, and sweeping it took the reader's own prompt off the screen with the compaction.
+    // Running status does not confirm prompt delivery. Reconcile live activity before removing completed entries.
     this.markStartedPresses();
     this.dropSpentPresses();
     void this.post({ type: 'usage', usage: this.usagePayload() });
-    // The rail and cards wear the same answer, so rebuild both when the set moves and not
-    // otherwise. This runs on every event a turn produces, and rebuilding on each one is
-    // hundreds of reads to say what the panel already said.
+    // Refresh cards and the session list only when running membership changes.
     if (moved) {
       void this.refresh(true);
     }
   }
 
-  // Which hosted sessions' processes have exited, as `runningKey` spells them. A dead host
-  // process ends every background child it held, so the rail stops counting them.
+  // Record exited hosted sessions by `runningKey` and refresh their status.
   public setExited(keys: readonly string[]): void {
     const { exited, moved } = recordExits(this.exitedSinceKeys, this.exitedNow, keys, Date.now());
     this.exitedNow = exited;
@@ -4015,10 +3564,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // Which press the agent is working on now, marked as its work begins.
-  //
-  // The rule is `pressesAfterRunning` in composerview.ts, where it is tested. This gathers
-  // what that rule asks about and nothing else.
+  // Apply `pressesAfterRunning` to live activity using each session's current running state.
   private markStartedPresses(): void {
     const keys = [...this.running];
     for (const [session, held] of Object.entries(this.live)) {
@@ -4030,11 +3576,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // Every press the panel has stopped waiting on, taken away. Run wherever an accepted
-  // window, a compaction boundary, or running state can have moved.
-  //
-  // Which press is over is decided in `composerview.ts`, where it is tested. This gathers
-  // what that rule asks about and nothing else.
+  // Remove live activity completed by recorded turns, compactions, or running-state changes.
   private dropSpentPresses(): boolean {
     const now = Date.now();
     const keys = [...this.running];
@@ -4068,15 +3610,7 @@ export class PanelProvider implements vscode.Disposable {
     return swept;
   }
 
-  // A command the CLI answers locally is taken away at once because no record will replace it.
-  // The first line of its reply shows once as the Composer's message, because the transcript
-  // keeps no card for it either. A restored session therefore shows no reply.
-  //
-  // Named by the session the child is in when it answers, which is not always the one
-  // the press was filed under: `/clear` renames the session before it reports the end,
-  // and `noteSessionMoved` has already carried the press across by then.
-  //
-  // The rule is `pressesAfterLocalAnswer` in composerview.ts, where it is tested.
+  // Remove locally answered commands through `pressesAfterLocalAnswer`. Their reply appears as a temporary composer notice without a transcript card.
   public noteLocalAnswer(session: string, clearFailure: string | null = null, reply = ''): void {
     if (clearFailure) {
       this.cancelClearSettlement(session, clearFailure);
@@ -4102,22 +3636,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.refresh(true);
   }
 
-  // The child kept its process and started a new session inside it.
-  //
-  // `/clear` does this. Everything the reader was waiting on was sent to a session the
-  // child has left, so unfinished work travels to the successor. Terminal responses stay
-  // with the source. The panel looks at the successor
-  // because that is where the next thing they type will go. The source keeps its turns, its
-  // place in the rail, its file on disk and its own labels. The labels are copied onto the
-  // successor rather than moved, since a reader who filed the source under a label still
-  // wants that label there after the clear.
-  //
-  // The successor is registered as a session with no records yet, the same way a fresh
-  // draft is once the agent names it. Without that it is reachable from nowhere: its file
-  // holds no typed prompt, so the listing filters it out, and `pickShowing` cannot settle on
-  // an id the walk never produced.
-  //
-  // The rule is `succeedSession` in composerview.ts, where it is tested.
+  // Transfer unfinished state to the session created by `/clear`. Completed responses remain with the source, while the successor receives an awaiting-record row.
   public noteSessionMoved(source: string, successor: string, agent: AgentKind, cwd: string | null): void {
     if (!source || !successor || source === successor) {
       return;
@@ -4218,11 +3737,7 @@ export class PanelProvider implements vscode.Disposable {
       cwd,
     };
     this.rememberStarted(successor);
-    // The source keeps its own labels: this is a copy, not a move, matching the source
-    // keeping its turns, its rail row and its file on disk. `setSessionLabels` evicts the
-    // oldest labelled session when the record is at capacity, so the source is re-written
-    // first to move it to the newest end before the successor is added. Otherwise a source
-    // that is the oldest labelled session would be evicted by its own copy.
+    // Copy labels to the successor. Refresh the source's insertion order first so capacity eviction does not remove it.
     const labels = labelsOf(this.saved.labels, source);
     if (labels.length) {
       this.saved.labels = setSessionLabels(this.saved.labels, source, labels);
@@ -4239,21 +3754,13 @@ export class PanelProvider implements vscode.Disposable {
     if (clearing?.delivery?.delivered) {
       this.finishClearSettlement(clearing);
     }
-    // The catalog is walked again rather than reused. The successor is a file that did not
-    // exist a moment ago, and a refresh reading the held catalog cannot see it.
+    // Refresh the filesystem catalog so the new successor can be discovered.
     void this.refresh(true);
   }
 
-  // What the panel draws until the transcript catches up, recorded at the press.
-  //
-  // Before the handoff rather than after it, which is the whole point: the handoff reaches an
-  // agent through two awaits, and a card built on the way back arrives a round trip behind the
-  // keystroke. The time it answers with names this press, so an answer landing after a second
-  // press cannot mark the wrong one.
+  // Create live activity before delivery. Its timestamp identifies the submission when asynchronous answers arrive.
   private noteLive(state: ComposerState, kind: LiveKind, text: string, assets: StoredPromptAsset[] = []): number {
-    // Read before the slot is written, because what is already in flight is half the answer:
-    // a prompt sent while a compaction runs is not a mid-turn prompt. The rule itself is
-    // `pressIsMidTurn` in composerview.ts, where it is tested.
+    // Classify the new prompt against existing activity before replacing it.
     const inFlight = this.live[state.sessionId] ?? [];
     const at = Math.max(Date.now(), ...inFlight.map((press) => press.at + 1));
     const recorded = this.newestBySession.get(state.sessionId);
@@ -4294,12 +3801,7 @@ export class PanelProvider implements vscode.Disposable {
     return at;
   }
 
-  // A chunk of the reply, as the agent writes it.
-  //
-  // Named by the session the chunk came from, which is the session the child is
-  // in and not the one the box happens to be aimed at. A chunk for a session with no
-  // card waits for its submitting press's delivery receipt. Events without that ownership
-  // are dropped because the recorded turn has replaced the temporary card.
+  // Append reply text to the submitting session's live prompt. Delivery ownership retains early responses and rejects unowned events.
   public noteReply(session: string, chunk: string, turnId?: number): void {
     const held = this.live[session];
     const press = this.responsePress(session, turnId, () => this.noteReply(session, chunk, turnId));
@@ -4462,19 +3964,14 @@ export class PanelProvider implements vscode.Disposable {
     return withLiveActivity(turn, remaining);
   }
 
-  // The card on its own, so a reply arriving does not rebuild the foot around it.
-  //
-  // Its own message rather than the usage payload the rest of the composer travels in. That
-  // payload redraws every control under the card, the box included, and the box is the one
-  // the reader may be typing their next prompt into while this arrives eight times a second.
+  // Post live cards without redrawing the prompt box or its controls.
   private postReply(): void {
     for (const host of this.hosts) {
       const state = this.composerStateFor(this.hostSessions?.get(host) ?? this.showing, host.webview);
       if (!state) {
         continue;
       }
-      // The chunk was for whatever session the child is in, and the box may be aimed
-      // somewhere else entirely by now. That card is drawn when the reader looks back at it.
+      // Each host receives live cards for its selected session.
       const view = composerView(state);
       if (!view?.live.length) {
         continue;
@@ -4483,10 +3980,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // One recorded card with its temporary child activity applied. The transcript has not
-  // moved, so listing and parsing every session would only rediscover the same turns.
-  // If the session has no card in the drawn set yet, a render is still needed to make
-  // one and remains the fallback.
+  // Update an existing card with live activity. A missing recorded card requires a full refresh.
   private postActivity(session: string): boolean {
     const recorded = this.newestBySession.get(session);
     const index = recorded
@@ -4535,12 +4029,10 @@ export class PanelProvider implements vscode.Disposable {
     const attachedHost = host && this.hosts.includes(host) ? host : undefined;
     this.livePressHosts.delete(originKey);
     const destination = delivery.delivered && delivery.session !== session ? delivery.session : undefined;
-    // A second press has already replaced this one, and applying this answer to that press
-    // would describe a different prompt.
+    // Ignore answers for a submission that no longer has a matching live timestamp.
     if (!held?.some((press) => press.at === at)) {
       if (delivery.turnId !== undefined) this.forgetPendingResponses(delivery.turnId);
-      // The consent window can outlive the temporary card. A prompt that did reach a fork
-      // must still take the reader to the session that received it.
+      // Confirmed delivery still selects its destination after the temporary card disappears.
       if (destination) {
         this.showing = destination;
         if (attachedHost) {
@@ -4584,11 +4076,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // A failed card, taken away by the reader. Nothing else removes one: it is the single card
-  // that says something they have to act on, and a notice that clears itself is one they miss.
-  //
-  // A failed one and no other. A press made between the message going out and its arriving has
-  // already replaced this one, and taking that card away would clear a prompt still on its way.
+  // Dismiss only failed live activity of the requested kind. Pending deliveries remain visible.
   private dismissLive(session: string, kind: string): void {
     const held = this.live[session];
     if (!held?.some((press) => press.kind === kind && press.failed)) {
@@ -4603,18 +4091,14 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // The safe way out of a failed prompt. The complete text goes back to the session's
-  // stored draft before the notice is removed, then the existing takeDraft path switches the
-  // composer, updates its undo steps, and focuses the box. A compaction carries no text and
-  // cannot reach this path.
+  // Restore a failed prompt to its saved draft and focus the prompt box. Compactions have no prompt text to restore.
   private restoreLive(session: string, kind: string): void {
     const held = this.live[session];
     const press = held?.find((one) => one.kind === kind && one.kind === 'prompt' && one.failed);
     if (!press) {
       return;
     }
-    // An explicit recovery is written at once. Removing the card before a delayed write
-    // would leave a window close between the two with no retained copy of the prompt.
+    // Persist recovered text before removing the failed card.
     const revision =
       Math.max(this.draftRevisions?.get(session) ?? 0, this.submittingDrafts?.get(session)?.revision ?? 0) + 1;
     this.holdDraft(session, press.text, true, revision);
@@ -4635,12 +4119,9 @@ export class PanelProvider implements vscode.Disposable {
     return state.queued.some((entry) => this.queueHandoffs.has(entry.id));
   }
 
-  // A turn ended, so the session's oldest waiting prompt goes. One at a time: the next
-  // is sent when this one ends, by the same path.
+  // Deliver the session's oldest eligible queued submission when it is idle.
   public flushQueue(session: string): void {
-    // The session whose turn ended, named by the caller, and never the one the box is
-    // aimed at. A drain that read the aim waited for the reader to look back at the
-    // session before it would send, which is exactly when they are not looking.
+    // Drain the caller's session, independent of the session displayed in the prompt box.
     if (!this.repositoryScopeReady) {
       this.pendingQueueDrains.add(session);
       return;
@@ -5038,27 +4519,15 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // What the reader typed, kept against the session they typed it into.
-  // The session is the one the box was aimed at when the reader typed, named on the
-  // message. Worked out here instead, through `composerState`, it was whichever session
-  // was newest or pinned at the moment the message arrived, and `sessionRows` is rebuilt on
-  // every poll: with several agents writing transcripts the aim moves under the reader
-  // between the keystroke and the send, and the prompt lands somewhere they are not looking.
-  // `keep` is what the reader typed and `text` is what the box shows. They differ only while
-  // the reader walks back through earlier prompts. The send control has to follow the box, or
-  // it reads Stop over a recalled prompt and the press that meant to send it kills the turn.
-  // The store and the rail follow `keep`, or a reload finds a sent prompt where the reader
-  // left a sentence they were writing.
+  // Use the session named by the typing message. `keep` is the saved draft, while `text` includes prompt-history navigation.
   private setDraft(text: string, keep: string, session: string): void {
-    // The row rather than the whole state. This runs on every letter typed, and building the
-    // state merges and cleans every prompt the walk offers to answer a question about which
-    // session the letter belongs to.
+    // Check row membership without assembling the complete composer state on each keystroke.
     if (!this.rowForSession(session)) {
       return;
     }
     this.typedRenames.delete(session);
     const shown = hasUnsentPrompt(this.boxText[session] ?? '') !== hasUnsentPrompt(text);
-    // After `holdDraft`, which puts the same words in both for every other caller.
+    // Set displayed text after `holdDraft`, which initially writes both text copies.
     const railMoved = this.holdDraft(session, keep);
     this.boxText[session] = text;
     this.clearAttachmentNotice(session);
@@ -5067,9 +4536,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // One way to change the words held in a session's box. Persistence can wait for
-  // ordinary typing, while an explicit recovery is written before its failed card leaves.
-  // The rail moves only when meaningful text appears or disappears, never once per letter.
+  // Persist ordinary typing later and recovered text immediately. Session-list updates follow changes in meaningful draft content.
   private holdDraft(session: string, text: string, immediate: boolean = false, revision?: number): boolean {
     if (revision !== undefined) {
       this.draftRevisions ??= new Map();
@@ -5081,8 +4548,7 @@ export class PanelProvider implements vscode.Disposable {
       return false;
     const moved = hasUnsentPrompt(this.drafts[session]) !== hasUnsentPrompt(text);
     this.drafts[session] = text;
-    // Every caller but the reader's own keystrokes puts the same words in both, and this is
-    // what keeps a cleared or recovered draft from leaving stale text on the send control.
+    // Reset displayed text with the saved draft. `setDraft` overrides this copy during history navigation.
     this.boxText[session] = text;
     if (immediate) {
       void this.writeDrafts();
@@ -5095,12 +4561,7 @@ export class PanelProvider implements vscode.Disposable {
     return moved;
   }
 
-  // The unsent prompts, on their way to storage that outlives the window.
-  //
-  // Waited on rather than written at once. This runs on every keystroke, and the store
-  // behind it is a real one on disk. The wait is short enough that a reader who stops typing
-  // and closes the window keeps what they typed, and `dispose` writes whatever it still
-  // holds.
+  // Batch ordinary draft persistence. Provider disposal writes remaining text.
   private rememberDrafts(): void {
     if (this.draftSave) {
       return;
@@ -5111,15 +4572,7 @@ export class PanelProvider implements vscode.Disposable {
     }, DRAFT_SAVE_MS);
   }
 
-  // Through the normalizer, so one rule decides what is stored and the same rule reads it
-  // back. It is what drops the boxes the reader emptied: an empty draft and no draft are the
-  // same thing to the box, and a session typed into once should not cost an entry
-  // forever.
-  // That this window started a session, kept for the next window as well as this one.
-  // Written at once rather than on the next save that happens to pass: the press that starts
-  // a session is the only moment this fact exists, and a window closed before the next
-  // save would leave the session to be read as a run for ever. Cut to the ceiling on the
-  // way out as well as on the way in, the way every stored list here is.
+  // Persist reader-started ownership immediately, bounded by `SESSION_LIMIT`.
   private rememberStarted(session: string): void {
     this.startedHere.add(session);
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
@@ -5277,8 +4730,7 @@ export class PanelProvider implements vscode.Disposable {
     return Promise.resolve(this.memento?.update(STATE_KEY, this.saved));
   }
 
-  // A press on Send, or an Enter. Whether that sends or queues is decided in
-  // `composerview.ts`, because a rule this file made would be one no test could reach.
+  // Route Send through the send-or-queue rules in `composerview.ts`.
   private sendPrompt(
     text: string,
     session: string,
@@ -5294,10 +4746,7 @@ export class PanelProvider implements vscode.Disposable {
       void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
       return;
     }
-    // A typed Codex `/rename` is the rail's rename, not a turn. It works beside a running
-    // turn, so it never waits in the queue and answers no open request. It sends no files and
-    // no comments, so staging files do not hold it back, and they stay for the next prompt
-    // with the comments. An open draft recovery keeps its slot for the next prompt too.
+    // Handle typed Codex `/rename` outside prompt delivery. Leave attachments, comments, and queued recovery available for the next prompt.
     const renamed = renameRequest(state.agent, text);
     if (renamed !== null) {
       this.holdDraft(state.sessionId, '');
@@ -5333,19 +4782,13 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
     }
-    // A command the panel answers itself never leaves. `/mcp` draws a list of servers in the
-    // agent's own terminal and the CLI answers a panel with nothing at all, so sent as a
-    // prompt it went out and nothing came back. The panel draws that list already, and the
-    // command opens it. The box is cleared the way a sent prompt clears it, because the
-    // reader has finished with those words either way.
+    // Open panel-owned commands locally and clear their typed text.
     const opens = panelCommand(text);
     if (opens) {
       this.holdDraft(state.sessionId, '');
       void this.post({ type: 'openPick', control: opens });
       void this.post({ type: 'usage', usage: this.usagePayload() });
-      // The control is opened at once and its contents are asked for behind it, because the
-      // asking needs a child and this file has none. A menu that waited for the answer would
-      // sit on a press for as long as the slowest server takes to time out.
+      // Open the control before asking its agent process for the contents.
       this.onPanelCommand?.(
         state.sessionId,
         state.agent,
@@ -5497,9 +4940,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const meant = sendAction({ ...state, onScreen: text });
     if (meant === 'nothing') {
-      // The browser clears optimistically. Its view can be one host message behind a newly
-      // started compaction, so return the exact revision even when the current view would
-      // already have disabled Send.
+      // Restore the browser's cleared text with its exact submission revision when host state refuses Send.
       void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
       return;
     }
@@ -5543,14 +4984,7 @@ export class PanelProvider implements vscode.Disposable {
     this.send(state, text, null, capturedDraft, capturedAssets, recoveryId);
   }
 
-  // Every request this session is waiting on, answered because the reader typed instead
-  // of pressing a choice. The child is blocked on the question or the permission and reads
-  // nothing else until one goes back, so this runs before the prompt is handed over, before
-  // it joins the queue, and before a compaction starts. The agent is told that the reader
-  // answered in the message that follows, which is a different thing from a refusal.
-  //
-  // `composerview.ts` decides which presses answer, because a press that leaves what was
-  // typed in the box has sent nothing and must leave the requests where they are.
+  // Answer this session's blocking requests when `asksAnsweredBySend` permits it. The prompt that follows carries the reader's answer.
   private answerOpenAsks(session: string, meant: PressMeaning): void {
     const waiting = this.asks.filter((entry) => entry.session === session);
     for (const open of asksAnsweredBySend(meant, waiting)) {
@@ -5570,9 +5004,7 @@ export class PanelProvider implements vscode.Disposable {
     recoveryId?: string,
   ): void {
     if (this.contextSource) this.invalidateContext(state.sessionId);
-    // A queued command reaches this method after the turn ahead of it ends, so command
-    // recognition belongs here as well as on the first press. It must happen before prompt
-    // assembly, which would attach the reader's comments and hand the text to the model.
+    // Recognize control commands before assembling ordinary prompt text and comments.
     if (compactSubmission(state.agent, text) && !queued) {
       this.startCompaction(state, queued);
       return;
@@ -5581,14 +5013,9 @@ export class PanelProvider implements vscode.Disposable {
       this.startClear(state, queued);
       return;
     }
-    // The prompts the Up arrow offers, filed where a prompt actually leaves for an agent.
-    // Filed at the press instead, a command the panel answers itself, a compaction, and a
-    // queued prompt the reader then removes all sat in front of every real prompt for the
-    // life of the window, and the removed one had never gone anywhere at all.
+    // Add ordinary outgoing prompts to recall history after local-command and queue handling.
     this.sentPrompts[state.sessionId] = sentAfter(this.sentPrompts[state.sessionId] ?? [], text);
-    // Read before the handoff rather than after it. A comment written while the prompt is on
-    // its way was not in that prompt, and gathering the set again on the way back would take
-    // it out of the reader's hands unsent.
+    // Capture submitted comments before delivery. Later comments remain available for another prompt.
     const carried = commentsForActiveSubmission(state);
     const going = agentPromptToSend({ ...state, draft: text });
     const carriedAssets = storedAssetsForPrompt(
@@ -5602,9 +5029,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const asset of carriedAssets) {
       this.assetIdsInHandoff.add(asset.id);
     }
-    // What the panel draws while the prompt is on its way, and it is what actually goes rather
-    // than what the box held: comments alone are a prompt, so a card built from the box would
-    // draw nothing for the press that sends three comments and an empty box.
+    // Live cards use the assembled prompt, including comment-only and attachment-only submissions.
     const display = going.text || `Attached: ${going.assets.map((asset) => asset.name).join(', ')}`;
     const pressed = this.noteLive(state, 'prompt', display, carriedAssets);
     if (this.promptOriginHost) {
@@ -5630,10 +5055,7 @@ export class PanelProvider implements vscode.Disposable {
           going,
           onSubmitted,
         );
-    // Waited for. The handoff reaches an agent through two awaits, and taking the comments
-    // before either one destroys them on every path that ends without sending: no folder
-    // open, a wrong path to the agent, a session whose child has exited. The card reads
-    // the same answer, so a prompt that reached nobody says so instead of sitting on Sending.
+    // Delivery status controls live-card settlement and removal of submitted comments.
     void Promise.resolve(went)
       .then((answer) => {
         if (this.disposed) return;
@@ -5736,10 +5158,7 @@ export class PanelProvider implements vscode.Disposable {
     else delete this.draftCommentIds[session];
   }
 
-  // What a delivered prompt takes with it. Taken away rather than marked: a comment that has
-  // gone out was said and the agent has it, and a card still drawing it would leave the reader
-  // working out which of their own marks are outstanding. The marks on the cards clear with
-  // it, which is the whole sign on screen that the prompt carried them.
+  // Remove only the comments carried by a delivered prompt.
   private dropCarriedComments(carried: readonly TurnComment[], delivered: boolean): void {
     const left = commentsAfterSend(this.saved.comments, carried, delivered);
     if (left.length === this.saved.comments.length) {
@@ -5747,7 +5166,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.saved.comments = left;
     void this.memento?.update(STATE_KEY, this.saved);
-    // Every host, because both draw their own copy and neither saw this happen.
+    // Update every attached host's comment copy.
     void this.post({ type: 'notes', comments: this.saved.comments });
     this.postRail(true);
   }
@@ -5845,13 +5264,7 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  // A compaction, asked for by the meter and sent as the command and nothing else.
-  //
-  // It does not go through `sendPrompt`. That one assembles the reader's comments under the
-  // text, hands the lot over and then takes the comments away, and it clears the stored
-  // draft on the way past: one press mailed a whole review out inside a `/compact`, cleared
-  // it off the cards, and left Send drawn unpressable over a box with the reader's prompt
-  // still in it.
+  // Request compaction without submitting or clearing the draft, attachments, or comments.
   private compact(session: string): void {
     const state = this.stateFor(session);
     const command = state ? compactCommand(state.agent) : '';
@@ -5881,14 +5294,9 @@ export class PanelProvider implements vscode.Disposable {
 
   private startCompaction(state: ComposerState, queued: QueuedSubmission | null = null): void {
     if (this.contextSource) this.invalidateContext(state.sessionId);
-    // The press is recorded the way a prompt's is, and it carries none of the reader's words
-    // because a compaction has none. This is the press the reader named first: it drew nothing
-    // at any point until its card arrived off the transcript, which is a whole session's
-    // work with no sign that anything was asked for.
+    // Create an empty live compaction card before agent delivery.
     const pressed = this.noteLive(state, 'compact', '');
-    // The answer is waited on for the card alone. Nothing is taken away here, so a compaction
-    // that reached no child still has nothing to undo, but a card left saying that an agent is
-    // compacting would be the panel claiming work that never started.
+    // Settle the compaction card from delivery status, retaining failures for the reader.
     const settle = (delivery: PromptDelivery): void => {
       if (queued) {
         const held = this.queues[state.sessionId] ?? [];
@@ -6088,12 +5496,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // A waiting prompt taken back into the box to be changed. It leaves the queue at the same
-  // moment: a prompt in the box and in the queue at once is one the reader would watch go
-  // out twice, the old wording first.
-  //
-  // There is no second editor. The box already carries the caret, the selection, the undo
-  // history and the growth, and every one of those is what changing a prompt needs.
+  // Reserve a queued submission for editing in the prompt box. Transfer it only after the browser accepts the offer.
   private requestQueuedEdit(
     id: string,
     session: string,
@@ -6200,10 +5603,7 @@ export class PanelProvider implements vscode.Disposable {
       this.flushQueue(queueSession);
       return;
     }
-    // The box and the row swap, decided in `composerview.ts`. What the box held goes back
-    // into the queue in the place the edited prompt came out of, because overwriting the box
-    // destroyed whatever was typed there: a reader editing a second waiting prompt lost the
-    // first one outright, since it had already left the queue and the box was its only copy.
+    // Exchange the queued submission with active draft content so neither prompt is overwritten.
     const submitting = this.submittingDrafts?.get(state.sessionId);
     const activeText =
       submitting && (this.draftRevisions?.get(state.sessionId) ?? 0) <= submitting.revision ? '' : state.draft;
@@ -6256,22 +5656,16 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.holdDraft(state.sessionId, wanted.text, false, currentRevision);
     void this.writeDrafts().then(() => this.flushQueue(state.sessionId));
-    // The box is a real element the panel owns and never rebuilds, so its value is set over
-    // there rather than drawn from a payload.
+    // The browser accepted the prompt text before this composer update.
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
-  // A turn's read state, set from the editor's context menu over its card. The set itself
-  // lives in the webview, so this says which turn and which way and the panel does the rest.
-  // Told to every host, because both draw the same card and the state is one thing.
+  // Broadcast turn read-state changes to all attached hosts.
   public setRead(key: string, read: boolean): void {
     void this.post({ type: 'setRead', key, read });
   }
 
-  // The comment box, asked for from the editor's context menu over a card. Sent to every
-  // host, because this side cannot tell which one the menu was drawn over. Only the host
-  // that saw the right-click has anything to open the box on, and it is the one that opens
-  // it: the panel refuses a message it has no press behind.
+  // Broadcast the comment-editor request. Only the host with a matching context-menu selection opens it.
   public openComment(key: string): void {
     void this.post({ type: 'openComment', key });
   }
@@ -6318,24 +5712,17 @@ export class PanelProvider implements vscode.Disposable {
     this.handoffSelectedText(text, session, key, copyLabels, host);
   }
 
-  // The label editor, asked for from the editor's context menu over a rail card or a session
-  // heading. Sent to every host for the reason the comment box is, and answered by the one
-  // that saw the right-click.
+  // Broadcast the label-editor request to the host with the matching context-menu selection.
   public openLabelEditor(session: string): void {
     void this.post({ type: 'openLabelEditor', session });
   }
 
-  // The view editor, asked for from the editor's context menu over the rail's views row. Sent
-  // to every host for the reason the label editor is, and answered by the one that saw the
-  // right-click. The mode says which press it was, and the panel draws the box: every word the
-  // reader types about a view stays inside the panel.
+  // Broadcast the view-editor request and mode. The host with the matching context-menu selection opens it.
   public openViewEditor(view: string, mode: 'rename' | 'delete'): void {
     void this.post({ type: 'openViewEditor', view, mode });
   }
 
-  // The session rename editor, asked for from the context menu over a rail row or a session
-  // heading. Only a session with a saved record can be renamed. The editor starts from the
-  // full name, not the shorter one the grouping heading over several sessions draws.
+  // Open renaming for a catalog session using its full name.
   public openSessionRename(sessionId: string): void {
     const session = this.catalog?.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (!session) {
@@ -6344,9 +5731,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.post(sessionRenameOpening(sessionId, this.sessionLabel(session)));
   }
 
-  // Renames one saved session. The shown name changes only after the agent confirmed the
-  // save, so a failure leaves the rail and the heading on the old name. Nothing keyed by the
-  // session id changes, because the id stays the same.
+  // Publish a renamed session only after the agent confirms success. Its ID remains unchanged.
   private async renameSession(sessionId: string, rawTitle: string): Promise<SessionRenameResult> {
     const session = this.catalog?.sessions.find((candidate) => candidate.sessionId === sessionId) ?? null;
     const result = await requestSessionRename(rawTitle, session !== null, async (title) => {
@@ -6367,11 +5752,7 @@ export class PanelProvider implements vscode.Disposable {
     return result;
   }
 
-  // A rename typed in the Composer. Success clears the box the way a sent prompt does. A
-  // failure puts the typed line back only when the box has not changed since the Send, and
-  // says why in an editor message, because the Composer has no rename editor to hold it. A
-  // box typed into and emptied again reads the same as an untouched one, so the Send's
-  // revision stands for the untouched box until typing, recovery, queue editing, or a later rename replaces it.
+  // Restore a failed typed rename only while its submission revision still owns the draft.
   private async renameFromComposer(
     sessionId: string,
     name: string,
@@ -6400,12 +5781,7 @@ export class PanelProvider implements vscode.Disposable {
     void vscode.window.showErrorMessage(`Arc: ${result.error}`);
   }
 
-  // A confirmed rename. A Claude name reports to the held names as a custom name one byte
-  // before the transcript's end after the rename. A same-rank name replaces a held one only
-  // from further into the file. That offset is past the record the rename appended, so a
-  // second rename replaces the first. A later record starts at the end or beyond, so a later
-  // native rename still replaces this one. A Codex name lives in the thread-name index, which
-  // is read again, and the session heading reads the index first.
+  // Observe confirmed Claude names at the final byte so later rename records supersede them. Codex names reload from the session index.
   private sessionRenamed(session: SessionFile, title: string): void {
     if (session.agent === 'claude') {
       const size = Math.max(this.revisionOf(session).size, session.size);
@@ -6426,29 +5802,12 @@ export class PanelProvider implements vscode.Disposable {
     this.refreshFrom('session-rename', true, false, [session.file]);
   }
 
-  // What the label editor draws for one session. Built here on every ask and after every
-  // write, because this side owns the record and the panel keeps no copy of it.
+  // Build label-editor rows from provider-owned labels and catalog sessions.
   private labelEditorReply(session: string, browserSession: string = session): unknown {
     return labelEditorReply(this.saved.labels, this.sessionRows, session, CARD_ACTIONS.labelHeading, browserSession);
   }
 
-  // One turn's comments, as the markdown a person could have written, on the clipboard.
-  //
-  // Per turn and never per session. The reader sends one turn's comments back to the
-  // agent that ran it, and a paste holding every turn they have written on is one they have to
-  // edit down before it is usable.
-  //
-  // Built here rather than in the panel: `emitTurnComments` is turnview.ts's rule, the webview
-  // cannot import that module, and a second copy of it over there would be the whole of it
-  // again in the one file nothing tests. The comments reach this side on every save, so what
-  // is read is the set the reader last wrote.
-  //
-  // Both halves name the turn. A turn key carries its own session, and reading it back
-  // out of the key would be a second copy of `turnKey`'s shape.
-  //
-  // A turn nobody has written on copies nothing. The menu entry is absent on one, so this only
-  // answers a press that crossed a comment being deleted, and the clipboard is better left as
-  // the reader had it than emptied by a press that found nothing.
+  // Copy one turn's comments through `emitTurnComments`. An empty result leaves the clipboard unchanged.
   public async copyComments(turnKey: string, session: string): Promise<void> {
     const notes = emitTurnComments(this.saved.comments, turnKey, session);
     if (!notes) {
@@ -6458,24 +5817,17 @@ export class PanelProvider implements vscode.Disposable {
     void vscode.window.setStatusBarMessage('Arc: copied.', 1500);
   }
 
-  // A whole session's read state, set from the editor's context menu over its rail
-  // card. The read set and the watermarks both live in the webview, so this says which
-  // session and which way, exactly as the per-turn command does, and every host is
-  // told because both draw the same rail.
+  // Broadcast session read-state changes to all attached hosts.
   public setSessionRead(session: string, read: boolean): void {
     void this.post({ type: 'setSessionRead', session: this.panelSession(session), read });
   }
 
-  // Archiving a whole session, set from the editor's context menu over its session
-  // heading. The provider changes the durable set itself because the browser can still
-  // name the provisional shell until the complete render arrives.
+  // Update durable archive membership through the provider, including actions targeting a provisional session ID.
   public setSessionArchived(session: string, archived: boolean): void {
     this.updateSessionMembership(archived ? 'archive' : 'unarchive', session);
   }
 
-  // Pinning a whole session to the top of the rail, set from the editor's context menu
-  // over its session heading. The provider changes the durable set for the same reason
-  // archive commands do.
+  // Update durable pin membership through the provider.
   public setSessionPinned(session: string, pinned: boolean): void {
     this.updateSessionMembership(pinned ? 'pin' : 'unpin', session);
   }
@@ -6555,10 +5907,7 @@ export class PanelProvider implements vscode.Disposable {
     void vscode.window.setStatusBarMessage('Arc: copied.', 1500);
   }
 
-  // The summary a turn closed with, put on the clipboard from the entry on the card's own
-  // context menu. The card is found by the key the menu handed over, the same way the turn
-  // diff finds its own. A key naming no card, and a card with nothing to say, copy nothing:
-  // the clipboard is better left as the reader had it than filled with the word undefined.
+  // Copy the card summary when its key and summary are available.
   public async copySummary(key: string): Promise<void> {
     const card = this.cards.find((c) => c.key === key);
     if (!card || !card.summary) {
@@ -6567,17 +5916,7 @@ export class PanelProvider implements vscode.Disposable {
     await this.copyText(card.summary);
   }
 
-  // Reset everything the panel remembers about this workspace.
-  //
-  // It asks first, and the question names what it will clear, because none of it can be got
-  // back: a reader who has hidden ten sessions over a week has no record of which ten.
-  //
-  // Then the order, which matters. Emptying the stored copy is not enough on its own: each
-  // webview keeps its own through `vscode.setState`, and a host left holding the old one
-  // writes it straight back on its next save. So the stored copy and the sets held beside it
-  // go first, and the hosts are told last; each empties its own sets and saves, and that
-  // empty state is the last thing written. The refresh after it redraws both views with the
-  // hidden set, the pinned set and the labels gone.
+  // Reset panel preferences after confirmation. Clear host state before instructing browsers to save their reset copies.
   public async forgetState(): Promise<void> {
     const answer = await vscode.window.showWarningMessage(
       'Reset everything Arc remembers about this workspace?',
@@ -6606,21 +5945,13 @@ export class PanelProvider implements vscode.Disposable {
     this.saved = normalizePanelState(null);
     this.saved.readerParents = readerParents;
     this.saved.submittedPrompts = submittedPrompts;
-    // Forgetting is starting over, and starting over in a workspace means what opening one
-    // for the first time means: what is already there is not new.
+    // Existing activity predates the reset unread baseline.
     this.saved.since = Date.now();
-    // The box is the exception, and it is not listed in the question above. Everything else
-    // here is a state the reader built by pressing something, and forgetting it costs them
-    // presses. A half-written prompt is words, it is on screen in front of them, and the
-    // press they aimed at their folds and filters would take it with no way back. So the
-    // stored copy is written from what the boxes still hold rather than emptied.
+    // Preserve unsent prompt text across preference resets.
     this.saved.drafts = normalizeDrafts(this.drafts);
-    // The same reason keeps a sent prompt no transcript has recorded yet: it is the
-    // reader's own words, standing in for a turn the forgotten workspace cannot rebuild.
+    // Preserve submitted prompt recall until the record contains it.
     this.saved.sentPrompts = normalizeSentPrompts(this.sentPrompts);
-    // Kept for a reason of its own, and it is not listed in the question above either.
-    // Forgetting is about what the reader built by pressing something. This says which
-    // sessions they started, and dropping it would file each one under Run by agents.
+    // Preserve reader-started session ownership across preference resets.
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
     this.saved.assets = normalizePromptAssetBook(this.assets);
     // Waiting submissions are user-authored content, like the draft and its files above.
@@ -6631,16 +5962,14 @@ export class PanelProvider implements vscode.Disposable {
     this.hidden.clear();
     this.onArchivedSessionsChange?.(this.hidden);
     this.pinnedTop.clear();
-    // Starting over opens where opening this workspace for the first time opens. The refresh
-    // at the foot picks the newest session again, so the panel is never left drawing none.
+    // Let the next refresh select the newest available session.
     this.showing = null;
     this.hostSessions.clear();
     this.hostPreviousSessions.clear();
-    // Starting over means there is nowhere to go back to either.
+    // Clear navigation history with the selection.
     this.trail = emptyTrail();
     await this.memento?.update(STATE_KEY, this.saved);
-    // The rail is posted only when its wording moved, and the counts are about to, so the
-    // comparison must not answer with what was drawn before any of this.
+    // Invalidate the previous session-list payload before reset state is posted.
     this.lastRailMessageType = null;
     this.lastRailMessageSerializedBytes = null;
     this.lastRailAdoptionsJson = '';
@@ -6653,12 +5982,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.refresh(true);
   }
 
-  // Back, and forward, over the sessions the reader has opened.
-  //
-  // The panel's own trail comes first. A trail with nowhere left to go hands the press to the
-  // editor's Go Back, which takes the reader out of the panel and into what they were reading
-  // before it. That command has its own end, and a window whose only editor is this panel
-  // reaches both ends at once, so a press there does nothing.
+  // Walk the panel's navigation trail first. At its boundary, delegate to the editor's navigation command.
   public goBack(host?: PanelHost): void {
     this.walk(stepBack(this.trail), 'workbench.action.navigateBack', host);
   }
@@ -6676,13 +6000,7 @@ export class PanelProvider implements vscode.Disposable {
     this.show(trailPlace(next), host ?? this.hosts.find((open) => open.active()));
   }
 
-  // Open the session the reader chose.
-  //
-  // A draft nobody sent does not survive the reader leaving it, and it has to go before the
-  // move rather than after. The rail's press and the walk both go through here, so the next
-  // rule about leaving a session cannot reach one of them and miss the other. Work that
-  // opens a session the reader did not choose, such as starting a draft or following a
-  // prompt to the session that took it, keeps its own path.
+  // Select a reader-chosen session after abandoning any untouched draft being left.
   private show(session: string | null, host?: PanelHost): void {
     const previousSelection = host ? (this.hostSessions.get(host) ?? this.showing) : this.showing;
     if (previousSelection && previousSelection !== session) {
@@ -6721,8 +6039,7 @@ export class PanelProvider implements vscode.Disposable {
         this.earlySelectedSources.delete(id);
     }
     this.selectionFailure = null;
-    // A selection cannot add, remove or grow a transcript, and walking back to one is a
-    // selection, so both routes through here skip the catalog walk.
+    // Selection refreshes reuse the catalog because navigation changes no transcript.
     const seeded = this.selectionGeneration;
     this.railSeedOwedFor = seeded;
     this.railSeedSkipped = false;
@@ -6735,8 +6052,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // The end of the refresh a selection asked for. A save that skipped its rail is owed one
-  // still, because the render that was going to word it may have aborted or failed.
+  // Post any session-list update deferred for a selection render that did not settle it.
   private settleRailSeed(generation: number): void {
     if (this.railSeedOwedFor !== generation) {
       return;
@@ -6753,8 +6069,7 @@ export class PanelProvider implements vscode.Disposable {
     return this.hosts.some((host) => this.readyHosts.has(host) && host.visible());
   }
 
-  // The editor group a diff opened from the panel should land in. The rule is in turnview.ts
-  // where it is tested; this only gathers what it asks about.
+  // Choose the editor column through `editorColumn` using current editor and panel locations.
   private column(): vscode.ViewColumn {
     return editorColumn({
       active: vscode.window.activeTextEditor?.viewColumn ?? null,
@@ -6765,14 +6080,7 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  // Where the webview may read a file from: this extension, the icon theme in somebody
-  // else's extension, and the open folders, which is where a picture a response names lives.
-  // Assigned rather than written into the page again: rebuilding the HTML drops the reader's
-  // scroll position and every open card.
-  //
-  // These are webview options, not panel options, so an assignment reaches a tab that was
-  // made before the option existed. A panel option cannot be changed that way, which is how
-  // `enableFindWidget` answered nothing in every tab the reader already had open.
+  // Permit extension, icon-theme, workspace, and staged-attachment resources. Assign webview options without replacing the page.
   private allowThemeFiles(webview: vscode.Webview): void {
     webview.options = {
       enableScripts: true,
@@ -6785,11 +6093,7 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // `force` repaints even when nothing moved, which is what the refresh button and a
-  // freshly shown panel need. The polling path passes nothing, so an idle session costs
-  // one stat per session file and no DOM work at all.
-  // Selection changes and accepted worker results reuse the catalog. Other refreshes discover
-  // added, removed, or changed transcripts through the catalog walk.
+  // Forced refreshes repaint unchanged content. Catalog reuse skips discovery for selection and accepted worker updates.
   refreshFrom(
     reason: string,
     force = false,
@@ -6810,9 +6114,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   async refresh(force = false, reuseCatalog = false, metadataAfterRender = false, selectedOnly = false): Promise<void> {
-    // One catalog refresh runs at a time. A trigger that arrives during it joins one merged
-    // request that runs when it ends, so a steady trigger stream cannot restart the refresh
-    // before it renders.
+    // Merge concurrent catalog refresh triggers into one pending request so active reads can finish.
     if (!selectedOnly && (this.refreshController || this.codexPriming)) {
       this.pendingRefresh = mergeRefreshRequests(this.pendingRefresh, {
         reason: this.refreshReason,
@@ -6855,8 +6157,7 @@ export class PanelProvider implements vscode.Disposable {
         try {
           const pass = await this.codexPriming;
           primedWalk = pass.walked;
-          // The pass reads rows before `allSessions` takes its baseline, so the walk never sees
-          // them move the revision. They reach the checkpoint here.
+          // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
           if (pass.read) {
             this.derivedCacheCheckpointState.markChanged(true);
           }
@@ -6916,9 +6217,7 @@ export class PanelProvider implements vscode.Disposable {
           this.runPendingRefresh();
         }, CATALOG_REFRESH_DEADLINE_MS);
       }
-      // Git resolves repository worktrees in the background. Until the first answer, an
-      // empty literal-folder listing is incomplete and must not create a draft or discard a
-      // restored selection. The completed lookup asks for another refresh.
+      // Wait for repository scope before changing selection or creating a draft from an incomplete catalog.
       if (!this.repositoryScopeReady) {
         return;
       }
@@ -6984,8 +6283,7 @@ export class PanelProvider implements vscode.Disposable {
           !all.some((source) => source.sessionId === pending.sessionId),
       );
       this.ensureProjectSpendWorkspace();
-      // Set from the listing, so a session started while the panel is open is watched
-      // from the first read that finds it rather than from the next window.
+      // Update watched directories when discovery finds new sessions.
       if (this.watching) {
         this.watchDirectories(watchDirs(all));
       }
@@ -7018,9 +6316,7 @@ export class PanelProvider implements vscode.Disposable {
           this.hostPreviousSessions?.delete(host);
         }
       }
-      // Every path that moves the reader ends here, so the trail is written in one place rather
-      // than beside each press. Stepping back is not a visit and needs no exception: the walk
-      // has already put the trail on the session this line is about to see.
+      // Reconcile navigation with reachable sessions and record the settled selection.
       this.trail = visitPlace(prunePlaces(this.trail, new Set(reachable)), this.showing ?? '');
       const sessions = this.shownSessions(all);
       if (
@@ -7033,17 +6329,10 @@ export class PanelProvider implements vscode.Disposable {
       const now = Date.now();
       const outcomes = this.outcomesFor(all);
       this.sessionOutcomes = outcomes;
-      // One stat, before the signature is built, because the signature carries the answer.
-      // Renaming a Claude session writes a new title into its transcript and the file's mtime
-      // says so; renaming a Codex thread writes into this index instead and touches no
-      // transcript at all, so the index has to be looked at on its own to be noticed.
+      // Read the Codex name index before computing the listing signature. Renames do not change rollout revisions.
       this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
       const children = this.agentListingStamp(sessions);
-      // Two signatures, because they answer two questions. The listing signature says whether
-      // the panel has anything new to draw, so it carries the shown session. The spend
-      // source signature says whether a spend source can have moved, and selection is not one
-      // of the things that moves one. The offer stats every ledger record the listing does not
-      // carry, so gating it on the listing signature makes every click pay that walk.
+      // Listing signatures include selection. Spend-source signatures exclude selection so navigation alone starts no source integrity pass.
       const parentEdges = this.sessionParentEdges(all);
       const listed: ListingFacts = {
         showing: this.showing,
@@ -7079,8 +6368,7 @@ export class PanelProvider implements vscode.Disposable {
           .filter(([id, outcome]) => !this.newestBySession.has(id) && outcome)
           .map(([, outcome]) => outcome as TurnOutcome),
       ];
-      // Sweep before the gate because a compaction can reach its limit without a record moving.
-      // A removal is its own reason to draw.
+      // Reconcile expired compaction activity before deciding whether to render. Removed activity requires an update.
       const swept = this.dropSpentPresses();
       if (
         !swept &&
@@ -7127,58 +6415,33 @@ export class PanelProvider implements vscode.Disposable {
       if (gained.agents.length) {
         this.onTurnsFinished?.(gained.agents);
       }
-      // Every session in this workspace, not only the ones read. A session that dropped
-      // off the recent list is otherwise indistinguishable from one that never existed,
-      // which is what makes turns look like they vanished when a few agents are started.
-      // Kept on the provider as well, because the rail is reworded when the read set moves,
-      // which is not a render, and listing everything again for that would stat every file.
+      // Build rows for the full catalog, independent of selected transcript reads.
       const counts = this.unreadCounts();
       const fullLabels = new Map<string, string>();
       this.pruneExits(all);
       this.sessionRows = all.map((f) => {
-        // The heading's last activity: the newest time the session itself recorded, not the
-        // newest drawn turn and not the file's mtime. Not the drawn turn, because the tail
-        // can cut a session's turns without changing when it was last active; not the mtime,
-        // because an agent writes bookkeeping to a finished transcript and that moved the
-        // file without the session moving.
+        // Use recorded activity time, with mtime only when metadata has no timestamp.
         const at = this.activityFor(f);
         const named = this.sessionLabel(f);
         const label = named.label;
         fullLabels.set(f.sessionId, named.fullLabel);
-        // The rail card's own drawn name, cut to RAIL_NAME_LIMIT rather than left at its
-        // complete length: every row's name rides every render and every rail post, not only
-        // the shown session's, so an uncapped name from a large pasted first prompt would
-        // scale the payload with the size of what the reader typed rather than with the
-        // number of sessions. Sent apart from `label` so only the rail's own drawn name
-        // carries it: the popover heading, the composer target and the rail's own action
-        // buttons keep reading `label`, the shorter form they always have.
+        // Bound session-list names by `RAIL_NAME_LIMIT`. Other session surfaces retain the short label.
         const railName = shortenTo(named.fullLabel, RAIL_NAME_LIMIT, '...');
         return {
           id: f.sessionId,
           persisted: true,
           label,
           ...(railName === label ? {} : { railName }),
-          // Formatted here, with the same helpers the cards use. The panel had its own copy
-          // of the clock and the month names, and a second copy drifts from the tested one.
+          // Use the shared calendar formatter for session activity.
           when: formatWhen(at),
-          // Named here for the same reason the card is: a Codex session's title is a
-          // truncated first prompt and reads exactly like a Claude one, so a list holding
-          // both says which is which or leaves the reader to guess.
-          //
-          // Two spellings, and they are not interchangeable. `agent` is what the rail draws.
-          // `agentKey` is what everything else is filed under: the model list, the reader's
-          // picks, how much the agent asks, and which CLI a prompt is handed to.
+          // `agent` is the displayed name. `agentKey` identifies catalogs, prompt settings, and agent callbacks.
           agent: AGENT_NAMES[f.agent],
           agentKey: f.agent,
           shown: sessions.some((s) => s.sessionId === f.sessionId),
-          // The relative wording is computed here and kept current in the panel by the
-          // ticker, through data-at. The unread indicator is the rail's own wording, worded
-          // fresh off `counts` where the rail card is built, so one session cannot show two
-          // unread states.
+          // The browser's age ticker reads `at`. Unread counts remain independent session-list facts.
           at,
           relative: formatRelative(at),
-          // Whether another agent started this one. Read off the same tail the name and the
-          // last activity come from, so it costs nothing beyond what the row already paid.
+          // Classify agent runs from accepted metadata and parent ownership.
           agentRun: this.agentRunFor(f, parentEdges.edges),
         };
       });
@@ -7210,8 +6473,7 @@ export class PanelProvider implements vscode.Disposable {
         metadata.map(([sessionId, meta]) => [sessionId, derivedTitleStats(meta)] as const),
         sessionStatsFromFacts,
       );
-      // A mark reads the clock, and it only ever turns null as time passes. A held mark that
-      // has expired is derived again, which clears it.
+      // Recompute expired cache marks so the cached value becomes null.
       const markNow = Date.now();
       this.metadataRailCaches = this.metadataCacheFigures.read(
         metadata.map(([sessionId, meta]) => [sessionId, derivedTitleCacheStats(meta)] as const),
@@ -7227,9 +6489,7 @@ export class PanelProvider implements vscode.Disposable {
       const railKey = railInputKey(railInput);
       const railPending = this.lifetimeFigures.answers();
       const railAdoptions = sessionAdoptions(this.sessionAliases);
-      // The two things that differ from one host to the next, and both for one reason: a
-      // theme's font and a theme's image reach a webview as addresses that webview alone may
-      // load.
+      // Resource URIs and icon fonts are resolved separately for each host.
       const light = isLightColourTheme();
       if (!selectedOnly) {
         this.performanceCounters.recordRefreshStage('rendered');
@@ -7240,18 +6500,9 @@ export class PanelProvider implements vscode.Disposable {
         const hostSession = this.hostSessions?.get(host) ?? this.showing;
         const hostPreviousSession = this.hostPreviousSessions?.get(host) ?? previousSelection;
         const hostDrawn = drawnSessionCards(this.cards, hostSession);
-        // The complete name answers the heading's hint and the Details dialog, and only the
-        // chosen session has one that differs from its short label, so it rides that row
-        // alone. The resume command rides no row: the panel words it from the agent key and
-        // the id every row already carries. Sending a field per session in the workspace to
-        // answer a question about one of them spent the payload on a copy of what it held.
-        // The session that started the chosen one rides that row alone for the same reason: only
-        // the chosen session's heading draws it.
+        // Only the selected row carries its full name and parent relationship.
         const hostParent = this.parentOfShown(hostSession);
-        // `railName` is stripped here rather than sent on: it exists for `railSessions` to
-        // read off `this.sessionRows` (through `railRows`/`railInputFor`) when it builds the
-        // rail's own cards, and this `sessions` array answers the popover heading, the
-        // composer target and the loading message instead, all of which keep the short label.
+        // Omit `railName` from general session rows. Session-list cards read it through the separate session-list payload.
         const hostRows = this.sessionRows.map(({ railName: _railName, ...row }) => {
           const full = row.id === hostSession ? (fullLabels.get(row.id) ?? row.label) : row.label;
           return {
@@ -7359,13 +6610,9 @@ export class PanelProvider implements vscode.Disposable {
                 ? this.usagePayloadForSession(hostSession, host.webview)
                 : this.usagePayload(host.webview),
             cards: this.themedFor(hostDrawn, host.webview, light),
-            // Keyed by session id, so a heading takes its own and nothing has to be matched up
-            // in the panel. Cost and turn count cover the whole recorded session, while
-            // context describes the current window.
+            // Heading figures are keyed by session. Cost and turn count cover its lifetime, while context describes the current window.
             ...(selectedOnly ? {} : { stats: hostRail.stats }),
-            // The icon theme's font, as a rule the panel can install. Where the file sits is only
-            // known once the theme has been found, so it cannot be part of the baked stylesheet.
-            // An empty list is the ordinary answer for a theme drawn with images, or for none.
+            // Resolve icon-font rules for this webview. Image-only themes supply no font rules.
             ...(selectedOnly ? {} : { iconFonts: this.icons.fontFaces(host.webview) }),
           },
           (serializedBytes) => {
@@ -7464,8 +6711,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       this.performanceCounters.recordRefresh(refreshReason, performance.now() - refreshStarted);
-      // A refresh that ended before it took the controller still owes the triggers that
-      // waited behind its opening reads.
+      // Run triggers retained during opening reads even when refresh ended before acquiring its controller.
       if (owned || (primed && !this.refreshController)) {
         this.runPendingRefresh();
         if (
@@ -7501,9 +6747,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Disposing the last visible host, a workspace folder change, and a repository scope lookup that
-  // answers for the first time, moves the roots, or fails call this. Each discards the catalog refresh in flight and every trigger that waits
-  // behind it. A host that only becomes hidden stops the poll and leaves the refresh running.
+  // Cancel catalog refresh and pending triggers. Hiding a host stops polling without calling this cancellation path.
   private abandonCatalogRefresh(): void {
     this.refreshGeneration++;
     this.refreshController?.abort();
@@ -7539,8 +6783,7 @@ export class PanelProvider implements vscode.Disposable {
     }, delay);
   }
 
-  // False when either file still needs a save, so the checkpoint stays dirty and the next one
-  // tries again. A shared-file save that found the lock busy also retries on its own timer.
+  // Return false when either cache needs another save. A busy shared-opening lock also schedules its own retry.
   private writeDerivedCache(): boolean {
     if (this.disposed && !this.cacheShutdownFlushing) return true;
     const openings = this.codexOpenings?.write() ?? true;
@@ -7593,16 +6836,12 @@ export class PanelProvider implements vscode.Disposable {
     return newestTurnStarts([], this.windows);
   }
 
-  // The sessions an agent is working in now, for the rail. The rule is
-  // `runningSessions` in composerview.ts, where the rows and the keys are joined and
-  // where a test says which of a row's two agent fields does the matching.
+  // Project running session IDs from catalog rows and native running keys.
   private runningSessions(): Set<string> {
     return runningSessions(this.sessionRows, [...this.running]);
   }
 
-  // When each of those sessions became busy, for the bound `sessionStatusOf` puts on a
-  // busy claim. The rule is `runningSessionsSince` in composerview.ts, beside the join
-  // the set itself comes from.
+  // Project running start times used to bound session status claims.
   private runningSince(): Map<string, number> {
     return runningSessionsSince(this.sessionRows, this.runningSinceKeys);
   }
@@ -7644,8 +6883,7 @@ export class PanelProvider implements vscode.Disposable {
     return { statuses, openChildren };
   }
 
-  // The background commands each session still waits on, for the rail's `background` state.
-  // It reads only the held outcomes and the clock, so two calls at one clock give one answer.
+  // Derive background command counts from held outcomes, exit times, and the supplied clock.
   private liveBackgroundCommands(now: number): Map<string, number> {
     return liveBackgroundCommands(
       this.sessionOutcomes,
@@ -7654,9 +6892,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // The live open background children of each session, for the rail's `subagents` state and
-  // the cards' agent rows. The write times come from what child discovery and
-  // `claudeChildRevisions` already read, so this adds no file read to the draw.
+  // Derive live child IDs from held outcomes and cached write times without reading files during rendering.
   private liveOpenChildren(now: number): Map<string, string[]> {
     let index: Map<string, number> | null = null;
     const writtenAt = (session: string, child: string): number | undefined => {
@@ -7692,35 +6928,25 @@ export class PanelProvider implements vscode.Disposable {
     return new Set(this.asks.map((entry) => entry.session));
   }
 
-  // The rail alone keeps its earlier order. Running sessions form a stable run above
-  // the inactive ones, so beginning work moves a card once and transcript writes do not
-  // keep moving it. Everything else continues to read sessionRows newest first.
+  // Preserve session-list placement within running and inactive groups. Catalog consumers retain newest-activity order.
   private railRows(statuses: ReturnType<typeof sessionStatusOf>): typeof this.sessionRows {
     const ordered = stableRailOrder(this.sessionRows, this.railOrder, statuses);
     this.railOrder = ordered.map((row) => row.id);
     return ordered;
   }
 
-  // What the read state comes to, as one string to compare two of against each other. Both
-  // halves are in it: a session marked read from the rail moves the watermarks without
-  // touching the read list, and a comparison of the list alone would leave that session
-  // wearing its badge until a transcript happened to move.
+  // Compare both explicit read markers and session watermarks.
   private readPrint(): string {
     return JSON.stringify([this.saved.read, this.saved.readTo]);
   }
 
-  // The files the lifetime figures are drawn from. A pass that is walking shows the files it
-  // has already settled, so a file the pass has only half read keeps its settled record.
+  // During indexing, retain the last settled record for sources whose new reads remain incomplete.
   private lifetimeDisplayFiles(): readonly SpendFileIndex[] {
     return sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles);
   }
 
   private lifetimeFiguresBySession(): LifetimeFigures {
-    // Held per session against that session's sources and the records they resolve to, which
-    // are all its figures read. A pass starting or ending, or a record changing that the display
-    // does not draw yet, keeps them. A grown transcript moves only the sessions that read it. A
-    // session with a dispatched source the ledger has not read whole also moves when the ledger
-    // queues that source or lets it go.
+    // Cache lifetime figures by session sources, displayed records, and pending-source state.
     return this.lifetimeFigures.read(
       this.lifetimeDisplayFiles(),
       this.sessionSpendSources,
@@ -7775,9 +7001,7 @@ export class PanelProvider implements vscode.Disposable {
           ],
           cost: cost.total,
           contextDetail: sessionCompactionContextDetail(cache?.compactions ?? []),
-          // Only a session whose facts are available at all gets an exact count. `cache` is
-          // undefined for the same reasons `sessionCacheFactsBySession` withholds it: no single
-          // complete primary source, or that source carries no cache-expiry index yet.
+          // Cache-expiry counts remain unknown without available complete primary-source cache facts.
           cacheExpiryCount: cache ? cacheExpiryReturnCount(cache.expiry) : null,
         };
         return { lifetime, ...(dispatched ? { dispatched } : {}) };
@@ -7808,10 +7032,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // What each dispatched session adds to the turn cards of each session above it. A card reads
-  // only these held ledger records and never a transcript. The ledger queue is asked here, at
-  // draw time, whether it still holds each dispatched session's own transcript, because a
-  // `claude -p --resume` can write to a file that the ledger read whole and finished.
+  // Project dispatched costs from cached lifetime contributions. Pending source reads withhold the settled-turn timestamp.
   private dispatchedTurnCosts(): Record<string, Record<string, DispatchedSessionCost>> {
     const out: Record<string, Record<string, DispatchedSessionCost>> = {};
     for (const [sessionId, contributions] of Object.entries(this.lifetimeFiguresBySession().dispatched)) {
@@ -7838,10 +7059,7 @@ export class PanelProvider implements vscode.Disposable {
     return spendSourceHeld(record, this.projectSpendQueued.has(file), this.projectSpendHistoryCutoff());
   }
 
-  // A parent whose dispatched source the ledger has just queued, let go, or left outside the
-  // history limit gains or loses its lower-bound mark with no record changing, so the rail and
-  // the heading draw it again. The answers are compared with those the last rail drew, because a
-  // selection render between the two reads the figures without drawing the rail.
+  // Refresh session-list figures when dispatched-source pending state changes, including changes since the last list payload.
   private postRailIfSpendPendingMoved(): void {
     const holds: SpendSourcePending = (file, record) => this.projectSpendHolds(file, record);
     if (
@@ -7852,9 +7070,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // `openChildren` and `now` are the reading `statuses` was built from, so a card that says
-  // `subagents` always has its count. The background command counts are read again at the same
-  // `now`, so a card that says `background` always has its count too.
+  // Supply statuses and child counts from one clock reading so their displayed states agree.
   private railInputFor(
     counts: ReadonlyMap<string, NewCount>,
     statuses: ReturnType<typeof sessionStatusOf>,
@@ -7896,19 +7112,13 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // Reword the rail after read state or an indexed figure moves. Opening a card is not a
-  // render, and background indexing need not move a transcript, so the rail receives its
-  // answer here. The cards are already in memory, so this costs no parse. A repeated
-  // notification gathers nothing. A read save gathers unread counts first. A changed source
-  // posts nothing when its assembled wording has not changed.
+  // Update session-list content from retained facts without parsing transcripts. Unchanged revisions and payload inputs skip the update.
   private postRail(
     inputsChanged: boolean,
     knownCounts?: ReadonlyMap<string, NewCount>,
     refreshCatalogFacts = true,
   ): void {
-    // A child can report a running-state change after the last panel host closes. Leaving
-    // before railRows keeps that event from seeding a new order from stale session rows;
-    // the next host then starts from the activity order its own refresh reads.
+    // Stop before deriving order when no host remains. The next host initializes order from its own catalog.
     if (!this.hosts.length) {
       return;
     }
@@ -7978,9 +7188,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.projectSpendWorkspace === workspace) {
       return;
     }
-    // An owed save belongs to the workspace this replaces, and the lists below are cleared. A
-    // save that fails here is dropped, because a later write would put the new workspace's
-    // empty lists over its saved ledger before hydration restores them.
+    // Flush the previous workspace before replacing its lists. Do not retry its failed save with the new workspace's state.
     this.flushProjectSpendSave();
     this.projectSpendSaveOwed = false;
     this.projectSpendSaveOwedSince = null;
@@ -8056,8 +7264,7 @@ export class PanelProvider implements vscode.Disposable {
     const catalog = this.authoritativeCatalog ?? [];
     this.scheduleProjectSpendIndex(trustedListedRevisions(catalog, this.catalogWalked, this.showing), null);
     this.postProjectSpend();
-    // The first render already settled catalog-derived order and status. Hydration adds
-    // lifetime figures only, so an older ledger outcome must not move a session afterward.
+    // Hydration adds lifetime figures without replacing catalog-derived order or status.
     this.postRail(true, undefined, false);
   }
 
@@ -8122,9 +7329,7 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendSaveScheduler.offer();
   }
 
-  // A failed save tries again on its own, because the last change before agents stop has no
-  // later change to carry it. A change that arrives first cancels the try and offers the save
-  // to the scheduler instead. After the last try the save waits for the next change or flush.
+  // Retry failed saves within a bounded budget. A new change restarts scheduling, while exhausted retries wait for another change or flush.
   private retryProjectSpendSave(): void {
     if (this.disposed) return;
     if (this.projectSpendSaveRetry || this.projectSpendSaveScheduler.pending) {
@@ -8196,9 +7401,7 @@ export class PanelProvider implements vscode.Disposable {
         this.cancelProjectSpendSaveRetry();
       }
     }
-    // A save can land while a pass is still walking. The figures the rail draws are
-    // whole-session totals, so a pass that is still walking has nothing final to say: the owed
-    // rail waits for the end of the pass, which posts it once.
+    // Defer the owed session-list update until indexing completes so it publishes settled lifetime figures.
     if (this.projectSpendRailOwed && !this.projectSpendIndexing) {
       this.projectSpendRailOwed = false;
       this.postRail(true);
@@ -8226,17 +7429,12 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // The offer stats every source a listing walk did not already describe, and a refresh runs
-  // before it posts the render the panel paints from. Spend indexing is background work, so
-  // the offer waits for a tick of its own and the paint does not wait on the filesystem.
+  // Defer spend-source checks until after the render, keeping filesystem work outside the immediate rendering path.
   private scheduleProjectSpendIndex(
     listedRevisions: ReadonlyMap<string, { size: number; mtimeMs: number }>,
     onlyFiles: ReadonlySet<string> | null,
   ): void {
-    // The workspace and the sources are taken here, with the revisions and the targeted set.
-    // A listing for another workspace replaces those source lists before the workspace the
-    // panel is on is settled, so an offer that read them on its own tick would write one
-    // workspace's sources into another's ledger.
+    // Capture workspace, sources, and revisions before deferral so later workspace changes cannot mix ledger inputs.
     const workspace = this.projectSpendWorkspace;
     const sources = this.projectSpendSources();
     const tick = setTimeout(() => {
@@ -8244,9 +7442,7 @@ export class PanelProvider implements vscode.Disposable {
       if (this.projectSpendWorkspace === workspace) {
         this.queueProjectSpendIndex(listedRevisions, onlyFiles, sources);
       }
-      // A waiting offer stands for the pass the ledger owes, so the face and the startup
-      // milestone both call the ledger unsettled while one waits. An offer that queues
-      // nothing has to say the ledger settled, because no pass will.
+      // Publish settled Project cost when an offer queues no work.
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
       }
@@ -8254,8 +7450,7 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendOffers.add(tick);
   }
 
-  // Whether the ledger owes work. A pass that is running owes it, and so does an offer that
-  // is waiting for its tick, because the offer is what decides whether a pass runs at all.
+  // Hydration, active indexing, and deferred offers each keep Project cost unsettled.
   private projectSpendBusy(): boolean {
     return !this.projectSpendHydrated || this.projectSpendIndexing || this.projectSpendOffers.size > 0;
   }
@@ -8276,8 +7471,7 @@ export class PanelProvider implements vscode.Disposable {
     ];
   }
 
-  // Drop every offer that has not run. A closed panel and a changed workspace both leave the
-  // files an earlier refresh listed with nothing to index them for.
+  // Cancel deferred source offers when their workspace or panel lifetime ends.
   private cancelProjectSpendOffers(): void {
     for (const tick of this.projectSpendOffers) {
       clearTimeout(tick);
@@ -8347,8 +7541,7 @@ export class PanelProvider implements vscode.Disposable {
     return projectSpendHistoryCutoff(readSetting('projectCost.historyDays'), now);
   }
 
-  // A new history limit drops every queued source and offers them all again under it, so a
-  // lower limit leaves older unscanned sources out and a higher one brings them in.
+  // Re-offer queued sources under the changed history cutoff.
   private restartProjectSpendOffer(): void {
     this.projectSpendQueue = [];
     this.projectSpendQueued.clear();
@@ -8398,9 +7591,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (result.complete) {
       this.projectSpendQueued.delete(key);
-      // One file can grow while its bounded read is in flight. Re-offer just that file
-      // against the revision the reader completed, rather than waiting for the broad
-      // integrity pass or walking every source again.
+      // Requeue this file if it grew during indexing instead of waiting for the next integrity pass.
       try {
         const stat = fs.statSync(next.file);
         if (stat.size !== result.record.size || stat.mtimeMs !== result.record.mtimeMs) {
@@ -8501,11 +7692,7 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendVisibleFiles.length !== this.projectSpendFiles.length ||
       this.projectSpendVisibleFiles.some((file, at) => file !== this.projectSpendFiles[at]);
     this.projectSpendVisibleFiles = this.projectSpendFiles.slice();
-    // A pass ends on every idle tick of the queue, so only a pass that moved the displayed
-    // files moves the ledger revision. The save writes the displayed files too, and a save the
-    // scheduler ran during the pass wrote the list this replaces. The save stays with the
-    // scheduler: while agents write, a pass ends on every append, and a save at each end would
-    // write the whole ledger that often.
+    // Advance the ledger revision when displayed files change. Schedule persistence so repeated appends still share bounded saves.
     if (displayMoved) {
       this.projectSpendRevision++;
       this.scheduleProjectSpendSave();
@@ -8520,20 +7707,11 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.postRailIfSpendPendingMoved();
       }
-      // The face and the rail carry every figure a pass moves, so a pass ends without a full
-      // refresh. A refresh offers a source again whenever the listing moved it, so a pass that
-      // ended in one would start the next pass for as long as an agent writes.
+      // Publish Project cost and session-list updates without a catalog refresh that would offer sources again.
     }
   }
 
-  // Every session belonging to this workspace, from either agent, newest activity first.
-  //
-  // Enumeration and source ownership stay here. The worker supplies transcript metadata
-  // before refresh orders the catalog by recorded activity.
-  //
-  // The two lists are merged here rather than kept apart, because the reader wants one
-  // session history: work moves between the two agents within an afternoon, and two
-  // lists side by side would make the order between them something to work out by hand.
+  // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
   private allSessions(reuseCatalog = false): SessionFile[] {
     const codexWalk = this.codexWalk ?? undefined;
     this.codexWalk = null;
@@ -8572,13 +7750,10 @@ export class PanelProvider implements vscode.Disposable {
           return null;
         }
       });
-      // Sorted again rather than handed back in the held order. The one session that
-      // was re-read may have grown, and growing moves the activity the list is ranked by.
+      // Reorder reused catalog rows after updating file revisions.
       if (held) {
         const sorted = orderSessionCatalog(held, (session) => this.activityFor(session));
-        // Held again rather than left as it was walked. The one session that was read
-        // again keeps its new revision, so a second selection does not hand the old size back
-        // and make every derived fact about it be worked out a second time.
+        // Retain the updated rows so later selections reuse their current revisions.
         this.catalog = { folders: folderPrint, sessions: sorted };
         this.catalogWalked = false;
         return sorted;
@@ -8615,9 +7790,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const file of staleMetas(this.codexStats.keys(), listing.walked)) {
       this.codexStats.delete(file);
     }
-    // Trimmed here rather than in `evictCache`, because this is the only place the walk's
-    // own list exists and it is the only list this cache may be measured against.
-    // `staleMetas` says why.
+    // Trim opening metadata against every walked rollout, including files excluded from the session list.
     for (const file of staleMetas(this.codexMetas.keys(), listing.walked)) {
       this.codexMetas.delete(file);
     }
@@ -8633,26 +7806,16 @@ export class PanelProvider implements vscode.Disposable {
     const codex = listing.sessions;
     this.claudeParents = [...claude, ...codex];
     this.walkedClaude = claude.map((s) => s.file);
-    // The peer-wake cut, after membership and before anything else touches the files. A
-    // cross-session message wakes a session whose transcript has no human prompt, no
-    // title and no drawable turn, and it drew as a "Session <hash>" card; a session
-    // joins the list only once a human has prompted it. Cut here, so the picker, rail,
-    // search corpus, and selected-session empty state all agree. The Codex side
-    // has its own rule for background review and dispatched children in `codex.ts`.
+    // Filter Claude peer-wake transcripts before catalog publication. Sessions enter this list after a human prompt is found.
     const listed = claude.filter((s) => this.hasHumanPrompt(s));
     this.subagentDirectories.sweep();
-    // Ordered by what each session recorded, not by what its file's mtime says. The picker
-    // and read cut use this order directly, and it seeds the rail before the rail holds its
-    // cards stable. An agent appending bookkeeping to a finished session therefore
-    // cannot lift it above every session the reader had actually worked in.
+    // Order the catalog by recorded activity before initializing stable session-list placement.
     const walked = new Set([
       ...listing.walked,
       ...claude.map((session) => session.file),
       ...this.claudeChildren.map((session) => session.file),
     ]);
-    // Before the first child discovery, this list lacks every Claude child transcript. A
-    // prune then would drop each child's stored entry and carried name, and the child would
-    // draw a placeholder until its reread. The discovery prunes against the complete list.
+    // Defer title pruning until discovery supplies Claude child transcripts. Earlier walks cannot establish their absence.
     if (this.claudeChildrenDiscovered && this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
     }
@@ -8664,8 +7827,7 @@ export class PanelProvider implements vscode.Disposable {
     return walkedSessions;
   }
 
-  // `sessions` is the catalog the sources are listed for. Its rows decide which dispatch edges
-  // count, by the same rule the heading, the filing and the refresh key read.
+  // Catalog membership selects dispatch edges consistently for headings, spend sources, and refresh keys.
   private updateSessionSpendSources(codex: SessionFile[], sessions: readonly SessionFile[]): void {
     const revision = this.sessionSpendSourceIndex.revision;
     this.sessionSpendSources = this.sessionSpendSourceIndex.update(
@@ -8914,9 +8076,7 @@ export class PanelProvider implements vscode.Disposable {
     return dropped;
   }
 
-  // The scan is sticky through the cache: a file once known to hold a human prompt is
-  // never read for one again, and a wake file is re-read only past where the last scan
-  // stopped, which its size says without opening anything.
+  // Reuse a successful human-prompt scan. Otherwise resume scanning from the retained cursor.
   private hasHumanPrompt(session: SessionFile): boolean {
     const prev = this.humanScans.get(session.file);
     if (prev?.found) {
@@ -8927,7 +8087,7 @@ export class PanelProvider implements vscode.Disposable {
     return next.found;
   }
 
-  // Only the selected session needs turn cards. Rail facts come from metadata.
+  // Selected sessions supply turn cards. Session-list facts come from metadata.
   private shownSessions(all: SessionFile[]): SessionFile[] {
     const showing = new Set(
       [this.showing, ...(this.hostSessions?.values() ?? [])].filter((session): session is string => session !== null),
@@ -9004,9 +8164,7 @@ export class PanelProvider implements vscode.Disposable {
         continue;
       }
       const entry = result.value.entry;
-      // Given back before the next session is weighed, because the read is done and says
-      // what it took. A titled session costs its tail and a 4 KiB fingerprint, not the whole
-      // prompt head the budget held for it.
+      // Return unused title-head budget after a metadata read so the next session can use it.
       remaining += unreadHeadBytes(session, entry);
       const carried = carryDerivedTitleFacts(previous, entry, session);
       this.storeTitleEntry(session.file, carried);
@@ -9264,11 +8422,7 @@ export class PanelProvider implements vscode.Disposable {
     this.postSessionLoading(this.authoritativeCatalog ?? [], generation, signal);
   }
 
-  // The name the rail card, the session heading, and search draw for a session. A Claude session
-  // reads the held name, else the name its stored metadata holds before that metadata has
-  // reported. A Codex session is named by its thread-name file, else its metadata. Either
-  // agent then falls back to the name a derived cache version bump carried, and only then to
-  // a placeholder built from the id.
+  // Use accepted agent-specific names, then carried cache names, then an ID placeholder.
   private sessionLabel(session: SessionFile): { label: string; fullLabel: string } {
     const carried = this.carriedNames.get(session.file);
     if (session.agent === 'claude') {
@@ -9285,10 +8439,7 @@ export class PanelProvider implements vscode.Disposable {
     return { label, fullLabel: this.fullTitleFor(session) || label };
   }
 
-  // Each session another session started, and that session, built once per worker hand-off of
-  // references and child files, and once per Codex listing. The heading names the parent. A
-  // dispatched child also counts in the parent's lifetime cost, and files under Run by agents
-  // unless the reader owns it.
+  // Cache parent relationships until reference or child collections change.
   private sessionParentsOf(): ReadonlyMap<string, SessionParentEdge> {
     const references = this.claudeChildReferences;
     const children = this.claudeChildren;
@@ -9302,13 +8453,7 @@ export class PanelProvider implements vscode.Disposable {
     return parents;
   }
 
-  // The parent edges whose child and parent both have a row among `sessions`, their dispatched
-  // part, and their refresh key. The heading and the refresh key read the edges, so no edge
-  // moves one without the other. The Run by agents filing and the parent's lifetime cost read
-  // the dispatched edges, and never a subagent edge: a subagent's transcript already files it
-  // as a run, and its file already counts in its parent's delegated work. A session a subagent
-  // dispatched still reaches the subagent's own parent, through the Claude child list the spend
-  // sources climb.
+  // Retain parent edges whose endpoints have catalog rows. Dispatched edges supply separate ownership and spend relationships.
   private sessionParentEdges(sessions: readonly SessionFile[]): SessionParentEdgeSet {
     this.sessionParentEdgeSet = sessionParentEdgeSet(this.sessionParentEdgeSet, this.sessionParentsOf(), sessions);
     return this.sessionParentEdgeSet;
@@ -9334,17 +8479,12 @@ export class PanelProvider implements vscode.Disposable {
     return this.sessionNames.get(session.sessionId) ?? storedSessionName(this.metaFor(session));
   }
 
-  // A metadata read of a Claude session arrived, or a stored one was kept for the current
-  // revision. Its name reports to the held names once, with the file it came from. When the
-  // panel already holds a higher name for this transcript, as when parsed turns raised it
-  // before any entry existed, the answered entry stores that name so a restart draws it.
+  // Observe stored Claude names and write any higher-priority held name back into the entry.
   private observeStoredName(session: SessionFile, entry: DerivedTitleEntry): DerivedTitleEntry {
     if (session.agent !== 'claude') {
       return entry;
     }
-    // The size is the entry's own, which the worker measured when it read. The file number
-    // rides on the catalog row, from the stat that listed it, so reporting a session the
-    // cache already answered opens nothing on this thread.
+    // Use the worker-measured entry size and catalog inode without another file read.
     this.sessionNames.observe(
       session.sessionId,
       storedSessionName(entry),
@@ -9354,7 +8494,7 @@ export class PanelProvider implements vscode.Disposable {
     return held ? withSessionName(entry, held) : entry;
   }
 
-  // Report a stored entry's name and keep the entry the held name leaves behind.
+  // Observe the stored name and retain any entry updated by held naming state.
   private observeStoredEntry(session: SessionFile, entry: DerivedTitleEntry): void {
     const next = this.observeStoredName(session, entry);
     if (next === entry) {
@@ -9364,12 +8504,7 @@ export class PanelProvider implements vscode.Disposable {
     this.derivedCacheCheckpointState.markChanged();
   }
 
-  // The parsed turns of one refresh report their Claude session names once, each with the
-  // transcript it was read from. A parse names that transcript by the file number the catalog
-  // walk already took, and reports no size. It read a window of records, not the end of the
-  // file, and the size the walk listed is older than the one a metadata read measures for
-  // itself, which would read as a transcript that shrank. A row with no number reports no
-  // identity rather than a size that says nothing about which file it is.
+  // Observe parsed Claude names with catalog inode identity. Omit catalog size because an older listing can misrepresent transcript shrinkage.
   private observeParsedNames(turns: readonly Turn[], byId: ReadonlyMap<string, SessionFile>): void {
     this.storeSessionNames(
       this.sessionNames.observeTurns(
@@ -9383,8 +8518,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // The name a card and its session heading carry. A Codex name comes from the thread-name
-  // index first, which a rename rereads, and otherwise from the name its turns' read was given.
+  // Prefer Codex index names over names found in parsed turns when naming card and session headings.
   private headingTitle(
     sessionId: string,
     byId: ReadonlyMap<string, SessionFile>,
@@ -9401,8 +8535,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Parsed turns raised some held names. The derived cache stores each one, so a restart
-  // starts from the name the panel last drew.
+  // Persist changed held names in existing derived entries for subsequent startup.
   private storeSessionNames(changed: Iterable<string>, fileOf: (sessionId: string) => SessionFile | undefined): void {
     for (const sessionId of changed) {
       const session = fileOf(sessionId);
@@ -9442,32 +8575,12 @@ export class PanelProvider implements vscode.Disposable {
     return this.threadNames.fullNames.get(session.sessionId) || fromFile;
   }
 
-  // When a session was last active, as it recorded it rather than as the filesystem
-  // saw it. An agent appends bookkeeping after the session has stopped, and taking
-  // the mtime made closing a session send it to the top of the rail reading `less than a
-  // minute ago` with nothing in it changed.
-  //
-  // A session whose window records no time at all falls back to its mtime, which is what
-  // every session did before. That can only rank such a session too high, never too low:
-  // a touched file's mtime is at or after the last activity it holds.
+  // Use recorded activity time, falling back to mtime when metadata has no timestamp.
   private activityFor(session: SessionFile): number {
     return this.metaFor(session).activityMs ?? session.mtimeMs;
   }
 
-  // Whether a session was run by another agent rather than had by the reader. The
-  // rule and its limits are `agentRunIn` in transcript.ts; this is where the answer is
-  // cached alongside the name and the activity it was read with, and where this window's
-  // own record of starting a session overrides it. `agentRunAnswer` in turnrail.ts
-  // carries that rule, including the child-transcript case: the parent's `Agent` call
-  // is the positive fact, and it outranks the cached reading and any stale scan on it.
-  //
-  // The override sits here rather than in `metaFor`, so the cached fact stays the reading
-  // of the transcript and the derived cache keeps answering for every window.
-  //
-  // `edges` is the edge set of `sessionParentEdges` over the listed sessions, the set the
-  // refresh key carries, so a reference the key leaves out cannot move a card. A dispatched
-  // session is the reader's when its launch recorded that the reader asked for it, or when a
-  // person spoke in its transcript, which the worker reads with the child's other figures.
+  // Apply reader-started and parent ownership to cached agent-run classification without changing the shared metadata fact.
   private agentRunFor(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>): boolean {
     const edge = edges.get(session.sessionId);
     const dispatched = edge?.relation === 'dispatched';
@@ -9692,7 +8805,7 @@ export class PanelProvider implements vscode.Disposable {
     return false;
   }
 
-  // `spendNow` is the clock reading of a key the host stores for this trip's child spend.
+  // `spendNow` binds worker child-spend classification to the clock used by the host's dependency key.
   private progressiveInput(session: SessionFile, spendNow?: number): ProgressiveInput {
     return {
       session,
@@ -9718,8 +8831,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Cost figures come from child transcripts, which grow while the parent's turns stay the
-  // same. A stale answer here starts a refresh of those figures and never shows the loading row.
+  // Check child-spend keys independently of parent revisions. Stale child figures refresh without the selected-window loading row.
   private agentFactsCurrent(session: SessionFile): boolean {
     const structuralKey = this.structuralKey(session);
     const entry = this.cache.get(session.file);
@@ -9743,19 +8855,14 @@ export class PanelProvider implements vscode.Disposable {
     return this.agentSpendKey(session, { turns: pages.flatMap((page) => page.turns) }, structuralKey, versions, now);
   }
 
-  // Reapply child spend to the cached tail without reading the parent transcript again. The
-  // key moves even when the worker gives no answer, so a failed refresh waits for the next
-  // child write instead of repeating at once. A parent write makes the read stale on its own.
+  // Refresh cached child spend without rereading the parent. Store the attempted dependency key even when the worker returns no accepted answer.
   private async refreshAgentFacts(
     session: SessionFile,
     entry: CacheEntry,
     generation: number,
     signal: AbortSignal,
   ): Promise<boolean> {
-    // One reading of each child revision, taken before the round trip, for both keys below.
-    // A child that writes while the trip runs leaves the key stale, so its cost figures move
-    // on the next poll instead of waiting for the parent file.
-    // One clock reading too, so the worker and both keys agree on which running child is quiet.
+    // Capture child revisions and one clock before the worker request. Changes during the request leave the answer eligible for another refresh.
     const versions = new Map<string, string>();
     const now = Date.now();
     const agentKey = this.agentSpendKey(session, entry.read, undefined, versions, now);
@@ -9782,9 +8889,7 @@ export class PanelProvider implements vscode.Disposable {
       return false;
     }
     entry.read = { ...entry.read, turns: updated.value.pages[0].turns };
-    // The stored turns answer the key from here on. A child that finished during the round
-    // trip changes what those turns name, and a key over the turns the trip replaced never
-    // matches again, so every poll would enter this worker round trip a second time.
+    // Recompute the key over stored turns using the same captured child revisions and clock.
     entry.agentKey = this.agentSpendKey(session, entry.read, undefined, versions, now);
     return true;
   }
@@ -9857,10 +8962,7 @@ export class PanelProvider implements vscode.Disposable {
         });
       }
     }, 5_000);
-    // Set when a worker round trip below runs. Without a trip, a render already shows the window
-    // the cached return finds. `show` draws just before its call, a catalog refresh draws just
-    // after, and a retry finds a window that its store drew: the accepted read below and
-    // `prepareProgressive` each refresh after they store. Only a trip can change that render.
+    // Track worker requests so an unchanged cached result does not trigger another render.
     let roundTrip = false;
     try {
       let session = this.currentSelectedSession(work);
@@ -9927,8 +9029,7 @@ export class PanelProvider implements vscode.Disposable {
           }
         } else if (this.history.get(sessionId) === history) {
           this.history.set(sessionId, { ...history, pages: updated.value.pages });
-          // The refresh rewrites these turns, so a key over the pages sent never matches the
-          // pages kept. Name the pages stored here, with the revisions read before the trip.
+          // Key the accepted pages with the captured child revisions, rather than the pages sent to the worker.
           this.historyStructuralKeys.set(
             sessionId,
             this.historyAgentKey(current, updated.value.pages, undefined, historyVersions, historyNow),
@@ -9942,9 +9043,7 @@ export class PanelProvider implements vscode.Disposable {
         if (cached.agentKey !== this.agentSpendKey(session, cached.read)) {
           roundTrip = true;
           await this.refreshAgentFacts(session, cached, generation, controller.signal);
-          // The parent can write while this round trip runs, and that write reaches the rail
-          // through the metadata cache. Ask again, and read the window when the retained
-          // answer is now behind the file, so both places say the same thing.
+          // Recheck the parent after child-spend refresh. A parent append requires a new selected window.
           const refreshed = this.currentSelectedSession(work);
           if (!refreshed) {
             return;
@@ -9971,10 +9070,7 @@ export class PanelProvider implements vscode.Disposable {
         (previous?.checkpoint as ClaudeForwardCheckpoint | undefined)?.attachmentRecovery?.status !== 'pending'
       ) {
         this.acceptSelectedMetadataRead(session, generation);
-        // A render of this retained window exists already, as `roundTrip` says. Another
-        // selected-only refresh would draw the same window again, so refresh only
-        // for what a worker trip or a cleared failure changed. A stale failure that is no longer
-        // on screen costs one refresh that draws nothing new.
+        // Refresh a current retained window only when worker work or a displayed failure changed its presentation.
         const failureDrawn = this.selectionFailure !== null;
         this.selectionFailure = null;
         if (roundTrip || failureDrawn) {
@@ -10197,26 +9293,14 @@ export class PanelProvider implements vscode.Disposable {
     return changed;
   }
 
-  // Answer the sentinel at the end of the list with one older page.
-  //
-  // One request is in flight at a time, whether the reader pressed the button or the page
-  // came into view. A second reader of the same file would read the same bytes twice and
-  // merge the same turns twice, and the panel asks again as soon as a page lands.
-  //
-  // The first request starts at the end of the file, so its first pages hold turns the
-  // ordinary tail already lists. It keeps reading until a page carries a turn that is new,
-  // which `historyPageReads` bounds. Every later request chains from the stored cursor and
-  // reaches new turns on its first read.
+  // Load one older history page at a time. Bounded repeated reads skip initial pages containing only turns already present in the tail.
   private async loadOlderHistory(sessionId: string): Promise<void> {
     if (this.historyRequest) {
       return;
     }
     const selected = () =>
       new Set([this.showing, ...this.hostSessions.values()].filter((held): held is string => held !== null));
-    // A catalog walk during the cold pass would read on the main thread every opening record
-    // the pass has not reached yet, so the press waits for the pass. It holds the request while
-    // it waits, so a second press starts nothing, and the sentinel says it is loading at once.
-    // A catalog refresh waits for the pass too, so the status goes out in a selection-only render.
+    // Hold the request while cold opening reads finish. Publish loading through a selected-only refresh without starting a competing catalog walk.
     const priming = this.codexPriming;
     if (priming) {
       if (!selected().has(sessionId) || !this.readWindows.has(sessionId) || this.history.get(sessionId)?.atBeginning) {
@@ -10249,9 +9333,7 @@ export class PanelProvider implements vscode.Disposable {
     const controller = new AbortController();
     const generation = ++this.historyGeneration;
     this.historyRequest = { sessionId, controller, generation };
-    // The loading status reaches the panel before the first read starts, so the sentinel
-    // says what it is doing instead of standing still under the reader. The catalog is
-    // reused because this press changed no file.
+    // Publish loading before the page read, reusing the catalog.
     void this.refresh(true, true, true, true);
     const before = this.history.get(sessionId) ?? startSessionHistory<HistoryCursor>(session, Date.now());
     let metadataReadAccepted = false;
@@ -10261,9 +9343,7 @@ export class PanelProvider implements vscode.Disposable {
         if (this.historyRequest?.generation !== generation) {
           return;
         }
-        // Read from the provider each round rather than from a value held across the await.
-        // A refresh runs while a page is being read, and it can rebase this session's
-        // cursor onto an appended file or throw its pages away entirely.
+        // Read retained history anew after each await because a refresh can replace its pages or cursor.
         const held = this.history.get(sessionId) ?? startSessionHistory<HistoryCursor>(session, Date.now());
         if (held.atBeginning) {
           break;
@@ -10293,8 +9373,7 @@ export class PanelProvider implements vscode.Disposable {
           break;
         }
       }
-      // A page read can throw, and a request that ended in one would leave the sentinel
-      // saying it was loading until the next poll repainted it.
+      // Convert read failures to settled history state so loading does not remain active.
     } catch {
       const held = this.history.get(sessionId) ?? before;
       this.history.set(
@@ -10314,8 +9393,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.refresh(true, true, true, true);
   }
 
-  // The transcript's size and write time as they are now, so a stale answer can be told from
-  // a cursor that names a generation the file no longer has.
+  // Read current file identity and revision for stale-result and cursor checks.
   private revisionOf(session: SessionFile): FileRevision {
     try {
       const stat = fs.statSync(session.file);
@@ -10345,8 +9423,7 @@ export class PanelProvider implements vscode.Disposable {
     this.derivedCacheCheckpointState.markChanged();
   }
 
-  // One page, read through the adapter that owns this transcript. The provider chooses the
-  // adapter and keeps its cursor; it never reads a record itself.
+  // Request one page through the worker, retaining the source adapter's opaque cursor.
   private async readOlderHistoryPage(
     session: SessionFile,
     cursor: HistoryCursor | null,
@@ -10385,10 +9462,7 @@ export class PanelProvider implements vscode.Disposable {
       : [];
   }
 
-  // Like the Claude key below, this names each child relationship and leaves out the child
-  // file revision. A Codex child appends to its own rollout while it runs, and a revision
-  // here makes the parent's read stale on every append. `agentSpendKey` carries those
-  // revisions, so the cost figures move and the turn card stays.
+  // Key Codex child relationships without file revisions. `agentSpendKey` refreshes changed child figures without rereading the parent.
   private codexStructuralKey(session: SessionFile): string {
     return this.codexStructuralChildren(session)
       .map(
@@ -10399,8 +9473,7 @@ export class PanelProvider implements vscode.Disposable {
       .join('\n');
   }
 
-  // The version of one child's spend figure. A caller that must compare two keys over the same
-  // files passes a map, and every file it already named keeps the version read the first time.
+  // Cache child spend versions in the supplied map so related comparisons use one revision per file.
   private spendVersion(
     session: SessionFile,
     file: string,
@@ -10419,14 +9492,7 @@ export class PanelProvider implements vscode.Disposable {
     return version;
   }
 
-  // The key names each child relationship and leaves out the child file revision. A child
-  // appends to its own transcript many times a minute, and a revision here makes the parent's
-  // read stale on every append. The recorded part of `agentSpendKey` carries the revision of
-  // each finished child that the tail or a retained older page shows, and of every nested
-  // subagent whose spend that child's figure includes. It carries the shared spend band of a
-  // running child or recently writing Codex descendants, so their cost moves once a band. `agentFactsCurrent`
-  // refreshes those cost figures without another read of the parent. `agentListingStamp`
-  // carries every child revision for the spend sources.
+  // Key Claude child relationships without file revisions. Separate spend keys track completed children and active spend bands.
   private claudeStructuralKey(session: SessionFile): string {
     return session.agent === 'claude'
       ? this.claudeChildReferences
@@ -10454,7 +9520,7 @@ export class PanelProvider implements vscode.Disposable {
     versions?: Map<string, string>,
     now = Date.now(),
   ): string {
-    // The worker files the same key with each window, so the two agree until a child writes.
+    // The worker records each window's dependency key. The host recomputes it from current child revisions and the supplied clock.
     const metas = claudeSubagentMetaReader();
     return agentSpendDependencyKey(
       read.turns,
@@ -10509,10 +9575,7 @@ export class PanelProvider implements vscode.Disposable {
     return new Set(this.hostSessions.values());
   }
 
-  // A parsed tail is megabytes. Sessions rotate, and without this the map keeps every
-  // transcript the window has ever shown, long after it dropped off the list. The name
-  // and cwd maps are small but grow the same way, so they are trimmed to the sessions
-  // that still exist rather than to the few being read.
+  // Evict absent parsed windows and apply the retained-history budget. Trim small discovery caches against all present files.
   private evictCache(keep: SessionFile[], known: SessionFile[]): void {
     const live = new Set(known.map((s) => s.file));
     for (const file of [...this.cache.keys()]) {
@@ -10538,10 +9601,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.dropOlderHistory(sessionId);
     }
-    // The walked files join the known sessions here, because the peer-wake cut removes
-    // its files from every list a caller holds: trimmed against those lists alone, a
-    // wake file's cwd and scan cursor would be evicted on every refresh and read back
-    // on every poll, which is the trap staleMetas documents for the Codex side.
+    // Include filtered Claude peer-wake files when retaining working-directory and human-prompt scan caches.
     const present = new Set([...known.map((s) => s.file), ...this.walkedClaude]);
     if (this.pruneDerivedTitles(present)) {
       this.derivedCacheCheckpointState.markChanged();
@@ -10570,8 +9630,7 @@ export class PanelProvider implements vscode.Disposable {
   private trimOlderHistory(sessions: readonly SessionFile[]): void {
     const now = Date.now();
     const selectedSessions = new Set(sessions.map((session) => session.sessionId));
-    // A page being read for a session the reader has left is work nobody will see, and
-    // it holds the one request slot the newly selected session needs.
+    // Cancel an older-page request when its session is no longer selected in any host.
     if (this.historyRequest && !selectedSessions.has(this.historyRequest.sessionId)) {
       this.historyRequest.controller.abort();
       this.historyRequest = null;
@@ -10675,8 +9734,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private collect(sessions: SessionFile[]): RenderCard[] {
-    // Cleared here rather than trimmed, so a session that drops off the list does not
-    // linger in it.
+    // Rebuild card-to-turn references from the current selected windows.
     this.turnsByKey.clear();
     const ordinary = { maxTurns: TRANSCRIPT_TURN_LIMIT, tailBytes: TRANSCRIPT_TAIL_BYTES };
     const turns: Turn[] = [];
@@ -10684,17 +9742,13 @@ export class PanelProvider implements vscode.Disposable {
     const parsedCacheRevisions = new Map<string, Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>>();
     let listedMaxTurns = 0;
     this.readWindows.clear();
-    // What each session's retained pages still describe, before anything reads a
-    // transcript. A file that moved under its pages starts over here rather than merging
-    // turns from bytes that now hold other records.
+    // Update retained-page recency and apply the shared budget before collecting selected windows.
     this.trimOlderHistory(sessions);
     for (const session of sessions) {
       const window = this.readFor(session, ordinary.maxTurns, ordinary.tailBytes);
       const read = window.read;
       parsedCacheRevisions.set(session.sessionId, window.revision);
-      // The older pages join the session on screen alone. A session the reader
-      // moved away from keeps its pages for the return, and drawing them would widen a
-      // session nobody asked to widen.
+      // Include retained pages for each selected session. Unselected sessions retain pages without drawing them.
       const older = historyRecordsOutside(this.history.get(session.sessionId)?.pages ?? [], read);
       // The budget admits the tail and retained pages for every session visible in a host.
       // Without their combined size, navigating one panel would cut a peer panel to one card.
@@ -10702,9 +9756,7 @@ export class PanelProvider implements vscode.Disposable {
       this.readWindows.set(session.sessionId, {
         readBytes: read.readBytes,
         turnLimitReached: read.turnLimitReached,
-        // Everything on the list for this session: the ordinary tail and the pages
-        // the reader has loaded. The sentinel reports it, the next request sizes its walk
-        // back from it, and the session figures cover the same set.
+        // Count the tail and retained pages together for the history sentinel.
         loadedTurns: read.turns.length + older.turns.length,
       });
       turns.push(...read.turns, ...older.turns);
@@ -10718,17 +9770,12 @@ export class PanelProvider implements vscode.Disposable {
       startedAt: t.startedAt,
       kind: 'turn',
     }));
-    // Which agents gained a finished turn, and the newest turn in each session. Both
-    // are read off the same sorted list, which is newest first, so the first turn seen for
-    // a session is its newest. The agents are told to the caller after the render, since
-    // the answer is about what to ask an agent rather than about what to draw.
+    // Derive completion markers and each session's newest records from the accepted turns.
     this.turnMarks = turns.map((t) => ({ id: turnKey(t), agent: t.agent, finished: t.finished }));
     const currentRecords = currentRecordsBySession(turns, compactions);
     this.newestBySession = currentRecords.newestTurns;
     this.composerRuntime = composerRuntimeBySession(turns, currentRecords.newestCompactions);
-    // The prompts each session has already sent, read off the same newest-first list.
-    // A turn's own prompt opened it and its later prompts were typed while it ran, so the
-    // later ones are the newer of the two and are reversed into newest-first order with it.
+    // Build recorded prompt recall in newest-first order, including messages submitted during a turn.
     this.promptsBySession.clear();
     for (const t of turns) {
       if (!this.newestBySession.has(t.sessionId)) {
@@ -10743,10 +9790,7 @@ export class PanelProvider implements vscode.Disposable {
         ),
       );
     }
-    // A saved prompt the transcript has now recorded. The transcript is the durable copy
-    // from here on, so the saved entry is redundant. Only the saved projection drops it,
-    // through `writeDrafts`: `this.sentPrompts` itself is left as sent, so Up still returns
-    // the words as they were typed for the rest of this window.
+    // Prune recorded submissions from persisted recall. Keep the in-memory submitted text for this provider's remaining lifetime.
     if (Object.keys(this.sentPrompts).length) {
       const prunedSent = prunedSentPrompts(this.sentPrompts, this.promptsBySession);
       if (JSON.stringify(prunedSent) !== JSON.stringify(this.sentPrompts)) {
@@ -10754,16 +9798,10 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     this.newestCompactionBySession = currentRecords.newestCompactions;
-    // Through the budget rule rather than a bare slice: the shown session fills
-    // first, and every parsed session keeps at least its newest turn, so the rail's
-    // statuses and counts stay knowable for everything that was paid for.
+    // Apply the display budget while preserving selected-session priority and each session's newest turn.
     const listed = turnBudget(turns, listedMaxTurns, this.showing);
     const byId = new Map(sessions.map((s) => [s.sessionId, s]));
-    // Every card carries its session's name, compactions included. The panel groups by it
-    // when more than one session is on screen, and ignores it when there is only one. A
-    // Claude session's name comes from `sessionNames`, which this refresh's stored metadata
-    // and parsed turns feed, so the session heading and the rail card draw the same held name. A
-    // Codex turn carries the name its read was given.
+    // Resolve session names consistently for turn and compaction cards.
     this.observeParsedNames(listed, byId);
     const codexTitles = new Map<string, string>();
     for (const turn of listed) {
@@ -10773,15 +9811,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const titleOf = (sessionId: string): string => this.headingTitle(sessionId, byId, codexTitles);
 
-    // Over the turns that were read, which is what the hover on each figure says. Not over
-    // the cards drawn: those follow the display window, and a session's cost that fell when
-    // fewer cards were retained would be a claim about the session that the session
-    // never made. The heading receives the indexed lifetime cost and turn count later, while
-    // the parsed figures continue to supply current context and change totals.
-    //
-    // Which turns feed which session is decided in turnview.ts, not here, for the same
-    // reason the arithmetic is: this file has no tests.
-    // The compactions go with them because the context hover describes the read window.
+    // Derive current-window figures from budgeted turns and compactions. The heading receives lifetime cost and turn count separately.
     this.statsBySession = statsBySession(listed, compactions);
     const parsedCacheFacts = new Map<string, { turns: Turn[]; compactions: Compaction[] }>();
     for (const turn of listed) {
@@ -10816,25 +9846,19 @@ export class PanelProvider implements vscode.Disposable {
     );
 
     const now = Date.now();
-    // Kept, because a turn's status moves on the clock alone and the next poll has to compare
-    // against the reading these cards were worded at rather than one of its own.
+    // Retain the rendering clock for later status-change comparisons.
     this.collectedAt = now;
-    // The open folders decide how a file row names itself: a file under one of them is
-    // drawn by its basename, and a file under none of them by its whole path.
+    // Use filenames for workspace files and full paths for files outside the open folders.
     const folders = this.folders();
     const cards = this.drawTurnCards(listed, titleOf, now, folders);
-    // A compaction older than the oldest turn on screen marks a boundary to nothing, so
-    // it is left out rather than drawn hanging off the end of the list. Found rather
-    // than read off the end: the budget puts the shown session first and appends
-    // the per-session floor, so listed is not newest-first end to end.
+    // Omit compactions older than every displayed turn. Find the minimum timestamp because the budgeted list is not globally sorted.
     const oldest = listed.length ? listed.reduce((low, t) => Math.min(low, t.startedAt), Infinity) : 0;
     for (const c of compactions) {
       if (c.at < oldest) {
         continue;
       }
       const card = toCompactionCard(c, now);
-      // A compaction carries its session's name too. Without it a group whose newest card
-      // is a compaction draws its heading with no name at all.
+      // Compaction cards also carry the session title used by grouping.
       card.sessionTitle = titleOf(c.sessionId);
       cards.push({ ...card, summaryHtml: renderRichMarkdown(c.summary), at: c.at });
     }
@@ -10850,13 +9874,10 @@ export class PanelProvider implements vscode.Disposable {
     folders: string[],
   ): (RenderCard & { at: number })[] {
     const newestOf = newestPerSession(listed);
-    // A session whose main agent is idle can still have live background children. Their rows
-    // draw as running on whichever card launched them, the agents figure counts them, and the
-    // newest card counts the carried subagents too.
+    // Include live background children on launching cards and carried children on each session's newest card.
     const runningSessions = this.runningSessions();
     const liveChildren = this.liveOpenChildren(now);
-    // A dispatched session's row reads its rail status, background commands included, so a
-    // session idle on its subagents or on a command still reads running.
+    // Dispatched rows share session-list status, including work still running in subagents or background commands.
     const dispatchStatuses = this.railStatuses(now).statuses;
     // Read at most once for the batch, and only when a card counts a dispatched session. Each
     // card looks up only its own session's contributions.
@@ -10889,8 +9910,7 @@ export class PanelProvider implements vscode.Disposable {
     runningSessions: ReadonlySet<string> = this.runningSessions(),
     liveChildren: ReadonlyMap<string, readonly string[]> = new Map(),
     dispatchStatuses: ReturnType<typeof sessionStatusOf> = this.railStatuses(now).statuses,
-    // The contributions of dispatched sessions, from `dispatchedTurnCosts`. An activity redraw
-    // reads them here, so the newest card keeps its dispatched cost.
+    // Activity redraws retain dispatched costs through the same contribution lookup as complete card renders.
     dispatchedCosts: () => Readonly<Record<string, Readonly<Record<string, DispatchedSessionCost>>>> = () =>
       this.dispatchedTurnCosts(),
   ): RenderCard {
@@ -10910,9 +9930,7 @@ export class PanelProvider implements vscode.Disposable {
       !this.projectSpendHydrated || this.dispatchDiscoveryPending || this.authoritativeCatalog === null,
       this.codexSubagents ?? [],
     );
-    // The prompt press alone. A compaction carries none of the reader's words, so it has
-    // nothing to draw under "You asked", and picking the newest press of either kind would
-    // let a compaction pressed after a mid-turn prompt take that prompt off the card.
+    // Only prompt activity supplies text under You asked. Compaction activity carries no prompt text.
     const card = toCard(
       turn,
       latest,
@@ -10973,8 +9991,7 @@ export class PanelProvider implements vscode.Disposable {
     this.turnsByKey.set(card.key, turn);
     return {
       ...card,
-      // Each earlier answer is markdown the same way the summary is, and the panel draws
-      // only rendered html, so the renderer runs here for both.
+      // Render earlier answers as markdown before sending their HTML to the panel.
       earlierAnswers: card.earlierAnswers.map((answer) => ({
         ...answer,
         summaryHtml: renderRichMarkdown(answer.summary),
@@ -10991,8 +10008,7 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // Where this webview loads a picture a response named. A resource URI belongs to one
-  // webview, so this is built per host, like the icon a file row draws.
+  // Resolve response image URIs for each webview's resource access.
   private imagesFor(webview: vscode.Webview): ImageResolver {
     const folders = this.folders();
     return (target) => {
@@ -11001,20 +10017,7 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // Put the reader's own icon on each of a turn's file rows, and the pictures a response
-  // named into its rendered text, both addressed for one host.
-  //
-  // These are the parts of a card that are not the same from one host to the next: a theme's
-  // icon and a response's picture each reach a webview as a URI that webview alone may load,
-  // so a card built for one webview draws a broken picture in another. Everything else is
-  // built once in `collect()` and these are redrawn here, per host, on a copy.
-  //
-  // A file the theme knows nothing about keeps the lettered badge the card already carries,
-  // so the column is never empty.
-  //
-  // The summary is rendered again only when it names a picture, which almost none do. A post
-  // of forty cards otherwise pays one string test each and no parse, and the poll runs every
-  // few seconds.
+  // Resolve response images and file icons per host. Preserve existing badges and rerender markdown only when it contains image references.
   private themedFor(cards: RenderCard[], webview: vscode.Webview, light: boolean): RenderCard[] {
     const resolveImage = this.imagesFor(webview);
     return cards.map((card) => {
@@ -11024,22 +10027,14 @@ export class PanelProvider implements vscode.Disposable {
       }
       const files = drawn.files.map((file) => {
         const themed = this.icons.iconFor(file.path, webview, light);
-        // `iconFor` in `fileicons.ts` hands back the shared entry out of its own table, so
-        // the theme's answer goes onto a copy. Writing it into that object would give every
-        // file of the same type whatever icon the last row resolved.
+        // Apply theme values to a copy because file-type icons are shared table entries.
         return themed ? { ...file, icon: { ...file.icon, ...themed } } : file;
       });
       return { ...drawn, files };
     });
   }
 
-  // One card's rendered text, with any picture it names addressed to this host. An earlier
-  // answer is markdown the same way the response is, so it goes through the same rule.
-  //
-  // `collect` still renders the same summary once with no host. That first parse is thrown
-  // away for a card holding a picture, and it is kept deliberately: it is the value any
-  // future path that posts a card without coming through here would send, and words in place
-  // of a picture is a better failure than an empty response.
+  // Resolve images in summaries, earlier answers, and mid-turn messages for this host. Other text retains its host-independent rendered HTML.
   private picturedFor(card: RenderCard, resolveImage: ImageResolver): RenderCard {
     if (card.kind !== 'turn') {
       return hasImageReference(card.summary)
@@ -11075,15 +10070,9 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // Put focus in the group a diff should open in, for the one command that cannot be told.
-  // A group that is not there yet is not created: the command does nothing, focus stays where
-  // it is, and the diff opens there, which is still not a split.
+  // Focus the target editor group before opening a multi-file diff.
   private async focusColumn(beside = false): Promise<void> {
-    // A group of its own is asked for by splitting first, since `vscode.changes` can only be
-    // told where to open by what has focus when it runs. Splitting on every press opened a
-    // new group per ctrl-click, so the column the last split landed in is remembered and a
-    // repeat press focuses it instead. Whether the memory still answers is besideColumn's
-    // rule in turnview.ts, where it is tested; this only gathers what it asks about.
+    // Reuse a valid previous beside column. Otherwise split once and remember the new active group.
     if (beside) {
       const reuse = besideColumn({
         last: this.lastBeside,
@@ -11108,19 +10097,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // The results of one search query, posted to the panel.
   private answerSearch(query: string): void {
-    // The session on screen scopes the search to itself. The corpus read is narrowed
-    // by the same session before the per-file reads, so the expensive pass shrinks
-    // with the scope; searchScope is the tested rule that says the narrowing is meant, and
-    // its flag is what the panel words the scope from.
+    // Limit source reads before applying the selected-session search scope.
     const scope = searchScope(this.searchCorpus(this.showing), this.showing);
-    // The labels are put on the entries here, at the moment the search runs, and never
-    // held with them. The corpus is cached against each file's size and time, and labels
-    // move when the reader ticks a box rather than when a transcript grows, so an entry
-    // carrying them through that cache would answer with the labels its session had
-    // when it was last parsed.
-    // The archived and agent-run facts are put on here for the same reason. The reader
-    // archives a session, and an agent starts one, while a transcript sits still, so
-    // both are read now rather than held with the parsed text.
+    // Apply current labels, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
     const archived = this.archivedSessions();
     const sessions = this.allSessions(true);
     const parentEdges = this.sessionParentEdges(sessions).edges;
@@ -11137,17 +10116,10 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'results', query, hits, scope: searchScopeName(scope) });
   }
 
-  // Every session in the workspace, read into the searchable corpus.
-  //
-  // This is the one expensive thing the panel does, and where it runs is the whole constraint:
-  // 143 ms here, 1475 ms on the largest project on this machine. It is called from a search
-  // and from nowhere else. Never on load, never on the poll, never as a side effect of drawing
-  // anything, because a freeze the reader asked for and is watching is a different thing from
-  // one that happens to them.
+  // Populate the bounded search corpus only for an explicit content search, outside polling and rendering.
   private searchCorpus(only: string | null = null): SearchEntry[] {
     const all = this.allSessions();
-    // A search can be the first thing a window does, before any poll has looked at the
-    // index, and the names decide what every result is filed under.
+    // Refresh Codex names before filing search results.
     this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
     const live = new Set(all.map((f) => f.file));
     for (const file of [...this.corpus.keys()]) {
@@ -11157,24 +10129,14 @@ export class PanelProvider implements vscode.Disposable {
     }
     const out: SearchEntry[] = [];
     for (const session of all) {
-      // A scoped search reads one session, and the cut is made here, before the
-      // per-file reads, because the reads are the whole cost: searchScope over the full
-      // corpus would filter the entries after every transcript had already been paid for.
-      // The cache trim above still runs over everything, so scoped searches do not grow it.
+      // Skip unselected files before reading their text. Cache trimming still uses the whole catalog.
       if (only && session.sessionId !== only) {
         continue;
       }
       const held = this.corpus.get(session.file);
-      // Size as well as mtime, which is what `readFor` already decided: two appends inside one
-      // mtime tick would otherwise leave the corpus holding the older of the two.
+      // Compare size and mtime so appends within one timestamp tick invalidate cached entries.
       if (held && held.mtimeMs === session.mtimeMs && held.size === session.size) {
-        // Except for the name, which can have arrived since. Codex names a thread into a
-        // file of its own, so a session being named leaves the transcript's size and mtime
-        // where they were: what was read is still current and only what it is called has
-        // moved. A Claude session's held name can rise from a read of another surface. A
-        // metadata read replaces the name a derived cache version bump carried, even with no
-        // name, and the session then draws its id placeholder. Restamped with the name a fresh
-        // read files the session under, rather than re-read, because the read is the whole cost.
+        // Refresh cached entries' names without rereading unchanged transcript text.
         const named = this.sessionLabel(session).label;
         for (const entry of held.entries) {
           entry.sessionTitle = named;
@@ -11182,10 +10144,7 @@ export class PanelProvider implements vscode.Disposable {
         out.push(...held.entries);
         continue;
       }
-      // Parsed here rather than through `readFor`, which keys its cache on the file alone: a
-      // corpus read asks for every turn and a different number of bytes, so going through it
-      // would overwrite the entry the render path just filled and make the next poll parse
-      // those sessions again for nothing.
+      // Search has a separate read window and cache so it does not replace selected-session reads.
       const read =
         session.agent === 'codex'
           ? readCodexSession(session.file, session.sessionId, {
@@ -11208,15 +10167,10 @@ export class PanelProvider implements vscode.Disposable {
         sessionTitle: title,
         agent: AGENT_NAMES[turn.agent],
         startedAt: turn.startedAt,
-        // Everything the reader typed and everything the turn answered, not only the
-        // first of each: a search for words typed while the turn ran, or said in an
-        // earlier answer, would otherwise find nothing. Both rules are tested where the
-        // other search rules are.
+        // Include initial and later prompts, plus earlier and final responses, in searchable text.
         prompt: searchablePrompt(turn),
         summary: searchableSummary(turn),
-        // Whether this read reached the first byte of the transcript. Search keeps its own
-        // window, so a session the reader has paged back through can still be searched
-        // over less than they can see, and the answer has to say which.
+        // Report whether this search read reached the transcript's beginning, independently of retained timeline pages.
         whole: read.readBytes >= session.size,
       }));
       this.corpus.set(session.file, { mtimeMs: session.mtimeMs, size: session.size, entries });
@@ -11234,19 +10188,13 @@ export class PanelProvider implements vscode.Disposable {
     return pendingIn(this.manifestFor(sessionId), filePath);
   }
 
-  // The URI one side of a turn's diff is served under. The version is a digest of the text
-  // itself: VS Code caches a virtual document per URI, so two turns whose diffs differ must
-  // not share one.
+  // Include a content digest in diff-side URIs so VS Code caches distinct text as distinct virtual documents.
   private sideUri(filePath: string, side: 'before' | 'after', text: string): vscode.Uri {
     const version = crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
     return turnFileUri(filePath, side, version);
   }
 
-  // Keep every side of one diff, then drop whatever is over budget, oldest first. Nothing
-  // this call keeps is dropped by it: trimming file by file would let one large turn evict
-  // its own earlier files before the editor ever opened, and an evicted side is served as an
-  // empty document, which reads as "this file did not change" rather than as an error. So a
-  // single diff can put the map over budget, and the next one trims it back.
+  // Retain all sides of this diff before trimming older entries. The current diff can exceed the byte budget without evicting itself.
   private keepSides(sides: { key: string; text: string }[]): void {
     const fresh = new Set<string>();
     for (const { key, text } of sides) {
@@ -11275,17 +10223,12 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // Every file a turn changed, as one multi-file diff. Each file is shown from the best
-  // source it has: the snapshot taken before the session's first edit to it, the whole files the edit
-  // results recorded, or the changed regions alone. The title says how many files are not an
-  // exact record of the turn.
+  // Open a multi-file diff using pending snapshots, recorded whole-file content, or recorded edit regions. The title identifies less exact sources.
   private async openTurnDiff(sessionId: string, turn: Turn, headline: string, beside = false): Promise<void> {
     if (!turn.files.length) {
       return;
     }
-    // Read once, not once per file: the lookup that follows costs a stat and, when the
-    // sizes match, a byte comparison, and re-parsing the manifest beside each of those puts
-    // the whole cost on the shared extension-host event loop.
+    // Read the manifest once for the complete multi-file diff.
     const manifest = this.manifestFor(sessionId);
     const resources: [vscode.Uri, vscode.Uri, vscode.Uri][] = [];
     const sidesToKeep: { key: string; text: string }[] = [];
@@ -11300,8 +10243,7 @@ export class PanelProvider implements vscode.Disposable {
       const pending = pendingIn(manifest, file.path);
       if (pending) {
         againstBaseline++;
-        // The store's own path, for all three, because a transcript writes a path in a
-        // different shape and the entry would then be labelled by a second URI for one file.
+        // Use the snapshot entry's canonical file path for resource labels and both diff sides.
         const live = vscode.Uri.file(pending.path);
         resources.push([live, baselineUri(pending.snapshot, pending.path), live]);
         continue;
@@ -11318,21 +10260,13 @@ export class PanelProvider implements vscode.Disposable {
       resources.push([vscode.Uri.file(file.path), before, after]);
     }
     this.keepSides(sidesToKeep);
-    // `vscode.changes` takes a title and its resources and nothing else: there is no options
-    // argument, so the group it opens in cannot be named the way `vscode.diff`'s can. It opens
-    // in whichever group has focus, and once the panel is an editor tab of its own that is
-    // the panel's own group. So the group is focused first and the command follows it.
+    // `vscode.changes` opens in the focused group and accepts no column option. Focus the destination first.
     await this.focusColumn(beside);
-    // Opening this again gives a second editor rather than reusing the first: a multi-file
-    // diff's identity is a random URI, so there is nothing to reuse and no API to update
-    // one in place.
+    // Each multi-file diff opens a new editor because its document identity is generated by VS Code.
     await vscode.commands.executeCommand('vscode.changes', diffTitle(headline, againstBaseline, asHunks), resources);
   }
 
-  // Everything the panel sends, read by `parsePanelToHost` before any of it runs. The parser
-  // answers with one of the contract's variants or with nothing, and the handlers below are
-  // named by the variant they answer. A message kind added to the contract and left out here
-  // does not compile.
+  // Parse messages before dispatch. Exhaustive variant handlers keep the host aligned with the panel protocol.
   private async onMessage(raw: unknown, host: PanelHost): Promise<void> {
     const parsed = parsePanelToHost(raw);
     const browserSession = parsed && 'session' in parsed ? parsed.session : null;
@@ -11354,8 +10288,7 @@ export class PanelProvider implements vscode.Disposable {
     if (message.type !== 'ready' && message.type !== 'importPromptRecovery' && !this.readyHosts.has(host)) {
       return;
     }
-    // The three messages that name a card. A key the list no longer draws answers nothing,
-    // and the card that is found carries the session the message works in.
+    // Resolve current cards by key. Missing cards cannot supply action targets.
     const cardFor = (key: string): { card: RenderCard; sessionId: string } | null => {
       const card = this.cards.find((c) => c.key === key);
       return card ? { card, sessionId: card.key.slice(0, card.key.indexOf(':')) } : null;
@@ -11388,10 +10321,7 @@ export class PanelProvider implements vscode.Disposable {
       perf: (msg) => {
         this.performanceCounters.recordPanelMessage(msg.kind, msg.ms, host);
       },
-      // The mouse's own back and forward buttons. The panel sees them and the workbench does
-      // not, because its listener sits outside the frame the panel draws in. That also means
-      // the editor's own setting cannot turn them off in here, so this reads it: a reader who
-      // switched the buttons off did so because their mouse presses them by accident.
+      // Honor the editor's mouse-navigation setting because workbench listeners do not receive webview button events.
       goBack: () => {
         if (mouseNavigates()) {
           this.goBack(host);
@@ -11413,8 +10343,7 @@ export class PanelProvider implements vscode.Disposable {
         if (msg.owner !== this.setupOwner) return;
         void this.unpinSetup(msg.id);
       },
-      // The presses on the panel's foot. Every one needs a child, which this file has none
-      // of, so each is passed straight out to the caller that owns them.
+      // Forward account-refresh requests to the callback that owns agent processes.
       refreshUsage: (msg) => {
         this.refreshUsageHandler?.(msg.agent, msg.force);
       },
@@ -11434,25 +10363,15 @@ export class PanelProvider implements vscode.Disposable {
           this.cwdForSession(state.agent, state.sessionId),
         );
       },
-      // The panel draws its own menu, so a press arrives with the choice already made and
-      // nothing here opens a picker.
+      // Apply the choice already made by the panel menu.
       pick: (msg) => {
         if (msg.control === 'model') this.invalidateContext(msg.session);
-        // The session the press names, resolved to a row the panel still draws, the way
-        // the `stopTurn` handler below resolves its own. An id the panel draws no row for
-        // reaches neither path. Without that, a press still in flight when a draft takes its
-        // real id falls through to `onPicked`, which stores an ask-mode value against the
-        // agent and pushes it to every child that agent is running.
-        //
-        // The resolved row also answers whether this is a draft. A bare index on a key the
-        // browser supplied answers truthy for `constructor` and `toString`, so one crafted
-        // message writes a draft whose every field is undefined.
+        // Resolve the target through current session state. Reject missing rows and inherited object keys before applying settings.
         const aimed = this.stateFor(msg.session);
         if (!aimed) {
           return;
         }
-        // A draft owns its setup picks. MCP actions belong to its agent, the same as they do
-        // on a live session, so they must reach the callback that owns agent children.
+        // Apply draft setup choices locally. MCP choices reach the agent-process callback.
         if (aimed.profile && msg.control !== 'mcp') {
           this.pickOnDraft(msg.session, msg.control, msg.value);
           return;
@@ -11466,7 +10385,7 @@ export class PanelProvider implements vscode.Disposable {
           this.ownCwdForSession(aimed.agent, msg.session),
         );
       },
-      // What the composer does. Each needs a child, which this file has none of.
+      // Update draft text for the session named by the typing message.
       draft: (msg) => {
         this.draftRevisions ??= new Map();
         if (msg.revision !== undefined) this.draftRevisions.set(msg.session, msg.revision);
@@ -11586,10 +10505,7 @@ export class PanelProvider implements vscode.Disposable {
         this.restoreLive(msg.session, msg.kind);
       },
       stopTurn: (msg) => {
-        // The session whose Stop the reader pressed, named on the message. Worked out
-        // here instead it was whichever session was on screen when the message
-        // arrived, so a poll landing between the press and the message stopped the wrong turn
-        // and left the one on screen running.
+        // Stop the session named by the message, independent of the current panel selection.
         const aimed = this.stateFor(msg.session);
         if (aimed) {
           this.cancelClearSettlement(aimed.sessionId, 'The clear request stopped before a new session opened.');
@@ -11608,12 +10524,7 @@ export class PanelProvider implements vscode.Disposable {
       copy: async (msg) => {
         await this.copyText(msg.text);
       },
-      // One change to the reader's notes: a note written, a note edited, or a note deleted.
-      //
-      // An operation rather than the whole array, which is the treatment `hidden` already gets
-      // and for the same reason: a set posted by one host is a set that never knew what the
-      // other host did. Applied by `applyComment` in turnview.ts, where the ceilings and the
-      // cap live, and pushed back to every host so both draw the answer this side holds.
+      // Apply one comment change to provider state and broadcast the resulting list, preserving peer-host edits.
       note: (msg) => {
         this.saved.comments = applyComment(this.saved.comments, msg.note);
         void this.memento?.update(STATE_KEY, this.saved);
@@ -11645,21 +10556,18 @@ export class PanelProvider implements vscode.Disposable {
       armComposer: () => {
         this.composerMenuArm = { host, at: Date.now() };
       },
-      // Which session to show. An id the workspace no longer has, and the empty string,
-      // both fall to the newest in `refresh` below: the panel never draws no session.
+      // Select the named session. Refresh reconciles unavailable IDs with the newest reachable session.
       showReaderParent: (msg) => {
         this.show(msg.session || null, host);
       },
       showSession: (msg) => {
         this.show(msg.session || null, host);
       },
-      // The rows the label editor draws. The panel asks each time it opens, so a popover
-      // opened in one host never shows what another host wrote before it.
+      // Build label-editor rows from current provider state on each opening.
       labelEditor: (msg) => {
         void this.post(this.labelEditorReply(msg.session, browserSession ?? msg.session));
       },
-      // A session renamed from its rail card or its heading. The answer goes to the host that
-      // asked, because its editor waits for it, and it goes even when the rename throws.
+      // Return rename success or failure to the host that opened the editor.
       renameSession: async (msg) => {
         await answerSessionRename(
           msg,
@@ -11667,32 +10575,16 @@ export class PanelProvider implements vscode.Disposable {
           (answer) => this.sendToHost(host, answer),
         );
       },
-      // One session's labels, replaced. The whole list arrives rather than one name, the
-      // way the hidden and pinned sets do: a box ticked and a name created are the same
-      // message.
-      //
-      // The rules that clean a name, fold two spellings into one and hold the record to its
-      // ceiling all run here, so the panel's create row is an offer rather than a promise. The
-      // rail is reworded from the same write, and the fresh rows go back to every host, so the
-      // popover draws what was stored and not what was typed.
+      // Normalize and replace one session's labels, then publish the stored result.
       setLabels: (msg) => {
         this.saved.labels = setSessionLabels(this.saved.labels, msg.session, msg.names);
         void this.memento?.update(STATE_KEY, this.saved);
         this.postRail(true);
         void this.post(this.labelEditorReply(msg.session, browserSession ?? msg.session));
-        // And a word to the hosts that are looking at another session. A write moves the
-        // counts every editor draws and can add a label none of them names, so a host with an
-        // editor open on something else asks again for its own.
+        // Notify peer editors so their label counts and available names refresh.
         void this.post({ type: 'labelsChanged', session: browserSession ?? msg.session });
       },
-      // The saved views, replaced. The whole list arrives rather than one view, the way a
-      // session's labels do: a view saved, a view renamed and a view deleted are one
-      // message, and the panel posts back what it drew.
-      //
-      // The rules that clean a name, refuse a repeated one and hold the list to its ceiling
-      // all run here, so the panel's editor is an offer rather than a promise. The rail post
-      // carries the stored list back to every host, so a second window draws what was kept and
-      // not what was typed.
+      // Normalize and persist the complete saved-view list. The session-list update publishes it to every host.
       setViews: (msg) => {
         this.saved.views = normalizeSavedViews(msg.views);
         void this.memento?.update(STATE_KEY, this.saved);
@@ -11722,9 +10614,7 @@ export class PanelProvider implements vscode.Disposable {
       saveState: (msg) => {
         this.saveState(msg.state);
       },
-      // The panel sends its query on every keystroke and this decides whether any of it is a
-      // search. Doing it here rather than in the panel keeps one copy of the rule: the panel
-      // draws results when it is sent some and the ordinary list when it is not.
+      // Classify typed queries through `isSearch` before reading session content.
       search: (msg) => {
         const query = msg.text;
         this.waitingSearch = null;
@@ -11732,9 +10622,7 @@ export class PanelProvider implements vscode.Disposable {
           void this.post({ type: 'results', query, hits: null, scope: 'workspace' });
           return;
         }
-        // A corpus walk during the cold pass would read on the main thread every opening record
-        // the pass has not reached yet. The search waits for the pass, and only the latest
-        // query that waited is answered.
+        // Wait for cold opening reads before building the corpus. Answer only the latest waiting query.
         const priming = this.codexPriming;
         if (priming) {
           this.waitingSearch = query;
@@ -11751,9 +10639,7 @@ export class PanelProvider implements vscode.Disposable {
         this.answerSearch(query);
       },
       loadOlder: (msg) => {
-        // The session is named by the message, because a sentinel drawn by another panel
-        // host can arrive after the reader moved on. A request for a session that is no
-        // longer on screen would widen the newly selected one instead.
+        // Reject older-history requests that no longer match this host's selected session.
         const showing = this.hostSessions.get(host) ?? this.showing;
         if (!showing || msg.session !== showing) {
           return;
@@ -11811,9 +10697,7 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         try {
-          // `git.viewCommit` resolves its first argument only against repositories already
-          // known to the built-in Git extension. A recorded external repository is safe to
-          // register on demand because the reader resolved this exact directory from the call.
+          // Register the resolved repository before `git.viewCommit`, which uses repositories known to the built-in Git extension.
           await vscode.commands.executeCommand('git.openRepository', folder);
           await vscode.commands.executeCommand('git.viewCommit', vscode.Uri.file(folder), msg.sha);
         } catch {
@@ -11836,11 +10720,7 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         const pending = this.pendingEntry(sourceSessionId ?? found.sessionId, msg.path);
-        // Named group, never the default. Without one the diff opens wherever focus happens to
-        // be, and once the panel is an editor tab of its own that is the panel's own
-        // group: the reader's editor splits in two and the diff lands where the panel was.
-        // Ctrl or Cmd asks for a group of its own instead, which is what the editor's own lists
-        // do with the same press.
+        // Open in the chosen editor column. The beside modifier requests a separate group.
         const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
         if (pending) {
           await vscode.commands.executeCommand(
@@ -11859,15 +10739,11 @@ export class PanelProvider implements vscode.Disposable {
         if (!found || found.card.kind !== 'turn' || !msg.path) {
           return;
         }
-        // Only a path this card published. `openFile` opens the path it is handed, because
-        // every path on a card's file list came off the same turn. A skill row must not widen
-        // that to any path a message names, since the reader never saw one that is not here.
+        // Accept only skill paths published by this card.
         if (!found.card.activitySkills.some((skill) => skill.path === msg.path)) {
           return;
         }
-        // And only a file. A recorded skill that has since become a directory, a link to
-        // nothing, or nothing at all opens no editor and says nothing: where the reader keeps
-        // their skills is a fact about their disk rather than a fault they must dismiss.
+        // Silently ignore missing or non-file skill targets.
         let stat: fs.Stats | undefined;
         try {
           stat = fs.statSync(msg.path, { throwIfNoEntry: false });
@@ -11877,30 +10753,20 @@ export class PanelProvider implements vscode.Disposable {
         if (!stat?.isFile()) {
           return;
         }
-        // The same column rule a file row takes, so a skill opens where a reader who pressed
-        // one of those expects it.
+        // Use the same editor-column rule as file rows.
         const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
         await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path), { viewColumn: column });
       },
     });
   }
 
-  // Everything the panel remembers, on its way to storage that outlives one webview. A
-  // webview's own `vscode.setState` goes when that webview does, so without this a tab
-  // opened after the last one was closed starts with every card shut, no folds and no
-  // filters, which reads as a different panel rather than the same one back.
+  // Persist normalized panel preferences beyond the lifetime of an individual webview.
   private saveState(state: unknown): void {
     const readBefore = this.readPrint();
     const stateBefore: ReadState = { read: this.saved.read, readTo: this.saved.readTo };
-    // The drafts never travel in this state at all: the box posts each keystroke on its
-    // own, and this side is the only place the typing is gathered. Taken from the saving
-    // side they would be empty every time, so a host saving its folds would wipe a prompt
-    // left half-written in another. Words the reader typed, like the notes below, rather
-    // than a set they can rebuild by pressing something again.
+    // Preserve provider-owned draft text. Browser preference saves do not carry current typing.
     const drafts = this.saved.drafts;
-    // The sent-but-unrecorded prompts are held for the drafts' own reason: this side is the
-    // only place a send is gathered, so a host saving its folds would wipe a prompt no
-    // transcript has recorded yet.
+    // Preserve sent prompt recall while its recorded copy remains unavailable.
     const sentPrompts = this.saved.sentPrompts;
     const submittedPrompts = this.saved.submittedPrompts;
     const draftCommentIds = this.saved.draftCommentIds;
@@ -11909,38 +10775,19 @@ export class PanelProvider implements vscode.Disposable {
     // not replace them.
     const hidden = [...this.hidden];
     const pinnedTop = [...this.pinnedTop];
-    // The webview draws attachment and queue state but never owns or posts it. Preserve
-    // both across a save for the same reason as the draft they came from.
+    // Preserve provider-owned attachments and queues during browser preference saves.
     const assets = this.saved.assets;
     const queues = this.saved.queues;
-    // The notes are the exception, and they are held here rather than taken from whoever
-    // saved last. Two hosts are two copies of the array, each seeded when its webview
-    // loaded, so a note written in one never reaches the other and the other's next save
-    // posts a set that never knew about it. The reader would watch a note they had typed
-    // disappear. Every other field in this state is a set the reader can rebuild by
-    // pressing the control again; a note is not.
+    // Preserve provider-owned comments so a stale browser state save cannot remove peer-host changes.
     const notes = this.saved.comments;
-    // The floor is held here for the same reason the notes are, and for one of its own: it
-    // is written once and a panel that never received it would post a zero over it, which
-    // hands the reader every old turn in the workspace as unread.
+    // Preserve the workspace unread baseline. A browser without it cannot reset older activity to unread.
     const since = this.saved.since;
-    // Held here for the notes' reason. The panel neither reads this record nor writes it,
-    // so a save that carried the panel's answer would drop every session this window
-    // started and file each one under Run by agents.
+    // Preserve reader-started ownership, which browsers do not supply in preference saves.
     const started = this.saved.started;
-    // The labels are held for the reason the notes are, and for one of their own: the
-    // extension owns them and no webview ever posts them, so the state arriving here
-    // carries none at all. Taken from the saving side they would be empty every time. A
-    // second host, opened before the reader filed anything, would write that empty set
-    // over every label the first host had put on.
+    // Preserve labels updated through their dedicated messages, independent of browser preference saves.
     const labels = this.saved.labels;
     const readerParents = this.saved.readerParents;
-    // The saved views are held for the labels' reason. The panel posts them through a message
-    // of its own, so a state save carries back the copy that panel was served, and a second
-    // host opened before the reader made a view would write an empty list over every one of
-    // them. Saved filters use the same ownership rule through a separate message. Their active
-    // id, query, match, and order come from the saving side because they describe one
-    // panel, and they are checked against the held list, because the saving side sends none.
+    // Preserve provider-owned views and saved filters. Normalize browser filter selection against the retained catalog.
     const views = this.saved.views;
     const railFilters = this.saved.railFilters;
     const showing = this.showing;
@@ -11962,14 +10809,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.assets = assets;
     this.saved.queues = queues;
     void this.memento?.update(STATE_KEY, this.saved);
-    // The read state moves when a card is opened, and nothing repaints on that, so the
-    // rail is reworded here or it keeps counting turns the reader has just read.
-    //
-    // A selection is the exception. The panel moves the watermark of the card it opened and
-    // saves it before the render that selection asked for has run, and that render words the
-    // rail from this same read state. Rewording it here builds the whole payload a second
-    // time for a rail that is already on its way. The skip is recorded, so the end of that
-    // refresh posts the rail if no render did.
+    // Update unread counts after read-state saves. Defer selection-only changes to the pending render, with a fallback when it settles.
     if (readBefore === this.readPrint()) {
       return;
     }
@@ -12008,15 +10848,13 @@ export function registerPanel(
   output.appendLine(
     `Arc reads Claude sessions from ${projectsRoot()}. Arc reads Codex sessions from ${codexSessionsRoot()}.`,
   );
-  // The two lines of glue the log needs from the editor: where the home directory is, and
-  // what the setting says. Everything the log then decides is in `diagnosticslog.ts`.
+  // Supply diagnostics settings, storage location, workspace, and process identity from the editor host.
   const diagnostics = createDiagnosticsLog({
     enabled: readSetting('diagnostics.log'),
     directory: path.join(arcHome(), DIAGNOSTICS_LOG_DIRECTORY),
     workspace: vscode.workspace.name ?? 'no folder',
     pid: process.pid,
-    // When the extension host process started, which is what names the file and the identity.
-    // Arc activates whenever something first asks for it, which is later than the window.
+    // Name diagnostics with process start time, independent of later extension activation.
     startedAt: Math.round(performance.timeOrigin),
     measurementRun: process.env[MEASUREMENT_ENVIRONMENT.run],
   });
@@ -12039,21 +10877,17 @@ export function registerPanel(
     vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, {
       provideTextDocumentContent: (uri) => provider.patches.get(uri.toString()) ?? '',
     }),
-    // A press in the Command Palette passes nothing. A caller passes the file to write, and
-    // anything that is not a string is the same as nothing.
+    // Accept an optional output path. Non-string command arguments use the default destination.
     vscode.commands.registerCommand('arc.savePerformanceDiagnostics', (target?: unknown) =>
       provider.savePerformanceDiagnostics(typeof target === 'string' ? target : undefined),
     ),
     vscode.commands.registerCommand('arc.openDiagnosticsLog', () => provider.openDiagnosticsLog()),
     vscode.commands.registerCommand('arc.showProjectSpend', () => provider.showProjectSpend()),
     vscode.commands.registerCommand('arc.newSession', () => provider.newSession()),
-    // The editor area takes a panel and nothing else, and only extension code can make one,
-    // so this command is the way the panel is opened at all. From the tab it can be
-    // dragged wherever the reader wants it, the side panes included.
+    // Register commands that create the editor panel and its beside variant.
     vscode.commands.registerCommand('arc.openInEditor', () => provider.openInEditor()),
     vscode.commands.registerCommand('arc.openBeside', () => provider.openInEditor(vscode.ViewColumn.Beside)),
-    // Without this the tab is gone after a window reload, with no way back but the command.
-    // The editor restores the tab itself and hands the webview back here to be wired up.
+    // Reattach editor-restored webview tabs after a window reload.
     vscode.window.registerWebviewPanelSerializer(PANEL_TYPE, {
       deserializeWebviewPanel: async (panel, state) => {
         await provider.revivePanel(panel, state);
@@ -12063,29 +10897,11 @@ export function registerPanel(
   return provider;
 }
 
-// The panel's stylesheet and its browser script, which are two real files under
-// `webview/` rather than text held in here.
-//
-// They were template literals in this file until they were 73% of it: 6,181 lines the
-// compiler never read, the editor never highlighted, and no rename, no lint and no
-// go-to-definition could reach. `CLAUDE.md` had already recorded what that cost, that the
-// two literals were the least-checked code in the repo and that every regression this panel
-// shipped landed inside them.
-//
-// `esbuild.mjs` reads both files and substitutes their text here, so what ships is still one
-// bundle with the page inline. Nothing about the page itself moved: `shell` writes the same
-// nonce policy, `SAVED_STATE` still goes in a script tag of its own ahead of the panel's,
-// and neither file is fetched at load. A change to either needs a build before the panel
-// shows it, which is the one habit the split asks for.
+// The build embeds the panel stylesheet and browser bundle. Rebuild after changing their source files.
 declare const PANEL_CSS: string;
 declare const PANEL_JS: string;
 declare const PANEL_DEV_SERVER_URL: string | null;
 
-// What the two files ask this side for arrives by name rather than through an
-// interpolation, because a plain file has no template literal around it. `paneltext.ts`
-// holds the token shape, the table of values and what an unnamed token does; the table is
-// there rather than here because both test files fill these same two files the same way,
-// and a copy written out in each would let a guard pass against a value the page never
-// gets.
+// `paneltext.ts` expands named tokens using the shared value table for production and browser fixtures.
 const STYLE = fillPanelText(PANEL_CSS, panelValues());
 const SCRIPT = fillPanelText(PANEL_JS, panelValues());

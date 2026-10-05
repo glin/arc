@@ -97,8 +97,7 @@ export interface SavedPanelState {
   railGroupBy?: unknown;
   railShowArchived?: unknown;
   railShowRuns?: unknown;
-  // The Quick filters a build without the Running lens stored. The panel reads it while
-  // `railQuickFilters` is absent and never writes it.
+  // Legacy Quick filters fallback when railQuickFilters is absent. Saving omits this field.
   railHeadLenses?: unknown;
   railQuickFilters?: unknown;
   railWidth: number;
@@ -179,7 +178,7 @@ export function savedPanelState(values: SavedStateValues): SavedPanelState {
   };
 }
 
-// Reader layout uses the host copy. Submitted text joins both lifetimes by attempt identity.
+// Layout prefers the host copy, with browser state as fallback. Submitted prompts combine both copies by attempt identity.
 export function createSavedState(
   sharedState: unknown,
   browserState: BrowserStatePort,
@@ -200,8 +199,7 @@ export function createSavedState(
     if (unsent) unsent.submittedPrompts = next;
     for (const callback of listeners) callback();
   };
-  // The newest state not yet sent to the extension. Every saved state is whole, so the newest
-  // one carries everything the ones before it did.
+  // Newest complete state awaiting host delivery. It replaces earlier pending states.
   let unsent: SavedPanelState | null = null;
   const sendNewest = () => {
     const state = unsent;
@@ -243,10 +241,8 @@ export function createSavedState(
     save(values) {
       const state = savedPanelState(values);
       if (recovery.length) state.submittedPrompts = recovery;
-      // These writes have different lifetimes. Neither replaces the other. The browser copy is
-      // written at once. The extension copy goes once the current task ends, so one render that
-      // marks several cards read sends one state, and the extension words the rail for it once.
-      // A task always runs its microtasks before the page can unload, so no state is lost.
+      // Save browser state synchronously. Send the newest state to the host in one microtask.
+      // Multiple saves in the same task share one host update.
       browserState.write(state);
       latest = state as unknown as Record<string, unknown>;
       if (unsent === null) {

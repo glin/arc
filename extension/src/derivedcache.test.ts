@@ -350,9 +350,9 @@ test('derived cache round trips positive metadata and outcome facts', () => {
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['cache.json']);
 });
 
-// The closed children of an outcome arrived with a `VERSION` bump, so no cache written before
-// them is read again. An outcome that holds open children and no closed list therefore reaches
-// the merge only from this version, where the empty list and the missing list mean the same.
+// Earlier cache versions discard outcomes, including stored child state.
+// Current-version outcomes preserve open children without requiring a closed-child list.
+// A missing closed-child list has the same meaning as an empty list.
 test('a derived cache from an earlier version keeps no outcome that predates the closed children', () => {
   const file = path.join(folder(), 'cache.json');
   const open = { ...title, outcome: { ...outcome, openChildren: ['x1'] } };
@@ -365,8 +365,8 @@ test('a derived cache from an earlier version keeps no outcome that predates the
     }),
   );
   assert.equal(loadDerivedCache(file).titles.size, 0, 'a cache written before this version was read');
-  // An outcome this version wrote keeps every open child it holds, so the session that holds
-  // live carried subagents reads nothing again.
+  // Current-version outcomes retain open children through a save and reload.
+  // Stored child state remains available for carried subagents.
   saveDerivedCache(file, [
     ['/open.jsonl', open],
     ['/quiet.jsonl', title],
@@ -469,8 +469,8 @@ test('derived cache round trips completed Claude child-reference facts including
   assert.deepEqual(loaded.get('c:/parent.jsonl'), entry);
   assert.deepEqual(loaded.get('/quiet.jsonl'), negative);
 
-  // A dispatch reference stored before references carried `owned` sends its parent back to be
-  // read again, so no stored edge reads as unowned without the parent saying so.
+  // A dispatch reference without an explicit owned value requires a parent rescan.
+  // Missing ownership must not classify the dispatch as unowned.
   const { owned: _owned, ...unmarked } = entry.references[1] as { owned: boolean };
   saveDerivedCache(file, [], [['/parent.jsonl', { ...entry, references: [entry.references[0], unmarked as never] }]]);
   assert.equal(
@@ -508,9 +508,9 @@ test('derived cache rejects child references from another parser generation', ()
   assert.equal(loadDerivedCache(file).claudeChildReferences.size, 0);
 });
 
-// Parser 2 read no receipts. Parser 7 ended a quoted prompt at a double quote in a heredoc
-// inside its command substitution. Cache 28 read a background session's slash-command launch
-// as a person.
+// References from older parser generations require an unchanged parent to be rescanned.
+// This includes receipt detection, heredoc boundaries, and launch classification.
+// Cache format compatibility alone does not establish parser compatibility.
 test('derived cache rescans an unchanged parent after the receipt parser upgrade', () => {
   const file = path.join(folder(), 'cache.json');
   for (const parserVersion of [2, 7, 12, 13, 14, 17, 18]) {
@@ -704,7 +704,7 @@ test('derived cache round trips a regional Bedrock request', () => {
   assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), bedrock);
 });
 
-// Version 27 priced a regional Bedrock request at list, so a parse it stored is read again.
+// Unsupported cache versions must not supply stored Bedrock pricing.
 test('a derived cache from before the Bedrock charge serves no list-priced Bedrock parse', () => {
   const file = path.join(folder(), 'cache.json');
   const turn = stats.turns[0];
@@ -1316,24 +1316,24 @@ test('rail enrichment for a child transcript past the metadata tail keeps the me
   );
 });
 
-// The metadata entry the progressive worker builds for one Claude transcript. A null
-// agent-run reading files as a person, the way the worker stores it.
+// Build the progressive worker's metadata entry for one Claude transcript.
+// Only an explicit true agent-run reading classifies the session as an agent run.
 function metadataEntry(file: string): DerivedTitleEntry {
   const size = fs.statSync(file).size;
   const meta = readSessionMeta(file, CLAUDE_METADATA_TAIL_BYTES);
   return { ...title, size, agentRun: meta.agentRun === true, ...(meta.headKey ? { headKey: meta.headKey } : {}) };
 }
 
-// The buckets the rail files one entry under.
+// Return the session list buckets for one metadata entry.
 function railBucketsOf(entry: DerivedTitleEntry): string[] {
   const now = new Date(2026, 0, 1).getTime();
   const card = { at: now, pinnedTop: false, current: false, archived: false, agentRun: entry.agentRun ?? false };
   return railBuckets([card], now).buckets.map((bucket) => bucket.id);
 }
 
-// The size of one Claude transcript and the buckets the rail files it under: the metadata
-// reading of its tail, then the whole-file scan when the file is larger than the metadata
-// window.
+// Read transcript metadata, then scan beyond the metadata window when needed.
+// Enrichment combines the metadata and scan before assigning session list buckets.
+// Return the transcript size alongside its buckets.
 function railBucketsOfTranscript(file: string): { size: number; buckets: string[] } {
   const entry = metadataEntry(file);
   const session = { agent: 'claude', size: entry.size };
@@ -1357,7 +1357,7 @@ const transcriptSizes = [
   { name: 'past the metadata window', padding: pastWindow },
 ];
 
-// The rail buckets for the running transcript `records` builds at each size, keyed by size,
+// Return session list buckets for each generated transcript size.
 // and whether each file is past the metadata window.
 function railBucketsBySize(records: (padding: string) => object[]): {
   buckets: Record<string, string[]>;
@@ -1489,9 +1489,9 @@ test('a running SDK-only run past the metadata window stays under Run by agents 
   assert.deepEqual(railBucketsOf(rescanned), ['today'], 'the scan kept a run answer past a typed prompt');
 });
 
-// The reported symptom: a running SDK-only transcript under the metadata window grows past
-// it. Its answer came from the tail read alone, with no scan yet, and the next metadata
-// entry lost it until the first scan caught up.
+// A running SDK-only transcript retains its agent-run classification while crossing the metadata window.
+// The small file receives its classification from the metadata tail without a scan.
+// The larger metadata entry must retain that classification until the first scan completes.
 test('a running SDK-only run crossing the metadata window stays under Run by agents until the first scan', () => {
   const file = writeRunningTranscript(runningSdkTranscript());
   const before = metadataEntry(file);
@@ -1611,9 +1611,9 @@ test('a scan that found a person files under Today and stays there across the ne
   );
 });
 
-// The reported symptom for the stale path: a first scan lands late, after the no-scan carry
-// has already kept an `agentRun: true` forward twice. The scan finds the human-origin prompt
-// neither tail read could see past the window, and its person answer must win at once.
+// A late first scan finds a human-origin prompt outside the metadata window.
+// Two intervening metadata entries have retained agentRun: true without a scan.
+// The scan's person classification must clear the carried agent-run value immediately.
 test('a stale first scan that finds a person clears a previously carried run answer', () => {
   const file = writeRunningTranscript(runningSdkTranscript());
   const before = metadataEntry(file);
@@ -2009,7 +2009,7 @@ test('a workspace seed reaches the shared file at the first save when the walk r
   const writer = new CodexOpeningsWriter(shared, window.cache, openings.seeded);
   writer.setWalk(window.list(root, [root]).walked);
   assert.equal(window.reads(), 0);
-  // The first checkpoint writes both files, and the workspace file no longer holds the seed.
+  // The first checkpoint writes both files and removes the workspace opening seed.
   saveDerivedCache(workspace, cached.titles, cached.claudeChildReferences);
   assert.ok(writer.write());
   const next = countingCodexMetas();

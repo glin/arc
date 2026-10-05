@@ -31,27 +31,14 @@ export interface StaticStatChip {
   added?: number;
   removed?: number;
   warnings?: readonly unknown[];
-  // The record behind this figure, drawn in a popover of its own. Built when the popover asks
-  // for it rather than on every repaint, because a record that holds rows is a list the card
-  // already carries and filtering it on each clock tick buys nothing.
+  // Build the figure's record when its popover opens, avoiding work on every clock tick.
   record?: () => StatDetailList;
 }
 
-// One figure, drawn as text the reader can question or as text they cannot. A figure given a
-// record and a renderer to draw it in marks itself, takes the keyboard, and opens that record
-// on hover, on focus and on a press. It draws no native `title` as well: two hovers on one
-// element fight, and only one of them reaches a keyboard. Its empty `data-hint` keeps the hint
-// box of whatever holds the figure off the record, because one pointer opens one box.
-//
-// Every figure carries a role. A name on an element with no role is dropped, because ARIA reads
-// no name off a generic element. A figure holding a record is a press that opens and shuts it,
-// so it takes the button role and says whether it is pressed, whatever name it was handed. A
-// figure with nothing behind it is a run of text, and `group` names the label and
-// the pair it wraps as one run, so a reader hears `3 files, 18 lines added, 4 removed` rather
-// than the compact form on the face.
-//
-// `stop` is the row's one keyboard stop. A row hands the arrow keys the crossing from figure to
-// figure, so every other figure holding a record stays out of the tab walk.
+// Draw a static figure or an interactive figure with a record popover.
+// Interactive figures use a button role and suppress the enclosing hint and native title.
+// Named static figures use a group role so assistive technology reads their full names.
+// Only the figure identified by stop enters the Tab order. Row arrow keys reach the others.
 export function StaticStatChip({
   stat,
   contextClass,
@@ -65,14 +52,9 @@ export function StaticStatChip({
 }) {
   const tone = stat.level ? contextClass(stat.level) : '';
   const record = !!(stat.record && statDetails);
-  // A figure that opens a record is a press, so it says so and says what it is whatever name
-  // it was handed. Where it speaks no name of its own it takes the words on its own face,
-  // because a press with no role and no name reaches a reader as an unnamed something.
+  // Interactive figures fall back to their visible label for an accessible name.
   const spoken = stat.name || (record ? stat.compactLabel : '');
-  // The record is tied to the element through a callback ref rather than a hook, so the figure
-  // stays a plain function a text reading can call outside a render. A ref called with nothing
-  // is an element leaving the page, and the renderer's own watch on the body takes the popover
-  // off with it, so there is nothing to undo here.
+  // A callback ref connects the figure without hooks. The renderer dismisses popovers when their anchors leave the page.
   const connect = (element: HTMLElement | null) => {
     if (element) {
       statDetails!.connect(element, stat.detail ?? null, stat.record, true);
@@ -92,10 +74,8 @@ export function StaticStatChip({
   );
 }
 
-// A rail card's figure line: the cost, the turns and the context, in the order the rail
-// draws them. A comfortable rail card draws it under its meta line, and the card a compact row
-// opens on hover draws the same line, so the two cannot drift apart. A line with no figure is
-// drawn hidden.
+// Draw the same cost, turns, and context line in Full rows and Compact row hover cards.
+// Hide the line when it has no figures.
 export function RailStats({
   stats,
   contextClass,
@@ -110,10 +90,7 @@ export function RailStats({
   );
 }
 
-// A span that takes the button role answers the keys a button answers. The click it raises is
-// the one the record's renderer listens for, so a key pins the record exactly as a pointer does
-// and focus stays on the figure. Space is kept from scrolling the popover or the page, and a
-// held key presses once rather than pinning and unpinning on every repeat.
+// Enter and Space activate the figure once per press. Prevent Space scrolling and ignore held-key repeats.
 function pressFigure(event: KeyboardEvent) {
   if (event.key !== 'Enter' && event.key !== ' ') {
     return;
@@ -128,15 +105,12 @@ function WarningSign() {
   return h('span', { class: 'statwarningsign', 'aria-hidden': 'true' }, STAT_WARNING_SIGN);
 }
 
-// Whether a record moved any line at all. A recorded zero is absent everywhere a diff pair is
-// drawn, so the caller that would wrap the pair drops its wrapper and its separator with it.
+// Return whether either diff half is nonzero. Callers omit empty wrappers and separators.
 export function hasDiff(added: number | undefined, removed: number | undefined): boolean {
   return diffHalves(added, removed).length > 0;
 }
 
-// A figure's label and the pair that follows it, for the static figure and the pressable one
-// alike. A record that moved no line draws its label alone, and the separator that would have
-// led to the pair is never written, so nothing trails the label.
+// Add a separated diff pair only when at least one half is nonzero.
 export function labelledDiff(
   label: string | null | undefined,
   added: number | undefined,
@@ -148,10 +122,7 @@ export function labelledDiff(
   ]);
 }
 
-// The added and the removed halves of one record, drawn by the rule `diffHalves` holds: a file
-// that only lost lines reads `−3` rather than `+0 −3`, and the space between the halves belongs to
-// the pair that has both. A record that moved nothing draws nothing, which is why
-// every caller asks `hasDiff` before it writes a label separator in front of this.
+// Draw nonzero diff halves with a space between them. A zero pair draws nothing.
 export function DiffPair({ added, removed }: { added: number; removed: number }) {
   const halves = diffHalves(added, removed);
   if (!halves.length) {

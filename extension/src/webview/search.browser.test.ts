@@ -38,9 +38,7 @@ async function post(page: Page, payload: unknown): Promise<void> {
   await page.evaluate(SETTLED);
 }
 
-// The query the panel actually asked for, read back off the posts. The owner turns a plain
-// query into the grammar's own find term, so a test that spelled the term out would pass
-// against a panel that asked for something else.
+// Read the posted query so replies answer the panel's actual grammar transformation.
 async function search(page: Page, query: string): Promise<string> {
   return (await page.evaluate(`(() => {
     document.dispatchEvent(new CustomEvent('arc-test-search', { detail: ${JSON.stringify(query)} }));
@@ -208,7 +206,7 @@ test('a result row keeps its identity and its mark across an unrelated repaint',
     assert.equal(await page.locator('.timeline-foreign .resultcount').textContent(), '2 turns');
     await page.evaluate(`window.__firstResult = document.querySelectorAll('.timeline-foreign .result')[1]`);
 
-    // An ordinary render, which is what arrives every few seconds while a turn runs.
+    // Redraw the panel with unchanged result data.
     await post(page, renderPayload());
 
     assert.equal(
@@ -283,7 +281,7 @@ test('pressing a result shows that session and refuses the reply the press dismi
     await page.locator('[data-control="result:k1"]').click();
 
     assert.deepEqual(await page.evaluate(`window.__posted.at(-1)`), { type: 'showSession', session: 's2' });
-    // The render the press brings draws the session, not this same list again.
+    // Render the session selected from the results.
     await post(page, renderPayload());
     assert.equal(
       await page.locator('.timeline-foreign .result').count(),
@@ -300,8 +298,7 @@ test('a press dismisses a search that is still running', async (t) => {
   if (!held) return;
   const { page } = held;
   try {
-    // The first answer's rows stay on screen while a second search runs, because a reader
-    // refining a query must not be left looking at nothing.
+    // Keep existing results visible while the next search is pending.
     const first = await search(page, 'needle');
     await answer(page, first, 'workspace', [hit('k1', 's2')]);
     const second = await search(page, 'thread');
@@ -333,8 +330,7 @@ test('an empty answer is worded by the scope the search actually covered', async
   const { page } = held;
   try {
     const query = await search(page, 'needle');
-    // The session on screen is pinned, and the reply still decides the wording, because the
-    // pin can move while the reply is in flight.
+    // Reply scope determines empty-result wording, even if pin state changes while the search is pending.
     await answer(page, query, 'sessionPart', []);
     assert.equal(
       await page.locator('.timeline-foreign .results .empty').textContent(),

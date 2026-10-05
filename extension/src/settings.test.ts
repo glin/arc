@@ -1,4 +1,4 @@
-// extension/src/settings.test.ts
+// Settings contributions and reader vocabulary.
 import { test } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -25,10 +25,8 @@ test('agent processes keep a one-hour idle window by default', () => {
   assert.equal(contributed.minimum, 1);
 });
 
-// The guard that matters: a key read in code but never contributed reads its default for
-// ever, in silence, and a default that disagrees with the contributed one makes the settings
-// editor and the panel two different answers. package.json is the only place either fact is
-// recorded, so the test reads it rather than restating it.
+// Setting keys and defaults must match package.json contributions.
+
 test('every setting is contributed, with the default the code uses', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
     contributes: { configuration: { properties: Record<string, Record<string, unknown>> } };
@@ -51,9 +49,8 @@ test('every setting is contributed, with the default the code uses', () => {
     }
   }
 
-  // Nothing contributed that no longer has a reader. A key left behind after its reader
-  // goes still shows up in the settings editor, where it reads as a setting that does
-  // something.
+  // Every contributed setting must appear in SETTING_KEYS.
+
   const known = new Set(SETTING_KEYS.map(settingName));
   for (const name of Object.keys(props)) {
     assert.ok(known.has(name), `${name} is contributed but nothing reads it`);
@@ -82,10 +79,8 @@ test('every public setting has a runtime reader', () => {
   );
 });
 
-// The panel's name is written down in four places that nothing else compares: the
-// marketplace entry, the settings page, the palette prefix, and the title on the tab itself.
-// A rename that reaches some of them leaves the reader looking at two names for one thing,
-// which no other check would see.
+// Marketplace, settings, command categories, and the panel tab use the same product name.
+
 test('the name the reader sees is the same everywhere it is written down', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
     displayName: string;
@@ -98,11 +93,8 @@ test('the name the reader sees is the same everywhere it is written down', () =>
   const NAME = 'Arc';
   assert.equal(manifest.displayName, NAME);
   assert.equal(manifest.contributes.configuration.title, NAME);
-  // The palette prefixes a command with its category, so a category that says anything else
-  // offers the reader two products under one set of commands. A command the palette never
-  // shows can carry a longer category instead, to tell it apart from another command sharing
-  // its title in the Keyboard Shortcuts editor, as long as that category still opens with
-  // this one name.
+  // Visible command categories use the product name. Hidden commands can append words to distinguish them in Keyboard Shortcuts.
+
   const hiddenFromPalette = new Set(
     (manifest.contributes.menus.commandPalette ?? [])
       .filter((entry) => entry.when === 'false')
@@ -118,8 +110,8 @@ test('the name the reader sees is the same everywhere it is written down', () =>
       `${command.command} carries a category longer than 'Arc' but the palette can still show it`,
     );
   }
-  // The tab is where the name is read most, and it is a constant in panelhost.ts rather than
-  // anything the manifest contributes, so a manifest-only rename never reaches it.
+  // The panel tab title uses ARC_IDENTITY.productName.
+
   const panelHostSource = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
   assert.match(
     panelHostSource,
@@ -128,9 +120,8 @@ test('the name the reader sees is the same everywhere it is written down', () =>
   );
 });
 
-// The Settings editor offers the contributed enum, and the panel draws the values the layout
-// module names. A value in one list and not the other is a choice the reader can pick that the
-// panel draws as the default, or a dialog row the Settings editor cannot show.
+// Contributed Timeline layout choices must match the layout module.
+
 test('the Timeline layout settings contribute the values the panel draws', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
     contributes: {
@@ -146,8 +137,8 @@ test('the Timeline layout settings contribute the values the panel draws', () =>
   ] as const) {
     const name = settingName(TIMELINE_LAYOUT_SETTINGS[key]);
     assert.deepEqual(props[name].enum, [...values], `${name} contributes values the panel does not draw`);
-    // The Settings editor names each value the way the dialog names its row, and explains it the
-    // way the row's hover does.
+    // Settings labels and descriptions match the dialog labels and hints.
+
     const words = TIMELINE_LAYOUT_WORDS.values[key] as Record<string, string>;
     const explanations = TIMELINE_LAYOUT_WORDS.explanations[key] as Record<string, string>;
     assert.deepEqual(
@@ -163,8 +154,8 @@ test('the Timeline layout settings contribute the values the panel draws', () =>
   }
 });
 
-// Every string under a value, whatever shape holds it, paired with the path that names where
-// it sits. An array is an object whose keys are its indices, so one walk covers both.
+// Collect strings with their object paths. Array indices participate in the same traversal.
+
 function readerWords(value: unknown, where: string, into: [string, string][]): void {
   if (typeof value === 'string') {
     into.push([where, value]);
@@ -178,10 +169,8 @@ function readerWords(value: unknown, where: string, into: [string, string][]): v
   }
 }
 
-// Every module Arc ships, because a word the reader reads can be written in any of them. The
-// browser modules draw the panel, and the host modules hand them the figure names, the records,
-// the hints and the accessible names they draw. A test file writes for a developer, and a
-// fixture writes test data, so neither one reaches a reader.
+// Read shipped host and browser modules. Exclude test sources and fixtures.
+
 function shippedSources(dir: string, into: string[] = []): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
@@ -198,21 +187,20 @@ function shippedSources(dir: string, into: string[] = []): string[] {
   return into;
 }
 
-// The names a slot wears when what it holds is a class or an element id rather than copy.
+// These property names identify element ids and classes.
 const NAMES_AN_ELEMENT = new Set(['id', 'class', 'className', 'cls']);
 const CLASS_LIST_CALLS = /^(add|remove|toggle|contains|replace)$/;
 const SELECTOR_CALLS = /^(querySelector|querySelectorAll|closest|matches)$/;
-// The calls whose first argument is an attribute name. Every later argument is a value, and a
-// value can be copy, so only the first slot names something.
+// The first argument names an attribute. Later arguments contain its value.
+
 const ATTRIBUTE_NAME_CALLS = /^(setAttribute|getAttribute|removeAttribute|hasAttribute)$/;
 
-// The literals a shipped module writes with the code word on purpose. Each one names a field of
-// the card payload rather than saying anything, and the reader never reads a field name. A new
-// entry has to be argued for, because the rule is that the reader never reads the word.
+// This literal names a payload field rather than reader-facing text.
+
 const NAMES_A_PAYLOAD_FIELD = new Set(['view/card-presentation.ts:chips']);
 
-// The expressions a value can pass through on its way into a slot. A class written as
-// `themed ? 'ficon themed' : 'ficon'`, or as one arm of a template, is still a class.
+// Follow expressions that carry a value into its destination, including conditional classes and template fragments.
+
 function crossable(node: ts.Node): boolean {
   return (
     ts.isConditionalExpression(node) ||
@@ -226,9 +214,8 @@ function crossable(node: ts.Node): boolean {
   );
 }
 
-// The parameters of the function a call names, when that function is written in the same source.
-// A helper such as `el(tag, className, text)` names the slot its class rides in, so an argument
-// there is a class however it is written.
+// A local helper's parameter names identify arguments that hold element ids or classes.
+
 function parameterNames(call: ts.CallExpression, source: ts.SourceFile): readonly ts.ParameterDeclaration[] | null {
   if (!ts.isIdentifier(call.expression)) {
     return null;
@@ -256,10 +243,8 @@ function parameterNames(call: ts.CallExpression, source: ts.SourceFile): readonl
   return found;
 }
 
-// Whether a literal names something rather than saying it, read from where the syntax puts it
-// and not from how it is spelled. A module path, a property name, a literal type, a CSS selector
-// and a CSS class each name something the reader never reads. Nothing here reads the characters
-// of the literal, because reader copy can spell itself any way a name can.
+// Use syntax to distinguish identifiers, module paths, types, selectors, and classes from reader-facing copy.
+
 function namesRatherThanSays(node: ts.Node, source: ts.SourceFile): boolean {
   const parent = node.parent;
   if (ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent) || ts.isImportTypeNode(parent)) {
@@ -274,9 +259,8 @@ function namesRatherThanSays(node: ts.Node, source: ts.SourceFile): boolean {
   if ((ts.isPropertyAssignment(parent) || ts.isPropertySignature(parent)) && parent.name === node) {
     return true;
   }
-  // Every slot the value reaches after the expressions it passes through. A value that crosses
-  // none of them arrives here as itself, so one walk reads a direct argument and an argument
-  // written as `busy ? 'chip busy' : 'chip'` the same way.
+  // Follow the containing expressions to identify the destination of both direct and conditional values.
+
   let held: ts.Node = node;
   let above: ts.Node | undefined = node.parent;
   while (above && crossable(above)) {
@@ -291,9 +275,8 @@ function namesRatherThanSays(node: ts.Node, source: ts.SourceFile): boolean {
     if (at >= 0 && ts.isPropertyAccessExpression(above.expression)) {
       const method = above.expression.name.text;
       const target = above.expression.expression;
-      // `row.querySelector('.card .chip')`, where the call reads a selector and not copy. A
-      // selector is a name because of the call it rides into, and never because of the
-      // character it opens with. Reader copy can open with any character.
+      // Selector calls identify selector arguments regardless of their spelling.
+
       if (SELECTOR_CALLS.test(method)) {
         return true;
       }
@@ -334,14 +317,13 @@ function namesRatherThanSays(node: ts.Node, source: ts.SourceFile): boolean {
   return false;
 }
 
-// Only literals with the code word need their syntax checked. The tokenizer keeps template
-// fragments separate from interpolation holes and skips comments. The line points to the
-// literal that needs different reader copy.
+// Check the syntax of literals containing chip. Keep template fragments separate and report the literal's source line.
+
 function sourceStrings(file: string, where: string, into: [string, string][]): void {
   readerStrings(fs.readFileSync(file, 'utf8'), file, where, into);
 }
 
-// The same walk over source held in memory, so a test can put a shape in front of it.
+// Inspect source supplied in memory with the same traversal.
 function readerStrings(code: string, file: string, where: string, into: [string, string][]): void {
   const source = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true);
   const visit = (node: ts.Node): void => {
@@ -361,11 +343,8 @@ function readerStrings(code: string, file: string, where: string, into: [string,
   visit(source);
 }
 
-// Chip is the word for the pill in code, tests and developer documentation. The reader never
-// reads it. The Settings editor and the Timeline layout dialog say Compact, or they name the
-// figure the pill carries, and so does every word a shipped module writes for the reader.
-// Nothing else compares the two vocabularies, so copy written in the code word reaches the
-// reader in silence.
+// Reader-facing copy names the figure or says Compact. Chip remains a code and developer-documentation term.
+
 test('no word the reader reads says chip', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as {
     contributes: { configuration: { properties: Record<string, Record<string, unknown>> } };
@@ -378,8 +357,8 @@ test('no word the reader reads says chip', () => {
   }
   assert.ok(read.length > 0, 'no contributed setting copy to read');
   readerWords(TIMELINE_LAYOUT_WORDS, 'the Timeline layout words', read);
-  // The contributed copy is one surface. Every other word the reader reads is written in a
-  // shipped module, so the same rule reads them all.
+  // Apply the vocabulary check to shipped source as well as contributed copy.
+
   const sources = shippedSources(__dirname);
   assert.ok(sources.length > 0, 'no shipped source to read');
   for (const file of sources) {
@@ -390,11 +369,8 @@ test('no word the reader reads says chip', () => {
   }
 });
 
-// The scan above decides what a literal is from the slot the syntax puts it in. Two readings
-// carry the whole rule, and each one fails silently in the opposite direction. A class reached
-// through a conditional is still a class, and a scan that missed it would fail a module over a
-// CSS class name. Reader copy that opens with a selector character is still copy, and a scan
-// that read the character would let the code word reach the reader.
+// Conditional classes remain classes. Copy beginning with a selector character remains reader-facing text.
+
 test('the reader-word scan reads a literal by its slot and not by its spelling', () => {
   const read: [string, string][] = [];
   readerStrings(

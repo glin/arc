@@ -1,9 +1,6 @@
-// Turns raw tool input into the one subject an activity row or permission card needs.
-//
-// Protocol adapters keep ownership of their wire shapes. Once they have an ordinary input
-// object, this module gives equivalent operations the same detail policy and selection
-// rules. Unknown tools use only the conservative scalar fields below. Arbitrary objects are
-// never serialized because tool input can contain file contents, patches, or credentials.
+// Selects the subject for an activity row or permission card.
+// Protocol adapters retain their wire formats. Equivalent operations share detail policies and field-selection rules.
+// Unknown tools use safe scalar fields. Arbitrary input objects can contain file contents, patches, or credentials.
 
 export type ActivityDetailPolicy = 'required' | 'optional' | 'none';
 export type ActivityDetailFormat = 'command' | 'path' | 'url' | 'query' | 'prose' | 'none';

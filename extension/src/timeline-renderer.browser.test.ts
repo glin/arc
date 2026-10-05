@@ -211,10 +211,8 @@ test('the production page exposes the semantic Timeline hierarchy and accessible
     for (const session of await sessions.all()) {
       const labelledBy = await session.getAttribute('aria-labelledby');
       assert.ok(labelledBy);
-      // The row a right-click reads, and the row the panel looks for again when a pin or an
-      // archiving changes what the menu over it offers. It is found by the session named
-      // on the row itself, so a row drawn with the context and without the name is a row
-      // nothing can reach, and its menu goes on offering what the session has left.
+      // The session row names its session so context-menu updates can find it after pin or archive changes.
+
       const row = session.locator(':scope > .sessionrow');
       const named = await row.getAttribute('data-session');
       assert.ok(named, 'a session row names no session, so nothing finds it again');
@@ -233,8 +231,8 @@ test('the production page exposes the semantic Timeline hierarchy and accessible
       const controls = await disclosure.getAttribute('aria-controls');
       assert.ok(controls);
       assert.equal(await page.locator(`[id=${JSON.stringify(controls)}]`).count(), 1);
-      // The button a button cannot hold: a sibling of the disclosure, always drawn, that
-      // opens the same menu a right-click over the row does.
+      // The menu button sits beside the disclosure and opens the row's context menu.
+
       const menu = heading.locator(':scope > button.sessionmenu:not(.sessionlayout):not(.sessionpin)');
       assert.equal(await menu.count(), 1);
       assert.equal(await menu.getAttribute('aria-haspopup'), 'menu');
@@ -274,8 +272,8 @@ test('the production page exposes the semantic Timeline hierarchy and accessible
     const sectionTitles = page.locator('article.turn .sec-title');
     assert.ok((await sectionTitles.count()) > 0);
     assert.equal(await sectionTitles.evaluateAll((nodes) => nodes.every((node) => node.closest('h4') !== null)), true);
-    // Every section head on the page that folds: the opened card's Activity and You asked,
-    // and the Activity head of the long fixture turn, whose body is drawn shut.
+    // Activity and You asked disclosures expose expanded state and controlled body IDs.
+
     assert.equal(
       await page
         .locator(
@@ -417,8 +415,8 @@ test('named stat and label surfaces keep semantic text separators', async (t) =>
     await page.setContent(pageHtml());
     const payload = renderPayload() as Payload;
     payload.stats = structuredClone(payload.stats);
-    // Metrics the rail draws, because a rail card takes its figures out of the record keyed
-    // by its session id and names the three it draws.
+    // Session list figures come from stats keyed by session ID.
+
     const stats = [
       { kind: 'plain', metric: 'turns', label: '0 turns', compactLabel: '0 turns', detail: '' },
       { kind: 'plain', metric: 'context', label: 'next stat', compactLabel: 'next stat', detail: '' },
@@ -457,9 +455,8 @@ test('named stat and label surfaces keep semantic text separators', async (t) =>
 });
 
 test('a files figure that is a known floor draws no partial word on the turn card or the session heading', async (t) => {
-  // `StatChip` mounts a ref and reads `chip.detail` in a layout effect, so it needs a real
-  // render pass rather than a direct call the way the hookless `StaticStatChip` is tested in
-  // card.test.ts. This is the one check that has to run in a browser.
+  // StatChip reads detail through a mounted ref in a layout effect.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -470,11 +467,8 @@ test('a files figure that is a known floor draws no partial word on the turn car
     await page.setContent(pageHtml());
     const payload = renderPayload() as Payload;
     payload.stats = structuredClone(payload.stats);
-    // Shaped the way a floor figure reads today: the name, the label and the flat `detail`
-    // all carry no caveat. This fixture holds no `detailList`, so nothing here exercises a
-    // record or its footer. `filesFloor` rides the payload regardless, so a renderer that still
-    // branched on it would still be caught even though nothing in this codebase sets that field
-    // any more.
+    // The figure has no partial wording or detailList. The supplied filesFloor field must not add a visible partial mark.
+
     const floor = {
       kind: 'diff',
       metric: 'files',
@@ -490,11 +484,8 @@ test('a files figure that is a known floor draws no partial word on the turn car
     const cardKey = payload.cards[0].key;
     await post(page, payload);
 
-    // The fixture's own `name` is hand-written above with no partial word in it, so reading it
-    // back here would only confirm the fixture, never the renderer. `card.test.ts` covers the
-    // accessible name against a figure `dispatchedAgentCard` builds for real. This browser check
-    // is left to what only a browser render can show: whether the stylesheet still draws a
-    // `.statpartial` mark for a chip carrying the retired `filesFloor` field.
+    // Read rendered partial marks rather than the fixture's supplied accessible name.
+
     const turnChip = `[data-key=${JSON.stringify(cardKey)}] .chips [data-metric="files"]`;
     const headingChip = 'section.sessionsection[data-session="s1"] .sessionstats [data-metric="files"]';
     const marks = (await page.evaluate(`(() => {
@@ -514,10 +505,8 @@ test('a files figure that is a known floor draws no partial word on the turn car
       turnMark: string | null;
       headingMark: string | null;
     };
-    // The absence of a mark below proves nothing if the figure itself never drew, the way a
-    // turn's `.chips` or a heading's `.sessionstats` draws nothing for a card with no files.
-    // Both checks below hold the fixture's own label, so a renderer that drops the figure fails
-    // here rather than passing the mark check by omission.
+    // Both files figures must render before checking that their partial marks are absent.
+
     assert.ok(marks.turnFigure?.includes('2 files'), 'the turn card drew no files figure to check for the mark');
     assert.ok(
       marks.headingFigure?.includes('2 files'),
@@ -1566,8 +1555,8 @@ test('the session heading puts cost before turns and names how many turns are dr
   try {
     await page.setContent(pageHtml());
     const payload = renderPayload() as Payload;
-    // The fixture's turns chip reads "8 turns"; cutting the drawn cards to 3 makes this
-    // render prove the drawn-turns line as well as the heading and the chip order.
+    // The fixture counts eight turns while this render draws three.
+
     payload.cards = payload.cards.slice(0, 3);
     await post(page, payload);
 
@@ -1610,7 +1599,7 @@ test('the session heading puts cost before turns and names how many turns are dr
     assert.equal(await page.locator('#chippop').isHidden(), true);
     assert.equal(await turnsChip.evaluate((node) => document.activeElement === node), true);
 
-    // Every turn the chip counts is now drawn, so the hover has nothing left to add.
+    // All eight counted turns are drawn.
     await turnsChip.evaluate((node) => (node as HTMLElement).blur());
     const wholePayload = renderPayload() as Payload;
     wholePayload.cards = wholePayload.cards.slice(0, 8);
@@ -1790,8 +1779,8 @@ test('a comment editor holds a replacement view that a session change draws at o
       selection.addRange(range);
       return selection.toString();
     })()`);
-    // The reader opened another session, which is their own instruction. The replacement
-    // draws at once, and the selection goes with the cards it was made in.
+    // Opening another session replaces the view and clears the outgoing selection.
+
     assert.ok(selected, 'nothing was selected, so the rule under test never engages');
     await post(page, replacement);
     assert.equal(await page.locator(`[data-key=${JSON.stringify(key)}]`).count(), 0);
@@ -2642,8 +2631,8 @@ test('usage before the first render defers removing a selected live response', a
 });
 
 test('updated summary content owns one safe action path and one comment paint', async (t) => {
-  // This catches duplicated handlers and annotation effects after changed HTML. Existing
-  // single-action tests never update the mounted summary before a press.
+  // Updating mounted summary HTML must preserve one action handler and one annotation effect.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3124,8 +3113,8 @@ test('a non-file summary URI keeps Copy Path context without handoff identity', 
 });
 
 test('file, diff, and commit controls post one keyed action with editor modifiers', async (t) => {
-  // This catches card actions losing their turn identity or posting twice. Existing host
-  // checks cannot exercise the typed browser handlers or modifier keys.
+  // Browser card actions retain their turn key and editor modifiers and post once.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3204,9 +3193,8 @@ test('file, diff, and commit controls post one keyed action with editor modifier
 });
 
 test('a hover on the Files chip reaches a file row the pointer crosses to', async (t) => {
-  // This catches the record staying out of reach of a pointer that never presses the chip. A
-  // popover drawn without its rows, or with rows that are not presses, leaves a reader who
-  // hovers the chip looking at the file names and unable to open one.
+  // Hovering Files exposes file rows that the pointer can enter and open.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3227,8 +3215,8 @@ test('a hover on the Files chip reaches a file row the pointer crosses to', asyn
     const pop = page.locator('#chippop');
     await page.locator(`[data-key=${JSON.stringify(card.key)}] .statchip[data-metric="files"]`).hover();
     await pop.waitFor({ state: 'visible' });
-    // A popover a reader walks into is a dialog, and it carries the same presses a pinned one
-    // carries.
+    // The hover popover exposes the same dialog controls as the pinned popover.
+
     assert.equal(await pop.getAttribute('role'), 'dialog');
 
     // The pointer crosses from the chip onto the row and presses it there.
@@ -3245,8 +3233,8 @@ test('a hover on the Files chip reaches a file row the pointer crosses to', asyn
 });
 
 test('the pointer entering the Files popover cancels the close the chip armed', async (t) => {
-  // This catches the gap between a chip and its popover shutting under the pointer. The guard
-  // reads the armed close rather than waiting for it, so it neither sleeps nor races.
+  // Entering the popover cancels the close timer armed when the pointer leaves its chip.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3265,8 +3253,8 @@ test('the pointer entering the Files popover cancels the close the chip armed', 
     await page.locator(chip).hover();
     await pop.waitFor({ state: 'visible' });
 
-    // The page's own timers stand in for a clock. A close armed at the grace is recorded and
-    // never runs, so the guard reads whether one is pending instead of how long it waits.
+    // Intercept the grace-period close timer and inspect its pending state without advancing wall time.
+
     await page.evaluate(`(() => {
       const realSet = window.setTimeout;
       const realClear = window.clearTimeout;
@@ -3309,8 +3297,8 @@ test('the pointer entering the Files popover cancels the close the chip armed', 
       'the pointer reached the popover and the close the chip armed still stands',
     );
 
-    // The armed close is a real close. Leaving the popover arms one of its own, and running it
-    // puts the popover away.
+    // Leaving the popover arms another close timer. Running its callback closes the popover.
+
     await page.evaluate(`document.getElementById('chippop').dispatchEvent(new PointerEvent('pointerleave'))`);
     assert.deepEqual(
       await state(),
@@ -3330,8 +3318,8 @@ test('the pointer entering the Files popover cancels the close the chip armed', 
 });
 
 test('card stat detail keeps its anchor and removes listeners with its card', async (t) => {
-  // This catches pinned detail moving on unrelated updates and detached controls reopening it.
-  // Existing layout checks close the popover before they exercise card removal.
+  // Pinned detail retains its anchor across updates. Removing the card disables its detached controls.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3611,8 +3599,8 @@ test('next-turn cost chip opens cold detail after a closed cache crosses its bou
 });
 
 test('a long activity update keeps the chosen disclosure and visible row', async (t) => {
-  // This catches an activity refresh remounting its list or resetting its disclosure. The
-  // existing identity case does not hold a row deep inside a long log.
+  // A long Activity update retains disclosure state and the visible row.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3665,10 +3653,8 @@ test('a long activity update keeps the chosen disclosure and visible row', async
 });
 
 test("the session menu button presses the row's own context menu", async (t) => {
-  // The source-text guard in panel.webview.test.ts matches only the helper's name, so a
-  // renderer that stops wiring `onClick: pressSessionMenu` to the drawn button still passes
-  // that guard while the visible button does nothing. This focuses the real button, presses
-  // it, and reads the real event it raises on the row.
+  // Pressing the focused menu button raises the session row's context-menu event.
+
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -3711,9 +3697,8 @@ interface HeadingPin {
   blue: boolean;
 }
 
-// What the reader sees of one heading's pin: whether it is drawn, its state, and whether it
-// wears the notice blue. The blue is read off the page's own `--notice`, so the check holds in
-// any theme the fixture carries.
+// Read pin presence, pressed state, and notice colour using the page's theme variable.
+
 async function headingPin(page: Page, session: string): Promise<HeadingPin | null> {
   return (await page.evaluate(`(() => {
     const node = document.querySelector(${JSON.stringify(`#list [data-control="sessionpin:${session}"]`)});
@@ -4259,9 +4244,8 @@ test('cache-write warnings share cost faces and retain pinned detail through upd
   }
 });
 
-// The reader opened another session while a selection was still alive in the one they
-// left. Every card of the old session is absent from the new view, which is the shape
-// the repaint deferral holds back, so the new session drew nothing at all.
+// The helper selects text inside one card before a session change removes that card.
+
 async function heldOneCard(page: Page): Promise<string> {
   return (await page.evaluate(`(() => {
     const target = document.querySelector('article.turn .summary p');
@@ -4313,8 +4297,8 @@ test('opening another session draws it while a selection is still held', async (
     await post(page, { ...payload, cards: [second], showing: 's2' });
     assert.deepEqual(await drawnKeys(page), [second.key], 'the timeline kept drawing the session the reader left');
 
-    // The selection the reader abandoned goes with the cards it was made in. Left pointing at
-    // removed nodes, it holds back the next update that arrives on its own.
+    // Removing the outgoing selection must allow subsequent updates in the new session.
+
     const later = { ...second, key: `${second.key}:later`, headline: 'A turn that arrived after the change.' };
     await post(page, { ...payload, cards: [second, later], showing: 's2' });
     assert.deepEqual(
@@ -4396,8 +4380,8 @@ test('a session with no turns draws past a held selection and records what it dr
       'the session the reader left stayed on screen while their selection was alive',
     );
 
-    // The empty view stands for the session the host is showing. Reopening the first session
-    // is the reader's own instruction, even with a selection alive in the view they leave.
+    // Reopening the first session replaces the empty view despite its active selection.
+
     const inForeign = (await page.evaluate(`(() => {
       const target = document.querySelector('.timeline-foreign');
       const range = document.createRange();
@@ -4455,8 +4439,8 @@ test('dismissing a comment editor draws the session the reader opened', async (t
       return !!document.querySelector('.noteedit');
     })()`);
     assert.equal(opened, true, 'the comment editor did not open, so the rule under test never engages');
-    // The reader reads another card while the draft waits. Dismissing the draft leaves that
-    // selection alive, and nothing else is coming to release the session they opened.
+    // Dismissing the comment editor must release the pending session view while another selection remains active.
+
     const elsewhere = (await page.evaluate(`(() => {
       const heading = [...document.querySelectorAll('article.turn .head')][1];
       const range = document.createRange();
@@ -4504,8 +4488,8 @@ test('a turn arriving beside the card the reader is reading draws at once', asyn
     const selected = await heldOneCard(page);
     assert.ok(selected, 'nothing was selected, so the rule under test never engages');
 
-    // The selection sits inside one card that the next view keeps, so the reader loses
-    // nothing they are holding and the new turn does not wait on them.
+    // A new turn beside the selected card draws without replacing that card.
+
     const later = { ...payload.cards[2], key: `${key}:later`, headline: 'A turn that arrived while they read.' };
     await post(page, { ...payload, cards: [...payload.cards, later] });
     assert.deepEqual(
@@ -4627,9 +4611,8 @@ test('the layout gear opens the Timeline layout dialog, which posts the setting 
     await page.evaluate(SETTLED);
     assert.equal(await dialog.isHidden(), true, 'a press outside the dialog left it open');
 
-    // Tab walks from the Card layout row to the Prompt row. In the editor, Tab past that last row
-    // can take focus out of the panel to nothing, which a page on its own never does: it wraps Tab
-    // back to its first control. The key alone, with no focus move after it, is that case.
+    // Tab past the final dialog row closes the dialog even when the editor consumes the key without moving page focus.
+
     await gear.click();
     await page.evaluate(SETTLED);
     await page.keyboard.press('Tab');
@@ -4679,8 +4662,8 @@ for (const relation of ['dispatched', 'reader'] as const) {
       const payload = renderPayload() as Payload;
       const stats = 'section.sessionsection[data-session="s1"] .sessionstats';
       const row = payload.sessions.find((candidate) => candidate.id === 's1')!;
-      // The host names a parent only when the parent has a session row of its own, so the
-      // parent is listed here too. startup.test.ts covers the parent the workspace lacks.
+      // The fixture lists the parent because parent navigation requires a session row.
+
       payload.sessions.push({ ...row, id: 'parent-session-full-id', label: 'Plan the dispatch', shown: false });
       await post(page, payload);
       const plain = await page.locator(stats).evaluate((node) => node.outerHTML);
@@ -4746,8 +4729,8 @@ for (const relation of ['dispatched', 'reader'] as const) {
   });
 }
 
-// A subagent opens from its parent's Subagents section as a session of its own. Its heading
-// ends with the session that started it, and a press goes back there by the full id.
+// The subagent heading opens its parent by full session ID.
+
 test('a subagent opened from its parent opens that parent again from its heading', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -4766,8 +4749,8 @@ test('a subagent opened from its parent opens that parent again from its heading
     const agent = agents.find((candidate) => candidate.sessionId);
     assert.ok(agent, 'the fixture turn has no subagent that opens as a session');
     agent.sessionId = childId;
-    // The same payload, shown as one session or the other. The host names the parent only when
-    // the parent has a session row, so each view lists both.
+    // Both views list the parent and child rows required for navigation.
+
     const shownAs = (shown: string, other: string) => {
       const view = JSON.parse(JSON.stringify(base).replaceAll('"s1"', JSON.stringify(shown))) as Payload;
       const row = view.sessions.find((candidate) => candidate.id === shown)!;

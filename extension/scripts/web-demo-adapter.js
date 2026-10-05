@@ -16,9 +16,7 @@
   let comments = sample.commentRules.normalizeComments(
     Object.values(sample.payloads).flatMap((payload) => payload.comments),
   );
-  // A session the demo lists as read starts with its turns marked read, so the panel's read
-  // marks and the session list agree. Each save then decides a session's unread state from
-  // those marks with the extension's rule.
+  // Initialize turn read marks to match session unread state. Saves then derive session unread state with the production rule.
   const initialState = {
     composerHidden: false,
     railWidth: sample.railWidth,
@@ -152,8 +150,7 @@
   function copy(text) {
     if (typeof text === 'string' && text) navigator.clipboard?.writeText(text).catch(() => {});
   }
-  // The context menu's entries, answered the way the extension answers them, in page memory.
-  // Host actions start nothing.
+  // Answer supported context menu actions in page memory. Host actions start nothing.
   sample.installMenu(document, sample.menuEntries, (command, context) => {
     const session = ids.includes(context.session) ? context.session : null;
     const card = Object.values(sample.payloads)

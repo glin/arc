@@ -41,7 +41,7 @@ interface SessionStateOptions {
   promptFloor(): number | null;
   composerHidden(): boolean;
   refreshContext(session: string): void;
-  // The same rewrite for many sessions at once, drawing each surface once for the batch.
+  // Refresh contexts in a batch and draw each affected surface once.
   refreshContexts(sessions: readonly string[]): void;
 }
 
@@ -69,23 +69,14 @@ export interface PanelSessionState {
   context(session: string, persisted: boolean, extra?: SessionContextExtra): string;
 }
 
-// What a caller adds to a row's context beyond the archived state, the pin state and the
-// saved fact every row carries.
-//
-// A rail card names its own section, which already carries the read state the session
-// heading has no room for, and it names its own archived state directly because the rail's
-// three sections carry read state instead. A session heading carries neither: it always
-// answers archived from its own two sections, and a caller merges in what it knows about
-// read state itself, since the cards and the read marks both live outside this module.
+// Optional native-menu context fields. Session list sections encode read state and need explicit archived state.
+// Session heading sections encode archived state. Callers supply read state from their cards and read marks.
 export interface SessionContextExtra {
   menuSection?: string;
   preventDefaultContextMenuItems?: boolean;
-  // A word rather than a boolean, so the manifest's when clause can single out the case an
-  // entry applies to without the special case VS Code gives a context key compared against a
-  // literal `false`, which also matches the key being absent.
+  // Use words for read state. VS Code matches absent keys when a when clause compares against false.
   sessionRead?: 'read' | 'unread';
-  // Present only on a session with at least one label, which is when New session with the
-  // same labels has anything to copy.
+  // Set only when the session has labels for New session with the same labels to copy.
   sessionLabeled?: boolean;
 }
 
@@ -110,8 +101,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
   const initialReadTo = new Map(Object.entries(record(initial.readTo)));
   const initialSince = typeof initial.since === 'number' ? initial.since : 0;
   let showing = typeof initial.showing === 'string' ? initial.showing : '';
-  // A browser copy never passed through the host's normalizer, so a lens an older build stored
-  // as a filter id, as rail state or as the old Warm words joins the query here as well.
+  // Browser state bypasses host normalization. Convert stored lens fields and Warm query terms here.
   const storedRail = migrateStoredRailLens({
     filterId: initial.railFilterId,
     query: typeof initial.railFilter === 'string' ? initial.railFilter : '',
@@ -259,9 +249,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
         sessionPinned: pinnedTop.has(session),
         sessionPersisted: persisted,
       };
-      // A rail card names its section for read state already, so it needs archived spelled
-      // out on its own. A session heading's two sections already say it, and a third key
-      // repeating the same fact would be one more place for the two to disagree.
+      // Session list sections encode read state, so they need a separate archived key.
       if (extra?.menuSection) {
         out.sessionArchived = archived;
       }

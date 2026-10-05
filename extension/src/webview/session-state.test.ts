@@ -147,8 +147,7 @@ test('session context follows adopted archived and pinned state', () => {
 
 test('a heading context merges in the read state a caller already knows', () => {
   const { state } = owner();
-  // Undefined answers nothing markable, so the key drops out rather than forcing the menu
-  // to choose between an entry that toggles nothing and one written as a false claim.
+  // An absent read state omits the key and its menu entries.
   assert.deepEqual(JSON.parse(state.context('s1', true, { sessionRead: undefined })), {
     webviewSection: 'arcSessionLive',
     session: 's1',
@@ -205,8 +204,7 @@ test('the rail row words normalize on load and round-trip through every save', (
   assert.deepEqual(saved?.railQuickFilters, ['input']);
 });
 
-// A build without the Running lens stored `railHeadLenses` and drew a running figure on every
-// rail. Its list loads with Running added and saves back as `railQuickFilters` alone.
+// Loading railHeadLenses adds Running. Saving uses railQuickFilters.
 test('a Quick filters choice stored before the Running lens loads with Running and saves under the new field', () => {
   const all = ['running', 'active', 'unread', 'input'];
   const cases: [unknown, string[]][] = [
@@ -222,13 +220,12 @@ test('a Quick filters choice stored before the Running lens loads with Running a
     assert.deepEqual(saves.at(-1)?.railQuickFilters, loads, JSON.stringify(legacy));
     assert.equal('railHeadLenses' in (saves.at(-1) ?? {}), false, JSON.stringify(legacy));
   }
-  // The new field wins over the legacy one.
+  // railQuickFilters takes precedence over railHeadLenses.
   const { state } = owner({ railQuickFilters: [], railHeadLenses: ['active'] });
   assert.deepEqual(state.initialRail.headLenses, []);
 });
 
-// An empty Quick filters choice is one the reader made, so it stays empty through a load and a
-// save rather than reading as the default.
+// Preserve an explicit empty Quick filters choice through loading and saving.
 test('an empty head lens choice stays empty through a load and a save', () => {
   const { state, saves } = owner({ railQuickFilters: [] });
   assert.deepEqual(state.initialRail.headLenses, []);
@@ -284,10 +281,8 @@ test('junk saved rail-row words fall back to the same defaults as a missing one,
   assert.equal(saved?.railShowRuns, true);
 });
 
-// Browser state bypasses the host normalizer, so it normalizes stored lenses here.
-// Warm words and a stored Active lens become Active words in the query.
-// The retired Needs you id preserves its query. A live `is:running` stays typed text.
-// Saving writes query words without a lens field.
+// Browser state bypasses host normalization. Convert stored lens fields and Warm query terms here.
+// Preserve the needs-you query and typed is:running. Save query terms without a lens field.
 test('a browser copy that names an old lens opens with the lens words in the query and saves them', () => {
   const cases: Array<[Record<string, unknown>, { filter: string; filterId: string }]> = [
     [
@@ -332,8 +327,7 @@ test('a rail context names its own section and spells out archived state directl
       preventDefaultContextMenuItems: true,
     },
   );
-  // A rail card not yet archived or pinned still names both explicitly, since the rail's
-  // three sections carry read state rather than either of them.
+  // Session list contexts name archived and pinned state separately from read state.
   assert.deepEqual(JSON.parse(state.context('s2', false, { menuSection: 'arcRail' })), {
     webviewSection: 'arcRail',
     session: 's2',

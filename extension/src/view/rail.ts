@@ -1,4 +1,4 @@
-// Browser-safe session rail projections.
+// Browser-safe session list projections.
 
 export function createSessionLabelIndex() {
   let source: readonly { id: string; labels?: string[] }[] | undefined;
@@ -39,9 +39,8 @@ import {
   formatRelativeShort,
 } from './time.ts';
 
-// `subagents` is a session whose main agent is idle while its background subagents still run.
-// `background` is a session whose agent is idle while a command it started in the background
-// still runs. The agent resumes by itself when the command ends.
+// The subagents status means the main agent is idle while background subagents run.
+// The background status means a started command still runs. The agent continues when the command ends.
 export type RailStatus =
   | 'background'
   | 'done'
@@ -114,14 +113,9 @@ export function backgroundCommandsHintDetail(count: number): string {
   );
 }
 
-// The time after a running word, with the space that parts the two, or nothing under a minute.
-// A figure the panel clock rewrites carries its own space, so a row drawn under a minute holds
-// no stray space before the time arrives.
+// Fields used to assemble a session list card accessible name.
 export interface RailCardNameParts {
-  // The card's own drawn name, present only where it differs from `label`. `nameBeforeAge`
-  // used to repeat this text so the accessible name could lead with it; it no longer does,
-  // so the wire never carries the name twice, and this function falls back to `label` where
-  // `name` is absent.
+  // The displayed name, when different from label. railCardName falls back to label when name is absent.
   name?: string;
   label: string;
   nameBeforeAge: string;
@@ -130,24 +124,13 @@ export interface RailCardNameParts {
   status: string | null;
   subagents?: number | null;
   commands?: number | null;
-  // What is waiting to be sent, or null once nothing is. `nameBeforeAge` used to carry this
-  // clause itself, which repeated the same handful of phrases across every session sharing an
-  // agent, a status, and an unsent state, so the wire counted the repeats as one string per
-  // card. It arrives on its own field instead, the same field the card's hint reads, and this
-  // function appends it once.
+  // The unsent-input clause, separate from nameBeforeAge. railCardName appends it once, and the card hint reads the same field.
   unsentName?: string | null;
 }
 
-// The card's complete accessible name, composed from the name and the two clauses around it
-// that the payload carries separately.
-//
-// The payload sends the clauses and not the joined string, because the panel owns the two
-// clauses that go between them: the prompt-cache state and how long a running session has
-// run, both of which move with the browser's own clock. A caller holding that clock passes
-// the clauses in, and a caller without one passes neither and reads the same wording.
-//
-// A `subagents` or `background` card draws no time, so its name says none either. Its name
-// ends on the state, which is also a comfortable card's hint title.
+// Compose the accessible name from the card name, metadata and unsent-input clause.
+// The caller supplies cache and running-duration clauses using its clock.
+// Subagents and background statuses omit the age and end with their state explanation.
 export function railCardName(
   card: RailCardNameParts,
   clauses: { running?: string | null; cache?: string | null } = {},
@@ -194,8 +177,7 @@ export function railCacheTitle(cache: RailCacheSpan, now: number): string {
   return `Cache warm for another ${formatCacheSpan(cache.expiresAt - now)}`;
 }
 
-// The fixed window the Active lens reads. One hour, chosen so the lens holds a session a
-// reader might still be thinking about even after its own cache runs out.
+// The Active lens includes activity from the last hour, independently of cache lifetime.
 export const ACTIVE_WINDOW_MS = 60 * 60 * 1000;
 
 // The parts of a card the Active lens reads: when the session last recorded activity, and how
@@ -218,9 +200,7 @@ export interface RailLensCard extends RailActiveCard {
   runByAgent?: boolean;
 }
 
-// Whether a card holds the Active lens, which is what the lens's words keep. The lens drops a
-// session the reader archived and one an agent runs, what `-is:archived -is:agentrun` drops,
-// because neither is work the reader can pick up.
+// The Active lens excludes archived sessions and agent runs, matching its -is:archived and -is:agentrun terms.
 export function railLensHolds(card: RailLensCard, now: number): boolean {
   return !card.archived && !card.runByAgent && railCardActive(card, now);
 }
@@ -251,14 +231,9 @@ export interface RailDrawnRow<Card> {
 // each press adds.
 export const RAIL_ROW_STEP = 200;
 
-// How many of a section's `count` cards a draw puts on screen after `steps` presses of its
-// Show more press.
-//
-// Pinned draws every card. The reader pinned each one, so a pin made while Pinned holds more
-// than a step would otherwise land under the press. A section also draws at least through
-// `current`, the index of the current session's card in it, or the session the reader is
-// looking at has no row until enough presses reach it. That reach is rounded up to a whole
-// step, so the answer is always a whole number of steps and a press adds exactly one.
+// Return the row count after Show more presses. Pinned always draws every row.
+// Other sections extend through the current session, rounding its position up to a full step.
+// Limit the result to the available card count.
 export function railRowsDrawn(
   section: string,
   steps: number,
@@ -273,13 +248,9 @@ export function railRowsDrawn(
   return Math.min(count, Math.max(steps + 1, reach) * step);
 }
 
-// The rows a draw puts on screen, in the order it draws them, and per section the number of
-// cards it left undrawn.
-//
-// A shut heading draws no row under it, so its cards are left out here and it leaves none.
-// `drawn` answers how many of a section's cards go on screen, and the rest wait under that
-// section's Show more press. The draw builds its rows from this list and the clock reads the
-// same list back, which is what keeps a card nobody can see from asking for a repaint.
+// Return drawn rows in section order and the remaining card count for each open section.
+// Folded sections contribute no rows or remaining counts. Show more holds the rows beyond the drawn limit.
+// The renderer and clock share this list, excluding hidden rows from tick work.
 export function railDrawnRows<Card extends RailTickCard & { id: string }>(
   sections: readonly { id: string; cards: readonly Card[] }[],
   folded: Readonly<Record<string, boolean>>,
@@ -306,28 +277,19 @@ export function railDrawnRows<Card extends RailTickCard & { id: string }>(
   return { rows, left };
 }
 
-// The element id a row answers to.
-//
-// A session drawn once takes its own id. A session that a second saved view or a second group
-// also holds draws a second row. Every repeated row names its section to keep element ids unique.
-//
-// Which row is first is the order the sections are drawn in, which `railSections` settles. It
-// does not move while a session stays in the same sections.
+// Build a session row element id. Repeated rows include their section to keep ids distinct.
+// The first occurrence uses the plain session id, according to railSections order.
 export function railRowId(section: string, id: string, repeat: boolean): string {
   return repeat ? `railrow-${safeIdPart(section)}__${safeIdPart(id)}` : `railrow-${safeIdPart(id)}`;
 }
 
-// The key a row's element reconciles under: the session and the section, for every row. A row
-// that moves to another section, by a regroup or a pin, is a new element, so the focus, the
-// open label editor and the hover state of one section's row never pass to another's. The
-// focus follows the session through `focusAfterList`, which looks in the old section first.
+// Key each row by session and section. Moving sections creates a new element without the old editor or hover state.
+// focusAfterList restores session focus, looking in the old section first.
 export function railRowKey(section: string, id: string): string {
   return `${id}:${section}`;
 }
 
-// A piece of an element id that no two values share. `encodeURIComponent` already gives each
-// value its own spelling. Its `_` is escaped as well, so after every `%` turns into `_` an
-// underscore only ever opens an escape, and `__` only ever joins a section to a session.
+// Encode an element id part without collisions. Escape underscores before replacing percent signs, reserving double underscores for the section/session separator.
 function safeIdPart(value: string): string {
   return encodeURIComponent(value).replace(/_/g, '%5F').replace(/%/g, '_');
 }
@@ -364,16 +326,8 @@ function tickRunningWord(card: RailTickCard, now: number): string | null {
   return card.status === 'running' && card.runningSince !== null ? railRunningWord(card.runningSince, now) : null;
 }
 
-// What a clock tick owes the rows the rail has drawn.
-//
-// The rows are the ones a draw put on screen, so a card under a folded heading is not in the
-// list and cannot ask for a repaint of a row nobody can see. Every comparison is between the
-// wording a time yields now and the wording the drawn time yielded, which is what those rows
-// carry, so the answer needs no reading of the page.
-//
-// A cache tooltip is the one piece of wording a redraw is too much for. It lives inside a
-// decorative mark, it changes every minute, and the row around it says nothing new, so it
-// travels back as a text to write into the row that already holds it.
+// Compare drawn rows with their wording at the new clock time. Folded rows are absent from the input.
+// Return changed cache tooltip text separately so the existing row can receive it without a redraw.
 export function railTickWork(
   rows: readonly RailTickRow[],
   drawnAt: number,
@@ -456,14 +410,8 @@ export function sessionCount(turns: number): string {
   return `${turns} turn${turns === 1 ? '' : 's'}`;
 }
 
-// The three figures a rail card draws, in the order it draws them: cost leads, the
-// whole-session turn count follows, and current context closes the line. A figure the
-// session has no record for takes no place.
-//
-// The heading over a session draws more metrics than these, and it draws them in an order
-// of its own, so the heading's record is the one that crosses the wire and this is the
-// projection the rail takes from it. The card names its own figures for a reader who cannot
-// see them, so the host runs this over the same record while it words those names.
+// Session list figures appear in cost, whole-session turns and current-context order. Omit unavailable figures.
+// The host and browser project these figures from the session heading data, including their accessible wording.
 export const RAIL_STAT_METRICS = ['cost', 'turns', 'context'] as const;
 
 export function railStatChips<Chip extends { metric: string }>(chips: readonly Chip[]): Chip[] {
@@ -473,9 +421,8 @@ export function railStatChips<Chip extends { metric: string }>(chips: readonly C
   });
 }
 
-// Live and failed states use the rail's single status slot; unsent input takes the time slot.
-// A `subagents` session draws its open child count in the running word's place, with no time.
-// A `background` session draws its command count there in the same way.
+// Live and failed states use the status slot. Unsent input uses the time slot.
+// Subagents and background statuses show their counts in place of running, without an age.
 export function railTimeSlot(
   status: RailStatus | null,
   unsent: boolean = false,
@@ -503,10 +450,7 @@ export function railTimeSlot(
 export const RAIL_BUCKETS = ['top', 'today', 'yesterday', 'week', 'older', 'agent', 'archived'] as const;
 export type RailBucket = (typeof RAIL_BUCKETS)[number];
 
-// What each time bucket's fold is saved under. The bucket id names the run of cards and this
-// names the reader's choice about it, and the two are different strings because the saved key
-// outlives the code that wrote it. One module answers what a fold is called, so the browser
-// and the grouping below cannot disagree about which key a heading writes.
+// Saved fold keys for time buckets. Keep these keys independent of bucket ids because saved panel state retains them.
 export const RAIL_FOLDS: Record<RailBucket, string> = {
   top: 'railpinned',
   today: 'railtoday',
@@ -595,13 +539,7 @@ export function railBuckets<T extends RailBucketCard>(
   return { buckets, olderFolded, agentFolded };
 }
 
-// What a view's section writes its fold under. The view's own id follows it, so a view and a
-// time bucket can never take one another's fold, and a stored fold outlives the name the
-// reader gave the view.
-// What a fold key is. A time bucket writes the name in `RAIL_FOLDS`. A saved view and a group
-// heading each write a key under this one prefix instead, so a view or a group called `today`
-// cannot take the Today bucket's fold. Each grouping writes its own second word after it, so a
-// label group and an agent group never share a fold.
+// Saved views and groups use this fold-key prefix. Their keys remain distinct from time-bucket keys and from other grouping types.
 export const RAIL_GROUP_FOLD_PREFIX = 'railgroup:';
 
 export const VIEW_FOLD_PREFIX = `${RAIL_GROUP_FOLD_PREFIX}view:`;
@@ -630,21 +568,13 @@ export interface RailSectionCard extends RailBucketCard {
   // How long this session's prompt cache has left, which the Active lens reads against the
   // clock the caller passes in.
   cache?: RailCacheSpan | null;
-  // Whether an agent runs this session, apart from `agentRun` above, which archiving can
-  // turn off for the same card. `railCounts` and `is:warm` read this one, so neither ever
-  // counts a cache only an agent is spending, archived or not.
+  // Agent-run identity remains true when archiving clears agentRun presentation. Counts and cache matching use this identity.
   runByAgent?: boolean;
 }
 
-// The figures the rail head row's counts and the View menu's Filter row draw. The caller passes
-// only the archived and agent-run buckets' shown state, so a hidden bucket's sessions fall out of every figure the same
-// switch that empties them from the list.
-//
-// `active` and `expiring` are the Active count's figures. Each unpressed lens figure equals what
-// its press would leave on screen, because `railHeadCounts` counts it inside the rest of the query
-// that its own press produces. The pressed lens's figure counts what its lens keeps now, and its
-// press clears the lens. `unread` and `input` count over what is unread or waiting now, so either
-// can read smaller than the list its lens keeps.
+// Figures for session list filter buttons and the View menu. Hidden buckets do not contribute.
+// railHeadCounts applies the remaining query terms after a lens press.
+// Unread and Needs input count current matches, while their displayed lists also retain sessions the reader has read or answered.
 export interface RailCounts {
   // How many cards hold the Running lens: not archived, not run by an agent, and in the
   // running, subagents or background state.
@@ -669,10 +599,7 @@ export interface RailCountsOptions {
   showRuns: boolean;
 }
 
-// Both buckets on, which is what the reader gets before they touch the View menu's `Show`
-// section. The rail passes its own saved pair to the list and to the counts together, so a
-// bucket that is off is out of both at once and a figure can never report a session the list
-// leaves out.
+// Both Show buckets default on. The list and counts use the same saved visibility settings.
 export const RAIL_SHOWN_BUCKETS: RailCountsOptions = { showArchived: true, showRuns: true };
 
 // What the Active figures count inside. `inQuery` keeps the cards the rail's query keeps,
@@ -681,15 +608,9 @@ export interface RailCountScope {
   inQuery?: (card: RailSectionCard) => boolean;
 }
 
-// `running` is what `is:running` matches, which folds the `subagents` and `background` states
-// in with `running` because the grammar has one term for all three, and only over the cards
-// `inQuery` keeps.
-// `active` is what `railLensHolds` keeps, read against the clock the caller passes in, and only
-// over the cards `inQuery` keeps.
-//
-// The counting loop stays a loop rather than a `matchSessions` call, because a `matchSessions`
-// pass allocates a filtered array and this runs on every render. `rail.test.ts` ties each
-// condition to the lens that reads it so the loop cannot drift from it.
+// Count lens matches within inQuery and the shown buckets. Running includes running, subagents and background statuses.
+// Active uses the supplied clock.
+// Count in one loop without allocating a filtered matchSessions array on every render.
 export function railCounts(
   cards: readonly RailSectionCard[],
   { showArchived, showRuns }: RailCountsOptions,
@@ -709,8 +630,7 @@ export function railCounts(
     if (card.agentRun && !showRuns) {
       continue;
     }
-    // A card an agent runs, or a card the reader archived, never adds to any figure, whether or
-    // not the Show switches draw it, because every lens's words drop both.
+    // All lenses exclude agent runs and archived sessions, even when Show settings draw them.
     if (card.runByAgent || card.archived || !inQuery(card)) {
       continue;
     }
@@ -736,12 +656,7 @@ export function railCounts(
   return { running, warm, expiring, active, unread, input };
 }
 
-// Whether a query asks about either fact this module answers against its own clock: a prompt
-// cache's remaining span, or a session's recency window, which `is:active` and `is:needsyou`
-// both read. A card carries the moment either one
-// runs out or falls outside the window, not a flag, so the rail stamps `cacheWarm` and
-// `active` on its cards only when a query it is about to run reads one of them. Every other
-// draw hands the matcher the cards it already holds.
+// Identify queries that read cache warmth or Active recency. Stamp these clock-derived fields only when the query requires them.
 export function railQueryReadsCache(query: string): boolean {
   return parseSessionQuery(query).terms.some(
     (term) =>
@@ -749,8 +664,7 @@ export function railQueryReadsCache(query: string): boolean {
   );
 }
 
-// A card with the two clock facts the query grammar reads stamped on it: whether its prompt
-// cache is still warm, and whether it sits inside the Active window, both at `at`.
+// Card fields for cache warmth and Active recency at the supplied clock time.
 export type RailClockCard<Card> = Card & { cacheWarm?: boolean; active?: boolean };
 
 export function railClockCards<Card extends RailActiveCard>(cards: readonly Card[], at: number): RailClockCard<Card>[] {
@@ -773,8 +687,8 @@ export interface RailKept {
 }
 
 // Match the live query before sections claim sessions.
-// Unread and Needs input retain previously matching sessions that still satisfy the other query terms.
-// Archived sessions and agent runs leave retention. A different query starts retention again.
+// Unread and Needs input retain matching sessions while the query remains unchanged and its other terms still match.
+// Archived sessions and agent runs leave retention. A changed query clears retention.
 // Stamp clock facts when the query or a saved view reads them.
 export function railShownCards<Card extends RailSectionCard>(
   cards: readonly Card[],
@@ -884,10 +798,8 @@ export interface RailCountButton {
   control: string;
   label: string;
   figure: string;
-  // The Active count's bolt: nearly gone while any session it counts has a cache about to go,
-  // else warm while any has a warm cache, else absent. `cacheDetail` says the same in words, as
-  // the name's last clause and the hint's detail. Both are null on the other counts, because a
-  // cache is a fact about recent work only.
+  // The Active count shows an expiring cache before a warm cache, or no indication when neither exists.
+  // cacheDetail names the same state. Both fields are null for other lens counts.
   cacheState: RailCacheState | null;
   cacheDetail: string | null;
   pressed: boolean;
@@ -895,9 +807,7 @@ export interface RailCountButton {
   hint: string;
 }
 
-// Whether the rail rests on what one count sets: the query holds that lens's words whole, and no
-// other lens whole, whatever wrote them. A count press, a saved filter, a restored panel and a
-// reader who typed the words all press it, and a reader who deletes one of the words unpresses it.
+// A count is pressed when the query contains its complete lens and no other complete lens, regardless of query source.
 export function railCountPressed(kind: RailCountKind, lens: RailHeadLens): boolean {
   return railQueryHeldLens(lens.query) === kind;
 }
@@ -949,8 +859,7 @@ export function railCountButtons(
   );
 }
 
-// One checkbox of the View menu's Quick filters line, which chooses the lenses whose counts may
-// draw on the rail head.
+// One Quick filters checkbox selecting whether its lens count appears on the session list header.
 export interface RailHeadLensBox {
   lens: RailLens;
   control: string;
@@ -958,8 +867,7 @@ export interface RailHeadLensBox {
   checked: boolean;
 }
 
-// The Quick filters checkboxes in `RAIL_LENSES` order, worded here so a Node test reads the
-// names and ticks the menu draws.
+// Quick filters checkbox names and checked states in RAIL_LENSES order.
 export function railHeadLensBoxes(
   headLenses: readonly RailLens[],
   labels: Readonly<Record<RailLens, string>>,
@@ -1053,17 +961,12 @@ export function sortRailCards<T extends RailSectionCard>(cards: readonly T[], so
   });
 }
 
-// Whether a card sits in a bucket the reader shows. The View menu's two Show switches each take
-// one bucket off the rail, and everything that reads the rail's sessions asks this one question,
-// so a hidden session leaves the list, the figures and the label chips together.
+// Apply the two Show settings to bucket visibility. The list, counts and label chips share this rule.
 export function railCardShown(card: RailBucketCard, { showArchived, showRuns }: RailCountsOptions): boolean {
   return (showArchived || !card.archived) && (showRuns || !card.agentRun);
 }
 
-// The View menu's label chips with the hidden buckets taken out of each count. The catalogue
-// counts every session carrying a label, and a session the Show switches hide is taken off each
-// label it carries, so a chip never counts a session its press could not draw. A label no shown
-// session carries keeps its chip at zero, because a pressed chip is the way to unpress it.
+// Subtract hidden sessions from each label count. Keep zero-count labels available so a selected label can still be cleared.
 export function railShownLabelCounts<Label extends { name: string; count: number; countName: string }>(
   labels: readonly Label[],
   cards: readonly RailSectionCard[],
@@ -1129,24 +1032,11 @@ export interface RailGrouping {
   groupBy?: RailGroupBy;
 }
 
-// The rail's sections, in the order the reader meets them: Pinned, then one per saved view, then
-// the groups over everything no view claimed, then Run by agents, then Archived.
-//
-// A view is a group of its own. It answers its query over every session the reader has not
-// archived. Pinned holds its own copy first, so a pinned session that matches also appears in
-// the view. Archived stays outside unless the view says it keeps archived sessions.
-//
-// A session two views match appears under both. Each view answers for itself, and a rule
-// that gave the first view the card would make a section's contents depend on the order the
-// reader happened to save its neighbours in.
-//
-// A view whose query matches nothing keeps its heading, folded, saying nothing is under it. The
-// heading is where the reader renames and deletes the view, so a section that vanished would
-// take the view out of reach the moment its query went stale.
-//
-// Under Group by Label, Agent or Status a pinned session sits under Pinned and again under its
-// group, the way a saved view holds a pinned match. Under Time and None it sits under Pinned
-// only. A session carrying two labels sits under both. The caller filters cards before assigning sections.
+// Build sections in Pinned, saved-view, unclaimed-group, Run by agents and Archived order.
+// Views match independently, so a session can appear in several views and in Pinned.
+// A view includes archived sessions only when its archived option permits them. Empty views retain their headings and start folded.
+// Label, Agent and Status groups repeat pinned sessions. Time and None do not repeat them. Multiple labels create multiple group memberships.
+// The caller applies the live query before section assignment.
 export function railSections<T extends RailSectionCard>(
   cards: T[],
   now: number,
@@ -1161,10 +1051,7 @@ export function railSections<T extends RailSectionCard>(
     folded[id] = shut;
     sections.push(section(id, label, held, railSort));
   };
-  // A bucket the reader turned off takes its sessions out of everything below: the pinned
-  // run, the saved views and the groups. A view that keeps
-  // archived sessions therefore keeps none while the Archived bucket is off, because the
-  // reader asked not to see them at all.
+  // Hidden buckets leave Pinned, saved views and groups. Hiding Archived also excludes those sessions from views that include archived sessions.
   const drawn = shown.showArchived && shown.showRuns ? cards : cards.filter((card) => railCardShown(card, shown));
   const pinned = drawn.filter((card) => card.pinnedTop && !card.archived);
   const archived = drawn.filter((card) => card.archived);
@@ -1200,8 +1087,7 @@ export function railSections<T extends RailSectionCard>(
       );
     }
   } else {
-    // Run by agents stays a bucket of its own under every grouping, and a pinned session an
-    // agent runs sits under Pinned only, as it does under time grouping.
+    // Run by agents keeps a separate bucket in each grouping. Pinned agent-run sessions remain under Pinned only.
     const runs = loose.filter((card) => card.agentRun);
     // A pinned copy keeps its own place in the rail's order rather than leading its group.
     const members = active.filter(
@@ -1290,9 +1176,7 @@ function railGroups<T extends RailSectionCard>(
   }
 }
 
-// The `Rows` row's values. A third, denser level is one more word here and one more block of
-// CSS rules. Every table keyed by `RailDensity` then fails the typecheck until it names the
-// new level, so its menu words and its age cannot be left out.
+// Supported Rows values. Tables keyed by RailDensity must supply every value, including its menu name and age formatter.
 export const RAIL_DENSITIES = ['comfortable', 'compact'] as const;
 export type RailDensity = (typeof RAIL_DENSITIES)[number];
 
@@ -1315,20 +1199,10 @@ export function railAgeFormat(density: RailDensity): (at: number, now: number) =
 // Whether a row leaves the agent word, the figures and the labels out of its drawing.
 const RAIL_DENSITY_DROPS: Record<RailDensity, boolean> = { comfortable: false, compact: true };
 
-// A card's hover. A `subagents` or `background` card explains its state in every density,
-// because neither word alone says that the agent is idle and takes a prompt now. A row that
-// drops the agent word, the figures and the labels shows them in its hover instead, drawn as a
-// card under the session's name: `body` names that card, and `hint` is the name. A comfortable
-// card in any other state has no hover.
-//
-// The accessible name always carries the agent word, the figures, the labels and a `subagents`
-// or `background` card's state word, in both densities. `detail` is the plain hover's second
-// line, in the words the accessible name uses. The card replaces it on screen, and it stays
-// what a screen reader reaches through `aria-describedby` where no `description` is set.
-// `description` is what a screen reader reads instead. It drops what `detail` says only because
-// the name already says it. That is the dropped words in a compact card with no state, and the
-// dropped words' line in a compact `subagents` or `background` card. That card's state
-// explanation is not in the name, so it stays in the description.
+// Full rows show state hints for subagents and background commands. Other full rows have no hint.
+// Compact rows show a hover card named for the session, including their hidden metadata.
+// Accessible descriptions omit metadata already present in the accessible name. They retain the state explanation.
+// description overrides detail for screen readers. Without description, detail supplies the linked description.
 export function railCardHint(
   card: { name?: string; label: string; agentWord: string; nameAfterAge: string },
   density: RailDensity,
@@ -1386,10 +1260,8 @@ export interface RailHoverPart {
   className?: string;
   // The instant behind an `age` part, which the panel clock rewords.
   at?: number;
-  // The instant a running `state` part's duration counts from, the words that lead the
-  // duration, and the duration as `runningFor` words it, empty in the first minute. The lead
-  // and the duration end `text` together, and the panel clock rewrites them alone, so `for`
-  // shows only beside a duration.
+  // Running-state start time, duration prefix and formatted duration. The clock updates the prefix and duration together.
+  // The first minute has no duration or prefix.
   runningSince?: number;
   lead?: string;
   duration?: string;
@@ -1405,14 +1277,10 @@ export interface RailHoverLines {
 // How many labels the hover card draws before it folds the rest into one `+N more` chip.
 export const RAIL_HOVER_LABELS = 8;
 
-// The words of the card a compact rail row opens on hover: the session's name, a meta line, a
-// `subagents` or `background` card's explanation, and the labels. The meta line holds the
-// agent, the agent-run word where it differs, the state word, the unsent word and the long
-// age. A running card with a recorded start shows `running`, adds its duration after the
-// first minute, and shows no age. A running card with no recorded start shows `running` and
-// the age. A `subagents` or `background` card shows no age. The card draws the rail's own
-// figure line beside these words. The age is worded against `now`, never the host's
-// `relative`, which is fixed when the host builds the card.
+// Compact hover cards show the name, metadata, state explanation and labels beside the shared session figures.
+// Metadata includes the agent, agent-run label, status, unsent-input label and age.
+// Running sessions with a start time replace age with duration after the first minute. Those without a start retain age.
+// Subagents and background statuses omit age. Format ages using now because the host-supplied relative text has a fixed clock.
 export function railHoverLines(card: RailHoverCard, now: number, words: RailHoverWords): RailHoverLines {
   const meta: RailHoverPart[] = [{ kind: 'agent', text: card.agent }];
   if (card.agentWord && card.agentWord !== card.agent) {
@@ -1432,8 +1300,7 @@ export function railHoverLines(card: RailHoverCard, now: number, words: RailHove
     if (since === null) {
       meta.push({ kind: 'state', text: 'running', className });
     } else {
-      // The mark is set in the first minute too, so a card open when the minute passes gains
-      // its duration from the clock with no host update.
+      // Keep the running start time during the first minute so the clock can add a duration without a host update.
       const lead = ` ${words.hoverFor}`;
       const duration = runningFor(since, now);
       meta.push({
@@ -1479,8 +1346,7 @@ export function normalizeRailGroupBy(raw: unknown): RailGroupBy {
   return (RAIL_GROUP_BY as readonly unknown[]).includes(raw) ? (raw as RailGroupBy) : 'time';
 }
 
-// The `Show` section's two rows. Both default on, so a panel saved before this build opens
-// with every bucket it drew before: only a stored `false` turns one off.
+// Both Show settings default on. Only an explicit false hides a bucket.
 export function normalizeRailShowArchived(raw: unknown): boolean {
   return raw !== false;
 }
@@ -1493,13 +1359,9 @@ export function normalizeRailShowRuns(raw: unknown): boolean {
 // filters line, and again after Forget State. Unread waits for the reader to tick it.
 export const DEFAULT_RAIL_QUICK_FILTERS: readonly RailLens[] = ['running', 'active', 'input'];
 
-// The lenses whose counts may draw on the rail head, from the View menu's Quick filters line.
-// `raw` is the stored `railQuickFilters` field, and an empty array there is a choice the reader
-// made and stays empty. `legacy` is the `railHeadLenses` field a build without the Running lens
-// stored, read only while `railQuickFilters` is absent. That build drew a running figure on
-// every rail, so its list reads with Running added, and an upgrade never takes away a figure the
-// reader saw before. A panel that stored neither draws `DEFAULT_RAIL_QUICK_FILTERS`. Unknown values leave, and the
-// rest read in `RAIL_LENSES` order.
+// Normalize the saved railQuickFilters list, preserving an explicit empty choice.
+// When absent, import legacy railHeadLenses with Running added. With neither list, use DEFAULT_RAIL_QUICK_FILTERS.
+// Discard unknown values and return selections in RAIL_LENSES order.
 export function normalizeRailQuickFilters(raw: unknown, legacy?: unknown): RailLens[] {
   if (Array.isArray(raw)) {
     return RAIL_LENSES.filter((lens) => raw.includes(lens));

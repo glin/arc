@@ -1,4 +1,4 @@
-// Measure a frozen corpus in a unique disposable editor and isolated build.
+// Measure a frozen corpus in an isolated editor profile and build.
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -94,9 +94,7 @@ interface LogLine {
   };
 }
 
-// What one milestone line carries. `elapsedMs` counts from the extension host process and
-// `panelElapsedMs` counts from the moment the panel opened. The two answer different
-// questions, so they stay in separate columns.
+// Keep host elapsed time and panel elapsed time in separate columns.
 interface Elapsed {
   hostMs: number | null;
   panelMs: number | null;
@@ -158,7 +156,7 @@ function readOptions(argv: string[]): Options {
   return options;
 }
 
-// The editor's command line, which both installs the build and opens the measured window.
+// Find the editor CLI used to install the build and open the measured window.
 function editorCommandLine(): string {
   const named = process.env.ARC_MEASURE_EDITOR;
   for (const root of named ? [named] : editorRoots()) {
@@ -191,9 +189,7 @@ function editorRoots(): string[] {
   return ['/usr/share/code', '/opt/visual-studio-code'];
 }
 
-// Windows refuses to start a `.cmd` file without a shell, and a shell splits an argument on
-// its spaces, so every argument of one carries its own quotes. Both the editor command line
-// and npm arrive as `.cmd` files, and the path of each holds a space.
+// Windows launches .cmd files through a shell. Quote arguments containing whitespace or shell metacharacters.
 function quoted(argument: string): string {
   return /[\s&|<>^"]/.test(argument) ? `"${argument}"` : argument;
 }
@@ -230,7 +226,7 @@ function git(args: string[]): string {
   return result.stdout.trim();
 }
 
-// Every revision builds in its own checkout with linked dependencies.
+// Build the selected revision in its own checkout with linked dependencies.
 function prepareTree(commit: string): string {
   fs.mkdirSync(path.dirname(BUILD_TREE), { recursive: true });
   git(['worktree', 'add', '--detach', BUILD_TREE, commit]);
@@ -411,7 +407,7 @@ function loadFixture(manifest: string): void {
   );
 }
 
-// The overlay records the visible card and accepted paint on the existing message route.
+// Add selected-card observations and paint acceptance to startup diagnostics.
 export function instrumentStartup(tree: string): void {
   const patch = (relative: string, needle: string, replacement: string) => {
     const file = path.join(tree, 'extension', 'src', relative);
@@ -456,7 +452,7 @@ export function instrumentStartup(tree: string): void {
   );
 }
 
-// Older baselines receive the same measurement-only launch block and state seed.
+// Add the measurement launch block and state seed when a selected baseline lacks them.
 export function protectBaseline(tree: string): void {
   const edit = (name: string, needle: string, replacement: string) => {
     const file = path.join(tree, 'extension', 'src', name);
@@ -523,10 +519,7 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-// Every line the run has written so far, read once. Each file keeps the byte it was read to
-// and the bytes after its last newline, so a tick reads only what arrived since the last
-// one. A file the editor is still appending to ends in a partial line, and that line waits
-// for the read that finds the rest of it.
+// Read appended bytes once per file. Retain each offset and incomplete trailing line for the next read.
 class LogReader {
   private readonly offsets = new Map<string, number>();
   private readonly tails = new Map<string, Buffer>();
@@ -572,8 +565,7 @@ class LogReader {
       }
     }
     this.offsets.set(file, offset + read);
-    // Split on the byte, not the decoded text. A character of several bytes can straddle two
-    // reads, and 0x0A never appears inside one of them.
+    // Split bytes at newline before decoding. This preserves UTF-8 characters spanning reads.
     const pending = Buffer.concat([this.tails.get(file) ?? Buffer.alloc(0), buffer.subarray(0, read)]);
     const end = pending.lastIndexOf(0x0a);
     this.tails.set(file, end < 0 ? pending : pending.subarray(end + 1));
@@ -587,16 +579,14 @@ class LogReader {
       try {
         this.lines.push(JSON.parse(text) as LogLine);
       } catch {
-        // A line this script does not read.
+        // Ignore a line that does not parse as JSON.
       }
     }
   }
 }
 
-// The extension host that produced the measured run. Every line carries the identity of the
-// host that wrote it, and a host that restarts writes a second one, so the numbers come from
-// one identity and the report names it. The host that reached the awaited milestone wins, and
-// the one that recorded the most milestones stands in when none did.
+// Select the first host instance to report completeRender for this run.
+// Otherwise, select the instance with the most startup lines.
 export function measuredInstance(lines: LogLine[], measurementRun: string): string | null {
   const counts = new Map<string, number>();
   const finished: string[] = [];
@@ -644,7 +634,7 @@ function reached(lines: LogLine[], milestone: string): boolean {
   return lines.some((line) => line.event === 'startup' && line.milestone === milestone);
 }
 
-// Every startup milestone must arrive before the measurement deadline.
+// Require every startup milestone by the measurement deadline.
 export function outcomeOf(
   lines: LogLine[],
   instance: string | null,
@@ -691,16 +681,12 @@ export function outcomeOf(
   };
 }
 
-// What the editor reports while it starts. An editor that exits before the run ends is a
-// failure, and the command line that opens the window is not: it hands the window on and
-// exits at once, which is a zero exit code.
+// Editor launch failure state. A successful CLI exit leaves the measured window running.
 interface Launch {
   failure: string | null;
 }
 
-// The measured window, started the same way a reader starts one. The application binary opens
-// nothing when a script starts it directly, so the run goes through the command line, which
-// returns as soon as the window is on its way.
+// Launches an isolated editor window through its CLI and releases the launcher process.
 function launchEditor(commandLine: string, workspace: string): Launch {
   const launch: Launch = { failure: null };
   const shell = process.platform === 'win32';
@@ -754,9 +740,7 @@ function launchEditor(commandLine: string, workspace: string): Launch {
   return launch;
 }
 
-// The window the run opened is nobody's child, because the command line handed it on and
-// exited. Every process of the run carries the throwaway profile on its command line, and
-// that is what tells them apart from the editor the reader is working in.
+// Identify the run's editor processes by their isolated profile path before stopping them.
 function stopEditor(): void {
   if (process.platform === 'win32') {
     const escaped = USER_DATA.replaceAll("'", "''");
@@ -815,7 +799,8 @@ export async function pollStartup(
   }
 }
 
-// The panel acknowledges completion after discovery and session-list metadata settle.
+// Wait for every startup milestone by the measurement deadline.
+// Selection runs also measure session switching. Editor failure or timeout ends an incomplete run.
 async function measure(commandLine: string, workspace: string, timeoutMs: number): Promise<Outcome> {
   const { acquireBrowserLock } = await import('../../test/browserlock.mjs');
   const lock = await acquireBrowserLock({ deadlineMs: timeoutMs });
@@ -842,8 +827,7 @@ interface SessionCount {
   total: number;
 }
 
-// The folder plus every registered worktree of its repository, which is the scope the rail
-// lists sessions over.
+// Include the workspace folder and its repository's registered worktrees.
 function repositoryRoots(workspace: string): string[] {
   const result = spawnSync('git', ['-C', workspace, 'worktree', 'list', '--porcelain', '-z'], { encoding: 'utf8' });
   const found = new Map<string, string>();
@@ -856,9 +840,7 @@ function repositoryRoots(workspace: string): string[] {
   return [...found.values()];
 }
 
-// The rail's own count, taken from the production listing. The rail scopes sessions to the
-// folder and every worktree of its repository, keeps the Claude sessions that carry a human
-// prompt, and adds the Claude child sessions to the Codex ones.
+// Count Claude sessions with human prompts, discovered Claude children, and Codex sessions across repository roots.
 function sessionCount(workspace: string): SessionCount {
   const roots = repositoryRoots(workspace);
   const parents = sessionFilesFor(projectsRoot(), roots, undefined, [workspace]);

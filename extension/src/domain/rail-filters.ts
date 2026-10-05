@@ -32,10 +32,8 @@ export const RESERVED_RAIL_FILTER_NAMES = [
 ] as const;
 const RESERVED_RAIL_FILTER_KEYS = new Set(RESERVED_RAIL_FILTER_NAMES.map((name) => railFilterKey(name)));
 
-// The lenses the View menu's Filter row sets and the rail head's counts press: Running, Active,
-// the recency lens, Unread, and Needs input. A press writes the lens's words into the query, the same
-// words a reader could type, and the lens reads set while the query holds them. A `needs-you`
-// lens an older build stored reads as no lens.
+// Quick filters and the View menu use these four session list lenses.
+// Each lens writes query terms that the reader can also type.
 export type RailLens = 'running' | 'active' | 'unread' | 'input';
 export const RAIL_LENSES: readonly RailLens[] = ['running', 'active', 'unread', 'input'];
 
@@ -104,9 +102,7 @@ export function railFilterQuery(raw: unknown): string {
   return boundedRailFilterQuery(raw).trim();
 }
 
-// The name a saved filter takes when its stored name is one the rail now uses for itself, such
-// as a filter the reader named Active before Active was a lens. The filter keeps its query
-// under a name no built-in and no other saved filter holds.
+// Gives a reserved saved-filter name a suffix that no existing name uses.
 function unreservedRailFilterName(name: string, taken: ReadonlySet<string>): string {
   for (let n = 1; ; n++) {
     const candidate = railFilterName(n === 1 ? `${name} (saved)` : `${name} (saved ${n})`);
@@ -310,13 +306,8 @@ function withRailLensWords(query: string, lens: RailLens): string {
   return [...words, query.trim()].filter(Boolean).join(' ');
 }
 
-// The query with the lens's words, or with none. No lens takes out the words of every lens the
-// query holds whole, two or more included, so All returns the rail to every session. The rail
-// holds at most one lens, so the lens asked for adds the words the query lacks, then takes out
-// each word of another lens that the result holds whole. The lenses share
-// `-is:archived -is:agentrun`, so a typed `is:unread` beside the Needs input words would complete
-// the Unread lens, and it leaves. A word the lens asked for also writes stays where the reader
-// put it, and every other word stays.
+// Adds the selected lens terms and removes completed competing lenses.
+// Shared terms and unrelated query words remain. A null lens removes every completed lens.
 export function withRailLens(query: string, lens: RailLens | null): string {
   if (lens === null) {
     return withoutWords(query, new Set(railQueryLenses(query).flatMap((held) => railLensKeys(held))));

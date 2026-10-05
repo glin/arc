@@ -1,4 +1,4 @@
-// extension/src/store.test.ts
+// Snapshot store and workspace cache behavior.
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -91,7 +91,7 @@ test('sweepOldSessions drops a session past the age cut and keeps one inside it'
   assert.ok(fs.existsSync(path.join(root, 'recent')));
   assert.deepEqual(sweepOldSessions(root, 0, Date.now()), []); // disabled
 
-  // The caller passes a root and nothing else, so the default has to be the real cut.
+  // The default sweep uses SNAPSHOT_KEEP_DAYS.
   const byDefault = tempDir('arc-');
   makeAgedSession(byDefault, 'past', SNAPSHOT_KEEP_DAYS + 10, false);
   makeAgedSession(byDefault, 'inside', SNAPSHOT_KEEP_DAYS - 10, false);
@@ -99,9 +99,8 @@ test('sweepOldSessions drops a session past the age cut and keeps one inside it'
 });
 
 test('age alone ends a session, because nothing marks its files kept or reverted any more', () => {
-  // Nothing ever marks a file as dealt with, so a session whose files still differ has no
-  // other way to end. Holding one for as long as any file differs keeps it until its
-  // transcript expires, and the store then only grows.
+  // Age expiry removes a session even when its live files still differ from the snapshots.
+
   const root = tempDir('arc-');
   makeAgedSession(root, 'old-and-differing', 30, true);
   makeAgedSession(root, 'recent-and-differing', 1, true);
@@ -154,23 +153,23 @@ test('fileDiffersOnDisk: size short-circuit, equal-size compare, deleted and mis
     return f;
   };
 
-  // different sizes -> differs (resolved by stat alone)
+  // Different sizes establish a difference without reading file contents.
   assert.equal(fileDiffersOnDisk({ path: p('l1', 'longer'), snapshot: p('s1', 'x'), isNew: false }), true);
-  // same size, different content -> differs
+  // Equal sizes still require a content comparison.
   assert.equal(fileDiffersOnDisk({ path: p('l2', 'abc'), snapshot: p('s2', 'abd'), isNew: false }), true);
-  // identical content -> resolved
+  // Identical contents have no difference.
   assert.equal(fileDiffersOnDisk({ path: p('l3', 'same'), snapshot: p('s3', 'same'), isNew: false }), false);
-  // both empty -> resolved
+  // Two empty files have no difference.
   assert.equal(fileDiffersOnDisk({ path: p('l4', ''), snapshot: p('s4', ''), isNew: false }), false);
-  // live deleted -> resolved
+  // A deleted live file has no current contents to compare.
   assert.equal(fileDiffersOnDisk({ path: path.join(dir, 'gone'), snapshot: p('s5', 'x'), isNew: false }), false);
-  // live path replaced by a directory -> resolved (nothing left to diff)
+  // A directory replacing the live file has no file contents to compare.
   const asDir = path.join(dir, 'now-a-dir');
   fs.mkdirSync(asDir);
   assert.equal(fileDiffersOnDisk({ path: asDir, snapshot: p('s5b', 'x'), isNew: false }), false);
-  // snapshot missing -> empty baseline; nonempty live differs
+  // A missing snapshot supplies an empty baseline.
   assert.equal(fileDiffersOnDisk({ path: p('l6', 'x'), snapshot: path.join(dir, 'nosnap'), isNew: true }), true);
-  // larger than one compare chunk, differing only in the last byte -> differs
+  // A difference after the first read chunk must still be detected.
   const big = Buffer.alloc(3 * 1024 * 1024, 7);
   const bigLive = p('l7', big);
   big[big.length - 1] = 8;
@@ -226,14 +225,14 @@ test('pendingSessions returns only in-workspace sessions with pending files, nar
     );
   };
 
-  // in-workspace: one changed + one unchanged file -> included, narrowed to the changed one
+  // Include only the changed file from the matching workspace session.
   mk('a', ws, ws, [
     { file: 'changed.txt', baseline: 'v1', current: 'v2' },
     { file: 'same.txt', baseline: 'k', current: 'k' },
   ]);
-  mk('b', ws, ws, [{ file: 'b.txt', baseline: 'x', current: 'x' }]); // all resolved -> excluded
-  mk('c', other, other, [{ file: 'c.txt', baseline: 'p', current: 'q' }]); // out-of-workspace -> excluded
-  mk('d', null, ws, [{ file: 'd.txt', baseline: 'p', current: 'q' }]); // no cwd -> excluded
+  mk('b', ws, ws, [{ file: 'b.txt', baseline: 'x', current: 'x' }]); // All files match their snapshots.
+  mk('c', other, other, [{ file: 'c.txt', baseline: 'p', current: 'q' }]); // This session belongs to another workspace.
+  mk('d', null, ws, [{ file: 'd.txt', baseline: 'p', current: 'q' }]); // The session has no working directory.
 
   const sessions = pendingSessions(root, [ws]);
   assert.equal(sessions.length, 1);
@@ -243,7 +242,7 @@ test('pendingSessions returns only in-workspace sessions with pending files, nar
     ['changed.txt'],
   );
 
-  assert.deepEqual(pendingSessions('/no/such/root', [ws]), []); // missing root -> empty, no throw
+  assert.deepEqual(pendingSessions('/no/such/root', [ws]), []); // A missing store root yields no pending sessions.
 });
 
 test('ARC_HOME moves the store root, and snapshots sit below it', () => {
@@ -263,8 +262,8 @@ test('ARC_HOME moves the store root, and snapshots sit below it', () => {
   }
 });
 
-// The key names a cache directory on disk that holds a project spend index and a derived session
-// cache. A different key for the same workspace starts both from nothing.
+// Workspace cache keys identify both the project spend index and derived session cache directories.
+
 test('a workspace cache key keeps its exact value for a known identity', () => {
   assert.equal(
     workspaceCacheKey({ workspaceFile: null, folders: ['c:/work/repo'] }),
@@ -530,7 +529,7 @@ test('folderless cleanup preserves unrelated bytes when an ancestor is replaced 
   });
   try {
     await reclaimFolderlessCaches(cache, { platform: 'linux', signal: new AbortController().signal });
-    // Conservative retention performs no traversal. Still exercise the external replacement itself.
+    // Retention performs no traversal. Exercise the external ancestor replacement directly.
     if (!replaced) replace();
     assert.equal(fs.readFileSync(precious, 'utf8'), 'valuable unrelated bytes');
     await Promise.all(

@@ -20,8 +20,7 @@ export interface LabelSuggestionCount {
 export const SEARCH_WHERE_UNKNOWN = 'was not understood. Use in:prompt, in:summary or in:both.';
 export const COST_UNKNOWN = 'was not understood. Use cost:>5.43 or cost:<5.43.';
 export const CACHE_EXPIRY_UNKNOWN = 'was not understood. Use cache-expiry:>0 or cache-expiry:<3.';
-// The correction names every value the grammar takes, read off the one list the completion
-// offers, so a value added to the grammar reaches the correction with it.
+// Build invalid-status guidance from IS_VALUES, the same list used by query completion.
 export const IS_UNKNOWN = `was not understood. Use ${IS_VALUES.map((status) => `${IS_PREFIX}:${status}`)
   .slice(0, -1)
   .join(', ')} or ${IS_PREFIX}:${IS_VALUES[IS_VALUES.length - 1]}.`;
@@ -49,11 +48,8 @@ export function isNote(query: string): string | null {
   return unknown.length ? `${unknown[0]} ${IS_UNKNOWN}` : null;
 }
 
-// The query text that files one label, written once for every control that offers one.
-//
-// Two controls write it: a row of the rail filter's own suggestions, and a chip on the
-// session heading. A label carrying a space needs its quotes, or the grammar reads the
-// second word as a title term, and a rule at each end is two answers to one question.
+// Build one label query term for session list suggestions and session heading labels.
+// Quote spaces so the matcher reads the full label, without introducing a title term.
 export function labelFilterToken(name: string): string {
   return `${LABEL_PREFIX}:${quoteQueryValue(name)}`;
 }
@@ -85,10 +81,8 @@ export interface RailMenuLabelChips<T> {
   more: number | null;
 }
 
-// The View menu's label chips: most used first, then by name, folded after twelve.
-//
-// Text in the find box shows every label it matches and draws no fold chip, because a reader
-// who typed part of a name is looking for that label and a fold would hide it.
+// Sort View menu labels by usage, then name. Fold after twelve unless expanded.
+// A find query shows all matching labels without folding.
 export function railMenuLabelChips<T extends LabelSuggestionCount>(
   labels: readonly T[],
   find: string,

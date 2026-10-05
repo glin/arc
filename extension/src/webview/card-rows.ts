@@ -1,7 +1,5 @@
-// The record rows a turn keeps: its files, its subagents and its commits.
-//
-// One component per row kind, drawn by the chip popover that carries the record. A row posts
-// the message its kind names, so a press reaches the editor tab the row stands for.
+// File, subagent and commit rows for turn-card sections and chip popovers.
+// Row controls post the message that opens their file, commit or session.
 
 import { Fragment, h, render, type ComponentChild } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
@@ -32,11 +30,9 @@ export type AgentRowView = NonNullable<CardView['agents']>[number];
 export type AgentFigureView = AgentRowView['figures'][number];
 export type CommitRowView = NonNullable<CardView['commits']>[number];
 
-// A turn's record, addressed by the card it belongs to. The same shape the extension puts on
-// a chip's detail list, so the browser reads rows rather than building them.
+// A card's record rows, in the shape carried by a chip's detail list.
 export type DetailRows =
-  // `turnDiff` is unset on the turn's own record, which offers the whole turn as one diff. A
-  // subagent's files record holds one child's share of that turn, so it offers none.
+  // An unset `turnDiff` offers the whole turn's diff. Subagent file lists set it to false.
   | { kind: 'files'; key: string; files: FileRowView[]; turnDiff?: boolean; sourceSessionId?: string }
   // Ordinary subagents filter the parent card's rows. Dispatched rows carry their own.
   | { kind: 'agents'; key: string; agents: AgentRowView[]; files: FileRowView[]; commits: CommitRowView[] }
@@ -47,16 +43,12 @@ export type RowPost = (message: PanelToHost) => void;
 
 const noContextClass = () => '';
 
-// The rows a subagent's commits figure may draw. The Commits list holds the turn's commits and
-// its landings together, and a landing is not a commit a child wrote, so a figure's record
-// reads the written commits alone.
+// Subagent commit figures list written commits without the parent turn's landings.
 export function writtenCommitRows(card: CardView): CommitRowView[] {
   return (card.commits ?? []).filter((row) => row.kind === 'commit');
 }
 
-// The record a chip popover draws, taken off the card that already holds it. A detail list
-// names its record on `layout`, and the card carries the rows themselves, so the popover and
-// the card body read the same owner and a press on either reaches the same editor tab.
+// Read the requested record from the card. Popovers and card sections share these rows.
 export function detailRowsFor(card: CardView, layout: string | undefined): DetailRows | null {
   if (layout === 'files') {
     return { kind: 'files', key: card.key, files: card.files ?? [] };
@@ -153,13 +145,8 @@ export function FileRow({
             h('span', { class: 'base' }, file.name),
           ])
         : h('span', { class: 'name' }, file.name),
-      // A row the shell named without hunks draws no counts: a zero would read as a claim
-      // that nothing moved in a file this record could not detail. A file that recorded a
-      // zero on both halves draws no cell at all, so the row ends on its name and draws no
-      // separator in front of an empty one. The nums span, when it is drawn, opens with a
-      // literal space, the way a commit row's facts line does, because the stylesheet's flex
-      // gap is not there for a copy of the row's text or a reading with no stylesheet. The
-      // space in front of the word new is written only where the pair it parts is drawn.
+      // Unknown counts draw no count cell. Recorded zeros draw no cell unless the file is new.
+      // Literal spaces preserve separators in copied text and without CSS.
       !file.countsUnknown && (hasDiff(file.added, file.removed) || file.isNew)
         ? h(Fragment, {}, [
             ' ',
@@ -175,8 +162,7 @@ export function FileRow({
   );
 }
 
-// The press under the file rows. It opens the whole turn as one diff, which is a different
-// act from opening one file, so it is drawn as a link rather than as another row.
+// A button styled as a link opens the whole turn's diff below the file rows.
 export function TurnDiffAction({ cardKey, post }: { cardKey: string; post: RowPost }) {
   return h(
     'div',
@@ -196,17 +182,13 @@ export function TurnDiffAction({ cardKey, post }: { cardKey: string; post: RowPo
   );
 }
 
-// The Files section's own row cap, past which the card body stops drawing the record inline. A
-// scroll region inside the timeline's own scroll would trap the wheel, so the section cuts the
-// list itself and offers a press for the rest instead. The chip popover floats above the page
-// and already scrolls on its own, so it passes no cap.
+// Card-body file lists reveal bounded batches to avoid nested scrolling and unbounded draws.
+// File popovers already scroll and use no cap.
 export const FILES_SECTION_CAP = 20;
 
-// The rows a capped Files section draws before the reader presses for the rest, and whether the
-// list is capped at all. A caller with no cap, or a list at or under it, gets every row back
-// untouched, the same array and not a copy of it. `capped` and `hiddenCount` name the cut at
-// rest and hold steady across a toggle, so the button they feed never draws "Show 0 more files"
-// at the boundary and a caller never has to recompute the cut this function already made.
+// Return the visible rows and the collapsed list's hidden count.
+// Expanded lists keep `capped` and `hiddenCount` so the collapse button remains available.
+// Uncapped and fully visible lists retain the original array.
 export function cappedFileRows<T>(
   files: readonly T[],
   cap: number | undefined,
@@ -222,9 +204,7 @@ export function cappedFileRows<T>(
   return { shown: files.slice(0, cap), capped: true, hiddenCount };
 }
 
-// The words a capped Files section's button carries. A single hidden file reads as a file, not
-// a files, and the toggle names what the next press does rather than repeating what this one
-// did, so an expanded list reads "fewer" instead of the count that pressed it open.
+// The toggle names its next action. Collapsed labels distinguish one file from several.
 export function filesMoreLabel(hiddenCount: number, expanded: boolean): string {
   if (expanded) {
     return CARD_ACTIONS.filesLess;
@@ -232,10 +212,7 @@ export function filesMoreLabel(hiddenCount: number, expanded: boolean): string {
   return `Show ${hiddenCount} ${hiddenCount === 1 ? CARD_ACTIONS.filesMoreOne : CARD_ACTIONS.filesMoreMany}`;
 }
 
-// The button's full accessible name: its visible label, plus the count the cap still keeps off
-// screen right now. The visible label only ever promises the next bounded batch, so on a turn
-// with thousands of files it never speaks the count a screen reader most needs. Silent once
-// nothing is left hidden, because a name that added "0 files hidden" would only repeat the label.
+// Add the total hidden count to the next-batch label. Omit it when no files remain hidden.
 export function filesMoreAccessibleName(label: string, hiddenTotal: number): string {
   if (hiddenTotal <= 0) {
     return label;
@@ -243,15 +220,9 @@ export function filesMoreAccessibleName(label: string, hiddenTotal: number): str
   return `${label}, ${hiddenTotal} ${hiddenTotal === 1 ? 'file' : 'files'} hidden`;
 }
 
-// The Files section's show/hide-more button, built as a pure function so a test can read its
-// vnode without mounting Preact's hook machinery. `hiddenCount` is what the visible label
-// spends: the next batch a press adds while collapsed, or the count `filesMoreLabel` ignores
-// once `labelExpanded` swaps it to "Show fewer files". `ariaExpanded` is true once any batch
-// past the first is on screen, which can be well before `labelExpanded` turns true on a list of
-// thousands. `hiddenTotal` is the count still off screen right now, added to the accessible name
-// so a screen reader hears it even where the label only names the next batch. `controlsId` names
-// the element the button's press draws rows into, so a screen reader can name that target from
-// the button before ever moving to it.
+// Build the Files section toggle. The hiddenCount parameter names the next batch while the list is partly revealed.
+// The labelExpanded flag selects the collapse label. The ariaExpanded flag reports any batch beyond the first.
+// The hiddenTotal parameter names all remaining hidden files. The controlsId parameter identifies the row container.
 export function filesMoreButton(
   cardKey: string,
   hiddenCount: number,
@@ -281,72 +252,45 @@ export function filesMoreButton(
   );
 }
 
-// The id the Files section's row list carries, so the show-more toggle's `aria-controls` names
-// the exact element it reveals rows into. Shares `cardPartId` with `disclosureId` in card.ts,
-// the same id shape a section's own list carries there, so the two never drift apart by hand.
+// Identify the file-row container with the shared card-part ID format.
 function filesRowsId(cardKey: string): string {
   return cardPartId(cardKey, 'files-rows');
 }
 
-// One turn's file rows, capped in place and revealed a batch at a time. The button that lifts
-// the cap stays mounted for as long as the list is capped, whether any of it is revealed or the
-// whole list is, and keeps its own revealed-batch count, which a redraw of a live card leaves
-// alone because Preact keeps a component's state wherever the tree above it keeps drawing the
-// same component in the same place. Keeping the button mounted rather than swapping it for the
-// full list on click keeps the reader's keyboard focus on it, since a button that unmounts on
-// press drops focus to the document body.
-//
-// A press reveals the next batch of `cap` rows rather than the whole list at once. A turn can
-// touch thousands of files, and mounting every one of them on a single press is the same
-// unbounded draw the cap exists to stop, only moved one press later. The batch is the section's
-// own cap rather than a second constant, so a reader who has already learned the rhythm of the
-// first press gets the same rhythm on every press after it.
+// Reveal one turn's file rows in batches of `cap`.
+// Keep the toggle mounted throughout expansion so keyboard focus stays on it.
+// Preact retains the component's expansion state across card redraws.
 function FilesRows({ rows, post, cap }: { rows: Extract<DetailRows, { kind: 'files' }>; post: RowPost; cap?: number }) {
   const [revealedBatches, setRevealedBatches] = useState(1);
-  // Sticky once a press reaches the end of the list, and cleared only by a collapse or by the
-  // list falling to or under the cap. Without it, a live card whose turn grows past the batch
-  // boundary that used to reach the end would fall back to partly revealed on its own, though no
-  // press asked for that: a redraw must leave an expanded list expanded.
+  // Keep fully revealed lists expanded when live updates add files.
+  // Collapse and shrinking to the cap clear this state.
   const [stickyExpanded, setStickyExpanded] = useState(false);
   const total = rows.files.length;
   const revealedCount = cap ? cap * revealedBatches : total;
   const atOrUnderCap = !cap || total <= cap;
   const naturallyFullyRevealed = !cap || revealedCount >= total;
   const fullyRevealed = stickyExpanded || naturallyFullyRevealed;
-  // True the moment a second batch is on screen, well before the list is fully revealed on a
-  // turn of thousands of files, because a screen reader must hear that the press already did
-  // something even where most of the list is still hidden.
+  // Report expansion as soon as a second batch appears, even when later batches remain hidden.
   const ariaExpanded = revealedBatches > 1;
-  // Guarded by `!atOrUnderCap` as well as by the count itself, so a list sitting exactly at the
-  // cap, which reads as naturally revealed the moment it has one batch, never re-arms the sticky
-  // flag the reset effect below just cleared: the two would otherwise fight to a standstill on
-  // every render a list held right at the cap causes.
+  // A list at the cap must not re-enable the sticky state that the reset effect clears.
   useEffect(() => {
     if (!atOrUnderCap && naturallyFullyRevealed && !stickyExpanded) {
       setStickyExpanded(true);
     }
   }, [atOrUnderCap, naturallyFullyRevealed, stickyExpanded]);
-  // A list that falls to or under the cap keeps no batches of its own. Clearing the state here
-  // means a later regrowth past the cap starts the reader back at the first batch, rather than
-  // resuming a stale expansion that would mount every row on the redraw that grew it.
+  // Reset short lists so later growth starts with the first batch.
   useEffect(() => {
     if (atOrUnderCap) {
       setRevealedBatches(1);
       setStickyExpanded(false);
     }
   }, [atOrUnderCap]);
-  // Once every row is revealed, `cappedFileRows` is asked with the original cap and `expanded:
-  // true`, the same call the section made before it could reveal in batches, so a fully open
-  // list still reads as capped and keeps its "Show fewer files" button. Short of that, it is
-  // asked with the batch boundary reached so far, which is always under `total`, so it keeps
-  // reading as capped and keeps handing back the rows this batch has reached.
+  // Fully revealed lists retain the original cap and collapse toggle.
+  // Partly revealed lists use the current batch boundary as their cap.
   const { shown, capped, hiddenCount } = fullyRevealed
     ? cappedFileRows(rows.files, cap, true)
     : cappedFileRows(rows.files, revealedCount, false);
-  // What the button's label promises the next press will add, never the count still hidden
-  // behind every press to come, so the visible label never claims a press will mount more rows
-  // than this one bounded batch. `hiddenCount` above already holds the true remaining count for
-  // the accessible name.
+  // The visible label promises one batch. `hiddenCount` supplies the accessible name's total.
   const nextBatch = cap ? Math.min(cap, total - revealedCount) : 0;
   const rowsId = filesRowsId(rows.key);
   const fileRows = shown.map((file) =>
@@ -358,10 +302,8 @@ function FilesRows({ rows, post, cap }: { rows: Extract<DetailRows, { kind: 'fil
       key: file.path,
     }),
   );
-  // The chip popover, which never carries a cap, keeps the file rows as the host's own direct
-  // children: the panel.layout browser tests read that structure with a direct-child selector,
-  // and the popover already scrolls inside its own bound so it draws no toggle to control. Only
-  // the card body, where `cap` names a batch, wraps the rows in the element the toggle controls.
+  // Uncapped popovers keep file rows as direct children.
+  // Capped card sections wrap them in the container named by the toggle's `aria-controls`.
   return h(Fragment, {}, [
     cap === undefined ? fileRows : h('div', { id: rowsId }, fileRows),
     capped
@@ -386,32 +328,9 @@ function FilesRows({ rows, post, cap }: { rows: Extract<DetailRows, { kind: 'fil
   ]);
 }
 
-// One subagent, in the Subagents chip popover and in the card's Subagents section alike. The
-// state mark is the row's own child, in the first grid column, so the name and the figures
-// under it share one left edge in the second. Line one is the name and one model run, wrapped
-// rather than cut, and the model and its reasoning effort stay on one line as that run. The
-// literal space before the facts is what parts line one from line two when the stylesheet is
-// unavailable, and a grid container leaves a space of its own unrendered. Line
-// two is the figures and the state word. A running row has live-process evidence and draws the session
-// rail's running word with the time since the launch, which the panel clock rewords. An open
-// child has an unfinished record Arc cannot place as live, so it draws the word alone and never
-// ticks. Its mark is the running dot. The time span holds
-// its own leading space and stays empty under a minute, so the clock can add the time later
-// without a stray space before it. A finished row draws no word, so its spoken text says
-// finished instead. The tools, requests and tokens ride in the row's hint, and each figure
-// carries the record behind its own total. The row's state rides on `data-state` rather than a
-// class, because the card around the row already carries its own status as a class.
-//
-// The row itself opens nothing. The name is its one press, into the child session, so a press
-// beside the name leaves every figure its own hover. A row whose child has no session draws
-// the plain name and takes the keyboard stop the link would have held. Every record is in a
-// hint rather than a native tooltip, which opens for a pointer and for nothing else.
-// The record behind one figure, built when its popover asks for it. The commits and the files
-// records draw their owner's rows, filtered to the shas and the paths the child touched, so
-// neither reads as the run of plain text it was. Every other record is the list as it arrived.
-// One grouping per rows array. The card body, the card's commits popover and the clock all read
-// the card's own `commits` array, so they share one grouping of it, and a subagent's record
-// groups its filtered rows once for its heading and its list alike.
+// Cache one commit grouping per rows array.
+// Card sections, popovers and clock updates share the grouping for the card's own array.
+// A subagent's filtered array gets its own grouping.
 const groupings = new WeakMap<readonly CommitRowView[], CommitGrouping<CommitRowView>>();
 
 export function commitGrouping(commits: readonly CommitRowView[]): CommitGrouping<CommitRowView> {
@@ -429,9 +348,8 @@ export function singleCommitGroup<Row extends CommitRowView>(
   return grouping.single ? grouping.groups[0] : null;
 }
 
-// What a one-group record's heading says beside its figure: the branch, and the merged word's
-// hover and hidden words when the branch was merged. The panel adds the arrival from the rows,
-// because its time moves at midnight and the host's heading must not.
+// Add branch facts and merge-arrival text to a single-group heading.
+// Browser formatting keeps the arrival time current across midnight.
 export function commitHeadingFact(group: CommitGroupView): {
   fact: string;
   factArrival?: { title: string; spoken: string };
@@ -444,21 +362,15 @@ export function commitHeadingFact(group: CommitGroupView): {
   };
 }
 
-// The subagent a record is scoped to. Two subagents can carry an identical description, so the
-// name alone cannot tell one from the other. A session on both sides proves they are the same
-// maker. Child artifacts can exist without a session id, and where the record's own subagent
-// carries none, a shared name proves nothing, so the row keeps its maker line rather than
-// risking a different subagent's row losing it.
+// Identify the subagent whose record is open.
+// Matching descriptions alone do not establish identity when session IDs differ or are absent.
 interface RecordScope {
   name: string;
   session: string | null;
 }
 
-// One commit row as the subagent that wrote it sees its own record. A turn's own record carries
-// several makers, so the maker line there is the only thing saying who wrote which row. A
-// subagent's record is already open under that one subagent's name, so the line naming that
-// same subagent says nothing and the row loses it. A row made by somebody else, including a
-// different subagent whose description happens to match, keeps it.
+// Omit the maker line only when its description and session match the record's subagent.
+// The enclosing record already names that subagent.
 function ownRow(row: CommitRowView, scopedTo?: RecordScope): CommitRowView {
   if (
     !scopedTo ||
@@ -484,17 +396,11 @@ export function agentFigureRecord(
     return undefined;
   }
   if (figure.metric === 'commits' && figure.shas) {
-    // A sha reaches the row abbreviated and the child's own record whole, or the other way
-    // about, so the two are matched by prefix the way the turn's own totals match them.
+    // Match abbreviated and full hashes by prefix in either direction.
     const shas = figure.shas;
     const held = (sha: string) => shas.some((held) => held.startsWith(sha) || sha.startsWith(held));
-    // The rows are picked inside the thunk, so a subagent row that nobody opens costs the
-    // render nothing. Picked outside it, every card draw would walk the turn's whole commit
-    // list once for each subagent on it.
-    //
-    // A child's commits often sit on one branch while the turn's span several, so the child's
-    // record groups its own rows. Where they form one group, its heading names that branch
-    // beside the figure, the way the turn's own record does.
+    // Filter rows when the popover opens, avoiding a commit-list walk for every subagent on each draw.
+    // Group the filtered rows separately so a single-branch heading names the child's branch.
     return () => {
       const own = commits.filter((row) => held(row.sha)).map((row) => ownRow(row, scopedTo));
       const single = singleCommitGroup(commitGrouping(own));
@@ -518,6 +424,9 @@ export function agentFigureRecord(
   return () => record;
 }
 
+// A subagent row opens its session from the name and its records from individual figures.
+// Running rows tick their duration. Open rows show their state without a live duration.
+// Finished rows name their state for screen readers. `data-state` separates child and card status.
 export function AgentRow({
   cardKey,
   agent,
@@ -547,9 +456,7 @@ export function AgentRow({
       : agent.stateWord
         ? h('span', { class: 'agentstate' }, agent.stateWord)
         : null;
-  // The row is one keyboard stop, whatever its figures come to. The first figure holding a
-  // record takes it, and the arrow keys below cross to the rest, so a popover of eight children
-  // costs the reader eight presses to walk rather than forty.
+  // The first available figure takes the figures' Tab stop. Arrow keys move between the remaining figures.
   let firstStop = true;
   const line: ComponentChild[] = agent.figures.map((figure) => {
     const record = agentFigureRecord(
@@ -581,13 +488,10 @@ export function AgentRow({
     line.push(h('span', { class: 'sr-only' }, ', session unavailable'));
   }
   const record = agent.hintDetail ? { 'data-hint-detail': agent.hintDetail, 'data-hint-lines': '' } : {};
-  // The row is a focus stop wherever it holds the run line and no link to carry it. A linked
-  // row puts that same record on its name, so one stop reaches the press and the record at
-  // once. A figure answers for its own total and never for the run line, so a row of figures
-  // leaves the run line out of the keyboard's reach unless the row itself holds a stop.
+  // A linked name carries the run detail. Without that link, the row itself takes its focus stop.
+  // Individual figure hints describe only their own totals.
   const rowStop = !link && !!agent.hintDetail;
-  // The arrow keys cross the row's figures. Focus on a figure opens its record unpinned, so
-  // the record the reader left closes before the next one opens.
+  // Dismiss the current figure's record before moving focus to the next figure.
   const crossFigures = (event: KeyboardEvent) => {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
       return;
@@ -673,12 +577,9 @@ export function AgentRow({
   );
 }
 
-// The row's hover, and the hidden words a screen reader reads after the subject. Both end in
-// the full local time, which moves at midnight, so `writeCardClock` writes them again from
-// these same two functions rather than from a copy of the wording.
-//
-// A landing drawn as a row is one no branch of the record explains, so its hover says which
-// branch it came from when the record knows, and says the record does not know otherwise.
+// Format a commit row's tooltip from its detail and full local time.
+// `commitRowSpoken` supplies the corresponding accessible time. Clock updates reuse both functions.
+// Landing tooltips name the source branch when recorded and state its absence otherwise.
 export function commitRowTitle(commit: CommitRowView): string {
   const when =
     commit.kind === 'landing'
@@ -697,22 +598,14 @@ export function commitRowSpoken(commit: CommitRowView): string {
     : `, committed ${commit.absolute}`;
 }
 
-// A commit row is one line: the hash, the subject and the line counts. The subject ends in an
-// ellipsis rather than wrapping, and the counts keep their cell at the right edge. The hash is
-// the row's first control. The branch and the place belong to the record's group heading, or to
-// the section heading when the record holds one group, so the row draws neither. The relative
-// age is not drawn either, because the card head already carries the turn's age. The full
-// subject and the full local time ride in the row's hover and in its spoken name.
-//
-// A subagent's row adds a second line, the words made by and the subagent's name. The name is a
-// press into the subagent's session when the row knows it, and plain text otherwise. A landing
-// drawn as a row reads merged in on that line. A commit that reports no line counts, and a
-// commit that moved no line, keep the count cell and leave it empty.
+// Draw the hash, subject and counts on one line. Group headings carry the branch and worktree.
+// The tooltip contains the full subject and time. Hidden text supplies the accessible time.
+// A maker line opens the subagent session when identified. A landing's second line says `merged in`.
+// Unknown counts leave the count cell empty. Recorded zeros draw both zero counts.
 export function CommitRow({ cardKey, commit, post }: { cardKey: string; commit: CommitRowView; post: RowPost }) {
   const landing = commit.kind === 'landing';
   const moved = hasDiff(commit.added ?? undefined, commit.removed ?? undefined);
-  // A commit recorded as moving no line says so, because an empty cell reads as a count never
-  // recorded. Every other pair keeps dropping a zero half.
+  // Draw recorded zeros explicitly so they differ from unknown counts. Other pairs omit zero halves.
   const counts = moved
     ? h(DiffPair, { added: commit.added as number, removed: commit.removed as number })
     : commit.added === 0 && commit.removed === 0
@@ -784,10 +677,8 @@ export function CommitRow({ cardKey, commit, post }: { cardKey: string; commit: 
   );
 }
 
-// One group's heading: the repository when it is not the open folder's, the branch, the place
-// when the tree is named otherwise than its branch, and the merged word when the branch's work
-// reached its target. The merged word's hover names the time and the hash, and hidden text says
-// the same, so the hover is never the only home of the hash.
+// Name the branch and worktree, with a repository prefix for a different repository.
+// Merge-arrival tooltips and hidden text include the time and hash.
 function CommitGroupHead({ group }: { group: CommitGroupView }) {
   const arrival = group.arrival;
   return h(
@@ -807,9 +698,7 @@ function CommitGroupHead({ group }: { group: CommitGroupView }) {
   );
 }
 
-// The groups of a record that touched more than one branch or repository, each a heading and its
-// rows behind a hairline. The list walks the groups and returns one tree, so a record of many
-// groups is still one draw.
+// Draw each commit group's heading and rows in one returned tree.
 export function CommitGroups({
   cardKey,
   groups,
@@ -860,8 +749,7 @@ function CommitRowList({ rows, post }: { rows: Extract<DetailRows, { kind: 'comm
   );
 }
 
-// The rows of one record. A chip popover mounts it, and the card body draws it under a section
-// heading when the Card layout setting puts the record in the body.
+// Draw record rows for a chip popover or a card-body section.
 export function DetailRowList({
   rows,
   post,
@@ -897,8 +785,7 @@ export function DetailRowList({
   return h(CommitRowList, { rows, post });
 }
 
-// Draws one record into a node the popover owns. Called again with `null` rows to take the
-// same node back, so the popover's next drawing starts from an empty tree.
+// Mount record rows in the popover's container. Null rows unmount the tree.
 export function renderDetailRows(
   host: HTMLElement,
   rows: DetailRows | null,

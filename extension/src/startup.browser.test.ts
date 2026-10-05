@@ -102,7 +102,7 @@ test('startup keeps the shell status through readiness, then replaces it with th
     assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "ready").length'), 1);
     assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "refresh").length'), 0);
     assert.equal(await page.locator('nav').first().isVisible(), true);
-    // A restored query leaves the count on the rail head, and the magnifying glass opens the box.
+    // The restored query keeps its count in the session list header. The magnifying glass opens the filter box.
     assert.equal(await page.locator('[data-control="railsearch"]').isVisible(), true);
     const payload = renderPayload();
     await page.evaluate((usage) => window.postMessage({ type: 'usage', usage }, '*'), payload.usage);

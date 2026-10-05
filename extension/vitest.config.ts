@@ -9,9 +9,8 @@ export default defineConfig({
     environment: 'node',
     globalSetup: [fileURLToPath(new URL('./test/temp-run.ts', import.meta.url))],
     include: ['src/**/*.test.ts'],
-    // A run that bypasses extension/test.mjs, such as an IDE runner or a bare `npx vitest
-    // run`, still needs a cap. extension/test.mjs overrides this for the node lane with its
-    // own `--maxWorkers=8` CLI flag, which wins over this config value.
+    // Cap direct Vitest and IDE runs at four workers.
+    // extension/test.mjs overrides this with --maxWorkers=8 for the Node lane.
     fileParallelism: true,
     maxWorkers: 4,
     testTimeout: 30_000,

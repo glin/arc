@@ -4,9 +4,7 @@ import { ARRIVAL_WORD } from '../view/card-presentation.ts';
 import type { DetailRows } from './card-rows.ts';
 import { drawContextDetail, type ContextDetailView } from './context-detail.ts';
 
-// How long the popover waits after the pointer leaves the chip or the popover itself. The
-// pointer crosses the gap between the two in that time, so a reader reaches a row without
-// pinning first.
+// Delay after the pointer leaves a chip or popover. This lets the pointer cross the gap without pinning.
 export const HOVER_GRACE_MS = 150;
 
 export const STAT_WARNING_SIGN = '\u26a0\ufe0e';
@@ -20,8 +18,7 @@ interface RelativeDetailLine {
   underline?: boolean;
 }
 
-// The one press an entry offers, drawn by turning its own label into a button rather than by
-// adding a separate control beside it.
+// Action rendered on an entry's label.
 export interface DetailNameAction {
   // The whole accessible name, which carries the label's own words and what they act on.
   name: string;
@@ -32,23 +29,20 @@ export interface DetailNameAction {
 
 interface DetailHead {
   label: string;
-  // A muted fact after the label, drawn in its own tone inside it: the branch a one-group
-  // Commits record holds, with its hover when the branch was merged.
+  // Muted text after the label, such as a commit branch. factArrival supplies the branch's landing tooltip.
   fact?: string;
   factArrival?: { title: string; spoken: string };
   value?: string | RelativeDetailLine;
   // Added and removed lines, drawn in their own tones rather than as words.
   diff?: { added: number; removed: number };
   mutedValue?: boolean;
-  // Drawn in the tone the panel gives work that is still moving, the way a running card and
-  // a running rail row are drawn.
+  // Use the running tone for the value.
   busyValue?: boolean;
   valueTitle?: string | null;
   lines?: DetailLine[];
   separateBefore?: boolean;
   warning?: boolean;
-  // Drawn whenever the popover is shown, and only where the list declares `actions`. Turns the
-  // label itself into the row's one press, in place of a separate button beside it.
+  // Turn the label into a button when the list declares actions.
   nameAction?: DetailNameAction;
 }
 
@@ -61,8 +55,7 @@ type DetailLine =
       cost?: boolean;
       cacheHit?: CacheHitDetail;
       warning?: boolean;
-      // The row's own tone within a sublist that otherwise reads at one weight: the foreground
-      // sentence a row is about, the file path underneath it, or a note held back to the idle tone.
+      // Distinguish the description, file path, and muted text within a sublist.
       kind?: 'description' | 'path' | 'muted';
       lines?: DetailLine[];
     }
@@ -76,23 +69,14 @@ const KIND_CLASS: Record<'description' | 'path' | 'muted', string> = {
 
 export interface StatDetailList {
   context?: ContextDetailView;
-  // A reading-order popover keeps its labels and values together. The default compact grid is
-  // still right for the many figures whose values scan more easily in a second column.
+  // Choose the record layout. Omission uses the compact label-and-value grid.
   layout?: 'stacked' | 'tool-breakdown' | 'skills' | 'economics' | 'files' | 'agents' | 'dispatched' | 'commits';
-  // Set where entries carry a press. The list says so once, so the renderer never scans its
-  // entries to find out what kind of surface it is drawing.
-  //
-  // A list that declares it is a different surface from a read-only one. It is a dialog the
-  // reader walks into, drawn with its buttons whenever the popover is shown, and its anchor is
-  // a disclosure. It takes the pointer, so the reader reaches a button over the grace above.
-  // A read-only list keeps ignoring the pointer, which leaves its anchor pressable where the
-  // popover is drawn over it.
+  // Declare entry actions. Draw their buttons whenever the popover is shown.
+  // Actions select the dialog role and disclosure attributes for the anchor.
   actions?: boolean;
   heading?: DetailHead;
   entries: DetailHead[];
-  // The turn's record, drawn by the same row components the card body draws. The card that
-  // holds the arrays puts it here, so the record crosses to the panel once. The entries above
-  // stay as the words the chip's plain-text hover is made of.
+  // Turn record arrays shared with the card body. Entries provide the chip's plain-text detail.
   rows?: DetailRows;
   bound?: DetailHead;
   footer?: string[];
@@ -118,13 +102,9 @@ export interface StatDetailRendererOptions {
   document: Document;
   // The element's own id, which its anchors name in `aria-controls` and `aria-describedby`.
   id?: string;
-  // Set on an instance drawn over another one. The outer instance owns the document's Escape
-  // key and its outside press for both, so the two cannot answer one key twice.
+  // The outer instance handles Escape and outside presses for nested instances.
   nested?: boolean;
-  // Called with the anchor a press has just pinned this instance on. The nested instance tells
-  // the outer one to pin as well, so a pinned record does not die when its hover-only parent's
-  // grace fires. The anchor says which popover holds the press, so a figure standing in the
-  // card body pins nothing but its own record.
+  // Report the newly pinned anchor. The outer instance uses it to pin only when that anchor is inside its popover.
   onPin?(anchor: HTMLElement): void;
   events: {
     document(
@@ -135,21 +115,16 @@ export interface StatDetailRendererOptions {
   };
   placeFloat(host: HTMLElement, anchor: HTMLElement, bottomLimit: number): void;
   selectionWithin?(node: HTMLElement): boolean;
-  // Draws a list's record rows into a node the popover owns, and takes that node back when
-  // called with no rows. The popover holds no opinion about what a row looks like.
+  // Draw record rows in the supplied host. Release them when rows is null.
   renderRows?(host: HTMLElement, rows: DetailRows | null): void;
 }
 
 export interface StatDetailRenderer {
   // The popover itself, for an owner that has to ask where the pointer or the focus stands.
   readonly element: HTMLElement;
-  // Ties a second instance that draws over this one. This instance then treats that element as
-  // part of itself: the pointer crossing into it holds this one open, a press inside it is not
-  // an outside press, and Escape reaches it first.
+  // Treat a nested instance as part of this popover for pointer, focus, and dismissal.
   attachNested(nested: StatDetailRenderer): void;
-  // Pins what is already drawn, without moving the anchor. The focus-return target is dropped
-  // with it, because the press that asked for this stands on a figure inside this popover and
-  // focus must never land on an element inside a hidden one.
+  // Pin the current popover without changing its anchor. Clear focus return to avoid targeting a hidden outer popover.
   pinCurrent(): void;
   mount(node: HTMLElement, ownStop?: boolean): () => void;
   update(
@@ -180,10 +155,8 @@ function current<T>(value: CurrentDetail<T>): T {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-// The watch that shuts a popover whose anchor has left the page or fallen under a hidden
-// ancestor. One observer serves every renderer in a document, and each renderer adds its own
-// check to it. A second popover with an observer of its own would walk the body twice on every
-// draw, and the panel draws up to a thousand sessions at once.
+// Shared anchor checks, served by one body MutationObserver per document.
+// Checks dismiss popovers whose anchors leave the page or gain a hidden ancestor.
 const anchorWatches = new WeakMap<Document, Set<() => void>>();
 
 function watchAnchors(document: Document, check: () => void): void {
@@ -201,23 +174,13 @@ function watchAnchors(document: Document, check: () => void): void {
   }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden'] });
 }
 
-// Everything the browser's own forward walk stops on, in document order.
-//
-// A popover's own buttons are left out where the walk runs, because the walk answers where the
-// reader goes after that popover shuts. A control a roving list has taken out of the walk keeps
-// a negative index, so the index decides rather than the selector.
+// Candidate controls for the document tab walk. The caller excludes popover descendants and negative tab indexes.
 export const TAB_STOPS =
   'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [tabindex]';
 
-// Where the reader goes when the walk leaves a popover, given every stop the document holds in
-// its own order.
-//
-// The anchor holds its own place whatever index it carries. A figure that is not its row's one
-// keyboard stop carries a negative index, and a walk that read only the stops lost the figure it
-// started from. `within` answers for the popover walking out and for the record drawn over it,
-// which is about a figure standing inside that popover: a reader leaving one must never be
-// dropped inside the other. An anchor that is the last stop the page holds sends the reader out
-// of the panel rather than into a popover standing behind it.
+// Find the next visible Tab stop after the anchor in document order.
+// Keep the anchor as the starting point even when its tabIndex is negative.
+// Exclude both popovers through within. Return null when no stop follows the anchor.
 export function walkOutOf(
   stops: readonly HTMLElement[],
   node: HTMLElement,
@@ -240,13 +203,11 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   const view = document.defaultView as Window;
   const pop = document.createElement('div');
   pop.id = options.id ?? 'chippop';
-  // Both instances carry the class, and the stylesheet formats them through it, so the second
-  // popover inherits the first one's shape rather than copying it.
+  // Both popover instances share the stylesheet's chippop rules.
   pop.className = 'pop chippop';
   pop.hidden = true;
   pop.setAttribute('role', 'tooltip');
-  // Popovers share one layer, so the one later in the body draws on top. The nested instance
-  // is created after the outer one and so draws over it.
+  // Nested popovers mount later in the body and draw above the outer instance.
   document.body.appendChild(pop);
   let nested: StatDetailRenderer | null = null;
   const inNested = (node: Node | null | undefined): boolean => !!node && !!nested?.element.contains(node);
@@ -260,13 +221,11 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   let rowsHost: HTMLElement | null = null;
   let graceTimer: ReturnType<typeof setTimeout> | null = null;
   let focusBack: HTMLElement | null = null;
-  // Set while a closing popover hands the press back to its anchor, so the anchor's own focus
-  // handler does not read that as a reader arriving and draw the popover again.
+  // Suppress the anchor's focus handler while returning focus after dismissal.
   let returning = false;
   let dismissedAnchor: HTMLElement | null = null;
   let drawnPrint: string | null = null;
-  // Whether the drawing on screen holds its list's buttons. The print says nothing about it:
-  // the same list is drawn with buttons pinned and without them as a hover preview.
+  // Track whether the current draw includes actions. The content print does not include this flag.
   let drawnActions = false;
   let contextMeasurementOpen = false;
   let drawDebt: { anchor: HTMLElement; value: ResolvedDetailValue } | null = null;
@@ -354,9 +313,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       label.append(document.createTextNode(' '), fact);
     }
     head.appendChild(label);
-    // The same halves the figure over this record draws, and by the same rule: a half that moved
-    // no line is left out, so a record that only added lines heads `+4` rather than `+4 −0`. A
-    // record that moved nothing at all heads with its label alone and gains no trailing space.
+    // Use the chip's diff rules. Omit zero halves and omit the separator for an empty pair.
     const halves = diffHalves(entry.diff?.added, entry.diff?.removed);
     if (halves.length) {
       head.appendChild(document.createTextNode(' '));
@@ -444,9 +401,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     row.appendChild(relative(line));
     return row;
   };
-  // Every press inside the popover: the actions a list declares, and the record rows the
-  // renderer drew. A row is the only way into a file, a subagent session or a commit from
-  // here, so the keyboard walk holds the rows as well as the actions.
+  // Arrow-key targets include label actions, record-row buttons, and the Context action.
   const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button';
   // The Tab walk holds presses, row figure stops, rows without links, and the Context
   // measurement disclosure. The arrow keys walk presses alone.
@@ -489,19 +444,16 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     pop.classList.toggle('chippop-tools', listValue?.layout === 'tool-breakdown');
     pop.classList.toggle('chippop-skills', listValue?.layout === 'skills');
     pop.classList.toggle('chippop-economics', listValue?.layout === 'economics');
-    // A popover drawing rows is the one the reader presses inside, so it takes the pointer
-    // whether or not it is pinned. The class is what the stylesheet reads to decide that.
+    // Record rows accept pointer input even when the popover is unpinned.
     pop.classList.toggle('chippop-rows', !!listValue?.rows);
     pop.classList.toggle('chippop-agents', listValue?.layout === 'agents' || listValue?.layout === 'dispatched');
     pop.classList.toggle('chippop-commits', listValue?.layout === 'commits');
     drawnPrint = value.print;
     drawnActions = withActions;
-    // A popover holding a press is a dialog the reader moves into, and it needs a name of its
-    // own there. One holding only text stays a tooltip, read where the reader already stands.
+    // Declared actions select the dialog role. Other lists use the tooltip role.
     pop.setAttribute('role', withActions ? 'dialog' : 'tooltip');
     if (withActions && listValue?.heading) {
-      // The reader walks into the dialog and hears its name once. The heading label alone
-      // leaves out the figure beside it, which the reader sees, so the name carries both.
+      // Include the heading label and its string value in the dialog's accessible name.
       const figure = typeof listValue.heading.value === 'string' ? listValue.heading.value : null;
       pop.setAttribute(
         'aria-label',
@@ -517,13 +469,10 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     } else {
       pop.removeAttribute('aria-label');
     }
-    // A line under the rows describes the dialog and does not name it. Carried in the name, it
-    // would follow the name on every announcement. Pointed at by `aria-describedby`, each line
-    // is spoken once as the reader walks in.
+    // Footer lines describe the dialog through aria-describedby, separately from its accessible name.
     const footIds =
       withActions && listValue?.footer?.length
-        ? // The id carries the popover's own, because both instances can stand at once and a
-          // description pointed at by two elements is read from whichever one the browser finds.
+        ? // Prefix footer ids with the popover id to distinguish simultaneous instances.
           listValue.footer.map((_line, at) => `${pop.id}foot-${at}`)
         : [];
     if (footIds.length) {
@@ -550,10 +499,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         (listValue.footer || []).forEach((line, at) => appendFoot(line, at, 'chippopfoot'));
         return;
       }
-      // An empty list still carries the margin `chippoplist` draws around its rows, which
-      // would leave a blank gap between the heading and whatever follows with nothing in it.
-      // The element itself is left off the page rather than styled around, so a list with
-      // nothing to say takes no room.
+      // Omit empty lists so their margins leave no blank gap.
       const hasEntries = listValue.entries.length > 0;
       if (hasEntries) {
         const list = el('ul', 'chippoplist');
@@ -575,12 +521,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         appendLines(bound, listValue.bound.lines, withActions);
         pop.appendChild(bound);
       }
-      // With the list gone, the footer would still carry the border and the padding it wears
-      // to part itself from a list above it, drawing a second rule right under the heading's
-      // own and pushing the description down by both. Where no list and no bound sat between
-      // the heading and this footer, it draws flush instead: the heading's rule is the only
-      // one, and the description sits below it at the same ordinary gap a list's own top
-      // margin would have left.
+      // Use the flush footer style when no entries or bound separate it from the heading.
       const flush = !hasEntries && !listValue.bound;
       (listValue.footer || []).forEach((line, at) =>
         appendFoot(line, at, flush ? 'chippopfoot chippopfoot-flush' : 'chippopfoot'),
@@ -591,10 +532,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       pop.appendChild(el('div', line ? 'chippopline' : 'chippopline gap', line || ' '));
     }
   };
-  // Whether the drawing on screen is being replaced right now. A redraw takes back the rows it
-  // drew, and focus standing on one of them falls to nothing as that row leaves. That is the
-  // popover rebuilding itself, not a reader walking out of it, so the watch below stands down
-  // for the length of the draw.
+  // Ignore focus departure during redraws. Removing focused rows does not represent reader navigation.
   let redrawing = false;
   const draw = (value: ResolvedDetailValue, withActions: boolean) => {
     const measurement = pop.querySelector<HTMLDetailsElement>('.context-measurement');
@@ -637,16 +575,14 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       contextMeasurementOpen = false;
     }
     anchor = node;
-    // An interactive list is a disclosure, so its anchor says what it controls and whether
-    // that is open. A read-only list is description, and its anchor keeps saying exactly that.
+    // Interactive anchors expose a disclosure. Read-only anchors expose a description.
     if (value.detailList?.actions) {
       node.setAttribute('aria-controls', pop.id);
       node.setAttribute('aria-expanded', 'true');
     } else {
       node.setAttribute('aria-describedby', pop.id);
     }
-    // Rows and presses are drawn whenever the popover is shown. The pointer crosses to them
-    // over the grace above, so a reader reaches one without pinning first.
+    // Draw available actions on hover as well as when pinned.
     const withActions = !!value.detailList?.actions;
     if (value.print !== drawnPrint || withActions !== drawnActions) {
       draw(value, withActions);
@@ -675,9 +611,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     cancelGrace();
     // A record drawn over this one is about a figure inside it, so it goes with it.
     nested?.dismiss();
-    // Focus standing on a press inside the popover has nowhere to fall once the popover is
-    // taken off the page. It goes back to the anchor whether or not the caller asked, which
-    // covers a popover the reader reached over the hover grace and never pinned.
+    // Return focus from inside the closing popover, including when the reader entered it without pinning.
     const held = refocus || pop.contains(document.activeElement);
     const prior = anchor;
     if (prior) {
@@ -697,8 +631,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     drawnActions = false;
     contextMeasurementOpen = false;
     drawDebt = null;
-    // Handed back last, from a shut popover. A chip draws its detail when it takes focus, and
-    // a chip that is only being given its press back has not been focused by the reader.
+    // Return focus after hiding. Suppress the anchor handler so it cannot reopen the popover.
     if (held && target) {
       returning = true;
       target.focus({ preventScroll: true });
@@ -732,9 +665,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     }
     dismissedAnchor = null;
     const active = document.activeElement;
-    // A nested record hands focus back to the figure it is about. The figure is where the
-    // reader stands, and whatever held focus before the press sits behind a popover this one
-    // does not close.
+    // Nested records return focus to their anchor, not to a control behind the outer popover.
     focusBack = options.actionAnchor ? node : options.nested || !(active instanceof HTMLElement) ? null : active;
     pinned = true;
     show(node);
@@ -757,8 +688,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         show(node);
       }
     };
-    // The pointer leaving the chip starts the grace rather than shutting the popover, so the
-    // gap between the two is crossable. Entering the popover cancels it.
+    // Leaving the chip starts the grace period. Entering the popover cancels it.
     const leave = () => {
       pointerOnAnchor = false;
       if (dismissedAnchor === node) dismissedAnchor = null;
@@ -780,14 +710,10 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       event.stopPropagation();
       pin(node);
     };
-    // The way into a pinned popover that holds stops. Both keys are offered because the
-    // popover is drawn on the body: a plain Tab from here would walk to whatever follows this
-    // anchor on the page and step straight over the controls the press just opened. Tab lands
-    // on the first stop of the Tab walk, and ArrowDown on the first press, because the arrow
-    // keys walk the presses alone.
+    // Body-mounted popovers sit outside the anchor's document order.
+    // Tab enters at the first Tab stop. ArrowDown enters at the first button.
     const keydown = (event: KeyboardEvent) => {
-      // A record that draws the turn's own rows holds presses without declaring actions, so the
-      // way in is whether the drawing has a stop rather than what the list called itself.
+      // Record rows can contain controls without declaring actions. Inspect the drawn controls.
       if ((!pinned && !options.actionAnchor) || anchor !== node) {
         return;
       }
@@ -829,10 +755,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   };
   const update: StatDetailRenderer['update'] = (node, detail, detailList) => {
     details.set(node, { detail, detailList });
-    // An interactive anchor says what it opens as soon as it has a list, so a screen reader
-    // reads a shut disclosure rather than a bare button the reader has to press to learn from.
-    // A list built on demand waits until it is shown: resolving every one of them here would
-    // run each card's detail builder on every repaint.
+    // Publish disclosure attributes for supplied interactive lists.
+    // Resolve lazy lists only when shown, avoiding detail construction on every card draw.
     if (typeof detailList !== 'function' && detailList?.actions) {
       node.setAttribute('aria-controls', pop.id);
       if (options.actionAnchor) node.setAttribute('aria-haspopup', 'dialog');
@@ -910,7 +834,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     walkOutOf(
       Array.from(document.querySelectorAll<HTMLElement>(TAB_STOPS)),
       node,
-      // This popover, and the record drawn over it, which is about a figure standing in it.
+      // Exclude this popover and its nested instance from the outgoing Tab route.
       (stop) => pop.contains(stop) || inNested(stop),
     );
   pop.addEventListener('pointerenter', () => {
@@ -919,8 +843,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   });
   pop.addEventListener('pointerleave', (event) => {
     pointerOnDetail = false;
-    // The pointer crossing into the record drawn over this one has not left this one: that
-    // record is about a figure inside it, and the reader is still reading this popover.
+    // Entering the nested popover keeps the outer instance open.
     if (inNested(event.relatedTarget as Node | null)) {
       return;
     }
@@ -954,17 +877,12 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     if (event.key !== 'Tab') {
       return;
     }
-    // Focus need not stand on a stop of the walk. A figure its row's arrows took out of the Tab
-    // order still takes focus from a press, and gets it back when its record closes. The browser
-    // steps on from where focus stands in the document, so the walk answers only where no stop
-    // lies that way.
+    // A focused figure can have a negative tabIndex. Use its document position to find stops in either direction.
     const toward = event.shiftKey ? target.DOCUMENT_POSITION_PRECEDING : target.DOCUMENT_POSITION_FOLLOWING;
     if (tabStops().some((stop) => stop !== target && target.compareDocumentPosition(stop) & toward)) {
       return;
     }
-    // The popover sits on the body, so where it is in the document is not where it is read.
-    // The walk is put back on the anchor's own place in the page: backward it returns to the
-    // anchor, and forward it carries on past it. Pinned context stays open.
+    // Continue from the anchor's document position. Shift+Tab returns to the anchor. Pinned context remains open.
     if (event.shiftKey) {
       event.preventDefault();
       owner.focus({ preventScroll: true });
@@ -977,12 +895,10 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     onwards?.focus();
     if (!options.actionAnchor || !pinned) hide(null, true);
   });
-  // Focus departure closes ordinary detail. Context stays open while pinned or while the
-  // pointer remains inside the detail or its anchor.
+  // Focus departure closes pinned ordinary detail. Context stays open while pinned or while the pointer remains on its popover or anchor.
   pop.addEventListener('focusout', (event) => {
     const next = event.relatedTarget as Node | null;
-    // A press inside the record drawn over this one is a press inside this one: that record is
-    // about a figure standing here, so the reader has not walked out.
+    // Moving focus into the nested popover keeps this instance open.
     if (
       redrawing ||
       (!pinned && !options.actionAnchor) ||
@@ -1016,9 +932,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
       event.preventDefault();
       event.stopPropagation();
-      // The record drawn over this one goes first, and focus lands on the figure it is about.
-      // A second Escape then closes this one. Both instances answering the key themselves
-      // would close the pair on one press, whichever order the two listeners ran in.
+      // Dismiss the nested popover first. A second Escape closes the outer instance.
       if (nested?.dismiss()) {
         return;
       }
@@ -1055,8 +969,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       next.element.addEventListener('pointerenter', cancelGrace);
       next.element.addEventListener('pointerleave', (event) => {
         const to = event.relatedTarget as Node | null;
-        // A record opened from a card figure has no popover under it. Its own press and Escape
-        // close it, so a pointer that leaves it starts no countdown here.
+        // A nested instance opened from a card figure has no outer anchor, so it starts no outer grace timer.
         if (!anchor || pop.contains(to) || inNested(to)) {
           return;
         }

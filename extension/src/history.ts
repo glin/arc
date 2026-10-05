@@ -43,7 +43,7 @@ export interface ForwardSessionReducer<State> {
   retainedPayloadScan?(): Generator<void, number>;
   pushLine(line: string | ParserLine): void;
   trimBefore?(offset: number): boolean | void;
-  // The read continues after bytes it never parsed, so state those bytes could change is stale.
+  // Invalidate state affected by bytes omitted before the resumed read.
   skipped?(): void;
   snapshot(): State;
   read(readBytes?: number): SessionRead;
@@ -730,12 +730,8 @@ function* scanSemanticHistoryPage<State>(
       yield;
     }
 
-    // A backward scan has to rebuild the source reducer when older records arrive because
-    // those records precede everything already held. Rebuilding after every fixed-size read
-    // makes sparse-turn transcripts progressively slower as the same prefix is replayed.
-    // Materialize after the first relevant batch, whenever the retained input doubles, and
-    // once at the beginning. The geometric schedule keeps the work proportional to the
-    // accepted input while still stopping early when a nearby page boundary is found.
+    // Rebuild the reducer when the first relevant older batch arrives, retained input doubles, or the scan reaches byte zero.
+    // Doubling limits repeated parsing while allowing an early stop at a nearby page boundary.
     const atBeginning = byteCursor.end === 0;
     if (parsed === null && !atBeginning && parsedBytes > 0 && heldBytes < parsedBytes * 2) {
       continue;
@@ -812,9 +808,8 @@ function* scanSemanticHistoryPage<State>(
     }
     const semanticEnd = Math.min(cursor.pageEnd, parsed.openRange?.start ?? cursor.pageEnd);
     const complete = parsed.turns.filter((entry) => entry.end <= semanticEnd);
-    // A complete older guard turn proves that records preceding the oldest published
-    // turn have arrived. Without it, a turn_context or queued association can still sit
-    // in the adjacent older chunk even though the turn already has a closing record.
+    // Read one additional complete turn before publishing a page.
+    // Its records establish the older boundary, including preceding turn_context and queued associations.
     if (complete.length < targetTurns + 1 && !atBeginning) {
       continue;
     }
@@ -841,7 +836,7 @@ function* scanSemanticHistoryPage<State>(
           adapterState: cloneParserState(nextAdapterState),
         }
       : null;
-    // The set is also a direct assertion that an adapter did not emit one identity twice.
+    // Reject duplicate source ranges within the selected page.
     if (selectedRanges.size !== turns.length) {
       throw new Error('A semantic page contained a duplicate source range');
     }

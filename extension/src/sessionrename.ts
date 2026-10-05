@@ -1,7 +1,7 @@
 import { cleanName } from './domain/text.ts';
 
-// A reader-chosen session name. It is cleaned once, before either provider call, and the
-// provider receives exactly the cleaned value.
+// Session names are cleaned once before either provider call.
+// This limit caps the cleaned value sent to the provider.
 export const SESSION_NAME_LIMIT = 200;
 
 // The name to send, or null when nothing visible remains. A null answer sends nothing,
@@ -31,10 +31,8 @@ export function sessionRenameOpening(
   return { type: 'openSessionRename', session, title: named.fullLabel };
 }
 
-// Answers one rename request from the panel, whatever happens on the way. The editor holds
-// its box read-only until an answer arrives, so a failure that skipped the answer would
-// leave the reader with a box they cannot type in. The answer carries the request id back,
-// so an editor waiting on a later rename of the same session ignores it.
+// Answer every panel rename request. The editor remains read-only until an answer arrives.
+// Return its request id so an editor awaiting a later rename of the same session ignores this answer.
 export async function answerSessionRename(
   ask: { session: string; request: number; title: string },
   rename: () => Promise<SessionRenameResult>,
@@ -80,9 +78,8 @@ export async function requestSessionRename(
 export const CLAUDE_RENAME_CHECKS = 6;
 export const CLAUDE_RENAME_CHECK_MS = 50;
 
-// Claude Code reports success for a rename it could not save, so its result alone confirms
-// nothing. The rename counts only when the saved title file holds the requested name within
-// a fixed number of checks.
+// Claude Code can report success without saving a rename. Confirmation requires the saved
+// title file to hold the requested name within a fixed number of checks.
 export async function confirmClaudeRename(
   requested: string,
   readTitle: () => string | null,

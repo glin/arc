@@ -21,9 +21,7 @@ const panel = fillPanelText(
   panelValues(),
 );
 
-// Every tone is measured, the excluded ones included, because the sheet is a reference and a
-// reader looking up --edge deserves an answer. The exclusions carry their reason instead of
-// a marked failure, which is the same list the contrast guard skips.
+// Measures excluded tones too. Their rows show the exclusion reason without a failure mark.
 const themes = MOCK_THEMES.map((t) => ({ id: t.id, kind: t.kind, table: t.table, grounds: groundsOf(t) }));
 const readings = measureTones(panel, themes);
 const usages = toneUsages(panel);

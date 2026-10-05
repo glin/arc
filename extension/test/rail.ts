@@ -1,7 +1,4 @@
-// Shared helpers for the rail browser test files.
-//
-// The tests that drive the rail in a real browser live in `extension/src/rail.*.browser.test.ts`.
-// Those files import the page, payload, and selector helpers from here so each one stays a plain list of tests.
+// Shared page, payload, and selector helpers for session-list browser tests.
 
 import type { Page } from 'playwright-core';
 import { SETTLED } from './browser.ts';
@@ -26,8 +23,7 @@ export interface PanelPayload extends Record<string, unknown> {
   stats: Record<string, unknown>;
 }
 
-// What a name box tells a reader who cannot see the note beside it: the regions the box names,
-// whether each one answers, what it reports itself as, and the notes inside it.
+// Description targets, roles, text, and validation state linked to a name field.
 interface DescribedNote {
   named: string[];
   answers: number[];
@@ -40,24 +36,19 @@ export function payload(...args: Parameters<typeof renderPayload>): PanelPayload
   return renderPayload(...args) as PanelPayload;
 }
 
-// The fold ids the rail writes on the sections the fixture's saved views produce. A view's
-// section is named by the view's own id, so renaming the view keeps the fold the reader set.
-// The fixture files s1 under Composer and under Release 0.4, and s2 under Release 0.4 alone.
+// View IDs identify section folds independently of view names.
+// The fixture puts s1 in Composer and Release 0.4, and s2 in Release 0.4.
 export const COMPOSER_VIEW = 'railgroup:view:v1';
 
 export const RELEASE_VIEW = 'railgroup:view:v2';
 
-// One control, named by the section its row is drawn under as well as by its session.
-// A session two saved views both match draws a card under each of their sections, so a
-// selector on the session alone names more than one node and every locator built from it
-// fails on the strict mode that stops a guard measuring the wrong card.
+// Select a control within one section.
+// A session can appear in multiple views, so its control alone does not identify one element.
 export function inSection(section: string, control: string): string {
   return `.railrow[data-rail-bucket="${section}"] [data-control="${control}"]`;
 }
 
-// The saved views ride every rail message. The boundary refuses one without them, and a
-// refused message reaches no renderer at all, so a guard built on a message missing them
-// measures the first render for ever and never the update it was written for.
+// Include saved views in each session-list update. The message boundary rejects updates without them.
 export function railMessage(base: PanelPayload, rail: RailCard[]): Record<string, unknown> {
   return {
     type: 'rail',
@@ -71,10 +62,8 @@ export function railMessage(base: PanelPayload, rail: RailCard[]): Record<string
   };
 }
 
-// The rail head rests on its counts and its two tools, and the magnifying glass puts the filter
-// box in the counts' place. Most of the rail tests measure the box, so each page opens it with the
-// magnifying glass over an unfiltered rail. A test that passes its own saved query keeps it, and
-// the page then opens on that query with the counts on the head.
+// Seed an unfiltered session list when the caller supplies no saved query.
+// openPage then opens the filter box. A supplied query keeps the saved state.
 const BOX_SEED = { railFilterId: ALL_RAIL_FILTER_ID };
 
 export async function openPage(
@@ -104,9 +93,7 @@ export async function postToPage(page: Page, message: unknown): Promise<void> {
   await page.evaluate(SETTLED);
 }
 
-// What a box says about the name in it, read the way a screen reader reads it. The note is
-// found through the box's own `aria-describedby`, and the region it names must exist and
-// report itself. A note drawn beside a box and named by nothing is a note nobody hears.
+// Read description targets through aria-describedby, including their text, roles, and match counts.
 export async function describedNote(page: Page, selector: string): Promise<DescribedNote> {
   return (await page.evaluate(`(() => {
     const box = document.querySelector(${JSON.stringify(selector)});

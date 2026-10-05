@@ -65,9 +65,8 @@ test('a transcript that shrank or changed its first record drops the held name',
   assert.equal(names.get('s1'), null, 'a truncated transcript keeps the old name');
 });
 
-// A parse and the first metadata read of the same path happen at different moments. A name
-// the parse found in the file that was there must not name the file that is there now, which
-// the stored entry would then keep across a restart.
+// A parsed name belongs to the file version that supplied its turns. Replacement must not retain that name.
+
 test('a name parsed from turns belongs to the transcript the turns were read from', () => {
   const names = new SessionNames();
   const turn = {
@@ -102,9 +101,8 @@ test('a read that carries no fingerprint keeps the one an earlier read of the sa
   assert.equal(names.get('s1')?.label, 'typed', 'a grown file with another first record kept the old name');
 });
 
-// A transcript can be replaced by one the same size or larger, which neither size tells from
-// an append, and the parse of a window carries no fingerprint of the head. The file system's
-// own number for the file answers on its own.
+// File identity distinguishes replacement from append when size alone cannot. A window parse carries no head fingerprint.
+
 test('a transcript replaced by a larger one at the same path drops the held name', () => {
   const names = new SessionNames();
   names.observeTurns(

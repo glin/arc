@@ -70,10 +70,8 @@ function usage(over: Partial<AgentUsage> = {}): AgentUsage {
   };
 }
 
-// Claude as it reports itself: a session limit, a weekly one covering every model, and a
-// weekly one scoped to a single model. Its window names say which limit each is rather than
-// how long its clock runs, so the length on screen comes from the group. Reported in an
-// order that is not the reading order, so the bar has to put them in one.
+// Claude fixture windows include session, weekly, and model-scoped limits in a different order from their display order.
+
 const CLAUDE = usage({
   agent: 'claude',
   plan: 'max',
@@ -90,8 +88,8 @@ const CLAUDE = usage({
   ],
 });
 
-// Codex names its windows for their own length, and reports the two limits that cover every
-// model and nothing else.
+// The Codex fixture names its account windows by duration.
+
 const CODEX = usage({
   agent: 'codex',
   plan: 'plus',
@@ -101,8 +99,8 @@ const CODEX = usage({
   ],
 });
 
-// One agent naming the two windows and no clock for either. Every wire names a clock today,
-// so this is the reading a source that has not been taught them gives.
+// These limits supply window names without explicit groups.
+
 const UNGROUPED = usage({
   windows: [
     reading({ window: 'seven_day', utilization: 0.07, resetsAtSeconds: at(2026, 7, 30, 16, 0) }),
@@ -157,8 +155,8 @@ test('a partial mid-turn reading keeps the plan name the complete one carried', 
 });
 
 test('the opened list reads the session, then the week, then the models a limit was scoped to', () => {
-  // The session limit is the one that stops the reader today, so it is the one they find
-  // first, on the line and in the list alike.
+  // Session limits precede weekly limits on both status surfaces.
+
   const bar = usageBar([CLAUDE, CODEX], NOW);
   assert.deepEqual(
     bar?.groups[0].lines.map((l) => l.label),
@@ -171,9 +169,8 @@ test('the opened list reads the session, then the week, then the models a limit 
 });
 
 test('an agent that named no groups is read by its window names instead', () => {
-  // The two clocks are recognised by name as well as by the agent's own word for them, so a
-  // reading that names a window and no clock is still put in the reading order and still
-  // drawn by its length.
+  // Window names supply grouping and duration when no explicit group is present.
+
   const bar = usageBar([UNGROUPED], NOW);
   assert.deepEqual(
     bar?.groups[0].lines.map((l) => l.label),
@@ -510,8 +507,8 @@ test('a figure is rounded to nearest, with 100% kept for a limit with nothing le
     usageBar([usage({ windows: [reading({ utilization })] })], NOW)?.groups[0].lines[0].percent;
   const fillOf = (utilization: number): number | undefined =>
     usageBar([usage({ windows: [reading({ utilization })] })], NOW)?.groups[0].lines[0].fill;
-  // Rounded to nearest, so the strip and the context figure beside it cannot report the
-  // same share as two different numbers.
+  // Round the usage and context figures consistently.
+
   assert.equal(percentOf(0.4989), 50);
   assert.equal(percentOf(0.004), 1, 'a limit that has been touched reads as untouched');
   assert.equal(percentOf(0.999), 99);
@@ -527,9 +524,8 @@ test('a figure is rounded to nearest, with 100% kept for a limit with nothing le
 });
 
 test('the bar takes the context chip’s bands, at the context chip’s thresholds', () => {
-  // Read off the one table rather than written again here: a threshold moved in
-  // turnview.ts has to move the bar with it, and a copy of the numbers would let the two
-  // drift while both tests went on passing.
+  // Usage levels use the shared CONTEXT_BANDS thresholds.
+
   const drawn = (utilization: number) => usageBar([usage({ windows: [reading({ utilization })] })], NOW);
   for (const band of CONTEXT_BANDS) {
     assert.equal(
@@ -562,8 +558,8 @@ test('the collapsed line carries the session first, the week after it, and no ba
       ['38%5h', '10%7d'],
     ],
   );
-  // Colour carries the caution band collapsed, and one line is what makes this a status bar
-  // rather than a strip. A width here is an invitation to draw a bar with it.
+  // Collapsed figures carry a caution level without a bar fill width.
+
   const figure = bar?.briefs[0].figures[0];
   assert.ok(figure && !('fill' in figure), 'a collapsed figure carries a width for a bar that is not drawn');
 });
@@ -597,9 +593,8 @@ test('an agent whose only live limit is scoped keeps its group and leaves the li
 });
 
 test('one model with a limit on both clocks keeps a line and a key for each', () => {
-  // A scoped entry carries whichever of the two windows the agent set for it, so one model
-  // can hold two. They are named alike on purpose, and a shared key would take the reader's
-  // focus off one of them on every repaint.
+  // Distinct clock keys preserve both model-scoped limit rows across redraws.
+
   const bar = usageBar(
     [
       usage({
@@ -633,8 +628,8 @@ test('one model with a limit on both clocks keeps a line and a key for each', ()
 });
 
 test('a limit that has already rolled over is drawn nowhere', () => {
-  // Its figure is about a period the reader has left. "93%, resets Tuesday" said on
-  // Wednesday is not a stale figure, it is a wrong one.
+  // Expired limits appear on neither usage surface.
+
   const bar = usageBar(
     [
       usage({
@@ -693,8 +688,8 @@ test('every line is found again by its own key after a repaint', () => {
     usageBar([CLAUDE], NOW)?.groups[0].lines.map((l) => l.key),
     ['claude:session:', 'claude:weekly:', 'claude:weekly:Fable'],
   );
-  // The same two clocks under their old names key the same, so the reader standing on a line
-  // keeps the focus when a reading arrives from the other of the agent's two sources.
+  // Equivalent window names retain the same keys across source changes.
+
   assert.deepEqual(
     usageBar([UNGROUPED], NOW)?.groups[0].lines.map((l) => l.key),
     ['claude:session:', 'claude:weekly:'],
@@ -721,8 +716,8 @@ test('a figure that has aged says when it was read, and a fresh one does not', (
 });
 
 test('the age is read in the same units as a reset, in the largest one that fits', () => {
-  // An age and a reset are the same kind of fact pointing opposite ways, and they sit a few
-  // pixels apart, so "read 4 mins ago" beside "resets in 6d" would be two scales on one bar.
+  // Usage ages and reset durations use the same compact units.
+
   const aged = (ms: number) => usageBar([usage({ windows: [reading({ readAt: NOW - ms })] })], NOW)?.age;
   assert.equal(aged(USAGE_FRESH_MS + 1000), 'updated 2m ago');
   assert.equal(aged(4 * 3600_000), 'updated 4h ago');
@@ -733,8 +728,8 @@ test('the age is read in the same units as a reset, in the largest one that fits
 });
 
 test('the age on the line and the age on the control are one wording', () => {
-  // Both are drawn from one reading, a few pixels apart, so a second rounding here would let
-  // the bar name two different numbers for one figure.
+  // The status line and control share the reading's age wording.
+
   for (const ms of [USAGE_FRESH_MS + 1000, 600_000, 4 * 3600_000, 50 * 3600_000]) {
     const bar = usageBar([usage({ windows: [reading({ readAt: NOW - ms })] })], NOW);
     assert.ok(bar?.read.startsWith(`${bar.age} ·`), `the line says "${bar?.age}" and the control says "${bar?.read}"`);
@@ -760,9 +755,8 @@ test('the bar is announced by every figure on the collapsed line, and by what th
 });
 
 test('an aged bar says its age out loud, and the moment behind it', () => {
-  // The line says a duration, which tells a reader how old a figure is and never when it was
-  // read. The name keeps the moment, because a duration cannot be planned around and the two
-  // together pin one reading down.
+  // The accessible name carries the reading time as well as its relative age.
+
   const bar = usageBar([usage({ windows: [reading({ readAt: NOW - 600_000 })] })], NOW);
   assert.ok(bar?.name.includes('updated 10m ago, 2:22 PM'), `the age is drawn and never said: ${bar?.name}`);
 });
@@ -816,8 +810,8 @@ test('a reset the agent never named leaves both wordings empty together', () => 
 test('a window is named by how long its clock runs, whatever the wire called it', () => {
   assert.equal(windowWord('five_hour'), '5h');
   assert.equal(windowWord('seven_day'), '7d');
-  // A duration neither agent reports today. Said in the same shape rather than dropped: a
-  // figure the panel has no name for is still the reader's own limit.
+  // Unknown numeric window durations retain their formatted duration.
+
   assert.equal(windowWord('30_minute'), '30m');
   assert.equal(windowWord('60_minute'), '1h');
   assert.equal(windowWord('1440_minute'), '1d');
@@ -832,8 +826,8 @@ test('a window is named by how long its clock runs, whatever the wire called it'
 });
 
 test('a reading of one limit leaves the others alone', () => {
-  // This is what makes the free mid-turn events usable: each carries one limit, and a fold
-  // that replaced the whole set would throw away the others every time one arrived.
+  // Partial events replace only their named limit.
+
   const full = foldUsage(null, 'claude', {
     plan: 'max',
     readAt: NOW - 600_000,
@@ -851,8 +845,8 @@ test('a reading of one limit leaves the others alone', () => {
   assert.equal(byName.get('five_hour')?.readAt, NOW, 'the replaced limit kept the old reading time');
   assert.equal(byName.get('seven_day')?.utilization, 0.93);
   assert.equal(byName.get('seven_day')?.readAt, NOW - 600_000, 'the untouched limit took a reading time it never had');
-  // And the plan survives, because the mid-turn events carry none and a bar that lost its
-  // plan name every turn would flicker.
+  // A partial event without a plan retains the existing plan.
+
   assert.equal(later.plan, 'max');
 });
 
@@ -871,8 +865,8 @@ test('two limits on one clock are kept apart by the model each is scoped to', ()
 });
 
 test('one clock an agent named two ways is folded into one limit', () => {
-  // The request answer and the free mid-turn event are free to call one clock different
-  // things. Two lines saying Session, with two figures on them, is worse than either alone.
+  // Equivalent window names fold into one limit.
+
   const full = foldUsage(null, 'claude', {
     plan: 'max',
     readAt: NOW - 600_000,
@@ -1091,8 +1085,8 @@ test('the cap reads last after every rate window', () => {
 });
 
 test('the bar draws every agent the folder uses, in the offered order', () => {
-  // A Claude session is often where a Codex run is dispatched from, so following the
-  // session on screen would hide a figure at the moment it is being spent.
+  // Show usage for every agent with folder readings, independently of the selected session.
+
   const bar = usageBar([CODEX, CLAUDE], NOW);
   assert.deepEqual(
     bar?.briefs.map((b) => b.agent),
@@ -1102,7 +1096,7 @@ test('the bar draws every agent the folder uses, in the offered order', () => {
     bar?.groups.map((g) => g.agent),
     ['claude', 'codex'],
   );
-  // An agent never driven from this folder earns no place saying nothing.
+  // An agent without a reading adds no usage group.
   assert.deepEqual(
     usageBar([CLAUDE], NOW)?.groups.map((g) => g.agent),
     ['claude'],
@@ -1216,7 +1210,7 @@ test('an agent that could not answer is not asked again until the reader asks', 
     ['claude'],
     'a machine without one of the CLIs pays a failed process start on every glance at the panel',
   );
-  // The press is somebody saying to try again, and it clears the silence for good.
+  // An explicit refresh clears the failed-read state.
   assert.deepEqual(book.toAsk(['codex'], NOW, true), ['codex']);
   assert.deepEqual(book.toAsk(USAGE_AGENT_ORDER, NOW, false), ['claude', 'codex']);
 });
@@ -1225,8 +1219,8 @@ test('the book keeps the last figure an agent gave, and grows its age by itself'
   const book = new UsageBook();
   book.note('claude', { plan: 'max', limits: [limit()], complete: true, spend: null, readAt: NOW });
   assert.equal(book.bar(NOW)?.age, '');
-  // Nothing has been told to the book in between: the age is worked out at the moment the
-  // bar is drawn, so a reading left alone goes stale without anything having to repaint it.
+  // Calculate age from the draw clock even when no new reading arrives.
+
   assert.equal(book.bar(NOW + USAGE_FRESH_MS + 1000)?.age, 'updated 2m ago');
 });
 
@@ -1340,8 +1334,8 @@ test('the usage write queue continues after a rejected write and drains the last
 });
 
 test('the first look after a reload counts nothing, so opening a window pays no reads', () => {
-  // Every turn in the folder is new to a window that has just started, and reading on that
-  // would cost a process start per agent on every open. The read at startup covers it.
+  // The first completed-turn scan initializes its seen set without starting additional usage reads.
+
   const first = agentsWithNewTurns(new Set(), [
     { id: 'a', agent: 'claude', finished: true },
     { id: 'b', agent: 'codex', finished: true },

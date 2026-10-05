@@ -116,7 +116,7 @@ const VIEW_ROW: Extract<PanelToHost, { type: 'setViews' }>['views'][number] = {
   archived: true,
 };
 
-// A row a build that kept the lens as rail state wrote, which the panel still reads.
+// A saved filter retaining the legacy lens field, which the parser accepts.
 const RAIL_FILTER_ROW: Extract<PanelToHost, { type: 'setRailFilters' }>['railFilters'][number] & { lens?: unknown } = {
   id: 'f1',
   name: 'Needs costs',
@@ -163,9 +163,7 @@ const SELECTION: Extract<HostToPanel, { type: 'selection' }> = {
   startup: null,
 };
 
-// One well-formed message of every kind the two sides send, with what the parser answers.
-// The list is the message inventory: a kind added to the wire and not written down here
-// reaches the count test below, which fails on the difference.
+// An unavailable context reply with valid request identity.
 const CONTEXT_DETAIL = unavailableContext({
   session: 's1',
   request: 1,
@@ -174,6 +172,7 @@ const CONTEXT_DETAIL = unavailableContext({
   model: 'opus',
   source: 'child',
 });
+// Valid host messages and their parsed results cover every variant through the typed handler count.
 const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
   {
     raw: { type: 'visibility', visible: false, revision: 1 },
@@ -551,8 +550,7 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
   },
 ];
 
-// A handler record has to name every variant, so its keys are the union itself rather than a
-// list written out beside it. The record below is what the count and routing tests read.
+// The typed handler record requires every host-message variant. Count and routing tests read its keys.
 function hostRecorder(seen: string[]): HostToPanelHandlers {
   const take = (name: string) => () => {
     seen.push(name);
@@ -735,8 +733,7 @@ test('extra fields are dropped, and the render payload is handed back whole', ()
     session: 's1',
   });
   assert.deepEqual(parsePanelToHost({ type: 'refresh', extra: 1 }), { type: 'refresh' });
-  // The panel keeps the render payload as `latest` and reads fields this file does not name,
-  // so the parser answers with the message itself.
+  // Render parsing preserves the complete payload, including fields beyond the required contract.
   const render = { ...RENDER, anything: { deep: true } };
   assert.equal(parseHostToPanel(render), render);
 });
@@ -970,7 +967,7 @@ test('a launcher request that names no offered shape is refused', () => {
 
 // The panel posts the whole saved-view list back. The host normalizes stored views, while the message parser checks each field's type.
 test('a saved view crossing the wire is checked field by field', () => {
-  // Both ways round, because the same guard reads the panel's write and the host's answer.
+  // Check empty and populated saved-view lists.
   assert.deepEqual(parsePanelToHost({ type: 'setViews', views: [] }), { type: 'setViews', views: [] });
   assert.deepEqual(parsePanelToHost({ type: 'setViews', views: [VIEW_ROW, { ...VIEW_ROW, id: 'v2', name: 'Mine' }] }), {
     type: 'setViews',
@@ -986,8 +983,7 @@ test('a saved view crossing the wire is checked field by field', () => {
   ];
   for (const row of broken) {
     assert.equal(parsePanelToHost({ type: 'setViews', views: [row] }), null, JSON.stringify(row));
-    // The whole list goes with one bad row rather than the rest arriving: the panel posts what
-    // it drew, so a dropped row would delete a view the reader can still see.
+    // Reject the whole list when any row is invalid, so parsing cannot silently remove a displayed view.
     assert.equal(parsePanelToHost({ type: 'setViews', views: [VIEW_ROW, row] }), null, JSON.stringify(row));
   }
   for (const views of [undefined, null, 'v1', 42, {}, [null], [[VIEW_ROW]]]) {
@@ -996,8 +992,7 @@ test('a saved view crossing the wire is checked field by field', () => {
 });
 
 test('a saved rail filter crossing the wire is checked field by field', () => {
-  // A layout value the settings do not list, or a value under the other setting's key, would
-  // write a setting the panel then reads back as its default.
+  // Reject unknown layout values and values belonging to another setting.
   assert.deepEqual(parsePanelToHost({ type: 'setLayout', key: 'promptPosition', value: 'below' }), {
     type: 'setLayout',
     key: 'promptPosition',
@@ -1017,7 +1012,7 @@ test('a saved rail filter crossing the wire is checked field by field', () => {
     type: 'setRailFilters',
     railFilters: [],
   });
-  // A row with no lens, or a null one, is a filter over the query alone.
+  // Retained lens fields do not change the parsed filter query.
   const { lens: _lens, ...noLens } = RAIL_FILTER_ROW;
   for (const row of [noLens, { ...RAIL_FILTER_ROW, lens: null }, { ...RAIL_FILTER_ROW, lens: 'needs-you' }]) {
     assert.deepEqual(
@@ -1053,8 +1048,7 @@ test('a saved rail filter crossing the wire is checked field by field', () => {
   }
 });
 
-// The editor's own context menu names a view and says which press it was. Every input stays
-// in the panel, so the message carries the id and the word and nothing else.
+// Native view commands carry the view id and editor mode. Form values stay in the panel.
 test('the view editor opens on a named view and one of two presses', () => {
   assert.deepEqual(parseHostToPanel({ type: 'openViewEditor', view: 'v1', mode: 'delete' }), {
     type: 'openViewEditor',
@@ -1074,8 +1068,8 @@ test('the view editor opens on a named view and one of two presses', () => {
   }
 });
 
-// A rename names one session and one request. A message without a session id or a request
-// id, or with a name that is not text, is refused on either side.
+// Rename requests and results require session and request identities.
+// Open-editor messages require session identity and a text title.
 test('a session rename message names a session and a request and carries text', () => {
   for (const raw of [
     { type: 'renameSession', session: '', request: 1, title: 'Name' },

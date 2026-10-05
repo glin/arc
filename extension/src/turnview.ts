@@ -33,9 +33,7 @@ import {
   normalizeStoredPromptAsset,
 } from './promptassets';
 
-// The seams this file was split into. Re-exported rather than left for every caller to
-// find, so a module that imports from turnview.ts keeps working and the split stays a
-// move rather than a rename of every import in the repo.
+// Compatibility re-exports for host projections owned by the `turn*` modules.
 export * from './turncard';
 export * from './turncomments';
 export * from './turnformat';
@@ -44,13 +42,9 @@ export * from './turnrail';
 export * from './turnread';
 export * from './turnsearch';
 
-// Which session the panel has on screen, out of the ones the workspace has, given the
-// one it was asked for. One session is drawn at a time, so this answers null only when
-// there is no session to answer with: an id whose transcript has gone, and a first paint
-// with nothing asked for, both fall to the newest.
-//
-// The list arrives newest activity first, which is the order every other cut here is made in,
-// so the newest is its first entry and no ranking is worked out again.
+// Choose the displayed session from the workspace catalog. Return null only when the catalog is empty.
+// Missing session ids and initial selections fall back to the newest session.
+// The catalog arrives in newest-activity order, so its first entry supplies that fallback.
 export function pickShowing(sessions: readonly string[], wanted: string | null): string | null {
   if (wanted && sessions.includes(wanted)) {
     return wanted;
@@ -67,13 +61,8 @@ export function orderSessionCatalog<T extends { sessionId: string }>(
   );
 }
 
-// The turns the panel lists, out of everything the parse produced, handed in newest
-// first. One global cap bounds the DOM, and two rules bend it. The session being
-// shown alone fills first: it is the one on screen, and a cap shared with every parsed
-// neighbour would cut the very turns the reader is there to read. And every parsed
-// session keeps at least its newest turn, because the rail's status and count are read
-// off the listed cards: a session parsed but absent from the list would wear neither, a
-// blank card that cost a full tail parse, the pinned-to-top sessions most of all.
+// Supply turns newest first. The selected session takes priority within the global turn budget.
+// Every other parsed session retains its newest supplied turn, even when that extends the budget.
 export function turnBudget<T extends { sessionId: string; startedAt: number }>(
   turns: T[],
   max: number,
@@ -92,15 +81,9 @@ export function turnBudget<T extends { sessionId: string; startedAt: number }>(
   return cut;
 }
 
-// Which editor group a file or a diff opened from the panel should land in.
-//
-// The panel can be an editor tab of its own now, and a diff opened while that tab has focus
-// lands in the panel's own group, which splits the reader's editor in two and puts the diff
-// where the panel was. So the target is the group a text editor is actually in, and the
-// panel's own group is never chosen while there is another.
-//
-// Numbers rather than `vscode.ViewColumn`, so the rule can be tested without an editor host.
-// One is the first group, which is where a window with nothing open puts its first editor.
+// Chooses an editor group for file and diff actions.
+// Prefer a text editor group outside the panel's group.
+// With no other text editor, reuse the panel group or the first editor group.
 export function editorColumn(state: {
   active: number | null; // the column of the active text editor, if one has focus
   visible: number[]; // the column of every visible text editor
@@ -111,29 +94,17 @@ export function editorColumn(state: {
   if (state.active !== null && notPanel(state.active)) {
     return state.active;
   }
-  // Otherwise the leftmost group holding a file, which is the one a reader with a split keeps
-  // their work in.
+  // Otherwise use the leftmost visible text editor group outside the panel group.
   const open = state.visible.filter(notPanel).sort((a, b) => a - b);
   if (open.length) {
     return open[0];
   }
-  // Nothing else is open. The panel's own group is then the right answer rather than a wrong
-  // one: the diff opens as another tab beside the panel instead of splitting the window,
-  // and not splitting is the whole point of this.
+  // Reuse the panel group when no other text editor group is available.
   return state.panel ?? 1;
 }
 
-// The group a beside-open reuses, or null when a new one has to be split off.
-//
-// Ctrl, or Cmd on a Mac, asks for a group of the diff's own, and the first press splits one
-// off. A second press should land in the group the first one made, not split again: the
-// editor's own lists reuse their side group the same way, and a reader who ctrl-clicks down
-// a list of turns wants one comparison column, not one per press.
-//
-// The remembered column answers only while it can keep that promise. Columns are positions,
-// not identities: closing a group hands its number to a neighbour, so a column no longer
-// open says nothing, and one now occupied by the panel's own tab would land the diff on
-// the panel, which is the one group editorColumn exists to refuse.
+// Reuses the last beside-open group while it remains open and differs from the panel group.
+// Editor columns identify positions, so closing a group can invalidate the retained destination.
 export function besideColumn(state: {
   last: number | null; // the column the previous beside-open landed in
   groups: number[]; // the column of every editor group open now
@@ -148,16 +119,11 @@ export function besideColumn(state: {
   return state.groups.includes(state.last) ? state.last : null;
 }
 
-// The same ceiling for the fields holding one entry per session: the folds, the hidden
-// set, the pinned-to-top set and the read watermarks. Far past any real workspace, measured
-// against the real thing: 52 sessions in this workspace and 132 in the largest project
-// on this machine. Nothing here is under pressure, and the totals are small enough that this
-// is tidiness rather than a leak; it exists because nothing drops an id whose session
-// has gone, and Claude Code deletes its own transcripts on a schedule, so a hidden
-// session's id outlives the session.
+// Maximum entries in per-session saved-state lists and watermarks.
+// Removed sessions can leave stored ids, so normalization bounds retained state.
 export const SESSION_LIMIT = 500;
 
-// What the panel remembers between reloads, and now between the two places it can be drawn.
+// Queued-submission ownership and recovery phases.
 export type QueueDelivery =
   | { phase: 'queued'; owner: string; resetId?: string; barrier?: string }
   | { phase: 'delivery'; owner: string }
@@ -189,134 +155,61 @@ export interface PanelState {
   readerParents: Record<string, string>;
   submittedPrompts?: SubmittedPrompt[];
   open: string[];
-  // The sessions a build with a fold on its heading had folded away. Nothing reads it:
-  // the panel draws one session at a time, so folding it left a heading over an empty
-  // list, and the heading's press now opens and shuts the turns instead. The field stays so
-  // a value that build stored still normalizes rather than throwing, and so the next save
-  // writes an empty one over it.
+  // Compatibility field normalized with saved state and cleared before storage.
+  // Session heading disclosure uses turn keys instead.
   collapsed: string[];
   hidden: string[];
   // The sessions pinned to the top of the rail. They stay there and stay parsed
   // however old they get, which is what pinning promises.
   pinnedTop: string[];
-  // The labels the reader has filed each session under, by session id, in the order they
-  // applied them.
-  //
-  // The reader's own opinion about a session, not a copy of anything the agent recorded.
-  // The transcript already supplies a name, and that name says what the work was. A label says
-  // what the reader will go looking for the session under later. That is a different
-  // question, and nothing an agent writes answers it.
-  //
-  // Kept for the reason the notes and the drafts are. These are words the reader chose, and
-  // no press rebuilds them. A session with no label takes no entry, so a workspace
-  // nobody has filed costs nothing. `turnlabels.ts` holds the ceilings, and the rule that one
-  // label carries one spelling.
+  // Reader-applied labels by session id, in applied order.
+  // `turnlabels.ts` normalizes names, spelling, and retained limits.
   labels: Record<string, string[]>;
-  // The filters the reader saved under a name, in the order they saved them. The rail draws
-  // one section per view, so the order here is the order of the headings on screen.
-  //
-  // Held here for the reason the labels and the notes are. A view's name is a word the reader
-  // typed, and no press rebuilds it. The panel edits the list through a message of its own,
-  // and a state save carries back the copy that panel was served, so a second host opened
-  // before the reader made a view would otherwise write an empty list over every one of them.
-  //
-  // A view narrows the rail alone. Nothing in the extension reads one to decide what to parse,
-  // which is why this is the reader's own filing rather than a cut like the hidden set.
+  // Saved views in section order. Views organize the session list without changing the parse cut.
+  // The host retains this reader-owned list separately from webview state saves.
   views: SavedView[];
   read: string[];
-  // How far the reader has marked each session read, by session id: the start time of
-  // the newest turn they marked. The read set above is per turn, and a session's older turns
-  // are usually not parsed, so "this session is read" cannot be written as a key per
-  // turn: the ones on screen would be marked and the session would go unread again the
-  // moment more of it was parsed. The watermark is the answer to that, and it stands beside
-  // the per-turn set rather than replacing it, because a turn can be read on its own.
+  // Session read watermarks keyed by id, using the newest marked turn's start time.
+  // They complement per-turn read keys and cover older turns outside the current parse.
   readTo: Record<string, number>;
-  // The moment this workspace first drew the panel. Every turn that started before it counts
-  // as read, and it is written once and never again.
-  //
-  // Without it a reader opening a project for the first time is handed every turn every agent
-  // has ever run there, all of it unread, and the one thing the panel is for, saying what is
-  // new, says nothing. The reader did not fail to read those turns. They were not being
-  // offered them.
-  //
-  // A floor rather than a watermark per session, because the rail lists sessions
-  // the panel has never parsed and cannot name them all to write a mark each. `isTurnRead`
-  // reads it as the watermark a session with none of its own falls back to, so a
-  // session the reader has marked either way keeps its own answer and this decides only
-  // the rest. Zero means no floor, which is what a reader who was already here has.
+  // Initial workspace read boundary. Turns before it count as read unless a session has its own watermark.
+  // Zero disables the boundary. The host retains the initial value across reloads.
   since: number;
-  // Which session is on screen, by id, or empty for none. The panel shows one
-  // session at a time, so this is the whole of what it is looking at, and it is
-  // remembered for the reason the folds are: a reload that opened on a different
-  // session would read as a different panel.
+  // Selected session id, or empty when no session is selected.
   showing: string;
-  // A session query, left by a build that had a box to type one into. Nothing reads or
-  // writes it now: with no such box on screen a stored value would narrow the list for ever
-  // and leave the reader nothing to widen it with. The field stays so an old value still
-  // normalizes rather than throwing.
+  // Compatibility query field normalized with saved state and cleared before storage.
+  // `railFilter` supplies the active session list query.
   filter: string;
   railFilter: string;
   railFilterId: string;
   railFilters: SavedRailFilter[];
   railSort: RailSort;
   railDefaultSort: RailSort;
-  // The View menu's Group by value. Rail-wide view state like the sort, and not part of a saved
-  // filter, so opening a saved filter keeps it.
+  // View menu Group by and Rows presentation values. Saved filters do not replace them.
   railGroupBy: RailGroupBy;
-  // The View menu's Rows value. Rail-wide presentation state saved beside the rail width, and
-  // not part of a saved filter or view.
   railDensity: RailDensity;
-  // Whether the rail draws the archived sessions and the sessions an agent ran. The reader
-  // sets each one from the View menu, and both start on, so a state saved before the
-  // switches existed opens the rail drawing everything it drew before.
+  // Whether the session list includes archived sessions and agent runs. Both default to enabled.
   railShowArchived: boolean;
   railShowRuns: boolean;
-  // Which lens counts may draw on the rail head, from the View menu's Quick filters line. View
-  // state like the Show switches, and not part of a saved filter.
+  // Quick filters enabled on the session list header. Saved filters do not replace this setting.
   railQuickFilters: RailLens[];
   railWidth: number;
   composerHidden: boolean;
   promptFloor: number;
-  // Which rail buckets the reader has opened or shut, by bucket id: true for one they
-  // opened, false for one they shut, and no entry at all for one they have never pressed,
-  // where the panel's own default stands.
-  //
-  // Remembered for the reason the shown session is. A reader who shuts Today means the
-  // rail to look that way, and a reload that opened every bucket again would read as a
-  // different panel rather than the same one back.
+  // Session list group folds by id. True means open, false means closed, and an absent id uses the default.
   railFolds: Record<string, boolean>;
-  // The notes the reader has left on turns, oldest first. See `TurnComment` for what one
-  // holds and why. This and the drafts below are the two fields here the reader wrote by
-  // hand rather than made by pressing something, so they are the ones that cannot be got
-  // back, and they are why the panel's state is remembered at all rather than rebuilt on
-  // every reload.
+  // Reader-authored turn comments in creation order.
   comments: TurnComment[];
-  // What the reader typed into the prompt box and has not sent, by session id.
-  //
-  // Kept for the notes' reason. Every other field here is a set the reader can rebuild by
-  // pressing the control again; a half-written prompt is words, and a reload is not always
-  // chosen. An empty box stores nothing, so a session the reader never typed into
-  // costs no entry.
+  // Unsent prompt text by session id. Empty drafts have no entry.
   drafts: Record<string, string>;
-  // The prompts this panel sent for a session that no transcript has recorded yet, by
-  // session id, newest first.
-  //
-  // Kept for the drafts' own reason: an agent process that dies before it writes the
-  // transcript takes the only other copy of these words with it. `sentAfter` fills this in
-  // memory at send time. Once the transcript records the same prompt, the transcript is the
-  // durable copy, so `sentPromptsToSave` drops that entry from what gets stored here. The
-  // in-memory copy is not touched by that pruning, so Up still returns the typed words for
-  // the rest of the window.
+  // Submitted prompts not yet present in the transcript, by session id, newest first.
+  // `sentPromptsToSave` omits recorded prompts from storage while retaining in-memory prompt history.
   sentPrompts: Record<string, string[]>;
-  // Comment ids reserved for a waiting prompt currently back in the composer for editing.
-  // They remain on their turns, so this claim keeps an earlier queued prompt from taking
-  // them while the edit is unfinished.
+  // Comment ids reserved for a queued prompt returned to the prompt box for editing.
+  // The comments remain on their turns and unavailable to earlier queued prompts.
   draftCommentIds: Record<string, string[]>;
-  // The sessions this workspace started from the panel, oldest first. A fresh
-  // session reads as a run another agent shelled out for: a Claude transcript names
-  // nobody as its author, and a first turn carries no sign of a person. This record is the
-  // one positive fact, and it is kept between reloads because the transcript never becomes
-  // any more readable than it was on the day it was written.
+  // Sessions the reader started from this panel, oldest first.
+  // Retain launch ownership across reloads because transcript classification alone cannot establish it.
   started: string[];
   // Normalized descriptors for extension-staged files held with each draft. The bytes stay
   // in global storage and never enter this state.
@@ -368,31 +261,18 @@ export function abandonReaderParents(parents: Record<string, string>, draft: str
   return Object.fromEntries(Object.entries(parents).filter(([child, parent]) => child !== draft && parent !== draft));
 }
 
-// The saved state, made safe to use.
-//
-// It comes back from storage that outlives the code that wrote it: a set written by an older
-// version, a key since renamed, or a file edited by hand all arrive here, and the panel has
-// no way to report a bad one. So every field is rebuilt rather than trusted, a value of the
-// wrong shape becomes the empty answer for its field rather than throwing, and every field
-// with a ceiling is cut to it on the way in as well as on the way out. A panel that throws
-// while reading its own state draws nothing at all and says nothing about why.
-//
-// `heldRailFilters` is the saved filter list the extension holds, for a caller whose state
-// omits the list. A panel's state save carries no list, and the selected filter id, its query
-// and its lens are checked against the one given here instead.
+// Normalizes saved fields and retained limits, replacing invalid values with field defaults.
+// `heldRailFilters` supplies the host-owned saved filters when a webview save omits them.
+// The selected filter id and query are reconciled against that list.
 export function normalizePanelState(raw: unknown, heldRailFilters?: readonly SavedRailFilter[]): PanelState {
   const src = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-  // Every list is cut to its ceiling here, and the newest are what is kept: each is written
-  // oldest first, so a list restored over its ceiling drops from the front, which is the end
-  // `markRead` already drops.
+  // Limit each restored list to its newest entries. Lists store oldest entries first, so remove excess entries from the front, as `markRead` does.
   const ids = (value: unknown, limit: number): string[] => {
     const kept = Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
     return kept.slice(Math.max(0, kept.length - limit));
   };
-  // The watermarks, rebuilt entry by entry. A value that is not a finite number is dropped
-  // rather than kept: every other field here is rebuilt rather than trusted, and a watermark
-  // read as a string or a NaN would compare against a turn's start time and answer nonsense.
-  // The newest entries are kept for the same reason a list's are.
+  // Rebuild watermarks from finite numeric values. Strings and NaN cannot provide valid comparisons against turn start times.
+  // Keep the newest entries, matching the lists' retention order.
   const readTo: Record<string, number> = {};
   const marks =
     src.readTo && typeof src.readTo === 'object' && !Array.isArray(src.readTo)
@@ -406,9 +286,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
   const railFilters = heldRailFilters ? [...heldRailFilters] : normalizeSavedRailFilters(src.railFilters);
   const railSort = normalizeRailSort(src.railSort);
   const railDefaultSort = src.railDefaultSort === undefined ? railSort : normalizeRailSort(src.railDefaultSort);
-  // A lens an older build stored as rail state, as the old Warm words, or as the retired Needs
-  // you filter id, joins the query as the words a count press now writes, before the id is
-  // checked against the saved list.
+  // Migrates compatibility lens fields to query terms before validating the saved-filter id.
   const storedRail = migrateStoredRailLens({
     filterId: src.railFilterId,
     query: boundedRailFilterQuery(src.railFilter),
@@ -436,9 +314,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     views,
     read: ids(src.read, READ_LIMIT),
     readTo,
-    // Rebuilt like the watermarks it stands in for, and zero rather than dropped where it
-    // will not read: a floor that arrived as a string or a NaN would compare against a turn's
-    // start and answer nonsense, and nonsense here hides turns rather than showing extra.
+    // Accept only a positive finite read boundary. Invalid values disable it.
     since: typeof src.since === 'number' && Number.isFinite(src.since) && src.since > 0 ? src.since : 0,
     showing: typeof src.showing === 'string' ? src.showing : '',
     filter: typeof src.filter === 'string' ? src.filter : '',
@@ -457,8 +333,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     composerHidden: src.composerHidden === true,
     promptFloor: clampPromptFloor(src.promptFloor, Number.POSITIVE_INFINITY),
     railFolds: normalizeRailFolds(src.railFolds),
-    // The one field holding records rather than ids, so it is rebuilt record by record and
-    // cut by its own count as well as by a ceiling on each string inside it.
+    // Normalize comment records and their count and text limits.
     comments: normalizeComments(src.comments),
     ...(src.submittedPrompts === undefined ? {} : { submittedPrompts: mergeSubmittedPrompts(src.submittedPrompts) }),
     drafts: normalizeDrafts(src.drafts),
@@ -471,19 +346,9 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
   };
 }
 
-// The stored state with every abandoned draft's labels taken out of it.
-//
-// Run once, where the state is first read, and never on a write. `sweepDraftLabels` carries
-// why, and this is the wrapper that puts the swept record back where the state holds it.
-//
-// It runs ahead of normalization rather than after it. `normalizeSessionLabels` cuts the
-// record to its ceiling on the way through, so a stored record over that ceiling dropped an
-// older real session to keep a draft id nothing can reach, and then shrank below the
-// ceiling when the sweep ran a moment later. Sweeping first leaves the cut to decide between
-// sessions that still exist.
-//
-// Reader parents also lose provisional identities at startup. Live normalization retains
-// them until adoption or abandonment. Every other field remains with its normalizer.
+// Removes abandoned draft label and reader-parent identities at startup.
+// Run before normalization so draft labels cannot evict real sessions at the retained limit.
+// Ordinary writes preserve active provisional identities until adoption or abandonment.
 export function withSweptDraftLabels(raw: unknown): unknown {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return raw;
@@ -503,16 +368,8 @@ export function withSweptDraftLabels(raw: unknown): unknown {
   };
 }
 
-// The stored state a webview is served, which is not the whole of it.
-//
-// `labels` stays behind. Nothing in the panel reads a label out of this state: each rail card
-// arrives holding the chips it draws, worded beside the rule that decided which of them the
-// row has room for. Serving the record would put every session's filing into the page of
-// every host that opens, for no reader, and it would make the panel's own claim to keep no
-// copy false of the page it was handed.
-//
-// Host-owned fields are taken out rather than naming the panel-owned fields to keep. A new
-// panel-owned field then reaches the panel without changing this projection.
+// Projects webview state while excluding host-owned labels, reader parents, and saved filters.
+// Session cards carry the displayed label fields. Other panel-owned fields pass through.
 export function webviewPanelState(state: PanelState): Omit<PanelState, 'labels' | 'railFilters' | 'readerParents'> {
   const served: Partial<PanelState> = { ...state };
   delete served.labels;
@@ -526,17 +383,9 @@ export function webviewPanelState(state: PanelState): Omit<PanelState, 'labels' 
 // entries so a live view's fold replaces a stale one.
 export const RAIL_FOLD_LIMIT = 200;
 
-// The stored fold state, made safe to use.
-//
-// Rebuilt entry by entry rather than trusted, for the reason `normalizePanelState` gives.
-// Only a key the rail can draw a heading for survives, and only a real boolean: a key the
-// panel no longer has draws no heading to press, and a value of any other shape would decide
-// a fold by whether it happens to be truthy.
-//
-// A key stored by a build that folded by the bucket id rather than by its fold name is
-// dropped. Nothing reads one now, so keeping it would hold a place under the ceiling for a
-// heading that can never be pressed. The reader loses one fold state on the upgrade and the
-// defaults stand until they press a heading again.
+// Rebuild stored fold state using recognized heading keys and boolean values.
+// Discard bucket-id keys because headings use fold names. These discarded entries must not occupy the retained-state limit.
+// A heading without retained state uses its default until the reader changes it.
 export function normalizeRailFolds(raw: unknown): Record<string, boolean> {
   const src = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
   const buckets = new Set<string>(RAIL_BUCKETS.map((id) => RAIL_FOLDS[id]));
@@ -550,18 +399,12 @@ export function normalizeRailFolds(raw: unknown): Record<string, boolean> {
   return out;
 }
 
-// The ceiling on one stored draft, in characters. A prompt written by hand runs far under
-// it; a prompt pasted whole is the only thing that reaches it.
-//
-// A draft over the ceiling is dropped rather than cut. A cut one would come back into the
-// box reading like the whole prompt, and the reader's next press would send the front half
-// of what they wrote to the agent without either of them noticing. An empty box says
-// plainly that nothing was kept.
+// Maximum stored draft length in characters.
+// Drop oversized drafts rather than silently restoring a truncated prompt.
 export const DRAFT_TEXT_LIMIT = 20000;
-// How big one prompt may be before Up-arrow history refuses to offer it. `promptHistory` and
-// `promptsAcross` in composerview.ts skip any entry over this length, whether it came from
-// the transcript or from a send this panel made. A saved prompt over this length could never
-// reach the reader, so `normalizeSentPrompts` holds storage to the same bound.
+// Maximum prompt length offered by Up-arrow history.
+// `promptHistory` and `promptsAcross` exclude longer transcript and panel-submitted prompts.
+// `normalizeSentPrompts` applies the same limit to stored submissions.
 export const PROMPT_HISTORY_ENTRY_CHARS = 4_000;
 export const QUEUED_SUBMISSION_LIMIT = 64;
 const QUEUED_SUBMISSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -824,13 +667,8 @@ export function normalizeDraftCommentIds(raw: unknown): Record<string, string[]>
   return out;
 }
 
-// The unsent prompts, made safe to use and cut to the ceilings.
-//
-// Rebuilt entry by entry rather than trusted, for the reason `normalizePanelState` gives:
-// this comes back from storage that outlives the code that wrote it. An entry that is not
-// text, is empty, or runs past `DRAFT_TEXT_LIMIT` is dropped; an empty draft and no draft
-// are the same thing to the box. The record takes the session-shaped ceiling, and the
-// newest entries are what is kept, the way the watermarks beside it are.
+// Normalizes unsent prompts and retains the newest bounded session entries.
+// Drop nontext, empty, or oversized drafts.
 export function normalizeDrafts(raw: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
@@ -843,14 +681,10 @@ export function normalizeDrafts(raw: unknown): Record<string, string> {
   return out;
 }
 
-// The sent-but-not-yet-recorded prompts, made safe to use.
-//
-// An entry that is not text, is blank or whitespace, or runs past `PROMPT_HISTORY_ENTRY_CHARS`
-// is dropped: `promptHistory` and `promptsAcross` refuse any entry that long, so a longer one
-// stored here could never reach the reader through Up-arrow history anyway. The record takes
-// the session-shaped ceiling, newest entries kept. `sentAfter` already bounds how many
-// prompts one session holds in memory, so this adds no separate count cap of its own. A
-// session left with no usable entry takes no place here, the way an empty draft takes none.
+// Normalizes stored sent prompts before transcript reconciliation.
+// Drop nontext, blank, and oversized entries.
+// Retain the newest bounded session entries. Per-session prompt counts are not capped here.
+// Sessions without a usable prompt have no entry.
 export function normalizeSentPrompts(raw: unknown): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
@@ -867,17 +701,12 @@ export function normalizeSentPrompts(raw: unknown): Record<string, string[]> {
   return out;
 }
 
-// The prompts a reload puts back into memory: a plain copy of the saved book.
-//
-// Copied rather than aliased, the way `this.drafts` is restored from `this.saved.drafts`: a
-// send fills this copy at send time, and the saved copy must move only when a save runs.
+// Returns a shallow copy of the saved sent-prompt map for in-memory updates.
 export function restoredSentPrompts(saved: Pick<PanelState, 'sentPrompts'>): Record<string, string[]> {
   return { ...saved.sentPrompts };
 }
 
-// The facts one refresh reads to decide what moved since the last one. Two questions are
-// asked of it, and they are not the same question, so it is written down once and answered
-// twice below.
+// Refresh facts shared by listing and spend-source signatures.
 export interface ListingFacts {
   showing: string | null;
   files: { file: string; size: number; mtimeMs: number }[];
@@ -888,59 +717,21 @@ export interface ListingFacts {
   sessionParents: string;
 }
 
-// What one refresh compares against the last to decide whether anything moved.
-//
-// Every listed file's size and mtime, so any transcript that changed shows up, over all of
-// them rather than the few parsed: the picker draws every session with its name and its
-// clock time, so one that is listed and not parsed can still change what is on screen.
-//
-// Codex's thread-name index is the one term that is not a transcript. Codex names a thread
-// after the rollout has stopped being written, into a file of its own, so a session being
-// named moves nothing else in here. Without that term the panel keeps the old name until some
-// unrelated session happens to move, which on an idle machine is never.
-//
-// The session shown alone is in it because showing one changes what is drawn without
-// any file changing. The session parents are in it for the same reason: the worker can
-// resolve a reference on a walk after the one that saw the parent transcript grow, and
-// the heading of the dispatched session or subagent then changes with every file still.
+// Signs listed source revisions, child discovery, session names, parent relationships, and selection.
+// Name and parent updates can change the drawn panel without changing a transcript.
 export function listingSignature(now: ListingFacts): string {
   return `${now.showing}|${now.threadNames}|${now.sessionParents}|${spendSourceSignature(now)}`;
 }
 
-// The same facts, cut down to what a Project cost source can be discovered or re-read from:
-// each listed transcript's revision, and the child listing, because a child transcript is a
-// spend source of its own.
-//
-// It reads the same object as the signature above and drops two of its terms. Selecting a
-// session cannot add, remove or grow a spend source. Codex names a thread into an index
-// of its own and touches no transcript, so a rename cannot either. Both are real reasons to
-// repaint and neither is a reason to offer.
-//
-// The offer walks every record in the ledger and stats the ones the listing does not carry,
-// so a term in here that moves for a reason the spend index does not care about pays that
-// whole walk for nothing. Adding one back is the cost of a click.
+// Signs source revisions and child discovery for Project cost offers.
+// Selection and the Codex name index change no spend source and are excluded.
 export function spendSourceSignature(now: ListingFacts): string {
   return `${now.children}|` + now.files.map((f) => `${f.file}:${f.size}:${f.mtimeMs}`).join('|');
 }
 
-// Whether a refresh has anything to do.
-//
-// Four terms, and each is a different reason to go on. `force` is the refresh button and a
-// freshly shown panel, which repaint whatever moved. The signature is every listed file's
-// size and mtime, so it answers whether any transcript changed. A glance that reached a
-// session it had not reached before is a reason on its own: the budget spends over
-// several polls, so a workspace where nothing is running produces the same signature for ever
-// and the rail would fill by one budget and stop.
-//
-// `statusMoved` is the clock. A turn whose agent died is never written to again, so its
-// signature never moves and the three terms above never fire, and the card it was drawn as
-// would keep the word running for as long as the panel stayed open. The caller answers this
-// by asking `statusOf` what each newest turn was at the last repaint and what it is now, so
-// the rule for when a turn stops running stays in one place.
-//
-// Here rather than in the panel because it is a decision, and the call site in `panelhost.ts`
-// is checked as source text rather than exercised. A guard there can see the terms in the
-// right order; only running it catches a boundary written the wrong way round.
+// Requests refresh for forced work, a changed signature, status or dispatched figures,
+// changed live children, or changed metadata coverage.
+// Clock-driven state changes require refresh even when source files stay unchanged.
 export function refreshWanted(now: {
   force: boolean;
   signature: string;
@@ -968,32 +759,13 @@ export function refreshWanted(now: {
   return now.glancedNow !== now.glancedBefore;
 }
 
-// How many bytes of transcript one refresh may glance at, over every session it has
-// not glanced at before.
-//
-// A glance is 1 MB at most and costs 0.44 ms, so a cold start over this workspace's 49
-// sessions reads 25.2 MB and the largest project's 130 read 20.2 MB. Taken in one go
-// that is 22 ms and 58 ms of the extension host's event loop, which is survivable here and
-// is not bounded: a workspace with five hundred sessions would freeze the host for a
-// quarter of a second on the poll that happened to be first.
-//
-// So a refresh spends a budget and stops, and the rail fills over the next few polls. Eight
-// megabytes covers this workspace in four refreshes and the largest project in three, at
-// roughly 8 ms of scanning each. A session whose window has not been read yet says
-// nothing, which is the answer every unparsed session gives today, so the filling reads
-// as the rail catching up rather than as a wrong count settling down.
+// Initial transcript-read byte budget across metadata candidates in one refresh.
+// Later refreshes continue filling session list metadata.
 export const GLANCE_BUDGET_BYTES = 8 * 1024 * 1024;
 
-// Which sessions a refresh glances at, newest first until the budget runs out.
-//
-// Newest first, because that is the order the rail draws and the order the reader looks in:
-// a budget spent oldest first would fill the fold of the rail before its top. A session
-// already glanced at is not re-read and does not spend budget, so a settled workspace spends
-// nothing and only a session whose file moved comes back round.
-//
-// The size counted against the budget is the initial read cost. Most glances stop there.
-// A miss can grow to the turn-start ceiling, but its revision cache pays that cost once.
-// Charging every candidate at the ceiling would leave most of the refresh budget unused.
+// Takes candidates in caller order until their initial read costs reach the budget.
+// Each cost is the lesser of file size and initial window size.
+// Recovery reads beyond that initial window are not charged here.
 export function glanceBudget<T extends { size: number }>(
   candidates: readonly T[],
   windowBytes: number,
@@ -1014,13 +786,9 @@ export function glanceBudget<T extends { size: number }>(
   return out;
 }
 
-// Why the selected session has no cards. Decided here rather than in the panel because
-// the panel is the file with no tests and must not infer workspace state from an empty list.
-//
-// Three states are all the current readers can support. Neither reader records whether its
-// root exists, holds records for other workspaces, or held records it could not read, so
-// no message may claim one of those; adding a state here means adding reader metadata for
-// both sources first.
+// Explanation for an empty selected timeline.
+// Messages require workspace-folder, selection, draft, and loading facts.
+// Missing source-root and read-failure metadata cannot support more specific claims.
 export interface EmptyTimeline {
   message: string;
 }
@@ -1034,10 +802,9 @@ function newestTurnLoadingMessage(label: string): string {
   return `Loading the newest turn from ${label}.`;
 }
 
-// A loading explanation occupies the empty state when there are no cards, and the history
-// status below existing cards when a compaction or another partial card is already visible.
-// Keeping the two destinations exclusive prevents the same sentence from being announced
-// twice on an empty timeline.
+// Show loading text in the empty state when there are no cards.
+// With visible cards, including partial compaction cards, show it in history status instead.
+// These destinations remain exclusive so an empty timeline announces the text once.
 export function newestTurnLoading(label: string | null, hasCards: boolean): NewestTurnLoading {
   if (!label) {
     return { diagnosis: null, history: null };

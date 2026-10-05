@@ -4,31 +4,28 @@ import * as path from 'node:path';
 import { writeFileAtomically } from './atomicfile';
 import type { CodexSessionMeta } from './codex';
 
-// The shape and the meaning of a stored Codex opening record. A stored row at another version
-// is dropped at load, and the rollout's head is read again.
+// CODEX_META_VERSION identifies stored opening fields and their derivation rules.
+// Loading drops rows with another version and rereads their rollout openings.
 //
-// Bump it when `CodexSessionMeta` gains or loses a field, and when the rule behind a stored
-// field changes. The rules live in `readCodexOpeningRecord` in `codex.ts` and the helpers it
-// derives a stored field with: `codexStartedAt`, `codexReplayBoundaryAt`, `guardianPayloadAt`,
-// `stamp`, `codexAgentPath`, and what they call. A changed rule keeps a valid shape, so nothing
-// else rejects the old row, and a rollout's opening record is read only once.
+// Bump this version when CodexSessionMeta fields or their derivation rules change.
+// readCodexOpeningRecord in codex.ts owns those rules and calls codexStartedAt,
+// codexReplayBoundaryAt, guardianPayloadAt, stamp, codexAgentPath, and their helpers.
+// Changed rules can leave the stored shape valid, so shape validation cannot detect them.
 //
-// It is apart from `VERSION` in `derivedcache.ts`, because every rollout on the machine has a
-// row here. A bump costs one read of every rollout's head, which is seconds at startup.
+// This version is independent of VERSION in derivedcache.ts.
+// A bump rereads every stored rollout opening on the machine.
 export const CODEX_META_VERSION = 3;
 
-// A file written before rows carried their own version names none. Versions 27 through 29 of
-// the derived session cache hold rows with the version 1 shape and meaning. Version 27 is the
-// first with `startedAt`, so an older file keeps no rows.
+// Unversioned opening rows use the derived session cache version below.
+// Versions before 27 lack startedAt and have no supported opening metadata version.
 const LEGACY_CODEX_META_VERSIONS: ReadonlyMap<number, number> = new Map([
   [27, 1],
   [28, 1],
   [29, 1],
 ]);
 
-// A save takes over a lock older than this. Its holder is a window that died holding it, or a
-// live window that paused past this age. A save holds the lock for one read and one write of
-// the file, which takes well under a second.
+// Saves attempt takeover when a lock reaches this age.
+// A dead holder or a paused live holder can leave a lock past the threshold.
 export const CODEX_OPENINGS_LOCK_STALE_MS = 30_000;
 
 interface StoredOpenings {
@@ -46,8 +43,8 @@ function nullableFinite(value: unknown): value is number | null {
   return value === null || (typeof value === 'number' && Number.isFinite(value));
 }
 
-// Whether a stored value has every field `CodexSessionMeta` holds, so a row that lacks one
-// drops alone.
+// Validates required stored fields and the optional nativeSpawnedAt field.
+// Invalid rows are dropped individually.
 export function isStoredCodexMeta(value: unknown): value is CodexSessionMeta {
   return (
     record(value) &&
@@ -67,9 +64,8 @@ export function isStoredCodexMeta(value: unknown): value is CodexSessionMeta {
   );
 }
 
-// The Codex opening rows a parsed cache file holds, or none when they were derived under
-// another `CODEX_META_VERSION`. Both the shared file and the older workspace file go through
-// here.
+// Reads valid Codex opening rows from shared or workspace cache data.
+// Rows with another CODEX_META_VERSION are dropped.
 export function storedCodexMetas(parsed: unknown): Map<string, CodexSessionMeta> {
   const rows = new Map<string, CodexSessionMeta>();
   if (!record(parsed) || !Array.isArray(parsed.codexMetas)) {
@@ -92,8 +88,8 @@ export function storedCodexMetas(parsed: unknown): Map<string, CodexSessionMeta>
   return rows;
 }
 
-// The rows of the machine's shared file, or null when the file is missing or unreadable. Null
-// is what lets the caller seed from an older workspace file.
+// Reads the shared opening rows, or null for a missing, unreadable, or malformed file.
+// A null result lets startup use workspace rows.
 export function loadCodexOpenings(file: string): Map<string, CodexSessionMeta> | null {
   let text: string;
   try {
@@ -108,9 +104,8 @@ export function loadCodexOpenings(file: string): Map<string, CodexSessionMeta> |
   }
 }
 
-// The Codex opening rows a window starts with. The machine's shared file answers when it
-// exists. A missing one takes the rows an older workspace file holds, read under the same
-// version rule, and `seeded` says the first save must write them into the shared file.
+// Starts with shared opening rows when the file loads, including an empty map.
+// Otherwise, workspace rows seed the first save into the shared file.
 export function codexOpeningsAtStartup(
   sharedFile: string,
   workspaceRows: ReadonlyMap<string, CodexSessionMeta> | undefined,
@@ -127,7 +122,7 @@ function readText(file: string): string | null {
   }
 }
 
-// Creates `file` holding `token`, or answers false when it exists.
+// Creates file containing token, or returns false if creation or writing fails.
 function createExclusive(file: string, token: string): boolean {
   let fd: number;
   try {
@@ -150,11 +145,10 @@ function createExclusive(file: string, token: string): boolean {
   return written;
 }
 
-// Removes a lock past `CODEX_OPENINGS_LOCK_STALE_MS` and takes it. Two windows can judge the
-// same lock stale, so the removal runs under a guard file named for that lock's text and time.
-// Only the window that creates the guard removes the lock, and it reads the lock again first.
-// A window that finds the guard taken, or a lock other than the one it judged stale, backs off.
-// `judged` runs once this window has judged the lock stale.
+// Takes over a stale lock under a guard named for its contents and modification time.
+// Only the window that creates the guard removes the lock after rechecking its identity.
+// Contending windows return false.
+// judged runs after the initial stale-lock read.
 function takeStaleLock(lock: string, token: string, now: number, judged?: () => void): boolean {
   let mtimeMs: number;
   let text: string;
@@ -165,7 +159,7 @@ function takeStaleLock(lock: string, token: string, now: number, judged?: () => 
     }
     text = fs.readFileSync(lock, 'utf8');
   } catch {
-    // The holder released the lock between the tries.
+    // The lock failed inspection or reading.
     return false;
   }
   judged?.();
@@ -195,10 +189,8 @@ function takeStaleLock(lock: string, token: string, now: number, judged?: () => 
   return createExclusive(lock, token);
 }
 
-// A window that dies after it removed a stale lock and before it removed its guard leaves that
-// guard behind. The guard names a lock that no longer exists, so no takeover meets it again.
-// The holder of the lock removes every guard past `CODEX_OPENINGS_LOCK_STALE_MS`, the same age
-// at which a takeover removes the guard it meets.
+// A takeover interrupted after lock removal can leave a guard that later takeovers will not encounter.
+// The lock holder removes guards past CODEX_OPENINGS_LOCK_STALE_MS.
 function removeAbandonedGuards(lock: string, now: number): void {
   const directory = path.dirname(lock);
   const prefix = `${path.basename(lock)}.`;
@@ -223,9 +215,8 @@ function removeAbandonedGuards(lock: string, now: number): void {
   }
 }
 
-// Takes the lock beside the shared file and answers the token it holds, or null when another
-// writer holds it. The holder reads the token back before it replaces the file and before it
-// removes the lock, so a holder whose lock was taken from it writes and removes nothing.
+// Returns the acquired lock token, or null when acquisition fails.
+// Before replacing the shared file or releasing the lock, the holder checks its token.
 export function takeCodexOpeningsLock(lock: string, now = Date.now(), judged?: () => void): string | null {
   const token = `${process.pid}.${randomUUID()}`;
   if (!createExclusive(lock, token) && !takeStaleLock(lock, token, now, judged)) {
@@ -241,16 +232,12 @@ export function releaseCodexOpeningsLock(lock: string, token: string): void {
   }
 }
 
-// Saves this window's Codex opening rows into the machine's shared file, merged with what the
-// file holds. Every window writes this file, so the read, the merge and the write run under a
-// lock file beside it. A busy lock skips the save and answers false, so a save never waits.
+// Saves opening rows into the shared file while holding its adjacent lock.
+// A failed lock acquisition returns false without waiting.
 //
-// The merge takes rows for the rollouts in `walked`, this window's latest complete walk, from
-// `rows` first and the file second. A walked rollout that the file lacks keeps its row only
-// while the rollout exists, because another window can have removed its row after this walk.
-// A row of the file outside the walk stays only while its rollout exists, which covers a
-// rollout another window saw first. Every other row is dropped, so a deleted rollout never
-// comes back and the file stays bounded by the rollouts on disk.
+// For walked rollouts, rows takes precedence over the shared file.
+// A walked row absent from the shared file stays only if its rollout exists.
+// Shared rows outside the walk also stay only if their rollouts exist.
 export function saveCodexOpenings(
   file: string,
   rows: ReadonlyMap<string, CodexSessionMeta>,
@@ -299,8 +286,7 @@ export function saveCodexOpenings(
   }
 }
 
-// How long a save that found the lock busy waits before it tries again. A holder keeps the lock
-// for one read and one write of the file.
+// Delay before retrying a save that failed to acquire the lock.
 export const CODEX_OPENINGS_RETRY_MS = 2_000;
 
 // The window's opening records, whose revision moves whenever a row is added or removed.
@@ -309,12 +295,9 @@ interface OpeningRows {
   snapshot(): Iterable<[string, CodexSessionMeta]>;
 }
 
-// One window's saves of the shared file. A save writes only when the window's opening records
-// moved since its last save, and none runs before the first walk. A save that finds the lock
-// busy tries again after `CODEX_OPENINGS_RETRY_MS`, because a quiet window can go without
-// another checkpoint for as long as it stays open.
-// It declares its fields apart from the constructor, because the child processes of the
-// concurrency test load this module with type stripping, which rejects parameter properties.
+// Saves opening records after the first walk when their revision differs from the last saved revision.
+// Failed lock acquisition retries after CODEX_OPENINGS_RETRY_MS, even when no checkpoint follows.
+// Node type stripping rejects constructor parameter properties, so fields are declared separately.
 export class CodexOpeningsWriter {
   private readonly file: string;
   private readonly rows: OpeningRows;
@@ -322,8 +305,7 @@ export class CodexOpeningsWriter {
   private walk: readonly string[] | null = null;
   private retry: ReturnType<typeof setTimeout> | null = null;
 
-  // `seeded` says the rows came from an older workspace file rather than the shared file. The
-  // first save then owes the shared file those rows even when the walk reads nothing new.
+  // Seeded workspace rows require a first shared save even if the walk adds nothing.
   constructor(file: string, rows: OpeningRows, seeded: boolean) {
     this.file = file;
     this.rows = rows;

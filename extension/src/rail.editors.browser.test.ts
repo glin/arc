@@ -1,4 +1,4 @@
-// The rail's label and rename editors and the session context menus around them.
+// Session list label and rename editors, with their surrounding context menus.
 // Shared helpers live in `../test/rail.ts`.
 
 import { test } from 'vitest';
@@ -92,10 +92,8 @@ test('label replies stay with their request and preserve the editor input', { ti
   }
 });
 
-// The page before and after a first prompt is answered. Before, s1 runs under its draft id
-// with no turn drawn, so its heading is the one drawn for the prompt still running. After, the
-// render names the adoption and draws s1's turns under the durable id, which gives the heading
-// its figures and a new height.
+// Adoption replaces the provisional session id with its durable id. The new heading gains turn figures and changes height.
+
 function draftAdoption(): { draft: PanelPayload; adopted: PanelPayload } {
   const durable = payload([], [LIVE_PRESS]);
   const draft = JSON.parse(JSON.stringify(durable).replaceAll('"s1"', '"draft:s1"')) as PanelPayload;
@@ -106,8 +104,8 @@ function draftAdoption(): { draft: PanelPayload; adopted: PanelPayload } {
   return { draft, adopted };
 }
 
-// Where the label editor sits against the heading's Labels button drawn for `session`. The
-// editor opens under the heading row and spans the button.
+// Measure the label editor against its session heading's Labels button.
+
 async function labelEditorPlace(page: Page, session: string): Promise<Record<string, unknown>> {
   return (await page.evaluate(`(() => {
     const button = document.querySelector('[data-control="sessionlabels:${session}"]');
@@ -155,7 +153,7 @@ test(
         );
       }
 
-      // Measured straight after the adopting render, before anything else could place it again.
+      // Check placement immediately after adoption.
       await postToPage(page, adopted);
       assert.deepEqual(await labelEditorPlace(page, 's1'), PLACED);
       assert.deepEqual(
@@ -251,7 +249,7 @@ test(
         'a place over a labeled session does not offer the entry, or does not arm the panel that drew its menu',
       );
 
-      // The last label goes. Every place drops the key, including a card whose print held.
+      // Removing the last label clears every context, including retained turn cards.
       const unlabeled = initial.rail.map((card) => (card.id === 's1' ? { ...card, labels: [] } : card));
       await postToPage(page, railMessage(initial, unlabeled));
       const cleared = { labeled: false, session: 's1', armed: ['s1'] };
@@ -274,7 +272,7 @@ test(
         'a place did not offer the entry again after its session regained a label',
       );
 
-      // A render or a selection carries the rail too, and a card whose print held follows it.
+      // Render and selection payloads update labels on retained turn cards.
       await postToPage(page, { ...initial, rail: unlabeled });
       const heldCard = async () => ((await places()) as Record<string, { labeled: boolean }>).turnBody.labeled;
       assert.equal(await heldCard(), false, 'a render that took the last label left the entry on a turn card');
@@ -310,9 +308,8 @@ test(
     }
     try {
       const page = await browser.newPage();
-      // The default fixture draws only s1's cards; s2 is a rail card and a session row with
-      // nothing shown in the timeline, which is exactly the row the details dialog used to
-      // find nothing to place itself against.
+      // The fixture draws s1 in the timeline. s2 appears only in the session list and session rows.
+
       await openPage(page);
       await page.evaluate(`window.__posted = []`);
       await page.evaluate(`(() => {
@@ -326,16 +323,16 @@ test(
         'a right-click on a rail card for a session the timeline is not showing did not arm the native menu',
       );
 
-      // The provider's reply, the same message a real accepted command sends back to the host
-      // that armed it.
+      // Reply to the panel that requested session details.
+
       await postToPage(page, { type: 'showSessionDetails', session: 's2' });
       const opened = (await page.evaluate(`(() => {
       const dialog = document.getElementById('sessiondetails');
       const values = [...dialog.querySelectorAll('.sessiondetailsvalue')].map((node) => node.textContent);
       return { hidden: dialog.hidden, sessionId: values[2], command: values[3] };
     })()`)) as { hidden: boolean; sessionId: string; command: string };
-      // The command too. The panel words it from the agent key and the id on the row, so a
-      // card the timeline is not showing draws the same command as the one it is.
+      // Session details builds the resume command from the row's agent key and id.
+
       assert.deepEqual(
         opened,
         { hidden: false, sessionId: 's2', command: 'codex resume s2' },
@@ -366,9 +363,8 @@ test(
     }
     try {
       const page = await browser.newPage();
-      // s1 is the session the default fixture shows in the timeline, so its heading is drawn
-      // at the same time as its rail card: exactly the case a lookup by session id alone
-      // cannot tell apart from a right-click on the heading itself.
+      // Both the heading and session list row identify s1. The dialog must distinguish their anchors.
+
       await openPage(page);
       await page.evaluate(`window.__posted = []`);
       await page.evaluate(`(() => {
@@ -383,10 +379,8 @@ test(
       );
 
       await postToPage(page, { type: 'showSessionDetails', session: 's1' });
-      // The dialog opens below its anchor when that fits, edge apart, which is the common case
-      // at this viewport height: a top this close to a box's bottom names that box as the
-      // anchor the panel actually measured, regardless of how the dialog's own width was later
-      // clamped to the viewport.
+      // The dialog edge identifies the measured anchor after viewport width clamping.
+
       const placement = (await page.evaluate(`(() => {
       const dialog = document.getElementById('sessiondetails');
       const card = document.querySelector('[data-control="rail:s1"]');
@@ -503,9 +497,8 @@ test('rail label dismissal reconciles and returns to the live trigger', { timeou
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
-    // The trigger the reader pressed, named by the section its row is drawn under. s1 matches
-    // two saved views, so it carries a labels button under each of their sections and the
-    // press has to return to the one it came from.
+    // s1 matches two saved views. Return focus to the Labels button in the section that opened the editor.
+
     const opener = inSection(COMPOSER_VIEW, 'raillabels:s1');
     const trigger = page.locator(opener);
     await page.evaluate(`window.__railLabelTrigger = document.querySelector('${opener}')`);
@@ -572,9 +565,8 @@ test(
       const failures: string[] = [];
       page.on('pageerror', (error) => failures.push(String(error)));
       await openPage(page);
-      // The Composer view's card for s1. The fixture files s1 under two saved views, so the
-      // session carries a labels button under each of their sections and the editor is
-      // opened from one of them.
+      // Open the label editor from s1's row in the Composer view.
+
       await page.locator(inSection(COMPOSER_VIEW, 'raillabels:s1')).click();
       await answerLabelEditor(page, 's1', [
         { name: 'component system', count: 1, countName: '1 session', applied: true },
@@ -770,9 +762,8 @@ test('a session two views match has one label editor, and a press moves it', { t
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
 
-    // Every control that reports the editor open, counted as elements and named by the row
-    // each one sits on. The defect here is two controls reporting one editor, so a read that
-    // folded them down to sessions would answer the same either way.
+    // Count expanded controls as elements, since one session appears under two view sections.
+
     const reported = async () =>
       await page.evaluate(`(() => {
         const open = [...document.querySelectorAll('.raillabelact')]
@@ -814,8 +805,8 @@ test('a session two views match has one label editor, and a press moves it', { t
   }
 });
 
-// Rename session, walked the way a reader walks it: right-click a saved rail row, then the
-// command its menu offers, which the host answers with the session's full name.
+// Open Rename session through the saved row's context menu and its host reply.
+
 async function openSessionRename(page: Page, section: string, session: string, title: string): Promise<void> {
   await page.locator(inSection(section, `rail:${session}`)).click({ button: 'right' });
   await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'openSessionRename', session, title })}, '*')`);
@@ -864,8 +855,8 @@ test(
         (await page.evaluate(`window.__posted.filter((message) => message.type === 'renameSession')`)) as unknown[];
       const closed = { hidden: true, name: null, readOnly: false, saveDisabled: false, note: '', label: null };
 
-      // The native menu reads the row's context. A saved row offers Rename session, and the row
-      // of a provisional new session carries no saved record, so its context turns the entry off.
+      // Saved row context enables Rename session. Provisional session context disables it.
+
       const draft = { ...initial.rail[0], id: 'draft:rename', persisted: false, label: 'New session', current: false };
       await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, [draft, ...initial.rail]))}, '*')`);
       await page.evaluate(SETTLED);
@@ -876,8 +867,8 @@ test(
       assert.equal((await contextOf('rail:s1')).sessionPersisted, true);
       assert.equal((await contextOf('rail:draft:rename')).sessionPersisted, false);
 
-      // The command reaches every open host. One that saw no right-click on a saved row opens
-      // nothing: not with no press, not after a press on a provisional session's row.
+      // A panel opens no rename editor without a matching context-menu request on a saved session.
+
       await page.evaluate(`window.postMessage({ type: 'openSessionRename', session: 's1', title: 'Full name' }, '*')`);
       await page.evaluate(SETTLED);
       assert.equal((await editor()).hidden, true, 'the editor opened with no right-click behind it');
@@ -979,8 +970,8 @@ test(
   },
 );
 
-// The rename editor's state, read in one call: whether it is shown, what its note says, which
-// other popovers float beside it, and where focus is.
+// Read rename visibility, message, neighboring popovers, and focus.
+
 const RENAME_STATE = `(() => {
   const pop = document.getElementById('sessionrenamepop');
   const active = document.activeElement;
@@ -1135,7 +1126,7 @@ test('a rename answer moves focus only while the reader is still in the editor',
     const page = await browser.newPage();
     await openPage(page, payload());
 
-    // The reader moved on to the Composer while the rename ran. Neither answer takes them back.
+    // Neither rename result moves focus back from the prompt box.
     await submitRename(page, 'Refused name');
     const refused = await lastRequest(page);
     await page.locator('#prompt').focus();
@@ -1259,8 +1250,8 @@ test('a projected provisional row reports and changes its durable membership', {
   }
 });
 
-// Rename session from a session heading: a right-click on it, or a press on its Session
-// actions button, which opens the same menu. Then the command the menu offers.
+// Open the heading's Rename session action through a right-click or Session actions.
+
 async function openHeadingRename(page: Page, control: string, session: string, title: string): Promise<void> {
   const node = page.locator(`main#list [data-control="${control}"]`);
   if (control.startsWith('sessionmenu:')) {
@@ -1499,8 +1490,8 @@ interface RailRowContext {
 }
 
 async function railRowContext(page: Page, session: string): Promise<RailRowContext> {
-  // A session a saved view also matches draws a second row, and `drawRowContext` patches
-  // every occurrence, so the first one answers for all of them.
+  // Read the first matching row's context.
+
   return JSON.parse(
     (await page.locator(`[data-control="rail:${session}"]`).first().getAttribute('data-vscode-context')) ?? '{}',
   ) as RailRowContext;
@@ -1526,9 +1517,8 @@ test(
         [true, true],
         'a pin took Rename session off the heading',
       );
-      // The command reaches the host and comes back as this same message to every panel, so the
-      // rail card the reader never right-clicked answers the pin too, without waiting on a
-      // fresh rail message.
+      // A pin reply updates session list context without requiring a new session list payload.
+
       assert.equal(
         (await railRowContext(page, 's1')).sessionPinned,
         true,
@@ -1571,8 +1561,8 @@ test(
         'the fixture session already reads as pinned',
       );
 
-      // The optimistic local patch, the same one a press makes: it answers before the host
-      // round-trips, by writing the attribute directly rather than through a Preact render.
+      // The pin reply updates context directly before the full host render.
+
       await postToPage(page, { type: 'setSessionPinned', session: 's1', pinned: true });
       assert.equal(
         (await railRowContext(page, 's1')).sessionPinned,
@@ -1580,10 +1570,8 @@ test(
         'the rail card did not answer the optimistic pin',
       );
 
-      // A full render adopts the host's own pinnedTop set, which never named s1, the way the
-      // very first render did not. This is the panel's own path for reconciling an optimistic
-      // patch with what the host actually persisted, not a message this test invented, and the
-      // row it draws must answer that reconciled state rather than the patch a press left behind.
+      // The full host render restores its pinnedTop state after the optimistic pin update.
+
       await postToPage(page, initial);
       assert.equal(
         (await railRowContext(page, 's1')).sessionPinned,
@@ -1615,8 +1603,8 @@ test(
         'the fixture session already reads as archived',
       );
 
-      // The optimistic local patch, the same one a press makes: it answers before the host
-      // round-trips, by writing the attribute directly rather than through a Preact render.
+      // The archive reply updates context directly before the full host render.
+
       await postToPage(page, { type: 'setSessionArchived', session: 's1', archived: true });
       assert.equal(
         (await headingContext(page, 's1')).webviewSection,
@@ -1624,10 +1612,8 @@ test(
         'the heading did not answer the optimistic archive',
       );
 
-      // A full render adopts the host's own hidden set, which never named s1, the way the very
-      // first render did not. This is the panel's own path for reconciling an optimistic patch
-      // with what the host actually persisted, and the heading it draws must answer that
-      // reconciled state rather than the patch a press left behind.
+      // The full host render restores its hidden state after the optimistic archive update.
+
       await postToPage(page, initial);
       for (const pinned of [true, false, true, false]) {
         await postToPage(page, { type: 'setSessionPinned', session: 's1', pinned });
@@ -1675,17 +1661,16 @@ test(
     try {
       const page = await browser.newPage();
       const initial = payload();
-      // `setSession` needs a watermark to mark up to, which the fixture's rail row does not
-      // carry by default: nothing on the page reads it until a session-wide read command does.
+      // Session-wide read commands require the newest-turn watermark, which the fixture row does not carry by default.
+
       const s1Cards = (
         initial as unknown as {
           cards: { sessionId: string; kind: string; key: string; startedAt: number; live?: boolean }[];
         }
       ).cards.filter((card) => card.sessionId === 's1' && card.kind === 'turn');
       const newest = s1Cards.reduce((a, b) => (a.startedAt > b.startedAt ? a : b));
-      // The oldest card rather than the newest: the newest card is the live one, which the
-      // read state never marks on its own, so toggling it alone would prove nothing about the
-      // heading.
+      // Choose a completed turn. Live turns cannot receive an individual read mark.
+
       const oldestKey = s1Cards.filter((card) => !card.live).reduce((a, b) => (a.startedAt < b.startedAt ? a : b)).key;
       const railRow = initial.rail.find((row) => row.id === 's1') as { newestTurnAt: number } | undefined;
       if (railRow) {
@@ -1694,8 +1679,8 @@ test(
       await openPage(page, initial);
       const headingReadState = async () =>
         ((await headingContext(page, 's1')) as HeadingContext & { sessionRead?: 'read' | 'unread' }).sessionRead;
-      // A fresh page opens with nothing marked read, so the heading starts by offering to
-      // mark the session read rather than the way back.
+      // A fresh page starts with the session unread.
+
       assert.equal(await headingReadState(), 'unread', 'the heading of a freshly opened session already reads as read');
 
       await postToPage(page, { type: 'setSessionRead', session: 's1', read: true });
@@ -1705,8 +1690,8 @@ test(
         'the heading still offers Mark as read after the whole session was marked read',
       );
 
-      // A press over one turn's own card, not the session command the heading exposes, still
-      // moves the heading: marking that turn back unread leaves the session no longer fully read.
+      // Marking one completed turn unread also marks its session unread.
+
       await postToPage(page, { type: 'setRead', key: oldestKey, read: false });
       assert.equal(
         await headingReadState(),
@@ -1746,8 +1731,8 @@ test(
       ).cards;
       const s1Cards = cards.filter((card) => card.sessionId === 's1' && card.kind === 'turn');
       const newest = s1Cards.reduce((a, b) => (a.startedAt > b.startedAt ? a : b));
-      // A copy of a markable card rather than the live one: the live card is never something the
-      // read state marks on its own, so a copy of it would prove nothing about the heading.
+      // Copy a completed turn, since live turns cannot receive an individual read mark.
+
       const oldest = s1Cards.filter((card) => !card.live).reduce((a, b) => (a.startedAt < b.startedAt ? a : b));
       const railRow = initial.rail.find((row) => row.id === 's1') as { newestTurnAt: number } | undefined;
       if (railRow) {
@@ -1758,9 +1743,8 @@ test(
         ((await headingContext(page, 's1')) as HeadingContext & { sessionRead?: 'read' | 'unread' }).sessionRead;
       assert.equal(await headingReadState(), 'unread', 'the heading of a freshly opened session already reads as read');
 
-      // The new turn arrives through an ordinary full render immediately after the read command,
-      // in the same task, before Preact's own read-driven re-render of the heading has settled.
-      // The row the read command patched directly must still answer the render Preact just drew.
+      // Deliver the new turn in the same task as the read command, before the read-driven render settles.
+
       const arrived = {
         ...oldest,
         key: 'new-turn',

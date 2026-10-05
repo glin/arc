@@ -1,20 +1,10 @@
-// What the panel's tones measure against the grounds they are drawn on.
-//
-// The stylesheet keeps its colours in custom properties, and a reader can only read a word
-// when the tone and the ground behind it are far enough apart. This module answers that in
-// numbers. It reads the stylesheet and a theme table as text, so it holds no second copy of
-// either and cannot drift from what ships.
-//
-// Two things use it. `panel.webview.test.ts` fails when a tone that carries a word falls
-// under 4.5 to 1 without a recorded exception. The panel-mockup skill draws the tone sheet
-// from it, so a mockup argues about a measured figure rather than about an impression.
-//
-// Every figure anyone states about a tone comes from here. Working one out by hand rounds the
-// chip mix per channel where `color-mix` does not, which lands a hundredth away from what the
-// guard reads, and a figure copied into a comment is a second source that drifts on its own.
+// Measures panel text contrast and status-color distance.
+// The module reads the stylesheet and theme table instead of retaining copies.
+// `panel.webview.test.ts` checks the 4.5:1 text contrast threshold with recorded exceptions.
+// The panel-mockup skill uses these measurements in its tone sheet.
+// Use these calculations for reported figures. Manual per-channel rounding differs from CSS color mixing.
 
-/* The grounds a card or a chip can sit on: the panel background, the sidebar-toned control
-   bar, a hovered row, and the row a card sits on selected but unfocused. */
+/* Card and control backgrounds include the panel, sidebar-toned control bar, hovered row, and selected row without focus. */
 export const BACKGROUNDS = {
   dark: ['#1f1f1f', '#181818', '#2a2d2e', '#37373d'],
   light: ['#ffffff', '#f8f8f8', '#f2f2f2', '#e4e6f1'],
@@ -22,25 +12,13 @@ export const BACKGROUNDS = {
 
 export type ThemeKind = keyof typeof BACKGROUNDS;
 
-/* Which of the four above only one row wears at a time, by position: the row under the
-   pointer, and the row a card sits on selected but unfocused. Two cards share the panel and
-   they share the control bar, and they can never share these, so a pair of tones is never
-   read with both of its words over one of them.
-
-   A position and not a colour. A colour is a spelling, and the same spelling is a hovered
-   row in one theme and an ordinary panel in another, so reading the role off the value gets
-   both directions wrong. */
+/* Indexes backgrounds exclusive to one row, including hover and selected-unfocused states. Two cards cannot both use these backgrounds.
+   Exclusivity follows role indexes because equal color values can represent different roles in different themes. */
 export const SOLE_GROUNDS: readonly number[] = [2, 3];
 
-/* A tone whose own tinted chip reads worse than any plain ground it is also drawn on, and
-   the percentage that chip's rule mixes into the ground behind it. `--warn`, `--full` and
-   `--notice` share the three-band context-figure chip. `--mod` has the new-draft chip.
-   `--ok` is the answered value and the answered mark on a request card's tab, which draws on
-   `--chipbg`.
-
-   `--chipbg` is the one of the five that tints with the editor's foreground rather than with
-   the tone drawn inside it, so the figure taken here is close to the pixel rather than equal
-   to it. It reads worse than the plain panel either way, which is what this table is for. */
+/* Tint percentages for tones whose chip backgrounds reduce contrast. `warn`, `full`, and `notice` share the context chip.
+   `mod` colors a new draft. `ok` colors answered request values and tab marks on `--chipbg`.
+   `--chipbg` mixes the editor foreground rather than the tone. Its approximation still gives lower contrast than the plain panel. */
 export const CHIP_MIX: Readonly<Partial<Record<string, number>>> = {
   warn: 18,
   full: 26,
@@ -49,16 +27,14 @@ export const CHIP_MIX: Readonly<Partial<Record<string, number>>> = {
   ok: 9,
 };
 
-/* A tone the scan finds that is not a status word, and why the 4.5 a word needs does not
-   apply to it. `--idle` is the editor's own de-emphasised text and is listed here too, so
-   the guard and the tone sheet skip the same set. */
+/* Non-status tones that do not require the 4.5 text contrast ratio.
+   `--idle` uses the editor's de-emphasized text color. The guard and tone sheet exclude the same tones. */
 export const EXCLUDED_TONES: Readonly<Record<string, string>> = {
   // .sbsep draws a literal separator between two status-bar figures. It is a mark between
   // two words, not a word of its own, the way a border or a bullet is not text either.
   edge: 'draws the status bar separator mark, not a word',
-  // panel.css leaves --idle on var(--vscode-descriptionForeground) rather than a literal:
-  // it is the editor's own de-emphasised text, drawn at the same weight through the chrome
-  // around the panel, and a literal here would make the panel disagree with its window.
+  // panel.css uses var(--vscode-descriptionForeground) for --idle.
+  // This editor color keeps de-emphasized panel text consistent with the surrounding editor.
   idle: "the editor's own colour for text nobody is meant to read first",
 };
 
@@ -69,8 +45,7 @@ export interface Rgba {
   a: number;
 }
 
-/* A hex or rgb value as numbers. A tone can carry alpha, which is the whole reason the
-   stylesheet must never read a graph token: charts.orange is orange at a third opacity. */
+/* Parses hex and rgb values, including alpha. Translucent editor chart tokens require alpha-aware text contrast calculations. */
 export function parseColor(value: string): Rgba {
   const hex = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(value.trim());
   if (hex) {
@@ -107,17 +82,9 @@ function over(fg: Rgba, bg: Rgba): Rgba {
   };
 }
 
-/* The WCAG ratio of a tone over a ground. Both are composited before their luminance is
-   read, so a translucent tone is measured at the strength it draws.
-
-   A ground can be translucent too, and several themes ship one: a hover row is often a
-   percentage of white laid over whatever is behind it. Contrast is a property of the pixel,
-   not of the declaration, so a translucent ground is laid over `base` first. Read as written,
-   a ground of `#ffffff14` measures as pure white and reports a readable word as hopeless.
-
-   `base` is the panel background. The webview's own body is transparent, so the true base is
-   whatever the editor paints behind the frame, and the panel background is the closest thing
-   the stylesheet can name. */
+/* Returns the WCAG contrast ratio after compositing text over its background.
+   A translucent background is first composited over `base`, then text alpha is applied.
+   `base` represents the panel background. The transparent webview body ultimately uses the editor background. */
 export function contrastOn(fg: string, bg: string, base = '#000000'): number {
   const ground = parseColor(bg);
   const solid = ground.a < 1 ? over(ground, parseColor(base)) : ground;
@@ -131,9 +98,8 @@ export function worstOf(fg: string, grounds: readonly string[], base?: string): 
   return Math.min(...grounds.map((bg) => contrastOn(fg, bg, base)));
 }
 
-/* The same figure for a tone drawn inside a chip whose own background is that tone mixed at
-   a set percentage into the ground the chip sits on. Tinting a ground with the text's own
-   hue pulls the two together, so this reads worse than the plain ground underneath. */
+/* Contrast for text inside a background tinted with that text's tone.
+   Mixing the tone into the background reduces contrast compared with the underlying background. */
 export function chipWorstOf(fg: string, grounds: readonly string[], mixPercent: number, base = '#000000'): number {
   const f = parseColor(fg);
   const p = mixPercent / 100;
@@ -141,9 +107,8 @@ export function chipWorstOf(fg: string, grounds: readonly string[], mixPercent: 
     ...grounds.map((bg) => {
       const raw = parseColor(bg);
       const b = raw.a < 1 ? over(raw, parseColor(base)) : raw;
-      // color-mix carries the tone's own alpha into the result, so a tone at a third opacity
-      // mixed at 26% tints the ground by about 9% and not by 26%. Reading the mix as opaque
-      // reports a chip far louder than the one the browser draws.
+      // color-mix includes the tone's alpha. A tone at one-third opacity mixed at 26% tints the background by about 9%.
+      // Treating the tone as opaque overstates the browser's tint.
       const tint = p * f.a;
       const ground =
         `rgb(${tint * f.r + (1 - tint) * b.r}, ${tint * f.g + (1 - tint) * b.g}, ` +
@@ -153,18 +118,15 @@ export function chipWorstOf(fg: string, grounds: readonly string[], mixPercent: 
   );
 }
 
-/* One top-level stylesheet rule's declarations, found by its exact selector list. Exact,
-   because the stylesheet is one namespace and the interesting selectors are prefixes of each
-   other. Top-level, because a rule inside `@media` or `@supports` applies only some of the
-   time. The selector list is compared with its whitespace in one shape, so line breaks and
-   indentation do not change which rule is read. */
+/* Collects top-level declarations with an exact normalized selector list.
+   Exact matching distinguishes selectors with shared prefixes. Whitespace differences do not affect matching.
+   Nested `@media` and `@supports` rules are excluded because their declarations apply conditionally. */
 export function ruleBody(styleSource: string, selector: string): string {
   const source = withoutComments(styleSource);
   const wanted = selectorList(selector);
   const bodies: string[] = [];
-  // Every rule with this selector, in the order they are written. A stylesheet may declare
-  // one twice, and the browser reads both, so a reader that stops at the first reports a
-  // value the second one replaced.
+  // Collect every matching rule in source order.
+  // A selector can appear twice. Later declarations of equal importance take precedence.
   let depth = 0;
   let prelude = 0;
   for (let at = 0; at < source.length; at += 1) {
@@ -200,17 +162,14 @@ function selectorList(text: string): string {
   return text.trim().replace(/\s+/g, ' ').replace(/ ?, ?/g, ', ');
 }
 
-/* The stylesheet with every comment blanked to spaces. A declaration written inside a comment
-   is not a declaration, and the browser draws nothing from it, so anything reading this file
-   for what ships has to be blind to it the same way. A `}` inside one would end a rule early
-   as well. Blanked and not deleted, so every offset still points at the same character. */
+/* Blanks CSS comments to spaces while preserving newlines and offsets.
+   Commented declarations do not render. Braces in comments must not close a rule. */
 function withoutComments(styleSource: string): string {
   return styleSource.replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '));
 }
 
-/* What a real editor hands the page for a token a declaration reads, so a declaration left
-   on var(--vscode-charts-orange, #d18616) is measured at the alpha value the editor sends
-   and not at the opaque fallback written for a broken host. */
+/* Resolves editor tokens from the theme table before using their declared fallback.
+   This preserves token alpha that an opaque fallback would omit. */
 export function resolveValue(raw: string, theme: string): string {
   const asVar = /^var\((--vscode-[\w-]+)(?:,\s*(.+))?\)$/.exec(raw.trim());
   if (!asVar) {
@@ -227,9 +186,8 @@ export function resolveValue(raw: string, theme: string): string {
   return resolveValue(fallback, theme);
 }
 
-/* Every custom property the stylesheet paints text with, read from the stylesheet rather
-   than from a list kept here: a tone added later and never taught to a caller would
-   otherwise carry text and never be asked about. */
+/* Collects custom properties used directly for text color.
+   Reading declarations keeps newly added tones in the measurement set. */
 export function textToneNames(styleSource: string): string[] {
   const names = new Set<string>();
   const re = /(?<![\w-])color:\s*var\(--(?!vscode-)([\w-]+)\)/g;
@@ -240,14 +198,11 @@ export function textToneNames(styleSource: string): string[] {
   return [...names].sort();
 }
 
-/* Every selector that paints text with a given tone, keyed by tone name. A tone sheet says
-   where a tone is drawn as well as how it measures, and reading the selectors back out of
-   the stylesheet keeps that list from going stale the way a written one does. */
+/* Groups text-color selectors by tone name.
+   Reading the stylesheet keeps the tone sheet aligned with declared uses. */
 export function toneUsages(styleSource: string): Record<string, string[]> {
   const usages: Record<string, string[]> = {};
-  // Blanked first, so a rule someone commented out is not read as a rule that ships. The
-  // browser draws nothing from it, and reading it makes this claim a tone is painted where
-  // nothing is painted at all.
+  // Exclude CSS comments so disabled declarations contribute no tone usage.
   const re = /([^{}]+)\{([^{}]*)\}/g;
   let rule: RegExpExecArray | null;
   while ((rule = re.exec(withoutComments(styleSource)))) {
@@ -255,9 +210,8 @@ export function toneUsages(styleSource: string): Record<string, string[]> {
     if (!selector) {
       continue;
     }
-    // A fallback after the name is ordinary CSS and this stylesheet writes several, so the
-    // name ends at a comma as well as at the closing bracket. Read only to the bracket, a
-    // rule painting `var(--paused, #654321)` is a rule this reports as painting nothing.
+    // CSS variables in this stylesheet include fallbacks. End the variable name at a comma or closing bracket.
+    // This keeps `var(--paused, #654321)` recognizable as --paused.
     const inner = /(?<![\w-])color:\s*var\(--(?!vscode-)([\w-]+)\s*[,)]/g;
     let paint: RegExpExecArray | null;
     while ((paint = inner.exec(rule[2]))) {
@@ -270,18 +224,16 @@ export function toneUsages(styleSource: string): Record<string, string[]> {
   return usages;
 }
 
-/* A theme to measure in: its variable table, which of the editor's two kinds it is, and the
-   four grounds a card sits on inside it. A theme the reader installed has its own grounds,
-   so they are given rather than assumed. Left out, the kind's own defaults answer. */
+/* A theme's variables, editor kind, and four card backgrounds.
+   Installed themes supply their own backgrounds. Omitted backgrounds use the editor kind's defaults. */
 export interface ThemeInput {
   id: string;
   kind: ThemeKind;
   table: string;
   grounds?: readonly string[];
-  /* Which of those grounds only one row wears at a time, by position. Left out with the
-     grounds, `SOLE_GROUNDS` answers for the kind's own four. Left out beside a ground list
-     of the caller's own, nothing is sole: the roles in that list are the caller's to state,
-     and guessing them from the colour values is how both directions go wrong. */
+  /* Background positions that cannot appear on separate rows together.
+   Omitting these positions and the backgrounds uses `SOLE_GROUNDS` for the kind's four defaults.
+   Custom background lists require explicit positions. Omitting positions with a custom list treats every background as able to appear together. */
   soleGrounds?: readonly number[];
   /* What a translucent ground is laid over. Defaults to the first ground, which is the panel
      background in every theme shipped here. A caller whose ground list does not lead with an
@@ -343,26 +295,13 @@ export function toneValue(styleSource: string, theme: string, tone: string, kind
   return resolveValue(found, theme);
 }
 
-/* The tones a reader is asked to tell one from another, rather than only to read against
-   the panel. A card says running where another says needs you, and a turn says failed where
-   another says done. A ratio against a ground says a word is legible and says nothing about
-   whether it is the word beside it.
-
-   The list is written out, and `statusSelectorTones` below is what stops it going stale: a
-   tone the stylesheet gives a rail status is compared whether or not anyone remembered to
-   add it here. `warn` and `ok` are named by hand because neither is a rail status. Caution
-   shares the panel with running and needs-you and is the warm tone nearest both, and done is
-   the other word a turn head can carry. */
+/* Status tones that require both readable text and distinguishable colors.
+   `statusSelectorTones` checks session list status coverage. `warn` and `ok` also appear outside session list statuses. */
 export const STATUS_TONES = ['ok', 'bad', 'warn', 'busy', 'need'] as const;
 
-/* Every tone the stylesheet paints a rail status word with. `STATUS_TONES` has to hold all
-   of them, which is the check that catches a state added to the rail and left out of the
-   comparison. A tone drawn only somewhere else is not found here and is nobody's omission.
-
-   One thing this cannot see: a rule that reaches the status word through a second custom
-   property, as `.railstatus.paused { --busy: var(--paused); color: var(--busy); }` does. The
-   scan reports `busy` there and the pixel is `paused`. A selector scan cannot follow an
-   alias, and the rule against writing one is in `docs/timeline.md` beside this guard. */
+/* Collects tones directly used by session list status selectors. `STATUS_TONES` must include them.
+   This scan does not follow custom-property aliases. For example, assigning `--busy: var(--paused)` still reports `busy`.
+   `docs/timeline.md` excludes status-color aliases for this reason. */
 export function statusSelectorTones(styleSource: string): string[] {
   const usages = toneUsages(styleSource);
   return Object.keys(usages)
@@ -370,31 +309,21 @@ export function statusSelectorTones(styleSource: string): string[] {
     .sort();
 }
 
-/* Whether a selector colours the rail status itself, rather than something standing next to
-   one. Only the last compound of each comma-separated part is the element being drawn, so
-   `.railstatus + .railwhen` paints the timestamp and does not count, while `.railstatus`
-   alone, `.railstatus.running` and `.railstatus[data-state='paused']` all do. A rule on
-   `.railstatus::before` counts: the mark it draws is part of the status word.
-
-   `:not()` and `:has()` are taken out first, because neither names the element being drawn:
-   one rules it out, the other tests what stands near it. `:is()` and `:where()` do name it,
-   so each of their arguments is read as a selector in its own right.
-
-   Three things are not recognised, and nothing in this stylesheet is written any of the three
-   ways. A class name written as an escape rather than as letters. A double negative,
-   `:not(:not(.railstatus))`, which this reads as the single negative it looks like. And a
-   structural character quoted inside an attribute value, which ends the attribute here and
-   does not end it in a browser. Each would mean parsing CSS rather than reading a selector. */
+/* Determine whether a selector colors the session list status. Inspect the last compound of each comma-separated selector.
+   `.railstatus + .railwhen` colors the timestamp. `.railstatus`, `.railstatus.running`, and `.railstatus[data-state='paused']` color the status.
+   `.railstatus::before` also counts because its mark forms part of the status.
+   Remove `:not()` and `:has()`: they exclude the subject or test nearby elements. Inspect each argument of `:is()` and `:where()` as a selector.
+   This reader does not support escaped class names, double negatives, or structural characters quoted in attributes.
+   It treats `:not(:not(.railstatus))` as a single negative. Quoted structural characters end its attribute scan.
+   The stylesheet avoids these forms, which require a CSS parser. */
 function paintsARailStatus(selector: string): boolean {
   const clean = selector.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\[[^\]]*\]/g, '[]');
   return splitOutside(withoutSubjectless(clean), ',').some(drawsAStatus);
 }
 
-/* Whether one selector, already free of the pseudo-classes that do not name their subject,
-   draws a rail status. The subject is the compound after the last combinator. Inside `:is()`
-   or `:where()` each argument is a selector of its own, so each one's subject is read the
-   same way: `:is(.railstatus, .other)` draws a status and `:is(.railstatus .child, .other)`
-   draws a child of one. */
+/* Check a selector after removing pseudo-classes that do not name the subject. Its subject follows the last combinator.
+   Inspect each `:is()` or `:where()` argument separately.
+   `:is(.railstatus, .other)` draws a status. `:is(.railstatus .child, .other)` draws a child. */
 function drawsAStatus(selector: string): boolean {
   const compounds = splitOutside(selector.trim(), ' >+~');
   const last = compounds[compounds.length - 1] ?? '';
@@ -407,10 +336,8 @@ function drawsAStatus(selector: string): boolean {
   });
 }
 
-/* A selector with every `:not()` and its whole argument taken out, brackets counted so the
-   one that closes it is its own. A regular expression cannot do this: written to stop at the
-   first `)` it cuts `:not(:is(.other), .railstatus)` in half and leaves the name standing,
-   and written to allow nested brackets it needs to count, which is this. */
+/* Removes `:not()` and `:has()` arguments with balanced parentheses.
+   Stopping at the first closing parenthesis would leave part of a nested argument in the selector. */
 function withoutSubjectless(selector: string): string {
   let text = selector;
   for (;;) {
@@ -471,9 +398,8 @@ function splitOutside(text: string, cuts: string): string[] {
   return parts;
 }
 
-/* CIE L*a*b*, from sRGB through D65. Colour distance needs a space where equal steps look
-   about equal, which sRGB is not: two hex values far apart in channel numbers can be one
-   colour to the eye, and two close ones can be plainly different. */
+/* Convert sRGB through D65 to CIE L*a*b*.
+   Equal steps in sRGB channels do not represent equal perceived color differences. L*a*b* provides the space for color distance. */
 function toLab(colour: string, base: string): [number, number, number] {
   const raw = parseColor(colour);
   const solid = raw.a < 1 ? over(raw, parseColor(base)) : raw;
@@ -490,17 +416,9 @@ function toLab(colour: string, base: string): [number, number, number] {
   return [116 * xyz[1] - 16, 500 * (xyz[0] - xyz[1]), 200 * (xyz[1] - xyz[2])];
 }
 
-/* How far apart two tones look, as CIEDE2000.
-
-   The plain distance between two Lab points, CIE76, cannot do this job. It reports about 12
-   for pairs a reader cannot separate at all: `#1f17ee` against `#0201ff` measures 12.05 that
-   way and 1.77 this way. Three of the tones compared here are yellow to orange, which is a
-   corner where the two formulas disagree, so the weaker one would sign off on the collision
-   this exists to stop.
-
-   CIEDE2000 corrects for lightness, chroma and hue against measured visual data. Its
-   reference implementation and test vectors are Sharma, Wu and Dalal, and the vectors are
-   what `tones.test.ts` pins this against. */
+/* Returns CIEDE2000 color distance, correcting for lightness, chroma, and hue.
+   CIE76 can overestimate separation near blue and yellow-orange.
+   `tones.test.ts` uses the Sharma, Wu, and Dalal reference vectors. */
 export function colourDistance(a: string, b: string, base = '#000000'): number {
   return labColourDistance(toLab(a, base), toLab(b, base));
 }
@@ -513,10 +431,9 @@ export function labColourDistance(
 ): number {
   const rad = Math.PI / 180;
   const cMean = (Math.hypot(a1, b1) + Math.hypot(a2, b2)) / 2;
-  // c^7 / (c^7 + 25^7). Dividing through by 25^7 first keeps both terms in range for any
-  // chroma an sRGB colour can produce, which tops out near 135. The function is exported for
-  // the published vectors and so takes any finite triple: past about 1e44 the seventh power
-  // is Infinity even scaled, and the ratio there is 1, which is the limit it is heading to.
+  // c^7 / (c^7 + 25^7). Divide by 25^7 to keep terms in range for sRGB chroma, which peaks near 135.
+  // The exported function also accepts finite triples from published vectors.
+  // Above about 1e44, even the scaled seventh power becomes Infinity. Return the limiting ratio of 1 there.
   const seventh = (c: number) => {
     const scaled = (c / 25) ** 7;
     return Number.isFinite(scaled) ? scaled / (scaled + 1) : 1;
@@ -572,29 +489,10 @@ export function labColourDistance(
   return Math.sqrt((dL / sl) ** 2 + (dC / sc) ** 2 + (dH / sh) ** 2 + rt * (dC / sc) * (dH / sh));
 }
 
-/* Every pair of status tones, in every theme given, at the grounds where the two sit closest.
-
-   Every ground is measured and not only the panel background. A tone can carry alpha, and a
-   translucent word over a hovered row is a different pixel from the same word over the panel.
-
-   The two are measured over every combination of grounds and not only over one shared
-   ground, because the two words being compared are on different cards. One card is hovered
-   while the next is not, and one is the selected row while the next is not, so the reader
-   meets running on one ground and needs-you on another. Two tones that hold apart on every
-   single ground can still converge across a pair of them.
-
-   A ground the theme marks sole is left out of that cross product on both sides at once.
-   Reporting a pair at its closest over two hovered cards names a view the rail never draws. */
-/* The widest two pairs a reader can find that share no tone, reported as the narrower of the
-   two. High when the palette holds two separate sessions of colour, and low when it has
-   become one cluster with an outlier.
-
-   This is the set-level question, and it is not a share of anything recorded, so a baseline
-   someone regenerated cannot move it. A total of the ten distances cannot do this job: its
-   largest terms carry it, so one tone moving a long way and every tone moving a little come
-   out the same. Asking instead for two disjoint pairs that are both far apart is a fact about
-   the shape of the set. Four tones huddled with a fifth away from them can offer only one
-   wide pair, and whichever second pair is chosen alongside it comes from inside the huddle. */
+/* Summarizes pair distances for a status palette. */
+/* Returns the largest minimum distance among two pairs with no shared tone.
+   A palette with one distant outlier still needs a second separated pair to produce a large value.
+   Summing all distances would let that outlier dominate the result. */
 export function widestDisjointPair(rows: readonly ToneDistance[]): number {
   const apart = new Map(rows.map((row) => [row.pair, row.distance]));
   let best = 0;
@@ -619,8 +517,7 @@ export function statusToneDistances(styleSource: string, themes: readonly ThemeI
     }
     const sole = new Set(theme.soleGrounds ?? (theme.grounds ? [] : SOLE_GROUNDS));
     for (const at of sole) {
-      // A position outside the list names no ground, so it takes no combination out and the
-      // caller believes a rule is in force that is not. Louder than a quiet no-op.
+      // Reject indexes outside the background list because they cannot exclude any combination.
       if (!Number.isInteger(at) || at < 0 || at >= grounds.length) {
         throw new Error(`theme ${theme.id} calls ground ${at} sole, and it gives ` + `${grounds.length} grounds`);
       }
@@ -638,11 +535,9 @@ export function statusToneDistances(styleSource: string, themes: readonly ThemeI
         let at: [string, string] = [solidGrounds[0].name, solidGrounds[0].name];
         for (const first of solidGrounds) {
           for (const second of solidGrounds) {
-            // A ground only one row wears cannot be under both words. Skipping it keeps the
-            // sweep to combinations a reader can meet, so a pair is never reported closest
-            // at two hovered cards, which the rail draws one of. Matched by position, so a
-            // theme whose panel happens to be spelled like another theme's hovered row is
-            // not read as one.
+            // Measure every background combination except an exclusive role on both cards.
+            // Two cards cannot both occupy the hovered or selected-unfocused row.
+            // Match roles by index because equal color values can have different roles across themes.
             if (first.at === second.at && sole.has(first.at)) {
               continue;
             }
@@ -690,9 +585,8 @@ export function measureTones(
     for (const theme of themes) {
       const value = toneValue(styleSource, theme.table, tone, theme.kind);
       const grounds = theme.grounds ?? BACKGROUNDS[theme.kind];
-      // A hovered or selected row is often a percentage laid over the panel background, so
-      // the first ground given is what the rest are composited over. A caller whose list does
-      // not lead with an opaque panel colour names the base itself.
+      // Composite translucent hovered and selected backgrounds over the first background.
+      // Callers whose list does not begin with an opaque panel color must supply the base.
       const base = theme.base ?? grounds[0];
       const chipMix = CHIP_MIX[tone] ?? null;
       const worst = chipMix === null ? worstOf(value, grounds, base) : chipWorstOf(value, grounds, chipMix, base);

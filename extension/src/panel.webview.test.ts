@@ -233,7 +233,7 @@ import { missingSetupValues } from './domain/session-setups.ts';
 import { ProjectSetupStore, SetupProjects, normalizeProjectPath, projectSetupKey } from './projectsetups.ts';
 import { STORED_STATE_KEYS } from './identity.ts';
 import { claudeDispatchTranscript, turn as fixtureTurn } from './turnfixtures';
-// extension/src/panel.webview.test.ts
+
 import { beforeAll, test, vi } from 'vitest';
 import { SessionNames } from './sessionnames.ts';
 import {
@@ -1366,8 +1366,7 @@ test('the panel narrows the command list the way the tested rule does', () => {
   );
   const match = matchCommandNames;
   const names = PANEL_COMMANDS.map((c) => c.name);
-  // Every caret position in every one of them, not only the end. The reader walks back into
-  // what they wrote, and which run the caret stands in is the whole of what this decides.
+  // Check command matching at every caret position.
   for (const text of TYPED) {
     for (let caret = 0; caret <= text.length; caret++) {
       const found = promptToken('claude', text, caret);
@@ -1381,8 +1380,7 @@ test('the panel narrows the command list the way the tested rule does', () => {
       );
     }
   }
-  // The matching sweep derives its expected result from the host rule. The parser answers
-  // are written out here so a matching mistake in both paths cannot hide.
+  // Explicit parser results also catch mistakes shared by both matchers.
   assert.deepEqual(promptToken('claude', '/co', 3), { prefix: '/', typed: 'co', start: 0, end: 3 });
   assert.equal(promptToken('claude', '/co ', 4), null, 'the space that ends the name shuts the menu');
   assert.deepEqual(
@@ -1435,12 +1433,7 @@ test('the Composer replaces a completed quoted path without taking its delimiter
 });
 
 test('a command the panel answers itself opens a menu instead of going to the agent', () => {
-  // `/mcp` draws a list of servers in the agent's own terminal, so the CLI answers a panel
-  // with nothing. Sent as a prompt it went out and nothing came back, in front of a reader
-  // who had just picked it off the composer's own menu.
-  //
-  // The decision is `panelCommand` in `composerview.ts`, which is tested there. These two
-  // read the wiring on either side of it from the source.
+  // The host handles panel commands before sending prompts to the agent.
   sourceMatch(
     panelHostSource,
     /const opens = panelCommand\(text\);/,
@@ -1462,8 +1455,7 @@ test('a command the panel answers itself opens a menu instead of going to the ag
     "pressing Servers opens cached rows without asking for the selected owner's live state",
   );
 
-  // And the panel acts on the message. Without this the extension answers the command, posts
-  // it, and the reader still watches nothing happen.
+  // The browser opens the control named by the host.
   sourceMatch(
     panelHandler('openPick'),
     /composerControlsRenderer\.openPick\(msg\.control\)/,
@@ -2096,8 +2088,7 @@ test('activation loads the stored working-directory skill list and sends it to t
   assert.deepEqual(published, [skills]);
 });
 
-// Nothing on screen names the rail, so its landmark carries the name, and no row above the head
-// draws it again.
+// The session list landmark takes its accessible name from railLabel.
 test('the rail landmark carries its name and the head has no row above it', () => {
   sourceMatch(
     railSource,
@@ -2288,8 +2279,7 @@ test('a created draft focuses the existing box and an untouched draft leaves on 
     1,
     'the launcher builds a second prompt box instead of focusing the existing one',
   );
-  // Every route that opens a session goes through one method, so this reads that one
-  // rather than the rail's press, and it covers the walk back and forward with it.
+  // Session switching abandons an untouched draft before updating the previous selection.
   const switchAt = panelHostSource.indexOf('private show(session: string | null, host?: PanelHost): void {');
   const switching = memberFrom(panelHostSource, switchAt);
   sourceMatch(
@@ -2356,9 +2346,7 @@ test('narrow panels keep the launcher inside the sticky panel bar', () => {
 });
 
 test('the browser clock owns one relative ladder and one duration rule', () => {
-  // Both formatters belong to view/time.ts and are tested there. The browser keeps no copy,
-  // so a change to the ladder cannot show the new wording on the host and the old one on
-  // every tick in the panel.
+  // The browser imports the shared relative-time and duration formatters.
   sourceMatch(
     clockSource,
     /import \{ formatCacheSpan, formatDuration, formatRelative \} from '\.\.\/view\/time\.ts';/,
@@ -2386,17 +2374,13 @@ test('the browser clock owns one relative ladder and one duration rule', () => {
 });
 
 test('copying a summary copies the markdown, not the rendered html', () => {
-  // Both sit on the card under near-identical names, and the rendered one is what the
-  // summary section assigned to innerHTML. Pasting escaped markup into a message is the kind
-  // of wrong that looks fine in the panel.
+  // Clipboard messages must exclude rendered summary HTML.
   const copies = `${script}\n${queueLiveSource}`.match(/type: 'copy'[^}]*}/g) ?? [];
   assert.ok(copies.length > 0, 'no clipboard message found in the panel source');
   for (const call of copies) {
     sourceDoesNotMatch(call, /summaryHtml/, `a clipboard message sends rendered html: ${call}`);
   }
-  // The summary itself is no longer one of those messages: the entry is on the card's menu,
-  // so the extension reads the card and writes the clipboard. Naming the field it must copy,
-  // not only the one it must not, since a third field would be just as wrong and just as quiet.
+  // The host copies card.summary for the native summary-menu action.
   const marker = 'public async copySummary(key: string)';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so nothing copies a summary`);
@@ -2407,8 +2391,7 @@ test('copying a summary copies the markdown, not the rendered html', () => {
     'the summary copy writes something other than the markdown the card carries',
   );
   sourceDoesNotMatch(copySummary, /summaryHtml/, 'the summary copy writes rendered html');
-  // A key naming no card, and a card with nothing to say, copy nothing: the clipboard is
-  // better left as the reader had it than filled with the word undefined.
+  // Missing cards and empty summaries leave the clipboard unchanged.
   sourceMatch(
     copySummary,
     /if \(!card \|\| !card\.summary\) \{ return; \}/,
@@ -2417,7 +2400,7 @@ test('copying a summary copies the markdown, not the rendered html', () => {
 });
 
 test('the panel answers every message the contract declares', () => {
-  // The dispatch record is typed and this source check also keeps every wire name visible.
+  // Compare the declared message names with the dispatcher properties.
   const [union] = sourceNodes(
     protocolSource,
     (node) => ts.isTypeAliasDeclaration(node) && node.name.text === 'HostToPanel',
@@ -2425,8 +2408,7 @@ test('the panel answers every message the contract declares', () => {
   assert.ok(union !== undefined, 'the contract no longer names the messages the host sends');
   const declared = [...union.matchAll(/type: '(\w+)'/g)].map((one) => one[1]);
   assert.ok(union.includes('| RenderMessage;'), 'the render payload left the contract');
-  // The handlers are the function-valued properties of the record handed to the dispatcher,
-  // read from the syntax tree so no indentation decides which ones count.
+  // Read function-valued dispatcher properties from the syntax tree.
   const [dispatch] = callSources(script, 'dispatchHostToPanel');
   assert.ok(dispatch !== undefined, 'the panel no longer hands its messages to the typed dispatcher');
   const answered = sourceNodes(
@@ -2446,8 +2428,7 @@ test('the panel answers every message the contract declares', () => {
 });
 
 test('rail counts use metadata windows until the progressive read is accepted', () => {
-  // The worker owns selected-turn parsing. The rail still needs a stable answer while that
-  // work is pending, so it consumes metadata windows rather than an incomplete parse.
+  // Session list counts and read watermarks use metadata windows during selected-turn parsing.
   const counts = memberFrom(panelHostSource, panelHostSource.indexOf('private unreadCounts():'));
   sourceMatch(
     counts,
@@ -2525,14 +2506,8 @@ test('page-level subjects stay behind their typed owners', () => {
   );
 });
 
-// One handler out of a message dispatch, from its name to the name of the next one.
-//
-// Both sides answer the contract in `webview/protocol.ts` with a record of handlers named by
-// the message they take, the panel's written as `name: function (msg) {` and the extension's
-// as `name: (msg) => {`. One reader finds either, and a guard about one message reads that
-// message alone rather than the whole file.
-// Vitest resolves `vscode` to the extension test stub. Browser-safe behavior is imported from
-// its production owner. Source checks remain for host wiring and static boundaries.
+// Vitest resolves vscode to the extension test stub.
+// Source checks cover host wiring and static boundaries.
 
 const panelHostSource = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
 
@@ -3473,8 +3448,7 @@ test('the host payload keeps dispatched artifacts on the child card', () => {
     card.dispatched[0].commits.map((commit: { sha: string; dir: string }) => [commit.sha, commit.dir]),
     [[childSha, 'C:/repo']],
   );
-  // The host appends the dispatched figure after the figures `toCard` built, so on a parent
-  // with its own commits and a subagent it lands directly after the subagents figure.
+  // The dispatched figure follows the parent card's subagents figure.
   const busy = turn({ ...subagentCommitTurn(), sessionId: 'parent', dispatchToolUseIds: ['launch'] });
   const busyCard = renderTurnCard.call(
     provider,
@@ -3596,8 +3570,7 @@ const transcriptSource = fs.readFileSync(path.join(__dirname, 'transcript.ts'), 
 const panelDevelopmentSource = fs.readFileSync(path.join(__dirname, 'paneldevelopment.ts'), 'utf8');
 const payloadSource = fs.readFileSync(path.join(__dirname, 'payload.ts'), 'utf8');
 const composerSource = fs.readFileSync(path.join(__dirname, 'composerview.ts'), 'utf8');
-// The message contract both sides read. A guard about a field a handler no longer checks
-// reads it here, where the field is required or given its value.
+// Both message directions share the protocol declarations.
 const protocolSource = fs.readFileSync(path.join(__dirname, 'webview', 'protocol.ts'), 'utf8');
 const bootstrapSource = fs.readFileSync(path.join(__dirname, 'webview', 'bootstrap.ts'), 'utf8');
 const stateSource = fs.readFileSync(path.join(__dirname, 'webview', 'state.ts'), 'utf8');
@@ -3612,11 +3585,10 @@ const browserComposerPresentationSource = fs.readFileSync(
 const queueLiveSource = fs.readFileSync(path.join(__dirname, 'webview', 'queue-live.ts'), 'utf8');
 const railSource = fs.readFileSync(path.join(__dirname, 'webview', 'rail.ts'), 'utf8');
 const sessionRenameSource = fs.readFileSync(path.join(__dirname, 'webview', 'session-rename.ts'), 'utf8');
-// The words the rail passes to the compact row's hover card, which `railHoverLines` reads.
+// view/rail.ts supplies the text for compact-row hover cards.
 const railHoverSource = fs.readFileSync(path.join(__dirname, 'view', 'rail.ts'), 'utf8');
 const cardSource = fs.readFileSync(path.join(__dirname, 'webview', 'card.ts'), 'utf8');
-// The file, subagent and commit rows. A guard about a row, its name or the message it posts
-// reads this file as well as the card.
+// Record-row source supplies file, subagent, and commit rendering.
 const cardRowsSource = fs.readFileSync(path.join(__dirname, 'webview', 'card-rows.ts'), 'utf8');
 const summarySource = fs.readFileSync(path.join(__dirname, 'webview', 'summary.ts'), 'utf8');
 const commentsSource = fs.readFileSync(path.join(__dirname, 'webview', 'comments.ts'), 'utf8');
@@ -3644,9 +3616,7 @@ const progressiveWorkerSource = esbuild.buildSync({
   write: false,
 }).outputFiles[0].text;
 
-// All three at once, for a guard that holds a name to being gone rather than to being
-// present. A class dropped from the script and left in the stylesheet is still on screen, so
-// "nothing draws this any more" has to be asked of the whole panel and not of one file.
+// Combine host, browser, and stylesheet sources for absence checks.
 const panelSource = [
   panelHostSource,
   styleSource,
@@ -3668,9 +3638,7 @@ const panelSource = [
   sessionRenameSource,
 ].join('\n');
 
-// Everything a reader can have in the box while a menu is or is not wanted: a plain prompt, a
-// path, a slash mid-sentence, a name half typed, a name finished, the space that ends it, and
-// a prompt written over two lines.
+// Cover prompt text, paths, partial commands, whitespace, and multiline input.
 const TYPED = [
   '',
   '/',
@@ -3704,8 +3672,7 @@ const TYPED = [
   'trailing space /co ',
 ];
 
-// The handler named `name` in the record a source hands to its typed dispatcher, read whole
-// from the syntax tree, so the handler ends at its own closing brace in any layout.
+// Extract one named dispatcher handler through the syntax tree.
 const DISPATCHERS = new Set(['dispatchHostToPanel', 'dispatchPanelToHost']);
 function messageHandler(source: string, name: string): string {
   const handlers = sourceNodes(
@@ -3731,15 +3698,13 @@ function hostHandler(name: string): string {
   return messageHandler(panelHostSource, name);
 }
 
-/** The statements inside one handler, which a lift can run as a function body. */
+/** Extract one dispatcher handler's statements as a function body. */
 function handlerBody(source: string, name: string): string {
   const whole = messageHandler(source, name);
   return whole.slice(whole.indexOf('{') + 1, whole.lastIndexOf('}'));
 }
 
-// Every name the panel reads, whole. Matched as whole words rather than searched for one at
-// a time: `codeCopy` is the start of `codeCopied`, so a substring search would report a key
-// as read when only the longer one is.
+// Whole-word matches distinguish codeCopy from codeCopied.
 const namesRead = [
   ...script.matchAll(/\bACTIONS\.(\w+)/g),
   ...browserComposerSource.matchAll(/\bprops\.words\.(\w+)/g),
@@ -3755,51 +3720,28 @@ const namesRead = [
   ...searchSource.matchAll(/\bsearchWords\(\)\.(\w+)/g),
 ].map((m) => m[1]);
 
-// The names that reach the panel on a card rather than out of the table, and the field each
-// rides on. A word the panel would have to pick between is one of these: picking it in
-// SCRIPT would put the rule in the file with no tests, and the head row's spoken name is
-// built in turnview.ts out of the same value, so the two would drift apart with the screen
-// reader saying one thing and the screen another. The two tenses of the duration word are
-// the whole list, and durationWord in turnview.ts is where the choice is made and tested.
-//
-// The two labels over a prompt are the same case. Which of them a prompt wears says whether
-// the transcript holds it yet, and that is a decision rather than a word, so it is made in
-// turnview.ts and rides the card on the prompt itself.
+// These labels arrive through card fields instead of CARD_ACTIONS lookups.
 const NAMES_ON_A_CARD: Record<string, string> = {
   ranFor: 'durationWord',
   runningFor: 'durationWord',
   askedMidTurn: 'laterPrompts',
   askedJustSent: 'laterPrompts',
-  // Whether a rail card says an agent ran this session or names the agent is the same
-  // kind of choice: made and tested in turnview.ts, where the accessible name is built out
-  // of the same value, and handed to the panel already picked.
+  // The session list row receives its selected agent label in agentWord.
   agentRun: 'agentWord',
-  // The word that opens a rail card's labels rides on the name and not on the chips.
-  // turnrail.ts words the clause beside the rule that decided which of them the row draws,
-  // and the panel draws the chips it was handed, so reading the word here as well would put
-  // a second copy of that rule in the file nothing can test. The entry certifies nothing
-  // itself: the panel reads both `card.name` and `card.labels`, so either spelling passes.
-  // What holds the word inside the name is turnrail.test.ts, which spells the whole name out.
+  // This check accepts either card.name or card.labels.
+  // turnrail.test.ts checks the complete name containing the labels clause.
   railLabelled: 'name',
-  // Said in a rail card's name when its unread count is known and zero, the same way
-  // railLabelled is: decided and worded in turnrail.ts, and handed to the panel already
-  // picked. The session heading dropped its own unread count, so this is the only place
-  // left that reads the word.
+  // The session list row name includes the known-zero unread label.
   sessionNothingNew: 'name',
   logRunning: 'activity',
   logRowsDetail: 'activity',
 };
 
-// The names that reach the panel on a message rather than out of the table, and what the
-// panel reads each one back off. The heading over the label editor is a word in front of the
-// session's own title, and the title lives on the extension side: joining the two here
-// would put half the sentence in the file nothing tests, and the popover would name a
-// session the rail had already renamed.
+// These labels arrive through message fields instead of CARD_ACTIONS lookups.
 const NAMES_ON_A_MESSAGE: Record<string, string> = { labelHeading: 'labelsOpen?.heading' };
 
 test('every name the panel can be operated by reaches an element', () => {
-  // A name nobody reads was written for a control that has since lost it, and a control
-  // with no name is one a reader who does not use a mouse cannot tell apart from any other.
+  // Every action label must reach a checked source reference.
   const used = new Set(namesRead);
   for (const key of Object.keys(CARD_ACTIONS)) {
     if (key === 'saidSection') {
@@ -3835,7 +3777,7 @@ test('every name the panel can be operated by reaches an element', () => {
 });
 
 test('the panel reads no name the table does not hold', () => {
-  // A misspelt key is `undefined` on screen and silent everywhere else.
+  // Reject source references to keys absent from CARD_ACTIONS.
   const keys = new Set(Object.keys(CARD_ACTIONS));
   assert.ok(namesRead.length > 0, 'the panel reads no names at all, so every control lost its own');
   for (const name of namesRead) {
@@ -3843,9 +3785,7 @@ test('the panel reads no name the table does not hold', () => {
   }
 });
 
-// The three guards above only follow the wording. These follow the shape, which is the part
-// that makes the panel reachable at all: the names could all be plumbed through correctly
-// while the buttons, the disclosure state and the arrow keys had all gone.
+// Count imperative native-control construction in the selected browser modules.
 test('vanilla-owned interactive construction stays below the migration ceiling', () => {
   const sources = [
     ts.createSourceFile('panel.ts', script, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS),
@@ -3889,12 +3829,7 @@ test('vanilla-owned interactive construction stays below the migration ceiling',
   for (const source of sources) {
     visit(source);
   }
-  // Raised for the line above the box, which says what the next turn costs, for the session
-  // heading's label chips, which file the rail under one label, and for the request card's
-  // fold, its question tabs and the box that takes an answer the agent did not offer. The
-  // ceiling is the count itself, so one control built anywhere else fails here. The composer
-  // session heading is a surface Preact has not reached. The Composer source joins the scan,
-  // so moving an owned native control into another vanilla module cannot hide it.
+  // Keep imperative native-control construction within the migration ceiling.
   assert.ok(
     controls <= 38,
     `panel.ts and typed browser owners imperatively construct ${controls} native controls, above the migration ceiling`,
@@ -3911,37 +3846,31 @@ test('vanilla-owned interactive construction stays below the migration ceiling',
   );
 });
 
-// The declarations of the top-level stylesheet rules whose selector list is exactly `selector`,
-// each written `property: value;` and joined by one space, in source order. Exact, because the
-// stylesheet is one namespace and the interesting selectors are prefixes of each other: a
-// search for `.chips` would otherwise answer with `.chips .warn`, and a guard that a rule
-// declares no font size would pass on a rule that is not the one it means. Top-level, so a
-// rule inside `@media` never answers for the rule every width reads.
+// Return declarations from top-level rules with this exact selector list.
+// Selector prefixes and rules inside at-rules do not match.
 function styleRule(selector: string): string {
   const declarations = cssDeclarations(styleSource, selector);
   assert.ok(
     styleRules().some((rule) => rule.selector === selector && !rule.conditions.length),
     `the stylesheet has no "${selector}" rule, so this guard cannot see it`,
   );
-  // Through the fill, so a rule whose width is a value from turnview.ts reads as the figure
-  // the reader gets rather than as the name the stylesheet asks for it by.
+  // Resolve panel text placeholders in declaration values.
   return fillPanelText(declarations.map((declaration) => `${declaration};`).join(' '), panelValues());
 }
 
-// Every rule of the stylesheet, in any at-rule, read once.
+// Cache all stylesheet rules, including rules inside at-rules.
 let styleRuleList: CssRule[] | undefined;
 function styleRules(): CssRule[] {
   styleRuleList ??= cssContract(styleSource);
   return styleRuleList;
 }
 
-// Each selector of every rule, the selector lists split apart, in any at-rule.
+// Split every stylesheet rule's selector list.
 function styleSelectors(): string[] {
   return styleRules().flatMap((rule) => rule.selector.split(', '));
 }
 
-// The declarations of every rule, in any at-rule, whose selector list names `selector`
-// exactly, each written `property: value;` and joined by one space.
+// Join declarations from rules whose selector list contains this exact selector.
 function styleRulesNaming(selector: string): string {
   const found = styleRules().filter((rule) => rule.selector.split(', ').includes(selector));
   assert.ok(found.length, `no stylesheet rule names "${selector}", so this guard cannot see it`);
@@ -3951,17 +3880,12 @@ function styleRulesNaming(selector: string): string {
     .join(' ');
 }
 
-// Whether any rule, in any at-rule, writes a declaration that starts with `start`, such as
-// `--full: var(--vscode-errorForeground`.
+// Match declaration prefixes in every stylesheet rule.
 function styleDeclares(start: string): boolean {
   return styleRules().some((rule) => rule.declarations.some((declaration) => declaration.startsWith(start)));
 }
 
-// How far in a rail card's text starts, and how far in a card wearing a status border
-// starts. Three rules share that one figure, the plain card, the running one and the
-// failed one, and the unread dot is placed in the space it makes: read off the stylesheet
-// rather than written down here, so a guard cannot go on asserting a figure the panel has
-// moved past.
+// Read the session list card's left padding from the stylesheet.
 function railCardIndent(): number {
   const found = /padding: 7px 10px 7px (\d+)px;/.exec(styleRule('.railcard'));
   assert.ok(found, 'the card no longer reserves the left padding the unread dot is drawn in');
@@ -3993,19 +3917,16 @@ interface FakeElement {
   alt?: string;
   title?: string;
   hidden?: boolean;
-  // A text box carries its own value, its hint and the id a label binds to. The note editor
-  // is the one builder that makes a control the reader types into rather than presses.
+  // Text fields expose their value, placeholder, row count, and label target.
   value?: string;
   placeholder?: string;
   rows?: number;
   id?: string;
-  // What was listened for and what has been focused, so a guard can press a key on the box
-  // and see where the focus went afterwards.
+  // Track registered listeners and focus calls.
   listeners: Record<string, ((e: unknown) => void)[]>;
   focused: number;
   appendChild(child: FakeElement): FakeElement;
-  // The first child and the insert before it, because the comment box puts the line it was
-  // written against above the label the editor already built.
+  // Comment editors insert the quoted text before the existing label.
   readonly firstChild: FakeElement | null;
   insertBefore(child: FakeElement, before: FakeElement | null): FakeElement;
   setAttribute(name: string, value: string): void;
@@ -4018,9 +3939,7 @@ interface FakeElement {
   [extra: string]: unknown;
 }
 
-// Every element under one, in document order, so a guard can find what a builder drew
-// without a real DOM. Matches one class or one tag, which is all the panel's own markup
-// asks of querySelector.
+// Match one class or one tag against a fake element.
 function fakeMatches(node: FakeElement, selector: string): boolean {
   if (selector.startsWith('.')) {
     return (node.className || '').split(' ').includes(selector.slice(1));
@@ -4040,9 +3959,7 @@ function fakeFind(node: FakeElement, selector: string): FakeElement | null {
   return null;
 }
 
-// Every element under one that answers any of the selectors, in document order. The panel
-// asks for a list two ways: a class, and the attribute every control it can find again by
-// carries. A comma-separated list is one query there, so it is one query here.
+// Find matching descendants in document order across a comma-separated selector list.
 function fakeFindAll(node: FakeElement, selector: string): FakeElement[] {
   const wanted = selector
     .split(',')
@@ -4060,10 +3977,8 @@ function fakeFindAll(node: FakeElement, selector: string): FakeElement[] {
   return found;
 }
 
-// Enough of an element for the markup builders to run against. Two of these are the DOM's
-// own behaviour rather than a convenience: setting `textContent` to the empty string empties
-// the element, which is how a row is cleared before it is written again, and `classList.add`
-// joins the class it is given to the ones already there.
+// Clearing textContent removes children.
+// classList.add preserves existing classes.
 const fakeDocument = {
   createElement(tag: string): FakeElement {
     let text = '';
@@ -4081,8 +3996,7 @@ const fakeDocument = {
       },
       style: {},
       attributes: {},
-      // The ticker finds its nodes by a data attribute and reads the timestamp back off
-      // this, so an element without one cannot stand in for a drawn duration.
+      // Clock updates read timestamps from data attributes.
       dataset: {},
       children: [],
       classList: {
@@ -4156,26 +4070,21 @@ const fakeDocument = {
     node.textContent = value;
     return node;
   },
-  // Whether a control is still on screen, which the panel asks before handing focus back to
-  // one: a press can take the control that made it away with it. Nothing here is ever
-  // detached, so the answer is always yes.
+  // This fixture treats every element as attached.
   contains(_node: unknown): boolean {
     return true;
   },
 };
 
 test('the icon on a file row is not read out', () => {
-  // The filename beside it already carries the extension, so an icon that is announced says
-  // the type twice, and an image with no alt is announced by its own filename.
+  // File icons have empty alt text and stay outside the accessibility tree.
   const body = `${cardSource}\n${cardRowsSource}`;
   sourceMatch(body, /aria-hidden/, 'the file icon is announced, so a row says its type twice');
   sourceMatch(body, /alt: ''/, 'a theme image has no empty alt, so it is read out by its own filename');
 });
 
 test('the content policy lets the icon theme font and a theme image through', () => {
-  // `default-src 'none'` blocks both until each is named. Losing `img-src` breaks every
-  // image-based icon theme and nothing else: the panel builds, every glyph theme keeps
-  // working, and only a reader on an image theme sees a column of broken pictures.
+  // The content policy must admit icon fonts and theme images.
   const marker = 'const csp = [';
   const from = panelDevelopmentSource.indexOf(marker);
   assert.notEqual(
@@ -4213,9 +4122,7 @@ test('the panel imports the shared archived note wording', () => {
   assert.deepEqual(archivedNote(2), { text: '2 sessions archived', action: 'Unarchive all' });
 });
 test('the selected session is the progressive read target', () => {
-  // Not a webview guard, but it lives here because this is the file that reads panelhost.ts
-  // as text, and the extension half of it has no tests of its own either.
-  //
+  // Check the host's selected-session target and scheduling order.
   const marker = 'private shownSessions(';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the cut`);
@@ -4238,9 +4145,7 @@ test('the selected session is the progressive read target', () => {
   );
 });
 
-// Three lines in panelhost.ts carry the rest of the agent-run mark, and panelhost.ts has no
-// tests of its own. Each was measured to survive deletion with the whole suite green, so
-// each is read here as text, the way the cut above is.
+// Worker metadata carries the agent-run classification to session list rows.
 test('worker metadata carries the agent-run mark to the host', () => {
   const rowsAt = panelHostSource.indexOf('this.sessionRows = all.map(');
   assert.notEqual(rowsAt, -1, 'panelhost.ts no longer builds the rail rows, so this guard reads nothing');
@@ -4261,11 +4166,7 @@ test('worker metadata carries the agent-run mark to the host', () => {
   );
 });
 
-// The other half of the mark, and the one the reader reported: a session this window
-// started reads like a run in its own transcript, so the panel filed the session the
-// reader had just started under Run by agents and dropped it from the parse cut as soon as
-// they looked at another. The rule is agentRunAnswer in turnrail.ts, tested there. These
-// are the three lines in panelhost.ts that carry it.
+// A session started in this window overrides transcript-based agent-run classification.
 test('a session this window started overrides what its transcript suggests', () => {
   const adoptAt = panelHostSource.indexOf('private adoptDraft(');
   assert.notEqual(adoptAt, -1, 'fresh session identity is no longer adopted');
@@ -4286,8 +4187,7 @@ test('a session this window started overrides what its transcript suggests', () 
     'the one seam every caller reads takes the transcript guess alone',
   );
 
-  // The awaiting record goes when the disk record arrives. This one must not, because that
-  // record is what marks the session in the first place.
+  // Refresh must retain the host's startedHere identities.
   const refreshAt = panelHostSource.indexOf('async refresh(');
   sourceDoesNotMatch(
     panelHostSource.slice(refreshAt, panelHostSource.indexOf('private glanceAt(', refreshAt)),
@@ -4296,9 +4196,7 @@ test('a session this window started overrides what its transcript suggests', () 
   );
 });
 
-// The record has to outlive the window, because the transcript it argues with never becomes
-// any more readable. Without the lines below, a session started today is filed under
-// Run by agents tomorrow, which is the reported fault one reload later.
+// Persist started-session identities across window reloads.
 test('the record of starting a session outlives the window', () => {
   const between = (from: string, to: string) => {
     const at = panelHostSource.indexOf(from);
@@ -4325,7 +4223,7 @@ test('the record of starting a session outlives the window', () => {
     'the record is not stored when the session starts, so a window closed before the next save loses it',
   );
 
-  // The panel never sees this record, so a save posted from the panel carries none of it.
+  // Browser state saves must preserve the host-owned started-session identities.
   const save = between(
     'private saveState(state: unknown): void {',
     'void this.memento?.update(STATE_KEY, this.saved);',
@@ -4350,11 +4248,7 @@ test('the record of starting a session outlives the window', () => {
 });
 
 test('a session joins the list only once a human has prompted it, and the cut stays cheap', () => {
-  // Not a webview guard: the cut is made in the extension half, which has no tests of
-  // its own either. A cross-session message wakes a session whose transcript has no
-  // human prompt, and it drew as a "Session <hash>" card. The cut runs in allSessions,
-  // after membership and before anything else reads the files, so the picker, the rail,
-  // the search corpus and the empty-state selection all agree.
+  // Filter Claude sessions by human-prompt presence before combining the session catalog.
   sourceMatch(
     panelHostSource,
     /const listed = claude\.filter\(\(s\) => this\.hasHumanPrompt\(s\)\);/,
@@ -4370,9 +4264,7 @@ test('a session joins the list only once a human has prompted it, and the cut st
     /this\.catalog = \{ folders: folderPrint, sessions: walkedSessions \};[\s\S]{0,80}return walkedSessions;/,
     'the walk hands back something other than the merged list it held',
   );
-  // Sticky and incremental, or the cut costs a read per wake file per poll: a found
-  // file is never read for a prompt again, and a quiet one is never opened at all. The
-  // rule itself lives in transcript.ts, where it is tested.
+  // Retain successful prompt detection and pass the previous scan cursor.
   sourceMatch(
     panelHostSource,
     /if \(prev\?\.found\) \{ return true; \}/,
@@ -4383,9 +4275,7 @@ test('a session joins the list only once a human has prompted it, and the cut st
     /scanForHumanPrompt\(session\.file, session\.size, prev\)/,
     'the scan is not handed its cursor, so every poll reads every wake file whole',
   );
-  // The caches are trimmed against the walked files, never against the filtered list:
-  // trimmed to the list, the cut would evict the wake files' own entries each refresh
-  // and the next poll would read every wake head again, the trap staleMetas documents.
+  // Trim caches against walked files, including sessions excluded by the prompt filter.
   const from = panelHostSource.indexOf('private evictCache(');
   assert.notEqual(from, -1, 'panelhost.ts no longer contains evictCache, so this guard cannot see the trim');
   const evict = memberFrom(panelHostSource, from);
@@ -4553,9 +4443,8 @@ test('the first authoritative render precedes Project cost restoration and prici
 });
 
 test('the panel draws how far back it reads, rather than working it out', () => {
-  // Both the control that reads further back and the line that says how far back it is
-  // already reading are built out of byte counts, and a figure worked out in here is the
-  // one kind that nothing can check. They arrive as words, from turnview.ts.
+  // The host supplies the history text.
+  // The panel draws the deeper-history action as a button.
   sourceDoesNotMatch(
     script,
     /1048576|1024 \* 1024/,
@@ -4568,12 +4457,8 @@ test('the panel draws how far back it reads, rather than working it out', () => 
 });
 
 test('the disclosures still say whether they are open, and what they open', () => {
-  // Two controls show and hide something, and each needs both attributes: without
-  // aria-expanded a reader cannot tell a shut card from an open one, and without
-  // aria-controls they cannot tell what it opens.
-  // Three writes, and none of them is spare: the session heading needs it wherever the
-  // turns under it move, which is writeHeadingState, and the card head needs it in paint(),
-  // which runs both when the card is drawn and on every toggle.
+  // Require source references to aria-expanded and aria-controls.
+  // These counts do not check individual disclosure behavior.
   const expanded = panelSource.match(/aria-expanded/g) ?? [];
   assert.ok(
     expanded.length >= 3,
@@ -4593,24 +4478,9 @@ test('the list still answers the arrow keys', () => {
   }
 });
 
-// Four wires the notes feature hangs on, none of which any guard could see.
-//
-// Each was found by mutation: the line was taken out, the whole suite was run, and it
-// stayed green. A feature nothing draws and a note nothing saves both read exactly like a
-// working panel to every test in this repository, because the tests build `notesSection`
-// directly and never ask who calls it or where its result goes.
-//
-// These are text scans rather than lifts, and that is the honest tool here: what is being
-// checked is not a rule with an answer to compare, it is whether one function still calls
-// another. A lift of `body` would need every builder a card draws.
-// The failure this whole shape exists to stop, run rather than reasoned about. Two hosts each
-// hold a copy of the notes seeded when they loaded; a note written in one never reaches the
-// other. The old panel posted its whole array on every save, so the second save put the
-// session back to before the first note existed.
+// Comment operations apply to the current store rather than replacing it with a host's saved copy.
 test('clearing empties one session and leaves the other agents alone', () => {
-  // What a send does once a session's comments have gone out with it. Without it the
-  // next message carries them all again. It is not a reader's press, which is why it names a
-  // session rather than an id: the set belongs to the agent that ran the turns.
+  // Clearing sent comments targets one session.
   const note = (id: string, sessionId: string, at: number) => ({
     id,
     sessionId,
@@ -4627,19 +4497,18 @@ test('clearing empties one session and leaves the other agents alone', () => {
   held = applyComment(held, { op: 'write', note: note('b', 's1', 2) });
   held = applyComment(held, { op: 'write', note: note('c', 's2', 3) });
   held = applyComment(held, { op: 'clear', sessionId: 's1' });
-  // The reader has several agents open at once, so a send in one must not empty the rest.
+  // Preserve comments belonging to other sessions.
   assert.deepEqual(
     held.map((c) => c.id),
     ['c'],
     'clearing one session reached into another',
   );
-  // A session nothing was written on clears to the set that was already there.
+  // Clearing an absent session preserves the existing comments.
   assert.deepEqual(
     applyComment(held, { op: 'clear', sessionId: 's9' }).map((c) => c.id),
     ['c'],
   );
-  // An unnamed session takes nothing. Read the other way it would read as every
-  // session, and one malformed operation would empty the whole store.
+  // Reject clear operations without a valid session ID.
   for (const junk of [{ op: 'clear' }, { op: 'clear', sessionId: '' }, { op: 'clear', sessionId: 7 }]) {
     assert.deepEqual(
       applyComment(held, junk).map((c) => c.id),
@@ -4686,20 +4555,13 @@ test('both agents reach one list, and each session is read and named by its own 
     /automaticFirstProjectProfile/,
     'startup creates a draft before the reader presses New',
   );
-  // Anchored to what is returned, not to the three pieces appearing anywhere nearby. Checked
-  // separately, all three still match a body that lists both and then returns one of them,
-  // which is the drift this guard exists for. `listed` is the Claude list after the
-  // peer-wake cut, whose own guard holds its derivation from `claude`.
+  // Match the combined catalog through its return statement.
   sourceMatch(
     merge,
     /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);[\s\S]*return walkedSessions;/,
     'what the panel gets back is not both lists in one order, whatever was listed above it',
   );
-  // The opening record of every rollout on the machine is read to decide membership, so the
-  // panel keeps them. What may be trimmed away is `staleMetas`'s decision and is tested with
-  // it; all this can see is that the panel asks it, and asks it about the walk rather than
-  // about the sessions. Trimmed against the sessions, the cache would be emptied on every
-  // repaint and every head read again on the next poll.
+  // Retain rollout metadata and trim its cache against walked files.
   sourceMatch(
     merge,
     /this\.codexMetas\.get\(file\)/,
@@ -4789,9 +4651,7 @@ test('Claude child reference discovery runs in cancellable worker work', () => {
   );
 });
 
-// A dispatched session's cost joins its parent's whole-session figure, and the session files
-// under Run by agents. The host reads both from one set of dispatch edges, the pairs whose
-// child and parent both have a catalog row, so the heading, the rail and the refresh key agree.
+// Dispatch edges connect catalog members for cost attribution and agent-run classification.
 test("the host counts a dispatched session in its parent's cost once and files it by who asked for it", async () => {
   const folder = tempDir('dispatch-cost-');
   const bucket = (input: number) =>
@@ -4861,8 +4721,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     dispatchFacts: Map<string, { person: boolean }>;
     metaFor(session: unknown): { agentRun: boolean | null | undefined };
   };
-  // `children` are Claude subagents, as child id to parent id. Each child's file is also a
-  // delegated source of its parent, the way the parent's subagent directory lists it.
+  // Map Claude subagent IDs to their parent IDs.
   const hostWith = (
     references: unknown[],
     listed = ['parent', 'child'],
@@ -4935,8 +4794,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     assert.equal(cost(host, 'child'), child, "the dispatched session's own cost moved");
   }
 
-  // Two sessions that each dispatched the other climb once around the loop. Each figure counts
-  // both transcripts once.
+  // Dispatch cycles count each transcript once.
   const cycle = hostWith([launch('parent', 'child'), launch('child', 'parent', 'toolu_9')]);
   for (const id of ['parent', 'child']) {
     assert.ok(
@@ -4945,8 +4803,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     );
   }
 
-  // A subagent dispatched a session that has a subagent of its own. The top session counts the
-  // dispatched session and its subagent once, through the subagent that dispatched it.
+  // A subagent's dispatch contributes the child session and its subagent once.
   const family = { helper: 'parent', worker: 'child' };
   const members = ['parent', 'helper', 'child', 'worker'];
   const unlinked = hostWith([], members, records, family);
@@ -4958,8 +4815,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     `a subagent's dispatch put ${cost(chained, 'parent')} on the top session, not ${top}`,
   );
 
-  // While the child's record is still being written, the parent's figure is its own and marked
-  // as a lower bound. The mark and the note clear once the record completes.
+  // An incomplete child record leaves the parent cost as a lower bound.
   const writing = records.map((record) =>
     record.file === fileOf('child') ? { ...record, trailing: '{"type":' } : record,
   );
@@ -4979,9 +4835,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
   );
   assert.doesNotMatch(figure(growing).label, /[+]$/, 'the lower-bound mark outlived the completed record');
 
-  // A running child between two writes ends on a whole line, and its newest turn is still open.
-  // The parent stays a lower bound until that turn ends, or until the history limit skips the
-  // child. The child's usage then joins, and the mark clears with no record changing.
+  // An open child turn keeps the parent cost partial until completion or exclusion by the history limit.
   const turn = { finished: false, error: false, interrupted: false, endedAt: 1, startedAt: 1 };
   const withTurn = (outcome: typeof turn) =>
     records.map((record) => (record.file === fileOf('child') ? { ...record, outcome } : record));
@@ -5005,9 +4859,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
   limit = 10_000;
   assert.deepEqual(figure(running).cost, joined, 'a running child the history limit skips held its parent');
 
-  // A child that stopped mid-line holds its parent while its last write falls inside the history
-  // limit. Nothing reads it past the limit, so the usage the ledger read from it then joins and
-  // the mark clears with no record changing.
+  // A child record ending mid-line keeps the parent partial until the history limit excludes it.
   let stale: number | null = null;
   const stopped = Object.assign(hostWith([launch('parent', 'child')], ['parent', 'child'], writing), {
     projectSpendHistoryCutoff: () => stale,
@@ -5022,9 +4874,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
   assert.deepEqual(figure(stopped).cost, joined, 'a child cut off mid-line past the history limit held its parent');
   assert.doesNotMatch(figure(stopped).label, /[+]$/, 'a child cut off mid-line past the history limit kept the mark');
 
-  // A dispatched child counts in its parent's figure only while both sessions are in the
-  // catalog. A child that left it takes its usage with it and leaves no mark on the parent, even
-  // when the ledger still holds its unfinished record.
+  // A dispatched child outside the catalog contributes no cost or partial marker.
   for (const files of [records, writing]) {
     const gone = hostWith([launch('parent', 'child')], ['parent'], files);
     assert.deepEqual(
@@ -5035,9 +4885,8 @@ test("the host counts a dispatched session in its parent's cost once and files i
     assert.doesNotMatch(figure(gone).label, /[+]$/, 'a child outside the catalog marked its parent');
   }
 
-  // A child the history limit skips never enters the ledger's queue, so its parent draws no
-  // lower bound, even while a listing's spend offer waits for its tick. A child the ledger
-  // queues marks its parent, and the rail draws again when the ledger lets it go.
+  // Skipped children leave the parent cost complete.
+  // Queued children keep it partial until the ledger releases them.
   const cutoff = 10_000;
   const age = (id: string, mtimeMs: number) => fs.utimesSync(fileOf(id), mtimeMs / 1000, mtimeMs / 1000);
   for (const id of Object.keys(inputs)) {
@@ -5054,7 +4903,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     codexSpendSources: [],
     projectSpendHistoryCutoff: () => cutoff,
     postProjectSpend: () => {},
-    // The lifetime costs the rail payload carries, read the way `railInputFor` reads them.
+    // Capture the parent cost supplied to the session list.
     postRail(this: Host) {
       rail.push(this.lifetimeFiguresBySession().costs.parent);
     },
@@ -5073,7 +4922,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
   await vi.waitFor(() => assert.equal(waiting.projectSpendOffers.size, 0));
   assert.equal(waiting.projectSpendQueued.size, 0, 'the offer queued a child the history limit skips');
   assert.deepEqual(rail, [whole], 'the offer redrew the rail with no figure moved');
-  // A tick that is already set holds the queued child unread.
+  // Hold the queued child by supplying an existing tick.
   waiting.projectSpendTick = {};
   age('child', cutoff * 2);
   waiting.queueProjectSpendIndex();
@@ -5082,10 +4931,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
   waiting.restartProjectSpendOffer();
   assert.deepEqual(rail.at(-1), whole, 'the rail kept the lower bound after the ledger let the child go');
 
-  // A selection render reads the figures without drawing the rail. When one runs after a
-  // dispatched source's answer moved and before the ledger's pass ends, the end of the pass still
-  // draws the rail with the mark moved. The ledger lets a queued child go, or the history limit
-  // passes the last write of a child inside a turn.
+  // Finishing ledger indexing refreshes the session list after a selection render reads the changed figures.
   type Rail = { stats: Record<string, { label?: string }[]> };
   type Drawn = Host & {
     projectSpendIndexing: boolean;
@@ -5161,7 +5007,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
   );
   assert.equal(loose.projectSpendRevision, drawn.projectSpendRevision, 'an edge with no row moved the spend revision');
 
-  // The rail files the child under Run by agents, and never a session this window started.
+  // A dispatched child is an agent run unless this window started it.
   const rows = [session('parent'), session('child')];
   const edges = drawn.sessionParentEdges(rows).edges;
   assert.equal(drawn.agentRunFor(rows[1], edges), true, "a dispatched session was filed as the reader's own");
@@ -5175,8 +5021,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     'a dispatched session whose parent has no row was filed as a run',
   );
 
-  // A subagent edge names the parent on the child's heading and nothing more. The subagent's
-  // file already counts in its parent's delegated work, and its own transcript files it.
+  // Subagent edges do not add another cost contribution or override transcript classification.
   const subagent = hostWith([
     { kind: 'subagent', parentSessionId: 'parent', sessionId: 'child', file: fileOf('child'), toolUseIds: ['toolu_1'] },
   ]);
@@ -5188,8 +5033,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     'a subagent edge filed a session whose transcript shows a person as a run',
   );
 
-  // A session the reader asked for is the reader's, however its transcript reads. Only the
-  // filing moves: the heading still names the parent, and the parent still counts the child once.
+  // Reader-owned dispatches retain parent links and cost attribution without agent-run classification.
   for (const references of [
     [launch('parent', 'child', 'toolu_1', true)],
     [launch('parent', 'child'), launch('parent', 'child', 'toolu_2', true)],
@@ -5212,9 +5056,8 @@ test("the host counts a dispatched session in its parent's cost once and files i
     );
   }
 
-  // Without a receipt that says owned, a person typing into the child files it with the
-  // reader's sessions. The dispatching agent's own follow-ups, another session's message and a
-  // background task's notice are no person, so an agent's own worker stays a run.
+  // A human prompt overrides agent-run classification.
+  // Automated follow-ups and notices retain it.
   const bg = { sessionKind: 'bg', entrypoint: 'cli', cwd: 'C:/repo' };
   const typed = (at: number, text: string, extra: Record<string, unknown>) => ({
     type: 'user',
@@ -5272,9 +5115,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     host.dispatchFacts.set('child', { person: scanForPerson(fileOf('child'), size).person });
     assert.equal(host.agentRunFor(rows[1], host.sessionParentEdges(rows).edges), run, why);
   }
-  // The parent's turn card counts the dispatched session's whole cost on its cost figure, from
-  // the ledger records alone. Each transcript on disk holds usage that differs from its record,
-  // so a draw that priced a file would show another amount.
+  // Ledger usage differs from transcript usage, so the cost assertion detects direct transcript pricing.
   for (const id of ['child', 'grandchild']) {
     fs.writeFileSync(
       fileOf(id),
@@ -5309,8 +5150,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     }) as CardHost;
   const parentTurn = (ids: string[], startedAt = Date.parse('2026-08-31T09:00:00')) =>
     fixtureTurn({ sessionId: 'parent', startedAt, files: [], commits: [], agents: [], dispatchToolUseIds: ids });
-  // The card as a card batch draws it, and as the activity redraw posts the newest card, which
-  // reads the contributions itself.
+  // Exercise card batches and the newest-card Activity update.
   const cardOf = (host: CardHost, recorded: ReturnType<typeof fixtureTurn>, latest = false) => {
     if (!latest) {
       return host.renderTurnCard(recorded, false, 'Parent', NOW, [], new Set(), new Map(), new Map(), () =>
@@ -5340,7 +5180,8 @@ test("the host counts a dispatched session in its parent's cost once and files i
   const assertCounted = (card: ReturnType<CardHost['renderTurnCard']>, sessions: number, why: string) => {
     const figure = costOf(card);
     if (!figure) {
-      // The fixture turn prices nothing of its own, so a card that counts no session has no cost.
+      // This fixture has no own-turn cost.
+      // A card with no counted child therefore has no cost figure.
       assert.deepEqual([sessions, ownCost], [0, 0], `${why}: the card drew no cost figure`);
       return;
     }
@@ -5367,7 +5208,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     assert.ok(Math.abs((before.parent?.dollars ?? 0) - (parent + child)) < 1e-9);
   }
   {
-    // Two receipts that name one session differently give its row and its cost entry one name.
+    // Repeated receipts share the displayed name between the dispatched row and cost entry.
     const host = cardHost([
       { ...launch('parent', 'child'), name: 'First name' },
       { ...launch('parent', 'child', 'toolu_2'), name: 'Second name' },
@@ -5390,8 +5231,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     assertCounted(later, 0, 'a later receipt');
   }
   {
-    // A session that one of the turn's subagents dispatched counts on the card that launched
-    // the subagent, and draws no Dispatched row.
+    // A subagent's dispatched session contributes cost without a Dispatched row.
     const subagentLaunch = (parentSessionId: string, sessionId: string, toolUseId: string) => ({
       kind: 'subagent',
       parentSessionId,
@@ -5626,14 +5466,13 @@ test('a queued handoff rechecks repository scope after its save completes', () =
 
 test('the mid-turn section head is announced by what the next plain press does', () => {
   const head = declarationSource(cardSource, 'ActivitySection');
-  // The counts first, then the action, joined the way the heading joins its own last clause.
+  // The accessible name joins Activity counts, filters, and the next action.
   sourceMatch(
     head,
     /'aria-label': `\$\{card\.activityName\}\$\{filterName\}, \$\{plainAction\}`/,
     'the head is announced without saying what a press on it does',
   );
-  // One word per state. A name that stays the same while the state moves tells a reader who
-  // cannot see the twist nothing about the next press.
+  // The action label follows the disclosure state.
   sourceMatch(
     head,
     /const plainAction = shown \? cardWords\(\)\.saidCollapse : cardWords\(\)\.saidExpand;/,
@@ -5644,10 +5483,8 @@ test('the mid-turn section head is announced by what the next plain press does',
 });
 
 test('every row under a card head row sits at the one indent', () => {
-  // The indent is written as an expression in ems, so the row that carries it decides what
-  // it comes to. A font size on the row itself makes its `1em` smaller than the card's and
-  // pulls that row a pixel or two left of the headline above it, which is a misalignment
-  // nothing on screen explains. The figures carry their own size instead.
+  // Rows share an em-based indent.
+  // The chip row must inherit the card's font size to resolve that indent consistently.
   const chips = styleRule('.chips');
   assert.ok(chips.includes('calc(1em + 6px)'), 'the folded chip row no longer takes the card indent');
   assert.doesNotMatch(
@@ -5661,10 +5498,7 @@ test('every row under a card head row sits at the one indent', () => {
       `${selector} no longer writes the card indent the same way the chip row does`,
     );
   }
-  // The row is on every card now, written rather than appended, so a card with no figures at
-  // all has to be able to take it off screen. `hidden` alone cannot: the rule above lays the
-  // row out with flex, which beats the user agent's own `[hidden]` rule, and the row's top
-  // margin then draws a gap under the headline with nothing in it.
+  // The explicit hidden rule overrides the chip row's flex display.
   assert.match(
     styleRule('.chips[hidden]'),
     /display: none/,
@@ -5677,21 +5511,18 @@ test('a figure is the same pill on a card, session heading and rail', () => {
     ROVING_SELECTOR.includes('.statdetail'),
     'stat detail buttons are outside the arrow-key walk, so keyboard readers cannot reach them',
   );
-  // The ground is mixed from the theme rather than written as a colour, so one value covers
-  // a light theme and a dark one. A literal lifted from a dark mockup is invisible on one.
+  // Mix the chip background from theme colors.
   assert.ok(
     styleDeclares('--chipbg: color-mix(in srgb, '),
     'the pill ground is a fixed colour again, so one of the two themes gets a value meant for the other',
   );
 
-  // One rule for every stat row. Written separately, the same figure can quietly become a
-  // different shape in one place.
+  // Card, session-heading, and session-list chips share one pill rule.
   const pill = styleRule('.chips > .statchip, .sessionstats > .statchip, .railstatchip');
   for (const decl of ['background: var(--chipbg)', 'border-radius:', 'padding:']) {
     assert.ok(pill.includes(decl), `the pill shared by the card, heading and rail no longer declares ${decl}`);
   }
-  // Every chip carries the border, not only the ones with something to say, so a row keeps
-  // its width and its height as the figures on it change.
+  // A transparent border reserves the same space on chips without detail.
   assert.match(
     pill,
     /border: 1px solid transparent/,
@@ -5700,8 +5531,7 @@ test('a figure is the same pill on a card, session heading and rail', () => {
   const detail = styleRule('.chips .has-detail, .sessionstats .has-detail');
   assert.match(detail, /border-color: var\(--edge\)/, 'a chip with a hover no longer says so on the pill');
   assert.doesNotMatch(detail, /border-bottom/, 'the hover is drawn as a line under the text inside the pill again');
-  // The subagent row keeps the help cursor but drops the drawn border: after almost every
-  // figure on that row opens a record, the border stops telling figures apart.
+  // Subagent-row figures retain the help cursor without a border-color override.
   const rowDetail = styleRule('.agentfacts .has-detail');
   assert.match(rowDetail, /cursor: help/, 'the subagent row figure stops offering the help cursor on hover');
   assert.doesNotMatch(
@@ -5710,17 +5540,14 @@ test('a figure is the same pill on a card, session heading and rail', () => {
     'the subagent row figure draws a border again, so it no longer looks less prominent',
   );
 
-  // A toned chip takes the pill's ground from the token its text takes. The context chip is
-  // the one this is for: it is quiet until it crosses a threshold and called out after, off
-  // the tone it already had rather than off a highlight of its own.
+  // Warning chips use the warning token for text and background.
   const warnRule = styleRule('.chips .warn, .sessionstats .warn');
   assert.ok(warnRule.includes('color: var(--warn)'), 'a warn chip no longer takes its text from --warn');
   assert.ok(
     warnRule.includes('background: color-mix(in srgb, var(--warn)'),
     'a warn chip pill is not mixed from --warn, so its ground and its text can disagree',
   );
-  // Warn is the one tone left. The notice tone went with the `needs you` chip: nothing built
-  // one, and a rule for a tone no chip carries paints nothing.
+  // The stylesheet declares no notice-tone chip selector.
   assert.ok(
     !styleSelectors().some((selector) => selector.startsWith('.chips .notice')),
     'the stylesheet still tones a chip kind nothing produces',
@@ -5728,10 +5555,7 @@ test('a figure is the same pill on a card, session heading and rail', () => {
 });
 
 test('the context chip is drawn as a scale, each band mixed from the token its own text takes', () => {
-  // Three toned bands in temperature order, out of the editor's own informational, caution
-  // and error colours. The text is always the pure token and only the ground is mixed, and
-  // the ground grows heavier band by band, so the order survives in grayscale and under the
-  // common colour deficiencies even where two hues converge.
+  // Context bands use theme tokens with increasing background weights.
   assert.ok(styleDeclares('--full: var(--vscode-errorForeground'), 'there is no tone for the top of the context scale');
   const bands: [string, string, number][] = [
     ['ctx-filling', 'notice', 12],
@@ -5752,8 +5576,7 @@ test('the context chip is drawn as a scale, each band mixed from the token its o
     );
     below = weight;
   }
-  // The middle band is drawn exactly as the warn chip is, so caution is one look on the row
-  // rather than a second one beside it.
+  // The middle context band shares the warning chip's declarations.
   assert.equal(
     styleRule('.chips .ctx-getting-full, .sessionstats .ctx-getting-full'),
     styleRule('.chips .warn, .sessionstats .warn'),
@@ -5809,10 +5632,7 @@ test('polling discovers a completed transcript turn without a snapshot trigger',
   }
 });
 
-// The panel is one UI behind a list of hosts, and an editor tab is the only host there
-// is. The list is what everything from `attach()` down is written against, so a second way
-// in has to arrive through the same wiring: a second copy of it is how a listener ends up on
-// one host and not another, which shows as a panel that never refreshes.
+// Editor panels attach through one shared method.
 test('every host reaches the panel through one attach, and the editor tab is the only one', () => {
   sourceMatch(
     panelHostSource,
@@ -5821,9 +5641,7 @@ test('every host reaches the panel through one attach, and the editor tab is the
   );
   const attaches = panelHostSource.match(/private attach\(host: PanelHost\)/g) ?? [];
   assert.equal(attaches.length, 1, 'attach is written more than once, so two hosts can drift apart');
-  // Both editor-tab paths use the same attachment method. A `WebviewView` cannot be dragged to
-  // the editor column and a `WebviewPanel` goes anywhere, so the tab is the only host and
-  // nothing else should be building one.
+  // Both editor-panel paths call the shared attachment method.
   const calls = panelHostSource.match(/this\.attach\(\w+\(/g) ?? [];
   assert.deepEqual(
     calls,
@@ -5836,16 +5654,13 @@ test('every host reaches the panel through one attach, and the editor tab is the
     'a webview view is wired up here, and the manifest contributes no container for one to sit in',
   );
 
-  // A render reaches every host. Posting to one leaves another frozen at whatever it last
-  // drew, which looks like a panel that has stopped rather than one that was never told.
+  // Render delivery iterates over every attached host.
   sourceMatch(
     panelHostSource,
     /for \(const host of this\.hosts\) \{\s*void this\.sendToHost\(host,/,
     'a render is not posted to every host',
   );
-  // State-only updates use the shared post path. Every host must be contacted before the
-  // first delivery is awaited, or two rapid updates can reach a later host in reverse order:
-  // a deleted comment is then followed by the older saved copy and its annotation returns.
+  // Start state-update delivery to every host before awaiting any result.
   const postBody = memberFrom(panelHostSource, panelHostSource.indexOf('private async post('));
   sourceMatch(
     postBody,
@@ -5857,8 +5672,7 @@ test('every host reaches the panel through one attach, and the editor tab is the
     /for \(const host of this\.hosts\)[\s\S]*await host\.webview\.postMessage/,
     'shared updates are sent to later hosts only after earlier hosts answer',
   );
-  // Polling follows the hosts, not the one that changed: a host going out of sight must not
-  // stop the poll another one is still watching.
+  // Continue polling while any host remains visible.
   sourceMatch(
     panelHostSource,
     /if \(this\.anyVisible\(\)\) \{\s*void this\.refresh\(true\);\s*this\.startPolling\(\);/,
@@ -5867,9 +5681,7 @@ test('every host reaches the panel through one attach, and the editor tab is the
 });
 
 test('a theme icon is addressed for the host that will load it', () => {
-  // A webview may only load a URI minted for itself, so a card built for one host draws a
-  // broken picture in another. The icon column is the one part of a card that is not the
-  // same from host to host, and it is redrawn per host on a copy.
+  // Resolve card icons and font-face URIs for the receiving webview.
   sourceMatch(
     panelHostSource,
     /this\.themedFor\(hostDrawn, host\.webview, light\)/,
@@ -5880,8 +5692,7 @@ test('a theme icon is addressed for the host that will load it', () => {
     /iconFonts: this\.icons\.fontFaces\(host\.webview\)/,
     'the icon font is minted for something other than the host being posted to',
   );
-  // On a copy: writing the theme's answer into the shared card would leave the second host's
-  // addresses on the first host's cards.
+  // Copy file icons before applying host-specific theme values.
   const from = panelHostSource.indexOf('private themedFor(');
   assert.notEqual(from, -1, 'themedFor has gone, so nothing addresses an icon per host');
   const body = memberFrom(panelHostSource, from);
@@ -5893,10 +5704,7 @@ test('a theme icon is addressed for the host that will load it', () => {
 });
 
 test('the reader icon theme reaches the rows the Files popover draws', () => {
-  // `themedFor` is the only place a theme icon is put on a card, and the Files popover is the
-  // only surface that draws a file row. This walks the path the host takes, from the card the
-  // parse built to the rows the popover is given, because a card put straight into the page
-  // never passes a theme at all.
+  // Resolve the card's file icons through themedFor before reading its Files detail rows.
   const recorded = FIXTURE_TURNS.find((one) => one.files.length > 1)!;
   const card = toCard(recorded, false, NOW);
   const host = Object.create(PanelProvider.prototype) as Record<string, unknown>;
@@ -5928,13 +5736,8 @@ test('the reader icon theme reaches the rows the Files popover draws', () => {
 });
 
 test('the panel prefers the shared state, so a tab opens where the last one left off', () => {
-  // A webview's own `vscode.setState` store goes when that webview does. Without a shared
-  // copy a tab opened after the last one was closed has every card shut, no folds and no
-  // filters, which reads as a different panel rather than as the same one back.
-  // Through `webviewPanelState`, which is the whole of that state minus the label record.
-  // Nothing in the panel reads a label out of it, and turnview.test.ts holds what the
-  // projection drops. A bare `this.saved` here would write every session's filing into
-  // the page of every host that opens, for no reader.
+  // Inject shared state through webviewPanelState.
+  // The projection excludes host-owned labels.
   sourceMatch(
     panelHostSource,
     /savedStateJson: scriptJson\(webviewPanelState\(this\.saved\)\)/,
@@ -5945,9 +5748,7 @@ test('the panel prefers the shared state, so a tab opens where the last one left
     /const SAVED_STATE = \$\{options\.savedStateJson\};/,
     'the panel shell does not put the prepared state before the browser entry',
   );
-  // Through `scriptJson`, never a bare `JSON.stringify`: JSON escapes what JSON needs and
-  // HTML is not JSON, so a value holding a closing script tag would end the block early and
-  // the rest of the page would be parsed as markup.
+  // scriptJson protects embedded state from closing the script element.
   sourceDoesNotMatch(
     panelHostSource,
     /const SAVED_STATE = \$\{JSON\.stringify/,
@@ -5963,13 +5764,11 @@ test('the panel prefers the shared state, so a tab opens where the last one left
     /const initial = \{ \.\.\.\(shared \?\? browser \?\? \{\}\) \};/,
     'the saved-state service does not prefer the shared state over its own',
   );
-  // Every remembered set reads that one value. One left reading `vscode.getState()` is a set
-  // that silently does not travel.
+  // Every checked session-state field reads the same initial state.
   for (const key of ['open', 'read', 'hidden', 'pinnedTop', 'showing']) {
     assert.ok(sessionStateSource.includes(`initial.${key}`), `the ${key} state is not read from the shared state`);
   }
-  // The folds are not among them. A session cannot be folded away, so the panel holds
-  // no such set and reading a stored one would be reading a state it cannot draw.
+  // panel.ts must not read the stored collapsed set.
   sourceDoesNotMatch(script, /saved\.collapsed/, 'the panel reads a fold set it has no way to draw');
   sourceDoesNotMatch(
     script,
@@ -5977,8 +5776,7 @@ test('the panel prefers the shared state, so a tab opens where the last one left
     'a remembered set still reads this webview own state directly, so it does not reach the other host',
   );
 
-  // And it is written to both. setState is what survives this webview being rebuilt; the
-  // message is what a host attaching later is handed. Neither stands in for the other.
+  // Save state to both browser storage and the host.
   sourceMatch(
     stateSource,
     /browserState\.write\(state\)/,
@@ -5992,10 +5790,7 @@ test('the panel prefers the shared state, so a tab opens where the last one left
 });
 
 test('a reload opens on the session the reader left, not on the newest', () => {
-  // The panel draws one session at a time, so which one it is is the whole of what the
-  // reader is looking at. Held on both sides, the way the archived set is: the extension makes
-  // the parse cut and so has to know before any host attaches, and the panel is the side whose
-  // saved state carries it across a reload.
+  // Restore the selected session in both the host and browser.
   sourceMatch(
     sessionStateSource,
     /let showing = typeof initial\.showing === 'string' \? initial\.showing : '';/,
@@ -6011,20 +5806,17 @@ test('a reload opens on the session the reader left, not on the newest', () => {
     /this\.showing = this\.saved\.showing \|\| null;/,
     'the extension does not restore the session on screen, so the first parse is of another one',
   );
-  // And it is saved when it moves rather than on the reader's next press. A press on a rail
-  // card and then a reload, with nothing else touched, would otherwise come back to the
-  // session before it.
+  // Save selection changes immediately.
   sourceMatch(
     sessionStateSource,
     /if \(showing !== next\) \{ showing = next; owner\.save\(\); \}/,
     'a change of session is not saved until something else is',
   );
-  // The stored shape holds the field, so what is written can be read back.
+  // State normalization retains the selected session.
   assert.equal(normalizePanelState({ showing: 'abc' }).showing, 'abc');
 });
 
-// Enough of an editor tab for the adoption path: the options the editor stored, a disposable for
-// every listener, and a record of what the panel was told to do.
+// Supply editor options, disposable listeners, and reveal tracking for panel adoption tests.
 function fakeWebviewPanel(options: Record<string, unknown>) {
   const panel = {
     webview: { postMessage: () => Promise.resolve(true) },
@@ -6047,10 +5839,7 @@ function fakeWebviewPanel(options: Record<string, unknown>) {
 }
 
 test('the log says where the panel it timed came from', () => {
-  // A restored tab and a created one start from different places, so a startup measurement is
-  // only readable beside the origin of the panel it measured. Every way a panel reaches the
-  // reader is walked here, adoption and reveal alike, because the origin is decided by the path
-  // and not by the panel. A reveal adopts nothing, so it has to name the panel on screen.
+  // Adoption and reveal diagnostics identify the panel's creation or restoration route.
   const logged: { event: string; record: unknown }[] = [];
   const created: ReturnType<typeof fakeWebviewPanel>[] = [];
   let currentOptions: Record<string, unknown> = {};
@@ -6077,8 +5866,7 @@ test('the log says where the panel it timed came from', () => {
     _column: number,
     options: Record<string, unknown>,
   ) => {
-    // The options the extension asks for, read from the call rather than written out here, so a
-    // restored tab below carries exactly what a current one would.
+    // Capture requested options for the restored-panel fixture.
     currentOptions = options;
     const panel = fakeWebviewPanel(options);
     created.push(panel);
@@ -6086,30 +5874,25 @@ test('the log says where the panel it timed came from', () => {
   };
   try {
     host.openInEditor();
-    // The open command pressed again over the panel it just made. Nothing is created there, and
-    // nothing is adopted.
+    // Reopening an existing panel reveals it without creating another.
     host.openInEditor();
     assert.equal(created.length, 1, 'the command made a second panel while one was already open');
     assert.equal(created[0].revealed, 1, 'the panel already open was not brought to the front');
-    // A reload that hands back a tab holding the options this version asks for.
+    // Restore a panel with the current host options.
     host.editorPanel = null;
     const restored = fakeWebviewPanel({ ...currentOptions });
     host.revivePanel(restored as unknown as vscode.WebviewPanel);
-    // And the open command pressed over that restored panel. This is the reveal a reader matches
-    // against a startup measurement, so a line naming the open it did not do reads as a panel
-    // that was built here rather than restored.
+    // Reveal the restored panel with its recorded origin.
     host.openInEditor();
     assert.equal(created.length, 1, 'the command made a panel while a restored one was held');
     assert.equal(restored.revealed, 1, 'the restored panel was not brought to the front');
-    // A reload whose tab was saved before one of those options existed. The restored tab goes and
-    // a fresh one takes its place, and the reload is what the log still has to show.
+    // Replace a restored panel whose stored options are stale.
     host.editorPanel = null;
     const stale = fakeWebviewPanel({ retainContextWhenHidden: true });
     host.revivePanel(stale as unknown as vscode.WebviewPanel);
     assert.equal(stale.disposed, true, 'a restored tab carrying stale options was kept');
     assert.equal(created.length, 2, 'a restored tab with stale options was not replaced');
-    // The same reload arriving while a panel is already open. Nothing is adopted there, and the
-    // panel on screen is revealed instead.
+    // With a panel already open, discard the stale restored panel and reveal the existing one.
     const alsoStale = fakeWebviewPanel({ retainContextWhenHidden: true });
     host.revivePanel(alsoStale as unknown as vscode.WebviewPanel);
     assert.equal(created.length, 2, 'a second panel was made while one was already open');
@@ -6168,8 +5951,7 @@ test('performance diagnostics are a redacted read-only snapshot of held state', 
     'the command writes without asking where the reader wants the JSON file',
   );
   sourceMatch(saveBody, /vscode\.workspace\.fs\.writeFile\(/, 'the selected diagnostics file is never written');
-  // Three ways to run one capture: the file a caller names, the directory the variable names,
-  // and the dialog. One tested function decides between them, and the host only carries it.
+  // The host delegates capture-destination selection to savePerformanceDiagnosticsSnapshot.
   sourceMatch(
     saveBody,
     /savePerformanceDiagnosticsSnapshot\(\{/,
@@ -6247,8 +6029,7 @@ test('performance diagnostics are a redacted read-only snapshot of held state', 
     'a webview performance reply loses the panel identity that sent it',
   );
 
-  // The measurement is a serialization of the largest message the panel receives, and a click
-  // waits on that message. The post goes first so the wait is the post alone.
+  // Post the message before measuring its serialized size.
   const sendBody = methodBody('private sendToHost(');
   const postedAt = layoutIndexOf(sendBody, 'const posted = host.webview.postMessage(message);');
   const measuredAt = layoutIndexOf(
@@ -6266,10 +6047,7 @@ test('performance diagnostics are a redacted read-only snapshot of held state', 
 });
 
 test('a capture that writes nothing puts its reason where a run with no reader can read it', async () => {
-  // An automated capture gets `null` back and no window. The reason it failed has to reach the
-  // diagnostics log, or that run cannot tell a refused path from a closed dialog. `arc.diagnostics.log`
-  // is off until a reader turns it on and reloads the window, so the real log is built here with
-  // the setting off: a reason written through the channel that setting silences reaches nobody.
+  // Failed captures reach the diagnostics log even when ordinary diagnostics logging is disabled.
   const shown: string[] = [];
   const diagnostics = createDiagnosticsLog({
     enabled: false,
@@ -6301,8 +6079,7 @@ test('a capture that writes nothing puts its reason where a run with no reader c
   let refused: string | null = target;
   try {
     answered = await capture.savePerformanceDiagnostics(target);
-    // And the other way a capture answers with nothing while the window has no folder open. A
-    // closed dialog answers the same, so the log is the only thing that tells the two apart.
+    // A relative destination without an open folder also records its refusal.
     refused = await capture.savePerformanceDiagnostics('out/startup.json');
   } finally {
     delete editorWindow.showErrorMessage;
@@ -6337,11 +6114,8 @@ test('a capture that writes nothing puts its reason where a run with no reader c
 });
 
 test('a render writes the rail it posted down without yielding first', () => {
-  // The rail input key answers the next rail post's wording comparison. It is stamped after the
-  // render is posted, and the stretch between the wording and the stamp must reach the stamp
-  // in one turn. An await in it lets a rail post land between the two, and the stamp then
-  // names a rail the panel no longer holds. The next post of that older wording returns early
-  // and the panel keeps a rail the host believes it replaced.
+  // Compute and retain the posted session list key without yielding.
+  // Another post during that interval would leave the retained key stale.
   const refresh = memberFrom(panelHostSource, panelHostSource.indexOf('async refresh('));
   const body = refresh;
   const worded = body.indexOf('const railInput = this.railInputFor(counts, statuses, openChildren, railNow);');
@@ -6355,11 +6129,7 @@ test('a render writes the rail it posted down without yielding first', () => {
 });
 
 test('both copy commands write one spelling of the path', () => {
-  // `copyPath` lives in `extension.ts`, which imports `vscode` and so has no unit test of its
-  // own. `nativePath` is tested to the letter in `transcript.test.ts`, but a call site that
-  // skips it copies whatever spelling the transcript recorded with every one of those tests
-  // still green, which is the fault itself: the same file copies one way from one turn and
-  // another way from the next.
+  // Both absolute and relative path-copy branches pass through nativePath.
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   sourceMatch(
     extensionSource,
@@ -6835,17 +6605,14 @@ test('turn handoff commands validate context and preserve labels only when reque
     'Arc: this selected text can no longer be sent.',
   ]);
 
-  // New session with the same labels. A turn card, a session heading, and a rail card each
-  // arm the one record a right-click over a session writes, so the command reaches the host
-  // the same way from all three. `rail.editors.browser.test.ts` checks that each place writes it.
+  // The native session context supplies New session with the same labels.
   const labeledCommand = 'arc.newSessionWithLabels';
   sourceMatch(extensionSource, /reg\('arc\.newSessionWithLabels', \(arg\) => newSessionWithLabels\(panel, arg\)\);/);
   sourceMatch(
     extensionSource,
     /function newSessionWithLabels\(panel: PanelProvider, arg: unknown\): void \{\s*const session = sessionIdFrom\(arg\);\s*if \(!session\) \{\s*return;\s*\}\s*panel\.newSessionWithLabels\(session\);/,
   );
-  // A rendered link and a changed-file row inside a card merge the card's context but keep their
-  // own menus, so the card entry excludes every section either one writes.
+  // Exclude link, table-link, and file sections from the card-level action.
   const cardEntryWhen =
     menu.find((entry) => entry.command === labeledCommand && entry.group === '4_handoff@3')?.when || '';
   const inCardSections = [...`${summarySource}\n${cardRowsSource}`.matchAll(/webviewSection: ([^,\n]+)/g)]
@@ -7210,14 +6977,8 @@ ${methodBody('private acceptSelectedTextHandoff(')}
   );
 });
 
-// The three below are the findings a two-model review caught in the first multi-host commit.
-// Each was invisible while there was one webview and each only misbehaves once both are open,
-// which is the feature's own main case, so each gets a guard rather than a note.
-
 test('a host takes its own listeners away with it, and the editor ones are wired once', () => {
-  // An editor tab is opened and closed at will. Registered per host, the two editor-wide
-  // listeners pile up one pair per open and are released only at shutdown, so a single theme
-  // change ends up repainting once per tab the reader ever opened.
+  // Host attachment must not register editor-wide listeners.
   const attach = panelHostSource.slice(
     panelHostSource.indexOf('private attach(host: PanelHost)'),
     panelHostSource.indexOf('private anyVisible()'),
@@ -7244,8 +7005,8 @@ test('a host takes its own listeners away with it, and the editor ones are wired
     'a disposed host does not release its own listeners',
   );
 
-  // Wired once, and from the constructor, so there is exactly one of each however many hosts
-  // come and go.
+  // Require one editor-listener method and a call to it.
+  // This source check does not count runtime registrations.
   const wired = panelHostSource.match(/private wireEditorListeners\(\): void/g) ?? [];
   assert.equal(wired.length, 1, 'the editor-wide listeners are wired in more than one place');
   sourceMatch(panelHostSource, /this\.wireEditorListeners\(\);/, 'nothing wires the editor-wide listeners at all');
@@ -7429,9 +7190,7 @@ test('launcher initial and refreshed metadata requests follow its committed rece
 });
 
 test('an editor tab only announces a visibility change when its visibility changed', () => {
-  // onDidChangeViewState is not the visibility event: it fires on focus too. Passed straight
-  // through, clicking from the panel tab to a file and back forces two full repaints of
-  // every host, and a repaint drops the reader's text selection.
+  // Ignore view-state events that leave panel visibility unchanged.
   const host = panelHostSource.slice(
     panelHostSource.indexOf('function panelHost('),
     panelHostSource.indexOf('export class PanelProvider'),
@@ -7446,10 +7205,7 @@ test('an editor tab only announces a visibility change when its visibility chang
 });
 
 test('rail updates publish and adopt authoritative memberships', () => {
-  // The cut that hiding drives is made in the extension, before the parse, and its result
-  // reaches both hosts. A webview keeping only what its own reader told it draws the other
-  // host's hidden session as simply absent, with no footer and no way back, and its next
-  // hide posts a set that never knew about the first.
+  // Adopt host-owned session memberships before drawing a session list update.
   sourceMatch(
     panelHostSource,
     /hidden: this\.hidden,/,
@@ -8568,10 +8324,7 @@ test('the panel imports the shared session query rules', () => {
   assert.equal(whereNote('find: x in:respons'), 'in:respons was not understood. Use in:prompt, in:summary or in:both.');
 });
 test('the panel keeps no copy of asQuote, because nothing in it quotes a selection', () => {
-  // The panel had one while a selection could be copied out as a quote block. That control
-  // is gone: a comment goes on the line, and a turn's comments are copied together from the
-  // card's menu, where turnview.ts does the quoting. A second copy here would be a rule kept
-  // in two places again, and the drift guard that used to hold them together went with it.
+  // panel.ts contains no local asQuote implementation.
   sourceDoesNotMatch(
     script,
     /function asQuote\(/,
@@ -8580,9 +8333,7 @@ test('the panel keeps no copy of asQuote, because nothing in it quotes a selecti
 });
 
 test('a diff opened from the panel names the group it lands in', () => {
-  // Left to the default, a diff opens wherever focus happens to be, and once the panel is
-  // an editor tab of its own that is the panel's own group: the reader's editor splits in
-  // two and the diff lands where the panel was.
+  // File and single-file diff commands name their target editor column.
   sourceMatch(
     panelHostSource,
     /\{ viewColumn: column, preserveFocus: false \}/,
@@ -8593,8 +8344,7 @@ test('a diff opened from the panel names the group it lands in', () => {
     /'vscode\.open', vscode\.Uri\.file\(msg\.path\), \{ viewColumn: column \}/,
     'opening a file without a pending diff does not name a group',
   );
-  // Ctrl, or Cmd on a Mac, asks for a group of its own, which is what the editor's own
-  // lists do with the same press.
+  // A modifier press requests the editor column beside the panel.
   sourceMatch(
     hostHandler('openFile'),
     /const column = msg\.beside \? vscode\.ViewColumn\.Beside : this\.column\(\);/,
@@ -8610,14 +8360,13 @@ test('a diff opened from the panel names the group it lands in', () => {
     /workbench\.action\.splitEditorRight/,
     'the multi-file diff ignores the modifier, since focus is the only way to tell it where to open',
   );
-  // `vscode.changes` has no options argument, so focusing first is the only way to say where
-  // its editor should open.
+  // Focus the target column before opening a multi-file diff.
   sourceMatch(
     panelHostSource,
     /await this\.focusColumn\(beside\);\s*(?:\/\/[^\n]*\s*)*await vscode\.commands\.executeCommand\('vscode\.changes'/,
     'the multi-file diff does not focus the group it should open in, so it lands wherever focus was',
   );
-  // The rule itself lives where it can be tested, and this file only gathers its inputs.
+  // The host passes column-selection inputs to editorColumn.
   sourceMatch(
     panelHostSource,
     /return editorColumn\(\{/,
@@ -8691,9 +8440,7 @@ test('dispatched file presses open the child snapshot, including a path the pare
 });
 
 test('the page fixture carries every skill row a picture has to show', () => {
-  // The page the layout guards measure and the shot script photographs is built from these
-  // turns. A state missing here is a state no picture can show, and the popover then looks
-  // finished in every board while a reader meets a row nobody ever looked at.
+  // The fixture covers repeated skills, missing paths, and best-effort skill descriptions.
   const drawn = FIXTURE_TURNS.slice(0, 2).map((one) => toCard(one, false, NOW));
   const [newest, before] = drawn;
   assert.deepEqual(
@@ -8711,8 +8458,7 @@ test('the page fixture carries every skill row a picture has to show', () => {
     [['best-effort', true]],
     'no fixture turn draws a best-effort skill with the sentence its catalog published',
   );
-  // The `Skill` call the newest turn recorded is a skill load and not a tool category, so the
-  // page draws no `other` count for it.
+  // Skill calls do not contribute to the other-tool count.
   assert.equal(
     newest.activityToolCategories.some((category) => category.key === 'other'),
     false,
@@ -8720,11 +8466,7 @@ test('the page fixture carries every skill row a picture has to show', () => {
   );
 });
 
-// What one press of a skill row asked the editor to do, as the calls the handler made.
-//
-// The handler is lifted out of `onMessage` and run over a fake disk and a fake editor, because
-// what it refuses is the whole point of it: a text guard would pass over a check that had been
-// weakened to nothing.
+// Run the extracted openSkill handler against fake filesystem and editor services.
 function routeOpenSkill(
   card: unknown,
   disk: Record<string, 'file' | 'directory'>,
@@ -8751,9 +8493,7 @@ function routeOpenSkill(
       },
     },
   };
-  // The statements as plain JavaScript, since the handler is typed and awaits. They are
-  // wrapped in a function before the types come off, because a bare `return` at the top level
-  // of a module is an error.
+  // Wrap the handler in an async function before transpiling its types and return statements.
   const lifted = esbuild.transformSync(
     `async function lifted(msg, cardFor, fs, vscode) {${handlerBody(panelHostSource, 'openSkill')}}`,
     { loader: 'ts' },
@@ -8782,16 +8522,13 @@ test('a skill row opens only a file the card itself published', () => {
     [['vscode.open', { path: skill }, { viewColumn: 99 }]],
     'a modifier press no longer opens the skill in a group of its own',
   );
-  // The panel is the only thing that sends this, and a card names every path the reader could
-  // have pressed. A message naming any other file is not a press the panel could have made.
+  // Reject paths absent from the addressed card's skill entries.
   assert.deepEqual(
     routeOpenSkill(card, disk, { key: 's1:1', path: 'c:/repo/secrets.env' }),
     [],
     'the host opened a readable file the card never named',
   );
-  // A skill that moved, one whose name is now a directory, and a turn the list no longer
-  // draws. Each opens nothing, and none of them says anything: where a reader keeps their
-  // skills is a fact about their disk rather than a fault they must dismiss.
+  // Missing paths, directories, and unavailable turn cards open nothing.
   assert.deepEqual(
     routeOpenSkill(card, {}, { key: 's1:1', path: skill }),
     [],
@@ -8822,13 +8559,7 @@ test('a skill row opens only a file the card itself published', () => {
 });
 
 test('the session on screen scopes the search, and every wording follows the scope', () => {
-  // Nothing on screen starts a search: the box that did is gone and what replaces it is not
-  // built yet. The engine is kept whole, and this is what stops the wiring rotting meanwhile.
-  //
-  // The decision lives in searchScope in turnview.ts, tested there; the extension feeds it the
-  // session on screen and narrows the corpus read by the same one before the per-file
-  // reads, so the expensive pass shrinks with the scope instead of reading everything and
-  // filtering afterwards.
+  // Scope search inputs to the selected session before reading individual files.
   sourceMatch(
     panelHostSource,
     /searchScope\(this\.searchCorpus\(this\.showing\), this\.showing\)/,
@@ -8857,9 +8588,8 @@ test('the session on screen scopes the search, and every wording follows the sco
     read !== -1 && cut < read,
     'the corpus narrows after the per-file reads, so a scoped search still pays for every session',
   );
-  // The panel words the scope from the reply, never from a rule of its own: the flag
-  // arrives with the results, and the busy line, drawn before any reply exists, reads
-  // the session the extension named on the render.
+  // Result text uses the reply scope.
+  // Pending-search text uses the scope supplied by the host.
   sourceMatch(
     searchSource,
     /scope = searchWords\(\)\.searchEmptyByScope\[replyScope\]\s*\? replyScope : DEFAULT_SEARCH_SCOPE;/,
@@ -8875,9 +8605,7 @@ test('the session on screen scopes the search, and every wording follows the sco
     /searchWords\(\)\.searchCountByScope\[scope\]/,
     'a result count reads as an answer for a scope the search did not cover',
   );
-  // Search keeps its own read window, so a session the reader paged back through can
-  // still be searched over less than they can see. A scoped answer over a partial window is
-  // a third claim and not a wording of the second.
+  // Search scope distinguishes a partial session window from a complete session.
   assert.equal(
     searchScopeName({ scoped: true, whole: false }),
     'sessionPart',
@@ -8908,7 +8636,7 @@ test('the session on screen scopes the search, and every wording follows the sco
   );
 });
 
-// The search handler as the host runs it, with `answerSearch` compiled from the host source.
+// Compile answerSearch from the host source for handler tests.
 function searchHandler(): (host: object, text: string) => void {
   const member = memberFrom(panelHostSource, panelHostSource.indexOf('private answerSearch(query'));
   const answer = new Function(
@@ -8931,10 +8659,7 @@ function searchHandler(): (host: object, text: string) => void {
 }
 
 test('a search reuses the held catalog instead of rewalking it', () => {
-  // allSessions(reuseCatalog) does the full disk walk, resorts the catalog and can move the
-  // spend revision when called with no argument. A search runs on every keystroke, outside
-  // any refresh generation, so it must ask for the held catalog the way the session lookup at
-  // "const session = this.allSessions(true).find(...)" already does, and never trigger a walk.
+  // Search reuses the retained session catalog instead of starting another disk walk.
   const calls: boolean[] = [];
   const posted: unknown[] = [];
   const host = {
@@ -8976,8 +8701,7 @@ test('a search reuses the held catalog instead of rewalking it', () => {
 });
 
 test('a search during the cold opening pass waits for it and answers only the latest query', async () => {
-  // A corpus walk during the pass reads every opening record the pass has not reached on the
-  // extension host's main thread, and trims the rows the pass is still adding.
+  // Delay corpus reads until opening-record discovery completes.
   let finish: () => void = () => {};
   const corpusReads: (string | null)[] = [];
   const posted: { query: string; hits: unknown }[] = [];
@@ -9011,7 +8735,7 @@ test('a search during the cold opening pass waits for it and answers only the la
   await vi.waitFor(() => assert.equal(posted.length, 1, 'the search that waited for the pass was never answered'));
   assert.equal(posted[0].query, 'find:hello', 'an older query that waited was answered');
   assert.equal(corpusReads.length, 1, 'every query that waited read the corpus');
-  // A cleared box during the pass drops the query that waited.
+  // Clearing the query cancels the search waiting for discovery.
   host.codexPriming = new Promise<void>((resolve) => {
     finish = resolve;
   });
@@ -9019,21 +8743,19 @@ test('a search during the cold opening pass waits for it and answers only the la
   search(host, '');
   assert.equal(posted[1].hits, null, 'the cleared box did not reply with the ordinary list');
   finish();
-  // Chained the way the handler chains its wait, so this settles after the handler's own.
+  // Settle the same promise chain used by the handler.
   await host.codexPriming.catch(() => undefined).then(() => undefined);
   assert.equal(posted.length, 2, 'a query the reader cleared was answered after the pass');
   assert.equal(corpusReads.length, 1, 'a query the reader cleared was answered after the pass');
 });
 
 test('nothing styles a search result the marks cannot be seen in', () => {
-  // What a press does, and where a mark comes from, are behaviour and run in
-  // webview/search.browser.test.ts. The rule that paints the mark has no behavioural twin.
+  // Require a stylesheet selector for marked result text.
   assert.ok(styleSelectors().includes('.resultsnippet .hl'), 'nothing styles the marked match');
 });
 
 test('a stored session query normalizes but is neither adopted nor written', () => {
-  // A build that had a box to type into could leave a query behind. The panel no longer
-  // reads or writes that field, while the normalizer still accepts the older shape.
+  // panel.ts does not adopt filter, and session-state saves use railFilter.
   sourceDoesNotMatch(script, /saved\.filter/, 'the stored query is read back in');
   sourceDoesNotMatch(script, /\bsessionFilter\b/, 'the removed session query still has live state');
   const [savedCall] = callSources(sessionStateSource, 'options.savedState.save');
@@ -9044,10 +8766,9 @@ test('a stored session query normalizes but is neither adopted nor written', () 
     /railFilter: rail\.filter/,
     'the typed rail query is not written through its named state field',
   );
-  // The field is kept in the stored shape, so a value written by an older build still
-  // normalizes rather than throwing.
+  // The normalizer still accepts the stored filter field.
   assert.equal(normalizePanelState({ filter: 'agent:codex' }).filter, 'agent:codex');
-  // And a query going empty still clears the results it found.
+  // Clearing the active query clears its results.
   sourceMatch(
     searchSource,
     /if \(!working\) \{ hits = null; \}/,
@@ -9056,14 +8777,12 @@ test('a stored session query normalizes but is neither adopted nor written', () 
 });
 
 test('a result row joins the arrow-key walk rather than being its own tab stop', () => {
-  // The whole list is one tab stop. Left out of the walk, a results list is one tab stop per
-  // hit, which is the thing the roving design exists to avoid.
+  // Include result rows in the supplementary arrow-key walk.
   assert.ok(ROVING_SELECTOR.includes('.result'), `a result row is not in the arrow-key walk: ${ROVING_SELECTOR}`);
 });
 
 test("the session menu button is the walk's next stop after the heading", () => {
-  // Right after `.session`, so the walk goes heading, menu, label chips, Labels, cards, the
-  // order the reader meets them in on the row.
+  // The walk selector lists the session menu immediately after the heading.
   sourceMatch(
     ROVING_SELECTOR,
     /^\.session, \.sessionmenu,/,
@@ -9085,9 +8804,7 @@ test("the session menu button opens the row's own context menu on a press", () =
 });
 
 test('the corpus does not fill the cache the render path reads', () => {
-  // `readFor` holds one entry per file. A corpus read asks for every turn and a different
-  // number of bytes, so going through it overwrites what the render path just filled, and
-  // stores a full parsed read of every session in the workspace rather than the few on screen.
+  // Search uses a separate corpus cache keyed by file size and modification time.
   const body = memberFrom(panelHostSource, panelHostSource.indexOf('private searchCorpus(only'));
   assert.ok(body.length > 100, 'searchCorpus has gone, so this guard cannot see how it reads');
   sourceDoesNotMatch(
@@ -9104,10 +8821,7 @@ test('the corpus does not fill the cache the render path reads', () => {
 });
 
 test('a repaint follows every session drawn, not only the few that are parsed', () => {
-  // The picker draws every session in the workspace with its name and its clock time, so one
-  // that is listed and never parsed can still change what is on screen: renaming it writes a
-  // new title into its transcript. Watching only the parsed few means nothing notices until
-  // something else moves.
+  // ListingFacts includes every catalog session, including unparsed sessions whose titles change.
   sourceMatch(
     panelHostSource,
     /const listed: ListingFacts = \{\s*showing: this\.showing, files: all,/,
@@ -9121,11 +8835,7 @@ test('a repaint follows every session drawn, not only the few that are parsed', 
 });
 
 test('a Codex thread being named is a reason to repaint', () => {
-  // Renaming a Codex session writes into an index of its own and touches no transcript, so
-  // the file terms of the signature all stay where they were. The index has to be looked at
-  // before the signature is built and its state carried into it, or a name that lands after
-  // the rollout has gone quiet is never noticed and the panel shows `Session 01a0545e` until
-  // the window is reloaded.
+  // Read the Codex name index before building ListingFacts and include its stamp.
   const body = memberFrom(panelHostSource, panelHostSource.indexOf('async refresh('));
   assert.ok(body.length > 100, 'refresh has gone, so this guard cannot see what it compares');
   sourceMatch(
@@ -9180,22 +8890,19 @@ test('the advanced rail search keeps the plain-query rule without drawing the ol
     /ask\(`\$\{FIND_PREFIX\}: \$\{text\}`\);/,
     'starting a search does not turn the query into one',
   );
-  // The word comes from the shared grammar, not spelled out again, or this could type one
-  // the parser does not read.
+  // Search prefixes queries with the shared FIND_PREFIX.
   sourceDoesNotMatch(searchSource, /'find'/, 'the search word is spelled out rather than taken from the grammar');
 });
 
 test('the search keeps one door, and no control on screen opens it', () => {
-  // Typing narrowed the session list and Enter read every session. Both belonged to
-  // one box, and the box is out: the owner never used it, and what replaces it belongs to the
-  // rail and wants its own plan. startSearch is the engine door retained for that control.
+  // Require the search owner's start method without the addSessionFilter builder.
   assert.equal(
     panelSource.indexOf('function addSessionFilter('),
     -1,
     'a box that narrows the session list is drawn again',
   );
   sourceMatch(searchSource, /    start\(text\) \{/, 'the engine has no door at all');
-  // Production publishes no test caller. The owner browser gate calls the typed owner directly.
+  // The combined panel sources contain no searchRenderer.start call.
   assert.equal(
     (panelSource.match(/searchRenderer\.start\(/g) ?? []).length,
     0,
@@ -9204,19 +8911,14 @@ test('the search keeps one door, and no control on screen opens it', () => {
 });
 
 test('nothing leaves the panel with no session shown', () => {
-  // One session is on screen at every width, so no control offers the way back to none.
-  // Two did: a press beside the query box that emptied the query, the results and the choice
-  // of session together, and the picker's first option. Both are gone, and the empty
-  // session id they posted is not sent from anywhere.
+  // panel.ts contains no empty-session showSession message or Recent sessions option.
   sourceDoesNotMatch(script, /type: 'showSession', session: ''/, 'a control still asks for no session at all');
   sourceDoesNotMatch(
     script,
     /Recent sessions/,
     'the picker offers no session again, which draws every one of them at once',
   );
-  // And an id that names nothing falls to the newest rather than to the whole list. The rule
-  // is pickShowing in turnview.ts, run over its own cases there; here it is that the refresh
-  // actually goes through it, before the parse cut and the budget read the answer.
+  // Refresh resolves selection through pickShowing using all reachable session identities.
   sourceMatch(
     panelHostSource,
     /const reachable = \[\s*\.\.\.scopedDrafts\.map\(\(draft\) => draft\.draftId\),\s*\.\.\.scopedPendingRecords\.map\(\(pending\) => pending\.sessionId\),\s*\.\.\.all\.map\(\(f\) => f\.sessionId\),\s*\];/,
@@ -9227,8 +8929,7 @@ test('nothing leaves the panel with no session shown', () => {
     /this\.showing = pickShowing\(reachable, this\.showing\);/,
     'a refresh takes the session on screen as it finds it, so a stale id draws nothing',
   );
-  // The same set decides what is left of the trail, so Back cannot offer a session that
-  // the line above has just refused to show.
+  // Prune navigation history against the same reachable identities.
   sourceMatch(
     panelHostSource,
     /this\.trail = visitPlace\(prunePlaces\(this\.trail, new Set\(reachable\)\), this\.showing \?\? ''\);/,
@@ -9239,8 +8940,7 @@ test('nothing leaves the panel with no session shown', () => {
     /this\.show\(msg\.session \|\| null, host\);/,
     'the panel can name a session the workspace does not have and be believed',
   );
-  // And the one method it goes through is the one the walk goes through, so a rule about
-  // leaving a session cannot reach the rail's press and miss Back.
+  // Native selection and navigation history both call show to settle the departing draft.
   sourceMatch(
     panelHostSource,
     /private show\(session: string \| null, host\?: PanelHost\): void \{\s*const previousSelection = host \? \(this\.hostSessions\.get\(host\) \?\? this\.showing\) : this\.showing;\s*if \(previousSelection && previousSelection !== session\) \{ this\.abandonDraft\(previousSelection, false\); \}[\s\S]*this\.hostSessions\.set\(host, session\);[\s\S]*this\.previousSelection = previousSelection;\s*this\.showing = session;/,
@@ -9330,43 +9030,25 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     selectionFailure: null,
     railSeedOwedFor: null,
     railSeedSkipped: false,
-    notePanelStart() {
-      /* no startup clock in this symptom check */
-    },
-    allowThemeFiles() {
-      /* no theme files in this symptom check */
-    },
+    notePanelStart() {},
+    allowThemeFiles() {},
     shell() {
       return '';
     },
     anyVisible() {
       return true;
     },
-    startPolling() {
-      /* no poll in this symptom check */
-    },
-    stopPolling() {
-      /* no poll in this symptom check */
-    },
+    startPolling() {},
+    stopPolling() {},
     requestInitialCatalogRefresh() {
       return false;
     },
-    refreshSelectedCatalogs() {
-      /* no live catalog in this symptom check */
-    },
-    releaseQueuedEditOffer() {
-      /* no queued edit in this symptom check */
-    },
-    closeBrowserStagingForHost() {
-      /* no staged assets in this symptom check */
-    },
-    abandonCatalogRefresh() {
-      /* no catalog read in this symptom check */
-    },
+    refreshSelectedCatalogs() {},
+    releaseQueuedEditOffer() {},
+    closeBrowserStagingForHost() {},
+    abandonCatalogRefresh() {},
     progressiveWorker: {
-      stop() {
-        /* no worker in this symptom check */
-      },
+      stop() {},
     },
     clearRoutes: new Map(),
     detailsMenuArm: null,
@@ -9383,9 +9065,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     refresh() {
       return Promise.resolve();
     },
-    settleRailSeed() {
-      /* the payload check posts explicitly below */
-    },
+    settleRailSeed() {},
     completeSelectedWindow() {
       return Promise.resolve();
     },
@@ -9404,9 +9084,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     authoritativeCatalog: catalog,
     awaitingSessionRecords: {},
     repositoryScopeRoots: [],
-    ensureProjectSpendWorkspace() {
-      /* no spend index in this symptom check */
-    },
+    ensureProjectSpendWorkspace() {},
     watching: false,
     prepareMetadata() {
       return Promise.resolve(true);
@@ -9463,9 +9141,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     cwds: new Map(),
     humanScans: new Map(),
     derivedCacheCheckpointState: {
-      markChanged() {
-        /* no derived cache in this symptom check */
-      },
+      markChanged() {},
     },
     sessionCacheBudgetBytes() {
       return 1024 * 1024;
@@ -9731,27 +9407,20 @@ test('a fresh session stays selected until its disk record is discoverable', () 
     /panel\.noteSessionMoved\([\s\S]*event\.previous, event\.sessionId, agent \?\? 'claude', host\.get\(key\)\?\.state\(\)\.cwd \?\? null/,
     'a workspace change can replace a live successor cwd with the new editor folder',
   );
-  // And the labels move with the identity. A reader who files a session while it is
-  // starting put the label on the draft's own id, and the agent answers with an id of its
-  // choosing a moment later. `turnlabels.ts` holds what the move does; nothing but this
-  // holds that the move happens at all, and the label would vanish off a card the reader
-  // had filed seconds earlier.
+  // Transfer draft labels to the adopted session identity.
   sourceMatch(
     adopt,
     /adoptLabelSession\(this\.saved\.labels, provisional, actual\)/,
     'a label put on a session while it was starting is left on an id no card can draw',
   );
-  // And before the write that puts the state on disk. Moved after it, or dropped, the move
-  // happens in memory and a reload puts the label straight back on the id no card can draw.
+  // Transfer labels before persisting the draft state.
   const movedAt = adopt.indexOf('adoptLabelSession(');
   assert.ok(
     movedAt > -1 && movedAt < adopt.indexOf('this.writeDrafts();'),
     'the labels are moved after the state is written, so a reload undoes the move',
   );
 
-  // A draft the reader abandons takes its labels with it, or the record holds filing under
-  // an id nothing can reach: it costs a place under the record's ceiling, and every list
-  // built from the record offers a label that files nothing.
+  // Remove labels when abandoning a draft.
   const abandonAt = panelHostSource.indexOf('public abandonDraft(draftId: string, repaint: boolean = true)');
   assert.notEqual(abandonAt, -1, 'a fresh session can no longer be abandoned');
   const abandon = panelHostSource.slice(abandonAt, panelHostSource.indexOf('private adoptDraft(', abandonAt));
@@ -9918,9 +9587,7 @@ test('awaiting session state and delayed panel actions use the adopted identity'
       this.drafts[session] = text;
       return true;
     },
-    clearAttachmentNotice() {
-      /* no attachment notice belongs to this test */
-    },
+    clearAttachmentNotice() {},
     usagePayload() {
       return { composer: 'durable' };
     },
@@ -10118,9 +9785,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
   )(
     {
       window: {
-        showInformationMessage() {
-          /* the reply is asserted below */
-        },
+        showInformationMessage() {},
       },
     },
     renameRequest,
@@ -10357,9 +10022,7 @@ test('a queued edit keeps a newer draft written from another panel', () => {
     `return function (id, session, revision, host, browserSession = session) {\n${methodBody('private requestQueuedEdit(')}\n};`,
   )(() => [], queueSubmissionAfter, {
     window: {
-      showInformationMessage() {
-        /* this offer fits */
-      },
+      showInformationMessage() {},
     },
   });
   const releaseQueuedEditOffer = new Function(
@@ -10416,9 +10079,7 @@ test('a queued edit keeps a newer draft written from another panel', () => {
       this.boxText[session] = text;
       return false;
     },
-    clearAttachmentNotice() {
-      /* no notice belongs to this scenario */
-    },
+    clearAttachmentNotice() {},
     writeDrafts() {
       return Promise.resolve();
     },
@@ -10478,9 +10139,7 @@ test('a queued edit retains an attachment that finishes after the offer', () => 
     `return function (id, session, revision, host, browserSession = session) {\n${methodBody('private requestQueuedEdit(')}\n};`,
   )(() => [], queueSubmissionAfter, {
     window: {
-      showInformationMessage() {
-        /* this offer fits */
-      },
+      showInformationMessage() {},
     },
   });
   const releaseQueuedEditOffer = new Function(
@@ -10564,9 +10223,7 @@ test('releasing a rejected or abandoned queued edit resumes eligible delivery', 
     `return function (id, session, revision, host, browserSession = session) {\n${methodBody('private requestQueuedEdit(')}\n};`,
   )(() => [], queueSubmissionAfter, {
     window: {
-      showInformationMessage() {
-        /* this offer fits */
-      },
+      showInformationMessage() {},
     },
   });
   const releaseQueuedEditOffer = new Function(
@@ -10824,9 +10481,7 @@ test('pinning persists the opened pinned section with the membership write', () 
         persisted.push(structuredClone(value));
       },
     },
-    postRail() {
-      /* membership publishing is covered beside archive */
-    },
+    postRail() {},
     onArchivedSessionsChange: null,
   };
 
@@ -10934,9 +10589,7 @@ test('a delayed browser save preserves durable provider memberships', () => {
   );
 });
 
-// A panel's state save carries no saved filter list, because the extension owns it. The
-// selected filter, its query and its lens still have to reach storage, or a reload opens on
-// All sessions with the lens gone.
+// Browser saves preserve the host-owned saved-filter catalog and the selected filter's query and sort.
 test('a browser save on a saved filter keeps its selection and lens words through a reload', () => {
   const saveState = new Function(
     'normalizePanelState',
@@ -10990,10 +10643,7 @@ test('a browser save on a saved filter keeps its selection and lens words throug
   );
 });
 
-// One method of the panel's extension side, as a body a guard can run.
-//
-// These source checks run each method body against a stand-in for the panel's books. Imported
-// browser-safe modules test the rules that those host methods call.
+// Extract one host method's block from the syntax tree.
 function methodBody(marker: string): string {
   const at = panelHostSource.indexOf(marker);
   assert.notEqual(at, -1, `panelhost.ts no longer holds "${marker}", so this guard cannot see what it does`);
@@ -11223,12 +10873,10 @@ test('/clear publishes the copied setup', () => {
     saved,
     memento,
     rememberStarted() {
-      /* the started record is separate from settings persistence, and
-      real code persists it before the label copy below; a no-op here keeps this guard
-      pinned to what the copy itself, and the writeDrafts it triggers, make durable */
+      /* Keep started-session persistence inactive to isolate label copying and writeDrafts persistence. */
     },
     refresh() {
-      /* the test reads the books before any render */
+      /* Inspect persisted state without rendering. */
     },
     post(msg: { type: string; session: string }) {
       posted.push(msg);
@@ -11244,9 +10892,7 @@ test('/clear publishes the copied setup', () => {
     onSessionSettingsAdopted(session: string, accepted: typeof settings) {
       persisted = withSessionSettings(persisted, session, accepted);
     },
-    finishClearSettlement() {
-      /* no clear request is active in this state-transfer guard */
-    },
+    finishClearSettlement() {},
   };
   move.call(host, 'old', 'new', 'claude', 'C:\\ws');
   assert.equal(
@@ -11350,11 +10996,9 @@ test("/clear does not evict the source session's own labels at a full label reco
         return Promise.resolve();
       },
     },
-    rememberStarted() {
-      /* not under test here */
-    },
+    rememberStarted() {},
     refresh() {
-      /* the test reads the books before any render */
+      /* Inspect state without rendering. */
     },
     post(msg: { type: string; session: string }) {
       posted.push(msg);
@@ -11363,12 +11007,8 @@ test("/clear does not evict the source session's own labels at a full label reco
     writeDrafts() {
       return Promise.resolve();
     },
-    onSessionSettingsAdopted() {
-      /* not under test here */
-    },
-    finishClearSettlement() {
-      /* no clear request is active in this label-copy guard */
-    },
+    onSessionSettingsAdopted() {},
+    finishClearSettlement() {},
   };
   move.call(host, 'old', 'new', 'claude', 'C:\\ws');
   assert.deepEqual(
@@ -11472,26 +11112,20 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
     detailsMenuArm: null,
     selectedTextMenuArm: null,
     onArchivedSessionsChange: null as ((sessions: ReadonlySet<string>) => void) | null,
-    rememberStarted() {
-      /* the launch record is outside the identity books */
-    },
+    rememberStarted() {},
     post() {
       return Promise.resolve();
     },
     usagePayload() {
       return {};
     },
-    setAskLevels() {
-      /* unrelated publication state */
-    },
-    setModels() {
-      /* unrelated publication state */
-    },
+    setAskLevels() {},
+    setModels() {},
     setPicks(picks: SessionSettingBook) {
       setPicks.call(this, picks);
     },
     writeDrafts() {
-      /* adoption has already updated every in-memory book */
+      /* Keep persistence inactive while inspecting in-memory adoption. */
     },
     onSessionSettingsAdopted: null as ((session: string, settings: typeof firstSettings) => void) | null,
     onDraftAdopted: null as ((provisional: string, actual: string) => void) | null,
@@ -11628,18 +11262,10 @@ test('a failed fresh-session launch keeps its reader parent for a successful ret
     noteLive() {
       return { kind: 'prompt' };
     },
-    clearAttachmentNotice() {
-      /* no attachment notice exists */
-    },
-    dropCarriedComments() {
-      /* no comments were carried */
-    },
-    dropCarriedAssets() {
-      /* no assets were carried */
-    },
-    livePressAnswered() {
-      /* the failed card is not part of this assertion */
-    },
+    clearAttachmentNotice() {},
+    dropCarriedComments() {},
+    dropCarriedAssets() {},
+    livePressAnswered() {},
     post() {
       return Promise.resolve();
     },
@@ -11666,16 +11292,12 @@ test('a failed fresh-session launch keeps its reader parent for a successful ret
   await vi.waitFor(() => assert.deepEqual(host.saved.readerParents, { actual: 'source' }));
   assert.equal('ghost' in host.saved.readerParents, false);
 });
-// The pick handler of `onMessage`, as statements a lift can run.
+// Return the pick handler's statements.
 function pickBranch(): string {
   return handlerBody(panelHostSource, 'pick');
 }
 
-// Where one press went, as the calls it made.
-//
-// The rows are a Map because `sessionRows.find` is a scan over an array: it answers for the
-// ids the rail draws and for nothing else. The draft book is a plain object for the opposite
-// reason, since a bare index on one is what a press used to be routed by.
+// Run the pick handler against explicit session rows and a plain-object draft map.
 function routePick(
   rows: Map<string, { profile: unknown; agent: string }>,
   session: string,
@@ -11715,9 +11337,7 @@ test('a press on a setting reaches the session the panel still draws, and no oth
     ['d1', { profile: { agent: 'claude' }, agent: 'claude' }],
     ['s1', { profile: null, agent: 'claude' }],
   ]);
-  // The live path stores a permission mode against the agent and pushes it to every child
-  // that agent is running, so one draft press answered there changes every session the
-  // reader has open.
+  // Draft setup picks and live-session picks use separate handlers.
   assert.deepEqual(
     routePick(rows, 'd1'),
     [['pickOnDraft', 'd1', 'askmode', 'plan']],
@@ -11738,15 +11358,13 @@ test('a press on a setting reaches the session the panel still draws, and no oth
     [['onPicked', 'claude', 'd1', 'mcp', 'reconnect', '', 'D:/owners/d1']],
     'an MCP reconnect on a draft is rejected by the setup-only draft handler',
   );
-  // Adoption takes the draft's provisional id away, and the rail then draws no row for it. A
-  // press made from that draft's own menu a moment earlier arrives naming exactly that id.
+  // Ignore picks for identities absent from the session rows.
   assert.deepEqual(
     routePick(rows, 'd1-adopted-away'),
     [],
     'a press naming a session the panel draws no row for is answered anyway',
   );
-  // A key every object carries. Truthy off a bare index, it wrote a draft whose every field
-  // was undefined.
+  // An inherited object key must not resolve to a draft.
   assert.deepEqual(
     routePick(rows, 'constructor'),
     [],
@@ -11809,8 +11427,7 @@ test('opening another draft retries an unanswered MCP read for its agent', () =>
   );
 });
 
-// What each agent published, cut to what a draft's pickers ask of it: the model a setup was
-// copied on, a second one with an effort level of its own, and the other agent's catalog.
+// Supply two Claude models with distinct effort choices and a separate Codex catalog.
 const DRAFT_PICK_MODELS = {
   claude: [
     {
@@ -11839,8 +11456,7 @@ const DRAFT_PICK_MODELS = {
   ],
 };
 
-// A draft as the launcher made it: the setup copied from the session beside it, the
-// folder the child will run in, and the comment it was started from.
+// The draft profile inherits its setup from a Claude session.
 const DRAFT_SETUP: SessionProfile = {
   agent: 'claude',
   model: 'opus',
@@ -11851,8 +11467,7 @@ const DRAFT_SETUP: SessionProfile = {
 const DRAFT_MADE_AT = 1_756_000_000_000;
 const DRAFT_CWD = 'C:\\ws\\one';
 const DRAFT_FROM_COMMENT = { sessionId: 's1', turnKey: 's1:7' };
-// The one press `send` makes. It has not failed, so the prompt has gone and the child is
-// being started on the setup that went with it.
+// The first prompt has been submitted without a reported failure.
 const DRAFT_SENT: LivePress = {
   sessionId: 'd1',
   agent: 'claude',
@@ -11889,11 +11504,7 @@ interface DraftPanel {
   press(control: string, value: string): void;
 }
 
-// `pickOnDraft`, run rather than read, over the rules it actually calls.
-//
-// Everything it decides comes from `composerview.ts`, which imports here, so the only thing
-// standing in is the panel's own books. A press that writes one of them and leaves another
-// holding the setup the reader replaced reads exactly like a working one to a text scan.
+// Run pickOnDraft with production draft rules and fixture-owned state.
 function draftPanel(
   profile: SessionProfile,
   live: LivePress[] = [],
@@ -11959,21 +11570,19 @@ function draftPanel(
 test('a press on a draft writes the new setup into all three books it is read back from', () => {
   const panel = draftPanel(DRAFT_SETUP);
   panel.press('model', 'sonnet');
-  // `send` hands the frozen draft to the callback that starts a fresh session, and the
-  // spawn plan is built from the profile inside it.
+  // The frozen draft retains the selected model for launch.
   assert.equal(
     panel.newDrafts.d1.profile.model,
     'sonnet',
     'the frozen draft holds the setup the press replaced, so the child starts on the old one',
   );
-  // `abandonSessionDraft` and `adoptSessionIdentity` read this book, so the setup
-  // it holds is the one that travels to the real session id.
+  // The draft profile map retains the same selected model.
   assert.equal(
     panel.draftProfiles.d1.model,
     'sonnet',
     'the profile book holds the setup the press replaced, so adoption carries the old one over',
   );
-  // And this is the book the composer reads a model and an effort back out of.
+  // The settings map supplies the prompt box's model and effort values.
   assert.deepEqual(
     sessionSettings(panel.picks, 'd1'),
     {
@@ -12015,9 +11624,7 @@ test('every launch-setting change retires the draft child built from the previou
 test('the draft a press rebuilds is the same draft, with none of its facts shuffled', () => {
   const panel = draftPanel(DRAFT_SETUP);
   panel.press('askmode', 'plan');
-  // `startFreshSession` reads the id, the folder and the profile off this value. Its id, its
-  // folder and its source are all strings, so a rebuild with two of them the wrong way round
-  // type-checks and starts the child in a folder named after the draft.
+  // Rebuilding the profile must preserve the draft identity, working directory, source, and origin.
   assert.deepEqual(
     { ...panel.newDrafts.d1 },
     {
@@ -12027,8 +11634,7 @@ test('the draft a press rebuilds is the same draft, with none of its facts shuff
       createdAt: DRAFT_MADE_AT,
       profile: { ...DRAFT_SETUP, permissionMode: 'plan', source: 'custom' },
       origin: DRAFT_FROM_COMMENT,
-      // The press is the reader's own work. Unrecorded, the rail throws the setup away the
-      // moment they look at another session.
+      // A changed setup marks the draft as reader-modified.
       handChanged: true,
     },
     'the press rebuilt a different draft from the one it was made on',
@@ -12036,10 +11642,7 @@ test('the draft a press rebuilds is the same draft, with none of its facts shuff
 });
 
 test('a press on the row already ticked leaves the draft the panel own work', () => {
-  // The menu ticks the row the draft is on, and pressing it posts the same message any other
-  // row does. `draftProfileAfterPick` answers an unchanged setup for it rather than nothing,
-  // so a press counted as the reader's work here marks a draft nobody has changed. That draft
-  // then refuses to leave the rail, and no press exists that would let it.
+  // Picking the current value leaves an untouched draft unmodified.
   const panel = draftPanel(DRAFT_SETUP);
   panel.press('askmode', DRAFT_SETUP.permissionMode);
   assert.deepEqual(
@@ -12052,7 +11655,7 @@ test('a press on the row already ticked leaves the draft the panel own work', ()
     false,
     'a press that moved no value counts as the reader own work, so the draft can never be dismissed',
   );
-  // And a real change afterwards still counts, so the reader's work is never unmarked.
+  // A real change sets handChanged, and later identical picks preserve it.
   panel.press('askmode', 'plan');
   assert.equal(
     panel.newDrafts.d1.handChanged,
@@ -12068,7 +11671,7 @@ test('a press on the row already ticked leaves the draft the panel own work', ()
 });
 
 test('a draft leaves on a rail press unless the reader changed it on its own controls', () => {
-  // The real body reaches the label store as well as the draft books, so both travel in.
+  // Supply the label and reader-parent operations used by abandonDraft.
   const drop = new Function(
     'abandonSessionDraft',
     'labelsOf',
@@ -12080,8 +11683,7 @@ test('a draft leaves on a rail press unless the reader changed it on its own con
     draftId: string,
     repaint: boolean,
   ) => boolean;
-  // The setup the launcher's own form makes. It is stamped custom before the draft exists,
-  // so the source cannot say whether anyone has touched the draft.
+  // A custom profile source does not identify whether the reader changed this draft.
   const fromTheForm: SessionProfile = { ...DRAFT_SETUP, source: 'custom' };
   const host = (handChanged: boolean) => ({
     newDrafts: { d1: newSessionDraft('d1', DRAFT_CWD, 's1', DRAFT_MADE_AT, fromTheForm, null, handChanged) },
@@ -12102,14 +11704,13 @@ test('a draft leaves on a rail press unless the reader changed it on its own con
       this.removed.push(draft);
     },
     writeDrafts() {
-      /* the panel writes its saved state, and this guard reads its books */
+      /* Inspect draft state without persisting. */
     },
     refresh() {
-      /* the rail is redrawn by the caller, and this guard reads its books */
+      /* Inspect draft state without redrawing the session list. */
     },
   });
-  // Create draft makes a draft with no typed text and no press. A rule reading the profile
-  // source leaves one row on the rail for every use of that form, for the life of the window.
+  // An untouched custom-profile draft remains eligible for abandonment.
   const untouched = host(false);
   assert.equal(
     drop.call(untouched, 'd1', false),
@@ -12136,7 +11737,7 @@ test('a draft leaves on a rail press unless the reader changed it on its own con
 test('a press on a draft rebuilds the rail only where it changes the agent', () => {
   const settled = draftPanel(DRAFT_SETUP);
   settled.press('askmode', 'plan');
-  // A full refresh lists every session, refreshes its metadata and parses its transcripts.
+  // A permission pick posts prompt-box state without a full refresh.
   assert.deepEqual(
     settled.refreshed,
     [],
@@ -12148,8 +11749,7 @@ test('a press on a draft rebuilds the rail only where it changes the agent', () 
     'the composer, its tag, its labels and its menus never reach the panel, so the press shows nowhere',
   );
 
-  // The rail row takes its name and its agent key from the draft, and that key is what
-  // chooses the model catalog the next menu is built from.
+  // Changing the agent refreshes the session list.
   const moved = draftPanel(DRAFT_SETUP);
   moved.press('agent', 'codex');
   assert.deepEqual(
@@ -12179,8 +11779,7 @@ test('a draft keeps its agent when the next agent cannot read an attached file',
 test('a press on a draft whose first prompt has gone changes nothing', () => {
   const starting = draftPanel(DRAFT_SETUP, [DRAFT_SENT]);
   starting.press('agent', 'codex');
-  // The spawn plan was built from the copy `send` already handed over, so a press taken now
-  // leaves the panel naming a setup the running child never had.
+  // A submitted first prompt locks the draft setup used for launch.
   assert.equal(
     starting.newDrafts.d1.profile.agent,
     'claude',
@@ -12202,8 +11801,7 @@ test('a press on a draft whose first prompt has gone changes nothing', () => {
     'a press that changes nothing repaints anyway',
   );
 
-  // A prompt that never left is not a start. The reader has to be able to change the setup
-  // and press send again.
+  // A failed first prompt leaves the setup editable for a retry.
   const failed = draftPanel(DRAFT_SETUP, [{ ...DRAFT_SENT, failed: true, reason: 'the agent never answered' }]);
   failed.press('agent', 'codex');
   assert.equal(
@@ -12213,8 +11811,7 @@ test('a press on a draft whose first prompt has gone changes nothing', () => {
   );
 });
 
-// `stateForRow`, run rather than read. `windowFor` stands in because a draft has no recorded
-// turn to read a window off, and nothing else here is about the figure.
+// Run stateForRow with a placeholder read window for drafts.
 function stateForRow(
   rows: { id: string; label: string; agentKey: string }[],
   drafts: Record<string, NewSessionDraft>,
@@ -12256,9 +11853,7 @@ function stateForRow(
     normalizeWorkspace,
     storedAskValue,
   ) as (this: unknown, row: unknown) => ComposerState;
-  // Both drawn straight off the shipped source, so a row's directory here comes from the same
-  // catalog, draft, and awaiting-record lookups production runs, and not from a hand-written
-  // stand-in that could return an answer the real chain never would.
+  // Compile both working-directory lookups from the host source.
   const cwdForSession = new Function(
     `return function (agent, sessionId) {\n${methodBody('private cwdForSession(')}\n};`,
   )() as (this: unknown, agent: string, sessionId: string) => string | null;
@@ -12277,9 +11872,7 @@ function stateForRow(
       composerRuntimeBySession([...(selected.newest?.values() ?? [])], selected.compactions ?? new Map()),
     picks: overrides.picks ?? {},
     newDrafts: drafts,
-    // The other book a draft's setup lives in, holding a setup nothing here ever wrote. The
-    // composer must draw the frozen draft's own profile, because that copy is the one `send`
-    // hands to the callback that starts the child.
+    // Supply a conflicting draftProfiles entry to identify which profile the prompt box reads.
     draftProfiles: Object.fromEntries(Object.keys(drafts).map((id) => [id, OTHER_BOOK_SETUP])),
     sessionRows: rows,
     sessionOrigins: {},
@@ -12316,7 +11909,7 @@ function stateForRow(
   );
 }
 
-// A setup no press ever made, filed in the book the composer must not read.
+// This conflicting profile belongs only to the draftProfiles fixture map.
 const OTHER_BOOK_SETUP: SessionProfile = {
   agent: 'codex',
   model: 'gpt-5',
@@ -12334,8 +11927,7 @@ test('a draft composer draws the setup its child is started on', () => {
     },
     'd1',
   ).profile;
-  // `pickOnDraft` writes both books. A write that reached one and not the other would draw
-  // one setup here and start the child on another.
+  // The prompt box must draw the frozen draft's profile.
   assert.deepEqual(drawn, DRAFT_SETUP, 'the composer draws a setup off a book the child is never started from');
 });
 
@@ -12433,7 +12025,7 @@ for (const [agent, preselected] of [
         post: () => Promise.resolve(),
       };
       assert.equal(createHandoffDraft.call(host, 'source', null, '', false), null);
-      // The draft files its setup under its own id, and the session it becomes keeps that entry.
+      // Read the adopted session's settings under its durable identity.
       const started = stateForRow(
         [{ id: 'started', label: 'Started', agentKey: agent }],
         {},
@@ -13028,9 +12620,7 @@ test('an accepted Codex compaction removes the price until a later request suppl
 });
 
 test('which half a search reads is still a rule, with no control left over it', () => {
-  // The dropdown stood beside the query box and went with it. It held no state of its own: it
-  // wrote the in: token into the query, so what the reader typed and what the control showed
-  // could not disagree. Anything put back in its place writes the query the same way.
+  // withWhere writes the search scope into the query's in: token.
   assert.equal(
     script.indexOf('function addWhereControl('),
     -1,
@@ -13041,14 +12631,8 @@ test('which half a search reads is still a rule, with no control left over it', 
   assert.equal(parseSessionQuery(withWhere('find: root', 'summary')).where, 'summary');
 });
 
-// A clock stopped at one instant that can still be constructed from. The rail's day
-// buckets build local midnights out of Date, so a plain { now } stub throws the moment
-// anything lifted from the panel reaches them.
-
 test('archive and pin are drawn over the row, on the ground the row is wearing', () => {
-  // They used to hold a strip of the column each, and at the rail's own width two targets
-  // nobody can see most of the time cost a fifth of it: the name lost its end and the meta
-  // line under it wrapped. Drawn over the card instead, the card keeps the whole width.
+  // Position session-list actions over the row without consuming card width.
   const row = styleRule('.railrow');
   assert.match(
     row,
@@ -13062,11 +12646,7 @@ test('archive and pin are drawn over the row, on the ground the row is wearing',
     'the controls are back in the row flow, so an invisible one still costs the card its width',
   );
   assert.match(act, /top: 5px; right: 6px;/, 'the controls are not placed in the row corner');
-  // Placed one by one rather than by a flex box round the pair, so the pin holds the
-  // rightmost status position when the archive beside it is invisible. Where the archive
-  // sits is the pin's own width clear of the row edge, worked out from the base rule rather
-  // than written down here: a figure copied into this guard goes on passing after a wider
-  // control has slid the two on top of one another.
+  // Archive clears the pin's width while the pin retains its right-edge position.
   const placed = /right: (\d+)px;/.exec(act);
   const wide = /min-width: (\d+)px;/.exec(act);
   assert.ok(placed && wide, 'a control has no edge offset or no width, so what the pin must clear is unknown');
@@ -13078,15 +12658,7 @@ test('archive and pin are drawn over the row, on the ground the row is wearing',
     'archive does not clear the width of the pin beside it, so the two controls overlap',
   );
 
-  // The ground under each control. The row is three colours: the rail's own, the hover
-  // tint over it, and the shown session's tint over it. The control is painted as an
-  // opaque colour with the row's tint over it as an image, so it matches all three; a flat
-  // colour reads as a hole punched in a lit row.
-  //
-  // Which opaque colour is read off the rail's own filter box, the thing directly above the
-  // controls, so the two cannot name different grounds. The panel body is transparent, and
-  // the two hosts paint different things behind it: a control naming the editor background
-  // is a lighter square over the row in a side bar, which is the hole this layering closes.
+  // Actions use the filter box's opaque background and overlay the row tint.
   const boxGround = /background: var\((--[\w-]+), var\((--[\w-]+)/.exec(styleRule('.railbox'));
   assert.ok(boxGround, 'the rail filter box no longer names its ground, so the controls have nothing to match');
   assert.ok(
@@ -13103,9 +12675,7 @@ test('archive and pin are drawn over the row, on the ground the row is wearing',
     /--railtint: transparent;/,
     'an unlit row hands its controls no tint, so they fall back to whatever was last set',
   );
-  // The two lit states each say their tint twice, and the two halves have to agree: a row
-  // repainted in a new colour with the control left on the old one is exactly the hole
-  // this idiom exists to close.
+  // Current and hovered rows supply the same tint they draw.
   for (const [selector, what] of [
     ['.railrow:has(> .railcard.is-current)', 'the shown session'],
     ['.railrow:hover:has(> .railcard)', 'the row under the pointer'],
@@ -13121,9 +12691,7 @@ test('archive and pin are drawn over the row, on the ground the row is wearing',
       `${what} paints itself one colour and its controls another, so each control is a patch of the wrong tone`,
     );
   }
-  // The chip under the pointer is a third layer over that same ground rather than a
-  // background of its own: a theme whose toolbar tone is translucent would otherwise take
-  // the opaque colour off with it and put the hole back under the pointer.
+  // Hover adds a layer while preserving the opaque background and row tint.
   const chip = styleRule('.railact:hover');
   assert.doesNotMatch(
     chip,
@@ -13138,13 +12706,7 @@ test('archive and pin are drawn over the row, on the ground the row is wearing',
 });
 
 test('showing one session stages that session ahead of retained recent data', () => {
-  // One session is drawn at every width, and the rail is the chooser between them, so
-  // this is the standing case rather than something a press turns on. A parse that collapsed
-  // to the session on screen would blank every other card's status and unread count the
-  // moment the rail was used. So it joins the parse set rather than replacing it; only its
-  // cards are posted, which is what shows it alone; it fills the turn budget first, so the
-  // view it fills keeps its depth; and every parsed session keeps at least its newest turn,
-  // or an old pinned session would wear a blank card that cost a full tail parse.
+  // Filter selected-session reads independently from the cards supplied to each host.
   sourceMatch(
     panelHostSource,
     /private shownSessions\(all: SessionFile\[\]\): SessionFile\[\] \{[\s\S]*return all\.filter\(\(session\) => showing\.has\(session\.sessionId\)\);/,
@@ -13226,8 +12788,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
     /if \(settled\) \{ this\.history\.set\(sessionId, afterHistoryRequest\(settled, before\)\); \}/,
     'the automatic trigger is bounded by the reads inside one request rather than by requests',
   );
-  // A refresh runs between the reads and can rebase this session's cursor onto an
-  // appended file. A value held across the await would be written back over that.
+  // Read the current history state again after awaiting a page.
   sourceMatch(
     body,
     /const held = this\.history\.get\(sessionId\) \?\? startSessionHistory<HistoryCursor>\(session, Date\.now\(\)\);/,
@@ -13243,8 +12804,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
     /this\.history\.set\(sessionId, applied\.history\);[\s\S]*?if \(outcome\.kind === 'page'\) \{\s*this\.historyStructuralKeys\.delete\(sessionId\);/,
     'a page parsed against an older child listing can remain stale after it is admitted',
   );
-  // Only a page has proved both of its semantic edges. Every other answer names a file that
-  // moved, went away, or a request that was cancelled.
+  // Accept worker page results only for the current history generation and source revision.
   const readerAt = panelHostSource.indexOf('private async readOlderHistoryPage(');
   const reader = memberFrom(panelHostSource, readerAt);
   sourceMatch(
@@ -13257,8 +12817,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
     /acceptsProgressiveResult\(result, this\.historyGeneration, this\.revisionOf\(session\)\)/,
     'a stale page result can reach the retained session',
   );
-  // The session on screen alone merges its pages. A session the reader moved away
-  // from keeps them for the return, and drawing them would widen a session nobody asked for.
+  // Combine retained pages with the read window for each listed session.
   sourceMatch(
     panelHostSource,
     /const older = historyRecordsOutside\(this\.history\.get\(session\.sessionId\)\?\.pages \?\? \[\], read\);/,
@@ -13274,8 +12833,7 @@ test('one older page is read at a time, for the session on screen alone', () => 
     /loadedTurns: read\.turns\.length \+ older\.turns\.length,/,
     'the sentinel and the session figures answer for different sets of turns',
   );
-  // The figures are worked out over what reached the list, so the pages are inside the same
-  // window the caveat on every figure names.
+  // Session figures include the listed turns and retained pages.
   sourceMatch(
     panelHostSource,
     /this\.statsBySession = statsBySession\(listed, compactions\);/,
@@ -13338,7 +12896,7 @@ test('older pages survive an append, and go when the file or the budget says so'
     3,
     'selected, background, and handoff reads must use the accepted-window history transition',
   );
-  // Switching away keeps the pages; the session leaving the workspace takes them.
+  // Drop retained pages when their session leaves the workspace.
   sourceMatch(
     panelHostSource,
     /for \(const sessionId of \[\.\.\.this\.history\.keys\(\)\]\) \{\s*if \(!presentIds\.has\(sessionId\)\) \{\s*this\.dropOlderHistory\(sessionId\);\s*\}/,
@@ -13352,15 +12910,7 @@ test('older pages survive an append, and go when the file or the budget says so'
 });
 
 test('a rail card wears the status that needs attention', () => {
-  // Three states earn a border and no others. A colour on every card made finished the
-  // loudest thing on the rail and green the resting state, which reads as a claim rather
-  // than as silence. Running, waiting and failed are worth catching at a glance. The
-  // status is still a word beside the time, since a colour reads out as nothing, and the
-  // accessible name says it too.
-  //
-  // Each of the three names its own tone here. Running and waiting were both drawn in the
-  // caution colour once, so the rail answered the one question a colour is there to answer
-  // with the same colour twice, and only the word's weight told them apart.
+  // Running, waiting, and failed cards use distinct border tokens and colored status text.
   for (const [status, tone] of [
     ['running', '--busy'],
     ['waiting', '--need'],
@@ -13387,10 +12937,7 @@ test('a rail card wears the status that needs attention', () => {
     /border-left: 3px solid transparent;/,
     'every card still reserves the border strip, so a bordered card is drawn at a different indent',
   );
-  // The bordered card gives its own left padding back, so the text on it stays on the
-  // same line as the text on its neighbours. Subtracted from the card's own indent rather
-  // than written down beside it: the indent has moved once already, and a border rule left
-  // at the old figure puts the running and failed cards' text out of line with the rest.
+  // Reduce bordered-card padding by the border width to preserve text alignment.
   assert.equal(
     railCardIndent() - 3,
     borderedCardIndent('running'),
@@ -13401,8 +12948,7 @@ test('a rail card wears the status that needs attention', () => {
     borderedCardIndent('failed'),
     'a failed card keeps its full left padding beside a 3px border, so its text sits out of line with the rest',
   );
-  // Both senders feed the rule the same cards, so the rail message and the render cannot
-  // wear different statuses.
+  // Require one railSessions projection and the shared host payload inputs.
   assert.equal(
     (payloadSource.match(/railSessions\(/g) ?? []).length,
     1,
@@ -13488,8 +13034,7 @@ test('a rail card wears the status that needs attention', () => {
 });
 
 test('the heading pin wears its pinned blue through a tone the contrast guard measures', () => {
-  // The blue is the heading's only pinned mark. The guard below measures every tone panel.css
-  // paints as text, and the tone sheet lists every selector that paints it.
+  // Include the pinned heading control in notice-tone usage.
   assert.ok(
     toneUsages(styleSource).notice?.includes('.sessionmenu.sessionpin.is-pinned'),
     'no rule paints a pinned heading pin with --notice, so the pin reads the same set and unset',
@@ -13508,14 +13053,14 @@ test('the setup list pin draws its pressed state the way a pinned rail session d
     rail.filter((one) => one.startsWith('color')),
     'a pinned setup pin and a pinned rail pin wear different tones',
   );
-  // The pin sits inside a row that lights as one, so only its own chip shows its target.
+  // Setup pins share the session-list action hover background.
   const chip = cssDeclarations(styleSource, '#launcher .launchpin:hover')
     .filter((one) => one.startsWith('background'))
     .map((one) => one.slice(one.indexOf(':') + 1).trim());
   const railChip = cssDeclarations(styleSource, '.railact:hover').find((one) => one.startsWith('background')) ?? '';
   assert.equal(chip.length, 1, 'a setup pin under the pointer draws no box of its own inside the lit row');
   assert.ok(railChip.includes(chip[0]), 'a setup pin under the pointer wears a different chip from a rail action');
-  // The rows and headings inside the list scale their own text, so a scale here applies twice.
+  // Leave text scaling to the setup list's rows and headings.
   assert.ok(
     !cssDeclarations(styleSource, '#launcher > .launchlist').some((one) => one.startsWith('font-size')),
     'the setup list scales the text its rows scale again',
@@ -13523,45 +13068,28 @@ test('the setup list pin draws its pressed state the way a pinned rail session d
 });
 
 test('every tone panel.css draws as text reads at 4.5 to 1, or is a named exception', () => {
-  // The measurement lives in tones.ts, which reads the stylesheet and the theme table as
-  // text and composites any alpha a tone carries. A grep for a hex string would pass the
-  // day someone writes a different unreadable one. What stays here is the policy: which
-  // tones are allowed to fall short, and at what figure. The panel-mockup tone sheet uses the
-  // same calculations but covers different themes, exclusions, and known-failure rules. See
-  // docs/ui-design.md for their boundary.
+  // Measure stylesheet text tones in the dark and light theme fixtures.
+  // Named exceptions retain their measured ratios.
   const THEMES = [
     { id: 'dark', kind: 'dark', table: DARK_MODERN_THEME },
     { id: 'light', kind: 'light', table: LIGHT_MODERN_THEME },
   ] as const;
 
-  // Every figure below is pinned tightly enough that a change of more than a rounding
-  // error in either direction fails this guard, whichever way the tone moved: nobody can
-  // quietly make one worse, and nobody can improve one without moving it out of this table.
+  // Exception ratios must remain within the asserted rounding tolerance.
   const KNOWN_FAILING: Partial<Record<string, Partial<Record<'dark' | 'light', number>>>> = {
-    // errorForeground is #f85149 in both theme kinds, and --full is only ever drawn as
-    // text inside the context chip's hottest band, whose 26% mix is the tint asked for in
-    // the correction: it reads worse than the plain-ground figure in both kinds.
+    // The full context band's background mix reduces contrast below 4.5 in both theme fixtures.
     full: { dark: 2.65, light: 2.04 },
-    // textLink.foreground reads fine as plain text on the rail and the session heading,
-    // but --notice is also drawn inside the context chip's first band, and that chip's 12%
-    // mix reads under 4.5 in both kinds too.
+    // The notice context band's background mix reduces contrast below 4.5 in both theme fixtures.
     notice: { dark: 3.94, light: 4.28 },
-    // gitDecoration.modifiedResourceForeground reads fine on its own on the unsent-input
-    // marker, but the new-draft chip mixes --mod at 18% into the ground behind it, and
-    // that mix falls under 4.5 on a light panel. The dark mix still clears 4.5.
+    // The draft chip's modified-color mix falls below 4.5 in the light theme fixture.
     mod: { light: 3.93 },
-    // gitDecoration.addedResourceForeground is a plain-text tone with no chip of its own;
-    // light alone falls under 4.5.
+    // The added-text tone falls below 4.5 in the light theme fixture.
     add: { light: 3.92 },
-    // gitDecoration.deletedResourceForeground is a plain-text tone with no chip of its own;
-    // dark alone falls under 4.5.
+    // The deleted-text tone falls below 4.5 in the dark theme fixture.
     del: { dark: 2.58 },
   };
 
-  // --comment and --unread are absent from EXCLUDED_TONES because they are absent from the
-  // scan itself: --comment only tints --cmark and lights an outline, and --unread only fills
-  // the unread dot and the wash gradient. No rule anywhere paints text with either, so the
-  // scan never offers them and nothing has to say why they are not here.
+  // comment and unread are decoration tones, so text-tone measurements exclude them.
   const readings = measureTones(styleSource, THEMES, { skip: Object.keys(EXCLUDED_TONES) });
   assert.ok(readings.length, 'the scan found no tone that panel.css draws as text');
   for (const { tone, kind, worst } of readings) {
@@ -13581,13 +13109,7 @@ test('every tone panel.css draws as text reads at 4.5 to 1, or is a named except
     }
   }
 
-  // --idle is the one tone panel.css still leaves on var(--vscode-descriptionForeground)
-  // rather than a literal: it is the editor's own de-emphasised text, drawn at the same
-  // weight all through the chrome around the panel, and a literal here would make the panel
-  // disagree with the window it sits in. A dark panel's own value for that token measures
-  // under 4.5 on the row a card sits on selected but unfocused, which is left as the one
-  // recorded exception rather than fixed, because there is no tone of this stylesheet's own
-  // to fix: it is the editor's own pick for text nobody is meant to read first.
+  // The editor-supplied idle text tone remains below 4.5 in the dark theme fixture.
   const darkIdle = /--vscode-descriptionForeground:([^;]+);/.exec(DARK_MODERN_THEME);
   const lightIdle = /--vscode-descriptionForeground:([^;]+);/.exec(LIGHT_MODERN_THEME);
   assert.ok(
@@ -13600,8 +13122,7 @@ test('every tone panel.css draws as text reads at 4.5 to 1, or is a named except
     darkIdleWorst < 4.5,
     `--idle now reads at ${darkIdleWorst.toFixed(2)} to 1 on a dark panel; the recorded exception no longer applies, so update this comment`,
   );
-  // Light is not the recorded exception: Light Modern sets descriptionForeground to #3b3b3b,
-  // which reads well above 4.5 on every one of the four grounds.
+  // The idle text tone clears 4.5 on every measured background in the light theme fixture.
   assert.ok(
     lightIdleWorst >= 4.5,
     `--idle now reads at ${lightIdleWorst.toFixed(2)} to 1 on a light panel, below 4.5; the exception may need to cover light too`,
@@ -13609,20 +13130,13 @@ test('every tone panel.css draws as text reads at 4.5 to 1, or is a named except
 });
 
 test('two status tones a reader tells apart never converge', () => {
-  // The guard above asks whether a word can be read against what is behind it. It cannot
-  // answer the other question the rail asks of these five: whether running looks like needs
-  // you. Both tones can clear 4.5 against every ground and still be one colour to the reader,
-  // because a ratio against a ground says nothing about a ratio against a sibling.
+  // Background contrast does not measure the difference between two status colors.
   const THEMES = [
     { id: 'dark', kind: 'dark', table: DARK_MODERN_THEME },
     { id: 'light', kind: 'light', table: LIGHT_MODERN_THEME },
   ] as const;
 
-  // Every pair carries the figure it ships at, in CIEDE2000, at the ground where the two sit
-  // closest. A single floor for all of them cannot work in either direction: set at the
-  // closest pair it fails on a change of two in one channel somewhere else, and set low
-  // enough to survive that it lets a pair at 60 collapse to 13 unnoticed. What each pair is
-  // held to is what it already is.
+  // Compare each pair's minimum CIEDE2000 distance with its stored baseline.
   const BASELINE: Record<'dark' | 'light', Record<string, number>> = {
     dark: {
       'busy/need': 9.16,
@@ -13650,42 +13164,18 @@ test('two status tones a reader tells apart never converge', () => {
     },
   };
 
-  // How far a pair may move before this fails. A share of what it already has, not a fixed
-  // figure: one number cannot serve a table running from 7 to 61. Fixed at 2, a pair at 61
-  // fails on a green nobody would question, and a pair at 7 keeps passing while it slides
-  // most of the way to nothing. The floor of 1.5 stops the share vanishing on the closest
-  // pairs, which are the ones that matter most.
-  //
-  // It is a policy and not a perception threshold. Nothing here says a reader stops telling
-  // two colours apart at any figure.
+  // Allow each pair to move by 15% of its baseline or 1.5, whichever is greater.
+  // This tolerance is policy, not a perception threshold.
   const allowanceFor = (baseline: number) => Math.max(1.5, baseline * 0.15);
 
-  // The table below is data a person edits, so on its own it is an oracle that can be told
-  // any answer: set two tones to the same value, regenerate the table, and every pair sits at
-  // its baseline again with one of them at zero. This floor is under the table and is not
-  // derived from it. It sits below the closest pair the panel ships, so nothing today has to
-  // move, and far enough above zero that no amount of editing can record a collision.
+  // Apply an independent distance floor so edited baselines cannot admit equal tones.
   const FLOOR = 6;
 
-  // Every check above and below reads the table, so a palette regenerated into a cluster
-  // passes all of them: five tones a little apart, each pair over FLOOR, each word over 4.5,
-  // the table rewritten to match. This one reads no table.
-  //
-  // The two widest pairs that share no tone, reported as the narrower of the two. Three
-  // baseline-relative answers were tried first and each was broken in both directions, by
-  // rejecting an honest restyle and by admitting a cluster: the total of the ten distances,
-  // the middle of what each pair kept, and a floor under the fourth smallest. Each failed the
-  // same way, because one tone moving a long way and every tone moving a little land on the
-  // same number. Two disjoint pairs is a fact about the shape instead: a huddle of four with
-  // one tone away from it can offer one wide pair and no second one to go beside it.
-  //
-  // The figure is a policy, like FLOOR. It sits far enough under what both kinds ship at that
-  // an honest restyle has room, and the failure below reports where they actually are.
+  // Require two disjoint status-tone pairs whose narrower distance reaches APART.
+  // This limit does not depend on the editable baseline table.
   const APART = 20;
 
-  // A status tone the stylesheet gives a rail state, and nobody added to the list, would be
-  // compared against nothing at all and this guard would pass while saying it checked
-  // everything. Neither figure below is what catches that. This is.
+  // Every tone used by a session-list status selector must appear in STATUS_TONES.
   const onTheRail = statusSelectorTones(styleSource);
   assert.ok(onTheRail.length, 'no tone was found painting a rail status word');
   for (const tone of onTheRail) {
@@ -13715,14 +13205,11 @@ test('two status tones a reader tells apart never converge', () => {
     );
   }
 
-  // Every pair is checked for converging before any is checked for improving. One change
-  // moves several pairs, and a collision reported as somebody else's improvement sends the
-  // reader to the wrong line.
+  // Check decreasing distances before increasing distances.
   const byFall = rows
     .slice()
     .sort((a, b) => a.distance - BASELINE[a.kind][a.pair] - (b.distance - BASELINE[b.kind][b.pair]));
-  // The allowance is what holds ordinary work. The floor is what survives a table someone
-  // regenerated around a regression, so it is checked first and reported first.
+  // Apply the independent floor before baseline-relative allowances.
   assert.ok(
     Math.min(...Object.values(BASELINE.light), ...Object.values(BASELINE.dark)) > FLOOR,
     `a recorded baseline has reached the ${FLOOR} floor, so the table no longer holds anything ` +
@@ -13746,8 +13233,7 @@ test('two status tones a reader tells apart never converge', () => {
         `${values[1]} on ${grounds[1]} are what converge`,
     );
   }
-  // Read after every pair and before any improvement, for the same reason: a palette that
-  // became a cluster is not news the reader wants under a line saying one pair got better.
+  // Check disjoint-pair separation before reporting increased pair distances.
   for (const kind of ['dark', 'light'] as const) {
     const held = widestDisjointPair(rows.filter((r) => r.kind === kind));
     assert.ok(
@@ -13759,12 +13245,7 @@ test('two status tones a reader tells apart never converge', () => {
     );
   }
 
-  // And that figure is held to a palette that has to fail it, so it cannot be quietly lowered
-  // or taken out. Four of these five light values are one colour with a little space between
-  // them. Every pair of them clears FLOOR and every word clears the 4.5 the guard above holds
-  // them to, so nothing else here objects. Each declaration is replaced on its own rather
-  // than the block rewritten, so a comment or a new property in that block leaves this
-  // attack intact.
+  // This clustered palette clears the contrast and pair-floor limits but must fail disjoint-pair separation.
   const CLUSTERED: Record<string, string> = {
     ok: '#581e5b',
     bad: '#553e6d',
@@ -13814,22 +13295,9 @@ test('two status tones a reader tells apart never converge', () => {
 });
 
 test('panel.css sizes every word in a unit the editor can move', () => {
-  // The editor writes --vscode-font-size on the webview body, and the type scale in the body
-  // rule is built from it. A length in px, pt or another absolute unit ignores the size the
-  // reader picked: the words around it grow and it stays. rem is no better here. It resolves
-  // against the root element, and nothing in this panel sets a size on html, so a rem is the
-  // browser's own 16px whatever the editor says. Page zoom moves every unit, so zoom is not
-  // the case this catches.
-  //
-  // Three properties, and no exception among them. A border, a radius and a decorative bar are
-  // correct in pixels, and a rule wide enough to reach them would need a list of exceptions
-  // longer than the rule. CSS folds case in a property name and in a unit, and a value inside
-  // a comment is not a declaration, so the scan folds case too and blanks every comment first.
-  //
-  // Three families of unit are fixed against the editor: the absolute ones, everything the root
-  // element sizes, and everything the viewport sizes. A custom property is read through to its
-  // value, because the panel keeps its type scale in two of them and a fixed length written
-  // there would reach every word that reads it.
+  // Text sizing must follow the editor's font-size setting.
+  // Check font, font-size, and line-height values after resolving custom properties and excluding comments.
+  // Reject absolute, root-relative, and viewport-relative units.
   const FIXED = /\d\s*(px|pt|pc|cm|mm|in|q|r(em|ex|ch|cap|ic|lh)|[sld]?v(w|h|i|b|min|max))\b/i;
   const blanked = styleSource.replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '));
   const tokens = new Map<string, string>();
@@ -13871,21 +13339,9 @@ test('panel.css sizes every word in a unit the editor can move', () => {
   );
 });
 
-// Every figure a card draws takes one size, wherever it sits. The Activity head draws its figures
-// in `.actmix`. A run row in the Activity log draws the same mix, and its failed count in
-// `.actbad`, inside a row that already draws smaller than the card. A Files, Subagents or Commits
-// head draws its total in `.count` beside the word. The chip row draws the pill, and a record row
-// draws its own figures. A rule that gives one of them a size of its own puts the card back on
-// figures that disagree, which is what the reader saw when the Activity total drew smallest.
-//
-// The scan resolves no cascade. A figure sized in em reads its size against every element around
-// it, so any rule that can reach a figure or a wrapper counts. The classes come from the builders
-// of the card, its figures, the session heading, the page and both figure popovers, as every word
-// their strings hold. A rule counts when its selector, or a rule it is nested in, names one of
-// those words anywhere, or when its subject is a bare tag or `*`. Every `font`, `font-size` and
-// `all` declaration of those rules is held to the list below, so a new rule fails whatever value
-// it carries. A declaration inside an at-rule, under a theme selector or with `!important` fails
-// with its own reason, so no edit to the list lets one through.
+// Pin sizing declarations for figure elements and their wrappers without resolving the cascade.
+// Match class names from the listed builders and bare selector subjects.
+// Reject at-rules, theme selectors, and important sizing declarations.
 const FIGURE_SIZES = [
   '.timeline-root, .timeline-owner, .timeline-foreign, .timeline-tree, .timeline-footer, .transientcards, .sessionsection, .sessionheading, .cardheading, .sectionheading { font: inherit }',
   'button:where(.session, .head, .row, .result, .railcard) { font: inherit }',
@@ -13981,12 +13437,8 @@ const FIGURE_SIZES = [
   '.context-table thead th { font-size: var(--t-small) }',
 ];
 
-// The tokens those sizes read, and the tokens those tokens read in turn. The test finds them in
-// the pinned rules, so this list names every one. Each has one declaration in the whole
-// stylesheet, so a copy scoped to a section, a state or a theme cannot restore a value the
-// unconditional one changed. The editor writes `--vscode-font-size`, and the stylesheet never
-// does. With `--heading-step` at 1 the word stops standing above the card's own text while
-// `.sec-word` still reads as written.
+// Pin every size token's declarations, including tokens referenced by other size tokens.
+// The editor owns vscode-font-size, so the stylesheet declares no value for it.
 const SIZE_TOKENS: Record<string, string[]> = {
   '--t-small': ['body { --t-small: 0.86em }'],
   '--t-figure': ['body { --t-figure: calc(0.92 * var(--vscode-font-size)) }'],
@@ -14006,7 +13458,7 @@ test('every figure on a card draws at one size', () => {
   EDITOR_BODY_CLASSES.forEach((name) => figureClasses.words.add(name));
   const written = (rule: CssRule, declaration: string): string =>
     `${[...rule.conditions, rule.selector].join(' { ')} { ${declaration} }`;
-  // A property name is read in any case, and `all` resets the size with everything else.
+  // Match sizing properties without case sensitivity, including the all reset.
   const sizing = (text: string): boolean => /^(font|font-size|all):/i.test(text);
   const complaints: string[] = [];
   const sizes: string[] = [];
@@ -14027,7 +13479,7 @@ test('every figure on a card draws at one size', () => {
       }
     }
   }
-  // Every custom property a pinned size reads, and every one a declaration of such a property reads.
+  // Follow custom-property references in sizing declarations.
   const reads = (text: string): string[] => [...text.matchAll(/var\(\s*(--[\w-]+)/g)].map((match) => match[1]);
   const pending = sizes.flatMap(reads);
   const tokens: Record<string, string[]> = {};
@@ -14051,9 +13503,7 @@ test('every figure on a card draws at one size', () => {
     'a figure on a card, or an element around one, takes its size from a different set of rules. ' +
       'A rule added here is a second home for a size even when it carries the value the first one carries.',
   );
-  // `.commitheadfact` also names the branch fact inside a stat popover's own heading
-  // (`stat-detail.ts`). A bare `.commitheadfact` in the figure rule would shrink that fact too,
-  // so the rule must scope the class to the card's Commits heading instead.
+  // Scope commitheadfact sizing to card headings because popover headings also use that class.
   assert.deepEqual(
     rules
       .filter((rule) => rule.declarations.some(sizing))
@@ -14079,10 +13529,8 @@ test('every figure on a card draws at one size', () => {
   );
 });
 
-// The heading step lifts the word a section head reads and nothing else on that head. It lives on
-// `.sec-word` around the word, so the counted total beside the word stays at the card's own em and
-// draws at the size every other figure draws at. The tracking and the gap under the head still
-// carry the step, because the head reads as one line of type.
+// Apply heading-step to the section word, letter spacing, and bottom margin.
+// The adjacent count retains its figure size.
 test('a section head lifts its word and carries the step through its spacing', () => {
   assert.deepEqual(cssDeclarations(styleSource, '.sec-word'), ['font-size: calc(1em * var(--heading-step))']);
   assert.ok(
@@ -14122,8 +13570,7 @@ test('a section head lifts its word and carries the step through its spacing', (
   );
 });
 
-// The files figure draws no partial mark on its face. Its status lives in the popover it opens,
-// not in a rule the stylesheet gives the pill itself.
+// Require no statpartial declarations in the stylesheet.
 test('the stylesheet carries no rule for a partial mark on a figure', () => {
   assert.deepEqual(
     cssDeclarations(styleSource, '.statpartial'),
@@ -14133,11 +13580,8 @@ test('the stylesheet carries no rule for a partial mark on a figure', () => {
 });
 
 test('a read turn drops its bold headline text to the same weight as the rest of the line', () => {
-  // `.summary strong, .headline strong` sets font-weight: 600 directly on the strong element,
-  // which a read turn's `.turn.is-read .headline { font-weight: 400 }` cannot override: that
-  // rule only sets the weight of the headline div itself, and the strong child's own explicit
-  // weight does not inherit from it. Without a rule that targets the strong element the same
-  // way, a read turn's bold headline text stays bold while the rest of the line goes plain.
+  // A strong element's explicit weight overrides inherited headline weight.
+  // Read-turn styling must target headline strong elements directly.
   assert.match(
     styleRulesNaming('.turn.is-read .headline strong'),
     /font-weight: 400/,
@@ -14159,14 +13603,7 @@ test('unsent input shares the new draft modified-work tone', () => {
 });
 
 test('the rail is reworded when work starts or stops, and not on every event', () => {
-  // The rail's running status now comes off the children as well as off the cards, and
-  // setRunning is the only thing that hears a child start or stop. Nothing else reposts the
-  // rail for it: a rail that waited for a transcript stayed finished for the whole of a
-  // compaction, which writes no turn for a poll to find.
-  //
-  // Not on every call either. setRunning runs on every event a turn produces, thinking
-  // tokens included, and refresh rebuilds the cards and rail each time. The refresh is gated
-  // on the set actually moving, and this test reads that gate from the source.
+  // Refresh session-list status only when the running-session set changes.
   const marker = 'public setRunning(keys: readonly string[]): void {';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, 'setRunning is no longer where the rail hears about work in flight');
@@ -14189,16 +13626,13 @@ test('the rail is reworded when work starts or stops, and not on every event', (
 });
 
 test('activity changes leave the rail order alone while a host remains open', () => {
-  // allSessions stays newest activity first because the parse cut, default session
-  // and picker need recency. The rail alone reconciles those rows with what its current
-  // hosts already drew.
+  // The catalog orders by activity, while the session list reconciles its displayed order separately.
   sourceMatch(
     panelHostSource,
     /const walkedSessions = orderSessionCatalog\(\[\.\.\.listed, \.\.\.this\.claudeChildren, \.\.\.codex\],[\s\S]*this\.activityFor\(session\)\);/,
     'the stable rail order replaced the recency order used outside the rail',
   );
-  // The reuse path ranks by the same reading. A session that grew moved the activity the
-  // list is ordered by, and handing back the held order would leave it where it was.
+  // Reused catalogs also order by the current activity reading.
   sourceMatch(
     panelHostSource,
     /const sorted = orderSessionCatalog\(held, \(session\) => this\.activityFor\(session\)\);/,
@@ -14274,9 +13708,7 @@ test('unread dots keep the same column across session statuses', () => {
 });
 
 test('the card menu offers the read state and the copy, and none of it in the palette', () => {
-  // The words are the manifest's, because the entries are drawn by the editor and nothing
-  // the panel holds could say them. Written out, since the manifest can be edited to
-  // anything, and the read pair has to read as one control: the way in and the way back.
+  // Pin native menu labels from the extension manifest.
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   const titles = new Map<string, string>(
     manifest.contributes.commands.map((c: { command: string; title: string }) => [c.command, c.title]),
@@ -14288,10 +13720,8 @@ test('the card menu offers the read state and the copy, and none of it in the pa
 
   const menu = manifest.contributes.menus['webview/context'] as { command: string; when: string; group: string }[];
   const whenOf = (command: string) => menu.filter((m) => m.command === command).map((m) => m.when);
-  // Composed from the table rather than written out, so a name renamed on one side still
-  // fails: a clause naming a section nothing writes matches no card at all, and the entry
-  // simply never appears. Each entry is on exactly the states it is the way out of, and one
-  // on both states of an axis is a menu offering to mark a card read when it already is.
+  // Build menu conditions from the shared turn-section identifiers.
+  // Read and unread actions apply only to the states they change.
   const S = TURN_MENU_SECTIONS;
   const on = (...names: string[]) => names.map((n) => `webviewSection == '${n}'`).join(' || ');
   assert.deepEqual(
@@ -14309,15 +13739,13 @@ test('the card menu offers the read state and the copy, and none of it in the pa
     [on(S.readSummary, S.unreadSummary, S.summary)],
     'Copy the summary is not offered on exactly the cards that hold one',
   );
-  // The comment matches on the flag every card that can draw one carries, and never on a
-  // section: a card with no summary and no read state to take carries no section at all, and
-  // an entry written against the five would be missing from exactly those cards.
+  // The comment action uses arcTurn, including cards without a summary or read-state section.
   assert.deepEqual(
     whenOf('arc.commentOnTurn'),
     ['arcTurn'],
     'the comment entry is offered by section, so a card naming none is offered nothing',
   );
-  // Below the read group, because the read state is what a card is right-clicked for most.
+  // Order copy actions after read actions, then comment actions.
   assert.equal(
     menu.filter((m) => m.command === 'arc.copyTurnSummary')[0].group,
     '2_copy@1',
@@ -14329,8 +13757,7 @@ test('the card menu offers the read state and the copy, and none of it in the pa
     'the comment is not grouped below the copy',
   );
 
-  // Out of the palette, like the copy-path commands: a card is what they act on, and pressed
-  // with no card under the pointer they have nothing to name.
+  // Card context actions stay outside the command palette.
   const palette = manifest.contributes.menus.commandPalette as { command: string; when: string }[];
   for (const command of ['arc.markTurnRead', 'arc.markTurnUnread', 'arc.copyTurnSummary', 'arc.commentOnTurn']) {
     assert.ok(
@@ -14339,9 +13766,7 @@ test('the card menu offers the read state and the copy, and none of it in the pa
     );
   }
 
-  // The file entries stay at the head of the array. The guard that checks a section named in
-  // the manifest is named in the panel takes the first section it finds, so the order here
-  // is what keeps that guard pointed at a section the panel writes as a literal.
+  // Keep the file-section entry first for the manifest section check.
   assert.equal(
     menu[0].when,
     "webviewSection == 'arcFile'",
@@ -14350,9 +13775,7 @@ test('the card menu offers the read state and the copy, and none of it in the pa
 });
 
 test('a visualization reference reaches a named local-file action', () => {
-  // The tested renderer produces the button. This guard holds the two unimportable host
-  // seams to it: the webview sends the path, and the extension opens it only after that
-  // explicit press.
+  // Check rich-summary rendering and the openVisualization handler.
   sourceMatch(
     panelHostSource,
     /summaryHtml: renderRichMarkdown\(turn\.summary\)/,
@@ -14388,9 +13811,7 @@ test('local HTML and Markdown response links use their readers', () => {
   const html = opener.indexOf("if (uri.scheme === 'file' && linkTargetIsHtml(uri.fsPath))");
   assert.ok(directory !== -1 && html > directory, 'an HTML-named directory bypasses the existing directory action');
 
-  // A picture reaches the editor's own viewer. The text editor refuses one and throws from
-  // the same call a missing file throws from, so without this branch a link to a picture
-  // that is on disk told the reader there was no file at that path.
+  // Open image links with the editor viewer before checking the HTML branch.
   const image = opener.indexOf("if (uri.scheme === 'file' && linkTargetIsImage(uri.fsPath))");
   assert.ok(
     image !== -1 && image > directory && image < html,
@@ -14446,10 +13867,7 @@ test('local HTML and Markdown response links use their readers', () => {
 });
 
 test('a picture in a response reaches the reader, and the file it names opens on a press', () => {
-  // The tested renderer produces the button and decides which file may be drawn. This guard
-  // holds the host seams no test can import to it. Each one is invisible on its own: a
-  // resource root nothing asks for, a message nothing sends, and a listener nothing reaches
-  // all read as working code, and the reader sees the same empty box behind any of them.
+  // Check workspace resource roots and image-action wiring.
   const rootsAt = panelHostSource.indexOf('private allowThemeFiles(webview: vscode.Webview)');
   const roots = memberFrom(panelHostSource, rootsAt);
   assert.ok(roots.length > 60, 'allowThemeFiles has gone, so this guard cannot see the resource roots');
@@ -14459,8 +13877,7 @@ test('a picture in a response reaches the reader, and the file it names opens on
     'the webview may not read the open folders, so every picture a response names draws nothing',
   );
 
-  // Built per host, like the icon column beside it. One shared URI draws a picture in the
-  // webview it was made for and a broken box in the other.
+  // Resolve image URIs for the receiving webview.
   sourceMatch(
     panelHostSource,
     /webview\.asWebviewUri\(vscode\.Uri\.file\(file\)\)\.toString\(\)/,
@@ -14476,8 +13893,7 @@ test('a picture in a response reaches the reader, and the file it names opens on
     /if \(!inSummary && !inAnswers && !inSaid\) \{ return card; \}/,
     'every card is rendered again for every host, so an idle poll pays a parse per card',
   );
-  // The mid-turn messages are markdown too, so a picture named in one is re-rendered per
-  // host beside the response and the answers. Without it the section draws image syntax.
+  // Re-render image references in mid-turn messages for each receiving host.
   sourceMatch(
     panelHostSource,
     /saidMessages: card\.saidMessages\.map\(\(said\) => \(\{/,
@@ -14489,9 +13905,7 @@ test('a picture in a response reaches the reader, and the file it names opens on
     'a picture named in a mid-turn message draws as literal text',
   );
 
-  // The rule itself, lifted and run against a card that names a picture. Read as text it
-  // answers nothing: a scan finds the names it looks for whether or not they are wired to
-  // anything, and a whole branch can go missing under one.
+  // Run picturedFor with production Markdown and image-reference helpers.
   const pictured = (card: Record<string, unknown>) => {
     const marker = 'private picturedFor(card: RenderCard, resolveImage: ImageResolver): RenderCard {';
     const from = panelHostSource.indexOf(marker);
@@ -14537,8 +13951,7 @@ test('a picture in a response reaches the reader, and the file it names opens on
     /data-image="C:\/work\/shot\.png"/,
     'the picture in a mid-turn message opens nothing when the reader presses it',
   );
-  // A card naming a picture nowhere is handed back whole, which is what keeps an idle poll
-  // from paying a parse per card per host.
+  // picturedFor returns cards without image references unchanged.
   const plain = {
     kind: 'turn',
     summary: 's',
@@ -14570,9 +13983,7 @@ test('a picture in a response reaches the reader, and the file it names opens on
     'the picture does not open in the editor, so the panel needs a viewer of its own',
   );
 
-  // A screenshot is taller than a card. Without the bound it pushes everything below it off
-  // the screen, and the browser test measures that. Written against the picture rather than
-  // the button, because a picture the response wrote as a link is drawn without one.
+  // Bound image height on the summary image selector.
   assert.match(
     styleRulesNaming('.summary img'),
     /max-height:/,
@@ -14586,21 +13997,8 @@ test('the panel imports shared label notes and keeps no copied rule', () => {
   assert.deepEqual(labelTypedNotes('rail, perf'), ['comma']);
   assert.deepEqual(labelTypedNotes('a'.repeat(LABEL_NAME_LIMIT + 1)), ['limit']);
 });
-// The popover itself, built and pressed. It is the one surface in the panel that writes to a
-// record the extension owns, so what it posts is what the reader's labels become.
 
-// What a keystroke costs the reader, and what the popover is still holding when it redraws.
-//
-// The popover is rebuilt on every keystroke, because the box narrows the rows under it. So the
-// three things a rebuild can take are the whole of what this asks about: the box the reader is
-// typing into, the two keys that move a caret inside it, and the control the popover hangs off.
-
-// The id a session the panel starts is filed under, held against the rule that sweeps it.
-//
-// `sweepDraftLabels` takes an entry off the stored record when its key opens with
-// `DRAFT_SESSION_PREFIX`. A draft id built any other way is one the sweep never recognizes: its
-// labels stay on the record for ever, they hold a place under the record's ceiling, and they
-// count towards a label in the catalogue that files nothing a reader can open.
+// Draft IDs use DRAFT_SESSION_PREFIX so the label sweep recognizes them.
 test('every provisional session id is built from the prefix the sweep matches on', () => {
   const template = '`${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`';
   const built: string[] = [];
@@ -14610,8 +14008,7 @@ test('every provisional session id is built from the prefix the sweep matches on
       built.push(arg);
       continue;
     }
-    // A name rather than the id itself, so the declaration it was last given before the call
-    // is what the id is really built from.
+    // Resolve identifier arguments through their most recent preceding const declaration.
     const declared = [...panelHostSource.slice(0, call.index).matchAll(new RegExp(`const ${arg} = (.+);`, 'g'))].pop();
     built.push(declared ? declared[1] : arg);
   }
@@ -14623,38 +14020,13 @@ test('every provisional session id is built from the prefix the sweep matches on
   );
 });
 
-// Two hosts, two editors, one record.
-//
-// A write moves the count on every label the workspace has, and can add one no open editor
-// names. The extension cannot tell which session each host has open, so it says only that
-// something moved and each host asks again for its own.
-
-// The walk inside the popover, run rather than scanned. Which key does what is a run of
-// conditionals, and a guard that only reads the call site passes with any two of them swapped.
-
-// The one press that makes a label, and the composition that owns it.
-//
-// A reader typing a Japanese or Chinese name accepts each candidate with Enter. Taken here,
-// that press files the session under whatever half-written text the box holds at the
-// moment they accept, and the label is on the record before the word is finished.
-
-// The order a popover already open keeps through a write.
-//
-// The extension answers every write with a fresh set of rows, and its order puts the
-// session's own labels at the front. Taken again while the popover is open, that order
-// moves the row the reader has just ticked to the top of the list they are reading, between
-// one press and the next.
-
 test('the rail card and the session heading both offer the read state the session is not in, and none of it in the palette', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   const titles = new Map<string, string>(
     manifest.contributes.commands.map((c: { command: string; title: string }) => [c.command, c.title]),
   );
-  // The words are the manifest's, since the entries are drawn by the editor. The rail card
-  // and the session heading share one title on purpose, and every session command is hidden
-  // from the command palette below, so `category` only has to tell the session command apart
-  // from the turn command of the same name in the Keyboard Shortcuts editor, where the menu's
-  // own placement offers no such hint.
+  // Session read commands share their menu labels.
+  // Categories distinguish session commands from turn commands in Keyboard Shortcuts.
   assert.equal(titles.get('arc.markSessionRead'), 'Mark as read');
   assert.equal(titles.get('arc.markSessionUnread'), 'Mark as unread');
   const categories = new Map<string, string | undefined>(
@@ -14693,11 +14065,8 @@ test('the rail card and the session heading both offer the read state the sessio
 
   const menu = manifest.contributes.menus['webview/context'] as { command: string; when: string; group: string }[];
   const whenOf = (command: string) => menu.filter((m) => m.command === command).map((m) => m.when);
-  // Composed from the table rather than written out, so a name renamed on one side still
-  // fails: a clause naming a section nothing writes matches no card at all, and the entry
-  // simply never appears. The rail names its read state in its own section, and the
-  // session heading carries a plain read flag instead, since its two sections already name
-  // the archived state.
+  // Session-list sections identify read state.
+  // Heading sections identify archived state and carry read state separately.
   const S = RAIL_MENU_SECTIONS;
   const H = SESSION_MENU_SECTIONS;
   const onHeading = (suffix: string) =>
@@ -14712,9 +14081,7 @@ test('the rail card and the session heading both offer the read state the sessio
     [onHeading("sessionRead == 'read'"), `webviewSection == '${S.read}'`],
     'the way back is not offered on exactly the sessions with nothing new',
   );
-  // A context key VS Code compares against the boolean literal `false` also matches the key
-  // being absent, which is exactly the case of nothing markable this entry must stay off of.
-  // A word the key holds only when an entry applies has no such reading.
+  // Menu conditions compare explicit read-state strings rather than booleans.
   assert.doesNotMatch(
     whenOf('arc.markSessionRead').join(''),
     /=== false|== false/,
@@ -14726,8 +14093,7 @@ test('the rail card and the session heading both offer the read state the sessio
     'the way back reads a boolean the absent case can be mistaken for',
   );
 
-  // Out of the palette, like every other entry that acts on what was right-clicked: pressed
-  // with nothing under the pointer they have no session to name.
+  // Session read actions stay outside the command palette.
   const palette = manifest.contributes.menus.commandPalette as { command: string; when: string }[];
   for (const command of ['arc.markSessionRead', 'arc.markSessionUnread']) {
     assert.ok(
@@ -14736,8 +14102,7 @@ test('the rail card and the session heading both offer the read state the sessio
     );
   }
 
-  // The hand-off, both halves: a message nothing listens for and a listener nothing sends to
-  // look the same from either side.
+  // Check native command registration and browser message handling.
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   sourceMatch(
     extensionSource,
@@ -14749,8 +14114,7 @@ test('the rail card and the session heading both offer the read state the sessio
     /reg\('arc\.markSessionUnread', \(arg\) => setSessionRead\(panel, arg, false\)\);/,
     'the session way back is registered on something other than the read hand-off',
   );
-  // Nothing about the argument's shape is guaranteed, so a session is named or nothing
-  // is sent, the way a turn key is read.
+  // Ignore command arguments without a valid session identity.
   sourceMatch(
     extensionSource,
     /const session = sessionIdFrom\(arg\);\s*if \(!session\) \{\s*return;\s*\}/,
@@ -14766,7 +14130,7 @@ test('the rail card and the session heading both offer the read state the sessio
     /readState\.setSession\(msg\.session, msg\.read\);/,
     'the message never reaches the two presses, so the menu entries do nothing',
   );
-  // The heading's own read flag, refreshed the way its pinned and archived facts are.
+  // Update the heading's native-menu read state when session read state changes.
   const panelSource = fs.readFileSync(path.join(__dirname, 'webview', 'panel.ts'), 'utf8');
   sourceMatch(
     panelSource,
@@ -14785,14 +14149,10 @@ test('the rail card and the session heading both offer archiving, and none of it
   const titles = new Map<string, string>(
     manifest.contributes.commands.map((c: { command: string; title: string }) => [c.command, c.title]),
   );
-  // Short words: the context menu is the only place either title is drawn, since both are
-  // withheld from the command palette below.
+  // Pin the native archive action labels.
   assert.equal(titles.get('arc.archiveSession'), 'Archive');
   assert.equal(titles.get('arc.unarchiveSession'), 'Unarchive');
-  // Bare enough, out of the menu that gives them a session, to read as nothing in the
-  // Keyboard Shortcuts editor: a category names what they act on, and it names the session
-  // rather than the whole extension so it also tells the pair apart from the turn command of
-  // the same title.
+  // Archive command categories identify the session in Keyboard Shortcuts.
   const categories = new Map<string, string | undefined>(
     manifest.contributes.commands.map((c: { command: string; category?: string }) => [c.command, c.category]),
   );
@@ -14801,10 +14161,7 @@ test('the rail card and the session heading both offer archiving, and none of it
 
   const menu = manifest.contributes.menus['webview/context'] as { command: string; when: string; group: string }[];
   const whenOf = (command: string) => menu.filter((m) => m.command === command).map((m) => m.when);
-  // Composed from the table rather than written out. Nothing typechecks a when clause, and a
-  // clause naming a section nothing writes matches no row at all: the entry then never
-  // appears, silently, and a one-character difference on either side is enough. The rail
-  // names its archived state directly, since its three sections already name read state.
+  // Build archive conditions from shared section identifiers and the sessionArchived flag.
   const S = RAIL_MENU_SECTIONS;
   const H = SESSION_MENU_SECTIONS;
   const onRail = (suffix: string) =>
@@ -14820,8 +14177,7 @@ test('the rail card and the session heading both offer archiving, and none of it
     'the way back is not offered on exactly the sessions that are archived',
   );
 
-  // Out of the palette, like every other entry that acts on what was right-clicked: pressed
-  // with nothing under the pointer they have no session to name.
+  // Session archive actions stay outside the command palette.
   const palette = manifest.contributes.menus.commandPalette as { command: string; when: string }[];
   for (const command of ['arc.archiveSession', 'arc.unarchiveSession']) {
     assert.ok(
@@ -14830,8 +14186,7 @@ test('the rail card and the session heading both offer archiving, and none of it
     );
   }
 
-  // The hand-off, both halves: a message nothing listens for and a listener nothing sends to
-  // look the same from either side.
+  // Check native archive command registration and message handling.
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   sourceMatch(
     extensionSource,
@@ -14853,8 +14208,7 @@ test('the rail card and the session heading both offer archiving, and none of it
     /if \(msg\.archived\) sessionState\.hide\(msg\.session\);\s*else sessionState\.unarchive\(msg\.session\);/,
     'the message never reaches the two presses, so the menu entries do nothing',
   );
-  // An archive or a pin refreshes both rows' native context in place, so a menu reopened on
-  // either surface right after the press already offers the other direction.
+  // Refresh native-menu context on both session headings and session-list rows.
   const panelSource = fs.readFileSync(path.join(__dirname, 'webview', 'panel.ts'), 'utf8');
   sourceMatch(
     panelSource,
@@ -14919,9 +14273,7 @@ test('the rail card and the session heading offer Copy session ID beside details
       `webviewSection == '${RAIL_MENU_SECTIONS.unread}' || webviewSection == '${RAIL_MENU_SECTIONS.read}' || webviewSection == '${RAIL_MENU_SECTIONS.plain}'`,
     ],
   );
-  // The editor sorts the sections by their group name and draws a rule between them. Copy
-  // session ID and details read together in the final group, under both the entries that
-  // change the session and the editor's own copy entries under `9_cutcopypaste`.
+  // Copy session ID shares the details group after session-change actions.
   const archive = menu.find((entry) => entry.command === 'arc.archiveSession');
   const section = (group: string) => group.split('@')[0];
   assert.ok(
@@ -14975,8 +14327,7 @@ test('the rail card and the session heading offer Copy session ID beside details
     /reg\('arc\.showSessionDetails', \(arg\) => showSessionDetails\(panel, arg\)\);/,
   );
   sourceMatch(script, /vscode\.postMessage\(\{ type: 'armSessionDetails', session \}\);/);
-  // The arm also names the control the press landed on, so a rail card for a session the
-  // timeline is not showing still has somewhere to send focus back to when the dialog closes.
+  // Retain the invoking heading or session-list card as the dialog's focus-return target.
   sourceMatch(
     script,
     /const row = start\?\.closest<HTMLElement>\('\.sessionrow'\) \|\| start\?\.closest<HTMLElement>\('\.railrow'\);/,
@@ -15188,16 +14539,10 @@ test('the rail card and the session heading both offer pinning, and none of it i
   const titles = new Map<string, string>(
     manifest.contributes.commands.map((c: { command: string; title: string }) => [c.command, c.title]),
   );
-  // Short words for the menu, deliberately apart from CARD_ACTIONS.railPin and railUnpin: those
-  // name the rail card's own pin button in a full sentence an accessible name reads well, and
-  // this menu entry is scanned rather than read aloud, so it keeps the short form the rest of
-  // the menu uses. Both are withheld from the command palette below, so this is the only place
-  // either title is drawn.
+  // Pin native menu labels separately from the session-list button's accessible names.
   assert.equal(titles.get('arc.pinSession'), 'Pin to top');
   assert.equal(titles.get('arc.unpinSession'), 'Unpin');
-  // Both carry a category the way the menu's other short titles do, naming the session
-  // rather than the whole extension so it also tells this pair apart from nothing else, since
-  // no turn command shares either title.
+  // Pin command categories identify the session in Keyboard Shortcuts.
   const categories = new Map<string, string | undefined>(
     manifest.contributes.commands.map((c: { command: string; category?: string }) => [c.command, c.category]),
   );
@@ -15206,11 +14551,8 @@ test('the rail card and the session heading both offer pinning, and none of it i
 
   const menu = manifest.contributes.menus['webview/context'] as { command: string; when: string; group: string }[];
   const whenOf = (command: string) => menu.filter((m) => m.command === command).map((m) => m.when);
-  // Composed from the table rather than written out. Nothing typechecks a when clause, and a
-  // clause naming a section nothing writes matches no row at all: the entry then never
-  // appears, silently, and a one-character difference on either side is enough. A pinned or
-  // archived session is either one or the other, so the rail's entry also excludes archived,
-  // the state its own three sections do not name.
+  // Build pin conditions from shared section identifiers.
+  // Session-list entries exclude archived sessions.
   const S = SESSION_MENU_SECTIONS;
   const R = RAIL_MENU_SECTIONS;
   const onRail = (suffix: string) =>
@@ -15226,8 +14568,7 @@ test('the rail card and the session heading both offer pinning, and none of it i
     'the way back is not offered on exactly the live sessions that are pinned',
   );
 
-  // Out of the palette, like every other entry that acts on what was right-clicked: pressed
-  // with nothing under the pointer they have no session to name.
+  // Session pin actions stay outside the command palette.
   const palette = manifest.contributes.menus.commandPalette as { command: string; when: string }[];
   for (const command of ['arc.pinSession', 'arc.unpinSession']) {
     assert.ok(
@@ -15236,8 +14577,7 @@ test('the rail card and the session heading both offer pinning, and none of it i
     );
   }
 
-  // The hand-off, both halves: a message nothing listens for and a listener nothing sends to
-  // look the same from either side.
+  // Check native pin command registration and message handling.
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   sourceMatch(
     extensionSource,
@@ -15262,13 +14602,9 @@ test('the rail card and the session heading both offer pinning, and none of it i
 });
 
 test('nothing the panel opens is left to land wherever focus happens to be', () => {
-  // Every way a file reaches the editor names its group. Left to the default it opens wherever
-  // focus is, and once the panel is an editor tab of its own that is the panel's own
-  // group: the reader's editor splits in two and the file lands where the panel was. This is a
-  // sweep rather than a list, so a sixth way added later cannot slip in untouched.
+  // Require viewColumn in every checked file-opener call.
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
-  // Each opener is read as the whole call that holds it, so the group must be one of its
-  // arguments.
+  // Extract the enclosing call so viewColumn must appear in its arguments.
   const opens = [panelHostSource, extensionSource].flatMap((source) =>
     [...source.matchAll(/showTextDocument\(|'vscode\.open'|'vscode\.diff'/g)].map(
       (m) =>
@@ -15285,7 +14621,7 @@ test('nothing the panel opens is left to land wherever focus happens to be', () 
       `something opens a file without naming a group, so it can split the reader editor:\n${call.slice(0, 160)}`,
     );
   }
-  // `vscode.changes` is the one that cannot be told, so it focuses the group first instead.
+  // Multi-file diff source must contain a FOCUS_GROUP reference.
   for (const source of [panelHostSource, extensionSource]) {
     if (!source.includes("'vscode.changes'")) {
       continue;
@@ -15296,7 +14632,7 @@ test('nothing the panel opens is left to land wherever focus happens to be', () 
       'a multi-file diff is opened without focusing the group it should land in first',
     );
   }
-  // And a link out of a summary takes the same rule as everything else.
+  // Response links also receive an explicit target column.
   sourceMatch(
     hostHandler('openLink'),
     /await openLink\(msg\.href, msg\.beside \? vscode\.ViewColumn\.Beside : this\.column\(\)\)/,
@@ -15305,10 +14641,7 @@ test('nothing the panel opens is left to land wherever focus happens to be', () 
 });
 
 test('a ctrl-opened turn diff reuses the group the last press split off', () => {
-  // vscode.changes cannot be told a column, so the beside press splits a group off, and
-  // splitting on every press opened a new group per ctrl-click. The rule saying when the
-  // remembered column still answers is besideColumn in turnview.ts, where it is tested;
-  // this holds the untested glue to asking it and to remembering where the split landed.
+  // Ask besideColumn whether to reuse the remembered split and retain the resulting column.
   sourceMatch(
     panelHostSource,
     /const reuse = besideColumn\(\{/,
@@ -15322,10 +14655,7 @@ test('a ctrl-opened turn diff reuses the group the last press split off', () => 
 });
 
 test('a turn diff never opens an empty pair for a file the shell record could not detail', () => {
-  // A row with countsUnknown carries no edits and, ordinarily, no snapshot baseline either, so
-  // sidesFor would hand it two empty strings and the diff would draw the row with nothing
-  // in it. Decision 2 says such a row has no diff to open, so the loop drops it before it
-  // ever reaches sidesFor or the resource list.
+  // Skip files with unknown counts before building turn-diff resources.
   const body = methodBody('private async openTurnDiff(');
   sourceMatch(
     body,
@@ -15335,14 +14665,8 @@ test('a turn diff never opens an empty pair for a file the shell record could no
 });
 
 test('every function called in the panel is declared there or imported into its browser graph', () => {
-  // The guard this file most needed and did not have. `withWhere` was imported from turnview.ts
-  // and called inside SCRIPT, where that import does not reach: the import lands in the
-  // extension host bundle and the webview is a separate script. The control that called it threw
-  // on every use and shipped that way, because the assertion written for it matched the *text*
-  // of a call to a function that did not exist.
-  //
-  // This is the shape of that mistake, so this is what is checked: a name imported into
-  // panelhost.ts and called in SCRIPT has to be declared in SCRIPT or interpolated into it.
+  // Host imports do not supply browser functions.
+  // Check panel calls to turnview imports against browser declarations and imports.
   const imports = /import \{([^}]*)\} from '\.\/turnview';/.exec(panelHostSource);
   assert.ok(imports, 'panelhost.ts no longer imports from turnview.ts, so this guard is blind');
   const named = imports[1]
@@ -15368,7 +14692,7 @@ test('every function called in the panel is declared there or imported into its 
     ),
   ]);
   const unreachable = named.filter((name) => {
-    // Called as a function somewhere in the panel, and not something the panel has of its own.
+    // Match direct function calls without matching member access.
     const calls = new RegExp(`(?:^|[^.\\w$])${name}\\s*\\(`).test(script);
     return calls && !declared.has(name);
   });
@@ -15380,8 +14704,7 @@ test('every function called in the panel is declared there or imported into its 
 });
 
 test('the heading, rail card and View menu label chips are drawn by one rule', () => {
-  // Two rules drift: one grows a border, a radius or a tone the other does not, and the reader
-  // has to read the words to see that the two lines say the same thing.
+  // Session-list, session-heading, and View menu labels share one style rule.
   const shared = styleRule('.raillabel, .sessionlabel, .railfilterlabel');
   assert.match(
     shared,
@@ -15403,29 +14726,13 @@ test('the heading, rail card and View menu label chips are drawn by one rule', (
     false,
     'the View menu chip has a rule of its own, so it and the rail card chip can be drawn differently',
   );
-  // The heading's line wraps where the card's refuses to, which is the whole of what it has
-  // that the card does not.
+  // Session-heading labels wrap across rows.
   assert.match(
     styleRule('.sessionlabels'),
     /flex-wrap: wrap/,
     'the heading line holds every label on one row, so a filed session runs its chips off the panel',
   );
 });
-
-// The list under the filter box, run rather than scanned: which presses it takes, and which
-// word a dismissal belongs to.
-//
-// A flag held against the whole box and a dismissal held against one word read the same to
-// every text scan, and they differ only once the caret moves. `label:perf label:co` is two
-// words the list has something to say about, and Escape on the first says nothing about the
-// second.
-
-// The pattern the filter box claims, and the hover every offered name carries.
-//
-// The list is the only way to type a whole label name, so this is the one axis a reader
-// working by ear cannot reach without it. A box carrying a combobox's state without a
-// combobox's role is announced as a plain text box, and the list and the row under the walk
-// are never mentioned.
 
 test('the rail owner imports the shared time projection', () => {
   sourceMatch(railSource, /from '\.\.\/view\/rail[.]ts'/);
@@ -15444,8 +14751,7 @@ test('the rail owner imports the shared time projection', () => {
 
 test('the shared rail projection groups sessions by day', () => {
   sourceDoesNotMatch(script, /function railBuckets\(/);
-  // Mid-afternoon, so yesterday and the week boundary are whole days away from it rather
-  // than a few hours.
+  // Set the fixture clock away from midnight boundaries.
   const now = new Date(2026, 7, 27, 15, 30).getTime();
   const at = (days: number, hour = 12) => new Date(2026, 7, 27 - days, hour).getTime();
   const card = (id: string, days: number, over: object = {}) => ({
@@ -15479,15 +14785,13 @@ test('the shared rail projection groups sessions by day', () => {
         ['older', 'Older', ['old']],
       ],
     );
-    // A bucket holding nothing is left out entirely rather than drawn as an empty heading.
+    // Omit empty buckets.
     assert.deepEqual(
       buckets([card('a', 0), card('b', 0)], now).buckets.map((b) => b.id),
       ['today'],
     );
     assert.deepEqual(buckets([], now).buckets, []);
-    // The boundaries, walked as calendar days: midnight this morning starts today, and a
-    // minute before it is yesterday; seven days back is still the week, and the day
-    // before that is older.
+    // Classify bucket boundaries by local calendar days.
     const edges = buckets(
       [
         card('a', 0, { at: new Date(2026, 7, 27, 0, 0).getTime() }),
@@ -15507,17 +14811,13 @@ test('the shared rail projection groups sessions by day', () => {
         ['older', ['e']],
       ],
     );
-    // Folded by default, and two things stand the fold down: the session on screen
-    // must stay visible in the chooser pointing at it, and a reader back after days away
-    // must not open to a nearly empty rail.
+    // Unfold older sessions when the selected session or remaining visible-card count requires it.
     assert.equal(buckets([card('a', 0), card('b', 0), card('c', 30)], now).olderFolded, true);
     assert.equal(buckets([card('a', 0), card('b', 0), card('c', 30, { current: true })], now).olderFolded, false);
     assert.equal(buckets([card('a', 0), card('b', 30), card('c', 40)], now).olderFolded, false);
     assert.equal(buckets([card('a', 0), card('b', 0)], now).olderFolded, false);
     assert.equal(buckets([], now).olderFolded, false);
-    // The runs another agent started leave the days entirely, whatever day they ran on,
-    // and sit between the older ones and the archive. The reader did not put them away, so
-    // they are not archived; they are not one of the reader's days either.
+    // Agent runs occupy their own group after Older and before Archived.
     const runs = buckets(
       [
         card('mine', 0),
@@ -15539,8 +14839,7 @@ test('the shared rail projection groups sessions by day', () => {
         ['archived', 'Archived', ['gone']],
       ],
     );
-    // Both of the reader's own words outrank the guess. An archived run stays archived,
-    // and a pinned one keeps the top it was pinned to.
+    // Archived and pinned membership override agent-run grouping.
     const beaten = buckets(
       [
         card('a', 0),
@@ -15558,9 +14857,7 @@ test('the shared rail projection groups sessions by day', () => {
         ['archived', ['put-away']],
       ],
     );
-    // Folded by the same two rules the older ones take: the session on screen stays
-    // visible in the chooser pointing at it, and a rail that is nearly all runs does not
-    // fold itself down to nothing.
+    // Agent-run folding also preserves selection and enough visible session cards.
     assert.equal(buckets([card('a', 0), card('b', 0), card('r', 0, { agentRun: true })], now).agentFolded, true);
     assert.equal(
       buckets([card('a', 0), card('b', 0), card('r', 0, { agentRun: true, current: true })], now).agentFolded,
@@ -15572,8 +14869,7 @@ test('the shared rail projection groups sessions by day', () => {
     );
     assert.equal(buckets([card('a', 0), card('b', 0)], now).agentFolded, false);
     assert.equal(buckets([], now).agentFolded, false);
-    // The two folds are counted together, because what is left on screen is what both of
-    // them left. Two old ones and two runs behind their own headings is a rail of one.
+    // Account for both Older and Run by agents when computing visible cards.
     assert.equal(
       buckets([card('a', 0), card('o', 30), card('p', 30), card('r', 0, { agentRun: true })], now).olderFolded,
       false,
@@ -15592,7 +14888,7 @@ test('every message in the Activity log accepts a comment mark, not only a reply
       closest: (selector: string) =>
         selector === '.actlist' ? {} : selector === said ? { dataset: { message } } : null,
     }) as unknown as Element;
-  // A run or a step carries no name a comment can be saved under, so it takes no mark.
+  // Activity rows without message identity remain outside comment marking.
   assert.equal(outsideCommentMarks(node('.actlist')), true);
   assert.equal(outsideCommentMarks(node('.actlist', '.answer')), false);
   assert.equal(outsideCommentMarks(node('.actlist', said)), false);
@@ -15600,8 +14896,7 @@ test('every message in the Activity log accepts a comment mark, not only a reply
   assert.equal(outsideCommentMarks(node(said)), false);
   assert.equal(outsideCommentMarks(node()), false);
   assert.equal(outsideCommentMarks(null), false);
-  // A message whose id no saved comment keeps takes no comment. An empty id would save the
-  // comment on the final response, and a longer or spaced id would move it there on reload.
+  // Reject empty, oversized, and whitespace-containing message IDs before comment marking.
   assert.equal(outsideCommentMarks(row('')), true);
   assert.equal(outsideCommentMarks(row('x'.repeat(201))), true);
   assert.equal(outsideCommentMarks(row('commentary 1')), true);
@@ -15609,12 +14904,7 @@ test('every message in the Activity log accepts a comment mark, not only a reply
 });
 
 test('the panel dates a session by what it recorded, not by its file being touched', () => {
-  // An agent appends bookkeeping to a transcript after the session has stopped: a
-  // title, a mode, a snapshot of file history, the records written as a session is closed.
-  // Every one of them moves the file's mtime, and reading that as the activity sent a
-  // session nobody had touched back to the top of the rail, into the Today bucket,
-  // reading `just now`. `readSessionActivity` in transcript.ts is the rule
-  // and is tested there; what is checked here is that the host asks it.
+  // Prefer recorded session activity over filesystem modification time.
   sourceMatch(
     panelHostSource,
     /private activityFor\(session: SessionFile\): number \{/,
@@ -15625,8 +14915,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
     /return this\.metaFor\(session\)\.activityMs \?\? session\.mtimeMs;/,
     'activityFor no longer prefers the recorded time, or no longer falls back to the mtime',
   );
-  // Both answers off one read, kept against the mtime, which is still the right question
-  // about whether the file has changed at all.
+  // Key derived title and activity metadata by the complete session revision.
   sourceMatch(
     panelHostSource,
     /private titles = new Map<string, DerivedTitleEntry>\(\);/,
@@ -15654,7 +14943,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
     'the rail reads selected cards before their progressive result is accepted',
   );
 
-  // The three values the session heading and the ticker draw.
+  // Session rows derive calendar, timestamp, and relative-age fields from activityFor.
   const from = panelHostSource.indexOf('this.sessionRows = all.map(');
   assert.notEqual(from, -1, 'panelhost.ts no longer builds sessionRows from the listing');
   const rows = statementFrom(panelHostSource, from);
@@ -15668,7 +14957,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
     'a session row dates itself by the file mtime again, which a closed session moves',
   );
 
-  // And the activity order the picker and read cut use directly, and the rail starts from.
+  // Order the merged catalog by activityFor.
   const merge = panelHostSource.indexOf('const listed = claude.filter');
   assert.notEqual(merge, -1, 'allSessions no longer merges the two listings, so this guard cannot see its order');
   const merged = memberFrom(panelHostSource, merge);
@@ -15680,9 +14969,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
 });
 
 test('initial session listing keeps every metadata read within 64 MiB before the first rail', () => {
-  // The affected workspace held 226 Claude sessions with prompts. A synchronous
-  // full-history title scan stalled the extension host before the panel could load. This
-  // guard measures bytes from the fixed tail window instead of timing a particular machine.
+  // Bound the initial-listing fixture's aggregate metadata allowance to 64 MiB.
   const eligibleClaudeSessions = 226;
   const maximumAggregateBytes = 64 * 1024 * 1024;
   const claudeMetadataBytes = 256 * 1024;
@@ -15844,9 +15131,7 @@ test('initial session listing keeps every metadata read within 64 MiB before the
     'Claude metadata reads more of the head than its bounded prompt window',
   );
 
-  // The saved Claude title file is read only to confirm a rename. A read anywhere else can
-  // reach the listing path and read one more file per session before the first rail. The
-  // file name appears only inside its reader, and the reader has one caller, the rename.
+  // Restrict saved-title sidecar reads to rename confirmation.
   const uncommented = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
   const sources = fs
     .readdirSync(__dirname, { recursive: true, encoding: 'utf8' })
@@ -15906,16 +15191,13 @@ test('initial session listing keeps every metadata read within 64 MiB before the
 
 const USAGE_NOW = new Date(2026, 7, 28, 14, 32, 0).getTime();
 
-// What an agent published for its slash menu, in the shape the wires reduce to. One takes an
-// argument and one does not, because the row draws them differently.
+// Supply commands with and without argument hints.
 const PANEL_COMMANDS = [
   { name: 'commit', description: 'Write a commit for what is in the working tree', argumentHint: '<message>' },
   { name: 'compact', description: 'Summarise the session and keep going', argumentHint: '' },
   { name: 'code-review', description: 'Review the current diff', argumentHint: '[level]' },
   { name: 'polish', description: '', argumentHint: '' },
-  // A name that contains what a reader types without starting with it. Without one in here
-  // the two groups never both fill, and a copy that returned them the wrong way round would
-  // agree with the original on every case this sweeps.
+  // safe-compact fills the substring-match group alongside prefix matches.
   { name: 'safe-compact', description: 'Save what only the session holds', argumentHint: '' },
 ];
 
@@ -15954,12 +15236,7 @@ const COMPOSER_STATE = {
   claudeSkills: null,
 };
 
-// The glance spends a budget per refresh, so the rail fills over several polls. A workspace
-// where no agent is running produces the same signature for ever, and a refresh that finds
-// the signature unchanged gives up before it does anything. So the order of those two decides
-// whether the rail ever finishes filling: with the glance after the comparison, the panel
-// glanced at one budget on the poll that opened it and every session past that budget
-// stayed silent until some transcript happened to move.
+// Update metadata windows before deciding whether the refresh needs a render.
 test('the glance goes on filling the rail on a refresh where nothing else moved', () => {
   const glance = panelHostSource.indexOf('this.windows = this.glanceAt(all, sessions)');
   assert.notEqual(glance, -1, 'panelhost.ts no longer glances, so this guard cannot see the order');
@@ -15970,19 +15247,14 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
     'the glance runs after the refresh gives up, so a quiet workspace fills one budget and stops',
   );
 
-  // The rule itself is refreshWanted's and is run in turnview.ts. What is checked here is that
-  // this file asks it with the sizes either side of the glance, rather than with one of them
-  // twice, which would read as a working panel and never repaint.
+  // Pass the metadata-window counts before and after glanceAt to refreshWanted.
   sourceMatch(
     panelHostSource,
     /glancedBefore: glanced, glancedNow: this\.windows\.size,/,
     'the refresh asks refreshWanted with the wrong sizes, so a new glance never reaches the rail',
   );
 
-  // And that it asks the clock with both readings rather than with a constant. The rule is
-  // statusMoved's and is run in turncard.ts, so a term wired as `false` typechecks, passes
-  // every test either file has, and leaves a dead session drawn as running for as long
-  // as the panel stays open. Only the call written out here says it is really being asked.
+  // Pass the retained collection time and current time to statusMoved.
   sourceMatch(
     panelHostSource,
     /const statusFacts = \[[\s\S]*?this\.newestBySession\.values\(\)[\s\S]*?outcomes[\s\S]*?statusMoved: statusMoved\(statusFacts, this\.collectedAt, now\),/,
@@ -15994,8 +15266,7 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
     'the cards are worded at one clock and compared against another, so the poll repaints for ever or never',
   );
 
-  // Metadata windows are rebuilt by each refresh. The worker owns persistent parse state,
-  // so the host must not retain a second per-file glance cache.
+  // Rebuild metadata windows during refresh without a host-owned per-file glance cache.
   sourceDoesNotMatch(
     panelHostSource,
     /this\.glances/,
@@ -16009,24 +15280,15 @@ test('the glance goes on filling the rail on a refresh where nothing else moved'
 });
 
 test('the composer is aimed by the agent key, never by the name the rail draws', () => {
-  // A session row carries both spellings: `agent` is what the rail prints, "Claude
-  // Code" or "Codex", and `agentKey` is what every table is filed under. Reading the drawn
-  // name as a key fails silently and completely. The model list misses, so the picker says
-  // it has no models; the ask modes miss, so an unknown agent is lent Claude's four; and the
-  // prompt is handed to whichever CLI the name is not equal to, which sent Claude
-  // sessions to Codex and answered with "Auto is not a setting Codex can be put in".
-  //
-  // The type is the real guard, since ComposerState.agent is the two keys and no caller can
-  // write a display name. This holds the line the type cannot see: that the row keeps both
-  // spellings, and that the composer reads the key.
+  // Session rows carry the displayed agent name and the agentKey used for routing.
+  // Prompt-box state reads agentKey.
   const rows = panelHostSource.indexOf('this.sessionRows = all.map');
   assert.notEqual(rows, -1, 'the panel no longer builds its session rows here');
   const built = statementFrom(panelHostSource, rows);
   sourceMatch(built, /agent: AGENT_NAMES\[f\.agent\]/, 'the rail draws something other than the agent name');
   sourceMatch(built, /agentKey: f\.agent/, 'the row carries no key, so everything is filed under a drawn name');
 
-  // `stateForRow` builds it and `composerState` only picks the row, since a queue drains for
-  // the session whose turn ended rather than for the one the box is aimed at.
+  // Build prompt-box state from the addressed session row.
   const at = panelHostSource.indexOf('private stateForRow(');
   assert.notEqual(at, -1, 'the panel no longer builds the composer state here');
   const body = memberFrom(panelHostSource, at);
@@ -16136,13 +15398,7 @@ test('the composer current context is selected against the newest compaction', (
 });
 
 test('a prompt goes to the session the composer names, and nowhere else', () => {
-  // The composer draws "To <name>" over the box. A prompt that lands anywhere else makes
-  // the panel a liar about the one thing it exists to do, and the reader finds out by
-  // watching an unrelated session answer them.
-  //
-  // The folder alone is not enough to say where. Keyed by agent and folder, one project
-  // holds one session per agent, so a prompt reaches whatever that agent last resumed
-  // there. The session has to travel with the prompt.
+  // Prompt delivery carries the agent, session identity, and working directory.
   const send = panelHostSource.indexOf('private send(');
   assert.notEqual(send, -1, 'the panel no longer sends from here');
   const body = memberFrom(panelHostSource, send);
@@ -16152,18 +15408,8 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     'the prompt leaves without naming its session, so it lands wherever the folder last resumed',
   );
 
-  // And the comments it carried are taken away, but only once the prompt has gone. A comment
-  // that has gone out was said and the agent has it, so a card still drawing it would leave
-  // the reader working out which of their own marks are outstanding. The marks clearing is the
-  // whole sign on screen that the prompt carried them, and nothing records which were sent
-  // because there is nothing left to record.
-  //
-  // The set is read before the handoff. Gathering it again on the way back would take a
-  // comment written while the prompt was in flight, which was in no prompt at all.
-  //
-  // Held by where each line falls rather than by the two being adjacent. The live card is
-  // recorded between them now, and a guard that reads the order says what it means: one that
-  // reads the spelling goes red at the next line written there and says nothing at all.
+  // Capture carried comments before handing the prompt to the agent.
+  // Later comments remain outside that submission.
   const gathered = body.indexOf('const carried = commentsForActiveSubmission(state);');
   const handed = body.indexOf('this.onSendPrompt?.(');
   assert.notEqual(gathered, -1, 'the send no longer gathers what rides out with the prompt');
@@ -16176,9 +15422,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     /commentsForActiveSubmission[\s\S]*state\.queued\.flatMap\(\(entry\) => entry\.commentIds\)/,
     'a native mid-turn send can take comments already owned by a local waiting record',
   );
-  // Waited for. The handoff reaches an agent through two awaits and refuses on three ordinary
-  // paths: no folder open, a wrong path to the agent, a session whose child has exited.
-  // Taking the comments before the answer destroys them on every one of those.
+  // Remove carried comments only after the delivery answer arrives.
   const answered = layoutIndexOf(body, 'Promise.resolve(went).then(');
   assert.notEqual(answered, -1, 'the send hands the prompt over and never waits for the answer');
   sourceMatch(
@@ -16186,8 +15430,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     /this\.dropCarriedComments\(carried, delivery\.delivered\)/,
     'the comments are taken before the prompt is known to have gone, so a refused send destroys them',
   );
-  // `=== true` rather than a truth test: a caller with no answer to give sent nothing, and no
-  // answer must cost the reader nothing.
+  // send must not replace saved comments directly.
   sourceDoesNotMatch(
     body,
     /this\.saved\.comments = /,
@@ -16197,22 +15440,19 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
   const drop = panelHostSource.indexOf('private dropCarriedComments(');
   assert.notEqual(drop, -1, 'nothing takes away the comments a prompt carried');
   const taken = memberFrom(panelHostSource, drop);
-  // The rule itself is `commentsAfterSend` in composerview.ts, which is tested. This file is
-  // read by nothing that runs it, so what it can check is that the decision is asked for
-  // rather than spelled a second time here.
+  // Apply the commentsAfterSend rule to the captured comments and delivery answer.
   sourceMatch(
     taken,
     /const left = commentsAfterSend\(this\.saved\.comments, carried, delivered\);/,
     'the panel decides what a sent prompt takes away itself, so the rule is spelled twice',
   );
-  // Written to storage, not only to memory. Held in memory alone, a reload would put every
-  // sent comment back and the next prompt would carry the whole notebook out a second time.
+  // Persist the comments remaining after delivery.
   sourceMatch(
     taken,
     /void this\.memento\?\.update\(STATE_KEY, this\.saved\);/,
     'the removal is never written down, so a reload puts every sent comment back',
   );
-  // And both hosts are told, because each draws its own copy and neither saw this happen.
+  // Publish the remaining comments to attached hosts.
   sourceMatch(
     taken,
     /void this\.post\(\{ type: 'notes', comments: this\.saved\.comments \}\);/,
@@ -16223,25 +15463,20 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     /this\.postRail\(true\);/,
     'the rail keeps showing comments that a delivered prompt has taken away',
   );
-  // The type is what makes the answer impossible to leave out. A handler returning void would
-  // read as "not delivered" at the call and silently keep every comment for ever.
+  // The send callback returns a PromptDelivery answer.
   sourceMatch(
     panelHostSource,
     /public onSendPrompt: \|? ?\(\(agent: string, session: string, cwd: string \| null, prompt: AgentPrompt, onSubmitted\?: \(session: string, turnId: number\) => void\) => Promise<PromptDelivery>\) \| null/,
     'the send handoff does not have to say whether the prompt went, so the panel cannot wait for it',
   );
-  // Nothing marks a comment as sent any more. The field is gone, and a second record of what
-  // went out would be a second answer to keep in step with the set itself.
+  // The host keeps no saved.sent field.
   sourceDoesNotMatch(
     panelHostSource,
     /\bsaved\.sent\b/,
     'the panel still keeps a record of which comments were sent, which now names nothing',
   );
 
-  // Stopping is aimed the same way, and by the same means: the session rides the
-  // message. Read here through `composerState` it was whichever session was pinned or
-  // newest when the message arrived, so a poll landing between the press and the message
-  // stopped a turn the reader was not looking at and left theirs running.
+  // Stop controls resolve the session named by the message.
   const stop = hostHandler('stopTurn');
   sourceMatch(stop, /this\.stateFor\(msg\.session\)/, 'a stop works out which session it meant instead of being told');
   sourceDoesNotMatch(
@@ -16250,9 +15485,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     'a stop reads the aim again when the message lands, which is a different session by then',
   );
   sourceMatch(stop, /aimed\.agent, aimed\.sessionId/, 'a stop is not aimed at the session on screen');
-  // And the two that only carried it are held to reading it. Named alone, both took the
-  // session on the message and then went on calling composerState, so the whole of this
-  // fix was unguarded for them.
+  // Dequeue and queued-edit actions also resolve the addressed session.
   for (const [named, marker] of [
     ['dequeue', 'private dequeue(id: string, session: string'],
     ['requestQueuedEdit', 'private requestQueuedEdit('],
@@ -16267,8 +15500,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
       named + ' reads the aim again when the message lands, which is a different session by then',
     );
   }
-  // Every message about the box names its session, and none of them works it out again.
-  // The contract requires the field, so a message without one never reaches the handler.
+  // Prompt-box message types require session identities, and handlers read those identities.
   for (const named of ['draft', 'sendPrompt', 'compact', 'stopTurn', 'dequeue', 'editQueued']) {
     sourceMatch(
       protocolSource,
@@ -16278,7 +15510,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     sourceMatch(hostHandler(named), /msg\.session/, `${named} is answered without the session it belongs to`);
   }
 
-  // And the type says so, so a caller cannot leave it out.
+  // Send and stop callback signatures require a session identity.
   sourceMatch(
     panelHostSource,
     /onSendPrompt: \|? ?\(\(agent: string, session: string, cwd: string \| null, prompt: AgentPrompt,/,
@@ -16290,8 +15522,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     'the stop callback does not require a session',
   );
 
-  // Each body is sliced to its own function before the pattern is checked, so a match cannot
-  // wander into an unrelated `this.folders()[0]` sitting further down the file.
+  // Scope working-directory checks to each extracted method.
   const cwdForSessionAt = panelHostSource.indexOf(
     'private cwdForSession(agent: string, sessionId: string): string | null {',
   );
@@ -16325,11 +15556,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
 });
 
 test('no source file carries a control byte a reader cannot see', () => {
-  // A regex literal in this file ended in a raw 0x08 rather than the two characters that
-  // spell a word boundary. The guard it belonged to then matched only text holding a
-  // backspace, which source never does, so it passed whatever the code said and the bug it
-  // was written for could come back unseen. The byte is invisible in a diff and in an
-  // editor, so nothing but a byte-level read finds it.
+  // Reject source control characters except tabs and line endings.
   const dir = path.join(__dirname);
   const allowed = new Set(['\t'.charCodeAt(0), '\n'.charCodeAt(0), '\r'.charCodeAt(0)]);
   const sourceTree = inventorySourceTree(dir);
@@ -16788,18 +16015,14 @@ test('Context detail keeps the percentage, window and used count together', () =
 });
 
 test('compacting asks for a compaction, and never travels the prompt path', () => {
-  // The control posted the message a typed prompt posts. That path assembles the reader's
-  // comments under the text, hands the lot over and then takes the comments away, and it
-  // clears the stored draft on the way past. So one press mailed a whole review out inside a
-  // compact command, cleared it off the cards with no undo, and left Send drawn unpressable
-  // over a box with the reader's prompt still in it.
+  // Compact sends a session control message without using prompt submission.
   sourceMatch(
     composerControlsSource,
     /run\(\) \{[\s\S]*contextDetails\.dismiss\(\);[\s\S]*options\.sendToHost\(\{ type: 'compact', session \}\)/,
     'Compact does not dispatch its session control',
   );
   sourceDoesNotMatch(composerControlsSource, /sendPrompt/, 'Compact reaches the prompt path');
-  // And the extension answers it on a path of its own, with no assembler and no draft.
+  // The host handles Compact through its own session-specific method.
   const at = panelHostSource.indexOf('private compact(session: string)');
   assert.notEqual(at, -1, 'the panel has no compaction of its own, so the press falls back to the prompt path');
   const body = memberFrom(panelHostSource, at);
@@ -18175,9 +17398,7 @@ export function browserPainted(host: any, generation: number, stage: any, usable
     readyHosts: new Set([browser]),
     refreshGeneration: 7,
     performanceCounters: {
-      recordStartup() {
-        /* not under test */
-      },
+      recordStartup() {},
     },
   };
   assert.equal(module.exports.panelSession.call(host, 'source', browser), 'successor');
@@ -18421,7 +17642,7 @@ test('queued comments and prompts drain only after compaction ends', () => {
   );
 });
 
-// A press the panel is still waiting on, in the shape `send` and `compact` record one.
+// A submitted prompt awaiting its delivery answer.
 const LIVE_PRESS = {
   sessionId: 's1',
   agent: 'claude' as const,
@@ -18458,9 +17679,7 @@ test('only a failed card offers a way out of it, and the press names its session
     'the restore action does not name the session that owns the failed press',
   );
 
-  // And the extension clears a failed press and no other. A press made between the message
-  // going out and its arriving has replaced this one, so clearing whatever is there takes the
-  // card off a prompt that is still on its way.
+  // Dismiss only the failed live press matching the requested kind.
   const at = panelHostSource.indexOf('private dismissLive(session: string, kind: string)');
   assert.notEqual(at, -1, 'nothing answers the press that clears the notice');
   sourceMatch(
@@ -18484,8 +17703,7 @@ test('only a failed card offers a way out of it, and the press names its session
     'restore does not use the path that switches to the matching composer and focuses its box',
   );
 
-  // An opening refusal has to reach the callback's catch. Returning null here would reduce
-  // the active-writer answer to the same generic failure as a cancelled agent picker.
+  // Propagate an opening failure through the callback rejection.
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const ensureAt = extensionSource.indexOf('const ensureSession = async');
   const ensure = memberFrom(extensionSource, ensureAt);
@@ -18640,10 +17858,7 @@ test('fresh and forked prompt delivery retry on a replacement child after permis
 });
 
 test('the press records whether a turn was already running when it was made', () => {
-  // Read at the press and never after it. Whether the agent will answer this prompt inside a
-  // turn already going is settled the moment it is sent, and a turn that starts a second
-  // later must not turn a fresh press into a mid-turn one. Without the flag every press
-  // draws a card, and a prompt sent into a running turn draws a second card for that turn.
+  // Capture whether the press belongs to a running turn before recording it.
   const at = panelHostSource.indexOf('private noteLive(state: ComposerState');
   assert.notEqual(at, -1, 'the panel no longer records the press here');
   const body = memberFrom(panelHostSource, at);
@@ -18651,23 +17866,19 @@ test('the press records whether a turn was already running when it was made', ()
     body.includes('midTurn: pressIsMidTurn('),
     'the press is recorded without saying whether a turn was already running, so it always draws a card',
   );
-  // Asked of the tested rule rather than answered here. The panel spelt this as the running
-  // flag alone, which called a prompt sent during a compaction a mid-turn prompt and drew
-  // nothing at all for it.
+  // Use pressIsMidTurn rather than the running flag alone.
   assert.ok(
     !/midTurn:\s*state\.running/.test(body),
     'the panel decides for itself what counts as mid-turn, which is a rule no test can reach',
   );
-  // Read before the slot is written, because what is already in flight is half the answer.
+  // Read existing live presses before adding the new press.
   const liveReadAt = body.indexOf('this.live[state.sessionId] ?? []');
   const midTurnAt = body.indexOf('midTurn:');
   assert.ok(
     liveReadAt >= 0 && liveReadAt < midTurnAt,
     'the press reads what is in flight after replacing it, so it always reads itself',
   );
-  // And the press joins what is already in flight through the tested rule, rather than
-  // taking its place. A compaction and a prompt sent during it are two pieces of work, and
-  // one slot for both took the compaction card off the screen the moment the reader typed.
+  // pressesAfter retains concurrent compaction and prompt presses.
   assert.ok(
     body.includes('pressesAfter(inFlight,'),
     'a new press replaces whatever is in flight, so a compaction loses its card to a follow-up',
@@ -18754,9 +17965,7 @@ test('a follow-up in an unparsed successor stays between its calls instead of in
 });
 
 test('the panel records the press before the handoff, and says so when the prompt never went', () => {
-  // The card is created by the press, not by the round trip. The handoff reaches an agent
-  // through two awaits, so a card built on the way back arrives behind the keystroke, which
-  // is the delay the card exists to fill.
+  // Record the live press before handing the prompt to the agent.
   const at = panelHostSource.indexOf('private send(');
   assert.notEqual(at, -1, 'the panel no longer sends from here');
   const body = memberFrom(panelHostSource, at);
@@ -18764,8 +17973,7 @@ test('the panel records the press before the handoff, and says so when the promp
   const handed = body.indexOf('this.onSendPrompt?.(');
   assert.notEqual(noted, -1, 'a prompt goes with nothing recorded, so the panel draws nothing about it');
   assert.ok(noted < handed, 'the card is recorded on the way back, so it arrives a round trip behind the press');
-  // And what is recorded is what actually goes. Comments alone are a prompt, so a card built
-  // from the box draws nothing for the press that sends three comments and an empty box.
+  // Build delivery and live-card inputs from the same captured submission.
   sourceMatch(
     body,
     /const going = agentPromptToSend\(\{ \.\.\.state, draft: text \}\);/,
@@ -18781,7 +17989,7 @@ test('the panel records the press before the handoff, and says so when the promp
     /this\.noteLive\(state, 'prompt', display, carriedAssets\)/,
     'the card is recorded from something other than what was sent',
   );
-  // A prompt that reached no agent says so rather than sitting on Sending until the ceiling.
+  // Settle the recorded press with its delivery answer.
   const answered = layoutIndexOf(body, 'Promise.resolve(went).then(');
   sourceMatch(
     body.slice(answered),
@@ -18791,8 +17999,7 @@ test('the panel records the press before the handoff, and says so when the promp
 });
 
 test('a compaction records its own press, and still never travels the prompt path', () => {
-  // The press the owner named first. It drew nothing at any point until its card arrived off
-  // the transcript, which is a whole session's work with no sign anything was asked for.
+  // Record compaction as its own live press.
   const at = panelHostSource.indexOf('private startCompaction(state: ComposerState,');
   assert.notEqual(at, -1, 'the panel has no compaction of its own');
   const body = memberFrom(panelHostSource, at);
@@ -18801,15 +18008,13 @@ test('a compaction records its own press, and still never travels the prompt pat
     /this\.noteLive\(state, 'compact', ''\)/,
     'the compaction is sent with nothing recorded, so the panel still draws nothing about it',
   );
-  // The separation holds. That path assembles the reader's comments under the text and takes
-  // them away afterwards, and one press mailed a whole review out inside a compact command.
+  // Compaction must not assemble comments or mutate drafts.
   sourceDoesNotMatch(
     body,
     /promptToSend|attachedComments|this\.drafts/,
     'the compaction assembles comments or clears a draft, which is the prompt path again',
   );
-  // The answer is waited on for the card alone, so a compaction that reached no child says so
-  // rather than claiming work that never started.
+  // Settle failed compaction delivery on its own live press.
   sourceMatch(
     body,
     /answer \?\? \{[\s\S]*reason: 'No agent handoff is available\.'/,
@@ -18823,9 +18028,7 @@ test('a compaction records its own press, and still never travels the prompt pat
 });
 
 test('a card is taken down by the tested rule, and matched on the session', () => {
-  // A card that outlives its turn draws the prompt twice, and the reader cannot tell which of
-  // the two the agent has. Which press is over is decided in composerview.ts; this gathers
-  // what that rule asks about and nothing else.
+  // Use livePressOver to reconcile live presses with accepted recorded work.
   const at = panelHostSource.indexOf('private dropSpentPresses()');
   assert.notEqual(at, -1, 'nothing takes a live card down, so every press leaves one behind');
   const body = memberFrom(panelHostSource, at);
@@ -18834,7 +18037,7 @@ test('a card is taken down by the tested rule, and matched on the session', () =
     /livePressOver\(press, seen, running, now, acceptedRecordedTurn\)/,
     'the panel decides when a card is over, which is a rule no test can reach',
   );
-  // A compaction is not a turn, so the two are matched against different records.
+  // Compaction presses match compaction records, while prompt presses match turn records.
   sourceMatch(
     body,
     /this\.newestCompactionBySession\.get\(session\)/,
@@ -18845,8 +18048,7 @@ test('a card is taken down by the tested rule, and matched on the session', () =
     /this\.newestBySession\.get\(session\)\?\.startedAt/,
     'a prompt card waits for something other than the turn the prompt made',
   );
-  // On the session, never on the agent. One agent runs several sessions at once,
-  // and a card keyed on the agent comes down when any of them stops.
+  // Read running state for the press's session and agent.
   sourceMatch(
     body,
     /sessionRunning\(keys, press\.agent, session\)/,
@@ -18858,8 +18060,7 @@ test('a card is taken down by the tested rule, and matched on the session', () =
     'a live prompt can leave without its recorded turn in the accepted selected window',
   );
 
-  // Run wherever the answer can have moved: the parse that reads a new turn, and a turn
-  // starting or stopping.
+  // Reconcile live presses after collection and running-state updates.
   const refresh = memberFrom(panelHostSource, panelHostSource.indexOf('async refresh('));
   sourceMatch(
     refresh,
@@ -19088,7 +18289,7 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
   const provider = Object.create(PanelProvider.prototype) as LiveProvider;
   const host = { webview: {}, visible: () => true };
   Object.assign(provider, {
-    // An empty ledger, so a card that counts a dispatched session finds no contribution.
+    // The fixture ledger supplies no dispatched cost contribution.
     lifetimeFigures: new SessionFiguresCache(),
     sessionSpendSources: [],
     projectSpendFiles: [],
@@ -19921,8 +19122,7 @@ test('a press is confirmed by its own handoff answer, not by the host becoming b
     /this\.showing = destination;[\s\S]*this\.refresh\(true\)/,
     'the prompt reached a new session but the panel leaves the reader on the old one',
   );
-  // And the state the composer is built from reads the press for the row it is building,
-  // rather than whichever press was made last.
+  // Prompt-box state reads live presses for its session row.
   const row = panelHostSource.indexOf('private stateForRow(');
   const built = memberFrom(panelHostSource, row);
   sourceMatch(
@@ -20027,9 +19227,7 @@ test('the reply arrives on a message of its own, and the usage message still car
 });
 
 test('the panel watches transcript paths and hands each burst to the bounded scheduler', () => {
-  // Both CLIs append to the transcript as each message lands, so the file is a live feed
-  // and not a record written at the end. Left to the poll, a card appears up to five
-  // seconds after the thing it is about, which is what the panel was reported for.
+  // Watch transcript directories selected by watchDirs.
   assert.ok(
     /fs\.watch\(/.test(panelHostSource),
     'nothing watches the transcripts, so the panel is back to waiting for the poll',
@@ -20069,8 +19267,7 @@ test('the panel watches transcript paths and hands each burst to the bounded sch
     'a no-card activity wake can be skipped when the transcript signature has not moved',
   );
 
-  // And nothing outlives a panel nobody is looking at. A watcher left open holds a handle
-  // on a directory and keeps reading a workspace the reader has closed.
+  // Stopping polling closes transcript-directory watchers.
   const stop = memberFrom(panelHostSource, panelHostSource.indexOf('private stopPolling()'));
   const end = stop.length;
   assert.ok(
@@ -20093,15 +19290,13 @@ test('quiet polls do not walk every Project cost source', () => {
     /if \(projectSpendSourceOfferDue\(sourcesMoved, now, this\.projectSpendLastOfferAt\)\) \{[\s\S]*this\.scheduleProjectSpendIndex\(/,
     'an unchanged poll still offers every Project cost source',
   );
-  // The gate reads the source signature and not the listing signature. The listing signature
-  // carries the shown session, so reading it here offered every source on every click.
+  // Spend-source scheduling uses spendSourceSignature rather than listingSignature.
   sourceMatch(
     body,
     /const sourceSignature = spendSourceSignature\(listed\);\s*const signature = listingSignature\(listed\);/,
     'the two signatures no longer read the same facts, so they can disagree about what moved',
   );
-  // A revision the listing already read, and only when this listing read it. A reused catalog
-  // read one file, and the rest of its entries are what the last walk saw.
+  // Supply trustedListedRevisions with catalog-walk status and selected identity.
   sourceMatch(
     body,
     /trustedListedRevisions\(all, this\.catalogWalked, this\.showing\)/,
@@ -20122,9 +19317,7 @@ test('quiet polls do not walk every Project cost source', () => {
 });
 
 test('the unsent prompts reach storage and come back out of it', () => {
-  // The extension holds the copy that outlives a window, so these are the three places it
-  // has to move: seeded on the way in, written on the way out, and held through a save the
-  // panel makes for its own reasons.
+  // Restore drafts and submitted-prompt recovery from saved host state.
   const ctor = memberFrom(panelHostSource, panelHostSource.indexOf('constructor('));
   sourceMatch(
     ctor,
@@ -20170,9 +19363,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
     'a comments-only waiting submission disappears when panel preferences are forgotten',
   );
 
-  // Every path that changes what is in a box goes through one writer: typing, sending, and
-  // taking a queued prompt back to be edited. A path that skips it loses either persistence
-  // or the rail transition that says meaningful input appeared or disappeared.
+  // Typing, sending, and accepted queue edits use holdDraft.
   for (const [marker, what] of [
     ['private setDraft(', 'a keystroke'],
     ['private sendPrompt(', 'a prompt going out'],
@@ -20214,20 +19405,16 @@ test('the unsent prompts reach storage and come back out of it', () => {
     /const railMoved = this\.holdDraft\(session, keep\);/,
     'every letter asks the host to rebuild and return the complete composer state',
   );
-  // The box and the stored draft differ while the reader walks back through earlier prompts.
-  // Read off the stored copy alone, the send control says Stop over a recalled prompt and the
-  // press that meant to send it kills the turn.
+  // Visible recalled text can differ from the persisted draft.
+  // Keep boxText synchronized with the visible text.
   sourceMatch(typedBody, /this\.boxText\[session\] = text;/, 'the send control no longer follows the words on screen');
-  // The row rather than the whole state. Building the state runs the whole prompt merge, and
-  // this runs on every letter typed.
+  // Draft typing resolves the row without rebuilding complete prompt-box state.
   sourceDoesNotMatch(
     typedBody,
     /this\.stateFor\(/,
     'every letter typed merges and cleans every prompt the walk offers, to name a session',
   );
-  // After the call, because `holdDraft` writes the same field from its own argument. Written
-  // before it, the words on screen were overwritten by the words to remember and the whole
-  // pair collapsed back into one: the control read Stop over a recalled prompt again.
+  // Write visible boxText after holdDraft to preserve recalled text.
   assert.ok(
     typedBody.indexOf('this.boxText[session] = text;') > typedBody.indexOf('this.holdDraft('),
     'the words to remember overwrite the words on screen, so the send control answers for neither',
@@ -20238,8 +19425,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
     'a recalled prompt in an empty box leaves the send control saying there is nothing to send',
   );
 
-  // The wait exists so a keystroke is not a write to disk, and it has to be flushed or the
-  // last thing typed before a window closes is the one thing that never gets written.
+  // Flush pending draft persistence during provider disposal.
   const dispose = memberFrom(panelHostSource, panelHostSource.indexOf('private disposeOwned(): void {'));
   sourceMatch(
     dispose,
@@ -20247,9 +19433,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
     'the pending write is dropped when the window closes, which is exactly when it matters',
   );
 
-  // A save from any host replaces the stored state wholesale. The drafts never travel in
-  // it, so without this a host saving its folds empties a prompt left half-written in
-  // another.
+  // Preserve host-owned drafts across browser state normalization.
   const body = memberFrom(panelHostSource, panelHostSource.indexOf('private saveState(state: unknown): void {'));
   const held = body.indexOf('const drafts = this.saved.drafts;');
   const rebuilt = body.indexOf('this.saved = normalizePanelState(state, railFilters);');
@@ -20263,8 +19447,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
     'the drafts are read or put back on the wrong side of the rebuild, so an empty set is what survives',
   );
 
-  // The saved sent prompts never travel in this state either, for the same reason: a host
-  // saving its folds must not wipe a prompt no transcript has recorded yet.
+  // Preserve host-owned submitted-prompt recovery across browser state normalization.
   const sentHeld = body.indexOf('const sentPrompts = this.saved.sentPrompts;');
   const sentPut = body.indexOf('this.saved.sentPrompts = sentPrompts;');
   assert.ok(
@@ -20277,12 +19460,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
 });
 
-// The box's undo, lifted whole and run.
-//
-// It is the panel's own and has no twin on the extension side, so there is nothing to check
-// it against: these guards run the real functions rather than a copy. That is the same reason
-// `commentKeyWanted` is a function, and the rules below are what the reader actually feels,
-// which is where a run of typing ends.
+// Typed facade for the imported prompt-editing history helpers.
 
 interface UndoParts {
   textEdit(before: string, after: string, caret: number): TextEdit;
@@ -20299,8 +19477,7 @@ function undoParts(): UndoParts {
   return { textEdit, undoJoins, undoStart, undoRecord, undoTake, undoIntent, UNDO_GAP, UNDO_DEPTH };
 }
 
-// A reader typing a run of characters onto the end of what the box holds, one press at a
-// time, with the clock moving between them. Answers with the time of the last press.
+// Append characters with controlled edit timestamps and return the final timestamp.
 function typedInto(parts: UndoParts, stack: UndoStack, run: string, from: number, gap: number): number {
   let now = from;
   let text = stack.done[stack.done.length - 1].text;
@@ -20312,15 +19489,14 @@ function typedInto(parts: UndoParts, stack: UndoStack, run: string, from: number
   return now;
 }
 
-// The text of every step held, oldest first, which is what undo walks back through.
+// Return retained undo text from oldest to newest.
 function undoTexts(stack: UndoStack): string[] {
   return stack.done.map((step) => step.text);
 }
 
 test('an edit is read off the two texts, at the right place and the right size', () => {
   const { textEdit } = undoParts();
-  // Every row carries the caret the box would report after the change, because that is what
-  // the panel hands over and what decides the answer when the texts alone cannot.
+  // Supply the caret position reported after each edit.
   const cases: [string, string, number, string, number, string, string][] = [
     ['', 'h', 1, 'insert', 0, '', 'h'],
     ['hell', 'hello', 5, 'insert', 4, '', 'o'],
@@ -20330,8 +19506,7 @@ test('an edit is read off the two texts, at the right place and the right size',
     ['hello', 'world', 5, 'other', 0, 'hello', 'world'],
     ['hi', 'hi', 2, 'other', 2, '', ''],
     ['run /co', 'run /compact ', 13, 'insert', 7, '', 'mpact '],
-    // The same character typed at each end of a run of it. The texts read alike, and only the
-    // caret says which end the reader was standing at.
+    // The caret distinguishes identical-character edits at opposite ends of a run.
     ['aaa', 'aaaa', 1, 'insert', 0, '', 'a'],
     ['aaa', 'aaaa', 4, 'insert', 3, '', 'a'],
     ['aaa', 'aa', 0, 'delete', 0, 'a', ''],
@@ -20345,21 +19520,19 @@ test('an edit is read off the two texts, at the right place and the right size',
     assert.equal(edit.added, added, `"${before}" to "${after}" puts in the wrong text`);
   }
 
-  // A caret the change cannot account for falls back to comparing the texts, rather than
-  // reporting a position that does not rebuild what the box now holds.
+  // An invalid caret falls back to the difference between the texts.
   assert.equal(textEdit('hell', 'hello', 99).at, 4, 'a caret that explains nothing is trusted anyway');
 
-  // One character joins the run before it, and a space closes the word it ends. Anything
-  // larger is a paste, a command completed or a word taken out whole, and each of those
-  // stands alone in both directions.
+  // Single-character edits join typing runs.
+  // Whitespace ends a run, while larger edits remain separate.
   assert.equal(textEdit('hell', 'hello', 5).solo, false, 'a single character typed is read as a paste');
   assert.equal(textEdit('hell', 'hello', 5).ends, false, 'a letter closes the word it is part of');
   assert.equal(textEdit('one', 'one ', 4).ends, true, 'a space leaves the word it ends open');
   assert.equal(textEdit('one', 'one\n', 4).ends, true, 'a newline leaves the line it ends open');
   assert.equal(textEdit('run /co', 'run /compact ', 13).solo, true, 'a command completed is read as one keystroke');
 
-  // Counted in the characters the reader sees. An emoji is two units and one keystroke, and a
-  // no-break space is a space wherever it came from.
+  // Count Unicode characters rather than UTF-16 units for edit grouping.
+  // Nonbreaking spaces end a run.
   assert.equal(textEdit('a', 'a\u{1F600}', 3).solo, false, 'an emoji typed is read as a paste');
   assert.equal(textEdit('a', 'a\u{1F600}', 3).ends, false, 'an emoji closes the word it is part of');
   assert.equal(
@@ -20392,7 +19565,7 @@ test('a run of typing is one step, and undo walks back a word at a time', () => 
 test('a run ends at a pause, at a change of direction and at anything larger than a keystroke', () => {
   const parts = undoParts();
 
-  // A pause. The reader stopped to think, and what they wrote after the pause is its own step.
+  // A pause beyond UNDO_GAP starts another step.
   const paused = parts.undoStart('', 0, 0);
   const at = typedInto(parts, paused, 'ab', 1000, 40);
   typedInto(parts, paused, 'c', at + parts.UNDO_GAP + 1, 0);
@@ -20402,8 +19575,7 @@ test('a run ends at a pause, at a change of direction and at anything larger tha
     'a pause longer than the gap does not end the run it interrupted',
   );
 
-  // Deleting after typing. The two directions never join, and a run of backspaces is one step
-  // however the caret walks back through it.
+  // Deletion starts a separate run after insertion, while consecutive backspaces join.
   const wiped = parts.undoStart('', 0, 0);
   typedInto(parts, wiped, 'abc', 1000, 40);
   parts.undoRecord(wiped, 'ab', 2, 2, 1200);
@@ -20414,8 +19586,7 @@ test('a run ends at a pause, at a change of direction and at anything larger tha
     'a backspace joins the typing before it, or a run of them is filed one step per press',
   );
 
-  // A paste. It is larger than a keystroke, so it neither joins the typing before it nor is
-  // joined by the typing after it.
+  // A paste stays separate from typing before and after it.
   const pasted = parts.undoStart('', 0, 0);
   typedInto(parts, pasted, 'ab', 1000, 40);
   parts.undoRecord(pasted, 'abLONG', 6, 6, 1090);
@@ -20428,10 +19599,7 @@ test('a run ends at a pause, at a change of direction and at anything larger tha
 });
 
 test('two edits at opposite ends of a run of one character do not join', () => {
-  // The texts read alike whichever end the reader typed at, so without the caret both changes
-  // land at the end, the second joins the first, and the state between them is gone. This is
-  // written at the stack rather than at the edit because the loss is what a reader feels: one
-  // press of undo that goes back further than the one thing they just typed.
+  // Preserve separate undo steps for identical-character edits at opposite ends of a run.
   const parts = undoParts();
   const stack = parts.undoStart('aa', 2, 2);
   parts.undoRecord(stack, 'aaa', 3, 3, 1000);
@@ -20442,7 +19610,7 @@ test('two edits at opposite ends of a run of one character do not join', () => {
     'the two ends of a run of one character are read as the same place, so a state is lost',
   );
 
-  // A run of the same character deleted from either end has the ambiguity too.
+  // Opposite-end deletions also retain separate steps.
   const cut = parts.undoStart('bbb', 3, 3);
   parts.undoRecord(cut, 'bb', 2, 2, 2000);
   parts.undoRecord(cut, 'b', 0, 0, 2040);
@@ -20452,7 +19620,7 @@ test('two edits at opposite ends of a run of one character do not join', () => {
     'a character taken off each end of a run is read as one run of backspaces',
   );
 
-  // And the ordinary run still joins, or the fix has cost the reader the whole feature.
+  // Ordinary consecutive typing retains one undo step.
   const plain = parts.undoStart('', 0, 0);
   typedInto(parts, plain, 'word', 3000, 40);
   assert.deepEqual(undoTexts(plain), ['', 'word'], 'a plain run of typing is no longer one step');
@@ -20465,14 +19633,12 @@ test('a change ends what the reader had taken back, and the steps have a ceiling
   parts.undoTake(stack, true);
   assert.equal(stack.undone.length, 1, 'undo keeps nothing to put back');
 
-  // Typed over, which is the branch redo cannot cross: the step it held was never made
-  // against the text now in the box.
+  // Typing after undo clears the redo branch.
   typedInto(parts, stack, 'x', 5000, 40);
   assert.equal(stack.undone.length, 0, 'redo still offers a step the new text was never made against');
   assert.equal(parts.undoTake(stack, false), null, 'redo puts back text the reader wrote over');
 
-  // A record that changes nothing is not a step. The caret moving fires the same path, and a
-  // stack that grew on it would need a press per arrow key to get anywhere.
+  // Caret movement without a text change adds no undo step.
   const still = parts.undoStart('hi', 2, 2);
   parts.undoRecord(still, 'hi', 0, 0, 9000);
   assert.equal(still.done.length, 1, 'a caret moving is filed as a step of its own');
@@ -20522,7 +19688,7 @@ test('undo and redo are read off the press the same way on both platforms', () =
   assert.equal(undoIntent(null), '', 'a listener handed nothing at all answers with a move');
 });
 
-// The send chord, which is the only key that reaches the composer from outside its box.
+// The page-level send chord follows platform conventions.
 
 test('the send chord takes one modifier per platform and refuses the other one', () => {
   const press = (over: Record<string, unknown>) => ({
@@ -20547,7 +19713,7 @@ test('the send chord takes one modifier per platform and refuses the other one',
   assert.equal(isSendChord(press({ ctrlKey: true }), 'Linux x86_64'), true, 'Ctrl and Enter does not send on Linux');
   assert.equal(isSendChord(press({ metaKey: true }), 'MacIntel'), true, 'Command and Enter does not send on a Mac');
 
-  // Each platform refuses the other one's modifier, so one key press cannot mean two things.
+  // Reject the other platform's modifier.
   assert.equal(isSendChord(press({ ctrlKey: true }), 'MacIntel'), false, 'Ctrl and Enter sends on a Mac');
   assert.equal(isSendChord(press({ metaKey: true }), 'Win32'), false, 'Command and Enter sends on Windows');
 
@@ -20568,8 +19734,7 @@ test('the send chord takes one modifier per platform and refuses the other one',
   assert.equal(isSendChord(null, 'Win32'), false, 'a listener handed nothing at all sends the box');
 });
 
-// Cut and copy with nothing selected, which the editor answers with the whole line and a
-// textarea answers with nothing at all.
+// Cut and copy use the current line when the text selection is empty.
 
 test('the line under the caret is taken with the break that separates it from its neighbour', () => {
   const took = (text: string, caret: number, cut = false) => {
@@ -20577,8 +19742,7 @@ test('the line under the caret is taken with the break that separates it from it
     return text.slice(at.start, at.end);
   };
 
-  // A line with a break after it takes that break, so what leaves opens at the start of a
-  // line. Both presses agree there.
+  // Include the following line break for both cut and copy.
   for (const cut of [false, true]) {
     assert.equal(took('one\ntwo\nthree', 0, cut), 'one\n', 'the caret at the start of a line takes the wrong line');
     assert.equal(took('one\ntwo\nthree', 3, cut), 'one\n', 'the caret at the end of a line takes the line after it');
@@ -20592,13 +19756,12 @@ test('the line under the caret is taken with the break that separates it from it
       'two\n',
       'the caret inside a line takes something other than that line',
     );
-    // An empty line is a line, and cutting it is how the reader closes a gap they opened.
+    // Empty middle lines retain their line break.
     assert.equal(took('a\n\nb', 2, cut), '\n', 'an empty line in the middle cannot be cut');
   }
 
-  // The last line has no break after it, and the two presses part company. A cut takes the
-  // break before it, or an empty line is left standing where the line was. A copy does not,
-  // or the clipboard opens with a break and pastes a blank line nobody copied.
+  // Cutting the final line includes its preceding break.
+  // Copying it excludes that break.
   assert.equal(took('one\ntwo\nthree', 9, true), '\nthree', 'the last line leaves an empty line behind when it is cut');
   assert.equal(took('one\ntwo\nthree', 13, true), '\nthree', 'the caret at the very end cuts the wrong line');
   assert.equal(
@@ -20608,7 +19771,7 @@ test('the line under the caret is taken with the break that separates it from it
   );
   assert.equal(took('one\ntwo\nthree', 13), 'three', 'a copy at the very end takes the wrong line');
 
-  // One line and no break at all takes the whole of it, and an empty box takes nothing.
+  // A single line is taken whole, and an empty text field supplies nothing.
   for (const cut of [false, true]) {
     assert.equal(took('one line', 4, cut), 'one line', 'the only line in the box is not taken whole');
     assert.equal(took('', 0, cut), '', 'an empty box hands the clipboard something');
@@ -20654,14 +19817,8 @@ test('the Composer and comment box install the shared line clipboard wiring', ()
   );
 });
 
-// Each of these can be taken out with the suite green and the typecheck clean, so these tests
-// read `panelhost.ts` as text, which is what the guards over `setDraft` above do.
 test('the press with nothing behind it is swept before the gate that asks what moved', () => {
-  // One press expires on the clock alone: a command the agent answered by itself, whose text
-  // the transcript reader strips to nothing so no turn ever appears under it. The gate below
-  // asks whether the transcript moved, and on a quiet workspace the answer is no for as long
-  // as the panel stays open. A sweep only after the gate therefore never runs at all, and the
-  // card goes on saying an agent is working on something it finished in milliseconds.
+  // Sweep expired live presses before the refresh-change gate.
   const swept = panelHostSource.indexOf('const swept = this.dropSpentPresses();');
   const gate = panelHostSource.indexOf('refreshWanted({');
   assert.ok(swept !== -1, 'nothing sweeps the presses before the gate, so the ceiling never runs');
@@ -20669,8 +19826,7 @@ test('the press with nothing behind it is swept before the gate that asks what m
     gate !== -1 && swept < gate,
     'the sweep moved behind the gate, so a press with no record outlives the panel',
   );
-  // And the sweep is a reason to draw in its own right. Without this the card is taken out of
-  // the book and left on the screen, because nothing else asked for a repaint.
+  // A sweep that removes a press also requires a render.
   sourceMatch(
     sourceNodes(
       panelHostSource,
@@ -20716,9 +19872,7 @@ test('the provider carries the walk between its two books and the composer', () 
       `${why}: \`${line}\` is gone from panelhost.ts`,
     );
   }
-  // The save after pruning, read from the catch-up block rather than from the whole file, so
-  // this fails if the write moves out of the block instead of passing on a `writeDrafts` call
-  // that some other, unrelated site still makes.
+  // Require persistence inside the submitted-prompt pruning block.
   const pruneAt = panelHostSource.indexOf('this.promptsBySession.clear();');
   const pruneEnd = panelHostSource.indexOf(
     'this.newestCompactionBySession = currentRecords.newestCompactions;',
@@ -20734,18 +19888,14 @@ test('the provider carries the walk between its two books and the composer', () 
     /void this\.writeDrafts\(\);/,
     'the pruned projection never reaches storage, so a restart brings back a prompt the transcript already recorded',
   );
-  // The write inside `holdDraft`, read from that method rather than from the file. The same
-  // line stands in `setDraft`, so a check over the whole file passes with this one deleted.
-  // Without it a prompt going out never clears the box copy: the control reads Send over an
-  // empty box for the whole running turn, and the press meant to stop the turn does nothing.
+  // holdDraft updates boxText as well as the retained draft.
   const heldBody = declarationSource(panelHostSource, 'holdDraft');
   sourceMatch(
     heldBody,
     /this\.boxText\[session\] = text;/,
     'the box copy outlives the words it held, so the send control answers for a prompt that has gone',
   );
-  // Three times each. Adoption, abandonment and succession all hand the two books over, and
-  // a call site that leaves one out empties that book for every session the panel holds.
+  // Adoption, abandonment, and succession each receive sentPrompts and boxText.
   for (const book of ['sent: this.sentPrompts', 'boxText: this.boxText']) {
     assert.equal(
       sourceNodes(panelHostSource, (node) => ts.isPropertyAssignment(node) && node.getText() === book).length,
@@ -20753,12 +19903,8 @@ test('the provider carries the walk between its two books and the composer', () 
       `one of the three identity calls does not hand over \`${book}\``,
     );
   }
-  // Where, as well as whether. The one place a prompt leaves for an agent, which both the
-  // press and the queue drain reach. Filed at the press instead, a command the panel answers
-  // itself, a compaction, and a queued prompt the reader then removes all sit in front of
-  // every real prompt for the life of the window, and the removed one never went anywhere.
-  // Each method is read whole from the syntax tree. A slice between two text anchors read
-  // nothing once a signature wrapped, and a check over nothing passes.
+  // Record submitted-prompt recovery in send, after local panel-command handling.
+  // Extract each method through the syntax tree.
   const body = declarationSource(panelHostSource, 'send');
   sourceMatch(
     body,
@@ -20917,9 +20063,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     /railRenderer\.visible\(\)/,
     'wide startup decides compact controls from a nullable rail payload instead of the responsive rail state',
   );
-  // Outcome 3 of the interaction plan: selecting a session must not be what reveals its
-  // facts. The walk is the broadest of those reads, and a click cannot have changed what it
-  // would find. Worker results also reuse it when the file stayed at that catalog revision.
+  // Count refresh callers that request catalog reuse.
   const reusing = [...panelHostSource.matchAll(/this\.refresh\([^)]*\b(?:true|false)\s*,\s*true\)/g)];
   assert.equal(
     reusing.length,
@@ -20947,8 +20091,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     2,
     'rail enrichment cannot reuse a current catalog or replace one invalidated by stale metadata',
   );
-  // The older-history sentinel paints its loading status before the first read.
-  // The selected-only refresh gets past a catalog refresh already in flight.
+  // Older-history loading requests an immediate selected-only refresh.
   const olderAt = panelHostSource.indexOf('private async loadOlderHistory(sessionId: string): Promise<void> {');
   assert.notEqual(olderAt, -1, 'older history is requested some other way, so this guard is blind');
   const older = memberFrom(panelHostSource, olderAt);
@@ -20957,9 +20100,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     /this\.refresh\(true, true, true, true\);/,
     'the sentinel stands still under the reader while its page is read',
   );
-  // The selection message and the walk back and forward both open a session through one
-  // method, so the reuse is read there. Walking back to a session is a selection too: it
-  // can no more add, remove or grow a transcript than a press on the rail can.
+  // Selection and history navigation share show and its selected-only refresh.
   const showAt = panelHostSource.indexOf('private show(session: string | null, host?: PanelHost): void {');
   assert.notEqual(showAt, -1, 'the panel opens a session some other way, so this guard is blind');
   const show = memberFrom(panelHostSource, showAt);
@@ -20974,8 +20115,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     'the selection message no longer opens a session the way every other route does',
   );
 
-  // The held catalog is read only when a caller asks for it, and written by every walk, so
-  // the oldest it can ever be is one refresh. Nothing has to invalidate it.
+  // Reuse the retained catalog only when requested and its folder identity matches.
   const listing = memberFrom(
     panelHostSource,
     panelHostSource.indexOf('private allSessions(reuseCatalog = false): SessionFile[] {'),
@@ -20991,8 +20131,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     /revalidatedCatalog\(this\.catalog\.sessions, this\.showing,/,
     'the reuse path does not state the session it is about to read',
   );
-  // The session that was read again is held, or the next selection hands its old size
-  // back and every derived fact about it is worked out a second time.
+  // Retain revalidated session revisions and distinguish reuse from a catalog walk.
   sourceMatch(
     body,
     /this\.catalog = \{ folders: folderPrint, sessions: sorted \};\s*this\.catalogWalked = false;/,
@@ -21271,12 +20410,10 @@ test('a refresh keeps parsed rail cache facts at their parse revision until the 
 });
 
 test('the panel reads the mouse buttons the way the workbench reads them', () => {
-  // Three and four are what a page is given for the two buttons on the side of a mouse, and
-  // they are the two the workbench itself reads.
+  // Mouse buttons three and four map to Back and Forward.
   assert.equal(navigationButton(3), 'goBack');
   assert.equal(navigationButton(4), 'goForward');
-  // Everything the reader uses to press a control has to fall through untouched, or the
-  // panel cancels the press that was meant to open something.
+  // Other mouse buttons do not request navigation.
   for (const other of [0, 1, 2, 5, -1]) {
     assert.equal(navigationButton(other), null, `button ${other} must not navigate`);
   }
@@ -21314,10 +20451,7 @@ test('a navigation press is cancelled on the way down and on the way up', () => 
 });
 
 test('back and forward answer the keys the editor already answers', () => {
-  // The same chords VS Code binds to Go Back and Go Forward on each platform, so the panel
-  // answers the key the reader already presses rather than teaching them a second one. The
-  // `when` clause is what keeps the override inside the panel: everywhere else the chord
-  // still reaches the editor's own navigation.
+  // Pin navigation chords for Windows, macOS, and Linux inside the Arc panel.
   const chords: Record<string, { key: string; mac: string; linux: string }> = {
     'arc.goBack': { key: 'alt+left', mac: 'ctrl+-', linux: 'ctrl+alt+-' },
     'arc.goForward': { key: 'alt+right', mac: 'ctrl+shift+-', linux: 'ctrl+shift+-' },
@@ -21333,8 +20467,7 @@ test('back and forward answer the keys the editor already answers', () => {
       'activeWebviewPanelId == arc.panel',
       `${command} takes its chord away from the editor outside the panel`,
     );
-    // And an arrow in the panel's own tab, which is the only route that needs no chord and
-    // no mouse of the right shape.
+    // The Arc editor tab also exposes both navigation actions as arrow icons.
     assert.equal(
       manifest.contributes.menus['editor/title'].some(
         (one: { command: string; when?: string }) =>
@@ -21353,8 +20486,7 @@ test('back and forward answer the keys the editor already answers', () => {
 });
 
 test('the editor setting for the mouse buttons reaches the panel too', () => {
-  // The workbench listener sits outside the frame the panel draws in, so switching the buttons
-  // off there leaves the panel walking on presses the reader asked nothing to answer.
+  // Mouse navigation follows the editor's mouseBackForwardToNavigate setting.
   sourceMatch(
     panelHostSource,
     /getConfiguration\('workbench\.editor'\)\s*\.get<boolean>\('mouseBackForwardToNavigate', true\)/,
@@ -21370,7 +20502,7 @@ test('the editor setting for the mouse buttons reaches the panel too', () => {
     /if \(mouseNavigates\(\)\) \{ this\.goForward\(host\); \}/,
     'a mouse press walks the trail even where the reader switched those buttons off',
   );
-  // The chord and the toolbar arrow are not that setting's business, so they stay ungated.
+  // Keep the direct Back method outside the mouse-setting gate.
   const goBack = panelHostSource.slice(panelHostSource.indexOf('public goBack(host?: PanelHost): void'));
   sourceDoesNotMatch(
     goBack.slice(0, 200),
@@ -21519,9 +20651,7 @@ test('session details keeps native controls and dialog lifetime outside the redr
     'full names are not scoped to sessions with a drawn heading',
   );
 
-  // The heading popover, the loading message and the composer's target all keep reading the
-  // sixty-character `label`, never the rail's own wider name, so a long session name cannot
-  // wrap a popover, rename an in-flight loading line, or repeat itself on the composer.
+  // Label-editor headings and prompt-box targets read the short session label.
   sourceMatch(
     panelHostSource,
     /labelEditorReply\(this\.saved\.labels, this\.sessionRows, session, CARD_ACTIONS\.labelHeading, browserSession\)/,
@@ -21542,15 +20672,13 @@ test('session details keeps native controls and dialog lifetime outside the redr
     /session: row\.label,/,
     'the composer target reads a field other than the sixty-character label',
   );
-  // The rail's own action buttons (pin, archive, label) are announced by the same short
-  // label, so a long session name cannot repeat itself on every button on a card.
+  // Session-list action names also read the short label.
   sourceMatch(
     railSource,
     /return `\$\{hotkeyName\(action, hotkey\)\}: \$\{card\.label\}`;/,
     'a rail action button is announced by a field other than the sixty-character label',
   );
-  // The rail card's own drawn name is a separate field, stripped from the `sessions` array
-  // the render payload sends, so the rail is the only reader that pays for the wider bound.
+  // Remove railName from the session rows supplied to the session view.
   sourceMatch(
     panelHostSource,
     /this\.sessionRows\.map\(\(\{ railName: _railName, \.\.\.row \}\) => \{/,
@@ -21607,9 +20735,7 @@ test('a session row carries a bounded rail name, past the sixty-character cut th
   );
 });
 
-// Two refreshes of one running Claude session through the provider's own naming path: the
-// metadata read reports once when it arrives, each parse reports its turns, and the rail row
-// and the session heading read the held name.
+// Supply metadata, parsed-name, and rename inputs to the provider's naming methods.
 function namedSessionProvider(
   stored: Iterable<[string, Record<string, unknown>]> = [],
   overrides: { file?: string; agent?: 'claude' | 'codex'; codexTurnTitle?: string } = {},
@@ -21621,10 +20747,10 @@ function namedSessionProvider(
     size: overrides.file ? fs.statSync(overrides.file).size : 1000,
     mtimeMs: 10,
     cwd: 'C:\\ws',
-    // The file number the catalog walk took, which every report of this session carries.
+    // Preserve the catalog's file identity with each reported revision.
     ino: overrides.file ? fs.statSync(overrides.file).ino : undefined,
   };
-  // The name a Codex session's parsed turns carry, which a refresh hands the heading.
+  // Supply Codex parsed-turn names for heading projection.
   const codexTitles = new Map(overrides.codexTurnTitle ? [[session.sessionId, overrides.codexTurnTitle]] : []);
   const provider = Object.create(PanelProvider.prototype) as LiveProvider;
   const titles = new Map<string, Record<string, unknown>>(stored);
@@ -21657,7 +20783,7 @@ function namedSessionProvider(
           stored as DerivedTitleEntry,
         ) as unknown as Record<string, unknown>,
       );
-      // As prepareMetadata does, the read's own name replaces the one a version bump carried.
+      // Fresh metadata replaces the carried name.
       (provider['carriedNames'] as Map<string, unknown>).delete(session.file);
       call('observeStoredEntry', session, titles.get(session.file));
     },
@@ -21667,9 +20793,7 @@ function namedSessionProvider(
         heading: call('headingTitle', session.sessionId, byId, codexTitles) as string,
       };
     },
-    // The metadata read of a transcript that grew after the catalog walk listed it. The
-    // worker stats the file itself before it reads, so its entry names the larger size while
-    // the catalog row still names the smaller one.
+    // Supply current metadata size while retaining the catalog's earlier size.
     readMetadataAfterGrowth() {
       const meta = readSessionMeta(session.file);
       this.metadata({
@@ -21680,8 +20804,7 @@ function namedSessionProvider(
         nameAt: meta.titleAt,
       });
     },
-    // The metadata read a refresh runs for a grown transcript, through the real reader. The
-    // catalog walk lists the file again first, so the row names the file that is there now.
+    // Update catalog identity and size before reading transcript metadata.
     readMetadata() {
       const listed = fs.statSync(session.file);
       session.ino = listed.ino;
@@ -21702,13 +20825,11 @@ function namedSessionProvider(
         heading: call('headingTitle', session.sessionId, byId, new Map()) as string,
       };
     },
-    // The thread-name index as a refresh reads it.
+    // Read the native Codex name index into the provider.
     readIndex() {
       Object.assign(provider, { threadNames: readThreadNames(codexSessionIndexPath(), null) });
     },
-    // A rename from the rail through the provider's own handler and its own refresh request.
-    // The agent call stands in for the provider. Each render the refresh asks for records
-    // what the rail row and the heading draw at that moment.
+    // Run the host rename method with a stubbed agent callback and capture names at refresh.
     rename(title: string, agent: (title: string) => Promise<void>, state: Record<string, unknown> = {}) {
       const renders: Array<{ reason: unknown; paths: unknown; rail: string; heading: string }> = [];
       Object.assign(provider, {
@@ -21725,23 +20846,23 @@ function namedSessionProvider(
         result: call('renameSession', session.sessionId, title) as Promise<{ title: string; error: string }>,
       };
     },
-    // A name a derived cache version bump carried for this session.
+    // Supply a name carried across derived-cache invalidation.
     carry(label: string) {
       (provider['carriedNames'] as Map<string, unknown>).set(session.file, { label, fullLabel: label });
     },
-    // The name every search entry of this session is filed under, as the corpus reads it.
+    // Return the distinct names used by this session's search entries.
     search() {
       Object.assign(provider, { corpus: provider['corpus'] ?? new Map(), allSessions: () => [session] });
       return [...new Set((call('searchCorpus') as Array<{ sessionTitle: string }>).map((entry) => entry.sessionTitle))];
     },
-    // The reader-owned state a rename must leave alone, read off the provider.
+    // Read provider-owned selection, pin, label, and read state.
     reader() {
       return readerOf(provider);
     },
   };
 }
 
-// Which session is shown, its pin, its labels, and how far it was read.
+// Supply selected identity, pin membership, labels, and read watermarks.
 function readerState(): Record<string, unknown> {
   return {
     showing: 'named-session',
@@ -21767,7 +20888,7 @@ function readerOf(from: Record<string, unknown>): unknown {
   };
 }
 
-// A Claude transcript whose custom title is already set, as a rename leaves it.
+// Build one native Claude custom-title record.
 function customTitleRecord(title: string): string {
   return `${JSON.stringify({ type: 'custom-title', customTitle: title, sessionId: 'named-session' })}\n`;
 }
@@ -21814,7 +20935,7 @@ test('renaming a session that already has a custom name draws the new name on it
     'a rename changed the selection, the pin, the labels, or the read state',
   );
 
-  // A rename typed in Claude Code afterward lands where the file ended, and it wins.
+  // A later native Claude title takes precedence.
   fs.appendFileSync(file, customTitleRecord('Third name'));
   provider.readMetadata();
   assert.deepEqual(
@@ -21824,9 +20945,7 @@ test('renaming a session that already has a custom name draws the new name on it
   );
 });
 
-// The page test for a heading rename posts its own payload. This ties the save to the host:
-// the panel hears the answer only after one render carries the new name to both the heading
-// and the rail row.
+// Send the rename answer after the host refresh observes updated heading and session-list names.
 test('a rename answers the panel after one render draws the new name on the heading and the rail row', async () => {
   const file = renamedClaudeTranscript();
   const provider = namedSessionProvider([], { file });
@@ -21872,7 +20991,7 @@ test('a Claude rename the agent refuses keeps the old name on the rail row and h
   assert.equal(provider.titles.get(file)?.label, 'First name');
 });
 
-// A Codex session named in the thread-name index, with parsed turns that carry the old name.
+// Supply a native Codex index name that differs from parsed-turn names.
 async function renameCodexSession(agent: (index: string) => Promise<void>) {
   const variable = 'ARC_CODEX_ROOT';
   const held = process.env[variable];
@@ -21913,8 +21032,7 @@ test('a Codex rename draws the name the index now holds on the rail row and head
   assert.deepEqual(provider.drawn(), { rail: 'New thread', heading: 'New thread' });
 });
 
-// A search reads a Codex session while it draws the name a version bump carried. The metadata
-// read then stores the real name, and the transcript itself does not change.
+// Fresh metadata replaces the carried Codex name in search without a transcript change.
 test('search files a Codex session under its read name once a metadata read replaces its carried name', () => {
   const variable = 'ARC_CODEX_ROOT';
   const held = process.env[variable];
@@ -21951,8 +21069,7 @@ test('search files a Codex session under its read name once a metadata read repl
   }
 });
 
-// A metadata read finds no name, as for a Codex rollout whose head prompt has no text. The
-// rail falls back to the id placeholder, and the transcript itself does not change.
+// Nameless fresh metadata replaces the carried name with the session placeholder.
 test('search files a session where the rail draws it once a metadata read finds no name in place of its carried name', () => {
   const variable = 'ARC_CODEX_ROOT';
   const held = process.env[variable];
@@ -22013,8 +21130,7 @@ test('a Codex rename the server refuses keeps the old name on the rail row and h
   assert.deepEqual(provider.drawn(), { rail: 'Old thread', heading: 'Old thread' });
 });
 
-// A session typed into from the Composer, recorded in the catalog so the rail can rename it.
-// Every prompt, rename and posted message it makes is kept for the test to read.
+// Capture prompts, rename requests, callback titles, and messages for a cataloged session.
 function typedRenameProvider(agent: 'claude' | 'codex', rename: (name: string) => Promise<void> = async () => {}) {
   const session = 'typed-session';
   const { provider } = queueRecoveryProvider();
@@ -22050,7 +21166,7 @@ function typedRenameProvider(agent: 'claude' | 'codex', rename: (name: string) =
       return Promise.resolve();
     },
   });
-  // What the reader typed, then Send.
+  // Submit the supplied text through sendPrompt.
   const type = async (text: string) => {
     provider.drafts[session] = text;
     provider.sendPrompt(text, session, 1);
@@ -22098,7 +21214,7 @@ test('a staged file stays attached through a typed Codex rename', async () => {
   assert.deepEqual(provider.assets[session], [asset], 'the rename consumed or dropped the staged file');
 });
 
-// Runs the test body with the editor's error and information messages kept for it to read.
+// Capture editor error and information messages while running the test callback.
 async function withEditorErrors(run: (errors: string[], notes: string[]) => Promise<void>): Promise<void> {
   const window = vscode.window as unknown as Record<string, unknown>;
   const held = { error: window.showErrorMessage, note: window.showInformationMessage };
@@ -22230,9 +21346,7 @@ test('a typed /rename renames while attached files are still staging', async () 
   });
 });
 
-// A Claude transcript at one path, then a different transcript written at the same path. The
-// first names itself far into the file and the second names itself near the start, so the
-// name of the file that is gone outranks the name of the file that is there.
+// Replace a transcript with a larger file whose custom title appears earlier.
 function replacedClaudeTranscript(): { file: string; replace: () => void } {
   const file = path.join(tempDir('replaced-panel-'), 'named-session.jsonl');
   const prompt = (text: string, uuid: string) => `${JSON.stringify({
@@ -22246,10 +21360,7 @@ function replacedClaudeTranscript(): { file: string; replace: () => void } {
   fs.writeFileSync(file, prompt('a'.repeat(4000), 'u1') + customTitleRecord('First name'));
   return {
     file,
-    // Written beside the transcript and renamed over it, so the replacement holds a file
-    // number of its own. A file written after the old one is removed can be given the number
-    // the removal freed, which ext4 does for the next file in the directory, and the test
-    // would then assert nothing about a replacement it cannot see.
+    // Create the replacement beside the existing file before renaming it, so both files have distinct identities.
     replace() {
       const written = `${file}.next`;
       fs.writeFileSync(written, prompt('b', 'u2') + customTitleRecord('Second name') + prompt('c'.repeat(8000), 'u3'));
@@ -22258,10 +21369,8 @@ function replacedClaudeTranscript(): { file: string; replace: () => void } {
   };
 }
 
-// The catalog walk lists a session, the transcript grows, and the metadata read that follows
-// stats the file for itself. The parse of that same refresh must measure the file too. Given
-// the listed size it reports a transcript smaller than the one the metadata read named, which
-// reads as a replacement and throws away the name the owner gave the session.
+// Metadata can observe growth after catalog listing.
+// Later parsing must preserve the name from that larger revision.
 test('a session that only grew between the walk and its metadata read keeps its name through the next parse', () => {
   const file = renamedClaudeTranscript();
   const provider = namedSessionProvider([], { file });
@@ -22286,11 +21395,7 @@ test('a session that only grew between the walk and its metadata read keeps its 
   );
 });
 
-// A search parses a session on its own timer while a metadata read of the same session is in
-// flight. The search reads the file as it is now and finds the name the owner gave it. The
-// read measured the file before the session grew, and its window found only the first prompt.
-// The two reports are of one file, so the earlier measurement arriving last must not read as
-// a transcript that shrank and take the higher name with it.
+// An earlier metadata result must not replace a higher-priority name observed by a later search read.
 test('a metadata read that measured a session before a search keeps the name the search raised', () => {
   const file = renamedClaudeTranscript();
   const provider = namedSessionProvider([], { file });
@@ -22325,9 +21430,7 @@ test('a metadata read that measured a session before a search keeps the name the
   );
 });
 
-// A parse reports before any metadata read, and the transcript at that path is replaced
-// before the read arrives. The replacement is larger and its own name sits earlier in it, so
-// only the identity of the file the parse read keeps the old name out of the new transcript.
+// File identity distinguishes replacement from growth when the replacement title appears earlier.
 test('a transcript replaced after its turns were parsed takes its own name, and keeps it after a restart', () => {
   const replaced = replacedClaudeTranscript();
   const provider = namedSessionProvider([], { file: replaced.file });
@@ -22417,10 +21520,8 @@ test('a Claude session raised by its parsed turns before its metadata read draws
   );
 });
 
-// Turn 1 launches a background subagent, and turn 2's main agent finishes while it still runs.
-// The tail read reaches only turn 2, so the host merges the parsed window. The rail then says
-// 1 subagent, and the newest card counts the same carried subagent on a full draw and on a
-// single-card activity refresh.
+// Preserve a background subagent launched outside the tail window.
+// Session-list and newest-card figures count the same carried subagent.
 test('the host counts a carried subagent on the rail and the newest card alike', () => {
   const stampAt = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
   const prompt = (text: string, second: number, id: string) => ({
@@ -22514,9 +21615,7 @@ test('the host counts a carried subagent on the rail and the newest card alike',
   }
 });
 
-// A dispatched session can close its turn while its work goes on: a subagent it launched in the
-// background still runs, or a command it started in the background does. The rail words each
-// state, and the parent card's dispatched row reads running until the work ends, then done.
+// Dispatched rows remain running while their sessions retain background subagents or commands.
 test.each(['subagents', 'background'] as const)(
   'the host draws a dispatched row as running while its session reads %s, then done',
   (status) => {
@@ -22613,7 +21712,7 @@ test.each(['subagents', 'background'] as const)(
             owned: false,
           },
         ],
-        // The rail input's other figures are not under test.
+        // Supply empty lifetime figures to isolate running-state projection.
         lifetimeFiguresBySession: () => ({ stats: {}, contextDetails: {}, costs: {}, dispatched: {} }),
         railRows: () => [],
         windows: new Map(),
@@ -22695,10 +21794,7 @@ test.each(['subagents', 'background'] as const)(
   },
 );
 
-// A dispatched session's typed prompt lies before the metadata tail, and the command it
-// launches lies inside the tail. The tail read then reports the launch as `meta.backgroundCommands`
-// rather than as part of an outcome, so the host must carry the whole metadata read forward,
-// not the outcome alone, for the rail to still draw `background`.
+// Retain background commands from metadata when the tail window excludes their typed prompt.
 test('the host counts a background command whose typed prompt lies before the tail', () => {
   const stampAt = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
   const file = path.join(tempDir('background-tail-'), 'sess.jsonl');
@@ -22769,8 +21865,7 @@ test('the host counts a background command whose typed prompt lies before the ta
     const { provider } = liveProviderFixture(livePress({ sessionId: 'sess' }));
     Object.assign(provider, {
       titles: new Map([[file, meta]]),
-      // The lifetime scan reads the whole file, so it holds the same turn's outcome with no
-      // typed-prompt gap. `outcomeWithWiderChildren` attaches the tail's commands to it.
+      // Supply the complete turn outcome independently from tail-window commands.
       lifetimeRailFacts: () => ({
         sess: {
           outcome: {
@@ -22817,8 +21912,7 @@ test('the host counts a background command whose typed prompt lies before the ta
   }
 });
 
-// A provider holding the real counters, the real sink and the real threshold watch, so a
-// milestone travels the path it travels in an editor window.
+// Supply production performance counters and threshold checks with captured diagnostic outputs.
 function startupFixture() {
   const logged: Array<[string, Record<string, unknown>]> = [];
   const warned: Array<[string, Record<string, unknown>]> = [];
@@ -22857,14 +21951,12 @@ function startupFixture() {
   return { call, host, logged, warned, notices };
 }
 
-// A startup milestone carries `performance.now()`, which counts from the extension host
-// process and is therefore as old as the editor window. A reader who opens the panel an hour
-// into a window must not be told that Arc took an hour to draw its first card.
+// Measure startup duration from panel opening rather than process startup.
 test('the startup threshold measures the wait since the panel opened', () => {
   const clock = vi.spyOn(performance, 'now');
   try {
     const quick = startupFixture();
-    // An editor window one hour old, and a panel that drew its first card in 1.5 seconds.
+    // Open the panel after one process hour and acknowledge its first card 1.5 seconds later.
     clock.mockReturnValue(3_600_000);
     quick.call.notePanelStart();
     clock.mockReturnValue(3_601_500);
@@ -22925,9 +22017,7 @@ test('the startup threshold measures the wait since the panel opened', () => {
   );
 });
 
-// An empty workspace draws its whole first view in seconds and gains a first card only when
-// an agent runs. The hours in between are the reader's own wait, so Arc reports no slow start
-// and writes no breach file for it.
+// A first card after completeRender does not extend the startup interval.
 test('a first card drawn after the first draw finished reports no slow start', () => {
   const clock = vi.spyOn(performance, 'now');
   try {
@@ -22938,7 +22028,7 @@ test('a first card drawn after the first draw finished reports no slow start', (
     empty.call.browserPainted(empty.host, 7, 'railReady');
     clock.mockReturnValue(3_000);
     empty.call.browserPainted(empty.host, 7, 'completeRender');
-    // Three hours of an empty rail, and then the first agent of the day.
+    // Advance three hours after startup completion before acknowledging the first card.
     clock.mockReturnValue(10_803_000);
     empty.call.browserPainted(empty.host, 7, 'firstCard');
 
@@ -22958,8 +22048,7 @@ test('a first card drawn after the first draw finished reports no slow start', (
   }
 });
 
-// The threshold reads the wait since the panel opened. With no panel start recorded there is
-// no such number, so it measures nothing rather than measuring from the extension host.
+// Without a recorded panel start, milestone handling applies no startup threshold.
 test('a milestone with no recorded panel start runs no threshold', () => {
   const clock = vi.spyOn(performance, 'now');
   try {
@@ -22979,8 +22068,7 @@ test('a milestone with no recorded panel start runs no threshold', () => {
   }
 });
 
-// The output channel holds one line for each message kind, because a message over budget on
-// every refresh would fill it. The log is the surface that carries what that one line cannot.
+// Log every message-budget breach and warn once per message kind.
 test('every budget breach reaches the log and the first of a kind reaches the reader', () => {
   const logged: Array<[string, Record<string, unknown>]> = [];
   const notices: string[] = [];
@@ -23027,8 +22115,7 @@ test('every budget breach reaches the log and the first of a kind reaches the re
   );
 });
 
-// The log writes nothing while the setting is off, and the reader still hears about a message
-// over budget. The warning is the panel's own signal and does not wait for a setting.
+// Message-budget warnings remain active when diagnostics logging is disabled.
 test('a message over budget warns the reader while the log is off', () => {
   const logged: Array<[string, Record<string, unknown>]> = [];
   const notices: string[] = [];
@@ -23064,38 +22151,17 @@ test('a message over budget warns the reader while the log is off', () => {
   assert.equal(notices[0].startsWith(`render message is ${bytes} bytes, above its 250000-byte budget.`), true);
 });
 
-// The subagent figure each side of the message boundary declares. `AgentFigureFacts` in
-// `view/stat-detail.ts` is the one declaration of the fields a figure carries. `AgentFigure` in
-// `turncard.ts` builds the figures from it, and `WireAgentFigure` in `webview/payload-contracts.ts`
-// types what arrives. The declarations below hold the two to each other.
-//
-// They compare field names as well as field types. Mutual assignability on its own reads an
-// optional field that one side alone declares as a match, and six of the figure's eight fields
-// are optional, so the name comparison is the half that catches the next field anyone adds.
-//
-// A wider field type fails earlier, at each side's own `extends` clause, because both sides
-// extend the shared declaration instead of intersecting with it.
-//
-// Three things these declarations do not reach. The record behind a figure is the field each side
-// declares for itself, for the reason `view/stat-detail.ts` gives, so a field added inside a
-// record arrives unchecked. The rest of a subagent row is mirrored by hand and is compared
-// nowhere: `description`, `model`, `effort`, `state`, `stateWord`, `since`, `hintDetail` and
-// `sessionId` each stand written twice, and `state` repeats a union word for word. And nothing
-// here reads a message, because the host casts the card it posts, so this proves the two
-// declarations agree and not that a payload matches either one.
-//
-// The compiler alone runs this check. `npm run typecheck` builds `extension/tsconfig.json`, which
-// includes this file, and a mismatch fails there. It does not stop the test run:
-// `extension/vitest.config.ts` sets no `typecheck` option, so vitest transpiles through esbuild
-// and runs this file green with a type error present.
+// Compare host and wire subagent figure types by field names and mutual assignability.
+// Exclude record details, the remaining subagent fields, and runtime payload validation.
+// TypeScript compilation runs this check.
+// Vitest transpilation alone does not enforce it.
 type HostFigure = AgentCard['figures'][number];
 type WireFigure = NonNullable<CardView['agents']>[number]['figures'][number];
 
-// What a mismatch reads as, so the compiler's own message says what broke.
+// Name the mismatch in the compiler diagnostic.
 type FigureMismatch = 'the panel contract and the card reducer describe different subagent figures';
 
-// True where two shapes carry the same field names and each side's field types accept the
-// other's, and the sentence above otherwise.
+// Require equal field names and mutually assignable field types.
 type Mirrors<A, B> = [keyof A] extends [keyof B]
   ? [keyof B] extends [keyof A]
     ? [A] extends [B]
@@ -23106,14 +22172,12 @@ type Mirrors<A, B> = [keyof A] extends [keyof B]
     : FigureMismatch
   : FigureMismatch;
 
-// Resolves to what it is given, and fails to compile where that is the sentence above, which then
-// reads in the compiler's message.
+// Accept only true, so a mismatch fails the generic constraint.
 type Holds<T extends true> = T;
 
 export type SubagentFigureMirror = Holds<Mirrors<Omit<HostFigure, 'record'>, Omit<WireFigure, 'record'>>>;
 
-// Returning a commit row's subject or its maker's name to wrapping has to be a change to one
-// rule each, so no second rule may set the four truncation properties on either.
+// Each commit subject and maker selector has one truncation rule.
 test('one rule truncates a commit row subject, and one rule truncates its maker name', () => {
   const rules = [...styleSource.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g)];
   const setting = (selector: string) =>
@@ -23126,15 +22190,13 @@ test('one rule truncates a commit row subject, and one rule truncates its maker 
   assert.equal(setting('.commitrow .commitmakerlink'), 1, 'a second rule sets how a maker name truncates');
 });
 
-// Every popover shares one layer, so a hint whose control sits inside a popover drew under it
-// whenever that popover came later in the body. The hint box now has a layer of its own. This
-// holds what keeps it on top: the highest z-index in the stylesheet, no inline z-index in the
-// panel's scripts, and no entry to the browser's top layer, which draws over any z-index.
+// Require the hint box's stylesheet z-index to exceed every other declared z-index.
+// Forbid inline z-index and browser top-layer APIs in the checked sources.
 test('the hint box draws over every popover', () => {
   const css = styleSource.replace(/\/\*[\s\S]*?\*\//g, '');
   const hint = /(?:^|\n)#hintpop \{([^}]*)\}/.exec(css);
   assert.ok(hint, 'panel.css has no #hintpop rule');
-  // A declaration ends at a semicolon or at the brace that closes its rule.
+  // A declaration ends at its semicolon or closing rule brace.
   const own = /z-index:\s*([^;}]+?)\s*(?:;|$)/.exec(hint[1]);
   assert.ok(own, 'the #hintpop rule sets no z-index');
   const top = Number(own[1].trim());
@@ -23502,8 +22564,7 @@ function pendingModelLauncher() {
   return { provider, owner, created, release, result, completed: () => completion };
 }
 
-// The first selection must carry the parent before any later refresh can repair it.
-// These Node cases cover both creation routes without a browser or timer wait.
+// The first child selection includes its reader-started parent on both creation routes.
 test.each([false, true])('the first reader child selection includes its parent (recovery %s)', async (recovery) => {
   const f = pendingModelLauncher();
   const provider = f.provider as Record<string, any>;

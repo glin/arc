@@ -96,9 +96,9 @@ import { TURN_QUIET_MS, statusOf } from './turncard';
 const agentSpends = new AgentSpendCache();
 const claudeChildSessions = new ClaudeChildSessionCache();
 const claudeChildReferences = new Map<string, ClaudeChildReferenceCacheEntry>();
-// `tree` holds the revisions of the session's subagents, whose spend its figure includes.
-// `person` is the scan for a sign of a person while the session runs, which reads only the
-// bytes appended since. Codex retains copied-turn corrections through quiet reads too.
+// Cached subagent revisions invalidate the dispatched session's spend.
+// Claude retains its append scan for reader input.
+// Codex retains its prompt cursor across quiet reads to correct copied-turn classification.
 const dispatchFacts = new Map<
   string,
   {
@@ -909,7 +909,7 @@ async function execute(
     .sort()
     .join('\n');
   const claudeSpendParseKey = session.agent === 'claude' ? folders.map(normalizeFsPath).sort().join('\n') : '';
-  // One clock reading for every spend read and for the key filed with them.
+  // Use one clock reading for child spend and its dependency key.
   const spendNow = request.input.spendNow ?? Date.now();
   const agentSpendOf: AgentSpendLookup = (agent) => {
     const file = agentFile(agent);
@@ -1255,9 +1255,9 @@ async function handleMessage(message: {
       });
       return;
     }
-    // Catalog metadata is a bounded prefix fact. Start it from the revision that exists
-    // when the worker begins, even when listing happened before an active session appended.
-    // Semantic windows and pages still require the exact revision their adapter requested.
+    // Read catalog metadata against the revision present when the worker starts.
+    // An active session can append after listing.
+    // History windows and pages require the exact requested revision.
     const metadataRequest =
       request.kind === 'metadata'
         ? { ...request, session: { ...request.session, size: before.size, mtimeMs: before.mtimeMs } }

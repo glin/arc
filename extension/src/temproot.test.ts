@@ -1,4 +1,4 @@
-// extension/src/temproot.test.ts
+// Test temporary-directory configuration.
 import { test } from 'vitest';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';

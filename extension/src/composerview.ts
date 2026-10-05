@@ -11,17 +11,8 @@ import {
   type DefaultContext,
 } from './view/model-picks';
 import { CARD_ACTIONS } from './view/card-words';
-// What the composer shows and what the reader's answer means.
-//
-// The prompt box, the picker that answers an agent's question and the words on the
-// interrupt affordance all need decisions made: which executable to start, which
-// session a prompt belongs to, what a permission ask reads as, and what the reader
-// choosing "Deny" turns into on the wire. Those decisions live here because this file
-// imports no `vscode`, so they are the part of the composer the tests can reach.
-//
-// `extension.ts` and the webview draw what this file decides. Neither of them decides
-// anything: both are exempt from testing, and this repo's two shipped regressions were
-// both in code that drew and decided at once.
+// Prepares Prompt box state, permission requests, and answers without importing `vscode`.
+// The host and webview consume these decisions.
 
 import {
   AgentPrompt,
@@ -44,9 +35,8 @@ import {
 } from './promptassets';
 import { formatMegabytes } from './turnformat';
 import { PermissionMode } from './claudewire';
-// The servers control is written whole in `mcpview.ts`, words and all, and this file places
-// it on the row. The two are imported as values here and only as types there, which is what
-// keeps the pair from needing each other at load time.
+// `mcpview.ts` prepares the Servers control and menu. This module places the control
+// on the row. Type-only imports there prevent a runtime dependency cycle.
 import { mcpMenu, mcpPick } from './mcpview';
 import {
   WINDOW_SUFFIX,
@@ -95,10 +85,8 @@ import {
 } from './pricing';
 import { CACHE_SPAN_MINIMUM_SECONDS } from './view/time';
 import { looksLikeComments } from './turncomments';
-// The line that says what a tool wants to do, from whichever field the tool put it in.
-// It lives in `transcript.ts` because the step rows on a card read the same rule, and
-// this module is downstream of that one. Re-exported because the ask is what a reader
-// looking for the words on a permission dialog opens.
+// `transcript.ts` describes tool input for both turn cards and permission requests.
+// Re-export the shared description for request presentation.
 import { describeToolInput, firstLine } from './transcript';
 export { describeToolInput };
 import { activityDetail } from './activitydetail';
@@ -134,36 +122,24 @@ import {
   type SetupValueName,
 } from './domain/session-setups';
 
-// A lookup on a table written as an object literal. Never a bare index: `toString` and
-// `constructor` are keys every object literal answers to, and an agent name arriving from
-// stored state is text, so a bare lookup can hand back a function where a table row was
-// expected.
+// Read only the table's own keys. Inherited keys such as `toString` and `constructor`
+// must not return functions in place of rows for stored agent names.
 function own<T>(table: Record<string, T>, key: string): T | undefined {
   return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
 }
 
-// How much the agent asks before it acts. One control per agent, in that agent's own words.
-//
-// Neither CLI publishes words for its permission values: Claude's `--help` lists the names
-// alone, and Codex's generated schema carries `untrusted | on-request | never | {granular}`
-// with no labels against them. So whatever this panel draws is a copy, and both label sets
-// below are copied from each agent's own official VS Code extension rather than written
-// here. Those words are a published product surface the reader has already seen, and each
-// one stands for exactly one CLI value. The cost is that both sets have to be read again
-// whenever either extension ships a new version, and a value one of them drops has to be
-// dropped here too.
+// Each agent has its own permission control and labels. Claude choices use permission modes.
+// Codex presets combine approval policy, reviewer, and sandbox access.
+// Keep these tables aligned with the presets each agent offers.
 export type ApprovalPolicy = 'untrusted' | 'on-request' | 'never';
 export type ApprovalsReviewer = 'user' | 'auto_review';
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
 export interface AskMode {
-  // What workspace state keeps, which is the agent's own CLI value. A stored answer is then
-  // read back through one table rather than translated through two.
+  // The preset key stored in workspace state.
   value: string;
   label: string;
-  // The agent's own sentence under the label, and empty for an agent that publishes none.
-  // A sentence written here would be this panel's claim about what another product's
-  // setting does.
+  // The permission description under the label.
   description: string;
   // Claude takes this at spawn as `--permission-mode`, and again while the child runs as a
   // `set_permission_mode` control request.
@@ -177,14 +153,9 @@ export interface AskMode {
   };
 }
 
-// Four of Claude's seven `--permission-mode` values. The labels are the Claude Code
-// extension's own words for these four (`default` is named Manual across the CLI, the
-// extensions and the desktop app); Arc orders the four itself. Each description states
-// what that mode runs without asking, drawn from Claude Code's permission-modes
-// documentation rather than copied from any one surface.
-//
-// `bypassPermissions` runs everything with no check, and `dontAsk` denies anything that
-// would prompt, so Arc offers neither.
+// Arc offers Auto, Manual, Edit automatically, and Plan for Claude. Each description
+// states what the mode runs without approval. Arc omits `bypassPermissions`, which
+// skips permission checks, and `dontAsk`, which denies actions requiring approval.
 export const CLAUDE_ASK_MODES: readonly AskMode[] = [
   {
     value: 'auto',
@@ -212,12 +183,9 @@ export const CLAUDE_ASK_MODES: readonly AskMode[] = [
   },
 ];
 
-// Codex's four permission presets, in the order and words the Codex CLI uses.
-//
-// One choice covers what may run, which requests need review, and who performs that review.
-// `approvalPolicy` on its own does not answer it: `on-request` with the default `user`
-// reviewer still stops for the reader, while "Approve for me" promises automatic review.
-//
+// Codex permission presets combine access, approval policy, and reviewer.
+// `on-request` with the `user` reviewer asks the reader. The same policy with
+// `auto_review` sends eligible actions to automatic review.
 export const CODEX_ASK_MODES: readonly AskMode[] = [
   {
     value: 'read-only',
@@ -248,9 +216,8 @@ export const CODEX_ASK_MODES: readonly AskMode[] = [
   },
 ];
 
-// The line the menu opens with, per agent. The two questions are not the same question:
-// Claude's control says how much it asks before acting, and Codex's says how the actions it
-// takes get approved, so neither head can be written once for both.
+// Each menu heading names its agent's permission choice. Claude asks how often
+// to request approval. Codex asks how actions receive approval.
 export const ASK_MODE_HEADS: Record<string, string> = {
   claude: 'How much should Claude ask before it acts?',
   codex: 'How should Codex actions be approved?',
@@ -264,9 +231,7 @@ const ASK_MODE_TABLES: Record<string, readonly AskMode[]> = {
 // The explicit mode a new setup preselects, and the mode a legacy or unknown value presents.
 const DEFAULT_ASK_VALUES: Record<string, string> = { claude: 'auto', codex: 'on-request' };
 
-// The modes on offer for one agent. An agent this version has no table for is given the
-// first agent's, because a control drawn with nothing in it is worse than one showing a
-// setting the reader can see is not theirs.
+// Return the named agent's modes. Unknown agents use Claude's modes.
 export function askModes(agent: string): readonly AskMode[] {
   return own(ASK_MODE_TABLES, agent) ?? CLAUDE_ASK_MODES;
 }
@@ -301,9 +266,8 @@ export function savedAskMode(
   );
 }
 
-// The permission value the composer state carries. It resolves like `savedAskMode`, but
-// keeps an explicit agent default apart from no stored pick: the empty value is the reader's
-// choice of the agent default, and undefined means nothing stored names a permission.
+// The stored permission value preserves an explicit agent default as an empty
+// string. Undefined means no stored pick resolves to a permission value.
 export function storedAskValue(
   agent: string,
   sessionValue: string | undefined,
@@ -492,64 +456,44 @@ function liveAskMode(
   return effectiveClaudeDisplayMode(effectiveClaude) ?? agentDefaultMode(agent);
 }
 
-// What the composer draws above the prompt box: which session is being typed into, how
-// full its context window is, and the three settings the next turn will run under.
-//
-// The context figure lives here rather than on the status bar because a window belongs to
-// the session while a plan belongs to the account, and the two get full at different
-// times. The status bar carries the account's figures on the panel's bottom edge.
+// Prompt box controls describe the selected session, its context window, and its
+// next-turn settings. Context belongs to the session. Account usage belongs to
+// the status bar.
 
-// One control on the row. Every word is written here, so the webview inserts strings and
-// decides nothing: the label the eye reads, the name a reader who cannot see it hears, and
-// the hover.
+// A control's visible label, accessible name, and hint.
 export interface ComposerPick {
-  // What a repaint finds the control again by.
+  // Identifies the control across renders.
   control: string;
   label: string;
-  // The button's accessible name, carrying both halves always: what the control is, and
-  // what it is set to. A reader who cannot see the row gets this and nothing else, and a
-  // name saying only "Auto" names no question.
+  // The accessible name includes the control's purpose and selected value.
   name: string;
-  // The button's hover.
+  // The button's hint.
   detail: string;
-  // Drawn, but not pressable. A model that takes no effort setting is the ordinary case,
-  // and hiding the control would move the row's three positions around under the reader.
+  // Keep the control visible but disable it. Models without effort settings retain
+  // the effort control's position.
   disabled: boolean;
-  // Drawn in the caution tone, which stands for something the reader is losing rather than
-  // something they chose. Only the servers control sets it, where it means a server is down
-  // and the tools behind it cannot be called.
-  //
-  // It rides the pick rather than being worked out where the row is drawn. The panel tones
-  // the button from this and reads none of the words on it, so the one place that knows a
-  // server has failed is the one place that says so; a rule that matched on the label would
-  // be a second copy of a sentence written here, and the tone would go the moment the wording
-  // changed.
+  // A failed server gives its control the caution tone because its tools are unavailable.
+  // The panel reads this flag rather than matching the visible label.
   caution: boolean;
 }
 
-// One row of the menu a control opens. The menu is drawn in the panel rather than by the
-// editor, so every word in it is written here for the same reason the controls are: the
-// popover inserts strings and decides nothing.
+// A panel menu row with its visible and accessible wording.
 export interface MenuItem {
-  // What the row is, which decides how it is announced and how many of its neighbours can be
-  // on at once. A setting is one of several and exactly one is chosen, so it is a radio. A
-  // server is on or off on its own and any number of them can be on, so it is a toggle. An
-  // action is neither: it has no state to announce, and pressing it does a thing rather than
-  // choosing one. Announced wrongly, a list of toggles read as radios tells a listening
-  // reader that turning one server on turned another off.
+  // The kind sets the row's accessible role and selection behavior. Radio choices
+  // share one selection. Toggles have independent states. Actions have no selected
+  // state. Status rows report a value.
   kind: 'radio' | 'toggle' | 'action' | 'status';
-  // What goes back on the wire when the reader picks this row.
+  // The value returned when the reader chooses this row.
   value: string;
   label: string;
-  // The agent's own sentence for this choice, and empty where it publishes none.
+  // The description displayed under the menu choice. Empty when the row has no description.
   description: string;
   // Drawn with a tick, and announced as the current setting.
   checked: boolean;
-  // Drawn in the caution tone. True only for a server row that has failed, which is set in
-  // `mcpview.ts`. No radio row built here is ever a caution: every setting on those menus is
-  // one the reader chose, not one they are losing.
+  // `mcpview.ts` marks failed server rows with the caution tone. Setting rows built
+  // here never set this flag.
   caution: boolean;
-  // The row's accessible name. A reader who cannot see the menu gets this and nothing else.
+  // The row's accessible name.
   name: string;
 }
 
@@ -558,41 +502,35 @@ export interface Menu {
   // Which control this menu belongs to.
   control: string;
   agent: string;
-  // The session the menu was opened for. A reader can change the visible row while a
-  // menu is open, so the choice carries its original target rather than being applied to
-  // whichever session happens to be visible when the message returns.
+  // The session that opened the menu remains the choice's target after selection changes.
   session?: string;
-  // The settled model an effort menu was built from. It travels with the choice so the
-  // extension validates the same model whose legal efforts the reader saw.
+  // The effort menu's model travels with the choice so the host validates its
+  // available effort levels against that model.
   model?: string;
   // The question at the top of the menu, in the agent's own terms.
   head: string;
   items: MenuItem[];
-  // What the menu says in place of rows when it has none, and empty when it has some. A menu
-  // with nothing in it says why rather than opening as a blank box.
+  // The message displayed instead of rows in an empty menu. Empty when rows exist.
   empty: string;
 }
 
-// Settings selected for one session. The selected values are what the reader asked
-// for, while the pending values say which of those requests still wait for a turn to prove
-// them. Confirmed values are kept out of this stored shape because they come from the
-// transcript and change whenever a newer turn is recorded.
+// Selected settings belong to one session. Pending values wait for a turn to
+// confirm them. Confirmed values come from the transcript and remain outside
+// this stored shape.
 export interface SessionSettingSelection {
   selectedModel: string;
   selectedEffort: string;
-  // A fresh draft can choose a mode different from the agent-wide launch default. Keep it
-  // with that session so a replacement child resumes the setup the first child used.
+  // Retain a draft's permission choice for a replacement child.
   permissionMode?: string;
-  // The model whose menu supplied `selectedEffort`. This can come from the transcript when
-  // no model was explicitly selected, and preserves a legal effort without turning that
-  // recorded model into a model choice of its own.
+  // The model whose menu supplied `selectedEffort`. A recorded model preserves
+  // that effort's validity without becoming an explicit model pick.
   effortModel: string;
   pendingModel: string | null;
   pendingEffort: string | null;
 }
 
 export interface AppliedSessionSettings extends SessionSettingSelection {
-  // The API id the last reply ran under, which never names its window.
+  // The API model id used by the last reply.
   confirmedModel: string | null;
   // The model attachment that names the same model with its window, when the transcript has one.
   confirmedModelAttachment?: string | null;
@@ -609,8 +547,8 @@ export const EMPTY_SESSION_SETTINGS: SessionSettingSelection = {
   pendingEffort: null,
 };
 
-// One immutable update, keyed by session. The copy is what prevents a setting chosen
-// in one Codex session from changing a sibling that happens to use the same agent.
+// Copy the book and this session's settings. Updating one session never changes
+// a sibling session's settings.
 export function withSessionSettings(
   book: SessionSettingBook,
   session: string,
@@ -624,16 +562,14 @@ export function sessionSettings(book: SessionSettingBook, session: string): Sess
   return stored ? { ...EMPTY_SESSION_SETTINGS, ...stored } : { ...EMPTY_SESSION_SETTINGS };
 }
 
-// Commit a setting only after the protocol path accepted it. A rejected Claude `set_model`
-// therefore leaves the book handed in untouched and the composer keeps its prior value.
+// Store settings only after the agent accepts the change. Rejection leaves the
+// settings book and displayed value unchanged.
 export async function acceptedSessionSettings(
   read: () => SessionSettingBook,
   write: (book: SessionSettingBook) => Promise<void>,
   session: string,
-  // Fields, or a reading of them taken after the agent answers. A model change needs the
-  // later reading: the effort level belongs to the model, and a reader can pick a level
-  // while the model request is in flight, so fields worked out before the request would
-  // store the level that pick replaced.
+  // Read fields after acceptance when they depend on the agent's answer. An effort
+  // pick made during a model request must survive that request's completion.
   update: Partial<SessionSettingSelection> | (() => Partial<SessionSettingSelection>),
   accept: () => Promise<void>,
 ): Promise<void> {
@@ -680,16 +616,13 @@ export interface ComposerContext {
   used: number;
   capacity: number;
   generation: number;
-  // Rounded to nearest by `wholePercent`, which holds 100 back for a window with nothing
-  // left in it.
+  // `wholePercent` rounds to the nearest percentage and reserves 100 for a full window.
   percent: number;
-  // The bar's width, which is the share held inside the track however full the window is
-  // reported to be.
+  // The reported usage share clamped to the bar's track.
   fill: number;
   level: ContextLevel | null;
-  // The figure's hover, and the whole of what the bar beside it would have said. The bar
-  // carries nothing the percentage does not, so it is hidden from a screen reader and this
-  // sentence is what is left.
+  // The figure's tooltip and accessible name describe the percentage. The redundant
+  // bar is hidden from screen readers.
   name: string;
   // The command available to the Compact button in Context detail.
   compact: string;
@@ -701,45 +634,28 @@ export interface ComposerState {
   submittedRecoveryId?: string;
   submittedComments?: readonly TurnComment[];
   submittedDraftRevision?: number;
-  // Present only while this session is still a local draft. The profile is the whole of
-  // what the draft will start on, so every control the composer draws for it reads from here
-  // and a press changes this alone. Nothing on a draft's row reaches the live session
-  // the setup was copied from.
+  // A local draft's complete launch setup. Draft controls read and update this
+  // profile without changing the session that supplied it.
   profile?: SessionProfile | null;
-  // The agent's own key, never its drawn name. Everything the composer looks up is filed
-  // under the key: the model list, the reader's picks, how much the agent asks, and which
-  // CLI a prompt is handed to. Typed rather than left a string because the panel holds both
-  // spellings a few lines apart, and a display name read as a key is silent: the tables all
-  // miss, the pickers fall back to their defaults, and a prompt goes to the wrong agent.
+  // The agent key selects catalogs, settings, and the destination CLI. Display names
+  // must not replace keys because their table lookups fail.
   agent: AgentKind;
   session: string;
   // Empty until the agent has been asked what it runs.
   models: readonly ModelChoice[];
   defaults?: DefaultContext;
-  // Every command this session's agent publishes, in the agent's own order. Empty
-  // until the agent has been asked, and empty for good on one that publishes none. Claude
-  // answers it on `initialize`; Codex has no slash menu to mirror, so its skills are what
-  // the composer offers there.
+  // The agent's reported prompt entries in catalog order. Empty before the catalog
+  // arrives or when the agent publishes none.
   commands: readonly ComposerPromptEntry[];
-  // The Claude skill list for this session's working directory, for the Composer's inline
-  // highlight. Null until that directory has reported one at all, which is the fallback that
-  // highlights every command; an empty list is a real answer and highlights none. Codex
-  // ignores this, because a Codex entry already carries its own skill flag on `kind`.
+  // The Claude skill list for the session's working directory controls inline
+  // highlighting. Null highlights all eligible commands. An empty list highlights
+  // none. Codex entries carry their own `kind`.
   claudeSkills: readonly string[] | null;
-  // What the agent last said about the servers it can call tools on. Filed under the agent's
-  // key like the model list, and for the same reason: the servers belong to the agent rather
-  // than to the session. Two sessions of one agent are two views of one set of
-  // servers, so a server switched off in one is switched off in the other, and a list kept
-  // per session would show the reader two answers to a single question.
-  //
-  // Empty for an agent nobody has asked yet, and empty again for one that was asked and has
-  // no servers. Both draw nothing, which is the honest answer to each: until an agent has
-  // answered there is nothing to say about its servers, and once it has answered with none
-  // there is a control that would count to zero and open on an empty box.
+  // The servers last reported for this session or draft. An unanswered catalog
+  // and a catalog with no servers both omit the Servers control.
   mcpServers: readonly McpServer[];
-  // What the reader selected for this session, what still waits for the next turn, and
-  // what the newest transcript turn confirmed. These are separate facts: a Codex choice is
-  // pending until `turn/start` runs, while a recorded value says what actually happened.
+  // Selected settings, pending requests, and the newest turn's confirmed settings
+  // remain separate. Codex selections wait for a turn to confirm what ran.
   settings: AppliedSessionSettings;
   // A stored permission value, the empty value for an explicit agent default, or undefined
   // when nothing stored names one. Both of the last two run the agent's own default.
@@ -748,81 +664,67 @@ export interface ComposerState {
   effectiveMode?: CodexEffectiveMode | null;
   // Claude reports the mode that settings and launch flags resolved after its first prompt.
   effectivePermissionMode?: string | null;
-  // Null for a session with no turn in it yet, which has no window to be a share of.
-  // `max` is the model's window and not a constant: the same build of one model answers
-  // with 1,000,000 where another answers with 200,000, so the figure is divided here and
-  // never assumed.
+  // Reported context usage and capacity. Null when unavailable. Capacity comes
+  // from the model's window rather than a fixed value.
   context: { used: number; max: number } | null;
   contextGeneration?: number;
-  // Everything the next turn's floor price is worked out from, or null where the panel has
-  // no context figure or no priced model to work it out with.
+  // Inputs for the next-turn cost estimate. Null when context or pricing is unavailable.
   nextTurn?: NextTurnBasis | null;
   // What the reader has typed into the box, exactly as they typed it.
   draft: string;
-  // The submissions waiting for the running turn to end, oldest first. A comments-only
-  // submission keeps no copied prompt text because its comments remain on their turns.
+  // Queued submissions in delivery order. Comment ids refer to comments on their
+  // turns rather than copying those comments into prompt text.
   queued: readonly QueuedSubmission[];
   // Comment ids reserved for the queued prompt currently back in the box for editing.
   draftCommentIds?: readonly string[];
   // Queue entries currently crossing the agent acceptance boundary. They remain persisted
   // owners until acceptance, but their live card replaces the waiting card on screen.
   queueHandoffs?: ReadonlySet<string>;
-  // The prompts this session has already sent, newest first, which the Up arrow walks
-  // back through. Built by `promptHistory` from the transcript and from what this panel has
-  // handed over since the window opened.
+  // Submitted prompts, newest first. `promptHistory` combines recorded
+  // prompts with submissions from this panel.
   history: readonly string[];
-  // What the box on screen holds, when that is not the draft. The two differ only while the
-  // reader walks back through earlier prompts. Whether the control sends, stops or refuses
-  // is read off this one, because the reader is looking at it. The draft is what the box
-  // keeps and what a queue edit swaps with, because those are the words they wrote.
+  // The visible prompt text can differ from the retained draft during history recall.
+  // Visible text determines Send or Stop. The retained draft survives recall and
+  // participates in queue editing.
   onScreen: string;
   // Files staged for the next prompt in this session.
   assets?: readonly PromptAsset[];
   // Webview-local addresses for image previews. The same staged path gets a different safe
   // address in each webview, so this is prepared at the host boundary.
   assetPreviews?: Readonly<Record<string, string>>;
-  // A short attachment refusal shown beside the composer. It stays in memory only.
+  // An attachment refusal beside the Prompt box. Retained only in memory.
   notice?: string | null;
   // Whether a turn is running in this session now.
   running: boolean;
   // A clear waits for both agent acceptance and the successor session. It stays outside
   // `live` because the command produces no turn card.
   clearing?: boolean;
-  // Every comment the panel holds, across every session. The composer takes the lot
-  // and picks its own out through `commentsFor`, for the reason that function gives: a set
-  // gathered across sessions would send one agent's review to another.
+  // All stored comments. `commentsFor` selects this session's comments so another
+  // session's comments never reach its agent.
   comments: readonly TurnComment[];
-  // Which session the composer is aimed at, which is what picks those comments out.
+  // The session whose comments this Prompt box selects.
   sessionId: string;
   // The turn whose content opened this draft. This is UI metadata rather than prompt text,
   // so normal prompt assembly never sees it.
   origin?: DraftOrigin | null;
-  // The presses this session is still waiting on, oldest first, and empty between
-  // presses. See `LivePress`: it is what the panel says it is doing between the press and
-  // the reply. A list rather than one press, because a compaction and a prompt sent during
-  // it are two pieces of work the agent does one after the other, and each has to say so.
+  // Pending presses, oldest first. A compaction and a prompt queued behind it
+  // remain separate operations.
   live: readonly LivePress[];
-  // Requests the agent is holding open for this session. They arrive already
-  // normalized by the wire, and remain here until the host accepts an answer or the turn
-  // ends. Keeping them with the composer state puts the action beside the session it
-  // blocks without making the transcript pretend the request was a recorded turn.
+  // Open requests for this session. The wire normalizes them. The host removes
+  // them after an accepted answer or the turn ends.
   asks?: readonly Ask[];
 }
 
-// The chip above the box, saying what rides out with the prompt.
-//
-// The comments a reader left on turns go with the prompt as attachments rather than as text
-// pasted into the draft. The reader keeps their own words in the box, and the notes are
-// carried under them, counted here so the count can be checked before anything is sent.
+// The comments figure above the Prompt box counts comments attached to the prompt.
+// Prompt assembly places those comments below the reader's text without changing
+// the retained draft.
 export interface ComposerAnnotations {
   count: number;
-  // '3 comments', '1 comment'. A session with none attached draws no chip at
-  // all, so this never counts nothing.
+  // The comment count, such as '3 comments' or '1 comment'. Zero comments omit the figure.
   label: string;
-  // The chip's accessible name. It carries the count and what becomes of the attachments,
-  // because neither is anywhere else for a reader who cannot see the chip.
+  // The accessible name includes the count and how the prompt includes the comments.
   name: string;
-  // The chip's hover, naming what is attached.
+  // The figure's hint names the attached comments.
   detail: string;
   control: string;
 }
@@ -847,38 +749,29 @@ export interface QueuedPrompt {
   // Stable across repaints and reloads. It is the submission id, not a hash of visible text,
   // because an attachment-only prompt and equal text with different files still differ.
   id: string;
-  // The prompt, cut to one line. What the row draws while it is shut.
+  // The collapsed preview flattens whitespace and caps the display text's length.
   label: string;
-  // The whole prompt, drawn when the row is opened. A queued prompt is the reader's own
-  // writing and they cannot see it anywhere else: the box was cleared when it went into the
-  // queue, so a row that only ever shows its first line hides the thing the reader most
-  // needs to check before it goes.
+  // The complete prompt displayed when the card expands. Retain its text so the
+  // reader can review it after queueing clears the Prompt box.
   text: string;
-  // Whether opening the row shows anything the shut row does not. A prompt that already fits
-  // on one line is drawn as text with no disclosure, because a control that opens onto the
-  // same words is a press that answers nothing.
+  // Expand only when the complete prompt adds text beyond the collapsed preview.
   long: boolean;
   // The disclosure's accessible name in each state, and empty on a row that does not open.
   openName: string;
   shutName: string;
-  // What a repaint finds the disclosure again by, and empty on a row that does not open.
+  // Identifies the disclosure across renders. Empty when the card has no disclosure.
   control: string;
-  // The control that takes the prompt out of the queue, which is its own button rather than
-  // the whole row: a reader opening a long prompt to read it must not drop it by doing so.
+  // Drop has its own button. Expanding a prompt must not remove it from the queue.
   dropName: string;
   dropControl: string;
-  // Puts the prompt back in the box and takes it out of the queue. There is no second editor
-  // anywhere: the box already has the caret, the selection, the undo history and the growth,
-  // and a reader who wants to change a queued prompt wants all four.
+  // Edit exchanges the queued submission with the active draft in the Prompt box.
+  // The reader edits it with the same caret, selection, history, and resizing behavior.
   editName: string;
   editControl: string;
-  // The word on each control. Written here with the rest of the composer's words, so the
-  // panel inserts strings and decides nothing, and words rather than glyphs because that is
-  // what the rest of the panel's controls use.
+  // Visible action labels supplied with the rest of the Prompt box wording.
   editLabel: string;
   dropLabel: string;
-  // The whole prompt on the clipboard. The reader wrote it and a queued one is the only copy
-  // on screen, so taking it somewhere else must not mean retyping it.
+  // Copy the complete queued prompt to the clipboard.
   copyText: string;
   copyName: string;
   copyControl: string;
@@ -895,57 +788,45 @@ export interface QueuedPrompt {
   files: ComposerFile[];
 }
 
-// The card the composer draws between the press and the reply: what the panel is doing, and
-// the reader's own words, until the transcript poll draws the real turn over the top of it.
+// A live card displays a pending press and the reader's prompt until the recorded
+// turn replaces it.
 export interface ComposerLive {
-  // Which press this card is for. Two can be on screen at once, a compaction and the prompt
-  // waiting behind it, and the panel tells them apart by this: it is what keeps a reply
-  // being written into the card it belongs to rather than into whichever one is on top.
+  // Identifies the operation so responses update the matching card. A compaction
+  // and the prompt queued behind it can both appear.
   kind: LiveKind;
-  // Which of the three states the card is in. The panel tones the card by it and reads none
-  // of it: every word on the card is decided here.
+  // The operation's state. Card wording and response tone are supplied separately.
   state: LiveState;
   // The response state supplies the card's tone and glyph.
   tone: 'running' | 'failed' | 'done' | 'interrupted';
-  // The head row, worded the way a turn card's head row is worded, because it is drawn as
-  // one. A press is a turn that has not been recorded yet, so the card that stands for it
-  // wears the same frame, the same time, the same elapsed figure and the same agent and
-  // model as the card that will replace it. What the reader saw before was a strip of a
-  // different shape being swapped for a card, twice, in the first few seconds of a prompt.
+  // The header uses the turn card's time, elapsed duration, agent, and model fields
+  // so its recorded replacement keeps the same presentation.
   relative: string;
   absolute: string;
   agent: string;
-  // Empty where the reader has picked nothing and no turn has run to say what the agent
-  // uses, which is a session's first prompt.
+  // Empty until a model pick or recorded turn identifies the model.
   model: string;
   // The head row's spoken name, which carries what the eye reads off the row.
   label: string;
-  // What the card leads with, in the same slot a turn card leads with its headline, and the
-  // same words: the first line of what the reader typed, which is what the turn itself leads
-  // with until the agent has written something. Empty for a compaction, which carries none
-  // of the reader's words.
+  // The first line of the submitted prompt occupies the turn card's headline slot.
+  // Empty for compaction, which submits no reader text.
   headline: string;
   // The line under the headline, where a turn card says what the agent is doing now. Here it
   // says what the panel is doing, in the agent's own name.
   status: string;
   // The complete streamed response, including whitespace. The browser bounds its collapsed preview.
   reply: string;
-  // When the press was, for the one-second ticker that rewrites every other card's relative
-  // time. A failed card carries it too: the notice stands until the reader dismisses it, and
-  // a moment that still reads "now" ten minutes later is the card lying about its own age.
+  // The press time supplies the card's relative age, including while a failed card
+  // waits for dismissal.
   at: number;
-  // What the elapsed figure counts up from, and null on a failed card, which counts up no
-  // further: a figure growing beside a notice that nothing happened reads as work still
-  // being done. This is why it is not `at` under another name.
+  // The elapsed duration's start time. Null when the card stops counting elapsed
+  // time, including after failure.
   since: number | null;
-  // The control that takes a failed card away, and empty on a card the poll will remove
-  // itself. A card the reader must clear is exactly the card that says a press did not go.
+  // Dismiss removes a failed card. Empty when transcript refresh will remove the card.
   dismissLabel: string;
   dismissName: string;
   dismissControl: string;
-  // The primary way out of a failed prompt. It returns the complete text to the matching
-  // session's box; the headline above is only the first line and cannot do that job.
-  // Empty for a compaction, which carries no reader text to restore.
+  // Restore returns the complete failed prompt to its session's Prompt box. The
+  // headline contains only its first line. Empty for compaction.
   restoreLabel: string;
   restoreName: string;
   restoreControl: string;
@@ -960,114 +841,83 @@ export interface ComposerBox {
   // What the empty box says, in the agent's own vocabulary.
   placeholder: string;
   dropPlaceholder: string;
-  // How to send and how to make a new line. It sat on a line of its own under the box, which
-  // spent a row of a narrow panel on something a reader learns once. It rides the send
-  // control's hover and its spoken name instead, where somebody who has not learnt it yet is
-  // the one who finds it.
+  // The send and newline shortcuts appear in the Send hint and accessible name.
   hint: string;
   heightName: string;
   heightHint: string;
   heightHintDetail: string;
-  // The one button at the end of the controls row. It is Send when nothing is running and
-  // Stop while a turn is, and the two are one control because they never both apply.
+  // Send submits available prompt content. During active work with no prompt text
+  // or files, the same control becomes Stop.
   actionLabel: string;
   actionName: string;
   actionControl: string;
-  // The same word as the control, so the panel can tone the button without reading the
-  // label it was given.
+  // The action kind selects the button's tone without matching its label.
   actionKind: string;
   // False when there is nothing to send or the current operation cannot accept it. A Stop
   // remains enabled because stopping a turn needs no draft.
   actionEnabled: boolean;
 }
 
-// The chip above a draft's controls, saying that this session has not started yet.
-//
-// It says nothing about the setup. The four controls under it draw every value already, and
-// a second copy of them in words adds no fact. What stood here named the session the
-// setup was copied from, which builds a sentence out of a session title and reads as
-// one.
+// A local draft's status figure. Visible text names the draft state rather than
+// repeating the setup controls.
 export interface ComposerDraftTag {
-  // What the draft is. The same word whatever the setup, because it names the state and not
-  // the setup.
+  // The draft state label, independent of its launch setup.
   word: string;
-  // The hover, carrying the four facts the controls draw. It is what a reader checks the
-  // whole setup with in one look, and the controls carry the same words one at a time.
+  // The hint summarizes the four values displayed by the setup controls.
   detail: string;
 }
 
 export interface ComposerView {
   recoverySetup?: SessionProfile;
   agent: string;
-  // The session the box is aimed at. It rides the view because the panel files the
-  // draft under it and names it on every message about the box: without it the panel aimed
-  // at `undefined`, so every session shared one draft slot and a prompt was filed
-  // against whichever session was newest when the message arrived.
+  // The target session keys the stored draft and every Prompt box message. Keeping
+  // it on the view prevents prompts from sharing an undefined draft slot.
   sessionId: string;
-  // What the reader had typed into the box and not sent, so a panel drawn from nothing can
-  // put it back. The box holds its own copy while the window lives, and this is the only way
-  // into it after a reload, when the panel is new and the extension holds what was typed.
-  //
-  // The panel takes this once per session and never again. The answer arrives a round
-  // trip behind the keystroke, so a box that adopted it on every draw would put stale text
-  // back under the caret of a reader still typing.
+  // The retained unsent draft restores the Prompt box after reload. The panel
+  // adopts it once per session. Repeated adoption during typing would replace
+  // current text with a delayed host value.
   draft: string;
-  // Which session the prompt goes to, said rather than drawn. The rail already names it
-  // at the top of the panel, so a second copy over the box spent a line on what the reader
-  // was already looking at. It stays as the box's accessible name, where the only reader who
-  // cannot see the rail's answer is the one who needs it.
+  // The Prompt box's accessible name includes its target session. The session list
+  // already displays that session's name.
   targetName: string;
   origin: ComposerOrigin | null;
-  // Null for a live session, which is every session with a child behind it.
+  // Null when the session has no local draft profile.
   draftTag: ComposerDraftTag | null;
   context: ComposerContext | null;
-  // The line directly above the box, saying what the next turn costs before the reader types
-  // a word. Null where the session has no context figure or no priced model, which is a
-  // line that is not drawn rather than a line that says it does not know.
+  // The next-turn cost estimate above the Prompt box. Null omits the line when
+  // context or pricing is unavailable.
   nextTurn: ComposerNextTurn | null;
-  // Model, effort and how much the agent asks, in that order, and then the agent's MCP
-  // servers where it has any. The first three are always here and the last is not, which is
-  // why it is last: the row's settled positions stay where they are.
+  // Model, effort, and permission controls in that order, followed by Servers
+  // when the session reports configured servers.
   picks: ComposerPick[];
-  // Every command the agent published, already worded. The panel narrows this to what the
-  // reader has typed rather than being sent a narrowed list, because the narrowing has to
-  // answer the keystroke that is in the box now: a list worked out here arrives a round
-  // trip later, and an Enter pressed inside that gap completes a command the reader never
-  // saw. It changes when the agent answers rather than when the reader types, so the foot
-  // is not rebuilt around it.
+  // Prepared prompt entries. The browser matches current text locally so completion
+  // uses the latest keystroke without a host round trip. Catalog changes update
+  // the entries independently of typing.
   commands: PromptEntryView[];
-  // The Claude skill list for this session's working directory, carried through for the
-  // Composer's inline highlight. Null when that directory has never reported one. Codex
-  // ignores this field.
+  // The working directory's Claude skill list for inline highlighting. Null before
+  // its first report. Codex ignores this field.
   claudeSkills: readonly string[] | null;
-  // The menu's own accessible name, for commands and local paths alike. A listbox with no
-  // name is announced as a list of nothing in particular.
+  // The accessible name shared by command and local-path completion lists.
   completionName: string;
   box: ComposerBox;
-  // Null when nothing is attached, which is when no chip is drawn at all.
+  // Null when no comments are available to attach to this prompt.
   annotations: ComposerAnnotations | null;
   files: ComposerFile[];
   notice: string | null;
   filePendingName: string;
   // Oldest first, which is the order they will be sent in.
   queue: QueuedPrompt[];
-  // The earlier prompts the box offers, newest first. They ride the view because the panel
-  // has to answer the press with them: a list asked for on Up would arrive a round trip
-  // after the key, which is the reason the command menu keeps its own copy of matching too.
+  // Earlier prompts, newest first. Keeping them in the view lets the browser
+  // answer history keys without waiting for the host.
   history: string[];
-  // What the panel is doing between the press and the reply, newest first, and empty
-  // between presses. More than one only while a prompt is waiting behind a compaction.
+  // Live cards, newest first. A prompt can wait behind a compaction as a separate card.
   live: ComposerLive[];
   // Requests waiting for the reader, oldest first. They sit above the prompt box at the
   // foot of this session, where a reply can be given without leaving the panel.
   asks: AskCard[];
-  // The sentence beside Send while a request is waiting, saying that the press will answer
-  // the request before it sends what is typed. Empty when nothing is waiting, and empty
-  // whenever the press would not send: the control is Stop while a turn runs over an empty
-  // box, and a Send with nothing to send is refused, and neither one answers a request.
-  //
-  // It joins the send control's own name as well, because a request that arrives while the
-  // reader is typing changes what Send does with no other signal.
+  // The line beside Send states that it answers pending requests before sending.
+  // Empty when no request waits or Send will not submit. The same line joins
+  // Send's accessible name because a new request changes the action during typing.
   sendOverAsk: string;
 }
 
@@ -1087,27 +937,22 @@ export interface AskCardQuestion {
   legend: string;
   legendHtml: string;
   legendText: string;
-  // The agent's own short label for this question, drawn as a chip before the legend. Claude
-  // documents `header` as a chip label, so the card draws it as one. Empty for a question
-  // that carries none, and the chip is then left out.
+  // The agent's short question label appears before its legend. Empty labels omit
+  // the figure.
   key: string;
-  // How many choices the reader may take. It is the one thing the controls themselves do not
-  // say: a set of checkboxes and a set of radios look alike until one is pressed.
+  // Describes whether the question accepts one choice or several.
   hint: string;
   multiSelect: boolean;
   // A secret answer goes into a password box, and its tab reports that it is answered
   // without reporting what it says.
   secret: boolean;
   choices: AskCardChoice[];
-  // The word on this question's tab. It is the agent's short label where it sent one and the
-  // question's number where it did not, because a strip of tabs called nothing tells the
-  // reader only how many questions there are.
+  // The tab uses the agent's short label, or the question number when no label exists.
   tab: string;
   // The tab's spoken name while the question has no answer.
   tabName: string;
-  // The first half of the tab's spoken name once the question has one. The panel adds the
-  // reader's own answer after it, whole, however far the strip cut the visible value. A
-  // secret question keeps this half alone.
+  // The answered tab's accessible-name prefix. The browser appends the complete
+  // answer even when visible text is shortened. Secret answers keep the prefix alone.
   tabAnsweredName: string;
   // The box that takes an answer the agent did not offer, and what it says while it is empty.
   writtenName: string;
@@ -1119,21 +964,16 @@ const REFUSED_ASK: AskAnswer = {
   reason: 'The reader refused this from the panel.',
 };
 
-// The reader answered in the message that follows rather than on the card. It is worded for
-// a permission as well as a question, because a permission left open holds a prompt behind it
-// exactly as a question does, and neither one was refused.
+// The reader answers a request in the next prompt instead of on its card. Use
+// the same explanation for questions and permissions without reporting refusal.
 export const ANSWERED_IN_PROMPT: AskAnswer = {
   decision: 'deny',
   reason: 'The reader did not answer this here and replied in their next message instead.',
 };
 
-// A denial this file wrote, matched by its reason, or nothing for a denial it did not.
-//
-// `acceptedAskAnswer` narrows every denial it takes to `REFUSED_ASK`, because the reason
-// reaches the model as this panel's own words and the webview is an input boundary. The
-// answer the send path gives comes back through the same door, so a denial that is one of
-// this file's own has to survive it: told the reader refused, a model tries something else,
-// and the reader who typed over the request said no such thing.
+// Match panel-authored denial reasons. `acceptedAskAnswer` preserves these reasons
+// and normalizes other submitted denials. Answering in the next prompt must
+// remain distinct from refusing the request.
 function panelDenial(reason: unknown): AskAnswer | null {
   for (const denial of [REFUSED_ASK, ANSWERED_IN_PROMPT]) {
     if (denial.decision === 'deny' && denial.reason === reason) {
@@ -1149,8 +989,8 @@ export interface AskCardAction {
   answer: AskAnswer;
 }
 
-// One blocking request in the session foot. Every visible and spoken word is settled
-// here so the browser only builds controls and returns the values they carry.
+// A blocking request with its visible and accessible wording. The browser builds
+// controls and returns their values.
 export interface AskCard {
   id: string;
   kind: Ask['kind'];
@@ -1167,23 +1007,18 @@ export interface AskCard {
   // question the reader has not answered, and sends nothing.
   nextLabel: string;
   nextName: string;
-  // Which question the reader is on, one line per question, in question order. The panel
-  // draws the line for the question on screen, so the count is worded here with every other
-  // word on the card.
+  // One progress line per question, in question order. The browser selects the
+  // line for the visible question.
   steps: string[];
-  // How many questions are answered, one line per possible count, from none through all of
-  // them. The shut head row draws the line for the count reached, so a reader who folded the
-  // card can still see how far they got. Empty for a permission, which has nothing to count.
+  // One answered-count line for each count from zero through all questions. The
+  // collapsed header displays the current count. Permission requests have no count.
   answeredWords: string[];
-  // What the fold press will do, the way a session heading names its own press rather than
-  // its state. Each is named for what it does, so `openName` is worn while the card is shut
-  // and `shutName` while it is open. That is the queued prompt's rule at `openName` above,
-  // and the panel reads both through the same `open ? shutName : openName`.
+  // The fold control names its action. A collapsed card uses `openName`. An expanded
+  // card uses `shutName`, matching queued prompt disclosures.
   openName: string;
   shutName: string;
-  // The state on the head row, and what it becomes once the reader's answer is on its way.
-  // The waiting phrase is the rail's, so a session marked `needs you` on the rail and
-  // the card at its foot say one thing and point at each other.
+  // The header's waiting phrase shares `NEEDS_INPUT` with the session list.
+  // The sending phrase reports answer delivery.
   stateWord: string;
   sendingWord: string;
 }
@@ -1198,11 +1033,7 @@ export interface ComposerOrigin extends DraftOrigin {
   name: string;
 }
 
-// What a reader types to compact each agent's session. Claude publishes `compact` in
-// its initialize response. Codex has the same composer command but no native command list,
-// so `codexwire.ts` keeps it beside the discovered skills. The command is recognized before
-// prompt assembly and handed to the live session's compaction control. An agent with no
-// entry here draws the figure and no control.
+// Compaction commands for supported agents. An unlisted agent has no compaction control.
 const COMPACT_COMMANDS: Record<string, string> = { claude: '/compact', codex: '/compact' };
 
 const CLEAR_COMMANDS: Record<string, string> = { claude: '/clear', codex: '/clear' };
@@ -1212,22 +1043,18 @@ export interface ClearRequest {
   name: string;
 }
 
-// The composer command for one agent's compaction control, or nothing for an agent with none.
+// Return the agent's prompt box compaction command, or an empty string.
 export function compactCommand(agent: string): string {
   return own(COMPACT_COMMANDS, agent) ?? '';
 }
 
-// Whether the whole submission asks for compaction. Exact means the command can never take
-// a sentence mentioning `/compact`, an argument intended for an agent, or a similarly named
-// skill. Whitespace and case are presentation details, as they are for panel-owned commands.
+// Match the entire compaction command, ignoring surrounding whitespace and case. Arguments and other command names do not match.
 export function compactSubmission(agent: string, text: string): boolean {
   const command = compactCommand(agent);
   return Boolean(command) && text.trim().toLowerCase() === command.toLowerCase();
 }
 
-// Where an exact compaction submission goes. A running session cannot take a second
-// control turn yet, so the command waits in the same queue as a prompt and is recognized
-// again when that queue drains.
+// Queue an exact compaction command while the session runs. Otherwise, compact immediately.
 export function compactAction(agent: string, text: string, running: boolean): 'compact' | 'queue' | null {
   if (!compactSubmission(agent, text)) {
     return null;
@@ -1239,10 +1066,7 @@ export function clearCommand(agent: string): string {
   return own(CLEAR_COMMANDS, agent) ?? '';
 }
 
-// Codex accepts `/new` with an optional name for the chat it opens. The name is the
-// complete remainder of the line. Quotes and internal spacing are part of that name.
-// A line break ends the native command grammar, so a prompt that starts with `/new`
-// but continues on another line still reaches the model as ordinary text.
+// Codex accepts `/new` with an optional session name on the same line. Preserve internal spacing and quotes in that name.
 export function clearRequest(agent: string, text: string): ClearRequest | null {
   const trimmed = text.trim();
   const command = clearCommand(agent);
@@ -1270,33 +1094,20 @@ export function clearAction(agent: string, text: string, running: boolean): 'cle
   return running ? 'queue' : 'clear';
 }
 
-// What the model control says while nothing has been picked and nothing is known to pick.
+// Effort label when neither a selection nor a reported level supplies one.
 const DEFAULT_EFFORT_LABEL = 'Effort not reported';
 
-// What the effort control says when there is no effort to set. It says that rather than
-// going blank, because a blank control that cannot be pressed is a question the reader is
-// left holding.
+// Effort label when the menu has no supported setting.
 const NO_EFFORT_LABEL = 'No effort setting';
 
-// The model the session will run on, or null for the agent's own default and for a
-// stored pick this version of the agent no longer lists.
+// Find the selected catalog value, then its resolved model. Return null when neither matches.
 export function chosenModel(models: readonly ModelChoice[], model: string | undefined): ModelChoice | null {
   return (
     models.find((m) => m.value === model) ?? (model ? models.find((m) => m.resolvedModel === model) : undefined) ?? null
   );
 }
 
-// The listed model a recorded model id names, when exactly one names it.
-//
-// The two vocabularies are not the same one. `list_models` answers with the CLI's own
-// aliases, `opus`, `sonnet`, `opus[1m]`, and a transcript records the resolved API id the
-// reply came back under, `claude-opus-4-5-20251101`, so the two never compare equal. When
-// the agent's reply carries a resolvedModel, that id is the exact link between the pick and
-// what ran. This alias search is the fallback for a reply with no resolvedModel.
-//
-// Taken only when one alias matches. Two would be a guess about which, and a guess here
-// names the wrong model on screen and offers the wrong effort levels behind it. `default` is
-// never a match: it is the CLI's word for making no choice and it names no model.
+// Match a recorded model id against catalog aliases without their window suffixes. Ignore empty and default aliases. Require exactly one match.
 export function modelRan(models: readonly ModelChoice[], ran: string | null): ModelChoice | null {
   if (!ran) {
     return null;
@@ -1309,13 +1120,7 @@ export function modelRan(models: readonly ModelChoice[], ran: string | null): Mo
   return named.length === 1 ? named[0] : null;
 }
 
-// The listed model a `model` attachment names, when exactly one names it.
-//
-// An attachment names the window, as in `claude-opus-5-5[1m]`, where a reply's API id never
-// does. So a listed model matches only with the same window. An exact resolvedModel comes
-// first, then an exact value, then the alias search for a choice that lists no resolvedModel.
-// Two matches at one step leave the model unresolved, because list order is no evidence.
-// `default` is never a match, even when it resolves to the same model.
+// Resolve an attachment by resolved model, exact value, then an alias without a resolved model. Each match must preserve the window suffix. Ambiguous matches stop resolution. Exclude empty and default choices.
 export function modelAttached(models: readonly ModelChoice[], attached: string | null): ModelChoice | null {
   if (!attached) {
     return null;
@@ -1351,20 +1156,13 @@ export function modelAttached(models: readonly ModelChoice[], attached: string |
   return named.length === 1 ? named[0] : null;
 }
 
-// The listed model the transcript says the last turn ran on. A recorded attachment is the
-// only evidence for it when there is one. The API id cannot rule out a larger window, so
-// falling back to it could name a smaller window than the session ran with.
+// Use a recorded model attachment when present. Only an absent attachment permits fallback to the recorded API model id.
 function recordedModel(state: ComposerState): ModelChoice | null {
   const attached = state.settings.confirmedModelAttachment;
   return attached ? modelAttached(state.models, attached) : modelRan(state.models, state.settings.confirmedModel);
 }
 
-// The model this session's next turn will run on, and the one its controls describe:
-// the reader's pick where they made one, and otherwise the model the transcript says the
-// last turn actually ran on.
-//
-// The fallback is a reading, not a pick. It is what makes the effort control usable at all,
-// since effort belongs to a model and a reader who has chosen no model still has one running.
+// Use the selected catalog model, then the recorded model. The recorded fallback supplies effort choices without creating a selection.
 export function settledModel(state: ComposerState): ModelChoice | null {
   return chosenModel(state.models, state.settings.selectedModel) ?? recordedModel(state);
 }
@@ -1382,10 +1180,7 @@ function effortPending(state: ComposerState): boolean {
   return Boolean(pending && state.settings.confirmedEffort !== pending);
 }
 
-// The efforts that model offers, which is none for a model that takes no effort setting and
-// none again while no model is settled on. Nothing is offered for a model nobody has
-// chosen: the effort a turn would run at is the chosen model's business, and a list pooled
-// from every model would offer settings the running one does not take.
+// Return the selected catalog model's effort choices. Return no choices for an unresolved model or a model without effort settings.
 export function effortChoices(models: readonly ModelChoice[], model: string | undefined): readonly EffortChoice[] {
   return chosenModel(models, model)?.efforts ?? [];
 }
@@ -1394,32 +1189,29 @@ function agentName(agent: string): string {
   return own(USAGE_AGENT_NAMES, agent) ?? agent;
 }
 
-// The answer to one prompt handoff. A boolean could say only that nothing went; the card
-// also needs enough to tell the reader what to fix before they try again.
+// Report whether prompt delivery succeeded and explain a failure.
 export interface PromptDelivery {
   delivered: boolean;
   reason: string;
-  // The accepted submission in the agent session. Claude uses it to match an
-  // ending event to the staged files owned by that exact prompt.
+  // Accepted submission identifier for matching completion to its staged files.
   turnId?: number;
-  // Set when delivery continued in a new session because the named one was owned by
-  // another client.
+  // Successor session used when another client owns the requested session.
   session?: string;
 }
 
 const LAUNCH_AGENTS: readonly AgentKind[] = ['claude', 'codex'];
-// The inherited row is the one row outside a titled section, so its detail names its source.
+// The inherited row names its source because it sits outside the titled sections.
 const INHERITED_SOURCE_NAME = 'Inherited';
 const PINNED_HEADING = 'Pinned setups';
 const RECENT_HEADING = 'Recent setups';
-// Why a pinned setup cannot start a session, by the value the catalog no longer offers.
+// Refusal text for each setup value missing from the catalog.
 const MISSING_SETUP_REASONS: Record<SetupValueName, string> = {
   agent: 'Agent not available',
   model: 'Model not available',
   effort: 'Effort not available',
   permission: 'Permissions not available',
 };
-// The setup value each launcher fact shows, in fact order.
+// Setup fields in the order their facts appear.
 const SETUP_FACT_FIELDS: readonly SetupValueName[] = ['agent', 'model', 'effort', 'permission'];
 
 function launchValue(value: string, label: string, detail: string = ''): LauncherValue {
@@ -1469,15 +1261,10 @@ function launcherProfileAvailable(profile: SessionProfile, agents: readonly Laun
   return missingSetupValue(profile, agents) === null;
 }
 
-// What separates one fact from the next wherever a setup is said in a line.
+// Separator between setup facts.
 const PROFILE_FACT_SEPARATOR = ' · ';
 
-// The four facts a setup runs under, in the order every surface names them.
-//
-// Each falls back to what is known: the catalog's word for a value, then the value itself
-// for one this version of the agent no longer lists, and only then the word for making no
-// choice. Written once because a launcher row, a draft's tag and a draft's controls all say
-// the same setup, and three copies of the fallbacks would drift into three answers.
+// Describe agent, model, effort, and permissions in the shared setup order.
 function profileFacts(
   profile: SessionProfile,
   catalog: readonly ModelChoice[],
@@ -1492,13 +1279,7 @@ function profileFacts(
   ];
 }
 
-// The inherited row says its own label and every fact, then its source. A pinned or recent
-// row sits under a heading that names its section, so only its accessible name repeats the
-// heading. Its label is the agent and model, and its detail spells the whole setup the way the
-// Composer's model picker does, so the detail still reads alone under a label that names no
-// value. The section comes from the list the row is built for, because a pinned row's profile
-// says recent.
-// A missing value shows as stored, because the catalog's fallback for it names another value.
+// An inherited row includes its source in the detail. Pinned and recent rows include their section in the accessible name. Preserve a missing value's stored text instead of its catalog fallback.
 function launchProfileRow(
   key: string,
   section: 'inherited' | 'pinned' | 'recent',
@@ -1524,10 +1305,7 @@ function launchProfileRow(
   return { key, label, detail, name, profile: { ...profile } };
 }
 
-// A session with no stored permission offers the permission a new setup preselects, while
-// an explicit agent default stays the empty value. An effort the inherited model does not
-// offer becomes the Default effort, since the launcher refuses a setup that names one. The
-// omitted model accepts any effort the catalog offers.
+// Inherit the model and supported effort. Use the agent's preselected permission when none is stored. Preserve an explicit default as an empty value.
 function inheritedProfile(state: ComposerState): SessionProfile {
   const stored = state.askMode;
   const model = state.profile ? state.profile.model : (settledModel(state)?.value ?? state.settings.selectedModel);
@@ -1549,8 +1327,7 @@ function inheritedProfile(state: ComposerState): SessionProfile {
   };
 }
 
-// The complete launch surface, including every word the browser draws. The panel only
-// chooses a row and posts its key; profile meaning and accessible names stay testable here.
+// Build launcher rows, setup choices, and accessible wording for the panel.
 export function sessionLauncherView(
   current: ComposerState | null,
   recent: readonly SessionProfile[],
@@ -1573,8 +1350,7 @@ export function sessionLauncherView(
       null,
       defaults[profile.agent],
     );
-  // Each entry keeps its index into the stored history, so hiding a duplicate or a row past
-  // the display cap never renumbers the key of a row the reader sees.
+  // Keep original history indexes in row keys after filtering and display limits.
   const shown = visibleRecents(
     recent.map((profile, index) => ({ ...profile, index })),
     pinned,
@@ -1594,8 +1370,7 @@ export function sessionLauncherView(
     const row = launchProfileRow(`pin:${setup.id}`, 'pinned', profile, models, missingValue, defaults[profile.agent]);
     return { ...row, id: setup.id, available: missingValue === null, missingValue };
   });
-  // Quick New takes the latest valid setup before any pin hides it from the list, so pinning
-  // the latest setup never changes what New starts.
+  // Quick New uses the latest valid setup before pin filtering.
   const latest = recent.findIndex((profile) => launcherProfileAvailable(profile, agents));
   const primary = inherited ?? (latest >= 0 ? recentRow(recent[latest], latest) : null);
   return {
@@ -1644,11 +1419,10 @@ export function sessionLauncherView(
   };
 }
 
-// Loaded catalogs validate setup values. Pending catalogs keep stored model and effort
-// choices startable while agent and permission checks still apply.
+// Validate launch requests against the available agent choices.
 export function launcherProfile(view: SessionLauncherView, request: LauncherRequest): SessionProfile | null {
   if (request.kind === 'row') {
-    // The primary row can be a recent setup that a pin hides from the menu, so it resolves on its own.
+    // Resolve the primary row separately because pin filtering can hide it from the menu.
     const rows = [view.inherited, view.primary, ...view.pinned.filter((row) => row.available), ...view.recent].filter(
       (row): row is LauncherProfileRow => Boolean(row),
     );
@@ -1668,11 +1442,10 @@ export function launcherProfile(view: SessionLauncherView, request: LauncherRequ
   };
 }
 
-// Why a handoff made no draft. The reader fixes each cause a different way.
+// Reasons a session handoff cannot create a draft.
 export type HandoffRefusal = 'turn' | 'source' | 'setup' | 'folder';
 
-// What the reader sees when a handoff makes no draft. `sending` is true when the handoff
-// carries text from a turn, and false for an empty draft.
+// Describe a refused handoff. `sending` distinguishes transferred text from an empty draft.
 export function handoffRefusalMessage(refusal: HandoffRefusal, sending: boolean): string {
   const action = sending ? 'send this to a new session' : 'start a new session from it';
   const messages: Record<HandoffRefusal, string> = {
@@ -1691,11 +1464,7 @@ export interface NewSessionDraft {
   createdAt: number;
   profile: SessionProfile;
   origin: DraftOrigin | null;
-  // Whether the reader changed this setup on one of the draft's own controls.
-  //
-  // The profile's source cannot answer that question. The launcher's own form stamps a
-  // custom source on a setup chosen before any draft exists, so a draft made through it
-  // would count as the reader's work the moment it appeared.
+  // Track setup changes made through the draft's controls. The profile source also describes choices made before the draft existed.
   handChanged: boolean;
 }
 
@@ -1719,8 +1488,7 @@ export function newSessionDraft(
   });
 }
 
-// Text redirected from a turn starts an editable draft with one blank line after it. Links
-// and selected text share the same size boundary without sharing link validation.
+// Normalize line endings and add a blank line to nonempty handoff text within the draft size limit.
 export function handoffDraftText(value: string): string | null {
   const text = value.replace(/\r\n?/g, '\n');
   const draft = text.trim() ? `${text}\n\n` : null;
@@ -1731,12 +1499,7 @@ export function responseLinkDraftText(link: string): string | null {
   return isLocalLinkPath(link) ? handoffDraftText(link) : null;
 }
 
-// A draft's setup as the session settings book keeps it.
-//
-// The book is what the composer reads a live session's model and effort from, and a
-// draft is filed in it under its own provisional id so the panel has one shape to read. The
-// effort's model is recorded only where an effort was chosen, because an effort belongs to
-// a model and naming one under no effort would claim a choice nobody made.
+// Choose a supported effort for the profile. An omitted model permits levels from any catalog model.
 function pickedProfileEffort(
   models: readonly ModelChoice[],
   model: string,
@@ -1762,23 +1525,13 @@ export function sessionSettingsForProfile(
     selectedEffort: profile.effort,
     permissionMode: profile.permissionMode,
     effortModel: profile.effort ? profile.model || supporting?.value || '' : '',
-    // Nothing is pending on a draft. There is no turn to confirm a value, and the child is
-    // started on whatever the profile holds when the first prompt goes.
+    // A draft has no pending turn to confirm these settings.
     pendingModel: null,
     pendingEffort: null,
   };
 }
 
-// The setup a draft has after the reader picks one row of one of its menus, or nothing at
-// all for a value no menu offered.
-//
-// It resolves only what the menus draw, the guarantee `launcherProfile` gives for the
-// launcher: a stale or altered browser message cannot start an agent on a model, effort or
-// permission value the reader was never shown.
-//
-// Re-picking the value already set leaves the setup exactly as it was, source included. The
-// source is what the tag says, and a reader pressing the row that is already ticked has
-// changed nothing to call custom.
+// Apply supported draft menu choices. Reject unknown controls or values. Repeated choices preserve the profile source.
 export function draftProfileAfterPick(
   profile: SessionProfile,
   control: string,
@@ -1795,11 +1548,7 @@ export function draftProfileAfterPick(
     if (agent === profile.agent) {
       return { ...profile };
     }
-    // The other three belong to the agent that was left. A model is one agent's own name for
-    // one of its own models, an effort is a level of that model, and a permission value is
-    // one agent's CLI vocabulary, so carrying any of them across would start the new agent on
-    // a setting it has never heard of. The permission takes the new agent's preselected mode,
-    // as the launcher form does.
+    // Changing agents clears model and effort selections and uses the new agent's preselected permissions.
     return {
       agent,
       model: '',
@@ -1857,12 +1606,9 @@ export interface SessionIdentityState {
   railOrder: string[];
   showing: string | null;
   origins?: Record<string, DraftOrigin>;
-  // What the panel has submitted in each session, which the Up arrow walks back
-  // through. It moves with the rest or the first prompt of a new session is offered by
-  // nothing: the transcript has not recorded it, and this is where it lives until then.
+  // Locally submitted prompts available to prompt history before the transcript records them.
   sent?: Record<string, string[]>;
-  // What the box on screen holds in each session, which the send control follows. It
-  // moves with the rest, or the control reads a session that no longer exists.
+  // On-screen prompt text for each session's send control.
   boxText?: Record<string, string>;
   pinned?: string[];
   archived?: string[];
@@ -1934,9 +1680,7 @@ export function sessionAdoptionFor(
   return sessionAdoptions(aliases, now).find((adoption) => adoption.durable === durable) ?? null;
 }
 
-// A first prompt gives a provisional draft its real session id. All state that was
-// filed under the provisional id moves together, or none of it does. A real id with local
-// state is a collision, not an invitation to combine two sessions.
+// Move a provisional draft's state to its actual session id. Reject an actual id that already holds local state.
 export function adoptSessionIdentity(
   state: SessionIdentityState,
   provisional: string,
@@ -1990,19 +1734,7 @@ export function adoptSessionIdentity(
   };
 }
 
-// One session continuing as another, both of them real.
-//
-// This is what `/clear` does. The agent keeps its child and starts a new session inside
-// it, and the transcript it was writing stays on disk complete and resumable. So this is not
-// the rename above it. Adoption exists because a provisional id never existed and has to stop
-// existing; here the source keeps every turn it has, keeps its place in the rail, and can be
-// opened again tomorrow.
-//
-// What follows the reader forward is what the old session can no longer answer for. A
-// press was sent to a session the child has left, so it moves. Unsent text, queued work
-// and attachments in flight belong to the person rather than the transcript, so they move
-// too. The model pick is copied instead, because the source still exists and reopening it
-// must not find its settings gone.
+// Transfer pending work to a successor session while retaining the source session. Copy settings, profiles, and origins. Retain source drafts and sent history. Move attachments, queued submissions, on-screen text, and unfinished live presses.
 export function succeedSession(state: SessionIdentityState, source: string, successor: string): SessionIdentityState {
   if (!source || !successor || source === successor) {
     throw new Error('session identity must change');
@@ -2016,9 +1748,7 @@ export function succeedSession(state: SessionIdentityState, source: string, succ
   };
   const copy = <T>(book: Record<string, T>): Record<string, T> =>
     Object.prototype.hasOwnProperty.call(book, source) ? { ...book, [successor]: book[source] } : { ...book };
-  // Beside the session it came from rather than at the head of the rail. The two are one
-  // piece of work, and a successor filed anywhere else reads as an unrelated session
-  // that happens to have started at the same moment.
+  // Insert a new successor immediately before its source. Keep an existing successor's position.
   const at = state.railOrder.indexOf(source);
   const railOrder = state.railOrder.includes(successor)
     ? [...state.railOrder]
@@ -2050,15 +1780,7 @@ export function succeedSession(state: SessionIdentityState, source: string, succ
   };
 }
 
-// An untouched draft leaves without starting anything. Once it holds text, queued work, a
-// live press, or a setup the reader changed by hand, it is not abandoned: all four are the
-// reader's own work, and pressing another row in the rail must not throw any of them away
-// without a word.
-//
-// The caller says whether the reader changed the setup, because the profile cannot. The
-// launcher's own form writes a custom source onto a setup chosen before any draft exists, so
-// a rule reading that source here leaves every draft made through Create draft on the rail
-// for the life of the window, with no typed text and no press to explain it.
+// Remove an untouched provisional draft. Retain text, attachments, queued work, live presses, hand-changed setup, and staging. The caller supplies handChanged because a custom profile source also describes launcher choices.
 export function abandonSessionDraft(
   state: SessionIdentityState,
   provisional: string,
@@ -2102,9 +1824,7 @@ export function activeWriterFailure(error: unknown): boolean {
   return /already has an active writer/i.test(message);
 }
 
-// Protocol failures translated into the stable words a failed-send card carries. The full
-// server error is still shown by the editor for diagnosis, while the card says what the
-// reader can do without exposing JSON-RPC terms or version-specific enum names.
+// Translate prompt-delivery errors into recovery instructions for the failed-send card.
 export function failedPromptDelivery(agent: string, error: unknown): PromptDelivery {
   const name = agentName(agent);
   const message = error instanceof Error ? error.message : String(error ?? '');
@@ -2126,18 +1846,7 @@ export function failedPromptDelivery(agent: string, error: unknown): PromptDeliv
   };
 }
 
-// The same translation for a compaction, which fails differently and recovers differently.
-//
-// It says only why. The card above it already says that the session was not compacted,
-// and every layer under it used to say so again: the extension, the session and the wire each
-// added a sentence of its own, and together they left no room for the cause. A reader whose
-// provider sign-in had expired was told over and over that nothing had happened, and never
-// once that they were signed out.
-//
-// So the agent's own sentence is passed through rather than replaced. A refused prompt can be
-// mapped to stable words because the reader's move is always the same, which is to restore it
-// and send it again. A compaction has nothing to restore and one move only, which is to fix
-// what the agent named and press again, so the naming is the whole value.
+// Report compaction failures through the shared session-control error formatter. Preserve the agent's error text and add a retry instruction.
 export function failedCompactionDelivery(agent: string, error: unknown): PromptDelivery {
   return failedSessionControlDelivery(agent, error, 'compacting');
 }
@@ -2166,25 +1875,15 @@ function failedSessionControlDelivery(
   };
 }
 
-// A sentence that leads rather than follows. `sentence` gives agent text a full stop for a
-// line it shares with other words. This one is for text standing alone at the head of its
-// own line, where a lower-case opening reads as a fragment torn out of a log.
+// Capitalize the opening character of a standalone sentence.
 function opened(said: string): string {
   return said.charAt(0).toUpperCase() + said.slice(1);
 }
 
-// The floor price of the next turn, and every word that explains it.
-//
-// Every turn re-presents the whole session, so a turn has a price fixed before the
-// reader types. Which of the two prices it is depends on whether the cache the last request
-// bought is still alive, and that answer moves with the clock rather than with anything the
-// panel draws. So all three faces travel together with the moment the lifetime runs out, and
-// the browser picks one from its own clock. Nothing here reads the time.
+// Cache states for the next-turn starting estimate. The browser selects a face from its clock and the supplied cache boundary.
 export type NextTurnState = 'warm' | 'cold' | 'range';
 
-// One line of the disclosed working. Plain text where nothing in it moves, and the split form
-// where an age sits inside it. The panel rewords ages from a ticker of its own, so the age
-// goes in where the line is drawn and the words stay here.
+// A detail line contains plain text or text split around a timestamp for the panel's age ticker.
 export type NextTurnLine = string | { lead: string; at: number; title?: string; trail: string; remaining?: boolean };
 
 export interface NextTurnEntry {
@@ -2194,19 +1893,14 @@ export interface NextTurnEntry {
   separateBefore?: boolean;
 }
 
-// The tail of a sentence with a length of time inside it. The panel prints the figure off its
-// own clock and rewords it in place every second, so the words are held here and the
-// arithmetic is done there, the way a popover line carrying an age already works.
+// Split text around a duration that the panel updates from its clock.
 export interface NextTurnSpan {
   lead: string;
-  // Which way the panel counts from the moment the lifetime ends: what is left of it, or how
-  // long ago it ran out.
+  // Count time remaining or time since the boundary.
   count: 'left' | 'since';
-  // The whole lifetime the figure is measured against, as a native tooltip on the figure. The
-  // total is a detail, and what is left of it is the headline.
+  // Native tooltip describing the full cache lifetime.
   title: string;
-  // The same sentence at the uncertain boundary, split around the wording that replaces the
-  // duration. The panel swaps these values into the existing nodes without choosing words.
+  // Text that replaces the duration near the uncertain cache boundary.
   near: { lead: string; value: string; trail: string };
   trail: string;
 }
@@ -2215,36 +1909,30 @@ export type NextTurnWords = string | NextTurnSpan;
 
 export interface NextTurnFace {
   state: NextTurnState;
-  // The words before the price, which are ordinary text. Only the price is pressable, so the
-  // line reads as a sentence and not as a second Send.
+  // Plain text before the pressable price.
   lead: string;
-  // The figure the reader presses. This is always one conservative starting price.
+  // Conservative starting price displayed as the control.
   price: string;
-  // The words after it, split wherever a length of time sits inside them.
+  // Text after the price, split around any duration.
   trail: NextTurnWords;
   // The model cache lifetime behind the cache status, if the pricing row records one.
   statusTitle: string | null;
-  // This working is intentionally read in one column. Other stat popovers retain their
-  // compact label-and-value grid.
+  // Display estimate details in one column.
   layout: 'stacked';
   entries: NextTurnEntry[];
   footer: string[];
 }
 
 export interface ComposerNextTurn {
-  // The word saying that a press discloses the working.
+  // Disclosure label for the estimate details.
   disclosure: string;
-  // When the cache is treated as cold. The panel calls it cold before the nominal lifetime
-  // ends, so the visible price stays conservative.
+  // Conservative cache-expiry boundary, earlier than the nominal lifetime.
   coldAt: number | null;
-  // Whether a compaction replaced the session after the last request. Nothing has cached
-  // the replacement, so the next request writes it again whatever the clock says. It is a
-  // separate fact from the boundary because there is no boundary here: no lifetime ran out.
+  // Mark estimates after compaction so the panel selects the cold face regardless of the clock.
   afterCompaction: boolean;
-  // How early the panel calls a cache cold to cover the recorded request clock error.
+  // Allowance for recorded request-clock error.
   tolerance: number;
-  // The span either side of the boundary where the compact formatter would only say two
-  // minutes. The line names that uncertainty instead of presenting it as a duration.
+  // Duration range around the boundary that uses uncertainty wording.
   nearBoundary: number;
   warm: NextTurnFace | null;
   cold: NextTurnFace | null;
@@ -2256,13 +1944,10 @@ const TIER_WORDS: Record<CacheTier, { bought: string; noun: string; window: stri
   '5m': { bought: '5 minutes', noun: '5 minutes', window: 'the last 5 minutes' },
 };
 
-// The word saying a press shows the working. It rides the accessible name as well as the line,
-// because a reader who cannot see it is otherwise told the figure and never told it can be
-// opened.
+// Disclosure wording for the visible estimate and its accessible name.
 const NEXT_TURN_DISCLOSURE = 'Details';
 
-// The words that open every face. The price follows them and the state follows the price,
-// because the price is the answer and the state is the reason for it.
+// Shared text before the price on every estimate face.
 const NEXT_TURN_LEAD = 'Next turn starts at ';
 
 const NEXT_TURN_FOOTER = ['Conservative API list-price estimates. Actual charges can differ.'];
@@ -2314,9 +1999,7 @@ function nextTurnFaces(
     lead: NEXT_TURN_LEAD,
     price: warmMoney,
     statusTitle,
-    // Each request starts the lifetime again at no cost, so what is left of it is the one
-    // thing the reader is deciding against: how long they can leave the session before
-    // answering it costs the write rate instead of the read rate.
+    // Show remaining cache time on the warm face.
     trail: {
       lead: ', cached for another ',
       count: 'left',
@@ -2346,9 +2029,7 @@ interface ProspectiveNextTurn {
   coldOnly: 'model-change' | null;
 }
 
-// The recorded context remains the evidence for the next request. A selected model changes
-// only the facts that belong to that model: its exact pricing identity, advertised window,
-// and cache state. The previous model's cache cannot make the selected model warm.
+// Keep the recorded request basis when the selected model matches. A different model replaces pricing identity and window and clears cache state.
 export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn | null {
   const basis = state.nextTurn;
   if (!basis) {
@@ -2359,22 +2040,7 @@ export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn |
     return { basis, coldOnly: null };
   }
   if (selected.resolvedModel) {
-    // A resolved model id names the exact priced model the pick runs, so it is compared
-    // against what the last request ran instead of going through the alias search below.
-    // That search fails a pick like `default` (`modelRan` never returns it) and a pick
-    // whose alias text is a substring of more than one listed alias inside the recorded id,
-    // for example `opus`, `claude-opus-5`, and `opus[1m]` all occurring inside
-    // `claude-opus-5-5`. The comparison is an exact match on the normalized id, never a
-    // substring check: `claude-opus-5` must not read as unchanged after a `claude-opus-5-5`
-    // request, and `gpt-5.6` must not read as unchanged after `gpt-5.6-luna`, because those
-    // are distinct priced models. Two dated snapshots of one model must also carry the same
-    // date: `claude-sonnet-4-5-20250929` and `claude-sonnet-4-5-20251201` normalize to the
-    // same base id, but they are still two different snapshots, so a real snapshot switch
-    // reads cold. A dated id still matches an undated alias of the same model, since a live
-    // CLI alias resolves to a dated id that a recorded transcript may carry no date for. The
-    // transcript never records the CLI's `[1m]` window suffix, so a `[1m]` pick that resolves
-    // to the same base model and snapshot date as the last request reads warm here, same as
-    // any other pick of that model would.
+    // Compare resolved pricing identities exactly after normalization. Require equal snapshot dates when both ids carry a date. An undated id permits a dated match. Window suffixes do not affect this comparison.
     const pickedId = normalizeModelIdentity(selected.resolvedModel);
     const recordedId = normalizeModelIdentity(basis.model);
     const pickedDate = snapshotDateOf(selected.resolvedModel);
@@ -2402,8 +2068,7 @@ export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn |
   };
 }
 
-// Nothing at all where the session has no context figure or no priced model. An absent
-// line is the right answer there, and a line reading `unknown` is not.
+// Omit the next-turn figure without a request basis or a usable formatted price.
 function nextTurnFigure(prospective: ProspectiveNextTurn | null): ComposerNextTurn | null {
   if (!prospective) {
     return null;
@@ -2442,16 +2107,7 @@ function nextTurnFigure(prospective: ProspectiveNextTurn | null): ComposerNextTu
   };
 }
 
-// Which face the clock says. The cold face starts before the nominal lifetime ends, because the
-// transcript clock can trail the actual request by ninety seconds.
-//
-// A compaction is the exception the clock cannot answer. Nothing has cached the session
-// it wrote, so the next request writes it again from the moment the compaction lands, and the
-// state is cold at every clock rather than at one after a boundary.
-//
-// `webview/composer-presentation.ts` keeps a copy of this. The face has to move on the second the clock does, from a
-// clock only the browser holds, and asking the extension would arrive a round trip late once a
-// minute for as long as the panel is open. `panel.webview.test.ts` runs the two together.
+// Select the estimate face from the supplied cache boundary and clock. After compaction, select the cold face when available. `webview/composer-presentation.ts` also evaluates this state in the browser.
 export function nextTurnStateAt(figure: ComposerNextTurn | null, now: number): NextTurnState {
   if (!figure) {
     return 'range';
@@ -2479,9 +2135,7 @@ function contextFigure(
   }
   const share = used / max;
   const percent = wholePercent(share);
-  // The bands are the context chip's, taken off `bandForPercent` rather than written again.
-  // The panel keeps one vocabulary for a window getting full, and a scale of its own here
-  // would be a second thing to learn for the same warning.
+  // Use the context chip's shared percentage bands.
   const band = bandForPercent(percent);
   const compact = compactCommand(agent);
   const said = `${percent}% of the context window used${band ? `, ${band.word}` : ''}`;
@@ -2497,8 +2151,7 @@ function contextFigure(
   };
 }
 
-// Text that has to sit beside other text in one spoken line, so a sentence that came without
-// a full stop is given one and a sentence that came with one is left alone.
+// Trim text and append a full stop unless it already ends in sentence punctuation.
 function sentence(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) {
@@ -2507,9 +2160,7 @@ function sentence(text: string): string {
   return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
-// What one row says to a reader who cannot see it. It carries every part the row shows: the
-// label, the agent's own sentence under it, and whether this is what the session is set to
-// now.
+// Include the visible label, description, and selected state in the row's accessible name.
 function rowName(item: Omit<MenuItem, 'name'>): string {
   const parts = [sentence(item.label)];
   if (item.description) {
@@ -2521,12 +2172,9 @@ function rowName(item: Omit<MenuItem, 'name'>): string {
   return parts.join(' ');
 }
 
-// One row, from whichever of the three tables it came out of. A mode, a model and an effort
-// level all carry the same three words, so a row is assembled once rather than per control.
+// Build model, effort, and permission menu rows with shared accessible names.
 function menuItem(choice: { value: string; label: string; description: string }, checked: boolean): MenuItem {
-  // Every row this builder makes is one of a set the reader picks exactly one of, and none of
-  // them is a caution: the server rows are the only toggles that carry that tone, and they are
-  // built in `mcpview.ts`, which is where the other kind is set.
+  // Each row selects one setting and uses no caution styling.
   const row = {
     value: choice.value,
     label: choice.label,
@@ -2538,14 +2186,12 @@ function menuItem(choice: { value: string; label: string; description: string },
   return { ...row, name: rowName(row) };
 }
 
-// Why the model menu has nothing to offer. The reader is told who has not answered rather
-// than shown a box with nothing in it.
+// Explain an empty model menu.
 function modelEmpty(name: string): string {
   return `${name} has not said yet which models it runs.`;
 }
 
-// Why the effort menu has nothing to offer, which is two different reasons: the model takes
-// no effort setting, or there is no model yet for it to be the setting of.
+// Distinguish an unresolved model from a model without effort settings.
 function effortEmpty(model: ModelChoice | null, name: string): string {
   return model
     ? `${model.label} takes no effort setting.`
@@ -2565,8 +2211,7 @@ function modelMenu(state: ComposerState, name: string): Menu {
     agent: state.agent,
     session: state.sessionId,
     head: `Which model should ${name} run this session on?`,
-    // No row here is a caution: which model answers is a different question from how much it
-    // asks before it acts, and none of these widens anything.
+    // Model rows use no caution styling.
     items: modelPicks(state.models, state.defaults, true).map((model) =>
       menuItem(
         model,
@@ -2581,9 +2226,7 @@ function modelMenu(state: ComposerState, name: string): Menu {
 function effortMenu(state: ComposerState, name: string): Menu {
   const model = settledModel(state);
   const efforts = model ? effortPicks(state.models, model.value, state.defaults) : [];
-  // Ticked by what the next turn will run at: the reader's level where they set one, and
-  // otherwise the level the last turn recorded itself running at. A menu that ticked nothing
-  // over a session visibly running at high says the setting is unset when it is not.
+  // Select the effort from the reader's choice, recorded level, then applied default.
   const at =
     state.settings.selectedEffort ||
     state.settings.confirmedEffort ||
@@ -2596,17 +2239,14 @@ function effortMenu(state: ComposerState, name: string): Menu {
     agent: state.agent,
     session: state.sessionId,
     model: model?.value ?? '',
-    // The question is about the model, so it names the model. A menu opened with none settled
-    // on has no name to use and asks about the model the reader has yet to pick.
+    // Name the settled model in the question, or use the generic model label.
     head: `How much should ${model ? model.label : 'the model'} work on a turn?`,
     items: efforts.map((effort) => menuItem(effort, effort === chosen)),
     empty: efforts.length === 0 ? effortEmpty(model, name) : '',
   };
 }
 
-// Built from an agent and a stored value rather than from the state, because a draft asks
-// this question about the agent in its profile while a live session asks it about the
-// agent it is running.
+// Build permission choices from the supplied agent and stored value for either a draft or a live session.
 function askModeMenu(
   agent: string,
   value: string | undefined,
@@ -2620,30 +2260,23 @@ function askModeMenu(
     agent,
     session,
     head: own(ASK_MODE_HEADS, agent) ?? ASK_MODE_HEADS.claude,
-    // No row here is a caution: every mode is a setting the reader chose, not a warning.
+    // Permission rows use no caution styling.
     items: permissionModes(agent).map((mode) => menuItem(mode, mode === chosen)),
-    // Every agent has a table and an unknown one is lent Claude's, so this menu never opens
-    // on nothing and has no line to say when it does.
+    // Every supported agent has permission choices. Unknown agents use the Claude choices.
     empty: '',
   };
 }
 
-// A draft's menus are built from its profile and from nothing else.
-//
-// The reader's live picks and the agent's stored ask level both belong to a session with a
-// child behind it. Read here, each one would answer with the source session's setup, and
-// picking a row would change that session rather than the draft in front of the reader.
+// Draft menus read their setup choices from the draft profile.
 
-// Which agent starts the draft. The choice exists on a draft alone: a session with a
-// child behind it is that agent's session and cannot become another agent's.
+// Only drafts offer an agent choice.
 function draftAgentMenu(state: ComposerState, profile: SessionProfile): Menu {
   return {
     control: 'agent',
     agent: profile.agent,
     session: state.sessionId,
     head: 'Which agent should start this draft?',
-    // No sentence under either name. Neither CLI publishes one about itself, and a line
-    // written here would be this panel's claim about another product.
+    // Agent rows show their names without descriptions.
     items: LAUNCH_AGENTS.map((agent) =>
       menuItem({ value: agent, label: agentName(agent), description: '' }, agent === profile.agent),
     ),
@@ -2676,18 +2309,14 @@ function draftEffortMenu(state: ComposerState, profile: SessionProfile, name: st
     agent: profile.agent,
     session: state.sessionId,
     model: model?.value ?? '',
-    // The same question a live session asks, and asked of the draft's own model. The rows
-    // come from the profile rather than from the state beside it, whose model and levels
-    // belong to a child this draft has not started.
+    // Use the draft's model in the question and its effort choices in the rows.
     head: `How much should ${model ? model.readingLabel : 'the model'} work on a turn?`,
     items: rows.map((effort) => menuItem(effort, effort.value === at)),
     empty: rows.length === 0 ? effortEmpty(model ? { ...model, label: model.readingLabel } : null, name) : '',
   };
 }
 
-// The menu one control opens, or nothing at all for a control this version does not draw and
-// for a window with no session to open it from. The popover is handed a finished menu
-// the same way the row is handed finished picks.
+// Return the selected control's menu, or null for an absent session or unsupported control.
 export function pickMenu(control: string, state: ComposerState | null): Menu | null {
   if (!state) {
     return null;
@@ -2723,9 +2352,7 @@ export function pickMenu(control: string, state: ComposerState | null): Menu | n
   if (control === 'askmode') {
     return askModeMenu(state.agent, state.askMode, state.sessionId, state.effectiveMode, true);
   }
-  // The servers menu is built whole in `mcpview.ts`, rows and head and all. It answers with
-  // nothing for an agent that has no servers, which is the same answer this function gives
-  // for a control it does not draw, so the two arrive at the popover as one case.
+  // Use the shared server menu, omitting it when the agent reports no servers.
   if (control === 'mcp') {
     const menu = mcpMenu(state.mcpServers, state.agent, name);
     return menu ? { ...menu, session: state.sessionId } : null;
@@ -2733,33 +2360,17 @@ export function pickMenu(control: string, state: ComposerState | null): Menu | n
   return null;
 }
 
-// A control is drawn unpressable exactly when the menu behind it has no rows, and every pick
-// below reads that off the menu itself rather than working the same condition out a second
-// time. A button that opens on nothing and a button that refuses a menu it has choices for
-// are both worse than either alone, and both are what two copies of one condition drift into.
+// Disable the model control when its menu has no rows.
 function modelPick(state: ComposerState, name: string): ComposerPick {
   const selected = state.settings.selectedModel;
   const chosen = chosenModel(state.models, selected);
-  // What the session is on, in order of what the panel actually knows: the reader's
-  // pick; then the model the last turn recorded, named by the list where the list names it
-  // and by its own shortened id where it does not; then a stored pick no list can name; and
-  // only then the word "default".
-  //
-  // Reading the transcript is what stops the row saying "Default model" over a session
-  // the reader can see running Opus. It is a reading rather than a pick, and both the name
-  // and the hover say so, because the two are not the same claim.
-  //
-  // Written with `||` rather than `??` because a pick nobody has made arrives as the empty
-  // string, not as nothing: `pickedModel` answers '' for a reader who has never opened the
-  // menu. `??` steps over the empty string and the control is drawn with no words in it.
+  // Resolve the label from the selected or recorded model, then the catalog fallback. Empty selections need `||` to reach a nonempty label.
   const pending = modelPending(state);
   const confirmedChoice = recordedModel(state);
   const readConfirmed = !selected || (!pending && state.settings.pendingModel !== null);
   const running = readConfirmed ? confirmedChoice : null;
   const recorded = readConfirmed ? (shortModel(state.settings.confirmedModel) ?? '') : '';
-  // The reader's own pick comes before anything read off a transcript. A pick outlives a
-  // reload while the model list does not, so a stored pick with no list to name it was being
-  // drawn over by whatever the last turn happened to run on.
+  // An unconfirmed selection keeps its own label, including a stored value absent from the catalog.
   const baseLabel =
     (readConfirmed ? running?.label || recorded : chosen?.label || selected) ||
     modelLabel(state.models, selected, state.defaults);
@@ -2769,9 +2380,7 @@ function modelPick(state: ComposerState, name: string): ComposerPick {
   const label = projected?.configuredDefault ? projected.readingLabel : baseLabel;
   const menu = modelMenu(state, name);
   const waiting = menu.items.length === 0;
-  // Read off the last turn only where nothing has been picked. Said over a stored pick, the
-  // hover told the reader nothing was chosen while naming a model the next turn will not run
-  // on, and both halves were false.
+  // Describe a recorded model only when the label uses confirmed state.
   const read = readConfirmed && (running !== null || recorded !== '');
   const application = pending ? ', selected for the next turn' : read ? ', which is what the last turn ran on' : '';
   return {
@@ -2785,8 +2394,7 @@ function modelPick(state: ComposerState, name: string): ComposerPick {
         ? 'What the last turn in this session ran on. Nothing has been picked for it yet.'
         : chosen?.description || `Which model ${name} runs this session on`,
     disabled: waiting,
-    // Which model answers is not a question that can go wrong in the way a fallen-over
-    // server can, so no model control is ever toned.
+    // Model controls use no caution styling.
     caution: false,
   };
 }
@@ -2807,7 +2415,7 @@ function effortPick(state: ComposerState, name: string): ComposerPick {
   const rows = effortPicks(state.models, model.value, state.defaults);
   const selected = menu.items.find((option) => option.checked)?.value;
   const chosen = rows.find((item) => item.value === selected);
-  // `||` for the same reason the model control uses it: an unset effort arrives as ''.
+  // Unset effort values are empty strings, so label fallbacks use `||`.
   const pending = effortPending(state);
   const read =
     (!state.settings.selectedEffort || (!pending && state.settings.pendingEffort !== null)) &&
@@ -2834,9 +2442,7 @@ function effortPick(state: ComposerState, name: string): ComposerPick {
 function askModePick(state: ComposerState): ComposerPick {
   const menu = askModeMenu(state.agent, state.askMode, state.sessionId, state.effectiveMode, true);
   const mode = liveAskMode(state.agent, state.askMode, state.effectiveMode, state.effectivePermissionMode);
-  // The head is the question, the label is what the control is set to, and the mode's own
-  // sentence sits with that setting so a reader who cannot see the hover still hears what
-  // the mode runs without asking.
+  // The accessible name includes the question, selected mode, and mode description.
   const description = mode.description ? ` ${sentence(mode.description)}` : '';
   return {
     control: 'askmode',
@@ -2844,20 +2450,12 @@ function askModePick(state: ComposerState): ComposerPick {
     name: `${menu.head} ${mode.label}.${description} Press to change it.`,
     detail: mode.description || menu.head,
     disabled: menu.items.length === 0,
-    // No row of the menu behind this control is a caution: every ask mode is a setting the
-    // reader chose, not a warning, so the button that shows the current one is never toned.
+    // Permission controls use no caution styling.
     caution: false,
   };
 }
 
-// The servers control, or nothing at all for an agent with no servers to show. Both answers
-// come from `mcpPick`, which writes every word of it, and this only carries them onto the row
-// in the shape the other three controls arrive in.
-//
-// Never drawn unpressable, unlike the model and effort controls. Those two are always on the
-// row and go grey when there is nothing behind them, because a row whose positions moved
-// about would move the settings the reader was reaching for. This one is on the row only when
-// there is something behind it, so there is no state in which it is drawn with an empty menu.
+// Convert the shared servers pick into a prompt box control. Omit it when no pick exists. A displayed servers control is enabled.
 function mcpControl(state: ComposerState, name: string): ComposerPick | null {
   const pick = mcpPick(state.mcpServers, name);
   if (!pick) {
@@ -2873,19 +2471,7 @@ function mcpControl(state: ComposerState, name: string): ComposerPick | null {
   };
 }
 
-// What the box says while it is empty.
-//
-// While a turn runs it says what will happen to the prompt, because that is the one moment
-// the answer is not obvious: the reader is watching the agent work and the button beside
-// them says Stop. Whether the agent takes it now or the panel holds it is the whole of the
-// difference, and it is said in the agent's own name rather than in the panel's terms.
-//
-// The idle box names the slash key, because a menu nothing points at is one the reader has
-// to already know about. It says it only where a command is available, whether the agent
-// published it or the panel implements it through an equivalent protocol call.
-// The walk back through earlier prompts is not named here. A second clause runs past what a
-// narrow sidebar draws, and an empty box has nothing to scroll, so the reader cannot reach
-// the rest of the line. Up is the key every shell and both agent CLIs already use for it.
+// Running placeholders describe prompt delivery for the agent. Idle placeholders name available command and skill prefixes.
 function placeholderFor(agent: string, name: string, running: boolean, commands: boolean, skills: boolean): string {
   if (running) {
     return takesMidTurnPrompt(agent)
@@ -2900,37 +2486,18 @@ function placeholderFor(agent: string, name: string, running: boolean, commands:
     : `Ask ${name} anything, or type / for its commands`;
 }
 
-// How the box is sent and how a new line is made. Written once here, because a panel that
-// wrote its own copy would be the second place this key press is described.
+// Shared wording for sending and inserting a new line.
 const SEND_HINT = 'Enter sends, Shift and Enter for a new line';
 
 const SEND_LABEL = 'Send';
 const STOP_LABEL = 'Stop';
 
-// A prompt, or a note, cut to the one line a control's name can carry. This is `noteName`'s
-// rule exactly: the reader's own words run together and shortened. It is called rather than
-// copied because the cut is the part that goes wrong, and `shortenTo` inside it is the one
-// place that keeps half a character out of a spoken name.
+// Use the shared comment-name formatter to normalize and shorten prompt text.
 function oneLine(text: string): string {
   return noteName({ note: text });
 }
 
-// Which agents hold a prompt of their own that arrives during a turn.
-//
-// Both do, and both were measured against a real child rather than read. A prompt sent well
-// into a running turn drew no error from either, and both answered the running turn first
-// and the new one after it, in order. So the panel holding that prompt back was a second
-// queue in front of a queue that already works, and every fault in the panel's own was a
-// prompt the agent would have taken.
-//
-// The two report it differently, and only one of them ends a turn per answer. Claude sends a
-// `turnEnd` after each: two prompts, two ends. Codex sends one after the last answer, so a
-// second prompt keeps the session busy through both rather than closing and reopening.
-// Nothing here reads that, and it is written down because a reader counting ends against
-// answers will find them equal on one agent and not on the other.
-//
-// An agent not listed here keeps the panel's queue, which is the answer that cannot lose a
-// prompt to a server that refuses it. Measure before adding one.
+// Agents listed here accept prompts during a running turn. Unknown agents retain the panel queue.
 const TAKES_MIDTURN_PROMPT: Record<string, boolean> = { claude: true, codex: true };
 
 export function takesMidTurnPrompt(agent: string): boolean {
@@ -2941,18 +2508,12 @@ export function turnEndCompletesEveryPrompt(agent: string): boolean {
   return agent === 'codex';
 }
 
-// What a press on Send, or an Enter, actually means.
-//
-// A blank draft with nothing waiting to go with it sends nothing, a running turn included.
-// Without that an Enter hit by accident while a turn runs puts an empty prompt in the queue,
-// and the reader finds out when the turn ends and the agent is asked nothing. A blank draft
-// with comments on the session's cards is a prompt, and the branch below says why.
+// A submission sends immediately, enters the queue, or does nothing.
 export type SendMeaning = 'send' | 'queue' | 'nothing';
 
 export function sendAction(state: ComposerState): SendMeaning {
   const typed = state.onScreen.trim();
-  // Codex accepts another prompt during a model turn, but its manual compaction turn is not
-  // steerable. The live press distinguishes those two kinds of running work.
+  // Codex compaction and clear controls hold new submissions in the panel queue.
   const compacting =
     state.agent === 'codex' &&
     state.live.some((press) => (press.kind === 'compact' || press.kind === 'clear') && !press.failed);
@@ -2963,12 +2524,7 @@ export function sendAction(state: ComposerState): SendMeaning {
         takesMidTurnPrompt(state.agent) &&
         !compacting &&
         (state.agent !== 'codex' || !state.queued.length)));
-  // Comments on their own are a prompt. The reader marked the lines they want answered, and
-  // `promptToSend` has always built a prompt out of those alone, so refusing an empty box left
-  // the one thing the marks are for unreachable from the control that sends them.
-  //
-  // A comments-only submission behind Codex compaction is represented in the queue without
-  // copying the comments. They remain visible and attached until the queue drains.
+  // Comments or files permit a submission without typed text. Queued comments retain their attachments until delivery.
   const files = state.assets?.length ?? 0;
   if (!typed) {
     if (!commentsForActiveSubmission(state).length && !files) {
@@ -2979,36 +2535,20 @@ export function sendAction(state: ComposerState): SendMeaning {
   return takesNow ? 'send' : 'queue';
 }
 
-// What one press on the composer's action button does with what the box holds. `sendAction`
-// answers the first three and `compactAction` the fourth, and the button is the same button.
+// Actions available to the prompt box's main button.
 export type PressMeaning = SendMeaning | 'compact' | 'clear';
 
-// Which of a session's waiting requests one press on that button answers.
-//
-// A prompt that goes now, a prompt that joins the local queue, and a compaction all free the
-// child. A request holds every one of them behind it: the queue drains when the running turn
-// ends, a turn blocked on a request never ends, and a compaction is a control turn the child
-// cannot reach while it waits to be answered. Left open, each one waits for ever behind the
-// request it was meant to replace, with nothing on screen saying why.
-//
-// A press that leaves what was typed in the box answers nothing, because nothing went.
+// Any submission action answers the waiting requests. A press that sends nothing leaves them unanswered.
 export function asksAnsweredBySend<T>(meant: PressMeaning, waiting: readonly T[]): readonly T[] {
   return meant === 'nothing' ? [] : waiting;
 }
 
-// The comments that ride out with the next prompt, so the caller knows what to take away
-// once it has gone. One session's, through `commentsFor`, which is the only way into the
-// notes for the reason it states.
-//
-// A comment that has gone out is gone. It was said and the agent has it, and a card still
-// drawing it would leave the reader working out which of their own marks are outstanding. So
-// sending takes them, and nothing has to remember which were sent.
+// Return comments attached to this session.
 export function attachedComments(state: ComposerState): TurnComment[] {
   return commentsFor(state.comments, state.sessionId);
 }
 
-// Comments available to the active box. Waiting records keep their claims while Claude
-// accepts a later prompt through its own mid-turn queue.
+// Use the captured submission comments when supplied. Otherwise, exclude comments claimed by queued submissions and include explicit draft claims.
 export function commentsForActiveSubmission(state: ComposerState): TurnComment[] {
   if (state.submittedComments) return [...state.submittedComments];
   const queued = new Set(state.queued.flatMap((entry) => entry.commentIds));
@@ -3022,15 +2562,7 @@ export function commentsForActiveSubmission(state: ComposerState): TurnComment[]
     );
 }
 
-// What is left of the reader's comments once a prompt has been handed to an agent.
-//
-// A comment goes only when the prompt carrying it went. The handoff ends without sending
-// anything at all on three ordinary paths: no folder is open, the agent's path is wrong, or
-// the session it would have resumed has exited. On each of those the reader still needs
-// what they wrote. Taking those comments would discard the reader's text.
-//
-// The set that went is passed in rather than read again here. A comment written while the
-// prompt was on its way was not in it, and re-reading would take that one too.
+// Remove delivered comments only when their content still matches the captured submission. Failed delivery preserves every comment.
 export function commentsAfterSend(
   comments: readonly TurnComment[],
   carried: readonly TurnComment[],
@@ -3058,19 +2590,10 @@ export function commentsAfterSend(
   });
 }
 
-// The text that goes to the agent: the reader's prompt, with the attached comments under it.
-//
-// `emitComments` builds the notes, rather than a second assembler here. This one assembler
-// builds the send, the queued row's copy and the live card, so all three read the same to the
-// agent and the ordering rules live in one place.
-//
-// A prompt with nothing attached is handed back exactly as it was typed: no heading, no
-// separator and no empty section, because the agent reads all three as something the reader
-// meant.
+// Combine the trimmed draft with its generated comments block. Omit headings and separators when no comments exist.
 export function promptToSend(state: ComposerState, now?: number): string {
   const prompt = state.draft.trim();
-  // `emitComments` takes the whole set and picks the session out of it, so one assembler
-  // builds both the paste and the prompt.
+  // Assemble comments with the shared formatter.
   const notes = emitComments(commentsForActiveSubmission(state), state.sessionId, now);
   if (!notes) {
     return prompt;
@@ -3078,63 +2601,31 @@ export function promptToSend(state: ComposerState, now?: number): string {
   return prompt ? `${prompt}\n\n${notes}` : notes;
 }
 
-// How many earlier prompts one session offers, and how much text they add up to.
-//
-// Both caps are on the message rather than on the walk. The list rides the composer view,
-// which is posted whenever anything around the box changes, so a session whose prompts
-// are whole documents would otherwise send every one of them on every repaint. A reader who
-// wants something older than this walks past what an arrow key is for.
+// Bound the count and total size of prompt history sent to the panel.
 export const PROMPT_HISTORY_LIMIT = 20;
 export const PROMPT_HISTORY_CHARS = 20_000;
-// And how much of one the walk reads out. Long enough to tell two prompts apart, short
-// enough that a reader hears where they are rather than the prompt itself.
-// The prompts one session has already sent, newest first, kept in the order this panel
-// sent them.
-//
-// The newest is dropped rather than repeated. A reader who sends the same words twice wants
-// one entry to walk back to, not two presses that land on the same line.
+// Keep submitted prompts newest first. Repeated cleaned text replaces its older entry.
 export function sentAfter(held: readonly string[], text: string, limit: number = PROMPT_HISTORY_LIMIT): string[] {
   const one = text.trim();
   const key = cleanPrompt(one);
   if (!one || !key) {
     return [...held];
   }
-  // The same words sent again keep one place, and it is the newest. Two entries cost the
-  // reader a press that lands where they already are. They also part this list from the
-  // record, which drops a repeat the same way, and the two are matched against each other
-  // in order: one list holding a prompt twice while the other holds it once pairs every
-  // prompt behind it with the wrong record.
-  //
-  // Told apart by the cleaned key, which is the rule the record drops its own repeat by. Two
-  // texts differing only in spacing or in a tag-shaped word are one prompt to the record.
+  // Deduplicate by the same cleaned key used for recorded prompts.
   return [one, ...held.filter((word) => cleanPrompt(word) !== key)].slice(0, limit);
 }
 
-// Whether a recorded prompt carries a generated comments block under a sent prompt: the sent
-// prompt, a blank line, and a block whose first line looks like a turn heading.
+// Recognize a sent prompt followed by a blank line and a generated comments block.
 function carriesComments(key: string, own: string): boolean {
   return key.startsWith(`${own}\n\n`) && looksLikeComments(key.slice(own.length + 2));
 }
 
-// Whether one recorded prompt is a send this panel made. Either the prompt alone, or the
-// prompt with a comments block under it. Nothing looser: an opening line that matches a
-// short prompt such as `continue` belongs to a different prompt, and a looser rule takes that
-// prompt out of the walk with nothing on screen to say why. `promptHistory` and
-// `prunedSentPrompts` both compare through this, so the two agree on which recorded prompt is
-// which send.
+// Match the complete sent prompt or its assembled comments form. A shared opening line alone does not identify a submission.
 function sameSend(key: string, own: { key: string }): boolean {
   return key === own.key || carriesComments(key, own.key);
 }
 
-// The saved sent prompts with every one the transcript has now recorded taken out.
-//
-// A prompt joins `sentPrompts` before any process has written it down, and stays there until
-// the transcript catches up. Once a session's own transcript-read prompts hold the same
-// prompt, the transcript is the durable copy, so the saved entry is redundant. Matched
-// through `sameSend`, the same rule `promptHistory` pairs a send with its record by, so a
-// prompt sent with comments attached is recognized as recorded here too. A session left with
-// nothing kept takes no place in the answer, the way a session with nothing sent takes none
-// in the input.
+// Remove saved submissions once the recorded prompts contain their plain or comments-appended form. Omit sessions without remaining submissions.
 export function prunedSentPrompts(
   sent: Readonly<Record<string, readonly string[]>>,
   recorded: ReadonlyMap<string, readonly string[]>,
@@ -3153,10 +2644,7 @@ export function prunedSentPrompts(
   return out;
 }
 
-// The sent prompts as they belong in storage: normalized, and with every one the transcript
-// has now recorded pruned out. `writeDrafts` and the transcript catch-up site in
-// `panelhost.ts` both save through this, so the saved copy never holds a prompt the
-// transcript can supply on its own.
+// Prune recorded submissions, then normalize the remaining prompts for storage.
 export function sentPromptsToSave(
   sent: Readonly<Record<string, readonly string[]>>,
   recorded: ReadonlyMap<string, readonly string[]>,
@@ -3164,13 +2652,7 @@ export function sentPromptsToSave(
   return normalizeSentPrompts(prunedSentPrompts(sent, recorded));
 }
 
-// What the reader typed in one recorded turn, newest first.
-//
-// Ordered by when each was typed rather than by which list it came from. `prompts` is a list
-// because a turn that got no response of its own is carried into the next one, whose recorded
-// prompt then holds both. That carried turn contributes its own mid-turn prompts as well, and
-// those are older than the prompt that carried it, so a rule putting one list wholly ahead of
-// the other hands back the prompt before the newest one.
+// Order all prompts by descending timestamp, using reverse input order to break ties.
 export function askedInTurn(
   prompts: readonly { text: string; at: number }[],
   laterPrompts: readonly { text: string; at: number }[],
@@ -3181,26 +2663,7 @@ export function askedInTurn(
     .map(({ one }) => one.text);
 }
 
-// The prompts one session offers the Up arrow, newest first.
-//
-// Two sources. `sent` is what this panel handed over and the transcript does not hold yet.
-// Claude Code writes a queued prompt to the file when the agent picks it up, up to a minute
-// after it goes, and recalling the prompt just sent is the commonest press there is.
-// `recorded` is what the transcript holds, which outlives the window and carries work
-// started in a terminal.
-//
-// The two are compared through `cleanPrompt`, which is what wrote the recorded copy. It
-// collapses runs of spaces and strips tag-shaped words, so the recorded text of a prompt is
-// rarely the text that was sent. Compared raw, the same prompt appears twice.
-//
-// A prompt sent with comments attached is recorded as the typed text with the comments on
-// the lines beneath it. That record is offered as its sent original, so the box gets back
-// the reader's own words rather than the assembled prompt.
-//
-// The record decides the order wherever it holds the send at all, so a prompt typed in a
-// terminal after one sent from this panel is still offered first. Only a send the record has
-// not caught up with goes in front of everything, which is where it belongs: it is the newest
-// thing this session has.
+// Combine locally sent and recorded prompts, newest first. Cleaned keys identify duplicates. Use the original sent text for recorded submissions with appended comments. Put unmatched newer submissions before the recorded sequence.
 export function promptHistory(
   recorded: readonly string[],
   sent: readonly string[],
@@ -3212,17 +2675,7 @@ export function promptHistory(
     .map((one) => one.trim())
     .map((text) => ({ text, key: cleanPrompt(text) }))
     .filter((one) => one.key);
-  // Which recorded prompt each send is. Matched oldest first up both lists at once, because
-  // the record catches up in the order the prompts went. So the sends it has not reached yet
-  // are the newest ones, and a prompt sent twice takes the older record for its first send.
-  //
-  // Matching on the text alone put the second send at the first send's place, and the press
-  // that asks for the prompt just sent walked past it into the middle of the list.
-  //
-  // A send the record does not hold is passed over rather than stopped at. The record holds
-  // only its own newest, and drops a prompt too big to offer, so the oldest sends of a long
-  // window are missing from it. Stopping there put every send in front of work started in a
-  // terminal since. Only the sends newer than every one the record does hold are ahead of it.
+  // Match both lists oldest first, preserving recorded order. Skip unmatched sends because recorded history omits older or oversized entries. Only sends newer than the newest match precede the recorded sequence.
   const keys = recorded.map((raw) => cleanPrompt(raw.trim()));
   const stands = new Map<number, { text: string; key: string }>();
   let ahead = mine.length;
@@ -3251,16 +2704,11 @@ export function promptHistory(
     if (!key) {
       return;
     }
-    // A submission with an empty box sends the reader's comments alone, and the transcript
-    // records that assembled document as the prompt. The reader typed none of it, so the
-    // walk does not offer it back.
+    // Exclude generated comments-only prompts from history.
     if (looksLikeComments(key)) {
       return;
     }
-    // Nor the assembled form of a prompt this panel sent. One send with comments attached is
-    // matched above and offered as the words the reader typed. A second send of the same
-    // words leaves the first record with nothing to pair with, and offered raw it puts the
-    // reader's own notes markup in the box.
+    // Exclude unmatched assembled copies of submissions already represented by their typed text.
     if (mine.some((own) => carriesComments(key, own.key))) {
       return;
     }
@@ -3269,8 +2717,7 @@ export function promptHistory(
   const kept: string[] = [];
   const seen = new Set<string>();
   let spent = 0;
-  // The sends the record has not caught up with, newest first, then everything the record
-  // holds in the order it holds it.
+  // Offer unmatched newer sends first, then recorded prompts in their existing order.
   for (const one of [...mine.slice(0, ahead), ...older]) {
     if (seen.has(one.key)) {
       continue;
@@ -3278,13 +2725,11 @@ export function promptHistory(
     if (kept.length >= limit) {
       break;
     }
-    // A prompt too big to share the message is left out of the walk altogether. The reader
-    // pasted a document and still has what they pasted from, and one of these admitted first
-    // spends the whole budget and puts every prompt behind it out of reach.
+    // Skip entries beyond the individual size limit without excluding smaller prompts that follow.
     if (one.text.length > entry) {
       continue;
     }
-    // Passed over rather than stopped at, for the same reason.
+    // Skip an entry that exceeds the remaining total text budget.
     if (spent + one.text.length > chars) {
       continue;
     }
@@ -3295,14 +2740,7 @@ export function promptHistory(
   return kept;
 }
 
-// One session's recorded prompts as the reader walks over the turns, newest first.
-//
-// Stopped once there are enough of them, because the caller reads every turn in the
-// workspace and a long-running session offers far more than an arrow key reaches.
-// Blanks and repeats are dropped here rather than left to `promptHistory`. A session
-// spends this limit on the turns it has, so a reader who sends `continue` over and over would
-// give one word every place in it while older prompts fell outside. Codex records a turn with
-// no prompt at all when the reader only pressed a control.
+// Add a turn's prompts to recorded history until the limit is reached. Exclude oversized, blank, and repeated cleaned prompts.
 export function promptsAcross(
   held: readonly string[],
   prompts: readonly { text: string; at: number }[],
@@ -3316,9 +2754,7 @@ export function promptsAcross(
   const seen = new Set(held.map((one) => cleanPrompt(one)));
   const kept = [...held];
   for (const one of askedInTurn(prompts, laterPrompts)) {
-    // The size test is here as well as in `promptHistory`, or a session of pasted
-    // documents fills every place with prompts the walk then throws away. The reader presses
-    // Up on a full session and is told there is no earlier prompt.
+    // Exclude oversized prompts before they consume a history slot.
     if (one.length > entry) {
       continue;
     }
@@ -3339,22 +2775,15 @@ export function agentPromptToSend(state: ComposerState, now?: number): AgentProm
   return { text: promptToSend(state, now), assets: [...(state.assets ?? [])] };
 }
 
-// How many attached comments the chip's hover names one by one.
-//
-// The hover is there so a reader can tell before sending whether these are the three they
-// meant. It is not a second reading of the comments, and one that runs longer than the panel
-// is tall covers the box it hangs off. A reader with forty is checking the count rather than
-// the list, so everything past this many is summed into a last line.
+// Maximum comments listed individually in the attachment detail. Summarize the remaining count on one line.
 export const ATTACHED_DETAIL_ROWS = 5;
 
-// What the chip counts, in the words the reader sees.
+// Visible label for the attached comment count.
 function attachedLabel(count: number): string {
   return `${count} ${count === 1 ? 'comment' : 'comments'}`;
 }
 
-// The chip, or nothing at all when the session has no comments on it. Nothing is drawn
-// rather than a chip reading zero: a control saying that nothing is attached is a control
-// about nothing.
+// Omit the comments chip when the active submission has no comments.
 function annotationChip(state: ComposerState): ComposerAnnotations | null {
   const mine = commentsForActiveSubmission(state);
   if (!mine.length) {
@@ -3369,8 +2798,7 @@ function annotationChip(state: ComposerState): ComposerAnnotations | null {
   return {
     count: mine.length,
     label,
-    // A reader who cannot see the chip is told what a reader who can see it works out by
-    // watching: the comments go out and the marks on the cards go with them.
+    // The accessible name explains that sending clears the attached comments from their turns.
     name: `${label} ${one ? 'goes' : 'go'} out with this prompt and ${one ? 'is' : 'are'} cleared from the turns afterwards`,
     detail: lines.join('\n'),
     control: 'attachments',
@@ -3430,15 +2858,12 @@ export function attachmentFailureNotice(error: unknown, name: string = ''): stri
   return error instanceof Error && error.message === busy ? busy : attachmentRefusal('read', name);
 }
 
-// The three words on a waiting card's controls. Words rather than glyphs, which is what the
-// rest of the panel's controls use: a glyph needs a legend and these three do not.
+// Text labels for waiting-card actions.
 const QUEUE_EDIT = 'Edit';
 const QUEUE_COPY = 'Copy';
 const QUEUE_DROP = 'Drop';
 
-// Queue one explicit submission and bind the comments that press owns. Comments already
-// claimed by an earlier waiting submission stay there, while an empty press with no new
-// comments adds nothing.
+// Queue a bounded submission and claim comments not already owned by earlier entries. Empty submissions with no comments or files add nothing.
 export function queueSubmissionAfter(
   queued: readonly QueuedSubmission[],
   id: string,
@@ -3490,11 +2915,7 @@ export function queueSubmissionAfter(
     : [...queued];
 }
 
-// Comments carried by the next waiting submission. Its explicitly bound comments remain
-// its own, comments bound later stay out, and newly added unclaimed comments retain the
-// established behavior of riding with the next submission. A reset can move an explicit
-// claim across sessions. Its delivery copy takes the successor identity so prompt assembly
-// includes it without changing the comment stored on the source turn.
+// Include this entry's explicit comment claims and this session's unclaimed comments. Exclude later and draft claims from the unclaimed set. Rebind explicit claims to the delivery session without changing stored comments.
 export function commentsForQueuedSubmission(
   state: ComposerState,
   next: QueuedSubmission,
@@ -3516,11 +2937,7 @@ export function commentsForQueuedSubmission(
     );
 }
 
-// One row of the queue: a reminder of what is waiting, and the whole prompt behind it.
-//
-// The row is shut to one line because a queue of several paragraphs would push the box off
-// the panel. It opens because the reader cannot read the prompt anywhere else: sending it
-// cleared the box, and until the turn ends this row is the only copy on screen.
+// Build a waiting row with abbreviated text and a full copy of its prompt. Long text gets an expansion control.
 function queuedPrompt(state: ComposerState, entry: QueuedSubmission, name: string, now: number): QueuedPrompt {
   const text = entry.text.trim();
   const ownedComments = new Set(entry.commentIds);
@@ -3590,8 +3007,7 @@ function queuedPrompt(state: ComposerState, entry: QueuedSubmission, name: strin
   };
 }
 
-// The queue with one more prompt at the end, or the queue unchanged. Whitespace is dropped
-// and an empty prompt is refused, so nothing the agent would be asked to answer is blank.
+// Append a trimmed prompt through the shared submission builder. Empty text adds nothing.
 export function queueAfter(
   queued: readonly QueuedSubmission[],
   id: string,
@@ -3603,9 +3019,7 @@ export function queueAfter(
   return queueSubmissionAfter(queued, id, text, [], [], at, heldForClear, ownership);
 }
 
-// The prompt one card names, or nothing where that card has gone. Named by the stable id the
-// same rule `queueWithout` uses, so one answer decides which card is which and a
-// press that arrives after a repaint cannot reach the prompt beside the one it meant.
+// Find a queued prompt by its stable submission id. Return null when that entry no longer exists.
 export function queuedText(queued: readonly QueuedSubmission[], id: string): string | null {
   const found = queued.find((entry) => entry.id === id);
   return found === undefined ? null : found.text;
@@ -3615,13 +3029,12 @@ export function queuedSubmission(queued: readonly QueuedSubmission[], id: string
   return queued.find((entry) => entry.id === id) ?? null;
 }
 
-// The queue with one prompt taken out, named the way the row that draws it is named.
+// Remove the queued submission with the given id.
 export function queueWithout(queued: readonly QueuedSubmission[], id: string): QueuedSubmission[] {
   return queued.filter((entry) => entry.id !== id);
 }
 
-// A prompt queued during a clear cannot return to the source session until the reader
-// resolves that clear. Editing or dropping the clear is that decision.
+// A queued or successor-owned submission drains only without a reset barrier. A source-owned submission drains directly.
 export function queueCanDrain(entry: QueuedSubmission): boolean {
   if (!entry.delivery) {
     const legacy = entry as QueuedSubmission & { attempted?: boolean; heldForClear?: boolean };
@@ -3831,16 +3244,7 @@ export function queueAfterAcceptedRecovery(
   });
 }
 
-// Taking a waiting prompt back into the box to change it, and what happens to the prompt the
-// box was already holding.
-//
-// The two swap. The named prompt leaves the queue for the box, and what the box held takes
-// the place it left, keeping its position so the order the reader queued things in survives.
-// Overwriting the box instead destroyed whatever was typed there, with no undo and nothing
-// on screen to say it had gone: a reader editing a second waiting prompt lost the first one
-// outright, because it had already left the queue.
-//
-// A box with nothing in it puts nothing back, so the named prompt simply leaves.
+// Return the named submission for editing and put its replacement at the same queue position. Reset recovery retains a delivery marker and barrier.
 export function queueEdit(
   queued: readonly QueuedSubmission[],
   id: string,
@@ -3931,79 +3335,41 @@ export function queueRecoverySubmission(
   };
 }
 
-// One press the panel has not seen the end of yet.
-//
-// Between the press and the reply the panel said nothing. The box emptied, the prompt went
-// to a child, and the screen did not change until the transcript poll read the reader's own
-// words back off disk seconds later. A compaction was worse: it drew nothing at any point
-// until its card arrived off the transcript, which is a whole session's work with no
-// sign that anything was asked for.
-//
-// This is what the panel holds in that gap. It is recorded at the press rather than at the
-// round trip, so the card is on screen in the same frame as the keystroke.
+// Temporary state for a submitted prompt or session control before its recorded replacement arrives.
 export interface LivePress extends PendingAskPosition {
-  // The session, and never the agent. One agent runs several sessions at once, so
-  // a press filed under the agent draws its card over whichever of them the reader happens
-  // to be looking at. This is the fault `runningKey` exists for.
+  // The session that owns this submission.
   sessionId: string;
   agent: AgentKind;
   kind: LiveKind;
-  // Exactly what went to the agent, which is what `promptToSend` built and never what the
-  // box held. Comments alone are a prompt, so a card drawn from the box draws nothing at all
-  // for the press that sends three comments and an empty box. Empty for a compaction, which
-  // carries none of the reader's words.
+  // The assembled prompt text, or attachment names for a prompt without text. Session controls use an empty string.
   text: string;
   assets?: StoredPromptAsset[];
-  // The panel's own clock at the press. The elapsed figure counts from it, and the real turn
-  // is matched against it.
+  // The submission time used for elapsed duration and recorded-turn matching.
   at: number;
   // The full response remains available until its recorded turn replaces the temporary card.
   reply: string;
   completed?: boolean;
   outcome?: 'ok' | 'interrupted' | 'error';
   turnId?: number;
-  // Whether a turn was already running in this session when the press was made. Such a
-  // prompt starts no turn of its own: the agent answers it inside the one already going, and
-  // that turn's card is where it belongs.
+  // Whether this prompt belongs to a turn already running when it was submitted.
   midTurn: boolean;
-  // Whether the agent took the press. The handoff answer sets it and a busy signal does not:
-  // a child reports itself busy before it answers, so a press marked from busy would be erased
-  // by the rejection that arrived a moment later.
+  // Whether the delivery receipt confirms acceptance. A busy signal alone does not confirm delivery.
   ran: boolean;
-  // Whether the work this press opened has been seen running. Claude can take a prompt sent
-  // during its compaction and answer it afterward, so a press can be taken before it begins,
-  // and only the one that began carries this.
+  // Whether accepted work has begun. A prompt accepted during compaction waits before starting.
   started: boolean;
-  // Whether the handoff came back without reaching an agent. Until this is set, a prompt
-  // that never left looks exactly like one that did.
+  // Whether delivery failed.
   failed: boolean;
-  // Why it did not go, in words meant for the reader. Empty until a handoff fails.
+  // The reader-facing delivery failure reason, or an empty string before failure.
   reason: string;
 }
 
-// What the press was. A prompt carries the reader's words and a compaction carries none, and
-// the two are worded apart because a reader who presses the window figure is not sending a
-// prompt and must not be told that they are.
+// The submitted prompt or session control.
 export type LiveKind = 'prompt' | 'compact' | 'clear';
 
 // The response state before its recorded turn replaces the temporary card.
 export type LiveState = 'sent' | 'running' | 'failed' | 'done' | 'interrupted';
 
-// Whether the agent will answer this press inside work it is already doing, so the card for
-// that work is where it belongs and this press opens none of its own.
-//
-// Read at the press and never after it, which is why it is settled here rather than at the
-// draw: a turn starting a second later must not turn a fresh press into a mid-turn one.
-//
-// Only a prompt sent into a running turn is one. Two other presses were being called mid-turn
-// and neither is:
-//
-// A prompt Claude accepts while its compaction is running has no card to be folded into. A
-// compaction carries none of the reader's words, and the card it becomes carries no prompts.
-//
-// A compaction pressed while a turn is running is not a prompt at all. It is its own piece of
-// work, it becomes a card of its own, and folding it into the running turn drew nothing for
-// it either.
+// Only prompts submitted during a running turn qualify. An unfinished compaction or clear prevents classification as a mid-turn prompt.
 export function pressIsMidTurn(
   kind: LiveKind,
   running: boolean,
@@ -4012,29 +3378,16 @@ export function pressIsMidTurn(
   if (kind !== 'prompt' || !running) {
     return false;
   }
-  // A failed press is not in flight, whatever the panel still holds for it. Nothing sweeps
-  // one: `livePressOver` keeps it for the reader to dismiss, so a compaction that never
-  // reached an agent sits there until they do. Read as work still going, it would call every
-  // later prompt a compaction's neighbour, and each one would draw a card beside the running
-  // turn's card that is already carrying it.
+  // Failed session controls do not block classification. Their notices remain until the reader dismisses them.
   return !inFlight.some((held) => (held.kind === 'compact' || held.kind === 'clear') && !held.failed);
 }
 
-// The presses a session is waiting on once a new one is made.
-//
-// Unfinished prompts replace one another. Completed responses stay until their recorded
-// turns replace them, including when another prompt starts before discovery finishes.
+// Replace unfinished submissions of the same kind. Retain completed responses until their recorded turns replace them.
 export function pressesAfter(held: readonly LivePress[], next: LivePress): LivePress[] {
   return [...held.filter((one) => one.kind !== next.kind || one.completed), next];
 }
 
-// The press whose work has begun, marked while the session is working.
-//
-// An agent works one thing at a time in a session, so the press that began is the oldest
-// one it has taken and not finished. A prompt Claude accepts during compaction waits behind
-// it, and marking that one as well retires its card before its own turn begins.
-//
-// A failed press is neither working nor in the way of the one that is.
+// Mark the oldest accepted, unfinished submission as started when the session runs. Failed submissions do not qualify.
 export function pressesAfterRunning(held: readonly LivePress[], running: boolean): LivePress[] {
   if (!running) {
     return [...held];
@@ -4049,23 +3402,7 @@ export function pressesAfterRunning(held: readonly LivePress[], running: boolean
   return held.map((press) => (press === begun ? { ...press, started: true } : press));
 }
 
-// The presses left once the agent answers something out of its own head.
-//
-// A harness control reports a turn with no turn in it: no model was called, no cost was spent,
-// and nothing lands in the transcript for the poll to find. `/clear`,
-// `/model` and `/context` all end this way, and so does a compaction the agent turns down.
-//
-// No command the CLI answers by itself leaves a turn for the selected window to accept. A
-// harness control writes none, and the recorded answer to any other local command withdraws
-// the turn its typed record opened. This explicit exit removes the matching unstarted press
-// when the CLI reports that answer.
-//
-// The oldest press that has not begun is the one that ended, for the reason
-// `pressesAfterRunning` gives: an agent works one thing at a time in a session. A press
-// already marked as started keeps its card, because a real turn is behind it and the
-// transcript owes that card its replacement. A prompt waiting behind a compaction is not the
-// one that just ended, and taking its card would take the reader's own words off the screen
-// before their turn had begun.
+// Remove the oldest unfinished submission that has not started when the CLI answers locally. Started submissions retain their recorded-turn replacement requirement.
 export function pressesAfterLocalAnswer(held: readonly LivePress[]): LivePress[] {
   const ended = held.find((press) => !press.failed && !press.started && !press.completed);
   if (!ended) {
@@ -4074,23 +3411,16 @@ export function pressesAfterLocalAnswer(held: readonly LivePress[]): LivePress[]
   return held.filter((press) => !(press === ended && livePressOver(press, null, false, 0, false, true)));
 }
 
-// Terminal control sequences, such as the bold a model name is printed in.
+// Terminal escape sequences removed from local CLI replies.
 const TERMINAL_CONTROL = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, 'g');
 
-// The Composer message for a command the CLI answered by itself: the first line of its reply,
-// without terminal color codes and cut to `firstLine`'s length, because a report such as
-// `/context` or `/usage` runs to many lines. Null when the reply is empty, so nothing shows.
+// The first line of a local CLI reply, without terminal escape sequences. Empty replies return null.
 export function localAnswerNotice(reply: string): string | null {
   const text = reply.replace(TERMINAL_CONTROL, '').replace(/\r\n?/g, '\n').trim();
   return text ? firstLine(text) : null;
 }
 
-// The presses left once the child answers the handoff for one of them.
-//
-// Busy is not this answer. AgentSession becomes busy before it waits for the CLI, so using
-// that signal as acceptance lets an immediate rejection look like a turn that started and
-// stopped. The exact press is named because another one can replace it while the answer is
-// on its way back.
+// Apply the delivery receipt to the submission with the matching timestamp. Busy state does not confirm acceptance.
 export function pressesAfterHandoff(held: readonly LivePress[], at: number, delivery: PromptDelivery): LivePress[] {
   return held.map((press) => {
     if (press.at !== at) {
@@ -4132,11 +3462,7 @@ export function pressOfKind(held: readonly LivePress[], kind: LiveKind): LivePre
   return held.find((one) => one.kind === kind && !one.completed) ?? null;
 }
 
-// Which press a chunk of the reply belongs to, or nothing when there is none to write it on.
-//
-// The newest, which is the press the reader is waiting on. Only a prompt held behind a
-// compaction makes this a choice at all, and the words arriving then are the answer the
-// reader is watching for rather than a summary they never asked to read.
+// The newest submission that has neither failed nor completed receives the reply.
 export function pressForReply(held: readonly LivePress[]): LivePress | null {
   for (let i = held.length - 1; i >= 0; i--) {
     if (!held[i].failed && !held[i].completed) {
@@ -4146,7 +3472,7 @@ export function pressForReply(held: readonly LivePress[]): LivePress | null {
   return null;
 }
 
-// How long a compaction with nothing behind it is drawn for.
+// The expiry interval for an idle session-control card.
 export const LIVE_PRESS_LIMIT_MS = 5 * 60_000;
 
 // Whether the selected accepted window contains the turn that replaces this prompt card.
@@ -4165,13 +3491,7 @@ export function selectedWindowContainsRecordedTurn(
   );
 }
 
-// Whether the press is finished with, so the card comes down.
-//
-// A prompt ends when the accepted selected window contains its recorded turn or the CLI answers
-// locally. A compaction has its own exits.
-//
-// A failed press is the reader's to clear and nothing takes it away. It is the one card that
-// says something they have to act on, and a notice that removes itself is one they can miss.
+// Failed deliveries retain their notices. Prompts end after a local CLI answer or an accepted recorded replacement. Session controls also expire when idle.
 export function livePressOver(
   press: LivePress,
   transcriptAt: number | null,
@@ -4192,27 +3512,18 @@ export function livePressOver(
   if (transcriptAt !== null && transcriptAt >= press.at) {
     return true;
   }
-  // The work this press opened ran and stopped. The reader's own Stop lands here too, and its
-  // card goes without a word: a press they cancelled needs no notice.
-  //
-  // It reads `started` and not `ran`. A compaction can be accepted before it begins.
+  // Started work ends when the session stops running. Acceptance alone does not establish that work started.
   if (press.started && !running) {
     return true;
   }
-  // A working compaction keeps its card past the limit. Removing it would also hide a prompt
-  // sent behind it until the record catches up.
+  // Running session controls retain their cards past the expiry interval.
   if (running) {
     return false;
   }
   return now - press.at >= LIVE_PRESS_LIMIT_MS;
 }
 
-// How long chunks are gathered for before the card is sent on.
-//
-// Both agents write faster than anyone reads, and the panel is across a message channel from
-// the extension. Sending each chunk as it lands is a message per word for the length of a
-// turn, and every one of them redraws a card that is one line long. An eighth of a second is
-// below what a reader sees as a pause and it turns a turn's thousands of messages into tens.
+// The interval for batching streamed reply updates across the webview message channel.
 export const LIVE_REPLY_POST_MS = 125;
 
 // Keep every chunk until the recorded turn replaces the temporary card.
@@ -4220,10 +3531,7 @@ export function appendReply(reply: string, chunk: string): string {
   return reply + chunk;
 }
 
-// Remove a completed commentary message from the provisional reply line. Claude cannot say
-// whether streamed text is narration until the message ends, so those chunks initially use
-// the reply path. Once the completed message identifies them as commentary, Activity owns
-// the text and the temporary response copy must go.
+// Remove a completed commentary message from the reply suffix. The Activity list displays that message separately.
 export function replyAfterCommentary(reply: string, commentary: string): string {
   if (!reply || !commentary) {
     return reply;
@@ -4231,13 +3539,7 @@ export function replyAfterCommentary(reply: string, commentary: string): string 
   return reply.endsWith(commentary) ? reply.slice(0, -commentary.length) : reply;
 }
 
-// Which state the card is in. `running` is this session's and never its agent's, for the
-// reason `sessionRunning` gives.
-//
-// A reply that has started arriving is a turn running, whatever the child has reported. The
-// two signals come by different routes and the streamed one is often first, and a card that
-// said it was still sending while the answer was being written on it would be wrong on the
-// screen the reader is looking at.
+// Delivery failure and completion take priority. Session activity or a nonempty reply marks an unfinished submission as running.
 export function liveState(press: LivePress, running: boolean): LiveState {
   if (press.failed) {
     return 'failed';
@@ -4247,28 +3549,18 @@ export function liveState(press: LivePress, running: boolean): LiveState {
   return running || press.reply !== '' ? 'running' : 'sent';
 }
 
-// The controls on a failed card. Restore is the safe first action for a prompt; Dismiss is
-// the explicit discard. A compaction has no reader text to restore and offers only Dismiss.
+// Failed prompts offer Restore and Dismiss. Failed session controls offer only Dismiss.
 const LIVE_RESTORE = 'Restore';
 const LIVE_DISMISS = 'Dismiss';
 
-// The line the card leads with, in the agent's own name.
-//
-// Six sentences written out rather than assembled from parts. Each one is read at the moment
-// the reader is wondering whether anything happened at all, and a sentence built out of
-// fragments reads like one.
+// The live-card status line, using the agent's display name.
 function liveStatus(kind: LiveKind, state: LiveState, name: string, waiting: boolean): string {
-  // Taken, and not begun. Claude answers a prompt accepted during compaction afterward, and
-  // until then a card saying it is working on that prompt claims work that has not started.
+  // An accepted prompt waiting behind other work is not yet running.
   if (waiting) {
     return `${name} has this and is finishing something else first`;
   }
   if (kind === 'compact') {
-    // Said of a compaction refused before it left and of one that started and then failed,
-    // because the card cannot tell them apart: for Codex the whole compaction is awaited
-    // inside the one handoff, so a compaction that ran for a minute and died comes back
-    // looking exactly like one the server turned down. The earlier wording claimed the agent
-    // was never asked, which was wrong every time it had been.
+    // A failed compaction uses the same status whether failure occurred before or after work started.
     if (state === 'failed') {
       return `${name} did not compact this session`;
     }
@@ -4297,52 +3589,28 @@ function liveStatus(kind: LiveKind, state: LiveState, name: string, waiting: boo
   return `Sending this to ${name}`;
 }
 
-// The card the press opens at the top of the timeline, or nothing at all between presses,
-// which is most of the time.
-//
-// It stands where the turn's own card will stand, and it is drawn as that card: the same
-// frame, the same head row, the reader's words in the headline slot and what the panel is
-// doing in the slot where a turn card says what the agent is doing. The turn that the press
-// becomes then leads with the same words, because a running turn with nothing said yet
-// leads with its prompt too, so the transcript's card replacing this one changes what the
-// card says rather than what it is.
-//
-// The response remains available while the recorded turn is still being read.
+// Build a temporary timeline card from the submission, current settings, and response state.
 function liveCard(state: ComposerState, press: LivePress, name: string, now: number): ComposerLive | null {
-  // A prompt sent into a turn that was already running gets no card. It starts no turn of its
-  // own, so there is nothing for a card to become: the agent answers it inside the turn
-  // already going, whose card is on screen and already carrying the reply, the log and, once
-  // the transcript has the prompt a moment later, the prompt itself. A second card would be
-  // one turn drawn twice, which is what the reader saw.
-  //
-  // A press that failed still draws one, wherever it was sent from. It is the one card that
-  // says something the reader has to act on, and no turn card will ever carry that.
+  // Mid-turn prompts use the running turn's card. Failed deliveries retain a separate notice.
   if (press.midTurn && !press.failed) {
     return null;
   }
   const which = liveState(press, state.running);
-  // Running because the session is, with nothing of this press's own begun. Words already
-  // streaming say it began, whatever the session's flag reads.
+  // A prompt waits when the session runs but it has neither started nor received reply text.
   const waiting = press.kind === 'prompt' && which === 'running' && !press.started && press.reply === '';
   const said =
     press.outcome === 'error' ? `${name} did not finish this response` : liveStatus(press.kind, which, name, waiting);
   const failed = press.failed;
   const tone = which === 'sent' ? 'running' : which;
-  // What the reader picked, or what the last turn in this session ran on. The head row
-  // has to say the same thing before and after the transcript catches up, and the only thing
-  // it can say beforehand is the pick; a session whose first prompt this is has no pick
-  // and no last turn, and the row says nothing rather than guessing.
+  // Prefer the selected model, then the confirmed model. Without either, leave the model label empty.
   const model = shortModel(state.settings.selectedModel || state.settings.confirmedModel) ?? '';
   const relative = formatRelative(press.at, now);
-  // A compaction carries none of the reader's words, so the card leads with nothing and the
-  // line under the head row is the whole of what it says.
+  // Session controls have no prompt headline.
   const compaction = press.kind === 'compact' || press.kind === 'clear';
   return {
     kind: press.kind,
     state: which,
-    // The turn status the card is drawn as. Decided here rather than in the panel, which had
-    // been collapsing the three states onto two of its own and picking a glyph out of the
-    // result: a rule spelt in the one file no test reads.
+    // Use the live state as the card tone, with sent submissions shown as running.
     tone,
     status: said,
     relative,
@@ -4351,11 +3619,7 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
     agent: name,
     model,
     label: headLabel('Turn', [STATUS_WORDS[tone], relative, [name, model].filter(Boolean).join(' ') || null], said),
-    // The first line of what the reader typed, which is what the turn will lead with once
-    // the transcript has it, wrapped and clamped by the stylesheet to the same few lines a
-    // turn card clamps its headline to. Sending the whole prompt would draw the same words
-    // as the card that replaces it and then a paragraph more of them, and the column below
-    // would move when the poll caught up.
+    // Use the prompt's first line as the headline. Session controls leave it empty.
     headline: compaction ? '' : firstLine(press.text),
     reply: press.reply,
     // Terminal responses and failed deliveries have no running duration.
@@ -4364,9 +3628,7 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
     dismissName: failed
       ? `${compaction ? 'Take this notice away' : 'Discard this prompt and take this notice away'}. ${said}.`
       : '',
-    // Named by the press it clears. Two notices can stand at once, a compaction that reached
-    // no child and a prompt that did not either, and one word on both would put the focus on
-    // whichever the panel found first when the other was pressed.
+    // Include the submission kind in the dismissal control to distinguish simultaneous notices.
     dismissControl: failed ? `dismissLive:${press.kind}` : '',
     restoreLabel: failed && !compaction ? LIVE_RESTORE : '',
     restoreName:
@@ -4387,12 +3649,7 @@ function liveCard(state: ComposerState, press: LivePress, name: string, now: num
   };
 }
 
-// Every card the presses in flight open, newest first, which is the order the column draws
-// turns in: the press made last stands above the one it was sent behind.
-//
-// More than one only while a prompt is waiting behind a compaction. The two are separate
-// pieces of work and the agent does them in order, so the compaction goes on saying it is
-// compacting under the prompt's own card rather than being replaced by it.
+// Draw visible temporary cards newest first. Different submission kinds retain separate cards.
 function liveCards(state: ComposerState, name: string, now: number): ComposerLive[] {
   const cards: ComposerLive[] = [];
   for (const press of state.live) {
@@ -4404,11 +3661,7 @@ function liveCards(state: ComposerState, name: string, now: number): ComposerLiv
   return cards;
 }
 
-// What the send control is called to a reader who cannot see the box or the chip.
-//
-// An empty box that will still send says what is going, because pressing it then sends words
-// the reader wrote minutes ago on another part of the screen. A control announcing only "Send
-// this prompt" would give no warning of that.
+// The Send control names queued prompts when a Codex session control delays submission. Otherwise, it identifies comments and attached files when the prompt text field is empty.
 function sendName(state: ComposerState, name: string, enabled: boolean): string {
   const compacting =
     state.agent === 'codex' &&
@@ -4432,34 +3685,15 @@ function sendName(state: ComposerState, name: string, enabled: boolean): string 
   return `Send this prompt to ${name}. ${SEND_HINT}.${enabled ? '' : ' Nothing has been typed to send yet.'}`;
 }
 
-// Which of the two the one button at the end of the row is, and whether it can be pressed.
-// Two places read it: the box names the control from it, and the sentence beside the control
-// is worded from the same answer, so the two can never describe different presses.
+// Share the Send or Stop decision between the control and its request-answer explanation.
 function sendState(state: ComposerState): { stopping: boolean; enabled: boolean } {
-  // Stop while a turn runs and the box is empty, and Send the moment anything is typed.
-  //
-  // The reader who has started typing has said what they want, and it is not to stop. Both
-  // agents take a prompt mid-turn, so the send is real rather than a queue, and the control
-  // follows the box the way the reader's own agent extensions do. A button that stayed Stop
-  // over a written prompt offered the one action they had just ruled out, and put the only
-  // way to send it on a key the button was contradicting.
-  //
-  // Read off the box itself rather than off `sendAction`, because comments alone now make that
-  // answer 'send'. Asked through `sendAction`, a reader with one comment written would lose the
-  // Stop button for the whole of a running turn.
+  // Stop requires a running session, an empty prompt text field, and no attachments. Comments alone retain Stop.
   const stopping = state.running && !state.onScreen.trim() && !(state.assets?.length ?? 0);
-  // Stop remains available during any running turn. Send follows the tested action, including
-  // a Codex compaction, where the panel accepts the complete submission into its own queue.
+  // Stop stays enabled. Send is enabled when sendAction accepts the submission.
   return { stopping, enabled: stopping || sendAction(state) !== 'nothing' };
 }
 
-// What a press on Send does to the requests waiting above the box, and nothing when none are
-// waiting. A request holds the prompt behind it, so the press answers it first and tells the
-// agent that the reader replied in the message that follows.
-//
-// Nothing is said over a press that will not send. The control is Stop while a turn runs over
-// an empty box, and a Send with nothing to send is refused, and a promise to answer the
-// request beside either one is a promise the press does not keep.
+// Explain how Send answers pending requests. Stop and disabled Send provide no request-answer explanation.
 function sendOverAskLine(state: ComposerState): string {
   const waiting = (state.asks ?? []).length;
   if (!waiting) {
@@ -4469,17 +3703,12 @@ function sendOverAskLine(state: ComposerState): string {
   if (stopping || !enabled) {
     return '';
   }
-  // A command the panel answers itself never reaches the agent and never answers a request.
-  // `/mcp` opens the server list and clears the box, and a Codex `/rename` renames the
-  // session, so a sentence promising an answer would describe a press that leaves the child
-  // blocked exactly where it was.
+  // Panel commands and Codex rename requests do not answer pending requests.
   if (panelCommand(state.onScreen) || renameRequest(state.agent, state.onScreen) !== null) {
     return '';
   }
   const subject = waiting === 1 ? 'the request above' : `the ${waiting} requests above`;
-  // A compaction answers the request the same way and sends no prompt at all: the box holds a
-  // command the agent never reads. Said to send a prompt, the sentence would name the one
-  // thing this press does not do.
+  // Compaction answers pending requests without sending a prompt.
   if (compactSubmission(state.agent, state.onScreen)) {
     return `Send answers ${subject} before it compacts.`;
   }
@@ -4489,13 +3718,11 @@ function sendOverAskLine(state: ComposerState): string {
   return `Send answers ${subject} with this prompt.`;
 }
 
-// The box and the one button at the end of the row. Every word of it is settled here, so the
-// panel draws a finished box the same way it draws finished picks.
+// Build the prompt box's labels and Send or Stop control.
 function composerBox(state: ComposerState, name: string): ComposerBox {
   const running = state.running;
   const { stopping, enabled } = sendState(state);
-  // A request that arrives while the reader is typing changes what Send does with no other
-  // signal, so the sentence beside the button joins its spoken name as well.
+  // Include the request-answer explanation in the Send control's accessible name.
   const overAsk = sendOverAskLine(state);
   return {
     placeholder: placeholderFor(
@@ -4520,34 +3747,18 @@ function composerBox(state: ComposerState, name: string): ComposerBox {
   };
 }
 
-// What a press on a draft's control changes, said in every one of their names.
-//
-// A draft sits in the same rail beside the session its setup came from, and the row
-// looks like that session's row. A reader who cannot see the tag above it has nothing
-// else to tell them that this model, this effort and this permission belong to a
-// session nobody has started.
+// Identify draft setup controls as applying to a session that has not started.
 const DRAFT_SCOPE = ', for this draft.';
 
-// Whether this draft's first prompt has gone and the child is being started on it.
-//
-// A press that changed the setup after this point would leave the panel naming a setup the
-// running child never had: the spawn plan is built from the copy `send` already handed over.
-// A failed press does not count. The prompt never left, so the reader must be able to change
-// the setup and try again.
+// Any submission without a delivery failure marks the draft as starting and disables setup changes.
 export function draftStarted(presses: readonly LivePress[]): boolean {
   return presses.some((press) => !press.failed);
 }
 
-// What every one of a draft's controls says once its first prompt has gone. The value stays
-// on the control and in its name, and the sentence offering a press is replaced by the reason
-// there is none to make.
+// Explain why setup controls are disabled after draft submission.
 const DRAFT_STARTING = 'It is starting and its setup cannot change now.';
 
-// The four setup controls a draft wears, every one built from its profile.
-//
-// They stand where a live session's three stand and read the same way, because a draft
-// is the same set of settings before anything has run on them. The agent is the fourth
-// because a draft is the one state in which the answer can still change.
+// Build the draft's agent, model, effort, and permission controls from its profile.
 function draftProfilePicks(state: ComposerState, profile: SessionProfile): ComposerPick[] {
   const name = agentName(profile.agent);
   const model = selectedModelPick(state.models, profile.model, state.defaults);
@@ -4557,28 +3768,20 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
   const models = draftModelMenu(state, profile, name);
   const efforts = draftEffortMenu(state, profile, name);
   const modes = askModeMenu(profile.agent, profile.permissionMode, state.sessionId);
-  // The catalog's word for the value, then the value itself, then the word for the agent's
-  // own default: the fallbacks the tag and the launcher rows use, which is why they are
-  // taken off one builder rather than written again here.
+  // Use shared profile labels so draft controls and setup summaries use the same fallbacks.
   const [, modelLabel, effortLabel] = profileFacts(profile, state.models, state.defaults);
-  // Unpressable exactly where the menu behind it has no rows, which is the live rule, and
-  // everywhere once the draft has started.
+  // Disable empty menus and all setup controls while the draft starts.
   const noModel = models.items.length === 0;
   const noEffort = efforts.items.length === 0;
   const starting = draftStarted(state.live);
-  // The sentence after the value in every name. A menu with no rows carries its own reason,
-  // and a draft being started overrides all four: that is why the press is refused now, and a
-  // reader who cannot press a control has to be told why somewhere.
+  // The starting explanation takes priority over an empty-menu reason or action offer.
   const nameEnding = (offer: string, empty: string): string => {
     if (starting) {
       return DRAFT_STARTING;
     }
     return empty || offer;
   };
-  // An effort belongs to a model, so a menu with no rows has two different reasons and two
-  // different values to name. A settled model that takes no effort setting has answered the
-  // question and says so. A draft with no model settled has not reached it, and its effort is
-  // the agent's own default, which is what the tag above the row already calls it.
+  // Distinguish a resolved model with no effort setting from an unresolved effort default.
   const applied = defaultsForModel(state.models, profile.model, state.defaults);
   const noEffortToSet =
     noEffort &&
@@ -4603,8 +3806,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
     },
     {
       control: 'effort',
-      // A model that takes no effort setting says that rather than going blank, the same way
-      // the live control does.
+      // Display an explicit label when the model has no effort setting.
       label: noEffortToSet ? NO_EFFORT_LABEL : effortLabel,
       name: `Effort: ${noEffortToSet ? 'none to set' : effortLabel}${DRAFT_SCOPE} ${nameEnding('Press to start it at another effort.', efforts.empty)}`,
       detail: noEffort
@@ -4616,9 +3818,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
     {
       control: 'askmode',
       label: mode.label,
-      // The head is the question, so the name carries what the control is and the label
-      // carries what it is set to. The mode's own sentence sits with that setting, the same
-      // way the live control names it.
+      // Include the permission menu heading, selected mode, and mode description in the accessible name.
       name: `${modes.head} ${mode.label}${DRAFT_SCOPE}${mode.description ? ` ${sentence(mode.description)}` : ''} ${nameEnding('Press to change it.', modes.empty)}`,
       detail: mode.description || modes.head,
       disabled: starting || modes.items.length === 0,
@@ -4629,9 +3829,7 @@ function draftProfilePicks(state: ComposerState, profile: SessionProfile): Compo
 
 const DRAFT_TAG_WORD = 'New draft';
 
-// The tag above a draft's controls. One word for the state, and the four settings on the
-// hover, for a reader who wants the whole setup in one look rather than one control at a
-// time.
+// The draft tag's tooltip lists all four setup values.
 function draftTag(state: ComposerState, profile: SessionProfile): ComposerDraftTag {
   return {
     word: DRAFT_TAG_WORD,
@@ -4639,9 +3837,7 @@ function draftTag(state: ComposerState, profile: SessionProfile): ComposerDraftT
   };
 }
 
-// The composer, or nothing at all. A window with no session to type into draws no
-// composer rather than an empty one addressed to nobody, which is why a state of nothing is
-// an answer this takes rather than one its caller has to hold back.
+// Return no prompt box view when state or the session name is absent.
 export function composerView(state: ComposerState | null, now: number = Date.now()): ComposerView | null {
   if (!state) {
     return null;
@@ -4654,13 +3850,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
   const picks = state.profile
     ? draftProfilePicks(state, state.profile)
     : [modelPick(state, name), effortPick(state, name), askModePick(state)];
-  // The servers go last, after the three settings the next turn runs under. Those three are
-  // always there and this one often is not, so anywhere else on the row would shift the
-  // settled controls sideways the moment an agent turned out to have servers, and the reader
-  // would be reaching for a position rather than for a control.
-  //
-  // It is also the odd one out in what a press means. The settings before it say what the
-  // next turn will do, and this one acts on the agent's server configuration now.
+  // Append the MCP control after the setup controls when server state is available.
   const servers = mcpControl(state, state.profile ? agentName(state.profile.agent) : name);
   if (servers) {
     picks.push(servers);
@@ -4680,18 +3870,14 @@ export function composerView(state: ComposerState | null, now: number = Date.now
         }
       : null,
     draftTag: state.profile ? draftTag(state, state.profile) : null,
-    // A draft has run no turn, so it has filled no window and has none of its own to be a
-    // share of. Any figure reaching here belongs to the session the setup was copied
-    // from, and drawing it over a draft would tell the reader that a session with
-    // nothing in it is most of the way full.
+    // Drafts display no context figure from their source session.
     context: state.profile
       ? null
       : (() => {
           const figure = contextFigure(state.context, state.agent, name);
           return figure ? { ...figure, generation: state.contextGeneration ?? 0 } : null;
         })(),
-    // A draft has run no turn, so it has re-presented nothing and has no floor. It carries the
-    // setup it was copied from and none of that session's figures.
+    // Drafts display no next-turn estimate from their source session.
     nextTurn: state.profile ? null : nextTurnFigure(prospectiveNextTurn(state)),
     picks,
     commands: promptEntries(state.agent, availableCommands(state.commands)),
@@ -4723,8 +3909,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
   };
 }
 
-// A choice to put in front of the reader. `answer` is what picking it means, so the glue
-// hands back what it was given rather than working the meaning out a second time.
+// A picker choice carries its displayed text and the answer returned when selected.
 export interface Choice {
   label: string;
   detail: string;
@@ -4735,48 +3920,34 @@ export interface AskPrompt {
   title: string;
   placeholder: string;
   choices: Choice[];
-  // Questions keep refusal separate from the model's choices. A multi-select picker may
-  // return several rows, so the glue can recognize this action by its answer rather than
-  // by a label that the model could also have used.
+  // Identify refusal by its answer rather than a label that also appears among offered choices.
   decline: Choice | null;
-  // A question with several answers is asked one question at a time; this is which one.
-  // A permission ask has none.
+  // The question index for a question request, or null for permission requests.
   questionIndex: number | null;
   multiSelect: boolean;
 }
 
-// How an agent gets started: the program to run, and whatever has to come before the CLI's
-// own flags. Most of the time the program is the agent itself and `leadingArgs` is empty.
-// The exception is a package script, which has to be given to a Node to run.
+// The program to launch and arguments preceding the agent's own flags. Package scripts run under Node.
 export interface Launch {
   command: string;
   leadingArgs: string[];
-  // Why this will not work, when it will not. The reader is told this instead of watching a
-  // command do nothing.
+  // A launch problem to display to the reader, or null.
   problem: string | null;
-  // What the child has to be told that its own launcher would have told it. Empty for a
-  // launch that needs nothing, which is most of them, and added to the environment the
-  // child is started with rather than replacing it.
+  // Environment values required by the launch, added to the child's environment.
   env: Record<string, string>;
 }
 
-// What the panel needs to know about the machine to work out a launch. Passed in so the
-// rule can be tested on any machine, and because the answer is about the machine the panel
-// runs on rather than the one the tests run on.
+// Machine paths and filesystem checks used to select an agent launch.
 export interface Machine {
   homeDir: string;
   appData: string;
   pathEnv: string;
-  // The official Anthropic extension, when it is installed in this editor. Its bundled
-  // program speaks the protocol version that extension currently expects.
+  // The installed official Anthropic extension directory, supplied by the editor host.
   claudeExtensionDir: string;
-  // The official OpenAI extension, when it is installed in this editor. Its bundled
-  // program is the one that writes editor sessions, so it is the compatible reader
-  // for those records as the rollout format changes between Codex releases.
+  // The installed official OpenAI extension directory, supplied by the editor host.
   codexExtensionDir: string;
   platform: string;
-  // `process.arch`. A package built per platform is named for it, and so is the directory
-  // the binary inside it sits in.
+  // The process architecture used to select a platform package and binary directory.
   arch: string;
   // The Node that runs a package script. In the extension host this is VS Code's own
   // binary, which runs as Node when `ELECTRON_RUN_AS_NODE` is set.
@@ -4789,11 +3960,7 @@ function join(platform: string, parts: string[]): string {
   return parts.join(platform === 'win32' ? '\\' : '/');
 }
 
-// Where npm puts a globally installed package's own files on Windows. Only Windows is
-// worked out here, and on purpose: npm's global prefix elsewhere is `/usr/local`, or an
-// nvm-versioned directory, or whatever the reader set, and a guess that misses is worse
-// than no guess. On those systems the name on PATH is a real link to the script and starts
-// without help, which is the whole reason this exists only for Windows.
+// Find a package script under Windows' AppData npm directory. Other platforms return null because global package locations vary.
 export function npmPackageScript(machine: Machine, parts: string[]): string | null {
   if (machine.platform !== 'win32') {
     return null;
@@ -4802,11 +3969,7 @@ export function npmPackageScript(machine: Machine, parts: string[]): string | nu
   return machine.exists(script) ? script : null;
 }
 
-// A batch shim cannot be started with arguments and no shell: Node throws EINVAL. Windows
-// also resolves a bare name against `.com` and `.exe` only, so an agent installed by npm,
-// whose only entry on PATH is a `.cmd` shim, is not found either. Both are answered the
-// same way, by running the package's own script under Node, which is what the shim would
-// have done.
+// Resolve Windows batch shims to a package script launched under Node. Batch files cannot be spawned directly without a shell.
 function throughNode(machine: Machine, path: string, parts: string[]): Launch | null {
   const lower = path.toLowerCase();
   if (machine.platform !== 'win32') {
@@ -4833,27 +3996,13 @@ const CLAUDE_PACKAGE = ['@anthropic-ai', 'claude-code', 'cli.js'];
 const CODEX_ROOT = ['@openai', 'codex'];
 const CODEX_PACKAGE = [...CODEX_ROOT, 'bin', 'codex.js'];
 
-// The platform package a Codex install carries the real program in, and the directory the
-// program sits in inside it. Both are named for the architecture, and an architecture not
-// listed here is not guessed at: a path built from a guess names a file that is not there,
-// which is the launcher's case anyway.
+// The supported Windows Codex package names and binary directory triples, keyed by architecture.
 const CODEX_BUILDS: Record<string, { pkg: string; triple: string }> = {
   x64: { pkg: 'codex-win32-x64', triple: 'x86_64-pc-windows-msvc' },
   arm64: { pkg: 'codex-win32-arm64', triple: 'aarch64-pc-windows-msvc' },
 };
 
-// The real Codex program inside an npm install, and the two things its launcher would have
-// told it about how it was installed.
-//
-// `bin/codex.js` in the package is a launcher: it works out which platform package this
-// machine needs and spawns the program in it with `stdio: "inherit"` and no `windowsHide`,
-// so the program gets a console window of its own that flashes up on screen. The panel sets
-// `windowsHide` on the child it starts, and that child is the launcher rather than the
-// program, so the flash survives it. Starting the program directly is the only thing that
-// answers it, and it answers it for every Codex child rather than for one of them.
-//
-// Windows only, for the same reason as `npmPackageScript`: elsewhere the install lives
-// wherever npm's prefix is and the name on PATH starts the program on its own.
+// Prefer the Windows npm package's native Codex binary to avoid a console window from its JavaScript launcher. Supply its package environment directly.
 function codexBinary(machine: Machine, npmBin = join(machine.platform, [machine.appData, 'npm'])): Launch | null {
   if (machine.platform !== 'win32') {
     return null;
@@ -4880,8 +4029,7 @@ function codexBinary(machine: Machine, npmBin = join(machine.platform, [machine.
     command: binary,
     leadingArgs: [],
     problem: null,
-    // Both are the launcher's, and the program is told nothing about how it was installed
-    // without them.
+    // Preserve the package-root and npm-install environment values normally supplied by the launcher.
     env: {
       CODEX_MANAGED_PACKAGE_ROOT: packageRoot,
       CODEX_MANAGED_BY_NPM: '1',
@@ -4936,13 +4084,7 @@ function pathLaunch(machine: Machine, agent: 'claude' | 'codex'): Launch | null 
   return null;
 }
 
-// The Codex program shipped with the official OpenAI editor extension.
-//
-// The extension directory is supplied by the editor host rather than guessed from the
-// user's extensions folder. Targeted extension packages can move between installations,
-// and `vscode.extensions` already knows which copy is active. The platform directories
-// use the names in the bundled `codex-package.json`; a candidate that is not present falls
-// through to the standalone install rules below.
+// Find the Codex binary inside the official extension directory. Select its platform and architecture subdirectory, returning null if unsupported or absent.
 function extensionCodexBinary(machine: Machine): Launch | null {
   if (!machine.codexExtensionDir) {
     return null;
@@ -4964,10 +4106,7 @@ function extensionCodexBinary(machine: Machine): Launch | null {
   return machine.exists(binary) ? { command: binary, leadingArgs: [], problem: null, env: {} } : null;
 }
 
-// The Claude program shipped with the official Anthropic editor extension.
-//
-// The extension directory comes from the editor host. Every platform package keeps its
-// executable under the same resource directory.
+// Find the Claude binary inside the official extension directory, including Linux musl and Windows ARM64 fallback paths.
 function extensionClaudeBinary(machine: Machine): Launch | null {
   if (!machine.claudeExtensionDir) {
     return null;
@@ -5070,34 +4209,17 @@ export function codexLaunch(configured: string, machine: Machine): Launch {
   return { command: 'codex', leadingArgs: [], problem: null, env: {} };
 }
 
-// Which session a running turn is in. One agent runs several sessions at once, so
-// a name that says only which agent is busy cannot answer the question the composer asks.
-//
-// The session is the transcript's own session id rather than the key the child was
-// started under. A child started from the box is keyed by its session and one started
-// from the palette by its folder, and both end up in the same session once the CLI
-// names it, so matching on the key would miss half of them.
+// Key running work by agent and the child's recorded session id, independent of the launch key.
 export function runningKey(agent: string, session: string): string {
   return `${agent}:${session}`;
 }
 
-// Whether this session has a turn in flight. Asked of the session, because a box
-// aimed at a quiet session drew Stop while a different one of the same agent was busy,
-// and then stopped nothing: the press resolved a session that was not running.
+// Check running state for the specified agent and session.
 export function sessionRunning(running: readonly string[], agent: string, session: string): boolean {
   return running.includes(runningKey(agent, session));
 }
 
-// The sessions an agent is working in now, out of the ones a view lists.
-//
-// The rows come from the rail and the keys come from the children, and the two are joined
-// here rather than at the draw, because the join is where the mistake is. A row carries the
-// agent twice: the name a reader sees, `Claude Code`, and the key everything is filed under,
-// `claude`. A key built from the name matches nothing and says so to nobody, and the
-// session the reader is watching quietly stops being drawn as running.
-//
-// Rows decide the answer. A busy child in a session no view lists is no answer to a
-// question about what that view draws.
+// Return listed session ids with matching running keys. Use agentKey rather than the agent's display name.
 export function runningSessions(
   rows: readonly { id: string; agentKey: string }[],
   running: readonly string[],
@@ -5105,9 +4227,7 @@ export function runningSessions(
   return new Set(rows.filter((row) => sessionRunning(running, row.agentKey, row.id)).map((row) => row.id));
 }
 
-// When each of those sessions started the work it is busy with. The same join as above,
-// over the same keys, so the rail's bound on a busy claim is read against the rows the rail
-// draws. `sessionStatusOf` says what the bound is for.
+// Map listed sessions to start times using their agentKey and session id.
 export function runningSessionsSince(
   rows: readonly { id: string; agentKey: string }[],
   since: ReadonlyMap<string, number>,
@@ -5122,9 +4242,7 @@ export function runningSessionsSince(
   return out;
 }
 
-// The busy children in one session. Matched on the session the child is actually
-// in, for the reason `runningKey` gives, so a child started from the palette is reached by
-// the same rule as one started from the box.
+// Return busy, non-exited children matching the agent and recorded session id.
 export function busyInSession<T extends { agent: string; sessionId: string | null; busy: boolean; exited: boolean }>(
   states: readonly T[],
   agent: string,
@@ -5133,8 +4251,7 @@ export function busyInSession<T extends { agent: string; sessionId: string | nul
   return states.filter((s) => s.busy && !s.exited && s.agent === agent && s.sessionId === session);
 }
 
-// The agents a reader can start, in the order they are offered. Claude leads because it is
-// the one whose asks the panel can answer in full.
+// Offer Claude Code before Codex in the agent picker.
 export function agentChoices(): { agent: 'claude' | 'codex'; label: string; detail: string }[] {
   return [
     { agent: 'claude', label: 'Claude Code', detail: 'Asks before it runs a tool, and answers its own questions here' },
@@ -5142,9 +4259,7 @@ export function agentChoices(): { agent: 'claude' | 'codex'; label: string; deta
   ];
 }
 
-// What an ask looks like in a picker. A permission ask is a yes or no about one tool call,
-// so the tool and what it wants to do are the title and the reader picks a verdict. A
-// question is the model's own, so its options are the choices and its text is the title.
+// Build permission choices or the indexed question's choices and refusal action.
 export function askPrompt(ask: Ask, questionIndex = 0): AskPrompt {
   if (ask.kind === 'permission') {
     const presentation = activityDetail(ask.toolName, ask.input);
@@ -5184,8 +4299,7 @@ export function askPrompt(ask: Ask, questionIndex = 0): AskPrompt {
     choices: question.options.map((option) => ({
       label: option.label,
       detail: option.description,
-      // The whole answer is assembled once every question has been picked, so a single
-      // option carries only its own choice here.
+      // Each option carries only its question's selected label. Completed answers combine all questions.
       answer: { decision: 'answer', answers: { [question.id]: { labels: [option.label], written: '' } } },
     })),
     decline: { label: 'Decline', detail: 'The agent is told this was refused and carries on', answer: REFUSED_ASK },
@@ -5194,13 +4308,7 @@ export function askPrompt(ask: Ask, questionIndex = 0): AskPrompt {
   };
 }
 
-// The one answer that goes back for a whole question ask. `picked` holds the labels the
-// reader chose for each question, and `written` the answer they typed for it instead, both
-// in the order the questions arrived. A question left unanswered is not sent at all: the CLI
-// is blocked either way, and a made-up answer is worse than the reader being asked again.
-//
-// A question takes one or the other. Both at once would say that the reader chose a listed
-// answer and also refused the list, and neither agent has a way to read that.
+// Combine selected labels or written answers for every question in request order. Incomplete answers return null.
 export function questionAnswer(ask: Ask, picked: string[][], written: string[] = []): AskAnswer | null {
   if (ask.kind !== 'question') {
     return null;
@@ -5213,32 +4321,23 @@ export function questionAnswer(ask: Ask, picked: string[][], written: string[] =
   );
 }
 
-// What the head row says once a press has been taken and the host is resolving it. The card
-// stays on screen until the host removes it, so without this the reader has a form of dead
-// controls and nothing saying why.
+// The request status while the host processes a submitted answer.
 const ASK_SENDING = 'sending your answer';
 
-// How many of a question's choices the reader may take. Nothing else on the card says it,
-// and a reader who takes one of five checkboxes and presses Answer has told the agent less
-// than they meant to.
+// Explain whether a question accepts one choice or multiple choices.
 const ASK_CHOOSE_ONE = 'Choose one.';
 const ASK_CHOOSE_ANY = 'Choose any that apply.';
 
-// The last choice on every question, and the box it opens. Neither agent offers it: Claude
-// hands the whole tool input back to its tool, and Codex asks the client to add the free-form
-// choice itself, so both read what the reader types as an ordinary answer.
+// The panel adds Other after the agent's offered choices for a written answer.
 const ASK_WRITTEN_LABEL = 'Other';
 const ASK_WRITTEN_DETAIL = 'Answer in your own words';
 const ASK_WRITTEN_PLACEHOLDER = 'Type your answer';
 
-// What the fold press does, said rather than left to the twist. A reader who cannot see the
-// glyph has only this to tell them which way the press goes.
+// Accessible instructions for expanding and collapsing a request.
 const ASK_HIDE_PRESS = 'Press to hide it.';
 const ASK_SHOW_PRESS = 'Press to show it.';
 
-// The inline form for one request. A permission has two immediate actions. A question draws
-// one question at a time and has one final action, because sending some answers while another
-// question is blank would tell the agent something the reader did not say.
+// Prepared Markdown for one question and its choices.
 type RenderedQuestion = Pick<AskCardQuestion, 'legendHtml' | 'legendText'> & {
   headerText: string;
   choices: Pick<AskCardChoice, 'labelHtml' | 'detailHtml' | 'name'>[];
@@ -5321,7 +4420,7 @@ export function askCard(ask: Ask, agent: string): AskCard {
       incompleteName: '',
       nextLabel: '',
       nextName: '',
-      // A permission is one decision, so there is no question to be on and nothing to count.
+      // Permission requests have no question progress indicators.
       steps: [],
       answeredWords: [],
       openName: `${prompt.title}. ${ASK_SHOW_PRESS}`,
@@ -5339,14 +4438,12 @@ export function askCard(ask: Ask, agent: string): AskCard {
     id: ask.id,
     kind: ask.kind,
     title,
-    // Nothing under the title. The sentence here said that the agent would continue after an
-    // answer, which is what the state word on the head row already says in two words.
+    // The request state supplies the waiting message.
     detail: '',
     detailFormat: 'prose',
     name: `${agent} is waiting for you with ${subject}.`,
     questions: ask.questions.map((question, index) => {
-      // What the tab is called. The agent's own short label where it sent one, and the
-      // question's number where it did not: Claude always sends one and Codex may not.
+      // Use the supplied short label, or the question number when it is absent.
       const formatted = rendered[index];
       const spoken = formatted.headerText || `Question ${index + 1}`;
       return {
@@ -5367,8 +4464,7 @@ export function askCard(ask: Ask, agent: string): AskCard {
             name: formatted.choices[optionIndex].name,
             written: false,
           })),
-          // Last, after everything the agent thought of, because it is the answer for a
-          // reader none of those fit.
+          // Append the written-answer choice after the agent's offered choices.
           {
             label: ASK_WRITTEN_LABEL,
             labelHtml: escapeHtml(ASK_WRITTEN_LABEL),
@@ -5385,8 +4481,7 @@ export function askCard(ask: Ask, agent: string): AskCard {
         writtenPlaceholder: ASK_WRITTEN_PLACEHOLDER,
       };
     }),
-    // A reader who wants no part of a question still needs a way out, or the turn stays
-    // blocked on a form they will not fill in.
+    // Decline lets the reader refuse a question request without filling its answers.
     actions: [{ label: 'Decline', name: 'Decline the agent question', answer: REFUSED_ASK }],
     answerLabel: 'Answer',
     answerName: count === 1 ? 'Answer the agent question' : `Answer all ${count} agent questions`,
@@ -5404,9 +4499,7 @@ export function askCard(ask: Ask, agent: string): AskCard {
   };
 }
 
-// Accept only an answer the current request could have produced. The webview is isolated but
-// still an input boundary, and a stale form can post after the agent has replaced a request.
-// Normalizing here also puts question ids back in request order before the wire sees them.
+// Validate answers against the current request and restore question order before sending. Reject unknown labels, question ids, and incomplete answers.
 export function acceptedAskAnswer(ask: Ask, candidate: unknown): AskAnswer | null {
   if (!candidate || typeof candidate !== 'object') {
     return null;
@@ -5444,8 +4537,7 @@ export function acceptedAskAnswer(ask: Ask, candidate: unknown): AskAnswer | nul
       return null;
     }
     const labels = given.labels as string[];
-    // The reader answered in their own words, so there is no offered label to check. The two
-    // never arrive together: a question is answered from the list or off it.
+    // Accept a nonempty written answer only when no offered labels are selected.
     if (labels.length === 0) {
       if (!given.written.trim()) {
         return null;
@@ -5473,15 +4565,7 @@ export function acceptedAskAnswer(ask: Ask, candidate: unknown): AskAnswer | nul
   return questionAnswer(ask, picked, written);
 }
 
-// The prompt entries to offer for what the reader has typed. Matching is on the name only: a
-// description match would put an entry under a name that does not contain what was typed,
-// which reads as the list ignoring the reader.
-//
-// The host and browser import the same browser-safe matching rule. This wrapper keeps the
-// host's command objects while the shared rule orders their names.
-//
-// `typed` is everything after the prefix. An empty one offers the lot, because a reader who
-// has typed only the prefix is asking what there is.
+// Match prompt-entry names with the shared browser-safe rule. Return the last host entry for each matched name. An empty query offers every distinct name.
 export function matchCommands(commands: ComposerPromptEntry[], typed: string): ComposerPromptEntry[] {
   const byName = new Map(commands.map((command) => [command.name, command]));
   return matchCommandNames([...byName.keys()], typed)
@@ -5489,36 +4573,15 @@ export function matchCommands(commands: ComposerPromptEntry[], typed: string): C
     .filter((command): command is ComposerPromptEntry => command !== undefined);
 }
 
-// The prompt entry the caret is standing in, and where it starts and ends.
-//
-// A prompt entry is a run with no spaces in it that opens on an agent-recognized prefix.
-// A slash opens a
-// word: the start of the box, or a space in front of it. So it is read wherever the reader
-// is writing rather than only at the front of the box, which is how both agents' own boxes
-// behave and how the reader asked for it. `Take a look at /rev` offers the review command
-// under the caret and leaves the six words in front of it alone.
-//
-// A slash inside a word is not one. `a/b` and `src/main.ts` are a path or a fraction, and the
-// rule that a slash opens a word is what tells them apart from a command without knowing any
-// command's name. A run that does open a word and still names nothing, `/usr/local` being the
-// one that turns up, is left to the matching: it offers no command, and a menu with no rows
-// is not drawn.
-// One command as the menu under the box draws it.
-//
-// Worded here rather than in the panel, so the row a screen reader hears is decided in a
-// file a test can read. The panel narrows the list and draws it; every word on a row comes
-// from here, and every one of those words is the agent's own.
+// The displayed text, accessible name, and completion for one prompt-entry menu row.
 export interface PromptEntryView {
   kind: 'command' | 'skill';
-  // The agent's own name for the entry, with no prefix. This is what the panel narrows on
-  // and what a press carries back, so a stale list can only ever complete an entry the
-  // reader was looking at.
+  // The entry name without its prefix, used for matching and selection.
   command: string;
   prefix: '/' | '$';
   // The entry as the reader would type it.
   label: string;
-  // What it takes after its name, in the agent's words, and empty for one that takes
-  // nothing. Claude publishes this as `argumentHint`; Codex publishes none for a skill.
+  // The published argument hint, or an empty string.
   hint: string;
   // The agent's sentence about it, and empty where it gives none.
   description: string;
@@ -5526,15 +4589,9 @@ export interface PromptEntryView {
   path?: string;
   // The panel control that owns this command. Agent-owned entries omit it.
   panelControl?: string;
-  // The row's accessible name. An `aria-label` replaces what the row holds rather than
-  // adding to it, so everything the eye reads is in here: the name, what it takes, and the
-  // sentence under it.
+  // The accessible name includes the label, argument hint, and description in display order.
   name: string;
-  // What the run under the caret becomes when this row is taken. The words either side of it
-  // are kept, so a command completed in the middle of a sentence leaves the sentence.
-  //
-  // The trailing space is not decoration: it is what ends the name, which shuts the menu and
-  // lets the next Enter send the command rather than complete it again.
+  // The replacement for the entry under the caret. A trailing space ends the completed name.
   completion: string;
 }
 
@@ -5563,25 +4620,12 @@ export function pathEntries(
   });
 }
 
-// The commands the panel answers itself, and the control each one opens.
-//
-// Some of an agent's commands are not questions for the agent at all. `/mcp` draws a list of
-// servers in the agent's own terminal, so the CLI never answers it with anything a panel
-// could show: sent as a prompt it goes out and nothing comes back, and the reader is left
-// looking at a command that did nothing. The panel already draws that list, on the picker
-// row, so the command opens that instead of travelling.
-//
-// The list is short and stays short. A command belongs here only when the panel has a control
-// that does the same job, and every one that the agent can actually answer is left to the
-// agent. `/compact` is the case that shows the difference: the CLI reads it and compacts, so
-// it is not here.
+// Commands handled by existing panel controls rather than sent to the agent. The MCP command opens the server list.
 const PANEL_COMMANDS: Record<string, { control: string; description: string }> = {
   mcp: { control: 'mcp', description: 'View MCP server status' },
 };
 
-// The agent's own list plus commands this panel implements through an equivalent protocol
-// call. The panel command is appended and deduplicated so Claude can publish `/mcp` itself,
-// while Codex, which publishes no slash-command list, still offers it.
+// Append missing panel commands to the agent catalog. Compare non-skill names without case to avoid duplicate commands.
 export function availableCommands(commands: readonly ComposerPromptEntry[]): ComposerPromptEntry[] {
   const available = [...commands];
   const names = new Set(
@@ -5595,10 +4639,7 @@ export function availableCommands(commands: readonly ComposerPromptEntry[]): Com
   return available;
 }
 
-// Which control a typed command opens, or nothing for a command that goes to the agent.
-//
-// The argument is dropped on purpose. `/mcp` takes none, and a reader who typed one has still
-// asked for the servers.
+// Return the panel control for a slash command, ignoring its arguments. Agent commands return null.
 export function panelCommand(text: string): string | null {
   const said = text.trim();
   if (!said.startsWith('/')) {
@@ -5608,8 +4649,7 @@ export function panelCommand(text: string): string | null {
   return own(PANEL_COMMANDS, name)?.control ?? null;
 }
 
-// Every available prompt entry, worded for the menu. The agent's order is kept and panel-owned
-// commands follow it. Narrowing reorders them against what the reader typed.
+// Build menu rows in catalog order. Codex skills offer both dollar and slash prefixes.
 export function promptEntries(agent: string, commands: readonly ComposerPromptEntry[]): PromptEntryView[] {
   return commands.flatMap((command) => {
     const prefixes: Array<'/' | '$'> = command.kind === 'skill' && agent === 'codex' ? ['$', '/'] : ['/'];
@@ -5617,8 +4657,7 @@ export function promptEntries(agent: string, commands: readonly ComposerPromptEn
       const label = `${prefix}${command.name}`;
       const hint = command.argumentHint.trim();
       const description = command.description.trim();
-      // Joined the way the row reads, so what is heard and what is seen are the same words in
-      // the same order.
+      // Join the label, argument hint, and description in the displayed order for the accessible name.
       const said = [hint ? `${label} ${hint}` : label, description].filter(Boolean).join('. ');
       return {
         kind: command.kind ?? 'command',

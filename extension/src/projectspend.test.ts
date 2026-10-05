@@ -348,7 +348,7 @@ test('missing source validation invalidates its normalized path', () => {
   assert.equal(realpathCalls, 3);
 });
 
-// Stand-in figures for one session: everything the lifetime figures read from its records.
+// Calculate one session's lifetime figures from its spend sources.
 function sessionFactsOf(
   sessionId: string,
   files: readonly SpendFileIndex[],
@@ -364,7 +364,7 @@ function sessionFactsOf(
     : undefined;
 }
 
-// The same facts for every session at once, read from scratch over the whole project.
+// Recalculate lifetime figures for all sessions from the complete project sources.
 function projectFactsOf(files: readonly SpendFileIndex[], sources: readonly SessionSpendSource[]) {
   const awaiting = new Set<string>();
   const parts = sessionSpendPartsBySession(files, sources, awaiting);
@@ -441,8 +441,8 @@ test('held lifetime figures copy the record list, which the ledger edits in plac
   assert.deepEqual(calculated, ['a', 'a']);
 });
 
-// Whether the ledger still reads a file moves only a session that has a dispatched source
-// with no record. A session with any other unread source keeps its held figures.
+// Queue changes recalculate sessions with unread dispatched sources. Other unread sources retain their existing figures.
+
 test('a source the ledger queues or lets go recalculates only the sessions it was dispatched to', () => {
   const { read, calculated } = sessionFiguresReader();
   const sources: SessionSpendSource[] = [
@@ -468,11 +468,8 @@ test('a source the ledger queues or lets go recalculates only the sessions it wa
   assert.deepEqual(calculated, ['parent'], 'a queue change recalculated a session with no unread dispatched source');
 });
 
-// A dispatched source the ledger read in part holds its parent a lower bound only while the
-// ledger still queues it. Once the ledger lets it go, because its file went away or the history
-// limit now skips it, the parent adds the usage the ledger did read and marks nothing. A source
-// whose last line is still being written keeps the mark after the queue clears, until its last
-// write falls before the history limit.
+// A partially read dispatched source marks its parent while queued. An unfinished last line keeps that mark until it falls outside the history limit.
+
 test('a dispatched source read in part lets its parent go once the ledger stops queueing it', () => {
   const sources: SessionSpendSource[] = [
     { sessionId: 'parent', file: 'parent.jsonl', primary: true },
@@ -603,7 +600,7 @@ test('lifetime figures follow an alias that resolves to another record after its
   );
   invalidateSpendFileNormalization(alias);
   const { read, calculated } = sessionFiguresReader();
-  // The alias never matches a record lexically, so only its canonical path finds one.
+  // Only the resolved path associates this alias with its spend record.
   const sources: SessionSpendSource[] = [
     { sessionId: 'a', file: alias, primary: true },
     { sessionId: 'b', file: 'b.jsonl', primary: true },
@@ -1963,10 +1960,8 @@ test('a record from a reducer that reports zero turns and no span passes stored-
       type: 'event_msg',
       payload,
     });
-  // A rollout made only of a task that never counted as a turn: the real Codex reducer names
-  // no first or last turn at all, and the pair validation must accept that shape rather than
-  // reject it as one timestamp present without its match. The reducer is the genuine one, not
-  // a stand-in, so a regression that made it report a span here would fail this test too.
+  // The Codex reducer reports no turn span for this empty task. Stored-record validation must accept both absent timestamps.
+
   fs.writeFileSync(
     file,
     [
@@ -2236,9 +2231,8 @@ test('a save that cannot finish leaves no temporary behind', () => {
 });
 
 test('a subagent transcript read as a parent saves complete and empty', () => {
-  // Every record in a subagent transcript is a sidechain, so a parent read counts none of
-  // them. The ledger then holds the file as finished with nothing in it, which is what makes
-  // a wrong role permanent.
+  // A parent reducer skips all sidechain records and stores a complete empty result. Reader role therefore affects the persisted figures.
+
   const folder = dir();
   const file = path.join(folder, 'p', 'subagents', 'child.jsonl');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -2264,9 +2258,8 @@ test('a subagent transcript read as a parent saves complete and empty', () => {
 });
 
 test('a saved record names the reader that made it, not its first surviving bucket', () => {
-  // A Codex rollout that ran an embedded Claude invocation counts both agents, and a Claude
-  // bucket sorts before a Codex one on the same date. The windowed list can lose the Codex
-  // days as well, which would make the answer change with the clock.
+  // Embedded Claude usage sorts before Codex usage. Reader identity must remain Codex even when the retained buckets change.
+
   const rollout = {
     file: 'rollout.jsonl',
     workspace: 'w',
@@ -2362,8 +2355,8 @@ test('source discovery includes all parent and child sources once', () => {
   );
 });
 
-// The chain walk each discovery ran for every session and every candidate, kept as the
-// reference the indexed walk must match.
+// Reference source discovery follows each child's parent chain. The indexed traversal must return the same sources.
+
 function referenceCodexSessionSpendSources(sessions: readonly SpendSessionFile[], children: readonly SpendChildFile[]) {
   const byThread = new Map(children.map((child) => [child.threadId, child]));
   const out: SessionSpendSource[] = [];
@@ -2553,9 +2546,8 @@ test('session spend sources are built again when a listed file or a parent link 
   assert.ok(index.revision > moved, 'a source changing between main and delegated work kept the revision');
 });
 
-// A dispatched session is its own session, and the session that dispatched it counts the
-// child's whole cost as delegated work. The project counts every transcript once whichever
-// session claims it.
+// A dispatched session contributes its whole cost as delegated work to its parent. Project totals count each transcript once.
+
 describe('a dispatched session in lifetime cost', () => {
   const at = stamp('2026-08-31T10:00:00');
   const record = (file: string, input: number): SpendFileIndex => {
@@ -2610,7 +2602,7 @@ describe('a dispatched session in lifetime cost', () => {
       undefined,
       dispatchedParents(sessionParentIndex(references)),
     );
-  // The figures the panel draws, read the way the panel host reads them.
+  // Project the session figures supplied to the panel.
   const costs = (
     sources: readonly SessionSpendSource[],
     files: readonly SpendFileIndex[] = records,
@@ -2794,9 +2786,8 @@ describe('a dispatched session in lifetime cost', () => {
     }
   });
 
-  // A background session writes its transcript while it runs, long after the session that
-  // dispatched it may have stopped. The parent's own figure stays, and the child's cost joins
-  // it once every one of the child's sources is whole.
+  // An unfinished dispatched session leaves the parent's own cost available and contributes a lower-bound delegated figure.
+
   test("a parent keeps its own figure while a dispatched session's source is not whole", () => {
     const alone = costs(sourcesWith([]));
     const parent = alone.parent.total.dollars;
@@ -2835,11 +2826,8 @@ describe('a dispatched session in lifetime cost', () => {
     }
   });
 
-  // A dispatched source the ledger no longer reads never gets a record: the history limit
-  // skipped it, or its file is gone. The parent keeps every usage the ledger did read, and
-  // draws no lower bound. While the ledger still reads the source, the parent waits for it. A
-  // record whose last line is unfinished keeps the parent a lower bound until its last write
-  // falls before the history limit.
+  // A skipped or missing source retains recorded usage without a lower-bound mark. A queued or unfinished source keeps that mark.
+
   test('a dispatched source the ledger no longer reads keeps the usage it read and marks nothing', () => {
     const own = costs(sourcesWith([])).parent.total.dollars;
     const sources = sourcesWith([launch('toolu_1')]);
@@ -2957,9 +2945,8 @@ describe('a dispatched session in lifetime cost', () => {
     );
   });
 
-  // Subagent, then dispatched session, then that session's subagent, then a session that
-  // subagent dispatched. The top session's delegated work reaches the bottom of the chain, and
-  // its line takes the lower-bound mark while the deepest session is still being written.
+  // Follow the mixed subagent and dispatch chain once. An unfinished deepest source marks the top session's delegated figure as a lower bound.
+
   test("a mixed chain of subagents and dispatched sessions counts once in the top session's figure", () => {
     const ids = ['top', 'helper', 'launched', 'worker', 'deep'];
     const held = ids.map((id, at) => record(`${id}.jsonl`, 10_000 * (at + 1)));
@@ -3850,15 +3837,14 @@ test('a session total counts a Claude compaction as an estimate beside its main 
 const COMPACTION_ROW = COMPACTION_SAMPLES[0];
 const COMPACTION_OUTPUT = Math.round(COMPACTION_ROW.summaryChars / CLAUDE_COMPACTION_SUMMARY_CHARS_PER_TOKEN);
 
-// Indexes a Claude transcript, and a child transcript when one is given, the way the rail
-// does, then prices the session total.
+// Indexes a parent transcript and optional child, then projects their session cost.
 function indexCompactionSession(lines: readonly object[], child?: readonly object[]) {
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
   const write = (target: string, items: readonly object[]) =>
     fs.writeFileSync(target, items.map((line) => JSON.stringify(line)).join('\n') + '\n');
-  // One pass reads the whole file however slow the machine is. The default time budget stops a
-  // cold scan of the 256 KB filler partway, and the session total then waits for a later pass.
+  // Use an unlimited time budget so indexing completes in one pass, including the 256 KiB filler.
+
   const whole = { maxMilliseconds: Number.POSITIVE_INFINITY };
   write(file, lines);
   const record = indexSpendFile(undefined, file, 'w', createClaudeUsageLineReducer, 1, whole).record;
@@ -4670,8 +4656,8 @@ test('a configured input rate retains a published 30-minute cache-write multipli
   );
 });
 
-// A configured rate that names no tier is the user's standard-speed price. A fast turn priced
-// at it would show half of what the turn billed.
+// A configured rate without a service tier prices standard Claude usage and refuses fast usage.
+
 test('a configured rate refuses a fast Claude turn and keeps pricing a standard one', () => {
   const bucketAt = (serviceTier: string) =>
     aggregateUsageEvents([

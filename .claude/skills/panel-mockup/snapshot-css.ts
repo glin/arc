@@ -35,10 +35,8 @@ if (missing.length) {
   process.exit(1);
 }
 
-// Codex reads the skill through .agents/skills/panel-mockup, a symbolic link committed to
-// the repository. A checkout without symbolic links writes it as a text file holding the
-// target path, and Codex then finds no skill. This says so and carries on, because the
-// mockups themselves do not need the link and a git worktree on Windows rarely has it.
+// Warns when Codex cannot read the skill through .agents/skills/panel-mockup.
+// Snapshot generation continues without that link.
 const link = path.join(root, '.agents', 'skills', 'panel-mockup');
 if (!fs.existsSync(path.join(link, 'SKILL.md'))) {
   console.warn('warning: .agents/skills/panel-mockup is not a link to the skill, so Codex will not find it.'

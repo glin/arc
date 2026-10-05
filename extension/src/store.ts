@@ -311,8 +311,8 @@ export function tabLabelMatchesTitle(tabLabel: string, title: string): boolean {
   return tabLabel === title || tabLabel.startsWith(`${title} (`);
 }
 
-// True if `target` equals, or is nested under, any of `folders`. Used to decide
-// whether a session's cwd belongs to the current VS Code window's workspace.
+// Tests whether a path equals or is nested under an open workspace folder.
+// The comparison uses the current platform's path separator.
 export function isPathWithin(target: string, folders: string[]): boolean {
   if (!target) {
     return false;
@@ -326,10 +326,9 @@ export function isPathWithin(target: string, folders: string[]): boolean {
   });
 }
 
-// Compare two files chunk by chunk with early exit. This runs on the shared extension-host
-// event loop, where reading whole files into memory would stall every extension in the
-// host once a manifest references enough large files, so memory stays bounded regardless
-// of file size and runtime stops at the first differing chunk.
+// Compares files in bounded chunks, stopping at the first difference.
+// Synchronous reads share the extension-host event loop.
+// Whole-file buffers would increase memory use with file size.
 const COMPARE_CHUNK = 1 << 20;
 function filesEqual(a: string, b: string, size: number): boolean {
   let fa = -1,
@@ -348,7 +347,7 @@ function filesEqual(a: string, b: string, size: number): boolean {
       }
       if (n <= 0) {
         return true;
-      } // both hit EOF early (file changed mid-scan); next refresh recheck
+      } // Both files reached EOF early after changing. The next refresh compares them again.
       if (!bufA.subarray(0, n).equals(bufB.subarray(0, m))) {
         return false;
       }
@@ -357,7 +356,7 @@ function filesEqual(a: string, b: string, size: number): boolean {
     return true;
   } catch {
     return false;
-  } // unreadable mid-compare -> treat as differing; next refresh recheck
+  } // Treat an unreadable file as different. The next refresh compares it again.
   finally {
     if (fa >= 0) {
       try {
@@ -405,9 +404,8 @@ export function fileDiffersOnDisk(entry: ManifestEntry): boolean {
   return !filesEqual(entry.path, entry.snapshot, liveSize);
 }
 
-// Sessions under `root` whose cwd is inside one of `workspaceFolders` and that still have
-// files differing from their snapshots, each narrowed to those files. Taking the folders as
-// an argument, rather than reading the VS Code API, keeps it unit-testable.
+// Returns sessions in the workspace whose files still differ from snapshots.
+// Each manifest contains only the differing files.
 export function pendingSessions(
   root: string,
   workspaceFolders: string[],
@@ -433,11 +431,8 @@ export function pendingSessions(
   return out;
 }
 
-// How long a session's snapshots are kept, in days. Age is the only thing that ends a
-// session, because nothing ever marks a file as dealt with: a rule waiting for that would
-// hold every session until its transcript expired, and the store would only grow. A month is
-// longer than any turn a reader comes back to, and the snapshots are the exact pre-edit
-// files, which is what makes a diff of a recent turn exact rather than a guess.
+// Snapshot retention in days. Age determines cleanup because files have no resolved marker.
+// Snapshots retain the exact pre-edit content needed to compare recent turns.
 export const SNAPSHOT_KEEP_DAYS = 30;
 
 // Delete session folders whose last turn is older than maxAgeDays, by the trigger file's

@@ -80,23 +80,20 @@ function lowerBoundProjectSpend() {
     { now: NOW },
   );
 }
-// The least the session picker keeps beside Project cost and the New control in the
-// narrow bar. Under this it is an arrow and a letter or two, which names no session at
-// all. A little under what the panel leaves it today, so a machine whose fonts measure a pixel
-// wider than this one does not read as a fault.
+// The session picker retains at least this width beside Project cost and New.
+
 const PICKER_FLOOR = 72;
 
-// What Pricing details says about usage the panel holds no price for. Written out once,
-// because two tests far apart read it and a sentence copied into both drifts in one of them.
+// Share the unsupported-usage explanation between its two checks.
+
 const NO_PRICE_NOTE = 'Some Claude usage has no rate. The totals leave it out.';
 
-// The caveat that opens Pricing details. It waits behind the disclosure, so the primary view
-// never carries it.
+// The subscription caveat stays inside Pricing details.
+
 const RATE_CAVEAT = 'These amounts price the usage at API rates. A subscription plan charges differently.';
 
-// A workspace whose Claude models the list-price table does not name. Every Claude figure and
-// every total is a cost the panel holds no price for, which is what a first paint looks like
-// there. It is also the widest the table ever gets, because no cell in it wraps.
+// Every Claude cost is unknown in this fixture. Unknown values also exercise the table's widest text.
+
 const NOTHING_PRICED = {
   ...PROJECT_SPEND,
   windows: PROJECT_SPEND.windows.map((window) => ({
@@ -181,8 +178,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'the collapsed rail face does not show the supplied today value',
     );
     assert.equal(rail.when, 'today', 'the rail face does not say which period the figure covers');
-    // The composer's picker caret, in both states. The rail's own twist means folded on the
-    // sessions under it, and this face opens a box over the panel instead.
+    // The Project cost face uses the prompt box picker caret in both states.
+
     assert.equal(rail.twist, DOWN_CARET, 'the collapsed Project cost face wears the rail fold twist');
     assert.ok(
       rail.left >= wide.rail.left - 1 && rail.right <= wide.rail.right + 1 && rail.buttonRight <= wide.rail.right + 1,
@@ -228,20 +225,16 @@ test('project cost uses one popover without moving the rail or list', { timeout:
     assert.equal(opened.hidden, false, 'pressing Project cost did not open its detail');
     assert.equal(opened.role, 'dialog', 'Project cost is not a dialog popover');
     assert.equal(opened.focused, true, 'opening Project cost leaves keyboard focus outside its dialog');
-    // The words under the table read at the size the panel reads at. The first measurement is
-    // the session list, which is outside this box, so a size set on the box itself moves
-    // every other measurement and fails here rather than passing against itself.
+    // Compare table, notes, disclosure, and metadata text sizes with the session list outside the dialog.
+
     assert.deepEqual(
       opened.fonts,
       Array.from({ length: 5 }, () => opened.fonts[0]),
       `the panel draws its list, and the box its table, notes, disclosure and meta row, ` +
         `at ${opened.fonts.join(', ')}`,
     );
-    // One rate to a list item, measured while the disclosure is open. A closed one answers a
-    // question put to its text and to its computed style, so a list the stylesheet hid would
-    // pass both. The box count is what a hidden list cannot answer. The disclosure is opened
-    // and shut through the element, because a press on it would take the focus the sub-cases
-    // below stand on.
+    // Open the disclosure through its DOM property to preserve focus. Measure rate items while they are visible.
+
     const drawn = (await page.evaluate(`(() => {
       const pricing = document.querySelector('#projectspendpop .projectspendpricing');
       pricing.open = true;
@@ -302,7 +295,7 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       false,
       'a row still carries the payload word spend under a title that already says cost',
     );
-    // One sentence for the whole order of rates. The three log lines each repeated the date.
+    // The rate-order explanation appears once.
     assert.equal(
       opened.text.includes('Provider-reported cost, effective'),
       false,
@@ -355,10 +348,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'the opened Project cost age lacks its full timestamp',
     );
 
-    // An estimate with no effective date, beside one that has. Most rows of the list-price
-    // table carry no date, so this is the ordinary workspace rather than an edge of it. The
-    // dated phrase says its own date and no closing sentence hands that date to the rate that
-    // has none.
+    // Keep the undated rate beside a dated rate so the closing wording cannot apply one date to both.
+
     const undatedSpend = { ...PROJECT_SPEND, rateSources: PROJECT_SPEND_UNDATED_RATES };
     await page.evaluate(
       `window.postMessage(${JSON.stringify({ type: 'projectSpend', projectSpend: undatedSpend })}, '*')`,
@@ -382,8 +373,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       false,
       'a closing sentence dates an estimated rate that arrived without a date',
     );
-    // A workspace priced from one rate. An order names a sequence and a list draws one, and a
-    // single source has neither, so the box names it in a sentence instead.
+    // A single rate source uses a sentence rather than an ordered list.
+
     const lone = PROJECT_SPEND.rateSources.filter((source) => source.provenance === 'public');
     assert.equal(lone.length, 1, 'the fixture carries no single public rate, so this measures nothing');
     const oneRate = { ...PROJECT_SPEND, rateSources: lone };
@@ -424,8 +415,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       name: string;
     };
     assert.deepEqual(period.pressed, ['false', 'true', 'false'], 'the selected Project cost period is not exposed');
-    // The words At least belong to the figure and not to a column of them, so the cell keeps
-    // them in its name while the dotted rule carries the same meaning to the eye.
+    // Each lower-bound cell retains At least in its accessible name and uses a dotted underline.
+
     assert.deepEqual(
       period.rows,
       [
@@ -490,9 +481,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
         text: document.getElementById('projectspendpop').textContent,
         visible: document.getElementById('projectspendpop').innerText };
     })()`)) as { cells: { text: string; name: string | null; title: string }[]; text: string; visible: string };
-    // One word in the column and the full words in the name and on the hover. Nine cells
-    // reading Cost unknown set a width the box cannot shrink below, which the narrow guard
-    // further down measures.
+    // Cells show Unknown and expose Cost unknown in their accessible names and tooltips.
+
     assert.deepEqual(
       unknown.cells,
       Array.from({ length: 3 }, () => ({ text: 'Unknown', name: 'Cost unknown', title: 'Cost unknown' })),
@@ -503,8 +493,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       /2,709|Claude \/ Anthropic/,
       'unsupported Claude usage exposes raw counts or provider names',
     );
-    // A payload with no priced usage draws no dotted figure, so the primary view carries no
-    // note at all and the reason waits behind the disclosure with the rates.
+    // Unsupported usage stays unexplained in the primary view and receives an explanation inside Pricing details.
+
     assert.ok(
       unknown.text.includes(NO_PRICE_NOTE),
       `the popover reads "${unknown.text}", so a payload it can price nothing in explains ` +
@@ -515,8 +505,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       false,
       'the note about unpriced usage is drawn in the primary view rather than inside Pricing details',
     );
-    // Hidden is half the answer. A stylesheet that hid the disclosure would pass the two
-    // measurements above and leave an unknown figure with no reason anywhere on screen.
+    // Opening Pricing details must reveal the unsupported-usage explanation.
+
     const behind = (await page.evaluate(`(() => {
       const pricing = document.querySelector('#projectspendpop .projectspendpricing');
       pricing.open = true;
@@ -545,10 +535,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'a Project cost update drops focus from the selected period',
     );
 
-    // The same figures again, which is what an index report that moved nothing carries. The
-    // control the reader stands on has to be the same element afterwards. Another element
-    // answering to the same name reads as identical here and is not: the browser shuts a
-    // native list of choices with the element that owned it, and the reader loses their place.
+    // An unchanged payload must retain the focused period control's DOM identity.
+
     await page.evaluate(`(() => {
       window.__period = document.querySelector('#projectspendpop [data-control="projectspend:period:sevenDays"]');
     })()`);
@@ -610,8 +598,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'Escape does not close Project cost and return focus',
     );
 
-    // The message an agent at work sends several times a second, arriving on a face the close
-    // just handed the focus back to. A face rebuilt for it puts the reader on the body.
+    // A later payload must preserve focus on the face after the dialog closes.
+
     await page.evaluate(
       `window.postMessage(${JSON.stringify({ type: 'projectSpend', projectSpend: updatedSpend })}, '*')`,
     );
@@ -625,10 +613,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'a message that changed nothing takes the focus the close returned to the Project cost face',
     );
 
-    // The two announcements of the open state, read together. A face says whether the box is
-    // open in `aria-expanded` and again in the words that end its name, and the state belongs
-    // to the panel rather than to the payload. So a face whose repaint the reader's own text
-    // selection is holding back still owes the reader one answer about it.
+    // aria-expanded and the accessible name must agree while selection defers the face repaint.
+
     const FACE_OPEN = `(() => {
       const button = document.querySelector('.projectspendrailhost .projectspendbutton');
       const name = button.getAttribute('aria-label') || '';
@@ -681,8 +667,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'a Project cost face whose repaint a selection holds back answers the open state two ways at once',
     );
 
-    // And the held repaint lands whole once the selection goes, so neither answer is left
-    // standing on a payload the panel has moved past.
+    // Clearing selection applies the deferred face payload.
+
     await page.evaluate(
       `(() => { getSelection().removeAllRanges(); document.dispatchEvent(new Event('selectionchange')); })()`,
     );
@@ -698,7 +684,7 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       { expanded: 'false', named: 'false' },
       'the released Project cost repaint leaves the face saying the box is open',
     );
-    // The figures every measurement below this one is written against.
+    // Restore the figures used by the following layout checks.
     await page.evaluate(
       `window.postMessage(${JSON.stringify({ type: 'projectSpend', projectSpend: updatedSpend })}, '*')`,
     );
@@ -713,9 +699,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
     );
 
     await page.locator('.projectspendrailhost .projectspendbutton').click();
-    // A mark on the table, which nothing a rebuilt one carries answers for. The reader drags
-    // the editor's edge across this boundary with the box open, and a table taken down and
-    // built again there drops the text they were part way through selecting inside it.
+    // Preserve the table's DOM identity across the responsive boundary so active text selection survives.
+
     await page.evaluate(`document.querySelector('#projectspendpop .projectspendgrid').__mark = 'box'`);
     await page.setViewportSize({ width: RAIL_MIN_WIDTH - 60, height: 900 });
     await page.evaluate(SETTLED);
@@ -798,8 +783,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       );
       assert.equal(compact.valueFits, true, `the selected Project cost amount is clipped at ${width}px`);
       assert.equal(compact.newControl, true, `the ${width}px panel has no compact New control beside Project cost`);
-      // The Project cost face is allowed more than half the bar now. What is left has to still
-      // show a reader which session they are in, and an arrow on its own shows none.
+      // The session picker retains enough width to identify the selected session.
+
       assert.ok(
         compact.picker >= PICKER_FLOOR,
         `the session picker is ${Math.round(compact.picker)}px wide beside Project cost at ${width}px, ` +
@@ -922,9 +907,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
       'removing Project cost also removes the narrow New control',
     );
 
-    // The same empty payload again, which an agent at work sends several times a second. The
-    // host is already empty, so the pass owes it nothing. A mark left inside it says whether
-    // the panel emptied it a second time.
+    // An unchanged empty payload must leave the existing empty host contents intact.
+
     await page.evaluate(`(() => {
       const host = document.querySelector('.projectspendrailhost');
       const mark = document.createElement('span');
@@ -944,8 +928,8 @@ test('project cost uses one popover without moving the rail or list', { timeout:
   }
 });
 
-// The widths the all-unknown table was measured overflowing at. The first is the panel a
-// reader gets in a wide sidebar, and the last is the narrowest the panel is built for.
+// Check the unknown-cost table at wide, narrow, and minimum panel widths.
+
 const NARROW_BOX_WIDTHS = [480, 340, 320];
 
 test('a project cost the panel can price nothing in still fits the narrow box', { timeout: 60_000 }, async (t) => {
@@ -979,13 +963,13 @@ test('a project cost the panel can price nothing in still fits the narrow box', 
           past: Math.round(g.right - p.right) };
       })()`)) as { hidden: boolean; sideways: number; past: number };
       assert.equal(fit.hidden, false, `the box shut itself at ${width}px, so nothing here was measured`);
-      // A dialog the reader has to drag sideways to read the 30 days column.
+      // The table must fit without horizontal scrolling.
       assert.ok(fit.sideways <= 0, `the ${width}px box scrolls ${fit.sideways}px sideways with every window unknown`);
       assert.ok(fit.past <= 1, `the table is drawn ${fit.past}px past the right edge of its own box at ${width}px`);
     }
 
-    // What sets that width: one word in the column, and the full words where a reader who
-    // cannot see the column still meets them.
+    // The short cell text retains the full accessible name and tooltip.
+
     const cell = (await page.evaluate(`(() => {
       const cell = document.querySelector('#projectspendpop .projectspendcell');
       if (!cell) return null;
@@ -1002,12 +986,8 @@ test('a project cost the panel can price nothing in still fits the narrow box', 
   }
 });
 
-// Every part of the rail face, and how many lines the label was drawn over. The words are the
-// same whether the phrase broke or not, and so is the width it was given, so the count of
-// lines is the only thing that tells the two apart.
-//
-// The count comes off a range over the words and not off the element. A flex item is
-// blockified, so its own box is one rectangle however the text inside it wrapped.
+// Count text rectangles with a Range. A flex item's own rectangle does not reveal wrapped text lines.
+
 const LINES = `const lines = function (node) {
     const range = document.createRange();
     range.selectNodeContents(node);
@@ -1033,8 +1013,8 @@ const RAILFACE = `(() => {
   };
 })()`;
 
-// The counter itself, read against words the box did wrap. Without this the count above is
-// free to become the element's own rectangle again, and a broken label passes as it used to.
+// Compare the line counter with text that wraps, rather than the flex element's single rectangle.
+
 const LINECOUNTER = `(() => {
   const note = document.querySelector('#projectspendpop .projectspendpricing[open] .projectspendrate');
   ${LINES}
@@ -1074,14 +1054,12 @@ test(
       };
 
       await layoutAt(page, 1350);
-      // The longest figure the payload holds. Today fits beside the label at every width the
-      // sash allows, so a face measured on it says nothing about what a wrap does.
+      // Use the longest supplied period value to exercise wrapping.
+
       await page.locator('.projectspendrailhost .projectspendbutton').click();
       await page.locator('.projectspendperiod').nth(2).click();
-      // The line counter, held against a sentence the popover did wrap. A count taken off the
-      // element returns one for those same words, which is what let a broken label pass unread.
-      // The words are the pricing caveat, the longest run the box holds, so the disclosure has
-      // to be open before the counter can reach them.
+      // Open Pricing details so the counter can measure its wrapped caveat.
+
       await page.locator('#projectspendpop [data-control="projectspend:pricing"]').click();
       await page.evaluate(SETTLED);
       const counter = (await page.evaluate(LINECOUNTER)) as { text: string; lines: number; boxes: number };
@@ -1127,8 +1105,8 @@ test(
         `the face overflows the ${RAIL_WIDTH_MIN}px rail by ${Math.round(tight.overflow)}px`,
       );
 
-      // The second line is a fallback and not the shape. Given the room, the value comes back
-      // beside the label, so nothing above is passing because the face always wraps.
+      // With sufficient width, the value shares the label's line.
+
       const roomy = await faceAt(480);
       assert.equal(
         roomy.value,
@@ -1141,8 +1119,8 @@ test(
           '480px rail, so it takes a line of its own where there is room for both',
       );
 
-      // The width the rail opens at, on the period it opens on.
-      // By key, because the test widens the rail without moving the composer beside it.
+      // Restore the default period by keyboard without moving the prompt box.
+
       await page.locator('.projectspendrailhost .projectspendbutton').focus();
       await page.keyboard.press('Enter');
       await page.locator('.projectspendperiod').nth(0).click();
@@ -1178,8 +1156,8 @@ test('the compact Project cost face gives up a word before it gives up the figur
       `the short label starts at ${PROJECT_SPEND_SHORT_LABEL}px and the rail leaves at ${RAIL_MIN_WIDTH}px, ` +
         'so no width measured here has a compact face at all',
     );
-    // Both named widths and both sides of the line itself, because a rule that fires one
-    // pixel out reads exactly like a working one at 640 and at 340.
+    // Check both sides of the short-label boundary and the named wide and narrow widths.
+
     const widths: [number, string][] = [
       [640, 'Project cost'],
       [PROJECT_SPEND_SHORT_LABEL, 'Project cost'],
@@ -1197,8 +1175,8 @@ test('the compact Project cost face gives up a word before it gives up the figur
       })()`)) as { label: string; name: string; overflow: number } | null;
       assert.ok(face, `the ${width}px panel drew no compact Project cost face`);
       assert.equal(face.label, label, `the compact face reads "${face.label}" at ${width}px`);
-      // The eye gives the word up and the name keeps it, so nothing a reader is told depends
-      // on how wide the window happens to be.
+      // The accessible name retains Project cost when the visible label shortens.
+
       assert.match(
         face.name,
         /^Project cost, /,
@@ -1212,13 +1190,8 @@ test('the compact Project cost face gives up a word before it gives up the figur
   }
 });
 
-// What opens each line of the meta row under the table, and how tall the row is against the
-// height it reserves.
-//
-// Every drawn piece is measured, one character of text at a time and one pseudo-element at a
-// time, because the separator has been drawn both ways and either one can end up at the head
-// of a wrapped line. A piece opens a line when it starts at the row's own left edge, which
-// needs no guess about which pieces share a line.
+// Measure text and pseudo-elements to identify line-opening separators and the metadata row's reserved height.
+
 const METALINES = `(() => {
   const meta = document.querySelector('#projectspendpop .projectspendmeta');
   if (!meta) return null;
@@ -1260,8 +1233,8 @@ interface MetaLines {
   height: number;
 }
 
-// The place the index state and the update age share. One of them is in it at any moment, and
-// the row is only the same width in both states while the place they share is.
+// The indexing word and update age share one slot with a minimum width.
+
 const SLOT = `(() => {
   const node = document.querySelector('#projectspendpop .projectspendupdated, #projectspendpop .projectspendupdating');
   if (!node) return { text: '', width: 0 };
@@ -1272,10 +1245,8 @@ interface Slot {
   width: number;
 }
 
-// The font sizes the row is measured at once it has been read at the page's own. A reader can
-// set the editor's font as large as they like, and the row has to wrap without a line opening
-// on a dot at any of them. The list climbs so the wrap is reached on a machine whose fonts
-// measure narrower than this one's.
+// Use several larger font sizes to exercise metadata wrapping across different installed fonts.
+
 const META_WRAP_SIZES = [24, 32, 44, 60];
 
 test('the indexing word waits for a run worth reading and then holds the box still', { timeout: 60_000 }, async (t) => {
@@ -1311,9 +1282,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
     await page.locator('.projectspendrailhost .projectspendbutton').click();
     await page.evaluate(SETTLED);
 
-    // The word's line is drawn whether or not it says anything, so an empty one reads here as
-    // no word at all. The height beside it is the whole box, which is what the reader's hand
-    // rests against.
+    // Read the indexing word and the dialog height. An empty text node counts as no word.
+
     const READ = `(() => {
       const pop = document.getElementById('projectspendpop');
       const word = pop.querySelector('.projectspendupdating');
@@ -1334,10 +1304,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
       await page.evaluate(SETTLED);
     };
 
-    // The page is drawn from a payload with the index at rest, so no run is under way when the
-    // setup above finishes. This reads that back rather than assuming it, because a word left
-    // standing here would fail the measurement below with a message about a blink that never
-    // happened.
+    // Clear the indexing hold and confirm no word remains before measuring a new run.
+
     const settle = async (): Promise<void> => {
       await post(false, null);
       await page.clock.fastForward(INDEXING_HOLD_MS + 300);
@@ -1351,8 +1319,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
       );
     };
 
-    // A run that has only just begun, timed from a panel holding no word at all rather than
-    // from whenever the page finished its first paint.
+    // Start the run from a cleared indexing state.
+
     await settle();
     await post(true);
     const started = (await page.evaluate(READ)) as Meta;
@@ -1375,10 +1343,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
         'be worth reading is never reported',
     );
 
-    // The dot between the parts of the meta line divides them and says nothing on its own, so
-    // a line that opens on it stands in front of nothing. The row is one flow of text, and the
-    // word stands in the place of the age rather than beside it, so at the page's own font the
-    // word and the coverage share one line.
+    // The metadata separator must not start a line. At the default font, coverage and the indexing word share one line.
+
     const meta = (await page.evaluate(METALINES)) as MetaLines;
     assert.equal(
       meta.separator,
@@ -1392,9 +1358,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
         'coverage do not share one line',
     );
 
-    // The row at every font a reader can set, measured with the word up. The same fonts are
-    // read again once the word has gone, and the two readings have to agree. A row that wraps
-    // with the word and not without it grows and shrinks many times a minute under the hand.
+    // Compare wrapping at the same font sizes with and without the indexing word.
+
     interface Row {
       lines: number;
       opens: string[];
@@ -1424,8 +1389,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
     };
     const wordUp = await rowsAtEachFont();
 
-    // The flag drops on every drained queue. The word outlasts it, which is what stops the
-    // line from flickering while an agent writes to its transcript.
+    // The indexing word outlasts a drained queue to prevent flicker between transcript writes.
+
     await post(false, null);
     const drained = (await page.evaluate(READ)) as Meta;
     assert.equal(
@@ -1443,8 +1408,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
       `the popover still says "${quiet.word}" ${INDEXING_HOLD_MS + 300}ms after the index stopped`,
     );
 
-    // The defect this was written for: the word joined the line, the line grew, and the box
-    // moved under the reader's hand.
+    // Indexing state changes must preserve dialog height.
+
     const heights = [started.height, running.height, drained.height, quiet.height];
     assert.equal(
       new Set(heights).size,
@@ -1453,9 +1418,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
         'so it moves under the reader',
     );
 
-    // And at every font the reader can set, against the same fonts read with the word up. A
-    // reserved line kept the box still and left a blank line under the rule at every font that
-    // held no word. Nothing is reserved now, so the word has to fit where the age fits.
+    // The update age and indexing word must use the same number of lines at each tested font size.
+
     const wordGone = await rowsAtEachFont();
     for (const size of META_WRAP_SIZES) {
       assert.equal(
@@ -1479,32 +1443,29 @@ test('the indexing word waits for a run worth reading and then holds the box sti
         );
       }
     }
-    // The fonts above have to reach the wrap, or the comparison passes over a row that never
-    // wrapped at all. The list climbs so a machine whose fonts measure narrower still meets it.
+    // At least one tested font size must wrap the metadata row.
+
     assert.ok(
       META_WRAP_SIZES.some((size) => wordGone[size].lines > 1),
       `the meta row never wrapped at ${META_WRAP_SIZES.join('px, ')}px, so nothing above measures a wrapped line`,
     );
 
-    // The extension owns the words, and the payload carries none through the hold. A wording
-    // kept in the panel as well would be a second owner of one sentence, and the reader would
-    // watch it change part way through.
+    // The indexing word follows the host payload.
+
     const sent = 'Reading Codex records…';
     await post(true, sent);
     await page.clock.fastForward(INDEXING_SHOW_MS + 300);
     await page.evaluate(SETTLED);
     const second = (await page.evaluate(READ)) as Meta;
     assert.equal(second.word, sent, `the popover says "${second.word}" while the extension is sending "${sent}"`);
-    // The index stops and its words stop with it. Another figure lands in the same breath, so
-    // the box is drawn again while the word is still up and has to write the word from
-    // somewhere. The reader must not watch it change part way through the hold.
+    // Retain the host's last indexing wording while the hold remains active after indexing ends.
+
     await post(false, '', { earliestRecord: '2026-08-04' });
     const held = (await page.evaluate(READ)) as Meta;
     assert.equal(held.word, sent, `the popover holds "${held.word}" after a run the extension last worded "${sent}"`);
 
-    // The place the two share is held to one width, and the longest age the ladder writes has
-    // to fit it. An age that spills past the slot makes the row wider than the word leaves it,
-    // which is the wrap the width was fixed to prevent.
+    // The longest tested update age must fit the slot shared with the indexing word.
+
     await post(false, null, { lastIndexedAt: NOW - 350 * 24 * 60 * 60 * 1000 });
     await page.clock.fastForward(INDEXING_HOLD_MS + 300);
     await page.evaluate(SETTLED);
@@ -1528,9 +1489,8 @@ test('the indexing word waits for a run worth reading and then holds the box sti
   }
 });
 
-// A mark on the face and a mark inside the box, put there by hand and gone the moment either
-// is built again. Nothing a rebuilt element carries answers this: the words, the classes and
-// the attributes all come back the same, and only the element itself is new.
+// Marks identify surviving face, table, and age elements even when replacement would reproduce their attributes.
+
 const MARK_SURFACES = `(() => {
   document.querySelector('.projectspendrailhost .projectspendbutton').__mark = 'face';
   document.querySelector('#projectspendpop .projectspendgrid').__mark = 'box';
@@ -1542,9 +1502,8 @@ const MARKS = `(() => ({
   age: (document.querySelector('#projectspendpop [data-project-spend-at]') || {}).__mark || null,
 }))()`;
 
-// The index time on screen, and everything written beside it. The words move on their own once
-// a second, so the moment they were written for is what says whether the newest payload reached
-// them: a stale one leaves the tooltip and the spoken name naming a moment the index has passed.
+// The age timestamp, tooltip, and accessible name must follow the newest payload.
+
 const AGE = `(() => {
   const node = document.querySelector('#projectspendpop [data-project-spend-at]');
   if (!node) return null;
@@ -1570,8 +1529,8 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
     await layoutAt(page, 1350);
-    // A payload with the index at rest, so the panel's own timer for the indexing word does
-    // not wake it between the two messages below and rebuild the box for the word alone.
+    // Disable indexing so its timer cannot alter the dialog between payload checks.
+
     const still = { ...PROJECT_SPEND, indexing: false };
     const post = async (spend: unknown): Promise<void> => {
       await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'projectSpend', projectSpend: spend })}, '*')`);
@@ -1580,11 +1539,8 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
     await post(still);
     await page.locator('.projectspendrailhost .projectspendbutton').click();
     await page.evaluate(SETTLED);
-    // The page is drawn from a payload with the index at rest, so no hold is running that
-    // could take the word off the line between the two messages below and rebuild the box.
-    // That rebuild reads exactly like the repaint this guard is watching for, so the absence
-    // is read rather than assumed. The word stands in the place of the update age, so the
-    // element itself is what answers here.
+    // Confirm no indexing hold remains before checking element identity.
+
     assert.equal(
       await page.evaluate(`!document.querySelector('#projectspendpop .projectspendupdating')`),
       true,
@@ -1592,7 +1548,7 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
     );
     await page.evaluate(MARK_SURFACES);
 
-    // The same figures again, which is what an agent at work sends several times a second.
+    // Post identical figures to check element identity.
     await post(still);
     assert.deepEqual(
       await page.evaluate(MARKS),
@@ -1600,10 +1556,8 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
       'a Project cost message carrying nothing new rebuilds the face under the reader or the row they are reading',
     );
 
-    // A newer index run, and nothing else. The print answers for whether the row carries an
-    // index time and never for the moment itself, so the box is left standing, and the pass
-    // that left it standing owes the age its new moment. Written only on the rebuild, the
-    // tooltip and the spoken name would go on naming a moment the index has passed.
+    // A changed index timestamp updates the age tooltip and accessible name without replacing the table.
+
     const before = (await page.evaluate(AGE)) as Age;
     const indexedAt = NOW - 30_000;
     await post({ ...still, lastIndexedAt: indexedAt });
@@ -1631,8 +1585,8 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
       `the age reads "${after.text}" after an index time arrived on a box that was not rebuilt`,
     );
 
-    // A figure that did move. Reconciliation keeps each keyed surface and changes only the
-    // supplied text inside it.
+    // A changed cost updates the text while retaining keyed elements.
+
     await post({ ...still, windows: [{ ...still.windows[0], display: '$5.00' }, ...still.windows.slice(1)] });
     assert.deepEqual(
       await page.evaluate(MARKS),
@@ -1650,9 +1604,8 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
   }
 });
 
-// The whole table, and the two lines under it. Drawn on the themed page, because the tint on
-// a pressed column is mixed from a theme colour: on the bare page it resolves to nothing and
-// a guard about which cells are tinted would pass over a stylesheet that tints none of them.
+// Measure the table on a themed page so the selected-column tint resolves to a color.
+
 const SPENDGRID = `(() => {
   const pop = document.getElementById('projectspendpop');
   const grid = pop.querySelector('.projectspendgrid');
@@ -1740,15 +1693,15 @@ test('the Project cost popover reads as one table of agents against periods', { 
     );
     await page.evaluate(SETTLED);
     await page.locator('.projectspendrailhost .projectspendbutton').click();
-    // A period that is neither the first column nor the last, so a rule that tints a fixed
-    // column reads apart from one that tints the pressed column.
+    // Select the middle period to distinguish selection from a fixed-column tint.
+
     await page.locator('.projectspendperiod').nth(1).click();
     await page.evaluate(SETTLED);
     const grid = (await page.evaluate(SPENDGRID)) as SpendGrid;
 
     assert.equal(grid.label, 'Project cost by agent and period', 'the table has no name a screen reader can announce');
-    // The periods head their own columns. A control drawn as anything but a button cannot be
-    // reached without a mouse, and one without aria-pressed never says which is chosen.
+    // Period headings use buttons and expose their selection through aria-pressed.
+
     assert.deepEqual(
       grid.heads,
       [
@@ -1770,8 +1723,8 @@ test('the Project cost popover reads as one table of agents against periods', { 
       'the table lost an agent, its total, or the row heading a screen reader reads a cell against',
     );
 
-    // The pressed column is tinted down its whole length and nothing beside it is. A reader
-    // who presses one period must be able to see which figures the face outside is showing.
+    // Only the selected column receives a tint across all rows.
+
     const chosen = grid.heads.findIndex((head) => head.pressed === 'true') - 1;
     for (const row of grid.rows) {
       const tinted = row.cells.map((cell) => cell.selected);
@@ -1790,8 +1743,8 @@ test('the Project cost popover reads as one table of agents against periods', { 
       }
     }
 
-    // The face outside the box carries the total of the pressed column. A reader who has to
-    // add two figures to check the one on the rail is doing the panel's work for it.
+    // The collapsed face shows the selected period's total.
+
     const face = await page.locator('.projectspendrailhost .projectspendamount').textContent();
     const total = grid.rows[2].cells[chosen];
     assert.ok(
@@ -1799,8 +1752,8 @@ test('the Project cost popover reads as one table of agents against periods', { 
       `the face reads "${face}" with the pressed total reading "${total.name ?? total.text}"`,
     );
 
-    // A lower bound keeps its words where they are read out, and gives them up where they
-    // would head a whole column of figures. The dotted rule carries it to the eye instead.
+    // Lower-bound cells omit At least visually and retain it in accessible names and tooltips.
+
     assert.equal(total.lower, true, 'the 7-day total is drawn as an exact figure, so this measures no lower bound');
     assert.equal(total.text, '$18.24', `the lower-bound cell reads "${total.text}", so the column repeats the words`);
     assert.equal(total.name, 'At least $18.24', 'the lower-bound cell drops its floor wording from its name');
@@ -1815,8 +1768,8 @@ test('the Project cost popover reads as one table of agents against periods', { 
       { lower: false, name: null, text: '$0.20' },
       'an exact figure is drawn as a lower bound',
     );
-    // The dotted rule is the only thing on screen that marks a floor now that the words are
-    // gone. A class the stylesheet paints nothing for reads exactly like a working one here.
+    // The computed dotted underline identifies lower-bound cells.
+
     assert.equal(
       total.rule,
       'underline dotted',
@@ -1834,8 +1787,8 @@ test('the Project cost popover reads as one table of agents against periods', { 
       'the line under the table no longer says what a dotted figure means, or it carries more than that',
     );
 
-    // The same box under the compact face, which the reader reached from the control bar and
-    // not from the rail. The box says the same thing wherever it is anchored.
+    // The compact face opens the same table from the control bar.
+
     await page.keyboard.press('Escape');
     await layoutAt(page, 340);
     await page.evaluate(`window.postMessage({ type: 'focusProjectSpend' }, '*')`);

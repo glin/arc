@@ -1,19 +1,8 @@
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
-// The client half of the Codex app-server protocol.
-//
-// `codex app-server` speaks JSON-RPC 2.0 over stdio, one object per line, with the
-// `jsonrpc` field left off the wire. It is what the official Codex editor extension runs
-// on, and it is marked experimental, so everything below was read off a running server
-// rather than from a document.
-//
-// Three kinds of object arrive, and telling them apart is the one thing a client must get
-// right: a **response** carries `id` and no `method`, a **notification** carries `method`
-// and no `id`, and a **server request** carries both. Approvals are server requests. A
-// client that routes on `method` alone treats an approval as a notification and never
-// answers it, and the turn then waits for ever on a reader who was never asked.
-//
-// The events this file produces are the same ones `claudewire.ts` produces, so the panel
-// reads one vocabulary and never learns which agent is behind a session.
+// Adapts Codex app-server messages to the shared agent wire events.
+// JSON-RPC messages travel over stdio as one object per line without the jsonrpc field.
+// Responses have id only, notifications have method only, and server requests have both.
+// Approval requests need an answer, so routing them as notifications stalls the turn.
 
 import {
   Ask,
@@ -49,37 +38,24 @@ import {
   parseQuestionReply,
 } from './codexreply';
 
-// What the server asks about before doing it. `untrusted` asks about nearly everything,
-// `on-request` lets the model decide when to ask, `never` asks about nothing.
-//
-// The values are the ones `codex app-server generate-json-schema` publishes, and neither
-// CLI publishes words for any of them, so the labels the panel draws are a copy written
-// alongside and re-read on a version bump. The schema's fourth approval value is a
-// `granular` object rather than a name, and the panel draws no surface for it, so it is not
-// here: a value in this union is one the reader can actually be offered.
+// Controls when Codex requests approval.
+// untrusted requests approval for most actions. on-request lets the model request it. never disables requests.
+// The panel offers these named policies and supplies their labels.
+// The granular object policy has no panel control.
 export type ApprovalPolicy = 'untrusted' | 'on-request' | 'never';
 
-// Who receives an approval request after the policy decides that it may surface. Automatic
-// review lets Codex assess eligible requests and sends only potentially unsafe actions to
-// the reader. The server defaults to `user`, which would make "Approve for me" ask anyway.
+// Selects the recipient of approval requests.
+// auto_review assesses eligible requests and forwards requests requiring reader approval.
+// The user default requires an explicit auto_review override for automatic review.
 export type ApprovalsReviewer = 'user' | 'auto_review';
 
-// How much the server may do without asking. It is the other half of one choice: an
-// approval policy on its own says when the reader is asked, and says nothing about what
-// happens when nobody is. A reader who picked full access and got a workspace-write sandbox
-// was told one thing and given another, which is why the two always travel together.
+// Limits server access independently of its approval policy.
+// The panel sends both fields together to apply the reader's selected permissions.
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
-// The same sandbox choice under the two spellings the server takes. `thread/start` reads a
-// `sandbox` field holding the mode's own name; `turn/start` reads a `sandboxPolicy` field
-// holding an object tagged by a camelCase `type`. A turn handed the thread spelling is
-// accepted and its sandbox left exactly as it was, with nothing said, so the object form
-// below is the one `turn/start` reads and the string above is the one `thread/start` reads.
-//
-// The table is keyed by the mode union, so a mode added without a policy beside it is a
-// compile error rather than a turn that silently keeps the old sandbox. The policies also
-// take a network-access flag and a list of writable roots; the panel offers no surface for
-// either, so both are left off and the server applies its own defaults.
+// thread/start takes the sandbox mode name. turn/start takes a sandboxPolicy object with a camelCase type.
+// The map requires a policy type for every SandboxMode.
+// Network-access flags and writable roots are omitted, so the server applies their defaults.
 const SANDBOX_POLICY_TYPES: Record<SandboxMode, string> = {
   'read-only': 'readOnly',
   'workspace-write': 'workspaceWrite',
@@ -93,18 +69,14 @@ export function sandboxPolicy(mode: SandboxMode): Json {
 export interface CodexSpawnOptions {
   cwd: string;
   model?: string;
-  // How hard the model is asked to think, in whichever word the model advertised through
-  // `model/list`. It reaches the server on a turn rather than here: `thread/start` has no
-  // effort field at all.
+  // Reasoning effort advertised by model/list. turn/start applies it because thread/start has no effort field.
   effort?: string;
   approvalPolicy?: ApprovalPolicy;
   approvalsReviewer?: ApprovalsReviewer;
   sandbox?: SandboxMode;
 }
 
-// The subcommand the server runs under. The `.cmd` shim in the npm folder is not needed:
-// the package's own entry point runs under the Node already on this machine, which avoids
-// a shell and the quoting a shell would bring with it on Windows.
+// Arguments for the app-server subcommand.
 export function appServerArgs(): string[] {
   return ['app-server'];
 }
@@ -122,8 +94,7 @@ export interface CodexWireOptions {
   emit(event: WireEvent): void;
   clientInfo: ClientInfo;
   cwd: string;
-  // How long a request is waited on. Overridden in tests, which cannot wait a minute to
-  // prove that the wait ends.
+  // Request response deadline.
   deadlineMs?: number;
 }
 
@@ -141,9 +112,8 @@ class RequestRefused extends Error {}
 // taken effect.
 class NoAnswer extends Error {}
 
-// Where the answer to an async question goes: the thread it was asked on, and the turn
-// that asked it while that turn still runs. `turnId` is null once the turn has ended. `ask`
-// holds only the questions no client has answered yet.
+// Routes async answers to the thread that asked and to its running turn.
+// turnId becomes null when the turn ends. ask retains unanswered questions.
 interface AsyncAsk {
   threadId: string | null;
   turnId: string | null;
@@ -182,33 +152,19 @@ interface McpStartup {
   error: string;
 }
 
-// How long one request is waited on before it is given up as unanswered. The same clock the
-// Claude wire keeps, for the same reason: the panel holds one read per agent and joins every
-// later read to it, so a request that goes quiet stops that agent being asked again for the
-// life of the window, and leaks the child that was started to answer it.
-//
-// A turn is unaffected. A turn is a stream of events rather than a request.
+// Bounds request waits so an unanswered read cannot block later reads or retain an idle child indefinitely.
+// Turn event streams continue independently of request deadlines.
 export const CODEX_DEADLINE_MS = 60_000;
 
-// The verdicts the server takes on an approval. The panel sends two of them today, because
-// it offers the reader two choices. `acceptForSession` is the one to reach for when a
-// "always in this session" choice is added: it is the server's own idea of a standing
-// grant, so a reader who picks it is not relying on the panel to hold state a reload would
-// lose. `cancel` means the reader wants the turn stopped rather than this call refused.
+// Approval verdicts accepted by Codex.
+// The panel sends accept or decline. acceptForSession grants approval for the session. cancel requests a turn stop.
 export type Decision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
 
-// The server requests this client answers, and the shape each answer takes. They do not
-// share one: a command or a file change takes a verdict, and a user-input request takes a
-// map of answers. Sending a verdict to the wrong one is not a protocol error the server
-// reports, so the routing is on the method rather than on one shape for all of them.
-//
-// The full server-request set has ten methods, generated by `codex app-server generate-ts`
-// into `ServerRequest.ts`. The rest are refused rather than answered, and two of those are
-// worth naming. `item/permissions/requestApproval` answers with a whole granted-permission
-// profile and a scope, not a decision, so a verdict sent to it would grant something nobody
-// asked for; it needs its own card before it can be answered at all.
-// `mcpServer/elicitation/request` is an MCP server asking the reader for input, which this
-// panel has no surface for yet.
+// Answerable server requests use distinct reply shapes.
+// Command and file approvals take a decision. User-input requests take an answer map.
+// Other requests receive a method-not-found error.
+// item/permissions/requestApproval requires a permission profile and scope.
+// mcpServer/elicitation/request requires an input surface the panel does not provide.
 const COMMAND_APPROVAL = 'item/commandExecution/requestApproval';
 const FILE_APPROVAL = 'item/fileChange/requestApproval';
 const USER_INPUT = 'item/tool/requestUserInput';
@@ -342,9 +298,8 @@ function codexItemActivity(item: Json, status: WireActivity['status']): WireActi
   return null;
 }
 
-// The reply envelope for the async questions the reader answered, one entry per question,
-// with the picked labels and any written answer joined into one answer. Empty when the
-// reader answered none of them.
+// Builds one envelope entry per answered async question.
+// Picked labels and written input form the answer. No answers produce an empty string.
 function asyncReply(questions: { id: string; question: string }[], answers: Record<string, AskQuestionAnswer>): string {
   const replies: QuestionReply[] = [];
   for (const { id: questionItemId, question } of questions) {
@@ -390,21 +345,17 @@ export class CodexWire {
   // The compaction request only acknowledges that work started. Its turn id and terminal
   // result arrive later as notifications, so the operation stays here until that result.
   private compaction: PendingCompaction | null = null;
-  // How much the server asks before it acts, who reviews the asks, and how much it may do
-  // unasked, when the reader has changed them since the thread started. `turn/start` takes
-  // these "for this turn and subsequent turns", so they ride the send rather than needing
-  // a call of their own. Nothing is sent until the reader has actually chosen, so a thread
-  // keeps whatever it was started with. They are held as one because the reader picks them
-  // as one.
+  // Permission overrides selected by the reader travel together on the next turn/start.
+  // The server applies them to that turn and subsequent turns.
+  // Without an override, the thread retains its startup permissions.
   private approval: {
     policy: ApprovalPolicy;
     reviewer: ApprovalsReviewer;
     sandbox: SandboxMode;
   } | null = null;
-  // Which model the turns on this thread run, and how hard it is asked to think. Both ride
-  // `turn/start`, which overrides them "for this turn and subsequent turns", and for effort
-  // that is the only door: `thread/start` settles a model and takes no effort at all.
-  // Nothing goes out until the reader has picked, so a thread keeps what it opened with.
+  // Reader-selected model and effort overrides apply on the next turn/start and subsequent turns.
+  // thread/start accepts a model but no effort field.
+  // Null overrides leave the thread's current settings unchanged.
   private model: string | null = null;
   private effort: string | null = null;
   // The list response carries inventory and auth, while startup state arrives beside it as
@@ -431,8 +382,7 @@ export class CodexWire {
     return this.turns.length > 0 || this.compaction !== null;
   }
 
-  // The handshake. The server rejects everything sent before it, and the `initialized`
-  // notification after it is what opens the rest of the surface.
+  // Limits applied-default reads to server versions with confirmed configuration behavior.
   private defaultsQualified = false;
 
   async initialize(): Promise<Json> {
@@ -447,8 +397,7 @@ export class CodexWire {
     return result;
   }
 
-  // Codex does not publish its native slash commands. Keep the ones the panel runs itself, then
-  // add the skills Codex can enumerate for this working directory.
+  // Lists panel commands and skills available in this working directory.
   async commands(): Promise<PromptEntry[]> {
     this.commandsOpening = true;
     try {
@@ -581,10 +530,9 @@ export class CodexWire {
     );
   }
 
-  // Compaction starts through a thread control, not a text prompt. The empty response only
-  // acknowledges the request; the server then reports a regular turn lifecycle for the
-  // work. Keep the promise open for that lifecycle so the session remains busy and a later
-  // failure reaches the reader.
+  // Starts compaction through thread/compact/start.
+  // Its response acknowledges startup. Turn notifications settle completion and report failures.
+  // The pending operation keeps the session busy until completion.
   async compact(): Promise<void> {
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
@@ -605,8 +553,8 @@ export class CodexWire {
     }
   }
 
-  // Sends a prompt. The call returns as soon as the server has accepted the turn; the turn
-  // itself plays out as notifications, which is why nothing here waits for it.
+  // Returns the turn id after the server accepts the prompt.
+  // Notifications report the turn's subsequent progress and completion.
   async prompt(input: AgentPromptInput): Promise<string> {
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
@@ -675,17 +623,13 @@ export class CodexWire {
     }
   }
 
-  // How much the server asks before it acts, who reviews an ask, and how much its sandbox
-  // allows, from here on. They go out with the next prompt rather than at once, which is the
-  // whole mechanism on this agent: the server has no call that changes them on a live thread.
+  // Stores permission overrides for the next prompt and subsequent turns.
   async setApproval(policy: ApprovalPolicy, sandbox: SandboxMode, reviewer: ApprovalsReviewer): Promise<void> {
     this.approval = { policy, reviewer, sandbox };
   }
 
-  // Which model this session runs, and how hard it is asked to think, from here on.
-  // Both go out with the next prompt for the same reason the approval does: `turn/start` is
-  // where the server takes them, and it has no call of its own on a live thread. An empty
-  // pick is no pick, so the turn carries nothing and the thread keeps what it has.
+  // Stores a model override for the next prompt and subsequent turns.
+  // An empty selection clears the override and leaves the server's current model unchanged.
   async setModel(model: string): Promise<void> {
     this.model = model || null;
   }
@@ -737,14 +681,7 @@ export class CodexWire {
     return await this.request('account/rateLimits/read', {});
   }
 
-  // The models this server will run, with the words it uses for them. Asked once per
-  // server: the list turns over on a release rather than on a turn. The response is
-  // paginated, so the picker gets one catalog only after every page has arrived.
-  //
-  // A server that does not know the method answers with an error, and one that has gone
-  // answers nothing, so a refusal comes back as no list rather than as a failure. The
-  // picker then offers nothing, which is what it does before the answer arrives anyway, and
-  // the reader is not shown an error about a control they never pressed.
+  // Reads applied model and effort defaults for a supported server version.
   async appliedDefaults(cwd: string, model: string): Promise<AppliedDefaults> {
     if (!this.defaultsQualified)
       return unavailableDefaults('This Codex version has no confirmed default-settings behavior.');
@@ -800,8 +737,7 @@ export class CodexWire {
     }
   }
 
-  // Codex's `/mcp` is a status view. The app-server exposes that same inventory with
-  // pagination; tools and auth are enough for the panel, so resources are left out.
+  // Reads paginated MCP tool and authentication status without resources.
   async mcpStatus(): Promise<McpServer[]> {
     const data: Json[] = [];
     let cursor: string | null = null;
@@ -821,8 +757,7 @@ export class CodexWire {
     return readCodexMcpServers(data, this.mcpStartup);
   }
 
-  // Archiving is the server's own, and it moves the rollout file on disk, so a thread
-  // archived here is archived for the CLI and the editor extension too.
+  // Server archiving moves the rollout file and applies across Codex clients.
   async archive(threadId: string): Promise<void> {
     await this.request('thread/archive', { threadId });
   }
@@ -844,8 +779,7 @@ export class CodexWire {
       .filter((t): t is Json => t !== null);
   }
 
-  // Answers an approval. The reader's verdict is translated here rather than at the call
-  // site, so the panel's two buttons mean the same thing on both agents.
+  // Answers approvals and questions in their corresponding protocol shapes.
   answer(id: string, answer: AskAnswer): boolean {
     const asked = this.asyncAsks.get(id);
     if (asked) {
@@ -867,9 +801,7 @@ export class CodexWire {
     this.askIds.delete(id);
     this.approvalRequests.delete(id);
     if (pending.method === USER_INPUT) {
-      // A user-input request is answered with a map from question id to the labels picked,
-      // which is a different shape from an approval's verdict. A refusal has no way to be
-      // said in that shape, so it goes back as the request being cancelled.
+      // User-input requests take an answer map. Denial returns an empty map.
       if (answer.decision === 'deny') {
         this.write({ id: pending.requestId, result: { answers: {} } });
       } else {
@@ -980,10 +912,7 @@ export class CodexWire {
 
   private serverRequest(requestId: number, method: string, params: Json): void {
     if (!ANSWERABLE.has(method)) {
-      // Anything else is refused rather than left hanging, so the server can fall back to
-      // whatever it does without a client that understands the request. Refusing is the
-      // safe half of the choice: an unanswered request stalls the turn, and a wrongly
-      // shaped answer tells the server something the reader never said.
+      // Refuse unsupported requests so they cannot stall the turn or receive an invalid answer.
       this.write({ id: requestId, error: { code: -32601, message: `the panel cannot answer ${method}` } });
       return;
     }
@@ -1022,12 +951,8 @@ export class CodexWire {
     };
   }
 
-  // Codex's own version of a model asking the reader something. It is the same kind of ask
-  // Claude sends as AskUserQuestion, so it reaches the panel as the same card; the answer
-  // is keyed by each question's id, which is why `Question` carries one.
-  //
-  // Each question also carries `isOther`, which says whether the server wants a free-form
-  // choice offered beside the options. It is not read: the card offers one on every question.
+  // Converts synchronous questions to the shared question ask with answers keyed by question id.
+  // The card always offers written input, so isOther does not change its choices.
   private userInputAsk(itemId: string, params: Json): Ask {
     const questions: Question[] = [];
     for (const entry of arr(params.questions)) {
@@ -1060,10 +985,8 @@ export class CodexWire {
     return { kind: 'question', id: itemId, questions, input: params, toolUseId: itemId };
   }
 
-  // `request_user_input_async` reports the same shape as the synchronous ask, but the
-  // question carries no id of its own and its options are plain labels, not
-  // `{ label, description }` pairs. The id is the one Codex's own clients put in the reply
-  // envelope, so an answer names its question the way every other client reads it.
+  // Async questions have titles and plain option labels, without individual ids or descriptions.
+  // Their reply-envelope ids come from asyncQuestionId.
   private asyncQuestionAsk(itemId: string, questions: Json[]): Ask {
     const built: Question[] = [];
     questions.forEach((entry, index) => {
@@ -1094,12 +1017,9 @@ export class CodexWire {
     return this.asyncAsks.has(id);
   }
 
-  // The answer goes into the running turn with `turn/steer`, which the server refuses once
-  // `expectedTurnId` is no longer the active turn. A question can be the last thing its turn
-  // does and the reader can answer minutes later, so after the turn ends, or when the server
-  // refuses the steer, the same text goes out as a new prompt instead. The prompt goes only
-  // to the thread that asked. A request the server never answered is not sent again, because
-  // it can have arrived, and a second copy would answer the question twice.
+  // Steers an answer into its running turn.
+  // After the turn ends or the server refuses steering, send the same text as a prompt to the originating thread.
+  // An unanswered request is never retried because its answer can already have arrived.
   private async sendAsyncReply(id: string, asked: AsyncAsk, text: string): Promise<void> {
     if (asked.turnId && asked.threadId) {
       try {
@@ -1245,12 +1165,7 @@ export class CodexWire {
         }
         return;
       }
-      // A chunk of the reply as it is written. The server has always sent these and the
-      // panel dropped them, which is why a Codex turn was as silent as a Claude one. The
-      // shape is from the capture recorded off a real server: the whole payload is the
-      // piece of text, under `delta`, beside the ids of the thread and the item it belongs
-      // to. The item is finished separately by `item/completed`, which carries the whole
-      // message and is what the finished reply is read from.
+      // Streams agent-message text from delta. item/completed supplies the complete message.
       case 'item/agentMessage/delta': {
         const text = str(params.delta);
         if (!text) {
@@ -1258,8 +1173,7 @@ export class CodexWire {
         }
         const itemId = str(params.itemId);
         const active = itemId ? this.activeItems.get(itemId) : null;
-        // An async item is never the reply, streamed or not, so its delta goes to the same
-        // activity accumulator commentary uses rather than the reply stream.
+        // Known async and commentary items accumulate activity text outside the reply stream.
         if (!itemId || !active || (active.phase !== 'commentary' && active.delivery !== 'async')) {
           this.emit({ kind: 'delta', text, ...(str(params.turnId) ? { nativeTurnId: str(params.turnId)! } : {}) });
           return;
@@ -1414,12 +1328,8 @@ export class CodexWire {
     if (outcome.status === 'ok') {
       pending.resolveFinished();
     } else {
-      // An interrupted compaction gets a sentence of its own, because a reader's own stop is
-      // a different outcome from a failure and nothing else on the wire says so.
-      //
-      // A failure gets none. The caller already knows the compaction did not happen, and the
-      // only thing worth saying here is why. When the server named no reason the message is
-      // empty, which is what the panel reads to say that instead of inventing a cause.
+      // Use the server's reason when present. An interrupted compaction has a fallback message.
+      // Other failures keep an empty reason so the panel can report that none was supplied.
       if (outcome.status === 'interrupted') {
         pending.rejectFinished(new Error(outcome.text || 'the compaction was interrupted'));
       } else {
@@ -1495,9 +1405,8 @@ export class CodexWire {
       type,
       phase: str(item.phase) ?? '',
       delivery: str(item.delivery) ?? '',
-      // `null` and an array are different states to carry forward: `null` means the item
-      // names no questions field at all, and an array is the raw entries itemCompleted
-      // builds the ask from, which can still turn out empty once titleless entries drop.
+      // null means no question array. Arrays retain raw entries for itemCompleted to validate.
+      // Entries without titles do not produce questions.
       questions: Array.isArray(item.questions) ? (item.questions as Json[]) : null,
       item,
     });
@@ -1542,13 +1451,10 @@ export class CodexWire {
     const completedItem = active ? { ...active.item, ...item, type, phase } : item;
     if (type === 'agentMessage') {
       const text = itemText(completedItem);
-      // `request_user_input_async` and `send_message_to_user_async` both set `final_answer`,
-      // so phase cannot separate a question from a real reply. `delivery` can: it marks an
-      // item returned to the model without ending the turn, set for example by these two
-      // tools, and an async item never reaches the reply stream.
+      // Async tools can set final_answer without ending the turn.
+      // delivery identifies those items and keeps them out of the reply stream.
       if (delivery === 'async') {
-        // Built, not raw: a `questions` array whose entries all lack a title builds down
-        // to nothing, and that is a message with nothing to pick, not a question.
+        // Only entries with titles produce questions. An empty ask remains an activity message.
         const ask = id && questions ? this.asyncQuestionAsk(id, questions) : null;
         if (id && ask && ask.kind === 'question' && ask.questions.length > 0) {
           this.asyncAsks.set(id, {
@@ -1633,15 +1539,13 @@ export class CodexWire {
     }
   }
 
-  // Every window the server volunteers is reported, shorter first, because which one binds
-  // is the strip's decision and a wire that dropped one would be making it here. A named
-  // update belongs to that model, not to the account-wide line.
+  // Reports available primary and secondary windows in that order.
+  // Named updates retain their model scope. The usage strip chooses the binding window.
   private reportRateLimits(limits: Json | null): void {
     const scope = (limits && str(limits.limitName)) ?? '';
     const limitId = limits && str(limits.limitId);
-    // Older account updates may omit `limitId`. A bucket that explicitly identifies itself
-    // as something else needs a readable name, or treating it as unscoped corrupts the
-    // account figure.
+    // Account updates without limitId remain unscoped.
+    // Other identified buckets need a readable name to keep their figures separate from the account aggregate.
     if (limitId && limitId !== 'codex' && !scope.trim()) {
       return;
     }
@@ -1687,8 +1591,7 @@ export class CodexWire {
           late.reject(new NoAnswer('the agent did not answer'));
         }
       }, this.deadlineMs);
-      // The extension host outlives any one request, and a pending timer that keeps the host
-      // awake is a cost the reader pays for a question they did not ask.
+      // A pending request timer must not keep the extension host process alive.
       if (typeof timer === 'object' && typeof timer.unref === 'function') {
         timer.unref();
       }
@@ -1738,36 +1641,24 @@ export function readCodexMcpServers(
   return servers;
 }
 
-// How long each window covers, and what the panel calls it. Only the two durations both
-// agents report are named; anything else keeps its own length, because a window of 600
-// minutes called "five_hour" would put a wrong word on a real figure.
+// Names five-hour and seven-day windows. Other durations retain their minute count.
 const WINDOW_NAMES: Record<number, string> = { 300: 'five_hour', 10080: 'seven_day' };
 
 function windowName(minutes: number): string {
   return Object.prototype.hasOwnProperty.call(WINDOW_NAMES, minutes) ? WINDOW_NAMES[minutes] : `${minutes}_minute`;
 }
 
-// Which clock a window runs on, from the same length its name is read off. `session` is the
-// few-hour window and `weekly` the seven-day one, which is how a Codex figure lands in the
-// same group as the Claude figure it is drawn beside. A window of any other length is left
-// ungrouped rather than filed under a period it does not cover.
+// Groups five-hour windows as session and seven-day windows as weekly.
+// Other durations remain ungrouped.
 const WINDOW_GROUPS: Record<number, string> = { 300: 'session', 10080: 'weekly' };
 
 function windowGroup(minutes: number): string {
   return Object.prototype.hasOwnProperty.call(WINDOW_GROUPS, minutes) ? WINDOW_GROUPS[minutes] : '';
 }
 
-// Every window in a `rateLimits` object, in the panel's vocabulary. The share is a
-// whole-number percentage on this wire and a fraction in the panel's, so it is converted
-// here rather than at the reader; the notification and the request answer with the same
-// object, so both come through this.
-//
-// Codex reports two limits, `primary` and `secondary`, and those are the two the panel
-// draws. The `rateLimitsByLimitId` map beside a complete answer is not read: it is inventory,
-// including entries the server has not actively published. A live update can itself be for
-// a named model bucket, and its caller supplies that name as the scope.
-//
-// `secondary` is often absent, so whichever of the two exist are read, shorter first.
+// Converts primary and secondary limits to panel fractions in that order.
+// Both request responses and notifications use this decoder.
+// rateLimitsByLimitId inventory is excluded. Live named updates supply their own scope.
 function readLimits(limits: Json | null, scope: string): RateLimit[] {
   if (!limits) {
     return [];
@@ -1793,9 +1684,7 @@ function readLimits(limits: Json | null, scope: string): RateLimit[] {
   return out;
 }
 
-// The `account/rateLimits/read` answer, in the panel's vocabulary. A server that reports no
-// window at all returns nothing rather than an empty plan row: the reader is on a plan
-// either way, and a row with no figure on it says less than no row.
+// Reads account usage from rateLimits, or returns null when no window has a used percentage.
 export function readRateLimits(payload: unknown, readAt: number): UsageReading | null {
   const answer = obj(payload);
   const limits = obj(answer?.rateLimits);
@@ -1815,9 +1704,8 @@ export function readRateLimits(payload: unknown, readAt: number): UsageReading |
   };
 }
 
-// The `model/list` answer, in the panel's vocabulary. A model the server marks hidden is
-// one it will run but does not offer, so the panel does not offer it either; a model with
-// no id is skipped, because the id is what goes back when the reader picks it.
+// Reads model choices, including each model's hidden flag.
+// Entries without an id are skipped because selections use that id.
 export function readModels(payload: unknown, readAt: number): ModelList | null {
   const models: ModelChoice[] = [];
   for (const entry of arr(obj(payload)?.data)) {
@@ -1842,8 +1730,7 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
       hidden: model.hidden === true,
       isDefault: model.isDefault === true,
       ...(str(model.defaultReasoningEffort) ? { defaultReasoningEffort: str(model.defaultReasoningEffort)! } : {}),
-      // A model that named itself nothing is drawn under the id that goes back on the wire,
-      // which is at least something the reader can recognise again.
+      // Use the model id when displayName is absent.
       label: str(model.displayName) ?? value,
       description: str(model.description) ?? '',
       efforts,
@@ -1855,24 +1742,19 @@ export function readModels(payload: unknown, readAt: number): ModelList | null {
   return { models, readAt };
 }
 
-// What the server said went wrong, from either shape it uses. The failure that made this
-// necessary was an expired provider sign-in: the reader was told only that the work did not
-// happen, because the sentence naming the sign-in arrived in a field nothing read.
+// Reads an error string or an object's message field.
 function errorText(error: unknown): string {
   return str(error) ?? str(obj(error)?.message) ?? '';
 }
 
-// A finished turn, in the panel's vocabulary. Codex reports the reader's own stop as a
-// turn that did not complete, so it is read apart from a real failure for the same reason
-// the Claude side does.
+// Converts finished turns to shared outcomes, distinguishing interruptions from failures.
 export function turnOutcome(turn: Json | null): TurnOutcome {
   const status = str(turn?.status) ?? '';
   const items = arr(turn?.items);
   let text = '';
   for (const entry of items) {
     const item = obj(entry);
-    // An async item can carry `final_answer` on a question that never ended the turn, so it
-    // must never become the sentence the panel shows for how the turn ended.
+    // Async final_answer items do not supply the turn outcome text.
     if (
       item &&
       str(item.type) === 'agentMessage' &&
@@ -1882,9 +1764,7 @@ export function turnOutcome(turn: Json | null): TurnOutcome {
       text = str(item.text) ?? text;
     }
   }
-  // A turn that failed wrote no final answer, so the loop above leaves the text empty and
-  // the one sentence saying why the turn stopped sits on the turn itself. Read it here, or
-  // the panel has nothing to tell the reader beyond the fact that something did not work.
+  // A noncompleted turn without reply text uses its error message.
   if (!text && status !== 'completed') {
     text = errorText(turn?.error);
   }

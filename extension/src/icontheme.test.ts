@@ -16,9 +16,8 @@ import {
   ThemeFont,
 } from './icontheme.ts';
 
-// Fixtures in the shape of the real files, cut down to what the rules turn on. The escape
-// in `fontCharacter` is written the way the theme file writes it: a backslash and four hex
-// digits, five characters, which is what `JSON.parse` hands back.
+// The fixture preserves theme-file structure and escaped fontCharacter values.
+
 const SETI_SHAPED = {
   information_for_contributors: ['A fixture in the shape of the real theme.'],
   fonts: [
@@ -43,8 +42,8 @@ const SETI_SHAPED = {
     _image: { fontCharacter: '\\E036', fontColor: '#a074c4' },
   },
   file: '_default',
-  // Neither `ts` nor `md` nor `json` is here, exactly as in the real file. `PNG` is
-  // upper-case to show a theme is free to write its keys in any case.
+  // Omitted extensions resolve through languageIds. The uppercase PNG key checks case-insensitive extension lookup.
+
   fileExtensions: {
     'test.ts': '_typescript_1',
     js: '_javascript',
@@ -58,8 +57,8 @@ const SETI_SHAPED = {
   version: 'a commit of the theme this was cut down from',
 };
 
-// An image theme, in the shape of the built-in one that ships beside Seti: every definition
-// is a file to draw, and its `light` block swaps the default for a paler one.
+// Image definitions select files. The light override changes the default image.
+
 const IMAGE_SHAPED = {
   iconDefinitions: {
     _file_dark: { iconPath: './images/document-dark.svg' },
@@ -104,8 +103,8 @@ function glyphFor(theme: IconTheme, filePath: string, light = false): GlyphIcon 
   return icon as GlyphIcon;
 }
 
-// Every glyph here is a private-use character that prints as nothing, so the codepoint is
-// what a failure has to name or it reads as one empty string against another.
+// Report private-use glyphs by codepoint so assertion failures remain readable.
+
 function codeOf(theme: IconTheme, filePath: string, light = false): string {
   const character = glyphFor(theme, filePath, light).character;
   return `U+${character.codePointAt(0)?.toString(16).toUpperCase()} (${character.length} chars)`;
@@ -123,8 +122,8 @@ test('a whole filename is asked about before anything else', () => {
 
 test('the longest extension a filename ends in wins', () => {
   const theme = seti();
-  // Both `test.js` and `js` are in the theme, so a shortest-first walk would answer with
-  // the plain JavaScript icon and nothing else would show it.
+  // Both test.js and js are defined, so the longer matching extension must win.
+
   assert.equal(codeOf(theme, 'src/app.test.js'), code(0xe09a), 'app.test.js took the plain js entry');
   assert.equal(codeOf(theme, 'src/app.js'), code(0xe060), 'app.js took something other than the js entry');
   assert.equal(
@@ -135,8 +134,8 @@ test('the longest extension a filename ends in wins', () => {
 });
 
 test('a language id answers for the extensions the theme never lists', () => {
-  // This is the case `.ts` actually takes: the real theme has no `fileExtensions` entry for
-  // it at all, so without the language table a TypeScript file draws the default icon.
+  // The fixture maps ts through languageIds rather than fileExtensions.
+
   const theme = seti();
   assert.equal(
     codeOf(theme, 'extension/src/store.ts'),
@@ -220,8 +219,8 @@ test('a glyph is drawn in the font the theme declares for it', () => {
   const icon = glyphFor(theme, 'src/store.ts');
   assert.equal(fontFor(theme, icon)?.id, 'seti');
   assert.equal(fontFor(theme, icon)?.size, '150%');
-  // A definition naming a font the theme never declared still draws in a real font, because
-  // a glyph with none behind it is an empty box.
+  // An undeclared font ID falls back to the theme's first font.
+
   assert.equal(fontFor(theme, { ...icon, fontId: 'nothing-like-it' })?.id, 'seti');
   assert.equal(fontFor({ ...theme, fonts: [] }, icon), null);
 });
@@ -242,9 +241,8 @@ test('the language table strips the dot and keeps the first claim on a name', ()
 });
 
 test('a language id is matched in the case its own extension declares it', () => {
-  // The editor keys `languageIds` exactly, and an id is written one way only: it comes off
-  // an extension manifest on both sides. Lower-casing one side and not the other leaves any
-  // id carrying an upper-case letter unable to match anything, ever.
+  // Language IDs retain their declared case in both the contribution table and theme lookup.
+
   const theme = themeWith({ languageIds: { ...SETI_SHAPED.languageIds, ObjectPascal: '_info' } });
   const languages = buildLanguageTable([{ id: 'ObjectPascal', extensions: ['.pas'] }]);
   const icon = resolveIcon(theme, languages, 'src/unit.pas', false) as GlyphIcon;
@@ -253,11 +251,11 @@ test('a language id is matched in the case its own extension declares it', () =>
 });
 
 test('a font character that is not one character resolves nothing', () => {
-  // The field names one glyph out of a font. A whole word drawn in its place runs across the
-  // filename beside it, so it falls through and the row keeps its lettered badge instead.
+  // A fontCharacter value must resolve to one glyph. Invalid values leave the lettered file badge available.
+
   const words = themeWith({ iconDefinitions: { _default: { fontCharacter: 'hello', fontColor: '#d4d7d6' } } });
   assert.equal(resolveIcon(words, LANGUAGES, 'notes.qqq', false), null, 'a whole word was taken as the icon glyph');
-  // An escape naming no character there is falls through as well.
+  // Reject an escape beyond the last Unicode codepoint.
   const past = themeWith({ iconDefinitions: { _default: { fontCharacter: '\\110000' } } });
   assert.equal(
     resolveIcon(past, LANGUAGES, 'notes.qqq', false),
@@ -276,8 +274,8 @@ test('a font character that is not one character resolves nothing', () => {
 });
 
 test('a font size the row cannot hold is refused, and one it can is kept', () => {
-  // The size lands on the glyph in a fixed column beside the filename, and nothing clips
-  // that column, so an unbounded size paints one glyph across the whole panel.
+  // Bound glyph sizes to prevent them from extending across the filename column.
+
   const sizeOf = (size: unknown) => themeWith({ fonts: [{ ...SETI_SHAPED.fonts[0], size }] }).fonts[0].size;
   assert.equal(sizeOf('150%'), '150%', 'the size the default theme actually asks for was refused');
   assert.equal(sizeOf('300%'), '300%');
@@ -295,9 +293,8 @@ test('a font size the row cannot hold is refused, and one it can is kept', () =>
 });
 
 test('a font whose files have all gone is dropped, so the row gets its badge back', () => {
-  // Nothing else stats a theme's font files. This is not one row either: the theme's default
-  // entry answers for every file it does not otherwise know, so every row goes through the
-  // glyph path and one missing file empties the whole column.
+  // Drop fonts with no readable source so file rows can use their lettered badges.
+
   const theme = seti();
   const icon = glyphFor(theme, 'src/store.ts');
   assert.equal(
@@ -407,16 +404,15 @@ test('what the panel installs is one well-formed font-face rule and nothing else
     ),
     `the rule is not one well-formed @font-face: ${rules[0]}`,
   );
-  // A format and a style the shape above would not have accepted are left out, not written.
+  // Unsupported format and style values are omitted from the font-face rule.
   assert.doesNotMatch(rules[0], /true type/, 'a format with a space in it was written into the rule');
   assert.doesNotMatch(rules[0], /position/, 'a style carrying a declaration of its own was written into the rule');
   assert.match(rules[0], / font-weight: normal;/, 'an ordinary weight was dropped');
 });
 
 test('a file named after something on the object prototype resolves like any other', () => {
-  // Every one of these maps is built from someone else's JSON. On a plain object
-  // `constructor` answers with a function, which reaches the definitions as a key that is
-  // not a string and leaves the row with no icon at all rather than the default one.
+  // Theme maps must exclude inherited object properties when resolving filenames and extensions.
+
   const theme = seti();
   assert.equal(
     codeOf(theme, 'constructor'),
@@ -428,8 +424,8 @@ test('a file named after something on the object prototype resolves like any oth
     code(0xe023),
     'an extension called toString found something the theme never held',
   );
-  // And on the write side: `__proto__` on a plain object sets the prototype instead of a
-  // key, so the language it was given is silently thrown away.
+  // The language table must retain __proto__ as an own key without changing its prototype.
+
   const table = buildLanguageTable([{ id: 'proto-lang', filenames: ['__proto__'], extensions: ['.__proto__'] }]);
   assert.equal(table.byFilename['__proto__'], 'proto-lang', 'a language declared for __proto__ was dropped');
   assert.equal(table.byExtension['__proto__'], 'proto-lang', 'an extension of __proto__ was dropped');

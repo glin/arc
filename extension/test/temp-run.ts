@@ -1,17 +1,13 @@
-// Vitest global setup for every Vitest config in the repository. It gives each run one
-// directory and points TEMP, TMP and TMPDIR at it before any worker starts. Every scratch
-// file that a test, a child process or a browser writes to the temporary directory lands
-// inside it, and teardown removes it. Every run directory sits in one shared parent. A run
-// that dies before its teardown leaves its directory there, and the next run removes it once
-// its owner process has exited.
+// Vitest global setup gives each run a temporary directory before workers start.
+// TEMP, TMP, and TMPDIR point to it until teardown restores them and removes the directory.
+// The next run retries cleanup of abandoned directories whose owner processes have exited.
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-// The machine temporary directory as it was before the run moved TEMP. Files that coordinate
-// runs across the machine, such as the browser slots, stay there.
+// Environment key for the machine temporary directory. Cross-run coordination files stay there.
 export const MACHINE_TEMP = 'ARC_TEST_MACHINE_TEMP';
-// The directory this run moved TEMP to.
+// Environment key for this run's temporary directory.
 export const RUN_TEMP = 'ARC_TEST_RUN_TEMP';
 const RUNS = 'arc-test-runs';
 const MOVED = ['TEMP', 'TMP', 'TMPDIR', MACHINE_TEMP, RUN_TEMP];
@@ -48,8 +44,8 @@ function unlinkLinks(directory: string): void {
   }
 }
 
-// Removes a directory tree. It removes every symbolic link and junction inside the tree
-// first, so the recursive delete that follows never reaches files outside the tree.
+// Unlink symbolic links and junctions before deleting the directory tree.
+// Their targets remain outside the deletion.
 export function removeTree(directory: string): void {
   unlinkLinks(directory);
   fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 });
@@ -64,7 +60,7 @@ async function removeAbandoned(runs: string): Promise<void> {
     try {
       removeTree(path.join(runs, name));
     } catch {
-      // A file in the abandoned directory is still open. A later run removes it.
+      // Retry failed abandoned-directory cleanup on a later run.
     }
   }
 }

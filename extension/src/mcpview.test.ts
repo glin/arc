@@ -3,10 +3,8 @@ import assert from 'node:assert';
 import { MCP_RECONNECT, failedServers, mcpMenu, mcpPick, mcpToggleWanted, readMcpServers } from './mcpview';
 import { McpServer } from './agentwire';
 
-// One answer shaped the way the shipped binary shapes it: a server that is up, one that will
-// not start, and one the reader has switched off. The halves an agent only sometimes sends
-// are absent here rather than empty, because that is how they arrive, and a fixture that
-// spelled them as empty strings would let a reducer that never reads them pass.
+// The fixture includes connected, failed, and disabled servers. Optional response fields remain absent.
+
 const ANSWER = {
   mcpServers: [
     {
@@ -51,16 +49,8 @@ function server(over: Partial<McpServer> = {}): McpServer {
 const named = (servers: readonly McpServer[]): string[] => servers.map((s) => s.name);
 
 test('the menu answers an agent with no servers, and the picker row still draws no control', () => {
-  // Two different questions, and they were one answer.
-  //
-  // The reader reaches this menu by typing `/mcp`, which the composer offers whether the
-  // agent publishes it or the panel supplies it. A menu that refused to open for an agent
-  // with no servers made that command do nothing at all, which is worse than an empty list:
-  // the reader picked it off a list and watched the panel ignore them.
-  //
-  // A control on the picker row is the other question, and the answer there is still no. The
-  // row carries what the next turn runs under, and a count of zero standing there for the
-  // life of a folder with no servers is a control that never has anything behind it.
+  // An empty server list still opens the /mcp menu. The prompt box picker row has no server control.
+
   const empty = mcpMenu([], 'claude', 'Claude');
   assert.ok(empty, 'an agent with no servers opened no menu, so its own /mcp does nothing');
   assert.deepEqual(empty.items, [], 'a menu with no servers drew a row anyway');
@@ -104,10 +94,8 @@ test('a connected server, a failed one and a switched-off one are read as the ag
 });
 
 test('a state this version has never met is carried through as the agent wrote it', () => {
-  // The schema names five states today and is free to name a sixth tomorrow. A word from a
-  // version this one has never run against has to arrive intact: narrowed to a word the panel
-  // already knows, it would be a state nobody reported, and dropped it would be a server the
-  // reader has and cannot see.
+  // Retain unfamiliar server status strings without replacing them or dropping the server.
+
   const servers = readMcpServers({
     mcpServers: [
       { name: 'slow', status: 'starting', scope: 'project' },
@@ -153,8 +141,8 @@ test('an answer that is not the shape expected reads as no servers at all', () =
   assert.deepEqual(readMcpServers({ mcpServers: [null, 7, 'files'] }), []);
 });
 
-// The five states the schema names, one server in each, so every row below is written against
-// the whole set rather than against the three that are easiest to picture.
+// Cover connected, failed, needs-auth, pending, and disabled states.
+
 const FIVE: McpServer[] = [
   server({ name: 'files', status: 'connected', tools: ['read', 'write'], scope: 'project' }),
   server({ name: 'db', status: 'failed', error: 'Connection closed', tools: [], scope: 'user', title: '' }),
@@ -166,13 +154,8 @@ const FIVE: McpServer[] = [
 const rows = (servers: readonly McpServer[]) => mcpMenu(servers, 'claude', 'Claude')?.items ?? [];
 
 test('a machine with no MCP servers gets no control at all', () => {
-  // Not a control reading "0 servers". It would take a place on a row of settings and answer
-  // a question nobody asked.
-  //
-  // The menu behind it is a separate answer, and it used to be this one. It is not any more:
-  // the reader also reaches that menu by typing the agent's own `/mcp`, which the agent
-  // publishes and the composer offers, and a menu that refused to open made that command do
-  // nothing at all. The test above this one holds what it says instead.
+  // The prompt box picker row omits the server control when the list is empty.
+
   assert.equal(mcpPick([], 'Claude'), null);
 });
 
@@ -201,8 +184,8 @@ test('the control says how much trouble there is, and says nothing where there i
 });
 
 test('the control raises the caution tone for a failure and for no other state', () => {
-  // A server still starting, or waiting for a login, is not a fault. Drawn in the caution
-  // tone it would send the reader looking for something to mend that is only slow.
+  // Only a failed server raises the caution tone.
+
   for (const status of ['connected', 'pending', 'needs-auth', 'disabled', 'warming-up']) {
     assert.equal(
       mcpPick([server({ status, tools: [] })], 'Claude')?.caution,
@@ -254,8 +237,8 @@ test('the menu has one row per server, in the order the agent listed them', () =
 });
 
 test('only a server somebody switched off is drawn switched off', () => {
-  // A failing server is on and broken. Drawn unticked it would tell the reader they had
-  // turned it off, and send them to undo something they never did.
+  // A failed server remains enabled. Only disabled servers render an unchecked toggle.
+
   assert.deepEqual(
     rows(FIVE)
       .filter((i) => i.kind === 'toggle')
@@ -293,9 +276,8 @@ test('each row says the state in the word the agent used, the tool count and the
 });
 
 test('the menu writes no state word the agent did not say', () => {
-  // Every word the panel has phrasing for is a word it could reach for over a state it was
-  // never given. A server in an unfamiliar state is described in that state's own word and in
-  // no other, because a row calling it connected or failed is the panel inventing a reading.
+  // Menu descriptions retain unfamiliar status strings without inventing a known state.
+
   const menu = mcpMenu(
     [
       server({ name: 'a', status: 'warming-up', tools: [], scope: 'user' }),
@@ -316,8 +298,8 @@ test('the menu writes no state word the agent did not say', () => {
 });
 
 test('a server that has not connected says nothing at all about its tools', () => {
-  // The agent learns what a server offers by connecting to it, so "0 tools" on a row for one
-  // it never reached is a claim nobody made.
+  // A server that has not connected supplies no known tool count.
+
   const said = (status: string): string => rows([server({ status, tools: [], scope: '' })])[0].description;
   assert.equal(said('pending'), 'pending. Still starting.');
   assert.equal(said('warming-up'), 'warming-up');
@@ -364,8 +346,8 @@ test('the reconnect row is added once when something failed, and never when noth
 });
 
 test('a press on a switched-off server asks for it on, and a press on any other asks for it off', () => {
-  // The toggle on the wire is told the state the server should reach rather than asked to
-  // flip one, so the direction is read off the same list the row was drawn from.
+  // The toggle request carries the desired state derived from the displayed server list.
+
   assert.equal(mcpToggleWanted(FIVE, 'old'), true);
   for (const name of ['files', 'db', 'auth', 'slow']) {
     assert.equal(mcpToggleWanted(FIVE, name), false, `a press on ${name}, which is on, asked for it to be switched on`);
@@ -380,12 +362,8 @@ test('a press on a server that has gone from the list asks for nothing', () => {
 });
 
 test('the servers a reconnect asks about are the failed ones, and only those', () => {
-  // The press that reconnects is sent from `extension.ts`, which no test can reach, so which
-  // servers it acts on is decided here instead. Every other state is left alone on purpose: a
-  // server still starting will come up by itself, one wanting a login cannot be mended by
-  // reconnecting it, and one the reader switched off is not broken. Reconnecting those three
-  // would spend three requests undoing nothing and would restart a server somebody had
-  // deliberately stopped.
+  // Reconnect selects failed servers only. Pending, needs-auth, and disabled servers receive no reconnect request.
+
   assert.deepEqual(
     failedServers(FIVE).map((s) => s.name),
     ['db'],

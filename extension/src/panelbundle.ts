@@ -1,11 +1,4 @@
-// extension/src/panelbundle.ts
-//
-// The panel's browser program, built here and nowhere else.
-//
-// Three things need the script the page runs. The host build substitutes it into the
-// extension bundle. The page fixture draws it for the layout test and the screenshot script.
-// The guard beside this file holds those two to one another. Each asks this function, so there
-// is one artifact and not a built one in production beside a raw one in the tests.
+// Shared browser script and stylesheet builds for the extension host, page fixtures, and web demo.
 
 import * as esbuild from 'esbuild';
 import * as fs from 'node:fs';
@@ -22,15 +15,13 @@ export function browserStylesheet(): string {
 }
 
 export interface BrowserBundle {
-  // The script, as one classic-script IIFE for the page's inline tag.
+  // Minified classic-script IIFE for an inline script tag.
   text: string;
-  // Every file the script was built from, absolute. Watch mode watches these.
+  // Absolute build input paths used by watch mode.
   inputs: string[];
 }
 
-// How every script the page runs is built: one minified classic-script IIFE, in memory. The
-// panel bundle below and the web demo's label rules both build with these, so a change to
-// the target or the charset reaches both.
+// Shared options for in-memory browser builds, including the panel and web demo label rules.
 export const BROWSER_BUILD = {
   bundle: true,
   write: false,

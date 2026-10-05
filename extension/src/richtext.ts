@@ -1,9 +1,7 @@
 // Rich content references recorded inside assistant text.
 //
-// Some clients place a compact instruction in the text they save, then replace that
-// instruction with an interactive surface when they draw the response. The transcript is
-// still the source of truth, so the Timeline keeps the original summary and translates only
-// the copy handed to its Markdown renderer.
+// Some clients save rich-content instructions and draw them as interactive controls.
+// The timeline retains the original summary. Only the Markdown renderer receives translated text.
 
 import * as path from 'path';
 import { marked } from 'marked';
@@ -102,9 +100,9 @@ export function withoutRichContent(text: string): string {
   return text.replace(HOST_RICH_CONTENT, ' ').replace(/[\uE200-\uE202]/g, ' ');
 }
 
-// Replace a host-only visualization line with ordinary Markdown the Timeline can draw.
-// Fenced examples stay literal, and malformed references become an honest fallback instead
-// of exposing private-use control characters to the reader.
+// Replaces visualization lines with Markdown links for the timeline.
+// Fenced examples stay literal. Malformed references produce an unavailable message
+// without exposing private-use control characters.
 export function richMarkdown(text: string): string {
   return translateVisualizationLines(text, (spec) => {
     if (!spec) {
@@ -400,37 +398,29 @@ function renderMarkdownBlocks(text: string, renderer: marked.Renderer): string {
 // open, not a picture, and an image element pointed at one draws a broken box.
 const IMAGE_SUFFIX = /\.(?:png|jpe?g|gif|webp|avif|bmp|svg|ico)$/i;
 
-// Whether a link names a picture, which decides how the editor opens it. The same suffixes
-// the panel draws, because a file the panel can draw is a file the editor's own viewer can
-// show. A picture handed to the text editor instead is refused, and the reader is told the
-// file is missing when it is there.
+// Identifies image targets using the same suffixes the panel renders.
+// The editor opens those targets in its image viewer.
+// Opening them as text can produce a missing-file message even when the file exists.
 export function linkTargetIsImage(target: string): boolean {
   return IMAGE_SUFFIX.test(target);
 }
 
-// The two controls this module draws for a picture, matched so a link can take them out of
-// its own body. Both are written a few lines below, and every value inside them is escaped
-// before it is written, so no attribute holds a quote and no label holds a tag.
-//
-// Markdown has no link inside a link, so a link body holds nothing else of this shape.
+// Matches picture controls so an enclosing link can retain their content alone.
+// Generated attributes and labels are escaped, so quotes and tags cannot change the match.
+// Markdown link bodies cannot contain another Markdown link.
 const DRAWN_PICTURE = /<button type="button" class="image-link"[^>]*>([\s\S]*?)<\/button>/g;
 const DRAWN_REMOTE_PICTURE = /<a href="#" data-link="[^"]*">([\s\S]*?)<\/a>/g;
 
-// One link body, with every control inside it flattened to what it drew.
-//
-// A link's body is rendered before the link is, so a picture inside one arrives as a control
-// already. Neither of them may sit inside an anchor. A button there is invalid and takes a
-// tab stop of its own, and an anchor there is closed by the parser at the inner tag, which
-// empties the link the response actually wrote.
-//
-// So the picture stays visible and the link keeps the one press the reader expects.
+// Flattens picture controls inside a link body while retaining their visible content.
+// The renderer processes the body before the enclosing link.
+// A nested button adds an invalid tab stop. A nested anchor closes the outer anchor early.
+// Flattening keeps the picture visible and leaves one link action.
 function insideLink(body: string): string {
   return body.replace(DRAWN_PICTURE, '$1').replace(DRAWN_REMOTE_PICTURE, '$1');
 }
 
-// Where one webview loads a picture from, and the file itself for the press that opens it.
-// A resource URI belongs to the webview it was made for, so the host builds this per host,
-// the same way a file row's icon is built per host.
+// The image resource URI for one webview and the file path its open action uses.
+// Resource URIs belong to their creating webview, so each host resolves its own images.
 export interface ResolvedImage {
   src: string;
   path: string;
@@ -438,19 +428,15 @@ export interface ResolvedImage {
 
 export type ImageResolver = (target: string) => ResolvedImage | null;
 
-// Whether a response names a picture at all.
-//
-// The host asks this before it renders a summary a second time for one webview. Almost no
-// summary names a picture, so the ordinary path pays this test and no parse. It over-reports
-// on a literal inside a code fence, which costs one render, and it never under-reports,
-// which would leave a broken box on the card.
+// Detects possible Markdown image references before webview-specific rendering.
+// A code-fence example can cause an extra render.
+// Every Markdown image reference includes this marker, so the check cannot omit an image.
 export function hasImageReference(text: string): boolean {
   return text.includes('![');
 }
 
-// A path in a form two spellings can be compared by. Written here rather than taken from
-// `transcript.ts`, which reads this module. An import back would be a cycle, and a cycle
-// arrives as an undefined export the first time the panel loads.
+// Normalizes paths for comparison, ignoring case on Windows.
+// `transcript.ts` imports this module, so importing its path helper would create a cycle.
 function comparable(target: string): string {
   const unified = target.replace(/\\/g, '/').replace(/\/+$/, '');
   return process.platform === 'win32' ? unified.toLowerCase() : unified;
@@ -475,15 +461,10 @@ function decodedTarget(target: string): string {
   }
 }
 
-// Whether the panel draws this file, and which file it is.
-//
-// A response is written by the agent, so a path in one is not trusted to point anywhere it
-// likes. This is `openLink`'s rule: resolve before testing, because a target that keeps its
-// `..` segments passes a prefix test on the unresolved string, and the filesystem then walks
-// out of the folder when the file is read.
-//
-// The test is on the written path. A link inside an open folder still reaches whatever it
-// points at, which is what `openLink` does with the same kind of target.
+// Resolves local image paths within the open folders.
+// Resolve `..` before comparing prefixes, as `openLink` does.
+// Comparing an unresolved prefix can admit a file outside the folder.
+// The check uses the written path. A symlink inside a folder can point outside it.
 function imageInFolders(written: string, folders: readonly string[]): string | null {
   if (!written || !isLocalLinkPath(written) || !IMAGE_SUFFIX.test(written)) {
     return null;
@@ -499,11 +480,9 @@ export function imageFileFor(target: string, folders: readonly string[]): string
   return imageInFolders(decodedTarget((target || '').trim()), folders);
 }
 
-// The same rule for a path the panel already resolved and the webview sent back on a press.
-//
-// This one decodes nothing. A per-cent sign reaching here is part of the file's name, and
-// decoding it would name a different file: `plan%20b.png` would open `plan b.png`, which is
-// either the wrong picture or none at all.
+// Checks a resolved image path returned by the webview.
+// Percent signs remain literal because decoding can change the filename.
+// For example, `plan%20b.png` and `plan b.png` name different files.
 export function imagePathFor(target: string, folders: readonly string[]): string | null {
   return imageInFolders((target || '').trim(), folders);
 }
@@ -515,12 +494,8 @@ function imageFileName(target: string): string {
   return tail || 'image';
 }
 
-// Markdown for one response, including the safe button used for a local visualization.
-// Validated disclosures use generated native tags. Other raw HTML stays escaped. Links keep the data attribute
-// the webview already routes through the extension host.
-//
-// `resolveImage` reports where this webview loads a picture from. Without one, every picture
-// draws as the words the response wrote, which is what a caller that has no webview wants.
+// Renders response Markdown with validated disclosures and local visualization buttons. Other raw HTML stays escaped.
+// Links carry data-link for host routing. Without resolveImage, pictures render as text.
 export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): string {
   if (!text) {
     return '';
@@ -528,15 +503,14 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): 
   try {
     const renderer = new marked.Renderer();
     renderer.html = (html: string) => escapeHtml(html);
-    // A picture the reader can see, and press to open full size in the editor. Three cases,
-    // and only the first draws a picture. A remote address draws a link instead: a response
-    // is agent content, and fetching a picture as the card renders would tell that server
-    // the reader opened the panel. Anything else keeps the words the response wrote.
+    // Renders local images with an open action. Remote image addresses render as links.
+    // Loading remote images during card rendering would disclose panel access to that server.
+    // Unresolved images retain their label text.
     renderer.image = (href: string | null, title: string | null, alt: string) => {
       const target = href || '';
-      // The renderer escapes `alt` and `title` before it hands them here, so both go into
-      // an attribute as they are. Escaping either a second time would draw `&quot;` as five
-      // characters. The address and the file name are this module's own, so it escapes them.
+      // Marked supplies escaped `alt` and `title` values for direct attribute insertion.
+      // Escaping them again would display `&quot;` literally.
+      // This module escapes the address and fallback filename itself.
       const written = (alt || '').replace(/\s+/g, ' ').trim();
       const label = written || escapeHtml(imageFileName(target));
       if (/^https?:\/\//i.test(target)) {
@@ -546,9 +520,8 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): 
       if (!picture) {
         return label;
       }
-      // The alt text is what the browser draws in place of a picture that has gone, so the
-      // words stay on the card without a handler. The button carries the action a screen
-      // reader reads, which the alt text alone does not say.
+      // Alt text remains visible if the image fails to load.
+      // The button accessible name identifies the open action.
       return (
         `<button type="button" class="image-link"` +
         ` data-image="${escapeHtml(picture.path)}"` +
@@ -572,22 +545,15 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): 
         `>${insideLink(body)}</a>`
       );
     };
-    // `mangle: false`: marked 4's default obfuscates an autolinked email address behind
-    // random numeric character references, which differ on every call over the same text.
-    // The rendered response is redrawn on refresh, so an email in it would redraw with
-    // nothing visibly changed.
+    // renderMarkdownBlocks disables random email mangling so unchanged responses keep stable HTML.
     return renderMarkdownBlocks(richMarkdown(text), renderer);
   } catch {
     return `<pre>${escapeHtml(text)}</pre>`;
   }
 }
 
-// One line of inline Markdown, for a surface that draws no block content and takes no
-// pointer press of its own. Raw HTML stays escaped the same way `renderRichMarkdown` escapes
-// it. A link draws its body text with no anchor, and a picture draws its alt text, or its
-// file name where it has none, with no `img` and no button: the folded card's headline is not
-// itself interactive, and a link or a picture inside it would add a tab stop to every folded
-// card for a press the headline has no way to act on.
+// Renders inline text without raw HTML, link anchors, image elements, or buttons.
+// Images retain alt text or file names so folded headlines add no controls.
 export function renderInlineMarkdown(text: string, links?: marked.TokensList['links']): string {
   if (!text) {
     return '';
@@ -600,10 +566,7 @@ export function renderInlineMarkdown(text: string, links?: marked.TokensList['li
       const written = (alt || '').replace(/\s+/g, ' ').trim();
       return written || escapeHtml(imageFileName(href || ''));
     };
-    // `mangle: false`: marked 4's default obfuscates an autolinked email address behind
-    // random numeric character references, which differ on every call over the same text.
-    // `headlineHtml` sits in the card view payload that decides whether a card redraws, so a
-    // headline with an email in it would redraw on every refresh with nothing visibly changed.
+    // Disable random email character references so unchanged headlines retain stable HTML.
     const options = { ...marked.getDefaults(), async: false, gfm: true, mangle: false, renderer };
     if (!links) return marked.parseInline(text, options);
     const lexer = new marked.Lexer(options);

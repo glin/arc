@@ -1,22 +1,12 @@
-// A small badge for each file row, so a list of filenames can be read at a glance.
-//
-// This is the floor the reader's own icon theme is drawn in front of, and it answers from
-// the filename alone. It exists because nothing tells a webview which icon the explorer
-// draws for a path: `icontheme.ts` works that out by rebuilding the editor's own lookup, and
-// every step of that can come up empty, so something has to be under it.
-//
-// An unknown type is not a gap. Its own extension is the badge, in the panel's neutral
-// colour, so a file the table has never heard of still reads as what it is. The table only
-// adds a colour, and a shorter name where the extension is not the clearest label.
+// Choose a filename-based badge beneath the reader's icon theme. Theme lookup failures leave this badge visible.
+// Unknown extensions use a neutral badge with a truncated uppercase extension. Known entries provide labels and colors.
 
 export interface FileIcon {
   label: string; // what the badge draws, up to four characters
   colour: string; // a CSS colour, or the empty string for the panel's neutral tone
 }
 
-// Mid-tone colours, because the panel is read on a light theme and a dark one and each of
-// these has to stay legible on both. They follow the language's own familiar colour where
-// there is one.
+// Use mid-tone colors for badges on light and dark themes.
 const BLUE = '#4a9fe0';
 const YELLOW = '#d6b33c';
 const GREEN = '#5db56b';
@@ -26,16 +16,12 @@ const RED = '#e06a5c';
 const TEAL = '#43b0a3';
 const PINK = '#dd7bb0';
 
-// A table with nothing behind it. Both of these are asked about with a piece of a filename,
-// and on a plain object a file called `constructor` answers with the `Object` constructor
-// and one called `__proto__` with `Object.prototype`. Both are truthy, so both would be
-// handed back where an icon is expected, and the row would draw the word `undefined`.
+// Use null-prototype tables so filenames such as `constructor` and `__proto__` cannot return inherited objects instead of icons.
 function table(entries: Record<string, FileIcon>): Record<string, FileIcon> {
   return Object.assign(Object.create(null) as Record<string, FileIcon>, entries);
 }
 
-// By extension. The label is the extension itself wherever that is the clearest thing to
-// draw, and something shorter or more familiar where it is not.
+// Map extensions to short language or file-type labels.
 const BY_EXTENSION: Record<string, FileIcon> = table({
   ts: { label: 'TS', colour: BLUE },
   tsx: { label: 'TSX', colour: BLUE },
@@ -107,8 +93,7 @@ const BY_EXTENSION: Record<string, FileIcon> = table({
   svelte: { label: 'SVLT', colour: ORANGE },
 });
 
-// By whole filename, for the files that carry their meaning in the name rather than in an
-// extension. Checked before the extension, so `package.json` is not just another `{ }`.
+// Match whole filenames before extensions, so `package.json` receives its NPM badge.
 const BY_NAME: Record<string, FileIcon> = table({
   'package.json': { label: 'NPM', colour: RED },
   'package-lock.json': { label: 'LOCK', colour: RED },
@@ -121,20 +106,17 @@ const BY_NAME: Record<string, FileIcon> = table({
   '.npmrc': { label: 'NPM', colour: RED },
 });
 
-// The longest badge the row has room for. An unknown extension longer than this is cut
-// rather than pushing the filename out of the row.
+// Limit unknown extension labels to four characters so they do not displace filenames.
 const MAX_LABEL = 4;
 
-// The badge for one path. Never fails and never returns nothing: a name with no extension
-// at all still gets the panel's neutral file mark.
+// Return a badge for every path. Names without an extension receive a neutral file mark.
 export function iconFor(filePath: string): FileIcon {
   const base = (filePath.split(/[\\/]/).pop() || filePath).toLowerCase();
   const named = BY_NAME[base];
   if (named) {
     return named;
   }
-  // The last dot only. A name like `pricing.test.ts` is a TypeScript file, and a dotfile
-  // such as `.gitignore` has no extension at all rather than an extension of `gitignore`.
+  // Use the last dot in the basename. Unmapped dotfiles with no later dot have no extension.
   const dot = base.lastIndexOf('.');
   const extension = dot > 0 ? base.slice(dot + 1) : '';
   if (!extension) {

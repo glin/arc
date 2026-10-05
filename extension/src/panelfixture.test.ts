@@ -1,15 +1,4 @@
-// The page fixture, checked against itself.
-//
-// `panelfixture.ts` writes its rail and heading figures out as text, because a fixture a
-// reader cannot read is not a fixture. Written text goes stale: the heading said
-// `62% of 1M ctx (620k)` while every card under it said `59% of 200k ctx (118k)`, because the
-// cards are built from the turns and the heading was not. Only the fixture was wrong, so no
-// guard that measured the page could see it.
-//
-// Context is the one written figure that cannot honestly differ from the turns. Cost, turns
-// and files are lifetime totals for a session the page only draws part of, so the
-// fixture is free to write those larger than what the 24 cards add up to. Context is a level
-// off the newest turn, and the newest turn is on the page.
+// The fixture heading takes context from its newest turn.
 
 import { test } from 'vitest';
 import assert from 'node:assert';
@@ -54,23 +43,19 @@ test('each next-turn fixture carries the cost line its browser state measures', 
   }
 });
 
-// How far the fixture must stand clear of both local midnights. A card sits behind the clock,
-// so a clock near midnight puts that card in the day before it.
+// Keep fixture cards at least one hour from either local midnight.
+
 const CLEARANCE = 60 * 60_000;
 
-// The local calendar day an instant falls in, which is the day the rail files a card under.
+// The session list groups cards by their local calendar day.
 function localDay(at: number): string {
   const on = new Date(at);
   return `${on.getFullYear()}-${on.getMonth()}-${on.getDate()}`;
 }
 
 test('the fixture clock places its cards in the local day it runs the page on', () => {
-  // Every minute of one day, plus the three the rail fails on when the clock is the real one.
-  // Those three are the stroke of midnight, five minutes past it, and five minutes short of
-  // the next one.
-  //
-  // Three calendar days carry this sweep. One is of standard length. The other two are the
-  // days a daylight-saving change shortens or lengthens by an hour.
+  // Check every minute and both midnight boundaries on ordinary, shortened, and lengthened local days.
+
   const days: Array<[number, number, number]> = [
     [2026, 8, 5],
     [2026, 2, 8],
@@ -108,8 +93,8 @@ test('the fixture clock places its cards in the local day it runs the page on', 
       cards - dayStart >= CLEARANCE && dayEnd - clock >= CLEARANCE,
       `the fixture sits within ${CLEARANCE / 60_000} minutes of a local midnight at ${when}`,
     );
-    // The symptom itself. The browser buckets against the clock it is started on, so a card
-    // the fixture placed must reach Today and not Yesterday.
+    // The newest fixture card belongs in Today at the fixture clock.
+
     const card = { at: cards, pinnedTop: false, current: false, archived: false };
     assert.equal(
       railBuckets([card], clock).buckets[0]?.id,
@@ -118,10 +103,8 @@ test('the fixture clock places its cards in the local day it runs the page on', 
     );
     standings.add(`${on.getHours()}:${on.getMinutes()}:${on.getSeconds()}.${on.getMilliseconds()}`);
   }
-  // One position in the local day, whatever the minute the suite runs at. The fixture reaches
-  // back more than a day. A clock that follows the real one moves the session an hour
-  // behind the newest one. It swaps that card between Today and Yesterday with the hour of
-  // the run.
+  // The fixture clock keeps one local time regardless of the time the test runs.
+
   const standing = `${ANCHOR_HOUR}:${ANCHOR_MINUTE}:0.0`;
   assert.deepEqual(
     [...standings].sort(),
@@ -130,18 +113,11 @@ test('the fixture clock places its cards in the local day it runs the page on', 
   );
 });
 
-// A `--vscode-` custom property a real browser test sets by hand rather than through `themed`,
-// defined above, which is the one place that carries the editor's real theme tables into a test
-// page. A test that sets one directly can pass on a value no theme uses, the way a light theme
-// once drew no contrast at all because nothing but a hand-set variable stood in for it.
-//
-// A hand-set property is allowed only where it sweeps one realistic value on a page `themed`
-// has already dressed, to exercise a live update or a neutral font substitution the fixed tables
-// cannot parameterize on their own. Each entry names the exact property, so a new hand-set
-// variable cannot hide inside a stale allowance, and a removed sweep has to bring its entry down.
+// Browser tests must not hand-set editor theme properties. Named exceptions vary fonts on an already themed page.
+
 const ALLOWED_HAND_SET_THEME_VARS: Record<string, string[]> = {
-  // Both sweep `--vscode-font-size` across realistic sizes on an already-`themed` page, to prove
-  // the live update path a real editor font-size change takes, not to fake an untested theme.
+  // These tests vary font properties to cover live updates and font substitutions.
+
   'extension/src/panel.layout.cards.test.ts': [
     '--vscode-font-size',
     '--vscode-font-family',
@@ -151,10 +127,8 @@ const ALLOWED_HAND_SET_THEME_VARS: Record<string, string[]> = {
   'extension/src/webview/composer.browser.test.ts': ['--vscode-font-size'],
 };
 
-// A real browser test drives a live page through `browserOrNone`, in `extension/test/browser.ts`.
-// A test that only checks CSS source text or a fixture's theme-table constants as strings, such
-// as `tones.test.ts`, never opens a page, and a `--vscode-` mention there is fixture data under
-// test, not a hand-dressed page.
+// browserOrNone identifies tests that open a browser page. Source-only theme checks do not set page properties.
+
 const BROWSER_TEST_MARKER = /browserOrNone/;
 
 // Every mention of a `--vscode-` name, however it is spelled: a `setProperty` call, bracket

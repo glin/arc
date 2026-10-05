@@ -65,8 +65,8 @@ export function* retainedParserPayloadScan(value: unknown, limit = Number.POSITI
   return bytes;
 }
 
-// Parser snapshots must remain independent of the running reducer while retaining Maps,
-// shared references, symbols, and hidden activity metadata.
+// Clone parser snapshots independently of the running reducer.
+// Preserve Maps, shared references, symbols, and hidden activity metadata.
 export function cloneParserState<T>(value: T): T {
   const seen = new Map<object, unknown>();
   const copy = (input: unknown): unknown => {
@@ -123,31 +123,22 @@ export function cloneParserState<T>(value: T): T {
   return copy(value) as T;
 }
 
-// A Claude child response is written to the transcript again as it grows, so its usage reducer
-// keeps the last event for each request and emits a removal when a later line revises it. Those
-// retained events are the largest field in a saved project spend record.
-//
-// In a child read, one number bounds both halves of that memory. It bounds the queue of
-// request keys the reducer counts as seen, and the map of events a revision removes. They
-// stay equal on purpose.
-// A shorter event map refuses a revision the queue still calls counted. The request then
-// keeps the smaller figure its first record reported. A longer map holds events for
-// requests the queue already forgot, which no revision can ever reach.
-//
-// A parent read keeps no events and bounds nothing. A repeat there is a duplicate to drop, and
-// a queue that forgets a request bills the same response a second time.
+// Claude child responses repeat in the transcript as they grow.
+// The child usage reducer retains each request's latest event to replace revised usage.
+// The request-key queue and event map must share this limit.
+// A shorter map loses revisions. A longer map retains events the queue cannot reach.
+// Parent reads keep every request key to avoid counting duplicate responses twice.
 export const RETAINED_REQUESTS = 64;
 
-// The events a state must keep: the ones whose request keys are newest in the first-seen queue.
-// Returns the same object when nothing needs removing, so a caller can compare by reference.
+// Trim events to the request keys at the end of the first-seen queue.
+// Return the original object when it fits the limit or the queue is empty.
 export function retainedRequestEvents<T>(
   seenRequestKeys: readonly string[],
   events: Record<string, T>,
   limit: number = RETAINED_REQUESTS,
 ): Record<string, T> {
   const held = Object.keys(events);
-  // An empty queue names nothing to keep. Dropping every event would turn the next revision
-  // into a second request, so the state is left as it is.
+  // Preserve events when the queue is empty to avoid counting a revision as a new request.
   if (held.length <= limit || seenRequestKeys.length === 0) {
     return events;
   }
@@ -161,9 +152,8 @@ export function retainedRequestEvents<T>(
   return kept;
 }
 
-// Trims the retained event window inside a saved parser state. A record written under a larger
-// limit is otherwise never rewritten, because a transcript that stopped growing never runs its
-// reducer again. Returns the same value when nothing changed.
+// Trim retained request events in a saved parser state, including states whose transcript has stopped growing.
+// Return the original state when its event map is unchanged.
 export function withRetainedRequestEvents<T>(state: T, limit: number = RETAINED_REQUESTS): T {
   if (!state || typeof state !== 'object' || Array.isArray(state)) {
     return state;
@@ -180,37 +170,29 @@ export function withRetainedRequestEvents<T>(state: T, limit: number = RETAINED_
   return kept === events ? state : ({ ...held, requestEvents: kept } as unknown as T);
 }
 
-// How many compaction times a usage reducer keeps. A compaction is rare beside a request, so
-// a small window still covers the whole of nearly every session. compactionCount() stays the
-// exact total, and this list only dates the newest of them.
+// Retain the newest compaction timestamps. compactionCount() keeps the exact total.
 export const RETAINED_COMPACTIONS = 16;
 
-// How many cache-expiry return requests the derived ledger keeps in full. The counts beside
-// them stay exact, so a source past this limit reports its dollars as a lower bound and its
-// counts as the whole answer.
+// Retain full detail for the newest cache-expiry return requests.
+// Counts remain exact beyond this limit. Retained dollar totals become lower bounds.
 export const RETAINED_CACHE_EXPIRY_RETURNS = 32;
 
-// A parser snapshot crosses the progressive worker boundary through `postMessage`, which
-// copies it with structured clone. Structured clone keeps only enumerable string-keyed
-// properties, so a symbol key and a non-enumerable field are both gone on the far side. A
-// reducer keeps the open turn's byte range on symbol keys, and its pairing metadata and exact
-// call detail on non-enumerable fields, so that none of it rides in the card payload. It
-// therefore lifts that state into the plain record below when it hands a snapshot out, and
-// puts it back when it builds from a restored one.
+// Worker postMessage uses structured clone, which drops symbol keys and non-enumerable fields.
+// Reducers store open-turn byte ranges on symbols and pairing and call details on non-enumerable fields.
+// Snapshots carry these fields in plain records and restore them when parsing resumes.
 
-// How one reducer holds the state it hides.
+// Keys and field rules for hidden reducer state.
 export interface HiddenStatePolicy {
-  // The symbol keys it holds a building turn's byte range on.
+  // Symbol keys for the building turn's byte range.
   start: symbol;
   end: symbol;
   membershipStart: symbol;
-  // Whether this reducer rewrites a step's exact detail after the call that opened the step.
-  // Codex does, when a file-change record expands the call. Claude writes the field once.
+  // Codex rewrites exact step details when file-change records expand a call. Claude writes each detail once.
   redefinesDetail: boolean;
 }
 
-// What one retained turn hides. A turn already emitted keeps its byte range in the reducer's
-// own `turnRanges` and `turnMembershipStarts`, so its three range values stay null.
+// Hidden fields for one retained turn.
+// Emitted turns keep their ranges in turnRanges and turnMembershipStarts, so these three range values remain null.
 export interface HiddenTurnState {
   start: number | null;
   end: number | null;
@@ -225,8 +207,7 @@ export interface HiddenParserState {
   pending: HiddenTurnState | null;
 }
 
-// The turns one snapshot hides state for: those already emitted, the one still being built,
-// and the Claude turn held back for a successor prompt.
+// Snapshot slots for emitted turns, the building turn, and the Claude turn waiting for a successor prompt.
 export interface HiddenTurnSlots {
   turns: readonly HiddenTurnHolder[];
   open: HiddenTurnHolder | null;
@@ -243,10 +224,9 @@ function hiddenNumber(value: object, key: symbol): number | null {
   return typeof held === 'number' ? held : null;
 }
 
-// Restores a field with the descriptor its own parser writes. A parser seals what it writes
-// once, so a resumed read has to seal the same field: a later `defineProperty` throws on a
-// sealed field and is taken silently by a configurable one, which would make a resumed read
-// behave differently from a cold read of the same bytes.
+// Restore fields with the descriptors their parser uses.
+// Non-configurable fields reject incompatible redefinitions. Configurable fields permit them.
+// Matching descriptors keeps resumed reads consistent with cold reads.
 function hide(value: object, key: PropertyKey, held: unknown, rewritable: boolean): void {
   if (held === undefined) {
     return;
@@ -280,9 +260,8 @@ function applyHiddenTurnState(
   if (!hidden) {
     return;
   }
-  // Left absent rather than set to zero when the record names none. A range that starts at an
-  // unknown byte and one that starts at byte zero widen differently on the next record. Both
-  // range writers leave these keys configurable and writable, because the range widens.
+  // Leave missing range values absent. An unknown start and byte zero expand differently on later records.
+  // Range fields remain configurable and writable because subsequent records expand them.
   if (hidden.start !== null) {
     hide(turn, policy.start, hidden.start, true);
   }

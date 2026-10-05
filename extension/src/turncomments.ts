@@ -219,16 +219,9 @@ export function emitTurnComments(
   return mine.length ? turnBlock(mine, now).join('\n\n') : '';
 }
 
-// A generated block is told from a prompt by its first heading, not by a title: the title
-// line this rule once read is gone, so the bold turn heading and the blank line under it are
-// what is left to agree on. This is looser than the rule it replaces. It still rejects a
-// prompt with no heading under its first line, and a prompt whose first line is bold but
-// carries no parenthesized tail, such as `**Blocker**: it drops CRLF`.
-//
-// A turn with no headline heads itself `**<time>**`, which this rule does not match. That
-// turn comes from a send that carried comments and no prompt, so the case is rare. The walk
-// offers that document back as a prompt, the same direction the rule already takes for a
-// session retitled after its comments went out.
+// Identifies generated comment blocks by a bold heading with a parenthesized time
+// and a following blank line. Bold text without that suffix does not match.
+// A turn without a headline produces only a bold time and remains a prompt-history entry.
 const TURN_HEADING = /^\*\*.+\*\* \(.+\)$/;
 
 export function looksLikeComments(text: string): boolean {

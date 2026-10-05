@@ -1,15 +1,5 @@
-// The panel's content search: the query it waits on, the answer it accepts, and the list it
-// draws the hits in.
-//
-// Nothing on screen starts a search yet. The box that did is gone, and the rail's advanced
-// search will own what replaces it. This owner holds the door that control will press, so the
-// engine does not rot in the meantime.
-//
-// The reply arrives long after the ask, because reading every session in a large workspace
-// takes about a second and a half and blocks the extension host for all of it. So the query is
-// kept, and an answer is taken only while it is still the query the panel is waiting on and
-// still wanted. A reader who chooses a session has dismissed the search, and a reply that
-// lands after that press must not draw itself over the session they chose.
+// Content search state and results. Replies must match the pending query.
+// Selecting a session clears results and stops waiting for a reply.
 
 import { type ComponentChild, h, render } from 'preact';
 import { FIND_PREFIX, isSearch } from '../domain/session-query.ts';
@@ -18,10 +8,7 @@ import type { SearchHit } from './protocol.ts';
 
 export type { SearchHit } from './protocol.ts';
 
-// What the search was actually run over. It arrives with the results rather than being read
-// off the session on screen, because that pin can move while a reply is in flight and the
-// answer belongs to the search that ran. The extension names it and this file only indexes by
-// it, so an unknown name falls back to the workspace wording.
+// Scope used when a reply names an unknown search scope.
 export const DEFAULT_SEARCH_SCOPE = 'workspace';
 
 interface SearchWords {
@@ -43,28 +30,22 @@ export interface SearchRendererOptions {
 }
 
 export interface SearchRenderer {
-  // The one node the timeline is handed. It is created once and never replaced, so a result
-  // row survives every repaint that does not change the hits.
+  // Stable timeline container. Unchanged results retain their rows across draws.
   element: HTMLElement;
   // Turn a plain query into a content search and ask for it.
   start(query: string): void;
-  // Take a reply. Answers whether it was accepted, so a refused one can be told from a
-  // drawn one.
+  // Accept a pending query's reply and report whether it was accepted.
   accept(query: string, scope: string, hits: readonly SearchHit[]): boolean;
-  // A session was chosen. The results go, because the render that follows would draw this
-  // same list again and nothing would appear to happen. The query stays: it is what found
-  // the session, and running it again is the way back.
+  // Dismiss results and pending replies. Keep the query for another search.
   clear(): void;
-  // Everything this panel remembers, emptied. The query goes with the results, because the
-  // control that would run it again is empty too.
+  // Clear the query, results, pending reply, and scope.
   reset(): void;
-  // Draw the current state and answer whether search owns the timeline column.
+  // Draw current results or progress. Return whether search occupies the timeline.
   draw(showing: string): boolean;
 }
 
 function snippetLine(snippet: string, ranges: readonly (readonly [number, number])[]) {
-  // The positions arrive on the hit, worked out beside the search itself, so the panel holds
-  // no copy of the matching rule and the marks cannot disagree with what the search read.
+  // The host supplies match ranges so highlighting uses the search's matching rules.
   const parts: ComponentChild[] = [];
   let at = 0;
   for (const range of ranges) {
@@ -81,8 +62,7 @@ function snippetLine(snippet: string, ranges: readonly (readonly [number, number
 }
 
 function Results({ hits, scope, press }: { hits: readonly SearchHit[]; scope: string; press(hit: SearchHit): void }) {
-  // The scoped wording follows the results, not the pin: "no turn says that" over a
-  // workspace and over one session are different claims.
+  // Results carry their scope. Session selection can change while a search runs.
   if (!hits.length) {
     return h('div', { class: 'results' }, h('p', { class: 'empty' }, searchWords().searchEmptyByScope[scope]));
   }
@@ -101,8 +81,7 @@ function Results({ hits, scope, press }: { hits: readonly SearchHit[]; scope: st
           key: hit.key,
           type: 'button',
           'data-control': `result:${hit.key}`,
-          // The whole row, in the order the eye reads it. The spans inside are not announced,
-          // because this name replaces them.
+          // The button's name replaces its descendant text in the accessibility tree.
           'aria-label': `${hit.sessionTitle}, ${hit.when}, ${hit.snippet}`,
           onClick() {
             press(hit);
@@ -125,28 +104,23 @@ function Results({ hits, scope, press }: { hits: readonly SearchHit[]; scope: st
 }
 
 function Working({ showing }: { showing: string }) {
-  // While one session is pinned the search reads it alone, so the busy line must not promise
-  // the whole workspace.
+  // A selected session uses scoped progress wording.
   return h('p', { class: 'empty' }, showing ? searchWords().searchWorkingScoped : searchWords().searchWorking);
 }
 
 export function createSearchRenderer(options: SearchRendererOptions): SearchRenderer {
   const element = options.document.createElement('div');
   element.className = 'searchowner';
-  // The query whose reply is still wanted. It is transient, not panel state: nothing saves it
-  // and nothing restores it.
+  // Pending query text stays local to this page.
   let query = '';
-  // Whether an answer is still wanted. It is also the gate on replies: a reply for a query the
-  // reader has dismissed carries the same text as the one they asked for.
+  // Dismissal rejects replies even when their query text matches.
   let working = false;
   let hits: readonly SearchHit[] | null = null;
   let scope: string = DEFAULT_SEARCH_SCOPE;
 
   const ask = (text: string) => {
     query = text;
-    // The shared query rule decides what a query is. This only decides whether to say the
-    // panel is busy, and being wrong about that costs a message shown or not shown for an
-    // instant.
+    // The shared grammar decides whether to wait for search results.
     working = isSearch(text);
     if (!working) {
       hits = null;
@@ -163,13 +137,11 @@ export function createSearchRenderer(options: SearchRendererOptions): SearchRend
   return {
     element,
     start(text) {
-      // The word comes from the shared grammar, so this cannot type one the parser does not
-      // read.
+      // Use the content-search prefix from the shared grammar.
       ask(`${FIND_PREFIX}: ${text}`);
     },
     accept(replyQuery, replyScope, replyHits) {
-      // Only while it still answers the pending query. A slow search finishing after a newer
-      // ask would otherwise draw results for a query nobody wants.
+      // Reject replies for an older query or a dismissed search.
       if (replyQuery !== query) {
         return false;
       }

@@ -3,7 +3,8 @@ export const CONTEXT_PREFIX_BYTES = 4_096;
 export const CONTEXT_PENDING_LIMIT = 32;
 export const CONTEXT_DEADLINE_MS = 5_000;
 
-// Reads envelope strings without constructing the response body. A partial prefix returns no identity.
+// Reads envelope identity without constructing the response body.
+// Complete type and request-id strings identify a response before the body is complete.
 export function contextFrameId(text: string): string | null {
   let at = 0;
   let type: string | null = null;

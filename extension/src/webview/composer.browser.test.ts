@@ -769,8 +769,8 @@ test('Codex completes skills with dollar or slash while commands remain slash-on
   }
 });
 
-// Activity publishes the running Composer again. The repeated usage must leave the control
-// under the pointer and the open hint attached to that control.
+// Activity republishes the running prompt box.
+// Updates must retain the Stop control, its focus, and its open hint.
 test('a running usage update keeps the focused Stop control and its open hint', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1163,8 +1163,8 @@ test('composer controls keep hints while context inspection opens one detail', {
   }
 });
 
-// This catches a background update that replaces the Composer, its text box, or a reserved
-// child slot while the reader is editing.
+// Background updates must retain the prompt box, prompt text field, and reserved child slots
+// while the reader edits.
 test(
   'background messages retain the Composer editing surface and later-owner slots',
   { timeout: 60_000 },
@@ -1301,8 +1301,8 @@ test(
   },
 );
 
-// This catches a recognized skill that either loses its inline detail control or changes the
-// native prompt while the reader inspects it.
+// Recognized skills keep their detail controls. Inspection must preserve the prompt text
+// and selection in the prompt text field.
 test('slash-form catalog skills stay inspectable inside the live textarea', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1454,12 +1454,7 @@ test('slash-form catalog skills stay inspectable inside the live textarea', { ti
   }
 });
 
-// The owner saw a skill popover draw its name, a rule, a blank gap of about two lines, then
-// the description: an empty entries list was still drawing the element that carries its
-// margin. Checked for a Claude skill, which never carries a path, and a Codex skill whose
-// catalog happened to answer with none, since the fix sits in the shared popover renderer.
-// Measured against a skill that does carry a path, so the bound is the panel's own ordinary
-// spacing rather than a number picked by hand.
+// Pathless Claude and Codex skills omit the file list and its margin.
 test('a pathless skill popover shows no blank gap where its file line would be', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1513,8 +1508,7 @@ test('a pathless skill popover shows no blank gap where its file line would be',
     });
     const prompt = page.locator('#prompt');
     await prompt.fill('Use /land then /check-guide-docs then /context.');
-    // The reference distance: how far a popover with a path holds its heading's rule from the
-    // top of what follows it, before the reader ever reaches the description below the path.
+    // A skill with a path supplies the heading-to-file-list spacing for comparison.
     const pathed = page.locator('.cskilltoken', { hasText: '/context' });
     await moveTo(page, pathed);
     const pathedPop = page.locator('#chippop');
@@ -1559,9 +1553,7 @@ test('a pathless skill popover shows no blank gap where its file line would be',
   }
 });
 
-// A Claude skill mark carries a path only where the host found a SKILL.md on disk for it, the
-// same as a Codex skill whose catalog names one. Checked here at the webview boundary: the
-// mark's accessible name and its popover both name the path the host attached.
+// A skill mark and its popover show the path supplied by the host.
 test(
   'a Claude skill mark with a found path names it in its accessible name and popover',
   { timeout: 60_000 },
@@ -1634,8 +1626,7 @@ test('a skill press follows the shared click-away sequence', { timeout: 60_000 }
   }
   try {
     const page = await browser.newPage();
-    // A page tall enough that the open rail picker and the composer do not meet. The press
-    // this measures has to reach the token, not the picker drawn over it.
+    // Keep the session list picker above the prompt box so it cannot cover the skill token.
     await page.setViewportSize({ width: 1280, height: 1000 });
     await page.setContent(pageHtml());
     const payload = renderPayload();
@@ -3009,8 +3000,8 @@ test(
         'a Claude command inserted through the completion menu did not get the skill mark',
       );
 
-      // A working-directory skill list narrows the highlight to only the names it carries, and it
-      // redraws the marks over text already typed, without touching the box, the caret, or focus.
+      // The working-directory skill list limits highlights to its names.
+      // Updating the list must preserve prompt text, caret, and focus.
       await prompt.fill('Use /land, then /context, /compact, /model, or /mcp.');
       await prompt.evaluate((el) => (el as HTMLTextAreaElement).setSelectionRange(3, 3));
       const withList = composerView(
@@ -3045,8 +3036,7 @@ test(
         0,
         'a Claude command outside a reported skill list lost its highlight once the list arrived',
       );
-      // The reported list names compact, model and mcp too, and all three still stay plain:
-      // the native-command and panel-control exclusions win over skill-list membership.
+      // Native commands and panel controls stay unmarked even when the skill list includes them.
       assert.equal(
         await page.locator('[data-skill="compact"]').count(),
         0,
@@ -3139,8 +3129,8 @@ test(
   },
 );
 
-// This reproduces the delayed webview-focus replay VS Code makes after a click activates its
-// window. The replay must not leave the first click's caret outside the Composer.
+// VS Code replays webview focus after a click activates its window.
+// The prompt text field must retain the click's selection within the activation window.
 test('one click into the Composer survives the host window activation', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -3195,8 +3185,8 @@ test('one click into the Composer survives the host window activation', { timeou
   }
 });
 
-// This catches stale host authority, a session switch that loses either local draft,
-// and a focus request that targets the wrong visible session.
+// Draft restoration must preserve newer local text in each session.
+// Focus requests wait until their target session is visible.
 test('draft revisions and session changes preserve the newest local text', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -3665,8 +3655,8 @@ test('delayed first-prompt replies follow adoption after navigation', { timeout:
   }
 });
 
-// This catches ordering or cleanup drift among slash completion, history, undo, queued
-// restoration, line insertion, and send on the long-lived text box.
+// Completion, undo, redo, queued restoration, and send end prompt recall.
+// Shift+Enter inserts a line break into the text submitted by Enter.
 test('history, undo, redo, queued restore, and send act on the live textarea', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -4143,16 +4133,13 @@ test(
   },
 );
 
-// The send chord, which is the only way a reader who commented on several cards sends
-// without walking back to the box. Focus sits on the card the last comment came from.
-
-// The rail head rests on its count. A test that presses a key inside the filter box opens
-// the box with the magnifying glass first, the way a reader does.
+// Open the session list filter box before sending keys to it.
 async function openRailBox(page: Page): Promise<void> {
   await page.locator('[data-control="railsearch"]').click();
   await page.evaluate(SETTLED);
 }
 
+// The send chord submits comments while focus remains on a turn card.
 const CHORD = `/^Mac/.test(navigator.platform) ? 'Meta+Enter' : 'Control+Enter'`;
 
 async function writeComment(page: Page, key: string, words: string, saveKey: string): Promise<void> {
@@ -4203,8 +4190,7 @@ test(
       const key = (payload.cards as { key: string }[])[0].key;
       await writeComment(page, key, 'Answer this one first.', 'Enter');
 
-      // The host has caught up, so the box knows about the comment the way it does in a
-      // settled panel. This case is the page-level listener alone.
+      // The host supplies the saved comment before the page-level send handler runs.
       const noted = composerView(
         {
           ...COMPOSER,
@@ -4267,8 +4253,8 @@ test('the send chord inside a comment editor saves the comment and sends nothing
     assert.equal((await sentPrompts(page)).length, 0, 'the chord sent the prompt while a comment was open');
     assert.equal(await page.locator('.noteedit').count(), 0, 'the comment editor stayed open');
 
-    // Save and Close are real buttons and not editable targets, so the editable test alone
-    // lets the chord through. A send from there would leave the written comment behind.
+    // Save and Close are buttons, so an editable-target check does not block their send chord.
+    // The open comment editor must block sending.
     await writeComment(page, key, 'Leave this one unsaved.', chord);
     await page.evaluate(`(async () => {
       const card = document.querySelector('[data-key=${JSON.stringify(key)}]');
@@ -4313,8 +4299,8 @@ test('the send chord sends the first comment of a session before the host answer
     const key = (payload.cards as { key: string }[])[0].key;
     await writeComment(page, key, 'Send this before the host replies.', 'Enter');
 
-    // Nothing is posted back. The box still holds the view it had before the comment existed,
-    // so only the local comment store can answer for the empty prompt.
+    // The host has not supplied the saved comment.
+    // Sending an empty prompt must use the local comments.
     assert.equal(
       await page.evaluate(`document.querySelector('.cchips .cchip') !== null`),
       false,
@@ -4370,8 +4356,7 @@ test('the send chord inside the composer text field sends what the box holds', {
     await prompt.press(chord);
     await page.evaluate(SETTLED);
 
-    // The page-level listener refuses a textarea, so the box answers the chord itself or
-    // nothing does.
+    // The page-level listener skips the prompt text field, whose own handler sends the chord.
     const sent = await sentPrompts(page);
     assert.equal(sent.length, 1, 'the chord did nothing inside the box');
     assert.equal(sent[0].text, 'Send this from the box.');
@@ -4420,8 +4405,8 @@ test(
       const link = page.locator(`[data-key=${JSON.stringify(key)}] a[data-link]`).first();
       assert.equal(await link.count(), 1, 'the fixture drew no summary link');
 
-      // Chromium activates a focused link on this chord, which it does not do for a button.
-      // A send the composer refuses must leave that press where the reader put it.
+      // Chromium activates a focused link on the send chord.
+      // With nothing to send, the chord must retain that link action.
       await page.evaluate(`window.__posted = []`);
       await link.focus();
       await link.press(chord);
@@ -4432,7 +4417,7 @@ test(
         'a refused send ate the link the reader was standing on',
       );
 
-      // With something to send, the chord is the composer's and the link stays shut.
+      // With prompt text to send, the chord sends it without opening the focused link.
       await page.locator('#prompt').fill('a prompt worth sending');
       await page.evaluate(SETTLED);
       await page.evaluate(`window.__posted = []`);
@@ -5246,7 +5231,7 @@ test(
             throw new Error('the Composer sash did not schedule a resize frame');
           }
           callback(0);
-          // The extension copy of the state goes once the microtasks of this task have run.
+          // Wait for the microtask that sends the saved state to the host.
           await new Promise<void>((resolve) => {
             queueMicrotask(resolve);
           });
@@ -5353,7 +5338,7 @@ test(
             throw new Error('pointer cancellation did not keep the queued resize frame');
           }
           callback(0);
-          // The extension copy of the state goes once the microtasks of this task have run.
+          // Wait for the microtask that sends the saved state to the host.
           await new Promise<void>((resolve) => {
             queueMicrotask(resolve);
           });
@@ -5718,7 +5703,7 @@ test('a larger editor font keeps a ten-line prompt below the session heading', {
     await page.setContent(themed(pageHtml()));
     await post(page, renderPayload());
     const prompt = page.locator('#prompt');
-    // Sweeps a realistic font size over the real theme to test the live update path.
+    // Increase the editor font size to check the live height update.
     await page.evaluate(`document.body.style.setProperty('--vscode-font-size', '22px')`);
     await prompt.fill(Array.from({ length: 10 }, (_, at) => `line ${at}`).join('\n'));
     await page.evaluate(SETTLED);

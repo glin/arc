@@ -1425,11 +1425,8 @@ function railEnrichmentHarness(
   return new module.exports.Harness(run);
 }
 
-// The real `prepareMetadata`. A test that passes a `SessionNames` also gets the real name
-// reporting the method calls, so what the first rail tells the name owner is under test
-// rather than restated by the harness. A test that passes a derived cache file also gets the
-// provider's startup restore of that file, lifted from the constructor, and the real naming
-// and checkpoint methods, so what a start restores and draws is under test.
+// Extracts prepareMetadata and optional naming methods from PanelProvider.
+// A supplied cache file also enables constructor restore statements and display checkpoint methods.
 function metadataHarness(
   run: (request: ProgressiveRequest, generation: number, signal: AbortSignal) => Promise<ProgressiveResult | null>,
   sessionNames?: SessionNames,
@@ -1529,8 +1526,8 @@ function selectedWindowHarness(
       ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
   );
   assert.ok(owner);
-  // `spendVersion` reads a revision for every key the extracted methods build, so it comes
-  // with them rather than with each caller's list.
+  // spendVersion supplies revisions for keys built by the extracted methods.
+
   const names = new Set([
     'currentSelectedSession',
     'completeSelectedWindow',
@@ -1544,7 +1541,7 @@ function selectedWindowHarness(
     'spendVersion',
     'updateHistoryAfterAcceptedWindow',
     ...extra,
-    // The real evictCache trims derived titles through this.
+    // evictCache calls pruneDerivedTitles.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles'] : []),
   ]);
   const body = owner.members
@@ -1552,8 +1549,8 @@ function selectedWindowHarness(
     .map((member) => member.getText(file))
     .join('\n')
     .replace('} catch (error) {', '} catch (error) { this.lastError = error;');
-  // The multi-session test walks A, B, and C through the real evictCache, so its refresh
-  // records what a reader would see instead of the single-session bookkeeping other tests read.
+  // The eviction harness refreshes all three selected sessions.
+
   const refreshBody = extra.includes('evictCache')
     ? `refresh() {
         this.refreshes++;
@@ -2070,9 +2067,8 @@ test('a completed Codex response stays on the selected timeline after later turn
   }
 });
 
-// A hidden panel opens no watcher, so nothing reports a rollout write while it waits. The
-// held stats must go with the poll, or a panel shown again reports the size the file had
-// when it went away.
+// Stopping polling clears rollout stats because hidden panels receive no watcher updates.
+
 test('stopping the poll drops the rollout stats the panel held', () => {
   const provider = harness(false, true, ['stopPolling']);
   const file = 'rollout.jsonl';
@@ -2980,7 +2976,7 @@ test('opening records the cold pass reads reach the checkpoint and the shared fi
   provider.discovery = Promise.resolve(true);
   provider.codexOpenings = writer;
   provider.derivedCacheFile = null;
-  // The titles are warm, so only the opening records can mark the checkpoint.
+  // Cached titles leave opening records as the only checkpoint changes.
   const checkpoint = {
     dirty: false,
     markChanged() {
@@ -2997,7 +2993,7 @@ test('opening records the cold pass reads reach the checkpoint and the shared fi
     }
   };
   provider.codexColdReads = () => coldOpeningPass(cache, root);
-  // The walk as `allSessions` makes it: the pass read every record, so the revision holds still.
+  // allSessions retains the revision after the opening pass reads every record.
   provider.allSessions = () => {
     writer.setWalk(provider.codexWalk ?? []);
     return provider.partial;
@@ -3011,9 +3007,8 @@ test('opening records the cold pass reads reach the checkpoint and the shared fi
   assert.equal(checkpoint.dirty, false);
 });
 
-// The worker resolves dispatch references on a catalog walk that can come after the one that
-// saw the parent transcript grow. The heading of the dispatched session must not wait for an
-// unrelated transcript to move before it names the session that started it.
+// Resolved dispatch references update the child heading even when no transcript changes.
+
 test('a dispatch resolved with no transcript moving names its parent on the next render', async () => {
   const provider = completeDiscoveryHarness();
   provider.useRefreshGate(refreshWanted);
@@ -3065,8 +3060,8 @@ test('a dispatch resolved with no transcript moving names its parent on the next
   await provider.refresh();
   assert.equal(provider.messages.length, 2, 'the same resolved dispatch repainted the panel on every walk');
 
-  // An archived parent keeps its row, so the heading still names it, and opening it leaves
-  // it archived.
+  // An archived parent retains its row and remains archived when opened.
+
   resolved = [dispatch('archived')];
   await provider.refresh();
   assert.deepEqual(
@@ -3086,16 +3081,15 @@ test('a dispatch resolved with no transcript moving names its parent on the next
     'the chosen session lost its parent when the reader came back to it',
   );
 
-  // A parent the workspace does not list gets no press, because a selection of an unknown id
-  // falls to the newest session.
+  // A parent absent from the workspace catalog gets no navigation control.
+
   resolved = [dispatch('gone')];
   await provider.refresh();
   assert.equal(parentOfChild(), null, 'a parent with no session row was named');
 });
 
-// The walk's spend sources, the render and the search each read the parent edges over the
-// catalog, each in its own order. One walk builds the edges once, and a search and the
-// selection after it reuse them, so neither pays a set, sort or join of every id.
+// Catalog walks build parent edges once. Search and selection reuse those edges across different row orders.
+
 test('a walk builds the parent edges once, and a search and a selection reuse them', async () => {
   const provider = completeDiscoveryHarness(
     undefined,
@@ -3139,8 +3133,8 @@ test('a walk builds the parent edges once, and a search and a selection reuse th
   provider.sessionSpendSourceIndex = { revision: 0, update: () => new Map() };
   provider.searchCorpus = () => [];
   provider.archivedSessions = () => new Set();
-  // The walk hands the spend sources its own listing, parents before children, and the search
-  // reads the held catalog in that order too. The render reads the catalog by activity.
+  // Spend sources and search use parent-first order. Rendering uses activity order.
+
   const walkOrder = () => [...provider.partial].reverse();
   provider.allSessions = (reuseCatalog = false) => {
     if (reuseCatalog) {
@@ -3172,11 +3166,8 @@ test('a walk builds the parent edges once, and a search and a selection reuse th
   assert.equal(builds.length, 1, 'a search or the selection after it rebuilt the parent edges');
 });
 
-// A Claude subagent opens as a session of its own. Its row comes from the worker's child files,
-// keyed by the bare agent id, in the same hand-off as the reference that names it. Its heading
-// names the session that started it on the render that hand-off causes, without waiting for
-// an unrelated transcript to move. A forked parent repeats the `Agent` result, and its
-// reference never resolves to a file, so it must not take the subagent from its parent.
+// Resolved child files establish subagent ownership. An unresolved reference from a fork cannot replace the resolved parent.
+
 test('a subagent the worker hands over after the first render names its parent', async () => {
   const provider = completeDiscoveryHarness();
   provider.useRefreshGate(refreshWanted);
@@ -3210,8 +3201,8 @@ test('a subagent the worker hands over after the first render names its parent',
     toolUseIds: [`task-${agentId}`],
   });
   const children = [child('a1b2c3', 4), child('d4e5f6', 3)];
-  // The catalog lists the child transcripts and the references from the first walk, so no file
-  // and no child revision moves when the worker pairs the children with their parent.
+  // Pairing changes neither transcript revisions nor the catalog entries.
+
   provider.partial = parents;
   provider.catalog = { sessions: [...parents, ...children] };
   let paired = false;
@@ -3234,7 +3225,7 @@ test('a subagent the worker hands over after the first render names its parent',
   await vi.waitFor(() => assert.equal(last().showing, 'a1b2c3'));
   assert.equal(parentOf('a1b2c3'), null, 'a subagent named a parent before the worker paired it');
 
-  // Only the pairing changes from here, so only the parents key can move the listing.
+  // Only the parent relationship changes.
   const before = provider.messages.length;
   paired = true;
   await provider.refresh();
@@ -3251,9 +3242,8 @@ test('a subagent the worker hands over after the first render names its parent',
   assert.equal(provider.messages.length, drawn, 'the same hand-off repainted the panel on every walk');
 });
 
-// A Codex subagent with a session row names the thread that started it. The Codex listing is
-// replaced on every walk, and a listing that moves the child to another parent moves the
-// heading with it.
+// A Codex subagent heading follows the parent session named by the current listing.
+
 test('a Codex subagent names its parent thread and follows a replaced listing', async () => {
   const provider = completeDiscoveryHarness();
   provider.useRefreshGate(refreshWanted);
@@ -3320,8 +3310,8 @@ test('restored startup waits for all required metadata before its first payload'
   assert.equal(provider.messages.length, 1);
 });
 
-// Refresh and metadata decisions run together. Only filesystem discovery and worker failure
-// delivery are controlled. Successful requests use the production worker and real records.
+// The harness controls discovery and failed worker requests. Successful requests read fixture records through the production worker.
+
 function titlePublicationHarness(sessions: any[], run: any, cacheFile?: string): any {
   const provider = completeDiscoveryHarness(
     undefined,
@@ -3831,7 +3821,7 @@ for (const agent of ['codex', 'claude']) {
         },
       );
       provider._showing = selected.sessionId;
-      // Saved lifetime starts keep the glance cardinality stable during enrichment.
+      // Saved lifetime starts keep the session list row count stable during enrichment.
       provider.lifetimeRailFacts = () =>
         Object.fromEntries([selected, session, later].map((row) => [row.sessionId, { newestTurnStartedAt: 1 }]));
       const drawnName = () => provider.messages.at(-1).rail.find((row: any) => row.id === session.sessionId).label;
@@ -3959,14 +3949,12 @@ test('metadata completed before another append keeps the revision that supplied 
   );
 });
 
-// Every Claude session on the first rail reaches the name owner, whether its facts came from
-// this read or from the entry the last run left. A session the owner never hears about draws
-// its stored label until something else reports it, and a rename or a parse then has nothing
-// to outrank.
+// The first session list reports names from new reads and cached entries to SessionNames.
+
 test('the first rail reports the name of a session it read and of one it kept', async () => {
   const names = new SessionNames();
-  // The name a parse raised for the kept session before this rail run, which outranks the
-  // `generated` name its stored entry holds.
+  // The parsed custom name outranks the cached generated name.
+
   names.observe(
     'kept',
     { label: 'Owner name', fullLabel: 'Owner name', source: 'custom', at: 15 },
@@ -4029,11 +4017,8 @@ test('the first rail reports the name of a session it read and of one it kept', 
   );
 });
 
-// Most of a workspace's catalog is already in the derived cache, and the branch that answers
-// those sessions reads nothing and spends none of the budget. A stat per session there is
-// synchronous work on the extension host thread that grows with the catalog and nothing
-// bounds. `revisionOf` is where this loop reaches the file system, so its calls are counted.
-// A fixture of two sessions cannot show the cost, so this one holds five hundred.
+// Cached metadata consumes no read budget. Count revisionOf calls across 500 cached sessions to detect per-session filesystem work.
+
 test('a first rail over a cached catalog reads no file for the sessions it keeps', async () => {
   const names = new SessionNames();
   const sessions = Array.from({ length: 500 }, (_unused, index) => ({
@@ -4074,10 +4059,8 @@ test('a first rail over a cached catalog reads no file for the sessions it keeps
   assert.equal(names.get('cached-499')?.label, 'Cached name', 'a cached session never reported its name');
 });
 
-// The budget charges a prompt head to every large Claude session before its read, because
-// nothing knows whether the tail carries a title until it is read. A titled session read
-// 4 KiB of head instead, so the first rail has that much more to spend on the sessions after
-// it.
+// Large Claude sessions reserve a prompt-head read. A title in the tail reduces the actual head read to 4 KiB.
+
 test('the first rail gives back the prompt head a titled session did not read', async () => {
   const size = 1024 * 1024;
   const sessions = Array.from({ length: 400 }, (_, index) => ({
@@ -4116,9 +4099,8 @@ test('the first rail gives back the prompt head a titled session did not read', 
   provider.revision = { size, mtimeMs: 1, dev: 1, ino: 2 };
 
   assert.equal(await provider.prepareMetadata(sessions, 1, new AbortController().signal), true);
-  // Counted from the constants rather than from the refund itself, so a refund that gives
-  // back too much reads more sessions than this and a refund that gives back too little
-  // reads fewer. A charge with no refund at all reaches 170.
+  // The expected read count uses fixed head and tail charges and the refunded head bytes.
+
   const charge = 256 * 1024 + SESSION_HEAD_BYTES;
   const net = charge - (SESSION_HEAD_BYTES - HEAD_KEY_BYTES);
   assert.equal(
@@ -4138,10 +4120,8 @@ test('the first rail gives back the prompt head a titled session did not read', 
   );
 });
 
-// A workspace whose derived cache file an older build wrote, before a `VERSION` bump. It
-// names one Codex session, one Claude session and one Claude child transcript. A hundred
-// large Codex sessions sit ahead of the first two in the catalog, which is more than one
-// bounded metadata pass reads.
+// The fixture cache uses a different VERSION and retains Codex, Claude, and child names beyond the first metadata pass.
+
 function bumpedDerivedCache() {
   const cacheFile = path.join(tempDir('derived-names-'), 'derived-session-cache.json');
   const codex = {
@@ -4265,9 +4245,8 @@ test('a bounded pass after a derived cache version bump keeps the stored names o
   );
 });
 
-// The workspace of bumpedDerivedCache through the real catalog walk, the real child discovery
-// and the real naming. The metadata pass is the harness's own and reads nothing, as the bounded
-// first pass does for a session far down the catalog. The walk lists the files `codexWalk` holds.
+// Restores a derived-cache fixture through catalog discovery and naming methods.
+// The metadata harness reads no source bytes. codexWalk controls the returned Codex listing.
 function bumpedCatalogHarness() {
   const { cacheFile, codex, claude, child } = bumpedDerivedCache();
   const codexWalk = [codex];
@@ -4348,8 +4327,8 @@ test('the first rail after a derived cache version bump draws every stored name,
   );
 });
 
-// A session deleted after the first child discovery answered. The next catalog walk drops its
-// carried name, and every session the walk still lists keeps its own, a Claude child included.
+// Removing a session from the catalog removes its carried name and retains names for listed sessions.
+
 test('a catalog walk after child discovery drops the carried name of a session deleted since', async () => {
   const { provider, codex, claude, child, codexWalk } = bumpedCatalogHarness();
   await provider.refresh(true);
@@ -4367,7 +4346,7 @@ test('a restart between bounded passes still draws the stored name of a session 
   const { cacheFile, codex, claude, catalog, run } = bumpedDerivedCache();
   const first = metadataHarness(run, new SessionNames(), cacheFile);
   assert.equal(await first.prepareMetadata(catalog, 1, new AbortController().signal), true);
-  // The checkpoint after the first pass, and then the editor stops.
+  // Save the first pass checkpoint before restarting.
   assert.equal(first.writeDerivedCache(), true);
 
   const restarted = metadataHarness(
@@ -4510,9 +4489,8 @@ test('a local draft renders during discovery without replacing the discovery req
   );
 });
 
-// The reported trigger stream: each catalog walk waits 500 ms on the worker, and the watcher
-// delivers a batch with changed paths every 200 ms, so a new trigger arrives before the walk ends.
-// Each scenario also runs with batches a second apart, which lets every walk end before the next batch.
+// Worker walks take 500 ms. Watcher batches arrive every 200 ms or every second, covering overlapping and separate walks.
+
 const WORKER_AWAIT_MS = 500;
 const WATCHER_BATCH_MS = 200;
 const SLOW_WATCHER_BATCH_MS = 1_000;
@@ -4544,8 +4522,8 @@ function watcherStream(provider: any, every: number | null): () => void {
   return () => clearInterval(stream);
 }
 
-// Advances the fake clock in small steps until the condition holds. Answers null when it holds
-// within the bound, and otherwise what the scenario missed.
+// Advance fake timers until the condition holds or the deadline passes. Return the missing condition on timeout.
+
 async function reachWithinBound(reached: () => boolean, missed: () => string): Promise<string | null> {
   for (let elapsed = 0; elapsed < RENDER_BOUND_MS && !reached(); elapsed += 50) {
     await vi.advanceTimersByTimeAsync(50);
@@ -4574,8 +4552,8 @@ function streamedCatalogHarness(
   provider.catalog = { sessions: provider.partial };
   provider.authoritativeCatalog = provider.partial;
   provider.sessionRows = [{ id: 'existing', agentKey: 'claude', shown: true }];
-  // The composer that usagePayload posts, built the way composerState and stateForRow build it:
-  // the row on screen, its draft profile, and its live presses.
+  // Prompt box state includes the selected row, its draft profile, and live controls.
+
   provider.composerState = () => {
     const row = provider.sessionRows.find((one: any) => one.id === provider.showing);
     return row
@@ -4596,8 +4574,8 @@ function streamedCatalogHarness(
   return provider;
 }
 
-// createDraft renders from the held catalog before any await, so New reaches the panel under
-// the stream. This test keeps that path fast while the refresh changes.
+// createDraft posts the held catalog synchronously while watcher batches continue.
+
 test('New posts its draft composer within the bound while watcher batches keep arriving', async () => {
   vi.useFakeTimers(STREAM_TIMERS);
   const provider = streamedCatalogHarness(false, ['newSession', 'launcherFor']);
@@ -4657,8 +4635,8 @@ const SEND_SCOPE = {
   LIVE_ACTIVITY_STALE_MS: 30 * 60 * 1000,
 };
 
-// The first prompt of a new draft goes through the real send, adoptDraft, and livePressAnswered.
-// The agent accepts it as session `fresh`, and send then refreshes to show that session.
+// The accepted first prompt adopts session fresh and refreshes its prompt box state.
+
 async function sentPromptPosts(every: number | null): Promise<string | null> {
   vi.useFakeTimers(STREAM_TIMERS);
   const provider = streamedCatalogHarness(false, ['send', 'noteLive', 'adoptDraft', 'livePressAnswered'], SEND_SCOPE);
@@ -4727,8 +4705,8 @@ test('a prompt sent from a new draft posts its session within the bound while wa
   assert.equal(await sentPromptPosts(WATCHER_BATCH_MS), null);
 });
 
-// No watcher batch arrives, so only the refresh that send asks for after the agent accepts the
-// prompt can draw the new session.
+// Without watcher batches, the refresh after prompt acceptance must draw the adopted session.
+
 test('a prompt sent from a new draft posts its session when no other refresh trigger arrives', async () => {
   assert.equal(await sentPromptPosts(null), null);
 });
@@ -5191,8 +5169,8 @@ async function finishedTurnReachesSelected(every: number): Promise<string | null
     await provider.completeSelectedWindow('selected', 0);
     assert.equal(provider.cache.get(selected.file)?.revision.size, 10, 'the selected window was not accepted');
     await vi.advanceTimersByTimeAsync(1_000);
-    // The response finishes: the transcript grows on disk, the next catalog walk lists the new
-    // size, and the watcher delivers a batch that names the selected transcript.
+    // The completed response grows the selected transcript. The next catalog lists its new revision and the watcher names its path.
+
     disk.set(selected.file, { size: 20, mtimeMs: 20 });
     provider.partial = [{ ...selected, size: 20, mtimeMs: 20 }, ...provider.partial.slice(1)];
     provider.catalog = { sessions: provider.partial };
@@ -5379,8 +5357,8 @@ test('a compatible selected checkpoint is reused until the file changes', async 
   }
 });
 
-// The reported symptom: a walk from session A to B to C and back to A reads and parses A
-// again, and the reader sees the loading status for a session they viewed moments ago.
+// Returning to a cached session must reuse its read without showing a loading status.
+
 test('a walk from A to B to C and back to A reads each session once', async () => {
   let attempts = 0;
   let provider: any;
@@ -5431,8 +5409,8 @@ test('a walk from A to B to C and back to A reads each session once', async () =
   }
 });
 
-// A session gone from the catalog loses its carried name with its stored entry, or the saved
-// file keeps the name of a deleted session for good.
+// Eviction removes the stored entry and carried name of a session absent from the catalog.
+
 test('eviction drops the stored entry and the carried name of a session the catalog no longer lists', () => {
   const provider = selectedWindowHarness(() => Promise.resolve(null), ['evictCache']);
   const kept = { file: 'kept.jsonl', sessionId: 'kept', agent: 'claude', size: 10, mtimeMs: 10, dev: 1, ino: 1 };
@@ -5455,8 +5433,8 @@ test('eviction drops the stored entry and the carried name of a session the cata
   );
 });
 
-// The reported symptom: selecting a session the panel already holds runs two selected-only
-// refreshes, one from the selection and a second from the selected read that finds nothing to read.
+// Selecting a cached session must draw its retained window with one selected-only refresh.
+
 test('selecting a cached session runs one selected-only refresh that draws its held window', async () => {
   let attempts = 0;
   let provider: any;
@@ -5491,8 +5469,8 @@ test('selecting a cached session runs one selected-only refresh that draws its h
   assert.equal(provider.refreshes - before, 1, 'selecting a cached session ran more than one selected-only refresh');
 });
 
-// The reported symptom: a background subagent of the selected session writes its own
-// transcript, and on each write the reader sees the loading row below the unchanged card.
+// Subagent transcript writes must retain the unchanged parent window without a loading row.
+
 test.each([99999, 100000])(
   'a running subagent writing its transcript keeps the selected read and shows no loading row from %ims',
   async (initialMtime) => {
@@ -5606,8 +5584,8 @@ test.each([99999, 100000])(
   },
 );
 
-// The reported symptom: a subagent finished, then a subagent it launched kept working, and the
-// launcher's row kept the cost it had when it finished.
+// Nested subagent writes must update the finished launcher's cost.
+
 test('a nested subagent that appears or grows after its launcher finished moves the launcher row cost', async () => {
   const folder = tempDir('panel-startup-nested-');
   const launcher = path.join(folder, 'agent-a1.jsonl');
@@ -5726,8 +5704,8 @@ test('a nested subagent that appears or grows after its launcher finished moves 
   );
 });
 
-// A Codex subagent writes its own rollout the same way, and the parent's turns stay where
-// they are.
+// Codex subagent rollout writes retain the parent window.
+
 test('a running Codex subagent writing its rollout keeps the selected read and shows no loading row', async () => {
   const child = path.join(tempDir('panel-startup-codex-subagent-'), 'rollout-child.jsonl');
   fs.writeFileSync(child, JSON.stringify({ type: 'turn_context' }) + '\n');
@@ -5807,9 +5785,8 @@ test('a running Codex subagent writing its rollout keeps the selected read and s
   );
 });
 
-// The parent can close its turn while the host waits for a child's cost figures. The rail row
-// answers from the metadata cache and already shows the turn finished, so the selected card
-// must not keep the retained read that still calls it running.
+// A parent write during retained child-cost hydration must replace the selected card's running state.
+
 test('a parent write during a subagent cost refresh reaches the selected card', async () => {
   const child = path.join(tempDir('panel-startup-parent-write-'), 'agent-child.jsonl');
   const appendChild = (id: string) =>
@@ -5905,8 +5882,8 @@ test('a parent write during a subagent cost refresh reaches the selected card', 
   );
 });
 
-// A finished subagent that the parent resumes appends to its own transcript again. Its cost
-// moves on every write, and the turns of the selected session stay the same.
+// Resuming a subagent updates its cost while retaining the selected session's turns.
+
 function resumedSubagentProvider(tailShowsChild: boolean, extra: string[] = []) {
   const child = path.join(tempDir('panel-startup-resumed-'), 'agent-child.jsonl');
   const append = (id: string, output: number) =>
@@ -5990,8 +5967,8 @@ function resumedSubagentProvider(tailShowsChild: boolean, extra: string[] = []) 
   ];
   provider.claudeChildren = [];
   provider.codexSubagents = [];
-  // The refresh after a watcher batch draws the panel, then starts selected work when the
-  // read or its cost figures are stale.
+  // Refresh starts selected work when its window or cost facts are stale.
+
   const settle = async () => {
     provider.refresh();
     if (!provider.progressiveCurrent(provider.session) || !provider.agentFactsCurrent(provider.session)) {
@@ -6155,8 +6132,8 @@ test('a selected read failure becomes visible state and a later read recovers', 
   assert.ok(provider.cache.has('selected.jsonl'), 'the retry did not publish the selected window');
 });
 
-// A read failure on screen while the panel holds the current window leaves the read nothing to
-// fetch. Clearing the failure must still draw, or the failed state stays on screen.
+// Clearing a read failure must refresh even when the selected window needs no read.
+
 test('a selected read that finds its window held clears a drawn read failure with one refresh', async () => {
   let attempts = 0;
   const provider = selectedWindowHarness(async (_request, generation) => {
@@ -6343,7 +6320,7 @@ function heldLedgerFile(): Error {
   return Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
 }
 
-// A panel that already shows a rail, for tests that count which events word the rail again.
+// The harness supplies session list payloads and records later posts.
 function railPostHarness(extraMethods: string[], scope: Record<string, unknown> = {}): any {
   const provider = completeDiscoveryHarness(undefined, false, ['postRail', 'post', 'sendToHost', ...extraMethods], {
     normalizePanelState,
@@ -6383,7 +6360,7 @@ function projectSpendHydrationHarness(
   return provider;
 }
 
-// The unread counts the host words from the read state, so a read save moves a rail input.
+// Saved read watermarks supply the session list unread counts.
 function readCounts(provider: any): void {
   provider.unreadCounts = () =>
     new Map(
@@ -6404,8 +6381,8 @@ test('opening a session leaves the rail to the render that selection asked for',
     [],
     'the selection words the rail twice, once in its render and once from the read state it saved',
   );
-  // The refresh that selection asked for ends here. Its render never posted, so the rail the
-  // save left to it is owed and is posted now.
+  // A selection refresh that posts no render still owes the session list update.
+
   await vi.waitFor(() => assert.equal(owed.rails().length, 1));
   assert.equal(owed.railSeedSkipped, false);
 
@@ -6416,7 +6393,7 @@ test('opening a session leaves the rail to the render that selection asked for',
   provider.saveState({ read: ['session-a:10', 'session-b:20'], readTo: { 'session-a': 10, 'session-b': 20 } });
   assert.equal(provider.rails().length, 1, 'a card the reader did not open keeps a count it has lost');
 
-  // The owed rail settles on the rail the second save already posted, which carries both marks.
+  // The second save already posts both read marks, satisfying the pending session list update.
   await vi.waitFor(() => assert.equal(provider.railSeedSkipped, false));
   assert.equal(provider.rails().length, 1, 'the owed rail was worded again over unmoved inputs');
 
@@ -6427,7 +6404,7 @@ test('opening a session leaves the rail to the render that selection asked for',
   assert.equal(provider.rails().length, 2, 'a read mark made once the selection settled never reaches the rail');
 });
 
-// A click waits on everything a refresh runs before the post the panel paints from.
+// The harness retains the refresh stages that precede the render post.
 function paintHarness(extraMethods: string[] = [], scope: Record<string, unknown> = {}): any {
   const session = {
     file: 'claude.jsonl',
@@ -6462,8 +6439,8 @@ test('a refresh posts the render the panel paints from before it offers a spend 
   recordPosts(provider, order);
 
   await provider.refresh(true);
-  // Off the click path is not off the clock. The offer the refresh handed to a timer runs,
-  // so the figures it indexes still reach the rail.
+  // The deferred spend offer must run after the render post.
+
   await vi.waitFor(() => assert.ok(order.includes('spend sources offered')));
   assert.ok(
     order.indexOf('render posted') < order.indexOf('spend sources offered'),
@@ -6716,8 +6693,8 @@ test('a process exit refreshes a background subagent row without a transcript wr
   );
 });
 
-// A provider holding one workspace's ledger, with the lifetimes a waiting spend offer has to
-// survive and the ones it has to end on.
+// The harness retains spend offers across panel changes and cancels them at workspace changes or disposal.
+
 function spendOfferHarness(scope: Record<string, unknown> = {}): any {
   const provider = completeDiscoveryHarness(
     undefined,
@@ -6788,8 +6765,8 @@ function spendOfferHarness(scope: Record<string, unknown> = {}): any {
   return provider;
 }
 
-// Marks the offer rather than its sources, so the order the ticks ran in is readable even
-// when one of them was supposed never to run.
+// Each offer carries a marker to identify its timer execution.
+
 function markedOffer(provider: any, mark: string): void {
   provider.scheduleProjectSpendIndex(new Map([['mark', mark]]), null);
 }
@@ -6878,8 +6855,8 @@ test('a spend offer indexes the sources of the workspace that scheduled it', asy
   };
   provider.claudeSpendSources = [{ file: 'listed.jsonl', primary: true }];
   markedOffer(provider, 'listed');
-  // A listing for another workspace lands while the offer waits, and replaces the very lists
-  // the offer would otherwise read on its own tick.
+  // Another workspace listing replaces the source lists while the scheduled offer waits.
+
   provider.claudeSpendSources = [{ file: 'elsewhere.jsonl', primary: true }];
 
   await vi.waitFor(() => assert.equal(offered.length, 1));
@@ -6908,8 +6885,8 @@ test('a spend offer whose workspace moved under it queues nothing', async () => 
   );
 });
 
-// A later offer is the clock. Timers run in the order they were set, so an offer set after a
-// cancellation reaching its tick proves the cancelled one has had its turn and did not run.
+// The later offer runs after the cancelled offer's scheduled tick, establishing that cancellation prevented execution.
+
 for (const ending of ['a changed workspace', 'a disposed provider']) {
   test(`${ending} drops a spend offer that is still waiting`, async () => {
     const provider = spendOfferHarness();
@@ -6942,8 +6919,8 @@ test('a hidden panel and a shut tab leave a spend offer running', async () => {
     ran.push(String(revisions.get('mark')));
   };
   markedOffer(provider, 'offered');
-  // The reader looks at something else and shuts one of the panel's tabs. Neither ends the
-  // ledger's work, which Project cost is asked for the moment the panel is looked at again.
+  // Hiding or closing a panel leaves workspace spend indexing active.
+
   provider.hosts = [{ webview: {}, visible: () => false }];
   provider.readyHosts = new Set();
 
@@ -6961,7 +6938,7 @@ test('a restart with an unfinished ledger keeps its settled figures until the of
     queued = true;
   };
 
-  // What a restored tab asks a refresh for, before the offer that refresh scheduled has run.
+  // A restored tab reads busy state before the scheduled offer runs.
   markedOffer(provider, 'restart');
   assert.equal(
     provider.projectSpendBusy(),
@@ -7330,8 +7307,8 @@ test('a rail payload keeps its context facts through a metadata read that found 
     starts: { starts: [10], whole: true },
     foldedLabel: 'a session',
   };
-  // The turn that is running has filled the tail with answers, so this read found no prompt
-  // and no facts at all.
+  // The metadata read returns no prompt facts while the turn runs.
+
   const running = carryDerivedTitleFacts(answered, { ...answered, mtimeMs: 11, size: 40, stats: null });
   provider.metaFor = () => running;
   await provider.refresh(true);
@@ -7377,8 +7354,8 @@ test('a refresh derives the metadata figures again only for the session whose fa
   assert.deepEqual(derived, [grown], `a refresh after one session changed derived ${derived.length} figures`);
   assert.equal(provider.metadataStatsBySession.b, grown, 'the changed session kept its old figures');
 
-  // A renamed title, an enriched title and a session that moved in the rail replace their
-  // objects, and the facts stay the same objects.
+  // Title and agent-run changes replace metadata entries. Activity changes replace catalog rows. All retain the same stats objects.
+
   const figures = provider.metadataStatsBySession;
   entries.set('a.jsonl', { ...entries.get('a.jsonl')!, title: 'Renamed' });
   entries.set('c.jsonl', { ...entries.get('c.jsonl')!, agentRun: true });
@@ -7566,8 +7543,8 @@ test('read saves and unchanged rail posts skip payload builds', () => {
   const metadataStats = {};
   const hidden = new Set<string>();
   let inputBuilds = 0;
-  // Built afresh on every post, the way the host builds it: new maps and a new row list over
-  // the same rows and the same held figures.
+  // Each post receives new containers over the same rows and figures.
+
   provider.railInputFor = () => {
     inputBuilds++;
     return {
@@ -7686,8 +7663,8 @@ test('the lifetime figures hold through a spend pass that does not move them', (
     provider.projectSpendIndexing = true;
     assert.equal(read(), first, 'a spend pass starting threw away the figures it still shows');
 
-    // The pass reads part of the file. The ledger revision moves, and the display still draws
-    // the settled record.
+    // A partial read advances the ledger revision while retaining settled display records.
+
     provider.projectSpendQueue = [{ file: 'a.jsonl', agent: 'claude', primary: true }];
     provider.indexNextProjectSpendFile();
     assert.equal(provider.projectSpendRevision, 1);
@@ -7878,7 +7855,7 @@ test('a rail post words the rail again when an input held by identity is replace
   provider.postRail(false);
   assert.equal(provider.rails().length, 1);
 
-  // The same rows in a new list word the same rail.
+  // A new list containing the same rows retains the posted session list.
   provider.sessionRows = [a, b];
   provider.postRail(true);
   assert.equal(provider.rails().length, 1, 'a new list over the same rows worded the rail again');
@@ -8009,9 +7986,8 @@ test('a spend pass that settles a new cost posts a rail with that cost', () => {
 test('running agents that only grow their transcripts start no refresh from a spend pass and save on the maximum wait', () => {
   vi.useFakeTimers();
   try {
-    // Three agents append to their own transcripts, and five idle sessions keep theirs. The
-    // files stand in for the disk: a stat reads their current size, and a read settles the
-    // whole file.
+    // Three sessions append while five remain idle. The simulated disk supplies current stats and complete reads.
+
     const growing = ['a.jsonl', 'b.jsonl', 'c.jsonl'];
     const idle = Array.from({ length: 5 }, (_, at) => `idle-${at}.jsonl`);
     const sessionOf = (file: string) => file.replace('.jsonl', '');
@@ -8123,14 +8099,13 @@ test('running agents that only grow their transcripts start no refresh from a sp
     }));
     provider.lifetimeFigures = new SessionFiguresCache();
     provider.lifetimeRail = new SessionFiguresCache();
-    // A rail post reads the rail facts through the outcomes of the catalog it draws.
+    // The catalog supplies outcomes for session list fact projection.
     provider.catalog = { sessions: [] };
     provider.scheduleProjectSpendMidnight = () => {};
     provider.performanceCounters.recordLedgerSave = () => {};
     provider.projectSpendSaveScheduler = provider.newProjectSpendSaveScheduler();
-    // The stub models only the spend offer of a refresh. It offers every transcript at its
-    // current size on every call. The real refresh offers only when a listed transcript moved
-    // or the integrity interval passed. Any refresh the test does not start comes from a pass.
+    // The refresh stub offers every transcript at its current size. Unrequested refreshes identify indexing-triggered work.
+
     let watching = false;
     let passRefreshes = 0;
     provider.refresh = () => {
@@ -8152,8 +8127,8 @@ test('running agents that only grow their transcripts start no refresh from a sp
       `the first pass after the ledger was restored started ${passRefreshes} full refreshes`,
     );
 
-    // One watcher event, and so one refresh, for each append. Each agent appends every 300 ms,
-    // a third of a period after the one before it.
+    // Each simulated append triggers one refresh. The three agents append every 300 ms, offset by 100 ms.
+
     let events = 0;
     for (const [at, file] of growing.entries()) {
       setTimeout(() => {
@@ -8184,8 +8159,8 @@ test('running agents that only grow their transcripts start no refresh from a sp
         `${perSecond(saves - savesBefore)} ledger saves and ` +
         `${perSecond(lifetimeRecalculated.length - lifetimeBefore)} lifetime figure recalculations a second`,
     );
-    // A grown transcript recalculates the figures and rail facts of the one session that reads
-    // it. An idle session keeps its held figures, and a change is recalculated at most once.
+    // Changed transcripts recalculate only their own figures and session list facts, at most once per change.
+
     const recordChanges = changes.length - changesBefore;
     for (const [figures, recalculated] of [
       ['lifetime figures', lifetimeRecalculated.slice(lifetimeBefore)],
@@ -8206,15 +8181,15 @@ test('running agents that only grow their transcripts start no refresh from a sp
         `${recordChanges} record changes recalculated the ${figures} of ${recalculated.length} sessions`,
       );
     }
-    // Appends never leave the quiet wait, so the maximum wait paces the ledger saves.
+    // Continuous appends reset the quiet wait, so the maximum wait schedules saves.
     const count = saves - savesBefore;
     const allowed = (seconds * 1_000) / PROJECT_SPEND_SAVE_MAX_MS;
     assert.ok(
       count >= 1 && count <= allowed,
       `over ${seconds} seconds of appends the ledger saved ${count} times, and the save scheduler allows 1 to ${allowed}`,
     );
-    // The pacing never holds a change back longer than the maximum wait. The last changes of the
-    // run have no save yet, because their maximum wait has not passed.
+    // Check save delays only for changes whose maximum wait has elapsed.
+
     const late = changes.flatMap((at, index) => {
       if (at < appendsFrom || at > Date.now() - PROJECT_SPEND_SAVE_MAX_MS) {
         return [];

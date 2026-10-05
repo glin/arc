@@ -1,31 +1,21 @@
-// Where the reader has been, so that Back returns there.
-//
-// A place is a session. That is the whole of it today: the content search engine has no
-// control that opens it, so there is no second kind of view to come back to, and a query
-// nobody can type is not a place. When the rail's search control ships, a place gains the
-// query beside the session and everything below keeps its shape.
-//
-// The walk is called a trail because the panel already says history for two other things: how
-// far back a transcript is read, and the prompts the composer walks through with the Up
-// arrow. A third meaning for the same word would make each of the three harder to read.
+// Tracks visited sessions for Back and Forward navigation.
+// The trail is separate from transcript depth and prompt history.
 
 export interface Trail {
   // Oldest first. The reader moves along it and never edits it in the middle.
   places: string[];
-  // Where the reader stands. Minus one on an empty trail, which is the only trail with
-  // nowhere to stand.
+  // Current position, or -1 when the trail is empty.
   at: number;
 }
 
-// How far back the trail remembers. Old enough to cover an afternoon of moving between
-// sessions, and short enough that the walk stays somewhere a person can hold.
+// Maximum retained visited sessions.
 export const PLACE_LIMIT = 50;
 
 export function emptyTrail(): Trail {
   return { places: [], at: -1 };
 }
 
-// Where the trail stands now, or null when it stands nowhere.
+// Returns the current session, or null outside the trail.
 export function trailPlace(trail: Trail): string | null {
   return trail.at >= 0 && trail.at < trail.places.length ? trail.places[trail.at] : null;
 }
@@ -38,20 +28,13 @@ export function canStepForward(trail: Trail): boolean {
   return trail.at >= 0 && trail.at < trail.places.length - 1;
 }
 
-// The reader went somewhere.
-//
-// A visit ends the forward walk, the way every browser does it: the places after this one
-// describe a route the reader has just left, and keeping them would offer Forward into a
-// past that no longer follows from here.
+// Records a session visit and removes the forward entries after the current position.
 export function visitPlace(trail: Trail, session: string): Trail {
-  // No session is not a place. The panel passes through this state whenever a draft is
-  // abandoned or a transcript disappears, and recording it would put a stop on the trail
-  // that draws nothing when the reader returns to it.
+  // Ignore an empty session id because it cannot identify a navigable session.
   if (!session) {
     return trail;
   }
-  // Standing still. A second press on the session already open must not fill the trail
-  // with a place the reader cannot tell from the one before it.
+  // Ignore a repeat visit to the current session.
   if (trailPlace(trail) === session) {
     return trail;
   }
@@ -68,16 +51,12 @@ export function stepForward(trail: Trail): Trail | null {
   return canStepForward(trail) ? { places: trail.places, at: trail.at + 1 } : null;
 }
 
-// The sessions that still exist. A draft the reader abandoned and a transcript that was
-// deleted both leave a place pointing at nothing, and Back to nothing shows the newest
-// session instead, which reads as the press having done something else entirely.
+// Removes visits to sessions that no longer exist.
 export function prunePlaces(trail: Trail, live: Set<string>): Trail {
   return rebuild(trail, (place) => (live.has(place) ? place : null));
 }
 
-// A draft is filed under an invented id until the agent reports the real one. The trail has
-// to follow that rename, because the invented id stops existing the moment it is replaced and
-// every place holding it would be pruned away.
+// Replaces provisional session ids with their actual ids before pruning.
 export function renamePlace(trail: Trail, from: string, to: string): Trail {
   if (!from || !to || from === to) {
     return trail;
@@ -85,17 +64,12 @@ export function renamePlace(trail: Trail, from: string, to: string): Trail {
   return rebuild(trail, (place) => (place === from ? to : place));
 }
 
-// Rewrite every place, dropping the ones that came back null, and leave the reader standing
-// as close as possible to where they stood.
-//
-// Neighbours that become equal are folded into one. Removing B from A, B, A leaves the reader
-// with two presses that both draw A, which looks like a Back that did nothing.
+// Maps visited sessions, removes null results, and collapses adjacent duplicates.
+// Preserve the nearest surviving position at or before the current one.
 function rebuild(trail: Trail, next: (place: string) => string | null): Trail {
   const places: string[] = [];
-  // Where the reader ends up: the last surviving place at or before where they stood, so a
-  // pruned trail steps back rather than forward into places they have not seen. When the place
-  // they stood on and everything before it has gone, the oldest survivor is the only answer
-  // left, and it lies ahead of them.
+  // Select the last surviving position at or before the current position.
+  // If none survives there, select the oldest remaining session.
   let at = -1;
   for (let i = 0; i < trail.places.length; i += 1) {
     const place = next(trail.places[i]);
@@ -112,9 +86,7 @@ function rebuild(trail: Trail, next: (place: string) => string | null): Trail {
   return { places, at: places.length ? Math.max(at, 0) : -1 };
 }
 
-// The oldest places go first. The reader walking back from the newest end reaches the cut
-// long after they have stopped caring, and the alternative, refusing the newest place, would
-// lose the one they are standing on.
+// Remove oldest visits while retaining the current position relative to the remaining list.
 function capped(trail: Trail): Trail {
   if (trail.places.length <= PLACE_LIMIT) {
     return trail;

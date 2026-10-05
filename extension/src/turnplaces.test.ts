@@ -1,7 +1,5 @@
-// extension/src/turnplaces.test.ts
-//
-// The tests for turnplaces.ts. A trail is small enough to write out whole, so each test names
-// the places it expects rather than asserting on a length.
+// Navigation trail places and cursor movement.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import {

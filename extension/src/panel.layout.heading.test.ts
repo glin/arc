@@ -1,4 +1,4 @@
-// The session heading and the next-turn price line, measured by a real browser.
+// Browser layout checks for the session heading and next-turn starting price.
 // Shared measurement helpers live in `../test/layout.ts`.
 
 import { test } from 'vitest';
@@ -34,15 +34,14 @@ test('a draft draws its tag over four enabled pickers and no window figure', { t
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
 
-    // What the extension side decided, so the words below are held against the reducer
-    // rather than written out twice.
+    // Use the prompt box state builder for the expected tag and controls.
+
     const view = composerView(DRAFT_COMPOSER, FIXTURE_CLOCK);
     assert.ok(view, 'the reducer drew no composer for the draft, so there is nothing to measure');
     const tag = view.draftTag;
     assert.ok(tag, 'the reducer built no tag for the draft, so this measures nothing');
-    // The fixture offers the source session's figure on purpose. With none on the state
-    // the guard below would prove that nothing was passed rather than that the reducer
-    // dropped what was.
+    // The draft fixture carries source-session context. The draft must omit that figure.
+
     assert.ok(DRAFT_COMPOSER.context, 'the draft fixture carries no window figure, so the guard below proves nothing');
 
     for (const width of [1350, 340]) {
@@ -51,8 +50,8 @@ test('a draft draws its tag over four enabled pickers and no window figure', { t
       const where = `at ${width}px`;
       assert.deepEqual(failures, [], `the panel threw while drawing the draft composer ${where}`);
 
-      // The tag, drawn, and reading what the reducer wrote. One chip, with the whole setup
-      // on the tooltip.
+      // The draft tag shows one word and exposes the setup in its tooltip.
+
       assert.ok(at.tag, `the draft tag is not on the page ${where}`);
       assert.deepEqual(
         at.tagWords,
@@ -72,9 +71,8 @@ test('a draft draws its tag over four enabled pickers and no window figure', { t
           `${Math.round(at.prompt.top)}, so one is drawn over the other`,
       );
 
-      // Four controls, in the order the reducer put them, and every one of them pressable. A
-      // draft is the cheapest place to change any of the four, so a control drawn dead here
-      // sends the reader back to the launcher to start again.
+      // A draft exposes four enabled setup controls in this order.
+
       assert.deepEqual(
         at.picks.map((p) => p.control),
         ['agent', 'model', 'effort', 'askmode'],
@@ -86,17 +84,16 @@ test('a draft draws its tag over four enabled pickers and no window figure', { t
         `the draft row drew an unpressable control ${where}`,
       );
 
-      // No window figure. The draft has run no turn, and the figure the state carries is the
-      // source session's share of a window this draft has never opened.
+      // The draft has no context window of its own.
+
       assert.equal(
         at.figure,
         null,
         `the draft drew a window figure ${where}, and the setup it copied is what filled that window`,
       );
 
-      // Everything inside the panel, at an editor tab and at a sidebar. A tag that will not
-      // break takes the composer past the panel's own edge, which the reader then has to
-      // scroll across to reach the send.
+      // Check the prompt box and its controls at editor-tab and sidebar widths.
+
       assert.ok(
         at.documentWidth <= at.viewportWidth + 1,
         `the panel scrolls sideways ${where} with the draft composer on it: ` +
@@ -134,8 +131,8 @@ test('a draft draws its tag over four enabled pickers and no window figure', { t
       );
     }
 
-    // And the agent control opens the choice it promises. It is the one control a draft has
-    // that a started session does not, so nothing else in this suite presses it.
+    // The agent picker is available only on drafts.
+
     const agents = pickMenu('agent', DRAFT_COMPOSER);
     assert.ok(agents, 'the reducer built no agent menu for the draft, so there is nothing to open');
     assert.equal(
@@ -177,9 +174,8 @@ test(
       const payload = renderPayload() as { sessions: Array<Record<string, unknown>> };
       payload.sessions[0].fullLabel = fullTitle;
 
-      // What the heading says and what the turns under it come to. The heights are what only a
-      // browser can answer: a body the panel has opened and the stylesheet still lays out at
-      // nothing reads exactly like one the reader can see.
+      // Measure visible turn bodies as well as their open state. A zero-height body remains unreadable.
+
       const READING = `(() => {
       const head = document.querySelector('#list .session');
       const group = document.querySelector('#list .group');
@@ -277,8 +273,8 @@ test(
           ((await page.locator('#hintpop .hintdetail').textContent()) ?? '').endsWith(CARD_ACTIONS.expandAllTurns),
           `hovering the session heading does not show its action second at ${width}px while every turn is shut`,
         );
-        // The twist is a glyph and reads out as nothing, so the same fact goes to a screen
-        // reader as the state of the turns the heading names.
+        // The heading exposes the turn group and its expansion state to screen readers.
+
         assert.ok(shut.groupId, `the group of turns has no id at ${width}px, so nothing can name it`);
         assert.equal(
           shut.controls,
@@ -295,8 +291,8 @@ test(
         await page.evaluate(SETTLED);
         const open = (await page.evaluate(READING)) as Reading;
         assert.deepEqual(failures, [], 'the panel threw while opening every turn');
-        // Every one of them, and every one of them taking room on the page. This is the whole
-        // of what the press is for, and the only check in the repository that runs it.
+        // Opening all turns must make every body visible and increase the group height.
+
         assert.equal(open.shown, open.bodies, `the press opened ${open.shown} of ${open.bodies} turns at ${width}px`);
         assert.equal(
           open.read,
@@ -307,8 +303,8 @@ test(
           open.groupHeight > shut.groupHeight,
           `the turns opened and the session is still ${Math.round(open.groupHeight)}px tall at ${width}px`,
         );
-        // And the heading is still a row on the page with the turns under it, rather than a
-        // line standing over an empty list.
+        // The heading and cards remain visible after expansion.
+
         assert.ok(open.headHeight > 0, `the heading has no height of its own at ${width}px`);
         assert.equal(open.cards, shut.cards, `the press took cards off the list at ${width}px`);
         assert.equal(
@@ -356,8 +352,8 @@ test(
           `the heading is announced as "${open.label}" at ${width}px, which does not say what the next press does`,
         );
 
-        // The second press shuts them again, and leaves the session on screen: the cards
-        // are still there, and so is the heading.
+        // Collapsing all turns keeps the heading and cards in the session.
+
         await page.evaluate(pressHeading);
         await page.evaluate(SETTLED);
         const again = (await page.evaluate(READING)) as Reading;
@@ -373,8 +369,8 @@ test(
           `the heading hint second line offers "${again.hintDetail}" at ${width}px after shutting every turn under it`,
         );
 
-        // One turn opened by its own head row, which is the press the heading cannot see. The
-        // glyph and the name have to follow it, or they claim a state the list is not in.
+        // Opening one turn independently must leave the heading action set to expand all turns.
+
         await page.evaluate(`document.querySelector('#list .turn .head').click()`);
         await page.evaluate(SETTLED);
         const one = (await page.evaluate(READING)) as Reading;
@@ -466,11 +462,8 @@ test(
         viewportWidth: number;
         clipped: boolean;
       };
-      // The editor draws its overlay scrollbar over the column's last 14 pixels, and the real
-      // row carries a few more pixels of its own padding besides. This bare page has neither,
-      // so the heading's own padding is the one part of that clearance a browser test can see.
-      // Ten pixels is short of the full 14 and long enough that a padding collapsed to zero,
-      // which leaves no clearance at all, cannot pass it.
+      // The fixture omits editor scrollbar and container padding. The 10px threshold detects missing heading clearance.
+
       const clearance = found.viewportWidth - found.ageRight;
       assert.ok(
         clearance >= 10,
@@ -516,10 +509,8 @@ test('the menu dots sit on the ink of the words beside them', { timeout: 60_000 
     const page = await browser.newPage();
     await page.setContent(pageHtml());
     await layoutAt(page, 1350);
-    // A box is not what the eye reads. A line box reserves descent under the baseline, so the
-    // ink of a word sits high inside it, and an icon centered on that box reads high beside
-    // the word. The guard above measures boxes and passes either way, which is why this one
-    // measures the ink: where the glyphs actually start and stop.
+    // Measure glyph ink because line boxes include space below the text baseline.
+
     const ink = (await page.evaluate(`(() => {
       const inkMid = (node) => {
         const box = node.getBoundingClientRect();
@@ -542,9 +533,8 @@ test('the menu dots sit on the ink of the words beside them', { timeout: 60_000 
         })(),
       };
     })()`)) as { dots: number; name: number; gear: number };
-    // Three quarters of a pixel. Anything wider than this lets the whole box-centered offset
-    // back in. The gear is drawn larger than the dots and takes the same nudge, so its center
-    // sits on theirs.
+    // Compare the dots with both the gear and title ink within 0.75px.
+
     assert.ok(
       Math.abs(ink.dots - ink.gear) <= 0.75,
       `the dots sit at ${ink.dots}px and the layout gear's center at ${ink.gear}px`,
@@ -585,9 +575,8 @@ test(
         viewportWidth: document.documentElement.clientWidth,
       };
     })()`)) as { gap: number; pinToMenu: number; menuRight: number; viewportWidth: number };
-      // The title's own text sits close behind the pin when the button sizes to its content.
-      // It sits far short of it when the button still stretches to fill the row. The threshold
-      // below catches the stretched case with room to spare and never the one sized to content.
+      // In this fixture, a stretched title button leaves more than 20px between its text and the pin.
+
       assert.ok(
         found.gap <= 20,
         `the title's text sits ${Math.round(found.gap)}px short of the pin, ` +
@@ -597,9 +586,8 @@ test(
         Math.abs(found.pinToMenu) <= 1,
         `the menu button sits ${Math.round(found.pinToMenu)}px from the pin rather than beside it`,
       );
-      // The same fixture puts the menu button close to the viewport's edge when the button
-      // stretches to fill the row. It sits well clear of that edge when the button sizes to its
-      // content instead. The clearance checked below sits well inside that spread.
+      // The menu button must clear the viewport edge by at least 300px in this fixture.
+
       const clearance = found.viewportWidth - found.menuRight;
       assert.ok(
         clearance >= 300,
@@ -625,12 +613,8 @@ test('a press on the heading row past the title leaves the session as it was', {
     const before = (await page.evaluate(
       `document.querySelector('#list .session').getAttribute('aria-expanded')`,
     )) as string;
-    // This point sits halfway between the title's own text and the layout gear. A title button
-    // sized to its content ends before the pin and the menu button, which sit close behind its
-    // text. That leaves this point in the bare heading row, with the gear further right still.
-    // A title button that instead stretches to fill the row reaches this same point too. That is
-    // the defect this test guards against: the button's box ends at the pin regardless of where
-    // its text stops.
+    // Click halfway between the title text and layout gear. A stretched title button captures this empty-row press.
+
     const point = (await page.evaluate(`(() => {
       const heading = document.querySelector('#list .sessionheading');
       const name = document.querySelector('#list .session .name');
@@ -654,8 +638,8 @@ test('a press on the heading row past the title leaves the session as it was', {
       `a press on the heading row past the title's own text changed aria-expanded from "${before}" to "${afterOutside}", ` +
         'so the row toggled the session outside its title',
     );
-    // The guard above would also pass if nothing on the row answered a press at all, so this
-    // presses the title itself and checks the state actually moves.
+    // Also press the title to distinguish a working toggle from a row that ignores every press.
+
     await page.evaluate(`document.querySelector('#list .session').click()`);
     await page.evaluate(SETTLED);
     const afterTitle = (await page.evaluate(
@@ -693,7 +677,7 @@ test(
       };
     })()`)) as { fullTime: string | null; detail: string; ticking: number };
       assert.ok(found.fullTime, 'the heading carries no hidden full local time for its last activity');
-      // A pointer reader never hears the hidden span, so the title's hint carries the same time.
+      // The heading hint exposes the full local time to pointer users.
       assert.ok(
         found.detail.startsWith(`${CARD_ACTIONS.lastActive} ${found.fullTime}. `),
         `the heading hint's second line is "${found.detail}", which drops the full local time "${found.fullTime}"`,
@@ -703,8 +687,8 @@ test(
         name && name.includes(found.fullTime),
         `the heading's accessible name is "${name}", which drops the full local time "${found.fullTime}"`,
       );
-      // The rail row and the newest card head draw the age. A ticking age in the heading as well
-      // would put the same figure three times within a hundred pixels.
+      // The session list and newest card show relative age. The session heading omits it.
+
       assert.equal(found.ticking, 0, 'the heading still draws an age the ticker rewrites');
     } finally {
       await browser.close();
@@ -787,8 +771,8 @@ test('the next-turn line keeps one height through every state it can wear', { ti
         assert.equal(measured.insideComposer, true, `the line runs outside the composer at ${width}px`);
         assert.equal(measured.borderless, true, 'a hairline still parts the line from the box');
         assert.ok(measured.gap >= 10, `only ${measured.gap}px parts the line from the box at ${width}px`);
-        // Only the price is pressable. The line itself is ordinary text, so a press anywhere
-        // else in the sentence selects words rather than opening the working.
+        // Only the price opens details. The surrounding line remains selectable text.
+
         assert.equal(measured.lineIsButton, false, 'the whole line is a control, so it reads as a second Send');
         assert.equal(measured.pressable, true, `the price is not a real button at ${width}px`);
         assert.ok(measured.priceGap > 0, `the price runs into the words before it at ${width}px`);
@@ -811,8 +795,8 @@ test('the next-turn line keeps one height through every state it can wear', { ti
           /^Next turn starts at \$\d/,
           `the price name does not open on the figure at ${width}px`,
         );
-        // The word the eye does not see has to reach the name, or a listening reader is told
-        // the figure and never told the working can be opened.
+        // The accessible name must announce that price details can be opened.
+
         assert.match(measured.name ?? '', /Details\.$/, 'the accessible name drops the disclosure word');
       }
       assert.match(
@@ -833,8 +817,8 @@ test('the next-turn line keeps one height through every state it can wear', { ti
       );
       assert.match(seen.warm.name ?? '', /cached for another/, 'the warm name does not carry its state');
       assert.match(seen.cold.name ?? '', /uncached/, 'the cold name does not carry its state');
-      // The whole point of stacking the faces. A line that grew when the cache went would push
-      // the box down under a reader who was typing into it.
+      // Cache expiry must preserve the line height and prompt text field position.
+
       assert.equal(
         seen.warm.height,
         seen.cold.height,
@@ -846,7 +830,7 @@ test('the next-turn line keeps one height through every state it can wear', { ti
         `the box moves ${Math.abs(seen.warm.promptTop - seen.cold.promptTop)}px when the cache goes at ${width}px`,
       );
     }
-    // A session whose record named no lifetime still quotes the conservative cold price.
+    // A missing cache lifetime selects the cold price.
     await page.evaluate(`window.postMessage(${JSON.stringify(nextTurnPayload('no-tier'))}, '*')`);
     await page.evaluate(SETTLED);
     const bare = (await page.evaluate(NEXT_TURN)) as Measured | null;
@@ -1070,9 +1054,8 @@ test('a rebuild hands the price back to the reader who was holding it', { timeou
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
     await page.setViewportSize({ width: 1350, height: 900 });
-    // Every face carries a price and the restore takes the first control of its name. The cold
-    // face is the second of the three, so a name shared with the hidden warm one sends the
-    // reader's focus to a button that cannot take it.
+    // Use the cold face to check that focus restoration selects the visible price when hidden faces precede it.
+
     await page.evaluate(`window.postMessage(${JSON.stringify(nextTurnPayload('cold'))}, '*')`);
     await page.evaluate(SETTLED);
     await page.evaluate(`document.querySelector('.cnextturnface:not(.is-off) .cnextturnprice').focus()`);
@@ -1081,8 +1064,8 @@ test('a rebuild hands the price back to the reader who was holding it', { timeou
       return { onPrice: active.classList.contains('cnextturnprice'), state: active.closest('.cnextturnface').dataset.state };
     })()`)) as { onPrice: boolean; state: string };
     assert.deepEqual(before, { onPrice: true, state: 'cold' }, 'the reader is not holding the visible price');
-    // A figure somewhere else in the foot moves, which rebuilds the whole composer. Nothing
-    // about the line itself changed.
+    // Changing context rebuilds the prompt box without changing the next-turn line.
+
     const moved = JSON.parse(JSON.stringify(nextTurnPayload('cold'))) as Record<string, unknown>;
     const composer = (moved.usage as { composer: { context: { percent: number; said: string } } }).composer;
     composer.context.percent = 61;
@@ -1276,10 +1259,10 @@ test(
       page.on('pageerror', (e) => failures.push(String(e)));
       await page.setContent(pageHtml());
       await page.setViewportSize({ width: 1350, height: 900 });
-      // The page's own clock again, for the same reason: it starts on the fixture's instant.
+      // Read the page clock because it runs from the fixture instant.
       const pageNow = Number(await page.evaluate('Date.now()'));
-      // The remaining time sits halfway through a displayed minute, so the figure does not
-      // depend on how long the render took. The line is sent once and nothing is sent again.
+      // Place the remaining lifetime halfway through a displayed minute to allow rendering time. Send the payload once.
+
       const lastRequest = pageNow - 15 * 60_000;
       await page.evaluate(`window.postMessage(${JSON.stringify(nextTurnPayload('warm', lastRequest))}, '*')`);
       await page.evaluate(SETTLED);
@@ -1297,9 +1280,8 @@ test(
       );
       assert.equal(shown.text, '43m');
       assert.equal(shown.title, 'opus-5 cache lifetime: 1 hour');
-      // A second session whose figure is a minute from moving. Nothing is sent to the page,
-      // so a figure that moves moved on the ticker that rewords every other age. The page clock
-      // is read again, because the two seconds of margin are spent by the round trips above.
+      // Set the remaining lifetime two seconds past a minute boundary. After rendering, the ticker must update it without another payload.
+
       const nearly =
         Number(await page.evaluate('Date.now()')) - 3_600_000 + CONSERVATIVE_CACHE_BOUNDARY_MS + 30 * 60_000 + 2_000;
       await page.evaluate(`window.postMessage(${JSON.stringify(nextTurnPayload('warm', nearly))}, '*')`);
@@ -1329,9 +1311,8 @@ test('the session heading hint falls back to the name the rail draws', { timeout
   try {
     const page = await browser.newPage();
     await page.setContent(pageHtml());
-    // A session row with no complete name. The row's label and the card's title are two
-    // names from two sources, and a Codex session words them differently: the row takes the
-    // stored name, and the card takes the transcript's own title.
+    // Give the session list a stored name without a full label. The heading hint must use that name.
+
     const payload = renderPayload();
     const rows = payload.sessions as Array<Record<string, unknown>>;
     const stored = 'The name the rail draws for this session';
@@ -1367,9 +1348,8 @@ test(
     }
     try {
       const page = await browser.newPage();
-      // `themed` dresses the page at the editor's own default size. The unthemed page renders
-      // at the bare browser's 16px instead of the editor's 13px, which measures a glyph large
-      // enough to pass here while it still draws small in the product.
+      // Use the editor theme font size. The bare browser font size changes the glyph measurements.
+
       await page.setContent(themed(pageHtml()));
       await layoutAt(page, 1350);
       const found = (await page.evaluate(`(() => {
@@ -1391,10 +1371,8 @@ test(
         menu: { width: number; height: number };
         gear: { width: number; height: number };
       };
-      // Half a pixel, not a styling allowance: the rail's box is drawn in flat pixels and the
-      // heading's in `em`, so the two never land on the exact same float even sized to match.
-      // The symptom this guards is the heading glyph reading a different size than the rail's,
-      // in either direction, which half a pixel of slack never hides.
+      // Allow 0.5px for the difference between pixel-sized session-list glyphs and em-sized heading glyphs.
+
       const tolerance = 0.5;
       for (const [name, glyph] of [
         ['pin', found.pin],
@@ -1411,11 +1389,8 @@ test(
             `off the rail pin's ${found.rail.height.toFixed(2)}px by more than a pixel`,
         );
       }
-      // The layout gear's size on the commit before this one, measured the same way: 14.30px
-      // wide (the button's own unreset padding shrinks it that far) and 19.13px tall (untouched
-      // by that shrink, which only narrows the row's main axis). A rule meant only for the pin
-      // and the dots that also reaches the gear grows this past 19px on both axes, which this
-      // catches even though nothing here looks at the pin or the dots to find it.
+      // The layout gear measures 14.296875px by 19.125px in this fixture. Pin and menu sizing must leave those dimensions unchanged.
+
       const gearTolerance = 0.1;
       assert.ok(
         Math.abs(found.gear.width - 14.296875) <= gearTolerance,

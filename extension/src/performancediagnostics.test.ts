@@ -245,9 +245,8 @@ test('render and rail messages have explicit production byte budgets', () => {
   assert.equal(messageByteBudget('usage'), null);
 });
 
-// The log reports what the counters already measured, so the counters decide what an event is
-// called and what it carries. A counted operation that routes nothing leaves the log silent
-// about work the saved snapshot can see.
+// Startup, refresh, message, and watcher events carry their measured values.
+
 test('every counted operation reaches the sink once, with what it cost', () => {
   const events: [string, Record<string, unknown>][] = [];
   const counters = new PanelPerformanceCounters(1_000, {
@@ -289,8 +288,8 @@ test('every counted operation reaches the sink once, with what it cost', () => {
   );
 });
 
-// A log nobody turned on has to cost nothing, and the writer's own early return comes far too
-// late for that: the record is built by the caller, on the path every posted message takes.
+// A disabled sink skips message, refresh, and watcher payloads. Startup still emits its payload.
+
 test('a counted operation builds no record while nothing reads the sink', () => {
   const events: string[] = [];
   let asked = 0;
@@ -328,9 +327,8 @@ const CAPTURED_AT = Date.UTC(2026, 8, 21, 4, 5, 6, 700);
 const ROOT = path.resolve(path.sep === '\\' ? 'C:\\arc-capture' : '/arc-capture');
 const SNAPSHOT = { schemaVersion: PERFORMANCE_DIAGNOSTICS_SCHEMA_VERSION, panel: { hostCount: 1 } };
 
-// Stands in for the four things the extension host brings: the save dialog, the file write, the
-// failure a reader and the log both see, and the message that names a file nobody chose. Each one
-// records what it was handed.
+// Capture the save dialog, file writes, failure reports, and destination announcements.
+
 function capture(options: { picks?: string | null; failure?: string } = {}) {
   const written: { file: string; contents: string }[] = [];
   const asked: (string | null)[] = [];
@@ -381,8 +379,8 @@ test('a capture writes to the path it is given, and asks nobody', async () => {
     'the snapshot did not reach the named file as formatted JSON',
   );
 
-  // A relative path is read against the open folder, so a harness can name one file for any
-  // folder it opens.
+  // Resolve relative destinations against the open folder.
+
   const relative = await savePerformanceDiagnosticsSnapshot({
     snapshot: SNAPSHOT,
     target: 'out/startup.json',
@@ -400,9 +398,8 @@ test('a capture writes to the path it is given, and asks nobody', async () => {
 });
 
 test('a relative destination with no folder open is refused and nothing is written', async () => {
-  // A window with no folder open has nothing to read a relative path against, and the writer takes
-  // the path as it is given. Left alone the capture would land at the root of the file system
-  // under a name its caller cannot open, and the command would answer with that name.
+  // A relative destination requires an open folder.
+
   const sink = capture();
   const refused = await savePerformanceDiagnosticsSnapshot({
     snapshot: SNAPSHOT,
@@ -442,10 +439,8 @@ test('a relative destination with no folder open is refused and nothing is writt
 });
 
 test('a destination the file system refuses answers with no file and carries its reason', async () => {
-  // Against a real directory and the real writer, so the reason the capture carries is one the
-  // file system raised rather than one a double was told to raise. A target that is already a
-  // directory is the way a plausible path fails: the host writer makes a parent directory that is
-  // not there, so a missing parent is not one.
+  // Writing onto an existing directory produces a filesystem error.
+
   const root = tempDir('arc-capture-');
   const onto = { write: (file: string, contents: string) => fs.writeFile(file, contents, 'utf8') };
 
@@ -465,8 +460,8 @@ test('a destination the file system refuses answers with no file and carries its
   assert.ok(atDirectory.reported[0].message.includes(root), 'the failure does not name the target it could not write');
   assert.ok(atDirectory.reported[0].reason.length > 0, 'the failure carries nothing the file system said');
 
-  // And a target beside it in the same directory, so the failure above is about the path and not
-  // about the writer.
+  // A neighboring file succeeds with the same writer.
+
   const beside = path.join(root, 'startup.json');
   const good = capture();
   const wrote = await savePerformanceDiagnosticsSnapshot({
@@ -506,8 +501,8 @@ test('the output directory variable captures a stamped file with no argument and
   assert.deepEqual(sink.asked, [], 'a run with the variable set still waited on the dialog');
   assert.ok(!path.basename(written ?? '').includes(':'), 'the stamped file name carries a character Windows refuses');
   assert.equal(sink.written.length, 1, 'the variable wrote no snapshot, or wrote more than one');
-  // Nobody chose this file, and no dialog named it. A reader who pressed the command in the
-  // Command Palette learns where the snapshot went only from the message.
+  // A capture selected through the output directory variable announces its destination.
+
   assert.deepEqual(
     sink.announced,
     [written],
@@ -551,7 +546,7 @@ test('with no path and no variable the reader picks the file', async () => {
   );
   assert.deepEqual(sink.announced, [], 'the reader who picked the file was told where it went');
 
-  // A closed dialog is the reader saying no, and it leaves nothing behind.
+  // Dismissing the dialog leaves no snapshot.
   const dismissed = capture({ picks: null });
   const nothing = await savePerformanceDiagnosticsSnapshot({
     snapshot: SNAPSHOT,

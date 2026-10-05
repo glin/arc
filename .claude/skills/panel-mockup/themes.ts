@@ -1,12 +1,5 @@
-// The themes a mockup can be drawn in.
-//
-// Two of them are the editor's own defaults and live in `extension/src/panelfixture.ts`,
-// because the tests measure against those. The rest are here, because they belong to a
-// mockup and nothing that ships may depend on them.
-//
-// A tone that reads well on Dark Modern can be unreadable on a theme the reader actually
-// installed. The panel gets its colours from the editor, so the only way to see that is to
-// draw the panel in a real theme's variables and look.
+// Mockup themes extend the editor defaults from panelfixture.ts.
+// Custom theme variables expose contrast differences outside the editor defaults.
 import { DARK_MODERN_THEME, LIGHT_MODERN_THEME } from '../../../extension/src/panelfixture.ts';
 
 export interface MockTheme {
@@ -19,9 +12,7 @@ export interface MockTheme {
   table: string;
 }
 
-/* A theme file only sets the colours it wants to change. Every other name falls to the
-   colour registry's default for the theme's kind, which is what the table it is layered on
-   already holds. So a theme is written here as the names it overrides and nothing else. */
+/* Overrides selected colours while retaining every other value from the base table. */
 function derive(base: string, overrides: Record<string, string>): string {
   let table = base;
   for (const [name, value] of Object.entries(overrides)) {

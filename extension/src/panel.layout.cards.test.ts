@@ -1,4 +1,4 @@
-// A turn card's rail figures and its activity log, laid out by a real browser.
+// Browser checks for turn-card figures, response disclosures, and activity.
 // Shared measurement helpers live in `../test/layout.ts`.
 
 import { test } from 'vitest';
@@ -183,23 +183,10 @@ import {
   subagentRows,
 } from '../test/layout.ts';
 
-// The line of labels the reader put on a session, measured on the card that draws it.
-//
-// It follows everything else the card draws, and the card is only as wide as the reader has
-// dragged the rail. A row of chips that takes a second line pushes every card under it
-// down the list, and a chip that refuses to give way runs out past the card and out of the
-// rail's column. Neither shows in a text scan of the stylesheet, and both are the first
-// thing a reader would meet.
-//
-// The fixture draws every case side by side. One session carries more labels than the
-// row can hold, so the fold is on screen beside a label that has to give way to it. One
-// carries a single label and folds nothing. One carries the longest label a reader may type,
-// which is what the rule that cuts a chip exists for. Every session the record does not
-// name carries none, which is the case that decides whether an empty line costs a card its
-// height.
+// Label fixtures cover folded labels, one label, the maximum label length, and sessions without labels.
 
-// Page source that defines `contrastOn(element)`: the contrast of the element's text against
-// the ground it sits on, with every translucent background up its ancestors laid over the next.
+// Page source computes text contrast after compositing translucent ancestor backgrounds.
+
 const CONTRAST_SOURCE = String.raw`
   function parsed(color) {
     const rgb = color.match(/rgba?\(([^)]+)\)/);
@@ -242,11 +229,8 @@ const CONTRAST_SOURCE = String.raw`
   }
 `;
 
-// The contrast ratio of the skills popover's file path against the popover's own background,
-// read from the rendered page rather than from the theme table's raw values, so a mix function
-// that resolves differently than expected still gets caught here.
-// The lines a pinned popover points at with `aria-describedby`, in the order a reader hears
-// them. A description is spoken once on arrival, where a name is spoken on every announcement.
+// Read the pinned popover's `aria-describedby` text in reference order.
+
 async function popoverDescriptions(page: Page): Promise<string[]> {
   return page.evaluate(() => {
     const pop = document.getElementById('chippop');
@@ -378,8 +362,8 @@ test(
           coversCardBelow: boolean | null;
         };
         assert.ok(measured, `the rail did not draw the label fixtures at ${width}px`);
-        // The fold has to be on screen, or everything below is measured on a line the column
-        // holds whole, and a stylesheet that lets one chip take the row passes.
+        // The fixture must display the folded count before measuring the folded row.
+
         assert.deepEqual(
           measured.folded.chips,
           [
@@ -394,9 +378,8 @@ test(
           [['raillabel', 'release 0.4']],
           `the session carrying one label drew a fold beside it at ${width}px`,
         );
-        // Every chip carries the whole of what it says on its hover, which is the only way
-        // back for a reader who can see a chip the row had to cut. The count carries the
-        // labels it stands for rather than itself.
+        // Label tooltips retain complete labels. The folded count's tooltip names hidden labels.
+
         assert.deepEqual(
           measured.folded.titles,
           ['composer', 'release 0.4', 'perf'],
@@ -427,8 +410,8 @@ test(
             line.chips.map(() => 1),
             `the ${which} card broke a label across lines at ${width}px, so the card is taller than its neighbours`,
           );
-          // One row of chips and not two, measured against a chip rather than a written-down
-          // height, so the check holds at whatever size the reader's theme asks for.
+          // Row height is compared with chip height to accommodate theme text sizing.
+
           assert.ok(line.chipHeight > 0, `the ${which} card's label chips have no height at ${width}px`);
           assert.ok(
             line.height < line.chipHeight * 2,
@@ -438,10 +421,8 @@ test(
             line.outsideRow <= 1,
             `a chip on the ${which} card hangs ${Math.round(line.outsideRow)}px outside its own line at ${width}px`,
           );
-          // Every chip on the line starts at the same height. The row's own box grows around
-          // a chip that a stray rule pushed down, so its height and the check above it both
-          // stay inside their bounds while the count hangs below the labels beside it. A
-          // class this sheet already uses for something else is how that happens.
+          // Chip tops detect vertical misalignment independently of the row's bounding box.
+
           const drop = Math.max(...line.chipTops) - Math.min(...line.chipTops);
           assert.ok(
             drop <= 1,
@@ -464,21 +445,16 @@ test(
             false,
             `the archive and pin controls cover the ${which} card's labels at ${width}px`,
           );
-          // The rule that cuts a chip inside its own box, read off the chip rather than off
-          // the stylesheet. Nothing else here can see it: a chip whose overflow is visible
-          // paints its words over the chip beside it while its own rect, its line count and
-          // every distance above stay exactly where the flex row put them. So the geometry
-          // measures clean either way, and the reader is the one who sees the difference.
+          // Computed overflow and ellipsis rules detect clipped-text behavior that bounding rectangles do not establish.
+
           assert.deepEqual(
             line.cutRule,
             line.chips.map(() => 'hidden ellipsis'),
             `a chip on the ${which} card lost the rule that cuts it, so a long label paints over its neighbour at ${width}px`,
           );
         }
-        // At the width the rail opens at, and wider, a card carrying short labels draws
-        // them whole. Dragged to its floor the row cuts them, which the hover answers, and
-        // the longest label a reader may type is cut at the narrow widths whatever it says.
-        // So the claim is made where it holds and nowhere else.
+        // Short labels fit at the default width and wider. The longest label clips at narrow widths.
+
         if (width > RAIL_WIDTH_MIN) {
           assert.deepEqual(
             measured.folded.cut,
@@ -487,17 +463,15 @@ test(
           );
           assert.deepEqual(measured.single.cut, [false], `a card carrying one short label cut it at ${width}px`);
         } else {
-          // And the fixture reaches the case the rule above exists for. A page whose every
-          // chip fits would keep that rule green with the rule taken away.
+          // The minimum-width fixture includes a label that requires clipping.
+
           assert.deepEqual(
             measured.long.cut,
             [true],
             `the longest label a reader may type still fits the rail at its floor, so nothing here needs cutting`,
           );
-          // At the floor the row has to give way somewhere, and the count is the piece that
-          // must not: it is the only thing on the line saying the card is showing less than
-          // it holds, and cut to a bare plus it says nothing. So the labels beside it give
-          // way and it keeps its width.
+          // The folded count retains its width while neighboring labels can clip.
+
           const chips = measured.folded.cut;
           assert.equal(
             chips[chips.length - 1],
@@ -528,13 +502,8 @@ test(
   },
 );
 
-// The card the panel draws between the press and the reply, measured.
-//
-// It stands at the top of the column, which is the one place on the panel where a wrong size
-// moves everything: a card that grows to what it holds pushes every card below it down the
-// page while the reader is looking at one of them. Nothing in the text scan can see that. The
-// fixture holds a prompt long enough to run past the clamp at every width it is drawn at, so
-// a rule that lets it grow fails here and nowhere else.
+// The live-card fixture includes a prompt exceeding the headline clamp at both tested widths.
+
 test('the card a press opens stands at the top of the column and widens nothing', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -545,8 +514,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
     const page = await browser.newPage();
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
-    // The page records its intervals, so the ticker's one-second interval can be stopped
-    // below. The bundle's closure keeps the ticker's own name off the page.
+    // Capture interval handles so the test can stop the panel ticker.
+
     await page.setContent(
       pageHtml().replace(
         '<script>',
@@ -564,8 +533,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
       ),
     );
 
-    // The sidebar width, which is where the panel is usually docked and the width the card's
-    // one line is most likely to overflow.
+    // Cover wide and narrow panel widths.
+
     for (const width of [1350, 340]) {
       const quiet = await layoutAt(page, width);
       assert.equal(quiet.live, null, `a session with no press in flight drew a card at ${width}px`);
@@ -573,9 +542,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
       assert.deepEqual(failures, [], 'the panel threw while drawing the card');
       assert.ok(busy.live, `the press was recorded and no card was drawn at ${width}px`);
 
-      // In the column, at the top of it, which is where the newest turn is and so where the
-      // turn this press becomes will stand. Not in the composer, which is what the reader
-      // said they did not want to be reading while the timeline sat still above it.
+      // The live card appears in the timeline above the Prompt box.
+
       assert.ok(
         busy.live.top < busy.composer.top,
         `the card runs from ${Math.round(busy.live.top)} to ${Math.round(busy.live.bottom)} ` +
@@ -586,8 +554,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
         busy.live.top >= busy.list.top - 1,
         `at ${width}px the card is drawn above the top of the list, so it is not in the column at all`,
       );
-      // Inside the session it belongs to, under its heading. Above the heading it is a
-      // card belonging to no session, drawn over the name of the one below it.
+      // The live card belongs below its session heading.
+
       assert.ok(busy.liveInGroup, `at ${width}px the card is drawn outside every session in the list`);
       assert.ok(
         busy.sessionHead && busy.live.top >= busy.sessionHead.bottom - 1,
@@ -597,9 +565,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
         busy.live.right <= busy.list.right + 1 && busy.live.left >= busy.list.left - 1,
         `at ${width}px the card runs wider than the column it stands in`,
       );
-      // It is a turn card, in the frame a turn card stands in. The card the poll brings
-      // replaces this one, and a card of another shape in the same place is the swap the
-      // reader watched twice at the start of every prompt.
+      // Live and recorded cards share the timeline's horizontal bounds.
+
       assert.ok(busy.card, 'the fixture drew no recorded turn, so there is nothing to hold the press card against');
       assert.equal(
         Math.round(busy.live.left),
@@ -612,11 +579,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
         `at ${width}px the press card and the turn card end at different edges`,
       );
 
-      // It holds a bounded height: the headline is clamped to three lines, so a card at the
-      // top of the column cannot push every card below it down the page as the prompt grows.
-      // Measured against the same card carrying one line rather than against a fixed height,
-      // so the guard survives the card gaining a row of chrome and still fails the moment
-      // the clamp goes.
+      // Compare long and short prompts to bound live-card height growth.
+
       const brief = await layoutAt(page, width, [], [{ ...LIVE_PRESS, text: 'take the sandbox off' }]);
       assert.ok(brief.live, `the short press drew no card at ${width}px`);
       const grew = busy.live.bottom - busy.live.top - (brief.live.bottom - brief.live.top);
@@ -625,15 +589,14 @@ test('the card a press opens stands at the top of the column and widens nothing'
         `a long prompt drew a card ${Math.round(grew)}px taller than a one-line one at ${width}px, ` +
           'so the headline is unclamped',
       );
-      // And the panel still does not scroll sideways with a long prompt on the card.
+      // The long prompt leaves the panel without horizontal overflow.
       assert.ok(
         busy.documentWidth <= busy.viewportWidth + 1,
         `the card scrolls the panel sideways at ${width}px: ${busy.documentWidth} wide in ${busy.viewportWidth}`,
       );
 
-      // A failed prompt adds its reason and both choices without pushing either choice out
-      // of the card. This is tight at sidebar width, where the head row also carries the
-      // time and agent name.
+      // Failed delivery retains its cause and both recovery actions within the card.
+
       const failed = await layoutAt(
         page,
         width,
@@ -686,16 +649,15 @@ test('the card a press opens stands at the top of the column and widens nothing'
         failed.documentWidth <= failed.viewportWidth + 1,
         `failed-send recovery scrolls the panel sideways at ${width}px`,
       );
-      // The foot still ends on the status bar, and the composer did not move: the card is no
-      // longer part of it.
+      // The Prompt box remains above the status bar.
+
       assert.ok(
         busy.composer.bottom <= busy.statusbar.top + 1,
         'the composer runs into the status bar once a card is on screen',
       );
 
-      // A compaction and a prompt sent while it runs are two pieces of work, and both say so.
-      // The panel held one card per session, so the follow-up took the compaction card
-      // off the screen and nothing then said a compaction was running.
+      // A prompt sent during compaction preserves both live cards.
+
       const both = await layoutAt(
         page,
         width,
@@ -711,8 +673,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
         2,
         `at ${width}px a prompt sent during a compaction took the compaction card off the screen`,
       );
-      // Newest first, the order the column draws turns in: the press made last stands above
-      // the one it was sent behind.
+      // The newer prompt appears above the compaction card.
+
       assert.deepEqual(
         both.lives.map((one) => one.kind),
         ['prompt', 'compact'],
@@ -727,16 +689,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
       assert.ok(busy.list.top < 200, `at ${width}px the timeline starts ${Math.round(busy.list.top)}px down the page`);
     }
 
-    // The elapsed figure is written by the ticker rather than sent, and the draw calls it, so
-    // the card counts up from the frame it appears in rather than from the next second.
-    //
-    // Counted through the panel's own name for that function, and never by reading the figure
-    // alone. The one-second interval holds a reference of its own and never goes through the
-    // name, so this counts the draw's call and nothing else: a page left to the interval reads
-    // a filled figure a second later and passes a guard that measured the wait.
-    // The one-second interval is stopped before the card arrives, so the only thing left that
-    // can fill the figure is the draw's own call. The bundle's closure keeps the ticker's name
-    // off the page, and an interval the page recorded is what the test can reach instead.
+    // Stop the captured one-second interval so the test measures elapsed text supplied by the live-card draw.
+
     assert.ok(
       await page.evaluate('Array.isArray(window.__intervals) && window.__intervals.some((one) => one.ms === 1000)'),
       'the page never recorded a one-second interval, so this measures nothing',
@@ -744,10 +698,8 @@ test('the card a press opens stands at the top of the column and widens nothing'
     await page.evaluate(`(() => {
       for (const one of window.__intervals) { if (one.ms === 1000) clearInterval(one.handle); }
     })()`);
-    // On a usage message, which is how the card actually arrives. The press posts one and no
-    // render at all: the reader's words reach the timeline seconds later, off the transcript.
-    // Measured through a render instead, this passes on the ticker the render path already
-    // runs, and the card is blank on the one path it is drawn by.
+    // Deliver the live card through a usage message, independently of the full-render path.
+
     await layoutAt(page, 340);
     const usage = (renderPayload([], [LIVE_PRESS]) as { usage: unknown }).usage;
     await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'usage', usage })}, '*')`);
@@ -1028,22 +980,22 @@ test('the reply is anchored to its end, and the card it fills still widens nothi
       assert.deepEqual(failures, [], 'the panel threw while drawing the reply');
       assert.ok(busy.live, `the reply was recorded and no card was drawn at ${width}px`);
       assert.ok(busy.reply && busy.replyText, `the reply is on the press and no line was drawn at ${width}px`);
-      // Both on the card at once, which is what it is for: the reader watches their own
-      // words and the answer arriving under them in one place.
+      // The live card retains the prompt above the streamed reply.
+
       assert.ok(busy.promptLine, `at ${width}px the reply took the prompt off the card the reader is checking`);
       assert.ok(
         busy.promptLine.bottom <= busy.reply.top + 1,
         `at ${width}px the reply is drawn over the prompt rather than under it`,
       );
 
-      // Wider than the room it has, which is the case the anchoring exists for. A fixture that
-      // fitted would pass whichever end the panel cut.
+      // The reply fixture exceeds its row width so end anchoring is measurable.
+
       assert.ok(
         busy.replyText.right - busy.replyText.left > busy.reply.right - busy.reply.left + 1,
         `at ${width}px the reply fits the row, so nothing here measures which end is cut`,
       );
-      // The end of the line sits at the end of the row: the words that have just arrived are
-      // the words on screen.
+      // The newest reply text aligns with the row's trailing edge.
+
       assert.ok(
         Math.abs(busy.replyText.right - busy.reply.right) <= 1,
         `at ${width}px the reply ends ${Math.round(busy.reply.right - busy.replyText.right)}px short of the row, ` +
@@ -1054,8 +1006,8 @@ test('the reply is anchored to its end, and the card it fills still widens nothi
         `at ${width}px the start of the reply is on screen, so the end of it is what was cut`,
       );
 
-      // And none of that overflow reaches the panel. A line running off the near end of its
-      // row is one bad rule away from running off the window instead.
+      // Reply overflow stays within the live card.
+
       assert.ok(
         busy.reply.left >= busy.live.left - 1 && busy.reply.right <= busy.live.right + 1,
         `at ${width}px the reply row runs wider than the card it sits in`,
@@ -1064,9 +1016,8 @@ test('the reply is anchored to its end, and the card it fills still widens nothi
         busy.live.right <= busy.list.right + 1 && busy.live.left >= busy.list.left - 1,
         `at ${width}px the card runs wider than the column once a reply is on it`,
       );
-      // A reply that wrapped would take the card down the panel as the answer arrived.
-      // Measured against the same card with no reply on it rather than against a fixed
-      // height: the reply is one line, so the card grows by one line and no more.
+      // Compare cards with and without a reply to bound height growth.
+
       const dry = await layoutAt(page, width, [], [LIVE_PRESS]);
       assert.ok(dry.live, `the press with no reply on it drew no card at ${width}px`);
       const grew = busy.live.bottom - busy.live.top - (dry.live.bottom - dry.live.top);
@@ -1076,9 +1027,8 @@ test('the reply is anchored to its end, and the card it fills still widens nothi
         `the reply scrolls the panel sideways at ${width}px: ${busy.documentWidth} wide in ${busy.viewportWidth}`,
       );
 
-      // A reply that has just started is the other half of the same question. It sits against
-      // the line that says what is happening and grows away from it, rather than starting at
-      // the far end of an empty row with a gap where the words are about to be.
+      // A short reply uses its text width without a leading empty gap.
+
       const first = await layoutAt(page, width, [], [{ ...LIVE_REPLY, reply: 'One' }]);
       assert.ok(first.reply && first.replyText, `the first chunk of a reply drew no line at ${width}px`);
       assert.ok(
@@ -1122,7 +1072,7 @@ test('message bubble shapes stay centered on their first text line', { timeout: 
     for (const width of [340, 900]) {
       await page.setViewportSize({ width, height: 1100 });
       for (const size of [12, 16, 20]) {
-        // Sweeps a realistic font size over the real theme to test the live update path.
+        // Change the theme font size to exercise live text scaling.
         await page.evaluate((fontSize) => document.body.style.setProperty('--vscode-font-size', `${fontSize}px`), size);
         await page.evaluate(SETTLED);
         const shapes = await page.locator('.actrow.message').evaluateAll((rows) =>
@@ -1230,8 +1180,8 @@ test(
       card.toolTally = [{ name: 'Bash', count: 65, category: 'commands' }];
       card.activityName = built.activityName;
       card.status = built.status;
-      // This card alone, because the presses below reach for the log by class and another
-      // fixture card carries a log of its own.
+      // Use one card because the selectors address its Activity log by class.
+
       payload.cards = [card];
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
@@ -1282,10 +1232,8 @@ test(
         });
       })()`);
         assert.equal(inside, true, `a count is clipped at ${width}px`);
-        // The head is a wrapping flex row, and the mix is one item on it. A wide panel has room
-        // for the mix beside the word, so every count sits on the word's own line and shares its
-        // center. A narrow panel has no room, so the whole mix takes the line under the word. A
-        // count then shares the center of that line, which the mix box measures.
+        // At wide widths, counts share the Activity label's line. At narrow widths, the mix moves below it.
+
         const counts = (await page.evaluate(`(() => {
         const box = (node) => node.getBoundingClientRect();
         const mid = (rect) => rect.top + rect.height / 2;
@@ -1505,8 +1453,8 @@ test(
       const failures: string[] = [];
       page.on('pageerror', (error) => failures.push(String(error)));
       await page.setViewportSize({ width: 1350, height: 900 });
-      // Dressed with the real Dark Modern table, since a hand-picked pair of colors can pass a
-      // tone check that the real theme tables never would.
+      // Use the Dark Modern theme fixture for rendered contrast measurements.
+
       await page.setContent(themed(pageHtml(), 'dark'));
       const payload = renderPayload() as { cards: Array<Record<string, unknown> & { key: string; sessionId: string }> };
       const card = payload.cards[0];
@@ -1571,8 +1519,8 @@ test(
       await page.click('#list .turn .head');
       await page.evaluate(SETTLED);
 
-      // The count stands after the tool mix, with the separator the tool counts use between
-      // themselves, and it never joins the tool categories.
+      // The skill count follows the tool mix and remains separate from tool categories.
+
       const anchor = page.locator('#list .turn .actskills');
       assert.equal(await anchor.count(), 1);
       assert.equal(await anchor.textContent(), '4 skills');
@@ -1593,8 +1541,8 @@ test(
         'the shut skills list is not announced as a disclosure',
       );
 
-      // A hover opens the same list a press does, buttons and all. The popover holds the pointer
-      // over the grace between the two, so the reader crosses to a button without pressing first.
+      // Hover displays the skill rows and file controls.
+
       const pop = page.locator('#chippop');
       await anchor.hover();
       await page.evaluate(SETTLED);
@@ -1605,17 +1553,16 @@ test(
         2,
         'the hover drew a list with no file link on it, so the pointer reaches nothing',
       );
-      // The skills list draws no record rows, so it keeps ignoring the pointer until a press
-      // pins it. Taking the pointer on hover alone would cover the activity rows under it and
-      // hold itself open over them.
+      // The unpinned skills popover ignores pointer events.
+
       assert.equal(
         await pop.evaluate((node) => getComputedStyle(node).pointerEvents),
         'none',
         'the shown skills popover takes the pointer before it is pinned',
       );
 
-      // A press pins it, and the pinned popover keeps the dialog name of its own. The line under
-      // the rows describes the dialog and stays out of its name.
+      // Pinning gives the popover its dialog name. Supporting text remains a description.
+
       await anchor.click();
       await page.evaluate(SETTLED);
       assert.equal(await pop.getAttribute('role'), 'dialog');
@@ -1623,8 +1570,8 @@ test(
       assert.equal(await anchor.getAttribute('aria-expanded'), 'true');
       assert.equal(await anchor.getAttribute('aria-pressed'), 'true');
       assert.equal(await anchor.getAttribute('aria-controls'), 'chippop');
-      // The popover takes pointer events, so a reader can move the pointer onto a row and read
-      // its native title.
+      // The pinned popover accepts pointer events.
+
       assert.equal(await pop.evaluate((node) => getComputedStyle(node).pointerEvents), 'auto');
       assert.equal(await pop.locator('.chippophead .chippoplabel').textContent(), CARD_ACTIONS.activitySkillsHeading);
       assert.deepEqual(
@@ -1637,16 +1584,14 @@ test(
         [],
         'no row names its evidence in the head',
       );
-      // Neither row says what its evidence does or does not prove. Each keeps only its
-      // description and where its file is.
+      // Skill rows include their description and recorded path.
+
       assert.deepEqual(await pop.locator('.chippopitem').nth(1).locator('.chippopsubitem').allTextContents(), [
         MOCKUP_SKILL_DESCRIPTION,
         MOCKUP_SKILL_PATH,
       ]);
-      // The row shows the description cut, and its native title carries the whole sentence a
-      // reader's pointer can rest on to read, longer than the row's own cut.
-      // This only proves something if the raw description outruns the row's own cut: a fixture
-      // shorter than the limit would pass the clamp checks below without the clamp doing anything.
+      // The description fixture exceeds the text limit. Its native tooltip retains the complete description.
+
       assert.ok(
         MOCKUP_SKILL_FULL_DESCRIPTION.length > STEP_DETAIL_LIMIT,
         'the raw description is not longer than the row cuts it to, so the clamp guard below proves nothing',
@@ -1657,11 +1602,8 @@ test(
         MOCKUP_SKILL_FULL_DESCRIPTION,
         'the full description never reached the row as a hover title',
       );
-      // The description takes the row's foreground weight and stops at the two lines the clamp
-      // sets, so a description this long never grows the row past that. The row's own worst
-      // case, STEP_DETAIL_LIMIT characters, still fits inside the popover's own width without
-      // reaching the clamp, so this checks the CSS rule stays in force rather than checking an
-      // overflow the real data never produces here.
+      // The text limit fits within the row, so these assertions check the clamp rule rather than actual two-line overflow.
+
       assert.equal(
         await mockupDesc.evaluate((node) => node.classList.contains('chippopdesc')),
         true,
@@ -1671,9 +1613,8 @@ test(
         getComputedStyle(node).getPropertyValue('-webkit-line-clamp'),
       );
       assert.equal(mockupLineClamp, '2', 'the clamp does not stop the row at two lines');
-      // The path takes the editor's own code face, a step smaller, apart from the description's
-      // foreground weight, the way a raw tool name in the tool-breakdown popover takes the
-      // editor face apart from that popover's own heading.
+      // The file path uses the editor font separately from the description.
+
       const mockupPath = pop.locator('.chippopitem').nth(1).locator('.chippopsubitem').nth(1);
       assert.equal(
         await mockupPath.evaluate((node) => node.classList.contains('chippoppath')),
@@ -1699,16 +1640,15 @@ test(
         rowColors.path,
         'the description and the path share one idle tone instead of a hierarchy',
       );
-      // The path still has to read as text, not just differ from the description, so its
-      // contrast against the popover's own background is held to the 4.5:1 floor for text at
-      // this size in both theme tables.
+      // Rendered file-path contrast meets 4.5:1 in both default theme fixtures.
+
       const darkPathContrast = await skillPathContrastRatio(page);
       assert.ok(
         darkPathContrast >= 4.5,
         `the path contrast in Dark Modern fell to ${darkPathContrast.toFixed(2)}:1, under the 4.5:1 floor`,
       );
-      // Light Modern gives the foreground and the idle tone the same value, so a hierarchy that
-      // only reads in the dark table would still fail every reader on that theme.
+      // The Light Modern fixture also checks path and description hierarchy.
+
       const lightPage = await browser.newPage();
       try {
         lightPage.setDefaultTimeout(5000);
@@ -1742,7 +1682,7 @@ test(
         [RECORDED_SKILL_PATH],
         'a recorded row carries only its path',
       );
-      // The skill's file path carries the row's one press, while its name stays plain text.
+      // The file path is actionable while the skill name remains plain text.
       assert.equal(
         await pop
           .locator('.chippopitem')
@@ -1757,7 +1697,7 @@ test(
         1,
         'the recorded file path did not draw as the press',
       );
-      // A skill no record named a file for keeps its other lines and says where the file went.
+      // A skill without a recorded path has no open-file control.
       assert.deepEqual(await pop.locator('.chippopitem').nth(2).locator('.chippopsubitem').allTextContents(), [
         CARD_ACTIONS.activitySkillsMissing,
       ]);
@@ -1788,7 +1728,7 @@ test(
       const opens = pop.locator('.chippopsubitem.chippoppath .chippopnamelink');
       assert.equal(await opens.count(), 2);
       assert.equal(await opens.nth(0).textContent(), RECORDED_SKILL_PATH);
-      // The accessible name carries the skill label and the file path the press opens.
+      // The file control's accessible name includes the skill label and path.
       assert.equal(await opens.nth(0).getAttribute('aria-label'), `review-the-change ×2, ${RECORDED_SKILL_PATH}`);
       assert.equal(
         await opens.nth(0).getAttribute('data-hint'),
@@ -1811,8 +1751,8 @@ test(
         'the clickable skill file path repeated the row styling that sets its text size',
       );
 
-      // Before any press, the file path reads as a link: the same colour the theme gives every
-      // other link, and a colour a plain row name does not share.
+      // The file control uses the theme link color before interaction.
+
       const linkColors = (await page.evaluate(`(() => {
       const probe = document.createElement('span');
       probe.style.color = 'var(--vscode-textLink-foreground)';
@@ -1835,15 +1775,15 @@ test(
         'the skill file path read the same colour as a plain row name',
       );
 
-      // The keyboard reaches the buttons from the anchor and moves between them.
+      // The keyboard enters the popover from its anchor and moves between file controls.
       await anchor.focus();
       await page.keyboard.press('ArrowDown');
       assert.equal(
         await page.evaluate('document.activeElement?.getAttribute("aria-label")'),
         `review-the-change ×2, ${RECORDED_SKILL_PATH}`,
       );
-      // Keyboard focus on the file link draws a visible indicator: the panel's own focus outline,
-      // and the underline hover already gives it.
+      // Focused file controls have a visible outline and underline.
+
       const focusIndicator = (await page.evaluate(`(() => {
       const style = getComputedStyle(document.activeElement);
       return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth, textDecorationLine: style.textDecorationLine };
@@ -1874,7 +1814,7 @@ test(
         `review-the-change ×2, ${RECORDED_SKILL_PATH}`,
       );
 
-      // A press on a row asks the host for that skill, and a modifier asks for a group of its own.
+      // Control-click requests opening the skill beside the current editor.
       await opens.nth(0).click({ modifiers: ['Control'] });
       await page.evaluate(SETTLED);
       assert.deepEqual(await page.evaluate(`window.__posted.filter((m) => m.type === 'openSkill').at(-1)`), {
@@ -1892,7 +1832,7 @@ test(
         beside: false,
       });
 
-      // Escape shuts it and gives the press back to the count that opened it.
+      // Escape closes the popover and returns focus to its skill count.
       await page.keyboard.press('Escape');
       await page.evaluate(SETTLED);
       assert.equal(await pop.isHidden(), true);
@@ -1903,8 +1843,8 @@ test(
         'Escape left focus inside a popover the reader can no longer see',
       );
 
-      // Tab out of the last button carries on from the anchor's own place in the page, since the
-      // popover is drawn on the body and its place in the document is not where it is read.
+      // Tab leaves the body-mounted popover at its anchor's position in the keyboard order.
+
       await anchor.click();
       await page.evaluate(SETTLED);
       await page.keyboard.press('Tab');
@@ -1917,7 +1857,7 @@ test(
         'the walk out of the popover followed its place in the document instead of the anchor',
       );
 
-      // Focus that reaches anything but the popover and its own count takes the popover with it.
+      // Focus outside the popover and its anchor closes it.
       await anchor.click();
       await page.keyboard.press('ArrowDown');
       await page.locator('#list .turn .actviewaction').focus();
@@ -1928,7 +1868,7 @@ test(
         'focus left the popover for another control and the popover stayed open',
       );
 
-      // A second press on the count puts it away.
+      // A second anchor press closes the popover.
       await anchor.click();
       await page.evaluate(SETTLED);
       assert.equal(await pop.isHidden(), false);
@@ -1936,8 +1876,8 @@ test(
       await page.evaluate(SETTLED);
       assert.equal(await pop.isHidden(), true, 'a second press on the count left the list open');
 
-      // Every read-only anchor is untouched: it still describes the popover rather than
-      // controlling it, and the popover it opens is still a tooltip.
+      // Read-only tool anchors describe a tooltip rather than control a dialog.
+
       const tool = page.locator('#list .turn .acttool');
       await tool.hover();
       await page.evaluate(SETTLED);
@@ -1946,8 +1886,8 @@ test(
       assert.equal(await tool.getAttribute('aria-controls'), null);
       assert.equal(await pop.locator('.chippopnamelink').count(), 0);
 
-      // A turn that loaded no skill draws no count, and a turn whose only unusual call was a
-      // skill load draws no `other` category for it.
+      // Skill loads do not create tool categories, and zero skills omit the skill count.
+
       const loaded = toCard(turn({ stepCount: 2, stepKinds: ['commands', 'skill'] }), false, NOW);
       assert.deepEqual(
         loaded.activityToolCategories.map((category) => category.key),
@@ -2170,7 +2110,7 @@ test('Activity and expandable prompt headings read as interactive in both themes
       const payload = renderPayload() as { cards: Array<Record<string, unknown>> };
       payload.cards[0].prompt =
         'Keep this prompt readable when its expandable heading receives pointer and keyboard focus. '.repeat(40);
-      // The You asked heading is drawn where the Prompt position setting puts the prompt below the response.
+      // Below the response displays the You asked heading.
       Object.assign(payload, { timelineLayout: { cardLayout: 'compact', promptPosition: 'below' } });
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
@@ -2224,8 +2164,8 @@ test(
       const page = await browser.newPage();
       await page.setViewportSize({ width: 340, height: 600 });
       await page.setContent(themed(pageHtml()));
-      // A neutral font substitution over the real theme: still the editor's own colors and
-      // contrast, with a font stack a user could set that is not the fixture's default.
+      // Change font families while retaining the default theme colors.
+
       await page.evaluate(() => {
         document.documentElement.style.setProperty('--vscode-font-family', 'Arial');
         document.documentElement.style.setProperty('--vscode-editor-font-family', 'Consolas');
@@ -2687,7 +2627,7 @@ test(
       assert.equal(await page.getAttribute(run, 'aria-expanded'), 'false');
       assert.equal(await page.evaluate(`document.activeElement.matches('button.actrow.run')`), true);
 
-      // A new card instance has no manual run choice.
+      // Reloading creates a card without retained run-disclosure choices.
       await page.goto('about:blank');
       await page.setContent(pageHtml());
       card.activity = running;
@@ -2755,14 +2695,14 @@ test('the log fits the card at both widths, and its rows stay one line each', { 
 
     for (const width of [1350, 340]) {
       const shut = await layoutAt(page, width);
-      // The rows are in the document and laid out nowhere: a shut card hides its whole body,
-      // so nothing of the log takes a pixel until the reader asks for it.
+      // A closed card's Activity rows occupy no layout height.
+
       for (const row of shut.actrows) {
         assert.equal(row.bottom - row.top, 0, `a shut card lays out its log rows at ${width}px`);
       }
 
-      // Opening the card, then the log inside it. Two presses, because a finished turn draws
-      // the log shut: by then the answer is what the reader came for.
+      // Open the card and open Activity if its disclosure is closed.
+
       await page.evaluate(`(() => {
         document.querySelector('#list .turn .head').click();
         const head = document.querySelector('#list .turn .activitysec .actword');
@@ -2771,9 +2711,8 @@ test('the log fits the card at both widths, and its rows stay one line each', { 
       await page.evaluate(SETTLED);
       const open = (await page.evaluate(MEASURE)) as Laid;
       assert.deepEqual(failures, [], 'the panel threw while drawing the log');
-      // Four steps and the one prompt sent while they ran, which the log draws in among
-      // them at the moment it happened. Counted on the card the presses opened, because
-      // another fixture card carries a log of its own and draws it shut.
+      // Count Activity rows on the opened card independently of other fixture cards.
+
       const opened = (await page.evaluate(
         `document.querySelector('#list .turn').querySelectorAll('.actrow').length`,
       )) as number;
@@ -2784,14 +2723,14 @@ test('the log fits the card at both widths, and its rows stay one line each', { 
         if (!row.bottom && !row.top) {
           continue;
         }
-        // Inside the card, whatever the row holds. One of them is a path with no wrapping
-        // point in it, which is the case a row that will not shrink fails.
+        // The fixture includes an unbroken path to exercise row shrinking.
+
         assert.ok(
           row.right <= open.card.right + 1 && row.left >= open.card.left - 1,
           `at ${width}px a log row runs wider than the card it sits in`,
         );
-        // One line each. A wrapping row turns a sixty-step turn into a page of prose, and
-        // the count on the heading stops being a guide to how tall the log is.
+        // Activity rows stay within the single-line height bound.
+
         assert.ok(
           row.bottom - row.top < 34,
           `a log row is ${Math.round(row.bottom - row.top)}px tall at ${width}px, so its line wrapped`,
@@ -2801,7 +2740,7 @@ test('the log fits the card at both widths, and its rows stay one line each', { 
         open.documentWidth <= open.viewportWidth + 1,
         `the log scrolls the panel sideways at ${width}px: ${open.documentWidth} wide in ${open.viewportWidth}`,
       );
-      // Shut again, so the next width starts where this one did.
+      // Close the card before measuring the next width.
       await page.evaluate(`document.querySelector('#list .turn .head').click()`);
       await page.evaluate(SETTLED);
     }
@@ -3405,9 +3344,8 @@ test(
   },
 );
 
-// The activity path updates the keyed component in its existing list-owned wrapper. Exercise
-// both card-local disclosures and focus together, so the update cannot pass by preserving only
-// one of the states the reader put into the card.
+// Activity updates retain both card-local disclosure state and focused controls.
+
 test('a live activity update leaves an expanded prompt expanded', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -3431,10 +3369,10 @@ test('a live activity update leaves an expanded prompt expanded', { timeout: 60_
       >;
     };
     const card = payload.cards[0];
-    // The You asked heading is drawn where the Prompt position setting puts the prompt below the response.
+    // Below the response displays the You asked heading.
     Object.assign(payload, { timelineLayout: { cardLayout: 'compact', promptPosition: 'below' } });
-    // The clamp holds four lines, so a prompt shorter than five never draws the control that
-    // unclamps it and this test would press nothing.
+    // The prompt exceeds the four-line clamp so its expansion control exists.
+
     card.prompt = Array.from(
       { length: 14 },
       (_, index) => `Prompt line ${index + 1} of the request the reader sent to open this turn.`,
@@ -3486,8 +3424,8 @@ test('a live activity update leaves an expanded prompt expanded', { timeout: 60_
     const before = (await page.evaluate(READ)) as Shown;
     assert.equal(before.full, true, 'the press did not expand the prompt, so this test measures nothing');
     assert.ok(before.height > shut.height, 'the expanded prompt is no taller than the clamped one');
-    // Hold the wrapper and both controls by identity. The appended activity row below proves
-    // that the update ran while those nodes stayed in the document.
+    // Retain the wrapper and controls to compare node identity across the update.
+
     const stood = (await page.evaluate(`(() => {
       window.heldCard = document.querySelector('#list .turn');
       const control = ${JSON.stringify(`more:${card.key}`)};
@@ -3563,8 +3501,8 @@ test('a live activity update leaves an expanded prompt expanded', { timeout: 60_
       `more:${card.key}`,
       `the activity update moved the reader off the disclosure to ${JSON.stringify(held)}`,
     );
-    // Said last, because the reported failure is the collapse above and this is a separate
-    // contract. A run that breaks both should name the collapse.
+    // Disclosure attributes also describe the retained open state.
+
     assert.equal(shut.expanded, 'false', 'the clamped disclosure does not say that it is shut');
     assert.equal(before.expanded, 'true', 'the expanded disclosure does not say that it is open');
     assert.equal(after.expanded, 'true', 'the updated disclosure says that it is shut');
@@ -3600,10 +3538,8 @@ test('the folded running card carries a line saying what the agent is on, and on
         `the line is ${Math.round(laid.doing.bottom - laid.doing.top)}px tall at ${width}px, so it wrapped`,
       );
 
-      // Its figure is written by the ticker the whole card rides, and the draw runs that
-      // ticker, so the line counts from the frame it appears in rather than from the next
-      // second. Read here because a card that says what the agent is on without saying for
-      // how long reads the same whether the call started now or ten minutes ago.
+      // The folded Activity line includes an elapsed-time figure.
+
       const wording = (await page.evaluate(`(() => {
         const row = document.querySelector('#list .turn .doing');
         const parts = [':scope > .actverb', ':scope > .actcode', ':scope > .actfig']
@@ -3734,8 +3670,8 @@ test(
         );
         assert.equal(seen.inside, true, `a time fact runs outside the head row at ${width}px`);
         assert.equal(seen.cardInside, true, `the head row runs outside the turn card at ${width}px`);
-        // At 340px the running card read `running for 20mClaude`. Nothing on this row breaks
-        // inside itself, so a row too narrow for all of it painted one run over the next.
+        // The painted-text check detects overlapping head-row text.
+
         assert.equal(seen.painted, null, `the head row paints ${seen.painted} at ${width}px`);
       }
     } finally {
@@ -3744,7 +3680,7 @@ test(
   },
 );
 
-// A count that moved one way is spelled one way, on the figure and in the record it opens.
+// File figures and detail headings use the same one-way line-count wording.
 test('the head of a record spells a one-way line count the way the figure does', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -3766,8 +3702,8 @@ test('the head of a record spells a one-way line count the way the figure does',
         }
       >;
     };
-    // A turn that removed no line. The card carries one whose figure moved both ways, so the
-    // half under test is taken off it rather than added to a card that never had it.
+    // Remove the deleted count from an existing two-way file-count fixture.
+
     const card = payload.cards[LONG_TURN_INDEX];
     const files = card.chips.find((chip) => chip.metric === 'files');
     assert.ok(files?.detailList?.heading?.diff, 'the long turn drew no Files figure with a line count');
@@ -3804,9 +3740,8 @@ test('the head of a record spells a one-way line count the way the figure does',
   }
 });
 
-// A files figure that is a floor draws no mark of it on its face, but the record it opens still
-// says why. The turn's figure and a subagent's figure each open a record that draws the card's
-// own rows, so the sentence has to reach the part of the popover drawn beside those rows.
+// Partial file counts retain their explanation in turn and subagent details.
+
 test('a floor files figure opens a record that says why its count is a floor', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -3861,7 +3796,7 @@ test('a floor files figure opens a record that says why its count is a floor', {
       timelineLayout?: { cardLayout: string; promptPosition: string };
     };
     payload.cards = [card];
-    // One column draws the Subagents section, so the child's own files figure is on the card.
+    // One column exposes the subagent rows and their file figures.
     payload.timelineLayout = { cardLayout: 'one-column', promptPosition: 'above' };
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
@@ -3901,8 +3836,8 @@ test('a floor files figure opens a record that says why its count is a floor', {
   }
 });
 
-// A commit row as the host sends it: one branch of the card's own repository, written by the
-// main agent. A test names only what its case changes.
+// The commit fixture defaults to the main agent's branch in the card's repository.
+
 function commitRow(sha: string, subject: string, at: number, over: Partial<CommitRowView> = {}): CommitRowView {
   return {
     kind: 'commit',
@@ -3924,8 +3859,8 @@ function commitRow(sha: string, subject: string, at: number, over: Partial<Commi
   };
 }
 
-// Gives a card these commit rows, and heads its Commits popover the way the host heads that
-// record: a record of one branch names the branch beside the figure, and a grouped one does not.
+// Set commit rows and add a branch fact only for a single commit group.
+
 function withCommits(card: Record<string, unknown>, rows: CommitRowView[]): void {
   card.commits = rows;
   const chip = (card.chips as { metric?: string; detailList?: { heading: Record<string, unknown> } }[]).find(
@@ -3950,13 +3885,13 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
   }
   try {
     const page = await browser.newPage();
-    // The width is what this measures. The height leaves the open card room for its chip row,
-    // which the composer covers in a panel short enough to crowd it.
+    // The viewport leaves vertical room for the expanded card's chip row.
+
     await page.setViewportSize({ width: 800, height: 600 });
     await page.setContent(pageHtml());
     const payload = renderPayload() as { cards: Record<string, unknown>[] };
-    // Every row is on one branch whose name is 92 characters, so the record draws no group
-    // heading and the popover heading names the branch beside its figure.
+    // One long branch name belongs to the popover heading without a separate group heading.
+
     const onBranch = { branch: LONG_BRANCH };
     const commits = [
       commitRow('6816be3', 'Mark nested custom-tool spend partial', NOW - 600_000, {
@@ -3964,7 +3899,7 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
         added: 15,
         removed: 1,
       }),
-      // A subagent's row, the one row that draws a second line.
+      // The subagent commit row also includes its maker line.
       commitRow('69ab5b4', 'Record the broader child-spend review', NOW - 480_000, {
         ...onBranch,
         added: 96,
@@ -3972,17 +3907,17 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
         madeBy: 'Fold the Files rows behind a head line and prove the height guard goes red',
         madeBySession: 's-child',
       }),
-      // Four digits on both counts, the widest figure a count cell is sized to hold.
+      // Four-digit added and removed counts exercise wider count cells.
       commitRow('7c41d0e', 'Reflow every row at the narrow width', NOW - 360_000, {
         ...onBranch,
         added: 1284,
         removed: 1076,
       }),
-      // No counts at all, which Git reports for a commit that changed no line.
+      // Null counts exercise a row without line-count data.
       commitRow('0d5b7a2', 'Retag the release', NOW - 240_000, { ...onBranch, added: null, removed: null }),
     ];
-    // The card that already carries a Commits chip, given the four commits this measures. The
-    // popover draws the card's own commit array, so the rows reach it through the card.
+    // The existing card's commit figure opens its supplied commit rows.
+
     const card = payload.cards[LONG_TURN_INDEX];
     withCommits(card, commits);
     payload.cards = [card];
@@ -3990,9 +3925,8 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
     await page.evaluate(SETTLED);
     await page.evaluate(`document.querySelector('#list .turn .head').click()`);
     await page.evaluate(SETTLED);
-    // The Files section's own count pair, read first and off the same card, because the commit
-    // row's pair is measured against it. Both pairs are the one component, so one space parts the
-    // figures wherever they are drawn.
+    // Read the file-count gap as the comparison for commit-count spacing.
+
     await page.locator('#list .turn .statchip[data-metric="files"]').click();
     await page.evaluate(SETTLED);
     const filePairs = (await page.evaluate(`(() => {
@@ -4086,8 +4020,8 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
       seen.links[0].top - seen.rows[0].top <= 4,
       `the first commit link starts ${Math.round(seen.links[0].top - seen.rows[0].top)}px inside its row`,
     );
-    // Measured between the rows rather than between their tops, so a link that took the
-    // standalone margin opens a gap under the row above it whatever that row holds.
+    // Measure the gap between row bounds rather than between their top edges.
+
     assert.ok(
       seen.rows[1].top - seen.rows[0].bottom <= 4,
       `commit rows leave ${Math.round(seen.rows[1].top - seen.rows[0].bottom)}px between them`,
@@ -4096,14 +4030,14 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
       seen.links[0].top - seen.title.bottom < 13,
       `the first commit starts ${Math.round(seen.links[0].top - seen.title.bottom)}px below its heading`,
     );
-    // The heading owns the branch, so its full name is text there for every reader.
+    // The popover heading retains the complete branch name.
     assert.equal(seen.branch, `· on ${LONG_BRANCH}`, 'the long branch name is not on the popover heading');
     assert.ok(
       seen.popLeft >= -1 && seen.popRight <= seen.viewport + 1,
       'a long branch name pushes the commit list outside the panel',
     );
-    // The popover scrolls its own content, so its box stays inside the panel whatever a row
-    // does. The scroll widths are where a row too wide for the list shows up instead.
+    // Scroll width detects overflow inside a popover whose outer box stays within the viewport.
+
     assert.ok(
       seen.rowsScroll <= seen.rowsClient + 1,
       `the commit rows are ${Math.round(seen.rowsScroll - seen.rowsClient)}px wider than the list holding them, so the list scrolls sideways`,
@@ -4112,10 +4046,8 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
       seen.popScroll <= seen.popClient + 1,
       `the commit popover scrolls ${Math.round(seen.popScroll - seen.popClient)}px sideways`,
     );
-    // The row's first line is the hash, the subject and the line counts, and the counts hold its
-    // right edge. Only the subagent's row draws a second line, which starts under the subject's
-    // first character. The last row reports no counts and still draws the count cell, so its
-    // subject has the room every other subject has.
+    // Count cells retain alignment for subagent rows and rows without counts.
+
     for (const [index, part] of seen.parts.entries()) {
       const { sha, name, nums, add } = part;
       if (!sha || !name || !nums) {
@@ -4149,18 +4081,16 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
       Math.max(...edges) - Math.min(...edges) <= 1,
       `the line counts end at ${edges.join('px and ')}px, so they do not stand in one column`,
     );
-    // The pair reads the way a file row's pair reads: one space between the two figures, and the
-    // removed figure on the right edge the cell holds. A cell wider than the figures it carries
-    // parts them by many times that measure.
-    // Each row's own count cell first, because the spacing below is measured over the rows that
-    // drew both halves and says nothing about a row that lost one. The second commit removed no
-    // line and draws its added figure alone, and the last reports no counts and draws neither.
+    // Added and removed figures share the file-count component's gap.
+
+    // Check the displayed count text before measuring rows that contain both figures.
+
     assert.deepEqual(
       seen.parts.map((part) => part.numsText),
       ['+15 −1', '+96', '+1284 −1076', ''],
       'the commit rows do not draw the line counts their record holds',
     );
-    // A commit that removed no line draws no removed figure, so it carries no pair to measure.
+    // A row with additions only has no count pair to measure.
     const pairs = seen.parts.filter((part) => part.add && part.del);
     assert.equal(pairs.length, 2, 'the two rows that moved lines both ways drew no pair to measure');
     for (const part of pairs) {
@@ -4175,8 +4105,8 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
       Math.max(...removed) - Math.min(...removed) <= 1,
       `the removed counts end at ${removed.join('px and ')}px, so a four-digit count pulled its row out of the column`,
     );
-    // The cell holds one width down the list, four-digit row and countless row alike, which is
-    // what leaves every subject the same column.
+    // Count cells keep the same width even for four-digit or absent counts.
+
     const cells = seen.parts.map((part) => Math.round((part.nums?.right ?? 0) - (part.nums?.left ?? 0)));
     assert.ok(
       Math.max(...cells) - Math.min(...cells) <= 1,
@@ -4192,9 +4122,8 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
       Math.max(...columns) - Math.min(...columns) <= 1,
       `the subject columns end at ${columns.join('px and ')}px, so a row dropped its count cell`,
     );
-    // The maker follows the subject at the leading of the text around it, so the two lines read
-    // as one row. What parts one commit from the next is the gap between the rows, measured from
-    // the end of the maker line to the start of the next row's subject.
+    // The maker line stays closer to its subject than to the next commit row.
+
     const inside = (made.facts?.top ?? 0) - (made.name?.bottom ?? 0);
     const between = (seen.parts[2].name?.top ?? 0) - (made.facts?.bottom ?? 0);
     assert.ok(
@@ -4206,9 +4135,8 @@ test('links inside commit rows do not add standalone action spacing', { timeout:
   }
 });
 
-// A merge no branch of the record explains is a row of its own, under the heading of the branch
-// that moved. It reads merged in on the line a subagent's row names its maker on, and its hash
-// stands in the hash column of the commits around it.
+// A landing without an explained source branch draws a merged-in row under its destination branch.
+
 test('a landing no branch explains draws as a row that reads merged in', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -4220,9 +4148,8 @@ test('a landing no branch explains draws as a row that reads merged in', { timeo
     await page.setViewportSize({ width: 800, height: 600 });
     await page.setContent(pageHtml());
     const payload = renderPayload() as { cards: Record<string, unknown>[] };
-    // A commit on main above and below the landing, because the landing's hash starts where
-    // theirs start and there is nothing to compare it against alone. The commit on topic puts
-    // the record in two groups, so the landing has a heading to sit under.
+    // Neighboring commits provide hash-alignment comparisons. A topic commit creates the second branch group.
+
     const landing: CommitRowView = {
       ...commitRow('6816be3', 'Retag the release', NOW - 600_000, { added: null, removed: null }),
       kind: 'landing',
@@ -4296,8 +4223,8 @@ test('a landing no branch explains draws as a row that reads merged in', { timeo
       Math.abs((seen.facts?.left ?? 0) - (seen.name?.left ?? 0)) <= 1,
       'the merged in line starts away from the subject above it',
     );
-    // The landing's hash stands where the hashes of the commits around it stand. A gap left in
-    // front of it would indent the whole row against them.
+    // The landing hash aligns with the neighboring commit hashes.
+
     assert.equal(seen.neighbours.length, 2, 'the popover drew no commit rows around the landing');
     for (const [index, neighbour] of seen.neighbours.entries()) {
       assert.ok(neighbour, `commit row ${index} beside the landing drew no hash`);
@@ -4311,10 +4238,8 @@ test('a landing no branch explains draws as a row that reads merged in', { timeo
   }
 });
 
-// At the sidebar's width a commit row is one line, and a subagent's row is two. The subject and
-// the maker's name end in an ellipsis rather than wrapping, the counts hold the right edge of the
-// first line, and each group heading starts its text over the hash column of its rows. The rows
-// are the fixture's longest: an 83-character subject, and a 74-character maker name.
+// The narrow fixture includes long subject and maker names to exercise ellipsis and column alignment.
+
 test(
   'commit rows keep to their lines at 340 px, and group headings start over the hash column',
   { timeout: 60_000 },
@@ -4440,9 +4365,8 @@ test(
   },
 );
 
-// The Files, Subagents and Commits chips are the only way from the panel into a file, a
-// subagent session or a commit. A row that answers the pointer alone leaves a reader who does
-// not use one with no route at all, so this walks the whole route with the keyboard.
+// Keyboard navigation reaches rows from the Files, Subagents, and Commits figures.
+
 test('the record chips say what they open and give the keyboard their rows', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -4459,9 +4383,8 @@ test('the record chips say what they open and give the keyboard their rows', { t
     const agentRows = card.agents as Array<{ state: string; stateWord: string; since: number | null }>;
     Object.assign(agentRows[0], { state: 'running', stateWord: 'running', since: NOW - 120_000 });
     Object.assign(agentRows[1], { state: 'open', stateWord: 'no ending recorded', since: null });
-    // The long turn has ended, so its head counts none of its children. A card whose child
-    // still runs counts that child and marks the count busy, and that is the head this test
-    // draws.
+    // The fixture supplies one running subagent and updates its popover heading accordingly.
+
     const agentsHead = (card.chips as { metric?: string; detailList?: { heading: Record<string, unknown> } }[]).find(
       (chip) => chip.metric === 'agents',
     )?.detailList?.heading;
@@ -4476,8 +4399,8 @@ test('the record chips say what they open and give the keyboard their rows', { t
 
     const pop = page.locator('#chippop');
     const chipFor = (metric: string) => page.locator(`#list .turn .statchip[data-metric="${metric}"]`);
-    // Each of the three says it controls the popover before it is opened, and says whether it
-    // is open, the way the skills count does.
+    // Record figures identify their controlled popover and expanded state.
+
     for (const metric of ['files', 'agents', 'commits']) {
       const chip = chipFor(metric);
       assert.equal(await chip.count(), 1, `the long turn drew no ${metric} chip`);
@@ -4496,14 +4419,14 @@ test('the record chips say what they open and give the keyboard their rows', { t
       assert.equal(await pop.isHidden(), true, `Escape left the ${metric} popover open`);
     }
 
-    // A running count is the one fact in a head that changes while the reader looks at it, so
-    // it wears the tone the panel gives work that is still moving.
+    // The running subagent count carries the busy tone.
+
     await chipFor('agents').click();
     await page.evaluate(SETTLED);
     const running = pop.locator('.chippophead .chippopvalue');
     assert.equal(await running.textContent(), '1 running');
-    // Which colour that tone resolves to is read from the stylesheet in `tones.test.ts`. What
-    // only a browser can say is that the drawn count carries the class the rule paints.
+    // The assertion checks the busy class. `tones.test.ts` checks its color.
+
     assert.equal(
       await running.evaluate((node) => node.classList.contains('is-busy')),
       true,
@@ -4512,8 +4435,8 @@ test('the record chips say what they open and give the keyboard their rows', { t
     await page.keyboard.press('Escape');
     await page.evaluate(SETTLED);
 
-    // The arrows walk into the rows from the chip, a row acts on the key, and a backward walk
-    // hands the chip back.
+    // Arrow keys enter and traverse file rows, then return to the figure.
+
     const files = chipFor('files');
     await files.click();
     await page.evaluate(SETTLED);
@@ -4542,11 +4465,8 @@ test('the record chips say what they open and give the keyboard their rows', { t
       'the backward walk out of the first row did not hand the Files chip back',
     );
 
-    // The popover is drawn on the body, so a forward walk off its last press has to carry on
-    // from the chip's own place in the page rather than from the end of the document. The
-    // Activity disclosure is the stop after the chip row, so it is where the walk has to land.
-    // Focus handed back to the chip leaves the popover shut and focus outside it as well, so
-    // the walk has to be read off the control it reached.
+    // Tab leaves the body-mounted popover through the card's keyboard order after its anchor.
+
     await pop.locator('button').last().focus();
     await page.keyboard.press('Tab');
     await page.evaluate(SETTLED);
@@ -4556,19 +4476,18 @@ test('the record chips say what they open and give the keyboard their rows', { t
       false,
       'the walk stayed inside a popover the reader can no longer see',
     );
-    // The prompt sits before the response by default, so the press that shows the later asks is
-    // the next control in the card's order.
+    // With the prompt above the response, the later-prompts disclosure follows the chip row.
+
     assert.match(
       String(await page.evaluate(`document.activeElement?.dataset.control ?? ''`)),
       /^asks:/,
       'the walk off the last press reached something other than the control after the chip row',
     );
 
-    // A reader who crossed the hover grace onto a row never pinned anything. When the pointer
-    // leaves and the popover goes with it, focus has to come back to the chip rather than fall
-    // to the page.
-    // The pointer has been standing on the chip since the press above, so it is taken off the
-    // card first. A hover onto where the pointer already is enters nothing.
+    // Closing an unpinned popover returns its row focus to the figure.
+
+    // Move the pointer away first so hovering triggers a fresh entry event.
+
     await page.mouse.move(4, 4);
     await page.waitForFunction(`document.getElementById('chippop').hidden`);
     await files.hover();
@@ -4592,10 +4511,8 @@ test('the record chips say what they open and give the keyboard their rows', { t
   }
 });
 
-// The section the owner asked for, drawn at the width it is hardest at, with a card holding
-// as many messages as the longest turn on this machine produced. The symptom it answers is a
-// message that was readable only as a truncated activity row with a hover on it, so what is
-// measured is that every message is on the page, whole, and that the long one says so.
+// The message fixture combines many short messages with one message requiring expansion.
+
 test(
   'every mid-turn message is drawn in full, and a long one is bounded and offers the rest',
   { timeout: 90_000 },
@@ -4609,13 +4526,13 @@ test(
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on('pageerror', (e) => failures.push(String(e)));
-      // The narrow width, which is the sidebar. A section that scrolls sideways or hides behind
-      // a bound reads exactly like a working one at the editor-tab width.
+      // The narrow viewport exercises content bounds and horizontal overflow.
+
       await page.setViewportSize({ width: 340, height: 900 });
       await page.setContent(pageHtml());
       const payload = renderPayload() as { cards: Record<string, unknown>[] };
-      // One message long enough to need the bound, one closed answer, and the rest the one-line
-      // narrations that make up nearly all of a real section.
+      // The fixture includes one long message, one earlier reply, and short narration messages.
+
       const long = Array.from({ length: 60 }, (_, n) => `<p>Line ${n + 1} of a message that keeps going.</p>`).join('');
       const messages = Array.from({ length: 128 }, (_, n) => ({
         id: `${n === 3 ? 'answer' : 'commentary'}:${NOW - (128 - n) * 1000}:0`,
@@ -4719,8 +4636,8 @@ test(
         'the head carries no key of its own, so a repaint throws the reader out of it',
       );
       assert.equal(seen.controls, seen.listId, 'the head does not name what it opens');
-      // Not bounded and not a scroller. Board 5b drew one, and it hides messages behind a
-      // scrollbar inside a scrolling panel.
+      // The message section and list use the panel's scroll region without inner scrolling.
+
       assert.equal(seen.sectionOverflow, 'visible', 'the section has an inner scroll region');
       assert.equal(seen.sectionScrolls, false, 'the section is bounded, so it hides what it holds');
       assert.equal(seen.listOverflow, 'visible', 'the message list has an inner scroll region');
@@ -4729,7 +4646,7 @@ test(
         (seen.sectionHeight as number) > 2000,
         `the section is ${seen.sectionHeight}px tall, so the messages are not all drawn`,
       );
-      // The long one is bounded and says so; the short one beside it has nothing to offer.
+      // Only the long message receives a bound and an expansion control.
       assert.equal(seen.bounded, true, 'a message of thousands of characters is drawn at its full height');
       assert.ok(
         (seen.boundHeight as number) < 700,
@@ -4746,11 +4663,11 @@ test(
       );
       assert.equal(seen.shortBounded, false, 'a one-line message is bounded');
       assert.equal(seen.shortMoreHidden, true, 'a message with nothing hidden still offers to show the rest');
-      // The answer keeps its tag, its clock and the index a note anchors by.
+      // The earlier reply retains its label, timestamp, and comment anchor index.
       assert.equal(seen.answers, 1);
       assert.equal(seen.answerIndex, '0', 'a mid-turn answer lost the index every note left on it resolves through');
       assert.equal(seen.answerWord, CARD_ACTIONS.saidReplied, 'a reply is not told apart from a narration');
-      // The clock leads and the word follows it, with a space between them that survives a copy.
+      // Reply metadata places its label before the timestamp with a literal separator.
       assert.match(
         String(seen.answerMeta),
         /^Replied, 2:31 PM$/,
@@ -4758,8 +4675,8 @@ test(
       );
       assert.equal(seen.answerClockTitle, 'Replied 2:31 PM', 'the message clock reveals no exact time');
       assert.equal(seen.answerClockWords, '2:31 PM', 'the message clock is not the time the record carries');
-      // Every message opens on the same shape, which is what lets the eye read the pace off one
-      // column. A narration is told from a reply by the absence of the word, not by a label.
+      // Narration retains its timestamp without the earlier-reply label.
+
       assert.equal(seen.narrationClock, '2:31 PM', 'a narration carries no clock, so the column has two shapes');
       assert.equal(seen.narrationWord, null, 'a narration carries a word of its own, so the mark means nothing');
       assert.equal(seen.afterResponse, true, 'the section is drawn above the response it led to');
@@ -4769,7 +4686,7 @@ test(
         'a mid-turn message makes the panel scroll sideways',
       );
 
-      // The press lifts the bound on that one block and says which way the next press goes.
+      // Expansion removes this message's bound and reverses its control wording.
       await page.evaluate(`document.querySelector('#list .turn .activitysec .said button.more').click()`);
       await page.evaluate(SETTLED);
       const opened = (await page.evaluate(read)) as Record<string, unknown>;
@@ -4791,15 +4708,8 @@ test(
   },
 );
 
-// A table a response wrote, measured at both widths. Two rules keep it readable and neither
-// shows in a text scan of the stylesheet. `.summary` sets `overflow-wrap: anywhere`, and a
-// cell that inherits it breaks inside a word: every column then falls to the width of one
-// character, and the reader meets a commit hash cut into two pieces. A table too wide for the
-// card has to carry its own sideways scroll, or it pushes the whole panel over instead.
-//
-// Every cell of the fixture holds one word, so one line each is the whole check. The path is
-// what makes the table wider than the narrow card, and the centered column is what says the
-// head still takes the alignment the response asked for.
+// Table fixtures use unbroken words and a long path. Table scrolling stays within the card and preserves requested column alignment.
+
 test('a response table keeps its words whole and never widens the panel', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -4871,7 +4781,7 @@ test('a response table keeps its words whole and never widens the panel', { time
         'left',
         `at ${width}px the head reading Area sits ${seen.cells[0].align} of a left-aligned column`,
       );
-      // Chromium reports the align attribute's own value, which carries its prefix.
+      // Chromium includes a prefix in the computed alignment value.
       assert.ok(
         seen.cells[1].align.endsWith('center'),
         `at ${width}px the head reading Result sits ${seen.cells[1].align} of the column the response centered`,
@@ -4890,19 +4800,14 @@ test('a response table keeps its words whole and never widens the panel', { time
   }
 });
 
-// The open long card's bounding height at the two panel widths the density work measures, under
-// the default Timeline layout. With the record carried by the chips and the prompt before the
-// response the card measures 1442 at 340 and 665 at 1350. Each bound stands about a tenth above
-// the measured height, which covers a font metric or a scrollbar that differs between machines,
-// and stays far under the height COLUMN_BUDGET records for the same card with the Files,
-// Subagents and Commits sections drawn into the body, so a section that returns to the body
-// still turns the guard red.
+// Compact-layout height budgets leave limited room for font metrics and scrollbar differences.
+
 const CARD_HEIGHT_BUDGET = [
   { width: 340, bound: 1570 },
   { width: 1350, bound: 735 },
 ];
 
-// The body parts of an open card, in the order the page draws them.
+// Read visible card body parts in document order.
 const BODY_ORDER = `((selector) => {
   const body = document.querySelector(selector + ' .body');
   const name = (node) => node.classList.contains('promptlead') ? 'prompt'
@@ -4939,8 +4844,8 @@ test("every Timeline layout draws the long card's body in its own order", { time
         const expected = [
           ...(promptPosition === 'above' ? ['prompt'] : []),
           ...prose,
-          // Two columns draws the prompt that follows the response in the prose column, which
-          // comes before the record column in the page's order.
+          // Two columns places a below-response prompt in the prose column before the record column.
+
           ...(cardLayout === 'two-columns' && promptPosition === 'below' ? ['prompt'] : []),
           ...(cardLayout === 'compact' ? [] : record),
           ...(cardLayout !== 'two-columns' && promptPosition === 'below' ? ['prompt'] : []),
@@ -4966,9 +4871,8 @@ test("every Timeline layout draws the long card's body in its own order", { time
   }
 });
 
-// A record of one merged branch puts the merged word on the section heading and on the popover
-// heading. Its hover and its hidden words name the target, the time and the hash, and the clock
-// writes the time again when the day turns, as it does on a group heading.
+// A one-branch landing appears on both Commits headings with destination, timestamp, and commit identity details.
+
 test(
   'the merged word on a one-branch Commits heading speaks its arrival and follows the clock',
   { timeout: 60_000 },
@@ -5011,8 +4915,8 @@ test(
         spoken: word && word.querySelector('.sr-only') && word.querySelector('.sr-only').textContent,
       };
     })()`) as Promise<{ text: string; title: string | null; spoken: string | null } | null>;
-      // The fact sits beside the collapse button rather than inside it, so the section root for
-      // this lookup is the heading's `.acthead` wrapper rather than the button's own `.sec-title`.
+      // The landing fact is beside the collapse button, so lookup starts at the heading wrapper.
+
       const section = `${selector} .recordcommits .acthead`;
       assert.deepEqual(
         await arrivalOf(section),
@@ -5039,7 +4943,7 @@ test(
         'the popover name leaves out the branch or the merged word its heading draws',
       );
       await page.keyboard.press('Escape');
-      // The day turns. The host's card prints the same, so the clock is the only writer.
+      // The activity update supplies changed absolute-time text to the mounted heading.
       const later = { ...card, commits: merged('Aug 23 4:49 PM') };
       await page.evaluate(
         `window.postMessage(${JSON.stringify({ type: 'activity', session: card.sessionId, card: later })}, '*')`,
@@ -5048,7 +4952,7 @@ test(
       const turned = await arrivalOf(section);
       assert.match(turned?.title ?? '', /at Aug 23 4:49 PM/, 'the merged word kept the time the day turned away from');
       assert.equal(turned?.spoken, ' into main at Aug 23 4:49 PM, as c36e7b5b');
-      // A record of two branches draws a group heading, whose name follows the clock the same way.
+      // Grouped branch headings also update their accessible timestamp.
       const grouped = (absolute: string) => [
         ...merged(absolute),
         commitRow('bbbb222', 'Retag it', NOW - 100_000, { absolute }),
@@ -5070,12 +4974,8 @@ test(
   },
 );
 
-// Two columns puts the record beside the prose where the card holds both, and stacks it under
-// Activity where it does not. One column at the narrow width and Two columns at the wide width
-// each stay under a height bound, measured on the long card: 816 for Two columns at 1350, and
-// 2425 for either value at 340. Each bound stands about a tenth above its figure. The narrow
-// figure carries the two commit rows the fixture's fold child made, whose maker is named on a
-// line under each subject and wraps several times at that width.
+// Two columns places records beside prose at wide widths and stacks them at narrow widths. Height budgets allow font and scrollbar variation.
+
 const COLUMN_BUDGET = [
   { cardLayout: 'two-columns', width: 1350, beside: true, bound: 900 },
   { cardLayout: 'one-column', width: 340, beside: false, bound: 2670 },
@@ -5143,7 +5043,7 @@ test('Two columns sits the record beside the prose only where the card holds bot
   }
 });
 
-// The long card's body parts, each as its top and height against the card, and the card's height.
+// Read each body part's position and height relative to the card.
 const BODY_GEOMETRY = `((selector) => {
   const card = document.querySelector(selector);
   const top = card.getBoundingClientRect().top;
@@ -5282,8 +5182,8 @@ test(
   },
 );
 
-// The Two columns grid, read out of the panel stylesheet: the width its container query names, and
-// the rules inside it so a test can apply them at any width.
+// Read the column threshold and grid rules from the panel stylesheet.
+
 const COLUMNS_RULE = `(() => {
   for (const sheet of document.styleSheets) {
     for (const rule of sheet.cssRules) {
@@ -5296,9 +5196,8 @@ const COLUMNS_RULE = `(() => {
   return null;
 })()`;
 
-// The width the Two columns query reads on the long card, which is the card's content box, in the
-// card's own em. Then the pixels in one em, the card's height, and whether the record sits
-// beside the prose.
+// Measure the card's content width in em, its font size, height, and column placement.
+
 const COLUMNS_READING = `((selector) => {
   const card = document.querySelector(selector);
   const style = getComputedStyle(card);
@@ -5313,10 +5212,8 @@ const COLUMNS_READING = `((selector) => {
   };
 })`;
 
-// Two columns earns its place where it draws the long card shorter than One column does. Below
-// that width the prose column wraps so much more that the card grows, so the grid stops there.
-// The test applies the grid's own rules at each width it tries, finds that width, and holds the
-// stylesheet's threshold to it.
+// Compare forced two-column and one-column heights using the stylesheet's grid rules across widths.
+
 test('Two columns starts at the width where it stops making the long card taller', { timeout: 180_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -5345,7 +5242,7 @@ test('Two columns starts at the width where it stops making the long card taller
       })(${JSON.stringify(rule.inner)}, ${on})`);
       await page.evaluate(SETTLED);
     };
-    // The long card under One column and under the forced grid at one viewport width.
+    // Compare both layouts at the same viewport width.
     const compare = async (width: number) => {
       await at(width);
       await showLayout(page, payload, selector, 'one-column');
@@ -5374,7 +5271,7 @@ test('Two columns starts at the width where it stops making the long card taller
       `two columns stop making the long card taller at ${measured.toFixed(2)}em, and the stylesheet starts them at ${rule.em}em`,
     );
 
-    // Just under and just over the threshold, with the stylesheet alone deciding.
+    // Measure placement immediately below and above the stylesheet threshold.
     await showLayout(page, payload, selector, 'two-columns');
     for (const [offset, beside] of [
       [-0.5, false],
@@ -5417,8 +5314,8 @@ test('the open long card stays inside its height budget at both panel widths', {
     const key = (renderPayload() as { cards: { key: string }[] }).cards[LONG_TURN_INDEX].key;
     const selector = `[data-key=${JSON.stringify(key)}]`;
     for (const { width, bound } of CARD_HEIGHT_BUDGET) {
-      // The panel keeps each card's own open state across renders, so the card is opened only
-      // where the width before left it shut.
+      // Open the card only if its retained disclosure state is closed.
+
       await layoutAt(page, width);
       if ((await page.locator(`${selector} .body`).getAttribute('hidden')) !== null) {
         await page.locator(`${selector} .head`).click();
@@ -5441,9 +5338,8 @@ test('the open long card stays inside its height budget at both panel widths', {
   }
 });
 
-// What the reader hears on walking into the subagents popover. The heading alone leaves out the
-// running figure beside it, so the name carries both. The carried subagents under the rows are a
-// description of the dialog, spoken once rather than on every announcement of its name.
+// The dialog name includes its running count. Carried-subagent details remain a separate description.
+
 test(
   'the subagents popover is announced with its running figure and its carried subagents',
   { timeout: 60_000 },
@@ -5461,7 +5357,7 @@ test(
           index === 0 ? { ...agent, id: 'bg-live', status: 'running' } : agent,
         ),
       };
-      // The newest card, with one live child of its own and one an earlier turn launched.
+      // The fixture includes a live child from this turn and a carried child.
       const live = toCard(background, true, NOW, [], null, false, new Set(['bg-live', 'carried-1']));
       const page = await browser.newPage();
       await page.setViewportSize({ width: 1350, height: 900 });
@@ -5493,9 +5389,8 @@ test(
   },
 );
 
-// The agents figure on a finished turn whose background subagent still works. The open count
-// is the one figure on the row that says work goes on, so it wears the busy tone, and it is
-// text, so it holds the 4.5 to 1 floor against the figure's own ground in both themes.
+// The running-subagent count on a finished turn uses the busy tone and meets 4.5:1 contrast in both default themes.
+
 test(
   'the open subagent count on a finished turn wears the busy tone and stays readable',
   { timeout: 60_000 },
@@ -5507,8 +5402,8 @@ test(
     }
     try {
       const recorded = FIXTURE_TURNS[LONG_TURN_INDEX];
-      // A Claude background launch keeps the parser's `running` status after its turn ends. The
-      // rail's live open children name it, which is what makes the figure count it.
+      // The fixture keeps the child's recorded running status and includes its id in the live-child set.
+
       const background = {
         ...recorded,
         agents: recorded.agents.map((agent, index) =>
@@ -5556,8 +5451,8 @@ test(
   },
 );
 
-// A card chip, a rail figure and a subagent row figure are one shape wherever the panel draws
-// them, padding and line height included.
+// Card, session list, and subagent figures share padding and height.
+
 test('a card chip, a rail figure and a subagent row figure are one pill', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -5569,7 +5464,7 @@ test('a card chip, a rail figure and a subagent row figure are one pill', { time
     await page.setViewportSize({ width: 1350, height: 900 });
     await page.setContent(themed(pageHtml(), 'dark'));
     const payload = renderPayload() as { cards: Record<string, unknown>[] };
-    // The card's own Subagents section, so the figure is measured without a popover over it.
+    // One column exposes the subagent figure without a covering popover.
     Object.assign(payload, { timelineLayout: { cardLayout: 'one-column', promptPosition: 'above' } });
     payload.cards = [
       {
@@ -5628,8 +5523,8 @@ test('a card chip, a rail figure and a subagent row figure are one pill', { time
       [chip.left, chip.right],
       `the rail figure pads its sides by ${rail.left}em against the card chip's ${chip.left}em`,
     );
-    // The subagent row's own figure, held to the same shared padding and height as the card
-    // chip. A row that dropped back to a flattened override would fail this comparison.
+    // Compare the subagent figure's padding and height with the card figure.
+
     assert.deepEqual(
       [figure.left, figure.right],
       [chip.left, chip.right],
@@ -5639,11 +5534,8 @@ test('a card chip, a rail figure and a subagent row figure are one pill', { time
       Math.abs(figure.height - chip.height) <= 0.02,
       `the subagent row figure stands ${figure.height}em tall against the card chip's ${chip.height}em`,
     );
-    // The figure's own text size, read unscaled and compared against the row that holds it.
-    // The shared pill rule sets font-size to the body scale, which reads smaller than a row's
-    // own text, so the row's override must restate its own size rather than drop to the shared
-    // one. Padding parity alone cannot catch a pill whose text shrank inside a box of the right
-    // shape.
+    // Check the figure's font size separately because matching box dimensions do not establish text sizing.
+
     const rowFontSize = (await page.evaluate(
       `Number.parseFloat(getComputedStyle(document.querySelector('#list .recordagents .agentrow')).fontSize)`,
     )) as number;
@@ -5658,25 +5550,16 @@ test('a card chip, a rail figure and a subagent row figure are one pill', { time
   }
 });
 
-// Every stop the keyboard takes among the subagent rows, under one root, in the order the
-// page holds them. A row's own stop leads the stops inside it, because the row element comes
-// before its children.
+// Read row and child-control keyboard stops in document order.
+
 const SUBAGENT_STOPS = `((root) => [...document.querySelectorAll(root + ' .agentrow')].flatMap((row, index) => {
   const named = (node) => (node.classList.contains('namelink') ? 'name' : node.getAttribute('data-metric') || node.className);
   const own = row.getAttribute('tabindex') === '0' ? [index + ' row'] : [];
   return [...own, ...[...row.querySelectorAll('button, [tabindex="0"]')].map((node) => index + ' ' + named(node))];
 }))`;
 
-// What a keyboard reader walks through inside a popover of eight subagent rows.
-//
-// The figures sit outside `ROVING_SELECTOR` in `webview/navigation.ts`, so the row hands them
-// one stop of its own and the arrow keys cross from that stop to the rest. Eight children come
-// to at most one stop a row plus each row's link, whatever each row's figures come to.
-//
-// The rule underneath it: a row hands the keyboard its name link and one figure stop, and it
-// keeps a stop of its own only where no link carries its run line. A figure answers for its own
-// total and never for the run line, so a row that gives its stop away to its figures puts the
-// duration and the tool uses out of reach.
+// Subagent rows share one figure stop. A row retains its own stop when no session link carries its run details.
+
 test(
   'the subagent rows of a popover give the keyboard their links and one figure stop',
   { timeout: 60_000 },
@@ -5707,19 +5590,16 @@ test(
         false,
         'the Subagents popover shut before its stops were read',
       );
-      // Eight children come to nine stops. The first child holds two of them, because it has a
-      // session to open and its figures share one stop. Six children hold their link alone, and
-      // the child with no session holds the row.
+      // The eight-child fixture yields nine stops, including one shared figure stop and one row without a session link.
+
       assert.deepEqual(
         await page.evaluate(`${SUBAGENT_STOPS}('#chippop')`),
         ['0 name', '0 cost', '1 name', '2 name', '3 row', '4 name', '5 name', '6 name', '7 name'],
         'the popover hands the keyboard more than one stop a row and its link',
       );
 
-      // A finished child Arc has no session for, with a record on every figure it draws. The
-      // run line is the row's alone, so the row keeps its stop beside the three its figures
-      // take. `turncard.test.ts` owns the wording of this record under `a completed subagent
-      // carries cost, commits, and files`.
+      // A completed child without a session link retains its row stop and supplies details for each figure.
+
       const lone = {
         ...payload.cards[0],
         agents: [
@@ -5774,9 +5654,8 @@ test(
         'a child with no session to open loses the run line no figure carries',
       );
 
-      // Focus back on a figure the row's walk left out, after its record closed. The figure sits
-      // inside the row stop, and Shift+Tab steps back from the figure itself: to the figure
-      // before it, then to the row, never out to the anchor past both.
+      // After a nested detail closes, Shift+Tab moves from its figure through preceding figures and the row.
+
       const loneRow = page.locator('#chippop .agentrow').first();
       const isFocused = (selector: string) =>
         page.evaluate(`document.activeElement === document.querySelector(${JSON.stringify(selector)})`);
@@ -5800,9 +5679,8 @@ test(
       await page.evaluate(SETTLED);
       assert.equal(await isFocused('#chippop .agentrow'), true, 'Shift+Tab from the first figure skipped its row');
 
-      // The child with a session and records drawn last, so its figure stop is the popover's
-      // last stop. Tab from its name reaches that figure before the popover shuts, Enter on
-      // the figure pins its record as a click does, and Tab from there leaves the popover.
+      // Place the child with figure details last to test entry, activation, and exit at the popover boundary.
+
       const rows = subagentRows(now);
       const last = { ...payload.cards[0], agents: [...rows.slice(1), rows[0]] };
       await page.evaluate(`window.postMessage(${JSON.stringify({ ...payload, cards: [last] })}, '*')`);

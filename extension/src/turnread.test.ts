@@ -1,8 +1,5 @@
-// extension/src/turnread.test.ts
-//
-// The tests for turnread.ts. One that reads a second seam's names lives in turnview.test.ts
-// instead, because neither file owns it. The builders a test is written against are here
-// while only this file needs them, and in turnfixtures.ts once a second file does.
+// Turn read state and session unread counts. Cross-module wording checks live in turnview.test.ts.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -101,15 +98,15 @@ test('a retained tail stays until its newest turn is read', () => {
 });
 
 test('a turn is read by its own key or by how far its session is marked', () => {
-  // The one predicate, with every answer written out. Two ways in, and a card that drew one
-  // and reported the other is what a second copy of this rule costs.
+  // Explicit read keys and session watermarks use the same read predicate.
+
   const c = (sessionId: string, startedAt: number) => ({ key: `${sessionId}:${startedAt}`, sessionId, startedAt });
   const read = new Set(['a:200']);
   const readTo = new Map([['a', 500]]);
   // Its own key, whatever the watermark says.
   assert.equal(isTurnRead(c('a', 200), read, readTo), true);
   assert.equal(isTurnRead(c('b', 200), read, new Map()), false);
-  // Under the watermark, with no key of its own: read, which is the whole point of it.
+  // A turn below its session watermark is read without an explicit key.
   assert.equal(isTurnRead(c('a', 100), new Set(), readTo), true);
   // At the watermark exactly: the mark is the newest turn the reader marked, so it is read.
   assert.equal(isTurnRead(c('a', 500), new Set(), readTo), true);
@@ -140,9 +137,8 @@ test('a session marked read counts nothing new, and counts a turn that came afte
     1,
     'the read set alone already answers 0 here, so this fixture cannot see the watermark',
   );
-  // A deeper read then brings in an older turn nobody ever marked. The watermark covers it
-  // and the count holds at nothing new, which is what the reader was told when they marked
-  // the session.
+  // The watermark covers older turns recovered by a deeper read.
+
   const deeper = [...drawn, c('a', 100)];
   assert.equal(newBySession(deeper, keys, readTo).get('a'), 0);
   assert.equal(newBySession(deeper, keys, new Map()).get('a'), 1);
@@ -158,18 +154,9 @@ test('a session marked read counts nothing new, and counts a turn that came afte
   assert.equal(newBySession(both, [], readTo).get('a'), 0);
 });
 
-// The rail lists every session in the workspace and the panel parses a handful, so
-// nearly every card had no count and could draw no unread mark: with the default of three
-// parsed, 26 of this workspace's 29 sessions were silent whatever was waiting in them.
-// That is the bug the reader reported as the mark appearing only once they clicked in.
+// The first workspace opening sets a read floor. Older turns count as read on both parsed-card and metadata paths.
+
 test('a workspace opened for the first time is not handed every turn it already holds', () => {
-  // The reader did not fail to read what an agent did in a project before they installed
-  // this. They were not being offered it. So the moment the panel is first drawn is a floor,
-  // and everything under it counts as read.
-  //
-  // Held on the counts rather than on the predicate alone, because the count is what the
-  // reader meets: a rail saying 400 new in a project they have just opened is the failure,
-  // and it reaches that figure through here.
   const none = new Map<string, number>();
   const window = (starts: number[], whole = true) => ({ starts, whole });
   const SINCE = 1_000;
@@ -190,11 +177,11 @@ test('a workspace opened for the first time is not handed every turn it already 
     count: 0,
     atLeast: false,
   });
-  // And the same session with no floor is every turn new, which is what it did before.
+  // Without a floor, these turns count as new.
   assert.deepEqual(newCounts(before, new Map(), [], none).get('a'), { count: 3, atLeast: false });
 
-  // A session with turns either side counts only the ones after the floor. This is the
-  // whole point: a project the reader opens and then works in is new from that moment on.
+  // Count only turns after the first-opening floor.
+
   const both = [...old, ...fresh].map((at) => card('b', at));
   assert.deepEqual(newCounts(both, new Map(), [], none, SINCE).get('b'), { count: 2, atLeast: false });
   assert.deepEqual(newCounts([], new Map([['b', window([...old, ...fresh])]]), [], none, SINCE).get('b'), {
@@ -202,8 +189,8 @@ test('a workspace opened for the first time is not handed every turn it already 
     atLeast: false,
   });
 
-  // The floor answers for every session at once, which is why it is a floor and not a
-  // watermark each: the rail lists sessions the panel has never parsed.
+  // The read floor covers all workspace sessions, including sessions without parsed turns.
+
   const many = new Map([
     ['c', window(old)],
     ['d', window(old)],
@@ -237,15 +224,15 @@ test('a turn is new when it is unread and newer than the newest read turn of its
   assert.equal(newBySession(cards, [], none).get('a'), 3);
   // The newest turn read: the reader has seen past everything, middle turns included.
   assert.equal(newBySession(cards, ['a:300'], none).get('a'), 0);
-  // A middle turn read: only what came after it is new; the older unread one was passed by.
+  // Only turns after the newest read turn count as new.
   assert.equal(newBySession(cards, ['a:200'], none).get('a'), 1);
   // Two sessions are counted apart: reading all of one leaves the other's count alone.
   const two = [...cards, c('b', 250), c('b', 150)];
   const counts = newBySession(two, ['a:300', 'a:200', 'a:100'], none);
   assert.equal(counts.get('a'), 0);
   assert.equal(counts.get('b'), 2);
-  // A compaction is neither read nor counted, and alone it earns its session no entry:
-  // an entry says the count is knowable, and there are no turns to know it from.
+  // Compactions do not affect read counts. A session containing only compactions has no turn count.
+
   const withCompaction = [...cards, c('a', 250, 'compaction'), c('z', 50, 'compaction')];
   assert.equal(newBySession(withCompaction, ['a:300'], none).get('a'), 0);
   assert.equal(newBySession(withCompaction, [], none).has('z'), false);
@@ -364,36 +351,34 @@ test('a session nobody parsed still says how much is new in it', () => {
   const none = new Map<string, number>();
   const window = (starts: number[], whole = true) => ({ starts, whole });
 
-  // Nothing parsed at all, and a window that reached the start of the file: an exact count,
-  // over the same rule a parsed session's count goes through.
+  // A metadata window reaching the file start supplies an exact count without parsed turns.
+
   const counts = newCounts([], new Map([['a', window([100, 200, 300])]]), [], none);
   assert.deepEqual(counts.get('a'), { count: 3, atLeast: false });
 
-  // A turn read while the session was parsed stays read once it is only glanced at.
-  // The window's starts are keyed by `turnKey`, the same spelling the read set holds, and a
-  // second spelling here would count turns the reader has already read.
+  // Metadata turn starts use turnKey so explicit read marks survive parsed-turn eviction.
+
   const read = [turnKey({ sessionId: 'a', startedAt: 300 })];
   assert.deepEqual(newCounts([], new Map([['a', window([100, 200, 300])]]), read, none).get('a'), {
     count: 0,
     atLeast: false,
   });
 
-  // Three different answers, and the rail draws each differently.
-  //
-  // A session whose every turn is older than its watermark reports zero, not silence.
+  // A session with all turns under its watermark reports zero.
+
   const readTo = new Map([['a', 300]]);
   assert.deepEqual(newCounts([], new Map([['a', window([100, 200, 300])]]), [], readTo).get('a'), {
     count: 0,
     atLeast: false,
   });
-  // A session whose window found no turn reports silence, not zero: the window cannot
-  // support a claim that there is nothing new.
+  // A metadata window finding no turns has no count entry.
+
   assert.equal(newCounts([], new Map([['b', window([])]]), [], none).has('b'), false);
-  // A session nobody has glanced at yet reports silence too, and is simply absent.
+  // A session without metadata has no count entry.
   assert.equal(newCounts([], new Map(), [], none).has('c'), false);
 
-  // A parsed session keeps its real count and is never routed through its window. The
-  // window here would say two and the parse says one, and the parse is the answer.
+  // Parsed cards take precedence over metadata windows when both supply counts.
+
   const parsed = [{ key: turnKey({ sessionId: 'd', startedAt: 900 }), sessionId: 'd', startedAt: 900, kind: 'turn' }];
   assert.deepEqual(newCounts(parsed, new Map([['d', window([700, 900])]]), [], none).get('d'), {
     count: 1,

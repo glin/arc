@@ -25,8 +25,7 @@ export interface SessionRow {
   id: string;
   label?: string;
   fullLabel?: string;
-  // Whether the session has a saved record. A provisional new session has none, so its
-  // heading offers no rename.
+  // Saved-record status controls whether the heading offers Rename.
   persisted?: boolean;
   agent?: string;
   agentKey?: string;
@@ -61,16 +60,13 @@ export interface SessionStat {
 export interface TimelineView {
   cards: CardView[];
   sessions: SessionRow[];
-  // Which session the host is showing. A view that names none leaves the drawn session
-  // standing, which is what a full render of an empty panel sends.
+  // Host's displayed session identity. Omission retains the last displayed identity for navigation checks.
   showing?: string | null;
   transient?: { id: string; title?: string } | null;
 }
 
 interface TimelineRendererOptions {
   document: Document;
-  // The heading's label chips are controls only while the rail is up, so a width change
-  // redraws them. This owner watches for that itself, because the chips are its own.
   events: { window(type: string, listener: EventListenerOrEventListenerObject): void };
   list: HTMLElement;
   retained: HTMLElement;
@@ -83,8 +79,7 @@ interface TimelineRendererOptions {
   interactions: CommentRenderer;
   beforeCardDraw(host: CardHost): void;
   rowContext(sessionId: string, persisted: boolean): string;
-  // Whether the session is pinned, or null for a session that takes no pin. An archived
-  // session takes none, because archiving removes the pin.
+  // Pin state, or null when pinning is unavailable, including archived sessions.
   pinned(sessionId: string): boolean | null;
   setPinned(sessionId: string, pinned: boolean): void;
   labels(sessionId: string): string[];
@@ -99,8 +94,7 @@ interface TimelineRendererOptions {
   allControls(): HTMLElement[];
   rovingControls(controls?: HTMLElement[]): HTMLElement[];
   fallbackFocus(): HTMLElement | null;
-  // A test-only counter of full timeline draws. Production never supplies it, so the count
-  // adds no cost and no state outside a test that asks for it.
+  // Optional full-draw callback for tests. Production omits it.
   onDraw?(): void;
 }
 
@@ -117,10 +111,8 @@ function stableId(prefix: string, value: string): string {
   return `${prefix}-${encodeURIComponent(value)}`;
 }
 
-// A budget can cut a session back to its newest turns, so the chip carrying the
-// ledger's whole-session count also has to say how much of that count is actually on
-// screen. Text rather than the two figures compared as numbers, because the chip's own
-// label is already worded this way and a second wording risks drifting from the first.
+// Add the drawn turn count when it differs from the whole-session count.
+// Compare formatted labels through sessionCount so the detail follows the chip's wording.
 function withDrawnCount(chip: SessionStat, shown: number): SessionStat {
   const shownText = sessionCount(shown);
   const text = chip.compactLabel || chip.label;
@@ -143,8 +135,7 @@ function withDrawnCount(chip: SessionStat, shown: number): SessionStat {
   };
 }
 
-// Cost and turns lead the row in the same order as the rail card. The rest keep the order
-// the host built them in.
+// Lead with cost and turns. Preserve host order for the remaining figures.
 function orderedStats(stats: SessionStat[], shown: number): SessionStat[] {
   const cost = stats.find((candidate) => candidate.metric === 'cost');
   const turn = stats.find((candidate) => candidate.metric === 'turns');
@@ -171,8 +162,7 @@ function headingLabel(
 ): { expanded: boolean; label: string; hint: string; action: string; detail: string } {
   const expanded = allOpen(session.cards, options.open);
   const action = expanded ? cardWords().collapseAllTurns : cardWords().expandAllTurns;
-  // The heading draws no age, so the hint's second line carries the full local time of the last
-  // activity before the action.
+  // The heading's hint detail includes the last activity's full local time before the disclosure action.
   const when = session.row?.when;
   const detail = when ? `${cardWords().lastActive} ${when}. ${action}` : action;
   const hint = session.row?.fullLabel || session.row?.label || session.title;
@@ -186,8 +176,7 @@ function headingLabel(
   };
 }
 
-// A gear, the editor's own word for the settings of a view. Stroked, and drawn larger than the
-// dots beside it, because a gear at the dots' size reads as a speck.
+// Stroked gear for Timeline layout. Its larger drawing keeps the strokes visible beside the menu dots.
 function layoutIcon() {
   return h('svg', { class: 'sessionlayouticon', viewBox: '0 0 16 16', 'aria-hidden': 'true', focusable: 'false' }, [
     h('circle', { cx: '8', cy: '8', r: '4', 'stroke-width': '2.1' }),
@@ -198,13 +187,10 @@ function layoutIcon() {
   ]);
 }
 
-// Registered pins read current membership while their heading reconciles. A held view
-// keeps its cards while the named heading and pin update together.
+// Mounted pin redraw callbacks by session. They read current membership even while timeline content waits.
 type PinRedraws = Map<string, Set<() => void>>;
 
-// The pin, one press from the heading. The accessible name stays the same in both states and
-// `aria-pressed` carries the state, so a screen reader announces the change once. The blue of
-// a set pin is the heading's only pinned mark.
+// Keep the pin's accessible name stable. aria-pressed announces its state.
 function SessionPin({
   session,
   title,
@@ -377,9 +363,7 @@ function detailsRow(session: SessionView): SessionDetailsRow {
     label: row?.label || session.title,
     fullLabel: row?.fullLabel || row?.label || session.title,
     agent: row?.agent || session.cards[0]?.agent || '',
-    // Worded here, out of the two fields every row carries. The dialog opens from any rail
-    // card, so a command the payload carried for one session would leave every other card
-    // showing none. A session with no saved record has nothing to resume.
+    // Build a resume command for each persisted row, so Session details works for any session list card.
     resumeCommand: row?.persisted ? resumeCommand(row.agentKey || '', session.id) : null,
   };
 }
@@ -672,8 +656,7 @@ function SessionHeading({
           },
           nativeMenuIcon(),
         ),
-        // Every shown session's row carries a gear, and every gear opens the same dialog for
-        // the same two settings. The dialog marks the gear that holds it expanded.
+        // Every session heading opens the shared Timeline layout dialog. The dialog marks its opener expanded.
         h(
           'button',
           {
@@ -900,19 +883,15 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
   const headings: HeadingRedraws = new Map();
   const renderedCards = new Map<string, CardView>();
   const renderedPrints = new Map<string, string>();
-  // What each session came to, by session id, already worked out and already worded on the
-  // extension side. Two host messages carry it, `render` and `rail`, and the later arrival
-  // wins. It is kept here rather than on the drawn view, because a heading refresh that
-  // changes nothing else must not need a view to carry it.
+  // Latest host-supplied session figures, independent of the drawn view.
+  // render and rail messages both update them. The last arrival takes precedence.
   let sessionStats: Record<string, SessionStat[]> = {};
   let latest: TimelineView | null = null;
   let renderedShowing: string | null | undefined;
-  // A replacement view and a card repaint can wait on the same selection. Each keeps its
-  // place so an activity update cannot discard queued search results.
+  // Keep replacement views and card updates separately so Activity updates cannot discard pending search results.
   let pendingView: (() => void) | null = null;
   let pendingViewReplaces = false;
-  // The waiting view opens a session the reader asked for. Only a comment editor holds it,
-  // and the editor closing releases it even while the quote it marked stays selected.
+  // Navigation held by a comment editor. Closing the editor releases it even if its quote remains selected.
   let pendingViewEscapes = false;
   let pendingRefresh: (() => void) | null = null;
   let pendingCard: (() => void) | null = null;
@@ -1158,15 +1137,12 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
 
   const held = () => options.interactions.heldSelection() || options.interactions.noteBeingWritten();
 
-  // The reader opened another session. Every card of the one they left is absent from
-  // the next view, which is the shape the rules below hold back, so their own instruction
-  // would wait on a selection that nothing is going to release.
+  // Detect navigation so the selection in the departing session does not block the requested view.
   const opensAnother = (showing: string | null | undefined): boolean => !!showing && showing !== renderedShowing;
 
   const navigatedAway = (view: TimelineView): boolean => opensAnother(view.showing);
 
-  // The selection the reader left behind goes with the nodes it was made in. The rail keeps
-  // its own selection over its own rows, so only a selection this owner holds goes.
+  // Clear only this timeline's selection. Preserve selections in the session list.
   const dropOwnSelection = () => {
     const selection = window.getSelection();
     if (!selection || !selection.rangeCount) {
@@ -1179,8 +1155,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
   };
 
   const structuralRewriteWaits = (view: TimelineView): boolean => {
-    // A comment being written holds the card it is anchored to, whichever session the
-    // reader asks for next.
+    // Keep a comment's card mounted while the reader writes, including during navigation.
     if (options.interactions.noteBeingWritten()) {
       return true;
     }
@@ -1198,8 +1173,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
   };
 
   const applyPending = () => {
-    // The reader opened another session and a comment editor held it back. The editor is
-    // gone, so the session they asked for draws even though its quote is still selected.
+    // Release requested navigation when the comment editor closes, even if its quote remains selected.
     if (pendingView && pendingViewEscapes && !options.interactions.noteBeingWritten()) {
       const escape = pendingView;
       pendingView = null;
@@ -1237,10 +1211,8 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
       pendingViewEscapes = navigatedAway(view);
       return;
     }
-    // A selection left pointing at nodes this draw removes holds back the next update that
-    // arrives on its own. A comment list over a card of the session the reader left shuts before
-    // the draw, and the draw then places the keyboard. Shutting the list releases held work, so
-    // the held view of the old session goes first, or the release draws it over this one.
+    // Remove stale selection before navigating. Clear the pending view before closing the comment list.
+    // Closing releases pending work, which must not replace the newly requested session.
     if (navigatedAway(view) && !options.interactions.noteBeingWritten()) {
       dropOwnSelection();
       pendingView = null;
@@ -1262,8 +1234,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
     pendingRefresh = null;
     const next = showing === undefined ? retained?.showing : showing;
     const away = opensAnother(next);
-    // A comment being written holds the card it is anchored to, whichever view the reader
-    // asks for next. A selection holds this view only while the reader stays on it.
+    // Comment editing blocks any replacement. Selection blocks only updates to the same displayed session.
     if (options.interactions.noteBeingWritten() || (!away && options.interactions.heldSelection())) {
       pendingView = () => showForeign(nodes, footers, retained, showing);
       pendingViewReplaces = true;
@@ -1295,8 +1266,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
       cardIndexes.clear();
       renderedCards.clear();
       renderedPrints.clear();
-      // The foreign view stands for the session the host is showing. Recording it keeps the
-      // next update's navigation check reading what is on screen.
+      // Record the foreign view's displayed session for the next navigation check.
       if (next !== undefined) {
         renderedShowing = next;
       }
@@ -1351,7 +1321,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
       return false;
     }
     latest.cards[index] = card;
-    // The replacement keeps its structure and releases the newest Activity snapshot with it.
+    // Update latest while a structural replacement waits. That replacement draws the newest Activity snapshot when released.
     if (pendingView && pendingViewReplaces) return true;
     publishCard(card);
     if (deferredCards.size) {
@@ -1368,8 +1338,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
     if (stats) {
       sessionStats = stats;
     }
-    // A replacement view already waiting holds the draw. The figures are adopted either way,
-    // so the held view draws the newest ones when the reader releases it.
+    // Adopt figures while a replacement view waits. Draw them when that view is released.
     if (pendingView) {
       if (stats || footers || !pendingRefresh) {
         pendingRefresh = () => refresh(undefined, footers);
@@ -1446,8 +1415,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
         (JSON.parse(row.dataset.vscodeContext ?? '{}') as { sessionPersisted?: unknown }).sessionPersisted === true;
       row.dataset.vscodeContext = options.rowContext(drawn, persisted);
     }
-    // Reconcile remembered props as well as the immediate native context. A later reversal
-    // must not leave the optimistic attribute standing when Preact reuses its prior value.
+    // Update Preact props with the native context. Otherwise a reversal can preserve an outdated optimistic attribute.
     for (const session of wanted) {
       headings.get(session)?.forEach((redraw) => redraw());
       pins.get(session)?.forEach((redraw) => redraw());

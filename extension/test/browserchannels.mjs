@@ -1,6 +1,4 @@
-// Plain Node ESM with no vitest import, so extension/test.mjs can load it directly and
-// extension/test/browser.ts can load it too. The browser lane and the browser test fixture
-// try the same channels in the same order, so this is the one place that order lives.
+// Share browser channel order between the ESM lane runner and the CommonJS test fixture.
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,15 +8,14 @@ import { performance } from 'node:perf_hooks';
 const CHANNELS = ['msedge', 'chrome', undefined];
 const BROWSER_LAUNCH_TIMEOUT_MS = 10_000;
 export const BROWSER_SLOT_COUNT = 16;
-// A Vitest run moves TEMP to a directory of its own, so the slots read the machine temporary
-// directory that extension/test/temp-run.ts recorded before the move.
+// Use the machine temporary directory saved before Vitest redirects TEMP for its run.
 export const BROWSER_SLOT_ROOT = join(process.env.ARC_TEST_MACHINE_TEMP || tmpdir(), 'arc-browser-test-slots');
 const BROWSER_SLOT_OWNER = 'owner.json';
 const BROWSER_SLOT_DEADLINE_MS = 30 * 60_000;
 const BROWSER_SLOT_INCOMPLETE_GRACE_MS = 2_000;
 const BROWSER_SLOT_POLL_MS = 500;
 
-// Shared with extension/test/browserlock.mjs, which imports this instead of keeping its own copy.
+// browserlock.mjs imports this process-existence check.
 export function processExists(pid) {
   try {
     process.kill(pid, 0);
@@ -218,9 +215,8 @@ function releaseOnClose(browser, permit) {
   return browser;
 }
 
-// Tries chromium.launch with each channel in order and keeps the first that succeeds. `args` adds
-// command-line switches to every launch.
-// Returns null if playwright-core is not installed, or if every channel fails to launch.
+// Try browser channels in order with the supplied launch arguments.
+// Return null when playwright-core is unavailable or all launches fail.
 export async function launchAnyBrowser({
   args = [],
   acquireSlot = acquireBrowserSlot,

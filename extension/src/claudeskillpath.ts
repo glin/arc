@@ -1,10 +1,6 @@
-// Where Arc finds the file behind a Claude skill mark. Claude's `init` message names a skill
-// but never says where its `SKILL.md` lives, unlike Codex, which publishes a path on its own
-// catalog. This checks `<cwd>/.claude/skills/<name>/SKILL.md` first, then `<name>/SKILL.md`
-// under the config-home skills folder, by the skill's command name, so a custom
-// `CLAUDE_CONFIG_DIR` is honoured the same way it is everywhere else in Arc. Neither check
-// walks up through parent folders. Reads happen here, on the host, in a module that never
-// imports `vscode`.
+// Finds `SKILL.md` for a Claude skill name.
+// The project `.claude/skills` folder takes priority over the config-home skills folder.
+// `claudeConfigHome` honors `CLAUDE_CONFIG_DIR`. Neither lookup searches parent folders.
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { claudeConfigHome } from './agentpaths';

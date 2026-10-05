@@ -309,10 +309,8 @@ export function promptAssetReleaseIndexes(
   return matching < 0 ? [] : [matching];
 }
 
-// Codex can report that a turn ended while the promise accepting its prompt is still
-// returning through the host. This book keeps that completion with the handoff that was
-// already active, including a new-session handoff whose final session id was not
-// known when it began.
+// Codex can report turn completion before the host's prompt-acceptance promise returns.
+// Keep that completion with the active handoff, including new-session handoffs awaiting their final session id.
 export class PromptAssetCompletionBook {
   private handoffSequence = 0;
   private completionSequence = 0;

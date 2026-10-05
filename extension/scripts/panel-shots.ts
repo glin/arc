@@ -1,16 +1,10 @@
-// Pictures of the real panel, one per state worth looking at.
+// Capture panel states in Dark Modern and Light Modern as lossless WebP images.
 //
-// `panel.layout.test.ts` measures the same page and says nothing about how it looks: a
-// column can sit exactly where the guard wants it and still read as a wall of grey. This
-// renders that page in a browser, dresses it in the editor's dark theme, presses the controls
-// that open the panel's popovers, and writes a lossless WebP of each.
-//
-// Run it from the extension directory:
+// Run from the extension directory:
 //
 //     npx tsx scripts/panel-shots.ts [outDir]
 //
-// It drives a browser already on the machine and downloads nothing. With none installed it
-// says so and writes no files.
+// The script uses an installed browser and downloads nothing. Without a browser, it writes no files.
 
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -54,54 +48,52 @@ import type { RailStatus } from '../src/turnrail.ts';
 import type { RailDensity } from '../src/view/rail.ts';
 import { toCard } from '../src/turncard.ts';
 
-// The states, in the order they are taken. Each one starts from what the last one left on
-// screen, so a state that needs a clean page asks for `escape` first. Add a row here to add a
-// picture.
+// Capture options for one panel state. Shots share page state, so `escape` closes popovers before the next capture.
 export interface Shot {
   contextDetail?: 'claude' | 'codex' | 'codex-compacted';
-  name: string; // the file, without the extension
-  width?: number; // move the viewport to this width first
-  height?: number; // and to this height, for a state taller than the ordinary viewport
-  openCard?: string; // press this card head, and only when the card is shut
-  layout?: { cardLayout: string; promptPosition: string }; // draw with this Timeline layout, then put the default back
-  railWidth?: number; // draw the rail at this saved width
-  railDensity?: RailDensity; // choose this Rows value in the View menu, then put comfortable and the rail width back
-  pinned?: string; // post the rail in its coloured states with this session pinned, then put the plain page back
-  railFilterPreset?: string; // load this saved-filter id before the picture
-  railFilterPicker?: 'open' | 'closed'; // set the saved-filter picker state
-  escape?: boolean | number; // close whatever popover is open before pressing anything
-  click?: string; // the control to press
-  hover?: string; // the control to hover until its delayed hint opens
-  after?: string; // the control to press once the picture is taken, so no state carries
+  name: string; // Output filename without the extension.
+  width?: number; // Viewport width before capture.
+  height?: number; // Viewport height when setting the width.
+  openCard?: string; // Card heading to press if its card is closed.
+  layout?: { cardLayout: string; promptPosition: string }; // Timeline layout for capture. Restore the default afterward.
+  railWidth?: number; // Saved session list width for capture.
+  railDensity?: RailDensity; // Rows value for capture. Restore Full rows and the prior session list width afterward.
+  pinned?: string; // Session to pin in the status fixture. Restore the default payload afterward.
+  railFilterPreset?: string; // Saved filter ID to select before capture.
+  railFilterPicker?: 'open' | 'closed'; // View menu state before capture.
+  escape?: boolean | number; // Number of Escape presses before other actions. `true` presses once.
+  click?: string; // Control selector to press.
+  hover?: string; // Control selector to hover until its hint opens.
+  after?: string; // Control selector to press after capture.
   state?: 'first-project-empty' | 'first-project-draft';
   openCustom?: boolean;
   stats?: boolean;
-  draft?: boolean; // aim the composer at a draft first, by posting the draft render
-  unsent?: boolean; // post a rail card with unfinished reader input
-  subagents?: boolean; // post the rail and the long card with background subagents still at work
-  // Post the page with live requests: `true` is the permission and the one-question card,
-  // `three` is the tabbed card, and `six` is the strip that runs past two rows.
+  draft?: boolean; // Load a draft into the prompt box.
+  unsent?: boolean; // Load a session list card with unsent reader input.
+  subagents?: boolean; // Load sessions and the long turn card with running background subagents.
+  // Load live requests. `true` supplies a permission request and one question.
+  // `three` supplies tabbed questions. `six` supplies questions spanning more than two rows.
   asks?: boolean | 'three' | 'six';
-  files?: boolean; // aim the composer at the attachment fixture
-  waiting?: boolean; // draw a locally queued attachment above a running compaction
-  labels?: boolean; // answer the label editor's ask, so the popover the press opened fills
-  details?: boolean; // open session details through the host-message path
-  rename?: 'heading' | 'rail'; // right-click the first session heading or rail card, then answer Rename session
-  filter?: string; // type this into the rail's filter box first
-  railCount?: 'active'; // press this rail head count first
-  railLens?: 'unread' | 'input'; // press this Filter value in the View menu, then close the menu
-  headCounts?: boolean; // post running, unread, waiting and active sessions so the head draws all four counts
-  railHeadUntick?: 'active' | 'unread' | 'input'; // open the View menu and untick this Quick filters box
-  clip?: string; // picture only the top of this element, not the whole viewport
-  clipWhole?: boolean; // picture all of the clip element, not only its top
-  focus?: string; // keep this control focused in the capture
-  nextTurn?: 'warm' | 'cold' | 'no-tier' | 'compacted'; // draw the line above the box in this cache state
+  files?: boolean; // Load the prompt attachment fixture.
+  waiting?: boolean; // Show a queued attachment above a running compaction.
+  labels?: boolean; // Supply label editor rows after the control requests them.
+  details?: boolean; // Open session details through a host message.
+  rename?: 'heading' | 'rail'; // Open Rename session from the first session heading or session list card.
+  filter?: string; // Text to type into the session list filter box.
+  railCount?: 'active'; // Session list header count to press.
+  railLens?: 'unread' | 'input'; // Filter value to select before closing the View menu.
+  headCounts?: boolean; // Load sessions that populate Running, Active, Unread, and Needs input counts.
+  railHeadUntick?: 'active' | 'unread' | 'input'; // Quick filters checkbox to clear in the View menu.
+  clip?: string; // Element selector to crop to its first 140 pixels.
+  clipWhole?: boolean; // Capture the entire selected element.
+  focus?: string; // Control selector to focus before capture.
+  nextTurn?: 'warm' | 'cold' | 'no-tier' | 'compacted'; // Cache state for the next-turn starting price.
   activity?: 'messages' | 'empty' | 'all' | 'breakdown';
   compactionSummary?: 'collapsed' | 'expanded';
   cacheWriteWarning?: boolean;
   composerSkill?: boolean;
   raisedComposer?: boolean;
-  launcherPins?: number | 'unavailable'; // post the New session menu with this many pinned setups beside ten recent ones
+  launcherPins?: number | 'unavailable'; // Pinned setups for the New session menu fixture, beside ten recent setups.
 }
 
 const ATTACHMENT_ASSETS = [
@@ -131,20 +123,17 @@ const ATTACHMENT_ASSETS = [
   },
 ];
 
-// The one pressable part of the line above the box, on whichever face the clock is showing.
+// The visible next-turn starting price control.
 const NEXT_TURN_PRICE = '.cnextturnface:not(.is-off) .cnextturnprice';
 
-// What the workspace has filed, for the label editor's picture. The extension owns the record
-// and the panel asks for it, so a page with no extension behind it answers the ask from here.
-// It names what the rail fixture files, so the popover and the chips on the cards agree.
+// Label editor replies use these session labels to match the session list fixture.
 const SHOT_LABELS: Record<string, string[]> = {
   s1: ['composer', 'release 0.4', 'perf'],
   s2: ['release 0.4'],
   s4: ['worktree parallel sessions and the rails'],
 };
 
-// The head that opens the long fixture turn, found by the key the timeline writes onto its
-// card rather than by counting cards, so a card added above it moves nothing here.
+// Find the long turn by its key, so adding earlier cards leaves the selector unchanged.
 const LONG_CARD_HEAD = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] h3.cardheading button.head`;
 const LONG_CARD_FILES_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] .statchip[data-metric="files"]`;
 const LONG_CARD_AGENTS_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] .statchip[data-metric="agents"]`;
@@ -246,10 +235,8 @@ export const SHOTS: Shot[] = [
     railDensity: 'compact',
     pinned: 's6',
   },
-  // The card a compact row opens on hover, at the default rail width and at the rail's
-  // minimum width, where the card crosses the rail edge over the session view. The first hovers
-  // the pinned session, and the comfortable shot after it draws that session's row from the same
-  // payload, so the hover's figure line compares against the row's own.
+  // Capture the compact row hover at default and minimum session list widths.
+  // The Full rows capture uses the same pinned-session payload for comparison.
   {
     name: 'wide-compact-hover',
     width: 1350,
@@ -285,38 +272,27 @@ export const SHOTS: Shot[] = [
     after: '#projectspendpop [data-control="projectspend:pricing"]',
   },
   { name: 'wide-launcher', escape: true, click: '#rail .railnewmenu' },
-  // The custom fields on the menu's own page, with an agent whose catalog differs.
+  // Capture custom fields with the Codex model catalog.
   { name: 'wide-launcher-codex', click: '#launcher [data-control="launch-agent:codex"]' },
   { name: 'wide-label-editor', escape: 2, click: '.railrow .raillabelact', labels: true },
   { name: 'wide-details', escape: 2, details: true },
-  // The heading's own label line, and the editor opened from the button that closes it. One
-  // picture answers both halves: the chips the session carries, drawn where the reader
-  // is actually reading it, and where the popover lands when the press is made there rather
-  // than on the rail.
+  // Capture session labels and their editor under the session heading.
   { name: 'wide-session-labels', escape: true, click: '.sessionlabels .sessionlabelact', labels: true },
-  // The session rename editor, opened from each place that offers it. Cancel closes it after
-  // the picture, because the page blurs focus before it shoots and Escape then reaches nothing.
+  // Cancel closes Rename session after capture. Capture blurs focus, so Escape alone leaves the editor open.
   { name: 'wide-session-rename', escape: true, rename: 'heading', after: '[data-control="session-rename-cancel"]' },
   { name: 'wide-rail-session-rename', escape: true, rename: 'rail', after: '[data-control="session-rename-cancel"]' },
-  // The list the filter box offers while a `label:` term is being typed. The rail behind it
-  // is whole: a `label:` word with nothing after it pushes no term, so the query narrows
-  // nothing until the reader takes a name off the list.
+  // An unfinished `label:` term opens label suggestions without narrowing the session list.
   { name: 'wide-filter-offers', escape: true, filter: 'label:', after: '.filterclear' },
   { name: 'mid', width: 640, escape: true },
   { name: 'narrow', width: 340 },
-  // The open card of the long fixture turn, whole, at the three widths the density plan
-  // measures. The viewport is taller than the ordinary one because the card is: a picture
-  // clipped at 900px would leave the last sections out and argue about the wrong card.
+  // Use taller viewports for long turn card captures at wide and intermediate widths.
   { name: 'wide-long-card', width: 1350, height: 1650, escape: true, openCard: LONG_CARD_HEAD },
   { name: 'mid-long-card', width: 640, height: 1950, openCard: LONG_CARD_HEAD },
-  // The Files chip pinned on the same card, which is where that turn's file record now
-  // lives. The rows and the press under them are what the picture is taken for.
+  // Capture the long turn card with its Files popover pinned open.
   { name: 'wide-long-card-files', width: 1350, height: 1650, openCard: LONG_CARD_HEAD, click: LONG_CARD_FILES_CHIP },
-  // The Subagents chip pinned on the same card, at both widths, for the subagent rows.
+  // Capture the long turn card with its Subagents popover pinned open.
   { name: 'wide-long-card-agents', width: 1350, height: 1650, openCard: LONG_CARD_HEAD, click: LONG_CARD_AGENTS_CHIP },
-  // The hover of the first linked row in that popover, which is where the child's cost by
-  // usage and its commits are read. It opens the popover for itself, so its picture does not
-  // depend on the shot above it still being above it.
+  // The linked subagent row opens its own popover for usage cost and commits.
   {
     name: 'wide-long-card-agent-hint',
     width: 1350,
@@ -326,8 +302,7 @@ export const SHOTS: Shot[] = [
     click: LONG_CARD_AGENTS_CHIP,
     hover: '#chippop .agentrow .namelink',
   },
-  // The narrow one closes the popover the wide one left open first. A press on a chip whose
-  // popover is already open shuts it, and the picture then held the card with no rows in it.
+  // Close the wide capture's popover before pressing the same chip. Pressing an open chip closes its popover.
   {
     name: 'narrow-long-card-agents',
     width: 340,
@@ -336,8 +311,7 @@ export const SHOTS: Shot[] = [
     openCard: LONG_CARD_HEAD,
     click: LONG_CARD_AGENTS_CHIP,
   },
-  // The same card and the rail once the main agent finished while two subagents still work,
-  // with the rail card's hint open.
+  // Capture the long turn after its main agent finishes while two subagents run.
   {
     name: 'wide-long-card-subagents',
     width: 1350,
@@ -355,7 +329,7 @@ export const SHOTS: Shot[] = [
     subagents: true,
     openCard: LONG_CARD_HEAD,
   },
-  // The same card under each other value of the two Timeline layout settings.
+  // Capture the long turn under each alternative Timeline layout.
   {
     name: 'wide-long-card-one-column',
     width: 1350,
@@ -385,7 +359,7 @@ export const SHOTS: Shot[] = [
     openCard: LONG_CARD_HEAD,
     layout: { cardLayout: 'two-columns', promptPosition: 'above' },
   },
-  // The Timeline layout dialog open under the session heading's gear.
+  // Capture the Timeline layout dialog under the session heading.
   {
     name: 'wide-layout-dialog',
     width: 1350,
@@ -400,7 +374,7 @@ export const SHOTS: Shot[] = [
     click: '#list .sessionlayout',
     after: '#list .sessionlayout',
   },
-  // The last of the three puts the card back, so no picture after it carries an open card.
+  // Close the long turn card after the narrow capture.
   { name: 'narrow-long-card', width: 340, height: 2450, escape: true, openCard: LONG_CARD_HEAD, after: LONG_CARD_HEAD },
   { name: 'wide-composer-skill', width: 1350, escape: true, composerSkill: true, click: '.cskilltoken' },
   { name: 'narrow-composer-skill', width: 340, escape: true, composerSkill: true, click: '.cskilltoken' },
@@ -418,8 +392,7 @@ export const SHOTS: Shot[] = [
     compactionSummary: 'expanded',
     after: 'section.compaction .head',
   },
-  // The rail head at rest at its default width, then with the box open over the words an
-  // Active press wrote. The cross after the second picture clears the words and closes the box.
+  // Capture the session list header at rest and with the Active query visible. Clear the query afterward.
   { name: 'wide-rail-head-resting', width: 1350, escape: true, railWidth: RAIL_WIDTH_DEFAULT },
   {
     name: 'wide-rail-head-lens-words',
@@ -430,9 +403,8 @@ export const SHOTS: Shot[] = [
     click: '[data-control="railsearch"]',
     after: '[data-control="railclear"]',
   },
-  // The same open box at a wide rail, where the box, the cross, the funnel and the New split share
-  // one line, then at the default rail width, where the New split keeps the top line and the box
-  // takes the next with the cross and the funnel in its right end.
+  // Capture the open filter box at wide and default session list widths.
+  // Its tools share one line at the wide width and use two lines at the default width.
   {
     name: 'rail-head-box-open-480',
     width: 1350,
@@ -453,9 +425,8 @@ export const SHOTS: Shot[] = [
     clip: '#rail',
     after: '[data-control="railclear"]',
   },
-  // The rail head at rest and with Active pressed, at a wide rail, at the default and between.
-  // Each picture holds only the top of the rail, so the counts' widths and wrap read at a glance.
-  // The resting head holds running, unread, waiting and active sessions, so it draws all four counts.
+  // Capture the session list header at several widths, at rest and with Active selected.
+  // The resting fixture populates Running, Active, Unread, and Needs input counts.
   ...[480, 300, 247, 220].flatMap((railWidth): Shot[] => [
     {
       name: `rail-head-resting-${railWidth}`,
@@ -475,8 +446,7 @@ export const SHOTS: Shot[] = [
       after: '[data-control="railcount:active"]',
     },
   ]),
-  // The Project cost box opens from the rail head. The box floats past the
-  // rail's edge, so the picture holds the whole viewport.
+  // Capture the full viewport because Project cost extends beyond the session list.
   ...[480, RAIL_WIDTH_DEFAULT].map((railWidth): Shot => ({
     name: `rail-cost-open-${railWidth}`,
     width: 1350,
@@ -485,8 +455,7 @@ export const SHOTS: Shot[] = [
     click: '.projectspendrailhost .projectspendbutton',
     after: '.projectspendrailhost .projectspendbutton',
   })),
-  // The whole rail at rest at the wide, default and minimum widths, so the head, the list and
-  // the Project cost row read together.
+  // Capture the complete session list at wide, default, and minimum widths.
   ...[480, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN].map((railWidth): Shot => ({
     name: `rail-whole-resting-${railWidth}`,
     width: 1350,
@@ -496,8 +465,7 @@ export const SHOTS: Shot[] = [
     clip: '#rail',
     clipWhole: true,
   })),
-  // The rail head under the Unread lens names the lens, pressed, at the default width and the
-  // minimum. The press after each picture clears the lens.
+  // Capture the Unread lens at default and minimum widths. Clear the lens after each capture.
   ...[RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN].map((railWidth): Shot => ({
     name: `rail-head-unread-${railWidth}`,
     width: 1350,
@@ -507,8 +475,7 @@ export const SHOTS: Shot[] = [
     clip: '#rail',
     after: '[data-control="railcount:unread"]',
   })),
-  // The View menu open over the Unread lens, so the Filter row shows its checked value and
-  // any lens at zero.
+  // Capture the View menu with Unread selected, including lenses with zero sessions.
   {
     name: 'rail-lens-menu-open',
     width: 1350,
@@ -518,8 +485,7 @@ export const SHOTS: Shot[] = [
     click: '[data-control="railfilters"]',
     after: '[data-control="raillens:all"]',
   },
-  // The View menu open on the Filter section with Needs input unticked on the Quick filters
-  // line. The press after the picture ticks it again.
+  // Capture Quick filters with Needs input cleared. Select it again afterward.
   {
     name: 'rail-head-config-menu',
     width: 1350,
@@ -553,7 +519,7 @@ export const SHOTS: Shot[] = [
   { name: 'narrow-details', escape: true, details: true },
   { name: 'narrow-project-cost', click: '.projectspendcompacthost .projectspendbutton' },
   { name: 'narrow-launcher', escape: true, click: '.controls .compactnewmenu' },
-  // A short narrow panel, where the list of setups shrinks before the menu scrolls.
+  // Capture a short narrow panel where the setup list shrinks before the menu scrolls.
   ...([0, 4, 16, 'unavailable'] as const).map((pins): Shot => ({
     name: `narrow-short-launcher-pins-${pins}`,
     width: 340,
@@ -562,7 +528,7 @@ export const SHOTS: Shot[] = [
     launcherPins: pins,
     click: '.controls .compactnewmenu',
   })),
-  // A tall panel, where the list of setups grows with the viewport up to the menu's cap.
+  // Capture a tall panel where the setup list grows to the menu's size limit.
   {
     name: 'wide-tall-launcher-pins-16',
     width: 1200,
@@ -571,7 +537,7 @@ export const SHOTS: Shot[] = [
     launcherPins: 16,
     click: '#rail .railnewmenu',
   },
-  // A pinned row under the pointer, which lights as one row with its pin.
+  // Capture the hover highlight across a pinned setup and its pin.
   {
     name: 'wide-tall-launcher-pinned-hover',
     width: 1200,
@@ -581,7 +547,7 @@ export const SHOTS: Shot[] = [
     click: '#rail .railnewmenu',
     hover: '#launcher .launchentry .launchpin.is-pinned',
   },
-  // Unpin under the pointer on a pinned row that cannot start, which leaves the row unlit.
+  // Capture Unpin on an unavailable setup without highlighting the row.
   {
     name: 'wide-tall-launcher-unavailable-hover',
     width: 1200,
@@ -591,7 +557,7 @@ export const SHOTS: Shot[] = [
     click: '#rail .railnewmenu',
     hover: '#launcher .launchentry.is-unavailable [data-control^="launchpin:"]',
   },
-  // Edit on that row, which loads its values and names the one the catalog lacks.
+  // Edit loads the unavailable setup and identifies its missing catalog value.
   {
     name: 'wide-tall-launcher-edit-unavailable',
     width: 1200,
@@ -599,7 +565,7 @@ export const SHOTS: Shot[] = [
     launcherPins: 'unavailable',
     click: '#launcher [data-control="launchedit:pin:pin-retired"]',
   },
-  // The longest Effort catalog in the narrow panel, where its choices have the least room.
+  // Capture the longest Effort catalog in the narrow panel.
   {
     name: 'narrow-launcher-pins-4',
     width: 340,
@@ -635,11 +601,11 @@ export const SHOTS: Shot[] = [
   { name: 'narrow-attachments', width: 340, files: true },
   { name: 'wide-waiting-attachment', width: 1350, waiting: true },
   { name: 'narrow-waiting-attachment', width: 340, waiting: true },
-  // The line above the box, in each state it can wear, with its working pinned open. The
-  // fixture's own clock reaches only the cold one, so the warm state is posted.
+  // Capture next-turn starting price details in each cache state.
+  // The fixture clock produces the cold state, so the warm state needs an explicit payload.
   { name: 'wide-next-turn-warm', width: 1350, escape: true, nextTurn: 'warm', click: NEXT_TURN_PRICE },
   { name: 'wide-next-turn-cold', escape: true, nextTurn: 'cold', click: NEXT_TURN_PRICE },
-  // A session with no recorded lifetime quotes the conservative price.
+  // Capture the conservative price when the session has no recorded cache lifetime.
   { name: 'wide-next-turn-no-tier', escape: true, nextTurn: 'no-tier', click: NEXT_TURN_PRICE },
   { name: 'narrow-next-turn-warm', width: 340, escape: true, nextTurn: 'warm' },
   { name: 'narrow-next-turn-cold', escape: true, nextTurn: 'cold' },
@@ -663,9 +629,7 @@ export const SHOTS: Shot[] = [
   { name: 'rail-cache-write-warning', width: 1350, railWidth: RAIL_WIDTH_MIN, escape: true, cacheWriteWarning: true },
 ];
 
-// The sessions the rail draws a colour for, and the state each one is in. Every state
-// that earns a border is here, so one picture answers whether the reader can tell them
-// apart. The first is the shown session, whose foot carries the two requests below.
+// Session list status fixtures include waiting, running, running subagents, and failed sessions.
 const SHOT_STATUSES = new Map<string, RailStatus>([
   ['s1', 'waiting'],
   ['s2', 'running'],
@@ -676,20 +640,19 @@ const SHOT_STATUSES = new Map<string, RailStatus>([
 const SHOT_RUNNING_SINCE = new Map<string, number>([['s2', FIXTURE_CLOCK - 31 * 60_000]]);
 const SHOT_OPEN_CHILDREN = new Map<string, number>([['s3', 2]]);
 
-// The page a live child has stopped on: a permission request and a question at the foot of
-// the session, with the rail beside it holding a card in each coloured state.
+// Live requests appear below the selected session, beside session list status fixtures.
 function asksPayload(which: boolean | 'three' | 'six'): Record<string, unknown> {
   const asks =
     which === 'three' ? [THREE_QUESTION_ASK] : which === 'six' ? [SIX_QUESTION_ASK] : [PERMISSION_ASK, QUESTION_ASK];
   return renderPayload([], [], [], [], asks, [], SHOT_STATUSES, SHOT_RUNNING_SINCE, [], SHOT_OPEN_CHILDREN);
 }
 
-// The long turn after its main agent finished while its background subagents still work.
+// The long turn has finished main-agent work and running background subagents.
 function subagentsPayload(): Record<string, unknown> {
   const payload = renderPayload([], [], [], [], [], [], SHOT_STATUSES, SHOT_RUNNING_SINCE, [], SHOT_OPEN_CHILDREN) as {
     cards: Record<string, unknown>[];
   };
-  // The long turn's open child becomes a background launch, the kind that outlives its turn.
+  // Mark the first subagent as a background launch that outlives its turn.
   const recorded = FIXTURE_TURNS[LONG_TURN_INDEX];
   const background = {
     ...recorded,
@@ -826,14 +789,11 @@ function activityPayload(which: NonNullable<Shot['activity']>): Record<string, u
   return payload;
 }
 
-// One frame for the message to be taken, one for the layout it causes. A string rather than
-// a function, because this file is transpiled and a transpiled arrow function calls helpers
-// the page has never heard of.
+// Advance two animation frames. This does not confirm delivery of native browser events.
+// Use a string because transpiled functions can reference helpers unavailable inside the page.
 export const SETTLED = 'new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))';
 
-// A browser already installed, or nothing. Edge ships with Windows and Chrome is common
-// everywhere else; the bundled Chromium is tried last, for a machine that has run
-// `playwright install`. Nothing is downloaded here.
+// Try installed Edge, Chrome, then bundled Chromium. Download no browser.
 export async function browserOrNone(): Promise<Browser | null> {
   for (const channel of ['msedge', 'chrome', undefined]) {
     try {
@@ -843,7 +803,7 @@ export async function browserOrNone(): Promise<Browser | null> {
         ...(channel ? { channel } : {}),
       });
     } catch {
-      // The next one, and no report: which browsers a machine has is not a fault in the panel.
+      // Try the next installed browser.
     }
   }
   return null;
@@ -903,31 +863,24 @@ export function firstProjectPayload(draft: boolean): Record<string, unknown> {
     labelsMoreName: null,
     name: 'New session, Claude, just now, showing now',
   }));
-  // A session that has answered no prompt has no figures. The card and the heading over it
-  // both read the keyed record, so clearing this payload's entry clears both.
+  // An unsubmitted draft has no session figures. Deleting its keyed stats clears the card and heading.
   delete payload.stats.s1;
   payload.showing = 's1';
   return payload;
 }
 
-// How long ImageMagick gets for one conversion or one comparison.
+// Deadline for one ImageMagick conversion or comparison.
 const CONVERT_TIMEOUT_MS = 60_000;
 
-// What both a page and a region accept. Playwright types the two separately, and this helper
-// reads only the fields they share.
+// Screenshot options shared by Playwright page and element captures.
 type ScreenshotOptions = {
   path?: string;
   clip?: { x: number; y: number; width: number; height: number };
   fullPage?: boolean;
 };
 
-// Writes one picture as a lossless WebP. The browser has no lossless WebP encoder, so the
-// shot lands as a PNG first and ImageMagick converts it. The comparison that follows is what
-// makes the word lossless true: it counts the differing pixels and refuses anything but zero,
-// so a picture a reviewer measures a colour in is the picture the browser drew.
-//
-// The panel-mockup skill holds the same helper for its mockup boards. That skill is its own
-// repository, reached through a symbolic link, so the extension cannot import from it.
+// Capture PNG, convert it to lossless WebP, and reject any differing pixels.
+// The panel-mockup skill has the same helper in a separate repository that the extension cannot import.
 export async function writeLosslessWebp(
   target: { screenshot(options: ScreenshotOptions): Promise<Buffer> },
   file: string,
@@ -960,8 +913,7 @@ export async function writeLosslessWebp(
   }
 }
 
-// The Rows value is chosen the way a reader chooses it, so the rows redraw with the short age
-// as well as the compact layout. The View menu shuts again before the picture.
+// Select Rows through the View menu so row layout and relative ages update together. Close the menu before capture.
 async function chooseRailDensity(page: Page, density: RailDensity): Promise<void> {
   if (!(await page.locator('#railfilterpop').isVisible())) {
     await page.locator('[data-control="railfilters"]').click();
@@ -974,8 +926,7 @@ async function chooseRailDensity(page: Page, density: RailDensity): Promise<void
 export async function shoot(page: Page, shot: Shot, outDir: string): Promise<void> {
   const file = path.join(outDir, `${shot.name}.webp`);
   fs.rmSync(file, { force: true });
-  // Each state starts from the same focus condition. Actions below can move focus when the
-  // state includes that behavior, but an earlier state cannot leave an outline behind.
+  // Clear focus from the preceding capture before applying this state's actions.
   await page.evaluate(`document.activeElement instanceof HTMLElement && document.activeElement.blur()`);
   const escapes = shot.escape === true ? 1 : shot.escape || 0;
   for (let index = 0; index < escapes; index++) {
@@ -986,7 +937,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.setViewportSize({ width: shot.width, height: shot.height ?? 900 });
     await page.evaluate(SETTLED);
   }
-  // A density shot puts the rail width back with the density, so the shots after it keep theirs.
+  // Save the session list width for restoration after a density capture.
   const railBasis = shot.railDensity
     ? await page.locator('#rail').evaluate((node) => (node as HTMLElement).style.flexBasis)
     : null;
@@ -1012,8 +963,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
       await page.locator('[data-control="railfilters"]').click();
     }
     await page.locator(`[data-control="railfilterpick:${shot.railFilterPreset}"]`).click();
-    // A saved filter press leaves the View menu open, so the funnel shuts it again and the
-    // picker step below opens it only for the shots that draw it.
+    // Selecting a saved filter leaves the View menu open. Close it before applying the requested menu state.
     await page.locator('[data-control="railfilters"]').click();
     await page.evaluate(SETTLED);
   }
@@ -1043,9 +993,8 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
       [],
       SHOT_OPEN_CHILDREN,
     ) as { stats: Record<string, unknown> };
-    // The pinned session carries all three figures, with a lower-bound cost that has a warning
-    // and a context near its limit, so a comfortable row and a compact row's hover both show
-    // every figure state the line draws.
+    // The pinned-session fixture has cost, turns, and context figures.
+    // Its cost has a partial-total warning, and its context is near the limit.
     pinned.stats = {
       ...pinned.stats,
       [shot.pinned]: [
@@ -1138,8 +1087,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     }
   }
   if (shot.cacheWriteWarning) {
-    // A query an earlier picture left behind, emptied where one is on screen. The box has no
-    // resting place on the rail head row, so a page that rests on its counts has none.
+    // Clear any visible session list query from the preceding capture.
     if (await page.locator('.railfilter').count()) {
       await page
         .locator('.railfilter')
@@ -1184,8 +1132,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.headCounts) {
-    // Three unread sessions, one waiting session and one running session beside the fixture's
-    // active ones, so the head draws Running, Active, Unread and Needs input together.
+    // Unread, waiting, and running fixtures populate all four session list header counts alongside active sessions.
     const payload = renderPayload() as { rail: Record<string, unknown>[] };
     const idle = payload.rail.findIndex((card, index) => index > 3 && !card.status);
     payload.rail = payload.rail.map((card, index) =>
@@ -1201,7 +1148,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.railHeadUntick) {
-    // The shot before this one leaves the menu open, so the funnel is pressed only when it is shut.
+    // Open the View menu only when it is closed.
     const funnel = page.locator('[data-control="railfilters"]');
     if ((await funnel.getAttribute('aria-expanded')) !== 'true') {
       await funnel.click();
@@ -1211,8 +1158,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.railLens) {
-    // The fixture's sessions are all read, so the first three are posted unread to give the
-    // Unread lens something to count.
+    // Mark the first three fixture sessions unread so the Unread lens has sessions to count.
     const payload = renderPayload() as { rail: Record<string, unknown>[] };
     payload.rail = payload.rail.map((card, index) => (index < 3 ? { ...card, unread: true } : card));
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
@@ -1223,14 +1169,12 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.filter) {
-    // The rail head row rests on its counts and its two tools, so the box has to be opened
-    // before anything can be typed into it. The magnifying glass opens it directly.
+    // Open the filter box before typing.
     if (!(await page.locator('.railfilter').count())) {
       await page.locator('[data-control="railsearch"]').click();
       await page.evaluate(SETTLED);
     }
-    // Typed rather than written onto the box. The list under it opens off the word the caret
-    // stands in, and a value set straight on the element moves no caret and fires no press.
+    // Type into the filter box to move the caret and trigger suggestions for its current word.
     await page.locator('.railfilter').first().click();
     await page.keyboard.type(shot.filter);
     await page.evaluate(SETTLED);
@@ -1249,9 +1193,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.openCard) {
-    // A card the panel remembers stays open for every picture after it, so the press is made
-    // only on a shut card. Pressed unconditionally, the second of these states would shut the
-    // card the first one opened.
+    // Press only closed card headings. A second press closes a card retained from the preceding capture.
     await page.evaluate(`(() => {
       const head = document.querySelector(${JSON.stringify(shot.openCard)});
       if (head && head.getAttribute('aria-expanded') === 'false') { head.click(); }
@@ -1285,8 +1227,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
       console.log(`${shot.name}.webp not written: nothing on the page matches ${shot.hover}`);
       return;
     }
-    // The hint opens after the editor's hover delay, which differs by platform and by what
-    // the pointer rests on, so the shot waits for the box itself.
+    // Wait for the hint itself because hover delay varies by platform and target.
     try {
       await page.waitForFunction(() => document.getElementById('hintpop')?.hidden === false, undefined, {
         timeout: 5_000,
@@ -1298,8 +1239,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.labels) {
-    // The popover opens on the answer and not on the press, because the extension owns the
-    // rows. The press posted the ask; this is the reply the panel is waiting for.
+    // The label editor waits for host-owned rows. Supply its reply after the control sends its request.
     const row = page.locator('.railrow').first();
     const session = (await row.locator('.railcard').getAttribute('data-session')) ?? '';
     const title = await row.locator('.railname').innerText();
@@ -1313,8 +1253,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.rename) {
-    // The editor opens on the command and not on the right-click, because the extension owns
-    // the full name. The right-click arms it, and this posts the command's message.
+    // Right-click establishes the rename target. The host message opens the editor with the full session name.
     const node = page.locator(shot.rename === 'heading' ? '.sessionrow .session' : '.railrow .railcard').first();
     const named = await node.evaluate((element) => ({
       session: element.closest<HTMLElement>('[data-session]')?.dataset.session ?? '',
@@ -1338,8 +1277,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'showSessionDetails', session })}, '*')`);
     await page.evaluate(SETTLED);
   }
-  // A render message can schedule a Preact repaint from a layout effect after the first
-  // pair of frames. Let that follow-up finish before the pixels are sampled.
+  // Supply provider-specific context detail for the prompt box popover.
   if (shot.contextDetail) {
     const provider = shot.contextDetail === 'claude' ? 'claude' : 'codex';
     const payload = renderPayload();
@@ -1410,20 +1348,18 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
     await page.evaluate(SETTLED);
   }
   if (shot.labels || shot.hover) {
-    // The pointer is left where it pressed, and a rail row under it draws its controls in
-    // every picture after this one.
+    // Move the pointer away so later captures omit session list row hover controls.
     await page.mouse.move(0, 0);
     await page.evaluate(SETTLED);
   }
-  // The width goes back before the page redraws below, so the composer is placed for it.
+  // Restore the session list width before redrawing the prompt box.
   if (railBasis !== null) {
     await page.locator('#rail').evaluate((node, basis) => {
       (node as HTMLElement).style.flexBasis = basis;
     }, railBasis);
     await page.evaluate(SETTLED);
   }
-  // A disclosure the panel remembers stays open for every picture after this one. The page
-  // is shared, so a state opened for one shot is put back before the next.
+  // Restore the default payload after captures that replace its layout, sessions, or prompt box state.
   if (shot.layout || shot.pinned || shot.railLens || shot.launcherPins !== undefined || shot.contextDetail) {
     await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
     await page.evaluate(SETTLED);
@@ -1441,9 +1377,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
   }
 }
 
-// Every shot, taken twice: once dressed in Dark Modern and once in Light Modern. Dark keeps
-// the plain names so an existing link to one still resolves; light earns a `-light` suffix,
-// since the two are pictures of the same state and belong beside each other on disk.
+// Light Modern captures append `-light` to the filename. Dark Modern captures keep the base name.
 function shotFor(shot: Shot, kind: 'dark' | 'light'): Shot {
   return kind === 'light' ? { ...shot, name: `${shot.name}-light` } : shot;
 }
@@ -1458,9 +1392,7 @@ async function main(): Promise<void> {
   const errors: string[] = [];
   try {
     fs.mkdirSync(outDir, { recursive: true });
-    // A fresh page per theme kind, and not one page loaded twice: `setContent` writes into
-    // the page's existing document rather than navigating it, so the inline script that
-    // declares SAVED_STATE throws on a second call, having already declared it once.
+    // Use a fresh page for each theme. Repeating setContent redeclares SAVED_STATE in the same document and throws.
     for (const kind of ['dark', 'light'] as const) {
       const page = await browser.newPage({
         viewport: { width: 1350, height: 900 },
@@ -1468,8 +1400,7 @@ async function main(): Promise<void> {
       });
       let currentShot = 'initial panel';
       page.on('pageerror', (e) => errors.push(`${currentShot}: ${String(e)}`));
-      // Fix Date.now while browser timers continue. Time-sensitive labels then cannot cross a
-      // threshold between captured states.
+      // Fix Date.now while browser timers continue, keeping time labels stable between captures.
       await page.clock.setFixedTime(FIXTURE_CLOCK);
       const initialPayload = renderPayload() as { cards: Array<{ key: string }> };
       const savedState = JSON.stringify({ read: initialPayload.cards.map((card) => card.key) });

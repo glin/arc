@@ -152,9 +152,8 @@ export async function compareShotDirectories(beforeDir, afterDir) {
   if (pairs.length === 0) {
     return { ok: false, browser: false, results: [], error: 'No panel shots were found to compare.' };
   }
-  // A state with no baseline is a new state, and it is named rather than compared. It leaves
-  // the run standing, so the states that do have both images are still compared. A state whose
-  // after image is absent is a state that went missing, and that fails the run.
+  // A missing baseline identifies a new state without failing the comparison.
+  // A missing after image fails the run.
   const missing = pairs.filter((pair) => pair.missing).map((pair) => ({ name: pair.name, missing: pair.missing }));
   const lost = missing.some((result) => result.missing === 'after');
   const complete = pairs.filter((pair) => !pair.missing);

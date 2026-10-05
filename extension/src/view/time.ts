@@ -34,14 +34,10 @@ export function formatRelative(at: number, now: number = Date.now()): string {
   return RELATIVE_UNDER_A_MINUTE;
 }
 
-// The smallest span the panel will print for a cache lifetime. The clock behind it is good to
-// 90 seconds, and the near-boundary wording owns everything under two minutes. A smaller
-// figure would name a state the record cannot settle.
+// Cache estimates switch to cold 90 seconds before inferred expiry. Spans under two minutes use near-boundary wording.
 export const CACHE_SPAN_MINIMUM_SECONDS = 120;
 
-// A length of time in the compact units an age already uses, with no `ago` on it and never in
-// seconds. Used for what is left of a cache lifetime and for how long ago one ran out, so the
-// two read as one figure moving through a boundary rather than as two different clocks.
+// Format cache lifetime or time since expiry using compact relative units, without ago or seconds.
 export function formatCacheSpan(ms: number): string {
   const seconds = Math.max(CACHE_SPAN_MINIMUM_SECONDS, Math.floor(ms / 1000));
   for (let i = 0; i < RELATIVE_STEPS.length; i += 1) {
@@ -54,12 +50,8 @@ export function formatCacheSpan(ms: number): string {
   return `${CACHE_SPAN_MINIMUM_SECONDS / 60}m`;
 }
 
-// How long something ran, in the compact units an age already uses. The hours and the
-// minutes are separated by a space and the minutes are not padded, so an hour and eight
-// minutes reads `2h 8m`. Run together and padded it reads `2h08m`, which the eye takes as one
-// number before it finds the letters in the middle of it.
-//
-// The minutes are rounded before the split, so 1h59m30s reads `2h 0m` rather than `1h 60m`.
+// Format elapsed time with a space between hours and unpadded minutes. Two hours and eight minutes reads 2h 8m.
+// Round minutes before splitting hours, so 1h59m30s reads 2h 0m.
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) {
@@ -72,12 +64,8 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
-// The step `formatCompactRelative` and `formatRelativeShort` both walk, so an age and a
-// span that fall in the same step always print the same figure and the same unit letter.
-//
-// The last step's `max` is `null`, so it always matches and the walk never needs a
-// fallback: everything short of it returns from inside the loop, and the last step is
-// handled on its own right after.
+// Share compactRelativeStep between compact spans and short ages, keeping counts and unit letters consistent.
+// Test each bounded step before handling the final unbounded step.
 function compactRelativeStep(seconds: number): { count: number; unit: string } {
   for (let i = 0; i < RELATIVE_STEPS.length - 1; i += 1) {
     const step = RELATIVE_STEPS[i];

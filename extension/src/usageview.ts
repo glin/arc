@@ -1,17 +1,6 @@
-// What the usage bar shows, and what a reading of it means.
-//
-// Both agents answer for the reader's own rate limits, and neither charges model tokens to
-// do it. The two payloads have nothing in common, so each wire reduces its own to
-// `UsageReading` and everything after that point happens here: which limits are still about
-// a period the reader is in, what each one is called, which caution band it sits in, when it
-// resets, and how old the figure is.
-//
-// The bar has two faces and both are written here. Collapsed it carries a compact set of
-// figures and no bars, because colour carries the caution band. Opened it lists every limit
-// each agent reported, grouped as the agent groups them, with a bar on each.
-//
-// This file imports no `vscode`, so it is the part of the bar the tests can reach. `SCRIPT`
-// in `panelhost.ts` draws what it is handed and decides none of it.
+// Normalizes account usage and prepares collapsed figures and expanded limit rows.
+// Each agent wire supplies `UsageReading` without a model request.
+// This module determines labels, caution bands, resets, and reading age.
 
 import { RateLimit, SpendCap, UsageReading } from './agentwire';
 import { CONTEXT_BANDS, bandForPercent, formatClock, wholePercent } from './turnview';
@@ -24,10 +13,7 @@ function owns(table: Record<string, string>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(table, key);
 }
 
-// The names on the bar. Not `AGENT_NAMES`, which names the source of a turn: these name the
-// account the limit belongs to, the name is one word wide, and "Claude Code max" reads as a
-// plan called Code. The two tables answer different questions and are meant to be able to
-// differ.
+// Account names for the usage bar. These are independent of turn source labels.
 export const USAGE_AGENT_NAMES: Record<string, string> = {
   claude: 'Claude',
   codex: 'Codex',
@@ -36,12 +22,7 @@ export const USAGE_AGENT_NAMES: Record<string, string> = {
 // The order the agents are drawn in, which is the order they are offered in everywhere else.
 export const USAGE_AGENT_ORDER: readonly string[] = ['claude', 'codex'];
 
-// How long a figure stays fresh enough to say nothing about its age.
-//
-// A timestamp on a figure read seconds ago is a signal the reader cannot act on, and the bar
-// is read again whenever the panel becomes visible and whenever a turn finishes, so most
-// readings are seconds old. Past this the age is drawn, because a rate limit moves while
-// nobody is looking at it.
+// Maximum reading age before the usage bar displays its age.
 export const USAGE_FRESH_MS = 120_000;
 export const MAX_USAGE_RESET_DELAY_MS = 2_147_000_000;
 
@@ -101,9 +82,8 @@ export class UsageWriteQueue {
   }
 }
 
-// One limit's figure, and the moment that figure was read. The reading time rides the limit
-// rather than the agent because the free mid-turn events carry one limit at a time, so an
-// agent's limits can honestly have been read minutes apart.
+// A limit and its reading time. Mid-turn events update limits independently,
+// so an agent's limits can have different reading times.
 export interface WindowReading extends RateLimit {
   readAt: number;
   // Requested account answers replace one another. Live events survive a cap-only answer
@@ -127,8 +107,7 @@ export interface AgentUsage {
   checkedAt: number | null;
 }
 
-// One figure on the collapsed line. It carries no width: the collapsed bar draws no bars,
-// and a fill here would be an invitation to draw one.
+// Recognizes duration-based limit window names.
 const MINUTE_WINDOW = /^(\d+)_minute$/;
 
 const WINDOW_WORDS: Record<string, string> = {
@@ -155,10 +134,7 @@ export function moneyWord(minor: number, exponent: number, currency: string): st
   return symbol ? `${symbol}${amount}` : [currency, amount].filter(Boolean).join(' ');
 }
 
-// How long a window's clock runs, from the window's own name. A limit is named by its
-// length rather than by a word for it, which is both what the reader asked for and what the
-// Codex app itself prints. Short, because it shares a line with the figure, the bar and the
-// reset time inside a sidebar.
+// Formats a duration-based window name as compact minutes, hours, or days.
 export function windowWord(window: string): string {
   if (owns(WINDOW_WORDS, window)) {
     return WINDOW_WORDS[window];
@@ -169,9 +145,7 @@ export function windowWord(window: string): string {
     if (minutes < 60) {
       return `${minutes}m`;
     }
-    // Each unit is rounded before its own range is tested, so a length that rounds up to a
-    // full day of hours is said as a day. Tested the other way round, 1439 minutes reads
-    // `24h`, which is a day written in the unit below it.
+    // Round each unit before choosing its range. A duration of 1439 minutes rounds to a day, preventing a `24h` label.
     const hours = Math.round(minutes / 60);
     if (hours < 24) {
       return `${hours}h`;
@@ -183,19 +157,13 @@ export function windowWord(window: string): string {
   return window.replace(/_/g, ' ');
 }
 
-// Whether a window's name says how long its clock runs. Codex names every window for its own
-// length, so the length it reported is the length drawn; Claude names its own after the limit
-// rather than the clock, and only the two names it shares with Codex land here.
+// Recognizes windows whose names encode a duration.
+// Codex duration names take precedence over group-based Claude fallback labels.
 function statesDuration(window: string): boolean {
   return owns(WINDOW_WORDS, window) || MINUTE_WINDOW.test(window);
 }
 
-// The clock a limit runs on, from the agent's own word for it.
-//
-// An agent that names no group leaves the window to answer, which is what a payload keyed by
-// window name gives: the two windows both agents have always reported are the same two
-// clocks under their old names. A limit that is neither is left without a group, and is
-// drawn under its own window name.
+// Fallback groups for recognized window names when the agent supplies no group.
 const WINDOW_GROUPS: Record<string, string> = { five_hour: 'session', seven_day: 'weekly' };
 
 function groupOf(limit: RateLimit): string {
@@ -205,34 +173,21 @@ function groupOf(limit: RateLimit): string {
   return owns(WINDOW_GROUPS, limit.window) ? WINDOW_GROUPS[limit.window] : '';
 }
 
-// What one limit is, apart from every other limit the same agent reports.
-//
-// The group and the scope, not the window, because the two sources an agent answers through
-// are free to name one clock two ways: a request that calls it `weekly_all` and a mid-turn
-// event that calls it `seven_day` are one limit, and folding them under two names would draw
-// the same figure twice under the same word. The window is the fallback for an agent that
-// names no group, which is the one case where it is the only identity there is.
+// Identify each limit by its group and scope.
+// `weekly_all` in a request and `seven_day` in a mid-turn event name the same clock.
+// Using their window names would display that limit twice. A limit with no group uses its window as its identity.
 function limitKey(limit: RateLimit): string {
   return `${groupOf(limit) || limit.window}:${limit.scope}`;
 }
 
-// How long each clock runs, for an agent that reports the clock and not its length.
-//
-// Claude's listed limits carry a kind and a group and no duration at all. The same answer
-// carries `five_hour` and `seven_day` as sibling keys for those very two clocks, so the
-// lengths here are Claude's own words for its own windows rather than a guess. This is the
-// one place a duration is inferred instead of reported.
+// Fallback durations for Claude session and weekly groups without duration-based window names.
 const GROUP_LABELS: Record<string, string> = {
   session: '5h',
   weekly: '7d',
 };
 
-// What a limit is called, on the collapsed line and on the opened list alike, so a `5h` on
-// the line names the `5h` row below it. A model-scoped limit takes the model's own display
-// name, verbatim, because that is the word the reader knows it by and the panel has no
-// better one. Anything else is named for how long its clock runs, and a stated length
-// answers before a group does, so a session limit running on some other clock is never
-// called five hours.
+// Uses a model scope verbatim as the label. Otherwise use a stated duration before a group fallback.
+// Collapsed figures and expanded rows use the same label.
 function lineLabel(limit: RateLimit): string {
   if (limit.scope) {
     return limit.scope;
@@ -249,8 +204,7 @@ const GROUP_SPOKEN: Record<string, string> = {
   weekly: 'the week',
 };
 
-// The same figure said out loud. The collapsed line has room for `wk` and a reader listening
-// to it does not, so the unit is spelled out here rather than read as two letters.
+// Accessible wording for the limit's group or duration.
 function spokenWindow(limit: RateLimit): string {
   const group = groupOf(limit);
   if (owns(GROUP_SPOKEN, group)) {
@@ -284,15 +238,7 @@ export interface ResetWords {
   resetsExact: string;
 }
 
-// How long the reader has, and the moment itself.
-//
-// The duration is what the line draws, because "in 4h" is the answer to the question a
-// reader glancing at a limit is asking. It rounds down, so "in 4h" is at least four hours
-// and never less. The moment is kept beside it for the hover, since a duration alone cannot
-// be written into a calendar.
-//
-// A limit whose reset has already gone is dropped before it reaches here, so nothing below
-// words a moment in the past.
+// Returns the next UTC month start as Unix seconds for an expected credit reset.
 export function nextMonthStartUtc(now: number): number {
   const current = new Date(now);
   return Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 1) / 1000;
@@ -310,12 +256,8 @@ export function resetWord(atSeconds: number | null, now: number, expected = fals
   };
 }
 
-// How long a stretch of time is, in the largest unit that still gives a whole number of it,
-// rounded down. Empty under a minute, where no unit gives one.
-//
-// Every duration the bar draws is worded from here. A reset and an age are the same kind of
-// fact pointing opposite ways, and a second ladder for the second of them would put two
-// scales on one control.
+// Format a duration using the largest unit with at least one whole unit, rounded down. Durations under a minute produce no text.
+// The usage bar uses this scale for resets and ages.
 function lengthWord(span: number): string {
   if (span < A_MINUTE_MS) {
     return '';
@@ -336,14 +278,10 @@ function countdown(away: number): string {
   return length ? `in ${length}` : 'in less than a minute';
 }
 
-// One agent's readings, folded together.
-//
-// A complete reading replaces the account-wide limits when it carries rate windows. Scoped
-// live windows remain because the account answer can omit its per-model inventory. A cap-only
-// answer keeps live windows too, because it says nothing about any rate clock. A partial
-// mid-turn event names only the limit it covers, so that limit is updated without throwing
-// away the others. The plan name is taken from any reading that carries one: the mid-turn
-// events carry none, and dropping the name every time one arrives would make the bar flicker.
+// Combine one agent's readings. Complete readings with rate windows replace account-wide limits.
+// Keep model-scoped live-event windows because account responses omit some models. Cap-only responses keep live windows because they contain no rate clocks.
+// Partial mid-turn events update their named limit and keep the others.
+// Retain the plan name from any reading that supplies one. Mid-turn events omit it.
 export function foldUsage(current: AgentUsage | null, agent: string, reading: UsageReading): AgentUsage {
   const windows = new Map<string, WindowReading>();
   for (const window of current?.windows ?? []) {
@@ -374,8 +312,8 @@ export function usagePlanLabel(usage: AgentUsage | undefined): string {
   if (!usage?.plan) {
     return '';
   }
-  // Neither Claude's usage control response nor its status output corroborates the local
-  // credential hint, so Max is the most specific plan label the panel can report safely.
+  // Claude's usage control response and status output do not confirm the local credential hint.
+  // Max is the most specific plan label supported by those sources.
   if (usage.agent === 'claude' && usage.plan === 'max') {
     return 'Max plan';
   }
@@ -401,11 +339,8 @@ export function limitReading(
   };
 }
 
-// The reading order the owner asked for: the session limit, then the week, then every
-// model-scoped one in the order the agent reported it. The session comes first because it is
-// the one that stops the reader today. A limit on some other clock sits between the week and
-// the scoped ones, where a reader looking for the two familiar figures will already have
-// passed it.
+// Orders unscoped session limits, weekly limits, other limits, then model-scoped limits.
+// Equal ranks retain reported order.
 function rankOf(limit: RateLimit): number {
   if (limit.scope) {
     return 3;
@@ -430,9 +365,7 @@ function isModelBucketWindow(agent: string, limit: RateLimit): boolean {
   return (!limit.scope && limit.window === 'seven_day_overage_included') || (agent === 'codex' && Boolean(limit.scope));
 }
 
-// The limits still worth drawing, in reading order. A limit whose reset time has already
-// passed is not one of them, because its figure is about a period the reader has left and
-// "93%, resets Tuesday" said on Wednesday is not a stale figure but a wrong one.
+// Returns displayed windows whose reset has not passed, in reading order.
 function liveLimits(usage: AgentUsage, now: number): WindowReading[] {
   return usage.windows
     .filter((w) => !isModelBucketWindow(usage.agent, w))
@@ -468,12 +401,8 @@ function agentOrder(agents: Iterable<string>): string[] {
   return [...USAGE_AGENT_ORDER.filter((a) => seen.includes(a)), ...seen.filter((a) => !USAGE_AGENT_ORDER.includes(a))];
 }
 
-// The whole bar, or nothing at all when no agent has a live limit, so the panel draws no bar
-// rather than an empty one.
-//
-// Every agent the folder uses is on it, not only the one whose session is on screen: a
-// Claude session is often where a Codex run is dispatched from, and following the
-// selection would hide a figure at the moment it is being spent.
+// Prepares the usage bar for all supplied agents with a displayed window or spend cap.
+// Returns null when no groups remain. Session selection does not narrow account usage.
 export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
   const byAgent = new Map(usages.map((u) => [u.agent, u]));
   const briefs: UsageBrief[] = [];
@@ -510,10 +439,8 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
         resets,
         resetsExact,
         detail: '',
-        // The bar is drawn rather than written, so the figure and the reset are said here or
-        // a reader who is not looking at the line loses both. The exact moment is said too,
-        // because the hover that carries it is the one place it appears on screen and a
-        // reader listening to the line reaches no hover.
+        // Include utilization, relative reset, and exact reset time in the accessible name.
+        // Tooltip-only reset text would be unavailable to screen-reader users.
         name: [`${name}, ${percent}% used`, resets, resetsExact].filter(Boolean).join(', '),
       });
       if (limit.scope) {
@@ -553,8 +480,7 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
       figures.push({ percent, unit: SPEND_LABEL, level });
       spoken.push(`${percent}% of ${SPEND_SPOKEN}`);
     }
-    // An agent whose only live limits are model-scoped keeps its group and takes no part of
-    // the collapsed line, rather than putting its name there with nothing after it.
+    // Keep agents with only model-scoped limits in their own group. Omit them from the collapsed line, which has no account-wide figure for them.
     if (figures.length) {
       briefs.push({ agent, label, figures, name: [label, ...spoken].join(', ') });
     }
@@ -570,9 +496,7 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
   // The control that reads again carries the same words, so two wordings of one reading,
   // drawn a few pixels apart, can never name different numbers.
   const readWord = age || 'updated just now';
-  // The moment itself, which only the accessible name carries. A duration says how old a
-  // figure is and never when it was read, and the two together pin one reading down:
-  // "read 3d ago, 2:22 PM" is one moment and no other.
+  // Adds the reading's clock time to stale accessible age wording.
   const spokenAge = stale ? `${age}, ${formatClock(readAt)}` : '';
   const said = [briefs.map((b) => b.name).join('. '), spokenAge].filter(Boolean).join(', ');
   return {
@@ -591,18 +515,9 @@ export interface TurnMark {
   finished: boolean;
 }
 
-// Which agents gained a finished turn since the last look.
-//
-// Nothing else moves the figures for a turn run in a terminal: the bar is fed by children
-// this window started, and the turns the reader actually watches are read off transcripts
-// somebody else wrote. The poll knows when a finished turn appears, per session and so
-// per agent, so the read hangs on that rather than on the reader remembering to press.
-//
-// `seen` is every turn id already counted, and the returned set replaces it. An empty one
-// primes and names nobody: the first poll after a reload finds every turn in the folder new,
-// and reading on that would pay a process start per agent on every window open, which the
-// startup read already covers. An unfinished turn is counted nowhere and enters `seen`
-// nowhere either, so it counts once, when it finishes.
+// Returns agents with newly observed finished turns and the updated seen-id set.
+// An empty seen set primes history without requesting usage reads.
+// Unfinished turns enter neither the result nor the seen set until completion.
 export function agentsWithNewTurns(
   seen: ReadonlySet<string>,
   turns: readonly TurnMark[],
@@ -622,16 +537,11 @@ export function agentsWithNewTurns(
   return { agents: agentOrder(gained), seen: next };
 }
 
-// Everything the bar has been told, kept per agent. It holds no clock of its own: the wording
-// is worked out from `Date.now()` at the moment the bar is drawn, so a reading left alone
-// grows an age without anything having to repaint it.
+// Retains account readings per agent. Each bar projection uses the caller's current clock.
 export class UsageBook {
   private readonly byAgent = new Map<string, AgentUsage>();
   private readonly record: ((agent: string, reading: UsageReading) => void) | undefined;
-  // The agents that could not answer. A machine with only one of the two CLIs installed
-  // would otherwise pay a failed process start every time the panel came back into view,
-  // for an agent that is never going to answer. Cleared when the reader presses the bar,
-  // because a press is somebody saying to try again.
+  // Agents with failed usage reads. Suppress repeated automatic requests until a forced read.
   private readonly silent = new Set<string>();
 
   constructor(seed: readonly AgentUsage[] = [], record?: (agent: string, reading: UsageReading) => void) {
@@ -655,19 +565,13 @@ export class UsageBook {
     this.note(agent, limitReading(limit, readAt, creditResetsAtSeconds));
   }
 
-  // An agent that was asked and did not answer. Its last reading, if it has one, stays:
-  // an old figure with its age on it says more than an empty bar.
+  // Marks an agent as unavailable without discarding its last reading.
   noteSilent(agent: string): void {
     this.silent.add(agent);
   }
 
-  // Which of the agents to actually ask.
-  //
-  // Reading costs no model tokens, but it does cost a process start when nothing is
-  // running, and the panel becoming visible is a common event. So a figure still inside
-  // its fresh window is left alone, and an agent that has already failed to answer is not
-  // asked again. A press says otherwise: the reader pressing the bar is asking for this
-  // figure now, whatever its age, and it clears the silence too.
+  // Selects agents with no fresh complete reading, excluding failed automatic reads.
+  // A forced read clears their failed state and includes every requested agent.
   toAsk(agents: readonly string[], now: number, force: boolean): string[] {
     if (force) {
       for (const agent of agents) this.silent.delete(agent);
@@ -718,7 +622,5 @@ export class UsageBook {
   }
 }
 
-// The band table is re-exported so a reader of this file can see the bar takes the context
-// chip's scale rather than one of its own. The panel keeps one vocabulary for getting full,
-// and a second set of thresholds here would be two answers to one question.
+// Shares the context caution thresholds with the usage bar.
 export { CONTEXT_BANDS };

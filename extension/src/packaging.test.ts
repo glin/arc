@@ -164,11 +164,8 @@ test('watch startup invalidates identity from a preceding production build', asy
   }
 }, 30_000);
 
-// vsce matches `.vscodeignore` with minimatch, where a `*` does not cross a `/`. A pattern
-// written as `*.log` keeps a log out of the package's top level and ships every one written
-// into a folder under it, which is where a tool run in the tree tends to put it. The file
-// already spells the recursive form as `**/*.map`, so the two shapes sit side by side and
-// only the wrong one is silent: nothing about the packaged extension says a file got in.
+// A single-star ignore pattern does not cross directory separators. Excluded file types need recursive patterns.
+
 test('a file type the package leaves out is left out at every depth, not only at its top', () => {
   const file = path.join(__dirname, '..', '.vscodeignore');
   const patterns = fs
@@ -279,13 +276,8 @@ test('the extension requires the Agent Codicon and remains installable in suppor
   );
 });
 
-// The extension is Arc. The first name it answered to reached into command ids,
-// environment variables, workspace-state keys, two URI schemes and the extension identity
-// itself, and a rename that stops halfway is silent in every other check here: the manifest
-// and the code agree with each other under whichever name they share, and only the reader is
-// left with two products behind one panel. The retired name is written down once, as its
-// three words, and every shape it was ever spelled in is built from them, so this guard does
-// not report itself.
+// Product identifiers use Arc across code and public text. Build retired-name patterns from separate words to exclude their own definitions.
+
 const RETIRED_WORDS = ['agent', 'diff', 'review'];
 const RETIRED = [
   new RegExp(RETIRED_WORDS.join(''), 'i'), // one word, the way an identifier carries it
@@ -480,8 +472,8 @@ test.runIf(process.platform === 'win32')(
   },
 );
 
-// The product had a two-word name before it was Arc. A reader who meets that name meets two names
-// for one product. The pattern is built from the two words, so this guard does not report itself.
+// Public text excludes the legacy product name. Build the pattern from separate words to exclude its own definition.
+
 const LEGACY_WORDS = ['agent', 'timeline'];
 const LEGACY_NAME = new RegExp(LEGACY_WORDS.join('[ _-]?'), 'gi');
 

@@ -31,25 +31,17 @@ function keyFor(absPath) {
   return crypto.createHash('sha1').update(absPath).digest('hex');
 }
 
-// Locations the agent writes to for itself -- scratch plans, memory, internal state -- which
-// are not changes the user wants to review. Edits anywhere else, including other repos the
-// user asked the agent to touch, are still captured. The turn timeline hides the same
-// paths, and test/fixtures/ephemeral-paths.json holds the cases both sides must agree on.
-// Override with ARC_IGNORE_ROOTS, separated like PATH entries (':' on POSIX, ';' on Windows,
-// where ':' would split absolute paths at the drive letter); set empty to disable, e.g. in
-// tests.
+// Excludes temporary, agent-home, and Arc-store paths from snapshots. Other repositories remain eligible.
+// ARC_IGNORE_ROOTS uses PATH separators. An empty value disables exclusions.
+// Shared ephemeral-path fixtures also cover the timeline filter.
 function ignoreRoots() {
   const env = process.env.ARC_IGNORE_ROOTS;
   if (env !== undefined) return env.split(path.delimiter).filter(Boolean);
   const arcHome = path.resolve(process.env.ARC_HOME || path.join(os.homedir(), '.arc'));
   return [os.tmpdir(), claudeConfigHome(), codexHome(), arcHome];
 }
-// Path shapes differ between what a tool reports and what the OS hands back: separators,
-// a trailing slash, and on Windows the case of the drive letter. All three must be
-// levelled before comparing, or the same file counts as scratch on one side of the
-// extension and as the user's work on the other. This must stay in step with
-// `normalizeFsPath` in extension/src/transcript.ts; test/fixtures/ephemeral-paths.json is
-// run by both test suites to catch the two drifting apart.
+// Normalizes separators and a trailing slash. Windows paths compare without case differences.
+// Keep this aligned with normalizeFsPath in transcript.ts and the shared ephemeral-path fixtures.
 function normalizePath(target) {
   const unified = String(target).replace(/\\/g, '/').replace(/\/$/, '');
   const drive = /^([a-zA-Z]):\//.exec(unified);
@@ -200,7 +192,7 @@ function computeManifest(sessionId, cwd) {
 function manifestEntries(dir, idx) {
   const entries = [];
   for (const [key, info] of Object.entries(idx.files || {})) {
-    if (!fs.existsSync(info.path)) continue; // deletions not tracked in v1
+    if (!fs.existsSync(info.path)) continue; // Skip deleted paths. The manifest includes only files that still exist.
     const baselineFile = path.join(dir, 'baseline', key);
     let baseline = Buffer.alloc(0);
     try {
@@ -215,9 +207,9 @@ function manifestEntries(dir, idx) {
   return entries;
 }
 
-// Extract the session's AI-generated title from its transcript (the last `ai-title`
-// entry wins). Returns null if unavailable (e.g. title not generated yet).
+// Bounds the transcript tail searched by readSessionTitle.
 const TITLE_TAIL_BYTES = 256 * 1024;
+// Return the last nonempty ai-title in the tail window, or null when unavailable.
 function readSessionTitle(transcriptPath) {
   if (!transcriptPath) return null;
   let fd = -1;

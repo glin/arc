@@ -1,14 +1,7 @@
-// The page the panel is served, and one render payload full enough to fill it.
-//
-// Two things build the real panel outside the editor. The `panel.layout*.test.ts` files
-// measure it in a browser, and `scripts/panel-shots.ts` photographs it. Neither can read the other: a
-// test file registers its tests as soon as anything imports it, so a script that reached for
-// the page would run the whole suite to get it. The page and the payload live here instead,
-// and both read them from one place.
-//
-// Nothing that ships imports this file. It sits beside the modules it calls so the fixture is
-// built by the panel's own builders, which is what keeps it in step with the panel: a field
-// either builder grows is carried into this page the way it is carried into the real one.
+// Shared panel page and render payload for browser tests and screenshots.
+// Importing a test module registers its tests, so scripts use this separate fixture module.
+// Production modules do not import this file.
+// The fixture uses the panel's builders to keep payload fields aligned with their output.
 
 import { formatRelative, railSessions, toCard } from './turnview.ts';
 import { labelCounts } from './turnlabels.ts';
@@ -45,7 +38,7 @@ import { browserBundle, browserStylesheet } from './panelbundle.ts';
 import { renderRichMarkdown } from './richtext.ts';
 import type { Compaction } from './transcript.ts';
 
-// Fill the same built script and stylesheet that the extension serves.
+// Fill the browser bundle and stylesheet with the panel's text values.
 let builtScript: string | null = null;
 let builtStylesheet: string | null = null;
 function evaluated(name: 'STYLE' | 'SCRIPT'): string {
@@ -57,8 +50,7 @@ function evaluated(name: 'STYLE' | 'SCRIPT'): string {
   return fillPanelText(builtStylesheet, panelValues());
 }
 
-// The shell `PanelProvider.shell` serves, minus the content-security policy and the
-// nonces, which are about what a webview may load rather than about how it lays out.
+// Match the panel shell without its content-security policy or nonces.
 export function pageHtml(): string {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Arc</title>
 <style>${evaluated('STYLE')}</style></head>
@@ -83,77 +75,50 @@ export function pageHtml(): string {
 </body></html>`;
 }
 
-// A session with enough in it to fill the column.
-//
-// The cards and the rail are built by the panel's own builders rather than written out
-// here, so a field either grows is carried into this page the way it is carried into the
-// real one. The headlines are long on purpose: the list sizes from its content, so a short
-// one would fit beside the rail even in a body that wraps, and the guard would pass over
-// the very bug it exists for.
+// Long headlines exercise wrapping in the timeline.
+// The panel's builders produce the cards and session list rows.
 const HEADLINE =
   'Landed the usage reducer in extension/src/usageview.ts, wired both wires to it, and put the refresh path behind one press on the strip rather than on every repaint of the panel';
-// How far the newest turn sits behind the fixture's clock.
-//
-// The ten minutes are two bounds, not a preference. Over a minute, so the newest card reads
-// as an elapsed age rather than "just now". Under an hour, so its turn is still inside the
-// quiet window that makes a turn read as running.
+// Keep the newest turn over a minute old for an elapsed age.
+// Keep it under an hour old for the running turn's quiet window.
 export const NEWEST_TURN_AGE = 10 * 60_000;
 
-// Where in the local day the fixture stands. The newest card sits `NEWEST_TURN_AGE` behind
-// this, at 2:32 PM, which is the time the rail rows below write beside their names.
+// Anchor the fixture at 2:42 PM local time.
+// NOW is ten minutes earlier, matching the first session row's 2:32 PM label.
 export const ANCHOR_HOUR = 14;
 export const ANCHOR_MINUTE = 42;
 
-// The instant the fixture treats as now, on the local calendar rather than on a pinned date.
-//
-// The rail files a card under a day by the calendar. A pinned date walks out of Today, then
-// out of Yesterday, then out of Last 7 days. The page then stops drawing the buckets the
-// layout test measures. A pinned 2026-08-28 passed for eight days and then failed every day
-// after. Every card here is placed as an offset from this value.
-//
-// The answer stands at one position in the local day whatever clock it is handed. The fixture
-// reaches back thirty-one hours, and the rail files each card by the browser's own calendar.
-// A clock that followed the real one would move cards between Today and Yesterday with the
-// hour of the run.
-//
-// Where the two buckets divide holds on every day of a standard length. A daylight-saving
-// change makes two days a year twenty-three or twenty-five hours long, and one card crosses
-// the divide on each of them. Both buckets keep cards either way, so the page draws both.
-//
-// The answer never sits in the future of the clock it is given, so every age the page draws
-// from it is an elapsed one.
+// Anchor the fixture to the local calendar so its session list retains relative day groups.
+// A fixed wall time keeps group membership independent of the run's hour.
+// A daylight-saving change moves one older session across midnight, while both day groups retain sessions.
+// The anchor never exceeds the supplied clock, so all fixture ages remain elapsed.
 export function fixtureClock(realNow: number): number {
   const at = new Date(realNow);
   const anchor = new Date(at.getFullYear(), at.getMonth(), at.getDate(), ANCHOR_HOUR, ANCHOR_MINUTE, 0, 0);
-  // The day before, until the anchor has passed. A calendar step rather than a subtracted day
-  // length, so a daylight-saving change keeps the same wall time.
+  // Use the previous calendar day before the anchor time.
+  // Calendar subtraction preserves wall time across daylight-saving changes.
   if (anchor.getTime() > realNow) {
     anchor.setDate(anchor.getDate() - 1);
   }
   return anchor.getTime();
 }
 
-// The clock every guard and every picture of this page runs on. `test/browser.ts` starts the
-// browser on it, so the day the page files a card under is the day the fixture placed it in.
+// Browser tests and screenshots share this clock.
+// The browser uses its local calendar to group the fixture's sessions.
 export const FIXTURE_CLOCK = fixtureClock(Date.now());
 
 export const NOW = FIXTURE_CLOCK - NEWEST_TURN_AGE;
 
-// One card carries a path long enough to have no wrapping point in it. A flex item that has
-// not been told it may shrink below its content refuses to, and the panel then scrolls
-// sideways: a fixture made only of ordinary prose never asks the question.
+// This long path exercises horizontal overflow when a flex item cannot shrink below its content width.
 export const LONG_PATH =
   'extension/src/deeply/nested/generated/fixtures/one-very-long-unbroken-directory-name/another-one-just-as-long/report.json';
 
-// The turn the long card is built from. Its own index in `FIXTURE_TURNS`, so a guard, a
-// picture and a measurement all reach the same card without counting rows.
+// Identify the long turn by its one-based number and zero-based index.
+// Tests and screenshots use these constants to select the same card.
 export const LONG_TURN_N = 3;
 export const LONG_TURN_INDEX = LONG_TURN_N - 1;
 
-// The response of the long turn, as markdown, because the card renders markdown. Two
-// paragraphs around a list, which is the shape a turn that delegated work and committed
-// actually answers with. A one-line response draws a card as tall as its sections, and a
-// design measured against that card is measured against the wrong problem.
+// The long response includes two paragraphs around a list to exercise a tall Markdown response.
 export const LONG_SUMMARY = `The morning went to the tasks on the list from last week. Most of them were small, and each one closed before the next one started, so the list is shorter now than it has been for a while. Two items took longer than planned because they waited on answers from other people.
 
 - The first item was a set of notes from the planning meeting, tidied and shared with the group so everyone reads the same version.
@@ -163,10 +128,8 @@ export const LONG_SUMMARY = `The morning went to the tasks on the list from last
 
 Everything that was planned for today is done. The two items that waited on other people have answers now, and the rest of the week has room for the larger piece of work that comes next.`;
 
-// What the long turn carries in each of its record sections. Seven files at the lengths a
-// real repository produces, three delegated runs, and two commits. The paths are spread from
-// a bare \`README.md\` to the unbroken one above, because a column of names that are all the
-// same length asks the layout nothing.
+// The long turn carries seven files with varied path lengths, three subagents, and three commits.
+// The unbroken path exercises wrapping alongside short filenames.
 const LONG_FILES: TurnFileChange[] = [
   { path: 'c:/repo/extension/src/webview/card.ts', added: 142, removed: 38, isNew: false, edits: [] },
   { path: 'c:/repo/extension/src/webview/panel.css', added: 64, removed: 9, isNew: false, edits: [] },
@@ -186,15 +149,12 @@ const LONG_FILES: TurnFileChange[] = [
 // The id of the call that launched the long turn's open subagent.
 const LONG_AGENT_LAUNCH = 'toolu-find-fixed-waits';
 
-// Where the long turn's commits are placed on the clock, and where the rest of its record is.
-// Every stamp below hangs off this, so the card's rows read in the order the turn ran them.
+// Place the long turn's activity and commits relative to its start time.
 const LONG_TURN_START = NOW - LONG_TURN_N * 600_000;
 
-// One commit in the open folder and two made in linked worktrees of it. The second worktree is
-// named for its branch, so its row draws the branch alone. The third worktree's name differs,
-// so a picture of this card answers whether its `where` word reads as a place rather than as
-// another repository. The list is declared above the children, because one child holds the two
-// worktree commits as its own.
+// The commits cover the open folder and two linked worktrees.
+// One worktree matches its branch name. The other has a separate directory name.
+// One subagent also reports both worktree commits.
 const LONG_COMMITS: TurnCommit[] = [
   {
     sha: '4f2a91c',
@@ -231,14 +191,10 @@ const LONG_COMMITS: TurnCommit[] = [
   },
 ];
 
-// One run still going, one finished run whose child transcript the panel can open, and one
-// finished run with no child to open. The third is the row that draws no link, so a picture
-// of this card answers whether a reader can tell a linked row from an unlinked one. The
-// open child pairs with its launch step in `LONG_STEPS` by `toolUseId`. The turn has ended, so
-// its row reads running with no time. The finished children carry what they spent, so their
-// rows draw a cost. The first finished child recorded a reasoning effort, so its row draws the
-// model and the effort as one run. The second recorded no commit and no path, which is the
-// commonest record a child leaves, so its row draws the cost alone.
+// The long turn has one running subagent and two completed subagents.
+// Only one completed subagent has a child session link.
+// The running subagent pairs with its launch step through toolUseId.
+// The completed subagents carry cost data, and one also carries reasoning effort and artifacts.
 const LONG_AGENTS: TurnAgent[] = [
   {
     id: null,
@@ -278,13 +234,9 @@ const LONG_AGENTS: TurnAgent[] = [
     ],
     spendFound: true,
     spendPartial: false,
-    // The two worktree commits of the turn are this child's own, so the card attributes them
-    // to it and its hover names them. The turn holds the same records, and the count stays at
-    // three, because a sha the parent and the child both report is one commit.
-    //
-    // Two of the files are the turn's own as well, and the third is this child's alone. The
-    // parent transcript records no edit a child made, so the card's Files list draws that third
-    // file only because the card merges what the child recorded into its own rows.
+    // The subagent and parent share two commits, which count once per SHA.
+    // Two subagent files overlap the parent's files.
+    // The third appears only in the subagent's artifacts, exercising combined file rows.
     commits: [LONG_COMMITS[1], LONG_COMMITS[2]],
     artifacts: {
       files: [
@@ -295,8 +247,7 @@ const LONG_AGENTS: TurnAgent[] = [
       commits: ['9d7be30', 'b83e0d1'],
       complete: true,
       revision: 'fixture-fold',
-      // What its duration figure's record draws: the calls by tool, the two that failed, and
-      // when it ran inside its parent turn.
+      // Include tool counts, failures, and start and end times in the duration details.
       tools: { Bash: 12, Edit: 7, Read: 4 },
       failed: { count: 2, byTool: { Bash: 2 } },
       startedAt: NOW - LONG_TURN_N * 600_000 + 60_000,
@@ -337,9 +288,7 @@ const LONG_AGENTS: TurnAgent[] = [
   },
 ];
 
-// What the agent wrote while it worked, which the Activity log draws as messages. Four of
-// them at four lengths, because the log clamps a long one and leaves a short one whole, and
-// a fixture of equal-length narration pictures the same log either way.
+// Commentary messages vary in length to exercise clamped and unclamped Activity log text.
 const LONG_UPDATES: TurnUpdate[] = [
   {
     sourceId: 'p3-update-1',
@@ -375,8 +324,7 @@ const LONG_UPDATES: TurnUpdate[] = [
   },
 ];
 
-// Eight calls, one of them failed, which is the shape of a turn that edited, built, went red
-// and fixed what it broke. The failed one is what puts a failure mark in the log.
+// Nine steps include one failed command, which supplies an Activity log failure mark.
 const LONG_STEPS: TurnStep[] = [
   { ordinal: 1, name: 'Read', detail: 'extension/src/webview/card.ts', at: LONG_TURN_START + 20_000, status: 'done' },
   { ordinal: 2, name: 'Grep', detail: 'sectionheading', at: LONG_TURN_START + 60_000, status: 'done' },
@@ -420,11 +368,10 @@ const LONG_STEPS: TurnStep[] = [
   },
 ];
 
-// Ordinal for ordinal with the calls above, which is how every count built from them reads.
+// Match each step's tool category by ordinal.
 const LONG_STEP_KINDS = ['reads', 'searches', 'edits', 'edits', 'commands', 'commands', 'edits', 'commands', 'agents'];
 
-// Two things the reader typed while the turn ran. The card draws both under You asked, under
-// the prompt that started it, so the section is three blocks tall rather than one.
+// Two later prompts accompany the initial prompt, exercising multiple reader submissions on one card.
 const LONG_LATER_PROMPTS: TurnAsk[] = [
   { text: 'also check the 640 width while you are in there', at: LONG_TURN_START + 240_000, stepsBefore: 4 },
   {
@@ -513,13 +460,9 @@ function turnAt(n: number): Turn {
     answers: [],
     model: 'claude-opus-5',
     effort: 'high',
-    // Two turns changed files, and the rest draw no files-and-lines chip at all. A page where
-    // every card drew one measures the same whether that chip is one pill or two, which is
-    // the thing this fixture exists to tell apart.
-    //
-    // The two differ in how much they carry. One has a pair of files, which is what a card
-    // with a short record draws. The long turn has seven, spread from a bare `README.md` to
-    // the unbroken path above, which is what the card's own density is argued over.
+    // Only two turns carry file changes.
+    // One has two files, and the long turn has seven with varied path lengths.
+    // The remaining turns exercise cards without file figures.
     files:
       n === 2
         ? [
@@ -534,8 +477,7 @@ function turnAt(n: number): Turn {
     usage: { input: 4200, cacheWrite1h: 0, cacheWrite5m: 1200, cacheRead: 180_000, output: 3100, thinking: 0 },
     contextTokens: 118_000,
     contextWindow: 200_000,
-    // The request that set the level above, dated and named as itself. The turn's own end
-    // moves with a tool result, so a page built on that alone would date the cache wrong.
+    // Record the request timestamp separately from the turn's end for cache expiry.
     contextRequest: {
       at: n === 1 ? NOW - 4_000 : NOW - n * 600_000 + 492_000,
       lifetime: '5m' as const,
@@ -544,19 +486,15 @@ function turnAt(n: number): Turn {
       readBack: true,
       outputTokens: 2_900,
     },
-    // The long turn reports the calls it actually lists, so the breakdown behind its Activity
-    // head adds up to the run row above it. Every other turn keeps the tally it always had.
+    // Supply tool totals for the long turn and the other turns.
     toolUses: n === LONG_TURN_N ? 11 : 36,
     toolCounts:
       n === LONG_TURN_N
         ? { edits: 3, reads: 1, searches: 1, commands: 3, agents: 3, coordination: 0, web: 0, other: 0 }
         : { edits: 9, reads: 12, searches: 6, commands: 7, agents: 2, coordination: 0, web: 0, other: 0 },
     toolTally: {},
-    // The newest card carries a log, with one row long enough to have no wrapping point in
-    // it: a row that has not been told it may shrink below its content refuses to, and the
-    // panel then scrolls sideways.
-    // One turn was asked a second thing while it ran, which is the row the log draws for
-    // the reader rather than for the agent.
+    // The newest turn's Activity log includes an unbroken path to exercise horizontal overflow.
+    // It also includes a later prompt from the reader.
     laterPrompts:
       n === 1
         ? [{ text: 'and check the narrow width while you are there', at: NOW - 45_000, stepsBefore: 62 }]
@@ -582,8 +520,8 @@ function turnAt(n: number): Turn {
           : [],
     updates: n === LONG_TURN_N ? LONG_UPDATES : [],
     stepCount: n === 1 ? 64 : n === LONG_TURN_N ? LONG_STEPS.length : 0,
-    // Ordinal for ordinal with the steps above, so the `Skill` call is marked as the skill
-    // load it is and lands in no tool category at all.
+    // Match each category to its step ordinal.
+    // The Skill step uses the skill category, which is separate from tool categories.
     stepKinds:
       n === 1
         ? [...Array(60).fill('reads'), 'reads', 'skill', 'commands', 'searches']
@@ -591,10 +529,8 @@ function turnAt(n: number): Turn {
           ? LONG_STEP_KINDS
           : [],
     failedOrdinals: n === 1 ? [63] : n === LONG_TURN_N ? [6] : [],
-    // Two turns loaded skills, and between them they carry every row the skills popover draws:
-    // a recorded load with a file to open, a second load of that same skill, a recorded load
-    // no record named a file for, and a best-effort read with the sentence a catalog published.
-    // Both are turns the popover boards are drawn from, so every state reaches a picture.
+    // Two turns cover recorded skill loads and a best-effort skill read.
+    // They include repeated loads, missing paths, and a catalog description.
     skillUses:
       n === 1
         ? [
@@ -627,8 +563,8 @@ function turnAt(n: number): Turn {
             ]
           : [],
     skillUseCount: n === 1 ? 3 : n === 2 ? 1 : 0,
-    // The newest turn is still running, which is what puts the line saying what the agent is
-    // doing on its folded card. Every other turn has closed.
+    // Keep the newest turn running for the folded card's activity text.
+    // The other turns are finished.
     failures: [],
     interrupted: false,
     finished: n !== 1,
@@ -636,22 +572,18 @@ function turnAt(n: number): Turn {
   };
 }
 
-// The session the page is drawn from, newest first by the clock inside each turn.
-//
-// Exported so a guard can price and measure the same turns the page draws and compare the
-// answer with the figures written out below. The two drifted apart once: the heading said
-// one window and every card under it said another.
+// Export the session's turns in newest-first order.
+// Tests compare their context level with the separately written session figures.
 export const FIXTURE_TURNS: Turn[] = Array.from({ length: 24 }, (_, n) => turnAt(n + 1));
 
-// What the composer is aimed at, and everything its controls and their menus are built from.
+// State for the prompt box, its controls, and their menus.
 export const COMPOSER = {
   agent: 'claude' as const,
   session: 'Embedded agent input',
   draft: '',
   onScreen: '',
   queued: [],
-  // Earlier prompts, so the layout board is drawn for a box the Up arrow can walk back
-  // through. They are never on screen: the walk changes what the box holds and nothing else.
+  // Supply prompt history for Up-arrow navigation without adding submitted prompts to the timeline.
   history: ['Explain the snapshot store', 'Rename the note type to comment'],
   running: false,
   comments: [],
@@ -659,9 +591,8 @@ export const COMPOSER = {
   models: [
     { value: 'opus', label: 'Opus 5', description: '', efforts: [{ value: 'high', label: 'high', description: '' }] },
   ],
-  // Enough commands, and long enough ones, that the menu is taller than its cap and wider
-  // than the box. A short list never reaches either, so a menu drawn off the panel or one
-  // that pushes the body sideways would measure exactly like a working one.
+  // Long command names and descriptions exercise menu wrapping.
+  // The command count exercises the menu's height limit.
   commands: [
     {
       name: 'compact',
@@ -693,26 +624,17 @@ export const COMPOSER = {
   },
   askMode: 'auto',
   context: { used: 118_000, max: 200_000 },
-  // What the next turn's floor price is worked out from, taken off the same newest turn the
-  // window figure comes from rather than written out again. The page then draws the real
-  // sentence and the real working, at the real rate for the model the fixture records.
+  // Derive the next-turn basis from the newest turn.
+  // An unfinished turn produces no basis.
   nextTurn: nextTurnBasisOf(FIXTURE_TURNS[0], null),
   mcpServers: [],
   live: [],
-  // No skill list has ever arrived for this fixture's working directory, so its Claude
-  // commands fall back to the pre-skill-list rule wherever a test spreads `COMPOSER` without
-  // its own value.
+  // A null skill catalog exercises Claude command fallback when callers retain this value.
   claudeSkills: null,
 };
 
-// The same composer as a session nobody has started yet, which is what the four
-// enabled pickers and the tag above them are drawn for. The session stays `s1`, so the
-// draft is aimed at a row the rail already draws.
-//
-// It keeps the window figure `COMPOSER` carries. A draft has run no turn and has filled no
-// window, so any figure reaching it belongs to the session its setup was copied from.
-// Left in place, the layout guard proves that `composerView` drops it. Taken out, the guard
-// would only prove that the fixture never offered one.
+// Add an inherited draft profile while retaining session s1.
+// Keep the copied context figure to exercise composerView's omission of context for drafts.
 export const DRAFT_COMPOSER = {
   ...COMPOSER,
   profile: {
@@ -724,15 +646,12 @@ export const DRAFT_COMPOSER = {
   },
 };
 
-// A press the panel is still waiting on, in the shape `send` records one. The card it draws
-// stands at the top of the column, so every card below it moves if it grows.
+// A pending submission draws a live card above the timeline.
 export const LIVE_PRESS = {
   sessionId: 's1',
   agent: 'claude' as const,
   kind: 'prompt' as 'prompt' | 'compact',
-  // Long enough to run past three lines at both widths, because the card holds the height it
-  // was first drawn at and the clamp is the only thing that makes that true. A shorter one
-  // never reaches the clamp, so the height guard passes whether it is there or not.
+  // The long prompt exercises the live card's three-line clamp.
   text:
     'take the sandbox with the approval and then run the whole smoke test again from the top, ' +
     'then read back what it printed and say which of the checks were skipped and why, and if ' +
@@ -740,8 +659,7 @@ export const LIVE_PRESS = {
     'leaving it in the list, and then do the same for the browser tests',
   reply: '',
   at: NOW - 4000,
-  // A fresh press, which is the one that draws a card. One sent into a turn already running
-  // draws none: that turn's card is where it belongs.
+  // A submission outside a running turn draws its own live card.
   midTurn: false,
   ran: false,
   started: false,
@@ -749,17 +667,9 @@ export const LIVE_PRESS = {
   reason: '',
 };
 
-// An agent's MCP servers, in the shape the wire hands them over.
-//
-// Five of them with two failed, because that is the widest the control on the composer row
-// ever gets: the label carries the count and then the trouble, and a machine with two healthy
-// servers draws a control narrow enough to fit anywhere. The names are long for the same
-// reason the headlines above are, since a short one asks the layout no question, and one
-// server carries an error long enough to wrap the row it is drawn on.
-//
-// The default is no servers at all, which is what every guard above this one measures. The
-// control is not drawn for a machine with none, so the picker row those guards see is the
-// three-control row it has always been.
+// Five MCP servers cover connected, failed, and disabled states.
+// Long names and one long error exercise menu wrapping.
+// The default prompt box has no servers, exercising omission of the server control.
 export const MCP_SERVERS = [
   {
     name: 'github-enterprise-issues-and-pull-requests',
@@ -803,9 +713,7 @@ export const MCP_SERVERS = [
   },
 ];
 
-// Every rate source below is typed against the producer rather than left to inference. Bare,
-// `provenance` widens to `string`, and a renamed member of `ProjectSpendProvenance` reaches
-// the panel while every rates guard here goes on passing against the word the panel dropped.
+// Type rate sources against ProjectSpendView so provenance values retain the producer's union type.
 type ProjectSpendRateSources = ProjectSpendView['rateSources'];
 
 const PROJECT_SPEND_RATES: ProjectSpendRateSources = [
@@ -924,55 +832,37 @@ export const PROJECT_SPEND = {
   ],
   earliestRecord: '2026-08-03',
   lastIndexedAt: NOW - 120_000,
-  // What the pricing answered with, in the order it answered. The panel builds its rate lines
-  // out of this, so a page without it draws no Pricing details at all. One entry per
-  // provenance the payload can carry, because each takes a different phrase.
-  //
-  // Every entry is the one production sends. The reported entry is what `priceBucket` builds
-  // for a cost the provider already charged, which carries no rate and no date. The public
-  // entry is what `publicRateFor` names a rate it read out of the list-price table. A source
-  // invented here would put words in the list that no reader ever sees.
-  //
-  // Both estimated rates share one date. The undated list below is the other case, where one
-  // estimate has a date and one has none.
+  // Rate sources cover reported, configured, and public pricing.
+  // The reported charge has no effective date.
+  // The configured and public rates share a date, exercising a shared pricing date.
   rateSources: PROJECT_SPEND_RATES,
-  // At rest, which is what a workspace shows for all but a few seconds at a time. A run is
-  // posted by the tests that measure one, so nothing else has to wait one out.
+  // Keep project cost idle unless a caller supplies an indexing or calculating state.
   indexing: false,
   calculating: false,
   indexingStatus: null,
 };
 
-// The words the extension sends while it indexes. They stand in the place of the update age
-// rather than beside it, so they must stay shorter than every age they replace. A guard in
-// `panel.webview.test.ts` pairs this with the line that writes it.
+// Use this wording while project cost indexes.
 export const PROJECT_SPEND_INDEXING_WORD = 'Updating…';
 
-// The rates a workspace gets when one estimate has an effective date and another has none.
-// Most rows of the list-price table carry no date, so `publicRateFor` sends null for them,
-// and this is the ordinary payload rather than an edge of it. The reported entry is undated
-// for the reason it always is: a charge the provider already made is not a rate.
-//
-// One date must not speak for an estimate that has none, so the lines built from this date
-// the rate that has one and leave the other bare.
+// One estimated rate has an effective date and the other has none.
+// Pricing details must attach the date only to the rate that supplies it.
+// The reported charge remains undated.
 export const PROJECT_SPEND_UNDATED_RATES: ProjectSpendRateSources = [
   { source: 'Provider-reported cost', effectiveDate: null, provenance: 'reported' },
   { source: 'Workspace contract', effectiveDate: '2026-08-01', provenance: 'configured' },
   { source: 'OpenAI list price', effectiveDate: null, provenance: 'public' },
 ];
 
-// The rates a workspace gets when it runs both agents and configures neither. Both are public,
-// so rank settles nothing between them, and the order the payload sends is the order the walk
-// over the records first met each one. That order turns over between passes, so the lines
-// and the print built from them have to settle the pair themselves.
+// Both agents use public rates with equal provenance rank.
+// Reversing these inputs must preserve the displayed rate order.
 export const PROJECT_SPEND_PEER_RATES: ProjectSpendRateSources = [
   { source: 'Anthropic list price', effectiveDate: null, provenance: 'public' },
   { source: 'OpenAI list price', effectiveDate: null, provenance: 'public' },
 ];
 
-// The figures the rail and the session heading draw, written out rather than computed, so
-// the page reads as one fixture. `panelfixture.test.ts` builds the same chips from the turns
-// below and fails when a literal here stops agreeing with them.
+// Write session figures separately from the displayed turns.
+// The fixture test compares the context figure with the newest turn's context level.
 export const RAIL_STATS: Record<string, SessionStatChip[]> = {
   s1: [
     { metric: 'files', compactLabel: '7 files', kind: 'plain', label: '7 files', detail: '' },
@@ -1020,40 +910,21 @@ export const RAIL_STATS: Record<string, SessionStatChip[]> = {
       },
     },
   ],
-  // The session beside it is priced by no figure at all, which is what makes a heading
-  // over both of them draw a floor rather than a total. A page where every card carried a
-  // figure would picture the same heading whether the floor rule held or not.
+  // Session s2 has no cost figure, exercising a combined cost that remains a lower bound.
   s2: [{ metric: 'context', compactLabel: '14% ctx', kind: 'plain', label: '14% of 1M ctx (140k)', detail: '' }],
-  // The card carrying the longest label carries a figure too, so the browser guard that
-  // measures the label line against the figures above it has figures to measure on every
-  // card it reads. A hidden figure row has no box, and the distance from it is whatever the
-  // viewport says, which passes for any draw order.
+  // Session s4 pairs its long label with a cost figure for label placement measurements.
   s4: [{ metric: 'cost', compactLabel: '$0.42', kind: 'plain', label: '$0.42', detail: '', dollars: 0.42 }],
 };
 
-// The first rail row shows the ordinary warm bolt. The second shows the filled final-quarter
-// face, so every full-panel picture includes both approved states.
+// The first session's cache is warm.
+// The second is in the final quarter of its lifetime.
 const RAIL_CACHES = {
   s1: { expiresAt: FIXTURE_CLOCK + 45 * 60_000, nearlyGoneAt: FIXTURE_CLOCK + 30 * 60_000 },
   s2: { expiresAt: FIXTURE_CLOCK + 10 * 60_000, nearlyGoneAt: FIXTURE_CLOCK - 5 * 60_000 },
 };
 
-// What the reader filed each session under, in the order they applied it.
-//
-// The newest session carries one more label than the row can draw, so the fold is on
-// screen. A fixture filled to exactly what the row holds would picture the same line whether
-// the fold worked or not, and the fold is the half of it that no text scan can see.
-//
-// The one beside it carries a single label, so the page also holds a labelled card that
-// folds nothing. Every session the record does not name carries none, so the page holds
-// a card with no label line at all. The cases sit side by side because the line's own margin is what
-// pushes the cards under it down, and a page where every card wore labels would measure
-// the same whether the empty line is taken out or left standing.
-//
-// The `s4` card carries a label at `LABEL_NAME_LIMIT` characters, the longest a label can
-// be. A short label fits the row at every width, so a page of short ones measures the same
-// with the rule that cuts a chip and without it, and a chip that painted across its
-// neighbour would draw exactly like one that gave way.
+// Labels cover overflow, a single label, and sessions without labels.
+// Session s4 has a long label to exercise truncation beside its cost figure.
 const RAIL_LABELS: Record<string, string[]> = {
   s1: ['composer', 'release 0.4', 'perf'],
   s2: ['release 0.4'],
@@ -1074,10 +945,7 @@ const RAIL_FILTERS: SavedRailFilter[] = [
   { id: 'f2', name: MAX_RAIL_FILTER_NAME, query: 'label:"release 0.4"', sort: 'latest' },
 ];
 
-// The two requests a live child can stop on, drawn at the foot of the selected session.
-// They live here rather than in the guard that first needed them, because the pictures need
-// the same two: a card photographed from one pair of requests and measured against another
-// argues about the fixture instead of about the card.
+// Share question and permission requests between browser tests and screenshots.
 export const QUESTION_ASK: QuestionAsk = {
   kind: 'question',
   id: 'layout-ask',
@@ -1112,17 +980,13 @@ export const QUESTION_ASK: QuestionAsk = {
   ],
 };
 
-// The answer a reader types on a question none of whose choices fit. Long on purpose: the tab
-// that reports it cuts a value short and keeps the whole of it in its accessible name, and a
-// short answer asks the strip no question.
+// A long written answer exercises tab truncation while retaining the full answer in its accessible name.
 export const LONG_WRITTEN_ANSWER =
   'Keep the tab strip, but let the arrow keys move between ' +
   'questions as well, and remember which question the reader was on across a repaint';
 
-// A third request, for the card that draws one question at a time. Three questions is the
-// smallest number that puts a question between the first and the last, so the strip has a tab
-// the reader can only reach by pressing it. The middle question carries a label long enough to
-// be cut on the tab, and is the one `LONG_WRITTEN_ANSWER` is written into.
+// Three questions supply a middle tab and a long header.
+// The first question receives LONG_WRITTEN_ANSWER in the browser test.
 export const THREE_QUESTION_ASK: QuestionAsk = {
   kind: 'question',
   id: 'layout-three',
@@ -1165,9 +1029,8 @@ export const THREE_QUESTION_ASK: QuestionAsk = {
   ],
 };
 
-// Six questions, which is where the strip runs past two rows at the sidebar width and drops
-// every value. The last one asks for a secret, so a picture proves that its tab reports that
-// it is answered without reporting what it says.
+// Six questions exercise a wrapped tab strip.
+// The final question accepts a secret, so its tab must indicate an answer without exposing it.
 export const SIX_QUESTION_ASK: QuestionAsk = {
   kind: 'question',
   id: 'layout-six',
@@ -1257,16 +1120,9 @@ export const PERMISSION_ASK: PermissionAsk = {
   input: { command: PERMISSION_COMMAND },
 };
 
-// `archived` is the set the reader put away, and it travels the way the extension sends
-// it: in `hidden`, and again as the flag `railSessions` writes onto each card. The two are
-// one answer from one rule, so a payload cannot say a session is archived on the rail
-// and live in the list.
-//
-// The status the rail draws each session in, by session id. Empty for every page but
-// the one about status colours: a card built with a status wears a border and a word, and a
-// figure measured against a page where every card wore one would measure nothing about the
-// card that wears none. The map reaches `railSessions`, so the card's accessible name is
-// worded from the same status the border is drawn from.
+// The archived IDs populate hidden and the session list's archived flags.
+// Optional statuses reach railSessions for row styling and accessible names.
+// An empty status map exercises rows without a status.
 export function renderPayload(
   archived: string[] = [],
   live: (typeof LIVE_PRESS)[] = [],
@@ -1277,13 +1133,12 @@ export function renderPayload(
   statuses: ReadonlyMap<string, RailStatus> = new Map(),
   runningSince: ReadonlyMap<string, number> = new Map(),
   assets: readonly Record<string, unknown>[] = [],
-  // The live open-child count of each session the map words as `subagents`.
+  // Live subagent counts for sessions with subagents status.
   openChildren: ReadonlyMap<string, number> = new Map(),
-  // The live background command count of each session the map words as `background`.
+  // Live command counts for sessions with background status.
   commands: ReadonlyMap<string, number> = new Map(),
 ): Record<string, unknown> {
-  // Both agents, and every limit each one reports, because that is the widest the status
-  // bar ever gets and so the case that decides how much of the panel it takes.
+  // Include usage windows for both agents and Claude spend to exercise a crowded usage bar.
   const usage = [
     {
       agent: 'claude',
@@ -1354,13 +1209,8 @@ export function renderPayload(
       ],
     },
   ];
-  // Enough cards that the page is several viewports tall. On a short page a sticky row
-  // reaches the end of the body it sticks inside within one scroll, and is released there
-  // by the rules rather than by a fault, so a scrolled measurement says nothing.
-  // The host renders each card's markdown beside it, so the page does the same. Every card
-  // but one answers with a single paragraph. The long turn answers with the markdown it
-  // records, because a design argued over a card whose response is one line is argued over a
-  // card that does not exist.
+  // Enough cards exercise sticky headings through a long timeline.
+  // Render the long turn's Markdown response beside its card, matching the host payload.
   const cards = FIXTURE_TURNS.map((turn, index) => {
     const card = toCard(turn, index === 0, NOW);
     if (index !== LONG_TURN_INDEX) {
@@ -1369,17 +1219,13 @@ export function renderPayload(
     return {
       ...card,
       summaryHtml: renderRichMarkdown(turn.summary),
-      // Each message in the log is rendered the same way, because the host renders one
-      // beside every message it sends. A row that arrived without it draws its mark and no
-      // words at all.
+      // Render Markdown for Activity message rows beside their source text.
       activity: card.activity.map((row) =>
         row.kind === 'message' ? { ...row, summaryHtml: renderRichMarkdown(row.text ?? '') } : row,
       ),
     };
   });
-  // Enough sessions that the rail is taller than the viewport. A short rail sizes from
-  // its own content and never reaches the cap that keeps it clear of the foot, so a rail
-  // running the full viewport height measures exactly like one that stops above the bar.
+  // Enough sessions exercise the session list's height limit above the panel foot.
   const rows = [
     {
       id: 's1',
@@ -1406,8 +1252,7 @@ export function renderPayload(
       relative: formatRelative(NOW - (n + 2) * 3_600_000, NOW),
     })),
   ];
-  // Which of them another agent ran, carried on the row the way the extension carries it,
-  // so the rail this builds groups them the way the real one would.
+  // Mark supplied session IDs as agent runs for session list grouping.
   const marked = rows.map((r) => ({
     ...r,
     persisted: true,
@@ -1417,8 +1262,7 @@ export function renderPayload(
   return {
     type: 'render',
     cards,
-    // No resume command: the panel words its own out of the agent key and the id each row
-    // carries, the same two fields the extension would have worded it from.
+    // Leave resume commands to the browser, using each session's agent key and ID.
     sessions: marked.map((r) => ({ ...r, shown: r.id === 's1' })),
     rail: railSessions(
       marked,
@@ -1438,20 +1282,17 @@ export function renderPayload(
       openChildren,
       commands,
     ),
-    // Every label the fixture files, counted the way the extension counts them. The filter
-    // box offers these rows, so a page built without them draws a box that offers nothing.
+    // Count fixture labels for filter suggestions.
     labels: labelCounts(RAIL_LABELS),
-    // The saved views, which the rail draws a section for.
+    // Saved views supply session list sections.
     views: RAIL_VIEWS,
     railFilters: RAIL_FILTERS,
-    // A copy of the keyed record, not the record itself. A caller that drops one session's
-    // entry to draw a session with no figures drops it from this payload alone.
+    // Copy the stats map so callers can remove a session's figures from this payload alone.
     stats: { ...RAIL_STATS },
     hidden: archived,
     pinnedTop: pinned,
     comments: [],
-    // Every card built above belongs to this session, which is what the extension sends:
-    // one session is drawn at a time and only its cards are posted.
+    // All timeline cards belong to the selected session s1.
     showing: 's1',
     sessionAdoptions: [],
     maxSessions: 10,
@@ -1462,9 +1303,8 @@ export function renderPayload(
     projectSpend: PROJECT_SPEND,
     usage: {
       bar: usageBar(usage, NOW),
-      // The servers menu is built the way the other three are, off the same state the
-      // composer is built from. It answers with nothing for a machine that has no servers,
-      // which the filter drops, so a payload with none carries the three settings menus and nothing more.
+      // Build settings and server menus from the prompt box state.
+      // Remove empty menus, including the server menu when no servers exist.
       menus: Object.fromEntries(
         ['model', 'effort', 'askmode', 'mcp']
           .map((c) => [c, pickMenu(c, { ...COMPOSER, mcpServers: servers })])
@@ -1566,9 +1406,7 @@ export function cacheWriteWarningPayload(): Record<string, unknown> {
   };
 }
 
-// A focused production-shaped page for the compaction disclosure. The host normally adds
-// rendered Markdown beside each card, so this fixture follows the same boundary instead of
-// handing browser tests an invented HTML fragment.
+// Build compaction cards and render their summaries as Markdown, matching the host payload.
 export function compactionSummaryPayload(): Record<string, unknown> {
   const payload = renderPayload() as Record<string, unknown> & { cards: Record<string, unknown>[] };
   payload.cards = COMPACTION_SUMMARIES.map((compaction) => ({
@@ -1578,21 +1416,9 @@ export function compactionSummaryPayload(): Record<string, unknown> {
   return payload;
 }
 
-// The same page with the composer aimed at a draft, for the guards and the pictures that
-// are about a session nobody has started.
-//
-// It replaces the composer and its menus and nothing else. `renderPayload` is what every
-// other layout guard is measured against, so a draft written into that one would move
-// figures that have nothing to do with a draft.
-//
-// The page with the line above the box in a state the fixture's own clock does not reach.
-//
-// The session's newest turn is ten minutes old and bought a five-minute cache, so the
-// page draws the cold face and nothing else. A guard or a picture built on that alone would
-// see the warm or cold face.
-//
-// Only the clock and the recorded lifetime move here. Everything else is the same
-// session, so a difference between two of these pages is the state and never the data.
+// Build next-turn cost states from a completed turn with a one-hour cache lifetime or no recorded lifetime.
+// Warm and cold states vary the request timestamp.
+// The compacted state supplies a newer compaction and its retained context level.
 export function nextTurnPayload(
   state: 'warm' | 'cold' | 'no-tier' | 'compacted',
   lastRequestAt?: number,
@@ -1600,28 +1426,20 @@ export function nextTurnPayload(
   const payload = renderPayload();
   const newest = FIXTURE_TURNS[0];
   const hour = 3_600_000;
-  // The fixture's clock rather than the wall clock, because that is the one the page runs on.
-  // The warm and cold states are one session at different moments. The clock is the
-  // only thing that tells them apart.
-  //
-  // A caller can name the moment instead, which is how a guard puts the boundary a second or
-  // two ahead and watches the face cross it on its own. Such a caller reads the page's own
-  // clock, because seconds decide that answer and the page runs on from this instant.
+  // Use the browser fixture's clock for cache expiry.
+  // An explicit request timestamp lets callers place the expiry boundary relative to that clock.
   const now = FIXTURE_CLOCK;
   const endedAt = lastRequestAt ?? (state === 'warm' ? now - 10 * 60_000 : now - 3 * hour);
-  // A compaction newer than the last request. Nothing has cached what it wrote, so the line
-  // names the written price at every clock and says why.
+  // A newer compaction supplies uncached retained context for the next-turn estimate.
   const compaction =
     state === 'compacted' ? { at: now - 60_000, contextAfter: 42_000, trigger: 'manual', model: newest.model } : null;
   const basis = nextTurnBasisOf(
     {
       ...newest,
       endedAt,
-      // These pages isolate cache state after a completed turn. The ordinary fixture keeps
-      // this same card running so the timeline can exercise its live activity row.
+      // Complete the turn so nextTurnBasisOf can supply its cost basis.
       finished: true,
-      // A one-hour lifetime, which is what the harness this panel reads actually buys. The last
-      // no-tier state names none at all, which makes the estimate conservative immediately.
+      // Use a one-hour cache lifetime except in the no-tier state, which records none.
       contextRequest: {
         at: endedAt,
         lifetime: state === 'no-tier' ? null : '1h',
@@ -1637,8 +1455,7 @@ export function nextTurnPayload(
   return payload;
 }
 
-// A catalog with enough models, efforts and modes for the New session menu to list sixteen
-// pinned setups beside ten recent ones, each one different.
+// A model catalog supplies distinct combinations for pinned and recent setups.
 const LAUNCHER_PIN_CATALOG = {
   claude: [
     ...COMPOSER.models,
@@ -1659,8 +1476,8 @@ const LAUNCHER_PIN_CATALOG = {
   ],
 };
 
-// Every setup the pin catalog offers, each one distinct, taken in a stride so neighbors
-// differ in more than one value.
+// Enumerate distinct setup combinations.
+// Use a stride when it covers every combination, otherwise retain the enumeration order.
 export function launcherPinSetups(): CompleteSetupValues[] {
   const catalog = sessionLauncherView(null, [], LAUNCHER_PIN_CATALOG).agents;
   const all = catalog.flatMap((agent) =>
@@ -1679,7 +1496,7 @@ export function launcherPinSetups(): CompleteSetupValues[] {
   return new Set(order).size === all.length ? order : all;
 }
 
-// The render payload's usage with the New session menu built from these setups.
+// Build the payload's New session menu from supplied recent and pinned setups.
 export function launcherPinsUsage(
   recents: readonly CompleteSetupValues[],
   pinned: readonly PinnedSetup[],
@@ -1695,8 +1512,8 @@ export function launcherPinsUsage(
   return usage;
 }
 
-// The New session menu with this many pinned setups beside ten recent ones, or `recents`.
-// `unavailable` puts a pinned setup whose model left the catalog first.
+// Supply the requested pins and recent setups, defaulting to ten recents.
+// The unavailable option prepends a pin whose model is absent from the catalog.
 export function launcherPinsPayload(
   pins: number,
   options: { recents?: number; unavailable?: boolean; inherited?: boolean } = {},
@@ -1711,9 +1528,8 @@ export function launcherPinsPayload(
   return payload;
 }
 
-// The agent menu travels with the other four here the way it travels with them in the real
-// render. A control whose menu answers nothing is dropped, which is what the servers control
-// does on a draft.
+// Build draft menus, including the agent menu, and remove empty menus.
+// Build the prompt box from the draft profile.
 export function draftRenderPayload(): Record<string, unknown> {
   const payload = renderPayload();
   const usage = payload.usage as Record<string, unknown>;
@@ -1731,9 +1547,7 @@ export function draftRenderPayload(): Record<string, unknown> {
   };
 }
 
-// VS Code Dark Modern, the variables the panel stylesheet reads, so a headless render looks
-// like the editor tab rather than like an unstyled document. The screenshot script and the
-// mockup skill both dress the page with it, so it is written once, here.
+// Dark Modern theme variables for browser tests, screenshots, and mockups.
 export const DARK_MODERN_THEME = `:root{
 --vscode-foreground:#cccccc;--vscode-descriptionForeground:#9d9d9d;
 --vscode-editor-background:#1f1f1f;--vscode-sideBar-background:#181818;
@@ -1757,10 +1571,7 @@ export const DARK_MODERN_THEME = `:root{
 }
 body{background:var(--vscode-editor-background);color:var(--vscode-foreground);}`;
 
-// VS Code Light Modern, the same variables at the values that theme and its registry
-// defaults resolve to. `themed` picks this table for a light-page render, so a light
-// screenshot or a light layout measurement dresses the page the way a reader who switched
-// the editor's theme would actually see it, rather than in the dark table above.
+// Light Modern theme variables for light fixture pages.
 export const LIGHT_MODERN_THEME = `:root{
 --vscode-foreground:#3b3b3b;--vscode-descriptionForeground:#3b3b3b;
 --vscode-editor-background:#ffffff;--vscode-sideBar-background:#f8f8f8;
@@ -1784,9 +1595,8 @@ export const LIGHT_MODERN_THEME = `:root{
 }
 body{background:var(--vscode-editor-background);color:var(--vscode-foreground);}`;
 
-// One Dark Pro Darker, a dark theme a reader installs, at the values its theme file sets. It
-// sets no `foreground`, so the editor's dark default applies, and every variable the theme
-// leaves out keeps the Dark Modern value above.
+// Layer One Dark Pro Darker values over the Dark Modern table.
+// Variables omitted here retain the Dark Modern values.
 export const ONE_DARK_PRO_DARKER_THEME = `${DARK_MODERN_THEME}
 :root{
 --vscode-descriptionForeground:#abb2bf;--vscode-editor-background:#23272e;--vscode-sideBar-background:#1e2227;
@@ -1801,7 +1611,7 @@ export const ONE_DARK_PRO_DARKER_THEME = `${DARK_MODERN_THEME}
 --vscode-editor-selectionBackground:#67769660;--vscode-editor-findMatchHighlightBackground:#ffffff22;
 }`;
 
-// The editor's high-contrast registry values for the variables the fixture supplies.
+// High-contrast dark values layered over the Dark Modern table.
 export const HIGH_CONTRAST_DARK_THEME = `${DARK_MODERN_THEME}
 :root{
 --vscode-foreground:#fff;--vscode-descriptionForeground:#ffffffb3;
@@ -1844,9 +1654,7 @@ export const HIGH_CONTRAST_LIGHT_THEME = `${LIGHT_MODERN_THEME}
 
 export type FixtureTheme = 'dark' | 'light' | 'onedark' | 'hc-dark' | 'hc-light';
 
-// The class the editor puts on the body of a webview it serves, which is what `themed`
-// switches so the page's own `body.vscode-light` rule and the theme table it dresses the
-// page with never disagree about which kind is on screen.
+// Apply the theme's body class and variable table together.
 export function themed(html: string, kind: FixtureTheme = 'dark'): string {
   const tables = {
     dark: DARK_MODERN_THEME,
@@ -1893,11 +1701,8 @@ export function statPopoverPayload(): Record<string, unknown> {
   };
 }
 
-// The sources that put a class on a subagent row or on either figure popover that holds one, and
-// the comment marks that wrap text on a row. A stylesheet scan reads every word these sources
-// write as a class that can colour the row. A
-// selector whose subject is a bare tag also counts, so a wrapper around the row needs no entry
-// here for a rule such as `.cardmain span`. Paths are relative to `src`.
+// Source paths for the subagent row color checks, relative to src.
+// The check also includes selectors with a bare tag subject, such as .cardmain span.
 export const AGENT_ROW_BUILDERS = [
   'webview/card-rows.ts',
   'webview/stat-chip.ts',
@@ -1905,12 +1710,8 @@ export const AGENT_ROW_BUILDERS = [
   'webview/comments.ts',
 ];
 
-// The sources that put a class or an id on a turn card, its figures, the session heading above
-// it, the page around the timeline, or either figure popover and its rows, and the sources that
-// wrap or mark text inside a card or a row: code blocks in a summary, the files
-// on a queued card and the pinned hint on a chip. A stylesheet scan reads every word these
-// sources write as a class that can size a figure. A new source that draws an element around a
-// figure, or around text on a card, joins this list.
+// Source paths for the card figure size checks, including text wrappers and hints.
+// Add sources that create elements around figures or card text.
 export const FIGURE_BUILDERS = [
   ...AGENT_ROW_BUILDERS,
   'webview/card.ts',
@@ -1924,16 +1725,11 @@ export const FIGURE_BUILDERS = [
   'paneldevelopment.ts',
 ];
 
-// The values those builders substitute into a class from a field the webview reads as a plain
-// string, as the host types them: the turn status on a card, and the status and kind on an
-// Activity row. A stylesheet scan adds every string of this union to the builders' classes, so
-// a new status joins it with no edit here. A builder that substitutes another such field into a
-// class adds the field's host type.
+// Host union types supply dynamic class values for figure size checks.
+// Add the host type when a builder uses another plain-string field in a class.
 export type FigureClassValues = TurnStatus | TurnStepStatus | ActivityRow['kind'];
 
-// The classes the editor puts on the body of a webview: one theme kind, and the flags for
-// reduced motion and a screen reader. No panel source writes them, so a stylesheet scan that
-// reads classes from the sources adds these by hand.
+// Include editor body classes in figure size checks because panel sources do not create them.
 export const EDITOR_BODY_CLASSES = [
   'vscode-dark',
   'vscode-light',

@@ -61,12 +61,11 @@ export class CommitRepositoryReservations {
   }
 }
 
-// What one metadata read costs the shared budget, from the size the catalog listed. The
-// worker stats the file again before it reads, so a session that grew past a window edge
-// between the listing and the read takes more bytes than this charged, and the aggregate
-// can pass the budget by that much. The budget bounds the corpus the first rail admits, not
-// the bytes the disk serves. The charge is not clamped to the listed size, because a read
-// cut short at a stale edge answers facts for a window that is no longer the file's end.
+// Charge the metadata budget from the catalog's listed file size.
+// The worker checks the revision again before reading.
+// Growth after listing can increase the read beyond the charge.
+// This budget limits catalog admission, not total disk bytes.
+// Reads use the current revision so the tail includes its latest records.
 export function metadataReadBudget(session: Pick<SessionFile, 'agent' | 'size'>, tailBytes = 256 * 1024): number {
   return (
     Math.min(session.size, tailBytes) +
@@ -75,12 +74,9 @@ export function metadataReadBudget(session: Pick<SessionFile, 'agent' | 'size'>,
   );
 }
 
-// The head bytes the budget above charged that the read did not take. A Claude read looks
-// for a first prompt in the head only when its tail window carries no title, and no read can
-// say which case it is before it runs: the budget therefore charges the larger head so a
-// session can never read past it. A read that answered with a recorded title took the short
-// window that fingerprints the file instead, so the rest goes back and the first rail reaches
-// further down the list.
+// Return unused Claude head bytes to the metadata budget.
+// Recorded titles need only a head fingerprint, rather than the first-prompt window.
+// The budget reserves the larger window until the read identifies the title source.
 export function unreadHeadBytes(
   session: Pick<SessionFile, 'agent' | 'size'>,
   entry: Pick<DerivedTitleEntry, 'nameSource'>,
@@ -103,8 +99,8 @@ export interface ProgressiveInput {
   claudeChildReferences?: ClaudeChildSessionReference[];
   maxTurns: number;
   tailBytes: number;
-  // The clock reading that decides whether a running child is quiet, when the host stores a key
-  // it built before the trip. The worker reads the clock once per request otherwise.
+  // Host-supplied clock for child activity and its cache key.
+  // The worker otherwise reads the clock once per request.
   spendNow?: number;
 }
 export interface DispatchSessionFacts {
@@ -115,8 +111,7 @@ export interface DispatchSessionFacts {
   startedAt: number | null;
   endedAt: number | null;
   toolUses: number;
-  // Whether the session's own transcript holds a sign that only a person leaves, from
-  // `scanForPerson` in transcript.ts.
+  // Whether the session's own records establish reader input.
   person: boolean;
 }
 export interface DiscoveryCheckpoint {

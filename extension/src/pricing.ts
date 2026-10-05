@@ -2,22 +2,11 @@ import type { CacheLifetime, TurnUsage, UsageContextBand, UsageInferenceClass } 
 
 export { formatCost } from './view/cost.ts';
 
-// Published prices in dollars per million tokens. API rows use each provider's published
-// API rates. Product-specific aliases use the named product rate card. The shared cache tiers
-// are multiples of base input. A provider row can carry an explicit cache price.
-//
-// One formula prices every provider. OpenAI cached-read rates vary by model. GPT-5.6
-// cache writes and Bedrock GPT-5.6 prompt-cache writes have explicit provider rates. What
-// differs is what a count means, and levelling that is the reader's job, not this table's.
-//
-// The result is an estimate against the rate a turn was actually billed at, and it ignores
-// any negotiated discount, so treat it as the shape of a turn's cost rather than an invoice.
-//
-// Where a rate is promotional, the row carries the promotional figure and says so, with the
-// standard rate and the date recorded in PROMOTIONS below. The alternative reads better and
-// is wrong for as long as the promotion lasts: gpt-5.6-sol runs most Codex turns and is
-// discounted into November, so pricing it at standard would overstate nearly every Codex
-// card by half.
+// Rates are dollars per million tokens. Cost consumers share these model and provider definitions.
+// Claude records cache reads and writes separately. Codex records them within total input.
+// Readers split those categories before pricing. Explicit cache-read and cache-write rates override the default multiples.
+// Estimates exclude negotiated discounts and do not represent invoices.
+// Promotional rows carry their current rates, end dates, and standard rates.
 export interface Rate {
   input: number;
   output: number;
@@ -63,10 +52,8 @@ export interface ModelDefinition {
   providerRequired?: boolean;
   maxPricedContext?: number;
   longContext?: { threshold: number; inputMultiplier: number; outputMultiplier: number };
-  // The published fast-mode rate, on a row whose model sells fast mode. It holds across the
-  // whole context window, and the cache multiples and the regional multiplier apply on top of
-  // it. The ratio to the standard rate is written out rather than derived, because each model
-  // publishes its own. A row without one leaves a fast request unpriced.
+  // Published fast-mode rates apply across the context window, with cache and regional multipliers.
+  // Each model supplies its own fast rate. Models without a published rate leave fast requests unpriced.
   fast?: Rate;
   // Only tiers published for this model have a multiplier. Others remain unpriced.
   serviceTierMultipliers?: Readonly<Record<string, number>>;
@@ -103,8 +90,7 @@ export interface UsageQuoteInput {
   model: string | null;
   provider?: string | null;
   contextWindow?: number | null;
-  // Actual request input, including cache reads and writes. This is the only safe answer
-  // for a request-wide long-context tier.
+  // Total request input, including cache reads and writes, selects the request-wide pricing band.
   requestTokens?: number | null;
   // Aggregated usage retains the band selected by each original request.
   contextBand?: UsageContextBand | null;
@@ -129,36 +115,15 @@ export interface UsageQuote {
 export type UsagePriceContext = Pick<UsageQuoteInput, 'inferenceClass' | 'serviceTier'>;
 
 // Each model definition requires rates, a fallback window, and a sourced cache policy.
-// Provider support carries its own policy beside its routing and pricing differences.
-//
-// Matched by family *and* generation. A family-only pattern quietly hands a model it has
-// never heard of its newest sibling's rate, and older generations have cost several times
-// what the current one does. An unknown model is better shown with no cost and no window
-// than with confident wrong ones, so anything not listed here returns null.
-//
-// The dash before a Claude generation is part of the pattern and the word boundary after
-// it stops `4-8` matching `4-88` and `4-5` matching `4-55`. Claude's dated snapshots and
-// bracketed context suffixes still match that generation. OpenAI snapshots are listed
-// exactly, because an unlisted product suffix can carry a different rate.
-//
-// 1M is the standard context window for the whole Claude 5 family, not a variant anything
-// opts into: no setting selects it, and a transcript's `message.model` is the resolved base
-// id either way. Haiku 4.5 and the supported Claude 4.5 generations remain at 200K.
-//
-// The list covers the generations in use. A generation missing from it is missing on
-// purpose, and a turn run on one shows no cost rather than a wrong one. Adding a row means
-// looking up its rates, window, and cache policy first. None is established by
-// a neighbouring model definition.
-//
-// The window on a Codex row is the advertised one, and it is the weaker of two answers. A
-// Codex turn records the window it actually ran against, which is smaller than the
-// advertised figure and moves with the plan the session was on, so the recorded value is
-// what a card reads and this is what is left when there is none to read.
-//
-// 272K is where the supported OpenAI long-context tier begins: a prompt past it is billed at
-// twice the input rate and one and a half times the output rate, for the whole request. The
-// request band is retained before several requests are summed, because a turn total cannot
-// distinguish one long request from two short ones.
+// Provider support carries its own policy, routing rules, and pricing differences.
+// Patterns match an explicit family and generation. Unlisted models return no rate or fallback window.
+// Claude generation boundaries reject longer generation numbers but accept dated snapshots and bracketed context suffixes.
+// OpenAI patterns list supported snapshot identities explicitly because other suffixes can identify different products.
+// Claude 5 definitions use a one-million-token fallback window. Supported Claude 4.5 definitions use 200,000 tokens.
+// Adding a definition requires published rates, window capacity, and cache policy for that model.
+// Codex definitions supply advertised windows. Consumers use recorded request windows when available.
+// Supported OpenAI models apply long-context multipliers to the whole request above 272,000 input tokens.
+// Readers retain each request's pricing band before aggregation. Aggregate totals cannot recover those bands.
 export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   {
     pattern: /^claude-(fable|mythos)-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/,
@@ -173,9 +138,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     window: 1_000_000,
   },
   // https://platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing
-  // Fast mode is sold on the first-party Claude API. A Claude row matches only a turn that
-  // names no provider. A Bedrock Claude request names none either, so a fast one pays these
-  // rates with the regional Bedrock charge on top.
+  // Fast rates require an omitted provider. A recorded regional Bedrock inference class adds the regional multiplier.
   {
     pattern: /^claude-opus-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
     rate: { input: 4, cacheRead: 0.2, output: 20 },
@@ -203,8 +166,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     cachePolicy: CLAUDE_CACHE_POLICY,
     window: 200_000,
   },
-  // Sonnet 5 and Sonnet 5.5 are priced apart from Sonnet 4.6 because their standing rates differ.
-  // Sonnet 5.5 has an exact row, so an unpublished later Sonnet stays unpriced.
+  // Sonnet definitions list supported generations explicitly. Unlisted Sonnet generations remain unpriced.
   {
     pattern: /^claude-sonnet-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
     rate: { input: 2, output: 10 },
@@ -338,7 +300,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
   },
-  // Promotional; see PROMOTIONS below for the date and the standard rate.
+  // The promotion carries its inclusive end date and standard rates.
   {
     pattern: /^gpt-5\.6(?:-sol)?$/,
     promotion: {
@@ -403,17 +365,12 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   },
 ];
 
-// A rate that is only right until a date, and the rate it goes back to.
-//
-// A promotional rate is a rate with an expiry, and the expiry is the part that gets forgotten:
-// the row keeps charging the discount months after it ended and nothing says so, because a
-// wrong price looks exactly like a right one. So the end date and the standard rate are written
-// down beside the promotion, and `pricing.test.ts` fails once the date has passed. A red test
-// is the only thing that reliably arrives three months later.
+// Promotional rates carry an inclusive end date and their standard replacement rates.
+// pricing.test.ts fails after the end date, requiring a rate or promotion update.
 interface Promotion {
   until: string; // ISO date the promotional rate is held to, inclusive
-  standard: Rate; // what it goes back to, so the fix is the row itself rather than research
-  note: string; // what to check when the test goes red
+  standard: Rate; // Rates to apply after the promotion ends.
+  note: string; // Rate-source guidance for promotion updates.
 }
 
 export const PROMOTIONS = MODEL_DEFINITIONS.flatMap((row) =>
@@ -511,9 +468,8 @@ function modernClaude(model: string | null): boolean {
   return model !== null && /^claude-(?:fable|mythos|opus|sonnet|haiku)-(?:5|4-[5678])\b/.test(model);
 }
 
-// A Claude model id on Amazon Bedrock names its inference profile, as in
-// `us.anthropic.claude-opus-5-5[1m]`. Bedrock bills every profile except `global.` at 1.1 times
-// list, and a bare `anthropic.` id as well. A first-party id takes list.
+// Bedrock Claude IDs identify inference profiles, including bare anthropic IDs.
+// Supported modern Claude models use a 1.1 multiplier outside the global profile.
 const BEDROCK_CLAUDE_ID = /^(?:([^.]+)\.)?anthropic\.claude-/;
 
 export function bedrockClaudeListMultiplier(modelId: string, model: string | null): number {
@@ -521,11 +477,11 @@ export function bedrockClaudeListMultiplier(modelId: string, model: string | nul
   return match && match[1] !== 'global' && modernClaude(model) ? 1.1 : 1;
 }
 
-// Claude CLI records a Claude cost at list price, under the `list` basis. A Codex-launched Claude
-// child on a Bedrock profile other than `global.` carries that cost times 1.1, under this basis.
+// Claude CLI records list-price cost under the list basis.
+// Codex-launched Claude children with regional Bedrock pricing carry the multiplied cost under this basis.
 export const BEDROCK_LIST_COST_BASIS = 'bedrock-list';
 
-// True when a recorded cost is the price to show, as recorded or with the Bedrock charge.
+// Accept recorded list costs and costs that include the Bedrock multiplier.
 export function recordedCostBasis(basis: string | null | undefined): boolean {
   return basis === 'list' || basis === BEDROCK_LIST_COST_BASIS;
 }
@@ -586,8 +542,7 @@ function publicRateFor(
     return null;
   }
   const row = resolved.definition;
-  // A known request size selects the tier itself. Capacity is only a guard for legacy
-  // aggregates that lost the request boundary.
+  // Request size or a retained band selects the tier. A legacy aggregate with neither uses capacity to reject unsupported pricing.
   if (
     requestTokens === null &&
     contextBand === null &&
@@ -612,9 +567,7 @@ function publicRateFor(
     return null;
   }
   const contextRate = fast && row.fast ? row.fast : longContextRate(row, band);
-  // Anthropic charges 1.1 times list for a request served in-region, and Amazon Bedrock charges the
-  // same for a request on any inference profile except `global.`. A request carries one class,
-  // so it never pays both.
+  // Modern Claude in-region and regional Bedrock requests receive one 1.1 multiplier, selected by their inference class.
   const tierRate = tierMultiplier === undefined ? contextRate : multiplied(contextRate, tierMultiplier);
   const rate = multiplied(tierRate, resolved.regionalMultiplier);
   return {
@@ -651,38 +604,28 @@ export function contextWindowFor(model: string | null, provider: string | null =
   return resolveModelPricing(model, provider)?.window ?? null;
 }
 
-// The three cache tiers, as multiples of the base input rate. Named, because more than one
-// formula charges the same tier: two copies of 0.1 are two answers, and the copy nobody
-// looks at is the one that keeps the old number after a rate moves.
+// Shared Claude cache-price multiples prevent differences between cost formulas.
 const CACHE_WRITE_1H = 2;
 const CACHE_WRITE_5M = 1.25;
 const CACHE_READ = 0.1;
 
-// The lifetimes the records name, which is where the vocabulary is set. Re-exported so a
-// caller pricing one does not have to reach past this module for the word.
+// Re-export recorded cache lifetimes for pricing consumers.
 export type CacheTier = CacheLifetime;
 
-// How long each one lasts. The provider starts the lifetime again on every request that uses
-// the cache, so the clock this is measured against is the age of the last request and never
-// the age of the write.
+// Nominal cache lifetimes. Reuse refreshes the lifetime, so consumers measure age from the latest request.
 export const CACHE_LIFETIME_MS: Record<CacheTier, number> = {
   '5m': 5 * 60_000,
   '30m': 30 * 60_000,
   '1h': 60 * 60_000,
 };
 
-// Transcript request clocks can trail the request that warmed a cache. Every consumer calls
-// the cache cold this far before its nominal lifetime ends.
+// Forward estimates treat the cache as cold this far before nominal expiry to account for request-clock differences.
 export const CONSERVATIVE_CACHE_BOUNDARY_MS = 90_000;
 
-// How long this model keeps a prompt cache, where its provider documents a figure.
-//
-// OpenAI publishes thirty minutes as a minimum for GPT-5.6 and later.
-// GPT-5.5 uses its documented typical thirty-minute retention for estimated timing.
+// Return the provider's documented cache lifetime for the model.
+// GPT-5.6 and later use the published thirty-minute minimum. GPT-5.5 uses typical thirty-minute retention.
 // GPT-5.4 uses the low end of its documented in-memory retention range.
-//
-// Claude records the lifetime it bought on the request itself, so no Claude row carries one
-// here. A caller reads the record first and reaches this only where the record is silent.
+// Claude definitions require recorded lifetimes and supply no documented fallback here.
 export function cacheLifetimeFor(model: string | null, provider: string | null = null): CacheTier | null {
   return resolveModelPricing(model, provider)?.cacheLifetime ?? null;
 }
@@ -699,16 +642,12 @@ export interface NextTurnFloorInput {
   contextWindow?: number | null;
   // The lifetime the request recorded, or null when it recorded none.
   tier?: CacheTier | null;
-  // What that request was billed under. Both are read here for the same reason every other
-  // quote reads them: an in-region or regional Bedrock request is charged 10% more, and a tier
-  // this table has no public rate for gets no figure at all rather than the standard one.
+  // Recorded inference class and service tier select regional multipliers and supported public rates.
   inferenceClass?: UsageInferenceClass;
   serviceTier?: string | null;
 }
 
-// The two prices a turn can start at, and the rates behind them. Every figure is dollars,
-// and every rate is dollars per million tokens, so a caller can print the rate beside the
-// price without dividing anything itself.
+// Warm and cold starting-price estimates in dollars, with rates in dollars per million tokens.
 export interface NextTurnFloor {
   warm: number;
   cold: number;
@@ -717,29 +656,19 @@ export interface NextTurnFloor {
   inputRate: number;
   // The lifetime the cold figure is priced at, or null where the record named none.
   tier: CacheTier | null;
-  // Whether the cold figure is a cache write or an ordinary uncached send. A record naming no
-  // lifetime still buys a write on a provider that sells one, so the two questions have
-  // different answers and anything wording the figure needs this one.
+  // Whether the cold estimate charges cache writes rather than ordinary input.
+  // A missing recorded lifetime does not exclude a provider's cache-write charge.
   coldIsWrite: boolean;
 }
 
-// A Claude compaction request sends the context of the last main request again, followed by
-// the instruction to summarise it, and the instruction is ordinary input.
-//
-// While the cache that request bought still holds, the compaction request reads back exactly what
-// that request read, and writes about as much as that request wrote again at the five-minute
-// lifetime. Once the cache has lapsed, the request marks nothing for caching: it reads back only
-// the system prompt and tool list that open every request of the transcript, which is what the
-// transcript's first request read, and sends the rest of the context as uncached input.
-//
-// The output is the summary the request wrote, and the stored summary text measures it. The
-// request also writes an analysis that is dropped before the summary is stored, so each output
-// token stands for fewer characters of stored text than ordinary prose.
+// Claude compaction estimates resend the previous main request's context plus an uncached summary instruction.
+// Warm estimates retain the previous cache-read count and repeat cache writes at the five-minute tier.
+// Cold estimates read the first request's cached prefix and send the remaining context uncached.
+// Stored summary text supplies an output estimate. The character ratio includes discarded analysis output.
 export const CLAUDE_COMPACTION_INSTRUCTION_TOKENS = 2_000;
 export const CLAUDE_COMPACTION_SUMMARY_CHARS_PER_TOKEN = 2.2;
 
-// The counts one Claude compaction request buys for its input. A request whose cache split is
-// unknown is read back whole while warm.
+// Estimate Claude compaction input. Warm requests with no cache split count the full previous input as a cache read.
 function claudeCompactionInput(
   previous: Pick<CompactionPreviousRequest, 'tokens' | 'cacheRead' | 'cacheWrite'>,
   cold: boolean,
@@ -781,13 +710,9 @@ function writeCounts(tier: CacheTier, tokens: number): Partial<TurnUsage> {
   return { cacheWrite30m: tokens };
 }
 
-// The counts that price sending the whole context again when the record named no lifetime.
-//
-// A provider that sells no cache-write product charges ordinary input for it, which is every
-// OpenAI row in this table without an explicit write price. Claude charges a write premium
-// whatever the record says, and its unnamed writes are charged at the hour, which is the same
-// fallback `claudeUsage` applies. Absence of a 30-minute price is not evidence of an hour, so
-// the two cases are answered apart rather than by one default.
+// Price uncached context when the request records no lifetime.
+// An explicit thirty-minute write rate selects that tier. Modern Claude otherwise uses the one-hour write fallback.
+// Other models without a write rate charge ordinary input.
 function uncachedCounts(
   model: string | null,
   provider: string | null,
@@ -806,9 +731,8 @@ function uncachedCounts(
   return { counts: { input: tokens }, isWrite: false };
 }
 
-// A retention lifetime says how long a read discount can remain available. It does not say
-// that the provider charges a separate write product. Claude sells five-minute and one-hour
-// writes, while a 30-minute write exists only where the selected rate names one.
+// Cache retention does not establish a separate write charge.
+// Modern Claude supports five-minute and one-hour writes. Thirty-minute writes require an explicit rate.
 function coldCounts(
   input: NextTurnFloorInput,
   tokens: number,
@@ -829,18 +753,11 @@ function perMillionRate(dollars: number, tokens: number): number {
   return Number(((dollars / tokens) * 1_000_000).toFixed(12));
 }
 
-// What the next turn costs before the reader types anything.
-//
-// Every turn re-presents the whole session, so the context already on the record has a
-// price fixed before the prompt exists. Read back from a warm cache it is charged at the read
-// rate; written again after the lifetime passed it is charged at the write rate for the tier
-// that was bought. Those are the two bounds, and the caller decides from the clock which one
-// to show.
-//
-// Priced through `quoteUsage` rather than by multiplying a rate here, so the long-context
-// band, the regional multiplier and the provider's own cache price all reach this figure the
-// way they reach every other one. Null when the model carries no row, which is the panel
-// showing nothing rather than showing an unknown.
+// Estimate the next request's warm and cold input cost before new prompt text or output.
+// Warm usage reads the established context and sends fresh output as ordinary input.
+// Cold usage resends both through the recorded write tier or the provider's uncached fallback.
+// quoteUsage applies request bands, regional multipliers, service tiers, and cache rates to both estimates.
+// Invalid counts or unavailable rates return null.
 export function nextTurnFloor(input: NextTurnFloorInput): NextTurnFloor | null {
   const cachedTokens = input.contextTokens;
   const freshTokens = input.freshTokens ?? 0;
@@ -906,8 +823,7 @@ function costAtRate(usage: TurnUsage, rate: Rate, cacheWritesFree = false): numb
   );
 }
 
-// Quotes retain where a figure came from. A recorded charge is already the answer for that
-// request; configured rates otherwise take precedence over public rows.
+// Quotes retain their pricing source. Recorded charges take precedence over configured rates and public definitions.
 export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
   const provider = input.provider ?? null;
   const requestBand = contextBandForRequest(input.model, provider, input.requestTokens ?? null);
@@ -942,8 +858,7 @@ export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
       ...metadata,
     };
   }
-  // A configured rate prices the speed the user priced. One that names no tier says nothing
-  // about fast mode, and charging a fast turn at it would undercount the turn by half.
+  // Overrides for fast requests must name the fast tier. Overrides without it leave fast usage unpriced.
   if (input.override && input.serviceTier === FAST_SPEED && input.override.serviceTier !== FAST_SPEED) {
     return null;
   }
@@ -994,7 +909,7 @@ export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
   };
 }
 
-// What the turn cost, in dollars, or null when the model is unknown to the table.
+// Estimate turn cost in dollars. Unsupported pricing or incomplete request bands return null.
 export function estimateCost(
   usage: TurnUsage,
   model: string | null,
@@ -1069,12 +984,8 @@ export function estimateCost(
   return quoteUsage({ usage, model, provider, contextWindow, requestTokens, ...priceContext })?.cost ?? null;
 }
 
-// What the turn paid to re-read the session, in dollars, or null when the model is
-// unknown to the table. It is the cache-read tier of `estimateCost` on its own, out of the
-// same rate and the same multiplier, so the two cannot charge one turn differently.
-//
-// A fact about the turn that has already run, never a rate for the ones to come: the panel
-// makes no projections, and the reader draws whatever inference they want from it.
+// Estimate recorded cache-read cost using the rates and request bands shared with estimateCost.
+// Unsupported pricing or unavailable aggregate request bands return null.
 export function estimateCacheReadCost(
   usage: TurnUsage,
   model: string | null,
@@ -1123,12 +1034,8 @@ export function estimateCacheReadCost(
   return estimateCost(part, model, provider, contextWindow, requestTokens);
 }
 
-// A starting price is a promise about the next request. Round it up so displayed cents never
-// understate the list-price charge that produced them.
-//
-// It stays here while `formatCost` sits in `view/cost.ts`, because only a host caller words a
-// starting price, and the rail's own section headings are what needed the other one in the
-// browser. Moving this one too would put a rule in `view/` that nothing there reads.
+// Round a positive starting-price estimate upward so the displayed amount covers the estimated cost.
+// Values below ten dollars round to cents. Larger values round to whole dollars.
 export function formatConservativeCost(dollars: number | null): string | null {
   if (dollars == null || dollars <= 0) {
     return null;
@@ -1142,9 +1049,8 @@ export function formatConservativeCost(dollars: number | null): string | null {
   return `$${Math.ceil(dollars)}`;
 }
 
-// The last main request before a compaction: the input side it sent, what of that it read from
-// and wrote to the cache, when it ran, and the cache lifetime it bought. A null clock or lifetime
-// leaves the compaction warm.
+// Previous main-request input, cache split, timestamp, and lifetime for compaction estimates.
+// A missing timestamp or lifetime leaves the estimate warm.
 export interface CompactionPreviousRequest {
   tokens: number;
   cacheRead?: number;
@@ -1176,13 +1082,8 @@ function knownClock(value: number | null): value is number {
   return value !== null && Number.isFinite(value) && value > 0;
 }
 
-// Whether the cache a request bought had lapsed by a later moment. The lifetime runs from the
-// request, as it does for every other cache answer here. A missing clock or lifetime answers
-// no, because an unknown moment is not evidence of a lapse.
-//
-// The full nominal lifetime, never `CONSERVATIVE_CACHE_BOUNDARY_MS`. That shorter bound keeps a
-// forward estimate safe against an imperfect clock. Applied backwards it would report an expiry
-// the provider never had.
+// Compare request age with the full nominal cache lifetime. Missing clocks or lifetime return false.
+// Retrospective compaction estimates exclude the conservative boundary used for forward estimates.
 export function cacheLapsedBy(requestAt: number | null, lifetime: CacheTier | null, at: number): boolean {
   if (lifetime === null || !knownClock(requestAt) || !knownClock(at)) {
     return false;
@@ -1190,10 +1091,9 @@ export function cacheLapsedBy(requestAt: number | null, lifetime: CacheTier | nu
   return at - requestAt >= CACHE_LIFETIME_MS[lifetime];
 }
 
-// How a compaction estimate priced its input. `warm` reads back what the previous request read,
-// writes what it wrote again at five minutes, and sends the instruction uncached. `cold` reads back
-// the prefix the transcript's first request read and sends the rest uncached. `read` prices the
-// recorded context as one cache read, for a model outside the Claude request shape.
+// Warm estimates repeat prior cache reads and five-minute writes, with the instruction sent uncached.
+// Cold estimates read the first request's cached prefix and send the rest uncached.
+// Read estimates price non-modern-Claude context as cached input.
 export type CompactionEstimateBasis = 'warm' | 'cold' | 'read';
 
 export interface CompactionEstimate {
@@ -1201,20 +1101,11 @@ export interface CompactionEstimate {
   basis: CompactionEstimateBasis;
 }
 
-// The usage one compaction request is estimated to have bought, and how it was priced, or null
-// when a figure is missing.
-//
-// A Claude compaction writes no usage of its own. Its input is the context of the last main
-// request before it, which the recorded context before the compaction does not measure after a
-// resume, so that request sizes the input and the recorded figure stands in only when no earlier
-// request is known. The request is warm unless the cache that request bought had lapsed by the
-// time the compaction request started, which is its duration before the record. The output is
-// the stored summary text, or the summary size the record names where no summary text is known.
-//
-// Both recorded figures are required. An older transcript records no size for the summary it
-// wrote, and pricing only the read there would put a confident number on the card that is short
-// by the whole output side of the call. Any other model, an older Claude model included, is
-// priced as a cache read of the recorded context plus the summary.
+// Estimate compaction usage and its cache basis. Both recorded context sizes are required.
+// Modern Claude uses previous request input when available, with recorded contextBefore as the fallback.
+// Cache expiry is measured at request start, using the compaction duration when available.
+// Output uses stored summary characters when positive, otherwise contextAfter.
+// Other models price contextBefore as cache reads and contextAfter as output.
 export function compactionEstimate(estimate: CompactionEstimateInput): CompactionEstimate | null {
   const { contextBefore, contextAfter } = estimate;
   if (!contextBefore || !contextAfter) {
@@ -1238,9 +1129,8 @@ export function compactionEstimate(estimate: CompactionEstimateInput): Compactio
   };
 }
 
-// What a compaction cost, priced from `compactionEstimate`. The input size also selects
-// the provider's short or long price for the whole call. Returns null when the model or a
-// recorded figure is unknown.
+// Price compactionEstimate usage with its request-wide context band and previous request's inference class and service tier.
+// Missing required figures or unavailable pricing return null.
 export function estimateCompactionCost(estimate: CompactionEstimateInput): number | null {
   const usage = compactionEstimate(estimate)?.usage;
   if (!usage) {
@@ -1253,8 +1143,7 @@ export function estimateCompactionCost(estimate: CompactionEstimateInput): numbe
   });
 }
 
-// The share of input tokens that came from the cache. This is the number that says
-// whether a long session is being re-read cheaply or paid for in full.
+// Cached reads as a percentage of total input, including cache writes.
 export function cacheHitPercent(usage: TurnUsage): number | null {
   const total = usage.input + usage.cacheWrite1h + usage.cacheWrite5m + (usage.cacheWrite30m ?? 0) + usage.cacheRead;
   if (total === 0) {

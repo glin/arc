@@ -37,9 +37,9 @@ function sameCatalogs(
   );
 }
 
-// Holds the newest complete command list each agent supplied. A revision captured before an
-// idle read lets a live child invalidate that read without coupling process lifetime to the
-// Composer payload.
+// Holds agent command lists. Complete updates or nonempty partial updates replace a list.
+// A captured revision lets a live update invalidate an older idle read.
+// The Prompt box payload remains independent of process lifetime.
 export class CommandCatalogs {
   private lists: Record<string, PromptEntry[]> = {};
   private readonly revisions = new Map<string, number>();

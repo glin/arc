@@ -20,10 +20,8 @@ import { DEMO_MENU_COMMANDS, manifestMenu } from './web-demo-menu.ts';
 const destination = path.resolve(process.argv[2] ?? path.join(__dirname, '../../.scratch-web-demo/site'));
 const theme = (css: string, name: string) =>
   css.replaceAll(':root', `:root[data-theme="${name}"]`).replaceAll('body{', `body[data-theme="${name}"]{`);
-// The production label and read rules, built for the page. The adapter edits labels with them, so a
-// name typed in the demo is cleaned and counted the way the extension cleans and counts it.
-// A session's unread state follows its turns' read marks by the rule the extension's list uses.
-// The context menu comes with them, and its entries come from the extension's manifest.
+// Bundle production label and read rules for page-local demo edits.
+// Bundle the menu stand-in with entries supplied separately from the manifest.
 const labelRules = esbuild.buildSync({
   stdin: {
     contents: `import { labelCounts, labelEditorReply, labelsOf, railLabelFields, setSessionLabels } from './src/turnlabels.ts';

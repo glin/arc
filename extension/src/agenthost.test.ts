@@ -80,17 +80,14 @@ const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
 const WS = 'C:\\ws';
 const CODEX_CLIENT = { name: 'arc', title: 'Arc', version: '0.1.0' };
 
-// A fake-timer block left real timers swapped out when an assertion inside it threw, and
-// every later test then advanced a clock that never moved. Restoring after each test keeps
-// one failure from cascading into every test that runs after it.
+// Restore real timers after every test, including tests whose assertions throw.
+
 afterEach(() => {
   vi.useRealTimers();
 });
 
-// How a control-channel Stop really ends the turn it abandoned. `claudewire.test.ts` holds the
-// same payload from the CLI, and `readOutcome` reads `aborted_streaming` as `interrupted`. The
-// session tells that ending from a later prompt's by exactly that word, so a test that invents
-// another `terminal_reason` proves nothing about the wire the panel actually reads.
+// Stop results use terminal_reason: aborted_streaming. The wire reads that outcome as interrupted.
+
 const ABORTED_RESULT =
   JSON.stringify({
     type: 'result',
@@ -107,9 +104,8 @@ const COMPLETED_RESULT =
     result: 'done',
   }) + '\n';
 
-// A child process that never was. It records what was written to stdin and lets a test
-// hand back whatever the real CLI would have written, one chunk at a time, including
-// chunks that split a line down the middle.
+// The fake child records stdin writes and delivers stdout chunks, including chunks split within a line.
+
 class FakeChild implements ChildLike {
   written: string[] = [];
   killed = false;
@@ -172,8 +168,8 @@ class FakeChild implements ChildLike {
     this.errorListener?.(error);
   }
 
-  // Everything this fake was asked to send, parsed. The wire adds the newline, so a test
-  // that reads these is reading exactly what went down the pipe.
+  // Parse each captured stdin write as JSON.
+
   sent(): Record<string, unknown>[] {
     return this.written.map((line) => JSON.parse(line) as Record<string, unknown>);
   }
@@ -194,8 +190,8 @@ class FakeChild implements ChildLike {
     this.say(JSON.stringify({ id: last.id, error: { code, message } }) + '\n');
   }
 
-  // Answers whichever JSON-RPC request named this method, whatever has gone out since. Two
-  // questions ride one idle child, so the last request is no longer the one a test means.
+  // Answer the first JSON-RPC request for the named method, even when later requests have been sent.
+
   replyTo(method: string, result: unknown): void {
     const found = this.sent().find((m) => m.method === method && typeof m.id === 'number');
     if (!found) throw new Error(`nothing asked ${method}`);
@@ -213,7 +209,7 @@ class FakeChild implements ChildLike {
     );
   }
 
-  // Answers whichever control request carried this subtype, for the same reason.
+  // Answer the first control request with the supplied subtype.
   answerControl(subtype: string, response: unknown): void {
     const found = this.sent().find((m) => (m.request as { subtype?: string } | undefined)?.subtype === subtype);
     if (!found) throw new Error(`nothing asked ${subtype}`);
@@ -239,9 +235,8 @@ class FakeChild implements ChildLike {
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
-// Rigs this child's next stdin write to throw, so the driver call that reaches it rejects
-// the way a live pipe failure would. The rig removes itself after the one throw, so a fix
-// under test can still write to the child once the refusal it caused has been handled.
+// Make the next stdin write throw once, then restore the original writer for subsequent requests.
+
 function failNextWrite(child: FakeChild, message: string): void {
   const original = child.stdin.write;
   child.stdin.write = (_chunk: string) => {
@@ -389,16 +384,8 @@ test('a session sends the handshake before anything else and keeps the command l
 });
 
 test('a listener told a session is ready can read its commands off it there and then', async () => {
-  // What `extension.ts` does with the event. `ready` is the one message that says a child has
-  // a list, and the list it publishes is read off the sessions, so that one agent answering
-  // does not drop what the others already said.
-  //
-  // The event is emitted from inside the opening handshake, and the session recorded the list
-  // only from what that handshake returned, which is after every listener has already run. So
-  // this read came back empty every time, the composer was handed a list with nothing in it,
-  // and the command menu never opened however much the reader typed. Nothing above catches
-  // it: the test before this one reads the same field after the handshake has settled, which
-  // is the one moment it is right.
+  // A ready listener must read the command list immediately. Publish handshake commands before emitting ready.
+
   const children: FakeChild[] = [];
   const seen: string[][] = [];
   let host: AgentHost | null = null;
@@ -429,11 +416,8 @@ test('a listener told a session is ready can read its commands off it there and 
 });
 
 test('a session resuming a session says which one before its child speaks', async () => {
-  // Everything the panel keys on the session reads this: which session counts as
-  // running, which rail card wears a status, and whether the card a press opened stays up.
-  // The CLI names no session in its answer to the handshake and a resumed child writes
-  // nothing else until the first prompt produces output, so the panel used to know nothing
-  // for the whole of that first press.
+  // A resumed session retains its launch ID before the child emits session output.
+
   const { host, children } = fakeHost();
   const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, resume: 'sess-1' }));
   children[0].answerHandshake();
@@ -546,9 +530,8 @@ const A_MODEL_LIST: ModelList = {
   readAt: 0,
 };
 
-// Every `/effort` line written to a child, in the order it was written. A pick that reaches
-// the child twice, or reaches it with no level, costs a turn the reader did not ask for, so
-// the tests below count the sends rather than reading only the last one.
+// Return every /effort send in order, so assertions detect duplicate or empty commands.
+
 function effortSends(child: FakeChild): string[] {
   return sentTexts(child).filter((text) => text.startsWith('/effort'));
 }
@@ -638,8 +621,8 @@ test('a Claude effort pick waiting through a Stop reaches the child', async () =
 
   await session.prompt('hello');
   await session.setEffort('low');
-  // A Stop ends the work without ending a turn. The pick would otherwise read as pending on
-  // the control for the life of the child, with nothing left to carry it out.
+  // An accepted Stop must release the effort pick waiting behind the interrupted work.
+
   const stopping = session.interrupt();
   child.answerControl('interrupt', {});
   await stopping;
@@ -660,9 +643,8 @@ test('a Claude effort pick waiting when the child exits reaches nothing', async 
   await vi.waitFor(() => assert.equal(session.state().exited, true));
 
   assert.deepEqual(effortSends(children[0]), [], 'the level was written to the stdin of a child that had already gone');
-  // The exit throws the pick away with the rest of the session's work. A pick left behind
-  // would be cleared by the next empty level, which the panel sends whenever a model change
-  // drops a level, and that clearing would redraw a session nothing can change.
+  // Exiting clears the pending effort pick. An empty pick after exit must not publish another state change.
+
   const published = states.length;
   await session.setEffort('');
   assert.equal(states.length, published, 'the session still held a pick for a child that had gone');
@@ -1229,10 +1211,8 @@ test('repeated Claude Stops share the ending still owed by the active turn', asy
 });
 
 test('an ending a Stop never produced stops being owed', async () => {
-  // Claude answers an accepted Stop in about a second. An ending still owed a minute later is
-  // one that never came, and charging a later turn's ending to it leaves that turn open. The
-  // session then calls itself busy for the rest of its life, and the rail says `running`
-  // about a session whose transcript closed hours before.
+  // Expire an unanswered Stop ending so it cannot consume a later prompt's completion.
+
   let clock = 1_000;
   const { host, children } = fakeHost(undefined, () => clock);
   const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
@@ -1264,10 +1244,8 @@ test('an ending a Stop never produced stops being owed', async () => {
 });
 
 test('a prompt that finishes seconds after a silent Stop keeps its own ending', async () => {
-  // The reader stops the agent, corrects it, and the correction answers in seconds, well
-  // inside the grace. Charging that ending to the Stop leaves the correction's turn open with
-  // nothing left to close it, and the session calls itself busy for the life of the
-  // child. The word the CLI puts on the ending is what tells the two apart.
+  // A prompt can complete within the Stop grace period. Its completion reason must distinguish it from the interrupted turn.
+
   let clock = 1_000;
   const { host, children } = fakeHost(undefined, () => clock);
   const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
@@ -1299,9 +1277,8 @@ test('a prompt that finishes seconds after a silent Stop keeps its own ending', 
 });
 
 test('a turn the reader is waiting on is never charged for a silent Stop', async () => {
-  // The mirror of the test above, and the more costly way to be wrong. A Stop that does answer
-  // answers after the correction was sent, so its ending arrives while a real turn is running.
-  // Closing that turn tells the reader the agent is idle while it is still working.
+  // An interrupted result arriving after a new prompt must not complete that prompt's turn.
+
   let clock = 1_000;
   const { host, children } = fakeHost(undefined, () => clock);
   const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
@@ -1423,9 +1400,8 @@ test('disposing the host ends every child it started', async () => {
   children[1].answerHandshake();
   await b;
   host.dispose();
-  // Closed rather than killed. Which of the two it is matters: the CLI writes its settings
-  // out as it shuts down, so a child taken away outright loses whatever the reader last
-  // changed. `dispose` kills only what closing the input did not end.
+  // Disposal closes child input first and kills only children that remain running. This gives the CLI time to save settings.
+
   assert.deepEqual(
     children.map((c) => c.ended),
     [true, true],
@@ -2442,8 +2418,8 @@ test('a rejected native compaction clears the running state and keeps the reason
   const compacting = session.compact();
   await tick();
   child.replyError(-32600, 'compaction is unavailable while a turn is running');
-  // The server's own sentence, with nothing wrapped around it. The panel says that the
-  // compaction did not happen. The only thing left for this to carry is why.
+  // The rejected promise retains the server error unchanged. Session diagnostics also identify the failed compaction.
+
   await assert.rejects(compacting, (error: Error) => {
     assert.equal(error.message, 'compaction is unavailable while a turn is running');
     return true;
@@ -2958,9 +2934,8 @@ test('two callers racing for one session wait on the same opening, not on two', 
   });
   assert.equal(children.length, 1, 'the second caller must not start a second child');
 
-  // The handshake has not been answered yet, so neither caller can have a usable session.
-  // Handing the second one back now is the bug: it would get a session with no command
-  // list, and on the Codex side no session to send a turn on.
+  // Both callers wait for the same handshake before receiving a usable session and command list.
+
   await tick();
   assert.equal(secondSettled, false, 'the second caller was handed a session mid-handshake');
 
@@ -2974,9 +2949,8 @@ test('two callers racing for one session wait on the same opening, not on two', 
 });
 
 test('a batch shim is refused with a message, not with a throw from inside a constructor', () => {
-  // Windows resolves a bare npm command to a `.cmd`, and Node throws EINVAL for one given
-  // arguments with no shell. The throw happens where no caller expects it, so the command
-  // does nothing and says nothing.
+  // Windows batch shims need a shell. Reject them before starting a child through Node's direct process API.
+
   assert.match(unstartable('C:\\Users\\g\\AppData\\Roaming\\npm\\claude.cmd', 'win32') ?? '', /batch shim/);
   assert.match(unstartable('C:\\tools\\claude.BAT', 'win32') ?? '', /batch shim/);
   assert.equal(unstartable('C:\\Users\\g\\.local\\bin\\claude.exe', 'win32'), null);
@@ -3042,8 +3016,8 @@ test('an ask left open when the turn ends is dropped, not left waiting on the re
   assert.deepEqual(host.waiting(), []);
 });
 
-// The read for a panel nobody is running a turn for: a child started, asked both of the
-// questions that cost no model tokens, and closed again.
+// Start an idle child for usage and model reads without sending a model prompt.
+
 function idleProbe(plan: AgentPlan): { children: FakeChild[]; answers: Promise<IdleAnswers> } {
   const children: FakeChild[] = [];
   const answers = askIdle(plan, () => {
@@ -3054,9 +3028,8 @@ function idleProbe(plan: AgentPlan): { children: FakeChild[]; answers: Promise<I
   return { children, answers };
 }
 
-// A plan whose two idle answers can be made to fail one at a time. Both wires swallow their
-// own refusals, so a real CLI cannot be made to fail one question and answer the other,
-// which is the case the rule is about.
+// The fake plan lets usage and model reads reject independently. The production adapters normalize their own unavailable responses.
+
 function answeringPlan(answers: {
   usage(refreshAuthentication?: boolean): Promise<UsageReading | null>;
   models(): Promise<ModelList | null>;
@@ -3520,8 +3493,8 @@ test('how much an agent asks reaches each CLI the way that CLI takes it', { time
   const claudeChild = h.children[0];
   claudeChild.answerHandshake();
   const claude = await opening;
-  // Not awaited yet: the CLI has to answer the control request before this settles, which
-  // is the difference between the two agents that this test exists to hold.
+  // A Claude permission change settles only after its control response arrives.
+
   const changed = claude.setAskMode(CLAUDE_ASK_MODES[2]);
   // Claude takes it at once, as its own control request, so a turn already running feels
   // the change.
@@ -3536,8 +3509,8 @@ test('how much an agent asks reaches each CLI the way that CLI takes it', { time
   child.reply({ thread: { id: 'thread-1' } });
   const codex = await openingCodex;
   await codex.setAskMode(CODEX_ASK_MODES[3]);
-  // Codex takes nothing at all here: its whole mechanism is two fields on the next send, so
-  // a call of its own would be a request the server has no method for.
+  // Codex sends permission settings on the next turn rather than as a separate approval request.
+
   assert.equal(
     child.sent().some((m) => String(m.method).includes('approval')),
     false,
@@ -3553,9 +3526,8 @@ test('how much an agent asks reaches each CLI the way that CLI takes it', { time
   };
   assert.equal(params.approvalPolicy, CODEX_ASK_MODES[3].codex?.approvalPolicy);
   assert.equal(params.approvalsReviewer, CODEX_ASK_MODES[3].codex?.approvalsReviewer);
-  // The sandbox travels with the policy, or a reader who picked full access was promised
-  // the machine and given a folder. It travels under the name and the shape a turn reads,
-  // which is not the pair a thread reads.
+  // The turn carries sandboxPolicy with the approval policy. Thread setup uses a different sandbox field.
+
   assert.deepEqual(params.sandboxPolicy, sandboxPolicy(CODEX_ASK_MODES[3].codex!.sandbox));
   assert.equal(params.sandbox, undefined);
 });
@@ -3625,9 +3597,8 @@ test(
     const codex = await openingCodex;
     const before = child.sent().length;
     await codex.setModel('gpt-5');
-    // Codex sends nothing here. Its whole mechanism is a field on the next turn, which the
-    // server reads for that turn and the ones after it, so a call of its own would be a
-    // request the server has no method for.
+    // A Codex model change sends no immediate request. The next turn/start carries the selected model.
+
     assert.equal(child.sent().length, before);
     void codex.prompt('go');
     await tick();
@@ -3789,18 +3760,11 @@ test('one idle child answers both the figures and the model list', { timeout: 50
   const child = probe.children[0];
   child.answerHandshake();
   await tick();
-  // The handshake, then the three questions, and nothing else. No prompt is ever sent, which
-  // is what makes the answers free; one child rather than three, because the process start is
-  // the only cost any of the questions has.
-  //
-  // The servers joined the other two once the composer grew a control for them: read from
-  // session children alone, that control could not exist until after a prompt had been
-  // sent, and the reader opens it by typing the agent's own `/mcp`.
+  // The idle child sends initialize, get_usage, and list_models without a prompt. MCP status uses a separate read.
+
   const asked = child.sent().map((m) => (m.request as { subtype: string }).subtype);
-  // The MCP servers are deliberately not among them. The CLI answers `mcp_status` only once
-  // it has tried every server, and one measured here timed out after 30 seconds, so asking
-  // for them on this child would put that wait in front of the figures the bar is opening to
-  // draw. A reader who asks for them outright pays it instead.
+  // MCP status can wait for server startup. Keep it separate so it cannot delay usage and model figures.
+
   assert.deepEqual(asked, ['initialize', 'get_usage', 'list_models']);
   child.answerControl('get_usage', {
     subscription_type: 'max',
@@ -3821,12 +3785,8 @@ test('one idle child answers both the figures and the model list', { timeout: 50
 });
 
 test('the idle child brings back the command list, which is the only way a quiet panel gets one', async () => {
-  // The composer's menu opens on a slash and has nothing to offer until some child has
-  // answered the handshake. A session child is started by the first prompt, so a panel
-  // gathering commands from those alone cannot have a list until after the reader has sent a
-  // prompt without the menu they wanted it for. This child is the one a quiet panel does
-  // start, it answers the handshake like any other, and the list came back on it and was
-  // dropped on the floor.
+  // The idle handshake returns command completions before a session receives its first prompt. Retain that catalog in the idle answer.
+
   const probe = idleProbe(claudeIdlePlan(CLAUDE, WS));
   await tick();
   const child = probe.children[0];
@@ -4183,9 +4143,8 @@ test('the MCP servers kept for an agent are whatever it last said, and none for 
   );
   book.note('claude', SOME_SERVERS);
   assert.deepEqual(book.get('claude'), SOME_SERVERS);
-  // The next reading replaces the last outright, however recently the last one arrived.
-  // This is where a model list would still be inside its window and be left alone, and it
-  // is why there is no window here: a server falls down between one press and the next.
+  // Each MCP reading replaces the previous list immediately, including an empty list.
+
   book.note('claude', []);
   assert.deepEqual(book.get('claude'), [], 'a reading that found nothing is still an answer');
   book.note('codex', SOME_SERVERS);
@@ -4793,8 +4752,8 @@ test(
 );
 
 test('an agent with no MCP servers to report answers none, and a press on one does nothing', async () => {
-  // Only Claude Code answers for its servers. The panel draws no such control for an agent
-  // that cannot be asked, so a call arriving anyway is nothing to put in front of a reader.
+  // A plan without MCP operations returns no server reading and performs no toggle or reconnect.
+
   const { host } = fakeHost();
   const session = await host.session(
     'bare',
@@ -4853,10 +4812,8 @@ test('a pick the agent has dropped is not passed to a child, and one made before
 });
 
 test('a streamed chunk of the reply is passed on and wakes nothing else', async () => {
-  // It arrives many times a second and says nothing about the child that is not already
-  // known: no busier, nothing asked, nothing failed. Everything a state change wakes, the
-  // status bar and the stored session id among them, would otherwise run hundreds of times
-  // in a turn to report what the first chunk reported.
+  // Reply chunks publish delta events without changing session state.
+
   const { host, children, events, states } = fakeHost();
   const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
   children[0].answerHandshake();
@@ -4919,10 +4876,8 @@ test('live activity is passed on without waking session state', async () => {
 });
 
 test('a child that ends when its input closes is never killed, and one that does not is', async () => {
-  // The reason this matters is not tidiness. The CLI writes its settings out as it shuts down,
-  // so a child killed in the same tick as the close loses whatever the reader last changed:
-  // a server switched off in the panel came back on in the next child. A real two-child
-  // check reproduced the behavior.
+  // Close child input before killing a process. Allow shutdown to save settings, then kill children that ignore the close.
+
   const wellBehaved = new FakeChild();
   vi.useFakeTimers();
   const polite = new AgentSession(
@@ -5007,10 +4962,8 @@ test('a child whose input cannot be closed is still killed after the grace perio
 });
 
 test('a press on the servers switch works with no session running', async () => {
-  // The composer draws the servers control as soon as the panel has counted them, which is
-  // before any prompt has been sent. So a press has to work with no session child, and
-  // this is the child it gets: one of its own, told the change and then asked what the
-  // servers are now.
+  // MCP changes before the first prompt use a separate idle child. Apply the change, then read the resulting server state.
+
   const children: FakeChild[] = [];
   const done = askIdleMcpChange(
     claudeIdlePlan(CLAUDE, WS),
@@ -5026,9 +4979,8 @@ test('a press on the servers switch works with no session running', async () => 
   child.answerHandshake();
   await tick();
   const read = () => child.sent().map((m) => m.request as { subtype: string; serverName?: string; enabled?: boolean });
-  // Both fields, every time. `mcp_toggle` sets a value despite its name, and the value left
-  // off means false, so a press meaning "switch it back on" that sent the name alone would
-  // switch it off again.
+  // mcp_toggle carries the server name and an explicit enabled value for either toggle direction.
+
   assert.equal(read()[1].serverName, 'notes');
   assert.equal(read()[1].enabled, false);
   child.answerControl('mcp_toggle', {});
@@ -5049,15 +5001,13 @@ test('a press on the servers switch works with no session running', async () => 
     result.servers?.map((s) => s.status),
     ['disabled'],
   );
-  // Closed, not killed, which is what makes the change outlast the child that made it.
+  // The child exits without being killed, allowing normal shutdown.
   assert.equal(child.killed, false, 'the child was killed instead of allowed to close');
 });
 
 test('a press that could not start a child says so rather than doing nothing quietly', async () => {
-  // The live path throws when a server refuses. This path had nothing to throw: a child that
-  // would not come up returned no servers and no failures, `setMcpFor` found nothing to
-  // report, and the reader who pressed a switch got silence. That is the one outcome this
-  // work refuses everywhere else.
+  // A failed child launch must report a failure for the requested MCP change.
+
   const children: FakeChild[] = [];
   const done = askIdleMcpChange(
     claudeIdlePlan(CLAUDE, WS),
@@ -5077,9 +5027,8 @@ test('a press that could not start a child says so rather than doing nothing qui
 });
 
 test('a change waits for its child to go, because that is when the change is written', async () => {
-  // The CLI writes the setting out as it shuts down. Returning before the child has gone lets
-  // the reader's next prompt start a session that reads the state they just changed
-  // away from, so the wait is the guarantee rather than tidiness.
+  // Wait for the idle child to exit before returning the change, so the next child can read saved settings.
+
   const children: FakeChild[] = [];
   let settled = false;
   const done = askIdleMcpChange(
@@ -5377,14 +5326,8 @@ const DRAFT_MODELS = {
   ],
 };
 
-// A draft as the panel holds it after three presses: the setup it inherited from the
-// session beside it, a model change, an effort change, then a permission change. The
-// frozen value this returns is what `send` hands over, and the whole of what a fresh child is
-// started from.
-//
-// Permissions are here because they are the part of the setup that reaches each CLI its own
-// way. Claude takes one word at spawn and Codex takes a policy and a sandbox together, so a
-// value that travelled for one agent says nothing about the other.
+// Build a frozen draft after model, effort, and permission picks. Claude launch flags and Codex thread settings must retain that draft's values.
+
 function draftAfterPicks(agent: 'claude' | 'codex', model: string, effort: string, permission: string) {
   const catalog = DRAFT_MODELS[agent];
   const inherited: SessionProfile = {
@@ -5398,8 +5341,8 @@ function draftAfterPicks(agent: 'claude' | 'codex', model: string, effort: strin
   assert.ok(onModel, `the model menu refused ${model}, so the press this test is about never happened`);
   const onEffort = draftProfileAfterPick(onModel, 'effort', effort, DRAFT_MODELS);
   assert.ok(onEffort, `the effort menu refused ${effort}, so the press this test is about never happened`);
-  // A press that lands on the value already held changes nothing, and a test written on one
-  // would pass on a child started from the setup nobody touched.
+  // Use a permission pick different from the inherited value so the fixture requires a changed draft.
+
   assert.notEqual(
     permission,
     inherited.permissionMode,
@@ -5407,16 +5350,14 @@ function draftAfterPicks(agent: 'claude' | 'codex', model: string, effort: strin
   );
   const onPermission = draftProfileAfterPick(onEffort, 'askmode', permission, DRAFT_MODELS);
   assert.ok(onPermission, `the permission menu refused ${permission}, so the press this test is about never happened`);
-  // Three picks made this profile, so the draft records the reader's own work. The field
-  // reaches no spawn argument, and a fixture saying otherwise describes a draft nobody made.
+  // The edited draft records the picked profile as reader-owned. That ownership field does not become a launch argument.
+
   return newSessionDraft(`draft-${agent}`, WS, 's1', 0, onPermission, null, true);
 }
 
 test('a draft the reader changed starts its child on the setup it now holds', { timeout: 5000 }, async () => {
-  // Both halves build the spawn plan the way a fresh session is started: off the frozen
-  // draft alone. A press that changed the stored setup and left the draft holding the old one
-  // would start the child on the setup the reader replaced, and every word on screen would
-  // still say the new one.
+  // Build both agents' launch plans from the frozen draft and check each selected value.
+
   const claude = draftAfterPicks('claude', 'sonnet', 'low', 'plan');
   const claudeMode = askMode(claude.profile.agent, claude.profile.permissionMode);
   assert.ok(claudeMode);
@@ -5437,8 +5378,8 @@ test('a draft the reader changed starts its child on the setup it now holds', { 
     'low',
     'the Claude child is started at a level the reader moved away from',
   );
-  // Permissions are the one part of the setup the other two presses never move. A child
-  // started on the wrong one edits files the reader asked it to plan first.
+  // The permission pick remains independent of model and effort picks.
+
   assert.equal(
     args[args.indexOf('--permission-mode') + 1],
     'plan',
@@ -5461,8 +5402,8 @@ test('a draft the reader changed starts its child on the setup it now holds', { 
   );
   const child = h.children[0];
   await answerCodexHandshake(child);
-  // The policy and the sandbox travel together and open the thread. A reader who picked full
-  // access and got the workspace sandbox was promised the machine and given a folder.
+  // Codex thread/start carries both the approval policy and the selected sandbox.
+
   const start = child.sent().find((m) => m.method === 'thread/start');
   assert.deepEqual(
     {
@@ -5474,8 +5415,8 @@ test('a draft the reader changed starts its child on the setup it now holds', { 
   );
   child.reply({ thread: { id: 'thread-1' } });
   const session = await opening;
-  // Not awaited. The server's reply is not what is under test, and what the child was sent is
-  // written before any reply comes back.
+  // Inspect the sent turn request without waiting for a server response.
+
   void session.prompt('go');
   await tick();
   const turn = child.sent().find((m) => m.method === 'turn/start');
@@ -5559,8 +5500,8 @@ test('a second rename of one live Claude session waits for the first to settle',
   const first = host.renameSession('claude', 'session-7', 'Complete name', NO_IDLE_PLAN);
   const second = host.renameSession('claude', 'session-7', 'Second name', NO_IDLE_PLAN);
   await vi.waitFor(() => assert.equal(renameRequests(child).length, 1));
-  // Both renames read the same transcript end, so the session would keep whichever record
-  // the CLI wrote last.
+  // Serialize renames so each reads the transcript after the preceding rename settles.
+
   for (let i = 0; i < 5; i += 1) {
     await tick();
   }
@@ -5595,10 +5536,8 @@ test('a Claude rename goes out while a turn runs, and a refusal leaves that turn
 
 test('a live rename carries the session id the host resolved, not the one its child moved to', async () => {
   const { host, children } = fakeHost();
-  // A child that reports another session id once the host has looked this one up, the way a
-  // Claude child reports a fork of the session it resumed. The CLI refuses a rename whose
-  // session id is not the one its own process holds, and a rename that reads the id back off
-  // the child asks for the session the child moved to, so the refusal never fires.
+  // Keep the session ID resolved by the host in the rename request. A changed child ID must not redirect it.
+
   const ordinary = claudePlan(CLAUDE, { cwd: WS, resume: 'session-7' });
   let watching = false;
   let lookedUp = false;

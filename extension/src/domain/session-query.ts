@@ -9,8 +9,7 @@ export interface DecimalValue {
   exponent: number;
 }
 
-// The strict comparison grammar `cost:` and `cache-expiry:` both parse and match through.
-// Named for what it is rather than for either field, so a third numeric axis reads it too.
+// Strict numeric comparisons shared by cost and cache-expiry query terms.
 export interface NumericComparison {
   operator: '>' | '<';
   threshold: DecimalValue;
@@ -238,10 +237,7 @@ export function parseSessionQuery(query: string): SessionQuery {
     if (!written || (!quotedHead && written === NEGATE_MARK)) {
       continue;
     }
-    // Two marks in front of a word ask for nothing the grammar can answer, so the word adds
-    // no term, the way a lone mark does. Without this it read as a title term for the text
-    // after the first mark, which kept every session and said nothing. A reader who wants
-    // that text quotes the word.
+    // Ignore unquoted words with two negation marks. Quote such text to search for it literally.
     if (!quotedHead && written.startsWith(NEGATE_MARK + NEGATE_MARK)) {
       continue;
     }
@@ -397,9 +393,7 @@ function plainTermHolds(
   // The exact count of cache-expiry returns from lifetime indexed facts. Null where the
   // source cannot answer, which holds for neither comparison the way an unpriced cost does.
   cacheExpiryCount: number | null = null,
-  // Whether that count is a floor rather than the whole answer, read the same way `costAtLeast`
-  // is. True wherever the classifier could not judge every adjacent pair, since an unjudged
-  // pair may itself have been a qualifying return the count has not added in.
+  // True when unclassified adjacent pairs prevent an exact count.
   cacheExpiryAtLeast = false,
 ): boolean {
   if (term.field === 'cost' || term.field === 'cache-expiry') {
@@ -434,10 +428,7 @@ function plainTermHolds(
     if (term.needle === 'read') {
       return !unread;
     }
-    // Warm covers a cache about to run out as well as one with time left. The rail draws a
-    // bolt on both, and a reader reaching for the cheaper session wants every one of them.
-    // The term asks about the cache and nothing else. A lens that wants the warm sessions a
-    // reader can act on says so in words, with `-is:archived -is:agentrun` beside it.
+    // Warm cache matching is independent of archived state and agent-run ownership.
     if (term.needle === 'warm') {
       return cacheWarm;
     }
@@ -534,9 +525,7 @@ export function matchSessions<
     costAtLeast?: boolean;
     status?: string | null;
     unread?: boolean;
-    // Whether this session's prompt cache is still warm, answered by the caller against its
-    // own clock. A caller that never asks about the cache leaves it out, and `is:warm` then
-    // matches nothing, which is what a list with no cache facts should answer.
+    // The caller supplies prompt-cache status using its own clock. Omission makes is:warm match nothing.
     cacheWarm?: boolean;
     // Whether an agent runs this session, which `is:agentrun` answers. A card's own bucket flag
     // turns this off when the session is archived, so the caller must hand in the plain fact.

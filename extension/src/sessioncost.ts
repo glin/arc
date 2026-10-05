@@ -2187,7 +2187,7 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
     try {
       canonical = fs.realpathSync(source.file);
     } catch {
-      /* Missing sources carry no usage. */
+      /* Retain the supplied path when realpath resolution fails. */
     }
     const key = normalizeFsPath(canonical);
     if (seen.has(key)) return;

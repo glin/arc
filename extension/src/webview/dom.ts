@@ -10,9 +10,7 @@ export function panelDom(document: Document): PanelDom {
   return { list };
 }
 
-// Whether a press belongs to whatever the reader is typing in. Two page-level key listeners
-// ask this, so they ask it in one place. A page-level key that fired inside a field would take
-// a character the reader meant to type.
+// Page-level keys leave editable controls alone, so they do not consume typed characters.
 export function editableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
     return false;
@@ -32,8 +30,7 @@ export function found(where: ParentNode, name: string): HTMLElement | null {
   return null;
 }
 
-// Every interactive panel element is a native control. This adds the accessible name, stable
-// identity, and optional activation without changing its browser-native keyboard behavior.
+// Adds an accessible name, control identity and optional activation handler. Native controls retain their keyboard behavior.
 export function actionable<T extends HTMLElement>(
   node: T,
   label: string | null,
@@ -79,24 +76,20 @@ type FloatRect = Pick<DOMRect, 'top' | 'right' | 'bottom' | 'left' | 'width' | '
 
 // How a float opens under its anchor.
 export interface FloatPlacement {
-  // The lowest edge the float may reach. Without it, the float stays inside the viewport margin.
+  // The available bottom boundary. Without it, placement uses the viewport margin.
   bottom?: number;
   // The space between the anchor and the float.
   gap?: number;
-  // The anchor edge the float lines up with. `end` lines the float's right edge up with the
-  // anchor's right edge.
+  // Aligns the float with the anchor's left edge, or its right edge for `end`.
   align?: 'start' | 'end';
-  // A wider box that holds the anchor, such as the row the anchor sits on. The float opens
-  // clear of this box and never starts left of it.
+  // Opens clear of this containing box and clamps the float's left edge to the box's visible left boundary.
   around?: FloatRect | HTMLElement;
-  // Where the float goes when it does not fit below. `flip` opens it above, at the top edge
-  // when there is no room there either. `flip-or-stay` opens it above only when it fits there,
-  // and otherwise keeps it below. `slide` moves it up until its bottom meets the lowest edge.
+  // The `flip` mode opens above, clamped to the top margin. The `flip-or-stay` mode opens above only when it fits.
+  // The `slide` mode aligns the bottom, clamped to the top margin.
   overflow?: 'flip' | 'flip-or-stay' | 'slide';
 }
 
-// The top of a float that opens under its anchor, or goes where `overflow` says when it does
-// not fit there.
+// Returns the top position below the anchor, with the selected overflow behavior when it does not fit.
 function floatTop(
   around: Pick<FloatRect, 'top' | 'bottom'>,
   height: number,
@@ -119,8 +112,7 @@ function floatTop(
   return Math.max(edge, above);
 }
 
-// The box an anchor occupies on screen, or null for an element out of the document or inside
-// a hidden region. Such an element measures as an empty box in the viewport corner.
+// Returns the anchor's screen box, or null for a disconnected element or one inside a hidden region.
 function anchorRect(target: FloatRect | HTMLElement): FloatRect | null {
   if (!('getBoundingClientRect' in target)) {
     return target;
@@ -131,9 +123,8 @@ function anchorRect(target: FloatRect | HTMLElement): FloatRect | null {
   return target.getBoundingClientRect();
 }
 
-// Places a fixed float beside its anchor. A float whose anchor element left the document or
-// sits in a hidden region keeps its last place. An anchor passed as a box is placed as given.
-// The float's own size comes from its rendered box.
+// Places a fixed float beside its anchor using its rendered size. Missing or hidden anchor elements preserve its last position.
+// Supplied anchor boxes remain usable independently of the DOM.
 export function placeFloat(
   view: Pick<Window, 'innerWidth' | 'innerHeight'>,
   host: HTMLElement,

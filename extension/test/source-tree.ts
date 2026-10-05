@@ -33,7 +33,7 @@ function entryKind(name: string): SourceEntryKind {
   return 'unsupported';
 }
 
-/** Walk a source directory without following symbolic links or junctions. */
+/** Walks directory entries without following symbolic links or junctions within the tree. */
 export function inventorySourceTree(root: string): SourceInventory {
   const absoluteRoot = path.resolve(root);
   const entries: SourceEntry[] = [];
@@ -82,13 +82,8 @@ export function inventorySourceTree(root: string): SourceInventory {
   };
 }
 
-// The lanes `npm test` runs, and where each keeps its test files. `extension/src` is the
-// extension's own suite. Plugin hooks, `scripts` and the repository-root `test` directory are the
-// root Vitest lane (`vitest.config.mts`). `cli/test` is the CLI's suite (`cli/vitest.config.ts`).
-// `extension/test`, `cli/test` and the repository-root `test` directory also hold shared test
-// helpers, not a Vitest lane, but a sleep or a hand-set theme variable hidden in a helper reaches
-// every test that imports it, so their suffix lists cover every source file in those directories,
-// not only `*.test.*`.
+// Collect test files from the extension, root, and CLI lanes.
+// Include helpers in extension/test, test, and cli/test so shared waits and theme assignments also receive checks.
 export function repoTestFiles(repoRoot: string): Map<string, string> {
   const files = new Map<string, string>(); // repository-relative path -> absolute path
   const lanes: Array<{ dir: string; prefix: string; suffixes: string[] }> = [
@@ -272,14 +267,10 @@ const RUNTIMES = new Set(['runtime/shared', 'runtime/claude', 'runtime/codex']);
 const BROWSER_SAFE = new Set(['domain', 'view', 'webview']);
 const NODE_MODULES = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
 
-// The one webview file that may name a type from a root module, and how many such names it
-// has. The message contract types payloads whose owners live in root modules. A type-only edge is
-// erased before the browser runs, so it cannot pull a Node import in through a re-export the
-// way a runtime edge could, and a runtime edge from `webview` to `legacy` stays forbidden.
-//
-// The count only goes down. `source-tree.test.ts` fails when the real tree disagrees with
-// the ceiling, in either direction, so a moved type lowers it and a new one has to be argued
-// for. The allowance goes with the last edge.
+// webview/protocol.ts can import root-module types, which disappear before browser execution.
+// Runtime imports from webview to root modules remain forbidden.
+// source-tree.test.ts requires the allowed edge count to equal the ceiling.
+// Lower the ceiling when removing an edge. Review any increase.
 export const PROTOCOL_TYPE_EDGE_SOURCE = 'webview/protocol.ts';
 export const PROTOCOL_TYPE_EDGE_CEILING = 1;
 

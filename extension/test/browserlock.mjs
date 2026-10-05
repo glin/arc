@@ -1,7 +1,6 @@
-// Plain Node ESM with no vitest import, so extension/test.mjs can load it directly and the
-// root test runner can load it too. One lock file in the system temporary directory bounds
-// the whole machine to one browser-lane run at a time, across every worktree and checkout,
-// because each run already spends its own --maxWorkers=4 worth of headless browsers.
+// Plain Node ESM lets extension/test.mjs and the root test runner import this module.
+// A shared temporary lock limits the machine to one browser lane across checkouts.
+// Each lane launches up to four workers. Stale-lock takeover has a three-run race described below.
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { linkSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -17,10 +16,8 @@ export const BROWSER_LOCK_STALE_AFTER_MS = 3 * 60_000;
 export const BROWSER_LOCK_HEARTBEAT_MS = 30_000;
 const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
 
-// Reads the raw text once and parses it once, so a caller that later needs to compare content
-// never reads the file a second time and risks seeing bytes a concurrent writer changed in
-// between. An owner with a missing or non-positive pid parses to no owner, the same as text
-// that is not valid JSON at all.
+// Read and parse the content once so later comparisons use the same bytes.
+// Invalid JSON or a missing or non-positive PID produces no owner.
 function readLock(lockPath) {
   let text;
   try {
@@ -40,15 +37,13 @@ function readLock(lockPath) {
     const parsed = JSON.parse(text);
     if (Number.isInteger(parsed.pid) && parsed.pid > 0) owner = parsed;
   } catch {
-    // Not valid JSON. The publish path below never leaves a lock file in this state, so this
-    // only covers a leftover from the hard-link fallback or a lock this scheme never wrote.
+    // Invalid JSON leaves no owner. Exclusive-create fallback can expose incomplete content.
   }
   return { text, mtimeMs, owner };
 }
 
-// owner is null when the lock file is empty, corrupt, or holds no valid pid. The lock is then
-// stale at once, but a rename can still fail with EPERM, EACCES, or EBUSY before the takeover
-// completes, so the waiter reaches this with no owner to describe.
+// Empty, corrupt, or invalid-PID content has no owner.
+// A stale-lock rename can fail while another process holds the file open.
 function describeHolder(owner) {
   if (!owner) return 'an unreadable lock record';
   const where = owner.cwd ? ` in ${owner.cwd}` : '';
@@ -56,17 +51,10 @@ function describeHolder(owner) {
   return `PID ${owner.pid}${where}${since}`;
 }
 
-// A dead or unparseable owner is stale at once. A live owner is stale only once this waiter's
-// own polls have watched the lock file's mtime sit unchanged for the whole stale age, measured
-// on the waiter's monotonic clock across consecutive polls, never by comparing the wall clock
-// against the mtime directly. A wall-clock comparison reads a live lock as stale the moment the
-// machine wakes from a sleep, because the wall clock jumps forward by the sleep length while
-// the holder's heartbeat simply has not had a tick yet.
-//
-// The observation restarts whenever the mtime moves, because the heartbeat ticked, or whenever
-// the gap between two consecutive polls is itself large enough to mean the machine suspended
-// between them: more than five poll intervals. That keeps a suspend-and-wake from being
-// mistaken for a long stretch of a stuck heartbeat.
+// Missing or dead owners and missing mtimes are stale immediately.
+// For live owners, consecutive polls must observe an unchanged mtime for the full stale age.
+// Measure that age with the waiter's monotonic clock. Wall-clock jumps after sleep can exceed it before the next heartbeat.
+// Restart the observation when mtime changes or the poll gap exceeds five intervals.
 function stepStaleObservation(observation, owner, mtimeMs, monotonicNow, isProcessAlive, staleAfterMs, pollMs) {
   if (!owner || !isProcessAlive(owner.pid)) return { stale: true, observation: null };
   if (mtimeMs === null) return { stale: true, observation: null };
@@ -77,11 +65,8 @@ function stepStaleObservation(observation, owner, mtimeMs, monotonicNow, isProce
   return { stale: at - since >= staleAfterMs, observation: { mtimeMs, since, lastPollAt: at } };
 }
 
-// Publishes the lock file exclusively and atomically: the content is written to a private
-// temporary file first, and only a filesystem link, which never replaces an existing path,
-// makes it visible at lockPath. A reader can therefore never observe an empty or partially
-// written lock file, unlike a plain create-then-write. Falls back to the old exclusive-create
-// scheme on a filesystem with no hard-link support, which reopens that narrow window.
+// Publish fully written content with a hard link that never replaces an existing path.
+// Without hard-link support, exclusive creation can expose empty or partially written content.
 function publishLock(lockPath, text, pid) {
   const temp = join(dirname(lockPath), `.arc-browser-tests.lock.tmp-${pid}-${randomUUID()}`);
   writeFileSync(temp, text, { flag: 'wx' });
@@ -104,14 +89,12 @@ function publishLock(lockPath, text, pid) {
     try {
       unlinkSync(temp);
     } catch {
-      // Already gone, or the link above moved past it.
+      // Ignore temporary-file cleanup errors.
     }
   }
 }
 
-// Links the retired file back onto lockPath, which fails instead of replacing anything a third
-// run has since published there. A plain rename back, the previous scheme, could silently
-// overwrite that fresh lock, which is exactly the race this restore exists to avoid.
+// Restore the retired file with a hard link that never replaces another run's lock.
 function restoreRetiredLock(retired, lockPath, { link = linkSync, write = writeFileSync } = {}) {
   try {
     link(retired, lockPath);
@@ -127,11 +110,8 @@ function restoreRetiredLock(retired, lockPath, { link = linkSync, write = writeF
       return;
     }
     if (error.code === 'EPERM' || error.code === 'ENOTSUP' || error.code === 'EXDEV') {
-      // The same filesystem constraint that sends publishLock to its exclusive-create fallback
-      // applies here too. A plain rename back would replace a lock a third run has since
-      // published at lockPath while that run is still using it; an exclusive create fails
-      // instead, the same outcome the EEXIST branch above reaches on a filesystem with hard
-      // links.
+      // Without hard-link support, exclusive creation also preserves an existing lock.
+      // A rename would overwrite it.
       let text;
       try {
         text = readFileSync(retired, 'utf8');
@@ -154,26 +134,12 @@ function restoreRetiredLock(retired, lockPath, { link = linkSync, write = writeF
   }
 }
 
-// Renames the lock aside so it stops answering to its own name, the same move that makes a
-// concurrent create possible. A rename off one path is atomic, so of two racers that both read
-// the same stale content, at most one lands here before the path is gone for the other, whose
-// rename then fails with ENOENT and takes over nothing.
-//
-// The remaining risk is a racer whose rename lands after the winner has already published a
-// fresh lock in the freed spot: its rename would move that fresh lock aside instead of the
-// stale one it meant to take. Comparing the file it actually took against the text it read
-// before acting catches the common two-racer case, because the two differ whenever a writer
-// landed in between, and this restores the file it took.
-//
-// A third racer publishing between that comparison and the restore can still make the restore
-// find its own path already occupied, in which case it gives up and leaves whatever record is
-// already there. That is a rare three-way race during stale-lock takeover, and it is the one
-// case in which this scheme's one-lane guarantee does not hold: a live holder's lock can end up
-// removed with a stranger's record standing in its place. Closing that window needs an
-// OS-level lock, which this scheme does not build.
-// Returns why the takeover did or did not happen, so a caller can tell an ordinary race
-// ('vanished', 'taken') from a rename that a lock this process should keep waiting on
-// ('busy'), instead of collapsing every non-takeover into one falsy result.
+// Rename the stale lock aside before publishing a replacement.
+// Concurrent renames of that path leave one winner and one ENOENT result.
+// A delayed rename can take a replacement lock. Compare its content with the earlier read and restore mismatches.
+// A third run can publish before restoration. Its lock then remains, but the displaced holder loses its lock.
+// This three-run race can allow multiple lanes. Preventing it requires an OS-level lock.
+// Return 'vanished' or 'taken' for races and 'busy' for a file that must wait before another attempt.
 function retireStaleLock(
   lockPath,
   expectedText,
@@ -212,11 +178,8 @@ function defaultScheduleHeartbeat(tick, milliseconds) {
   return timer;
 }
 
-// Refreshes the lock file's mtime while this process holds it, so a waiter's staleness check
-// tells a holder that is merely slow from one that is dead or hung. Checks ownership on every
-// tick instead of assuming it, so a lock this process no longer holds is never touched. Takes
-// the same clock the caller acquired the lock with, so a test can set the tick's time exactly
-// instead of racing the filesystem's write-time precision against `Date.now`'s millisecond one.
+// Refresh mtime only while this PID owns the lock.
+// The injected clock lets tests set heartbeat timestamps without depending on filesystem timestamp precision.
 function startHeartbeat(lockPath, pid, scheduleHeartbeat, heartbeatMs, now) {
   return scheduleHeartbeat(() => {
     try {
@@ -224,7 +187,7 @@ function startHeartbeat(lockPath, pid, scheduleHeartbeat, heartbeatMs, now) {
       const tickTime = new Date(now());
       utimesSync(lockPath, tickTime, tickTime);
     } catch {
-      // The lock is gone or unreadable. The next tick, or a waiter's own poll, will sort it out.
+      // Ignore heartbeat read and timestamp errors. Later ticks retry.
     }
   }, heartbeatMs);
 }
@@ -250,8 +213,7 @@ export async function acquireBrowserLock({
   const waitStartedAt = monotonicNow();
   const deadline = waitStartedAt + deadlineMs;
   while (true) {
-    // Built fresh on every attempt, so a lock this call ends up waiting on still carries the
-    // start time of the attempt that actually acquired it, not the moment the wait began.
+    // Refresh startedAt for each attempt so the acquired lock records acquisition time.
     const text = JSON.stringify({ pid, cwd, startedAt: new Date(now()).toISOString() });
     if (publishLock(lockPath, text, pid)) {
       if (announced) {
@@ -298,12 +260,8 @@ export async function acquireBrowserLock({
     );
     staleObservation = step.observation;
     if (step.stale) {
-      // A rename that fails because the lock vanished, or that wins or loses an ordinary race,
-      // means this process's view of the lock is already out of date: retry at once with a
-      // fresh read. A rename that fails because something else holds the file open (antivirus,
-      // an indexer, or a dead-PID lock owned by another user in a sticky /tmp) leaves the lock
-      // exactly as it was, so retrying at once would spin at full CPU until the deadline; fall
-      // through to the poll below instead, the same as an ordinary live, non-stale holder.
+      // Retry immediately after a race because the lock content has changed.
+      // EPERM, EACCES, and EBUSY leave the path in place. Poll instead of spinning until the deadline.
       const reason = retireStaleLock(lockPath, currentText, pid, { rename });
       if (reason !== 'busy') {
         staleObservation = null;
@@ -322,9 +280,8 @@ export async function acquireBrowserLock({
   }
 }
 
-// Windows does not tear down a process tree on a plain kill: the vitest child would die but its
-// headless browsers would not, which is exactly what the lock exists to bound. taskkill's /T
-// walks the tree; POSIX signals already propagate to a foreground child's own children.
+// Windows taskkill /T terminates the child process tree, including headless browsers.
+// If taskkill cannot launch, or on other platforms, send the signal to the child process.
 function killProcessTree(child, signal) {
   if (process.platform === 'win32' && child.pid) {
     const result = spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F']);
@@ -333,13 +290,9 @@ function killProcessTree(child, signal) {
   child.kill(signal);
 }
 
-// Ctrl+C on Windows delivers SIGINT to the child Vitest process directly, but the parent
-// running test.mjs also receives it. Left alone it would exit immediately and free the lock
-// while the child, and its headless browsers, are still shutting down. Forwarding the signal to
-// the child, waiting for it to close, and only then releasing the lock keeps the machine-wide
-// bound intact through a Ctrl+C the same way it holds through a normal run. A short hard
-// fallback still frees the lock if the child never closes, so a hung shutdown cannot wedge the
-// lock forever.
+// Both parent and child receive Ctrl+C on Windows.
+// Forward the signal and retain the lock until the child closes.
+// A deadline releases the lock and exits if shutdown hangs.
 export function forwardSignalToChildAndRelease(
   child,
   lock,
@@ -355,8 +308,7 @@ export function forwardSignalToChildAndRelease(
     cancelFallback = clearTimeout,
   } = {},
 ) {
-  // process.on('SIGINT', listener) calls listener with no argument, so each signal needs its
-  // own closure over its own name rather than reading it from the callback.
+  // Signal listeners receive no signal argument. Capture each signal name in its handler.
   let handled = false;
   const bound = Object.keys(SIGNAL_EXIT_CODES).map((signal) => {
     const handler = () => {
@@ -381,6 +333,5 @@ export function forwardSignalToChildAndRelease(
   };
 }
 
-// Exported for tests only, so a takeover race can be proven directly against the filesystem
-// instead of relying on two Node processes actually interleaving.
+// Expose takeover and stale-age helpers for deterministic tests.
 export const forTesting = { retireStaleLock, stepStaleObservation };

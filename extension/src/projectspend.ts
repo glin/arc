@@ -40,8 +40,7 @@ export interface UsageCounts {
   thinking: number;
 }
 
-// This deliberately mirrors the transcript boundary structurally. The index can therefore
-// be introduced before the Claude and Codex readers export their reducers.
+// Usage events carry request facts from transcript reducers into the spend index.
 export interface UsageEvent {
   timestamp: number;
   agent: string;
@@ -63,12 +62,9 @@ export interface UsageEvent {
   unclassifiedCacheWrite?: number;
   incomplete?: boolean;
   requestCountExact?: false;
-  // Adjacency facts, read in exact request order before a daily or lifetime bucket removes
-  // that order. None of them selects a bucket, so none of them can split one.
-  //
-  // The visible user turn this request ran under. Two requests with different values ran
-  // under different visible prompts. Null where the reducer establishes no visible turn,
-  // which keeps the request out of every adjacency answer rather than guessing one.
+  // Request-order facts do not select daily or lifetime buckets.
+  // The visible user turn identifies the prompt under which this request ran.
+  // Null excludes a request whose reducer establishes no visible turn from adjacency comparisons.
   visibleTurnId?: string | null;
   // The cache lifetime this request's own write bought, where the record names one. Null
   // where the record is silent, and the model's documented lifetime answers instead.
@@ -94,8 +90,7 @@ export interface ProjectUsageBucket {
   billingClass: 'metered' | 'subscription' | 'unknown';
   inferenceClass: 'in-region' | 'geo' | 'global' | 'bedrock-regional' | null;
   serviceTier: string | null;
-  // A null value means this bucket must be priced. A number is the sum reported by the
-  // provider for these requests, and must never be recomputed from a public rate.
+  // Sum of provider-reported costs for this bucket. Null means no reported amount.
   reportedCost: number | null;
   reportedCostBasis?: string | null;
   linkedSessionId?: string | null;
@@ -118,39 +113,39 @@ export interface SpendFileIndex {
   mtimeMs: number;
   // Byte position at the start of the unprocessed line, if there is one.
   offset: number;
-  // Kept serializable for diagnostics and old ledgers. trailingBytes is authoritative so
-  // an unfinished UTF-8 character is not decoded before its remaining bytes arrive.
+  // Readable trailing text supplies the fallback when trailingBytes is absent.
+  // trailingBytes stores the exact bytes behind this decoded text.
   trailing: string;
   trailingBytes?: string;
   buckets: ProjectUsageBucket[];
-  // Whole-file usage stays beside the rolling project-window buckets. Rail costs use it
-  // so selecting a session cannot replace a tail subtotal with a larger number.
-  // A missing or invalid value is derived again by the bounded background index.
+  // Lifetime buckets retain scanned usage for session figures.
+  // Session figures read these buckets without reparsing the selected timeline.
+  // Missing or invalid lifetime facts require a source rebuild.
   lifetimeBuckets?: ProjectUsageBucket[];
-  // Drawable turns in this one transcript. A number is available only after the reducer
-  // scanned the complete file revision. Null means this source's reducer has no turn model;
-  // undefined identifies a ledger written before turn counting was added and rebuilds once.
+  // Visible turn count for the bytes scanned, including an unfinished scan.
+  // Null means the reducer supplies no turn count.
+  // An absent field requires a source rebuild.
   turnCount?: number | null;
-  // How many compaction events this transcript holds, and the span from the first turn's
-  // start to the last turn's end (its own start while that turn is still open). Same null and
-  // undefined rules as turnCount: null means no turn model, undefined predates these fields.
+  // Compaction count, first turn start, and latest turn timestamp for the bytes scanned.
+  // The latest timestamp uses the turn start until Claude answers or Codex completes it.
+  // Null means the reducer supplies no value. An absent field requires a source rebuild.
   compactionCount?: number | null;
   firstTurnAt?: number | null;
   lastTurnAt?: number | null;
   newestTurnStartedAt?: number | null;
   outcome?: TurnOutcome | null;
-  // Cache-expiry returns and compaction facts, derived while this source's requests were
-  // still in order. Null means this source's reducer emits no ordered request identity;
-  // undefined identifies a ledger written before the derivation and rebuilds once.
+  // Cache-expiry and compaction facts derived in request order.
+  // Null means the reducer supplies no compaction-history method.
+  // An absent field requires a source rebuild.
   cacheExpiry?: CacheExpiryLedger | null;
-  // Reader behavior that produced this source's buckets and parser state. A mismatch
-  // rebuilds the source even when its size and modification time are unchanged.
+  // Parser generation that produced this source's buckets and state.
+  // A mismatch requires a rebuild even when size and modification time match.
   parserGeneration?: number;
   parserKind?: 'claude' | 'codex';
   indexedAt: number;
   parserState?: unknown;
-  // A false value means a byte or time budget stopped before the current revision was read.
-  // size and mtimeMs still name that target revision, while scanOffset resumes inside it.
+  // False means the scan stopped before the target size.
+  // size and mtimeMs identify the target revision. scanOffset resumes within it.
   complete?: boolean;
   scanOffset?: number;
   pendingBytes?: string;
@@ -163,27 +158,19 @@ export interface SpendLedger {
   // Resumable scan progress. A file part-way through a rescan appears here as its partial
   // record, so the next slice knows where to carry on.
   files: SpendFileIndex[];
-  // The display ledger the rail reads. This is not `files` filtered on `complete`. A file
-  // part-way through a rescan appears here as its last whole record, so the reader keeps a
-  // whole answer instead of a half-scanned one while the rescan runs. Rebuilding it by
-  // filtering `files` loses that record. `projectspend.test.ts` fixes the contract.
+  // Last complete records supply display figures while partial rescans advance in files.
+  // Filtering files by complete loses the previous complete record during a rescan.
   completeFiles: SpendFileIndex[];
 }
 
-// Figures for each session, drawn from the records its own sources name. A session's figures
-// are held against its source list and the record each source resolves to, so a transcript that
-// grows moves only the sessions that read it. A session reads every source listed under its id,
-// including a dispatched session's files listed under the session that dispatched it. The ledger
-// replaces a record that changes and never edits one in place, so the same record object reads
-// the same figures. `calculate` receives one session's records and sources, and must read
-// nothing else that can change except `pending`. `assemble` runs only when some session's
-// figures moved. `pending` says whether the ledger still holds a file, given its record, as
-// `spendSourceHeld` answers it. Only a session with a dispatched source that
-// `spendRecordAwaitsLedger` names consults it. Only such a session is figured again when its
-// answer moves.
-// The same record list, the same source list and the same normalization generation return the
-// held value without resolving any path. An invalidated path advances the generation, because
-// it can resolve to another record, so the next read resolves every source again.
+// Cache session figures by their source lists, record identities, and pending ownership.
+// Source changes recalculate only sessions that reference them, including dispatched sources.
+// Records retain their identity until the ledger replaces them.
+// calculate must depend only on its arguments and pending.
+// assemble runs only when a session's figures change.
+// Pending answers are watched only for dispatched sources that await the ledger.
+// Matching records, sources, and normalization generation reuse the cached value without resolving paths.
+// Invalidating a cached path advances the generation and forces source resolution.
 export class SessionFiguresCache<T, R> {
   private files: readonly SpendFileIndex[] | null = null;
   private sources: readonly SessionSpendSource[] | null = null;
@@ -276,14 +263,14 @@ export class SessionFiguresCache<T, R> {
     return this.value;
   }
 
-  // The answers the last read took. A read replaces the map and never edits it, so a caller can
-  // hold it as the answers one drawing used.
+  // The pending answers used by the last read.
+  // Each read replaces the map, so callers can retain the answers for one drawing.
   answers(): SpendPendingAnswers {
     return this.watched;
   }
 
-  // Whether `pending` now answers differently for a source in `since`, by default the answers
-  // the last read took. The next read then moves a figure that no file change moved.
+  // Whether a dispatched source's pending answer changed since the supplied read.
+  // This change invalidates figures even when no file changed.
   pendingMoved(pending: SpendSourcePending, since: SpendPendingAnswers = this.watched): boolean {
     for (const [file, { record, answer }] of since) {
       if (pending(file, record) !== answer) {
@@ -317,8 +304,7 @@ function spendRecordWhole(record: SpendFileIndex | undefined): record is SpendFi
   );
 }
 
-// A file the ledger read to its end while the file is still there, whose last line is not
-// finished yet. The session that writes it is still running, or it stopped mid-line.
+// A present file scanned to its end with an unfinished final line.
 function spendRecordWriting(record: SpendFileIndex | undefined): record is SpendFileIndex {
   return (
     !!record &&
@@ -329,9 +315,8 @@ function spendRecordWriting(record: SpendFileIndex | undefined): record is Spend
   );
 }
 
-// A file the ledger read whole while the file is still there, whose newest turn has not ended.
-// The session that writes it is still inside that turn, between two writes. A turn ends with a
-// final reply, an interruption, an error, or a recorded process end.
+// A present, fully scanned file whose newest turn remains open.
+// A final reply, interruption, error, or recorded process end closes the turn.
 function spendRecordRunning(record: SpendFileIndex | undefined): record is SpendFileIndex {
   const outcome = record?.outcome;
   return (
@@ -357,12 +342,9 @@ export type SpendSourcePending = (file: string, record: SpendFileIndex | undefin
 // it asked about.
 export type SpendPendingAnswers = ReadonlyMap<string, { record: SpendFileIndex | undefined; answer: boolean }>;
 
-// Whether the ledger still holds a dispatched source, given its record, whether the ledger
-// queues it, and the history limit. A queued source is held. A source whose last line is
-// unfinished, or whose session is still inside a turn, is held while its last write falls
-// inside the history limit. Nothing else is held, because the history limit skipped it or its
-// file is gone. Nothing reads a source past the history limit again, so an unfinished last line
-// there stays unfinished.
+// A queued dispatched source remains held.
+// An unfinished line or open turn holds a present source while its last write meets the history cutoff.
+// Other sources release their hold, including absent files and sources outside the history limit.
 export function spendSourceHeld(record: SpendFileIndex | undefined, queued: boolean, cutoff: number | null): boolean {
   return (
     queued ||
@@ -437,8 +419,8 @@ export const PROJECT_SPEND_SAVE_RETRIES = 5;
 export function projectSpendSaveRetryDelay(retries: number): number | null {
   return retries < PROJECT_SPEND_SAVE_RETRIES ? PROJECT_SPEND_SAVE_RETRY_MS * 2 ** retries : null;
 }
-// The generation of a stored spend record. A record from another generation is read again, so
-// raise this whenever a stored field changes what a reader of the record may conclude from it.
+// Saved source records require a rebuild when their parser generation differs.
+// Increase this when a stored field changes the conclusions consumers draw from it.
 export const PROJECT_SPEND_PARSER_GENERATION = 37;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
@@ -460,9 +442,8 @@ export interface SpendSourceRevision {
   mtimeMs: number;
 }
 
-// What one offer does with a source. A file that last changed before the cutoff holds no
-// request after it, so indexing skips it and leaves its saved record as it is. `revision`
-// is undefined when the offer read no file facts, and null when the file is gone.
+// Skip files last modified before the cutoff and retain their saved records.
+// An undefined revision means no file facts were read. Null means the file is absent.
 export function projectSpendOfferDecision(
   previous: SpendFileIndex | undefined,
   revision: SpendSourceRevision | null | undefined,
@@ -504,8 +485,8 @@ export type UsageReducerFactory<State = unknown> = (state: State | undefined) =>
 
 export interface IndexSpendFileResult {
   record: SpendFileIndex;
-  // True only when the raw totals changed. State can move forward on an unfinished line
-  // without changing a displayed total, so callers that persist the ledger need stateChanged.
+  // Whether usage buckets or derived lifetime facts changed.
+  // Callers that persist parser progress also need stateChanged.
   totalsChanged: boolean;
   stateChanged: boolean;
   changed: boolean;
@@ -756,8 +737,7 @@ export function normalizeWorkspace(workspace: string): string {
 }
 
 const canonicalPaths = new Map<string, string>();
-// Advances whenever a held canonical path is dropped, because the next resolution of that path
-// can name another file.
+// Invalidate figure caches when dropping a resolved path allows it to name another file.
 let spendFileNormalizationGeneration = 0;
 
 function canonicalPath(file: string): string {
@@ -902,13 +882,11 @@ export function aggregateUsageEvents(
 
 // # Cache expiry and compaction, derived in exact request order
 //
-// A daily or lifetime bucket answers what a day cost. It cannot answer what happened between
-// two requests, because it has already merged them. These types are filled during the scan,
-// while the reducer still emits one event per request in the order the source recorded them.
-//
-// Nothing here claims that waiting caused cost. It reports the input a request paid for after
-// its predecessor's cache had certainly expired. Fresh prompt text and cache-key changes the
-// record does not carry both move that figure, so the claim stops at what was observed.
+// Daily and lifetime buckets combine requests and discard their adjacency.
+// Derive these facts while the reducer still emits requests in source order.
+// The figures report input cost after a preceding request's cache expired.
+// Fresh prompt text and unrecorded cache-key changes also affect that cost.
+// The figures do not attribute the cost to waiting.
 
 // One qualifying return, kept in the shape the cost resolver already quotes.
 export interface CacheExpiryReturn {
@@ -931,12 +909,11 @@ export interface CacheExpiryFacts {
   truncated: boolean;
   // The longest qualifying gap, in milliseconds.
   longestGapMs: number | null;
-  // Adjacent requests that crossed a lifetime with a compaction, a model change, a provider
-  // change, a service-tier change, or an inference-geo change between them. The record cannot
-  // separate an idle gap from those, so they are counted here and never added to `counts`.
+  // Expired-cache pairs excluded for changed compaction count, model, provider, service tier, inference region, effort, or tool-list version.
+  // Unknown effort or tool-list version does not establish a change.
   excluded: number;
-  // Adjacent requests the record cannot answer at all: an unknown lifetime, a missing or
-  // out-of-order clock, an incomplete request, or a request under no visible turn.
+  // Pairs with unknown lifetime, invalid or out-of-order clocks, incomplete requests, or no visible turn.
+  // Delayed requests older than the current carry also count here.
   unavailable: number;
 }
 
@@ -1040,8 +1017,7 @@ export function requestCacheLifetime(
   return recorded ?? cacheLifetimeFor(model, provider);
 }
 
-// Classify one adjacent pair of primary requests. Pure, so each gate below is testable on its
-// own, and so the nominal lifetime stays the only clock this comparison ever uses.
+// Classify adjacent primary requests using the preceding request's cache lifetime.
 export function classifyCacheExpiry(
   previous: CacheExpiryCarry,
   next: CacheExpiryCarry,
@@ -1050,8 +1026,7 @@ export function classifyCacheExpiry(
   if (previous.visibleTurnId === null || next.visibleTurnId === null) {
     return { kind: 'unavailable' };
   }
-  // A long tool run inside one visible turn is not a reader who walked away. The next request
-  // there follows the same prompt, so no new prompt ever paid for a cold cache.
+  // Requests under the same visible prompt do not qualify as a return after cache expiry.
   if (previous.visibleTurnId === next.visibleTurnId) {
     return { kind: 'none' };
   }
@@ -1185,11 +1160,8 @@ export class CacheExpiryScan {
       return;
     }
     const next = carryFor(event);
-    // Codex holds a request whose model is not yet named, and releases it when a later record
-    // names one. That release can arrive after requests which ran after it, and its own clock
-    // says so. Such a pair cannot be judged, and the newest request has to stay the one the
-    // next comparison measures from. Taking the released request as the carry would measure a
-    // later request's gap from the wrong predecessor and report an expiry that never happened.
+    // A delayed request can arrive after newer requests when its model becomes known.
+    // Keep the newest request as the carry so later gaps use the correct predecessor.
     if (
       this.carry &&
       positiveClock(this.carry.timestamp) &&
@@ -1307,15 +1279,10 @@ export class CacheExpiryScan {
     }
   }
 
-  // The ledger for this source. `recorded` is the reducer's newest-compaction window, each
-  // entry naming its own ordinal, so the window needs no separate total to be read against.
-  // A compaction whose record carried no usable clock takes an entry with a null time, and
-  // therefore cannot shift another compaction's time onto itself.
-  //
-  // A fact is normally opened by the first request after its compaction. A compaction that
-  // ends a session has no such request, so this opens one for every recorded compaction the
-  // requests did not reach. The reader still gets its time, the context before it, and a
-  // later-request count of zero, rather than no evidence that it happened.
+  // Match recent compaction records to their derived facts by ordinal.
+  // Missing clocks remain null and cannot shift another compaction's timestamp.
+  // Open facts for trailing compactions that no later request reached.
+  // These facts retain their time and preceding context, with zero later requests.
   ledger(recorded: readonly ReducerCompaction[]): CacheExpiryLedger {
     const reached = this.carry?.compactionsBefore ?? 0;
     for (const item of recorded) {
@@ -1351,9 +1318,8 @@ export class CacheExpiryScan {
   }
 }
 
-// The input a cache-expiry return paid for again: ordinary uncached input and the cache write
-// it had to make a second time. A cache it still read was never lost, so its cost is not part
-// of this figure, and an answer is not input.
+// Input cost after cache expiry includes uncached input and cache writes.
+// Exclude cache reads, output, and thinking.
 export function cacheExpiryInputUsage(request: ProjectUsageBucket): ProjectUsageBucket {
   return {
     ...request,
@@ -1375,11 +1341,9 @@ export interface CacheExpiryInputCost {
   status: 'exact' | 'atLeast' | 'unknown';
 }
 
-// What the qualifying returns spent on input after expiry.
-//
-// A row the provider priced as a whole cannot be split into its input side, so it leaves the
-// figure a lower bound rather than being estimated at a list rate it was not billed at. A
-// truncated list does the same.
+// Price the input usage of recorded cache-expiry returns.
+// Incomplete requests, reported whole-request costs, missing prices, and truncated facts make the result partial.
+// Return an unknown cost when no request can be priced, unless the complete return list is empty.
 export function cacheExpiryInputCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryInputCost {
   let dollars = 0;
   let priced = 0;
@@ -1503,8 +1467,7 @@ function readIncremental(
         target.delete(key);
       }
     };
-    // The ordered pass runs before either bucket takes the event, because a bucket has
-    // already merged the adjacency this reads.
+    // Track request order before bucket aggregation removes adjacency.
     const ordered = reducer.recentCompactions ? new CacheExpiryScan(cacheExpiry ?? undefined) : null;
     // Lifetime buckets include estimated compactions. Dated buckets contain recorded requests.
     const add = (event: UsageEvent) => {
@@ -1578,8 +1541,8 @@ function readIncremental(
   }
 }
 
-// Index one file revision. A reducer snapshot always describes exactly the complete lines
-// before offset, so an unfinished line can safely be read again after it is completed.
+// Index one file revision within the byte and time budgets.
+// The saved reducer state covers complete lines before offset. Resume unfinished lines after their remaining bytes arrive.
 export function indexSpendFile<State>(
   previous: SpendFileIndex | undefined,
   file: string,
@@ -1772,9 +1735,8 @@ function ledgerFile(storageDirectory: string, workspace: string): string {
   return path.join(storageDirectory, `${partition}.json`);
 }
 
-// The workspace path that names a project spend ledger. A single-folder window uses its folder.
-// A multi-root window uses a path under the first folder's root, named by the prefix and a digest
-// of every folder.
+// Use the single folder as the project spend workspace path.
+// A multi-root window uses the first folder's filesystem root and a digest of all normalized, sorted folder paths.
 export function projectSpendWorkspace(folders: readonly string[], multiRootPrefix: string): string {
   if (folders.length <= 1) {
     return folders[0] ?? '';
@@ -1791,8 +1753,8 @@ function usableSpendRecord(record: unknown): record is SpendFileIndex {
   return !!candidate && typeof candidate.file === 'string' && Array.isArray(candidate.buckets);
 }
 
-// A completed scan's offset follows its last newline. NULs after that newline
-// contain no JSONL record, including in ledgers saved by an older reader.
+// Advance completed scans past trailing NUL padding.
+// Padding contains no JSONL record and must follow at least one complete line.
 function consumeSpendPadding(record: SpendFileIndex): SpendFileIndex {
   if (record.complete === false || record.offset === 0 || record.size <= record.offset) {
     return record;
@@ -1858,9 +1820,7 @@ export function saveSpendLedger(
     const { pendingBytes: _pendingBytes, trailingBytes: _trailingBytes, ...rest } = bounded;
     return { ...rest, scanOffset: bounded.offset, trailing: '' };
   };
-  // Each written array must hold one entry for each record and nothing else. `Array.from`
-  // visits a gap in the caller's array, which `map` would skip and leave as a gap in the
-  // text as well. An unusable entry is dropped, as the load drops one.
+  // Array.from exposes sparse entries so filtering drops holes and unusable records before serialization.
   const present = Array.from(files).filter(usableSpendRecord);
   const shown = Array.from(completeFiles).filter(usableSpendRecord);
   const saved = present.map(checkpoint);
@@ -1876,9 +1836,8 @@ export function saveSpendLedger(
       samePath.set(normalizedFile, at);
     }
   });
-  // The display ledger repeats a record of `files` for every file that is not part-way
-  // through a rescan, which is nearly all of them. An index stands for the repeat, and a
-  // record is written out in full only where the two arrays differ.
+  // Store display records as indexes when they match files by identity or by normalized path and serialized content.
+  // Write differing records in full.
   const display = shown.map((record) => {
     const shared = sameRecord.get(record);
     if (shared !== undefined) {
@@ -2009,8 +1968,7 @@ function displayWindow(
   truncated = false,
 ): ProjectSpendWindow {
   const unpriced = total.partial || incomplete;
-  // A window that starts before the history limit counts every indexed request it holds, so
-  // its known amount is a lower bound rather than an unknown.
+  // A truncated window marks a known amount as a lower bound.
   const partial = unpriced || truncated;
   const hasKnownActivity = total.activity || incomplete;
   const dollars =
@@ -2167,16 +2125,16 @@ export interface SessionSpendSource {
   sessionId: string;
   file: string;
   primary?: boolean;
-  // The dispatched session whose own source this is, on a source added to the session that
-  // dispatched it.
+  // Dispatched session whose own source was propagated to an ancestor.
+  // The receiving session does not need to be its direct dispatcher.
   dispatchedFrom?: string;
-  // On a source added to a session above a dispatched session, the topmost dispatched session on
-  // the chain below the receiving session. A subagent on the chain is never the key, so every
-  // source that a subagent's dispatched session brings, its own dispatches included, carries
-  // that session's id.
+  // Dispatched session id used to group this source at a receiving ancestor.
+  // A dispatch edge updates this id. A native subagent edge keeps it.
+  // Nested dispatched sources share the first dispatched session below that ancestor.
+  // The id never names a native subagent on the chain.
   dispatchedVia?: string;
-  // On a source added to a session above a dispatched session, marks the dispatched session's
-  // own primary transcript.
+  // Marks the dispatched session's primary transcript among its propagated sources.
+  // Only sources marked primary, or with primary omitted, receive this flag.
   dispatchedPrimary?: true;
 }
 
@@ -2267,12 +2225,9 @@ function uniqueFiles(files: readonly string[]): string[] {
   });
 }
 
-// The positions of the items below each ancestor, in item order. An item hangs from its parent
-// id. The last item with an id decides the parent of that id. A chain ends at an empty parent,
-// at an id no item holds, or at the first id it reaches twice.
-//
-// The answer walks the tree downward from the ancestor, so its cost follows the size of the
-// answer and not the number of items times the depth of every chain.
+// Return descendant item positions in input order.
+// The last item for each id supplies its parent link. Visit each id once to stop cycles.
+// Cache each ancestor's result after traversing its reachable descendants.
 function descendantPositions<T>(
   items: readonly T[],
   idOf: (item: T) => string,
@@ -2332,8 +2287,7 @@ export interface SubagentDirectoryReader {
   files(directory: string): readonly string[];
 }
 
-// Null when the directory cannot be read. Child sources can disappear between discovery passes,
-// and read access can be denied for a while.
+// Return null when the subagent directory cannot be read.
 function readSubagentFiles(directory: string): string[] | null {
   try {
     return fs
@@ -2353,10 +2307,8 @@ function subagentDirectoryOf(parent: SpendSessionFile): string {
   return path.join(path.dirname(parent.file), parent.sessionId, 'subagents');
 }
 
-// A directory listing changes the directory modification time, so an unchanged time means an
-// unchanged list of subagent transcripts. A time younger than the settle window is read again
-// on the next pass, because a file system with a coarse clock can add a file inside the same
-// tick as the listing.
+// Wait for directory modification times to settle before caching listings.
+// A coarse filesystem clock assigns one timestamp to changes within the same clock tick.
 export const SUBAGENT_DIRECTORY_SETTLE_MS = 2_000;
 
 export class SubagentDirectoryCache implements SubagentDirectoryReader {
@@ -2368,8 +2320,7 @@ export class SubagentDirectoryCache implements SubagentDirectoryReader {
     private readonly now: () => number = Date.now,
   ) {}
 
-  // Forgets every directory that no call to `files` named since the last sweep, so a directory
-  // that left the scope is not held for the life of the cache.
+  // Discard cached directories that files has not visited since the previous sweep.
   sweep(): void {
     for (const directory of [...this.entries.keys()]) {
       if (!this.listed.has(directory)) {
@@ -2396,7 +2347,7 @@ export class SubagentDirectoryCache implements SubagentDirectoryReader {
       return held.files;
     }
     const files = this.read(directory);
-    // A failed read is not held. Read access can return without moving the directory time.
+    // Do not cache failed reads. Restored access does not require a directory timestamp change.
     if (files && this.now() - stat.mtimeMs >= SUBAGENT_DIRECTORY_SETTLE_MS) {
       this.entries.set(directory, { mtimeMs: stat.mtimeMs, files });
     } else {
@@ -2452,19 +2403,8 @@ export function discoverClaudeSessionSpendSources(
   return sources;
 }
 
-// A Claude subagent transcript is the one Claude spend source that must be read as a child.
-// The directory holding it says so. A record re-offered from the saved ledger carries no role
-// of its own. A child read as a parent counts none of its records, because every one is a
-// sidechain. The file is then saved complete and empty, and never read again.
-//
-// Windows lowercases a saved path and the other platforms keep its case, so this compares the
-// name in one case. The ledger also resolves a path through its links, so a linked subagents
-// directory reads as a parent. A Codex record reaches this too, and its reducer takes no role.
-// The reader that produced a saved record. A Claude transcript never counts a Codex request,
-// and a Codex rollout that ran an embedded Claude invocation counts both, so one Codex bucket
-// anywhere in the record names the file. The lifetime list is read rather than the windowed
-// one, because a windowed list can lose its Codex days and change the answer for a record
-// nothing has touched.
+// Use the persisted parser kind when available.
+// Otherwise, infer Codex from any Codex lifetime bucket, falling back to windowed buckets for older records.
 export function spendRecordAgent(record: SpendFileIndex): 'claude' | 'codex' {
   if (record.parserKind) {
     return record.parserKind;
@@ -2507,18 +2447,10 @@ export function discoverCodexSessionSpendSources(
   return out;
 }
 
-// The sources again, with every source of a dispatched session added to the session that
-// dispatched it as delegated work, and to each session above that one in turn. Each added
-// source names the dispatched session it came from and the topmost dispatched session on the
-// chain below the receiving session, so a turn card can group the sources by the session the
-// turn started. `parents`
-// maps a dispatched session id to its dispatcher's. `delegators` maps a native subagent id to
-// the session that started it, so a session a subagent dispatched reaches the subagent's own
-// parent too. A subagent's own transcript already counts there, so that edge adds nothing
-// else. The child keeps its own sources, so its heading still counts them, and a file a
-// session already holds is not added twice. Project spend reads its own source list, so this
-// changes no project total. Only the sessions on a dispatched session's chain have their
-// paths resolved, because resolving a path can read the filesystem.
+// Add each dispatched session's sources to its ancestors as delegated work.
+// Keep the child's sources and deduplicate ancestor sources by file.
+// parents supplies dispatch edges. delegators supplies native subagent edges without adding the subagent's own sources.
+// Only resolve paths for sessions on a dispatch chain.
 export function withDispatchedSpendSources(
   sources: readonly SessionSpendSource[],
   parents: ReadonlyMap<string, string>,
@@ -2587,11 +2519,8 @@ export interface SessionSpendDiscovery {
   codex: typeof discoverCodexSessionSpendSources;
 }
 
-// The spend sources of every listed session, built again only when a listed file, a Claude
-// source, a parent link, or the subagent listing of a Claude child changed. The comparison
-// ignores input order, because a walk lists sessions by file time and a later pass lists them
-// by recorded activity. `revision` moves only when the sources themselves changed, so a walk
-// that finds the same files does not offer every source again.
+// Caches spend sources by sorted session, parent, and child-listing facts.
+// Input order does not affect the key. revision changes only when the resulting sources change.
 export class SessionSpendSourceIndex {
   private key: string | null = null;
   private print = '';
@@ -2701,21 +2630,21 @@ export class SessionSpendSourceIndex {
   }
 }
 
-// Persisted record paths are canonical by contract. Most live sources therefore match
-// lexically and need no filesystem read. Only an alias or a new source needs realpath.
+// Reuse normalized record keys without resolving filesystem links.
+// Resolve aliases and sources absent from the record map through normalizeSpendFile.
 function spendSourceKey<T>(file: string, records: ReadonlyMap<string, T>): string {
   const lexical = normalizeWorkspace(file);
   return records.has(lexical) ? lexical : normalizeSpendFile(file);
 }
 
-// A session keeps safe lifetime usage while required sources remain incomplete.
-// A dispatched session has a figure of its own and can run long after the session that
-// dispatched it stopped. Its sources therefore join the parent's figure once they are all
-// whole, and they never hold back the parent's own figure. Until then `awaiting` receives the
-// parent's id, because its figure is a lower bound. A dispatched source the ledger has not read
-// whole, whose last line is unfinished, or whose session is still inside a turn, waits only
-// while `pending` says the ledger still holds it. Otherwise the history limit skipped it or its
-// file is gone. It then adds the usage its record holds, if any, and marks nothing.
+// Session figures include complete lifetime buckets from their own sources.
+// Dispatched groups join when every waiting source clears the ledger's pending check.
+// An unread source, unfinished line, unresolved ownership, or open turn holds its group while pending.
+// Missing or history-limited sources join with their available records.
+// Incomplete buckets contribute no usage, even after pending clears.
+// awaiting receives the session id when its main or delegated usage is incomplete.
+// The output flags distinguish main usage from delegated usage.
+// Dispatched readiness never blocks the session's own sources.
 export function sessionSpendPartsBySession(
   files: readonly SpendFileIndex[],
   sources: readonly SessionSpendSource[],
@@ -2752,8 +2681,8 @@ export function sessionSpendPartsBySession(
         coverage.delegated = true;
       }
     }
-    // Incomplete buckets retain neither proven ownership nor complete usage. Their
-    // counters cannot establish a safe lower bound, including horizon-evicted requests.
+    // Exclude incomplete buckets from lifetime parts and mark their coverage incomplete.
+    // Their counters do not establish a lower bound.
     for (const file of found) {
       for (const part of spendPartsOf([file])) {
         if (!part.bucket.incomplete) continue;
@@ -2782,21 +2711,17 @@ export function sessionSpendPartsBySession(
   return out;
 }
 
-// What a dispatched session adds to a session above it, from the sources that reached that
-// session through it. `parts` holds the lifetime parts of each group that is ready, by the
-// dispatched session the group came from. `short` says that a group waits, so the parts are a
-// lower bound. `own` names the dispatched session's own primary transcript, its record and the
-// parts it holds, the same objects `parts` lists, when the group that holds it is ready.
+// Lifetime usage a dispatched session contributes to an ancestor.
+// parts groups ready usage by dispatchedFrom. short marks a group still awaiting ledger work.
+// own identifies the dispatchedVia session's primary source when its group is ready.
 export interface DispatchedSpendContribution {
   parts: Record<string, SessionSpendPart[]>;
   short: boolean;
   own?: { file: string; record: SpendFileIndex | undefined; parts: SessionSpendPart[] };
 }
 
-// For each receiving session and each dispatched session it reached a source through, as
-// `dispatchedVia` names it, that session's contribution. Each group waits by the rule the
-// session total applies to it, so the turn figure and the session total cannot disagree about
-// which groups have joined.
+// Group contributions by receiving session and dispatchedVia.
+// Use readyDispatchedFiles for the same admission decision as sessionSpendPartsBySession.
 export function dispatchedSpendPartsBySession(
   files: readonly SpendFileIndex[],
   sources: readonly SessionSpendSource[],
@@ -2847,8 +2772,8 @@ interface GroupedSpendFile {
   primary: boolean;
 }
 
-// The sources by `keyOf`, then by the dispatched session a group of files came from ('' for the
-// session's own), with each file in its record key form, its record, and whether it is primary.
+// Group sources by keyOf, then dispatchedFrom, using an empty key for the session's own sources.
+// Resolve each file's record key and combine its primary flags.
 function groupedSpendSources(
   sources: readonly SessionSpendSource[],
   records: ReadonlyMap<string, SpendFileIndex>,
@@ -2878,10 +2803,9 @@ function groupedSpendSources(
   );
 }
 
-// The files of one dispatched group that join the session above it, or null while the group
-// waits. A group waits while any of its files waits: the ledger still holds it, and it has not
-// read it whole, its last line is unfinished, or its session is still inside a turn. A ready
-// group adds the files that have a record.
+// Return recorded files when no source awaits pending ledger work.
+// Return null while any source waits, including unfinished lines, unresolved ownership, or an open turn.
+// Sources without records wait only while pending includes them.
 function readyDispatchedFiles(
   files: readonly GroupedSpendFile[],
   pending: SpendSourcePending,
@@ -2924,10 +2848,8 @@ export function sessionSpendBySession(
   );
 }
 
-// The lifetime turn figures a session heading and its rail card share: how many turns
-// the primary transcript drew, how many compactions it held, and the span from the first
-// turn's start to the last turn's end. Read only from a complete, fully-scanned primary
-// source, so a rescan never overwrites a whole answer with a partial one.
+// Lifetime turn counts, compaction counts, and first-start to last-end timestamps from one primary source.
+// Publish only complete sources with no unfinished line and a nonnegative safe-integer turn count.
 export interface SessionTurnStats {
   turnCount: number;
   compactionCount: number | null;
@@ -2977,9 +2899,8 @@ export function sessionTurnStatsBySession(
   return out;
 }
 
-// The cache-expiry and compaction evidence for one session, read under exactly the rule
-// `sessionTurnStatsBySession` uses: one complete, fully scanned primary source and nothing
-// else. A session whose source cannot answer is absent rather than reported as zero.
+// Cache-expiry and compaction facts from one complete primary source with no unfinished line.
+// Omit sessions whose primary source is missing, ambiguous, or lacks a cache-expiry ledger.
 export interface SessionCacheFacts {
   expiry: CacheExpiryFacts;
   compactions: CompactionFact[];

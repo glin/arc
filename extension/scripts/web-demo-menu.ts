@@ -1,7 +1,5 @@
-// A stand-in for the editor's native context menu, for the README captures and the web demo.
-// The entries, their titles, their order and their `when` clauses come from the extension's
-// own manifest, and the context each clause reads comes from the `data-vscode-context` the
-// production panel writes. Only the drawing belongs to this file.
+// Draw the editor context menu stand-in for README captures and the web demo.
+// Menu entries come from the manifest. Their context comes from the production panel's data-vscode-context.
 
 export interface MenuEntry {
   command: string;
@@ -19,7 +17,7 @@ interface Manifest {
   };
 }
 
-// The commands the web demo answers in page memory.
+// Commands offered by the demo menu, including host actions that the adapter leaves inactive.
 export const DEMO_MENU_COMMANDS: ReadonlySet<string> = new Set([
   'arc.pinSession',
   'arc.unpinSession',
@@ -41,8 +39,7 @@ export const DEMO_MENU_COMMANDS: ReadonlySet<string> = new Set([
   'arc.sendResponseLink',
 ]);
 
-// Every entry's `when` clause is read here, including the entries the caller leaves out, so a
-// clause outside the grammar `whenHolds` reads stops the build instead of drawing a wrong menu.
+// Validate every manifest when clause, including excluded entries. Unsupported grammar stops the build.
 export function manifestMenu(manifest: Manifest, commands?: ReadonlySet<string>): MenuEntry[] {
   const titles = new Map(manifest.contributes.commands.map((command) => [command.command, command.title]));
   const entries = manifest.contributes.menus['webview/context'] ?? [];
@@ -57,9 +54,8 @@ export function manifestMenu(manifest: Manifest, commands?: ReadonlySet<string>)
     }));
 }
 
-// The subset of the editor's `when` grammar the manifest uses: keys, `==`, `!=`, `!`, `&&`,
-// `||`, parentheses, and quoted or bare values. Any other operator, such as `in`, `=~`, `<`,
-// or `>=`, and any token left over throws, naming the clause.
+// Read keys, ==, !=, !, &&, ||, parentheses, and quoted or bare values in when clauses.
+// Reject other operators and leftover tokens.
 export function whenHolds(expression: string, context: MenuContext): boolean {
   if (!expression.trim()) return true;
   const fail = (reason: string): never => {
@@ -119,8 +115,7 @@ export function whenHolds(expression: string, context: MenuContext): boolean {
   return result;
 }
 
-// The entries a context shows, in the editor's order: `navigation` first, then groups by
-// name, then entries by the number after `@`.
+// Group visible entries in editor order: navigation, other group names, then each entry's number after @.
 export function menuGroups(entries: readonly MenuEntry[], context: MenuContext): MenuEntry[][] {
   const groups = new Map<string, { order: number; entry: MenuEntry }[]>();
   for (const entry of entries) {
@@ -140,7 +135,7 @@ export function menuGroups(entries: readonly MenuEntry[], context: MenuContext):
     );
 }
 
-// Every `data-vscode-context` from the element up to the root, the nearest one winning.
+// Combine ancestor data-vscode-context values. The nearest element wins.
 export function contextAt(node: Element | null): MenuContext {
   const chain: MenuContext[] = [];
   for (let at = node; at; at = at.parentElement) {
@@ -149,14 +144,13 @@ export function contextAt(node: Element | null): MenuContext {
     try {
       chain.push(JSON.parse(raw) as MenuContext);
     } catch {
-      // A context that does not parse adds nothing, as in the editor.
+      // Ignore context that does not parse as JSON.
     }
   }
   return Object.assign({}, ...chain.reverse()) as MenuContext;
 }
 
-// Opens the menu for each right-click, `Shift+F10`, or synthetic `contextmenu` event whose
-// context shows at least one entry. Anything else keeps the browser's menu.
+// Open for contextmenu events with visible entries. Otherwise, keep the browser menu.
 export function installMenu(
   document: Document,
   entries: readonly MenuEntry[],

@@ -1,4 +1,4 @@
-// extension/src/temproot.ts
+// Test scratch directory helpers.
 // Test-only scratch directories. Every directory sits under one root per test file, and the
 // file removes its root when its suite ends. The root sits in the run directory that
 // extension/test/temp-run.ts creates, so a worker that dies first leaves its root for the

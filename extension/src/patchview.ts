@@ -1,16 +1,10 @@
 import { applyPatch } from 'diff';
 import { patchMarkersAreValid, type EditRecord } from './transcript';
 
-// Builds the two sides of one file's diff for a single turn, out of what the transcript
-// recorded and nothing else.
-//
-// The after side is never read from the file on disk. The file has moved on since the turn
-// ran: later turns, the user, a formatter or a parallel agent may all have written to it,
-// and none of that belongs to this turn. Reading it would put a confident wrong answer on
-// screen, so both sides come from the recorded text, and the caller is told which of the
-// two routes produced them.
+// Build both sides of a per-turn file diff from recorded text.
+// Never read the after side from the live file. Later edits belong to other turns.
 
-// Whether the two sides are the whole files or only the changed regions.
+// Whether the diff contains whole files or only changed regions.
 export type DiffSource = 'recorded' | 'hunks';
 
 export interface FileSides {
@@ -19,8 +13,7 @@ export interface FileSides {
   source: DiffSource;
 }
 
-// The header the hunks route puts above each region, naming the lines it covers, in the
-// shape a unified diff writes it.
+// Format a changed region's line ranges as a unified diff header.
 function hunkHeader(hunk: { oldStart: number; oldLines: number; newStart: number; newLines: number }): string {
   return `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`;
 }
@@ -88,8 +81,7 @@ function patchFitsRecordedText(text: string, hunks: EditRecord['hunks']): boolea
   return true;
 }
 
-// Both whole files, when the records carry enough to rebuild them, or null when they do
-// not and the caller has to fall back.
+// Rebuild whole files from recorded edits. Return null when recorded text cannot establish both sides.
 function wholeFiles(edits: EditRecord[]): FileSides | null {
   const first = edits[0];
   let text: string;
@@ -102,7 +94,7 @@ function wholeFiles(edits: EditRecord[]): FileSides | null {
   }
   const before = text;
   for (const record of edits) {
-    // A Write records the whole after side, so it replaces the running text outright.
+    // A Write records the complete after side and replaces the accumulated text.
     if (typeof record.content === 'string') {
       text = record.content;
       continue;
@@ -116,12 +108,11 @@ function wholeFiles(edits: EditRecord[]): FileSides | null {
     if (!patchFitsRecordedText(text, record.hunks)) {
       return null;
     }
-    // A copy, because `applyPatch` writes an offset onto each hunk it is handed and these
-    // hunks belong to the parsed transcript the panel keeps.
+    // Copy hunks because applyPatch writes offsets onto them.
+    // Preserve the hunks retained in the parsed transcript.
     const hunks = record.hunks.map((h) => ({ ...h, offset: 0 }));
     const applied = applyPatch(text, { hunks });
-    // The patch does not fit the text it was recorded against, so the whole-file answer
-    // would be wrong rather than merely partial. This fires on real recorded data.
+    // Reject failed patches and offset matches. Neither establishes an exact whole-file result.
     if (applied === false || hunks.some((hunk) => hunk.offset !== 0)) {
       return null;
     }
@@ -130,8 +121,8 @@ function wholeFiles(edits: EditRecord[]): FileSides | null {
   return { before, after: text, source: 'recorded' };
 }
 
-// Only the regions the turn changed, each under a header naming its line range. Both sides
-// are text the transcript recorded, so neither claims to be the whole file.
+// Build each changed region under its line-range header.
+// Both sides contain recorded text without claiming whole-file coverage.
 function changedRegions(edits: EditRecord[]): FileSides {
   const before: string[] = [];
   const after: string[] = [];
@@ -141,10 +132,8 @@ function changedRegions(edits: EditRecord[]): FileSides {
       before.push(header);
       after.push(header);
       for (const line of hunk.lines) {
-        // The first character says which side the line belongs to, so an entry carrying
-        // none of the three reaches neither side. That is what keeps the patch's
-        // "\ No newline at end of file" note, which describes the file rather than being a
-        // line of it, out of the text on both sides, and an empty entry out of it too.
+        // Include only context, removed, and added lines.
+        // Exclude empty entries and the "No newline at end of file" marker from both sides.
         const text = line.slice(1);
         if (line.startsWith(' ') || line.startsWith('-')) {
           before.push(text);
@@ -158,8 +147,8 @@ function changedRegions(edits: EditRecord[]): FileSides {
   return { before: before.join('\n'), after: after.join('\n'), source: 'hunks' };
 }
 
-// The before and after sides of one file, from every edit the turn made to it, in order.
-// Whole files when the records carry them, the changed regions alone otherwise.
+// Build both sides from this turn's ordered file edits.
+// Use whole files when available and changed regions otherwise.
 export function sidesFor(edits: EditRecord[]): FileSides {
   if (!edits.length) {
     return { before: '', after: '', source: 'hunks' };

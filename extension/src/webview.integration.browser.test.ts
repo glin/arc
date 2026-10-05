@@ -253,10 +253,8 @@ function countedListenerPageHtml(bodyClass = 'vscode-dark'): string {
     );
 }
 
-// The panel counts a full draw itself, through `onDraw`. A session-count-dependent loop can
-// sit anywhere between a message and the one draw that should follow it.
-// Reading the page's own DOM cannot tell a batched update from one row redrawn a thousand
-// times the same way. Both leave the same rows on screen when they finish.
+// Count onDraw calls because repeated full draws can produce the same final DOM as a batched update.
+
 function drawCountedPageHtml(): string {
   return browserStatePageHtml()
     .replace(
@@ -284,9 +282,8 @@ async function drawCounts(page: Page): Promise<{ timeline: number; rail: number 
   return (await page.evaluate('window.__arcDrawCounts')) as { timeline: number; rail: number };
 }
 
-// A payload with `n` sessions, built by repeating the fixture's own first session and rail
-// row rather than by calling `railSessions` again, so the shape a real render message
-// carries never drifts from what `renderPayload` already produces elsewhere in this file.
+// Scale sessions by copying renderPayload's session and session list row templates.
+
 function scaledPayload(n: number, turns?: number): Payload {
   const base = renderPayload() as Payload;
   const sessionTemplate = base.sessions[0];
@@ -307,8 +304,8 @@ function scaledPayload(n: number, turns?: number): Payload {
     at: NOW - i * 60_000,
     current: i === 0,
   }));
-  // Every session carries figures on a real wire, and the rail takes each row's out of this
-  // record while it draws, so every bulk session is keyed here too.
+  // Give each copied session figures under its own id.
+
   const statsTemplate = base.stats[sessionTemplate.id as string] ?? [];
   const ordinary = base.cards.filter((card) => card.kind === 'turn' && !card.live);
   return {
@@ -576,10 +573,8 @@ test(
   },
 );
 
-// Each hot path that takes a host-supplied list must draw a constant number of times,
-// whatever the list holds. A path that draws once per session passes at 100 sessions, where
-// the extra draws are cheap enough to hide. It only fails once a real workspace's session
-// count reaches it.
+// A list update must draw a constant number of times at both tested session counts.
+
 test('a render message draws the timeline once, at 100 sessions and at 1000', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -958,10 +953,8 @@ test(
   },
 );
 
-// A query keeps every matching group, with a bounded step in each section. The section draws a bounded step and offers the
-// rest under a press, and the press walks the reader through every match by keyboard. A fold
-// heading names only the rows on the page, and the last press moves the focus once, to the row
-// it drew last.
+// Reveal matching rows in bounded pages. Fold headings name mounted rows, and the final press focuses the last revealed row.
+
 test('a query over 1000 sessions draws 200 rows and offers the rest a step a press', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1420,8 +1413,8 @@ test('browser state survives page destruction and is written to both owners', { 
     const first = await browser.newPage();
     const failures: string[] = [];
     first.on('pageerror', (error) => failures.push(String(error)));
-    // The rail head rests on its count, so the magnifying glass opens the filter box, and
-    // the query typed below is what the state under test carries.
+    // Open the filter box and type the query whose state will be restored.
+
     await first.setContent(browserStatePageHtml({ railFilterId: 'all' }));
     await first.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
     await first.evaluate(SETTLED);
@@ -1448,7 +1441,7 @@ test('browser state survives page destruction and is written to both owners', { 
     await restored.setContent(browserStatePageHtml(written.browser));
     await restored.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
     await restored.evaluate(SETTLED);
-    // A restored query leaves the count on the rail head, and the magnifying glass shows it.
+    // The magnifying glass opens the restored query in the filter box.
     await restored.locator('[data-control="railsearch"]').click();
     await restored.evaluate(SETTLED);
     assert.equal(await restored.locator('.railfilter').inputValue(), 'agent:codex');
@@ -1630,8 +1623,8 @@ test('VS Code body modes keep the panel functional', { timeout: 60_000 }, async 
   }
 });
 
-// A page that records every search for the controls in the roving walk, whether it is rooted
-// at the page or at one subtree of it. A repaint reads the walk many times over.
+// Record roving-control searches at both document and subtree scope.
+
 function countedScanPageHtml(): string {
   return pageHtml().replace(
     'window.__posted = [];',
@@ -1683,8 +1676,8 @@ test('a repaint reads the roving walk without searching the whole page for it', 
       await page.evaluate(`window.postMessage(${JSON.stringify(grownPayload())}, '*')`);
     }
     await page.evaluate(SETTLED);
-    // Every figure the page is asked for is read in one go, and the counts come first,
-    // because a question the test asks is searched and counted the way a repaint would be.
+    // Capture scan counters before measurement queries add their own scans.
+
     const measured = (await page.evaluate(`(() => ({
       scans: window.__pageScans.slice(0, 4),
       counted: window.__pageScans.length,
@@ -1693,9 +1686,8 @@ test('a repaint reads the roving walk without searching the whole page for it', 
       stops: Array.from(document.getElementById('list').querySelectorAll(${JSON.stringify(ROVING_SELECTOR)}))
         .filter((node) => node.getAttribute('tabindex') === '0').length,
     }))()`)) as { scans: string[]; counted: number; subtrees: number; controls: number; stops: number };
-    // What this holds: no read of the walk searches the whole page for it. What it does not
-    // hold: the marking pass still runs the selector over each subtree the page adds, and a
-    // repaint that replaces the timeline adds one subtree holding most of the page.
+    // Roving-control discovery scans added subtrees, including a replacement timeline, but never the complete document.
+
     assert.ok(
       measured.subtrees > 0,
       'no search for the roving walk was seen at all, so an empty whole-page count proves nothing',

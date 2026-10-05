@@ -663,9 +663,9 @@ function bucket(value: unknown): ProjectUsageBucket | null {
   };
 }
 
-// A reducer records one compaction beside every compaction it counts, and keeps the newest
-// `RETAINED_COMPACTIONS` of them in order, ending at the total it reports. A shorter list is a
-// state nothing wrote, and a scan resumed from it loses compaction evidence without saying so.
+// Reducers retain the newest `RETAINED_COMPACTIONS` entries in ordinal order.
+// The final ordinal must match the total compaction count.
+// Reject shorter lists because resumed scans would lose compaction evidence.
 function reducerCompactions(value: unknown, compactionCount: unknown): value is ReducerCompaction[] {
   if (!Array.isArray(value) || value.length > RETAINED_COMPACTIONS) {
     return false;
@@ -700,10 +700,10 @@ function reducerCompactions(value: unknown, compactionCount: unknown): value is 
   );
 }
 
-// A Codex reducer waits for a compaction's billing identity only while that compaction is the
-// newest one, because a later compaction replaces the marker and a closed turn clears it. It
-// waits only where the compaction billed a request of its own. A marker naming any other
-// compaction would move the next settings record's identity onto the wrong request.
+// A pending billing marker must identify the newest compaction with its own request usage.
+// Later compactions replace the marker. Closing a turn clears it.
+// A marker for another compaction would assign the next settings record's identity
+// to the wrong request.
 function pendingCompactionBilling(value: unknown, compactionCount: unknown, compactions: unknown): boolean {
   if (value === null) {
     return true;
@@ -791,7 +791,7 @@ function compactionFact(value: unknown): CompactionFact | null {
     !nullableText(value.requestProvider) ||
     !nullableText(value.requestServiceTier) ||
     !(value.requestContextWindow === null || nonNegativeInteger(value.requestContextWindow)) ||
-    // A compaction no request followed keeps no later request and no context after it.
+    // Without a following request, a compaction retains no later request count or context.
     (value.firstRequestAfter === null && (value.requestsAfter !== 0 || value.contextAfter !== null))
   ) {
     return null;
@@ -838,8 +838,8 @@ function cacheExpiryFacts(value: unknown): CacheExpiryFacts | null {
   if (!returns.every((item): item is CacheExpiryReturn => item !== null)) {
     return null;
   }
-  // The counts are the whole answer and the list is the bounded tail of it, so a list longer
-  // than the counts, or an undropped list shorter than them, describes no scan that ran.
+  // Counts cover the complete scan. Returns retain its bounded tail.
+  // A tail cannot exceed the count. An untruncated tail must equal it.
   const counted = counts['5m'] + counts['30m'] + counts['1h'];
   if (returns.length > counted || (!value.truncated && returns.length !== counted)) {
     return null;
@@ -923,10 +923,10 @@ function spendRecord(
       value.newestTurnStartedAt !== null &&
       !timestamp(value.newestTurnStartedAt)) ||
     (value.outcome !== undefined && value.outcome !== null && !turnOutcome(value.outcome)) ||
-    // The two timestamps stand for one span, so a record naming only one of them is broken.
+    // A turn span requires both timestamps or neither.
     (value.firstTurnAt === undefined || value.firstTurnAt === null) !==
       (value.lastTurnAt === undefined || value.lastTurnAt === null) ||
-    // A last turn earlier than the first turn is not a span that ever happened.
+    // The last turn timestamp cannot precede the first.
     (timestamp(value.firstTurnAt) && timestamp(value.lastTurnAt) && value.lastTurnAt < value.firstTurnAt) ||
     (value.parserGeneration !== undefined && !nonNegativeInteger(value.parserGeneration)) ||
     (value.complete !== undefined && typeof value.complete !== 'boolean') ||

@@ -29,9 +29,7 @@ export interface SavedView {
   name: string;
   query: string;
 
-  // Whether the view keeps the sessions the reader archived. Off on a new view: a reader
-  // who put a session away meant it to leave the list, and a saved filter is the list
-  // they built on purpose.
+  // New views exclude archived sessions unless the reader enables them.
   archived: boolean;
   sort?: SavedViewSort;
 }
@@ -59,8 +57,7 @@ export function viewQuery(raw: unknown): string {
   return typeof raw === 'string' ? raw.trim().slice(0, VIEW_QUERY_LIMIT) : '';
 }
 
-// An id nothing else in the list carries. Counted rather than randomized, so a test can name
-// the id a press produces and a stored record reads the same on every machine.
+// Returns the first unused sequential view id.
 export function nextViewId(views: readonly SavedView[]): string {
   const taken = new Set(views.map((view) => view.id));
   for (let n = 1; ; n++) {
@@ -121,8 +118,7 @@ export function normalizeSavedViews(raw: unknown): SavedView[] {
   return out;
 }
 
-// The view an id names, or nothing. An empty id is All sessions, which is the absence of
-// a view rather than a view of its own, so it answers with nothing here.
+// An empty id selects All sessions and has no saved view.
 export function findView(views: readonly SavedView[], id: string): SavedView | null {
   if (!id) {
     return null;

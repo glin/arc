@@ -38,12 +38,11 @@ export interface DerivedTitleEntry {
   activityMs: number | null;
   agentRun: boolean;
   outcome: TurnOutcome | null;
-  // The background commands the tail read found when it held no typed prompt. `outcome` can
-  // still hold the lifetime outcome of the same turn.
+  // Background commands found by a tail read without a typed prompt.
+  // `outcome` can still hold the lifetime outcome of that turn.
   backgroundCommands?: BackgroundCommand[];
   stats: SessionStatFacts | null;
-  // The facts an earlier read of this session found. A card draws these while the session's
-  // own read finds none.
+  // Displays earlier facts while current stats lack positive context usage.
   heldStats?: SessionStatFacts;
   expandedStatsRead?: boolean;
   metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean };
@@ -51,33 +50,26 @@ export interface DerivedTitleEntry {
   starts?: TurnStarts;
   foldedLabel?: string;
   agentRunScan?: AgentRunScan;
-  // Where a Claude `label` came from. The held name keeps its source so a later read that
-  // saw a lower-ranked source cannot replace it.
+  // Claude name source. A lower-ranked source cannot replace a held name.
   nameSource?: SessionNameSource;
-  // The byte offset of the record a Claude name came from. Within one rank the later
-  // record wins.
+  // Claude name record offset. The later record wins within one rank.
   nameAt?: number;
-  // The fingerprint of the transcript's first record, which tells a replaced file from a
-  // grown one.
+  // First-record fingerprint used to detect transcript replacement.
   headKey?: string;
 }
 
-// How much of a Claude transcript the metadata read takes. `agentRunIn` answers from that
-// window only when it reaches the start of the file, so a larger top-level session gets its
-// agent-run answer from the whole-file scan the rail enrichment runs. A child transcript
-// never needs that scan: see `needsAgentRunScan`.
+// Claude metadata tail budget. Agent-run classification needs the file start.
+// Session list enrichment scans larger top-level sessions. Child transcripts need no scan.
 export const CLAUDE_METADATA_TAIL_BYTES = 256 * 1024;
 
-// Whether a session needs the whole-file agent-run scan beside its turn starts. A child
-// transcript never does: the parent's `Agent` call that started it is a positive fact the
-// scan cannot improve on, and every record in a child transcript is a sidechain record the
-// scan would count as nobody's prompt.
+// Requests whole-file agent-run classification for large top-level Claude sessions.
+// The parent Agent call identifies a child transcript as an agent run without another scan.
 export function needsAgentRunScan(session: { agent: string; size: number; childTranscript?: boolean }): boolean {
   return session.agent === 'claude' && session.size > CLAUDE_METADATA_TAIL_BYTES && session.childTranscript !== true;
 }
 
-// The bytes the next agent-run scan reads. A person answer reads none, and a file that
-// shrank is read again from the start.
+// Returns unread agent-run bytes. A person classification needs no further reads.
+// Shrinkage restarts the scan at byte zero.
 export function agentRunScanUnread(
   session: { agent: string; size: number; childTranscript?: boolean },
   scan: AgentRunScan | undefined,
@@ -88,31 +80,11 @@ export function agentRunScanUnread(
   return session.size - (scan && scan.bytes <= session.size ? scan.bytes : 0);
 }
 
-// A new metadata entry for a changed revision keeps the scan cursor of the entry it replaces,
-// so the next scan reads only what was appended. The agent-run answer stays the metadata
-// reading until that scan runs, with two exceptions, both guarded on the file only growing:
-// no smaller size, and `replacedTranscript` finds no other head.
-//
-// The metadata read answers nothing for a file past its window, and that reads as a person.
-// So a run that files under Run by agents would move to Today on each append and back once
-// a scan caught up. An entry with no scan yet, answered `agentRun: true` from a whole-file
-// tail read below the window, keeps that answer forward once the file crosses the window,
-// until the first scan runs and replaces it. That carry needs `session` to name the file a
-// Claude session past `CLAUDE_METADATA_TAIL_BYTES`: a caller with no session, or a Codex
-// session, or a Claude session that stayed inside the window, never gets it, so a grown
-// entry's own correct tail read is never overwritten by a stale `agentRun: true`.
-//
-// An entry with a scan decides its carried answer from the scan alone, never from the
-// previous entry's own `agentRun` field. A scan result that lands through
-// `withAgentRunScanProgress` moves the cursor forward but leaves `agentRun` at whatever the
-// entry already held, so a carry that read `agentRun` there would drop a run answer the scan
-// itself already found. A scan that found a person is sticky and never carries a run answer,
-// whatever `agentRun` says.
-//
-// A session that no longer needs the scan drops any cursor carried from before. A child
-// transcript is the case that matters: its metadata read already answers the agent-run
-// question on its own, and a scan cursor left over from a stale cached entry must not come
-// back and overwrite that answer.
+// Carries the scan cursor into a changed revision.
+// Only growth without detected replacement preserves an agent-run answer.
+// The scan determines that answer when present. A person classification never carries a run answer.
+// Without a scan, a Claude session crossing the tail budget retains its prior run classification.
+// A session that needs no scan receives the new metadata entry without a carried cursor.
 export function carryAgentRunScan(
   previous: DerivedTitleEntry | undefined,
   next: DerivedTitleEntry,
@@ -134,11 +106,8 @@ export function carryAgentRunScan(
   return grew && crossedWindow && previous.agentRun ? { ...next, agentRun: true } : next;
 }
 
-// Whether a stat list says how full the session's context window is.
-//
-// Two reads answer no. A metadata read of a tail a running turn has filled with answers finds
-// no typed prompt, so it yields no facts at all. A read taken just after a turn boundary finds
-// the new turn, which carries no usage record until its first response lands.
+// Reports whether the newest stat turn has positive context usage.
+// A tail without a prompt supplies no stats. A new turn has no usage before its first response.
 export function statsHaveContext(stats: SessionStatFacts | null): boolean {
   const newest = newestStatTurn(stats);
   if (!newest) {
@@ -163,14 +132,9 @@ function released(entry: DerivedTitleEntry): DerivedTitleEntry {
   return out;
 }
 
-// The facts a new entry carries over from the entry it replaces.
-//
-// The rail chip drawn from a session's facts would leave the card between two appends and come
-// back on the next one. The last facts the session had stand in over that gap, and they are
-// held apart from `stats`, which stays as the read left it, because an empty `stats` is what
-// asks for the whole-file read that finds the real facts.
-//
-// A context figure, a complete negative read, shrinkage, or detected replacement releases held facts.
+// Carries context facts across incomplete reads to keep the session list figures visible.
+// `stats` stays unchanged so missing facts still request recovery.
+// Current context, a complete negative read, shrinkage, or detected replacement releases held facts.
 export function carryDerivedTitleFacts(
   previous: DerivedTitleEntry | undefined,
   next: DerivedTitleEntry,
@@ -190,9 +154,8 @@ export function carryDerivedTitleFacts(
   return held ? { ...carried, heldStats: held } : released(carried);
 }
 
-// The Claude session name a new entry keeps from the entry it replaces. The rule is
-// `resolveSessionName`. A file that shrank, or whose first record changed, is another
-// transcript, and its own read answers.
+// Carries the Claude session name through `resolveSessionName`.
+// Shrinkage or a changed first record releases the held name.
 function carrySessionName(previous: DerivedTitleEntry | undefined, next: DerivedTitleEntry): DerivedTitleEntry {
   const held = storedSessionName(previous);
   if (!previous || !held || replacedTranscript(previous, next)) {
@@ -202,7 +165,7 @@ function carrySessionName(previous: DerivedTitleEntry | undefined, next: Derived
   return name ? withSessionName(next, name) : next;
 }
 
-// An entry that holds a Claude session name, with the label search folds kept in step.
+// Updates the Claude session name and any existing folded search label.
 export function withSessionName(entry: DerivedTitleEntry, name: SessionName): DerivedTitleEntry {
   if (
     name.source === entry.nameSource &&
@@ -224,7 +187,7 @@ export function withSessionName(entry: DerivedTitleEntry, name: SessionName): De
   };
 }
 
-// The session facts a card draws: this read's own, or the last ones this session had.
+// Returns current session facts, or held facts when current context is unavailable.
 export function derivedTitleStats(entry: DerivedTitleEntry): SessionStatFacts | null {
   if (entry.heldStats && !statsHaveContext(entry.stats)) {
     return entry.heldStats;
@@ -232,8 +195,8 @@ export function derivedTitleStats(entry: DerivedTitleEntry): SessionStatFacts | 
   return entry.stats;
 }
 
-// Cache metadata keeps the held request through an incomplete running turn. A newer failure
-// or compaction changes that request's cache state, so it takes precedence over held facts.
+// Preserves held cache metadata during an incomplete turn.
+// A current failure or compaction after the held request takes precedence.
 export function derivedTitleCacheStats(entry: DerivedTitleEntry): SessionStatFacts | null {
   const current = entry.stats;
   const held = entry.heldStats;
@@ -250,14 +213,10 @@ export function derivedTitleCacheStats(entry: DerivedTitleEntry): SessionStatFac
   return held;
 }
 
-// One figure for each session, held against the facts object it was derived from. A read
-// derives the figure again only for a session whose facts object changed, or whose held figure
-// `current` rejects. Every other session keeps its held figure. `derive` must read only the
-// facts and values that never change. An input that changes outside the facts, such as the
-// clock, must enter through `current`, which rejects a held figure that input has made stale.
-// The caller must replace changed facts with a new object, because a figure derived from facts
-// edited in place stays stale. The record keeps its identity while no session moves, joins or
-// leaves, and a session that leaves the list drops its figure.
+// Caches figures by session id and facts-object identity.
+// The `current` predicate rejects figures affected by changing external inputs, such as the clock.
+// The `derive` callback must use facts and other unchanging inputs. Callers must replace changed facts with a new object.
+// The output keeps its identity when every listed session keeps its figure. Removed sessions lose their figures.
 export class SessionFactFigures<F, V> {
   private held = new Map<string, { facts: F; value: V }>();
   private value: Readonly<Record<string, V>> = {};
@@ -278,7 +237,7 @@ export class SessionFactFigures<F, V> {
       moved = true;
       next.set(sessionId, { facts, value: derive(facts) });
     }
-    // Every kept entry came from the held map, so equal sizes mean the same sessions.
+    // Unchanged entries come from the held map, so equal sizes also mean equal membership.
     if (moved || next.size !== this.held.size) {
       this.value = Object.fromEntries([...next].map(([sessionId, entry]) => [sessionId, entry.value]));
     }
@@ -287,10 +246,8 @@ export class SessionFactFigures<F, V> {
   }
 }
 
-// The entry after rail enrichment. A scan answers whether the session is an agent run and
-// sets `agentRun` from it. With no scan, the entry keeps whatever `agentRun` it already
-// holds, stale or not: `agentRunAnswer` in turnrail.ts answers true for a child transcript
-// whatever this entry holds, so a stale `false` here never reaches the rail.
+// Stores session list enrichment and uses scan results to set `agentRun`.
+// Without a scan, it keeps the metadata answer. `agentRunAnswer` in turnrail.ts independently identifies child transcripts as agent runs.
 export function withRailEnrichment(
   entry: DerivedTitleEntry,
   starts: TurnStarts,
@@ -304,9 +261,8 @@ export function withRailEnrichment(
   return next;
 }
 
-// The scan to apply during rail enrichment. A session that no longer needs the scan gets
-// none, so a cursor held from before a size change or a child-transcript flag never
-// overrides the metadata reading.
+// Drops scans for sessions that no longer need them.
+// Size changes and child-transcript classification cannot leave a stale cursor overriding metadata.
 export function scanForRailEnrichment(
   session: { agent: string; size: number; childTranscript?: boolean },
   scan: AgentRunScan | undefined,
@@ -314,13 +270,12 @@ export function scanForRailEnrichment(
   return needsAgentRunScan(session) ? scan : undefined;
 }
 
-// Whether a file only grew between two readings: the same file, and no shorter.
+// Checks matching device and inode identifiers and a nondecreasing size.
 export function onlyGrew(before: FileRevision | null, after: FileRevision | null): boolean {
   return !!before && !!after && before.dev === after.dev && before.ino === after.ino && after.size >= before.size;
 }
 
-// The agent-run scan a stale worker read still returns. A file that only grew while the scan
-// ran still holds every byte the scan read, so the cursor stays good. Any other change drops it.
+// Retains a starts scan when device and inode match and size does not shrink.
 export function scanKeptThroughGrowth(
   value: { kind: string; agentRunScan?: AgentRunScan },
   before: FileRevision | null,
@@ -329,11 +284,10 @@ export function scanKeptThroughGrowth(
   return value.kind === 'starts' && onlyGrew(before, after) ? value.agentRunScan : undefined;
 }
 
-// The entry after a scan whose result arrived stale. Only the scan cursor changes, and only
-// forward, so a result for an older revision never replaces the starts or the agent-run answer
-// of a newer entry, and never moves a newer cursor back. A person answer is the one exception:
-// it also sets `agentRun: false`, because a person answer is final and must not leave a stale
-// carried run beside it until the next scan. Null when the entry keeps its own.
+// Advances a stale scan cursor without replacing newer starts or metadata classification.
+// Oversized, older, and already settled person scans leave the entry unchanged.
+// A new person classification also clears `agentRun` so a carried run answer cannot survive it.
+// Returns null when the entry keeps its current cursor.
 export function withAgentRunScanProgress(entry: DerivedTitleEntry, scan: AgentRunScan): DerivedTitleEntry | null {
   const held = entry.agentRunScan;
   if (scan.bytes > entry.size || (held && (held.person || held.bytes >= scan.bytes))) {
@@ -345,13 +299,12 @@ export function withAgentRunScanProgress(entry: DerivedTitleEntry, scan: AgentRu
 export interface DerivedCache {
   reuse?: { reason: string; storedGeneration?: unknown; rejectedRelationships?: number };
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
-  // The Codex opening rows a workspace file written before the shared `codex-openings.json`
-  // holds. They seed that file once, when it is missing. A save writes none.
+  // Legacy workspace Codex opening rows seed a missing shared `codex-openings.json`.
+  // Workspace saves omit these rows.
   codexMetas: Map<string, CodexSessionMeta>;
   titles: Map<string, DerivedTitleEntry>;
   claudeChildReferences: Map<string, ClaudeChildReferenceCacheEntry>;
-  // The last name each session had before a `VERSION` bump dropped its entry. The rail draws
-  // it until a metadata read of that session stores a new entry.
+  // Names carried across a `VERSION` change until a metadata read supplies a title entry.
   carriedNames: Map<string, CarriedName>;
 }
 
@@ -407,27 +360,12 @@ interface StoredCache {
   carriedNames: StoredCarriedName[];
 }
 
-// The shape and the meaning of everything stored below. A file whose version does not match
-// this one is dropped at load, and the panel derives all of it again. Only the name of each
-// session survives, as a carried name the rail draws until a read replaces it.
-//
-// Bump it for either kind of change. A field added to or taken out of a stored entry is the
-// obvious kind. The other is a fact that keeps its name and its type while the rule behind
-// it changes. That one is easy to miss. The stored value stays valid, so nothing rejects it,
-// and a session whose file has stopped growing keeps the old answer for good.
-//
-// `agentRun` is the example. `transcript.ts` guesses it for Claude and `codex.ts` for Codex.
-// A change to either guess is invisible from this file.
-//
-// Weigh the bump against the rebuild. The first metadata pass reads at most
-// `INITIAL_RAIL_READ_BYTES`, so a large workspace rebuilds over many refreshes, not in one
-// pass. Until its own read arrives, a session draws its carried name, and its card shows the
-// values the file itself gives in place of the dropped derived facts. A rule change that
-// affects a few recognizable entries can drop only those entries at load instead of bumping
-// the version.
-//
-// Codex opening records are not under this version. They carry `CODEX_META_VERSION` from
-// `codexopenings.ts`, and a bump here keeps them.
+// Versions stored title and relationship facts. A mismatch discards derived entries but carries session names until metadata replaces them.
+// Bump the version for stored field changes or changed derivation rules, including agent-run classification in transcript.ts and codex.ts.
+// Unchanged files otherwise retain valid-looking stale facts indefinitely.
+// The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
+// Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
+// Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive this version change.
 export const VERSION = 44;
 
 export class DerivedCacheCheckpointState {
@@ -527,8 +465,7 @@ function empty(): DerivedCache {
   return { codexMetas: new Map(), titles: new Map(), claudeChildReferences: new Map(), carriedNames: new Map() };
 }
 
-// A name a stored row can carry: a nonempty label and a full label, both text. Every other
-// field of the row is left behind.
+// Carries only a nonempty label and a text full label from a stored row.
 function carriedName(value: unknown): CarriedName | null {
   return record(value) && text(value.label) && value.label.length > 0 && text(value.fullLabel)
     ? { label: value.label, fullLabel: value.fullLabel }
@@ -837,8 +774,7 @@ function childReference(value: unknown, parentSessionId: string): value is Claud
   if (value.kind === 'subagent') {
     return fileName(value.file);
   }
-  // A dispatch reference stored before references carried `owned` fails here, so its parent
-  // is read again once. No receipt could say owned then, because the reader rejected the key.
+  // Dispatch references require an explicit `owned` boolean. Missing ownership rejects the cached entry and requests another parent read.
   return (
     value.kind === 'dispatch' &&
     (value.agent === 'claude' || value.agent === 'codex') &&
@@ -1029,8 +965,8 @@ export function loadDerivedCache(file: string): DerivedCache {
       loaded.reuse = { reason: 'invalid-format' };
       return loaded;
     }
-    // A name carried through an earlier bump and not read since stays carried. A title row of
-    // an older version overrides it, because that row was stored later.
+    // Keeps carried names until a title row replaces them.
+    // On a version mismatch, title-row names override carried-name rows.
     carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
     if (parsed.version !== VERSION) {
       loaded.reuse = { reason: 'generation-mismatch', storedGeneration: parsed.version };
@@ -1149,8 +1085,7 @@ export function saveDerivedCache(
     discovery,
     titles: titleRows,
     claudeChildReferences: childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES),
-    // A carried name waits in the file until a read of its session stores a title, so a
-    // restart before that read still draws it.
+    // Persists carried names until a title entry replaces them, including across restarts.
     carriedNames: [...carriedNames]
       .filter(([entryFile]) => !titled.has(entryFile))
       .map(([entryFile, name]) => ({ file: entryFile, label: name.label, fullLabel: name.fullLabel }))
@@ -1159,15 +1094,15 @@ export function saveDerivedCache(
   writeFileAtomically(file, JSON.stringify(data), replace);
 }
 
-// A cursor is rebuildable from its parent file. Keep cursors that have not reached EOF before
-// cursors waiting for an append, so retention does not restart an unfinished scan.
+// Parent-file reads recreate discarded Codex cursors.
+// Evicts Codex cursors at EOF before unfinished scans, then complete entries and larger cursors.
 export function limitCodexDispatchCursors(
   entries: Iterable<[string, ClaudeChildReferenceCacheEntry]>,
   byteLimit = MAX_CODEX_DISPATCH_CURSOR_BYTES,
 ): Array<[string, ClaudeChildReferenceCacheEntry]> {
   const rows = [...entries];
-  // Pending Claude state contains unmatched launches and cannot be recreated at its offset.
-  // Keep it even above the soft target. The scheduler protects one large pending source.
+  // Unfinished Claude cursors retain unmatched launches that cannot be recreated at their saved offset.
+  // Keep them above the soft budget. The scheduler protects one large pending source.
   let claudeBytes = rows.reduce(
     (sum, [, entry]) => sum + (entry.claudeCursor ? Buffer.byteLength(JSON.stringify(entry.claudeCursor)) : 0),
     0,

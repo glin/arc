@@ -129,22 +129,15 @@ export function cardPrint(card: object): string {
   );
 }
 
-// What a turn did to the repository, in the order it happened. The commits it wrote and the
-// trees it fast-forwarded are counted apart, because a landing carries a commit somebody else
-// wrote. A turn that only merged says so, and a turn that did both names both figures.
-//
-// The card head's commits chip and the popover heading draw this label. The Commits section
-// heading draws the same two figures from `repositoryWorkFigures`, so a landing among the rows
-// cannot be counted as a commit in one place and not the other.
+// Count written commits and landings separately. A landing carries work the turn did not write.
+// The commits chip and its popover use this label. The Commits heading uses repositoryWorkFigures for the same counts.
 export function repositoryWorkLabel(commits: number, landings: number): string {
   return [commits ? `${commits} commit${commits === 1 ? '' : 's'}` : null, landingFigure(landings)]
     .filter(Boolean)
     .join(' · ');
 }
 
-// The same work, for a heading that already says the word Commits above the rows. The commit
-// count stands as a bare figure there, the way the Files and Subagents headings carry theirs,
-// and the landings keep their own word because nothing else on the heading names them.
+// The Commits heading supplies the commit label, so its count needs only a number. Landings retain their own label.
 export function repositoryWorkFigures(commits: number, landings: number): string {
   return [commits ? String(commits) : null, landingFigure(landings)].filter(Boolean).join(' · ');
 }
@@ -158,8 +151,7 @@ export function openMakerSession(name: string): string {
   return `Open ${name} session`;
 }
 
-// The fields of a commit row that grouping reads. The card's rows and the wire's rows both
-// carry them.
+// Shared grouping fields for card commit rows and message-boundary commit rows.
 export interface GroupableCommitRow {
   kind: 'commit' | 'landing';
   sha: string;
@@ -188,10 +180,10 @@ export interface CommitArrival {
 export interface CommitGroupView<Row extends GroupableCommitRow = GroupableCommitRow> {
   key: string;
   repository: { name: string; own: boolean };
-  branch: string | null; // null for commits made outside a named branch, or on a head git never named
-  detached: boolean; // the commits were made on a detached head, rather than on a head git never named
-  where: string | null; // the worktree fact, when the tree is named otherwise than its branch
-  rows: Row[]; // commits, and the landings no branch explains, in time order
+  branch: string | null; // Null for detached commits and commits with unknown branch state.
+  detached: boolean; // True only when Git identifies a detached head.
+  where: string | null; // The worktree label, when different from the branch name.
+  rows: Row[]; // Commits and landings not stored as arrivals, in time order.
   arrival: CommitArrival | null;
 }
 
@@ -200,22 +192,11 @@ export interface CommitGrouping<Row extends GroupableCommitRow = GroupableCommit
   groups: CommitGroupView<Row>[];
 }
 
-// A turn's commit rows by branch within a repository.
-//
-// A commit files under its repository and its branch, and a detached commit under its
-// repository alone. A commit whose head git never named files apart from both, because it is
-// neither on a known branch nor known to be detached. A landing whose merged branch is a group
-// holding a commit of the turn is that group's arrival rather than a row, because the group
-// already shows the work it carried. Every other landing is a row under the branch that moved.
-// Groups of the card's own repository come first, in time order among themselves. Groups of
-// another repository follow, that repository's own groups kept together and ordered in time
-// among themselves, repository after repository by each one's earliest row. Rows follow time
-// inside a group.
-//
-// A row git has not placed in a repository yet files under the card's own, because the only
-// commits without one are those still waiting on git or made where git could not answer. Its
-// key is the own repository's key when another row names it, so it joins that repository's
-// branch rather than drawing a second heading of the same name.
+// Group commit rows by repository and branch. Detached commits and commits with unknown branch state form separate groups.
+// The first matching landing becomes a group's arrival when its merged branch holds a commit from this turn. Other landings remain rows.
+// The card's repository sorts first. Other repositories sort by their earliest row, with each repository's groups kept together.
+// Groups and their rows sort by time.
+// Rows without a repository use the card's repository key, including its branch groups.
 export function groupCommitRows<Row extends GroupableCommitRow>(rows: readonly Row[]): CommitGrouping<Row> {
   const ownKey = rows.find((row) => row.repository?.own)?.repository?.key ?? '';
   const repositoryKey = (row: Row) => row.repository?.key ?? ownKey;
@@ -267,8 +248,7 @@ export function groupCommitRows<Row extends GroupableCommitRow>(rows: readonly R
     group.rows.sort((a, b) => a.at - b.at);
   }
   const first = (group: CommitGroupView<Row>) => group.rows[0]?.at ?? group.arrival?.at ?? 0;
-  // The repository half of a group's key, read back off the key rather than carried twice, so a
-  // repository's groups sort together whether or not two repositories share a name.
+  // Sort repositories by key rather than display name, because different repositories can share a name.
   const repoKeyOf = (group: CommitGroupView<Row>) => group.key.slice(0, group.key.indexOf('|'));
   const repoFirst = new Map<string, number>();
   for (const group of groups.values()) {
@@ -300,10 +280,7 @@ export function commitGroupName(group: CommitGroupView): string {
   return group.branch ?? (group.detached ? 'detached commit' : 'unknown branch');
 }
 
-// The id one of a card's own parts carries, so a control naming it in `aria-controls` or
-// `aria-labelledby` finds the exact element by that id. Two cards holding the same key never
-// draw the same id for a differently named part, and a key holding a character an id could not
-// carry raw still encodes into one that can.
+// Build the element id for a card part. Encode the card key and keep differently named parts distinct.
 export function cardPartId(key: string, part: string): string {
   return `card-${encodeURIComponent(key)}-${part}`;
 }
@@ -325,9 +302,7 @@ export function commitHeadFact(group: CommitGroupView): string {
 // The word a merged branch's heading ends on.
 export const ARRIVAL_WORD = '· merged';
 
-// The hover on a group's merged word: where and when the branch's work reached, and the hash
-// it reached as. A merge that made a new commit names that commit's subject, because its hash
-// is not one the rows under the heading draw.
+// The arrival tooltip names the target, time and hash. Include the subject when the arrival hash differs from the group's last commit.
 export function arrivalTitle(arrival: CommitArrival): string {
   const lead = `Merged into ${arrival.target} at ${arrival.absolute}, as ${arrival.sha}`;
   return arrival.sameAsLast

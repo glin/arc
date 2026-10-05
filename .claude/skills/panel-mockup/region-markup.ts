@@ -18,14 +18,8 @@ import * as path from 'node:path';
 import { FIXTURE_CLOCK, pageHtml, renderPayload, themed } from '../../../extension/src/panelfixture.ts';
 import { SETTLED, SHOTS, browserOrNone, shoot } from '../../../extension/scripts/panel-shots.ts';
 
-// Walks the matched elements and writes one line per element. A string rather than a
-// function, for the reason panel-shots.ts gives: this file is transpiled, and a transpiled
-// arrow function calls helpers the page has never heard of.
-//
-// `data-vscode-context` comes off every element. It holds a JSON object in double quotes, so
-// a line carrying it cannot be pasted into a Python or HTML generator. Every other attribute,
-// `id` and `data-key` included, prints as it is, because a board that renames them stops
-// matching the panel's own rules.
+// Dumps each matched element as indented markup. String evaluation avoids transpiled function helpers in the page.
+// Removes data-vscode-context and preserves other attributes so copied markup retains the panel selectors.
 const DUMP = `(function (selector, all) {
   var found = Array.prototype.slice.call(document.querySelectorAll(selector));
   if (!found.length) { return null; }

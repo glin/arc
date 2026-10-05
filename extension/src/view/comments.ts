@@ -41,15 +41,12 @@ export function answerPart(index: number): CommentPart {
   return `answer:${Math.max(0, Math.trunc(index))}`;
 }
 
-// A message id a comment can be saved under. A saved comment keeps a said part of at most 200
-// characters and no whitespace, so a message whose id falls outside that shape takes no comment.
+// Commentable message ids contain one to 200 non-whitespace characters.
 export function commentableMessageId(id: string | undefined): id is string {
   return !!id && /^\S{1,200}$/.test(id);
 }
 
-// A message the agent wrote while the turn ran, named by the message's own id. The Activity
-// log filters its rows before it draws them, so a name built from a position would move a
-// comment onto another row whenever the reader changed the filter.
+// Use the message id as the comment part. Activity filtering changes row positions without changing message identity.
 export function saidPart(id: string): CommentPart {
   return `said:${id}`;
 }

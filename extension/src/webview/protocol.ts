@@ -6,16 +6,8 @@ import {
   validContextDetail,
   type ContextDetail,
 } from '../domain/context-detail.ts';
-// The message contract between the extension host and the panel, in one file both sides
-// read. Each direction is a discriminated union with a parser that takes the raw value the
-// other process sent and answers with a variant or with null. A caller that receives null
-// ignores the message and says so once. Nothing here throws.
-//
-// The parsers also normalize fields whose wire semantics allow an omitted value. Handlers
-// receive the normalized type, which keeps one copy of each rule at the boundary.
-//
-// These are the wire shapes the panel and host use. The parsers refuse malformed values
-// without changing a well-formed message in either direction.
+// Host and panel messages use discriminated unions. Each parser returns a message variant or null.
+// Parsers reject malformed fields and normalize supported omissions before dispatch.
 import type {
   ComposerAnnotations,
   ComposerDraftTag,
@@ -95,9 +87,7 @@ export interface PanelHistoryControl {
 
 export type PanelOlderHistory = PanelHistoryControl | null;
 
-// Cards and rail rows cross the host boundary in the complete shapes their browser owners
-// consume. Sharing those contracts makes the coordinator prove that every accepted payload
-// satisfies its renderer without widening through `unknown`.
+// Turn cards and session list rows share their renderers' complete payload contracts.
 export type PanelCard = CardView;
 
 export interface PanelSessionRow {
@@ -106,8 +96,7 @@ export interface PanelSessionRow {
   fullLabel?: string;
   persisted?: boolean;
   agent: string;
-  // The agent the session belongs to, keyed rather than named. The panel words the resume
-  // command from this and the id.
+  // The agent key and session id determine the resume command wording.
   agentKey: string;
   at: number;
   relative: string;
@@ -147,11 +136,8 @@ interface LabelRow {
 
 type LabelEditorRow = LabelRow & { applied: boolean };
 
-// The whole render payload, which the panel adopts as `latest` and reads dozens of fields
-// from. It is the one message the parser hands back untouched rather than rebuilding: the
-// panel keeps the object and writes onto it, and a rebuilt copy would drop every field this
-// file does not name. The payload stays open because the card, rail and composer fields are
-// owned by their subject modules.
+// The parser preserves this complete payload, including fields owned by card, session list, and prompt box modules.
+// The panel retains and updates the same object.
 export interface RenderMessage extends Record<string, unknown> {
   type: 'render';
   cards: PanelCard[];
@@ -173,15 +159,13 @@ export interface RenderMessage extends Record<string, unknown> {
   diagnosis: PanelDiagnosis | null;
   usage: PanelUsage | null;
   startup: { generation: number; complete: boolean; failed?: boolean } | null;
-  // The reader's Timeline layout settings. A new panel reads them here, then receives changes
-  // through layout messages from the same configuration listener as the dialog.
+  // The initial render carries Timeline layout settings. Configuration changes arrive as layout messages.
   timelineLayout: TimelineLayout;
 }
 
 export interface SelectionMessage {
   type: 'selection';
-  // The previous and current identities bound this replacement. A missing row removes an
-  // abandoned draft from the complete lists retained from the last render.
+  // Session identities affected by this replacement. An absent row removes an abandoned draft from the retained lists.
   replaces: string[];
   cards: PanelCard[];
   sessions: PanelSessionRow[];
@@ -415,9 +399,7 @@ function labelEditorRow(value: unknown): value is LabelEditorRow {
   return labelCount(value) && typeof row?.applied === 'boolean';
 }
 
-// One saved view as it crosses the wire. The shape alone is checked here. The extension
-// normalizes every list it receives, so this refuses a message that cannot be read rather
-// than deciding what a readable one means.
+// Check saved-view fields here. The extension normalizes the accepted list.
 function savedViewRow(value: unknown): value is SavedView {
   const row = record(value);
   return (
@@ -520,7 +502,7 @@ function composerLive(value: unknown): value is ComposerLive {
   );
 }
 
-/** A string field the reader of the message treated as empty when it was missing. */
+/** Return the string value, or the fallback for a missing or non-string field. */
 function textOr(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
 }
@@ -557,9 +539,7 @@ function launcherRequest(raw: unknown): LauncherRequest | null {
   return null;
 }
 
-// How the reader answered an ask. The answer to a question is the labels it offered and the
-// reader took, beside whatever the reader wrote instead, so both halves of every value are
-// checked rather than the outer object alone.
+// Question answers contain chosen labels and written text. Check both parts of every value.
 function askAnswer(raw: unknown): AskAnswer | null {
   const m = record(raw);
   if (!m) {
@@ -818,7 +798,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         ? { type: 'results', query: m.query, hits: m.hits as SearchHit[], scope: m.scope }
         : null;
     case 'render': {
-      // Handed back rather than rebuilt, for the reason above the interface.
+      // Preserve the complete render object described by RenderMessage.
       const adoptions = m.sessionAdoptions;
       return records(m.cards) &&
         records(m.sessions) &&
@@ -879,9 +859,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'newSession': {
       if (m.owner !== undefined && !isString(m.owner)) return null;
       const ownership = m.owner === undefined ? {} : { owner: m.owner };
-      // A press on the plus carries no request at all, and a press on a launcher row
-      // carries one. A request that is present and malformed is refused, because dropping
-      // the field instead would start the agent on a setup nobody chose.
+      // An omitted request starts the default setup. Reject a malformed request rather than starting a setup the reader did not choose.
       if (m.request === undefined) {
         return { type: 'newSession', ...ownership };
       }
@@ -957,8 +935,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'beginFileStaging':
       return isString(m.session) ? { type: 'beginFileStaging', session: m.session, token: textOr(m.token, '') } : null;
     case 'attachFiles':
-      // The files stay unread here. A batch that is not a list is a refusal the reader is
-      // told about, so the host still sees the message and answers it.
+      // Pass files through for host validation. The host reports malformed batches to the reader.
       return isString(m.session)
         ? {
             type: 'attachFiles',
@@ -999,8 +976,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
         ...(isString(m.request) ? { request: m.request } : {}),
       };
     case 'sendPrompt':
-      // A revision that is not a whole number at or above zero counts as the first one, the
-      // way the host has always read it. The panel only ever sends one it issued itself.
+      // Invalid or missing revisions normalize to zero.
       return isString(m.text) && isString(m.session)
         ? {
             type: 'sendPrompt',
@@ -1077,15 +1053,12 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'labelEditor':
       return isString(m.session) ? { type: 'labelEditor', session: m.session } : null;
     case 'setLabels':
-      // The whole list arrives each time. A name that is not text is dropped here, where the
-      // host used to drop it, and the rest of the list still reaches the record.
+      // Drop non-string names and pass the remaining complete label list to the host.
       return isString(m.session) && Array.isArray(m.names)
         ? { type: 'setLabels', session: m.session, names: m.names.filter(isString) }
         : null;
     case 'setViews':
-      // The whole list arrives each time, the way a session's labels do. A list holding
-      // an entry this cannot read is refused whole rather than part way through: the panel
-      // posts what it drew, so a dropped entry would delete a view the reader can still see.
+      // Reject the whole list if any view is malformed. Dropping an entry would delete a view still visible in the panel.
       return savedViews(m.views) ? { type: 'setViews', views: m.views } : null;
     case 'renameSession':
       return isString(m.session) && m.session.length > 0 && Number.isSafeInteger(m.request) && isString(m.title)
@@ -1123,7 +1096,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
       }
       return null;
     case 'saveState':
-      // `normalizePanelState` is the one reader of this field and it takes anything.
+      // normalizePanelState accepts unknown state values.
       return { type: 'saveState', state: m.state };
     case 'search':
       return { type: 'search', text: textOr(m.text, '') };
@@ -1138,8 +1111,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'openTurnDiff':
       return isString(m.key) ? { type: 'openTurnDiff', key: m.key, beside: m.beside === true } : null;
     case 'openCommit':
-      // The directory is null where the commit landed somewhere this workspace cannot name,
-      // and the host tells the reader so. That is why it is kept rather than required.
+      // Preserve a missing directory as null. The host reports commits whose directory is unavailable.
       return isString(m.key) && isString(m.sha)
         ? {
             type: 'openCommit',
@@ -1168,8 +1140,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
   }
 }
 
-// One handler per variant, named by the variant. A variant added to the union above and not
-// named here is a compile error rather than a message that falls through.
+// Every message variant requires a named handler. Missing handlers fail the typecheck.
 type Handlers<M extends { type: string }, R> = {
   [K in M['type']]: (message: Extract<M, { type: K }>) => R;
 };
@@ -1177,8 +1148,7 @@ type Handlers<M extends { type: string }, R> = {
 export type HostToPanelHandlers = Handlers<HostToPanel, void>;
 export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
 
-// The `never` assignment in each default branch is what makes the switch exhaustive. A new
-// variant reaches it as itself rather than as `never`, and the typecheck fails there.
+// The default branch assigns to never, so unhandled variants fail the typecheck.
 export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
   switch (message.type) {
     case 'visibility':

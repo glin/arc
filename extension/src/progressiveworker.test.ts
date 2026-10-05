@@ -272,7 +272,7 @@ import { beginForwardSessionRecovery } from './history';
 import { createCodexSessionReducer, codexSessionLineMayAffectRead } from './codex';
 import { estimateCost } from './pricing';
 
-// Actual read counts catch the parent rescan. A second root catches unrelated rejection.
+// Measure actual read counts for parent rescans and use a second root to check unrelated rejection.
 test('a new Claude session reaches a complete cut beside parent growth with bounded append reads', async () => {
   const directory = tempDir('claude-changed-catalog-');
   const file = path.join(directory, 'parent.jsonl');
@@ -2711,9 +2711,8 @@ test('an active dispatched transcript reads only its bounded metadata', async ()
   }
 });
 
-// A background child found before its launch prompt is written is scanned from that end, so the
-// launch prompt must not read as a second one. A prompt typed while it runs is found once the
-// child is quiet and its whole file is read.
+// A running child scan excludes its launch prompt. A follow-up typed prompt is classified when the quiet child receives a whole-file read.
+
 test('a running dispatched child reads as a person only from its whole file', async () => {
   const directory = tempDir('panel-progressive-person-dispatch-');
   const parentFile = path.join(directory, 'parent.jsonl');
@@ -3199,9 +3198,8 @@ test('the Claude worker preserves the exact child close time', async () => {
   }
 });
 
-// A long turn whose typed prompt lies before the metadata tail, with a background command
-// launch inside the tail. The metadata entry must carry the tail's commands so the rail can
-// draw the `background` state for it, per `progressiveworker-entry.ts`.
+// Metadata retains background commands from the tail even when the turn's first prompt lies before it.
+
 test('a Claude metadata entry carries the background commands the tail read found', async () => {
   const directory = tempDir('panel-progressive-claude-background-');
   const file = path.join(directory, 'session.jsonl');
@@ -3298,9 +3296,8 @@ function activity(agent: AgentKind, n: number): object {
       };
 }
 
-// A turn holding what a reducer keeps off the enumerable surface: a call id, a command too
-// long to draw whole, and for Claude a launched child. An unclosed turn also keeps its byte
-// range, which the reducer holds on symbol keys.
+// Include hidden call ids, full commands, Claude child ids, and symbol-keyed byte ranges on open turns.
+
 function detailedTurn(agent: AgentKind, n: number, closed: boolean): object[] {
   const command = `echo ${n}\n${'echo more detail than one line holds\n'.repeat(8)}`;
   const answer = {
@@ -3368,8 +3365,8 @@ function detailedTurn(agent: AgentKind, n: number, closed: boolean): object[] {
       ];
 }
 
-// What `assert.deepEqual` never reaches, because a reducer defines these fields
-// non-enumerably so they stay out of the card payload and its comparison string.
+// Read non-enumerable fields explicitly because deep equality omits them.
+
 function hiddenFieldsOf(turns: readonly Turn[]): unknown[] {
   return turns.map((turn) => ({
     steps: turn.steps.map((step) => [step.id ?? null, step.fullDetail ?? null]),
@@ -3377,9 +3374,8 @@ function hiddenFieldsOf(turns: readonly Turn[]): unknown[] {
   }));
 }
 
-// The descriptor each hidden field carries, not just its value. A field a parser seals must
-// come back sealed, or a later write throws on a cold-parsed turn and is taken silently on a
-// resumed one.
+// Check hidden field descriptors as well as values so resumed turns retain their write constraints.
+
 function hiddenDescriptorsOf(turns: readonly Turn[]): unknown[] {
   return turns.map((turn) => ({
     steps: turn.steps.map((step) =>
@@ -3633,9 +3629,8 @@ test.each([
   },
 );
 
-// A Codex child writes its own rollout while it runs, and the parent rollout stays where it
-// is. The host holds a key of its own over the same files, so the worker key has to carry the
-// child revisions the host key carries and leave the structural key alone.
+// Child rollout appends change the worker cost key without changing the parent structural key.
+
 test('a Codex child append moves the worker cost key and leaves the parent window current', async () => {
   const directory = tempDir('panel-progressive-codex-child-');
   const parent = path.join(directory, 'parent.jsonl');
@@ -4311,7 +4306,7 @@ for (const agent of ['claude', 'codex'] as const) {
       const intact = resume(initial.checkpoint);
       const cloned = resume(throughStructuredClone(initial.checkpoint));
       assert.ok(cloned.checkpoint!.coveredFrom > 0);
-      // The fixture has to carry hidden fields, or comparing them proves nothing.
+      // Require hidden fields in the fixture before comparing their values.
       assert.ok(
         hiddenFieldsOf(intact.read!.turns).some((turn) =>
           JSON.stringify(turn).includes('more detail than one line holds'),
@@ -5265,9 +5260,8 @@ test('shrinkage, replacement, and same-size rewrite make a completed window stal
   }
 });
 
-// A read-only review another agent started with `claude -p`: one prompt with no origin, Bash
-// calls whose results push the file past the metadata tail, a finished turn, and the hook
-// summary Claude Code writes when the turn stops.
+// A Claude print review has one originless prompt, Bash results beyond the metadata tail, a finished turn, and a stop summary.
+
 function reviewRun(
   options: { prompt?: Record<string, unknown>; after?: object[]; middle?: object[]; hook?: boolean } = {},
 ): object[] {
@@ -5325,9 +5319,8 @@ function reviewRun(
 
 const jsonLines = (records: object[]) => records.map((record) => JSON.stringify(record)).join('\n') + '\n';
 
-// A Claude subagent's own transcript: every record carries `isSidechain: true`, and the
-// first prompt carries the SDK entrypoint an `Agent` launch writes. Bash calls whose results
-// push the file past the metadata tail, the way a real implementer's file does.
+// Every subagent record has isSidechain. Its first prompt names the SDK entrypoint, and Bash results extend beyond the metadata tail.
+
 function subagentRun(): object[] {
   const calls = Array.from({ length: 40 }, (_unused, n) => [
     {
@@ -5377,9 +5370,8 @@ function subagentRun(): object[] {
   ];
 }
 
-// A subagent's own transcript holds no record but sidechain ones, so a whole-file scan
-// counts zero prompts and reads as nobody's. This checks that a subagent transcript larger
-// than the metadata tail skips that scan and files under Run by agents, not Today.
+// Sidechain-only records have no parent prompts. A large subagent transcript must retain its agent-run classification.
+
 test('a large Claude subagent session files under Run by agents, not Today', async () => {
   const directory = tempDir('panel-progressive-subagent-run-');
   const worker = new ProgressiveWorker(source);
@@ -5452,7 +5444,7 @@ test('a large Claude subagent session files under Run by agents, not Today', asy
   }
 });
 
-// The metadata read, the carried cursor and the enrichment read the rail runs, in its order.
+// Read metadata, resume its cursor, and enrich the session list entry in order.
 async function railEntry(
   worker: ProgressiveWorker,
   file: string,
@@ -5518,9 +5510,8 @@ test('a review run larger than the metadata tail files under Run by agents', asy
           reviewRun({ after: [{ type: 'system', subtype: 'a_later_kind', timestamp: timestamp(92) }] }),
         ),
       ],
-      // A human origin outside the SDK-only exception, so a second sdk-cli prompt with no
-      // origin (the shape a resumed `claude -p --resume` review leaves, and no longer a
-      // person on its own) still proves a sign in the middle reaches the whole-file scan.
+      // Place a human-origin prompt outside the SDK-only exception and outside the head and tail windows.
+
       [
         'a human-origin prompt outside the head and the tail',
         write(
@@ -5594,7 +5585,7 @@ test('an agent-run scan whose transcript grew while it ran keeps its cursor', as
       'an older scan moved a newer cursor back',
     );
 
-    // The start of the file no longer parses. A pass that read it again would call this a person.
+    // Corrupt the first record so an accidental restart produces a different person classification.
     const text = fs.readFileSync(file, 'utf8');
     const firstLine = text.indexOf('\n');
     fs.writeFileSync(file, '#'.repeat(firstLine) + text.slice(firstLine));
@@ -5680,7 +5671,7 @@ test('the agent-run scan resumes from its stored cursor and stops reading a pers
     const stored = loadDerivedCache(cache).titles.get(file);
     assert.deepEqual(stored?.agentRunScan, first.agentRunScan, 'the scan cursor does not survive the derived cache');
 
-    // The start of the file no longer parses. A scan that read it again would call this a person.
+    // Corrupt the first record so an accidental restart produces a different person classification.
     const text = fs.readFileSync(file, 'utf8');
     const firstLine = text.indexOf('\n');
     fs.writeFileSync(
@@ -5692,11 +5683,8 @@ test('the agent-run scan resumes from its stored cursor and stops reading a pers
     const appended = await railEntry(worker, file, stored);
     assert.equal(appended.agentRun, true, 'a run answer read more than the appended bytes');
 
-    // A plain second sdk-cli prompt with no origin no longer decides this on its own: an
-    // SDK-only transcript never counts one toward a second, the shape a resumed
-    // `claude -p --resume` review leaves. A follow-up queued while the agent worked still
-    // does, because somebody attached and typed, which neither a resumed call nor a
-    // background dispatch does by itself.
+    // An originless SDK prompt does not establish human activity. A queued follow-up does, because it records an attached reader's submission.
+
     fs.appendFileSync(
       file,
       jsonLines([
@@ -5745,9 +5733,8 @@ test('a human-origin typed prompt appended after a stored run turns it into a fi
     const first = await railEntry(worker, file);
     assert.equal(first.agentRun, true);
 
-    // A typed prompt with a human origin is a final person sign the moment it is read,
-    // unlike a plain sdk-cli prompt with no origin, which a resumed review never counts
-    // toward a second. Appending one after a stored run must still flip the answer.
+    // A human-origin prompt changes the stored agent-run classification even after the initial scan.
+
     fs.appendFileSync(
       file,
       jsonLines([
@@ -5850,9 +5837,8 @@ test('the metadata read names a Claude session by one first prompt as it grows p
   }
 });
 
-// A long orchestrator can print more receipts than the derived session cache keeps for one
-// parent. The saved cache keeps the parent, so a restart links the same children without
-// reading the parent again.
+// A parent at the reference limit retains its cached child links across restart without rereading the parent.
+
 test('an orchestrator parent past the per-file reference limit stays cached across a restart', async () => {
   const directory = tempDir('panel-progressive-claude-dispatches-');
   const file = path.join(directory, 'parent.jsonl');

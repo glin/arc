@@ -5,29 +5,22 @@ import { fileURLToPath } from 'node:url';
 import { launchAnyBrowser } from './test/browserchannels.mjs';
 import { acquireBrowserLock, forwardSignalToChildAndRelease } from './test/browserlock.mjs';
 
-// runBrowserLane and runFull take no lock by default, so a caller that does not pass one, such
-// as a test that stubs spawn and detectBrowser, can never reach the real machine-wide lock by
-// accident. Only the CLI entry point below binds the real acquireBrowserLock.
+// Default injected runners acquire no machine lock. The CLI entry point supplies the real acquireBrowserLock.
 async function noopAcquireLock() {
   return { release: () => true };
 }
 
 const root = dirname(fileURLToPath(import.meta.url));
 const modes = new Set(['full', 'node', 'browser']);
-// Vitest's own default worker count scales with the machine's core count, which a shared
-// runner or a laptop under other load does not have to spare. Each lane states its own cap
-// instead of accepting that default.
+// Cap lane workers explicitly instead of using Vitest's core-count default.
 const LANE_ARGS = {
   node: ['--fileParallelism', '--maxWorkers=8'],
   browser: ['--fileParallelism', '--maxWorkers=4'],
 };
 
-// Flags that take a required value in Vitest's own CLI table (`cliOptionsConfig` in
-// node_modules/vitest/dist/chunks/cac-*.js, where each entry lists an `argument` wrapped in
-// angle brackets for a required value). Every other flag is boolean or takes an optional
-// value that a bare following token never supplies, so its value never travels with it.
-// `scripts/extension-test-runner.test.js` reads the installed table and fails when this list
-// drifts from it.
+// Vitest flags with required values. The installed cliOptionsConfig marks required arguments with angle brackets.
+// The runner keeps separate following tokens out of optional-value flags.
+// scripts/extension-test-runner.test.js compares this set with the installed table.
 export const VALUE_FLAGS = new Set([
   '--root',
   '-r',
@@ -98,24 +91,18 @@ function laneLabel(mode) {
   return mode === 'node' ? 'Node' : 'Browser';
 }
 
-// Selects a lane's full file list, before a named-file argument can narrow it further.
+// Select the full lane file list before applying requested filenames.
 function selectForLane(mode, testRoot) {
   return selectTestFiles(discoverTestFiles(join(testRoot, 'src'), testRoot), mode);
 }
 
-// Reports the file count actually selected, so both a standalone lane script and full mode
-// print the same line whether or not the lane goes on to spawn Vitest. Printed after a named
-// file argument has narrowed the lane, so `browser <one file>` reports 1 file, not the lane.
+// Report the selected file count after named-file filtering, including runs that skip Vitest.
 function reportSelection(mode, selected) {
   console.log(`${laneLabel(mode)} lane: ${selected.length} file${selected.length === 1 ? '' : 's'} selected`);
 }
 
-// Splits the arguments after the mode into Vitest option flags and requested test files, so a
-// named file can narrow a lane's selection while an option and its value still reach Vitest.
-// An argument that starts with "-" is a flag. A flag that is one of Vitest's own required-value
-// flags always takes the next token as its value, even when that token also looks like a test
-// file, because Vitest itself would read it the same way. Any other flag never takes the next
-// token, so a named file after it still reaches `files` on the next loop turn.
+// Separate requested files from Vitest flags. Required-value flags consume the next token only when it does not start with a hyphen.
+// Other flags leave the next token for file selection.
 function partitionArgs(args) {
   const passthrough = [];
   const files = [];
@@ -135,17 +122,13 @@ function partitionArgs(args) {
   return { passthrough, files };
 }
 
-// Resolves a requested file against the full file list. A caller can name a file relative to
-// extension/, the way the lane lists its own files, or relative to the current directory, the
-// way it reads from the repository root, so both resolutions are tried.
+// Resolve requested files relative to extension/ or the current directory.
 function resolveRequestedFile(fileArg, allFiles, testRoot) {
   const candidates = new Set([resolve(testRoot, fileArg), resolve(process.cwd(), fileArg)]);
   return allFiles.find((file) => candidates.has(resolve(testRoot, file))) ?? null;
 }
 
-// Narrows a lane's selection to the named files, in the lane's own order. Fails with a clear
-// message instead of falling back to the whole lane when a name does not resolve to a file in
-// this lane.
+// Keep requested files in lane order. Reject names outside the lane instead of running its full file list.
 function narrowSelection(fileArgs, selected, testRoot, mode) {
   const allFiles = discoverTestFiles(join(testRoot, 'src'), testRoot);
   const requested = new Set();
@@ -164,9 +147,7 @@ function narrowSelection(fileArgs, selected, testRoot, mode) {
   return selected.filter((file) => requested.has(file));
 }
 
-// Lists selected files before the forwarded flags. Vitest's own CLI parser reads a boolean
-// flag with an optional value, such as --update, as greedily as our own partitionArgs used
-// to: a file token right after one is read as its value unless nothing follows the flag.
+// List files before flags because Vitest optional-value flags can consume following filenames.
 function vitestArgs(mode, extraArgs, selected, testRoot) {
   return [join(testRoot, 'node_modules', 'vitest', 'vitest.mjs'), 'run', ...LANE_ARGS[mode], ...selected, ...extraArgs];
 }
@@ -195,8 +176,7 @@ async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock)
     }
     return result.status ?? 1;
   }
-  // Held only around the child's own lifetime, so a signal delivered before or after this lane
-  // runs never reaches a handler with no child to forward it to.
+  // Forward signals only while the child runs, then remove its handlers.
   const detachSignalForwarding = forwardSignalToChildAndRelease(result, lock);
   try {
     return await new Promise((resolveStatus) => {
@@ -243,8 +223,7 @@ export function runTestMode(mode, extraArgs, { testRoot = root, spawn = spawnSyn
   return spawnLane(mode, selected, passthrough, testRoot, spawn);
 }
 
-// Tries the same browsers the layout and browser test files try, in the same order, and
-// reports which one a Vitest worker would actually get. Nothing is downloaded here.
+// Detect the browser using the test fixture's channel order. Download no browser.
 export async function detectBrowser(_testRoot = root) {
   const result = await launchAnyBrowser();
   if (!result) {
@@ -284,11 +263,8 @@ export async function runBrowserLane(
     console.error('No test files selected for browser mode.');
     return 1;
   }
-  // One lock file in the system temporary directory bounds the whole machine to one browser
-  // lane at a time, because a single run already spends its own --maxWorkers=4 worth of
-  // headless browsers. Acquired before detection, so a session waiting for the lock never also
-  // launches a detection browser outside the limit the lock exists to enforce. The finally below
-  // covers every exit path, including the no-browser skip.
+  // Acquire the machine-wide browser-lane lock before detection so waiting sessions launch no detection browser.
+  // Release it on every exit, including the no-browser skip.
   const lock = await acquireLock({ cwd: testRoot });
   try {
     const browserName = await detect(testRoot);
@@ -303,9 +279,7 @@ export async function runBrowserLane(
   }
 }
 
-// Sorts named files into the lane each one belongs to, so full mode can give each lane only
-// its own files instead of handing every named file to both. Fails with a clear message
-// naming the file instead of silently dropping it when a name matches no test file at all.
+// Partition requested files by lane for full mode. Reject names that match no test file.
 function splitFilesByLane(fileArgs, testRoot) {
   const allFiles = discoverTestFiles(join(testRoot, 'src'), testRoot);
   const byLane = { node: [], browser: [] };

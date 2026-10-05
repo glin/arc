@@ -34,11 +34,9 @@ import type { Ask } from '../src/agentwire.ts';
 import { addUsage } from '../src/agentspend.ts';
 
 export const CAPTURE_TIME = Date.parse('2026-09-15T14:42:00-05:00');
-// The zone the capture browser draws in.
+// Browser timezone for captures.
 export const CAPTURE_ZONE = 'America/Chicago';
-// The rail width the README captures and the web demo draw. At 380px the head holds the four lens
-// counts, the magnifying glass, the funnel, and the New split on one line in the fixture's font.
-// Below 374px the counts drop under the tools.
+// Session list width for README captures and the web demo.
 export const CAPTURE_RAIL_WIDTH = 380;
 export const DEMO_RAIL_FOLDS = { [RAIL_FOLDS.agent]: false, [RAIL_FOLDS.archived]: false };
 const ROOT = 'C:/sample/arc';
@@ -476,9 +474,7 @@ export const README_SCENES = [
   'usage',
 ] as const;
 
-// Priced by the production list-price pricer, so the Project cost figures are what the panel
-// would show for these records. Every date comes from the capture day in the capture zone, so
-// the scene is the same on any host.
+// Derive the capture day in the capture timezone so host timezone changes leave it unchanged.
 const CAPTURE_DAY = new Intl.DateTimeFormat('en-CA', { timeZone: CAPTURE_ZONE }).format(CAPTURE_TIME);
 
 function spendDate(daysBack: number): string {
@@ -487,12 +483,11 @@ function spendDate(daysBack: number): string {
   return date.toISOString().slice(0, 10);
 }
 
-// The view reads its windows from the host calendar, so it is given noon of the capture day
-// on that calendar.
+// Use noon of the capture day on the host calendar for Project cost windows.
 const [captureYear, captureMonth, captureDate] = CAPTURE_DAY.split('-').map(Number);
 const SPEND_NOW = new Date(captureYear, captureMonth - 1, captureDate, 12).getTime();
 
-// The band comes from the average request, as the indexer bands each request it reads.
+// Estimate the context band from average request input. Production indexing bands individual requests.
 function spendBucket(
   agent: 'claude' | 'codex',
   daysBack: number,
@@ -552,7 +547,7 @@ const README_PROJECT_SPEND = {
   indexingStatus: null,
 };
 
-// One reading per agent, both read a minute before capture, so the bar says no age.
+// Each agent has a usage reading from one minute before capture.
 const README_USAGE: AgentUsage[] = [
   {
     agent: 'claude',
@@ -652,8 +647,7 @@ const demoCodexReadStateTurn: Turn = {
       at: start + 12 * 60_000,
       status: 'done',
     },
-    // Codex loads a skill by reading its SKILL.md with a command, which the parser records as a
-    // completed command and a best-effort skill use.
+    // Codex reads SKILL.md through a command. The fixture includes that command and its best-effort skill use.
     {
       ordinal: 23,
       name: 'exec_command',
@@ -920,8 +914,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       },
       usage: expiryUsage,
       finished: true,
-      // The unread-results agents without their child session link. Only the unread-results
-      // session opens "Preserve unread state", so that session's heading names one parent.
+      // Remove these subagent links so only the unread-results session opens Preserve unread state.
       agents: readStateTurn.agents.map((agent) => {
         const unlinked = { ...agent };
         delete unlinked.childSessionId;
@@ -1228,7 +1221,7 @@ export function demoContextSample(sessionId: string) {
 export const DEMO_SESSION_IDS = Object.keys(DEMO_TURNS).filter((id) => id !== 'arc-codex-read-state');
 DEMO_SESSION_IDS.splice(1, 0, 'arc-codex-read-state');
 
-// Each subagent session the unread-results turn links, as child id to its parent edge.
+// Map linked unread-results subagent session IDs to their parent edges.
 const demoParentEdges = new Map<string, SessionParentEdge>(
   demoReadStateTurn.agents.flatMap((agent) =>
     agent.childSessionId
@@ -1241,8 +1234,7 @@ demoParentEdges.set('arc-demo-review', { parent: 'arc-demo-dispatch', relation: 
 
 const demoReaderParents: Readonly<Record<string, string>> = { 'arc-demo-continuation': 'arc-demo-dispatch' };
 
-// The labels each sample session starts with. The web demo edits a copy of this record in the
-// page, so it rebuilds every rail card's label fields from the record it holds.
+// Initial demo session labels. The adapter edits a page-local copy and rebuilds session list label fields from it.
 export const DEMO_LABELS: Readonly<Record<string, readonly string[]>> = {
   'arc-read-state': ['review', 'navigation'],
   'arc-codex-read-state': ['navigation'],
@@ -1414,7 +1406,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
         membership === 'archived' ? everyId : new Set(),
         membership === 'pinned' ? everyId : new Set(),
         reading === 'unread' ? new Map(rows.map((row) => [row.id, { count: 1, atLeast: false }])) : new Map(),
-        // No labels, so `nameAfterAge` ends before the label clause the page appends.
+        // Omit labels because the page appends their accessible-name clause.
         {},
       );
       railVariants[`${membership}:${reading}`] = Object.fromEntries(

@@ -64,9 +64,7 @@ test('the View menu draws the twelve most used labels, then folds the rest behin
 });
 
 test('one label becomes one query term, quoted where the grammar needs it', () => {
-  // The rule two controls read: a row of the rail's own suggestions, and a chip on the session
-  // heading. A name carrying a space needs its quotes, or the grammar reads the second word as
-  // a title term and the filter answers a question nobody asked.
+  // Session list suggestions and session heading labels share this token rule. Quote spaces so the label remains one query term.
   assert.equal(labelFilterToken('perf'), 'label:perf');
   assert.equal(labelFilterToken('release 0.4'), 'label:"release 0.4"');
   assert.equal(labelFilterToken('say "yes"'), 'label:"say ""yes"""');

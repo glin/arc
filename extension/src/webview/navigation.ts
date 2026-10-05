@@ -30,15 +30,10 @@ export function navigationIndex(key: string, index: number, length: number): num
   return null;
 }
 
-// The attribute every control in the walk wears while it is on the page. Several owners draw
-// those controls, and the navigation owner puts the attribute on what the selector above
-// names as each changed subtree reaches the page. A read of the walk then matches one
-// attribute over the page, and a page that has not changed since the last read is not
-// matched at all.
+// Mark matching controls as changed subtrees arrive. Reads reuse the cached walk until the page changes.
 const ROVING_MARK = 'data-roving';
 
-// The element node type, by number. A node arrives from whichever document drew it, and a
-// check against this realm's own Element answers no for a node another realm made.
+// Compare nodeType across realms, where local Element instanceof checks fail.
 const ELEMENT_NODE = 1;
 
 export type NavigationMessage = Extract<PanelToHost, { type: 'goBack' | 'goForward' }>;
@@ -52,8 +47,7 @@ export interface NavigationEvents {
   window(type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void;
 }
 
-// What the owner keeps of the watch it asked for: the changes queued since the last read,
-// and the way to end the watch.
+// Exposes queued mutations and observer cleanup.
 export interface NavigationWatch {
   takeRecords(): MutationRecord[];
   disconnect(): void;
@@ -65,8 +59,7 @@ export interface NavigationService {
   setRoving(node: HTMLElement | null, controls?: readonly HTMLElement[]): void;
   installRoving(): void;
   refreshBackToTop(): void;
-  // Ends the watch on the page. A navigation left watching after its owner is finished keeps
-  // marking every subtree the page adds, and a second navigation over one page marks it twice.
+  // Disconnects the observer so a finished owner stops marking controls.
   dispose(): void;
 }
 
@@ -107,8 +100,7 @@ export function createNavigation(options: {
   toTopLabel: string;
 }): NavigationService {
   const marked = `[${ROVING_MARK}]`;
-  // The walk and the part of it the reader can reach, held from one read to the next. A page
-  // change drops both, so neither answer outlives the page it was taken from.
+  // Cache the complete walk and reachable controls. Page changes invalidate both.
   let walk: HTMLElement[] | null = null;
   let reachable: HTMLElement[] | null = null;
   const shown = (node: HTMLElement): boolean => !node.closest('[hidden]');
@@ -124,9 +116,7 @@ export function createNavigation(options: {
       node.removeAttribute(ROVING_MARK);
     }
   };
-  // A node arrives with its whole subtree, and an owner may have built that subtree off the
-  // page, where no change of it was reported. So the mark of every control in it is decided
-  // here, including a mark left on a control that no longer belongs to the walk.
+  // Inspect complete subtrees because owners build them off-page. Remove stale marks from controls outside the walk.
   const markTree = (node: Node): void => {
     if (!isElement(node)) {
       return;
@@ -161,8 +151,7 @@ export function createNavigation(options: {
     attributes: true,
     attributeFilter: ['class', 'hidden'],
   });
-  // A repaint draws its controls and reads the walk in one pass. The watcher reports a change
-  // only after that pass ends, so every read takes what it has queued first.
+  // Drain queued mutations before reading controls, including changes from the same rendering pass.
   const allControls = (): HTMLElement[] => {
     absorb(watcher.takeRecords());
     walk ??= Array.from(options.document.querySelectorAll<HTMLElement>(marked));

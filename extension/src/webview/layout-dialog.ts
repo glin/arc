@@ -1,10 +1,5 @@
-// The Timeline layout dialog, opened by the gear at the right end of a session heading row.
-//
-// One dialog per panel. Every gear opens it for the same two settings. It is drawn the way the
-// rail's View menu is drawn: a head, then one section per setting with a radio row per
-// value. Each row's name carries a native `title` that explains its value in the words the
-// Settings editor shows. A press on a row posts `setLayout`. The checked row follows the layout
-// the last host update carried, so the dialog shows a change only once the setting has been written.
+// One Timeline layout dialog serves every session-heading gear in the panel.
+// Radio rows post setLayout and reflect the latest host settings. Their labels expose native tooltips from the Settings editor.
 
 import { Fragment, h, render } from 'preact';
 import {
@@ -118,8 +113,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
   };
 
-  // Under the gear, with the dialog's right edge at the gear's right edge, because the gear
-  // sits at the right end of its row and a dialog drawn from its left edge would leave the panel.
+  // Align the dialog's right edge with the gear to keep it inside the panel.
   const place = () => {
     if (!anchor || pop.hidden) {
       return;
@@ -157,9 +151,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
       close(true);
       return;
     }
-    // Tab past the last row, or Shift+Tab before the first, leaves the dialog. In the editor
-    // nothing may follow the dialog in the panel, and focus then leaves the panel for nowhere,
-    // so the key closes the dialog itself and lets focus move on.
+    // Tab past either edge closes the dialog before focus leaves, including when no other panel control follows.
     if (event.key === 'Tab') {
       const stops = Array.from(pop.querySelectorAll<HTMLElement>('[role="radio"][tabindex="0"]'));
       const edge = event.shiftKey ? stops[0] : stops[stops.length - 1];
@@ -187,8 +179,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
     next.focus();
   });
-  // Focus leaving for a control outside closes the dialog. Focus that leaves for nowhere, as when
-  // the window loses focus, leaves it open.
+  // Focus moving to another control closes the dialog. A window blur with no focus target leaves it open.
   pop.addEventListener('focusout', (event) => {
     const to = event.relatedTarget as Node | null;
     if (!to || pop.contains(to) || anchor?.contains(to)) {

@@ -4,9 +4,8 @@ import * as path from 'node:path';
 import { test } from 'vitest';
 import { sendWaitsForStaging } from './composer.ts';
 
-// `createComposerRenderer` renders through Preact into a real document, so its `send` press
-// needs a browser to run. These tests cover the decision that press makes through the pure
-// function it calls, and a text scan below confirms the press still calls it before it sends.
+// The renderer needs a browser document. Node tests check staging decisions and
+// confirm that the send handler checks staging before posting sendPrompt.
 
 test('a Codex /rename draft sends while a file stages', () => {
   assert.equal(sendWaitsForStaging('codex', '/rename quest pro root', true), false);

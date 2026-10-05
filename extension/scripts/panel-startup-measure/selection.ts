@@ -215,7 +215,7 @@ export function pendingOverlap(
   return { available: true, reason: 'browser click lies within identified B worker window interval' };
 }
 
-// This module exists only in the disposable build. It never enters the shipping source.
+// The tracing module is written only into the disposable measurement build.
 export const TRACE_SOURCE = `
 import fs from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';

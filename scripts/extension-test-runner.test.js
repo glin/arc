@@ -1256,13 +1256,7 @@ test('a known value flag keeps its following positional token out of file select
   }
 });
 
-// Reads Vitest's own CLI option table out of its installed source, as plain text, so a Vitest
-// upgrade that adds or drops a required-value flag turns this test red instead of drifting
-// silently away from extension/test.mjs's hand-kept VALUE_FLAGS list. Parses only enough of the
-// object literal to split it into top-level entries and read each entry's own `argument`,
-// `shorthand`, and `alias` fields, skipping past nested `subcommands` blocks and skipping over
-// string and template-literal contents so a brace or colon inside a description never confuses
-// the split.
+// Extracts a balanced object body while skipping quoted text and escaped characters.
 function sliceBalancedBraces(source, openIndex, chunkPath) {
   if (source[openIndex] !== '{') {
     throw new Error(`expected "{" at offset ${openIndex} of ${chunkPath}`);
@@ -1354,6 +1348,8 @@ function splitTopLevelEntries(body, chunkPath) {
   return entries;
 }
 
+// Read required-value flags and their aliases from Vitest's CLI option table.
+// Skip nested subcommands so their options do not enter VALUE_FLAGS.
 function extractRequiredValueFlags(source, chunkPath) {
   const marker = 'const cliOptionsConfig = {';
   const markerIndex = source.indexOf(marker);

@@ -18,20 +18,17 @@ export interface ChildEvidence {
   }>;
 }
 
-// One file a child changed, summed over every edit of it the child recorded, rather than a
-// final net diff. It carries the fields a file row draws, because the card merges these into
-// its own file rows and a child's record then draws the rows the card draws.
+// One child's recorded edits to a file, summed across turns.
+// These totals describe recorded edits, rather than the final net diff. Parent cards and child details share the file-row fields.
 export interface ChildFileChange {
   path: string;
   added: number;
   removed: number;
   isNew: boolean;
-  // Set where no edit of this file carried its hunks, so the row holds no line count at all.
+  // Set when the row has no counted lines and includes an edit without hunks.
   countsUnknown?: true;
-  // Why the row is short of a count, carried across from the edit that named the path without
-  // its lines. It stays when `settleCounts` turns `countsUnknown` into `countsPartial`, because
-  // that edit is still why the count is a floor. Absent where the caller built the row without
-  // recording a cause.
+  // The cause of missing line counts. `settleCounts` retains it when other edits supply partial counts.
+  // Absent when the caller supplies no cause.
   unknownReason?: FileCountReason;
   // Set where the row holds a count and another edit of the same file named it without hunks.
   // The counts above are real, and they are a floor.
@@ -54,9 +51,7 @@ export interface ChildArtifacts {
   // For a Codex guardian, startedAt is the payload clock, before its first turn.
   startedAt?: number;
   endedAt?: number;
-  // How many turns the child ran. Present only where it ran more than one. A Claude subagent
-  // always holds exactly one, so this fires for a Codex child prompted more than once or for a
-  // dispatched session someone resumed and typed into again.
+  // The child's turn count, present only above one. Resumed dispatched sessions and repeatedly prompted Codex children can have multiple turns.
   turnCount?: number;
   // False when the child's record was cut short, so every figure above is a lower bound.
   complete: boolean;
@@ -77,9 +72,8 @@ export function childToolCalls(artifacts: ChildArtifacts | undefined): number | 
   return total;
 }
 
-// A child's own copy of the figures a read returned, independent of the cache or the lookup
-// result that supplied them. `files` and `commits` are copied too, so a later change to either
-// side never reaches through the other.
+// Copies child artifacts, including nested file, commit, tool, and failure values.
+// Changes to the copy do not affect the cached result.
 export function cloneChildArtifacts(artifacts: ChildArtifacts): ChildArtifacts {
   return {
     ...artifacts,
@@ -99,10 +93,8 @@ export interface ChildArtifactOptions {
   sameCommit: (left: string, right: string) => boolean;
 }
 
-// The span of a set of turns: the earliest start and the latest end, where the process that
-// ran a turn outlived the turn's own last record. A turn with no recorded start carries zero
-// rather than an absent field, so a zero is read as no start rather than as an epoch one, and
-// a caller that read a turn's start before this one ran never has it pull the span back to 1970.
+// Returns the earliest nonzero start and latest nonzero end.
+// Each turn uses `processEndedAt` when present, otherwise `endedAt`. Zero timestamps supply no boundary.
 export function childTurnSpan(turns: readonly { startedAt?: number; endedAt?: number; processEndedAt?: number }[]): {
   startedAt?: number;
   endedAt?: number;
@@ -121,15 +113,12 @@ export function childTurnSpan(turns: readonly { startedAt?: number; endedAt?: nu
   return { startedAt, endedAt };
 }
 
-// Reduce a child's own record to its distinct files and commits. A path that several turns
-// changed is one file whose counted edits all add to the line totals. Only the child's record
-// is read, so a path or a commit the parent turn recorded as well counts once on the child
-// row, and the parent's own work stays off it.
+// Reduces the child's record to distinct files and commits. Repeated edits to a path add to that file's totals.
+// The child row excludes the parent's own work.
 export function reduceChildArtifacts(child: ChildEvidence, options: ChildArtifactOptions): ChildArtifacts {
   const files = new Map<string, ChildFileChange>();
   const commits: string[] = [];
-  // Tool names are the agent's own words, so they are gathered in maps and written out with
-  // `Object.fromEntries`, which keeps a name such as `__proto__` an ordinary count.
+  // Maps and `Object.fromEntries` preserve arbitrary tool names, including `__proto__`, as ordinary counts.
   const tools = new Map<string, number>();
   const failed = new Map<string, number>();
   let failedCount = 0;
@@ -154,10 +143,8 @@ export function reduceChildArtifacts(child: ChildEvidence, options: ChildArtifac
       if (file.isNew) {
         held.isNew = true;
       }
-      // A record marked as saying nothing about its size can still carry counted lines. One
-      // child turn that edits a path and writes it whole holds both on one entry, so the mark
-      // never stands for a zero. The counted lines always reach the row, and `settleCounts`
-      // below decides which mark the row keeps once every record of the path has been read.
+      // An edit without hunks can share an entry with counted edits to the same path.
+      // Keep those lines. `settleCounts` chooses the final unknown or partial status after all edits are accumulated.
       if (file.countsUnknown) {
         held.countsUnknown = true;
         if (file.unknownReason) {
@@ -173,8 +160,7 @@ export function reduceChildArtifacts(child: ChildEvidence, options: ChildArtifac
       }
     }
   }
-  // Read once every record of a path has been gathered into its row, because the mark a row
-  // carries depends on whether any record of it counted a line.
+  // Settle each row after accumulating all edits. Missing hunks and counted edits together determine its status.
   for (const held of files.values()) {
     settleCounts(held);
   }
@@ -191,24 +177,14 @@ export function reduceChildArtifacts(child: ChildEvidence, options: ChildArtifac
   };
 }
 
-// Which of the two marks a row carries, once every record of one path has been read into it.
-//
-// A record that names a path without its hunks says nothing about the lines another record
-// counted on it, so it never takes those lines away. A row holding a count is partial rather
-// than unknown, which keeps it in the line totals and marks the total a floor, a fact its
-// record carries rather than the figure's face. A row holding no count at all is unknown,
-// whichever record named it first.
-//
-// A child's own reducer, the card's rows, and the session heading's rows all settle a row here,
-// so the child's figure, the turn's figure, the heading's figure and the rows under them cannot
-// mark one file two ways.
+// Settles a file row after all recorded edits have been accumulated.
+// Missing hunks do not remove counted lines. A row with counted lines becomes partial. A row without counted lines becomes unknown.
+// Child details, turn cards, and session headings use this rule.
 export function settleCounts(row: ChildFileChange): void {
   if (!row.countsUnknown && !row.countsPartial) {
     return;
   }
-  // A row that resolves to a counted floor keeps `unknownReason`, because the record that named
-  // the path without its lines is still why the count is short. An Edit and then a whole-file
-  // Write of one path settles to partial, and the figure still says the file was written whole.
+  // Keep `unknownReason` when counted edits make the row partial. The edit without hunks still explains the missing counts.
   if (row.added || row.removed) {
     row.countsPartial = true;
     delete row.countsUnknown;
@@ -244,9 +220,7 @@ export function lastLineWhole(line: string): boolean {
   }
 }
 
-// The same figures with the commits a repository read recovered for the child. The result is
-// a new object, because the figures a child read returns are shared with the cache that holds
-// them.
+// Adds distinct recovered commits without modifying cached artifacts. Returns the original object when every recovered commit is already present.
 export function withRecoveredCommits(
   artifacts: ChildArtifacts,
   recovered: readonly { sha: string }[],

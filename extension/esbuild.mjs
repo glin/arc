@@ -7,14 +7,11 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { require as tsRequire } from 'tsx/cjs/api';
 
-// The browser build is written in TypeScript beside the modules it builds, and Node does not
-// load TypeScript on its own. A scoped import keeps `node esbuild.mjs` as the build command.
+// The scoped TypeScript loader lets Node import panelbundle.ts from this build script.
 const { browserBundle, browserStylesheet } = tsRequire('./src/panelbundle.ts', import.meta.url);
 
-// The panel's browser program and compact stylesheet are built by
-// `panelbundle.ts`, the one place that knows how, so the page the tests draw and the script
-// this bundle carries are one artifact. Both are substituted into the production bundle.
-// A development bundle selects Vite at build time and never parses the browser sources.
+// panelbundle.ts supplies the browser program and stylesheet to production builds and test pages.
+// Development builds select Vite without parsing browser sources.
 const PANEL_CSS = 'src/webview/panel.css';
 
 function panelText(developmentServerUrl) {

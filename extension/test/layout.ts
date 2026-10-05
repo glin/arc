@@ -1,7 +1,4 @@
-// Shared helpers for the panel-layout browser test files.
-//
-// The tests that drive a real browser and measure the panel live in `extension/src/panel.layout*.test.ts`.
-// Those files import their fixtures and measurement helpers from here so each one stays a plain list of tests.
+// Shared fixtures and measurements for panel-layout browser tests.
 
 import assert from 'node:assert';
 import { Page } from 'playwright-core';
@@ -20,7 +17,7 @@ import {
 } from '../src/panelfixture.ts';
 import { STEP_CUT, STEP_DETAIL_LIMIT, shortenTo } from '../src/transcript.ts';
 
-// The walk the panel uses comes from its production owner.
+// Use the production keyboard-navigation selector.
 export function rovingSelector(): string {
   return ROVING_SELECTOR;
 }
@@ -54,7 +51,7 @@ export const RAPID_PERMISSION_ASKS: Ask[] = [
   },
 ];
 
-// The page, rendered once at a given width, with everything measured off it.
+// Panel element bounds and viewport measurements.
 export interface Laid {
   composer: { top: number; left: number; right: number; bottom: number };
   ask: { top: number; left: number; right: number; bottom: number } | null;
@@ -80,10 +77,7 @@ export interface Laid {
   viewportWidth: number;
 }
 
-// Every one of these runs in the page as a **string**, never as a function. This file is
-// transpiled before it runs, and a transpiler rewrites an arrow function to call helpers of
-// its own; handed to the browser, that function throws on a helper the page has never heard
-// of. A string is the source the page actually gets.
+// Send page code as strings. Transpiled functions can reference helpers unavailable in the browser.
 export const MEASURE = `(() => {
   const box = (el) => {
     if (!el) return null;
@@ -122,9 +116,7 @@ export const MEASURE = `(() => {
   };
 })()`;
 
-// Where the three sticky rows sit once the page has moved under them, and where the foot
-// begins. A sticky row that has ridden up above the viewport is drawn off the top of the
-// panel; anything below the foot's own top edge is drawn behind it.
+// Read sticky-row positions and the status bar and prompt box boundaries.
 export const STICKY = `(() => {
   const top = (s) => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().top : null; };
   const tops = {};
@@ -152,10 +144,8 @@ export interface Scrolled {
   composerTop: number;
 }
 
-// The rail scrolls inside itself rather than with the page, so the page scroll above says
-// nothing about what its own headings do. This reads the box that stays over them and every
-// heading drawn, each one twice: where it sits in the scroller, which does not move, and
-// where it is drawn, which is the whole question.
+// Measure session-list headings within their scroller and against the viewport.
+// Page scrolling does not describe the session list's independent scroll position.
 export const RAILROWS = `(() => {
   const rail = document.getElementById('rail');
   if (!rail || rail.hidden) return null;
@@ -228,10 +218,7 @@ export async function layoutAt(
   return (await page.evaluate(MEASURE)) as Laid;
 }
 
-// The name a screen reader would read for one element, taken from Chromium's own
-// accessibility tree. A hand-rolled version built by walking `textContent` and `aria-label`
-// risks its own answer, one no real screen reader gives. This asks the browser the same
-// question a screen reader asks.
+// Read the element's accessible name from Chromium's accessibility tree.
 export async function axName(page: Page, selector: string): Promise<string | null> {
   const client = await page.context().newCDPSession(page);
   await client.send('Accessibility.enable');
@@ -244,8 +231,7 @@ export async function axName(page: Page, selector: string): Promise<string | nul
   return tree.nodes[0]?.name?.value ?? null;
 }
 
-// The sentinel, measured on the real page. Two states, because they draw different elements:
-// the button that asks for a page, and the status line that replaces it at the first turn.
+// Measure the older-turn button or the status row shown at the first turn.
 export const OLDER_ROW = `(() => {
   const btn = document.querySelector('#list .deeper');
   const note = document.querySelector('#list .deeper-note');
@@ -273,9 +259,7 @@ export const OLDER_ROW = `(() => {
   };
 })()`;
 
-// Where the foot stands against the bar under it, with nothing about the page changed but
-// its width. The bar wraps to a second row in a narrow panel and the box grows with what is
-// in it, and neither of those reaches the composer's own print.
+// Measure prompt box overlap with the status bar, including its wrapped height.
 export const FOOT_OVER_BAR = `(() => {
   const bar = document.getElementById('statusbar');
   const composer = document.getElementById('composer');
@@ -290,17 +274,14 @@ export const FOOT_OVER_BAR = `(() => {
   return { over, barTop, barHeight: box(bar).height, reserved: document.body.style.getPropertyValue('--statusbar-height') };
 })()`;
 
-// Which choice rows on the drawn request card wear the taken mark, in the order they are
-// drawn. Read off the class rather than off the controls, because the class is what puts the
-// ground on the row and a control the stylesheet never reached would still report checked.
+// Read selected-row classes in display order.
+// These classes control the row background independently of checked inputs.
 export async function pickedRows(page: Page): Promise<boolean[]> {
   return (await page.evaluate(`(() => [...document.querySelectorAll('.cask .caskchoice')]
     .map((row) => row.classList.contains('is-picked')))()`)) as boolean[];
 }
 
-// Every question the card has on screen. One question at a time is the whole of the change,
-// so a guard that reads the choices without reading this measures a card that could still be
-// drawing all of them.
+// Read displayed question legends, excluding their key labels.
 export async function drawnQuestions(page: Page): Promise<string[]> {
   return (await page.evaluate(`(() => [...document.querySelectorAll('.cask .casklegend')].map((legend) => {
     const key = legend.querySelector('.caskkey');
@@ -315,8 +296,7 @@ export interface TabFace {
   stop: number;
 }
 
-// What the strip shows and where its one tab stop is. The value is read off the face rather
-// than off the name, because past the second row the face drops it and the name keeps it.
+// Read tab labels, visible values, selection, and tab stops. Hidden values contribute no text.
 export async function tabFaces(page: Page): Promise<TabFace[]> {
   return (await page.evaluate(`(() => [...document.querySelectorAll('.cask .casktab')].map((tab) => {
     const pick = tab.querySelector('.casktabpick');
@@ -330,8 +310,7 @@ export async function tabFaces(page: Page): Promise<TabFace[]> {
   }))()`)) as TabFace[];
 }
 
-// One question, which is the card that needs no strip. A strip of one tab is a tab widget over
-// nothing, and no board draws one.
+// A single-question request needs no question tabs.
 export const ONE_QUESTION_ASK = {
   ...THREE_QUESTION_ASK,
   id: 'layout-one',
@@ -339,9 +318,8 @@ export const ONE_QUESTION_ASK = {
   questions: [THREE_QUESTION_ASK.questions[0]],
 };
 
-// Claude names a question by the question itself, so a real card carries ids holding spaces
-// and a question mark. `aria-controls` and `aria-labelledby` are space-separated lists of ids,
-// so an id built from one of those resolves to nothing at all.
+// Question IDs contain the question text, including spaces.
+// aria-controls and aria-labelledby need whitespace-free IDs because they contain space-separated ID lists.
 export const SPOKEN_ID_ASK: Ask = {
   ...THREE_QUESTION_ASK,
   id: 'layout-spoken',
@@ -349,8 +327,7 @@ export const SPOKEN_ID_ASK: Ask = {
   questions: THREE_QUESTION_ASK.questions.map((question) => ({ ...question, id: question.question })),
 };
 
-// A question request holding no questions. The Codex wire builds one whatever its list holds,
-// and the reader still needs the way out of it.
+// An empty question request still needs a dismissal control.
 export const NO_QUESTION_ASK: Ask = {
   ...THREE_QUESTION_ASK,
   id: 'layout-empty',
@@ -358,14 +335,13 @@ export const NO_QUESTION_ASK: Ask = {
   questions: [],
 };
 
-// Every question of the six answered: the first in the reader's own words, which is the long
-// value in practice, the four after it off the list, and the last in its password box. It is
-// the state the strip is widest in, which is what the two-row rule is about.
+// Answer six questions with a long written answer, four listed choices, and a password.
+// The long answer exercises tab-value wrapping.
 export async function answerSixQuestions(page: Page): Promise<void> {
   const six = SIX_QUESTION_ASK.questions;
   await page.locator(`[data-control="ask:layout-six:${six[0].id}:Other"]`).click();
   await page.locator(`[data-control="askwritten:layout-six:${six[0].id}"]`).fill(LONG_WRITTEN_ANSWER);
-  // Next, because a written answer never moves the card by itself.
+  // Advance explicitly after a written answer.
   await page.locator('[data-control="ask:layout-six:answer"]').click();
   for (const question of six.slice(1, -1)) {
     await page.locator(`[data-control="ask:layout-six:${question.id}:${question.options[0].label}"]`).click();
@@ -375,7 +351,7 @@ export async function answerSixQuestions(page: Page): Promise<void> {
   await page.locator(`[data-control="askwritten:layout-six:${secret.id}"]`).fill('the-secret-answer');
 }
 
-// How many rows the strip took, and whether it gave up its values to get there.
+// Read the tab row count and the class that suppresses tab values.
 export const STRIP_ROWS = `(() => {
   const strip = document.querySelector('.cask .casktabs');
   return {
@@ -384,11 +360,7 @@ export const STRIP_ROWS = `(() => {
   };
 })()`;
 
-// The mark on a commented line, measured. Its vertical place is the one it would have had in
-// the line, and its horizontal place is a negative offset into the indent the card body
-// already leaves. Neither is knowable from the source: a mark clipped away by a code block,
-// pushed under the card's own left edge, or dropped a line below the text it belongs to reads
-// exactly like a working one to every text scan in this repository.
+// Bounds and visibility of a comment mark.
 export interface MarkBox {
   top: number;
   left: number;
@@ -413,14 +385,12 @@ export async function markedLayout(
   paraText: string;
 }> {
   await page.setViewportSize({ width, height: 900 });
-  // The marks are read in the order the card draws the response and then You asked, which is
-  // the order the Prompt position setting draws with the prompt below the response.
+  // Place the prompt below the response so mark order matches the assertions.
   await page.evaluate(
     `window.postMessage(${JSON.stringify({ ...renderPayload(), timelineLayout: { cardLayout: 'compact', promptPosition: 'below' } })}, '*')`,
   );
   await page.evaluate(SETTLED);
-  // The first card, opened, because a folded body has no layout at all. Only where it is
-  // shut: the open set outlives a render, so a second pass would fold it again.
+  // Open the first card only if closed. Open state survives a render.
   await page.evaluate(`(() => {
     const turn = document.querySelector('.turn');
     if (turn.querySelector('.body').hidden) turn.querySelector('.head').click();
@@ -485,9 +455,7 @@ export async function markedLayout(
   };
 }
 
-// One rail card's meta line: the words on it, whether each drew as a single unbroken run,
-// how tall the line came out against one line of its own text, how far past the card it
-// runs, and whether the first word had to be cut to fit inside the column.
+// Session-list metadata text, line counts, overflow, and clipping.
 export interface MetaLine {
   words: string[];
   rects: number[];
@@ -495,15 +463,9 @@ export interface MetaLine {
   clipped: boolean;
 }
 
-// How many lines a span's words actually came out on. Its own box cannot answer that: a
-// flex item is blockified whatever it was written as, so `getClientRects` on the span gives
-// one rect around the whole block however many lines of text sit inside it, and its height
-// grows in step with the line's, so a box-against-box check moves with the fault rather
-// than catching it. A range over the contents is measured instead.
-//
-// Counted by how many heights the rects sit at, and never by how many rects there are. A
-// clipped end draws a second rect at the same top as the first, so a span cut by its own
-// ellipsis reads as two lines to a count and as one to this.
+// Count distinct text-range top positions to measure wrapped lines.
+// Flex-item boxes contain every line and cannot identify wrapping.
+// Ellipsis can produce multiple rectangles on one line, so count heights rather than rectangles.
 export const META_LINES = `(() => {
   const rect = (e) => e.getBoundingClientRect();
   const lines = (e) => {
@@ -526,19 +488,7 @@ export const META_LINES = `(() => {
   });
 })()`;
 
-// The meta line under a rail card's name, at the narrowest column the sash can leave it.
-//
-// It is one line, or the card is wrong. The name above it was given nowrap and an ellipsis
-// when it was written and this line was not, so each of its spans shrank to its longest
-// word and then wrapped inside it: the agent's name over two lines with the time under it
-// over two more, on a card at nothing like the rail's minimum. Nothing measured a card's
-// own contents, so every text scan of the stylesheet read the rule as working.
-//
-// The words are the widest run the panel can actually draw and not an invented one. A
-// pinned session another agent ran says `run by an agent` where a name would go, its
-// last turn failed, and unfinished input replaces the time with `unsent`.
-// What the workspace has filed, for the editor the guard below opens. The rows come from the
-// extension in the real panel, so a page with no extension behind it answers the ask here.
+// Session labels supplied when the page answers an editor request without an extension host.
 export const EDITOR_LABELS: Record<string, string[]> = {
   s1: ['composer', 'release 0.4', 'perf'],
   s2: ['release 0.4', 'rail'],
@@ -546,18 +496,7 @@ export const EDITOR_LABELS: Record<string, string[]> = {
   s4: ['worktree parallel sessions and the rails'],
 };
 
-// The label editor, opened over the rail and measured.
-//
-// It is a popover about one card, hung off a control on that card, so the first thing it can
-// get wrong is covering the session it is about. The second is its own rows: a name as
-// long as a reader can type has to give way to the count beside it rather than push it out of
-// the popover. Neither shows in a scan of the stylesheet.
-//
-// The keyboard is measured here too, because it is the part no text scan can answer at all.
-// The popover sits on the document body, outside the rail, so the page's own arrow-key walk
-// never reaches into it and the walk inside it is the only way through by keyboard.
-
-// One heading's label line, as the browser laid it out.
+// Session-heading labels, accessibility attributes, and layout measurements.
 export interface SessionLabelLine {
   chips: string[];
   titles: (string | null)[];
@@ -580,8 +519,7 @@ export interface SessionLabelLine {
   rowBottom: number;
 }
 
-// One card's label line, as the browser laid it out. Every figure is a distance rather than
-// a verdict, so a failure says how far out the line came and not only that it did.
+// Session-list labels and their distances from row, card, and list boundaries.
 export interface RailLabelLine {
   chips: [string, string][];
   chipLines: number[];
@@ -598,9 +536,7 @@ export interface RailLabelLine {
   coversActions: boolean;
 }
 
-// The same press, with a reply arriving on it. As long as the panel ever holds, which is the
-// only length worth measuring: the card keeps a tail and this is a full one, so the line runs
-// off the row at every width the panel is dragged to and which end gets cut is a real answer.
+// A long live reply exercises clipping at different panel widths.
 export const LIVE_REPLY = {
   ...LIVE_PRESS,
   reply:
@@ -640,19 +576,15 @@ export function flatLog(rows: Record<string, unknown>[]): Record<string, unknown
   return rows.flatMap((row) => (row.steps as Record<string, unknown>[]) ?? [row]).map(({ id: _id, ...row }) => row);
 }
 
-// The three rows the skills popover can draw, as a card carries them. Written out here rather
-// than parsed, so the guard measures what the panel does with each row and not what the parser
-// made of one recording.
+// Paths for recorded and best-effort skill fixtures.
 export const RECORDED_SKILL_PATH = 'c:/repo/.claude/skills/review-the-change/SKILL.md';
 export const MOCKUP_SKILL_PATH = 'c:/repo/.claude/skills/panel-mockup/SKILL.md';
-// The published paragraph a skill's front matter carries, the way a real one reads before
-// anything cuts it.
+// Full skill description before display truncation.
 export const MOCKUP_SKILL_FULL_DESCRIPTION =
   'Review the panel, draw a mockup for it, and check every candidate against real panel ' +
   'shots before the reviewer signs off on the version the team ships to every reader on ' +
   'every platform.';
-// What the row actually shows: the same cut `activitySkillsOf` puts on every skill's
-// description, so the fixture never clamps a length production would not have reached.
+// Apply the production description limit to the skill fixture.
 export const MOCKUP_SKILL_DESCRIPTION = shortenTo(MOCKUP_SKILL_FULL_DESCRIPTION, STEP_DETAIL_LIMIT, STEP_CUT);
 export const CARD_SKILLS = [
   {
@@ -678,9 +610,7 @@ export const CARD_SKILLS = [
   },
 ];
 
-// One mid-turn message as the browser laid it out: whether the bound cut it, how far it
-// cleared or broke the cut, what the control under it offers, and the tab stop each control
-// inside it holds.
+// Mid-turn message bounds, disclosure text, and control tab stops.
 export interface BoundedBlock {
   bounded: boolean;
   height: number;
@@ -691,7 +621,7 @@ export interface BoundedBlock {
   under: boolean[];
 }
 
-// One bounded message, and where the browser put the cut in it.
+// Message clipping boundary and measured content positions.
 export interface SnappedBlock {
   cut: number;
   bound: number;
@@ -702,7 +632,7 @@ export interface SnappedBlock {
   lines: number[];
 }
 
-// One commented mid-turn message as the browser laid it out.
+// Comment-mark placement within a bounded mid-turn message.
 export interface Measured {
   bounded: boolean;
   clip: number;
@@ -714,17 +644,13 @@ export interface Measured {
   marks: { under: boolean; left: number; right: number; stop: string | null }[];
 }
 
-// A picture far taller than it is wide, so both bounds have work to do. The width bound alone
-// holds a wide screenshot inside the panel and does nothing to this one, which would run
-// 2000px down a 900px viewport and take every card under it off the screen.
+// A 400-by-2000 image exercises height limits that width limits alone cannot enforce.
 export const TALL_PICTURE = `data:image/svg+xml;utf8,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="2000">' +
     '<rect width="400" height="2000" fill="#456"/></svg>',
 )}`;
 
-// A response holding every shape a real one does, and an earlier answer under it. The answer
-// is the piece no fixture in this repository drew under a comment before, and it is where the
-// fault below lived.
+// Response blocks for comment-selection tests. COMMENTABLE_ANSWER supplies an earlier answer.
 export const COMMENTABLE_RESPONSE =
   '<p>The tokenizer now walks a table.</p>' +
   '<h3>What changed</h3>' +
@@ -738,9 +664,8 @@ export const COMMENTABLE_RESPONSE =
 export const COMMENTABLE_ANSWER =
   '<p>First pass at the scanner, later rewritten.</p>' + '<ul><li>Tried a switch and gave up on it</li></ul>';
 
-// Which block to select in, and how the reader selected it. contents is a drag inside one
-// line. triple is what a triple click actually gives in Chromium, which runs to offset zero of
-// the next block and so carries the block boundary with it.
+// Selection cases pair a block with a drag or triple-click range.
+// Triple-click ranges extend to offset zero of the next block.
 export const COMMENT_SHAPES: { where: string; mode: string }[] = [];
 for (const where of [
   'p',
@@ -757,15 +682,11 @@ for (const where of [
 ]) {
   for (const mode of ['contents', 'triple']) COMMENT_SHAPES.push({ where, mode });
 }
-// A table earns a third way of being selected. Its lines are its cells, and a drag that leaves
-// the row is the one shape where what the walk writes is not a line at all.
+// A selection across table rows contains row text rather than one cell's text.
 COMMENT_SHAPES.push({ where: 'td', mode: 'rows' });
 
-// Select a line, press Comment, save, and say where the mark went.
-//
-// The whole path in one go, because the halves each read correct on their own. The panel keeps
-// its own copy of the comments, so the mark is drawn even though no extension answers the
-// message the save posts.
+// Select text, save a comment, and report its mark placement.
+// The panel keeps comments locally, so no extension reply is needed to draw the mark.
 export async function commentLands(page: Page, spec: { where: string; mode: string }): Promise<string> {
   return (await page.evaluate(`(async () => {
     const spec = ${JSON.stringify(spec)};
@@ -838,10 +759,7 @@ export async function commentLands(page: Page, spec: { where: string; mode: stri
   })()`)) as string;
 }
 
-// What the command menu is showing, after a run of real keys and presses through the box.
-//
-// Driven rather than drawn. The menu narrows on what is in the box, so a guard that called
-// the builder directly would measure a list nobody ever typed.
+// Command-menu text, selection, accessibility state, and bounds after keyboard and pointer input.
 export interface Menued {
   rows: string[];
   on: string | null;
@@ -914,8 +832,7 @@ export async function slashMenu(page: Page, keys: string[]): Promise<Menued> {
   })()`)) as Menued;
 }
 
-// The box, emptied the way a completed prompt leaves it, so each run below starts from
-// nothing rather than from what the run before it typed.
+// Clear the prompt text field and dispatch input before the next interaction.
 export async function clearBox(page: Page): Promise<void> {
   await page.evaluate(`(() => {
     const box = document.getElementById('prompt');
@@ -924,16 +841,7 @@ export async function clearBox(page: Page): Promise<void> {
   })()`);
 }
 
-// The tint on the commented words, measured in a browser.
-//
-// This is the only check in the repository that can see it at all. A tint painted onto the
-// wrong words, painted twice over the run two comments share, or left behind after the box
-// shuts reads exactly like a working one to every text scan: the classes are there, the
-// functions are named, and nothing in Node draws a colour.
-//
-// The paragraphs are the mockup's own cases. One comment inside another, three overlapping
-// with one crossing another's edge rather than sitting inside it, and a quote no line of the
-// card holds as words.
+// Quotes for nested, overlapping, and unmatched comment-tint cases.
 export const OUTER = 'The wrapper now only shapes the request and hands the response straight back.';
 export const INNER = 'hands the response straight back';
 export const WIDE =
@@ -941,9 +849,8 @@ export const WIDE =
 export const MIDDLE = 'retry at all when the transcript is mid-write';
 export const LATE = 'when the transcript is mid-write, or wait for the poll';
 export const SECOND_LINE = 'One question is open: whether ' + WIDE + '.';
-// A quote no line holds as words. A drag down a table clones the row, so what was stored is a
-// line of pipes; the cell it began in reads `scanner.ts` and holds none of that. The mark
-// still finds the cell, because a mark matches on a coarser rule, and the tint refuses.
+// Table-row quote text differs from cell text.
+// A mark can match the cell through table handling, but tint requires matching words.
 export const ROW = '| scanner.ts | the loop is a table walk now |';
 
 export const TINTED_RESPONSE =
@@ -956,13 +863,11 @@ export const TINTED_RESPONSE =
   '<table><tr><th>File</th><th>What</th></tr>' +
   '<tr><td>scanner.ts</td><td>the loop is a table walk now</td></tr></table>';
 
-// One run of drawn words as the quote that found them reads: every run of whitespace is one
-// space, which is the panel's own rule for both sides of the search.
+// Collapse whitespace and trim the text for quote matching.
 export const flatWords = (words: string): string => words.replace(/\s+/g, ' ').trim();
 
-// The card, opened, with a written-out set of comments on it. The comments come back, so a
-// guard can send the same set again and see what a redraw does with the tint already there.
-// Lines in `lead` go ahead of the response, which puts the commented lines far down the card.
+// Render an open card with comments and return them for redraw tests.
+// Prefix lead content to place the commented response farther down the card.
 export async function tintedCard(page: Page, quotes: string[], lead = ''): Promise<Record<string, unknown>[]> {
   const payload = renderPayload() as { cards: Record<string, unknown>[] };
   payload.cards[0].summaryHtml = lead + TINTED_RESPONSE;
@@ -994,8 +899,7 @@ export async function tintedCard(page: Page, quotes: string[], lead = ''): Promi
   return comments;
 }
 
-// What the card came out as. Read off the first card alone, because every other card in the
-// fixture draws a summary of its own and none of them carry comments.
+// Measure comment tint on the first card. Other fixture cards have no comments.
 export const TINT = `(() => {
   const card = document.querySelector('.turn');
   const spans = (root) => [...root.querySelectorAll('.cmark')].map((s) => ({
@@ -1033,8 +937,7 @@ export interface Tinted {
   offLine: number;
 }
 
-// The words a selection is made of, as one string, so a guard can say the box opened on the
-// line the reader had rather than on some other one.
+// Select the second response paragraph and dispatch selectionchange.
 export const SELECT_SECOND_LINE = `(() => {
   const card = document.querySelector('.turn');
   const target = card.querySelectorAll('.summary p')[1];
@@ -1046,23 +949,14 @@ export const SELECT_SECOND_LINE = `(() => {
   document.dispatchEvent(new Event('selectionchange'));
 })()`;
 
-// What the box came out as, or nothing where none opened.
+// Read whether the comment editor opened and which quote it shows.
 export const BOX_OPEN = `(() => {
   const box = document.querySelector('.quoteslot .noteedit');
   const said = box ? box.querySelector('.notesaid') : null;
   return { open: !!box, said: said ? said.textContent : '' };
 })()`;
 
-// The composer's picker row, measured with every control on it.
-//
-// The row holds four controls for an agent with MCP servers and three for one without, and
-// every guard above this one draws a machine with none. So the four-control row is measured
-// here and nowhere else, which is exactly the shape of the fault at the top of this file: one
-// more item in a flex row, and nothing in the repository looking at what the row did with it.
-//
-// The narrow width is the case that decides it. A wide panel has room for anything, and the
-// row wraps rather than scrolling, so what breaks is a control pushed off the edge or the box
-// and the send squeezed out from under it.
+// Measure prompt-box picker controls, draft setup, Send, and the prompt text field.
 export const PICKER_ROW = `(() => {
   const box = (el) => {
     if (!el) return null;
@@ -1124,16 +1018,7 @@ export interface PickerRow {
   viewportHeight: number;
 }
 
-// The servers menu, opened and measured.
-//
-// It is the tallest thing the popover ever holds: one row per server, each carrying the
-// state, the tool count, where it is configured and, for a failed one, the error.
-// `placePickPop` puts the popover above the control that opened it where there is room and
-// below it where there is not, and the control sits at the bottom of the panel. So a menu
-// this tall placed the wrong way runs off the bottom edge and takes its last rows with it.
-//
-// No text scan can see that. The menu draws, every row is there in the markup, the panel
-// throws nothing, and the reader finds out by opening it.
+// Reopen the MCP servers menu so its placement reflects the current viewport.
 export const OPEN_SERVERS = `(() => {
   const control = document.querySelector('[data-control="mcp"]');
   if (!control) return false;
@@ -1182,17 +1067,14 @@ export interface MenuBox {
   viewportHeight: number;
 }
 
-// The same page with the composer aimed at a draft. It replaces the composer and its menus
-// and leaves every other figure the payload carries alone.
+// Render the draft payload at the requested width.
 export async function draftLayoutAt(page: Page, width: number): Promise<void> {
   await page.setViewportSize({ width, height: 900 });
   await page.evaluate(`window.postMessage(${JSON.stringify(draftRenderPayload())}, '*')`);
   await page.evaluate(SETTLED);
 }
 
-// The agent control, pressed. Shut first if a menu is already standing, because the foot is
-// redrawn only when something about it changed and the placement runs at the end of that
-// redraw.
+// Close any open picker menu before opening the agent menu to refresh placement.
 export const OPEN_AGENT = `(() => {
   const control = document.querySelector('[data-control="agent"]');
   if (!control) return false;
@@ -1239,10 +1121,8 @@ export interface Measured {
   tabular: string;
 }
 
-// What the line above the box measures, in each state and at each width.
-//
-// `rows` compares the face against its own height with wrapping turned off, which is the one
-// measure that does not need the stylesheet's line height to be a readable number.
+// Measure the next-turn line above the prompt text field.
+// Compare face height with its nowrap height to count rows without parsing CSS line-height.
 export const NEXT_TURN = `(() => {
   const composer = document.getElementById('composer');
   const node = composer.querySelector('.cnextturn');
@@ -1300,11 +1180,9 @@ export const NEXT_TURN = `(() => {
   };
 })()`;
 
-// A finished child's own hover, as `agentDisplay` writes it: the duration and the tool uses,
-// which word the row's own state. Every total the row draws sits on a figure of its own.
+// Finished-subagent tooltip with duration and tool count.
 export const REVIEW_CHILD_HINT = '3m · 23 tools';
-// The record behind the cost figure, in the shape the card's own Cost popover draws: a block
-// headed by the spend, its total in a second column, and its lines indented under it.
+// Cost-popover entries with usage details.
 export const REVIEW_COST_ENTRIES = [
   {
     label: 'Cost by usage · opus-5',
@@ -1315,7 +1193,7 @@ export const REVIEW_COST_ENTRIES = [
     ],
   },
 ];
-// The same record as one run of text, which the popover reads where it has no list to draw.
+// Plain-text cost detail for a popover without entries.
 export const REVIEW_COST_RECORD = [
   '$0.31 spent',
   '',
@@ -1323,10 +1201,8 @@ export const REVIEW_COST_RECORD = [
   '  Output: $0.11',
   '  Uncached input: $0.62',
 ].join('\n');
-// What the commits and the files records are filtered to. Both are shas and paths the long
-// fixture card already holds rows for, so each record draws the card's own rows. The last path
-// is one no edit of the turn recorded: the card holds a row for it only because it merged what
-// a child recorded into its own files, which is how a child's paths reach a card in production.
+// Commit and file filters identify rows in the long fixture card.
+// The final path represents a file contributed by a subagent.
 export const REVIEW_SHAS = ['9d7be30', 'b83e0d1'];
 export const REVIEW_PATHS = [
   'c:/repo/extension/src/turncard.ts',
@@ -1334,8 +1210,7 @@ export const REVIEW_PATHS = [
   'c:/repo/extension/src/panel.layout.cards.test.ts',
 ];
 
-// Every state a subagent row takes, as the card record carries it. `since` is filled from the
-// page clock, so the running figure is known.
+// Subagent-row states. The supplied clock fixes elapsed time for running rows.
 export function subagentRows(now: number) {
   return [
     {
@@ -1438,7 +1313,7 @@ export function subagentRows(now: number) {
       sessionId: 'left-session',
     },
     {
-      // An open child of a turn that no longer runs. Its record carries no launch time to count from.
+      // This open subagent has no launch timestamp for an elapsed-time figure.
       description: 'Open child',
       model: 'opus-5',
       effort: null,
@@ -1450,8 +1325,7 @@ export function subagentRows(now: number) {
       sessionId: 'open-session',
     },
     {
-      // The longest description and the longest model run a record has held, so the panel's
-      // narrowest width is measured on the row that wraps rather than on one that never can.
+      // Long description and model text exercise wrapping in a narrow panel.
       description: 'Review the panel implementation for correctness, maintainability, and interaction design findings',
       model: 'claude-haiku-4-5-20251001',
       effort: 'high',

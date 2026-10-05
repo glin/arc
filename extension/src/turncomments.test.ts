@@ -1,8 +1,5 @@
-// extension/src/turncomments.test.ts
-//
-// The tests for turncomments.ts. One that reads a second seam's names lives in turnview.test.ts
-// instead, because neither file owns it. The builders a test is written against are here
-// while only this file needs them, and in turnfixtures.ts once a second file does.
+// Turn comment anchors, normalization, and prompt text. Cross-module wording checks live in turnview.test.ts.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import {
@@ -39,14 +36,14 @@ test('the text a note is anchored to is found by its part, or not claimed at all
   assert.equal(commentAnchorText(card, 'summary'), 'the tokenizer now walks a table');
   assert.equal(commentAnchorText(card, 'answer:0'), 'first pass, still switching');
   assert.equal(commentAnchorText(card, 'answer:1'), 'second pass');
-  // An answer the card does not hold: the tail window can be read back to fewer bytes and
-  // lose the early answers of a turn it still draws. Nothing is there, so nothing is said.
+  // A smaller tail window can omit an early answer. Missing parts supply no anchor text.
+
   assert.equal(commentAnchorText(card, 'answer:2'), null);
   // What the reader sent while the turn was running, each its own part. The prompt that
   // opened the turn keeps the bare name, so every comment already saved still finds its text.
   assert.equal(commentAnchorText(card, 'prompt:0'), 'also check the lexer');
   assert.equal(commentAnchorText(card, 'prompt:1'), 'leave the tests alone');
-  // One the card no longer holds, for the reason the missing answer above gives.
+  // A missing later prompt supplies no anchor text.
   assert.equal(commentAnchorText(card, 'prompt:2'), null);
   assert.equal(commentAnchorText({ ...card, summary: '' }, 'summary'), null);
   assert.equal(commentAnchorText({ ...card, prompt: '' }, 'prompt'), null);
@@ -55,7 +52,7 @@ test('the text a note is anchored to is found by its part, or not claimed at all
   // A message the agent wrote while the turn ran is named by the message's own id, so an
   // Activity filter that removes rows cannot move it onto another part of the card.
   assert.equal(commentAnchorText(card, 'said:commentary:1757000000000:0'), 'reading the two wire files first');
-  // A message the card no longer holds, for the reason the missing answer above gives.
+  // A missing activity message supplies no anchor text.
   assert.equal(commentAnchorText(card, 'said:commentary:1757000000001:0'), null);
 });
 
@@ -129,9 +126,8 @@ test('a selection becomes a quote block ready to paste into a chat box', () => {
 });
 
 test('a note is dropped when it is not a note, and patched when it is only incomplete', () => {
-  // What makes a note a note: text to send, and a session, a turn and a moment to hang
-  // it on. A note missing any of those cannot be drawn or copied honestly, so it goes whole
-  // rather than being drawn as a blank row nothing explains.
+  // A comment requires valid identity, session, turn, text, and timestamps. Missing required fields discard the comment.
+
   for (const gone of ['id', 'sessionId', 'turnKey', 'note', 'at', 'turnAt'] as const) {
     const partial: Record<string, unknown> = { ...comment() };
     delete partial[gone];
@@ -140,8 +136,8 @@ test('a note is dropped when it is not a note, and patched when it is only incom
       [],
       `a note with no ${gone} was kept, and nothing on screen or in the paste can say what it is about`,
     );
-    // The same field of the wrong type, which is what a hand-edited state or an older
-    // version writes, takes the same path rather than reaching the panel as a number.
+    // Required fields with invalid types discard the comment.
+
     assert.deepEqual(
       normalizeComments([{ ...comment(), [gone]: { nested: true } }]),
       [],
@@ -152,20 +148,19 @@ test('a note is dropped when it is not a note, and patched when it is only incom
   assert.deepEqual(normalizeComments([comment({ note: '   \n  ' })]), []);
   // Anything that is not an object at all, inside a list that is otherwise fine.
   assert.deepEqual(normalizeComments(['nope', 42, null, [], comment()]).length, 1);
-  // A list that is not a list is no notes, not a throw: the panel that throws reading its
-  // own state draws nothing at all and says nothing about why.
+  // Invalid comment-list values normalize to an empty list.
+
   assert.deepEqual(normalizeComments(undefined), []);
   assert.deepEqual(normalizeComments({ id: 'n1' }), []);
   assert.deepEqual(normalizeComments('[]'), []);
 
-  // What only describes a note falls back rather than dropping it. The quote is the case
-  // that matters: a webview offers no keyboard text selection, so a note with none is the
-  // shape a reader who does not use a mouse leaves.
+  // Optional descriptive fields fall back to empty strings. A comment without a quote remains valid.
+
   const patched = normalizeComments([comment({ quote: 42, headline: null, sessionTitle: 7 } as never)]);
   assert.equal(patched.length, 1, 'a note lost its text because a field beside it was wrong');
   assert.deepEqual([patched[0].quote, patched[0].headline, patched[0].sessionTitle], ['', '', '']);
-  // The part is the same: a value the grammar does not read takes the summary, which costs
-  // at most a standing check that says nothing rather than one that says something false.
+  // An unrecognized part falls back to summary.
+
   assert.equal(normalizeComments([comment({ part: 'answer:2' })])[0].part, 'answer:2');
   assert.equal(normalizeComments([comment({ part: 'prompt' })])[0].part, 'prompt');
   assert.equal(normalizeComments([comment({ part: 'answer:x' } as never)])[0].part, 'summary');
@@ -180,23 +175,20 @@ test('a note is dropped when it is not a note, and patched when it is only incom
   assert.equal(answerPart(3), 'answer:3');
   assert.equal(answerPart(-1), 'answer:0');
   assert.equal(answerPart(2.7), 'answer:2');
-  // The same shape for a prompt the reader sent after the turn had started. Held here because
-  // the panel spells this string itself, from a count of the blocks on the card, and the guard
-  // below in panel.webview.test.ts holds that spelling against this one.
+  // Later prompts use indexed part names. The opening prompt retains the bare prompt name.
+
   assert.equal(laterPromptPart(0), 'prompt:0');
   assert.equal(laterPromptPart(3), 'prompt:3');
   assert.equal(laterPromptPart(-1), 'prompt:0');
   assert.equal(laterPromptPart(2.7), 'prompt:2');
-  // Never the bare name, whatever it is given. That name belongs to the prompt the turn opened
-  // with, and every comment saved before mid-turn prompts existed carries it.
+  // The bare prompt part remains the opening prompt's stored anchor.
+
   assert.notEqual(laterPromptPart(0), 'prompt');
 });
 
 test('a stored note is cut to its ceiling, and the cut says so', () => {
-  // Every string on a note has a ceiling, the way every list in the stored state does. The
-  // quote takes the measured one: over every transcript on this machine the longest
-  // paragraph a turn closed with is 4,828 characters, so a full paragraph is never cut and
-  // only a whole-summary selection is.
+  // Every comment string has a bound. A 4,828-character quote fits below the text limit.
+
   const paragraph = 'x'.repeat(4_828);
   assert.equal(
     normalizeComments([comment({ quote: paragraph })])[0].quote,
@@ -211,7 +203,7 @@ test('a stored note is cut to its ceiling, and the cut says so', () => {
   // that the passage does not end there.
   assert.ok(cut.quote.endsWith(COMMENT_CUT), 'a cut quote reads as the whole passage');
   assert.ok(cut.note.endsWith(COMMENT_CUT));
-  // The one-line fields take the smaller ceiling, above the longest headline measured.
+  // Headlines and session titles use the smaller line limit.
   const line = normalizeComments([comment({ headline: 'h'.repeat(5_000), sessionTitle: 't'.repeat(5_000) })])[0];
   assert.equal(line.headline.length, COMMENT_LINE_LIMIT);
   assert.equal(line.sessionTitle.length, COMMENT_LINE_LIMIT);
@@ -223,9 +215,8 @@ test('a stored note is cut to its ceiling, and the cut says so', () => {
 });
 
 test('the notes are capped by count, and the oldest are the ones that go', () => {
-  // The same rule and the same end as the read set: the list is written oldest first, so a
-  // list restored over its ceiling drops from the front. A reader who loses the note they
-  // wrote a minute ago and keeps one from last month has lost the wrong one.
+  // Comments are stored oldest first. An oversized list drops its oldest entries.
+
   const many = Array.from({ length: COMMENT_LIMIT + 5 }, (_, i) => comment({ id: 'n' + i, at: TURN_AT + i }));
   const kept = normalizeComments(many);
   assert.equal(kept.length, COMMENT_LIMIT);
@@ -239,9 +230,8 @@ test('the notes are capped by count, and the oldest are the ones that go', () =>
 });
 
 test('notes are gathered per session, never across them', () => {
-  // The reader has several agents open at once and each set of notes goes back to the agent
-  // that ran the turns it is about. A set gathered across sessions pastes one agent's
-  // review into another's box.
+  // Gather comments only for the selected session.
+
   const notes = [
     comment({ id: 'a1', sessionId: 'a' }),
     comment({ id: 'b1', sessionId: 'b' }),
@@ -260,10 +250,8 @@ test('notes are gathered per session, never across them', () => {
 });
 
 test('the copy takes one turn, and never the session around it', () => {
-  // The copy is per turn now. A reader sends one turn's comments back to the agent that ran
-  // it, so a paste holding every turn they have written on is one they have to edit down.
-  // Each note says which turn it is on: sharing one wording, the assertions below would pass
-  // on the wrong turn's comment and never see it.
+  // Copy only the requested turn's comments. Distinct text identifies each fixture turn's contribution.
+
   const notes = [
     comment({ id: 'on', turnKey: 'sess:1', note: 'left on turn one', headline: 'headline of turn one' }),
     comment({ id: 'also', turnKey: 'sess:1', note: 'and again on turn one', headline: 'headline of turn one' }),
@@ -276,9 +264,8 @@ test('the copy takes one turn, and never the session around it', () => {
       headline: 'headline elsewhere',
     }),
   ];
-  // Both halves name a turn. A turn key carries its own session, and the case that
-  // matters is two sessions whose keys collide: reading either half alone draws right
-  // almost always and wrong there.
+  // Match session id and turn key together, including colliding turn keys across sessions.
+
   assert.deepEqual(
     commentsOn(notes, 'sess:1', 'sess').map((c) => c.id),
     ['on', 'also'],
@@ -304,9 +291,8 @@ test('the copy takes one turn, and never the session around it', () => {
     !block.includes('left in another session'),
     'the copy reached into another session, which sends one agent a review of another',
   );
-  // No session heading. The turn is named, which is what the agent needs to know which of
-  // its own answers this is about, and naming the session the reader is pasting into
-  // tells that agent what it already knows.
+  // Per-turn comment text names the turn without adding a session heading.
+
   assert.doesNotMatch(block, /^Notes on/m, 'the per-turn copy still heads itself with the session');
   // A turn nobody wrote on copies nothing, rather than a heading with no comments under it.
   assert.equal(emitTurnComments(notes, 'sess:3', 'sess'), '');
@@ -315,12 +301,11 @@ test('the copy takes one turn, and never the session around it', () => {
 
 test('a quote is only said to stand where it really does', () => {
   const summary = 'The parser now walks a table\ninstead of the switch it had.';
-  // Whitespace is not the same on both sides of the trip: the summary is drawn through a
-  // markdown renderer and the quote is walked back out of the rendered fragment, so a line
-  // break on one side is a space on the other.
+  // Normalize whitespace when comparing a quote from rendered markdown with its source.
+
   assert.equal(quoteStanding('walks a table instead of the switch', summary), 'standing');
   assert.equal(quoteStanding('walks   a\n\n table', summary), 'standing');
-  // The summary genuinely changed under the quote: the words are not in it any more.
+  // A quote absent from the current summary has moved.
   assert.equal(quoteStanding('walks a tree instead of the switch', summary), 'moved');
   assert.equal(quoteStanding('the switch it kept', summary), 'moved');
   // Nothing to look in, and nothing to look for. Both say nothing rather than guess, and
@@ -329,9 +314,8 @@ test('a quote is only said to stand where it really does', () => {
   assert.equal(quoteStanding('', summary), 'unknown');
   assert.equal(quoteStanding('   \n ', summary), 'unknown');
   assert.equal(quoteStanding('', null), 'unknown');
-  // A quote cut at the ceiling carries the mark that says so, and that mark is in no text it
-  // came from, so it is taken off before the comparison rather than making every long quote
-  // read as moved.
+  // Remove the truncation marker before comparing a bounded quote with its source text.
+
   const long = normalizeComments([comment({ quote: summary + 'z'.repeat(COMMENT_TEXT_LIMIT) })])[0].quote;
   assert.ok(long.endsWith(COMMENT_CUT));
   assert.equal(quoteStanding(long, summary + 'z'.repeat(COMMENT_TEXT_LIMIT)), 'standing');
@@ -367,12 +351,12 @@ test("a session's notes copy as something a person could have written", () => {
     emitComments(notes, 'sess', now).indexOf('Added a regression test.') <
       emitComments(notes, 'sess', now).indexOf('Rewrote the tokenizer'),
   );
-  // A note with no quote is the note alone. An empty blockquote in front of it is a
-  // quotation of nothing, which whoever reads the paste has to work out is not a mistake.
+  // A comment without a quote emits no blockquote.
+
   assert.ok(!emitComments([notes[1]], 'sess', now).includes('>'));
   assert.ok(!emitComments([comment({ quote: '  \n  ' })], 'sess', now).includes('>'));
-  // Nothing the reader neither wrote nor saw on screen reaches the paste: no note id, no
-  // turn key, no session id.
+  // Generated comment text excludes comment ids, turn keys, and session ids.
+
   const block = emitComments(notes, 'sess', now);
   for (const internal of ['n1', 'n2', 'sess:', 'answer:']) {
     assert.ok(!block.includes(internal), `the paste carries ${internal}, which names nothing to whoever reads it`);
@@ -383,8 +367,8 @@ test("a session's notes copy as something a person could have written", () => {
 });
 
 test('several notes on one turn are headed once, in the order they were written', () => {
-  // A reader reads a turn once and leaves three notes down it. Three headings for one turn
-  // reads as three turns, and the notes have to keep the order they were thought in.
+  // Group each turn under one heading and preserve creation order within that group.
+
   const notes = [
     comment({ id: 'third', note: 'And the error path is untested.', at: TURN_AT + 3_000 }),
     comment({ id: 'first', note: 'Measure this on the hot path first.', quote: '', at: TURN_AT + 1_000 }),
@@ -415,8 +399,8 @@ test('several notes on one turn are headed once, in the order they were written'
 });
 
 test('the comments block a submission sends alone is told from a prompt', () => {
-  // The prompt walk asks. A submission with an empty box sends these notes and nothing else,
-  // and the transcript records the whole document as the prompt.
+  // A comment-only submission records its formatted comments as the prompt.
+
   const held = comment();
   const notes = emitComments([held], held.sessionId, TURN_AT);
   assert.equal(looksLikeComments(notes), true);
@@ -429,7 +413,7 @@ test('the comments block a submission sends alone is told from a prompt', () => 
 });
 
 test('a prompt of the reader own is not told for a comments block', () => {
-  // Two things have to agree, because a prompt read as notes leaves the walk in silence.
+  // Recognizing a comments block requires a matching heading before a double newline.
   assert.equal(looksLikeComments('**Blocker** (3:32 PM)'), false, 'no blank line under it');
   assert.equal(
     looksLikeComments(`say which is faster
@@ -445,9 +429,8 @@ Fix it.`),
     false,
     'a bold first line with no parenthesized tail',
   );
-  // The bound. A turn with no headline heads itself only with the time, which the rule does
-  // not match, and the walk offers the document back. Wrong in the direction that costs the
-  // reader nothing.
+  // A turn without a headline emits a time-only heading that does not match looksLikeComments.
+
   const held = comment({ headline: '' });
   const notes = emitComments([held], held.sessionId, TURN_AT);
   assert.equal(looksLikeComments(notes), false);

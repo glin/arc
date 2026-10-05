@@ -25,8 +25,7 @@ export const MEASUREMENT_ENVIRONMENT = {
   run: `${ARC_IDENTITY.environmentPrefix}MEASURE_RUN`,
 } as const;
 
-// Keys Arc reads and writes in VS Code workspace and global state. Saved reader state lives under
-// these exact strings, and a new spelling starts from nothing.
+// Workspace and global saved-state keys. Changing a key stops reading values stored under the old spelling.
 export const STORED_STATE_KEYS = {
   usage: 'arc.usage',
   askModes: 'arc.askModes',
@@ -39,6 +38,5 @@ export const STORED_STATE_KEYS = {
   claudeSkills: 'arc.claudeSkills',
 } as const;
 
-// The path prefix that names a multi-root workspace in the saved project spend ledger. A ledger
-// saved under another workspace name is discarded and rebuilt from every transcript.
+// Path prefix used to identify multi-root workspaces in the project spend ledger.
 export const MULTI_ROOT_SPEND_WORKSPACE_PREFIX = '.arc-workspace-';

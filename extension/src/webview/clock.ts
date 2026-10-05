@@ -1,35 +1,23 @@
-// The panel's one clock, and the ages and durations it keeps current.
-//
-// Every age on the page is a host timestamp worded against a browser clock. The host cannot
-// send the wording, because it moves on a second only the browser counts, and a message a
-// minute for every figure on screen is not a message the panel can afford. So each owner
-// draws the node and marks it with the instant it is about, and this owner rewords it.
-//
-// The words are written in place, and only when they actually move. The tick runs sixty times
-// for every time a minute figure changes, and a rewrite replaces the text node a reader is
-// selecting or a screen reader is sitting on.
-//
-// One clock, so two figures drawn from the same instant can never disagree by a second. An
-// owner that needs the tick for something other than an age subscribes to it.
+// One panel clock updates relative ages, durations and cache lifetimes from browser time.
+// Owners mark nodes with timestamps instead of sending new wording from the host each second.
+// Write only changed text to preserve selections and screen-reader position.
+// Every subscriber receives the same instant for each tick.
 
 import { runningFor } from '../view/rail.ts';
 import { formatCacheSpan, formatDuration, formatRelative } from '../view/time.ts';
 
-// How long the panel waits between ticks. A minute figure moves once a minute, but a running
-// turn counts seconds, so the second is the step.
+// Tick each second for live turn durations, even when other figures change only once a minute.
 export const TICK_MS = 1000;
 
 // How long something has been running, from the instant it started.
 const DURATIONS = '[data-since]';
 
-// How long a subagent or a session has been running, worded as the session rail words a
-// running session: whole minutes after a space, and nothing under the first one. A node's
-// `data-running-lead` words go before the duration, and only once a duration shows.
+// Running session and subagent durations use whole minutes and stay empty during the first minute.
+// `data-running-lead` appears only with a nonempty duration.
 const RUNNING = '[data-running-since]';
 
-// How long ago something happened, or how much of a cache lifetime is left when the node says
-// so. The rail's own ages are left out: `rail.ts` rewords its cards itself, because an age
-// moving there can also move the card's cache band.
+// Update relative ages and remaining cache lifetimes.
+// `rail.ts` updates session-list ages separately because they also affect cache bands.
 const AGES = '[data-at]:not(.railwhen)';
 
 export interface ClockOptions {
@@ -41,11 +29,9 @@ export interface ClockOptions {
 }
 
 export interface Clock {
-  // Run every listener once, now. Called after a draw, so a figure the owner drew empty is
-  // filled before the reader sees it rather than a second later.
+  // Update timestamp text and call every listener. A post-draw tick fills newly drawn empty figures immediately.
   tick(now?: number): void;
-  // Take the tick until the returned function is called. A listener that is dropped stops
-  // being called, so an owner that goes away leaves nothing behind.
+  // Subscribe until the returned function removes the listener.
   subscribe(listener: (now: number) => void): () => void;
 }
 
@@ -83,8 +69,7 @@ export function createClock(options: ClockOptions): Clock {
   const listeners = new Set<(now: number) => void>();
   const tick = (now: number = readNow()) => {
     writeRelativeTimes(options.document, now);
-    // Over a copy, so a listener that drops itself while the tick runs cannot change the set
-    // the loop is walking.
+    // Copy listeners so removals during the tick do not change this iteration.
     for (const listener of [...listeners]) {
       listener(now);
     }

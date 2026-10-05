@@ -1,4 +1,4 @@
-// The comment feature: marking, tinting, and the editor, measured by a real browser.
+// Browser checks for comment marks, quote highlights, and editing.
 // Shared measurement helpers live in `../test/layout.ts`.
 
 import { test } from 'vitest';
@@ -140,8 +140,8 @@ test(
       page.on('pageerror', (e) => failures.push(String(e)));
       await page.setContent(pageHtml());
 
-      // The sidebar width first, which is where the panel is docked and the width a menu is
-      // most likely to run off an edge or push the body sideways.
+      // Test sidebar width first, where the completion menu has less room.
+
       for (const width of [340, 1350]) {
         await layoutAt(page, width);
         await clearBox(page);
@@ -154,8 +154,8 @@ test(
         assert.equal(open.on, open.rows[0], 'nothing is highlighted, so Enter would complete nothing');
         assert.equal(open.active, 'slashrow0', 'the box points at no row, so nothing is read out as the list moves');
 
-        // On the panel, whole. A menu drawn past an edge is the fault this file exists for: it
-        // reads exactly like a working one to every scan that does not measure.
+        // Keep the entire completion menu inside the panel.
+
         const menu = open.menu;
         assert.ok(menu, 'the menu is open and has no box');
         assert.ok(
@@ -167,8 +167,8 @@ test(
           menu.left >= 0 && menu.right <= open.viewportWidth + 1,
           `at ${width}px the menu runs off a side edge`,
         );
-        // Above the box, never over it. The reader is reading what they typed to decide which
-        // row to take, and a menu covering it hides the half a name the list is narrowed on.
+        // Place the completion menu above the prompt text field without covering typed text.
+
         assert.ok(
           menu.bottom <= open.promptTop + 1,
           `at ${width}px the menu runs to ${Math.round(menu.bottom)} over a box starting at ` +
@@ -178,8 +178,8 @@ test(
           open.documentWidth <= open.viewportWidth + 1,
           `at ${width}px the menu widened the page, so the panel scrolls sideways`,
         );
-        // Two lines a row at most: the name with what it takes, and one line of the agent's
-        // sentence. A row per paragraph pushes the rest of the list off the top.
+        // Each completion row fits its name and one description line.
+
         for (const height of open.rowHeights) {
           assert.ok(
             height < 64,
@@ -187,8 +187,8 @@ test(
           );
         }
 
-        // A transcript poll redraws the footer even when its contents did not move. Keep the
-        // reader's own place in a long menu instead of returning to the highlighted first row.
+        // An unchanged render must preserve the scroll position in a long completion menu.
+
         const beforeRefresh = (await page.evaluate(`(() => {
         const pop = document.getElementById('slashpop');
         pop.scrollTop = pop.scrollHeight;
@@ -204,8 +204,8 @@ test(
           `at ${width}px a background render moved the command menu back to its active first row`,
         );
 
-        // A changed footer still keeps the same menu position when its command rows did not
-        // change. A changed command catalog instead reveals the new active row.
+        // An unrelated usage change preserves menu position. A changed command catalog reveals the active row.
+
         const updatedBar = renderPayload() as { usage: { bar: { name: string } } };
         updatedBar.usage.bar.name += ' updated';
         await page.evaluate(`window.postMessage(${JSON.stringify(updatedBar)}, '*')`);
@@ -235,29 +235,29 @@ test(
         await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
         await page.evaluate(SETTLED);
 
-        // Typing narrows it, and a name that starts with what was typed comes before one that
-        // only contains it.
+        // Prefix matches precede commands that only contain the typed text.
+
         const typed = await slashMenu(page, ['c', 'o']);
         assert.equal(typed.value, '/co');
-        // The agent's own order inside the group that starts with what was typed: narrowing
-        // reorders nothing it does not have to.
+        // Prefix matches retain the catalog order.
+
         assert.deepEqual(typed.rows.slice(0, 3), ['/compact', '/commit', '/code-review']);
 
-        // The arrow keys move the highlight, wrap at the ends, and the box says which row.
+        // Arrow keys wrap the active row and update the field accessibility state.
         const down = await slashMenu(page, ['ArrowDown']);
         assert.equal(down.on, '/commit');
         assert.equal(down.active, 'slashrow1');
         const up = await slashMenu(page, ['ArrowUp', 'ArrowUp']);
         assert.equal(up.on, typed.rows[typed.rows.length - 1], 'the highlight does not wrap round the end');
 
-        // Escape shuts it and leaves what was typed exactly as it was.
+        // Escape closes completion without changing typed text.
         const shut = await slashMenu(page, ['Escape']);
         assert.equal(shut.hidden, true, 'Escape left the menu standing');
         assert.equal(shut.value, '/co', 'Escape took the reader own words with it');
         assert.equal(shut.expanded, 'false');
 
-        // Enter takes the highlighted row. The box becomes the command and the space that ends
-        // it, which is what shuts the menu and lets the next Enter send.
+        // Enter completes the active command and adds its ending space. A later Enter sends the prompt.
+
         await clearBox(page);
         const done = await slashMenu(page, ['/', 'c', 'o', 'ArrowDown', 'Enter']);
         assert.equal(done.value, '/commit ', 'Enter completed something other than the highlighted row');
@@ -271,29 +271,28 @@ test(
           'the Enter that completed the name sent the prompt as well',
         );
 
-        // Tab takes it too, which is the key an editor completes on. It is the safer of the
-        // two: a mistimed Enter has sent half a command, a mistimed Tab has moved focus.
+        // Tab also completes the active command without sending the prompt.
+
         await clearBox(page);
         const tabbed = await slashMenu(page, ['/', 'c', 'o', 'ArrowDown', 'Tab']);
         assert.equal(tabbed.value, '/commit ', 'Tab did not take the highlighted row');
         assert.equal(tabbed.hidden, true, 'Tab completed the name and left the menu open');
         assert.ok(!tabbed.posted.some((m) => m.type === 'sendPrompt'), 'Tab sent the prompt as well');
 
-        // A press on a row does the same thing.
+        // A row press completes that command.
         await clearBox(page);
         const pressed = await slashMenu(page, ['/', 'c', 'o', 'ArrowDown', 'ArrowDown', 'Press']);
         assert.equal(pressed.value, '/code-review ', 'a press on a row completed something else');
 
-        // The next Enter sends, because the space ended the name and shut the menu.
+        // The next Enter sends after the ending space closes completion.
         const sent = await slashMenu(page, ['Enter']);
         assert.ok(
           sent.posted.some((m) => m.type === 'sendPrompt'),
           'the completed command could not be sent, so the menu is standing over a name it will complete for ever',
         );
 
-        // A menu the reader shut belongs to the words they shut it over. Once those words have
-        // gone out as a prompt the next slash opens it again: left shut, the menu would refuse
-        // the prompt after it with nothing on screen saying why.
+        // Sending a prompt clears completion dismissal so a slash in the next prompt can reopen the menu.
+
         await clearBox(page);
         const reopened = await slashMenu(page, ['/', 'c', 'o', 'Escape', 'Enter', '/']);
         assert.equal(
@@ -302,10 +301,8 @@ test(
           'a menu shut before the prompt went out is still shut over the prompt after it',
         );
 
-        // A command written into the middle of a sentence, which is how both agents' own boxes
-        // behave and what the reader asked for. The words on either side of it survive being
-        // completed into, and the caret lands inside the sentence rather than at the end of the
-        // box.
+        // Complete a command inside a sentence while preserving surrounding text and caret position.
+
         await clearBox(page);
         const mid = await slashMenu(page, ['t', 'a', 'k', 'e', ' ', 'a', ' ', 'l', 'o', 'o', 'k', ' ', '/', 'c', 'o']);
         assert.equal(mid.value, 'take a look /co');
@@ -323,8 +320,8 @@ test(
           'the caret did not land after the name it just completed',
         );
 
-        // And with words after it too, which is the case that says only the run is replaced.
-        // The space already there is not doubled.
+        // Completion must preserve trailing words without doubling the existing space.
+
         await clearBox(page);
         const around = await slashMenu(page, ['a', ' ', 'b', 'Caret:1', ' ', '/', 'c', 'o', 'm', 'm']);
         assert.equal(around.value, 'a /comm b');
@@ -333,14 +330,14 @@ test(
         assert.equal(spliced.value, 'a /commit b', 'the words after the command were eaten, or a space was doubled');
         assert.equal(spliced.caret, 'a /commit '.length, 'the caret did not land inside the sentence');
 
-        // Walking back into a name already written offers it again, which is what makes a typo
-        // fixable without deleting the rest of the line.
+        // Moving the caret back into a command reopens completion for the whole token.
+
         const back = await slashMenu(page, ['Caret:5']);
         assert.equal(back.hidden, false, 'the caret went back into a command and the menu stayed shut');
         assert.deepEqual(back.rows.slice(0, 1), ['/commit'], 'the run was cut at the caret rather than taken whole');
 
-        // A query that matches nothing shuts the menu rather than hanging an empty panel over
-        // the prompt the reader is writing, and a slash inside a word is a path.
+        // An unmatched command closes completion. A slash inside a word does not open command completion.
+
         await clearBox(page);
         const nothing = await slashMenu(page, ['/', 'z', 'z', 'z']);
         assert.equal(nothing.hidden, true, 'a query that matched nothing left an empty menu over the box');
@@ -444,8 +441,8 @@ test('a comment lands on the line it was left on, in every part of a card', { ti
 
     const payload = renderPayload() as { cards: Record<string, unknown>[] };
     payload.cards[0].summaryHtml = COMMENTABLE_RESPONSE;
-    // What the reader typed while the turn ran. A card draws one .prompt for each of these
-    // beside the one that opened the turn, so the class alone stops saying which.
+    // Later prompts share the prompt class with the opening prompt. The part identifier must distinguish them.
+
     payload.cards[0].laterPrompts = [
       {
         text: 'Also check the lexer while you are in there.',
@@ -460,8 +457,8 @@ test('a comment lands on the line it was left on, in every part of a card', { ti
         label: 'Asked while this was running',
       },
     ];
-    // The card still carries the answer, newest first, because that index is what a note left
-    // on one anchors by. The section under the response is what draws it.
+    // Earlier-answer comments use the newest-first answer index. The Activity log draws those answers.
+
     payload.cards[0].earlierAnswers = [
       {
         summary: 'the panel draws the html, not this',
@@ -492,8 +489,8 @@ test('a comment lands on the line it was left on, in every part of a card', { ti
       const body = document.querySelector('.turn .body');
       return body !== null && !(body as HTMLElement).hidden;
     });
-    // The prompt sits before the response by default, and what the reader typed while the turn
-    // ran is folded behind one press. A reader opens it to comment on one of those asks.
+    // Open later prompts before selecting one for a comment.
+
     await page.evaluate(`document.querySelector('.turn [data-control^="asks:"]').click()`);
     await page.evaluate(SETTLED);
 
@@ -508,10 +505,8 @@ test('a comment lands on the line it was left on, in every part of a card', { ti
     }
     assert.deepEqual(failures, [], 'the panel threw while a comment was being written');
 
-    // The box's name and the line it is about are both in the page and off the screen. Taken
-    // off the screen with display none instead, a screen reader loses both and every existing
-    // check still passes: they assert the elements exist, their text and the wiring, which is
-    // true either way. Measured rather than read, because only a browser resolves the rule.
+    // The editor name and quote must remain accessible while visually hidden. Display none would remove them from the accessibility tree.
+
     const said = (await page.evaluate(`(async () => {
       // Opened here, because every box above was saved and shut behind it.
       const target = document.querySelector('.turn .summary p');
@@ -546,10 +541,8 @@ test('a comment lands on the line it was left on, in every part of a card', { ti
       'the line the comment is about is display none, so nothing tells a reader what it is on',
     );
 
-    // And nothing gathered at the top of the card. That row is what the reader actually sees
-    // when this breaks, and a comment can reach it without any one case above having noticed:
-    // the marks are drawn again from scratch on every change, so a comment that landed on a
-    // line can still be sitting in the row by the end.
+    // After all comment updates, matched comments must remain on their lines rather than collect in the unmatched-comment row.
+
     const stranded = (await page.evaluate(`(() => {
       const off = document.querySelector('.offlinemark');
       return off ? off.textContent : '';
@@ -588,9 +581,8 @@ test('the bar waits for the reader to let go before it offers anything', { timeo
       return body !== null && !(body as HTMLElement).hidden;
     });
 
-    // A drag, one event at a time: the button goes down, the selection grows under it, and
-    // only then is it let go. The bar answered every step of that before, so it appeared on
-    // the first word and jumped along under the pointer while the reader was still choosing.
+    // Grow the selection while the pointer stays pressed. The selection action must wait until release.
+
     const seen = (await page.evaluate(`(async () => {
       const target = document.querySelector('.turn .summary p');
       document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
@@ -637,10 +629,8 @@ test('a comment on a prompt the reader sent twice marks the one they were in', {
     await page.setViewportSize({ width: 900, height: 900 });
     await page.setContent(pageHtml());
 
-    // The same words twice, which is what a reader does when the agent has not done the thing
-    // yet. Distinct wording is placed right whatever the parts are called, because the search
-    // inside a pool is by quote text and the texts differ; it is the repeat that makes the
-    // part name carry the answer. So the fixture has to repeat.
+    // Repeat the same prompt text in two parts. Quote matching alone cannot distinguish them, so the saved part must select the correct prompt.
+
     const SAID = 'Fix the scanner loop before anything else.';
     const payload = renderPayload() as { cards: Record<string, unknown>[] };
     payload.cards[0].prompt = SAID;
@@ -655,8 +645,8 @@ test('a comment on a prompt the reader sent twice marks the one they were in', {
       const body = document.querySelector('.turn .body');
       return body !== null && !(body as HTMLElement).hidden;
     });
-    // The prompt sits before the response by default, and what the reader typed while the turn
-    // ran is folded behind one press. A reader opens it to comment on one of those asks.
+    // Open later prompts before selecting the repeated ask.
+
     await page.evaluate(`document.querySelector('.turn [data-control^="asks:"]').click()`);
     await page.evaluate(SETTLED);
 
@@ -709,9 +699,8 @@ test('a comment on a prompt the reader sent twice marks the one they were in', {
   }
 });
 
-// A saved comment finds its line under every layout that moves the prompt or the response. Under
-// the default layout the asks from while the turn ran are folded, so a comment on one of them
-// shows them rather than drawing on a line nobody can see.
+// Saved comments must follow prompt placement and reveal folded later prompts containing their quotes.
+
 test(
   'saved comments draw on their lines under the default layout and under Two columns',
   { timeout: 60_000 },
@@ -737,7 +726,7 @@ test(
       card.laterPrompts = [
         { text: LATER, when: '1:05 PM', absolute: 'today at 1:05 PM', label: 'Asked while this was running' },
       ];
-      // A record, so Two columns draws its second column.
+      // Add file rows so Two columns draws a record column.
       card.files = payload.cards[LONG_TURN_INDEX].files;
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
@@ -769,7 +758,7 @@ test(
         ['two-columns', 'above'],
         ['two-columns', 'below'],
       ]) {
-        // A render carries the saved comments, as the extension's own render does.
+        // Include saved comments in each layout render.
         Object.assign(payload, { timelineLayout: { cardLayout, promptPosition }, comments });
         await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
         await page.evaluate(SETTLED);
@@ -812,10 +801,8 @@ test(
   },
 );
 
-// Two saved comments whose lines the default layout draws differently. A card with no first
-// prompt draws its first ask as its first prompt block, so a comment on that ask is stored under
-// `prompt` and still has to unfold the asks. The You asked heading is drawn as text only after
-// the response, and a comment saved on it there draws on the prompt it names before the response.
+// With no opening prompt, the first later ask uses the prompt part. A summary comment on You asked follows the input that heading names.
+
 test(
   'a saved comment on a first ask or on the You asked heading draws on a line under the default layout',
   { timeout: 60_000 },
@@ -884,8 +871,8 @@ test(
         `a comment on the first ask of a card with no first prompt did not draw on that ask: ${JSON.stringify(onAsk)}`,
       );
 
-      // With no first prompt the You asked heading names the first ask, so a comment on the heading
-      // unfolds the asks as well.
+      // With no opening prompt, a saved You asked comment reveals the first later ask.
+
       const headingNoPrompt = await draw('above', [note('on-heading-no-prompt', 'summary', 'You asked')]);
       assert.deepEqual(
         [headingNoPrompt.marked, headingNoPrompt.offline],
@@ -909,8 +896,8 @@ test(
         `a comment on the You asked heading did not draw on the prompt under the default layout: ${JSON.stringify(before)}`,
       );
 
-      // A reply comment saved under `summary` before replies had their own part. Its quote is a word
-      // of the You asked heading, and the reply still holds it.
+      // Store a reply comment under summary. Its quote also occurs in You asked, so reply matching must precede heading fallback.
+
       const REPLY = '<p>The scanner loop is fixed as you asked.</p>';
       card.earlierAnswers = [
         {
@@ -954,9 +941,8 @@ test(
   },
 );
 
-// A reply that is not a response renumbers the replies on its card. Before, the newest note was
-// the response and the report was the second reply back. Now the report is the response and the
-// notes are the two newest replies. Each saved comment keeps the part it was saved under.
+// The fixture makes an earlier report the response and retains two newer replies. Each saved comment must follow its original part.
+
 test(
   'saved comments on replies draw on their lines after the response moves to an earlier reply',
   { timeout: 60_000 },
@@ -1065,9 +1051,8 @@ test(
   },
 );
 
-// The You asked heading before the response is read and not drawn, and it holds no offset. A
-// stored offset tells two equal response lines apart, and it names the same line whether the
-// prompt sits before or after the response.
+// The opening-input heading contributes no response offset. Repeated response text must resolve identically with prompts above or below.
+
 test(
   'a stored response offset names the same line whether the prompt sits before or after the response',
   { timeout: 60_000 },
@@ -1089,10 +1074,8 @@ test(
       card.prompt = 'Fix the scanner loop before anything else.';
       card.summaryHtml = `<p>${SAME}</p><p>${SAME}</p>`;
       const key = String(card.key);
-      // A saved offset counts the card heading, then the Response title, which is read and not
-      // drawn. So the second line starts after the heading, the title and one line. The offset sits
-      // four short of that start, nearer the second line than the first. A You asked heading counted
-      // ahead of both lines moves them ten further on, and the first line is then the nearer.
+      // Count the card heading and Response title before the repeated lines. Place the offset four characters before the second line. Counting You asked would select the first line.
+
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
       const heading = await page
@@ -1465,9 +1448,8 @@ test('stored offsets choose repeated text and partial words stay unmatched', { t
   }
 });
 
-// The offset a comment is saved with and the count its line is drawn by run over the same lines,
-// the card heading among them. A drawing count that skipped a line the save counted would move
-// the mark onto a later copy of the same words.
+// Saving and drawing count the same heading and body lines. Otherwise, an offset can select the wrong repeated quote.
+
 test('a comment saved on the second of three equal lines draws on the second', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1552,8 +1534,8 @@ test(
       const at = (await page.evaluate(TINT)) as Tinted;
       assert.deepEqual(failures, [], 'the panel threw while drawing the tint');
 
-      // The words the comment was left on, and only those. This is the whole of what the tint
-      // is for: the bubble says a comment is here, and the tint says which words it is about.
+      // Highlight only the quoted words. The mark opens the comment.
+
       const first = at.paras[0];
       assert.equal(
         first.spans.length,
@@ -1566,37 +1548,33 @@ test(
         'the tint covers words the comment was never left on, which is worse than covering none',
       );
       assert.equal(first.marks, 1, 'the line lost the bubble that opens the comment on it');
-      // And it really is a colour. A rule that resolved to nothing draws no tint at all, and
-      // reads exactly like a working one to every scan of the stylesheet.
+      // The computed highlight background must be visible.
+
       assert.notEqual(
         first.spans[0].background,
         'rgba(0, 0, 0, 0)',
         'the tint resolved to no colour, so the commented words are drawn like every other word',
       );
-      // A solid colour rather than a layer over the card. Two translucent tints overlapping go
-      // darker where they meet, which is exactly the shading scheme this design exists to avoid,
-      // and no arrangement of the runs can make a layer behave.
-      // Read off the serialization rather than matched to one shape of it: a browser writes an
-      // opaque colour as `rgb(...)` or as `color(srgb ...)` depending on how it was mixed, and
-      // writes the alpha as a fourth number or after a slash only when there is one.
+      // Use opaque highlights so overlaps retain one color. Accept both rgb and color serialization without an alpha component.
+
       assert.ok(
         !/^rgba\(|\//.test(first.spans[0].background),
         `the tint is ${first.spans[0].background}, which is a layer laid over the card rather than ` +
           'a colour, so overlapping comments would draw darker',
       );
-      // And nothing about it offers a press. The bubble is the opener and the only way in from
-      // the keyboard, so a tint that looked pressable would be promising a second one.
+      // The mark is the comment control. Highlighted text must keep its text cursor.
+
       assert.notEqual(
         first.spans[0].cursor,
         'pointer',
         'the tint takes the pointer, so it reads as a control the keyboard cannot reach',
       );
 
-      // The line nobody commented on carries none of it.
+      // An uncommented line has no highlight.
       assert.deepEqual(at.paras[1].spans, [], 'a line nobody commented on is tinted anyway');
 
-      // A quote the line no longer holds as words paints nothing and falls back to exactly the
-      // bubble it had before, which is the fallback the whole design rests on.
+      // A quote missing from its matched line draws no highlight but retains its comment mark.
+
       assert.ok(at.cell, 'the fixture drew no table cell, so this measures nothing');
       assert.deepEqual(
         at.cell.spans,
@@ -1610,10 +1588,8 @@ test(
       );
       assert.equal(at.offLine, 0, 'a comment that matched a line was drawn as being about no line');
 
-      // The comment that paints nothing still opens a float, and pointing at its row must leave
-      // the rest of the card alone. Lighting one comment's words steps every other run back, and
-      // a comment with no words of its own would step them all back and light none: the card
-      // loses its whole tint and nothing takes its place.
+      // Hovering a comment with no highlighted words must preserve highlights belonging to other comments.
+
       const blanked = (await page.evaluate(`(async () => {
       const card = document.querySelector('.turn');
       const mark = card.querySelector('.summary td .linemark');
@@ -1640,8 +1616,8 @@ test(
           false,
           'the tint on another line was stepped back for a comment that lit nothing of its own',
         );
-        // The class is only half of it. `dulled` is drawn transparent, so this is what the reader
-        // sees: the words another comment was left on stop being tinted at all.
+        // Compare computed backgrounds as well as highlight classes.
+
         assert.equal(
           span.background,
           first.spans[0].background,
@@ -1668,15 +1644,14 @@ test('overlapping comments share one flat tint, and the float lights one of them
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setViewportSize({ width: 900, height: 900 });
     await page.setContent(pageHtml());
-    // Two on the first paragraph, one wholly inside the other. Three on the second, one of
-    // them crossing another's edge.
+    // Nest two quotes in the first paragraph. Cross quote boundaries among three comments in the second.
+
     const comments = await tintedCard(page, [OUTER, INNER, WIDE, MIDDLE, LATE]);
     const at = (await page.evaluate(TINT)) as Tinted;
     assert.deepEqual(failures, [], 'the panel threw while drawing the overlaps');
 
-    // Both sets of words are tinted, the words they share are one run naming both, and no run
-    // is drawn inside another: a run drawn twice goes darker, and the depth of the colour
-    // starts saying how many comments are here.
+    // Shared words form one flat run naming every covering comment. Highlight runs must not nest.
+
     const nest = at.paras[0].spans;
     assert.equal(
       flatWords(nest.map((s) => s.text).join('')),
@@ -1698,8 +1673,8 @@ test('overlapping comments share one flat tint, and the float lights one of them
     for (const span of nest) {
       assert.equal(span.nested, false, 'a tinted run is drawn inside another, so the two colours stack');
     }
-    // The whole point of the flat tint: the run two comments cover is the same colour as the
-    // run one covers.
+    // Shared and single-comment runs have the same resting background.
+
     const alone = nest.find((s) => s.notes.length === 1);
     assert.ok(alone, 'no run is covered by one comment alone, so there is nothing to compare against');
     assert.equal(
@@ -1709,8 +1684,8 @@ test('overlapping comments share one flat tint, and the float lights one of them
         'an overlap draws darker, which makes the colour say how many comments are here',
     );
 
-    // Three overlapping, which is the shape no scheme of shades can draw. Five runs, because
-    // every start and stop is an edge, and the middle one is covered by all three.
+    // Three overlapping quotes form five runs with coverage counts of one, two, three, two, and one.
+
     const three = at.paras[1].spans;
     assert.equal(
       flatWords(three.map((s) => s.text).join('')),
@@ -1732,9 +1707,8 @@ test('overlapping comments share one flat tint, and the float lights one of them
       );
     }
 
-    // Drawn again, which is what a comment written anywhere in either window causes. The tint
-    // the last sweep left has to come off first: painted over, the runs go inside one another
-    // and the colours stack, and the card gets a little darker every time a note is written.
+    // Resending comments must replace existing highlights without nesting new runs inside them.
+
     await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'notes', comments })}, '*')`);
     await page.evaluate(SETTLED);
     const twice = (await page.evaluate(TINT)) as Tinted;
@@ -1754,9 +1728,8 @@ test('overlapping comments share one flat tint, and the float lights one of them
       }
     }
 
-    // Pointing at an entry in the float lights that comment's own words and steps the rest of
-    // the tint back. This is the whole of how overlapping comments are told apart, and it is
-    // what lets the tint stay flat at rest.
+    // Hovering a comment highlights its words and dims the other comment highlights.
+
     const lit = (await page.evaluate(`(async () => {
       const card = document.querySelector('.turn');
       const marks = [...card.querySelectorAll('.summary p .linemark')];
@@ -1811,9 +1784,8 @@ test('overlapping comments share one flat tint, and the float lights one of them
       'pointing at one of three comments lit all of them or none, so it tells nothing apart',
     );
     for (const span of ownWords) {
-      // Against the tint at rest, not against the words stepped back beside it. Those go
-      // transparent, so a lit state that changed nothing at all would still read as different
-      // from them and the guard would hold whether the rule was there or not.
+      // Compare active words against the resting background. Comparing only with dimmed words would also pass without active styling.
+
       assert.notEqual(
         span.background,
         at.paras[1].spans[0].background,
@@ -1836,9 +1808,8 @@ test('overlapping comments share one flat tint, and the float lights one of them
       'the tint is left lit once the pointer leaves the entry, so the card stays stuck on one comment',
     );
 
-    // And a float taken down while the pointer is still on an entry, which fires no leave at
-    // all. Shutting has to clear the light itself, or the card is left with one comment's words
-    // lit, the rest of its tint gone, and nothing on screen that would ever put it back.
+    // Closing the comment list while its row is hovered must clear active highlighting without waiting for pointer departure.
+
     const shut = (await page.evaluate(`(async () => {
       const card = document.querySelector('.turn');
       const marks = [...card.querySelectorAll('.summary p .linemark')];
@@ -1953,9 +1924,8 @@ test('the words a comment is being written about stay painted until the box shut
     await page.setContent(pageHtml());
     await tintedCard(page, []);
 
-    // Select a line, press Comment, and read what is left on the response. Focusing the text
-    // box collapses the page's own selection, so without this the reader is typing about words
-    // nothing on screen points at any more.
+    // Opening the comment editor moves focus away from the response. Keep the selected quote visibly highlighted until editing ends.
+
     const cancelled = (await page.evaluate(`(async () => {
       const card = document.querySelector('.turn');
       const target = card.querySelectorAll('.summary p')[1];
@@ -1999,8 +1969,8 @@ test('the words a comment is being written about stay painted until the box shut
       'rgba(0, 0, 0, 0)',
       'the paint resolved to no colour, so the selection is drawn like every other word',
     );
-    // The line said to a screen reader is unchanged. The paint is for the eye, and never
-    // instead of the words a reader who cannot see it relies on.
+    // Quote highlighting must preserve the editor accessible description.
+
     assert.equal(open.said, true, 'the box no longer says which line it is about');
     assert.equal(
       cancelled.after,
@@ -2008,8 +1978,8 @@ test('the words a comment is being written about stay painted until the box shut
       'the paint is left on the response after Cancel, so the card keeps a selection nobody has',
     );
 
-    // And after Save, which is the other way out and a different path through the close: the
-    // box is shut first, then the comment is written and the card drawn again.
+    // Saving also closes the editor and clears selection highlighting.
+
     const saved = (await page.evaluate(`(async () => {
       window.__posted.length = 0;
       const card = document.querySelector('.turn');
@@ -2074,8 +2044,8 @@ test('the words a comment is being written about stay painted until the box shut
       0,
       'the paint is left on the response after Save, so the words stay drawn as still selected',
     );
-    // The comment just saved wears the tint instead, which is the handover: the selection
-    // paint comes off and the comment's own tint goes on in the same breath.
+    // The saved comment replaces selection highlighting with its own quote highlight.
+
     assert.ok((saved.tinted ?? 0) > 0, 'the comment just saved tints none of the words it was left on');
     assert.equal(saved.writes, 1, 'pressing Save posted the same comment more than once');
     assert.deepEqual(
@@ -2091,8 +2061,8 @@ test('the words a comment is being written about stay painted until the box shut
     );
     assert.deepEqual(saved.popup, { role: 'region', name: 'Comments' }, 'the comment popup is not a named region');
 
-    // Delete through the control the saved comment draws, then read the same card before any
-    // render or host reply can hide a stale local redraw behind a later refresh.
+    // Delete through the comment control and inspect the local result before a host refresh.
+
     const deleted = (await page.evaluate(`(async () => {
       const card = document.querySelector('.turn');
       const mark = card.querySelector('.linemark');
@@ -2131,17 +2101,16 @@ test(
       const failures: string[] = [];
       page.on('pageerror', (e) => failures.push(String(e)));
       await page.setViewportSize({ width: 900, height: 900 });
-      // The rail head rests on its count, and the letter measured below has to be measured
-      // in a box the reader can be typing in, so the magnifying glass opens the box first.
+      // Open the session-list filter field before testing text entry there.
+
       await page.setContent(pageHtml());
       await tintedCard(page, []);
       await page.locator('[data-control="railsearch"]').click();
       await page.evaluate('document.activeElement.blur()');
       await page.evaluate(SETTLED);
 
-      // Select a line and press the key, with nothing pressed on screen. The trip to the bar is
-      // exactly what the key removes, so a guard that pressed the bar would be measuring the
-      // path that was already there.
+      // Open the comment editor through the keyboard shortcut without pressing the selection action.
+
       await page.evaluate(SELECT_SECOND_LINE);
       await page.evaluate(SETTLED);
       await page.keyboard.press('c');
@@ -2154,9 +2123,8 @@ test(
         `the key opened the box on ${JSON.stringify(flatWords(byKey.said))} rather than on the words the reader had`,
       );
 
-      // The chip the word carries is inside the button, so a press that lands on it is the same
-      // press: it bubbles to the button, where the mousedown is defaulted and the selection the
-      // press is about to read survives.
+      // Press the shortcut badge inside the selection button. Preventing its mousedown default preserves the selection for the comment action.
+
       await page.evaluate(`document.querySelector('.quoteslot .noteclose').click()`);
       await page.evaluate(SETTLED);
       await page.evaluate(SELECT_SECOND_LINE);
@@ -2218,8 +2186,8 @@ test(
       };
       assert.equal(byChip.error, undefined, byChip.error || '');
 
-      // The chip as it is drawn. Only a browser resolves a rule, and a selector that matches
-      // nothing leaves a bare letter beside the word that reads like part of it.
+      // The shortcut badge must have visible dimensions and a border separating it from the action text.
+
       const drawn = byChip.drawn!;
       assert.ok(drawn.box.width > 0 && drawn.box.height > 0, 'the chip is drawn at no size at all');
       assert.notEqual(
@@ -2237,7 +2205,7 @@ test(
         drawn.offset <= 1,
         `the key's letter sits ${drawn.offset.toFixed(1)}px off the middle of the word's letters, so the pill hangs under the word`,
       );
-      // The bar is one line, and an inline chip must not push it to two.
+      // The shortcut badge must fit on the selection action line.
       assert.ok(
         drawn.lines < 40,
         `the word on the bar is ${drawn.lines}px tall, so the chip wrapped the bar onto a second line`,
@@ -2254,14 +2222,8 @@ test(
         'pressing the chip opened the box on words other than the ones the reader had',
       );
 
-      // And in a box the reader is typing in, the same key is a letter. Pressed with the
-      // selection in the card still standing, so what is measured is where the press landed and
-      // not that there was nothing left to open: a collapsed selection would say no by itself
-      // and this guard would pass over a panel that takes every letter the reader writes.
-      //
-      // The press is made in the page rather than through the keyboard, because a browser
-      // handed a selection outside the box it is typing into writes the letter nowhere, and the
-      // real press below is where the letter itself is measured.
+      // Keep a response selection while dispatching the shortcut from editable fields. Also test keyboard text entry separately after clearing the response selection.
+
       await page.evaluate(`document.querySelector('.quoteslot .noteclose').click()`);
       await page.evaluate(SETTLED);
       const typing = (await page.evaluate(`(async () => {
@@ -2297,9 +2259,8 @@ test(
         assert.equal(what, '', `the key pressed in ${where} ${what.trim()}`);
       }
 
-      // The letter itself, from the keyboard, with the page in the state a reader leaves it in:
-      // focusing a box collapses the page's own selection, so there is nothing standing by the
-      // time they type.
+      // Clear the response selection, focus the prompt field, and type the shortcut letter as ordinary text.
+
       await page.evaluate(`(() => { getSelection().removeAllRanges(); })()`);
       await page.focus('#prompt');
       await page.keyboard.press('c');
@@ -2338,8 +2299,8 @@ test(
       await page.setContent(pageHtml());
       await tintedCard(page, []);
 
-      // The box, opened on a selection the way a reader opens it. The card is stamped, so a card
-      // built again from the data can be told from the one that was left where it was.
+      // Mark the card after opening the editor so later updates reveal any replacement.
+
       await page.evaluate(SELECT_SECOND_LINE);
       await page.evaluate(SETTLED);
       await page.keyboard.press('c');
@@ -2356,8 +2317,8 @@ test(
       assert.equal(opened.open, true, 'the key opened no box, so nothing below measures anything');
       assert.ok(opened.painted > 0, 'the box painted nothing, so there is no paint for a rewrite to take');
 
-      // The turn writes another line, which is what the poll brings every few seconds while it is
-      // running. The card's content moved, so the in-place path would replace the whole of it.
+      // Send new response content while the comment editor is open. The card update must wait.
+
       const moved = renderPayload() as { cards: Record<string, unknown>[] };
       moved.cards[0].summaryHtml = TINTED_RESPONSE + '<p>And a line written while the reader was typing.</p>';
       await page.evaluate(`window.postMessage(${JSON.stringify(moved)}, '*')`);
@@ -2391,8 +2352,8 @@ test(
         'the card took the new line while the box stood over it, which is the rewrite this waits for',
       );
 
-      // And the wait ends with the box. A card held for a reader who has finished has to catch up,
-      // or a turn they commented on stays frozen at whatever it had written when they started.
+      // Closing the editor must release the deferred card update.
+
       await page.evaluate(`document.querySelector('.quoteslot .noteclose').click()`);
       await page.evaluate(SETTLED);
       await page.evaluate(SETTLED);
@@ -2698,9 +2659,8 @@ test(
       page.on('pageerror', (e) => failures.push(String(e)));
       await page.setContent(pageHtml());
 
-      // What the extension side decided, so the guard below measures the widest control this
-      // fixture can produce rather than whatever happens to be drawn. The label grows when
-      // servers fail, and a fixture with none would be measuring the narrow case.
+      // Build expected server-control text from the prompt-box state. Include failed servers so the control exercises its caution label.
+
       const view = composerView({ ...COMPOSER, mcpServers: MCP_SERVERS }, NOW);
       assert.ok(view, 'the reducer drew no composer, so there is nothing to measure');
       const servers = view.picks.filter((p) => p.control === 'mcp');
@@ -2716,8 +2676,8 @@ test(
         'no server in the fixture failed, so the control wears its short label and the widest case goes unmeasured',
       );
 
-      // The same widths the sideways-scroll guard drives, and held to the same rule. A row
-      // that overflows is a panel the reader has to scroll across to reach the send.
+      // Check that the picker row fits at editor-tab, breakpoint, and sidebar widths.
+
       for (const width of [1350, RAIL_MIN_WIDTH - 60, 340]) {
         await layoutAt(page, width, [], [], [], MCP_SERVERS);
         const at = (await page.evaluate(PICKER_ROW)) as PickerRow;
@@ -2738,9 +2698,8 @@ test(
             `${at.documentWidth} wide in a ${at.viewportWidth} viewport`,
         );
 
-        // Every control on the row is drawn, and drawn inside the composer. A control with no
-        // box has been collapsed to nothing by a flex rule; one outside the composer has been
-        // pushed past its edge, and at the right-hand edge that puts it off the panel.
+        // Each prompt-box control must have visible dimensions and stay inside the prompt box.
+
         const onRow: [string, Placed | null][] = [
           ...at.picks.map((p) => [`the ${p.control} control`, p] as [string, Placed]),
           ['the window figure', at.figure],
@@ -2769,9 +2728,8 @@ test(
           );
         }
 
-        // The row may wrap, and it is built to. What it may not do is wrap so far that it
-        // takes the composer past the panel's own bottom edge, which is where the box the
-        // reader types into and the send both live.
+        // The picker row can wrap, but it must keep the prompt box inside the panel bottom edge.
+
         assert.ok(
           at.composer.bottom <= at.viewportHeight + 1,
           `the composer ends at ${Math.round(at.composer.bottom)} ${where} in a ${at.viewportHeight} viewport, ` +
@@ -2782,19 +2740,16 @@ test(
           `the picker row ends at ${Math.round(at.row.bottom)} ${where} and the composer at ` +
             `${Math.round(at.composer.bottom)}, so the row is drawn out of the box it belongs to`,
         );
-        // The box stays above the row, whatever the row did with its own lines. A row that
-        // wrapped over the box would cover the thing the whole composer is for.
+        // The picker row must remain below the prompt text field.
+
         assert.ok(
           at.prompt && at.prompt.bottom <= at.row.top + 1,
           `the box ends at ${Math.round(at.prompt?.bottom ?? 0)} ${where} with the picker row starting at ` +
             `${Math.round(at.row.top)}, so one is drawn over the other`,
         );
 
-        // No two controls on the row overlap. Two boxes drawn over each other read as one long
-        // press target, and the reader takes the wrong setting off a row that looks right.
-        // Asked as a real overlap in both directions rather than by working out which line
-        // each control is on: the controls are different heights and a row that wraps leaves
-        // them centred, so their tops differ by a pixel or two while they sit side by side.
+        // Check overlap on both axes. Different control heights produce unequal top edges even when controls share a row.
+
         for (let i = 0; i < onRow.length; i++) {
           for (let j = i + 1; j < onRow.length; j++) {
             const [what, a] = onRow[i];
@@ -2834,7 +2789,7 @@ test('the actionable context meter shares picker geometry and hover treatment', 
     for (const width of [1350, 547]) {
       for (const fontSize of [13, 18]) {
         await page.setViewportSize({ width, height: 900 });
-        // Sweeps a realistic font size over the real theme to test the live update path.
+        // Change the editor font-size variable to exercise context-meter scaling.
         await page.evaluate((size) => document.body.style.setProperty('--vscode-font-size', `${size}px`), fontSize);
         await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
         await page.evaluate(SETTLED);
@@ -3092,15 +3047,15 @@ test('the servers menu opens inside the panel, with every row of it on screen', 
         'model',
         `choosing a model did not return focus to its control ${where}`,
       );
-      // Tall enough that where it is put is a real answer. A two-row menu fits above the
-      // control, below it and in the margin, so it would pass whatever the placement did.
+      // Require a menu taller than 200px so placement must account for available space.
+
       assert.ok(
         at.pop.height > 200,
         `the menu is only ${Math.round(at.pop.height)}px tall ${where}, so it fits anywhere and this measures nothing`,
       );
 
-      // On screen, whole. The control it opens from sits at the bottom of the panel, so a
-      // menu placed under it runs off the bottom edge and takes its last rows with it.
+      // The full server menu must remain inside the panel.
+
       assert.ok(at.pop.top >= -1, `the menu starts at ${Math.round(at.pop.top)} ${where}, above the top of the panel`);
       assert.ok(
         at.pop.bottom <= at.viewportHeight + 1,
@@ -3113,17 +3068,16 @@ test('the servers menu opens inside the panel, with every row of it on screen', 
           `in a ${at.viewportWidth} viewport, so it is off one edge`,
       );
 
-      // And it is not drawn over the control it was opened from, whichever side of it the
-      // placement chose. A menu covering its own anchor hides what the reader is setting.
+      // The server menu must leave its anchor control uncovered.
+
       assert.ok(
         at.pop.bottom <= at.anchor.top + 1 || at.pop.top >= at.anchor.bottom - 1,
         `the menu runs from ${Math.round(at.pop.top)} to ${Math.round(at.pop.bottom)} ${where} and the control it ` +
           `opened from from ${Math.round(at.anchor.top)} to ${Math.round(at.anchor.bottom)}: one covers the other`,
       );
 
-      // Every row is drawn, has a box, and is inside the menu that holds it. A row squeezed
-      // to nothing and a row past the end of a scrolling menu are both rows the reader
-      // cannot see, and both draw the same markup as a row they can.
+      // Every server row must have visible dimensions and fit inside the menu without scrolling.
+
       assert.ok(
         at.scrollHeight <= at.clientHeight + 1,
         `the menu holds ${at.scrollHeight}px of rows in ${at.clientHeight}px ${where}, so the reader has to scroll ` +
@@ -3184,8 +3138,8 @@ test('the servers menu opens inside the panel, with every row of it on screen', 
   }
 });
 
-// A message the agent wrote while the turn ran, which is not a reply it closed. The Activity
-// log draws both kinds with the same row, and only the reply took a comment before.
+// A commentary message provides a commentable Activity log row.
+
 const NARRATION_MESSAGE =
   '<p>Reading the two wire files before touching the switch.</p>' + '<ul><li>the chunk drop is one case long</li></ul>';
 
@@ -3257,8 +3211,8 @@ test('a message that is not a reply takes a comment on its own line', { timeout:
     assert.equal(offered.error, undefined, offered.error || '');
     assert.equal(offered.shown, true, 'a selection inside a message that is not a reply offered no Comment action');
 
-    // The shortcut, not the button: the bar and the key are two ways into the same editor and
-    // the key path reads the selection again for itself.
+    // Use the shortcut to test its independent selection read.
+
     await page.keyboard.press('c');
     await page.evaluate(SETTLED);
     assert.equal(
@@ -3291,8 +3245,8 @@ test('a message that is not a reply takes a comment on its own line', { timeout:
       '',
       `the card ends with "${landed.stranded}" at the top of it, so the comment is about no line`,
     );
-    // A message id carries an ordinal among the messages that share its timestamp, so a later
-    // read of the transcript renumbers it. The comment stays on the line it was written on.
+    // Change the message ordinal while retaining its kind and timestamp. The saved comment must stay on that message.
+
     const saved = (await page.evaluate(
       `window.__posted.filter((m) => m.type === 'note' && m.note && m.note.op === 'write').map((m) => m.note.note)`,
     )) as unknown[];
@@ -3419,8 +3373,8 @@ test(
         turnAt: 1,
         at: Number(id),
       });
-      // A comment on the response too, so the message mark is measured against the column every
-      // other mark hangs in.
+      // Add a response comment to compare the Activity log mark with the response mark column.
+
       payload.comments = [note('1', 'said:commentary:1:0', 'The script exists'), note('2', 'summary', response)];
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
@@ -3501,15 +3455,15 @@ test(
   },
 );
 
-// Lines ahead of the response. They put the commented lines far down a card that is taller than
-// the panel, where the card heading is well above the line the reader is reading.
+// Add enough preceding content to scroll the card heading above the commented response.
+
 const FILLER = Array.from(
   { length: 30 },
   (_, n) => `<p>Line ${n + 1} of the work that came before the response.</p>`,
 ).join('');
 
-// Scrolls the panel so the first mark stands partway down it, then starts counting. The count
-// takes every mark a sweep pulls off a card and every record the composer writes.
+// Scroll the first mark into view, then count removed marks and prompt-box mutations.
+
 const WATCH = `(() => {
   const mark = document.querySelector('.turn .linemark');
   document.scrollingElement.scrollTop += mark.getBoundingClientRect().top - 260;
@@ -3528,8 +3482,8 @@ const WATCH = `(() => {
   });
 })()`;
 
-// What the composer shows now that it did not show before the count started. An attribute
-// written again with the value it already had changes nothing on screen.
+// Count prompt-box changes that alter values. Rewriting an unchanged attribute does not change presentation.
+
 const COMPOSER_CHANGES = `(() => {
   const first = new Map();
   const changes = [];
@@ -3603,8 +3557,8 @@ const READING = `(() => {
   };
 })()`;
 
-// The three messages the extension sends back for one change to a comment, in the order it
-// sends them.
+// Simulate comment, usage, and session-list replies in this order.
+
 const hostAnswer = (comments: unknown[]): string => {
   const payload = renderPayload();
   const rail = {
@@ -3655,8 +3609,8 @@ test(
       return;
     }
     try {
-      // A press opens the list. So do keyboard focus on the mark and a pointer resting on it. A
-      // press inside a list that focus opened takes focus off the mark that opened it.
+      // Open the comment list by press, focus, and hover. Pressing a list control moves focus away from its mark.
+
       for (const opening of ['press', 'focus', 'hover'] as const) {
         const { page, failures, comments, start } = await longCommentedPage(browser, [OUTER, INNER, WIDE]);
         assert.equal(start.marks, 2, 'the card did not draw one mark for each of the two commented lines');
@@ -3708,8 +3662,8 @@ test(
         assert.equal(after.listOpen, false, 'the list opened again when the keyboard came back to the mark');
 
         if (opening === 'press') {
-          // By keyboard alone, the last comment on the line. The keyboard then goes to the mark on
-          // the nearest line that still has a comment.
+          // Delete the last comment on a line using the keyboard. Focus must move to the nearest remaining mark.
+
           await page.keyboard.press('Enter');
           await page.evaluate(SETTLED);
           assert.equal(
@@ -3858,7 +3812,7 @@ test(
         return payload;
       };
 
-      // The pointer goes down on Delete, and the agent writes a line before it comes up.
+      // Update response content while the pointer remains down on Delete.
       await page.locator(LINE_MARKS).first().click();
       await page.evaluate(SETTLED);
       await page.locator('.markfloat [data-control="notedel:n1"]').hover();
@@ -3880,8 +3834,8 @@ test(
         'the card did not draw the line the agent wrote once the press ended',
       );
 
-      // Pinned, with no press, the card still draws what the agent writes. The list opens again
-      // on the new mark, and the keyboard stays on the control it was on.
+      // An idle pinned list reopens on its replacement mark after a card update and retains its focused control.
+
       await page.locator(LINE_MARKS).first().click();
       await page.evaluate(SETTLED);
       assert.equal(
@@ -3907,7 +3861,7 @@ test(
         `after the redraw the keyboard is on "${followed.focusControl}"`,
       );
 
-      // A press inside the list that ends in a native drag gets no mouseup. The card still draws.
+      // Ending a native drag must release the held card update without requiring mouseup.
       await page.locator('.markfloat .notetext').first().hover();
       await page.mouse.down();
       await page.evaluate(`document.dispatchEvent(new DragEvent('dragend', { bubbles: true }))`);
@@ -3923,7 +3877,7 @@ test(
         'a press that ended in a drag kept holding its card, so the agent output stopped drawing',
       );
 
-      // Another session. The list over a card of the session the reader left shuts with it.
+      // Selecting another session closes the previous session comment list.
       const other = renderPayload() as {
         cards: Array<Record<string, unknown>>;
         showing: string;
@@ -3936,9 +3890,8 @@ test(
       }));
       other.sessions = other.sessions.map((session) => ({ ...session, shown: session.id === 's2' }));
       other.showing = 's2';
-      // Words selected on the card hold back a redraw of it while the list stays open. Opening the
-      // other session drops that selection, and the held redraw of the old session must not come
-      // back when the extension answers.
+      // Hold a card update with selected text. Switching sessions must cancel that deferred update.
+
       await page.evaluate(`(() => {
       const line = [...document.querySelectorAll('.turn .summary p')].find((p) => p.textContent.includes('Line 29 of'));
       const range = document.createRange();
@@ -3997,7 +3950,7 @@ test(
       return;
     }
     try {
-      // Tall enough that an open edit box leaves the mark on the table row uncovered.
+      // Use enough panel height to keep the table-row mark visible beside the open editor.
       const { page, failures, comments, start } = await longCommentedPage(browser, [OUTER, WIDE], 900);
       const withNote = (id: string, quote: string) => ({
         ...comments[0],
@@ -4007,7 +3960,7 @@ test(
         at: 9,
       });
 
-      // Escape out of an edit box, with a comment added on another line while the box was open.
+      // Add a comment elsewhere while editing, then close the editor with Escape.
       await page.locator(LINE_MARKS).first().click();
       await page.locator('.markfloat [data-control="noteedit:n1"]').click();
       await page.evaluate(SETTLED);
@@ -4044,7 +3997,7 @@ test(
         `Escape scrolled the panel from ${start.scrollTop} to ${shut.scrollTop}`,
       );
 
-      // A press on the mark of another line, with a sweep held by an open edit box.
+      // Press another line mark while the editor holds a deferred mark redraw.
       await page.locator(LINE_MARKS).first().click();
       await page.locator('.markfloat [data-control="noteedit:n1"]').click();
       await page.evaluate(SETTLED);
@@ -4061,8 +4014,8 @@ test(
       assert.equal(second.expanded, 1, `${second.expanded} marks on the page say their list is open`);
       assert.equal(second.floatNearMark, true, 'the list is not drawn at the mark that opened it');
 
-      // A press inside the list holds a sweep, and the reader selects words on the card before the
-      // press ends. The sweep waits for the selection to go.
+      // Select card text during a held list press. The deferred mark redraw must wait until the selection ends.
+
       await page.locator('.markfloat .notetext').first().hover();
       await page.mouse.down();
       const late = withNote('n6', 'Line 29 of the work');
@@ -4100,9 +4053,8 @@ test(
         'the held sweep did not run once the selection was gone',
       );
 
-      // The pointer rests on one mark while a comment box is open on selected words, and a sweep
-      // waits on that box. The pointer then moves to a second mark, and shutting the first list
-      // runs the sweep that replaces the second mark.
+      // Move between marks while an open comment editor defers mark redraw. Closing the first list replaces the next mark.
+
       await page.evaluate(`document.dispatchEvent(new Event('scroll'))`);
       await page.evaluate(`(() => {
       const line = [...document.querySelectorAll('.turn .summary p')].find((p) => p.textContent.includes('Line 1 of'));
@@ -4121,8 +4073,8 @@ test(
         true,
         'the key opened no comment box',
       );
-      // The box keeps its words painted, so the selection can go. A live selection would hold the
-      // sweep past the second mark.
+      // Clear native selection after the editor preserves its quote highlight. Otherwise, the selection still defers mark redraw.
+
       await page.evaluate(
         `(() => { getSelection().removeAllRanges(); document.dispatchEvent(new Event('selectionchange')); })()`,
       );
@@ -4134,8 +4086,8 @@ test(
         `window.postMessage(${JSON.stringify({ type: 'notes', comments: comments.concat(table, retry, late, wide) })}, '*')`,
       );
       await page.evaluate(SETTLED);
-      // Read in the same task as the pointer arrives. A later pointer move enters the rebuilt mark
-      // and hides a list drawn in the wrong place for a frame.
+      // Read in the pointer-event task to detect incorrect list placement before a later pointer move repairs it.
+
       const hovered = (await page.evaluate(`(() => {
       document.querySelector('.turn .summary td .linemark').dispatchEvent(new MouseEvent('mouseenter'));
       return ${READING};
@@ -4168,7 +4120,7 @@ test('a comment whose words stream into a line already drawn moves onto that lin
     }))()`;
     const before = (await page.evaluate(MARKS)) as { offline: number; first: number };
     assert.equal(before.offline, 1, 'a comment whose words no line holds did not draw at the top of the card');
-    // The same elements, with the quoted words written into the first line.
+    // Update the first response line to include the saved quote.
     const payload = renderPayload() as { cards: Record<string, unknown>[]; comments: unknown[] };
     payload.cards[0].summaryHtml = TINTED_RESPONSE.replace('</p>', ` ${quote}.</p>`);
     payload.comments = comments;

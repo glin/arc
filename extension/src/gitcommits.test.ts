@@ -1,8 +1,7 @@
 // extension/src/gitcommits.test.ts
 //
-// The tests for gitcommits.ts. Every git answer here was recorded from a real repository, so
-// what the parsers are held against is what git writes rather than what a format string
-// suggests it writes.
+// Parser fixtures cover Git log, repository identity, and HEAD reflog output.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
@@ -154,10 +153,8 @@ test('a subject cannot break the record that carries it', () => {
 });
 
 test('one read says which repository a directory belongs to and which tree it is', () => {
-  // Recorded from `git rev-parse --path-format=absolute --git-common-dir --git-dir
-  // --show-toplevel` inside a linked worktree and inside a subdirectory of the tree it came
-  // from. Both name the same repository, and git gives the main tree the same directory for
-  // its own state as for the state it shares.
+  // The identity fixture supplies the absolute common directory, Git directory, and root for a linked worktree and its main checkout.
+
   assert.deepEqual(parseIdentity(`${COMMON}\n${COMMON}/worktrees/usage-model-bucket\n${TREE}\n`), {
     commonDir: normalizeFsPath(COMMON),
     linked: true,
@@ -182,8 +179,8 @@ test('a detached head names no branch rather than naming a detached commit', () 
     kind: 'branch',
     name: 'feat/commits-from-the-repository',
   });
-  // `detached commit` is a claim about how a commit was made. Nothing here read that, so
-  // nothing here says it.
+  // HEAD denotes a detached checkout and supplies no branch name.
+
   assert.equal(parseBranch('HEAD\n'), null);
   assert.equal(parseBranch(null), null);
 });
@@ -200,16 +197,15 @@ test('a window names its commits only when it holds as many as the command asked
     ['Read commits from the repository'],
   );
 
-  // A parallel session committed to the same branch inside the window. Two commits where the
-  // command said `git commit` once names neither, because naming the wrong one is the
-  // failure this exists to avoid.
+  // Two commits within a one-commit window are ambiguous, so neither is attributed to the call.
+
   const theirs = parseCommitLog(
     record('5c8e9415c8e9415c8e9415c8e9415c8e9415c8e9', 'Send item four', '2026-09-02T04:08:19Z') +
       record('f245c68f245c68f245c68f245c68f245c68f2456', 'Read commits from the repository', '2026-09-02T04:08:19Z'),
   );
   assert.deepEqual(chooseCommits(theirs, from, to, 1, allOf(...theirs)), []);
 
-  // The same two, from a command that said `git commit` twice, are that command's own work.
+  // A matching expected count admits both candidates within the window.
   assert.equal(chooseCommits(theirs, from, to, 2, allOf(...theirs)).length, 2);
 
   // The commit failed, so the window holds none and the row stays as it was.
@@ -218,10 +214,8 @@ test('a window names its commits only when it holds as many as the command asked
 });
 
 test('a commit the call made survives git rounding its time down to the second', () => {
-  // Git stores a commit time as whole seconds and a window carries milliseconds. A call that
-  // ran from 19.400 to 20.139 and committed at 19.700 has that commit recorded as 19.000,
-  // which is before the window began. Comparing the two directly loses the commit this whole
-  // feature exists to recover.
+  // Git commit timestamps use whole seconds. A 19.000 timestamp must remain eligible for a call starting at 19.400.
+
   const from = AT('2026-09-02T04:08:19.400Z');
   const to = AT('2026-09-02T04:08:20.139Z');
   const mine = parseCommitLog(
@@ -243,8 +237,8 @@ test('a commit the call made survives git rounding its time down to the second',
 });
 
 test('a commit outside the window is not the call that ran inside it', () => {
-  // Measured on a real collision: a commit 4.5 seconds before the call sits inside the turn
-  // and outside every one of its call windows.
+  // A commit inside the turn but outside the call window must not be attributed to that call.
+
   const from = AT('2026-09-02T04:08:18.531Z');
   const to = AT('2026-09-02T04:08:20.139Z');
   const earlier = parseCommitLog(
@@ -292,9 +286,8 @@ test('a linked worktree is this repository and another repository is not', () =>
   });
 });
 
-// A runner that answers from a table and records what it was asked, so a test can hold both
-// the answer and the number of reads it took. `hold` keeps every answer pending until it is
-// released, which is what a cold render looks like.
+// Records each request and returns its table entry. With hold enabled, answers remain pending until release() runs.
+
 function fakeRunner(
   answers: Record<string, string | null>,
   hold = false,
@@ -311,9 +304,8 @@ function fakeRunner(
     run(dir: string, args: string[]): Promise<string | null> {
       const key = `${dir} ${args.join(' ')}`;
       asked.push(key);
-      // A head log that made every commit its own log holds is the ordinary case, so a test
-      // that says nothing about it gets that answer, and only the tests about the head log
-      // itself set one.
+      // Unless supplied explicitly, the fake HEAD reflog includes every commit from the directory's log answer.
+
       const answer = key in answers ? answers[key] : args[1] === '-g' ? headLogFor(dir, answers) : null;
       if (!hold) {
         return Promise.resolve(answer);
@@ -382,7 +374,7 @@ test('a quiet commit made in a worktree reaches the card as this project own wor
     filled++;
   });
 
-  // The first render knows nothing and draws nothing.
+  // The first apply starts reads without adding commits.
   commits.apply([one], [REPO]);
   assert.deepEqual(one.commits, []);
   await settle();
@@ -942,10 +934,8 @@ test('a worktree in the middle of a rebase names no branch', async () => {
 });
 
 test('a window holding more commits than one read allows names nothing', async () => {
-  // The read asks for one more than it allows, so a full answer means git had more to give
-  // and trimmed it. What it trims is the oldest, which is where the call's own commit sits,
-  // and what survives inside the window can be a stranger. Twenty commits here fall in the
-  // slack and outside the window, and the twenty-first falls inside it.
+  // An answer at the read limit cannot establish complete coverage. The fixture includes twenty slack-only commits and one in-window candidate.
+
   const quiet = intent({ dir: REPO });
   let stdout = record('5c8e9415c8e9415c8e9415c8e9415c8e9415c8e9', 'Send item four', '2026-09-02T04:08:19Z');
   for (let i = 0; i < 20; i++) {
@@ -1036,15 +1026,15 @@ test('a repaint that throws does not stop the reader from ever asking again', as
 });
 
 test('a head log names the commits a directory made and nothing else', () => {
-  // Recorded from `git log -g --format=%gs%x00%H` in this repository.
+  // HEAD reflog entries use the subject and hash format from git log -g --format=%gs%x00%H.
   const log = [
     'commit: Record that a cold derived cache rebuild blocks the first render' +
       FIELD +
       '8734e7c4b773c3926ec84a467c1385b1fefcc75e',
     'commit (amend): Reword it' + FIELD + 'aaaaaaa1aaaaaaa1aaaaaaa1aaaaaaa1aaaaaaa1',
     'commit (initial): First' + FIELD + 'bbbbbbb2bbbbbbb2bbbbbbb2bbbbbbb2bbbbbbb2',
-    // A head that only moved made nothing. A fast-forward landing carries a commit somebody
-    // else made, which is the case this exists to refuse.
+    // Fast-forward and checkout entries move HEAD without creating commits.
+
     'merge 302bd76: Fast-forward' + FIELD + 'ccccccc3ccccccc3ccccccc3ccccccc3ccccccc3',
     'checkout: moving from feat/x to main' + FIELD + 'ddddddd4ddddddd4ddddddd4ddddddd4ddddddd4',
   ].join('\n');
@@ -1235,8 +1225,8 @@ const entry = (name: string, sha: string, at: string = LANDED_AT): string =>
   `merge ${name}: Fast-forward${FIELD}${sha}${FIELD}${at}`;
 
 test('a head log names the trees this directory fast-forwarded', () => {
-  // Recorded from `git log -g --format=%gs%x00%H` after a fast-forward. The name after the
-  // word is the one the merge command named, and git's own output never carries it.
+  // A fast-forward reflog entry retains the source named by the merge command.
+
   const log = [
     entry('panel-ts/ui-1', LANDED),
     `commit: Read commits from the repository${FIELD}f245c68f245c68f245c68f245c68f245c68f2456${FIELD}${LANDED_AT}`,
@@ -1465,9 +1455,8 @@ test('a historical landing survives more than 40 later head movements', async ()
 });
 
 test('a real fast-forward is read back with its subject and the name the command named', async () => {
-  // Everything above is held against recorded git output. This one runs git, because the whole
-  // feature rests on git writing `merge <name>: Fast-forward` into the head log, and no
-  // recorded string can prove that it still does.
+  // Run Git to check that a fast-forward writes its source name into the HEAD reflog.
+
   const root = tempDir('landing-');
   const git = (...args: string[]): void => {
     execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });

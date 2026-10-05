@@ -80,8 +80,7 @@ export function timelineLayoutNotSaved(key: TimelineLayoutKey, value: string): s
   );
 }
 
-// A layout press saves one setting. A refused save tells the reader, because the dialog checks a
-// row only when the saved setting comes back, so a silent refusal leaves a press that did nothing.
+// Save one layout setting. Report a refused write because the dialog selects a row only after the saved setting returns.
 export function saveTimelineLayout(
   key: TimelineLayoutKey,
   value: string,
@@ -118,9 +117,7 @@ export function timelineLayout(raw: unknown): TimelineLayout {
   };
 }
 
-// The parts of an open turn card's body, and the columns a layout draws them in. A card draws a
-// part only when it holds one, and Two columns keeps a second column only when the card holds a
-// record for it.
+// Open card body parts and their layout columns. Two columns adds a record column only when hasRecord is true.
 export type CardBodyPart = 'prompt' | 'error' | 'response' | 'activity' | 'record';
 
 export function cardBodyColumns(layout: TimelineLayout, hasRecord: boolean): CardBodyPart[][] {

@@ -1,11 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-// A save writes a uniquely named temporary and renames it over the target, so a reader never
-// sees a half-written file. A failure between the two leaves the temporary behind, and a hard
-// kill leaves one that no `finally` will ever reach. A later save removes one only when it can
-// say that the writer is gone: the name carries this process's own id, or it names a process
-// that is no longer running and it is older than the grace period.
+// A save replaces its target through a uniquely named temporary file.
+// Cleanup removes this process's leftover temporaries immediately. Other writers' temporaries require a stopped process and this grace period.
 export const TEMPORARY_GRACE_MILLISECONDS = 60_000;
 const TEMPORARY_NAME = /^(.+)\.(\d+)\.(\d+)\.tmp$/;
 
@@ -34,7 +31,7 @@ function processIsRunning(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    // A process this one may not signal still exists.
+    // EPERM indicates an existing process that this process cannot signal.
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
@@ -56,23 +53,21 @@ function removeStaleTemporaries(target: string): void {
     try {
       fs.unlinkSync(path.join(directory, name));
     } catch {
-      /* another writer took it first */
+      // Leave a temporary that cannot be removed.
     }
   }
 }
 
-// A write runs to its rename without yielding, so two writes in this process cannot interleave.
-// Two editor windows on one store can still write at the same moment. Each writes its own
-// temporary and renames it, and the sweep leaves the other window's temporary alone while that
-// window is running. `replace` is the seam the tests use to fail the rename.
+// Writes synchronously through the rename so writes in this process cannot interleave.
+// Other editor windows use separate temporaries. Cleanup retains their temporaries while their processes run.
+// `replace` lets a caller supply the rename operation.
 export function writeFileAtomically(
   target: string,
   text: string,
   replace: (temporary: string, target: string) => void = fs.renameSync,
 ): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  // The sweep runs before the write, because a leftover of this process can carry the name this
-  // write is about to take. Sweeping afterwards would remove the file this write just made.
+  // Remove leftovers before writing. A previous temporary from this process can have the same name as the new one.
   removeStaleTemporaries(target);
   const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -83,7 +78,7 @@ export function writeFileAtomically(
     try {
       fs.unlinkSync(temporary);
     } catch {
-      /* the rename already took it */
+      // The temporary is absent or cannot be removed.
     }
   }
 }

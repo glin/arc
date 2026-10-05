@@ -61,7 +61,7 @@ test('the rename editor opens on the full name, not the shortened card label', (
     session: 's1',
     title: 'The complete session name',
   });
-  // The host builds the message here rather than inline, so this test covers what it posts.
+  // The host posts the message built by sessionRenameOpening.
   const host = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
   assert.match(host, /this\.post\(sessionRenameOpening\(sessionId, this\.sessionLabel\(session\)\)\)/);
 });

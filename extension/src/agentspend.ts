@@ -3,8 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import type { ChildArtifacts } from './childartifacts';
 import type { CommitIntent, TurnCommit, TurnUsage, TurnUsagePart, UsageContextBand, UsageCounts } from './transcript';
 
-// One agent's billed usage under one model. A child can change models while it runs, so the
-// model stays beside the counts it prices rather than being taken from the child's last reply.
+// One agent's billed usage under one model. Model changes retain separate counts for each model.
 export interface ModelSpend {
   model: string | null;
   provider?: string | null;
@@ -27,13 +26,10 @@ export interface AgentSpend {
   startedAt?: number | null;
   endedAt?: number | null;
   toolUses?: number;
-  // Whether the child file was present and readable. An empty transcript that exists is a
-  // known zero; an empty result for a missing file is not.
+  // Whether the child transcript exists and is readable. An empty readable transcript establishes zero usage. A missing file does not.
   found: boolean;
-  // The figures include every subagent this transcript launched, and theirs in turn. True when
-  // one of them is missing from the figures: a launch with no meta file, a descendant transcript
-  // that cannot be read, or a descendant whose last turn is still open. The figures are then
-  // a lower bound.
+  // The figures include nested subagents. True when metadata, a readable transcript, or a completed final turn is missing for a descendant.
+  // Partial figures are a lower bound.
   partial: boolean;
   // A stopped dispatched session whose last turn never reached a final answer.
   unfinished?: boolean;
@@ -147,9 +143,8 @@ export function modelSpends(byModel: Map<string | null, TurnUsage>, provider: st
 // running child's cost at most once a band, however often the child writes.
 export const OPEN_SPEND_BAND_MS = 5_000;
 
-// A read of a running child parses its whole transcript and every nested one. A band doubles
-// until it lasts one millisecond per this many of those bytes, so the reads of one band average
-// at most about 1 MB a second, however large the child grows.
+// A running-child read covers its transcript and nested transcripts.
+// The band doubles until its duration allows these bytes at about 1 MB per second.
 export const OPEN_SPEND_BYTES_PER_MS = 1_000;
 
 // The band length for a child whose figure reads this many bytes.
@@ -161,12 +156,9 @@ export function openSpendBandMs(bytes: number): number {
   return band;
 }
 
-// The band of a running child's spend version at `now`. Each line of a version ends in a
-// `spendFileVersion`, `size:mtime`. The band takes the newest write time and the total size over
-// every file the version names. A child that has written nothing for a whole band has no band,
-// and its caller keys it by its exact version instead. Its last writes then reach the card once,
-// even when the child ends without a status change. A version with no file on disk has the band
-// `none`.
+// Groups recent writes by their newest modification time and total file size.
+// Each version line ends with `size:mtime`. After a full quiet band, the caller uses the exact version.
+// A version with no valid file size and time returns `none`.
 export function openSpendBand(version: string, now: number): string | null {
   let newest = -Infinity;
   let bytes = 0;
@@ -205,12 +197,11 @@ export function childSpendRevisionKey(status: string, version: string, now: numb
   return `open:${band}\n${relationships}`;
 }
 
-// One child's spend through the cache, as the worker reads it for a parent card. A finished
-// child is read again whenever its version moves. A running child is read at most once a band,
-// the band its parent's render key carries, and once more when it goes quiet. It shows its usage
-// so far and leaves out its commits, files and run record, because the child can still add to
-// them or undo them. `versioned` puts the version in the parse key, for a file whose figure also
-// covers other files. `now` must be the clock reading the caller's render key used.
+// Reads cached child usage for a parent card. Closed children refresh when their revision changes.
+// Recent writes share a band and receive one final refresh after that band ends.
+// Open children omit files, commits, and run details.
+// The `versioned` flag includes the aggregate revision in the parse key.
+// The `now` value must match the caller's render clock.
 export function readChildSpend(
   cache: AgentSpendCache,
   file: string,
@@ -246,12 +237,9 @@ export function spendFileVersion(file: string): string {
   }
 }
 
-// Read a file one line at a time without holding the transcript itself in memory. Child
-// transcripts are usually small, but nothing in either format limits one, and the result
-// retained by the panel is only a few token counts.
-//
-// A visit that answers exactly true stops the scan, and the scan then answers false, because it did not
-// read the whole file.
+// Reads UTF-8 lines without retaining the full transcript. One unfinished line can span several read chunks.
+// A visitor returning exactly true stops newline-delimited scanning and returns false.
+// The final unterminated line is visited after EOF. Its visitor result does not change true completion.
 export function scanLines(file: string, visit: (line: string) => unknown): boolean {
   let fd = -1;
   let readWholeFile = false;
@@ -312,10 +300,8 @@ interface CachedSpend {
   value: AgentSpend;
 }
 
-// The panel re-parses a parent whenever it grows. A parent can keep references to dozens of
-// completed children, whose files have not moved, so their compact totals are cached by file
-// revision and parse inputs. The entry count is bounded because old
-// sessions rotate out of the panel while the window itself can stay open for weeks.
+// Caches child totals by file revision and parse inputs when a parent is reparsed.
+// The entry limit bounds retained results while an editor window remains open.
 export class AgentSpendCache {
   private entries = new Map<string, CachedSpend>();
 

@@ -13,9 +13,8 @@ type Written = Record<string, string | undefined>;
 
 const CHOSEN = '\u2713';
 const ASK_TAB_ROWS = 2;
-// How long the ask announcer keeps a written text: a request name, or the composer's draft
-// setup detail announced through the same call. A text arriving inside this time is added
-// beside the kept text, and aria-atomic rereads every held text again with the new one.
+// Hold request and draft-setup announcements for this interval.
+// New text joins retained announcements. aria-atomic reads the combined text.
 const ASK_ANNOUNCE_HOLD_MS = 1000;
 const ASK_CONTINUE =
   '.cask .caskaction:not([disabled]), .cask .caskchoice input:not([disabled]),' + ' .cask .caskwritten:not([disabled])';

@@ -1,8 +1,5 @@
-// extension/src/turncard.test.ts
-//
-// The tests for turncard.ts. One that reads a second seam's names lives in turnview.test.ts
-// instead, because neither file owns it. The builders a test is written against are here
-// while only this file needs them, and in turnfixtures.ts once a second file does.
+// Turn-card tests keep local builders here. Shared builders live in turnfixtures.ts, and cross-module tests live in turnview.test.ts.
+
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as path from 'node:path';
@@ -113,7 +110,7 @@ import { reduceChildArtifacts } from './childartifacts.ts';
 import { exposeClaudeAgentRelationshipIds } from './progressiveworker-entry.ts';
 import type { ChildArtifacts } from './childartifacts.ts';
 import { normalizeFsPath, sameCommitSha } from './transcript.ts';
-// The page fixture the panel's own pictures and measurements are drawn from.
+// Shared panel fixture for screenshots and measurements.
 import { FIXTURE_CLOCK, FIXTURE_TURNS, LONG_TURN_INDEX } from './panelfixture.ts';
 import type { CacheExpiryFacts, CompactionFact, ProjectUsageBucket, SessionTurnStats } from './projectspend.ts';
 
@@ -271,10 +268,8 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
   assert.ok(!lower.detail.includes('recommend'));
 });
 
-// The Rail's `cache-expiry:` filter reads this count as exact whenever the classifier judged
-// every adjacent pair. An unjudged pair may itself have been a qualifying return the count has
-// not added in, so a fact carrying any `unavailable` pairs must mark its count as a floor the
-// same way `SessionCostTotal.partial` marks an unpriced cost total.
+// Cache-expiry counts are lower bounds when any adjacent pair remains unavailable.
+
 test('a cache-expiry count with unavailable pairs is marked as a floor', () => {
   const judged: CacheExpiryFacts = {
     counts: { '5m': 0, '30m': 2, '1h': 1 },
@@ -395,8 +390,8 @@ test('absent indexed compaction evidence adds no row or fallback detail', () => 
   assert.deepEqual(withSessionContextDetail([turns], sessionCompactionContextDetail([])), [turns]);
 });
 
-// The whole row as a reader hears it. The words and the literal are drawn as two elements
-// side by side, and they read out in that order, so a wording guard reads them joined.
+// Join the step label and code in their spoken order.
+
 const said = (s: TurnStep): string => [stepLine(s), stepCode(s)].filter(Boolean).join(' ');
 const costLines = (...texts: string[]) =>
   texts.map((text) => {
@@ -439,10 +434,10 @@ const agent = (over: Partial<TurnAgent> = {}): TurnAgent => ({
   ...over,
 });
 
-// The cost reaches the panel as a chip, so that is where a test reads it from.
+// Read the card's cost figure label.
 const costChip = (card: TurnCard): string | undefined => card.chips.find((c) => c.label.startsWith('$'))?.label;
 
-// The context chip reaches the panel as a chip too, so a test reads it the same way.
+// Read the card's context figure.
 const ctxChip = (card: TurnCard) => card.chips.find((c) => c.label.includes('ctx'));
 
 test('a child commit stays attributed while the turn counts each sha once', () => {
@@ -917,22 +912,22 @@ test('exact direct child detail stays consistent beside a recorded nested result
   assert.match(cost.detail, /Audit the parser .* opus-5: \$3\.24/);
 });
 
-// The four bands, three of them toned. A colour reads out as nothing, so each band is read
-// through its word and its hover sentence as well as through the level the panel tones by.
+// Context bands carry a level, a word, and tooltip text because color alone conveys no accessible information.
+
 const bandAt = (share: number) => {
   const window = 1_000_000; // opus-5
   const chip = ctxChip(toCard(turn({ contextTokens: Math.round(window * share) }), false, NOW))!;
   return { level: chip.level, word: chip.word, kind: chip.kind, detail: chip.detail };
 };
 
-// The marks a card ends up with, by id. What is drawn is the character beside each id, and
-// the order is the table's, so reading ids back tests both.
+// Card mark IDs preserve the MARKS table order.
+
 const markIds = (over: Partial<Turn>) => toCard(turn(over), false, NOW).marks.map((m) => m.id);
 
 const changed = (path: string, added: number, removed: number) => ({ path, added, removed, isNew: false, edits: [] });
 
-// The chips and the marks a card carries, read off one built from a summary with the two
-// reader-facing rows written out.
+// Read figures and marks from a summary containing both closing rows.
+
 const closingCard = (rows: string[]) => {
   const card = toCard(turn({ summary: ['- The work landed.', '', ...rows].join('\n') }), false, NOW);
   return {
@@ -942,14 +937,13 @@ const closingCard = (rows: string[]) => {
   };
 };
 
-// The figures a session heading carries. Each expected number below is worked out by hand
-// beside the input rather than by calling the code under test a second time: two sums built
-// from one mistake agree with each other and the check passes.
+// Find a session-heading figure by its label prefix.
+
 const statOf = (chips: { label: string; detail: string; added?: number; removed?: number }[], starts: string) =>
   chips.find((c) => c.label.startsWith(starts));
 
-// The sentence that says what to do about a crowded session. It rides the session
-// heading's context chip alone, from the second band up.
+// The session-heading context figure carries compaction advice from the second context band upward.
+
 const COMPACT_HERE = 'This is a place to compact, or to hand the work to a fresh session.';
 
 const sessionCtxDetail = (share: number) => {
@@ -966,8 +960,8 @@ const sessionCtxDetail = (share: number) => {
     .map((line) => line.trim());
 };
 
-// The two facts the session heading's context chip carries on its hover, beside the level it
-// already reported. Both are drawn wherever the figures exist, not only on a crowded session.
+// Read the session-heading context detail.
+
 const ctxDetail = (turns: Turn[], compactions: Compaction[] = []) =>
   sessionStats(turns, compactions).find((c) => c.label.includes('ctx'))?.detail ?? '';
 
@@ -986,26 +980,26 @@ const step = (over: Partial<TurnStep> = {}): TurnStep => ({
 });
 
 test('a share is rounded to nearest, with neither end reached by a figure short of it', () => {
-  // The rule the CLI's own context report follows. A figure a point under the CLI's reads
-  // as a second measurement of the same window rather than as a second rounding of it.
+  // Interior percentages round to the nearest whole number.
+
   assert.equal(wholePercent(0.4989), 50);
   assert.equal(wholePercent(0.735), 74);
   assert.equal(wholePercent(0.104), 10);
-  // The two ends are absolutes and are held back from rounding. A window with a few
-  // thousand tokens left in it is not full, and one with a few thousand in it is not empty.
+  // Only an empty or full window reports 0% or 100%.
+
   assert.equal(wholePercent(0.999), 99);
   assert.equal(wholePercent(1), 100);
   assert.equal(wholePercent(0.0004), 1);
   assert.equal(wholePercent(0), 0);
   // A share past the window passes through: an overrun says so rather than reading as full.
   assert.equal(wholePercent(1.5), 150);
-  // And nothing under zero is a figure at all.
+  // Negative shares report zero.
   assert.equal(wholePercent(-0.2), 0);
 });
 
 test('every mark is one character and one id, and no two share either', () => {
-  // Two marks on one character draw the same thing for different reasons, and two on one id
-  // means one of them can never be earned. Neither shows up as a failure anywhere else.
+  // Each mark needs a distinct ID and character.
+
   assert.equal(new Set(MARKS.map((m) => m.id)).size, MARKS.length);
   assert.equal(new Set(MARKS.map((m) => m.character)).size, MARKS.length);
   assert.ok(
@@ -1015,15 +1009,15 @@ test('every mark is one character and one id, and no two share either', () => {
 });
 
 test('a symbol is read as one character, joined sequence and all, and taken off whole', () => {
-  // Read as characters, not as the pairs a string is stored in: a raised hand is two of
-  // those pairs, and reading the first alone finds half a character and no symbol.
+  // Symbol parsing preserves Unicode code points instead of splitting surrogate pairs.
+
   assert.equal(leadingSymbol('\u{1F64B} Your turn.'), '\u{1F64B}');
   assert.equal(withoutLeadingSymbol('\u{1F64B} Your turn.'), 'Your turn.');
   // The selector after a symbol belongs to it and goes with it.
   assert.equal(leadingSymbol('⚠️ Careful.'), '⚠');
   assert.equal(withoutLeadingSymbol('⚠️ Careful.'), 'Careful.');
-  // A joined sequence marks as the symbol it is built on, and none of what it is joined to
-  // is left behind: a stray gender sign at the head of the name is read out as "male sign".
+  // Removing a joined symbol also removes its trailing joiners, modifiers, and variation selectors.
+
   assert.equal(leadingSymbol('\u{1F64B}‍♂️ Your turn.'), '\u{1F64B}');
   assert.equal(withoutLeadingSymbol('\u{1F64B}‍♂️ Your turn.'), 'Your turn.');
   // A line that opens with anything else is left exactly as it is.
@@ -1056,10 +1050,8 @@ test('a headline too long for a tab title is cut to fit, and one that fits is le
 });
 
 test('a headline is cut between characters, so a tab title never shows half an emoji', () => {
-  // Reachable without doing anything unusual: a headline opens with an emoji whenever the
-  // summary's first line does, and every line of the summary format does.
-  // A high surrogate with no low surrogate after it is half a character, and a tab draws it
-  // as an empty box.
+  // A title must not end with an unmatched high surrogate.
+
   const halfACharacter = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
   const title = (headline: string) => diffTitle(headline, 0, 0).slice('Changes · '.length);
 
@@ -1087,11 +1079,11 @@ test('a file row is named by its basename, until two of them collide', () => {
     'x/src/index.ts',
     'y/src/index.ts',
   ]);
-  // The store writes backslashes and the transcript writes forward slashes, so a row can
-  // arrive in either shape and both have to split.
+  // Paths accept both slash spellings.
+
   assert.deepEqual(distinctNames(['c:\\repo\\a\\index.ts', 'c:/repo/b/index.ts']), ['a/index.ts', 'b/index.ts']);
-  // Two rows for one path cannot be told apart by their path, so this settles rather than
-  // growing for ever.
+  // Identical paths retain their full names because no directory suffix distinguishes them.
+
   assert.deepEqual(distinctNames(['c:/repo/a.ts', 'c:/repo/a.ts']), ['c:/repo/a.ts', 'c:/repo/a.ts']);
   assert.deepEqual(distinctNames([]), []);
 });
@@ -1099,28 +1091,28 @@ test('a file row is named by its basename, until two of them collide', () => {
 test('a file no open folder holds is drawn by its whole path, and said as one too', () => {
   const inside = 'c:/repo/src/store.ts';
   const outside = 'c:/Users/dev/AppData/Local/Temp/scratch/notes.md';
-  // One folder open: the file under it keeps its basename, and the one outside it cannot,
-  // because a scratch `notes.md` and a repository `notes.md` read the same.
+  // Outside files retain their full paths even when their basenames match files inside the workspace.
+
   assert.deepEqual(fileRowNames([inside, outside], ['c:/repo']), [
     { name: 'store.ts', spoken: 'store.ts' },
     { lead: 'c:/Users/dev/AppData/Local/Temp/scratch/', name: 'notes.md', spoken: outside },
   ]);
-  // Two folders open: a file under either is inside, and two basenames that collide still
-  // grow leftwards until they are distinct.
+  // Colliding basenames grow across all open folders.
+
   assert.deepEqual(fileRowNames(['c:/repo/src/index.ts', 'c:/other/src/index.ts', outside], ['c:/repo', 'c:/other']), [
     { name: 'index.ts', spoken: 'repo/src/index.ts' },
     { name: 'index.ts', spoken: 'other/src/index.ts' },
     { lead: 'c:/Users/dev/AppData/Local/Temp/scratch/', name: 'notes.md', spoken: outside },
   ]);
-  // The folder itself is inside it, which is the case `isInside` names and the one a rule
-  // written as a prefix test alone would answer wrongly.
+  // A folder path counts as inside that folder.
+
   assert.deepEqual(fileRowNames(['c:/repo'], ['c:/repo']), [{ name: 'repo', spoken: 'repo' }]);
   // A sibling folder whose name starts with the open one's is not inside it.
   assert.deepEqual(fileRowNames(['c:/repo-two/a.ts'], ['c:/repo']), [
     { lead: 'c:/repo-two/', name: 'a.ts', spoken: 'c:/repo-two/a.ts' },
   ]);
-  // With nothing open there is nothing to be outside of, so every row says the smaller
-  // thing rather than guessing that every file is foreign.
+  // Without open folders, file rows use basename labels.
+
   assert.deepEqual(fileRowNames([inside, outside], []), [
     { name: 'store.ts', spoken: 'store.ts' },
     { name: 'notes.md', spoken: 'notes.md' },
@@ -1128,13 +1120,13 @@ test('a file no open folder holds is drawn by its whole path, and said as one to
 });
 
 test('the inside test reads a path in either spelling, and the drive letter in either case', () => {
-  // The store writes backslashes and the transcript writes forward slashes, and the folder
-  // arrives from the editor in a third shape again, so every pairing has to answer the same.
+  // Folder membership accepts both slash spellings and drive-letter case differences.
+
   assert.deepEqual(fileRowNames(['c:\\repo\\src\\store.ts'], ['c:/repo']), [{ name: 'store.ts', spoken: 'store.ts' }]);
   assert.deepEqual(fileRowNames(['c:/repo/src/store.ts'], ['c:\\repo']), [{ name: 'store.ts', spoken: 'store.ts' }]);
   assert.deepEqual(fileRowNames(['C:/repo/src/store.ts'], ['c:/repo']), [{ name: 'store.ts', spoken: 'store.ts' }]);
-  // And a file genuinely outside stays outside in both spellings. What is drawn and what is
-  // announced come back in the one spelling the panel uses, whichever it arrived in.
+  // Outside paths use forward slashes in their visible and spoken names.
+
   const outside = 'c:\\Users\\dev\\AppData\\Local\\Temp\\notes.md';
   assert.deepEqual(fileRowNames([outside], ['c:/repo']), [
     { lead: 'c:/Users/dev/AppData/Local/Temp/', name: 'notes.md', spoken: 'c:/Users/dev/AppData/Local/Temp/notes.md' },
@@ -1142,15 +1134,14 @@ test('the inside test reads a path in either spelling, and the drive letter in e
 });
 
 test('only the rows that will draw a basename are told apart from one another', () => {
-  // The second row is outside the open folder, so it is drawn and announced by its whole
-  // path and never by a basename. Growing the first one to be distinct from it hangs a
-  // directory on a row the reader can neither see nor hear that directory on.
+  // An outside path does not force a workspace file's basename to grow.
+
   assert.deepEqual(fileRowNames(['c:/repo/notes.md', 'c:/temp/notes.md'], ['c:/repo']), [
     { name: 'notes.md', spoken: 'notes.md' },
     { lead: 'c:/temp/', name: 'notes.md', spoken: 'c:/temp/notes.md' },
   ]);
-  // Two rows that do draw a basename still grow, and a path row sitting between them does
-  // not shift the grown names onto the wrong rows.
+  // Outside rows preserve the positions of disambiguated workspace names.
+
   assert.deepEqual(fileRowNames(['c:/repo/a/index.ts', 'c:/temp/index.ts', 'c:/repo/b/index.ts'], ['c:/repo']), [
     { name: 'index.ts', spoken: 'a/index.ts' },
     { lead: 'c:/temp/', name: 'index.ts', spoken: 'c:/temp/index.ts' },
@@ -1160,28 +1151,26 @@ test('only the rows that will draw a basename are told apart from one another', 
 
 test('a row drawn by its whole path hands over the directory and the filename separately', () => {
   const outside = 'c:/Users/dev/AppData/Local/Temp/scratch/notes.md';
-  // The row truncates on the right. Handed one string it cuts the filename off first, and
-  // the filename is the part that says which file the row is, so the two pieces are split
-  // here and the row draws the directory as the piece that gives way.
+  // Separate directory and filename fields let the row truncate the directory while retaining the filename.
+
   assert.deepEqual(fileRowNames([outside], ['c:/repo']), [
     { lead: 'c:/Users/dev/AppData/Local/Temp/scratch/', name: 'notes.md', spoken: outside },
   ]);
-  // A path recorded with backslashes is cut into the same two pieces, in the spelling the
-  // panel draws: the row's hover carries that same spelling, and the two have to read alike.
+  // Backslash paths normalize before their directory and filename fields are split.
+
   const back = 'c:\\Users\\dev\\AppData\\Local\\Temp\\notes.md';
   assert.deepEqual(fileRowNames([back], ['c:/repo']), [
     { lead: 'c:/Users/dev/AppData/Local/Temp/', name: 'notes.md', spoken: 'c:/Users/dev/AppData/Local/Temp/notes.md' },
   ]);
-  // A row drawn by its basename is one piece, exactly as it always was.
+  // Workspace rows have no separate directory prefix.
   assert.deepEqual(fileRowNames(['c:/repo/src/store.ts'], ['c:/repo']), [{ name: 'store.ts', spoken: 'store.ts' }]);
   // And so is a path with no directory in front of the filename.
   assert.deepEqual(fileRowNames(['notes.md'], ['c:/repo']), [{ name: 'notes.md', spoken: 'notes.md' }]);
 });
 
 test('every control the panel can be operated with has something to be called', () => {
-  // Some entries are a table of their own, one word per scope or state. The leaves are the
-  // labels, so the walk goes through a table rather than stopping at it and calling the
-  // object a string that reads out as nothing.
+  // Nested action tables contain labels at their leaves.
+
   const leaves: [string, unknown][] = [];
   const walk = (name: string, value: unknown): void => {
     if (value && typeof value === 'object') {
@@ -1207,12 +1196,11 @@ test('every control the panel can be operated with has something to be called', 
   assert.equal(CARD_ACTIONS.collapseAllTurns, 'Collapse every shown turn');
 });
 
-// What the turn is waiting on the reader for. Every answer below is hand-written from the
-// row as a reader would read it, never from what the parser returned, so a reader that
-// starts missing a row fails here rather than agreeing with itself.
+// Closing rows distinguish reader actions from explicit statements that nothing remains open.
+
 test('a row that says it holds nothing is not something waiting on the reader', () => {
-  // All four are copied from summaries in the store. Before the format left an empty row
-  // out, this was how every turn with nothing outstanding wrote one.
+  // Explicit negations describe a closing row with no reader action.
+
   const nothing = [
     'none blocking. Items 1 and 2 can start whenever the other session frees turnview.ts.',
     'None for me. Both decisions are settled and recorded.',
@@ -1222,8 +1210,8 @@ test('a row that says it holds nothing is not something waiting on the reader', 
   for (const text of nothing) {
     assert.equal(waitingOn(`- 🙋 **Your actions** — ${text}`).needsYou, false, text);
   }
-  // And the other way: a row with something in it is waiting, including one that says what
-  // is not blocked as well as what is.
+  // A row with an action remains actionable even when it also describes work that is unblocked.
+
   const waiting = [
     'reload the window, then open a turn and confirm the badge.',
     'decide the icon question above; nothing else is blocked on you.',
@@ -1232,8 +1220,8 @@ test('a row that says it holds nothing is not something waiting on the reader', 
   for (const text of waiting) {
     assert.equal(waitingOn(`- 🙋 **Your actions** — ${text}`).needsYou, true, text);
   }
-  // A word that begins with one of the negations is not one of them. Without the boundary
-  // this row reads as holding nothing and the turn drops out of the filter.
+  // Negation words require a word boundary.
+
   assert.equal(waitingOn('- 🙋 **Your actions** — Nonetheless, decide the icon set.').needsYou, true);
   assert.equal(waitingOn('- 🙋 **Your actions** — Note the two questions below.').needsYou, true);
 });
@@ -1249,12 +1237,12 @@ test('a summary with no closing row at all is waiting on nothing', () => {
 test('questions are counted from the numbering the row was written with', () => {
   assert.equal(enumeratedCount('(1) keep the store? (2) rename the view?'), 2);
   assert.equal(enumeratedCount('(1) first (2) second (3) third (4) fourth'), 4);
-  // No numbering, so no number: the row is badged without one rather than with a guess.
+  // Unnumbered questions have no inferred count.
   assert.equal(enumeratedCount('whether to keep the store, and what to call it.'), null);
   assert.equal(enumeratedCount('the three above.'), null);
-  // A lone marker is prose far more often than it is a list of one.
+  // A single numbering marker does not establish a question list.
   assert.equal(enumeratedCount('only one thing: (1) the store.'), null);
-  // A run that does not start at one, or skips, is not a count of anything.
+  // Question counts require consecutive numbering starting at one.
   assert.equal(enumeratedCount('as in (2) and (3) above'), null);
   assert.equal(enumeratedCount('(1) first (3) third'), null);
 });
@@ -1264,8 +1252,8 @@ test('a session with no turns read has nothing to say about itself', () => {
 });
 
 test('the log names a mid-turn prompt without printing the whole of it twice', () => {
-  // The text itself is drawn under "You asked". A log row is a pointer to it, one line, cut
-  // the way a long command is, so a paragraph typed mid-turn cannot turn the log into prose.
+  // The Activity row uses the prompt's first line and limits its length.
+
   const long = 'a'.repeat(STEP_DETAIL_LIMIT + 40);
   const row = askLine({
     stepsBefore: 0,
@@ -1286,8 +1274,8 @@ test('a card names the agent that recorded it, in the badge and in what it is an
   const codex = toCard(turn({ agent: 'codex', model: 'gpt-5.6-sol', effort: 'high' }), false, NOW);
   assert.equal(claude.agent, 'Claude');
   assert.equal(codex.agent, 'Codex');
-  // A glyph and a badge say nothing to a reader who cannot see them, so the head row's own
-  // name carries the agent as a word beside the model.
+  // The card's accessible name includes the agent word alongside its model.
+
   assert.match(codex.label, /Codex gpt-5\.6-sol high/);
   assert.match(claude.label, /Claude opus-5/);
 });
@@ -1296,8 +1284,8 @@ test('a Codex turn that ran commands and recorded no files is marked as a gap, a
   const ran = { toolCounts: counts({ commands: 6 }), files: [] };
   const gap = (t: Turn) => toCard(t, false, NOW).marks.some((m) => m.id === 'gap');
   assert.equal(gap(turn({ agent: 'codex', ...ran })), true);
-  // Claude Code records every edit, so the same turn there changed nothing and the card can
-  // say so without a caveat.
+  // A Claude turn with commands and no recorded files carries no gap mark.
+
   assert.equal(gap(turn({ agent: 'claude', ...ran })), false);
   // A Codex turn that did record a change has no gap to report.
   assert.equal(
@@ -1310,17 +1298,16 @@ test('a Codex turn that ran commands and recorded no files is marked as a gap, a
     ),
     false,
   );
-  // A Codex turn that ran no command wrote no file by any route the panel cannot see.
+  // A Codex turn with no commands carries no command-related gap mark.
   assert.equal(gap(turn({ agent: 'codex', toolCounts: counts({ edits: 2 }), files: [] })), false);
-  // The word, not only the mark: it is what a reader who cannot see the symbol is told.
+  // The gap mark includes an accessible word.
   const mark = MARKS.find((m) => m.id === 'gap');
   assert.equal(mark?.word, 'a gap in what it recorded');
 });
 
 test('the window a turn recorded beats the one the price table would have guessed', () => {
-  // gpt-5.6-sol is advertised at 272,000 and this session was given 258,400. 200,000 of the
-  // smaller window is 77%; of the larger it is 73%, which is the wrong side of the line the
-  // chip changes colour on.
+  // The recorded 258,400-token window puts 200,000 tokens at 77%. The 272,000-token fallback puts them at 74%, in a different band.
+
   const recorded = toCard(
     turn({
       agent: 'codex',
@@ -1334,12 +1321,11 @@ test('the window a turn recorded beats the one the price table would have guesse
   const chip = recorded.chips.find((c) => c.label.includes(' ctx '));
   assert.equal(chip?.label, '77% of 258k ctx (200k)');
   assert.equal(chip?.level, 'gettingFull');
-  // The hover says where the figure came from. A recorded window is what that session was
-  // given, so calling it the window for the model would put a wrong number beside a real
-  // name: gpt-5.6 is advertised with the larger one.
+  // The tooltip identifies the recorded window separately from the model fallback.
+
   assert.match(chip?.detail ?? '', /77% of 258k[\s\S]*Recorded context window size/);
-  // With nothing recorded the table answers, which is what a Claude turn always relies on,
-  // and there the model's name is the right thing to say.
+  // An absent recorded window uses the pricing table's model window.
+
   const tabled = toCard(
     turn({
       agent: 'codex',
@@ -1356,18 +1342,17 @@ test('the window a turn recorded beats the one the price table would have guesse
   assert.match(fallback?.detail ?? '', /74% of 272k[\s\S]*model fallback for gpt-5\.6-sol/);
 });
 
-// When the fixture turn last recorded anything, read off the fixture rather than written out
-// again. The quiet window is measured from it, and a second copy of the time would move the
-// window without moving the turn.
+// Quiet-window checks use the fixture turn's end time.
+
 const TURN_END = turn().endedAt;
 
 test('status separates a finished turn from a failed, stopped, running or cut-short one', () => {
   assert.equal(statusOf(turn({ summary: 'Done.' }), false), 'done');
   assert.equal(statusOf(turn({ error: 'Overloaded.' }), false), 'failed');
   assert.equal(statusOf(turn({ finished: false, interrupted: true }), false), 'interrupted');
-  // a turn the user stopped that still closed properly afterwards counts as answered
+  // A stopped turn with a closing response counts as answered.
   assert.equal(statusOf(turn({ interrupted: true }), false), 'done');
-  // mid-turn text does not mean the turn is over: the newest one is still running
+  // Mid-turn text leaves the newest unfinished turn running.
   assert.equal(statusOf(turn({ finished: false, summary: 'Working on it.' }), true, TURN_END), 'running');
   assert.equal(statusOf(turn({ finished: false }), false, TURN_END), 'stopped');
   const processEndedAt = TURN_END + 4 * 60_000;
@@ -1381,9 +1366,8 @@ test('status separates a finished turn from a failed, stopped, running or cut-sh
 });
 
 test('a turn that has recorded nothing for an hour has been left unfinished, not left running', () => {
-  // The reported session: the CLI was closed part-way through a tool call, so no record
-  // ever closed the turn and nothing else in the file is newer. Every reading below is the
-  // one the reader was given for the three hours after it died.
+  // An unfinished newest turn stays running through its quiet deadline and stops after it.
+
   const abandoned = turn({ finished: false, interrupted: false, error: null });
   assert.equal(
     statusOf(abandoned, true, TURN_END + TURN_QUIET_MS),
@@ -1395,8 +1379,8 @@ test('a turn that has recorded nothing for an hour has been left unfinished, not
     'stopped',
     'a turn nothing has written to for an hour is still drawn as running',
   );
-  // What the reader could not do. A running card takes no read state, so the session
-  // wore its unread dot with no press that would clear it.
+  // A stopped card accepts read state and exposes the unread menu section.
+
   const dead = toCard(abandoned, true, TURN_END + TURN_QUIET_MS + 1);
   assert.equal(dead.live, false, 'the card still counts its duration up from a dead agent');
   assert.equal(canMarkRead(dead), true, 'the reader still has no way to mark the session read');
@@ -1405,15 +1389,15 @@ test('a turn that has recorded nothing for an hour has been left unfinished, not
     TURN_MENU_SECTIONS.unread,
     'the card still offers no entry for marking it read',
   );
-  // A turn the agent is working in keeps the word, which is what the window is for.
+  // Recent unfinished turns remain live and cannot be marked read.
   const busy = toCard(abandoned, true, TURN_END + 60_000);
   assert.equal(busy.live, true);
   assert.equal(canMarkRead(busy), false);
 });
 
 test('a turn cut off in the middle of a call stops saying it is on that call', () => {
-  // The call the agent was killed during is left recorded as running, because the record that
-  // would close it was never written. Both clocks on the card read off that record.
+  // A running step supplies both card clocks until the unfinished turn passes its quiet deadline.
+
   const cut = turn({
     finished: false,
     steps: [step({ name: 'Bash', detail: 'npm test', status: 'running' })],
@@ -1434,9 +1418,8 @@ test('a turn cut off in the middle of a call stops saying it is on that call', (
 });
 
 test('the poll is woken by a turn going quiet, and by nothing else about it', () => {
-  // The panel skips the parse when nothing about the listing moved. A turn whose agent died is
-  // never written to again, so this is the only thing that can wake it, and a card the poll
-  // never rebuilds keeps the word running for as long as the panel stays open.
+  // Crossing the quiet deadline triggers a refresh even when the source listing is unchanged.
+
   const dying = [turn({ finished: false })];
   const deadline = TURN_END + TURN_QUIET_MS;
 
@@ -1462,11 +1445,11 @@ test('the poll is woken by a turn going quiet, and by nothing else about it', ()
     'a session outside the parse cut crosses the quiet window without waking the rail',
   );
 
-  // Nothing drawn yet is nothing to have moved, which is the first refresh of all.
+  // The first refresh has no previous clock to compare.
   assert.equal(statusMoved(dying, 0, deadline + 1), false, 'the first refresh compares against a clock nobody set');
 
-  // A clock that goes backwards, which a machine waking from sleep can do. One repaint the
-  // other way and then quiet, rather than a poll that never settles.
+  // A clock moving backward across the deadline also changes status.
+
   assert.equal(statusMoved(dying, deadline + 1, deadline), true);
 
   // A session whose turn already ended is not woken by the clock at all.
@@ -1475,9 +1458,8 @@ test('the poll is woken by a turn going quiet, and by nothing else about it', ()
 });
 
 test('a turn whose end time could not be read keeps the word it had', () => {
-  // `stamp` answers zero for a timestamp it cannot parse, and a turn carries that zero. Aged
-  // against the clock a zero is older than everything, so the window would call the one turn
-  // nobody can time dead on the first repaint.
+  // An unreadable timestamp is zero, which must not expire a newest unfinished turn.
+
   const untimed = turn({ finished: false, endedAt: 0 });
   assert.equal(
     statusOf(untimed, true, TURN_END + TURN_QUIET_MS + 1),
@@ -1588,9 +1570,8 @@ test('the headline is the summary, the error, or what the turn ended up doing', 
     headlineFor(turn({ error: 'Usage credits are required for this model.' }), 'failed'),
     'Usage credits are required for this model.',
   );
-  // A turn with nothing said yet leads with what it was asked, which is what the card was
-  // already showing while the press was in flight. A stock line here put three different
-  // sentences in the same slot in the first seconds of every prompt.
+  // A running turn without response text uses the prompt's first line, or the empty-prompt fallback.
+
   assert.equal(headlineFor(turn({ prompt: 'take the sandbox off' }), 'running'), 'take the sandbox off');
   assert.equal(headlineFor(turn({ prompt: 'first line\nand a second' }), 'running'), 'first line');
   assert.equal(headlineFor(turn({ prompt: '' }), 'running'), 'Still working.');
@@ -1599,9 +1580,8 @@ test('the headline is the summary, the error, or what the turn ended up doing', 
 });
 
 test('the collapsed headline keeps an inline-code identifier intact', () => {
-  // headlineFor leaves a leading mark such as the checkmark below where it was written;
-  // withoutLeadingSymbol takes it off separately, once the headline reaches the card. This
-  // test is only about what stripMarkdown does to the bold text and the code span after it.
+  // headlineFor preserves the leading symbol. The card removes it separately after stripping Markdown.
+
   const summary =
     '✅ **Phase 0 is done and folded into the plan.** Codex publishes ' +
     '`CODEX_SESSION_ID`, so both agents can name themselves and no step in the plan is ' +
@@ -1647,36 +1627,29 @@ test('a headline with inline markup carries headlineHtml, and a plain one carrie
   assert.equal(running.statusWord, 'running');
   assert.equal(running.headlineHtml, undefined);
 
-  // A symbol sitting inside the emphasis marker survives in the Markdown line but is gone
-  // from the plain one, so the two would disagree: no headlineHtml is drawn rather than
-  // putting the symbol back on the folded card.
+  // A symbol inside emphasis prevents headlineHtml when the rendered and plain headlines disagree.
+
   const markedSymbol = toCard(turn({ summary: '**✅ Done**' }), false, NOW);
   assert.equal(markedSymbol.headlineHtml, undefined);
 
-  // A backtick with no closing mate, common while a turn is still streaming, stays literal
-  // once rendered but is deleted by the plain headline's strip. The two disagree, so no
-  // headlineHtml is drawn: a raw backtick on the folded card would be worse than none.
+  // An unmatched backtick prevents headlineHtml when rendered and plain headlines disagree.
+
   const unclosedBacktick = toCard(turn({ summary: 'Ran `npm test' }), false, NOW);
   assert.equal(unclosedBacktick.headlineHtml, undefined);
 
-  // An underscore inside a word is left alone by the renderer, since GFM does not read it as
-  // emphasis there, and the plain headline's strip now agrees rather than deleting it. The
-  // line carries no other Markdown, so it equals the plain headline and draws no
-  // headlineHtml regardless, the same as any other plain line.
+  // An underscore inside a word remains literal. A headline without rendered markup carries no headlineHtml.
+
   const strayUnderscore = toCard(turn({ summary: 'calc_total is a function' }), false, NOW);
   assert.equal(strayUnderscore.headline, 'calc_total is a function');
   assert.equal(strayUnderscore.headlineHtml, undefined);
 
-  // GFM draws `~~old~~` as a struck span with the tildes gone, while the plain headline's
-  // strip does not touch a tilde and keeps them. The two disagree, so no headlineHtml is
-  // drawn: a strikethrough span whose accessible name still reads the tildes would say two
-  // different things about the same line.
+  // Strikethrough prevents headlineHtml because plain stripping retains the tildes.
+
   const strikethrough = toCard(turn({ summary: '~~old~~ `new`' }), false, NOW);
   assert.equal(strikethrough.headlineHtml, undefined);
 
-  // An emphasis run nested inside another one of the same marker character, and a tripled
-  // marker, both lose every marker on the plain headline the same way the renderer's own
-  // nested tags read, so the two agree and headlineHtml is drawn.
+  // Nested and tripled emphasis produce matching rendered and plain headline text.
+
   const nested = toCard(turn({ summary: 'nested **bold *em* inside** text' }), false, NOW);
   assert.equal(nested.headline, 'nested bold em inside text');
   assert.equal(nested.headlineHtml, 'nested <strong>bold <em>em</em> inside</strong> text');
@@ -1687,10 +1660,8 @@ test('a headline with inline markup carries headlineHtml, and a plain one carrie
 });
 
 test("a folded headline keeps a file name's underscore and gets headlineHtml", () => {
-  // The reported bug: a card built from a summary naming `my_file.py` showed "myfile.py"
-  // in the folded headline, its accessible name and the tab title, because the plain strip
-  // deleted every underscore in the line rather than only the ones marking emphasis.
-  // Reproduced with `npx vitest run turncard.test.ts -t "keeps a file name's underscore"`.
+  // Filename underscores remain intact in the plain headline and its rendered HTML.
+
   const card = toCard(turn({ summary: 'Renamed `a` in my_file.py' }), false, NOW);
   assert.equal(card.headline, 'Renamed a in my_file.py');
   assert.equal(card.headlineHtml, 'Renamed <code>a</code> in my_file.py');
@@ -1753,8 +1724,8 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
   assert.equal(card.duration, '12m');
   assert.equal(card.model, 'opus-5');
   assert.equal(card.effort, 'xhigh');
-  // The panel draws these off the card, from inside a template literal the compiler never
-  // reads, so a card that quietly stopped carrying them would break nothing until it shipped.
+  // Commit rows carry the navigation and display fields consumed by the panel.
+
   assert.deepEqual(card.commits, [
     {
       kind: 'commit',
@@ -1786,8 +1757,8 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
     description: 'Audit the parser',
     model: 'haiku-4-5',
     effort: null,
-    // A child Arc read no spend for draws the token count it recorded, with nothing behind it.
-    // How long it ran leads the row when the child has no cost.
+    // A child without spend detail shows duration followed by its recorded token count.
+
     figures: [
       { metric: 'duration', compactLabel: '2m', name: 'Ran for 2m' },
       { metric: 'tokens', compactLabel: '70k tokens', name: '70k tokens' },
@@ -1798,8 +1769,8 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
     hintDetail: '20 tools',
     sessionId: null,
   });
-  // 200 @ $5 + 40k @ $10 + 3M @ $0.50 + 206k @ $25 per MTok = $0.40 + $1.50 + $5.15
-  // two failures is ordinary work the agent handled, so no chip and no mark.
+  // Parent usage costs $0.001 + $0.40 + $1.50 + $5.15. Missing child spend makes the displayed total a lower bound.
+  // Two tool failures add no figure or mark.
   assert.deepEqual(
     card.chips.map((c) => c.label),
     ['$7.05+', '16% of 1M ctx (160k)', '2 files', '3M in · 206k out', '1 commit', '1 subagent'],
@@ -1808,18 +1779,17 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
     foldedChips(card.chips).map((c) => c.label),
     ['$7.05+', '16% of 1M ctx (160k)', '2 files', '3M in · 206k out', '1 commit', '1 subagent'],
   );
-  // every chip spells out what it is made of, for the hover, and the files and the lines
-  // are one chip whose hover carries both
+  // The files figure tooltip includes file and line totals.
+
   assert.deepEqual(card.chips[2].detail.split('\n'), [
-    // A half that moved no line is left out, the way the drawn pair leaves it out.
+    // A file with no removals omits that count.
     '2 files: +85 −12',
     '',
     'a.ts: +80 −12',
     'new.md: +5 new',
   ]);
-  // The tool calls have no chip of their own. It only ever showed on an opened card, and an
-  // opened card draws the Activity heading, which says the same number broken down by kind
-  // and lists the calls under it.
+  // The Activity heading carries the tool mix without a separate tool-count figure.
+
   assert.equal(
     card.chips.some((c) => c.label.endsWith(' tools')),
     false,
@@ -1827,12 +1797,12 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
   );
   assert.equal(card.toolMix, '40 run · 20 edit · 8 read', 'the heading has no mix left to draw');
   assert.deepEqual(card.chips[5].detail.split('\n'), ['Audit the parser', '  haiku-4-5 · 2m · 20 tools · 70k']);
-  // The Commits chip reads its own list out, so its hover cannot drift from what the popover
-  // draws. See the record-chip test below for the rule.
+  // The commits figure tooltip lists the same commits as its popover.
+
   assert.equal(card.chips[4].detail, ['1 commit: +12', '', '00facf2a: Add the timeline'].join('\n'));
 
-  // a turn that changed nothing carries no row of zeros, only the one chip saying so, and
-  // nothing at all waiting inside the card
+  // A turn with no file changes carries only the no-change figure.
+
   const empty = toCard(turn({ summary: 'Answered your question.' }), false, NOW);
   assert.deepEqual(
     empty.chips.map((c) => c.label),
@@ -1862,18 +1832,16 @@ test('a shell edit named without hunks reports no counts, and the chip says how 
   );
   const files = card.chips.find((c) => c.metric === 'files')!;
   assert.equal(files.label, '2 files');
-  // The figure's face and its spoken name say nothing about the row that carries no count. The
-  // record it opens still says why, in the footer sentence below, which does not also ride the
-  // flat run.
+  // The files figure keeps unknown line-count details in its footer, separate from its label and accessible name.
+
   assert.equal(files.name, '2 files, 2 lines added, 1 removed');
   assert.deepEqual(files.detail.split('\n'), ['2 files: +2 −1', '', 'a.ts: +2 −1', 'unlisted.ts']);
   assert.deepEqual(files.detailList?.footer, ['1 file carries no line counts.']);
 });
 
 test('an Edit and then a whole-file Write keeps the lines and says the file was written whole', () => {
-  // The turn's own reader keeps an Edit's counted lines on the row a later Write of the same
-  // path left uncounted. The row settles to partial, keeps the Write as its cause, and the
-  // session heading names the file the way the turn's figure does.
+  // A whole-file write retains counted lines and marks their coverage partial in both turn and session figures.
+
   const written = turn({
     files: [
       {
@@ -1898,9 +1866,8 @@ test('an Edit and then a whole-file Write keeps the lines and says the file was 
 });
 
 test('the files figure names a Write and a shell edit apart, and folds a subagent write in too', () => {
-  // Two causes on one turn: the turn's own shell command named a path without hunks, and a
-  // subagent wrote a second path whole. The figure's own face and name say nothing about either
-  // cause. Its record names each in its own sentence, in the order write, then shell.
+  // The files footer names whole-file writes before shell edits. Neither cause changes the figure's label or accessible name.
+
   const card = toCard(
     turn({
       files: [
@@ -1948,8 +1915,8 @@ test('the files figure names a Write and a shell edit apart, and folds a subagen
     '1 file was written whole, so its old lines are unknown.',
     '1 file was named by the shell without its lines, so its line counts are unknown.',
   ]);
-  // The subagent's own file still rides the Files section with its maker named, unaffected by
-  // the figure's own mark: the plan puts the mark on the figure alone, not on this row.
+  // The child file row retains its maker attribution independently of the files figure's footer.
+
   const written = card.files.find((file) => file.name === 'written.ts');
   assert.equal(written?.detail, 'c:/repo/src/written.ts\nchanged by Rewrite the config');
 });
@@ -2010,16 +1977,8 @@ test('the files figure names the replaceAll, notebook and zero causes in their o
 });
 
 test('the card draws one ordered row in both its open and folded states', () => {
-  // Both the whole row and the folded view are written out in sequence rather than
-  // derived, so a chip that moves position goes red here and not only a chip that
-  // disappears. A rule read off the code would pass whatever the code did with it.
-  //
-  // The order: cost, context, files and lines lead, because they are what a reader steers
-  // by and what the session heading draws; the tool count, the token totals, the subagents
-  // and the commits follow. Closing the response does not hide any of them.
-  //
-  // The summary this is built from closes with both reader-facing rows, and the row ends
-  // without a word about either: every chip reports a figure the turn produced.
+  // Open and folded cards preserve figure order. Closing action and question rows add no figures.
+
   const loaded = toCard(
     turn({
       summary: [
@@ -2070,8 +2029,8 @@ test('the card draws one ordered row in both its open and folded states', () => 
     foldedChips(loaded.chips).map((c) => c.label),
     ['$7.05+', '16% of 1M ctx (160k)', '1 file', '3M in · 206k out', '1 commit', '1 subagent'],
   );
-  // The file count carries the two line figures, rather than a second chip beside it: one
-  // pill, one hover, and one thing to announce.
+  // The files figure carries both added and removed line counts.
+
   assert.deepEqual([loaded.chips[2].kind, loaded.chips[2].added, loaded.chips[2].removed], ['diff', 80, 12]);
   // The tones travel with the chips, so each remaining figure keeps its role in the row.
   assert.deepEqual(
@@ -2079,8 +2038,8 @@ test('the card draws one ordered row in both its open and folded states', () => 
     ['plain', 'plain', 'diff', 'plain', 'plain', 'plain'],
   );
 
-  // A turn that was never priced and recorded no context still leads with what it has,
-  // rather than leaving a hole where the first two chips would be.
+  // Absent cost and context figures leave no gap before the file count.
+
   const cheap = toCard(
     turn({
       files: [{ path: 'c:/repo/a.ts', added: 1, removed: 0, isNew: false, edits: [] }],
@@ -2101,10 +2060,8 @@ test('the card draws one ordered row in both its open and folded states', () => 
 });
 
 test('the files and the lines are one chip, and it is announced in words', () => {
-  // Two pills for one fact is what this replaced: they were never drawn apart, and each
-  // hover said most of what the other's said. What a screen reader is handed matters more
-  // on this chip than on any other, because the figures are drawn as `+85 -12` and that is
-  // two numbers and a run of punctuation when it is read out in order.
+  // One files figure announces added and removed line counts in words.
+
   const card = toCard(
     turn({
       files: [
@@ -2135,8 +2092,8 @@ test('the files and the lines are one chip, and it is announced in words', () =>
   );
   assert.equal(one.chips.find((c) => c.kind === 'diff')!.name, '1 file, 1 line added, 1 removed');
 
-  // The session heading builds from the same function, so the two cannot come to say one
-  // pair of figures in two sets of words.
+  // Session headings use the same file-count wording as turn cards.
+
   const heading = sessionStats(
     [
       turn({
@@ -2148,7 +2105,7 @@ test('the files and the lines are one chip, and it is announced in words', () =>
   assert.equal(heading.label, '1 file');
   assert.equal(heading.name, '1 file, 4 lines added');
   assert.match(heading.detail, /Lines changed: \+4\n/);
-  // The caveat is said once. Two chips carried one each, and the reader was told twice.
+  // The session-heading detail states its coverage once.
   assert.equal(
     heading.detail.split('\n').filter((l) => l.trim().startsWith('Across the ')).length,
     1,
@@ -2175,8 +2132,8 @@ test('the share is rounded down, so 100% is not claimed while the window has roo
   const full = ctxChip(toCard(turn({ contextTokens: 1_000_000, model: 'claude-opus-5' }), false, NOW))!;
   assert.equal(full.label, '100% of 1M ctx (1M)', 'a turn exactly at the window is full');
   assert.match(full.detail, /100% of 1M/);
-  // A window with nothing left in it is the one share the scale has no word for. The band
-  // does not move, so the colour does not either; only the word and the sentence do.
+  // A full window keeps the highest context band and changes its word and tooltip.
+
   assert.equal(full.level, 'nearlyFull', 'the full window changed band as well as wording');
   assert.equal(full.word, 'context full');
   assert.match(full.detail, /^\s*The window is full\.$/m);
@@ -2193,9 +2150,8 @@ test('the context chip stays a bare count when the model has no known window', (
 });
 
 test('the context chip takes its band at each threshold, and stays plain under the first', () => {
-  // The table is the vocabulary, so the guard reads it rather than spelling three numbers
-  // out again. Its order is what a share is matched against, and a reordered table would
-  // hand the wrong word to a share.
+  // Context thresholds preserve their order, levels, and words.
+
   assert.deepEqual(
     CONTEXT_BANDS.map((b) => [b.at, b.level, b.word]),
     [
@@ -2205,8 +2161,8 @@ test('the context chip takes its band at each threshold, and stays plain under t
     ],
   );
 
-  // Under the first band: no level, no word, and no sentence on the hover. A ramp that
-  // started at zero would colour every card and drown the chips beside it.
+  // Below the first band, context figures carry no level, band word, or fullness sentence.
+
   for (const share of [0.1, 0.49]) {
     const quiet = bandAt(share);
     assert.equal(quiet.level, undefined, `${share} of the window is toned`);
@@ -2214,14 +2170,14 @@ test('the context chip takes its band at each threshold, and stays plain under t
     assert.doesNotMatch(quiet.detail, /The window is/, `${share} of the window says how full it is`);
   }
 
-  // A share that rounds up to a threshold is toned at that threshold. The band is read off
-  // the figure the chip prints, so one number cannot be drawn in two colours.
+  // A share rounded to a threshold receives that threshold's band.
+
   const carried = bandAt(CONTEXT_BANDS[0].at - 0.0004);
   assert.equal(carried.level, CONTEXT_BANDS[0].level, 'a figure printed at the threshold was left untoned');
   assert.equal(carried.word, CONTEXT_BANDS[0].word);
 
-  // On each threshold, and one point under it. The kind stays plain throughout: the band
-  // travels beside it and never inside it.
+  // Context bands travel in level while the figure's kind remains plain.
+
   const edges: [number, string, string, string][] = [
     [0.5, 'filling', 'context filling up', 'The window is filling up.'],
     [0.75, 'gettingFull', 'context getting full', 'The window is getting full.'],
@@ -2253,8 +2209,8 @@ test('the context chip takes its band at each threshold, and stays plain under t
 });
 
 test('a context size past the window falls back rather than claiming an impossible share', () => {
-  // The table saying opus-5 has a 1M window does not stop a turn from recording more,
-  // whether the table is stale or the session switched models mid-way.
+  // Context exceeding the model window displays its token count without a percentage.
+
   const card = toCard(turn({ contextTokens: 1_200_000, model: 'claude-opus-5' }), false, NOW);
   const chip = ctxChip(card)!;
   assert.equal(chip.label, '1.2M ctx');
@@ -2263,9 +2219,8 @@ test('a context size past the window falls back rather than claiming an impossib
 });
 
 test('a chip with no share behind it wears no band, whichever way the share went unknown', () => {
-  // A band is set only after a real share, so a turn the panel cannot measure cannot print
-  // a band for a share nobody knows. Both ways in: a model with no window in the table, and
-  // a turn holding more context than the window it was measured against.
+  // An unknown model window or an overrun leaves the context figure without a band.
+
   for (const [why, held] of [
     ['a model the table does not name', turn({ contextTokens: 160_000, model: 'some-other-model' })],
     ['a turn past the window it was measured against', turn({ contextTokens: 1_200_000, model: 'claude-opus-5' })],
@@ -2395,8 +2350,8 @@ test('a subagent row draws model, effort and its figures, and leaves the tool us
     NOW,
   );
   assert.equal(card.status, 'running');
-  // The row's own hint is the tool uses, which word its state. The cost sits on a figure the
-  // reader can press and question, and how long the child ran sits on one of its own.
+  // The child row's hint carries tool counts. Cost and duration have separate figures.
+
   assert.deepEqual(
     card.agents.map((held) => [
       held.model,
@@ -2433,14 +2388,13 @@ test('a subagent row draws model, effort and its figures, and leaves the tool us
   );
 });
 
-// A record line as its words alone. A cost line carries its cache reading and any line
-// under it beside the text, so a reading of the words asks for the text.
+// Extract detail-line text without its adjacent cost and cache fields.
+
 const lineText = (line: StatDetailLine): string =>
   typeof line === 'string' ? line : 'text' in line ? line.text : `${line.lead}${line.trail}`;
 
-// The row draws a total and the reader asks what it bought. Each figure answers for its own
-// total: the cost by usage under the cost, the commits under their count, the paths under
-// theirs. The row's own hover keeps the run line none of them owns.
+// Each child figure carries its own detail. The row tooltip retains the run information.
+
 test('each subagent figure carries its own record and the row keeps the run line', () => {
   const made = (sha: string, subject: string): TurnCommit => ({
     sha,
@@ -2497,8 +2451,8 @@ test('each subagent figure carries its own record and the row keeps the run line
     NOW,
   );
   const drawn = card.agents[0].figures;
-  // Every figure the row draws answers for itself, and each record is headed by the figure's
-  // own words, so the popover never opens on the words under the pointer.
+  // Each child figure's detail heading uses its own accessible wording.
+
   assert.deepEqual(
     drawn.map((figure) => [figure.metric, figure.record?.heading?.label]),
     [
@@ -2508,9 +2462,8 @@ test('each subagent figure carries its own record and the row keeps the run line
       ['files', '3 files, 18 lines added, 4 removed'],
     ],
   );
-  // The cost record wears the shape the card's own Cost popover wears: a heading, the value in
-  // a second column, and the lines indented under it. The total is left out, because the figure
-  // the record hangs under already carries it. The child's own usage closes the record.
+  // The cost detail separates values from their breakdown and ends with usage totals.
+
   assert.deepEqual(
     drawn[0].record?.entries.map((entry) => [entry.label, entry.value]),
     [
@@ -2527,14 +2480,14 @@ test('each subagent figure carries its own record and the row keeps the run line
     'Uncached input: $0.01',
     '5-minute cache writes: $0.10',
   ]);
-  // The cache reading rides the line it belongs to, the way the card's own Cost popover draws
-  // it. A record flattened into text loses it.
+  // Cached-read detail retains its structured cache share.
+
   assert.equal(
     (drawn[0].record?.entries[0].lines ?? []).filter((line) => typeof line === 'object' && 'cacheHit' in line).length,
     1,
   );
-  // The commits and the files records draw the card's own rows rather than lines of text, so
-  // each carries the shas or the paths the panel filters those arrays down to.
+  // Commit and file figures select card rows by their SHAs and paths.
+
   assert.deepEqual(
     [drawn[2].record?.layout, drawn[2].record?.entries, drawn[2].shas],
     ['commits', [], ['9d7be30', 'b83e0d1']],
@@ -2543,24 +2496,24 @@ test('each subagent figure carries its own record and the row keeps the run line
     [drawn[3].record?.layout, drawn[3].record?.entries, drawn[3].paths],
     ['files', [], ['extension/src/a.ts', 'extension/src/b.ts', 'extension/src/c.ts']],
   );
-  // One fact has one home. The row's hover keeps the tool uses, which word its own state, and
-  // repeats no block a figure beside it already answers for.
+  // The child row tooltip contains tool counts without duplicating figure detail.
+
   assert.equal(card.agents[0].hintDetail, '23 tools');
-  // A child that spent nothing Arc can price and committed nothing keeps the tool line alone,
-  // and how long it ran stands as a figure beside it.
+  // An unpriced child without commits retains its tool tooltip and duration figure.
+
   const bare = toCard(turn({ agents: [agent({ durationMs: 60_000, toolUses: 4 })] }), false, NOW);
   assert.equal(bare.agents[0].hintDetail, '4 tools');
   assert.deepEqual(
     bare.agents[0].figures.map((figure) => [figure.metric, figure.compactLabel]),
     [['duration', '1m']],
   );
-  // A recorded zero is absent from every figure. A finished child's hover keeps only its tool
-  // uses, so a zero count leaves it with nothing to say rather than a line that reads "0 tools".
+  // A finished child with no tools has no tool-count tooltip.
+
   const noToolsYet = toCard(turn({ agents: [agent({ durationMs: 60_000, toolUses: 0 })] }), false, NOW);
   assert.equal(noToolsYet.agents[0].hintDetail, '');
 
-  // A spend Arc cannot price leaves its cost block with a heading and no lines under it. The
-  // hover keeps the run line alone rather than opening a section a reader finds empty.
+  // An unpriced child has no cost figure or empty cost section in its tooltip.
+
   const unpriced = toCard(
     turn({
       agents: [
@@ -2593,8 +2546,8 @@ test('each subagent figure carries its own record and the row keeps the run line
     unpriced.agents[0].figures.filter((figure) => figure.metric === 'cost'),
     [],
   );
-  // The money is unknown, so the usage keeps a figure of its own. A row with no cost figure has
-  // nowhere else to carry it, and a reader would lose the run's volume along with its price.
+  // Unpriced usage retains its token figure and detail.
+
   const unpricedTokens = unpriced.agents[0].figures.find((figure) => figure.metric === 'tokens');
   assert.deepEqual(
     unpricedTokens?.record?.entries.map((entry) => entry.label),
@@ -2607,8 +2560,8 @@ test('each subagent figure carries its own record and the row keeps the run line
     'the row hover opens a block of its own again',
   );
 
-  // A part Arc could not price says so under the block that did price. A heading over that
-  // note alone reads as a section whose figures went missing.
+  // Partial spend places its explanation under the priced detail.
+
   const partialSpend = toCard(
     turn({
       agents: [
@@ -2651,8 +2604,8 @@ test('each subagent figure carries its own record and the row keeps the run line
     NOW,
   );
   const partialCost = partialSpend.agents[0].figures.find((figure) => figure.metric === 'cost');
-  // The totals close the record, and they cover the unpriced part as well as the priced one.
-  // Read without the lead they are the volume the money beside them bought, which is half true.
+  // Usage totals include both priced and unpriced parts under an explicit coverage label.
+
   assert.deepEqual(
     partialCost?.record?.entries.map((entry) => [entry.label, entry.value]),
     [
@@ -2667,8 +2620,8 @@ test('each subagent figure carries its own record and the row keeps the run line
     'a block with nothing priced under it heads a lone note',
   );
 
-  // The record is a popover that takes the pointer and scrolls, so it names every commit the
-  // child made. The count that stood in for the rest was a bound the hint box needed.
+  // The scrollable commits popover includes every recorded commit.
+
   const listed = (count: number) =>
     Array.from({ length: count }, (_, at) => made(`sha${at}`, `fix(card): the ${at} change`));
   const withCommits = (count: number) =>
@@ -2696,8 +2649,8 @@ test('each subagent figure carries its own record and the row keeps the run line
   assert.equal(commitFigure(withCommits(8))?.shas?.length, 8);
   assert.deepEqual(commitFigure(withCommits(8))?.detail?.split('\n').slice(-1), ['sha7 fix(card): the 7 change']);
 
-  // A running child draws its cost so far and nothing else, so its hover names none of the
-  // commits the row itself withholds.
+  // A running child's figures include cost alone. Its tooltip omits commits.
+
   const live = toCard(
     turn({
       finished: false,
@@ -2733,8 +2686,8 @@ test('each subagent figure carries its own record and the row keeps the run line
     ['cost'],
   );
   assert.equal(live.agents[0].hintDetail, '1m · 4 tools');
-  // A recorded zero is absent from every figure. A child that has not yet run a tool keeps its
-  // running time alone, rather than a hover that reads "1m · 0 tools".
+  // A running child with no tools retains its duration tooltip without a zero tool count.
+
   const liveNoToolsYet = toCard(
     turn({
       finished: false,
@@ -2752,9 +2705,8 @@ test('each subagent figure carries its own record and the row keeps the run line
   assert.equal(liveNoToolsYet.agents[0].hintDetail, '1m');
 });
 
-// The host holds a session's retained turns and hands them to the progressive worker for each
-// refresh. Structured clone copies them both ways, and the worker copies each agent row by
-// spread on its way out, so a figure a later read may replace has to survive both copies.
+// Retained worker reads clone turns before refreshing child facts and clone the refreshed result before returning it.
+
 function retainedWorkerRead(held: Turn[], spend: Parameters<typeof refreshClaudeAgentFacts>[1]): Turn[] {
   const page = structuredClone(held);
   refreshClaudeAgentFacts(page, spend, undefined);
@@ -2762,9 +2714,8 @@ function retainedWorkerRead(held: Turn[], spend: Parameters<typeof refreshClaude
   return structuredClone(page);
 }
 
-// A retained history page re-reads a finished background child as its own transcript grows,
-// running refreshClaudeAgentFacts again on the turn the first read already filled. The row's
-// drawn count has to follow that second read, not freeze at the first one.
+// A growing finished child's transcript replaces its earlier fallback tool count.
+
 test('a finished background subagent refills its shown tool count when a later read finds more calls', () => {
   const artifactsOf = (tools: Record<string, number>, revision: string): ChildArtifacts => ({
     files: [],
@@ -2800,8 +2751,8 @@ test('a finished background subagent refills its shown tool count when a later r
   assert.equal(toCard(turns[0], false, NOW).agents[0].hintDetail, '5 tools');
 });
 
-// A background child can finish having run no tool at all, which the row draws the same as no
-// count. A later read that finds calls the first read missed still has to replace that zero.
+// A later child read replaces a zero fallback tool count when it finds calls.
+
 test('a finished background subagent with a zero tool count fills in once a later read finds calls', () => {
   const artifactsOf = (tools: Record<string, number>, revision: string): ChildArtifacts => ({
     files: [],
@@ -2838,9 +2789,8 @@ test('a finished background subagent with a zero tool count fills in once a late
   assert.equal(toCard(turns[0], false, NOW).agents[0].hintDetail, '3 tools');
 });
 
-// A genuine count from the Agent result or the task notification wins even where it happens
-// to equal the count the artifacts fallback already wrote, and a later, bigger artifacts read
-// never replaces it.
+// A result or notification count outranks the artifact fallback even when their initial values match.
+
 test('a genuine tool count survives a later artifacts read that recomputes the same figure', () => {
   const artifactsOf = (tools: Record<string, number>, revision: string): ChildArtifacts => ({
     files: [],
@@ -2858,26 +2808,24 @@ test('a genuine tool count survives a later artifacts read that recomputes the s
   });
   const turns = [turn({ agents: [agent({ id: 'child-bg9', status: 'completed', toolUses: null })] })];
 
-  // The fallback fills the row from the child's own calls, the same as any other finished
-  // child with no result or notification count.
+  // Artifacts supply a fallback tool count when the child has no result or notification count.
+
   refreshClaudeAgentFacts(turns, lookupOf(artifactsOf({ Bash: 5 }, 'child-r1')), undefined);
   assert.equal(turns[0].agents[0].toolUses, 5);
 
-  // A notification then arrives with its own count, which by chance equals the fallback's
-  // figure. It must read as the genuine source from here on.
+  // A notification count matching the fallback still changes the count's source.
+
   turns[0].agents[0].toolUses = 5;
   delete turns[0].agents[0].toolUsesFromArtifacts;
 
-  // A later read's artifacts total a different figure. The naive comparison this fix replaced
-  // would have refilled from it because the prior figure equalled the old artifacts total; the
-  // genuine count must stay instead.
+  // A larger artifact count must not replace the notification count.
+
   refreshClaudeAgentFacts(turns, lookupOf(artifactsOf({ Bash: 5, Edit: 4 }, 'child-r2')), undefined);
   assert.equal(turns[0].agents[0].toolUses, 5);
 });
 
-// The requests and the token totals rode the row's own hover, where a reader could read them
-// and not question them. A priced child carries them inside its cost record now, under the
-// money they came to, and its own face carries how long the child ran instead.
+// A priced child keeps request and token totals in cost detail. Duration remains a separate figure.
+
 test('a priced child keeps its requests and its token totals in the cost record', () => {
   const card = toCard(
     turn({
@@ -2951,8 +2899,8 @@ test('a priced child keeps its requests and its token totals in the cost record'
     'Uncached input: 6,000 tokens',
     '5-minute cache writes: 42k tokens',
   ]);
-  // A child Arc read no spend for keeps the token count it recorded as a figure's face, and
-  // that count answers for itself with nothing behind it.
+  // Without spend detail, the child's recorded token count has no popover.
+
   const counted = toCard(turn({ agents: [agent({ durationMs: 60_000, toolUses: 4, tokens: 12_400 })] }), false, NOW);
   assert.deepEqual(
     counted.agents[0].figures.map((figure) => [figure.metric, figure.compactLabel, !!figure.record]),
@@ -2986,8 +2934,8 @@ test("a child's duration figure opens what it ran and when, from its own record"
   assert.deepEqual(figure?.record, {
     heading: { label: 'Ran for 4m' },
     entries: [
-      // The mix leads, largest first, and a tie reads in name order. It carries no total, because
-      // the row's hint counts the child's tool uses.
+      // Tool counts sort by descending count, then name. Their detail omits the total carried by the row tooltip.
+
       { label: 'Calls by tool', lines: ['71 Bash', '24 Edit', '1 PowerShell', '1 Read'] },
       { label: 'Failed calls', value: '3', lines: ['2 Bash', '1 Edit'] },
       { label: 'Started', value: formatWhen(NOW - 300_000, NOW), separateBefore: true },
@@ -3018,8 +2966,8 @@ test("a child's duration figure opens what it ran and when, from its own record"
     { label: 'Started', value: formatWhen(NOW - 300_000, NOW) },
     { label: 'Ended', value: formatWhen(NOW - 60_000, NOW) },
   ]);
-  // A child a later prompt sent back for a second turn draws the count with Started and Ended,
-  // ahead of both since it says how often the child ran rather than when.
+  // Turn count precedes the child's start and end times.
+
   const again = ran({ turnCount: 3 });
   assert.deepEqual(again?.record?.entries.slice(-3), [
     { label: 'Turns', value: '3', separateBefore: true },
@@ -3056,8 +3004,8 @@ test("a Codex child's rollout reaches its duration figure's record", () => {
       output: [{ type: 'input_text', text }],
     });
   const turnId = '01a032c9-1e07-78b2-ae0c-dc76f2dd7901';
-  // The parent prompts the child a second time, after its first task completed, so its rollout
-  // holds a second `task_started`/`task_complete` cycle under a second turn id.
+  // A second prompt adds another task_started and task_complete pair under a distinct turn ID.
+
   const turnId2 = '01a032c9-1e07-78b2-ae0c-dc76f2dd7902';
   const rollout = [
     record('session_meta', 0, { id: '01a032c9-1a92-7931-845c-723117d24dbe', cwd: 'c:\\repo', source: 'vscode' }),
@@ -3105,9 +3053,8 @@ test("a Codex child's rollout reaches its duration figure's record", () => {
   assert.equal(toCard(parent, false, NOW).agents[0].hintDetail, '2 tools');
 });
 
-// A dispatched Claude session is a real session file someone can resume and prompt again, read
-// through readClaudeAgentSpend with childTranscript false, the same path dispatchedAgentCard
-// draws its row from.
+// Read dispatched Claude sessions with childTranscript disabled so later prompts count as separate turns.
+
 function dispatchedClaudeSessionSpend(prompts: string[]) {
   const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
   const folder = tempDir('claude-dispatch-turns-');
@@ -3198,8 +3145,8 @@ test('a completed subagent carries cost, commits, and files while a running one 
     stateWord: '',
     since: null,
     figures: [
-      // A recorded list-price total leaves no usage to break down, so the block names its
-      // basis and stops there. The requests behind it follow, parted from the money by a rule.
+      // Recorded list-price totals state their basis without a usage-cost breakdown. Request count follows a separator.
+
       {
         metric: 'cost',
         compactLabel: '$1.23',
@@ -3224,11 +3171,8 @@ test('a completed subagent carries cost, commits, and files while a running one 
           'Model requests: 1',
         ].join('\n'),
       },
-      // This child's commits reached Arc as shas with no subjects behind them. The record draws
-      // the card's own commit rows for those shas, and the run of text behind the figure names
-      // the shas alone, because a figure carries whatever the record holds. A record of rows
-      // declares its presses, or the popover drawing it stays a tooltip: it would take no name
-      // from its heading, and the figure would describe it rather than say it opens it.
+      // Commit figures retain SHAs without subjects. Their row layout enables actions so the popover exposes commit controls.
+
       {
         metric: 'commits',
         compactLabel: '2 commits',
@@ -3257,8 +3201,7 @@ test('a completed subagent carries cost, commits, and files while a running one 
           'extension/src/c.ts',
         ].join('\n'),
       },
-      // A list-price total records no token at all, and a recorded zero is absent. This child's
-      // record carries no run time either, so the row draws no figure for one.
+      // Absent token and duration counts add no figures.
     ],
     hintDetail: '',
     sessionId: null,
@@ -3268,8 +3211,8 @@ test('a completed subagent carries cost, commits, and files while a running one 
     [['cost', '$1.23+', 'At least $1.23 spent']],
   );
 
-  // A recorded zero is absent. A child that spent money and committed nothing draws its cost
-  // and nothing else, and one that recorded neither draws an empty line rather than two zeros.
+  // Zero commit and file counts add no figures, even beside a nonzero cost.
+
   const none = { files: [], commits: [], complete: true, revision: 'child-r2' };
   const costOnly = toCard(
     turn({
@@ -3290,8 +3233,8 @@ test('a completed subagent carries cost, commits, and files while a running one 
   );
   const nothing = toCard(turn({ agents: [agent({ artifacts: none })] }), false, NOW);
   assert.deepEqual(nothing.agents[0].figures, []);
-  // Partial evidence marks what it found. A partial zero is still absent, because `0+ commits`
-  // claims a count the record does not hold.
+  // Incomplete evidence still omits zero commit and file counts.
+
   const partialZeros = toCard(turn({ agents: [agent({ artifacts: { ...none, complete: false } })] }), false, NOW);
   assert.deepEqual(partialZeros.agents[0].figures, []);
   // A child that only removed lines names them in the figure it speaks.
@@ -3324,10 +3267,8 @@ test('a completed subagent carries cost, commits, and files while a running one 
 });
 
 test("a child's file changes reach the card as rows its record can draw", () => {
-  // The turn holds one file of its own, and the child holds one more of its own beside the same
-  // file under the spelling its own transcript recorded. That is what a delegated turn delivers:
-  // the parent transcript records no edit a child made, so a fixture that hands the card the
-  // child's paths in front of the test proves nothing about production.
+  // Parent and child artifacts supply separate file lists, including different spellings of their shared path.
+
   const card = toCard(
     turn({
       files: [changed('c:/repo/src/parent.ts', 4, 1)],
@@ -3349,8 +3290,8 @@ test("a child's file changes reach the card as rows its record can draw", () => 
     NOW,
   );
   const figure = card.agents[0].figures.find((entry) => entry.metric === 'files');
-  // A file the turn and a child both changed is one row holding both edits. A file only the
-  // child changed is a row of its own, and its hover and its spoken name say who changed it.
+  // Shared parent and child paths combine line counts. Child-only paths retain child attribution.
+
   assert.deepEqual(
     card.files.map((file) => [file.path, file.added, file.removed, file.detail ?? null, file.label]),
     [
@@ -3364,12 +3305,12 @@ test("a child's file changes reach the card as rows its record can draw", () => 
       ],
     ],
   );
-  // Every path the figure filters the card's rows by is a row the card holds, so the record the
-  // figure opens draws rows rather than nothing at all.
+  // Each path selected by the child figure matches a card file row.
+
   assert.deepEqual(figure?.paths, ['c:/repo/src/parent.ts', 'c:/repo/src/child.ts']);
   assert.deepEqual(card.files.filter((file) => figure?.paths?.includes(file.path)).length, 2);
-  // The turn's own figure counts the delegated work beside its own and says how much of it a
-  // child did, the way the commits figure does.
+  // The turn's files figure includes child changes and names how many files only a child changed.
+
   const chip = card.chips.find((held) => held.metric === 'files');
   assert.deepEqual(
     [chip?.label, chip?.name],
@@ -3377,8 +3318,8 @@ test("a child's file changes reach the card as rows its record can draw", () => 
   );
   assert.equal(card.fileCount, 2);
 
-  // Two children that changed one file come to one row, which holds both their edits and names
-  // neither of them, because the row cannot say one child changed what two did.
+  // Two children changing one path combine their counts without attributing the shared row to a single child.
+
   const child = (description: string, added: number, revision: string) =>
     agent({
       description,
@@ -3401,11 +3342,8 @@ test("a child's file changes reach the card as rows its record can draw", () => 
 });
 
 test("a child's uncounted mention keeps the lines the turn counted on the same path", () => {
-  // The turn counted its own edit of a path, and a child's record names that same file without
-  // the hunks behind it. A record that counted nothing says nothing about what another record
-  // measured, so the row and the turn's totals keep every line the turn really counted. The row
-  // keeps those lines as a floor rather than dropping them, which is what under-reporting a
-  // measured count would be.
+  // An uncounted child mention preserves the parent's measured lines. The files footer marks their coverage partial.
+
   const card = toCard(
     turn({
       files: [changed('c:/repo/src/parent.ts', 4, 1)],
@@ -3440,8 +3378,8 @@ test("a child's uncounted mention keeps the lines the turn counted on the same p
   assert.deepEqual(chip?.detail.split('\n'), ['1 file: +4 −1', '', 'parent.ts: +4 −1']);
   assert.deepEqual(chip?.detailList?.footer, ['1 file carries partial line counts.']);
 
-  // A path only an uncounted mention names carries no count to keep, so it stays a row with no
-  // counts and the turn's totals stay out of it.
+  // A child-only uncounted path contributes a file row without line totals.
+
   const mentioned = toCard(
     turn({
       agents: [
@@ -3500,10 +3438,8 @@ test("a child's uncounted mention keeps the lines the turn counted on the same p
 });
 
 test('one child that both counted and mentioned a path keeps the floor on its own row', () => {
-  // One child, one path, two records of it: an edit that carried its hunks and a Write that says
-  // nothing about the lines the file held before. A child transcript normally holds one turn, so
-  // the reader hands the reducer one entry carrying the counted lines and the mark together. A
-  // child that ran more than one turn hands it the same two records as separate entries.
+  // Child edits and whole-file writes retain measured lines and their partial-coverage cause, within one turn or across separate turns.
+
   const counted = { path: 'c:/repo/src/both.ts', added: 5, removed: 1, isNew: false, edits: [] };
   const mentioned = {
     path: 'c:/repo/src/both.ts',
@@ -3531,31 +3467,29 @@ test('one child that both counted and mentioned a path keeps the floor on its ow
       },
     );
     const card = toCard(turn({ agents: [agent({ artifacts })] }), false, NOW);
-    // The row in the child's record keeps the lines the child measured. A blank row under a figure
-    // that already added those lines up says two things about one file.
+    // The child file row retains its measured lines.
+
     assert.deepEqual(
       card.files.map((file) => [file.added, file.removed, file.countsUnknown ?? null]),
       [[5, 1, null]],
     );
-    // The turn total holds the same lines, because a row whose count is a floor stays in it.
+    // Partial line counts remain included in turn totals.
     assert.deepEqual([card.added, card.removed], [5, 1]);
     const figure = card.agents[0].figures.find((entry) => entry.metric === 'files');
     assert.deepEqual([figure?.compactLabel, figure?.added, figure?.removed], ['1 file', 5, 1]);
-    // The spoken name says nothing about the counts being partial, whatever the row settled to.
+    // The accessible figure name reports measured counts without the partial-coverage explanation.
     assert.equal(figure?.name, '1 file, 5 lines added, 1 removed');
-    // The flat run names the file once and does not repeat the record's own footer sentence.
+    // Flat file detail omits the footer's coverage explanation.
     assert.deepEqual((figure?.detail ?? '').split('\n'), ['1 file, 5 lines added, 1 removed', 'c:/repo/src/both.ts']);
-    // The record still says the Write is why, even though the figure's face does not, and it is
-    // the only place that sentence rides.
+    // The footer identifies the whole-file write as the cause of partial line coverage.
+
     assert.deepEqual(figure?.record?.footer, ['1 file was written whole, so its line counts are partial.']);
   }
 });
 
 test("a child's written-whole row keeps its cause where the turn already holds the path", () => {
-  // The turn Edits a path, and a subagent Edits the same path and then Writes it whole. The
-  // child's reducer settles its row to partial with the Write as its cause. The turn's row for
-  // that path takes the child's lines and its cause, so the turn's record names the file the way
-  // the subagent's record does.
+  // A shared parent path retains the child's counted lines and whole-file-write cause in the turn figure's footer.
+
   const artifacts = reduceChildArtifacts(
     {
       turns: [
@@ -3597,10 +3531,8 @@ test("a child's written-whole row keeps its cause where the turn already holds t
 });
 
 test("a child's files record names the card's own spelling of a path the child recorded another way", () => {
-  // The turn's file list holds the spelling the edit recorded, and the child's own record holds
-  // the spelling its transcript recorded. Both name one file. The figure carries the card's
-  // spelling, because the record filters the card's rows by it and an exact match on the other
-  // spelling would draw no row for a file the child did change.
+  // The child figure uses the card's path spelling so exact row selection still finds the shared file.
+
   const card = toCard(
     turn({
       files: [{ path: 'C:\\repo\\src\\A.ts', added: 2, removed: 0, isNew: false, edits: [] }],
@@ -3622,8 +3554,8 @@ test("a child's files record names the card's own spelling of a path the child r
   assert.deepEqual(figure?.paths, [card.files[0].path]);
 });
 
-// The line a partial record ends on, written out rather than imported, so a reworded note
-// goes red here and the reader of this test sees what a partial record says.
+// Footer text for incomplete child evidence.
+
 const CUT_SHORT = "This child session's record ended early, so this list holds only what Arc read.";
 
 test('a completed subagent marks incomplete commit and file evidence without obscuring line counts', () => {
@@ -3638,8 +3570,8 @@ test('a completed subagent marks incomplete commit and file evidence without obs
     revision: 'child-r1',
   };
   const card = toCard(turn({ agents: [agent({ artifacts })] }), false, NOW);
-  // A partial record keeps the `At least` wording its figure carries, and says on its own last
-  // line how far the child's own record reached.
+  // Incomplete child figures show lower-bound wording and explain their coverage in the footer.
+
   assert.deepEqual(card.agents[0].figures, [
     {
       metric: 'commits',
@@ -3677,9 +3609,8 @@ test('a completed subagent marks incomplete commit and file evidence without obs
       ].join('\n'),
     },
   ]);
-  // The popover reads the sentence from the record's footer alone. No reader draws `detail`
-  // while a record exists, so a figure whose flat reading repeated it there would double the
-  // payload rather than what the reader hears.
+  // The incomplete-coverage sentence appears only in the footer.
+
   for (const figure of card.agents[0].figures) {
     const count = (text: string) => text.split(CUT_SHORT).length - 1;
     assert.equal(count(figure.detail ?? '') + count((figure.record?.footer ?? []).join('\n')), 1);
@@ -3698,15 +3629,15 @@ test('an incomplete subagent runs the record-cut-short sentence once on its dura
   const card = toCard(turn({ agents: [agent({ artifacts, durationMs: 60_000 })] }), false, NOW);
   const figure = card.agents[0].figures.find((entry) => entry.metric === 'duration');
   assert.ok(figure?.record, 'the duration figure drew no record for a child with a recorded span');
-  // Matches the files-figure guard above: the sentence rides the footer alone, and never a
-  // second time inside the flat reading `detail` carries.
+  // Duration detail also keeps the incomplete-coverage sentence in its footer alone.
+
   const count = (text: string) => text.split(CUT_SHORT).length - 1;
   assert.equal(count(figure?.detail ?? '') + count((figure?.record?.footer ?? []).join('\n')), 1);
 });
 
 test('every status a reader records draws its own state, and only a real failure draws failed', () => {
-  // `running` from both readers, `async_launched` from Claude and `launched` from Codex are open.
-  // `interrupted` comes from Codex, and Claude passes a task word such as `killed` through raw.
+  // running, async_launched, and launched map to running. completed maps to done. failed and interrupted retain their names. Other terminal statuses become stopped.
+
   const statuses = [
     'running',
     'async_launched',
@@ -3745,11 +3676,8 @@ test('every status a reader records draws its own state, and only a real failure
   });
 });
 
-// The newest card counts its carried subagents on its agents figure, so the popover heading
-// counts them beside its own rows. A heading that counted the rows alone read below the
-// running figure standing next to it. The line naming the carried subagents counts subagents
-// and never turns, because the card knows how many children the rail counts and not which
-// turn launched each one.
+// The agents heading includes carried running children. Its footer counts children started before this turn, independent of their launching turns.
+
 test('the agents popover heading counts every subagent its running figure counts', () => {
   const finished = turn({
     finished: true,
@@ -3787,8 +3715,8 @@ test('the agents popover heading counts every subagent its running figure counts
     heading: { label: '3 subagents', value: '2 running', busyValue: true },
     footer: ['2 subagents started before this turn'],
   });
-  // A card that launched nothing names the carried subagents in the heading itself, and two
-  // of them can come from one earlier turn or from two.
+  // Without launches in this turn, the agents heading names the carried children directly.
+
   assert.deepEqual(read(popover(['carried-1', 'carried-2'], turn({ finished: true, endedAt: NOW - 60_000 }))), {
     heading: { label: '2 subagents started before this turn', value: '2 running', busyValue: true },
     footer: undefined,
@@ -3824,9 +3752,8 @@ test('an open subagent counts up only while its own turn runs', () => {
     '1 running',
     true,
   ]);
-  // Arc cannot tell whether a background child outlived its session. Outside a running turn the
-  // child says that no ending was recorded, drops the time it has run for three days after
-  // launch, and takes the idle tone. The heading counts no such child, so it holds no count.
+  // Outside a running parent turn, an unfinished child reports no recorded ending and carries no live clock or running count.
+
   const open = ['open', 'no ending recorded', null, undefined, false];
   assert.deepEqual(drawn({ finished: true }), ['done', ...open]);
   assert.deepEqual(drawn({ finished: true }, false), ['done', ...open]);
@@ -3909,8 +3836,8 @@ test('a subagent status is not repeated inside its detail, and a finished one na
   );
 });
 
-// What a child's own transcript billed, reduced to the field these cases read. The price is
-// not under test here, so every other count is zero.
+// Child usage fixture with only input tokens populated.
+
 const ran = (model: string | null, input: number) => ({
   model,
   usage: { input, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 0, thinking: 0 },
@@ -4118,8 +4045,8 @@ test('a cached-read cost shows its cache share and request scale on one line', (
     NOW,
   );
   const entry = card.chips[0].detailList!.entries[0];
-  // The payload carries the price as a number, and a raw quotient carries every digit a float
-  // has. Four significant digits survive the two-decimal display and keep the rail row small.
+  // Request scale carries the request count and average input rounded to whole tokens.
+
   assert.deepEqual(entry.lines, [
     {
       text: 'Cached input reads: $50',
@@ -4379,9 +4306,8 @@ test('a mixed-band cached reread keeps its long-context price in the cost detail
   assert.match(card.chips.find((chip) => chip.label === '$0.35')!.detail, /Cached input reads: \$0\.35/);
 });
 
-// A large cached-read figure is hundreds of small charges rather than one. The dollar list
-// carried neither the count nor the average, so the figure read as a single charge the reader
-// could not place against anything.
+// Cached-read cost detail includes request count and average input.
+
 test('the cached-input-reads money line says how many requests bought the reads', () => {
   const many = costDetail(
     turn({
@@ -4401,10 +4327,10 @@ test('the cached-input-reads money line says how many requests bought the reads'
     /Cached input reads: \$[\d,.]+ \(99% cached · 206 requests · 488k avg input\)/,
     `the money list drops the scale behind the reads: ${many}`,
   );
-  // Only the line the count explains. An output or an uncached-input figure does not read as
-  // one charge that needs breaking up.
+  // Request scale belongs to the cached-read line, not uncached-input or output lines.
+
   assert.doesNotMatch(many, /Uncached input: [^\n]*requests/);
-  // One request bought the whole figure, so there is nothing to explain.
+  // A single request retains its request count and average input.
   const one = costDetail(
     turn({
       usage: {
@@ -4425,9 +4351,8 @@ test('the cached-input-reads money line says how many requests bought the reads'
   );
 });
 
-// The reader asks what one more request on this session costs. A share cannot answer it. The
-// worst turn measured in this project ran at a 99% cached share and still cost $96.59, so a
-// share-based signal stays silent on exactly the session that needs an answer.
+// High cache share retains request-scale detail independently of the priced total.
+
 test('the cached-read line keeps request scale when the cache share is high', () => {
   const usage = {
     requests: 200,
@@ -4456,10 +4381,10 @@ test('the cached-read line keeps request scale when the cache share is high', ()
     /Cached input reads: \$50 \(99% cached · 200 requests · 500k avg input\)/,
     `a 99% cached session loses its request scale: ${priced.detail}`,
   );
-  // The price is a fact, not a defect. Repeated context is the normal shape of a long session.
+  // High cached-input share adds no cost warning.
   assert.equal(priced.warnings, undefined);
 
-  // An inexact request count cannot divide a cost, so no price is honest.
+  // An inexact request count omits average input.
   const counted = sessionCostStats([{ ...part, requestCountExact: false }])[0];
   assert.doesNotMatch(
     counted.detail,
@@ -4467,11 +4392,11 @@ test('the cached-read line keeps request scale when the cache share is high', ()
     `an estimated request count still reports an exact scale: ${counted.detail}`,
   );
 
-  // An incomplete scope has a lower bound, not a total.
+  // An incomplete usage scope omits average input.
   const open = sessionCostStats([{ ...part, incomplete: true }])[0];
   assert.doesNotMatch(open.detail, /avg input/);
 
-  // One unpriced part also leaves a lower bound, while the priced part still draws the line.
+  // An unpriced part retains recorded request scale alongside priced cached-read detail.
   const unpriced = sessionCostStats([
     part,
     {
@@ -4484,7 +4409,7 @@ test('the cached-read line keeps request scale when the cache share is high', ()
   assert.match(unpriced.detail, /204 requests · 500k avg input/);
 });
 
-// A running scope grows. Its cost is a lower bound, and dividing a lower bound is not a price.
+// Running turns and children retain request scale for their recorded usage.
 test('a running turn and child keep recorded request scale', () => {
   const usage = {
     requests: 8,
@@ -4511,7 +4436,7 @@ test('a running turn and child keep recorded request scale', () => {
   assert.match(priced({}), /8 requests · 500k avg input/);
   assert.match(priced({ finished: false }), /8 requests · 500k avg input/);
 
-  // The child's own run state counts too, beside the text that already says so.
+  // Child run state leaves its recorded request scale available.
   const withChild = (status: string) =>
     costDetail(
       turn({
@@ -4531,16 +4456,8 @@ test('a running turn and child keep recorded request scale', () => {
   assert.equal((withChild('running').match(/8 requests · 500k avg input/g) ?? []).length, 2);
 });
 
-// One cost record prices the same usage twice today: the heading's total prices it, and the
-// entry that shows it prices it again. The record inside that entry reads the entry's answer
-// rather than pricing a third time for the cache-rate warning's input cost, and a card with
-// no subagent builds a Main-agent entry only when a cache-write warning changes the wording.
-// These are upper bounds, so a later change that prices fewer times passes and one that prices
-// more goes red. The spy counts only calls carrying a usage object by reference, so the
-// categorized per-key repricing inside each breakdown, which builds its own partial usage
-// objects, is never mistaken for a repeat of this price. Each count also carries a floor of
-// one, because that same reference equality reads a change that copies a usage object as no
-// pricing at all, and a bound from above alone stays green when a count falls to zero.
+// A cost record permits at most two full-usage pricing calls per main or child part. Reference-based counts require at least one call. Per-category pricing uses separate usage objects and is excluded.
+
 const PRICINGS_PER_COST_RECORD = { mainOnly: 2, childPart: 2 };
 
 test('building one cost record prices a usage no more times than the bound allows', () => {
@@ -4595,7 +4512,7 @@ test('building one cost record prices a usage no more times than the bound allow
   );
 });
 
-// The turn card and the rail read the same record, so they must agree about what it says.
+// Recorded Claude CLI totals retain request scale in child cost detail.
 test('a recorded Claude CLI total keeps request scale on the turn card and in session detail', () => {
   const usage = {
     requests: 4,
@@ -4683,8 +4600,8 @@ test('a turn labels model requests separately from tool calls in its usage detai
 });
 
 test('what a subagent spent is reported beside the cost, never inside it', () => {
-  // The result gives one total, with no split between what it read and what it wrote and
-  // no model of its own, so there is nothing to price it with.
+  // A combined child token total has no input/output breakdown or model-specific price.
+
   const t = turn({
     usage: { input: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 100_000, output: 5000, thinking: 0 },
     agents: [agent({ tokens: 176_721 }), agent({ tokens: null })],
@@ -4804,9 +4721,8 @@ test('turn and compaction chips keep semantic identities while optional roles ch
   );
 });
 
-// The turn's record reaches the reader through the three chip popovers, so each chip names
-// the record its popover draws. The fixture's long turn is the one turn that has a record of
-// every kind: seven files, three delegated runs one of which is still going, and two commits.
+// The long-turn fixture supplies file, subagent, and commit detail layouts.
+
 test('the record chips name the record their popovers draw', () => {
   const card = toCard(FIXTURE_TURNS[LONG_TURN_INDEX], false, FIXTURE_CLOCK);
   const listFor = (metric: string) => card.chips.find((chip) => chip.metric === metric)?.detailList;
@@ -4836,8 +4752,8 @@ test('the record chips name the record their popovers draw', () => {
     ].join('\n'),
   );
 
-  // The heading counts what is still going, which is the one fact about the list that changes
-  // while the reader looks at it.
+  // The finished fixture has no live child evidence, so its agents heading reports no running count.
+
   const agents = listFor('agents');
   assert.deepEqual([agents?.layout, agents?.actions], ['agents', true]);
   // The turn has ended, so its open child recorded no ending and the heading counts nothing.
@@ -4854,8 +4770,8 @@ test('the record chips name the record their popovers draw', () => {
   const commits = listFor('commits');
   assert.deepEqual([commits?.layout, commits?.actions], ['commits', true]);
   assert.deepEqual(commits?.heading, { label: '3 commits', diff: { added: 271, removed: 59 } });
-  // The turn holds all three itself. A commit the fold child also reports reaches the card
-  // twice over, so the entries below would stand even after one left the turn's own record.
+  // The turn itself records all three commits, including commits also reported by its child.
+
   assert.deepEqual(
     FIXTURE_TURNS[LONG_TURN_INDEX].commits.map((held) => held.sha),
     ['4f2a91c', '9d7be30', 'b83e0d1'],
@@ -4866,7 +4782,7 @@ test('the record chips name the record their popovers draw', () => {
     { label: '9d7be30', value: 'test(card): measure the open card at the three panel widths' },
     { label: 'b83e0d1', value: 'fix(rail): keep the pinned row in view when the rail narrows' },
   ]);
-  // The chip's plain hover is the list read out, so the two cannot say different things.
+  // Commit tooltip text matches the popover's heading and entries.
   const commitsChip = card.chips.find((chip) => chip.metric === 'commits');
   assert.deepEqual(
     commitsChip?.detail.split('\n'),
@@ -4878,9 +4794,8 @@ test('the record chips name the record their popovers draw', () => {
     'the Commits chip hover and the list its popover draws say different things',
   );
 
-  // The record reaches the panel on the card's own arrays and on nothing else. A chip holding
-  // a copy of the rows as well put every row of a long turn on the wire twice, once under the
-  // card and once under the chip, on every post the poll makes.
+  // File and commit detail layouts select the card's arrays without copying their rows into figure payloads.
+
   assert.deepEqual(
     card.chips.filter((chip) => chip.detailList && 'rows' in chip.detailList).map((chip) => chip.metric),
     [],
@@ -4897,8 +4812,8 @@ test('the record chips name the record their popovers draw', () => {
       ['b83e0d1', 'fix/rail-pin', 'in worktree rail-review', 'c:/repo-trees/rail-review'],
     ],
   );
-  // The two worktree commits are the fold child's own, so each row names its maker and the
-  // chip counts them. The row a child did not make carries no maker line at all.
+  // Child-made commits retain maker attribution. Parent-only commits carry no maker line.
+
   const fold = 'Fold the Files rows behind a head line and prove the height guard goes red';
   assert.deepEqual(
     card.commits.map((held) => held.madeBy ?? null),
@@ -5144,10 +5059,8 @@ test('a partial Codex child says its own subagents are left out, on the row and 
   assert.doesNotMatch(text, /left no record/);
 });
 
-// A main transcript launches agent a1, and each agent launches the next one down to `depth`.
-// Claude Code writes every subagent transcript flat into the session's subagents folder, and
-// only a nested agent's meta file names its launcher. Each transcript bills one Haiku request
-// of 1M input tokens, which costs $1.00, so a whole chain of depth 2 costs $3.00.
+// The main transcript launches a flat-folder child chain through depth. Metadata identifies each child's launcher. Each transcript bills one million Haiku input tokens.
+
 function nestedAgentTurn(depth: number, omit: { meta?: string; transcript?: string } = {}): Turn {
   const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
   const folder = tempDir('nested-agents-');
@@ -5403,9 +5316,8 @@ test('a running child draws its cost and tokens so far as a lower bound, and no 
     revision: 'child-r1',
   };
   const running = { status: 'running', spendFound: true, artifacts };
-  // The second row is the `open` state: the parent turn ended and nothing says the child is
-  // alive, so the row draws the idle mark, and its face and its note say what Arc read rather
-  // than that work goes on.
+  // An unfinished child on a finished parent turn is open. Its detail describes recorded usage without claiming the child still runs.
+
   const cases = [
     ['running', false, 'running', 'Still running. This is the cost so far.'],
     ['async_launched', true, 'no ending recorded', 'This subagent recorded no ending. This is the cost Arc read.'],
@@ -5450,8 +5362,8 @@ test('a running child draws its cost and tokens so far as a lower bound, and no 
     [['tokens', '667k+ tokens', 'At least 667k tokens']],
   );
   assert.deepEqual(unpriced.figures[0].record?.footer, ['Still running. This is the usage so far.']);
-  // The same child on a turn that ended, with nothing saying it is alive. Its row is idle, so
-  // its usage footer says what Arc read instead of that the child still runs.
+  // The same unpriced child on a finished parent turn reports recorded usage without claiming continued activity.
+
   const idle = toCard(
     turn({
       finished: true,
@@ -5466,9 +5378,8 @@ test('a running child draws its cost and tokens so far as a lower bound, and no 
 });
 
 test('an idle subagent with nothing priced says no ending was recorded', () => {
-  // The row draws the idle mark, so the line under `cost unavailable` cannot call the child
-  // still running. It says what the record is missing instead. `costDetail` reads no session
-  // liveness, so it answers from the turn alone and has to reach the same words as the chip.
+  // An unpriced open child reports its missing ending. costDetail and the card figure use the same turn-based wording.
+
   const idle = turn({
     finished: true,
     endedAt: NOW,
@@ -5482,8 +5393,8 @@ test('an idle subagent with nothing priced says no ending was recorded', () => {
 });
 
 test('a running child with nothing priced says no cost is recorded yet', () => {
-  // The figure reads "cost unavailable", so a line repeating that says nothing. What the
-  // reader needs is why: the subagent has not finished, and no priced usage exists yet.
+  // An unpriced running child explains that no cost is recorded yet.
+
   const t = turn({ finished: false, agents: [agent({ status: 'running', tokens: 22_000 })] });
   const detail = costDetail(t).join('\n');
   assert.match(
@@ -5674,17 +5585,15 @@ test('a card is marked by what its summary declared, from the list it opens with
     '- \u{1F64B} **Your actions** - reload the panel',
     '- \u2753 **Open questions** - none',
   ].join('\n');
-  // Each mark once, in the table's order. The opening list gives the question and the done;
-  // the closing rows give the raised hand, because the actions row here has something in it
-  // and the questions row says "none". A card whose summary declares a question in its
-  // opening list and closes with a row of them is marked once, not twice.
+  // Opening-list and closing-row marks appear once each in table order.
+
   assert.deepEqual(
     toCard(turn({ summary }), false, NOW).marks.map((m) => m.id),
     ['needsYou', 'question', 'done'],
   );
 
-  // The same summary with nothing waiting in either row. The raised hand goes; the question
-  // stays, because the opening list declared one.
+  // Settling both closing rows removes the action mark but retains the opening list's question mark.
+
   const settled = summary
     .replace('**Your actions** - reload the panel', '**Your actions** - none blocking')
     .replace('**Open questions** - none', '**Open questions** - none open');
@@ -5695,12 +5604,12 @@ test('a card is marked by what its summary declared, from the list it opens with
 });
 
 test('a symbol the table does not hold marks nothing, and a variation selector changes nothing', () => {
-  // The warning sign is nearly always typed as U+26A0 followed by U+FE0F; the table holds
-  // the bare form, because that one keeps its width steady wherever it is drawn.
+  // The variation selector leaves the warning mark unchanged.
+
   assert.deepEqual(markIds({ summary: '- \u26A0\uFE0F This could bite later.' }), ['caveat']);
   assert.deepEqual(markIds({ summary: '- \u26A0 The same thing, written bare.' }), ['caveat']);
-  // An invented symbol is drawn in the headline where it was written and marks nothing, so
-  // it is something the reader can see rather than something the panel swallowed.
+  // An unknown symbol creates no mark.
+
   assert.deepEqual(markIds({ summary: '- \u{1F984} An invented one.' }), []);
   assert.deepEqual(markIds({ summary: '- No symbol at all.' }), []);
   assert.deepEqual(markIds({ summary: '' }), []);
@@ -5731,22 +5640,22 @@ test("the rest of a card's marks are worked out from what the turn changed", () 
     }),
     ['commit'],
   );
-  // A turn that took out twice what it put in reads as a removal; one that swapped a
-  // similar amount either way does not.
+  // The removal mark requires a positive removed count at least twice the added count.
+
   assert.deepEqual(markIds({ files: [changed('c:/repo/a.ts', 5, 40)] }), ['removal']);
   assert.deepEqual(markIds({ files: [changed('c:/repo/a.ts', 30, 40)] }), []);
   assert.deepEqual(markIds({ files: [changed('c:/repo/a.ts', 0, 0)] }), []);
-  // The first toned band, and not a threshold of its own, so the words on the head row and
-  // the tone on the chip beside them cannot disagree about how full the window is.
+  // The context mark begins at the first context band.
+
   const window = 1_000_000; // opus-5, which the fixture runs on
   const atShare = (share: number) => markIds({ contextTokens: Math.round(window * share) });
   assert.deepEqual(atShare(CONTEXT_BANDS[0].at), ['context']);
   assert.deepEqual(atShare(CONTEXT_BANDS[0].at - 0.01), []);
-  // And the mark is keyed off the printed figure, the way the chip's tone is, so the words
-  // on the head row and the tone beside them still arrive together.
+  // The context mark uses the printed percentage, matching the figure's band.
+
   assert.deepEqual(atShare(CONTEXT_BANDS[0].at - 0.0004), ['context']);
-  // Between the first band and the second, where a mark keyed on the wrong row of the table
-  // would still be silent.
+  // Shares between the first two thresholds still carry the context mark.
+
   assert.deepEqual(atShare(CONTEXT_BANDS[1].at - 0.01), ['context']);
   assert.deepEqual(markIds({ contextTokens: 160_000 }), []);
 });
@@ -5775,18 +5684,18 @@ test('the spoken name of a card says its marks in words, and carries no pictogra
     card.label,
     'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude opus-5, done, committed. The batch landed.',
   );
-  // A pictograph is announced by its Unicode name, so a tick left in here would be read out
-  // as "white heavy check mark" straight after the word it already stands for.
+  // Accessible card names use mark words instead of pictographs.
+
   assert.ok(!/\p{Extended_Pictographic}/u.test(card.label), 'the spoken name still carries a pictograph');
-  // Nor is it left in the headline, where it would be read out on top of the word this name
-  // already says it with. The card keeps it as a mark, which is what carries it.
+  // Recognized symbols leave the headline and remain in card marks.
+
   assert.equal(card.headline, 'The batch landed.');
   assert.ok(
     card.marks.some((m) => m.character === '\u2705'),
     'the symbol left the headline with nothing carrying it',
   );
-  // A symbol the table does not hold has no mark to stand in for it, so it stays where it
-  // was written rather than going missing from the card altogether.
+  // Unknown symbols remain in the headline because no mark represents them.
+
   const invented = toCard(turn({ summary: '- \u{1F984} An invented one.' }), false, NOW);
   assert.equal(invented.headline, '\u{1F984} An invented one.');
   assert.deepEqual(invented.marks, []);
@@ -5801,35 +5710,31 @@ test('a turn is marked read once it has finished, and a running one or a compact
 });
 
 test('a card names the section its own menu is matched on, from both of the two axes', () => {
-  // Which entries a right-click offers is the whole of what this decides, and the section
-  // name is the only piece of a card's context a when clause can read. Two things go into
-  // it and they move independently: whether the read state can be set, and whether the card
-  // holds a summary to copy. Every answer is written out, so a name changed on one side of
-  // the pair fails here rather than quietly matching no menu at all.
+  // Menu section identity combines read-state availability with summary-copy availability.
+
   const finished = toCard(turn({ summary: 'Done.' }), false, NOW);
   assert.equal(turnMenuSection(finished, false), 'arcTurnUnreadSummary');
   assert.equal(turnMenuSection(finished, true), 'arcTurnReadSummary');
 
-  // A running turn cannot take a read state, and its summary is still worth copying, so it
-  // reaches the summary-only name. A compaction that carried one over reaches it by the
-  // same rule: the kind of card is nowhere in the question.
+  // Running turns and compactions with summaries use the summary-only menu section.
+
   const running = toCard(turn({ finished: false, endedAt: NOW - 60_000, summary: 'Halfway.' }), true, NOW);
   assert.equal(running.live, true, 'the fixture is not a running turn, so it cannot see the rule');
   assert.equal(turnMenuSection(running, false), 'arcTurnSummary');
   assert.equal(turnMenuSection(toCompactionCard(compaction(), NOW), false), 'arcTurnSummary');
 
-  // A compaction with nothing carried over can take neither, so it names nothing at all and
-  // the editor draws its own menu instead of one whose entries would do nothing.
+  // A compaction with no summary supplies no turn-menu section.
+
   assert.equal(turnMenuSection(toCompactionCard(compaction({ summary: '' }), NOW), false), null);
 
-  // A finished turn whose summary is whitespace can still take a read state, so it names one
-  // of the two plain names: there is nothing to put on the clipboard.
+  // A finished turn with a whitespace-only summary retains its read-state menu section.
+
   const blank = toCard(turn({ summary: '   \n  ' }), false, NOW);
   assert.equal(turnMenuSection(blank, false), 'arcTurnUnread');
   assert.equal(turnMenuSection(blank, true), 'arcTurnRead');
 
-  // And every name the rule can return is one the table holds, or a card names a section no
-  // menu is looking for.
+  // Every returned section name belongs to TURN_MENU_SECTIONS.
+
   const named = new Set(Object.values(TURN_MENU_SECTIONS));
   for (const section of [
     turnMenuSection(finished, false),
@@ -5852,8 +5757,8 @@ test('a card carries sessionLabeled only while its session has a label, on every
   const finished = toCard(turn({ summary: 'Done.' }), false, NOW);
   assert.equal(turnMenuContext(finished, false, 'body', false, false, true)?.sessionLabeled, true);
   assert.equal('sessionLabeled' in (turnMenuContext(finished, false, 'body', false) ?? {}), false);
-  // package.json hides this entry over a selection with !arcSelection, so a labeled card
-  // must carry both flags together while text is selected, and drop arcSelection once it is not.
+  // Selected text keeps both sessionLabeled and arcSelection. Clearing the selection removes arcSelection so the label action can appear.
+
   assert.equal(turnMenuContext(finished, false, 'body', false, true, true)?.sessionLabeled, true);
   assert.equal(turnMenuContext(finished, false, 'body', false, true, true)?.arcSelection, true);
   assert.equal('arcSelection' in (turnMenuContext(finished, false, 'body', false, false, true) ?? {}), false);
@@ -5868,9 +5773,8 @@ test('a card carries sessionLabeled only while its session has a label, on every
 });
 
 test('a card carries its status as a word, for the head row hover', () => {
-  // The glyph is a pictograph and the unread dot is drawn by the stylesheet, so the word is
-  // the only thing a hover can say. It rides the card rather than being worked out in the
-  // panel, which is the file nothing tests.
+  // The card supplies a status word for its heading tooltip.
+
   assert.equal(toCard(turn(), false, NOW).statusWord, 'finished');
   assert.equal(toCard(turn({ finished: false, endedAt: NOW - 60_000 }), true, NOW).statusWord, 'running');
   assert.equal(toCard(turn({ interrupted: true, finished: false }), false, NOW).statusWord, 'stopped by you');
@@ -5885,8 +5789,8 @@ test('a compaction says why it ran, what it cost and how long it took', () => {
   assert.equal(card.duration, '2m');
   assert.equal(card.durationWord, CARD_ACTIONS.ranFor);
   assert.equal(card.durationDetail, 'Compacted 3:05 PM');
-  // With no earlier request the recorded 629k sizes the input: all of it read back at a tenth
-  // of $5, a 2k instruction, and 14k written at $25 per MTok.
+  // Without an earlier request, the estimate prices 629k cached-input tokens, a 2k uncached instruction, and a 14k output summary.
+
   assert.deepEqual(
     card.chips.map((c) => c.label),
     ['$0.68', '615k dropped'],
@@ -5959,17 +5863,15 @@ test('cost is omitted for a model the price table does not know', () => {
 });
 
 test('cardPrint holds still under the clock and moves with the content', () => {
-  // Still running at both clocks below: ahead of the first and half an hour behind the second.
-  // Left at zero the two cards compared here would both be turns left unfinished, and the
-  // running card this test is about would go uncovered.
+  // The fixture end time is ahead of the first clock and within the second clock's quiet window.
+
   const running = turn({
     finished: false,
     endedAt: new Date(2026, 7, 23, 23, 40).getTime(),
     summary: 'Working on it.',
   });
-  // The same running turn worded at two different clocks, the second past midnight so
-  // the absolute wording gains its day: relative, duration, absolute and the label all
-  // move, and none of them is a reason to rebuild the card.
+  // Crossing midnight changes clock wording without changing card content.
+
   const NOON = new Date(2026, 7, 23, 12, 0).getTime();
   const PAST_MIDNIGHT = new Date(2026, 7, 24, 0, 5).getTime();
   const early = toCard(running, true, NOON);
@@ -6008,9 +5910,8 @@ test('cardPrint holds still under the clock and moves with the content', () => {
   );
   // A field the card lacks stringifies as null on both sides rather than throwing.
   assert.equal(cardPrint({}), cardPrint({}));
-  // Clock-worded values nested inside a content field: an earlier answer's hover clock and a
-  // commit row's, both of which gain a day name at midnight. Neither alone must read as the
-  // card's content moving, or every card rebuilds at once and drops its selection.
+  // Clock wording inside answer and commit rows does not change the card print.
+
   const answeredAt = (absolute: string) => ({
     key: 'k',
     earlierAnswers: [{ summary: 'First answer.', at: 5, summaryHtml: '<p>First answer.</p>', absolute }],
@@ -6038,8 +5939,8 @@ test('cardPrint holds still under the clock and moves with the content', () => {
     cardPrint(committedAt('Aug 27 2:32 PM')),
     'the commit hover clock alone changed the print, so midnight rebuilds every card holding a commit',
   );
-  // A branch that merged names the merge on the Commits popover heading. The heading comes from
-  // the host, and the merge time on it would gain a day name at midnight like any other.
+  // A branch landing adds a commit row whose absolute time gains a date across midnight.
+
   const branchMerged = turn({
     commits: [recordCommit('aaaa1111', 'Write it', 0, { head: { kind: 'branch', name: 'topic' } })],
     landings: [recordLanding('bbbb2222', 'Merge topic', 5, 'topic')],
@@ -6077,8 +5978,8 @@ test('cardPrint holds still under the clock and moves with the content', () => {
 });
 
 test("every field a card carries is either compared or the clock's, and none is both", () => {
-  // Real cards, with the two fields the host adds before posting, so a field added to
-  // either card shape fails here until it is placed in exactly one of the two lists.
+  // Turn and compaction payload fields belong to exactly one content or time list.
+
   const turnPayload = {
     ...toCard(turn({ summary: 'Ran `npm test` and it passed.' }), true, NOW),
     summaryHtml: '<p>s</p>',
@@ -6123,16 +6024,14 @@ test("every field a card carries is either compared or the clock's, and none is 
   }
 });
 
-// The symptom this section exists for: a message the agent wrote while it worked was
-// readable only as a truncated activity row with a hover on it. So the guard is written
-// against what reaches the card, in the order the reader will read it.
+// Commentary and earlier answers reach the card in chronological order.
+
 test('every message the agent sent while the turn ran reaches the card, oldest first', () => {
   const at = (minutes: number) => new Date(2026, 7, 23, 14, 32 + minutes).getTime();
   const working = turn({
     summary: 'The last word.',
-    // Three answers, two of them closed before the last, so the index a note anchors by is
-    // not the same number as the entry's place in the section. An implementation that
-    // numbered by that place would pass a single-answer fixture and strand every note.
+    // Earlier-answer indexes differ from their positions in the chronological message list.
+
     answers: [
       { stepsBefore: 0, text: 'A first pass, closed.', at: at(2) },
       { stepsBefore: 0, text: 'A second pass, closed.', at: at(5) },
@@ -6193,8 +6092,8 @@ test('every message the agent sent while the turn ran reaches the card, oldest f
     'the response is repeated inside the section that sits under it',
   );
 
-  // Every message carries a clock now, because every one of them draws one: the meta line
-  // shows the time and the hover shows the same moment in full.
+  // Each message carries clock and absolute timestamp wording.
+
   assert.deepEqual(
     card.saidMessages.map((m) => m.when),
     ['2:33 PM', '2:34 PM', '2:36 PM', '2:37 PM'],
@@ -6204,9 +6103,8 @@ test('every message the agent sent while the turn ran reaches the card, oldest f
     ['2:33 PM', '2:34 PM', '2:36 PM', '2:37 PM'],
   );
 
-  // The anchor a note already carries still names the answer it was left on. `earlierAnswers`
-  // is newest first and the section is oldest first, so this is the one number that has to
-  // survive the change.
+  // Chronological message sorting preserves newest-first earlier-answer indexes used by comment anchors.
+
   const answers = card.saidMessages.filter((m) => m.kind === 'answer');
   assert.deepEqual(
     answers.map((m) => m.answerIndex),
@@ -6220,17 +6118,15 @@ test('every message the agent sent while the turn ran reaches the card, oldest f
     );
   }
 
-  // What the shut head says, and what a reader who cannot see it hears. It counts replies,
-  // which is the word the message itself wears.
+  // The section name and folded summary count messages and replies.
+
   assert.equal(card.saidName, 'Said while working, 4 messages, 2 replies');
   assert.equal(card.saidMix, '4 messages, 2 replies');
 });
 
 test('the messages are put in clock order, whatever order the two lists arrived in', () => {
-  // Neither source list promises the clock. `turnview.test.ts` holds that an answer stamp may
-  // go backwards, and an update stamp promises nothing either. Merged as though both were
-  // already sorted, one narration recorded late drags the answer beside it out of order too
-  // and the reader is shown the messages in an order nobody wrote them in.
+  // Answer and update timestamps need not follow source-list order. The displayed message list sorts their combined timestamps.
+
   const out = toCard(
     turn({
       summary: 'The last word.',
@@ -6252,8 +6148,8 @@ test('the messages are put in clock order, whatever order the two lists arrived 
     'the section is drawn in an order none of the messages were written in',
   );
 
-  // A narration and an answer on one stamp: the narration first, because an answer closes the
-  // stretch of narration that led to it.
+  // Commentary precedes an answer with the same timestamp.
+
   const tied = toCard(
     turn({
       summary: 'The last word.',
@@ -6274,7 +6170,7 @@ test('the messages are put in clock order, whatever order the two lists arrived 
 });
 
 test('sorting the section renumbers nothing, and leaves the record it was built from alone', () => {
-  // Two answers whose stamps go backwards, which is the case turnview.test.ts permits.
+  // Answer timestamps can run backward relative to their source order.
   const backwards = toCard(
     turn({
       summary: 'The last word.',
@@ -6291,8 +6187,8 @@ test('sorting the section renumbers nothing, and leaves the record it was built 
     backwards.saidMessages.map((m) => m.text),
     ['Recorded second, stamped earlier.', 'Recorded first, stamped later.'],
   );
-  // The anchor is the number earlierAnswersOf gave, and where the section draws an entry never
-  // touches it.
+  // Sorting messages preserves the answer indexes assigned by earlierAnswersOf.
+
   for (const said of backwards.saidMessages) {
     assert.equal(
       commentAnchorText(backwards, answerPart(said.answerIndex!)),
@@ -6301,8 +6197,8 @@ test('sorting the section renumbers nothing, and leaves the record it was built 
     );
   }
 
-  // And the record itself keeps the transcript's order, because searchableSummary reads it.
-  // Recorded oldest first, the card carries them newest first, which no sort would produce.
+  // earlierAnswers retains newest-first source order independently of displayed message sorting.
+
   const recorded = toCard(
     turn({
       summary: 'The last word.',
@@ -6361,9 +6257,8 @@ test('the said section counts what it holds, and says nothing about replies it h
 });
 
 test('the hover clock on a mid-turn message alone does not rebuild the card', () => {
-  // The same projection the earlier answers get, for the same reason: the wording gains a day
-  // name at midnight, and a day boundary must not read as the card's content moving. Every
-  // message carries the hover now, so every message is projected.
+  // Message tooltip wording changes across midnight without changing the card print.
+
   const saidAt = (absolute: string) => ({
     key: 'k',
     saidMessages: [
@@ -6404,9 +6299,8 @@ test('the hover clock on a mid-turn message alone does not rebuild the card', ()
     cardPrint(reworded),
     'a changed mid-turn message reads as unchanged, so the section on screen goes stale',
   );
-  // The rendered markdown is what the section draws, and it moves without the markdown behind
-  // it moving: a picture resolves to a host address the first render had no answer for.
-  // Dropped from the print, the card keeps drawing the markup it was first given.
+  // Rendered message HTML changes the card print even when source text stays identical.
+
   const rerendered = {
     key: 'k',
     saidMessages: [
@@ -6421,8 +6315,8 @@ test('the hover clock on a mid-turn message alone does not rebuild the card', ()
     cardPrint(rerendered),
     'a message rendered again reads as unchanged, so the section draws the markup it first had',
   );
-  // The clock the meta line draws is fixed, carries no day, and stays in the print the way a
-  // mid-turn prompt's does.
+  // The message clock field remains in the card print.
+
   const reclocked = {
     key: 'k',
     saidMessages: [{ ...saidAt('2:32 PM').saidMessages[0], when: '2:33 PM' }],
@@ -6455,9 +6349,8 @@ test('the hover clock on a mid-turn message alone does not rebuild the card', ()
   );
 });
 
-// The section keys the reader's own presses by message id: which messages they opened whole,
-// and which of them overflow their bound. An id that moves under them is a message they
-// opened snapping shut. The card repaints every few seconds while the turn runs.
+// Stable message IDs preserve expansion and overflow state across card updates.
+
 test('a mid-turn message keeps one identity, and a message arriving moves nobody else', () => {
   const at = (minutes: number) => new Date(2026, 7, 23, 14, 32 + minutes).getTime();
   const written = (updates: object[], answers: object[]) =>
@@ -6466,8 +6359,8 @@ test('a mid-turn message keeps one identity, and a message arriving moves nobody
     { text: 'A first pass, closed.', at: at(4) },
     { text: 'The last word.', at: at(9) },
   ];
-  // Two narrations on one stamp, which the record allows and which a stamp alone cannot tell
-  // apart. Both are drawn, so both need an identity of their own.
+  // Two commentary messages with the same timestamp retain distinct IDs.
+
   const tied = written(
     [
       { sourceId: 'u1', kind: 'commentary', text: 'Reading the parser.', at: at(2), status: 'done' },
@@ -6478,8 +6371,8 @@ test('a mid-turn message keeps one identity, and a message arriving moves nobody
   assert.equal(tied.length, 2, 'the fixture no longer draws two messages, so this measures nothing');
   assert.notEqual(tied[0].id, tied[1].id, 'two messages on one stamp share an id, so a press on one opens the other');
 
-  // Numbered after the sort. A narration recorded late but stamped early is drawn at the top.
-  // Numbering by arrival would hand it the id the message below it already holds.
+  // A newly arrived message with an earlier timestamp preserves existing message IDs.
+
   const reading = { sourceId: 'u1', kind: 'commentary', text: 'Reading the parser.', at: at(3), status: 'done' };
   const before = written([reading], closed);
   const after = written(
@@ -6497,9 +6390,8 @@ test('a mid-turn message keeps one identity, and a message arriving moves nobody
   }
 });
 
-// A transcript record whose timestamp will not parse is stamped zero by the reader, and zero is
-// a real moment both formatters draw. The section says a message with no time shows none, and a
-// reply then carries its word alone.
+// Zero message timestamps represent unavailable time and produce no visible or tooltip clock.
+
 test('a mid-turn message the record gave no time carries no clock at all', () => {
   const unstamped = saidMessagesOf(
     {
@@ -6562,9 +6454,8 @@ test('a card leads with latest activity and carries its start on the duration ho
 
 test('a turn with no file changes says so, in every status but a running one', () => {
   const chipLabels = (card: TurnCard) => card.chips.map((c) => c.label);
-  // Every status a finished turn can carry, so the rule stays "all but one" rather than
-  // quietly narrowing to the one status the first test happened to use. Each fixture
-  // asserts the status it is filed under, on the card being read.
+  // Finished, failed, interrupted, and stopped turns all expose the no-file-change figure when their file list is empty.
+
   for (const [status, card] of [
     ['done', toCard(turn({ summary: 'Read the parser.' }), false, NOW)],
     ['failed', toCard(turn({ error: 'Overloaded.' }), false, NOW)],
@@ -6574,8 +6465,8 @@ test('a turn with no file changes says so, in every status but a running one', (
     assert.equal(card.status, status, `the ${status} fixture is not a ${status} turn`);
     assert.ok(chipLabels(card).includes('no file changes'), `a ${status} turn should say it changed nothing`);
   }
-  // The one exception: a running turn has not finished, so this would guess at what it is
-  // still going to do.
+  // Running turns omit the no-file-change figure.
+
   const running = toCard(turn({ finished: false, endedAt: NOW - 60_000 }), true, NOW);
   assert.equal(running.status, 'running', 'the fixture must be a running turn');
   assert.ok(!chipLabels(running).includes('no file changes'));
@@ -6598,9 +6489,8 @@ test('a turn with no file changes says so, in every status but a running one', (
 });
 
 test('a path is drawn and announced with forward slashes, and acted on as it was recorded', () => {
-  // One card showed both spellings: a commit's hover said `in C:/Users/dev/...`, because
-  // that directory is read out of a command and comes back unified, while the file rows
-  // above it said `C:\Users\dev\...`. Everything the reader reads is now the first shape.
+  // Visible and spoken paths use forward slashes independently of their recorded spelling.
+
   const inside = 'c:\\repo\\src\\store.ts';
   const outside = 'c:\\Users\\dev\\AppData\\Local\\Temp\\scratch\\notes.md';
   const card = toCard(
@@ -6615,8 +6505,8 @@ test('a path is drawn and announced with forward slashes, and acted on as it was
     ['c:/repo'],
   );
 
-  // A basename row. Nothing drawn on it holds a separator at all, and the path it hovers
-  // with is the whole path in the drawn spelling.
+  // Workspace file rows use basename labels and a normalized full path for their tooltip.
+
   assert.deepEqual(
     [card.files[0].name, card.files[0].lead, card.files[0].label],
     ['store.ts', undefined, 'File store.ts'],
@@ -6629,16 +6519,15 @@ test('a path is drawn and announced with forward slashes, and acted on as it was
   assert.equal(card.files[1].label, 'File c:/Users/dev/AppData/Local/Temp/scratch/notes.md, new');
   assert.equal(card.files[1].shownPath, 'c:/Users/dev/AppData/Local/Temp/scratch/notes.md');
 
-  // The recorded path is still on the card beside them, exactly as the transcript wrote it.
-  // It is what the row opens, what Copy Path writes into a terminal, and what the snapshot
-  // store is looked up by, and none of those can take a spelling made for reading.
+  // The card retains the recorded path separately for file actions.
+
   assert.deepEqual(
     card.files.map((f) => f.path),
     [inside, outside],
   );
 
-  // Two basename rows that collide grow leftwards, and that growth is spelled the same way
-  // whichever separator the path arrived with.
+  // Colliding basename labels use normalized directory suffixes.
+
   const collide = toCard(
     turn({
       files: [
@@ -6673,10 +6562,8 @@ test('a commit made in a worktree of this repository is not read as another repo
     ...over,
   });
 
-  // A linked worktree shares the object store and the branch refs of the folder it came
-  // from, so the work is this project's own. The word `worktree` is what keeps the row from
-  // reading like `in side-repo`, which is the shape that means somebody else's repository,
-  // and the hover says "of this repository" rather than leaving one word to carry it.
+  // A linked worktree remains part of the same repository and receives a worktree location label.
+
   const card = commitCard(
     made({
       place: { kind: 'worktree', dir: 'C:/Users/dev/arc-worktrees/usage-model-bucket' },
@@ -6686,8 +6573,8 @@ test('a commit made in a worktree of this repository is not read as another repo
   );
   assert.equal(card.where, 'in worktree usage-model-bucket');
   assert.equal(card.detail, 'Note the run\n3 files changed');
-  // The group heading draws the branch and the place beside it. The two are different facts:
-  // where to look on disk, and what the reader will merge.
+  // The branch and worktree directory remain separate fields.
+
   assert.equal(card.branch, 'feat/usage-model-bucket');
   if (card.where === null) {
     assert.fail('the worktree label is missing');
@@ -6715,8 +6602,8 @@ test('the tree the worktrees came from is not called a worktree', () => {
     ...over,
   });
 
-  // The reader's open folder is a worktree and the commit was made in the tree that worktree
-  // came from. Both are the same repository, and only one of them is a worktree.
+  // The main checkout of the same repository receives a main-tree label.
+
   const main = 'C:/Users/dev/Projects/work/arc';
   const card = commitCard(made({ place: { kind: 'maintree', dir: main } }), NOW);
   assert.equal(card.where, 'in the main tree');
@@ -6726,8 +6613,8 @@ test('the tree the worktrees came from is not called a worktree', () => {
   }
   assert.doesNotMatch(card.where, /worktree/);
 
-  // A kind none of the arms name says nothing. Falling through to the wording for another
-  // repository is the worst thing a kind added later could be told to say.
+  // An unknown location kind supplies no location wording.
+
   const unknown = commitCard(
     made({ place: { kind: 'somewhere-new', dir: main } as unknown as TurnCommit['place'] }),
     NOW,
@@ -6749,14 +6636,14 @@ test('a commit row says which repository it landed in, and only when that is not
     ...over,
   });
 
-  // A commit in this workspace says nothing extra: the card it is drawn on already says
-  // where it is, and a row repeating that on every commit would say nothing at all.
+  // A workspace commit without location evidence adds no location label.
+
   const here = commitCard(made(), NOW);
   assert.deepEqual([here.branch, here.headKind, here.repository], [null, null, null]);
   assert.equal(here.where, null);
   assert.equal(here.detail, 'Note the run\n3 files changed');
-  // One made elsewhere says so by that directory's own name, which is the part that tells
-  // the reader which tree to go and look in, and the hover carries the whole path.
+  // Another repository uses its directory basename as the location label and its full path in the tooltip.
+
   const away = commitCard(made({ place: { kind: 'named', dir: 'C:/Users/dev/Projects/side-repo' } }), NOW);
   assert.equal(away.where, 'in side-repo');
   assert.equal(away.detail, 'Note the run\n3 files changed\nin C:/Users/dev/Projects/side-repo');
@@ -6766,11 +6653,8 @@ test('a commit row says which repository it landed in, and only when that is not
   assert.doesNotMatch(branch.detail, /on main/);
   const detached = commitCard(made({ head: { kind: 'detached' } }), NOW);
   assert.deepEqual([detached.branch, detached.headKind], [null, 'detached']);
-  // The repository a row files under. A nested repository inside the open folder is named by
-  // its path under that folder, one outside every folder by its own folder name, and the open
-  // folder's own repository and its worktrees are the card's own.
-  // A nested repository's tree sits inside the open folder, so git gives it no place, and its
-  // key alone says it is not the folder's own.
+  // Nested repositories use workspace-relative names. Outside repositories use directory basenames. Repository identity distinguishes a nested repository without separate location evidence.
+
   const repository = (place: TurnCommit['place'], root: string, own: boolean) =>
     commitCard(
       made({
@@ -6793,28 +6677,27 @@ test('a commit row says which repository it landed in, and only when that is not
   );
   assert.equal(repository(null, 'C:/Users/dev/Projects/arc', true)?.own, true);
   assert.equal(repository({ kind: 'worktree', dir: 'C:/Users/dev/trees/x' }, 'C:/Users/dev/trees/x', true)?.own, true);
-  // A directory written with backslashes names itself the same way, and its hover draws the
-  // path in the one spelling everything else on the panel is drawn in.
+  // Repository location labels and tooltip paths accept backslash spelling.
+
   const backslashed = commitCard(made({ place: { kind: 'named', dir: 'C:\\Users\\dev\\Projects\\side-repo' } }), NOW);
   assert.equal(backslashed.where, 'in side-repo');
   assert.equal(backslashed.detail, 'Note the run\n3 files changed\nin C:/Users/dev/Projects/side-repo');
-  // A call that committed to more than one repository, none of them here, can say that much
-  // and no more. The row keeps the shape a named one has, since it is already carrying a
-  // sha, a subject and two counts; the reason goes on the hover, where there is room.
+  // An ambiguous repository location keeps generic wording and explains the ambiguity in its tooltip.
+
   const elsewhere = commitCard(made({ place: { kind: 'unnamed' } }), NOW);
   assert.equal(elsewhere.where, 'in another repository');
   assert.equal(
     elsewhere.detail,
     'Note the run\n3 files changed\nIn another repository. The call committed to more than one, so which one cannot be said.',
   );
-  // No directory is named anywhere on it, which is the whole of what makes it safe.
+  // Ambiguous repository detail names no directory.
   if (elsewhere.where === null) {
     assert.fail('the other-repository label is missing');
   }
   assert.doesNotMatch(elsewhere.where, /[/\\]/);
   assert.doesNotMatch(elsewhere.detail, /[/\\]/);
-  // A commit that changed nothing prints no stat line, so the hover keeps the two parts it
-  // does have rather than writing a file count it never read.
+  // Absent commit statistics add no file-count line.
+
   const quiet = commitCard(
     made({ files: null, added: null, removed: null, place: { kind: 'named', dir: 'C:/Users/dev/Projects/side-repo' } }),
     NOW,
@@ -6865,8 +6748,8 @@ test('a worktree named for its branch draws the branch alone, and the hover keep
     commitCard(made({ place: { kind: 'named', dir }, head: { kind: 'branch', name: 'turn-card-density' } }), NOW).where,
     'in turn-card-density',
   );
-  // The row draws no age. The full local time rides beside the hover and names a day that is
-  // not today. It stays out of `detail`, which the panel compares to decide on a redraw.
+  // Commit absolute time stays separate from detail text so clock wording does not change the card print.
+
   const lastWeek = NOW - 7 * 86_400_000;
   const old = commitCard(made({ at: lastWeek }), NOW);
   assert.equal(old.absolute, formatWhen(lastWeek, NOW));
@@ -6893,7 +6776,7 @@ test('a landing row carries the branch it merged and the branch it moved', () =>
   assert.equal(card.subject, 'Bundle the panel script from a TypeScript entry');
   assert.equal(card.mergedBranch, 'panel-ts/ui-1');
   assert.equal(card.landingTarget, 'main');
-  // The branch that moved files the row when no branch of the record explains it.
+  // A landing row groups under the branch whose head moved.
   assert.deepEqual([card.branch, card.headKind], ['main', 'branch']);
   assert.equal(card.detail, 'Bundle the panel script from a TypeScript entry');
   assert.equal(commitRowSpoken(card), `, merged into main ${card.absolute}`);
@@ -6997,8 +6880,8 @@ test('a card names its file rows from the folders it was handed', () => {
     held.files.map((f) => f.name),
     ['store.ts', 'notes.md'],
   );
-  // The directory travels beside the filename rather than glued in front of it, so the row
-  // can shrink the one and not the other.
+  // Separate directory and filename fields let only the directory shrink.
+
   assert.deepEqual(
     held.files.map((f) => f.lead),
     [undefined, 'c:/Users/dev/AppData/Local/Temp/scratch/'],
@@ -7012,7 +6895,7 @@ test('a card names its file rows from the folders it was handed', () => {
     held.files.map((f) => f.path),
     files.map((f) => f.path),
   );
-  // Handed no folders, the card draws what it drew before there was anything to be outside of.
+  // Without folder context, every file row uses its basename.
   const bare = toCard(turn({ files }), false, NOW);
   assert.deepEqual(
     bare.files.map((f) => f.name),
@@ -7029,10 +6912,8 @@ test('a card names its file rows from the folders it was handed', () => {
 });
 
 test('every file row leaves here with an icon on it, whatever the file is', () => {
-  // The reader's icon theme is drawn in front of this, and the panel is where that happens,
-  // so this is the floor. A card that arrives with nothing in the icon column leaves the
-  // panel nothing to fall back to when the theme has no answer, which is the common case for
-  // a reader who has turned file icons off.
+  // Every file row carries a fallback icon label when the editor supplies no themed icon.
+
   const card = toCard(
     turn({
       files: [
@@ -7048,7 +6929,7 @@ test('every file row leaves here with an icon on it, whatever the file is', () =
   for (const file of card.files) {
     assert.ok(file.icon && file.icon.label, `${file.path} has nothing to draw in its icon column`);
   }
-  // The theme's own icon is the panel's to add, so a card carries neither half of it.
+  // The card leaves themed glyph and image fields unset.
   assert.ok(
     card.files.every((f) => !f.icon.glyph && !f.icon.image),
     'a card is resolving the reader icon theme, which needs the editor and cannot be tested here',
@@ -7071,23 +6952,22 @@ test('a head row is announced by everything it shows, since its glyph says nothi
     card.label,
     'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude opus-5 xhigh. Fixed the parser.',
   );
-  // A failed turn and a finished one look different only by colour, which is read out as
-  // nothing at all, so the word has to be in the name.
+  // Accessible card names include status words independently of visible color.
+
   const failed = toCard(turn({ error: 'Overloaded.' }), false, NOW);
   assert.match(failed.label, /^Turn, failed, /);
   const running = toCard(turn({ finished: false, endedAt: NOW - 60_000 }), true, NOW);
   assert.match(running.label, /^Turn, running, /);
   // A model with nothing to say about it leaves no empty gap in the middle of the name.
   const bare = toCard(turn({ model: null, summary: 'Done.' }), false, NOW);
-  // Never bare: the agent is on every card, so this is the shortest a name gets.
+  // Every turn card name includes its agent even when the model is absent.
   assert.equal(bare.label, 'Turn, finished, 5 hours ago, ran in 12m, started 2:32 PM, Claude. Done.');
   assert.match(toCompactionCard(compaction(), NOW).label, /^Compaction, 4 hours ago, ran in 2m\. Compacted by hand\./);
 });
 
 test('the duration phrase matches the turn status', () => {
-  // The figure beside the word is still growing: the panel counts it up once a second for
-  // exactly this status. Past-tense wording over a turn nothing has finished is a claim the
-  // ticker contradicts a second later.
+  // Running turns use present-tense duration wording.
+
   assert.equal(durationWord('running'), CARD_ACTIONS.runningFor);
   for (const status of ['done', 'failed', 'interrupted', 'stopped'] as const) {
     assert.equal(
@@ -7096,16 +6976,16 @@ test('the duration phrase matches the turn status', () => {
       `a ${status} turn has ended, so its duration takes the past tense`,
     );
   }
-  // The card carries the word, and its spoken name reads the same one, so the row and the
-  // screen reader cannot say different things about whether the turn is over.
+  // The card's accessible name uses its duration word.
+
   const running = toCard(turn({ finished: false, endedAt: NOW - 60_000 }), true, NOW);
   assert.equal(running.durationWord, CARD_ACTIONS.runningFor);
   assert.match(running.label, /running, 1 min ago, running for 5h 28m, started 2:32 PM,/);
   const done = toCard(turn({}), false, NOW);
   assert.equal(done.durationWord, CARD_ACTIONS.ranFor);
   assert.match(done.label, /finished, 5 hours ago, ran in 12m, started 2:32 PM,/);
-  // A turn left unfinished is not running: nothing is going to move its figure again, so
-  // the past tense is the honest one there and the two must not be one branch.
+  // Stopped unfinished turns use past-tense duration wording.
+
   const stopped = toCard(turn({ finished: false }), false, NOW);
   assert.equal(stopped.status, 'stopped');
   assert.equal(stopped.durationWord, CARD_ACTIONS.ranFor);
@@ -7122,7 +7002,7 @@ test('a file row says which file it opens, and whether the turn created it', () 
     false,
     NOW,
   );
-  // The row still draws the basename; only what it is announced by grows.
+  // Visible rows retain basenames while accessible names distinguish their directories.
   assert.deepEqual(
     card.files.map((f) => f.name),
     ['index.ts', 'index.ts'],
@@ -7134,11 +7014,8 @@ test('a file row says which file it opens, and whether the turn created it', () 
 });
 
 test('a turn waiting on the reader draws no chip for it, and its marks still say so', () => {
-  // The row used to end with a `needs you` chip, on the folded card as well as the open one,
-  // read out of the two rows a summary can close with. It was never acted on, and it put a
-  // claim taken from the agent's own prose at the end of a row of figures the panel counted
-  // itself. What the summary said it is waiting for is still carried, in the marks the head
-  // row is announced and hovered by.
+  // Closing action and question rows add marks without adding figures.
+
   const both = closingCard([
     '- 🙋 **Your actions** — reload the window and confirm.',
     '- ❓ **Open questions / follow-ups** — (1) keep the store? (2) rename the view?',
@@ -7147,25 +7024,24 @@ test('a turn waiting on the reader draws no chip for it, and its marks still say
     !both.labels.some((l) => /needs you|waiting|question/i.test(l)),
     'a chip is worded as something the reader has to answer',
   );
-  // The tone that chip was drawn in went with it, so nothing on the row is called out in a
-  // colour that means "act on this".
+  // Reader-action marks do not change figure kinds.
+
   assert.deepEqual(
     [...new Set(both.kinds)],
     ['plain'],
     'a chip on a turn that is waiting is drawn in a tone of its own again',
   );
   assert.deepEqual(both.marks, ['needsYou', 'question']);
-  // Each row on its own earns its own mark, and a row written to say it holds nothing earns
-  // neither, which is what keeps every turn recorded before the format dropped such a row
-  // from reading as one that is waiting on the reader.
+  // Each nonempty closing row adds its own mark. Explicit negations add neither mark.
+
   assert.deepEqual(closingCard(['- 🙋 **Your actions** — reload the window.']).marks, ['needsYou']);
   assert.deepEqual(closingCard(['- ❓ **Open questions** — whether to keep the store.']).marks, ['question']);
   assert.deepEqual(closingCard(['- 🙋 **Your actions** — none.']).marks, []);
 });
 
 test('a session total is worked out over the turns read, and says so', () => {
-  // 1M input tokens on opus-5 at $5/Mtok is exactly $5.00; 1M output at $25/Mtok is $25.00.
-  // Two turns of 100k input and 20k output each: 2 * (0.1 * 5 + 0.02 * 25) = $2.00.
+  // Two turns each use 100k input at $5 per million and 20k output at $25 per million, totaling $2.00.
+
   const usage = { input: 100_000, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 20_000, thinking: 0 };
   const chips = sessionStats(
     [turn({ usage, startedAt: 1_000, endedAt: 2_000 }), turn({ usage, startedAt: 3_000, endedAt: 4_000 })],
@@ -7711,10 +7587,8 @@ test('indexed lifetime cost prices aggregated Auto Review volume without changin
       state: 'done',
       stateWord: '',
       since: null,
-      // Two Auto Review spend parts are one block under one heading, as the cost popover
-      // draws them. Two blocks headed by the same words left the reader two Output lines and
-      // no way to tell which review each belonged to. The heading names the block the way
-      // every other cost block is named, with the review as the work the money bought.
+      // Auto Review spend parts combine under one cost-by-usage heading.
+
       figures: [
         {
           metric: 'cost',
@@ -8266,8 +8140,8 @@ test('an indexed primary transcript produces a whole-session turn chip', () => {
 });
 
 test('a ledger with no span and no compaction count leaves both lines out of the turn chip hover', () => {
-  // A ledger written before unit 3 recorded neither figure, which is exactly this shape:
-  // both null rather than a real number.
+  // Missing ledger span and compaction count remain null and add no detail lines.
+
   assert.equal(
     sessionTurnStats(turnStats(12))[0].detail,
     '12 turns in the main session\n\nAbout these figures\n  The turn count excludes delegated work.',
@@ -8440,7 +8314,7 @@ test('a file several turns touched is one file in the total, not several', () =>
       }),
       turn({
         files: [
-          // a.ts again: three distinct paths would be wrong, two is the answer.
+          // A repeated path contributes lines without increasing the distinct file count.
           { path: '/w/a.ts', added: 3, removed: 1, isNew: false, edits: [] },
         ],
       }),
@@ -8448,7 +8322,7 @@ test('a file several turns touched is one file in the total, not several', () =>
     [],
   );
   assert.equal(statOf(chips, '2 file')?.label, '2 files');
-  // 10 + 5 + 3 added, 2 + 0 + 1 removed. Lines are summed across every touch; files are not.
+  // Line totals sum each edit's counts. File totals count distinct paths.
   const lines = chips.find((c) => c.added !== undefined);
   assert.equal(lines?.added, 18);
   assert.equal(lines?.removed, 3);
@@ -8458,7 +8332,7 @@ test('context is the newest turn level, never a sum of the turns', () => {
   const chips = sessionStats(
     [
       turn({ contextTokens: 500_000, startedAt: 1_000, endedAt: 2_000 }),
-      // The newest, and the only one that counts. 200k of a 1M window is 20%.
+      // The newest turn supplies 200k tokens in a 1M window, or 20%.
       turn({ contextTokens: 200_000, startedAt: 9_000, endedAt: 9_500 }),
     ],
     [],
@@ -8466,7 +8340,7 @@ test('context is the newest turn level, never a sum of the turns', () => {
   const ctx = chips.find((c) => c.label.includes('ctx'));
   assert.equal(ctx?.label, '20% of 1M ctx (200k)');
   assert.match(ctx!.detail, /Context measures the current level, not cumulative token usage\./);
-  // 700k, the sum, must appear nowhere: it is the wrong answer and it is the easy mistake.
+  // Session context must not sum the turns' token levels.
   assert.ok(!chips.some((c) => c.label.includes('700k')));
 });
 
@@ -8548,9 +8422,8 @@ test('commits are counted across the turns read', () => {
 });
 
 test('a turn that spent nothing is not a hole in the total, so the figure keeps no floor mark', () => {
-  // Every unpriced turn in the local store is exactly this: model null and no tokens at all,
-  // which is a prompt that never reached a model. Counting one as a gap put a "+" on totals
-  // that were complete, and the store is the only place that showed it.
+  // A model-less turn with no usage leaves a fully priced total complete.
+
   const usage = { input: 100_000, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 20_000, thinking: 0 };
   const chips = sessionStats(
     [turn({ usage, startedAt: 1_000, endedAt: 2_000 }), turn({ model: null, startedAt: 3_000, endedAt: 4_000 })],
@@ -8569,17 +8442,16 @@ test('a crowded session heading says where a boundary could go, from the second 
       `a window ${share} full does not say where a boundary could go`,
     );
   }
-  // Not on the first band, where half a window remains and there is nothing to decide, and
-  // not on a quiet session, which is the ordinary answer: three quarters of the
-  // sessions measured end under the first band.
+  // Below the second context band, the session heading omits compaction advice.
+
   for (const share of [0.1, CONTEXT_BANDS[0].at, CONTEXT_BANDS[1].at - 0.01]) {
     assert.ok(
       !sessionCtxDetail(share).includes(COMPACT_HERE),
       `a window ${share} full is told to compact while most of it is still free`,
     );
   }
-  // And it says nothing about how many turns are left. A forecast is an estimated figure,
-  // and the panel draws none.
+  // Session context detail includes no forecast of remaining turns.
+
   assert.doesNotMatch(sessionCtxDetail(0.95).join('\n'), /turns? (left|remaining)|per turn|room for/);
 });
 
@@ -8615,8 +8487,8 @@ test('the context hover says what the newest turn paid for cached input reads', 
   assert.match(ctxDetail([turn({ contextTokens: 200_000, usage: reread })]), /Estimated from published model rates\./);
   // A fact about the turn that ran, never a rate for the ones to come.
   assert.doesNotMatch(ctxDetail([turn({ contextTokens: 200_000, usage: reread })]), /per turn|turns? (left|remaining)/);
-  // Nothing read back from the cache, and nothing to say about it. A line reading $0.00 is a
-  // different answer from no line.
+  // No cached input reads produce no cached-read cost line.
+
   assert.doesNotMatch(ctxDetail([turn({ contextTokens: 200_000 })]), /cached input reads/);
   // Nor for a model the price table cannot price at all.
   assert.doesNotMatch(
@@ -8635,10 +8507,8 @@ test('the context hover does not substitute loaded compactions for indexed evide
 });
 
 test('one file reached through both path shapes is one file, not two', () => {
-  // The two readers record a path in different shapes: transcripts write forward slashes and
-  // a lower-case drive letter, the store writes backslashes and the cwd's case. Counted with
-  // a bare lower-casing these are two files on every platform, and on the filesystems where
-  // case really does distinguish two files, a bare lower-casing folds those into one.
+  // Slash and drive-letter normalization count the two Windows path spellings as one file.
+
   const chips = sessionStats(
     [
       turn({ files: [{ path: 'C:\\Users\\dev\\work\\a.ts', added: 3, removed: 0, isNew: false, edits: [] }] }),
@@ -8650,9 +8520,8 @@ test('one file reached through both path shapes is one file, not two', () => {
 });
 
 test('a path the shell names without hunks in one turn and a later turn edits keeps a partial count', () => {
-  // Turn 1's shell names the path with no hunks. Turn 2 edits the same path with real hunks.
-  // The heading folds both records of the one path the way `attributedFiles` settles a
-  // child's merged row: a path with a count anywhere is a floor, not a blank mention.
+  // An uncounted shell mention and a later counted edit contribute one file with partial line coverage.
+
   const chips = sessionStats(
     [
       turn({
@@ -8697,8 +8566,8 @@ test('the cost hover explains missing pricing and still limits the total to the 
 });
 
 test('a session cost chip carries the number its label was worded from', () => {
-  // A heading over a run of rail cards adds several sessions together, and it cannot add
-  // `$1.87`. So the chip keeps the estimate beside the wording rather than throwing it away.
+  // The cost figure retains its numeric estimate alongside formatted wording for aggregation.
+
   const usage = { input: 100_000, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 20_000, thinking: 0 };
   const whole = sessionStats(
     [turn({ usage, startedAt: 1_000, endedAt: 2_000 }), turn({ usage, startedAt: 3_000, endedAt: 4_000 })],
@@ -8709,7 +8578,7 @@ test('a session cost chip carries the number its label was worded from', () => {
   // Every turn was priced, so the figure is the total and the label wears no mark.
   assert.equal(whole?.partial, false);
 
-  // Auto Review has a published rate, so its recorded usage makes the total exact.
+  // Auto Review's published rate prices its recorded usage without making the total partial.
   const withAutoReview = sessionStats(
     [
       turn({ usage, startedAt: 1_000, endedAt: 2_000 }),
@@ -8721,8 +8590,8 @@ test('a session cost chip carries the number its label was worded from', () => {
   assert.equal(withAutoReview?.dollars, 1.55);
   assert.equal(withAutoReview?.partial, false);
 
-  // Only the cost chip carries either. A context or a file count is not money and adds to
-  // nothing, so a caller reading `dollars` off one would be summing the wrong thing.
+  // Only cost figures carry dollars and partial fields.
+
   const others = sessionStats(
     [
       turn({
@@ -8742,8 +8611,8 @@ test('a session cost chip carries the number its label was worded from', () => {
 });
 
 test('a step is said in the panel own words, and in the tense the call is in', () => {
-  // The reader is not reading an API. A tool the table knows is said the same way whichever
-  // agent ran it, and a call still in flight is said in the present tense, because it is.
+  // Known tools use shared panel verbs and present tense while their calls run.
+
   assert.equal(said(step()), 'Read extension/src/store.ts');
   assert.equal(said(step({ status: 'running' })), 'Reading extension/src/store.ts');
   assert.equal(said(step({ name: 'Bash', detail: 'npm test' })), 'Ran npm test');
@@ -8755,13 +8624,12 @@ test('a step is said in the panel own words, and in the tense the call is in', (
   assert.equal(said(step({ name: 'Skill', detail: 'polish' })), 'Loaded the polish skill');
   assert.equal(said(step({ name: 'Skill', detail: '' })), 'Loaded a skill');
 
-  // Codex names its own tools, and a rollout writes no arguments for the exec sandbox, so
-  // that row carries the verb and nothing else. That is what the record holds.
+  // An exec step with no recorded detail carries its verb alone.
+
   assert.equal(said(step({ name: 'exec', detail: '' })), 'Ran');
   assert.equal(said(step({ name: 'apply_patch', detail: 'src/a.ts' })), 'Edited src/a.ts');
-  // A verb with nothing after it loses its colon. Measured over this workspace's own
-  // rollouts: a Codex turn is mostly exec and spawn_agent, and neither records an argument
-  // this reads, so the row that says only what was done is the common one there.
+  // A step with no detail omits the trailing colon.
+
   assert.equal(
     said(step({ name: 'spawn_agent', detail: '' })),
     'Started a subagent',
@@ -8776,23 +8644,23 @@ test('a step is said in the panel own words, and in the tense the call is in', (
   assert.equal(said(step({ name: 'SubagentHandback', detail: '' })), 'Handed back the report');
   assert.equal(said(step({ name: 'SubagentHandback', detail: '', status: 'running' })), 'Handing back the report');
 
-  // A tool the table has never heard of is drawn as the agent named it. A verb invented for
-  // it would be the panel saying something nobody recorded.
+  // Unknown tools retain their recorded names.
+
   assert.equal(said(step({ name: 'DesignSync', detail: 'the canvas' })), 'DesignSync: the canvas');
   assert.equal(said(step({ name: 'DesignSync', detail: '' })), 'DesignSync');
 });
 
 test('what the agent handed the tool is kept apart from the words about it', () => {
-  // The command, the path, the pattern and the URL are read character by character, so they
-  // are drawn in the editor's face and the words in front of them are not.
+  // Commands, paths, patterns, and URLs remain separate from their step verbs.
+
   assert.deepEqual(
     [stepLine(step({ name: 'Bash', detail: 'npm test' })), stepCode(step({ name: 'Bash', detail: 'npm test' }))],
     ['Ran', 'npm test'],
   );
   assert.equal(stepCode(step()), 'extension/src/store.ts');
   assert.equal(stepCode(step({ name: 'Grep', detail: 'livePressOver' })), 'livePressOver');
-  // A tool the table has never heard of still handed its argument to something, so the
-  // argument is a literal and the name in front of it is the words.
+  // Unknown tools also retain a separate literal argument.
+
   assert.deepEqual(
     [
       stepLine(step({ name: 'DesignSync', detail: 'the canvas' })),
@@ -8801,8 +8669,8 @@ test('what the agent handed the tool is kept apart from the words about it', () 
     ['DesignSync:', 'the canvas'],
   );
 
-  // What a person wrote stays in the prose face. A brief for a subagent and a web query are
-  // sentences, and a skill is named inside one, so none of the three is a literal to run.
+  // Skill names, child descriptions, and search queries stay in prose instead of the literal-code field.
+
   assert.equal(stepCode(step({ name: 'Skill', detail: 'polish' })), '');
   assert.equal(stepCode(step({ name: 'Task', detail: 'find the config loader' })), '');
   assert.equal(stepCode(step({ name: 'spawn_agent', detail: 'head_review' })), '');
@@ -8861,8 +8729,8 @@ test('an exact headline activity name includes each status once', () => {
 });
 
 test('a failed step says so in words, and nothing else carries a word at all', () => {
-  // The glyph in front of a failed row is the only thing on it the line does not already
-  // say, so the words say it too: colour and shape are never the only place a fact is.
+  // Failed steps carry an explicit failure word.
+
   assert.equal(stepFigure(step({ status: 'failed' })), 'failed');
   assert.equal(stepFigure(step()), '');
   assert.equal(
@@ -8895,9 +8763,8 @@ test('the rows of the log carry the clock on the one call still in flight', () =
 });
 
 test('what the reader typed mid-turn is drawn among the calls, where it happened', () => {
-  // The agent answers a mid-turn prompt inside the turn, so the log that shows the answer
-  // has to show the question. It sits where it was sent, between the calls that came before
-  // it and the ones that came after.
+  // The Activity log places a mid-turn prompt between the calls surrounding its submission.
+
   const rows = logOf(
     turn({
       steps: [step({ at: 10 }), step({ ordinal: 2, name: 'Bash', detail: 'npm test', at: 30 })],
@@ -8913,8 +8780,8 @@ test('what the reader typed mid-turn is drawn among the calls, where it happened
       ['step', 'Ran'],
     ],
   );
-  // The reader's row is not a call: it carries no literal, no clock and nothing that says
-  // an answer came back.
+  // Prompt rows carry no literal-code field, status figure, or running clock.
+
   assert.deepEqual([rows[1].code, rows[1].figure, rows[1].since], ['', '', null]);
 
   // A prompt sent after the last call still lands, at the end.
@@ -8930,8 +8797,8 @@ test('what the reader typed mid-turn is drawn among the calls, where it happened
     ['step', 'ask'],
   );
 
-  // And the calls keep the order the transcript wrote them in. Their times place a prompt;
-  // they are not what the calls themselves are sorted by.
+  // Tool calls retain transcript order independently of their timestamps.
+
   const unsorted = logOf(
     turn({
       steps: [step({ at: 90 }), step({ ordinal: 2, name: 'Bash', detail: 'npm test', at: 10 })],
@@ -8997,9 +8864,8 @@ test('activity merges narration, reasoning, prompts and tools while tool totals 
 });
 
 test('a narration reaches the log whole so its rendered block owns the bound', () => {
-  // The symptom: an ordinary narration block was cut on the card. The median recorded Codex
-  // block is 284 characters and its 90th percentile is 417, so a bound of 120 cut nearly
-  // every one of them, and a quarter of Claude's.
+  // Activity messages retain complete text so their rendered blocks own truncation.
+
   const ordinary = `Checking the parser. ${'x'.repeat(400)}`;
   const past = `Checking the parser\n${'x'.repeat(NARRATION_DETAIL_LIMIT * 2)}`;
   const [whole, cut] = logOf(
@@ -9187,17 +9053,15 @@ test('live activity before the turn is not attached to it', () => {
 });
 
 test('a prompt the panel has sent and the transcript has not caught up with is on the card', () => {
-  // Claude Code writes a queued prompt when the agent picks it up, not when the reader
-  // presses. Measured on a real transcript: the record carried the press time and was
-  // appended 76 seconds later, and for that whole minute the card showed the answer to a
-  // question it did not show. The panel knows it sent the prompt, so the card says so.
+  // A submitted mid-turn prompt appears before the transcript records its matching text.
+
   const running = turn({ startedAt: 1_000, endedAt: 9_000, finished: false });
   const sent = { text: 'follow up msg test', at: 5_000, midTurn: true };
   const ask = pendingAskOf(running, sent, true);
   assert.deepEqual(ask, { text: 'follow up msg test', at: 5_000, stepsBefore: 0 });
 
-  // Gone the moment the transcript carries the same words. The two are one prompt, and the
-  // copy that goes is the panel's own memory of it.
+  // A matching recorded prompt removes its pending copy.
+
   assert.equal(
     pendingAskOf({ ...running, laterPrompts: [{ stepsBefore: 0, text: 'follow up msg test', at: 5_100 }] }, sent, true),
     null,
@@ -9264,10 +9128,8 @@ test('a pending prompt keeps its submitted position after later recorded and liv
 });
 
 test('a slash command sent mid-turn stops being pending once the transcript carries it', () => {
-  // The composer holds the line the reader typed. The transcript records the same prompt as
-  // two tags on separate lines, and the panel drops its own copy only when the two clean to
-  // one string. Joined by a newline instead of a space they compare unequal, and the card
-  // draws the reader's prompt twice until the turn stops.
+  // Slash-command tags normalize to the submitted line so the card removes its pending copy.
+
   const running = turn({ startedAt: 1_000, endedAt: 9_000, finished: false });
   const sent = { text: '/write-ppm-docs review the plugin pages', at: 5_000, midTurn: true };
   const recorded = cleanPrompt(
@@ -9303,8 +9165,8 @@ test('the card says which of the prompts on it the transcript has and which it h
       ['the one just sent', CARD_ACTIONS.askedJustSent],
     ],
   );
-  // And the log carries it too, after every call the turn has recorded, which is when it
-  // happened.
+  // This pending prompt follows all recorded calls in the Activity log.
+
   assert.deepEqual(
     card.activity.map((r) => [r.kind, r.line]),
     [
@@ -9323,8 +9185,8 @@ test('the card says which of the prompts on it the transcript has and which it h
 });
 
 test('the log control counts what is under it, which is not only the calls', () => {
-  // A turn asked something while it was writing prose has run no tool, and a control saying
-  // "0 steps" over a row that is plainly there contradicts its own contents.
+  // Activity counts include prompts even when the turn made no tool calls.
+
   const asked = toCard(
     turn({
       steps: [],
@@ -9338,8 +9200,8 @@ test('the log control counts what is under it, which is not only the calls', () 
   assert.equal(asked.activityName, 'Activity, 1 prompt');
   assert.ok(!asked.activityName.includes('0 steps'), 'the control counts calls that were never made');
 
-  // Both, when the turn did both. The calls lead, because they are what the section is
-  // mostly made of.
+  // Activity names list tool counts before prompt counts.
+
   const both = toCard(
     turn({
       steps: [step()],
@@ -9355,8 +9217,8 @@ test('the log control counts what is under it, which is not only the calls', () 
   );
   assert.equal(both.activityName, 'Activity, 3 steps, 3 read, 2 prompts');
 
-  // And a turn nobody typed into says exactly what it said before there was anything else
-  // to count.
+  // Without later prompts, Activity names contain tool counts alone.
+
   assert.equal(
     toCard(turn({ steps: [step()], stepCount: 1, toolCounts: counts({ reads: 1 }) }), false, NOW).activityName,
     'Activity, 1 step, 1 read',
@@ -9364,8 +9226,8 @@ test('the log control counts what is under it, which is not only the calls', () 
 });
 
 test('a card says how many steps it is not showing', () => {
-  // A count on the heading that does not match the rows under it is the panel quietly
-  // under-reporting, which is the one thing a record of what happened may not do.
+  // Activity rows report earlier omitted steps separately from visible steps.
+
   assert.equal(logOf(turn({ steps: [step()], stepCount: 1 })).rows[0].earlierLine, undefined);
   assert.equal(logOf(turn({ steps: [step({ ordinal: 2 })], stepCount: 2 })).rows[0].earlierLine, 'and 1 earlier step');
   assert.equal(
@@ -9435,14 +9297,13 @@ test('the capped log retains messages, original run counts, failures and tool mi
 });
 
 test('the folded card names what the agent is on, and only while it is on something', () => {
-  // The newest step, and only while it is still running. A finished step drawn on a card
-  // that is still running says the agent is on something the panel cannot see, which is the
-  // silence the line is there to fill.
+  // The folded doing line names only a newest step that is still running.
+
   assert.equal(doingOf(turn({ steps: [step({ status: 'running' })], stepCount: 1 }))?.name, 'Read');
   assert.equal(doingOf(turn({ steps: [step()], stepCount: 1 })), null);
   assert.equal(doingOf(turn({ steps: [], stepCount: 0 })), null);
-  // The newest, never an older one that is still open. Two calls sent together both run, and
-  // the last is the one the line names.
+  // When two steps run together, the doing line names the newest one.
+
   const both = turn({
     steps: [step({ status: 'running' }), step({ name: 'Bash', detail: 'npm test', status: 'running' })],
     stepCount: 2,
@@ -9472,7 +9333,7 @@ test('the card carries the log, its heading and what the agent is doing', () => 
   assert.equal(running.doingCode, 'npm test', 'the folded line drew the command as prose');
   assert.equal(running.doingSince, running.activity[0].steps![0].since);
 
-  // A finished turn shuts it, because the answer is what the reader came for by then.
+  // Finished turns carry no current doing line or running clock.
   const done = toCard(turn({ steps: [step()], stepCount: 1 }), false);
   assert.equal('activityOpen' in done, false);
   assert.equal(done.doing, '', 'a finished card still says the agent is doing something');
@@ -9547,9 +9408,8 @@ test('a folded running card uses the latest commentary when no tool is running',
   assert.equal(withTool.doingCode, 'npm test');
 });
 
-// The floor price of the next turn rests on two facts about one request: when it happened and
-// which cache lifetime it bought. A turn is not that request. It sums every request it made and
-// it ends on whichever record came last, so both of those answers are wider than the question.
+// Next-turn cost basis uses the context-setting request's timestamp and cache lifetime, independently of aggregate turn usage and later activity.
+
 const CONTEXT_REQUEST = {
   at: 9_000,
   lifetime: '1h' as const,
@@ -9560,8 +9420,8 @@ const CONTEXT_REQUEST = {
 };
 
 test('the floor is dated by the request that set the level, not by the end of the turn', () => {
-  // A tool result, an interruption and a background notification all move a turn's end. None
-  // of them is a model request, and none of them refreshes a cache.
+  // Tool results, interruptions, and notifications do not refresh the model request's cache timestamp.
+
   const held = turn({
     contextTokens: 620_000,
     contextWindow: 1_000_000,
@@ -9577,8 +9437,8 @@ test('the floor is dated by the request that set the level, not by the end of th
 });
 
 test('the lifetime comes from that request, not from what the whole turn wrote', () => {
-  // The turn wrote far more at one hour early on and finished on a five-minute write. The sum
-  // says one hour, the request says five minutes, and only the request is about this cache.
+  // The latest request's five-minute lifetime outranks earlier one-hour writes in aggregate usage.
+
   const held = turn({
     contextTokens: 620_000,
     contextWindow: 1_000_000,
@@ -9692,21 +9552,19 @@ test('a newer compaction claims no cache for the history it just wrote', () => {
   assert.equal(basis?.tokens, 14_172);
   assert.equal(basis?.outputTokens, 0);
   assert.equal(basis?.model, 'claude-sonnet-5');
-  // The compaction is itself a request, so it is what any lifetime would be measured against.
+  // The compaction timestamp becomes the latest request time.
   assert.equal(basis?.lastRequestAt, 30_000);
-  // It records no cache write and no cache read for the history it wrote, so the lifetime the
-  // turn before it bought says nothing about the context that is there now. Carrying that
-  // lifetime over would call a replacement nobody has cached warm.
+  // Compacted context carries neither the preceding request's cache lifetime nor its cache-read evidence.
+
   assert.equal(basis?.tier, null);
   assert.equal(basis?.readBack, false);
-  // Nothing has cached the replacement, which is a fact about the record rather than a gap in
-  // it. The composer needs to tell the two apart, so the basis says which one this is.
+  // afterCompaction distinguishes replacement context from missing cache evidence.
+
   assert.equal(basis?.afterCompaction, true);
 });
 
-// The same request-versus-turn scope error the lifetime and the clock already answer. A turn
-// ends on whichever record came last, and a tool result or a synthetic response is one, so a
-// compaction can be newer than every request the turn made and older than the turn itself.
+// A compaction can follow the last model request while preceding later turn activity.
+
 test('a compaction newer than the last request drops the cache, whenever the turn ended', () => {
   const held = turn({
     contextTokens: 620_000,
@@ -9783,8 +9641,8 @@ test('the card draws one row for each skill, in the order the turn first loaded 
 });
 
 test('the strongest evidence and the first recorded file win for one skill', () => {
-  // A skill read from a Codex command and also loaded by a native call is one row, and the
-  // recorded load is what the row says: a file read is an inference and a named load is proof.
+  // Recorded skill loads outrank inferred file reads for the same skill.
+
   const card = toCard(
     turn({
       skillUses: [
@@ -9942,9 +9800,8 @@ test('a compaction estimate raises no cache-write warning and leaves the cached 
   assert.ok(alone.cacheHit, 'the recorded usage carries a cached share');
 });
 
-// A dispatched session whose cost has not joined has no usage in the parts yet. Every popover
-// layout draws the delegated line that holds that work with the lower-bound mark, even with no
-// delegated usage at all, and the lines drawn per scope or per model carry none.
+// Unjoined dispatched cost marks the delegated remainder across detail layouts. Independently priced scopes and model entries keep their own totals.
+
 test('each cost popover layout marks the delegated line that holds work not joined yet', () => {
   const usage = {
     requests: 5,
@@ -9981,7 +9838,7 @@ test('each cost popover layout marks the delegated line that holds work not join
   const unscoped = drawn([warm, scoped, other]).lines['Other delegated work'];
   assert.match(String(unscoped), /^[$][0-9.]+[+]$/, 'the warning layout left the Other delegated work line unmarked');
 
-  // Delegated usage with no price still leaves the line a lower bound of what is priced.
+  // An unpriced delegated remainder reports cost unavailable.
   const unpriced = { ...other, model: 'unknown' };
   assert.equal(
     drawn([main, unpriced]).lines['Delegated work'],
@@ -10221,8 +10078,8 @@ test('a print row of a dispatched session keeps its amount and is not counted tw
     assert.equal(entries.filter((entry) => entry.value === '$0.50').length, rows.length, 'a print row lost its amount');
     assert.equal(entries.at(-1)?.value, `$${(2 - printed).toFixed(2)}`);
     assert.equal(entries.at(-1)?.lines, undefined, 'a reduced share drew the whole session lines');
-    // A contribution that cannot be shown to hold the printed requests drops its own transcript,
-    // keeps every other group, and counts the rows.
+    // Without settled own usage, printed child requests remain counted separately. Other dispatched contributions remain included.
+
     for (const [unsettled, rest] of [
       [dispatchedCost({ short: true, parts: [] }), 0],
       [dispatchedCost({ parts: [dispatchedPart(2_000_000)], ownSettledAt: t.startedAt }), 2],

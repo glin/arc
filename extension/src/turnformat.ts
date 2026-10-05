@@ -1,11 +1,5 @@
-// extension/src/turnformat.ts
-//
-// How a duration, a moment, a token count, a size and a model name are spelled on screen.
-//
-// Split out of turnview.ts, which was 3,965 lines of pure functions with no shared state and
-// no seam anyone could find. Nothing here was edited on the way: every declaration is the one
-// that was there, in the order it was in. turnview.ts re-exports this module, so an import
-// written against it still resolves.
+// Formats durations, local times, token counts, byte counts, and model names.
+// `turnview.ts` re-exports these helpers for existing callers.
 
 export {
   formatCompactRelative,
@@ -35,7 +29,7 @@ export function formatDay(at: number, now: number = Date.now()): string | null {
   return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
 }
 
-// Model ids are long and share a prefix; the part that tells them apart is the tail.
+// Removes the Claude model prefix and trailing snapshot date.
 export function shortModel(model: string | null): string | null {
   if (!model) {
     return null;
@@ -43,12 +37,8 @@ export function shortModel(model: string | null): string | null {
   return model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
 }
 
-// A byte count as the reader thinks of it. Whole megabytes at the default, and one decimal
-// for a reader who set a tail of their own, because rounding 0.5 MB to 0 is a lie.
-//
-// The tail is a setting, so the size it names has no ceiling the panel controls. Past 1024
-// megabytes the megabyte is the wrong unit. The gigabyte is tested against the rounded
-// figure, so 1023.6 MB reads `1 GB` and never `1024 MB`.
+// Formats binary megabytes with one decimal below 10 MB and whole numbers above it.
+// Rounded values at or above 1024 MB use gigabytes, so 1023.6 MB displays as `1 GB`.
 export function formatMegabytes(bytes: number): string {
   const mb = bytes / (1024 * 1024);
   if (mb >= 10) {
@@ -59,8 +49,7 @@ export function formatMegabytes(bytes: number): string {
     return `${whole} MB`;
   }
   const tenths = Math.round(mb * 10) / 10;
-  // A tail under a tenth of a megabyte is the same lie one step smaller, so a count of real
-  // bytes keeps enough of a decimal to read as the size it is.
+  // Keep a positive byte count visible when rounding to tenths would produce zero.
   if (tenths === 0 && bytes > 0) {
     return `${Number(mb.toPrecision(1))} MB`;
   }

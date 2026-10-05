@@ -1,4 +1,3 @@
-// extension/src/transcript.test.ts
 import { test, vi } from 'vitest';
 import {
   scanClaudeRelationshipQuantum,
@@ -6,7 +5,7 @@ import {
   type ClaudeRelationshipCursor,
 } from './transcript';
 
-// These guards catch ownership lost across record boundaries and detectable source edits.
+// Relationship scans retain child ownership across record boundaries, restarts, and detectable source changes.
 test('Claude relationship quanta retain launches receipts and oversized records across restart', async () => {
   const records = [
     assistantTool('Agent', 1, 'far-launch', { description: 'nested' }),
@@ -254,9 +253,8 @@ import type { ClaudeHistoryCursor } from './claudehistory.ts';
 import { readClaudeHistoryPage, readClaudeHistoryPageAsync, readClaudeSessionIncremental } from './claudehistory.ts';
 import { readForwardSession, readSemanticHistoryPage, readSemanticHistoryPageAsync } from './history.ts';
 
-// Half of a character: a high surrogate with no low surrogate after it. This is what a cut
-// through the middle of an emoji leaves behind, and what a tab or a heading then draws as an
-// empty box.
+// A high surrogate without a following low surrogate indicates a character split during truncation.
+
 const HALF_A_CHARACTER = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
 
 let seq = 0;
@@ -297,8 +295,8 @@ function assistantText(text: string, second: number, usage?: Record<string, numb
     },
   };
 }
-// The real store writes a stop_reason on every text line; a closing answer is a text
-// whose response stopped for anything but a tool call.
+// A closing answer carries a stop_reason other than tool_use.
+
 function assistantAnswer(text: string, second: number, stop = 'end_turn') {
   return assistantText(text, second, undefined, undefined, stop);
 }
@@ -322,10 +320,8 @@ function editResult(filePath: string, second: number, added: number, removed: nu
     },
   };
 }
-// A child transcript's bare acknowledgement of a tool call, carrying neither output nor a
-// patch, which is the only kind of result most Claude child records ever hold. A call this
-// reader already read as a `pendingFileEdit` from its own input needs nothing more than this
-// to be recorded.
+// This child tool result acknowledges a call without output or patch data.
+
 function toolResult(id: string, second: number) {
   return {
     type: 'user',
@@ -341,9 +337,8 @@ function commitResult(stdout: string, second: number, id = 't1') {
     toolUseResult: { gitOperation: 'commit', stdout, stderr: '' },
   };
 }
-// A Bash result carrying the CLI's own record of the files a shell command changed, shaped
-// as the vendor audit found it: hunks for up to five files, and every changed path in
-// `changedFiles` whether or not it made the `files` list.
+// Bash file changes include hunks for up to five files and all paths in changedFiles.
+
 function bashEditResult(second: number, diff: Record<string, unknown>, id = 'b1') {
   return {
     type: 'user',
@@ -365,8 +360,8 @@ test('Claude process end timing accepts only a safe terminal record', () => {
   assert.equal(claudeProcessEndedAt(costState(Number.MAX_SAFE_INTEGER, 1)), null);
 });
 
-// The line Claude Code writes when something is handed to a turn that is already running.
-// Three different things share it, and only one of them is the reader.
+// Queued attachments carry prompts or notifications into a running turn.
+
 function queued(attachment: Record<string, unknown>, second: number) {
   return {
     type: 'attachment',
@@ -1224,8 +1219,8 @@ test('a prompt submitted into an idle Claude session keeps the newest card acros
     records.push(assistantAnswer(`answer ${index} ${'x'.repeat(600)}`, index * 2 + 1));
   }
   const file = writeTranscript(records);
-  // Smaller than the transcript, so the resumed read has a tail floor above byte zero. That
-  // floor is what discards a turn whose range came back as zero.
+  // The byte window begins after byte zero, so resumed turns need their original source ranges.
+
   const options = { tailBytes: 4096 };
   const initial = readClaudeSessionIncremental(file, 'sess', undefined, options);
   assert.equal(initial.read?.turns[initial.read.turns.length - 1].finished, true);
@@ -2296,7 +2291,7 @@ test('a compaction is reported with the context size it replaced', () => {
   assert.equal(c.summary, 'the summary that carried over');
   assert.equal(c.sessionId, 'sess');
   assert.equal(c.model, 'claude-opus-5', 'priced at the model that was running');
-  // the recorded figures win over the running context count
+  // Recorded compaction figures override the running context count.
   assert.deepEqual(
     [c.trigger, c.contextBefore, c.contextAfter, c.durationMs, c.droppedTokens],
     ['manual', 629_292, 14_172, 147_691, 615_120],
@@ -2393,9 +2388,8 @@ test('a human prompt is a typed prompt whose origin, where recorded, is not the 
     message: { role: 'user', content: 'done' },
   });
   assert.equal(holdsHumanPrompt(human), true);
-  // Fail open, the way the Codex internal-thread rule does: a prompt from before the
-  // origin field existed, and one whose kind this code has never seen, both count as
-  // human, or old transcripts and future formats silently hide a user's sessions.
+  // Missing and unknown origin kinds count as human prompts, preserving sessions across format changes.
+
   assert.equal(holdsHumanPrompt(bare), true, 'a transcript from before the origin field reads as machine work');
   assert.equal(holdsHumanPrompt(unknownKind), true, 'an unknown origin kind hides a session');
   assert.equal(holdsHumanPrompt(peerMeta), false, 'the wake message itself reads as a human prompt');
@@ -2420,8 +2414,8 @@ test('a session opened with a slash command is one somebody had', () => {
     true,
     'a session whose only prompt is a slash command is off the rail entirely',
   );
-  // The harness's own commands act on the session instead of asking for work, so a file
-  // holding nothing but those is still not a session anybody had.
+  // Model, compaction, and effort commands alone do not establish a reader-started session.
+
   assert.equal(
     holdsHumanPrompt(JSON.stringify(userPrompt(setting, 0, { origin: { kind: 'human' } }))),
     false,
@@ -2437,8 +2431,8 @@ test('a session opened with a slash command is one somebody had', () => {
     false,
     'an effort change reads as a session',
   );
-  // A name this code has never seen counts as work, the direction every other doubt in
-  // this file takes: reading one oddly costs a line, and hiding one costs a whole session.
+  // Unknown commands count as work so new command names remain discoverable.
+
   assert.equal(
     holdsHumanPrompt(JSON.stringify(userPrompt(later, 0, { origin: { kind: 'human' } }))),
     true,
@@ -2455,10 +2449,10 @@ test('the human-prompt scan reads each byte once, and a wake file joins when a h
   const first = scanForHumanPrompt(file, size1);
   assert.equal(first.found, false, 'a wake-only file reads as human work');
   assert.equal(first.bytes, size1, 'the scan did not consume the complete lines it read');
-  // A quiet file costs nothing: the size says there is nothing new without opening it.
+  // An unchanged file needs no additional read.
   assert.deepEqual(scanForHumanPrompt(file, size1, first), { bytes: size1, found: false });
-  // A human prompts the session: the prompt lands in the unread bytes and the scan finds
-  // it there.
+  // The next scan finds a human prompt appended after its saved offset.
+
   fs.appendFileSync(
     file,
     JSON.stringify(userPrompt('picking this up myself', 2, { origin: { kind: 'human' } })) + '\n',
@@ -2466,10 +2460,10 @@ test('the human-prompt scan reads each byte once, and a wake file joins when a h
   const size2 = fs.statSync(file).size;
   const second = scanForHumanPrompt(file, size2, first);
   assert.equal(second.found, true, 'a human prompt in the new bytes goes unseen, so the session never joins the list');
-  // Found is sticky: a prompt does not unhappen.
+  // A successful scan retains found across later appends.
   assert.deepEqual(scanForHumanPrompt(file, size2, second), second);
-  // Only the new bytes are read: a cursor already past the prompt cannot see it, which
-  // is what makes the scan affordable on every poll.
+  // A scan reads only bytes after its saved offset.
+
   fs.appendFileSync(file, JSON.stringify(assistantAnswer('More machine work.', 3)) + '\n');
   const size3 = fs.statSync(file).size;
   assert.equal(
@@ -2477,7 +2471,7 @@ test('the human-prompt scan reads each byte once, and a wake file joins when a h
     false,
     'the scan re-read bytes an earlier scan already answered for',
   );
-  // A file that shrank was rewritten, so the cursor resets and the scan starts over.
+  // A smaller file resets the cursor to byte zero.
   fs.writeFileSync(file, JSON.stringify(userPrompt('rewritten from scratch', 0)) + '\n');
   const size4 = fs.statSync(file).size;
   assert.equal(
@@ -2488,17 +2482,16 @@ test('the human-prompt scan reads each byte once, and a wake file joins when a h
 });
 
 test('the scan survives a line longer than its chunk, and waits for an unterminated one', () => {
-  // A peer line longer than the 256 KB chunk: the human prompt after it is only found if
-  // the carry across chunk boundaries works, at the byte level, so a multi-byte
-  // character split by the boundary cannot corrupt the line.
+  // A peer record exceeds one chunk and contains a multibyte character before the human prompt.
+
   const file = writeTranscript([
     { ...userPrompt('\u00e9' + 'x'.repeat(300 * 1024), 0), isMeta: true, origin: { kind: 'peer' } },
     userPrompt('a human at last', 1, { origin: { kind: 'human' } }),
   ]);
   const size = fs.statSync(file).size;
   assert.equal(scanForHumanPrompt(file, size).found, true, 'a line longer than one chunk ends the scan early');
-  // An unterminated final line is not scanned until its newline arrives: a prompt still
-  // being written is not yet a line, and the cursor stays before it.
+  // The cursor stays before an unfinished final line until its newline arrives.
+
   const partial = writeTranscript([{ ...userPrompt('a wake', 0), isMeta: true, origin: { kind: 'peer' } }]);
   const whole = fs.statSync(partial).size;
   fs.appendFileSync(partial, JSON.stringify(userPrompt('typed but not yet flushed', 1)));
@@ -2551,10 +2544,8 @@ test('session titles are normalized as plain text and discard rich content', () 
   assert.equal(normalizeSessionTitle(`  **Keep**\n${rich}\nthis   title  `), 'Keep this title');
   assert.equal(normalizeSessionTitle(rich), null);
 
-  // The complete name carries no length limit of its own. The rename editor and the
-  // Details dialog read it, and either would silently drop the end of a long session name
-  // if a cap crept back in here: a bound belongs where the rail assembles its own name,
-  // not in this shared source.
+  // Full session titles retain their complete text. Session list labels apply their own length limit.
+
   const huge = 'x'.repeat(10_000);
   assert.equal(normalizeFullSessionTitle(huge), huge);
 
@@ -2609,7 +2600,7 @@ test('a turn runs from one typed prompt to the next, absorbing task notification
       message: { role: 'user', content: '<task-notification><status>completed</status></task-notification>' },
     },
     assistantText('First turn is done.', 3, { output_tokens: 100, input_tokens: 5, cache_read_input_tokens: 1000 }),
-    // none of these start a turn
+    // These metadata records do not start turns.
     { ...userPrompt('injected', 4), isMeta: true },
     { ...userPrompt('compacted', 5), isCompactSummary: true },
     { ...userPrompt('subagent chatter', 6), isSidechain: true },
@@ -2624,14 +2615,14 @@ test('a turn runs from one typed prompt to the next, absorbing task notification
   assert.equal(turns[0].contextTokens, 1005);
   assert.equal(turns[0].toolUses, 1);
   assert.equal(turns[1].prompt, 'second ask');
-  // the turn ends at its last assistant activity, not at the next prompt
+  // The turn ends at its last assistant activity.
   assert.equal(turns[0].endedAt - turns[0].startedAt, 3000);
 });
 
 test('a turn woken mid-life keeps every answer it closed, in order and with its time', () => {
   const file = writeTranscript([
     userPrompt('take the batch', 0),
-    // Mid-work narration rides a response that went on to call a tool: not an answer.
+    // Text ending with tool_use remains narration.
     assistantText('Let me check the plan first.', 1, undefined, undefined, 'tool_use'),
     assistantTool('Bash', 2),
     assistantAnswer('First answer: holding edits until the peer replies.', 3),
@@ -2665,8 +2656,8 @@ test('a turn woken mid-life keeps every answer it closed, in order and with its 
   assert.equal(t.summary, 'Third answer: the batch landed.', 'the summary stays the last answer');
 });
 
-// The reported turn's shape. A subagent hands its report back, the agent writes the turn's
-// report, the same subagent's completion notice wakes the agent again, and it writes a note.
+// A peer handback identifies its sender and marks the user record as metadata.
+
 const HANDBACK_FROM = 'a054545111561daad';
 const REPORT = [
   'Phase 3 of the turn-card density plan (steps 22 to 30) is on main.',
@@ -2753,9 +2744,8 @@ function metaUser(text: string, second: number, origin?: Record<string, unknown>
   return { ...userPrompt(text, second), isMeta: true, ...(origin ? { origin } : {}) };
 }
 
-// A subagent in auto mode delivers its report as the message of a `SubagentHandback` call and
-// then writes a receipt. A subagent session is read as a child transcript, and the rule holds
-// for an ordinary read too.
+// Handback text supplies the response in ordinary and child reads. Its following receipt stays in Activity.
+
 for (const childTranscript of [true, false]) {
   test(`a subagent's hand-back message is its turn response and the receipt after it stays in Activity (${childTranscript ? 'child' : 'ordinary'} read)`, () => {
     const receipt = 'Report delivered.';
@@ -2792,9 +2782,8 @@ for (const childTranscript of [true, false]) {
   });
 }
 
-// A prompt, a peer message or a coordinator message asks the subagent for more, so its reply
-// to that wake is the response. A completion notice for its own background work and the
-// harness nudge after an empty reply ask nothing new, so the reply after them stays a receipt.
+// New prompts and peer or coordinator messages reopen the response. Completion notices and empty-reply reminders leave it closed.
+
 for (const [wake, record, answered] of [
   ['a new prompt', userPrompt('Now list the writers of that cache.', 8), true],
   ['a peer message', metaUser('Also list the writers of that cache.', 8, { kind: 'peer', from: 'lead' }), true],
@@ -2849,9 +2838,8 @@ test('a second hand-back in one turn makes the later report the response', () =>
   assert.equal(search.split(later).length, 2, 'the search text holds the later report once');
 });
 
-// Some subagents write the report as a closing reply, get a reminder that it was not
-// delivered, and send it again through the call. One text can hold the other, with a line
-// added or dropped, and whitespace around either one does not count.
+// A closing reply and its following handback share one report when either text contains the other after whitespace normalization.
+
 const PREAMBLE = 'Here is the report.';
 for (const [shape, reply, report, kept] of [
   ['the same text', REPORT, `${REPORT}\n`, `${REPORT}\n`],
@@ -2979,8 +2967,8 @@ for (const message of ['', '   ', 42, undefined]) {
   });
 }
 
-// Claude Code writes the thinking and the text of one closing message as separate lines that
-// share the message id, and both lines carry the stop.
+// Thinking and text records share a closing message id and stop_reason.
+
 function thoughtThenSaid(text: string, second: number) {
   const said = assistantAnswer(text, second) as { message: { id: string } };
   const thought = {
@@ -3081,9 +3069,8 @@ function toolDone(id: string, second: number) {
   };
 }
 
-// The order Claude Code writes when a handback wakes the agent and the agent works on it: the
-// completion notice lands among the tool calls, before the reply to the handback. Both shapes of
-// the notice arrive this way.
+// Completion notices can arrive between the handback and its reply, including while tools run.
+
 function workedHandback(
   from: string,
   notice: (taskId: string, second: number) => object,
@@ -3142,7 +3129,7 @@ for (const [shape, notice] of [
 }
 
 test('work or a closed reply after a repeat notice ends the repeat', () => {
-  // A plain notice for a background command, with no handback, wakes a real summary.
+  // A background-command completion without a handback permits a new response.
   const [plain] = readTurns(
     writeTranscript([
       userPrompt('run the suite in the background', 0),
@@ -3165,7 +3152,7 @@ test('work or a closed reply after a repeat notice ends the repeat', () => {
     'sess',
   );
   assert.equal(worked.summary, 'A new commit landed after the notice.');
-  // A wake with no record of its own, such as a loop tick, follows the note.
+  // A later reply without a recorded wake can become the response.
   const [ticked] = readTurns(
     writeTranscript([
       ...reportedTurnLines(completionNotice(HANDBACK_FROM, 5)),
@@ -3180,24 +3167,23 @@ test('work or a closed reply after a repeat notice ends the repeat', () => {
   );
 });
 
-// The live case in session `50fda840-5a87-4cb3-940c-e75eff827929`: a handback's completion
-// notice repeats after the reader typed the next prompt, because Claude Code can wait a full
-// turn before sending the second notice.
+// A handback's repeated completion notice can arrive in a later turn.
+
 test('a handback from an earlier turn still makes a later completion notice a repeat', () => {
   const taskId = 'aa60c1c303d5a7c96';
   const longReply = 'I recorded the decision and moved the ledger note into docs/design-goals.md.';
   const shortReply = "The title-trigger subagent's background work has now finished too.";
   const lines = [
-    // Turn A: a prompt, an Agent launch, a handback from task X, a reply, a queued notice for
-    // X, and a reply.
+    // The first turn receives a handback, then its queued completion notice.
+
     userPrompt('ship the title-trigger change', 0),
     assistantTool('Agent', 1, 'tu-title-agent', { description: 'title trigger', subagent_type: 'general-purpose' }),
     peerHandback(taskId, 2),
     assistantAnswer('The title-trigger subagent handed back its patch.', 3),
     queued({ commandMode: 'task-notification', prompt: completionNoticeText(taskId) }, 4),
     assistantAnswer('Noted, nothing else changed.', 5),
-    // Turn B: a typed prompt, a long reply, a user-record task-notification for X, and a
-    // short reply.
+    // The second turn receives the same task's completion notice after its own reply.
+
     userPrompt('lets not set it ffor now, record the decision instead', 6),
     assistantAnswer(longReply, 7),
     completionNotice(taskId, 8),
@@ -3219,21 +3205,19 @@ test('a handback from an earlier turn still makes a later completion notice a re
   assert.deepEqual(activityReplies, [shortReply], 'the repeat note sits in Activity marked repeat-notice');
 });
 
-// A notice arriving mid-work, after the turn's own unrelated reply already closed and the
-// agent then did more work, answers that work rather than the notice. `readTurns` must not
-// mark the reply that follows it, or it buries the turn's real final answer the same way a
-// notice delivered while the agent waits does when nothing separates it from the reply.
+// Work after a closed reply permits a new response even when a repeated completion notice arrives before it.
+
 test('a completion notice queued while the agent works after an unrelated reply leaves the following reply as the response', () => {
   const taskId = 'ux1';
   const finalAnswer = 'The migration finished and every row now carries the new column.';
   const lines = [
-    // Turn A: a handback from X and a reply that closes it.
+    // The first turn receives a handback and closes its reply.
     userPrompt('ship the migration', 0),
     assistantTool('Agent', 1, 'tu-migration-agent', { description: 'migration', subagent_type: 'general-purpose' }),
     peerHandback(taskId, 2),
     assistantAnswer('The migration subagent handed back.', 3),
-    // Turn B: a typed prompt, an interim reply, a tool call and result, a queued notice for
-    // X, then the real final answer.
+    // The second turn runs a tool before the repeated notice and final answer.
+
     userPrompt('run it now', 4),
     assistantAnswer('Starting the migration run.', 5),
     assistantTool('Bash', 6, 'tu-migrate'),
@@ -3289,9 +3273,8 @@ test('a turn opened by a repeat notice for an earlier handback keeps that reply 
   assert.deepEqual(activityReplies, [], 'the reply reads once, as the response, never again in Activity');
 });
 
-// Two subagents each handed back in an earlier turn. A later turn's own two replies each
-// answer one subagent's repeat notice, and only the first of them has no earlier response
-// reply to protect, so it becomes the response and the second sits in Activity.
+// Without an earlier response, the first reply remains the response. A second repeat-notice reply stays in Activity.
+
 test('a later turn with two repeat notices keeps its first reply as the response', () => {
   const [x, y] = ['x7', 'y8'];
   const firstReply = 'Filed the follow-up for the title-trigger regression.';
@@ -3346,7 +3329,7 @@ test('a handback id survives a parser state restore split between the turn it cl
   for (const record of records) {
     all.pushLine(JSON.stringify(record));
   }
-  // Split mid-way through turn A, well before the typed prompt that opens turn B.
+  // Save the checkpoint after the first turn's reply and before the second prompt.
   const first = createClaudeSessionReducer('sess');
   for (const record of records.slice(0, 3)) {
     first.pushLine(JSON.stringify(record));
@@ -3421,9 +3404,8 @@ test('"No response requested." in a second text block of the report line does no
 });
 
 test('what counts as a closed answer follows the stop the line carries', () => {
-  // Still running: the newest text has closed nothing yet, so it is the summary and not
-  // an answer. The reader of the last answer and the reader of the live text differ
-  // exactly here, and both have to be right.
+  // Text ending with tool_use stays in updates and leaves the earlier closed answer as the summary.
+
   const running = writeTranscript([
     userPrompt('go', 0),
     assistantAnswer('Answered once.', 1),
@@ -3440,15 +3422,15 @@ test('what counts as a closed answer follows the stop the line carries', () => {
     live.updates.map((update) => update.text),
     ['Still working on the follow-up.'],
   );
-  // stop_sequence closed a response on older lines, and it closes an answer here too,
-  // the same reading `finished` already takes.
+  // stop_sequence closes an answer and marks the turn finished.
+
   const stopped = writeTranscript([userPrompt('go', 0), assistantAnswer('Cut short but closed.', 1, 'stop_sequence')]);
   assert.deepEqual(
     readTurns(stopped, 'sess')[0].answers.map((a) => a.text),
     ['Cut short but closed.'],
   );
-  // Two text blocks on one closing line are one answer, the last text winning the way
-  // it wins the summary.
+  // The last text block on a closing message supplies its answer and summary.
+
   const doubled = writeTranscript([
     userPrompt('go', 0),
     {
@@ -3472,7 +3454,7 @@ test('what counts as a closed answer follows the stop the line carries', () => {
     ['half two'],
   );
   assert.equal(two.summary, 'half two');
-  // A single-answer turn: the ordinary case, one answer and it is the summary.
+  // A turn with one closed answer uses that answer as its summary.
   const plain = writeTranscript([userPrompt('go', 0), assistantAnswer('Done.', 1)]);
   assert.deepEqual(
     readTurns(plain, 'sess')[0].answers.map((a) => a.text),
@@ -3675,7 +3657,7 @@ test('a turn keeps the patch text each edit recorded, beside the line counts', (
   ]);
   const [turn] = readTurns(file, 'sess');
   const [edited, created] = turn.files;
-  // The counts the card already showed are unchanged by keeping the patch.
+  // Line counts and creation flags remain available beside retained patch text.
   assert.deepEqual([edited.added, edited.removed, edited.isNew], [1, 1, false]);
   assert.deepEqual([created.added, created.removed, created.isNew], [2, 0, true]);
   assert.equal(edited.edits.length, 1);
@@ -3833,9 +3815,8 @@ test('zero-length structured patch sides and complete Write content remain usabl
   });
 });
 
-// One session writes the same file under either drive letter case, because each command
-// takes the case of its own working directory. Keyed on the raw string, each spelling drew a
-// second row for the file, which is what a create followed by an edit showed on the card.
+// Drive-letter case and separator differences identify the same file within a session.
+
 test('a file written under two drive letter spellings keeps one row', () => {
   const file = writeTranscript([
     userPrompt('create the files, then edit them', 0),
@@ -3926,9 +3907,8 @@ test('a shell edit reads its file rows the way an edit tool result does', () => 
       ['unlisted.ts', 0, 0, false, true, 'shell'],
     ],
   );
-  // The counts above pass whether or not the hunks themselves were kept, so the recorded
-  // edits are checked directly: deleting the push that carries them would leave this row
-  // green on the counts alone while every shell diff lost its content.
+  // Shell file rows retain hunks for per-turn diffs, including created files.
+
   assert.deepEqual(turn.files[0].edits, [
     {
       hunks: [
@@ -3950,10 +3930,8 @@ test('a shell edit reads its file rows the way an edit tool result does', () => 
   assert.deepEqual(turn.files[2].edits, []);
 });
 
-// Decision 2's row survives no matter which of a turn's records reaches its file first. A
-// counted edit or a shell diff's own `files` entry sets the real numbers; a later mention of
-// the same path in another record's `changedFiles`, with no hunks, never resets the row back
-// to unknown.
+// A later shell mention without hunks preserves a file's existing line counts.
+
 test('a counted file that a later shell record names again keeps its counts, order A', () => {
   const file = writeTranscript([
     userPrompt('edit then shell-touch the same file', 0),
@@ -3968,8 +3946,8 @@ test('a counted file that a later shell record names again keeps its counts, ord
   );
 });
 
-// The same rule, the other way round: an unlisted mention lands first and an edit tool
-// details the file afterward. Both orders must land on the one row above.
+// An edit adds line counts to an earlier shell mention of the same file.
+
 test('an unlisted shell mention that a later edit details keeps its counts, order B', () => {
   const file = writeTranscript([
     userPrompt('shell-touch then edit the same file', 0),
@@ -4021,8 +3999,8 @@ test('a shell edit under a scratch root reports no rows, named and unnamed alike
 });
 
 test('a created file is counted the way an editor numbers its lines', () => {
-  // Most files end with a newline. Splitting on it counts a line that is not there, and
-  // the overstatement is summed into the card's +N total.
+  // A trailing newline terminates the last line without adding another line.
+
   assert.equal(countLines('one\ntwo\nthree'), 3);
   assert.equal(countLines('one\ntwo\n'), 2);
   assert.equal(countLines('one\r\ntwo\r\n'), 2);
@@ -4155,8 +4133,8 @@ test('a selected Claude child reads its sidechain prompt, edits, and response', 
   assert.equal(read.turns[0].contextTokens, 287);
 });
 
-// A subagent's own transcript records a nested `Agent` result as text alone, with no
-// `toolUseResult`. These are the text shapes Claude Code writes there.
+// Nested Agent results in child transcripts carry text without toolUseResult.
+
 const nestedForegroundResult = (agentId: string, tokens: number, tools: number, took: number) =>
   `  This agent's report was delivered to you as a message from "${agentId}" (its SubagentHandback call). ` +
   `Read it there; it is not repeated here.\n  \nagentId: ${agentId} (use SendMessage with to: '${agentId}', ` +
@@ -4172,7 +4150,7 @@ const nestedBackgroundResult = (agentId: string) =>
   'Async agent launched successfully. (This tool result is internal metadata.)\n' +
   `agentId: ${agentId} (internal ID - do not mention to user. Use SendMessage with to: '${agentId}' to continue this agent.)\n` +
   'The agent is working in the background. You will be notified automatically when it completes.';
-// Every record of a child transcript names its own agent at the top level.
+// This child result identifies its own agent at the top level.
 function nestedResult(toolUseId: string, second: number, text: string | string[], isError = false) {
   const blocks = (Array.isArray(text) ? text : [text]).map((part) => ({ type: 'text', text: part }));
   return {
@@ -4301,11 +4279,10 @@ test('a Claude child does not finish a nested subagent row whose launch failed',
 });
 
 test("a child's own edit calls carry the cause `pendingFileEdit` read off each tool's input", () => {
-  // A child transcript carries no patch, so every uncounted row here comes from the raw
-  // tool_use input alone, through `pendingFileEdit`, rather than from a result this fixture
-  // never supplies. `write` and `replaceAll` never carry a before side to measure. `notebook`
-  // is a replace on a cell whose old text was never sent. `zero` is a real Edit whose before
-  // and after sides are the same text, so the counted change comes to nothing.
+  // Child file causes come from tool inputs. Write, replace_all, and notebook replacement omit measurable prior content.
+
+  // Equal Edit strings produce the zero cause.
+
   const file = writeTranscript([
     { ...userPrompt('rewrite the config', 0), isSidechain: true, agentId: 'child-2', cwd: 'c:/repo' },
     { ...assistantTool('Write', 1, 'w1', { file_path: 'c:/repo/config.ts', content: 'export {}' }), isSidechain: true },
@@ -4571,9 +4548,8 @@ test('two receipts that name two sessions link both children', () => {
   ]);
 });
 
-// A wrapper can print output relayed from another command, such as an orchestrator's reply
-// that quotes its own worker's receipt, or a prompt file echoed by `cat`. A result links more
-// than one receipt only when its command holds that many opted-in launches.
+// Relayed output can contain unrelated receipts. The number of receipts must fit the command's opted-in launches.
+
 test('receipts beyond the opted-in launches of a command link nothing', () => {
   const receipt = (session: string) =>
     `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: 'claude', session_id: session })}`;
@@ -4594,9 +4570,8 @@ test('receipts beyond the opted-in launches of a command link nothing', () => {
   assert.deepEqual(readClaudeChildSessionReferences({ file: flood, sessionId: 'parent' }), []);
 });
 
-// The derived session cache drops a parent with more references than its limit, and startup
-// then reads that parent again. A command with that many opted-in launches and receipts links
-// nothing, and a command at the per-result limit links every receipt.
+// A result exceeding the receipt limit links nothing, even with enough opted-in launches.
+
 test('a result with more receipts than the per-result limit links nothing, whatever its launch count', () => {
   const linked = (count: number) => {
     const ids = Array.from(
@@ -4621,9 +4596,8 @@ test('a result with more receipts than the per-result limit links nothing, whate
   );
 });
 
-// One parent file keeps at most the references the derived session cache keeps for one file,
-// whatever mix of subagents and dispatches it names, so the cache keeps the parent. A parent
-// that grows keeps every child it already linked, even when a subagent arrives at the limit.
+// A parent retains its first references up to the shared per-file limit, across subagents and dispatches.
+
 test('a parent past the per-file reference limit keeps the children it linked first', () => {
   const receipts = MAX_CLAUDE_DISPATCH_RECEIPTS_PER_RESULT;
   const dispatched = (result: number) => {
@@ -4751,9 +4725,8 @@ test('an opted-in wrapper keeps its launch ID after activity steps are bounded',
   assert.equal(readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' }).length, 1);
 });
 
-// A parent card repaints when its render key moves, and its worker reads the child's spend on
-// every trip. A running child that writes four times a second for a minute moves the key and
-// costs a read once a band, where the child's exact revision would move on every write.
+// Running child revisions change on each write. Parent render keys and spend reads advance once per cache band.
+
 test('a running child moves its parent render key and its spend read once a band, not once a write', () => {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
   try {
@@ -4829,18 +4802,18 @@ test('a running child moves its parent render key and its spend read once a band
       { writes, revisionMoves, repaints, reads },
       { writes: 240, revisionMoves: 240, repaints: bands, reads: 1 + bands },
     );
-    // The figure keeps up: the last read holds the child's spend as of its last band.
+    // The latest band read includes additional child usage.
     assert.ok(spendTokens(latest.models) > spendTokens(first.models));
     assert.equal(latest.artifacts, undefined, 'a running child showed its files or commits');
-    // A finished child keys on its exact revision, so its last write always reaches the card.
+    // A finished child uses its exact revision key.
     assert.match(key('completed'), new RegExp(`${revision.split('\n')[0]}$`));
   } finally {
     vi.useRealTimers();
   }
 });
 
-// A running child's read parses its whole transcript and every nested one, so a band of fixed
-// length would parse a growing child ever faster. The band grows with those bytes instead.
+// The cache band grows with the total bytes read from a child and its nested transcripts.
+
 test('a running child that grows to 20 MB parses about 1 MB a second at most', () => {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
   try {
@@ -4858,7 +4831,7 @@ test('a running child that grows to 20 MB parses about 1 MB a second at most', (
     let parsed = 0;
     let repaints = 0;
     let drawn = '';
-    // The loader counts the bytes a real read would parse. It parses none, so the run stays fast.
+    // The loader charges file size without parsing content.
     const load = (file: string) => {
       reads++;
       parsed += fs.statSync(file).size;
@@ -4867,7 +4840,7 @@ test('a running child that grows to 20 MB parses about 1 MB a second at most', (
     const elapsed = 40 * 60_000;
     const target = 20_000_000;
     let writes = 0;
-    // Two writes a band, and one host poll after each write.
+    // Write and poll every 2.5 seconds.
     const writer = setInterval(() => {
       writes++;
       fs.truncateSync(child, Math.round((target * writes) / (elapsed / 2_500)));
@@ -4898,9 +4871,8 @@ test('a running child that grows to 20 MB parses about 1 MB a second at most', (
   }
 });
 
-// A background child keeps its launch status after it ends, until the parent records its
-// completion notice. Its last writes can land in a band the card has already read. Once it has
-// written nothing for a band, its key becomes its exact revision, so the card reads it once more.
+// A background child can finish before its parent records completion. A full quiet band changes its key to the exact revision.
+
 test('a background child that goes quiet without a completion notice reaches its final cost', () => {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
   try {
@@ -4965,7 +4937,7 @@ test('a background child that goes quiet without a completion notice reaches its
     vi.advanceTimersByTime(60_000);
     clearInterval(poller);
     assert.equal(shown, final, `the row kept ${shown} tokens of ${final}`);
-    // The quiet child costs one read more, and nothing after it.
+    // The quiet transition requires one additional read.
     assert.equal(reads, 2);
   } finally {
     vi.useRealTimers();
@@ -4993,8 +4965,8 @@ test('a dispatched session whose first turn has no readable timestamp keeps no s
     assistantText('The checks passed', 5, { input_tokens: 100, output_tokens: 20 }, 'high', 'end_turn'),
   ]);
   const spend = readClaudeAgentSpend(file, [], false);
-  // A turn whose timestamp did not parse reads a zero start. Reading that zero as a real time
-  // would put the span at the epoch, so it is skipped the way a missing start already is.
+  // An unreadable start timestamp leaves startedAt unavailable rather than placing it at the epoch.
+
   assert.equal(spend.startedAt, null);
   assert.equal(spend.endedAt, Date.parse(at(5)));
 });
@@ -5004,9 +4976,8 @@ test('a dispatched session whose first turn recorded a process end before its la
     userPrompt('Review the branch', 0),
     assistantTool('Bash', 2, 'run-check', { command: 'npm test' }),
     assistantText('The checks passed', 5, { input_tokens: 100, output_tokens: 20 }, 'high', 'end_turn'),
-    // The recorded process end lands two seconds in, well before the turn's own last record
-    // five seconds in. The turn's own record still names the later time, and this read's span
-    // must keep it rather than fall back to the earlier process end.
+    // The last activity occurs after the recorded process end and supplies the later endedAt.
+
     costState(ms(0), 2_000),
   ]);
   const spend = readClaudeAgentSpend(file, [], false);
@@ -5051,10 +5022,8 @@ test('Claude dispatch reads foreground JSON results and rejects quoted output fr
   assert.deepEqual(readClaudeChildSessionReferences({ file: quoted, sessionId: 'parent' }), []);
 });
 
-// The reported symptom: a parent resumed a session it did not start, such as one the reader
-// started, and that session drew as a Dispatched row whose cost joined the parent's delegated
-// work. The result of a resume names the resumed session's own id. The card's Dispatched row
-// reads the turn's launch ids, and the delegated cost reads the resolved references.
+// Resuming an existing session creates no dispatch row or delegated ownership. A fork creates a new dispatched session.
+
 test('a Claude command that resumes a session dispatches nothing, and a fork of one does', () => {
   const resumedId = '4f4bf298-958f-4751-8782-d8688ff808a6';
   const forkId = '9a1c2e3f-1111-4222-8333-444455556666';
@@ -5106,10 +5075,8 @@ test('a Claude command that resumes a session dispatches nothing, and a fork of 
   }
 });
 
-// A dispatching agent often passes its prompt on standard input, as a heredoc or a PowerShell
-// here-string, or as one argument through a heredoc inside a quoted command substitution. A
-// prompt about a review names flags. A word in it that reads as a resume flag must not drop
-// the dispatch, and a double quote in a substituted heredoc must not end the argument.
+// Heredoc and here-string bodies supply prompt text. Their resume flags and quotes do not alter the outer launch's arguments.
+
 test('a prompt passed as a heredoc or here-string never reads as a resume flag', () => {
   const childId = '4f4bf298-958f-4751-8782-d8688ff808a6';
   const catalog = [
@@ -5117,7 +5084,7 @@ test('a prompt passed as a heredoc or here-string never reads as a resume flag',
   ];
   const result = JSON.stringify({ type: 'result', session_id: childId });
   const body = 'Never run claude --resume or -r, rm -rf, git -c core.pager=cat, python -c pass or git log -pretty.';
-  // An apostrophe in a here-string once put the word scan out of step with the quotes.
+  // The here-string contains apostrophes and resume-like text.
   const spoken = "Don't pass --resume or -c here, and don't run rm -rf.";
   const quoted = 'Check the 27" monitor, then never run claude --resume or -r (or -c | cat).';
   // A lone double quote, then a body line that reads as its own resume if the mask ends early.
@@ -6051,9 +6018,8 @@ test('headlineOf skips section headings and returns the first line of substance'
 });
 
 test("headlineOf keeps a code span's own underscores and drops only its backticks", () => {
-  // The reported bug: a collapsed headline turned `CODEX_SESSION_ID` into CODEXSESSIONID,
-  // because the old stripMarkdown deleted every underscore in the line, not only the ones
-  // marking emphasis. This is the exact shape of the report.
+  // Code-span underscores remain literal characters in the headline.
+
   assert.equal(
     headlineOf('**Phase 0 is done.** Codex publishes `CODEX_SESSION_ID`, so both agents can name themselves.'),
     'Phase 0 is done. Codex publishes CODEX_SESSION_ID, so both agents can name themselves.',
@@ -6062,9 +6028,8 @@ test("headlineOf keeps a code span's own underscores and drops only its backtick
 });
 
 test('headlineOf keeps underscores and stray asterisks outside emphasis, and still strips real emphasis', () => {
-  // The reported bug: "Renamed my_file.py to calc_total.py" read as "Renamed myfile.py to
-  // calctotal.py" in the folded headline, because the strip deleted every underscore and
-  // asterisk in the line rather than only the ones marking GFM emphasis.
+  // Filename underscores remain literal characters outside emphasis.
+
   assert.equal(headlineOf('Renamed my_file.py to calc_total.py'), 'Renamed my_file.py to calc_total.py');
   // A lone `*` with spaces on both sides is not an emphasis marker by the GFM rule.
   assert.equal(headlineOf('The answer is 2 * 3, not 5.'), 'The answer is 2 * 3, not 5.');
@@ -6073,8 +6038,8 @@ test('headlineOf keeps underscores and stray asterisks outside emphasis, and sti
 });
 
 test('headlineOf agrees with what marked renders for nested, tripled and intraword markers', () => {
-  // Each line is checked against renderInlineMarkdown's own visible text, the same renderer
-  // headlineHtmlFor compares the plain headline against, rather than a hand-written guess.
+  // Headline text follows the inline Markdown renderer for nested and intraword markers.
+
   const cases = [
     'nested **bold *em* inside** text',
     '*em **strong** em* text',
@@ -6091,8 +6056,8 @@ test('headlineOf agrees with what marked renders for nested, tripled and intrawo
 });
 
 test('headlineOf skips a fence line and reads the content it encloses', () => {
-  // The reported bug: a summary opening with a fenced block, for example "```markdown",
-  // turned the fence's language tag into the headline once its backticks were stripped.
+  // A fence opener's language tag supplies no headline text.
+
   assert.equal(headlineOf('```markdown\n**Done** - the report is ready.\n```'), 'Done - the report is ready.');
   assert.equal(headlineOf('```\nPlain code line.\n```'), 'Plain code line.');
 });
@@ -6128,9 +6093,8 @@ test('shortenTo leaves a line that fits alone, and never cuts a character in hal
   // One place earlier the emoji is whole, and is kept whole.
   assert.equal(shortenTo('x'.repeat(15) + '\u{1F6A7} and more', 20, '...'), 'x'.repeat(15) + '\u{1F6A7}...');
 
-  // Whatever it drops, the result still fits the limit it was given. A limit shorter than
-  // the ellipsis is in here because a negative cut counts from the end of the line rather
-  // than shortening it, which returns more than the limit allows instead of less.
+  // Short limits retain the ellipsis without applying a negative substring offset.
+
   for (const limit of [20, 3, 1, 0]) {
     for (const line of [straddling, 'x'.repeat(60), '\u{1F6A7}'.repeat(30)]) {
       assert.ok(
@@ -6141,13 +6105,12 @@ test('shortenTo leaves a line that fits alone, and never cuts a character in hal
   }
 });
 
-// The title conversion. Every answer is written out, and the unchanged cases matter as
-// much as the converted ones: the rule is conservative because a title that kept stray
-// syntax is readable while one that lost real characters is not.
+// Title conversion removes complete Markdown syntax and preserves malformed or literal marks.
+
 test('plainTitle reduces link and image syntax to the text a reader would see', () => {
   assert.equal(plainTitle('[link text](https://x.example/page)'), 'link text');
-  // The escaped target parenthesis is what the VS Code wrapper writes when a prompt quotes
-  // a skill, and it is the shape that reached the picker verbatim.
+  // Skill links from the editor can escape their target's opening parenthesis.
+
   assert.equal(plainTitle('[$review-ai-pr]\\(/c:/skills/review-ai-pr/SKILL.md)'), '$review-ai-pr');
   assert.equal(plainTitle('![alt words](chart.png)'), 'alt words');
   assert.equal(plainTitle('see [the doc](a.md) and ![a chart](b.png) here'), 'see the doc and a chart here');
@@ -6173,9 +6136,8 @@ test('plainTitle keeps the visible text of code and balanced emphasis, and liter
 });
 
 test('openingLines takes the list a summary opens with, and stops before the one it closes with', () => {
-  // The shape a summary is written in: a heading, the list that says what the turn did, a
-  // rule, prose, then the closing rows. Those rows are a list as well, and they are written
-  // whether or not they hold anything, which is the reason for stopping.
+  // The opening list precedes a separator, prose, and a separate closing list.
+
   const summary = [
     '**TLDR**',
     '',
@@ -6199,24 +6161,23 @@ test('openingLines takes the list a summary opens with, and stops before the one
   assert.deepEqual(openingLines('Done. The hook is restored.\n\n- a later bullet'), []);
   assert.deepEqual(openingLines(''), []);
 
-  // A numbered list is a list, and a line set in under an item belongs to that item. Ending
-  // on either one keeps the items above it and drops every item below, which reads on a
-  // card as a turn that said less than it did.
+  // Numbered items and continuation lines preserve the opening list's later items.
+
   assert.deepEqual(openingLines('1. First thing.\n2. Second thing.'), ['First thing.', 'Second thing.']);
   assert.deepEqual(openingLines('- First thing,\n  wrapped onto a second line.\n- Second thing.'), [
     'First thing,',
     'Second thing.',
   ]);
 
-  // The lines the closing rows are separated by are what stops the scan, and one blank line
-  // between two lists is enough on its own.
+  // A blank line separates the opening list from later lists.
+
   assert.deepEqual(openingLines('- The one thing.\n\n- **Your actions** - reload'), ['The one thing.']);
 
   // Written on Windows, with a carriage return at the end of every line.
   assert.deepEqual(openingLines('**TLDR**\r\n\r\n- One thing.\r\n- And another.\r\n'), ['One thing.', 'And another.']);
 
-  // A fence line is punctuation, not a bullet the list opens on: skip it and read the list
-  // that follows, rather than reading the fence's own language tag as an opening line.
+  // Fence openers supply no list item text.
+
   assert.deepEqual(openingLines('```markdown\n- One thing.\n- And another.\n```'), ['One thing.', 'And another.']);
 });
 
@@ -6240,9 +6201,8 @@ test('projectSlug and transcriptDirsFor match a workspace folder whatever the dr
 });
 
 test('a directory whose name matches but whose sessions ran elsewhere is not read', () => {
-  // The slug turns every non-alphanumeric character into a dash, so two different folders
-  // produce the same directory name. Showing one project's prompts and summaries in
-  // another project's window is the failure this guards against.
+  // Distinct working directories can share a slug. Recorded cwd determines workspace membership.
+
   const root = tempDir('proj-');
   const dir = 'c--work-a-b';
   fs.mkdirSync(path.join(root, dir));
@@ -6273,9 +6233,8 @@ test('listSessionFiles returns non-empty jsonl transcripts, newest first', () =>
     listSessionFiles(dir).map((s) => s.sessionId),
     ['new', 'old'],
   );
-  // Which agent wrote them. Nothing else in this suite reads it, and the panel hands a
-  // session to a reader chosen by this value, so a session mislabelled here goes to the
-  // Codex parser, which finds nothing in a Claude transcript and draws an empty list.
+  // Session files identify their source agent for parser selection.
+
   assert.deepEqual(
     listSessionFiles(dir).map((s) => s.agent),
     ['claude', 'claude'],
@@ -6286,9 +6245,8 @@ test('a turn says the agent that recorded it, which decides what a card may clai
   const file = writeTranscript([userPrompt('build the timeline', 0), assistantText('Done.', 1, { output_tokens: 10 })]);
   const [turn] = readTurns(file, 'sess');
   assert.equal(turn.agent, 'claude');
-  // Claude Code records every edit as a tool result, so a turn here that changed nothing
-  // changed nothing. Labelled 'codex', the same turn would earn the mark that says its file
-  // list may be short.
+  // Without a recorded context window, the turn leaves contextWindow unavailable.
+
   assert.equal(turn.contextWindow, null, 'no window is recorded per turn, so the table answers');
 });
 
@@ -6307,8 +6265,8 @@ test('normalizeFsPath makes transcript and snapshot-store paths comparable', () 
   }
 });
 
-// The snapshot hook skips the same paths. Both sides run the cases in
-// test/fixtures/ephemeral-paths.json, so a change to one rule fails on the other.
+// The snapshot hook and transcript parser share the ephemeral-path fixture.
+
 test('isEphemeralPath matches the shared ephemeral-paths fixture', () => {
   const fixtureFile = path.join(__dirname, '..', '..', 'test', 'fixtures', 'ephemeral-paths.json');
   const fixture = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as {
@@ -6334,9 +6292,8 @@ test('isEphemeralPath matches the shared ephemeral-paths fixture', () => {
   const previous = process.env.ARC_IGNORE_ROOTS;
   process.env.ARC_IGNORE_ROOTS = fixture.ignoreRoots.map(fill).join(path.delimiter);
   try {
-    // Each case is checked in every shape the fixture lists. A rule that normalises one
-    // shape while the other side compares it raw is how the two drift apart, and only a
-    // shaped case can see it.
+    // Each fixture path retains its classification across the listed path forms.
+
     const shape = (native: string, kind: string) => {
       if (kind === 'forward-slash') {
         return native.split(path.sep).join('/');
@@ -6351,18 +6308,16 @@ test('isEphemeralPath matches the shared ephemeral-paths fixture', () => {
     };
     for (const c of fixture.cases) {
       for (const kind of fixture.shapes) {
-        // A path that names a file does not take a trailing slash, so that shape is
-        // skipped for it. The fixture keeps directory cases on both sides of the answer
-        // so the shape still tests both.
+        // File paths omit the trailing-slash form. Directory cases retain it for both classifications.
+
         if (kind === 'trailing-slash' && /\.[a-z]+$/.test(c.path)) {
           continue;
         }
         assert.equal(isEphemeralPath(shape(fill(c.path), kind)), c.ephemeral, `${c.path} as ${kind}: ${c.why}`);
       }
     }
-    // The same answers again, against the list the code ships rather than the one the
-    // fixture hands it. Without this pass the fixture only says how a path is compared, and
-    // a root dropped from a default would leave every case still answering correctly.
+    // Default ignore roots apply the fixture's classifications without an environment override.
+
     delete process.env.ARC_IGNORE_ROOTS;
     for (const c of fixture.cases) {
       assert.equal(isEphemeralPath(fill(c.path)), c.ephemeral, `${c.path} against the shipped roots: ${c.why}`);
@@ -6798,9 +6753,8 @@ test('a rename records the zeros git printed rather than reading as unknown', ()
   ]);
 });
 
-// The three lines below are what git actually printed, captured from a scratch repository
-// on 2026-08-26 rather than written from memory. Each has more than one token between the
-// bracket and the sha, which is the whole of what these three check.
+// Root and detached-head commit output can contain extra words before the hash.
+
 test('a repository first commit is recorded, though git names it a root commit', () => {
   const file = writeTranscript([
     userPrompt('start the repo', 0),
@@ -6873,8 +6827,8 @@ test('a first commit made off a branch carries both markers and is still recorde
   ]);
 });
 
-// Which repository a commit landed in. Every command quoted below is a shape taken from
-// the real transcripts, where the rule was measured before it was written.
+// Commit directory fixtures cover shell location changes and per-command Git directories.
+
 const HOME = 'C:/Users/dev';
 const REPO = 'c:/Users/dev/Projects/work/arc';
 const NOTES = 'C:/Users/dev/Projects/side-repo';
@@ -6884,15 +6838,15 @@ test('the directory a commit is made in is tracked through the command that made
 
   assert.deepEqual(dirs('cd ~/Projects/side-repo && git add -A && git commit -m "notes"'), [NOTES]);
   assert.deepEqual(dirs('cd "C:/Users/dev/Projects/side-repo" && git add . && git commit -m "notes"'), [NOTES]);
-  // Git Bash writes a drive as a directory under the root, and WSL writes it one deeper.
-  // Left alone both read as absolute paths inside nothing and outside everything.
+  // Git Bash and WSL drive paths resolve to the corresponding Windows directory.
+
   assert.deepEqual(dirs('cd /c/Users/dev/Projects/side-repo && git commit -m "notes"'), [NOTES]);
   assert.deepEqual(dirs('cd /mnt/c/Users/dev/Projects/side-repo && git commit -m "notes"'), [NOTES]);
   // A relative move resolves against the directory the call started in. This one goes up
   // out of a sub-directory and lands back in the repository it started under.
   assert.deepEqual(dirs('cd .. && git add docs && git commit -m "up one"', REPO + '/extension'), [REPO]);
-  // `git -C` names the directory for one call and leaves the shell where it was, which is
-  // how eight of the nine foreign commits measured over the real transcripts were made.
+  // git -C changes one Git command's directory without moving the shell.
+
   assert.deepEqual(
     dirs(
       'git -C "C:/Users/dev/Projects/side-repo" add . && git -C "C:/Users/dev/Projects/side-repo" commit -m "notes"',
@@ -6917,10 +6871,8 @@ test('a relative parent command cannot leave a UNC share', () => {
   assert.deepEqual(commitDirs('cd ../.. && git commit -m "x"', '//server/share/repo', HOME), ['//server/share']);
 });
 
-// Every spelling of a destination the two shells write, as the whole path in one go and as
-// the root on its own with the rest walked from there. A root that does not read as
-// absolute is joined onto the directory the call started in rather than replacing it, and
-// that miss only shows up one command later, so both halves are asserted.
+// Absolute destinations resolve equally as full paths or as a root followed by relative moves.
+
 test('a destination is read the same in every shape a shell writes it', () => {
   const dirs = (command: string, cwd: string | null = REPO) => commitDirs(command, cwd, HOME);
   const shapes: { whole: string; root: string; under: string }[] = [
@@ -6937,8 +6889,8 @@ test('a destination is read the same in every shape a shell writes it', () => {
     assert.deepEqual(dirs(`cd ${s.whole} && git commit -m "x"`), [NOTES], s.whole);
     assert.deepEqual(dirs(`cd ${s.root} && cd ${s.under} && git commit -m "x"`), [NOTES], `${s.root} then ${s.under}`);
   }
-  // A backslash still takes the character after it out of the shell's hands, which is how a
-  // space is written into a path that is not quoted.
+  // A backslash can escape a space in an unquoted Bash path.
+
   assert.deepEqual(dirs('cd /c/Users/dev/My\\ Documents && git commit -m "x"'), ['C:/Users/dev/My Documents']);
 });
 
@@ -6969,8 +6921,8 @@ test('a move is read past the parameter that names its destination', () => {
   }
   // PowerShell also writes a parameter and its value joined by a colon.
   assert.deepEqual(dirs('Set-Location -Path:"C:\\Users\\dev\\Projects\\side-repo"; git commit -m "x"'), [NOTES]);
-  // A switch this reader cannot read past could be hiding the destination behind it, so
-  // where the shell went is unknown rather than guessed from the switch itself.
+  // An unsupported location parameter leaves the destination unavailable.
+
   assert.deepEqual(dirs('Set-Location -Stack work; git commit -m "x"'), [null]);
   assert.deepEqual(dirs('cd -- sub; git commit -m "x"'), [null]);
 });
@@ -6986,8 +6938,8 @@ test('a command is read past its quoting, so neither a heredoc nor a message is 
     'git commit -F msg.txt',
   ].join('\n');
   assert.deepEqual(commitDirs(heredoc, REPO, HOME), [REPO]);
-  // A message holding a semicolon and a quote of its own is one argument, not the end of
-  // the command, and nothing inside it is read as a call or as a move.
+  // Quoted commit-message separators and escaped quotes remain inside one argument.
+
   assert.deepEqual(commitDirs('git commit -m "Keep the panel; do not split it, said \\"the note\\""', REPO, HOME), [
     REPO,
   ]);
@@ -7012,30 +6964,27 @@ test('a directory is attributed to a call only when every commit in it names the
     kind: 'named',
     dir: NOTES,
   });
-  // A commit made in the workspace carries no directory at all, so only a foreign one is
-  // ever drawn. Marking work the reader is looking at as somebody else's is the failure
-  // this rule exists to avoid; missing a foreign commit only leaves the row as it was.
+  // Workspace commits carry no foreign-repository label.
+
   assert.equal(call('git add -A && git commit -m "here"'), null);
   assert.equal(call('cd extension && git commit -m "still here"'), null);
   assert.equal(call('cd .. && git add docs && git commit -m "up one"', REPO + '/extension'), null);
-  // Two foreign repositories in one call: the lines git printed cannot be paired with the
-  // calls that printed them, so neither commit can be given a directory. Both are still
-  // outside this workspace, whichever line belongs to which, so both are marked and neither
-  // is named.
+  // Two distinct foreign targets supply an unnamed foreign-repository label.
+
   assert.deepEqual(
     call('cd ~/Projects/side-repo && git commit -m "a" && cd ~/Projects/work/other-repo && git commit -m "b"'),
     { kind: 'unnamed' },
   );
-  // One of the two inside the workspace, and nothing is said at all: a mark here could land
-  // on the commit the reader is looking at.
+  // A mixture of local and foreign targets supplies no foreign-repository label.
+
   assert.equal(call('git commit -m "a" && cd ~/Projects/side-repo && git commit -m "b"'), null);
   assert.equal(call('cd ~/Projects/side-repo && git commit -m "a" && cd ' + REPO + ' && git commit -m "b"'), null);
-  // One target that cannot be worked out is enough to say nothing, whatever the other
-  // directories are: an unreadable target could be this workspace.
+  // An unresolved target supplies no foreign-repository label.
+
   assert.equal(call('git -C "$R" commit -m "a" && git -C "C:/Users/dev/Projects/side-repo" commit -m "b"'), null);
   assert.equal(call('git log --oneline -1'), null);
-  // With no folder open there is nothing to be outside of, and a call nothing was recorded
-  // for says nothing either.
+  // Without open folders or a recorded call, repository labels remain unavailable.
+
   assert.equal(
     commitPlaceOf({ command: 'cd ~/Projects/side-repo && git commit -m "x"', cwd: REPO, at: 0 }, [], HOME),
     null,
@@ -7043,8 +6992,8 @@ test('a directory is attributed to a call only when every commit in it names the
   assert.equal(commitPlaceOf(null, [REPO], HOME), null);
 });
 
-// A Bash call the way the store writes one, carrying the directory the command started in.
-// The helper above leaves that out, and a quiet commit is read back against that directory.
+// Bash call records supply the starting cwd for commit recovery.
+
 function bashCall(second: number, id: string, cwd: string, ...commands: string[]) {
   return {
     type: 'assistant',
@@ -7072,13 +7021,13 @@ function bashResult(stdout: string, second: number, id: string, failed = false) 
 }
 
 test('a commit is read back only when the call status stands for it', () => {
-  // `A && B` qualifies. A skipped B leaves the whole call non-zero, and a call that failed is
-  // refused before this rule is reached.
+  // A successful && chain requires its commit command to succeed.
+
   assert.equal(commitStatusIsReadable('git add -A && git commit -q -m "x"'), true);
   assert.equal(commitStatusIsReadable('cd extension && git commit -q -F msg.txt && git log --oneline -1'), true);
   assert.equal(commitStatusIsReadable('git commit --quiet -m "x"'), true);
-  // The guarded shape the reader's own instructions teach. When the guard fails, the shell
-  // prints the warning and exits zero, and the window then holds only another session's work.
+  // A fallback after || can report success after a guard skips the commit.
+
   assert.equal(
     commitStatusIsReadable(
       '[[ "$(git rev-parse --short HEAD)" == "abc1234" ]] && git commit -q -F m.txt || echo "HEAD changed, aborting"',
@@ -7091,8 +7040,8 @@ test('a commit is read back only when the call status stands for it', () => {
   assert.equal(commitStatusIsReadable('true || git commit -q -m "x"'), false);
   // A dry run says outright that it makes no commit.
   assert.equal(commitStatusIsReadable('git commit --dry-run -q'), false);
-  // A semicolon and a newline report somebody else's status. A pipe keeps the repository
-  // count and head-log guards, so a quiet commit behind one is still read back.
+  // A separator after a commit disconnects its status. A pipeline retains repository-count and head-log checks.
+
   assert.equal(commitStatusIsReadable('git commit -q -m "x"; echo done'), false);
   assert.equal(commitStatusIsReadable('git commit -q -m "x"\ngit log --oneline -1'), false);
   assert.equal(commitStatusIsReadable('git commit -q -m "x" | tail -3'), true);
@@ -7104,8 +7053,8 @@ test('a commit is read back only when the call status stands for it', () => {
   assert.equal(commitStatusIsReadable('git log --oneline -1'), false);
   // A conditional keyword is a keyword whatever its case, which PowerShell writes either way.
   assert.equal(commitStatusIsReadable('If ($false) { git commit -q }'), false);
-  // A dry run anywhere disqualifies the whole command, because the count of commits it makes
-  // is read from the text and a dry run is counted like any other.
+  // Any dry-run commit leaves recovery unavailable for the whole command.
+
   assert.equal(commitStatusIsReadable('git commit --dry-run -q && git commit -q --allow-empty'), false);
   // A committer date the command chose puts its commit outside the window it ran in.
   assert.equal(commitStatusIsReadable('GIT_COMMITTER_DATE=2000-01-01T00:00:00Z git commit -q -m "x"'), false);
@@ -7114,17 +7063,17 @@ test('a commit is read back only when the call status stands for it', () => {
   assert.equal(commitStatusIsReadable('git add -A && git commit -q -m "x"'), true);
   // A negated commit reports the opposite of what git said.
   assert.equal(commitStatusIsReadable('! git commit -q -m "x"'), false);
-  // Words that are not a command are not a commit. Counting this one twice would take the
-  // second commit from whoever really made it.
+  // A command merely printing commit-like words cannot establish commit recovery.
+
   assert.equal(commitStatusIsReadable('git commit -q -m "x" && echo git commit'), false);
-  // A commit inside a guarded block still counts, which is why the count is not anchored to
-  // the head of a segment.
+  // A subshell's commit counts even when its command starts with a location change.
+
   assert.equal(commitStatusIsReadable('(cd extension && git commit -q -m "x")'), true);
-  // A separator between two commits hides the first one's failure the same way one after the
-  // last hides that one's, so the test reads from the first commit rather than the last.
+  // A separator after either commit prevents the call status from establishing both commits.
+
   assert.equal(commitStatusIsReadable('git commit -q -m "a"; git commit -q -m "b"'), false);
-  // Ahead of every commit it makes, a separator costs the call nothing: the status still ends
-  // up being git's.
+  // A separator before every commit leaves the final status available for commit recovery.
+
   assert.equal(commitStatusIsReadable('git add -A; git commit -q -m "x"'), true);
   // A redirect is not a background commit.
   assert.equal(commitStatusIsReadable('git commit -q -m "x" 2>&1'), true);
@@ -7147,8 +7096,8 @@ test('a commit is read back only when the call status stands for it', () => {
 });
 
 test('a call that names a commit it does not run is never read back', () => {
-  // `commitDirs` reads two commits out of this command and the call makes one. Recording it
-  // would leave room for a second commit that somebody else made.
+  // Printing commit-like words alongside a real commit leaves commit recovery unavailable.
+
   const file = writeTranscript([
     userPrompt('land it and say so', 0),
     bashCall(1, 't1', REPO, 'git commit -q -m "x" && echo git commit'),
@@ -7313,8 +7262,8 @@ test('a piped quiet commit records an intent while a plain or-else still records
 });
 
 test('a commit that printed nothing is recorded with the window to read it back in', () => {
-  // The symptom. A session committed with -q, git printed nothing, and the card showed no
-  // commit at all. A quiet flag is the common reason a commit-making call holds no line.
+  // A successful quiet commit supplies a recovery intent without a printed commit row.
+
   const file = writeTranscript([
     userPrompt('land the change', 0),
     bashCall(1, 't1', REPO, 'git commit -F msg.txt -q'),
@@ -7339,8 +7288,8 @@ test('a commit whose line git printed asks the repository nothing', () => {
 });
 
 test('a commit that failed is never read back, because the window would hold somebody else', () => {
-  // A call that exits non-zero committed nothing. A window around it can still hold a
-  // parallel session's commit, and claiming that one is the failure the whole path avoids.
+  // A failed call supplies no commit recovery intent because its time window can contain unrelated commits.
+
   const file = writeTranscript([
     userPrompt('land the change', 0),
     bashCall(1, 't1', REPO, 'git commit -q'),
@@ -7363,10 +7312,8 @@ test('a call that committed more than once says how many to expect', () => {
 });
 
 test('two calls issued by one record keep the whole record window', () => {
-  // Both calls carry the same record timestamp and can run at the same time, so the first
-  // result does not prove the second call had not started. Narrowing the second window would
-  // put its own commit outside it and leave the room for somebody else's. The windows overlap
-  // instead, and the count rule refuses whatever the overlap holds.
+  // Calls in one record share their starting timestamp. Their recovery windows end at their respective results.
+
   const file = writeTranscript([
     userPrompt('two commits', 0),
     bashCall(1, 't', REPO, 'git commit -q -m "first"', 'git commit -q -m "second"'),
@@ -7382,8 +7329,8 @@ test('two calls issued by one record keep the whole record window', () => {
 });
 
 test('a call issued after an earlier result starts where that result ended', () => {
-  // Two records, so the second call cannot have started before the first one finished. The
-  // window is narrowed to what the records prove, which keeps the first commit out of it.
+  // A later call's recovery window starts at its own recorded timestamp.
+
   const file = writeTranscript([
     userPrompt('two commits', 0),
     bashCall(1, 't1', REPO, 'git commit -q -m "first"'),
@@ -7400,8 +7347,8 @@ test('a call issued after an earlier result starts where that result ended', () 
 });
 
 test('a fast-forward landing is recorded with the window to read it back in', () => {
-  // The turn made no commit, so nothing printed an identity and the card showed nothing at
-  // all. What git printed carries two short shas and no subject, so the record is the window.
+  // Fast-forward output supplies a landing recovery intent without a commit row.
+
   const file = writeTranscript([
     userPrompt('land the branch', 0),
     bashCall(1, 't1', REPO, 'git merge --ff-only 1ede4cb1 && git log --oneline -3'),
@@ -7430,8 +7377,8 @@ test('a merge that failed is never read back, because the window would hold some
 });
 
 test('a merge whose call could have skipped it is never read back', () => {
-  // The or-else leaves the merge unrun and the call successful, so whatever landed in that
-  // window belongs to somebody else. This is the shape the reader's own instructions teach.
+  // A fallback after || can succeed after the guard skips its merge, leaving landing recovery unavailable.
+
   const file = writeTranscript([
     userPrompt('land it if head has not moved', 0),
     bashCall(
@@ -7491,13 +7438,8 @@ test('a workspace on a network share keeps local commits and marks foreign commi
   });
 });
 
-// Two path rules in this file are handed the same folder from opposite directions. The
-// workspace folder reaches `isInside` as the host spells it, and the directory beside it
-// was built out of a command by `resolveDir` and `normalizeDir`. A shape the two spell
-// differently makes every commit in that folder read as somebody else's, which is the
-// failure the whole rule exists to avoid, and it is how the network share above was found.
-// Every shape a folder arrives in is walked here, so a shape cannot be taught to one side
-// alone.
+// Host workspace paths and shell destinations must identify the same directory across supported path forms.
+
 test('a folder and a directory read out of a command are spelled the same way', () => {
   const shapes: [string, string, string][] = [
     ['forward slashes', 'C:/Users/dev/work/repo', 'C:/Users/dev/work/repo'],
@@ -7525,7 +7467,7 @@ test('a folder and a directory read out of a command are spelled the same way', 
   assert.ok(isInside(fromCommand, [share]));
 });
 
-// Whether a call ran git, which is what says its output may be read for a commit at all.
+// Git command identity determines whether its output supplies printed commits.
 test('a call whose command word is git qualifies, whatever the subcommand', () => {
   assert.equal(ranGit('git commit -m "add the plan"'), true);
   assert.equal(ranGit('git cherry-pick feat'), true);
@@ -7537,10 +7479,8 @@ test('a call whose command word is git qualifies, whatever the subcommand', () =
   assert.equal(ranGit('GIT_AUTHOR_NAME="A B" git commit -m "x"'), true);
 });
 
-// A commit guarded against another session moving HEAD, which is the shape this workspace's
-// own commits are made with. The whole guard is one segment, because nothing in it is an
-// operator that separates commands, so the git call sits inside the block rather than at the
-// head. Three commits in one measured run of the real transcripts were made this way.
+// Git calls inside conditional blocks and substitutions retain their command identity.
+
 test('a git call inside a conditional block qualifies, though the segment opens with the guard', () => {
   assert.equal(
     ranGit(
@@ -7563,23 +7503,16 @@ test('a call that never ran git does not qualify on the word alone', () => {
   assert.equal(ranGit(''), false);
 });
 
-// The shape most commits in this workspace are actually made with: the message is written
-// through a heredoc and the commit reads it back. The body is masked before anything is
-// split, so a `git commit` written inside the message does not qualify, and the real call
-// after the terminator does.
+// A heredoc body contains message text. Its following Git command remains visible to command classification.
+
 test('a heredoc body does not qualify a call, and the command after it still does', () => {
   const body = 'cat > /tmp/msg.txt <<\'EOF\'\ngit commit -m "this is the message"\nEOF';
   assert.equal(ranGit(body), false);
   assert.equal(ranGit(`${body}\ngit commit -F /tmp/msg.txt`), true);
 });
 
-// The characters read from `command` while `run` reads it. `run` receives the command behind
-// a proxy that counts each character read by index, so a loop that steps through the command
-// one character at a time counts as well as a string built-in does. The character array split
-// from the command counts each read and write, and the string it joins into counts its reads,
-// so work on a mask built from the command counts too. A search counts the stretch it
-// crossed, and a copy counts its length. Openers that each reread the rest of the
-// command show here as work that grows with the square of its length.
+// Count indexed string access, searches, copies, and character-array reads and writes during command inspection.
+
 function charactersRead(command: string, run: (command: string) => void): number {
   const proto = String.prototype;
   const saved = {
@@ -7612,8 +7545,8 @@ function charactersRead(command: string, run: (command: string) => void): number
     read += part.length;
     return part;
   };
-  // A string object is the target, because its own characters and length must read the same
-  // through the proxy. A method runs on the plain string, so its own reading counts above.
+  // Bind string methods to the original text while counting indexed access through the proxy.
+
   const countedString = (text: string): string =>
     new Proxy(Object(text) as object, {
       get(target, key) {
@@ -7625,8 +7558,8 @@ function charactersRead(command: string, run: (command: string) => void): number
         return typeof value === 'function' ? value.bind(text) : value;
       },
     }) as unknown as string;
-  // The characters of `command` split into an array count each read and each write, and the
-  // string the array joins back into is counted the same way. The mask is built that way.
+  // Track character-array reads and writes, then track the string produced by join.
+
   const countedArray = (items: string[]): string[] =>
     new Proxy(items, {
       get(target, key) {
@@ -7658,9 +7591,8 @@ function charactersRead(command: string, run: (command: string) => void): number
   return read;
 }
 
-// Openers with no newline after them are read once, not once each: heredoc openers in a
-// substitution, and PowerShell here-string openers on one line. On a line that ends in a long
-// run of whitespace, the here-string openers scan back over that run once between them.
+// Repeated openers and trailing whitespace must keep character work proportional to command length.
+
 test('reading a command costs work in step with its length', () => {
   const commands = [
     `claude -p "$(${'<<a '.repeat(1 << 14)})" --output-format json`,
@@ -7703,12 +7635,8 @@ test('reading a command costs work in step with its length', () => {
   }
 });
 
-// The same shape in PowerShell, and the one this workspace's own commits are written with.
-// The message goes into a `@'` here-string, the here-string goes to a file, and the commit
-// reads it back. An apostrophe in the body is what makes the mask worth having: without it
-// the scan reads everything from that apostrophe on as quoted text, so the git calls after
-// the terminator stop looking like calls at all. Four commits in the real transcripts are
-// made exactly this way.
+// A PowerShell here-string containing apostrophes ends at its terminator before the Git command.
+
 const HERE_STRING = [
   "$msg = @'",
   "The weight layer's Off state now reaches On when any of the three toggles",
@@ -7725,8 +7653,8 @@ test('a PowerShell here-string body does not qualify a call, and the commit afte
   assert.equal(ranGit(HERE_STRING), true);
   assert.deepEqual(commitDirs(HERE_STRING, REPO, HOME), [REPO]);
 
-  // The words on their own are text being written to a file. A call that only writes the
-  // body makes no commit, whatever the body says.
+  // Git-like text inside a here-string supplies no command.
+
   const bodyOnly = [
     "$note = @'",
     "The owner's note reads:",
@@ -7749,23 +7677,20 @@ test('a here-string is masked to its terminator, and only when its opener ends t
   assert.equal(ranGit(double), false);
   assert.equal(ranGit(`${double}\ngit commit -F msg.txt`), true);
 
-  // An opener with no terminator runs to the end of the command, the answer a heredoc with
-  // no terminator already gives, so nothing behind it is read as a call.
+  // An unterminated here-string masks the remaining command text.
+
   const unterminated = ["$t = @'", "The plan's next line reads:", 'git commit -m "x"'].join('\n');
   assert.equal(ranGit(unterminated), false);
 
-  // PowerShell requires the opener to end its line, which is what separates a here-string
-  // from an argument that merely holds the two characters. This one is an ordinary quoted
-  // string, so the commit under it is a real call.
+  // A here-string opener ends its line. An email-like quoted argument leaves the following command visible.
+
   const notAnOpener = '$addr = user@\'example.com\'\ngit commit -m "x"';
   assert.equal(ranGit(notAnOpener), true);
   assert.deepEqual(commitDirs(notAnOpener, REPO, HOME), [REPO]);
 });
 
-// What the Codex reader passes, because a rollout keeps the shell command inside the
-// JavaScript program its exec sandbox ran. Refusing it would take every commit Codex has
-// made off the timeline, so a source that says it cannot read its own commands has its
-// output read whatever ran.
+// The unreadable command marker permits printed commit extraction without command classification.
+
 test('a source that cannot read its own commands has its output read anyway', () => {
   const unreadable: { commits: TurnCommit[] } = { commits: [] };
   recordCommits(unreadable, '[main f572f41] Add the camera plan\n 1 file changed, 186 insertions(+)', 5, 'unreadable');
@@ -7782,8 +7707,8 @@ test('a source that cannot read its own commands has its output read anyway', ()
       dir: null,
     },
   ]);
-  // A reader that does record commands and recorded none for this result is the other
-  // answer: nothing says git ran, so nothing is read.
+  // An absent recorded command supplies no printed commits.
+
   const unrecorded: { commits: TurnCommit[] } = { commits: [] };
   recordCommits(unrecorded, '[main f572f41] Add the camera plan\n 1 file changed, 186 insertions(+)', 5, null);
   assert.deepEqual(unrecorded.commits, []);
@@ -7805,7 +7730,7 @@ test('a commit made in another repository is reported with it, and one made here
   };
   const away = 'cd "C:/Users/dev/Projects/side-repo" && git add -A && git commit -m "notes"';
   assert.deepEqual(readWith(away, REPO, [REPO]).place, { kind: 'named', dir: NOTES });
-  // The figures and the subject are untouched by any of this.
+  // Repository labels preserve the commit's subject and figures.
   assert.deepEqual(readWith(away, REPO, [REPO]), {
     sha: 'abc1234',
     subject: 'Note the run',
@@ -7833,8 +7758,8 @@ test('a commit made in another repository is reported with it, and one made here
 });
 
 test('the PowerShell tool is read for a commit the same way the Bash tool is', () => {
-  // 15 of the 133 commits in one measured run of the real transcripts came from it, and
-  // both tools carry the command in the same field.
+  // Both tools carry their command in the same input field.
+
   const file = writeTranscript([
     userPrompt('log the run', 0),
     {
@@ -7850,28 +7775,24 @@ test('the PowerShell tool is read for a commit the same way the Bash tool is', (
 });
 
 test('a relative move is resolved against where the call started, not where it ended', () => {
-  // The transcript keeps no working directory on the tool call. The record carrying the
-  // call has the directory before the command ran and the record carrying the result has
-  // the directory after, and only the first one a relative `cd` can be resolved against.
+  // Relative locations resolve against the call record's cwd before execution.
+
   const file = writeTranscript([
     userPrompt('note it', 0),
     { ...assistantTool('Bash', 1, 't1', { command: 'cd ../../side-repo && git commit -m "notes"' }), cwd: REPO },
     { ...commitResult('[main abc1234] Note the run\n 1 file changed, 4 insertions(+)', 2), cwd: NOTES },
     assistantText('Done.', 3),
   ]);
-  // Spelled with the drive case the record wrote, because a directory keeps the case the
-  // command gave it: the reader is shown this path, and a path is compared through
-  // `normalizeFsPath` rather than lower-cased on the way in.
+  // Display paths retain their drive-letter case. normalizeFsPath handles path comparisons.
+
   assert.deepEqual(readTurns(file, 'sess', { folders: [REPO] })[0].commits[0].place, {
     kind: 'named',
     dir: 'c:/Users/dev/Projects/side-repo',
   });
 });
 
-// git's own output carries lines a pre-commit hook and a build step wrote, so what the rule
-// accepts is what it will read out of the rest of a git call's output. Each line below is a
-// shape a rule that merely counts tokens before the sha would draw on a card as a commit that
-// never happened.
+// Unrelated bracketed log lines in Git output supply no commits.
+
 test('a bracketed log line is not read as a commit', () => {
   const noise = [
     '[2026-08-26 10:23:45 deadbeef] service started',
@@ -7888,9 +7809,8 @@ test('a bracketed log line is not read as a commit', () => {
   assert.deepEqual(turn.commits, []);
 });
 
-// Which output may be read for a commit at all. Every command below is a shape taken from
-// the real transcripts, and the commit line under them is the one a real session drew on a
-// card without git having made it in that call.
+// Only Git command output supplies these printed commit rows.
+
 const PLAN_COMMIT = '[main f572f41] Add camera share freeze plan\n 1 file changed, 186 insertions(+)';
 const PLAN_ROW = {
   sha: 'f572f41',
@@ -7904,8 +7824,8 @@ const PLAN_ROW = {
   dir: null,
 };
 
-// What a turn records for one command and the output that came back from it. Passing null
-// leaves the call with no command on it, which is a tool the reader recorded nothing for.
+// Read commit rows from a paired command and result. A null command leaves that call's command text absent.
+
 function commitsFor(command: string | null, stdout: string) {
   const file = writeTranscript([
     userPrompt('do the work', 0),
@@ -7930,11 +7850,8 @@ test('a commit made through git -C is recorded', () => {
   assert.deepEqual(commitsFor('git -C ../side-repo commit -m "notes"', PLAN_COMMIT), [PLAN_ROW]);
 });
 
-// A cherry-pick and a revert print the same line a commit does, and both are the turn's own
-// work, so the rule asks whether git ran and not whether `commit` was the subcommand. The
-// two outputs below were captured from git rather than written from memory; `git merge`
-// itself prints "Merge made by the 'ort' strategy." and no bracketed line at all, and the
-// line for a merge comes from the `git commit` that closes a conflicted one.
+// Cherry-pick and revert output supplies commit rows through Git command identity.
+
 test('a cherry-pick and a revert are recorded, though neither call says commit', () => {
   assert.deepEqual(
     commitsFor(
@@ -7976,10 +7893,8 @@ test('a cherry-pick and a revert are recorded, though neither call says commit',
   );
 });
 
-// The defect this rule was written for. A session ran a script that surveyed other agents'
-// transcripts and printed one of their commit lines as sample output. That commit is real,
-// it is in another project, and git did not make it in this call; the card claimed it as
-// the turn's own work.
+// Scripts that quote commit output supply no commit rows without a Git command.
+
 test('a script that quoted a commit line records nothing, since the call never ran git', () => {
   assert.deepEqual(commitsFor("cd /c/Users/dev/scratch && awk 'NR>95' sol.txt", PLAN_COMMIT), []);
   assert.deepEqual(commitsFor('python survey.py --root ~/.codex/sessions', PLAN_COMMIT), []);
@@ -8170,9 +8085,8 @@ test('an older transcript with no cache TTL split is charged at the 1h rate', ()
 });
 
 test('a prompt that never got a reply of its own joins the next turn instead of an empty card', () => {
-  // Messages queued while the agent is working are each recorded as their own prompt, but
-  // only the last one has the reply attached. The earlier ones would otherwise render as
-  // cards with nothing in them.
+  // Consecutive prompts without intervening work share the next turn's reply.
+
   const file = writeTranscript([
     userPrompt('first job', 0),
     assistantTool('Bash', 1),
@@ -8186,8 +8100,8 @@ test('a prompt that never got a reply of its own joins the next turn instead of 
   assert.equal(turns[0].prompt, 'first job');
   assert.equal(turns[1].prompt, 'queued one\n\nqueued two');
   assert.equal(turns[1].summary, 'Both done.');
-  // The two are kept apart as well as joined. Anything offering the reader their prompts back
-  // has to hand them one at a time, or one press puts both in the box and sends both.
+  // Joined prompts retain separate promptParts for individual recall.
+
   assert.deepEqual(
     turns[1].promptParts?.map((one) => one.text),
     ['queued one', 'queued two'],
@@ -8196,14 +8110,14 @@ test('a prompt that never got a reply of its own joins the next turn instead of 
     turns[0].promptParts?.map((one) => one.text),
     ['first job'],
   );
-  // Each carries when it was typed, which is what orders it against the prompts the reader
-  // typed while the turn ran.
+  // Prompt parts retain their recorded timestamps for ordering.
+
   assert.ok((turns[1].promptParts ?? []).every((one) => one.at > 0));
 });
 
 test('a line the cleaning leaves empty opens no turn and no part', () => {
-  // A wrapper with nothing of the reader's in it cleans away to nothing. `isTypedPrompt`
-  // refuses it, which is what keeps an entry saying nothing out of the walk.
+  // Editor wrappers with no remaining prompt text create no turn or prompt part.
+
   const file = writeTranscript([
     userPrompt('<ide_selection>lines 4 to 9</ide_selection>', 0),
     userPrompt('fix the parser', 1),
@@ -8219,8 +8133,8 @@ test('a line the cleaning leaves empty opens no turn and no part', () => {
 });
 
 test('a run of prompts with no reply between them is kept apart, not folded in pairs', () => {
-  // A turn carried forward can itself be carrying one. Handed on by its joined prompt, the
-  // first two rejoin into a single part and one press of Up puts both in the box.
+  // Multiple carried prompts retain distinct parts through repeated turn joins.
+
   const file = writeTranscript([
     userPrompt('queued one', 0),
     userPrompt('queued two', 1),
@@ -8236,8 +8150,8 @@ test('a run of prompts with no reply between them is kept apart, not folded in p
 });
 
 test('the turn at the end of the file is kept even before it has done anything', () => {
-  // The agent has taken the prompt but not yet called a tool. That looks identical to a
-  // queued message, so the last turn is always kept: it is the one running now.
+  // The last unanswered prompt retains its unfinished turn.
+
   const file = writeTranscript([
     userPrompt('first job', 0),
     assistantText('First done.', 1),
@@ -8298,8 +8212,8 @@ test('readSessionCwd reads the cwd out of a transcript head', () => {
 });
 
 test('a background subagent reports its figures through the task notification', () => {
-  // Its own lines go to a separate transcript, so the notification is the only place the
-  // reader can learn what it spent. The three tag names are the part most likely to drift.
+  // Notification tags supply aggregate token, tool, and duration figures. Child transcripts supply model usage.
+
   const file = writeTranscript([
     userPrompt('run the audit in the background', 0),
     assistantTool('Agent', 1, 'bg9', { description: 'Audit the parser', subagent_type: 'Explore' }),
@@ -8340,9 +8254,8 @@ test('a background subagent reports its figures through the task notification', 
 });
 
 test('a finished background subagent with no <tool_uses> tag counts its own calls', () => {
-  // A background launch's own result never carries a tool count, and measured across real
-  // notifications 42% carry no <tool_uses> tag either. This notice is one of those: it closes
-  // the child but says nothing about how many tools it ran.
+  // A completion notice can close the child without a tool_uses tag.
+
   const file = writeTranscript([
     userPrompt('run the audit in the background', 0),
     assistantTool('Agent', 1, 'bg9', { description: 'Audit the parser', subagent_type: 'Explore' }),
@@ -8381,8 +8294,8 @@ test('a finished background subagent with no <tool_uses> tag counts its own call
 });
 
 test('a still-running background subagent with no tool-use tag keeps no tool count', () => {
-  // The fallback fills a finished row only. A child still open may yet run more tools, so its
-  // count-so-far must not be read as its final one.
+  // Only finished children receive a tool-count fallback from their recorded calls.
+
   const file = writeTranscript([
     userPrompt('run the audit in the background', 0),
     assistantTool('Agent', 1, 'bg9', { description: 'Audit the parser', subagent_type: 'Explore' }),
@@ -8411,11 +8324,8 @@ test('a still-running background subagent with no tool-use tag keeps no tool cou
 });
 
 test('a background subagent that reports back as an attachment still leaves its row finished', () => {
-  // Claude Code writes the completion notice in two shapes. A notice delivered while the
-  // main agent waits lands as a user record. A notice delivered while the main agent works
-  // lands as a queued attachment, whose text sits in `attachment.prompt` and which carries
-  // no origin at all. Four rows of one real turn read "still running" with no cost, and the
-  // card under-reported that turn by 24 percent.
+  // Queued completion attachments carry notification text in attachment.prompt without an origin field.
+
   const asked: string[] = [];
   const spend = [
     {
@@ -8459,10 +8369,8 @@ test('a background subagent that reports back as an attachment still leaves its 
 });
 
 test('an attachment notice for an agent that is still running leaves the row running', () => {
-  // The same task reports more than once, and a later report can arrive under the id of the
-  // message that woke the agent rather than under its launch. A report that names no
-  // launched row must change nothing, or a resumed agent draws a second row and its cost is
-  // counted twice.
+  // Notifications without a matching launched row create no additional subagent row.
+
   const file = writeTranscript([
     userPrompt('start two background traces', 0),
     assistantTool('Agent', 1, 'bg7', { description: 'Trace host submit path', subagent_type: 'Explore' }),
@@ -8491,10 +8399,8 @@ test('an attachment notice for an agent that is still running leaves the row run
 });
 
 test('a notice under an unknown tool-use id leaves the call that holds that id alone', () => {
-  // A resumed agent reports back under the id of the message that woke it, not under the id
-  // of its launch. That id belongs to a call the agent is still waiting on. Ending it here
-  // drops the call record, and the result that arrives next has no step left to join, so a
-  // failure the reader has to see never reaches the row.
+  // A completion notice under a SendMessage id leaves that call available for its later result.
+
   const file = writeTranscript([
     userPrompt('wake the trace agent', 0),
     assistantTool('Agent', 1, 'bg7', { description: 'Trace host submit path', subagent_type: 'Explore' }),
@@ -8531,9 +8437,8 @@ test('a notice under an unknown tool-use id leaves the call that holds that id a
 });
 
 test('a notice recorded in a block shape the reader has no name for still gives up its tags', () => {
-  // The tags are read out of the raw text with a regular expression, so the text has to
-  // arrive whole. A content array of any other block shape folds to `[object Object]` under
-  // a text-only reading, and the child id goes with it.
+  // Notification tags remain readable inside unfamiliar content blocks.
+
   const file = writeTranscript([
     userPrompt('trace the submit path in the background', 0),
     assistantTool('Agent', 1, 'bg2', { description: 'Trace transcript append boundaries', subagent_type: 'Explore' }),
@@ -8560,9 +8465,8 @@ test('a notice recorded in a block shape the reader has no name for still gives 
 });
 
 test('a turn that ends on an attachment notice ends when the notice arrived', () => {
-  // The line reducer that the project index runs keeps every line of type user, assistant or
-  // cost-state and drops the rest. A background agent that finishes while the main agent
-  // waits reports back as an attachment, and that report is the turn's last event.
+  // A queued completion notice advances the usage reducer's newest turn end.
+
   const reducer = createClaudeUsageLineReducer();
   reducer.pushLine(JSON.stringify(userPrompt('trace the submit path in the background', 1)));
   reducer.pushLine(JSON.stringify(assistantText('Launched.', 2, { output_tokens: 1 }, undefined, 'end_turn')));
@@ -8586,9 +8490,8 @@ test('a turn that ends on an attachment notice ends when the notice arrived', ()
   );
 });
 
-// Every record a child agent writes carries `isSidechain`, because the same mark tells a
-// parent read that the line belongs to a child. The fixture carries it for that reason: a
-// child fixture without it prices work that no real child transcript ever offers.
+// Child transcript fixtures carry isSidechain for child-aware usage classification.
+
 test('a Claude child transcript keeps model rates apart, reports nested work, and retains its last effort', () => {
   const file = writeTranscript([
     {
@@ -8714,8 +8617,8 @@ test('a Claude child transcript keeps model rates apart, reports nested work, an
   });
 });
 
-// Claude Code writes every subagent of a session flat into one folder. A meta file beside each
-// transcript names the launching tool call, and a nested agent's meta file names its launcher.
+// Write each transcript record as a newline-terminated JSON line.
+
 function writeRecords(file: string, records: object[]): void {
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
 }
@@ -9040,9 +8943,8 @@ test('a child line reducer replaces a repeated cumulative response after restore
   });
 });
 
-// One assistant record. `id` names the response, and `block` names the content block the
-// record was written for. A response writes one record per block, and each block carries its
-// own uuid. A repeat is therefore the same id under a different uuid.
+// Response records share a message id across content blocks while each block has its own uuid.
+
 const usageRecord = (id: string, output: number, opts: { block?: number; sidechain?: boolean } = {}) =>
   JSON.stringify({
     type: 'assistant',
@@ -9105,9 +9007,8 @@ test('a record saved under a smaller window refuses to count its late revision t
 });
 
 test('a parent read bills one response once however many requests separate its records', () => {
-  // Claude Code writes one assistant record for each content block of a response. Every one
-  // repeats the same message id and the same usage under its own uuid, and other requests
-  // reach the reducer between them.
+  // Repeated response blocks retain one billed request despite intervening requests and checkpoint restoration.
+
   const reducer = createClaudeUsageLineReducer();
   const billed = (id: string, block: number) => reducer.pushLine(usageRecord(id, 1, { block })).length;
   assert.equal(billed('msg_01first', 1), 1);
@@ -9470,8 +9371,8 @@ test('a Claude process end stops an unfinished rail turn in full and indexed rea
   assert.equal(resumed[1].processEndedAt, undefined);
 });
 
-// The records Claude Code writes for a command it answers by itself: a caveat, the typed
-// command, and the answer that names the command as its parent.
+// Local command records include a caveat, the command, and its answer linked by parentUuid.
+
 function localCommand(
   name: string,
   args: string,
@@ -9518,8 +9419,8 @@ const renameRecords = (): object[] => [
   assistantAnswer('first answer', 1),
   ...localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', { stdout: RENAMED }),
 ];
-// A minute after the command, well inside the quiet window that keeps an open turn running.
-// The command is no turn, so each reader's newest turn is the answered one before it.
+// Evaluate one minute after the command, within the quiet window for an unfinished turn.
+
 const AFTER_COMMAND = ms(2) + 60_000;
 
 // What each reader of the newest turn's outcome says about it at one clock.
@@ -9554,7 +9455,7 @@ function localAnswerStatuses(records: object[], now = AFTER_COMMAND) {
     rail: rail ? statusOf(rail, true, now) : null,
     index: newest ? statusOf(newest, true, now) : null,
     count: indexed.turnCount(),
-    // When the newest turn of the full reader, the rail and the index started.
+    // Start times from the full read, session metadata, and usage index.
     starts: [turns[turns.length - 1]?.startedAt ?? null, rail?.startedAt ?? null, newest?.startedAt ?? null],
     railOutcome: rail,
     indexOutcome: newest,
@@ -9608,8 +9509,8 @@ test('a Claude local command answer makes no indexed turn across a resume', () =
   indexed.pushLine(JSON.stringify(userPrompt('the next prompt', 70)));
   assert.equal(indexed.turnCount(), 2, 'the command turn was counted when the next prompt arrived');
 
-  // The turn before the command is saved with the open command, so an answer read after a
-  // restore still withdraws it.
+  // Checkpoint restoration preserves the earlier turn when a local command answer removes the command's provisional turn.
+
   const first = createClaudeUsageLineReducer();
   for (const line of lines.slice(0, -1)) {
     first.pushLine(line);
@@ -9700,7 +9601,7 @@ test('a Claude local command answer leaves an earlier unanswered prompt on a car
     ...localCommand('/rename', 'claude entrypoint auto handback', 2, 'rename-1', { stdout: RENAMED }),
   ];
   const read = localAnswerStatuses(records);
-  // The unanswered prompt is the newest turn again. The CLI answered the command, so it was idle.
+  // The local command leaves the earlier unanswered prompt as the stopped newest turn.
   assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
   assert.deepEqual(
     [read.turns[1].processEndedAt, read.railOutcome?.processEndedAt, read.indexOutcome?.processEndedAt],
@@ -9766,7 +9667,7 @@ test('model work after a Claude local command answer makes the command the runni
   const read = localAnswerStatuses(records);
   assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
   assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'a reader does not take the command as the newest turn');
-  // The prompt card loses the stop the answer gave it, and reads stopped because it is not the newest.
+  // The earlier prompt loses processEndedAt and remains stopped because a newer turn follows it.
   const prompt = read.turns.find((turn) => turn.prompt === 'an unanswered prompt');
   assert.ok(prompt, 'the unanswered prompt lost its card');
   assert.notEqual(prompt, read.turns[read.turns.length - 1], 'the unanswered prompt is still the newest turn');
@@ -10134,9 +10035,8 @@ test('a synthetic Claude API error closes the newest spend-reducer turn without 
 });
 
 test('sessions are matched to a workspace one file at a time, not one directory at a time', () => {
-  // Two folders whose slugs collide share one directory. Deciding the whole directory from
-  // its newest transcript is wrong both ways: it shows the other project's sessions here,
-  // and it hides this project's own.
+  // Slug collisions share a directory. Each transcript's cwd determines its workspace membership.
+
   const root = tempDir('proj-');
   const dir = path.join(root, 'c--work-a-b');
   fs.mkdirSync(dir);
@@ -10236,9 +10136,8 @@ test('filesystem roots admit Claude directories for their descendants', () => {
   );
 });
 
-// The two rows a summary closes with. Every expected answer here is written out rather than
-// worked out from the reader, so a reader that stops finding a row cannot take the test with
-// it. The shapes are copied from real summaries on disk.
+// Closing action and question rows retain their own text across supported Markdown forms.
+
 test('the closing rows are read from the line they are written on', () => {
   const summary = [
     '- The hook is back and the suite is green.',
@@ -10254,8 +10153,8 @@ test('the closing rows are read from the line they are written on', () => {
 });
 
 test('the hyphen inside follow-ups is not the separator', () => {
-  // The reader took "ups - ..." as the whole row on every summary in the store before the
-  // separator was made to need a space in front of it.
+  // The hyphen within follow-ups does not separate its heading from its text.
+
   const rows = closingRows('- ❓ **Open questions / follow-ups** - whether to keep the store.');
   assert.equal(rows.questions, 'whether to keep the store.');
 });
@@ -10278,7 +10177,7 @@ test('a row written as a heading takes the list under it', () => {
 });
 
 test("a row named in passing in the summary's own prose is not a row", () => {
-  // Both lines are real, from summaries about the summary format itself.
+  // Prose references to row names supply no closing rows.
   const prose = [
     'Measured over every transcript: `Your actions` 8 times, `Context` 7, `Open questions` 6.',
     'The rows are 🙋 Your actions, ❓ Open questions, 📊 Context, 💭 Reflection candidates.',
@@ -10321,8 +10220,8 @@ test('openingLines still stops before the rows closingRows reads', () => {
 });
 
 test('a row holds what is under it, and stops where the next row starts', () => {
-  // The rows are bullets themselves, so the row below looks like another item of the one
-  // above. Reading it as one leaves the actions row claiming the questions row's text.
+  // A following heading starts a separate row even when both headings use bullets.
+
   const summary = [
     '- 🙋 **Your actions**',
     '  - Reload the window.',
@@ -10331,8 +10230,8 @@ test('a row holds what is under it, and stops where the next row starts', () => 
   ].join('\n');
   assert.deepEqual(closingRows(summary), { actions: 'Reload the window.', questions: 'none.' });
 
-  // The worse half of the same fault: an empty heading row taking the next row's text, which
-  // would say the reader is needed when the summary said nothing of the kind.
+  // An empty action heading leaves the following question text in its own row.
+
   const empty = ['- 🙋 **Your actions**', '- ❓ **Open questions / follow-ups** — whether to keep the store.'].join(
     '\n',
   );
@@ -10340,8 +10239,8 @@ test('a row holds what is under it, and stops where the next row starts', () => 
 });
 
 test('a sentence that opens with a row name does not empty the row above it', () => {
-  // "Last one wins" written as an unconditional assignment lets a later line that holds
-  // nothing wipe out the real row, and the card then silently stops saying it is waiting.
+  // Prose mentioning a row name preserves the earlier row's text.
+
   const summary = [
     '- 🙋 **Your actions** — reload the window and confirm.',
     '',
@@ -10351,7 +10250,7 @@ test('a sentence that opens with a row name does not empty the row above it', ()
 });
 
 test("a row written out inside a fenced example is not the turn's own row", () => {
-  // A summary about the summary format is a turn this panel has drawn several times.
+  // Fenced examples supply no closing row values.
   const summary = [
     '- Wrote the rule down.',
     '',
@@ -10373,10 +10272,8 @@ test('a row that is only a name, with nothing under it, is not a row', () => {
 });
 
 test('an item that opens with a row name is an item, not the next row', () => {
-  // Both names are ordinary English for the very thing these rows hold, so an item that
-  // begins with one is common rather than contrived. Reading it as a row ends the list on it
-  // and throws away that item and everything under it: the turn then shows no badge and
-  // drops out of the filter, which is the feature failing in the direction nobody notices.
+  // Indented items beginning with a row name remain content of their containing row.
+
   const summary = [
     '- ❓ **Open questions / follow-ups**',
     '  - Your actions here decide whether we ship Friday or slip to Monday.',
@@ -10389,7 +10286,7 @@ test('an item that opens with a row name is an item, not the next row', () => {
       ' Should the store rename land in the same release?',
   });
 
-  // And the same one line below a row written on its own line, which is the shape in use.
+  // Inline action text and a separate question section keep their own content.
   const mixed = [
     '- 🙋 **Your actions** — reload the window.',
     '- ❓ **Open questions / follow-ups**',
@@ -10402,9 +10299,8 @@ test('an item that opens with a row name is an item, not the next row', () => {
 });
 
 test('the section the newer format closes with is read as the actions row', () => {
-  // The format the summaries on disk are written in changed: no symbols, and every ask
-  // folded into one section. A reader that knows only the named rows says every turn
-  // written since is waiting on nothing at all.
+  // A Waiting on you section supplies action text without a separate question row.
+
   const summary = [
     'The rail keeps its focus, and the suite is green.',
     '',
@@ -10425,8 +10321,8 @@ test('the section the newer format closes with is read as the actions row', () =
 });
 
 test('the label is read with its colon written on either side of the bold', () => {
-  // Both spellings are written by hand, and the colon is punctuation rather than part of
-  // the label, so neither spelling can be the one that stops the section being found.
+  // A heading colon can sit inside or outside its bold markers.
+
   const inside = ['**Waiting on you:**', '- Reload the window.'].join('\n');
   assert.deepEqual(closingRows(inside), { actions: 'Reload the window.', questions: null });
   const outside = ['**Waiting on you**:', '- Reload the window.'].join('\n');
@@ -10434,8 +10330,8 @@ test('the label is read with its colon written on either side of the bold', () =
 });
 
 test('the section takes both bullet markers, and a blank line above its first item', () => {
-  // Two markers are in use for the same flat list, and the blank line under the label is
-  // written as often as not. Either one read as the end of the section drops the asks.
+  // Both bullet markers and a leading blank line retain the section's items.
+
   const summary = ['**Waiting on you**', '', '- Reload the window.', '* Decide the icon set.'].join('\n');
   assert.deepEqual(closingRows(summary), {
     actions: 'Reload the window.\nDecide the icon set.',
@@ -10444,9 +10340,8 @@ test('the section takes both bullet markers, and a blank line above its first it
 });
 
 test('the section takes the item shapes the older reader takes, and a wrap does not end it', () => {
-  // The older heading reader accepts numbered items and wrapped lines, and this section
-  // read bullets alone, so a numbered ask or an item that wrapped ended the section
-  // there and silently dropped every item after it.
+  // Numbered items and wrapped lines remain in the section alongside bullets.
+
   const summary = [
     '**Waiting on you**',
     '- Install the build and look at the rail,',
@@ -10459,16 +10354,15 @@ test('the section takes the item shapes the older reader takes, and a wrap does 
       'Install the build and look at the rail, the buckets most of all.\nDecide the done-glyph shape.\nAnswer the breakpoint question.',
     questions: null,
   });
-  // An indented line with no item above it is not a wrap of anything, so it ends the
-  // section the way any other stray line does.
+  // An indented line without a preceding item ends the section.
+
   const stray = ['**Waiting on you**', '  not an item', '- Too late to count.'].join('\n');
   assert.equal(closingRows(stray).actions, null);
 });
 
 test('the words waiting on you inside a sentence do not open a section', () => {
-  // A summary about the summary format names the section in its own prose, and the words
-  // are ordinary English besides. Either line read as a label hands the list under it to
-  // the card as work the reader owes.
+  // Row names within prose supply no section or action text.
+
   const prose = [
     'The rest of it is waiting on you to decide.',
     '- Not an item of anything.',
@@ -10480,8 +10374,8 @@ test('the words waiting on you inside a sentence do not open a section', () => {
 });
 
 test("the newer section written out inside a fenced example is not the turn's own", () => {
-  // A turn that writes the format down quotes the section in full, and a quoted example
-  // asks the reader for nothing.
+  // A fenced section supplies no action text.
+
   const summary = [
     'Wrote the newer format down.',
     '',
@@ -10496,8 +10390,8 @@ test("the newer section written out inside a fenced example is not the turn's ow
 });
 
 test('between the two shapes the one written later in the summary wins', () => {
-  // Both shapes are on disk, and a turn about the format itself carries the one it is not
-  // using. The rows close the summary, so whichever comes last is the turn's own.
+  // The last supported action row or section supplies the action value.
+
   const sectionLast = [
     '- 🙋 **Your actions** — the shape this turn replaced.',
     '- ❓ **Open questions / follow-ups** — whether to keep the store.',
@@ -10507,8 +10401,8 @@ test('between the two shapes the one written later in the summary wins', () => {
   ].join('\n');
   assert.deepEqual(closingRows(sectionLast), { actions: 'Reload the window.', questions: null });
 
-  // And the other way round, where the named row sits directly under the section's list and
-  // looks exactly like another item of it.
+  // A later action row replaces an earlier section's action value.
+
   const rowLast = [
     '**Waiting on you**',
     '- The shape this turn quoted.',
@@ -10520,8 +10414,8 @@ test('between the two shapes the one written later in the summary wins', () => {
 
 test('a relative path is written against the folder holding it, with forward slashes', () => {
   const one = ['C:/Users/dev/work/repo'];
-  // Forward slashes out, whatever shape the path arrived in: transcripts write one way and
-  // the snapshot store writes the other.
+  // Relative paths use forward slashes for both recorded separator styles.
+
   assert.equal(relativePath('C:/Users/dev/work/repo/src/a.ts', one), 'src/a.ts');
   const BS = String.fromCharCode(92);
   assert.equal(relativePath(['C:', 'Users', 'dev', 'work', 'repo', 'src', 'a.ts'].join(BS), one), 'src/a.ts');
@@ -10532,8 +10426,8 @@ test('a relative path is written against the folder holding it, with forward sla
 });
 
 test('the result keeps the case the disk holds, not the case the comparison used', () => {
-  // Comparing normalizes, which lower-cases the whole path on Windows. Cutting the result out
-  // of the normalized string would hand back a path that names nothing when it is pasted.
+  // Relative paths retain the source path's case after case-insensitive workspace matching.
+
   assert.equal(relativePath('C:/Users/dev/work/repo/src/MyFile.TS', ['c:/users/dev/work/repo']), 'src/MyFile.TS');
 });
 
@@ -10541,7 +10435,7 @@ test('with more than one folder open the answer says which one', () => {
   const two = ['C:/work/alpha', 'C:/work/beta'];
   assert.equal(relativePath('C:/work/alpha/src/a.ts', two), 'alpha/src/a.ts');
   assert.equal(relativePath('C:/work/beta/b.ts', two), 'beta/b.ts');
-  // With one folder the name would only stutter, so it is left off.
+  // A single open folder supplies no folder-name prefix.
   assert.equal(relativePath('C:/work/alpha/src/a.ts', ['C:/work/alpha']), 'src/a.ts');
 });
 
@@ -10563,33 +10457,33 @@ test('a path outside every folder has no relative form, so it keeps its own', ()
 });
 
 test('the four recorded spellings of one file copy as one string', () => {
-  // The two readers write `c:\`, `C:\`, `c:/` and `C:/` for the same file, so a path copied
-  // from one turn did not match the same path copied from the next.
+  // Absolute Windows paths normalize separator style and drive-letter case for copying.
+
   const want = 'C:\\Users\\dev\\work\\repo\\src\\a.ts';
   assert.equal(nativePath('c:\\Users\\dev\\work\\repo\\src\\a.ts'), want);
   assert.equal(nativePath('C:\\Users\\dev\\work\\repo\\src\\a.ts'), want);
   assert.equal(nativePath('c:/Users/dev/work/repo/src/a.ts'), want);
   assert.equal(nativePath('C:/Users/dev/work/repo/src/a.ts'), want);
-  // Any drive, not just the one this machine happens to record most often.
+  // Every drive letter follows the same conversion.
   assert.equal(nativePath('d:/work/repo/b.ts'), 'D:\\work\\repo\\b.ts');
   assert.equal(nativePath('d:\\work\\repo\\b.ts'), 'D:\\work\\repo\\b.ts');
 });
 
 test('a path with no drive letter is copied byte for byte', () => {
-  // The relative form keeps its forward slashes, which is what a message or a config file
-  // wants. It has no drive letter, so the shape gate leaves it alone.
+  // Relative paths retain their separator style.
+
   assert.equal(nativePath('src/a.ts'), 'src/a.ts');
   assert.equal(nativePath('docs/architecture.md'), 'docs/architecture.md');
   // A POSIX absolute path is already native where it names something.
   assert.equal(nativePath('/home/dev/x'), '/home/dev/x');
-  // A UNC share names a drive nobody lettered, and its leading slashes are already the
-  // separator this rule converts to.
+  // UNC paths retain their existing leading separators.
+
   assert.equal(nativePath('\\\\server\\share\\a.ts'), '\\\\server\\share\\a.ts');
 });
 
 test('a drive letter with no separator after it is not an absolute path', () => {
-  // `C:` on its own names the current directory of that drive, and `c:relative/x.ts` names a
-  // file under it. Neither is absolute, so neither is this rule's business.
+  // Bare drives and drive-relative paths remain unchanged because they are not absolute paths.
+
   assert.equal(nativePath(''), '');
   assert.equal(nativePath('C:'), 'C:');
   assert.equal(nativePath('c:'), 'c:');
@@ -10602,8 +10496,8 @@ test('a link names its file with the anchor stripped, and a URL names nothing', 
   assert.equal(linkTarget('src/store.ts:42'), 'src/store.ts');
   assert.equal(linkTarget('src/store.ts:42:7'), 'src/store.ts');
   assert.equal(linkTarget('src/store.ts'), 'src/store.ts');
-  // A Windows drive letter is a colon without slashes, and stays a file; the trailing
-  // line number still comes off.
+  // An absolute Windows drive path remains a file after its trailing line number is removed.
+
   assert.equal(linkTarget('c:/repo/a.ts:42'), 'c:/repo/a.ts');
   assert.equal(linkTarget('https://example.com/a.ts'), null);
   assert.equal(linkTarget('HTTP://x/y#L4'), null);
@@ -10668,10 +10562,8 @@ test('a relative link resolves to the folder that holds it, or the first folder'
 });
 
 test('a session was last active when it last recorded a time, not when its file was touched', () => {
-  // A transcript as an agent leaves it when a session is closed: real turns, then a
-  // run of bookkeeping that carries no time of its own. Those records still move the file,
-  // so a reader taking the mtime dates a session nobody touched to the moment it was
-  // closed.
+  // Untimed bookkeeping after the last activity leaves the recorded activity timestamp unchanged.
+
   const closed = writeTranscript([
     userPrompt('why does the panel show nothing in this repo', 0),
     assistantText('because no folder holding a transcript is open', 30),
@@ -10683,16 +10575,16 @@ test('a session was last active when it last recorded a time, not when its file 
   ]);
   assert.equal(readSessionActivity(closed), ms(30), 'the closing bookkeeping was read as activity');
 
-  // Nothing but bookkeeping. There is no recorded time to give, and saying so is what lets
-  // the caller fall back rather than invent one.
+  // Bookkeeping alone leaves activity time unavailable.
+
   const silent = writeTranscript([
     { type: 'ai-title', aiTitle: 'Named but never spoken in' },
     { type: 'mode', mode: 'default' },
   ]);
   assert.equal(readSessionActivity(silent), null);
 
-  // A time that will not parse is skipped rather than counted. Counting it makes the answer
-  // NaN, and rounding it to zero claims the session was last active in 1970.
+  // Invalid timestamps supply no activity time.
+
   const broken = writeTranscript([
     userPrompt('a real prompt', 10),
     { type: 'system', timestamp: 'not a date', content: 'hook fired' },
@@ -10702,9 +10594,8 @@ test('a session was last active when it last recorded a time, not when its file 
 });
 
 test('a record that lands out of order cannot pull a session back in time', () => {
-  // A sidechain's line is written when its answer arrives, so a line carrying an older time
-  // can land after a newer one. Taking the last time found rather than the newest reads
-  // that as the session going backwards.
+  // A late sidechain record with an older timestamp preserves the newest recorded activity time.
+
   const out = writeTranscript([
     userPrompt('run three agents', 0),
     assistantText('all three are done', 300),
@@ -10725,8 +10616,8 @@ test('a session name and its last activity come out of one read of the tail', ()
     { type: 'ai-title', aiTitle: 'Timeline view for agent turns' },
     { type: 'mode', mode: 'default' },
   ]);
-  // Not a run: its one turn never closed, and a session still inside its first turn
-  // is the one shape this rule refuses to guess at.
+  // A session still in its first unfinished turn has no agent-run classification.
+
   const { headKey, titleAt, coverage, ...meta } = readSessionMeta(file);
   assert.deepEqual(coverage, { whole: true, windowBytes: 256 * 1024 });
   assert.ok(headKey && titleAt, 'the read names the first record and places the title record');
@@ -10845,9 +10736,8 @@ test('session metadata follows the parser through API errors and a turn that res
   });
 });
 
-// Two background subagents, one completion notice, and a typed prompt between them. The
-// session's newest turn is closed, but one child still runs, and every reader of the outcome
-// has to name it.
+// A background Agent result identifies its child and asynchronous launch state.
+
 function backgroundLaunch(toolUseId: string, agentId: string, second: number) {
   return {
     type: 'user',
@@ -10900,8 +10790,8 @@ test('a closed turn names the background children no notice has closed yet', () 
   }
 });
 
-// A turn that started a command in the background and closed while it runs. The agent wakes
-// by itself when the command's end record arrives.
+// A command completion notice identifies its task, tool call, status, and timestamp.
+
 function commandNotice(toolUseId: string, taskId: string, status: string, second: number) {
   return {
     type: 'user',
@@ -10930,8 +10820,8 @@ const backgroundCommandTurn = [
   assistantAnswer('The suite runs in the background.', 3),
 ];
 
-// The rail status the tail read gives the session at one clock, with the open children the
-// caller names.
+// Derive session status from transcript metadata and the supplied open-child count at one clock reading.
+
 function railStatusFromTranscript(records: object[], now: number, openChildren = new Map<string, number>()) {
   const outcomes = new Map([['sess', readSessionMeta(writeTranscript(records)).outcome]]);
   return sessionStatusOf(
@@ -10983,7 +10873,7 @@ test('a closed turn reads background while a command it started in the backgroun
   // The state lasts one hour from the launch at most.
   assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(1) + BACKGROUND_COMMAND_CAP_MS - 1), 'background');
   assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(1) + BACKGROUND_COMMAND_CAP_MS), noCommand);
-  // A live background subagent wins, because it is work in progress and a command is a wait.
+  // Live subagents take precedence over background-command status.
   assert.equal(railStatusFromTranscript(backgroundCommandTurn, ms(4), new Map([['sess', 1]])), 'subagents');
 });
 
@@ -11197,8 +11087,8 @@ test('a resume after a recorded process end carries no open child into the new t
   }
 });
 
-// Child discovery names a child by the agent id its launch result carries, and the outcome names
-// the same id. The rail joins the two under the parent session to find the child's write time.
+// Child references and outcome facts share the launch result's agent id for write-time lookup.
+
 test('a child discovery reference joins the open child its launch names', () => {
   const file = writeTranscript(twoBackgroundChildren);
   const references = readClaudeChildSessionReferences({ file, sessionId: 'sess' });
@@ -11218,9 +11108,8 @@ test('a child discovery reference joins the open child its launch names', () => 
   assert.equal(writeTimeOfVersion('2048:'), null);
 });
 
-// A real Claude background launch keeps its row open with the parser's own `running` status.
-// The card's agents figure counts the same children the rail counts, and an open row whose
-// child has gone quiet stays out of the count.
+// Cards and the session list count the same live children. Quiet children supply no running figure.
+
 test('the agents figure counts the live open children the rail counts', () => {
   const file = writeTranscript(twoBackgroundChildren);
   const read = readSession(file, 'sess');
@@ -11243,8 +11132,8 @@ test('the agents figure counts the live open children the rail counts', () => {
   assert.deepEqual(figure(now - TURN_QUIET_MS - 1), { rail: undefined, card: undefined });
 });
 
-// Turn 1 launches a background child, and turn 2 finishes while the child still runs. The rail
-// says `1 subagent`, so the newest card must count the same carried subagent on its agents figure.
+// The newest finished card includes live subagents launched by earlier turns.
+
 test('the newest turn card counts a carried subagent', () => {
   const records = [
     userPrompt('scan in the background', 0),
@@ -11283,8 +11172,8 @@ test('the newest turn card counts a carried subagent', () => {
     { label: '1 subagent', running: 1, heading: '1 subagent in this turn', footer: undefined },
     'the older card counts only its own row',
   );
-  // The rail counts children only under a done, failed or interrupted newest turn, and the
-  // newest card follows the same rule. A running turn and a stopped turn count none.
+  // Running and stopped newest turns supply no carried-subagent figure.
+
   const railFor = (outcome: TurnOutcome) =>
     sessionStatusOf([], new Set(), new Map([['sess', outcome]]), now, new Set(), new Map(), openChildCounts(live)).get(
       'sess',
@@ -11330,9 +11219,8 @@ test('the newest turn card counts a carried subagent', () => {
   );
 });
 
-// The session is at rest and its carried subagent still runs. Its outcome comes back from the
-// derived cache, where nothing closed and the stored outcome names no closed child. The rail
-// must still wear `subagents`, and the newest card must still count the carried subagent.
+// Cached outcomes retain carried subagents without closed-child facts.
+
 test('a session at rest keeps its carried subagent through the derived cache', () => {
   const read = readSession(
     writeTranscript([
@@ -11424,8 +11312,8 @@ test('a session at rest keeps its carried subagent through the derived cache', (
   );
 });
 
-// A completion notice without a tool-use id closes its child in the tail read and the lifetime
-// facts, while the parsed window keeps the child's row open. No read may reopen the child.
+// A completion observed by metadata or lifetime readers prevents a parsed open row from reopening the child.
+
 test('a child that any read closed does not count as open', () => {
   const { tail, full, lifetime } = outcomeReaders([
     userPrompt('scan in the background', 0),
@@ -11456,8 +11344,8 @@ test('a child that any read closed does not count as open', () => {
   );
 });
 
-// The tail read reaches the newest turn and not the launch before it. The parsed window holds
-// the launch, and its card draws the child's row. The rail must count the same live child.
+// A launch outside the metadata tail remains available through the parsed window for live-child counts.
+
 test('the rail counts a live child only the parsed window holds', () => {
   const file = writeTranscript([
     userPrompt('scan in the background', 0),
@@ -11498,13 +11386,8 @@ test('session metadata skips an ordinary successful tool result like the full pa
   assert.equal(readSessionMeta(file).outcome?.endedAt, parsed.endedAt);
 });
 
-// A session another agent started by shelling out to the CLI is indistinguishable from
-// one the reader had, until you look for the reader. Nothing in the transcript names the
-// agent that started it, so the rule reads the six things only a person leaves behind, and
-// the one thing that outranks all six.
-//
-// Measured over the 86 sessions in this workspace: 44 answer true and every one is a
-// harness run, and over 67 sessions known to be runs it answers true for 66.
+// A completed single-prompt session without reader evidence receives agent-run classification.
+
 test('a session with no sign of a person in it is an agent run', () => {
   const run = writeTranscript([
     userPrompt('write the closing message for a long working turn', 0),
@@ -11514,9 +11397,8 @@ test('a session with no sign of a person in it is an agent run', () => {
 });
 
 test('any one sign of a person is enough to say a person was there', () => {
-  // Every case closes its turn, so the only thing left deciding the answer is the sign
-  // under test. Without the closing answer each case would come back false for the other
-  // reason and the whole table would pass while reading nothing.
+  // Each case closes its turn before reader evidence determines its classification.
+
   const done = assistantAnswer('done', 1);
   const cases: [string, object[]][] = [
     [
@@ -11553,9 +11435,8 @@ test('any one sign of a person is enough to say a person was there', () => {
       ],
     ],
     ['a question put to the reader', [userPrompt('one ask', 0), assistantTool('AskUserQuestion', 1, 'q1'), done]],
-    // The prompt id is how the panel's other readers tell prompts apart, and an older
-    // transcript can carry a prompt without one. Counting ids rather than prompts read
-    // this session as a run and folded a person's second question away.
+    // A second typed prompt counts even without promptId.
+
     [
       'a second prompt with no id of its own',
       [
@@ -11586,8 +11467,8 @@ test('the system records Claude Code writes with nobody present are no sign of a
   }
 });
 
-// An older editor build writes no origin on a prompt, so a long single-prompt editor session
-// that compacted shows one prompt, a finished turn and a compaction record, and nothing else.
+// Editor entrypoint compaction establishes reader evidence without a recorded origin.
+
 test('a compaction record in an editor session is a sign of a person', () => {
   const editor = writeTranscript([
     userPrompt('walk me through the store module', 0, { entrypoint: 'claude-vscode', version: '2.1.195' }),
@@ -11654,9 +11535,8 @@ test('the agent-run scan reads a character split across two read chunks', () => 
   assert.equal(agentRunOfScan(scan, built.bytes.length), true, 'a line crossing the chunk boundary did not parse');
 });
 
-// The person fact files a dispatched session with the reader's sessions, so it reads only the
-// signs `agentRunIn` already treats as a person's. Every person case here is a person to
-// `agentRunIn` too, and the spend read of a quiet session reads the same signs.
+// Person scans and child spend use the same reader evidence as agentRunIn.
+
 test('a dispatched session reads as a person only on a sign a person leaves', () => {
   const bg = { sessionKind: 'bg' };
   const human = { origin: { kind: 'human' } };
@@ -11739,8 +11619,8 @@ test('a dispatched session reads as a person only on a sign a person leaves', ()
   }
 });
 
-// A running child first seen before its launch prompt is written must not read that prompt as
-// a second one, because the scan cannot count what came before it.
+// An end-position scan counts a later launch prompt as the first prompt it observes.
+
 test('a dispatched session read from its end counts no prompt it could not see', () => {
   const file = writeTranscript([{ type: 'system', subtype: 'informational', sessionKind: 'bg', timestamp: at(0) }]);
   const end = fs.statSync(file).size;
@@ -11758,9 +11638,8 @@ test('a dispatched session read from its end counts no prompt it could not see',
   assert.equal(scan.person, true, 'a queued follow-up read from the end did not read as a person');
 });
 
-// A running background child can be first seen after its header records and before its launch
-// prompt. A slash-command launch the scan reads next is still the dispatching agent's. Once the
-// launch prompt sits before the point the scan starts from, a slash command is a person's.
+// An end-position scan distinguishes a later slash-command launch from a follow-up after an earlier launch.
+
 test('a dispatched session read from its end tells a slash-command launch from a person', () => {
   const bg = { sessionKind: 'bg' };
   const human = { origin: { kind: 'human' } };
@@ -11790,11 +11669,8 @@ test('a dispatched session read from its end tells a slash-command launch from a
   assert.equal(scan.person, true, 'a slash command a person typed after the launch did not read as a person');
 });
 
-// The shape the six signs cannot see, because every one of them arrives later in a
-// session than its first prompt. The reader asks a question, the agent reads and greps
-// its way towards an answer, and until it edits something or the reader types again the
-// transcript is indistinguishable from a print-mode run. Marking it would take the
-// session the reader is sitting in out of the panel that exists to show it.
+// A first unfinished turn remains outside agent-run classification.
+
 test('a session still inside its first turn is not called a run', () => {
   const live = writeTranscript([
     userPrompt('why is the panel slow', 0),
@@ -11818,10 +11694,8 @@ test('a session still inside its first turn is not called a run', () => {
   assert.equal(readSessionMeta(over).agentRun, true);
 });
 
-// A subagent writes its own file, so this shape does not occur today. The guard is the belt
-// every other reader of a transcript already wears: `readSession` skips a sidechain line and
-// `isTypedPrompt` refuses one. Read here, a subagent's closing answer ends the reader's own
-// first turn while the reader is still sitting in it, which is what the rule above refuses.
+// Sidechain answers leave the parent's first turn unfinished.
+
 test('a subagent answering does not close the turn the reader is still in', () => {
   const live = writeTranscript([
     userPrompt('why is the panel slow', 0),
@@ -11832,9 +11706,8 @@ test('a subagent answering does not close the turn the reader is still in', () =
   assert.equal(readSessionMeta(live).agentRun, false);
 });
 
-// The harness writes an assistant record of its own when a run is interrupted or a tool is
-// refused, and `readSession` skips it for the same reason. Read here it closes the turn, and
-// a session the reader is still inside is then called a run.
+// Synthetic assistant records leave the first turn unfinished.
+
 test('a record the harness wrote does not close the turn either', () => {
   const live = writeTranscript([
     userPrompt('why is the panel slow', 0),
@@ -11853,10 +11726,8 @@ test('a record the harness wrote does not close the turn either', () => {
   assert.equal(readSessionMeta(live).agentRun, false);
 });
 
-// A complete line that will not parse could hold any of the signs, so the tail reader answers
-// nothing. A transcript is appended to while an agent works, so a read can also land mid-write
-// and leave half a record after the last newline. That one waits for the next read, the way
-// the whole-file scan reads complete lines only.
+// Malformed complete lines leave classification unavailable. An unfinished final line waits for a later read.
+
 test('a complete line that will not parse leaves the question unanswered rather than assumed', () => {
   const dir = tempDir('tl-');
   const file = path.join(dir, 'sess.jsonl');
@@ -11867,22 +11738,17 @@ test('a complete line that will not parse leaves the question unanswered rather 
   assert.equal(readSessionMeta(file).agentRun, null, 'a complete line that will not parse was answered');
   fs.writeFileSync(file, whole + '\n{"type":"system"');
   assert.equal(readSessionMeta(file).agentRun, true, 'a half-written last record changed the answer');
-  // `null` is valid JSON and reading a field off it threw out of readSessionMeta, which
-  // every listed session goes through, so one such line took down the whole refresh.
+  // A null JSON value leaves classification available without a record to inspect.
+
   fs.writeFileSync(file, whole + '\nnull\n');
   assert.equal(readSessionMeta(file).agentRun, true);
 });
 
-// The rule that rescues the false positive that matters. The one session in this
-// workspace the six signs called a run and the owner had was him asking for help with a
-// hook error and getting it in a single turn, with two files changed and no reason to type
-// again. A session that touched the tree is also the last one this extension should
-// fold away, since showing what changed is the whole of its job.
+// An edit call without an SDK entrypoint supplies reader evidence.
+
 test('a changed file with no SDK entrypoint is never an agent run', () => {
-  // The call is what is read, not what came back. An edit that failed still says somebody
-  // meant to change this tree, and reading the result would need a second rule about what
-  // each tool calls success. So the fixture carries the call and nothing else: a result
-  // beside it would make the case pass whether the rule read the call or not.
+  // The edit call establishes intent without requiring a result.
+
   const fixed = writeTranscript([
     userPrompt('help, on windows i get a hook error', 0),
     assistantTool('Edit', 4, 'e1', { file_path: 'scripts/register-hooks.js' }),
@@ -11898,13 +11764,8 @@ test('a changed file with no SDK entrypoint is never an agent run', () => {
   assert.equal(readSessionMeta(looked).agentRun, true);
 });
 
-// The false negative that rescue introduced: a print-mode run started through the SDK, such
-// as a review Arc's own read-only dispatch launches, can write a plan or a report file and
-// then read as a person purely for touching the tree. A changed file steps back for a
-// transcript whose every record that names an entrypoint names an SDK one instead, so the
-// exception above never fires for the terminal entrypoint or the no-entrypoint case the test
-// above used. A finished single-prompt sdk-cli run that also wrote a file, padded past one
-// read chunk so the scan reader is exercised too.
+// An SDK-only session can retain agent-run classification after a file change.
+
 test('a changed file under an SDK entrypoint is an agent run, tail read and whole-file scan alike', () => {
   const small = writeTranscript(sdkFileChangeTranscript('ok'));
   assert.equal(
@@ -11921,8 +11782,8 @@ test('a changed file under an SDK entrypoint is an agent run, tail read and whol
     'the whole-file scan still called a changed file a person under sdk-cli',
   );
 
-  // The Write call arrives before the record naming the sdk-cli entrypoint, on both
-  // readers, to check the exception does not depend on entrypoint arriving first.
+  // File-change classification accepts an SDK entrypoint recorded after the Write call.
+
   const lateEntrypoint = (padding: string): object[] => [
     userPrompt('write the plan file', 0),
     assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
@@ -11948,8 +11809,8 @@ test('a changed file under an SDK entrypoint is an agent run, tail read and whol
   );
 });
 
-// A guard line built to scan past 256 KB, so both readers are exercised: `agentRunIn`
-// against its small twin above, and `scanForAgentRun`/`agentRunOfScan` here.
+// Classify the complete transcript through the incremental agent-run scan.
+
 function scannedAgentRun(lines: object[]): boolean {
   const file = writeTranscript(lines);
   const complete = fs.statSync(file).size;
@@ -12013,8 +11874,8 @@ test('the SDK file-change exception does not reach a terminal entrypoint or a hu
     'the whole-file scan read a human origin under an SDK entrypoint as a run',
   );
 
-  // The Write call arrives before any record names an entrypoint, on both readers. A
-  // terminal entrypoint named later still keeps the session a person's.
+  // A terminal entrypoint recorded after the Write call retains reader classification.
+
   const changeFirst = [
     userPrompt('write the plan file', 0),
     assistantTool('Write', 1, 'w1', { file_path: '.claude/plans/plan.md' }),
@@ -12054,8 +11915,8 @@ test('the SDK file-change exception does not reach a terminal entrypoint or a hu
   );
 });
 
-// A padded filler record, so a denial fixture can be pushed past the 256 KB tail window
-// for the whole-file scan without changing what the denial itself says.
+// Padding moves earlier reader evidence beyond the metadata tail without changing that evidence.
+
 function padded(second: number, padding: string): object {
   return {
     type: 'user',
@@ -12064,10 +11925,8 @@ function padded(second: number, padding: string): object {
   };
 }
 
-// Read-only dispatch runs `claude -p --permission-mode dontAsk`, so a command that is not
-// read-only comes back with `toolDenialKind: 'permission-rule'` and nobody saw the refusal.
-// That denial follows the same SDK-only exception as a changed file. A denial the reader
-// made themselves, `user-rejected`, is still a person under every entrypoint.
+// Permission-rule denials permit SDK-only agent-run classification. User-rejected denials establish reader evidence under every entrypoint.
+
 test('a rule denial under an SDK entrypoint follows the same exception as a changed file', () => {
   const excusedLines = (padding: string): object[] => [
     userPrompt('run the safe commands', 0, { entrypoint: 'sdk-cli' }),
@@ -12156,8 +12015,8 @@ test("a slash command with no origin in an SDK-only session is the run's own pro
     'the whole-file scan called an SDK slash command a person',
   );
 
-  // The command sign arrives before the record naming the sdk-cli entrypoint, on both
-  // readers, to check the exception does not depend on the entrypoint arriving first.
+  // SDK-only classification accepts an entrypoint recorded after the slash command.
+
   const entrypointLate = (padding: string): object[] => [
     {
       type: 'user',
@@ -12239,9 +12098,8 @@ test("a background session's one prompt reads as an agent run, tail read and who
     'the whole-file scan called a background session a person',
   );
 
-  // Claude Code's own remote-control bridge-session record arrives before the prompt record
-  // naming `sessionKind: 'bg'`, on both readers, to check the exception does not depend on
-  // that record arriving first.
+  // A bridge record preceding the background marker preserves background agent-run classification.
+
   const bridgeFirst = (padding: string): object[] => [
     {
       type: 'bridge-session',
@@ -12274,9 +12132,8 @@ test("a background session's one prompt reads as an agent run, tail read and who
   );
 });
 
-// `claude --bg "/review-and-report ..."` launches with a slash command that carries the human
-// origin a typed launch prompt carries. With no dispatch edge, the agent-run rule reads the two
-// launch forms alike: the launch prompt is no person, and a second prompt with a human origin is.
+// A background slash-command launch counts like a typed launch. A later human-origin command establishes reader evidence.
+
 test("a background session's slash-command launch reads as its typed launch does", () => {
   const command = (name: string, n: number, extra: object = {}): object => ({
     type: 'user',
@@ -12322,9 +12179,8 @@ test("a background session's second typed prompt is still a person", () => {
   assert.equal(readSessionMeta(second).agentRun, false, "a background session's second typed prompt was read as a run");
 });
 
-// The dispatching agent's own follow-up to a background worker carries `promptSource: 'sdk'`
-// and no human origin, so it must not fail the background branch's exactly-one-prompt check
-// the way a person's own second prompt does.
+// Background follow-ups with promptSource sdk and no human origin leave the counted launch prompt unchanged.
+
 test("a background worker's dispatched follow-up is an agent run, tail read and whole-file scan alike", () => {
   assert.equal(
     readSessionMeta(writeTranscript(bgWorkerFollowUpTranscript())).agentRun,
@@ -12338,9 +12194,8 @@ test("a background worker's dispatched follow-up is an agent run, tail read and 
   );
 });
 
-// A second prompt with a human origin is what `claude attach` plus typing writes, and it must
-// still mark the owner even though its `promptSource` also happens to read `sdk`: only a
-// prompt with no human origin is excused in a background session.
+// A second human-origin prompt establishes reader evidence even with promptSource sdk.
+
 test("a background session's second prompt with a human origin is still a person even under promptSource: sdk", () => {
   const humanSecond = (padding: string): object[] => [
     ...bgWorkerFollowUpTranscript(padding).slice(0, 4),
@@ -12367,10 +12222,8 @@ test("a background session's second prompt with a human origin is still a person
   );
 });
 
-// The dispatched-follow-up exclusion only drops a prompt that carries no human origin and
-// `promptSource: 'sdk'` once `sessionKind: 'bg'` is already known. A background session whose
-// only prompt is shaped that way then counts no prompt at all, and `promptsOk` rejects that
-// the same way it rejects a background session with no prompt at all.
+// An SDK-shaped prompt after the background marker supplies no counted launch prompt.
+
 test('a background session whose only prompt is a dispatched-shaped follow-up counts no prompt', () => {
   const onlyDispatchedShape = (padding: string): object[] => [
     {
@@ -12407,9 +12260,8 @@ test('a background session whose only prompt is a dispatched-shaped follow-up co
   );
 });
 
-// Claude Code writes `away_summary` as a recap with nobody watching, the same direction as
-// `stop_hook_summary` and the other unattended subtypes, so it must not mark a background
-// session a person's.
+// An away_summary record preserves background agent-run classification.
+
 test('an away_summary record in a background session is an agent run, tail read and whole-file scan alike', () => {
   assert.equal(
     readSessionMeta(writeTranscript(bgAwaySummaryTranscript())).agentRun,
@@ -12423,9 +12275,8 @@ test('an away_summary record in a background session is an agent run, tail read 
   );
 });
 
-// The unattended system subtypes are tallied on sight and only judged once the whole tally is
-// in, so an `away_summary` record arriving before the record that names `sessionKind: 'bg'`
-// reads no differently from one arriving after it.
+// An away_summary record preceding the background marker receives the same classification as one following it.
+
 test("an away_summary record seen before sessionKind: 'bg' is still an agent run for both readers", () => {
   const awayBeforeBg = (padding: string): object[] => [
     {
@@ -12464,8 +12315,8 @@ test("an away_summary record seen before sessionKind: 'bg' is still an agent run
   );
 });
 
-// A run needs exactly one counted prompt. `promptsOk`'s background branch once accepted
-// `tally.prompts <= 1`, which let a background session with no prompt at all read as a run.
+// A background agent run requires exactly one counted prompt.
+
 test('a background session with no counted prompt is never an agent run', () => {
   const noPrompt = writeTranscript([
     { type: 'system', timestamp: at(0), subtype: 'stop_hook_summary', sessionKind: 'bg' },
@@ -12527,10 +12378,8 @@ test('a resumed SDK review with a human-origin second prompt is still a person',
   );
 });
 
-// `claude --bg` writes `sdk-cli` on most real background transcripts, not the terminal `cli`
-// entrypoint the other background fixtures use. `promptsOk` checked the SDK entrypoint before
-// the background one, so a bg session under sdk-cli with a human-origin first prompt failed
-// the SDK branch's prompt check and read as a person.
+// A background launch permits a human-origin first prompt under the SDK entrypoint.
+
 test('a background session under sdk-cli with a human-origin first prompt is an agent run', () => {
   const bgSdk = (padding: string): object[] => [
     {
@@ -12563,8 +12412,8 @@ test('a background session under sdk-cli with a human-origin first prompt is an 
   );
 });
 
-// Run through the tail reader and the whole-file scan alike, over a file padded past 256 KB,
-// because a real session is megabytes and the panel reads one that size through the scan.
+// Reader evidence remains effective in both small metadata reads and scans spanning more than 256 KiB.
+
 test("a background session's other person signs still mark a person, tail read and whole-file scan alike", () => {
   const bgFirst = () =>
     userPrompt('fix the failing lint rule', 0, { entrypoint: 'cli', origin: { kind: 'human' }, sessionKind: 'bg' });
@@ -12633,9 +12482,8 @@ test("a background session's other person signs still mark a person, tail read a
   }
 });
 
-// `scanForAgentRun` already stopped on a non-SDK entrypoint seen with no `sessionKind: 'bg'`
-// yet, but `agentRunIn` decided leniency from the tally's final `bg` state, so a `bg` record
-// arriving after the entrypoint made the tail reader and the whole-file scan disagree.
+// A terminal entrypoint observed before the background marker retains reader classification.
+
 test("a non-SDK entrypoint seen before sessionKind: 'bg' is a person for both readers", () => {
   const entrypointBeforeBg = (padding: string): object[] => [
     {
@@ -12666,9 +12514,8 @@ test("a non-SDK entrypoint seen before sessionKind: 'bg' is a person for both re
   );
 });
 
-// The entrypoint and `sessionKind` tallying run after the sidechain and synthetic-message
-// skips, so a subagent's own aside and the synthetic filler record Claude Code writes must
-// neither one speak for the main session they sit inside.
+// Sidechain and synthetic records supply no entrypoint or background markers for the parent session.
+
 test('a sidechain record and a synthetic-model record contribute no entrypoint or background marker', () => {
   const leakage = (padding: string): object[] => [
     {
@@ -12796,8 +12643,8 @@ test('a slash command with no origin in a bg session under cli is still a second
   );
 });
 
-// A human origin is a final person sign the moment it is read, so it must still be one when
-// it arrives before the record naming the sdk-cli entrypoint, on both readers.
+// A human-origin prompt preceding the SDK entrypoint retains reader classification.
+
 test('a resumed SDK review with a human-origin sign before the entrypoint record is still a person, tail read and whole-file scan alike', () => {
   const signFirst = (padding: string): object[] => [
     userPrompt('now check the tests', 0, { origin: { kind: 'human' } }),
@@ -12822,10 +12669,8 @@ test('a resumed SDK review with a human-origin sign before the entrypoint record
   );
 });
 
-// The failure this rescues, as the owner met it. He asked for a question to be put to him,
-// chose an answer, and the rail filed the session he was sitting in under Run by
-// agents. One prompt closed by one answer is also the shape of a print-mode run, and until
-// the question was read nothing in the turn told the two apart.
+// AskUserQuestion establishes reader evidence in a completed single-prompt session.
+
 test('a question the reader answered is never an agent run', () => {
   const chose = writeTranscript([
     userPrompt('ask me which colour I prefer, with blue and red as options', 0),
@@ -12840,10 +12685,8 @@ test('a question the reader answered is never an agent run', () => {
   assert.equal(readSessionMeta(chose).agentRun, false);
 });
 
-// Every tool call writes its result back as a user record carrying the prompt id of the
-// prompt that started the turn. Counting those would make one prompt that ran two tools
-// look like three prompts, and no session with a tool call in it would ever be read
-// as a run.
+// Tool results carrying promptId supply no additional typed prompts.
+
 test('the results a tool writes back are not read as the reader typing again', () => {
   const run = writeTranscript([
     userPrompt('one ask', 0),
@@ -12860,10 +12703,8 @@ test('the results a tool writes back are not read as the reader typing again', (
   assert.equal(readSessionMeta(run).agentRun, true);
 });
 
-// The window this is read in is the tail, and a person's signs sit anywhere in a file. A
-// window that did not reach the start therefore answers nothing rather than guessing, and
-// the caller reads that as a person: the cost of missing a run is a row in a list, and the
-// cost of the other mistake is somebody's own work filed under an agent's name.
+// A metadata window that excludes the file start leaves agent-run classification unavailable.
+
 test('a window that did not reach the start of the file says nothing either way', () => {
   const long = writeTranscript([
     userPrompt('the first ask, which the small window below will not reach', 0),
@@ -12874,10 +12715,8 @@ test('a window that did not reach the start of the file says nothing either way'
   assert.equal(readSessionMeta(long).agentRun, true);
 });
 
-// A session the panel never parses still has to say how much is new in it, and turn
-// starts out of a window off the end of the file are what it says it from. The window's
-// reach is reported beside them, because a count taken from part of a file and drawn as the
-// whole of it is wrong in the way that reads as right.
+// Turn-start reads report window coverage beside their retained timestamps.
+
 test('the turn starts in a window come back with whether the window reached the start', () => {
   const file = writeTranscript([
     userPrompt('first ask', 0),
@@ -12889,9 +12728,8 @@ test('the turn starts in a window come back with whether the window reached the 
   // A window wider than the file reaches its start, so the figure taken from it is a total.
   assert.deepEqual(readSessionTurnStarts(file), { starts: [ms(0), ms(10), ms(20)], whole: true });
 
-  // A window that does not reach the start says so, and holds only what is inside it. The
-  // window is measured to open part way through the second turn's prompt, so that turn is
-  // the incomplete line the reader drops and the third is the only one left.
+  // A window opening inside the second prompt drops that incomplete record and retains the third prompt.
+
   const raw = fs.readFileSync(file, 'utf8');
   const secondAsk = raw.indexOf('second ask');
   const cut = readSessionTurnStarts(file, raw.length - secondAsk - 4);
@@ -12906,8 +12744,8 @@ test('the turn starts in a window come back with whether the window reached the 
     'the window did not open inside the second prompt, so this measures nothing about a partial one',
   );
 
-  // The same rule for what a turn is that `readSession` uses, not a second one. A subagent,
-  // a tool result, a machine's own message and a resumed summary are none of them a turn.
+  // Sidechain, tool-result, task-notification, and compact-summary records supply no typed turn starts.
+
   const noise = writeTranscript([
     userPrompt('first ask', 0),
     { ...userPrompt('a subagent asking itself', 1), isSidechain: true },
@@ -12918,14 +12756,10 @@ test('the turn starts in a window come back with whether the window reached the 
   ]);
   assert.deepEqual(readSessionTurnStarts(noise).starts, [ms(0), ms(6)]);
 
-  // A prompt from another session counts, and this is where the two readers part. Listing
-  // refuses it, because a session woken by a peer and never prompted by a human is not a
-  // session. Counting must not, because `readSession` opens a turn on one and draws a
-  // card for it: a glance that refused it would count fewer turns than the panel then shows,
-  // and would word an exact answer as a floor because the turn the reader had read was
-  // invisible to it. The two are held against each other here rather than described.
-  // Each prompt gets a reply, or the reader folds an unanswered one into the turn that
-  // follows and the two sides would be compared over a fixture with one turn in it.
+  // Peer prompts count as turn starts in both the full read and the start-timestamp read.
+
+  // Closing replies keep the fixture's prompts in separate turns.
+
   const woken = writeTranscript([
     userPrompt('first ask', 0),
     assistantAnswer('Done.', 1),
@@ -12940,20 +12774,19 @@ test('the turn starts in a window come back with whether the window reached the 
     [ms(0), ms(2), ms(6)],
     'the parse and the glance disagree about whether a peer prompt starts a turn',
   );
-  // And the listing rule still refuses it, which is the cut that keeps a session nobody
-  // prompted off the rail.
+  // Peer prompts alone supply no human-prompt evidence for session discovery.
+
   assert.equal(holdsHumanPrompt(JSON.stringify({ ...userPrompt('a wake', 0), origin: { kind: 'peer' } })), false);
 
-  // A session with nothing a reader typed says nothing, and that is not the same as
-  // zero: the count has to stay silent rather than claim the session is caught up.
+  // An unprompted answer supplies no turn starts.
+
   assert.deepEqual(readSessionTurnStarts(writeTranscript([assistantAnswer('unprompted', 0)])), {
     starts: [],
     whole: true,
   });
 
-  // A time that will not parse is dropped rather than counted. Date.parse answers NaN and
-  // the fallback elsewhere answers 0, which is a real epoch time that would sort as the
-  // oldest turn the session ever had.
+  // Invalid prompt timestamps supply no turn-start time.
+
   assert.deepEqual(
     readSessionTurnStarts(
       writeTranscript([{ ...userPrompt('untimed', 0), timestamp: 'not a date' }, userPrompt('timed', 7)]),
@@ -12961,15 +12794,15 @@ test('the turn starts in a window come back with whether the window reached the 
     [ms(7)],
   );
 
-  // A file that is not there answers with nothing found and a window that did not reach the
-  // start, which is silence rather than a claim that the session is empty.
+  // A missing file supplies no starts and incomplete coverage.
+
   assert.deepEqual(readSessionTurnStarts(path.join(os.tmpdir(), 'no-such-transcript.jsonl')), {
     starts: [],
     whole: false,
   });
 
-  // The window the panel actually takes, stated once so a change to it is a change to this
-  // line. Measured over the sessions a rail lists, not over every transcript on a disk.
+  // Turn-start reads begin with a 1 MiB window and expand to at most 16 MiB.
+
   assert.equal(TURN_START_BYTES, 1024 * 1024);
   assert.equal(TURN_START_MAX_BYTES, 16 * 1024 * 1024);
 });
@@ -12977,9 +12810,8 @@ test('the turn starts in a window come back with whether the window reached the 
 test('a Claude glance grows backward when the newest turn starts before its first window', () => {
   const bytes = 128;
   const file = writeTranscript([userPrompt('the only ask', 7), assistantAnswer('x'.repeat(bytes * 5), 8)]);
-  // Whole, because the growth reached the start of the file. Growing is not what makes a count
-  // a floor, and a floor here would draw `at least 1 new` over a session whose one turn
-  // was counted.
+  // Expansion reaching byte zero reports complete coverage.
+
   assert.deepEqual(
     readSessionTurnStarts(file, bytes),
     { starts: [ms(7)], whole: true },
@@ -12995,8 +12827,8 @@ test('a glance that stops short of the file start reports a partial answer', () 
     userPrompt('the newer ask', 7),
     assistantAnswer('x'.repeat(bytes * 4), 8),
   ]);
-  // The older turn sits past the ceiling this window scales to. The answer holds one start and
-  // says it did not reach the beginning, so the rail words the count as a floor.
+  // A window ending its expansion before the older turn reports partial coverage.
+
   assert.deepEqual(
     readSessionTurnStarts(file, bytes),
     { starts: [ms(7)], whole: false },
@@ -13008,9 +12840,8 @@ test('a glance keeps a turn start that begins on the byte its last read began on
   const bytes = 128;
   const ceiling = bytes * ((16 * 1024 * 1024) / (1024 * 1024));
   const prompt = JSON.stringify(userPrompt('the ask on the boundary', 7)) + '\n';
-  // The prompt starts exactly where the widest read starts, so the read holds it whole and
-  // nothing older. A reader that dropped its first line unread would lose the only start the
-  // session has, and the rail would draw no mark on a session with an unread turn.
+  // The prompt begins exactly at the widest read's boundary and remains a complete record.
+
   const body = ignoredClaudeLineOfBytes(512) + prompt + ignoredClaudeLineOfBytes(ceiling - Buffer.byteLength(prompt));
   const dir = tempDir('tl-');
   const file = path.join(dir, 'sess.jsonl');
@@ -13034,9 +12865,8 @@ test('a glance stops at its backward ceiling when no nearer turn start exists', 
 });
 
 test('the panel watches directories rather than files, so a new session is seen', () => {
-  // A session started while the panel is open writes a file that did not exist when
-  // the watch was set up. Watched per file, that session would never appear until the
-  // window was reloaded, which is the whole failure this answers.
+  // Directory watches cover new session files created after watch setup.
+
   const dir = path.join('C:', 'Users', 'dev', '.claude', 'projects', 'a-repo');
   const dirs = watchDirs([
     { file: path.join(dir, 'one.jsonl') },
@@ -13046,8 +12876,8 @@ test('the panel watches directories rather than files, so a new session is seen'
   assert.equal(dirs.length, 2, 'two files in one directory are watched twice over');
   assert.ok(dirs.includes(dir));
 
-  // Sorted and without duplicates, so the caller can tell a set that has moved from one
-  // that has not and does not tear down a watcher to put the same one back.
+  // Sorted unique directories keep watcher-set comparisons independent of input order.
+
   assert.deepEqual(watchDirs([{ file: path.join(dir, 'b.jsonl') }, { file: path.join(dir, 'a.jsonl') }]), [dir]);
   assert.deepEqual(watchDirs([]), []);
   assert.deepEqual(watchDirs([{ file: path.join('C:', 'b', 'x.jsonl') }, { file: path.join('C:', 'a', 'y.jsonl') }]), [
@@ -13057,9 +12887,8 @@ test('the panel watches directories rather than files, so a new session is seen'
 });
 
 test('a burst of appends is gathered before the panel reads again', () => {
-  // Both CLIs write a turn a message at a time and the writes arrive in pairs. Measured on
-  // a running turn: seven writes in twenty-five seconds. A fifth of a second folds a pair
-  // into one read and is far below what a reader sees as a wait.
+  // Transcript writes use a 200 ms wake delay, below the poll floor.
+
   assert.equal(TRANSCRIPT_WAKE_MS, 200);
   assert.ok(
     TRANSCRIPT_WAKE_MS < 2000,
@@ -13068,9 +12897,8 @@ test('a burst of appends is gathered before the panel reads again', () => {
 });
 
 test('a turn records what it did in order, and what each call was about', () => {
-  // A turn already says how many tools it ran and in what mix. That is a tally, and a
-  // reader watching a turn wants the order: what it is doing now, and what it did to get
-  // there.
+  // Retained steps preserve call order, details, timestamps, and outcomes beside aggregate counts.
+
   const file = writeTranscript([
     userPrompt('take the sandbox', 0),
     assistantTool('Read', 1, 'a1', { file_path: 'extension/src/panelhost.ts' }),
@@ -13192,11 +13020,8 @@ test('a shortened non-command subject retains its exact text outside the card pa
 });
 
 test('the call the agent is on is the one still running, and nothing else is', () => {
-  // A successful tool result is never parsed: those lines are the bulk of a transcript and
-  // are skipped before JSON.parse, which is what keeps a read of a 4 MB file affordable. So
-  // a call is finished by the next thing the agent writes, which is sound because the model
-  // cannot write again until its results are back. What that leaves running is the calls in
-  // the agent's newest message, and that is the call a reader watching a live turn wants.
+  // A newer assistant message ends earlier pending calls. Calls in the newest message remain running.
+
   const running = writeTranscript([
     userPrompt('take the sandbox', 0),
     assistantTool('Read', 1, 'a1', { file_path: 'a.ts' }),
@@ -13207,8 +13032,8 @@ test('the call the agent is on is the one still running, and nothing else is', (
     ['done', 'running'],
   );
 
-  // Two calls in one message go out together and come back together, so both are the call
-  // the agent is on.
+  // Calls issued in one message remain running together.
+
   const together = writeTranscript([
     userPrompt('take the sandbox', 0),
     {
@@ -13229,8 +13054,8 @@ test('the call the agent is on is the one still running, and nothing else is', (
     ['running', 'running'],
   );
 
-  // A call that failed keeps saying so. Its result line is one of the few that is parsed,
-  // and the next thing the agent writes must not quietly turn it into a success.
+  // A failed result retains its call's failure after later assistant activity.
+
   const failed = writeTranscript([
     userPrompt('take the sandbox', 0),
     assistantTool('Bash', 1, 'a1', { command: 'npm test' }),
@@ -13251,8 +13076,8 @@ test('the call the agent is on is the one still running, and nothing else is', (
 });
 
 test('a skill is a step under its own name, and needs no reading of its own', () => {
-  // A skill load is an ordinary tool call carrying the skill in its input, and the input
-  // carries the skill body as a prompt beside it. The name is what the reader asked for.
+  // Skill input names the skill separately from its prompt body.
+
   const file = writeTranscript([
     userPrompt('review this', 0),
     assistantTool('Skill', 1, 'a1', { skill: 'review-the-change', prompt: 'the whole body of the skill' }),
@@ -13280,9 +13105,8 @@ function skillLoaded(directory: string, second: number, id = 'a1') {
   };
 }
 
-// What a `Skill` call comes back with. Carried by the fixtures below to keep them true to the
-// record stream: the reader drops an ordinary tool result before it parses anything, so this
-// line is one nothing reads, and the load's file arrives in the record after it.
+// A successful Skill result supplies no definition path. Its instructions record carries that path separately.
+
 function skillResult(name: string, second: number, id = 'a1') {
   return {
     type: 'user',
@@ -13352,8 +13176,8 @@ test('a POSIX directory and a namespaced skill name are recorded as they were wr
 });
 
 test('a skill load is in no tool category, and holds its own place in the call kinds', () => {
-  // `Skill` is in no tool table, so counted as a tool it lands in `other` and the mix names
-  // a skill load an unrecognized call. The raw tool total still counts it: the call happened.
+  // Skill calls retain a separate step kind and count toward raw tool totals without entering other.
+
   const file = writeTranscript([
     userPrompt('clean the copy', 0),
     assistantTool('Read', 1, 'a0', { file_path: 'a.ts' }),
@@ -13392,8 +13216,8 @@ test('a skill call that came back as an error loaded nothing', () => {
 });
 
 test('a skill load with no instructions record keeps no path', () => {
-  // Measured over 858 real calls on this machine: 27 recorded nothing after the result. The
-  // load is still reported, without a file, and the row it draws opens nothing.
+  // A Skill call without instructions retains its use without a definition path.
+
   const file = writeTranscript([
     userPrompt('clean the copy', 0),
     assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
@@ -13406,9 +13230,8 @@ test('a skill load with no instructions record keeps no path', () => {
 });
 
 test("an instructions record names its own call, so one load's file is never another's", () => {
-  // The record names its call, and that name is the whole of the pairing. The load it names
-  // is deliberately not the newest one here: a reader that took the newest instead would put
-  // one skill's file on another skill's row and say nothing was wrong.
+  // sourceToolUseID pairs instructions with their Skill call, even when another call arrived later.
+
   const file = writeTranscript([
     userPrompt('clean the copy then rewrite it', 0),
     assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
@@ -13428,9 +13251,8 @@ test("an instructions record names its own call, so one load's file is never ano
 });
 
 test('two Skill calls for the same name in one turn record two uses', () => {
-  // The turn really did load the skill twice. A name-only skip here would fold the second
-  // real load into the first, which is the regression the typed path's own dedupe must
-  // never reach into: it only ever steps aside for a use the typed path itself recorded.
+  // Distinct Skill call ids retain separate uses of the same skill name.
+
   const file = writeTranscript([
     userPrompt('clean the copy twice', 0),
     assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
@@ -13450,9 +13272,8 @@ test('two Skill calls for the same name in one turn record two uses', () => {
 });
 
 test('a failed first Skill call does not withdraw a second call for the same name', () => {
-  // The first call's own result withdraws only the use its own id recorded. Before the
-  // fix, an unscoped name skip meant the second call never recorded its own use at all, so
-  // the withdrawal below left the turn reporting zero skills for a load that really happened.
+  // A failed Skill result withdraws only the use identified by its own call id.
+
   const file = writeTranscript([
     userPrompt('retry the skill', 0),
     assistantTool('Skill', 1, 'a1', { skill: 'polish' }),
@@ -13543,8 +13364,8 @@ test('typing a command that loaded a skill records it exactly as a Skill call wo
     },
   ]);
   assert.equal(turn.skillUseCount, 1);
-  // Pinned against the literal string, not against cleanPrompt's own output, so a change
-  // to cleanPrompt's rendering of a command would fail this test rather than pass it blind.
+  // The card prompt contains the command and arguments without the skill instructions.
+
   assert.equal(turn.prompt, '/land Phase 2');
   assert.equal(
     turn.prompt.includes('Base directory for this skill'),
@@ -13595,8 +13416,8 @@ test('a plain custom command with no base-directory record loads no skill', () =
 });
 
 test('a typed command followed by an unrelated meta record loads no skill', () => {
-  // The next record is the only proof this reader gets. An isMeta record that is not the
-  // base-directory line must refuse the load just as plainly as no record at all does.
+  // Unrelated metadata after a typed command supplies no skill-use evidence.
+
   const file = writeTranscript([
     typedCommand('/standup', 'today', 0),
     {
@@ -13613,9 +13434,8 @@ test('a typed command followed by an unrelated meta record loads no skill', () =
 });
 
 test('a harness command right after a typed skill clears the pending skill without resolving it', () => {
-  // `/compact` cleans to empty text (the harness blanks its scaffolding entirely) and so
-  // opens no turn of its own. It still arrives as the record right after the `/land`
-  // command, which is exactly the position a skill's base-directory line would take.
+  // A following compact command supplies no instructions evidence for the pending typed skill.
+
   const file = writeTranscript([
     typedCommand('/land', 'Phase 2', 0),
     typedCommand('/compact', '', 1),
@@ -13628,10 +13448,8 @@ test('a harness command right after a typed skill clears the pending skill witho
 });
 
 test('a Claude effort change writes command scaffolding but opens no turn of its own', () => {
-  // The reader presses the effort control mid-conversation. The CLI answers with a caveat
-  // record and the typed command. It then adds a local_command system record and a new
-  // assistant line at the new level. None of those records is a second prompt, so the level
-  // change stays inside the turn the reader already opened.
+  // The later assistant record updates effort within the existing turn. The effort command and local metadata open no new turn.
+
   const file = writeTranscript([
     userPrompt('write the migration', 0),
     assistantText('Working on it.', 1, undefined, 'high', 'end_turn'),
@@ -13651,9 +13469,8 @@ test('a Claude effort change writes command scaffolding but opens no turn of its
 });
 
 test('a stray base-directory line long after a typed command records no skill', () => {
-  // The pending skill is cleared on the record right after the command, whatever that record
-  // turns out to be. Without that clear, a base-directory line arriving much later would
-  // still find the stale pending state and record a skill named after the wrong command.
+  // Only the next record resolves a typed skill's pending instructions. A later base-directory record supplies no use.
+
   const file = writeTranscript([
     typedCommand('/standup', 'today', 0),
     assistantAnswer('Standing up now.', 1),
@@ -13669,9 +13486,8 @@ test('a stray base-directory line long after a typed command records no skill', 
 });
 
 test('a harness command name is excluded even when stray text keeps its record open', () => {
-  // A harness command ordinarily cleans to nothing and never reaches the skill check at all.
-  // Text outside the command tags survives cleaning, so this is the one shape that reaches
-  // the check with a harness name, and it is what the exclusion itself has to refuse.
+  // Extra prompt text can survive a local command wrapper, but its command name remains excluded from skill-use evidence.
+
   const file = writeTranscript([
     userPrompt('please <command-name>/compact</command-name><command-args></command-args>', 0),
     typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\compact', 1),
@@ -13700,11 +13516,8 @@ test('a typed skill invocation and a later Skill call for the same name record o
 });
 
 test('a reread of a typed skill companion alone does not double the load', () => {
-  // The reader works in byte windows and rereads its tail, so the companion record can arrive
-  // a second time on its own without the command record ahead of it arriving again too. The
-  // pending skill was already cleared and resolved on its first arrival, so the second
-  // companion reaches no code path that could record a use at all: this proves the clear
-  // alone, since a command record cannot be replayed here without opening a second turn.
+  // Repeating a resolved companion record without its typed command retains one skill use.
+
   const command = typedCommand('/land', 'Phase 2', 0);
   const companion = typedSkillCompanion('C:\\Users\\dev\\.claude\\skills\\land', 0);
   const reducer = createClaudeSessionReducer('sess');
@@ -13720,9 +13533,8 @@ test('a reread of a typed skill companion alone does not double the load', () =>
 });
 
 test('a long turn carries its newest steps and says how many it ran', () => {
-  // Measured over this workspace: the median turn runs 11 tools and the longest ran 211.
-  // Every step of every turn would put a fifth of a megabyte of tool calls into a payload
-  // that is 64 KB today, so the list is cut and the count is not.
+  // The retained step list keeps its newest calls while stepCount keeps the complete total.
+
   const lines: object[] = [userPrompt('do a lot', 0)];
   for (let i = 0; i < TURN_STEP_LIMIT + 5; i++) {
     lines.push(assistantTool('Read', i + 1, `a${i}`, { file_path: `file-${i}.ts` }));
@@ -13783,8 +13595,8 @@ test('the Claude step cap preserves every message and the original call position
 });
 
 test('the one thing a call acted on is read from whichever field named it', () => {
-  // One rule, read by two things: the permission ask and the step row on a card. The skill
-  // comes first because a skill call carries the skill body as a prompt beside it.
+  // Tool descriptions prefer the skill name over its accompanying prompt body.
+
   assert.equal(describeToolInput({ skill: 'polish', prompt: 'the body' }), 'polish');
   assert.equal(describeToolInput({ command: 'npm test' }), 'npm test');
   assert.equal(describeToolInput({ file_path: 'a.ts' }), 'a.ts');
@@ -13796,9 +13608,8 @@ test('the one thing a call acted on is read from whichever field named it', () =
   assert.equal(describeToolInput({}), '', 'a tool taking no arguments is given words it never said');
   assert.equal(describeToolInput({ command: '   ' }), '', 'whitespace is drawn as though it were a command');
 
-  // And cut to what a row can hold, whitespace first. A command written as a heredoc arrives
-  // with a whole script inside it: uncut, the shell commands alone took the payload for four
-  // turns of this workspace from 64 KB to 211 KB.
+  // Step details normalize whitespace and apply their length limit to full shell commands.
+
   const heredoc = ['cat > f <<EOF', 'x'.repeat(600), 'EOF'].join('\n');
   assert.equal(
     stepDetail({ command: heredoc }).length,
@@ -13814,11 +13625,8 @@ test('the one thing a call acted on is read from whichever field named it', () =
 });
 
 test('a prompt typed while the turn ran reaches the turn, and the two things beside it do not', () => {
-  // Claude Code writes a mid-turn prompt as an attachment rather than as a user line, and
-  // the agent answers it inside the running turn. Drawn nowhere, the card showed a reply to
-  // a question it did not show. Measured over 172 of these records in this workspace's own
-  // transcripts: a peer's message and a background task's report are written on the same
-  // kind of line, and neither is the reader.
+  // Reader prompts in queued attachments enter laterPrompts. Peer prompts and task notifications stay outside that list.
+
   const file = writeTranscript([
     userPrompt('start the parser work', 0),
     assistantTool('Read', 1, 'tu1', { file_path: 'a.ts' }),
@@ -13846,9 +13654,8 @@ test('a prompt typed while the turn ran reaches the turn, and the two things bes
 });
 
 test('a prompt typed into a turn that never answered goes to the turn that absorbs it', () => {
-  // A turn with no reply of its own is held back and its words join the next one, or the card
-  // would say less than the turn was asked. What was typed into it while it sat there is the
-  // reader's too, and it travels the same way.
+  // An unanswered turn carries its prompt and laterPrompts into the following turn.
+
   const file = writeTranscript([
     userPrompt('the first ask', 0),
     typedMidTurn('and this while it sat there', 1),
@@ -13866,9 +13673,8 @@ test('a prompt typed into a turn that never answered goes to the turn that absor
 });
 
 test('a queued prompt written by a subagent is not the reader typing', () => {
-  // A subagent writes its own transcript, and the launch and the result are all of it that
-  // reaches this file. One that arrived here anyway would put a subagent's words under the
-  // reader's own heading.
+  // Sidechain queued prompts stay outside the parent's laterPrompts.
+
   const file = writeTranscript([
     userPrompt('start the parser work', 0),
     assistantTool('Read', 1, 'tu1', { file_path: 'a.ts' }),
@@ -13880,8 +13686,8 @@ test('a queued prompt written by a subagent is not the reader typing', () => {
 });
 
 test('a mid-turn prompt is read as blocks, kept in order, and bounded', () => {
-  // The prompt is an array of content blocks, the same shape a user line carries, so it
-  // needs the same reading rather than a String().
+  // Queued prompt content uses the same block reading as user-message content.
+
   const many: object[] = [userPrompt('start', 0), assistantTool('Read', 1, 'tu1', { file_path: 'a.ts' })];
   for (let i = 0; i < TURN_ASK_LIMIT + 3; i += 1) {
     many.push(typedMidTurn(`ask ${i}`, 2 + i));
@@ -13890,18 +13696,17 @@ test('a mid-turn prompt is read as blocks, kept in order, and bounded', () => {
   const { turns } = readSession(writeTranscript(many), 'sess');
   const kept = turns[0].laterPrompts;
   assert.equal(kept.length, TURN_ASK_LIMIT, 'a turn asked over and over drew every one of them');
-  // The newest are kept, the way the step list keeps its newest: the end of the list is
-  // where the turn is now.
+  // The bounded laterPrompts list retains its newest prompts in order.
+
   assert.equal(kept[0].text, 'ask 3');
   assert.equal(kept[kept.length - 1].text, `ask ${TURN_ASK_LIMIT + 2}`);
 });
 
 test('an ordinary line that happens to hold the words is still read as itself', () => {
-  // The prefilter is a substring test, and those two words can sit inside any prompt or any
-  // tool argument. A line taken out of the stream on that alone takes its whole turn with it,
-  // which is what this asks about.
-  // The words as a whole quoted value, which is the shape the filter looks for: a prompt that
-  // is exactly them, and a search run for them.
+  // queued_command text inside prompts and tool arguments leaves ordinary records intact.
+
+  // These prompt and search values equal the prefilter's quoted marker.
+
   const file = writeTranscript([
     userPrompt('queued_command', 0),
     assistantTool('Grep', 1, 'tu1', { pattern: 'queued_command' }),
@@ -13920,8 +13725,8 @@ test('an ordinary line that happens to hold the words is still read as itself', 
 });
 
 test('the rule that picks the reader out reads the fields rather than the shape', () => {
-  // An absent origin counts as the reader, which is how a user line is read here too, and
-  // what the records written before the field existed carry.
+  // Queued prompts without origin count as reader prompts.
+
   assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt' }), true);
   assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: { kind: 'human' } }), true);
   assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: { kind: 'peer' } }), false);
@@ -13929,18 +13734,16 @@ test('the rule that picks the reader out reads the fields rather than the shape'
   // And nothing else on that line is one of these at all.
   assert.equal(isReaderQueued({ type: 'total_tokens_reminder', commandMode: 'prompt' }), false);
   assert.equal(isReaderQueued(null), false);
-  // An origin that is not a name at all is a record this does not understand, and guessing
-  // would put another session's message under the reader's own heading.
+  // Malformed origin values supply no reader-queued prompt.
+
   assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: 'peer' }), false);
   assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: [] }), false);
   assert.equal(isReaderQueued({ type: 'queued_command', commandMode: 'prompt', origin: { kind: 7 } }), false);
 });
 
 test('a selection reads one transcript again and not the whole workspace', () => {
-  // The measured symptom. The catalog walk ran 61 times in 30 seconds against a five-second
-  // poll, because clicking a session drove a refresh and every refresh walked. Selecting
-  // cannot add, remove or grow a transcript, so the walk answers a question the click already
-  // knew the answer to.
+  // Selection revalidates only its session while reusing the held workspace catalog.
+
   const held = [
     { agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 },
     { agent: 'claude' as const, file: 'b.jsonl', sessionId: 'b', mtimeMs: 2, size: 20 },
@@ -13973,12 +13776,12 @@ test('a selection the held catalog cannot account for falls back to the walk', (
   const held = [{ agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 }];
   const stat = () => ({ mtimeMs: 1, size: 10 });
 
-  // Nothing shown, so there is nothing to state and no reason to trust the held list.
+  // Without a selected session, the held catalog requires a fresh walk.
   assert.equal(revalidatedCatalog(held, null, stat), null);
-  // A session the last walk never listed. It can only have arrived since, which is
-  // exactly what a walk is for.
+  // A selected id absent from the held catalog requires a fresh walk.
+
   assert.equal(revalidatedCatalog(held, 'gone', stat), null);
-  // The transcript has been removed underneath the panel.
+  // A missing selected transcript requires a fresh walk.
   assert.equal(
     revalidatedCatalog(held, 'a', () => null),
     null,
@@ -14014,18 +13817,16 @@ test('unknown, removed, and empty watcher paths require an authoritative catalog
 });
 
 test('a reused catalog offers only the revision it read again', () => {
-  // The offer takes a listed revision in place of stating the file. A walk read every one of
-  // them, so a walk's list stands whole.
+  // A full catalog walk supplies every listed revision to Project cost indexing.
+
   const held = [
     { agent: 'claude' as const, file: 'a.jsonl', sessionId: 'a', mtimeMs: 1, size: 10 },
     { agent: 'claude' as const, file: 'b.jsonl', sessionId: 'b', mtimeMs: 2, size: 20 },
   ];
   assert.deepEqual([...trustedListedRevisions(held, true, 'a').keys()], ['a.jsonl', 'b.jsonl']);
 
-  // A reused catalog read one file. Every other entry is the size the last walk saw, and the
-  // offer compares that against the size in the ledger to decide whether to index the source
-  // again. Handed a stale pair that agree, it leaves a session that has grown out of
-  // Project cost until a later walking pass.
+  // A reused catalog supplies only its revalidated selected revision, leaving other sources for independent revision reads.
+
   const trusted = trustedListedRevisions(held, false, 'a');
   assert.deepEqual(
     [...trusted.keys()],
@@ -14034,14 +13835,13 @@ test('a reused catalog offers only the revision it read again', () => {
   );
   assert.deepEqual(trusted.get('a.jsonl'), { mtimeMs: 1, size: 10 });
 
-  // Nothing shown means nothing was read again, so the offer states every file itself.
+  // Without a selected session, the reused catalog supplies no checked revisions.
   assert.equal(trustedListedRevisions(held, false, null).size, 0);
 });
 
 test('a cache write with no recorded split names no lifetime', () => {
-  // `claudeUsage` charges an unsplit write at the hour, because that is the tier this harness
-  // asks for. That is a price fallback. Anything telling a reader which lifetime was bought
-  // has to be able to tell the fallback from the record.
+  // Unsplit cache writes use the one-hour price category without establishing a recorded cache lifetime.
+
   const unsplit = { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 620_000 } as never;
   assert.equal(claudeUsage(unsplit).cacheWrite1h, 620_000, 'the unsplit write stopped being priced at the hour');
   assert.equal(claudeCacheLifetime(unsplit), null, 'a price fallback is reported as a recorded lifetime');
@@ -14067,15 +13867,13 @@ test('a cache write with no recorded split names no lifetime', () => {
   );
 });
 
-// The one request that set the current context level, read back off a parsed transcript. The
-// figure above the composer rests entirely on this: without it the panel dates the cache from
-// the turn's end, which a tool result moves, and takes the lifetime from the turn's summed
-// usage, which covers every request the turn made.
+// Context state retains its establishing request separately from aggregate usage and the turn's end timestamp.
+
 test('a turn records the request that set its context level', () => {
   const file = writeTranscript([
     userPrompt('do the thing', 0),
-    // An early request buying an hour, then a much larger five-minute write. Summed, the turn
-    // says five minutes by volume and an hour by order, and neither is the answer.
+    // The earlier request writes one-hour cache. The later request writes five-minute cache and sets the context level.
+
     {
       type: 'assistant',
       timestamp: at(1),
@@ -14111,8 +13909,8 @@ test('a turn records the request that set its context level', () => {
         },
       },
     },
-    // A record the harness wrote, long after the last real request. It moves the turn's end and
-    // it refreshes no cache, because no model ran for it.
+    // A later synthetic record advances the turn end without refreshing the context request.
+
     {
       type: 'assistant',
       timestamp: at(7_200),
@@ -14140,11 +13938,8 @@ test('a turn records the request that set its context level', () => {
   assert.equal(only.contextTokens, 506_020);
 });
 
-// A compaction between the last request and the end of the turn that holds it. A tool result
-// or a synthetic response moves a turn's end with no model running, so the compaction is newer
-// than every request the turn made and older than the turn. Dated from the turn's end, the
-// panel carried the lifetime the request before the compaction bought and called a
-// session nobody has cached warm.
+// Compaction after the context request invalidates its cache state even when later activity advances the turn end.
+
 test('a compaction between the last request and the end of its turn still drops the cache', () => {
   const file = writeTranscript([
     userPrompt('do the thing', 0),
@@ -14170,7 +13965,7 @@ test('a compaction between the last request and the end of its turn still drops 
       compactMetadata: { trigger: 'manual', preTokens: 620_010, postTokens: 42_000 },
     },
     { ...userPrompt('summary', 3), isCompactSummary: true, message: { role: 'user', content: 'summary' } },
-    // The harness wrote this long afterwards. It moves the turn's end and no model ran for it.
+    // Later synthetic activity advances the turn end without a model request.
     {
       type: 'assistant',
       timestamp: at(7_200),
@@ -14233,8 +14028,8 @@ test('a request that only reads the prefix back keeps the lifetime the session b
   ]);
   const turns = readTurns(file, 'sess');
   const last = turns[turns.length - 1];
-  // The closing request wrote nothing and read the whole prefix back. It names no lifetime of
-  // its own and it sits inside the one the request before it bought.
+  // A read-only cache request retains the earlier write's lifetime while recording its own request timestamp.
+
   assert.equal(last.contextRequest?.lifetime, '1h');
   assert.equal(last.contextRequest?.at, Date.parse(at(4)));
   assert.equal(last.contextRequest?.readBack, true);
@@ -14262,8 +14057,8 @@ test('a request that wrote two lifetimes at once names neither', () => {
     },
   ]);
   const [only] = readTurns(file, 'sess');
-  // Part of that context expires in five minutes and part in an hour. Naming either one prices
-  // the rest at a rate it was never bought at.
+  // Mixed cache-write lifetimes leave the context request's lifetime unavailable.
+
   assert.equal(only.contextRequest?.lifetime, null);
   assert.equal(only.contextRequest?.readBack, false);
 });
@@ -14312,9 +14107,8 @@ test('a blank custom title clears the custom name in the tail read and in the pa
   assert.equal(readSession(file, 'sess').turns[0].sessionTitle, 'Generated name');
 });
 
-// What a reader of `customTitleOf` is told happens next. The record clears the custom name
-// for the read that sees it. The panel holds a name of its own, and a held custom name never
-// gives way to the generated title under it, so the session goes on drawing the owner's name.
+// A blank custom-title record clears the parsed custom title while SessionNames retains its held custom name.
+
 test('a blank custom title leaves a held custom name where it was', () => {
   const file = writeTranscript([
     userPrompt('build the timeline', 0),
@@ -14387,9 +14181,8 @@ test('the saved Claude title file is read whole up to 4 KiB and not at all beyon
   assert.equal(readCustomTitleSidecar(file), null, 'a saved title file over 4 KiB was read');
 });
 
-// A Claude Code 2.1.281 session on Amazon Bedrock, trimmed to its model attachment, its prompt,
-// two requests and their tool results. The first request spans three records with one
-// `msg_bdrk_` id and no requestId. Claude Code recorded $0.1585482, which is list price.
+// Read the Bedrock tool-call transcript fixture.
+
 const BEDROCK_SESSION = fs.readFileSync(
   path.join(__dirname, '..', '..', 'test', 'fixtures', 'bedrock-tool-calls.jsonl'),
   'utf8',

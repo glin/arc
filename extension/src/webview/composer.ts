@@ -27,11 +27,9 @@ const WALK_ANNOUNCE_MS = 120;
 const HOST_ACTIVATION_GRACE_MS = 150;
 const RESTORATION_ALIAS_LIMIT = 64;
 
-// `/compact` and `/model` are excluded because the Composer already draws its own control for
-// each action, and a highlight on the typed word would duplicate that control. This set is the
-// fallback's only carve-out: before a working directory has ever reported a skill list, every other
-// Claude command gets the highlight, including built-ins such as `/context`, `/help` and
-// `/review`. Once a list has arrived, only the names it carries do.
+// The prompt box supplies separate controls for `/compact` and `/model`.
+// Before a working directory reports its skill list, other Claude commands receive highlights.
+// Afterward, only listed names receive highlights.
 const CLAUDE_NATIVE_COMMANDS = new Set(['compact', 'model']);
 
 interface HistoryWalk {
@@ -114,8 +112,7 @@ export interface ComposerRenderer {
   adoptSessionIdentity(provisional: string, durable: string): boolean;
   sessionIdentity(session: string): string;
   endHistoryIntoPrompt(): void;
-  // Answers whether the prompt went. The page-level chord reads it, because a press this
-  // refuses has to stay with the control the reader was standing on.
+  // Returns whether the prompt was sent. The page-level chord leaves a refused press with its focused control.
   send(fromKey: boolean): boolean;
   grow(): void;
   setDropping(dropping: boolean): void;
@@ -363,10 +360,8 @@ function attachLineClipboard(box: HTMLTextAreaElement): void {
   });
 }
 
-// Whether a press or Enter must wait for a file that is still staging. A Codex `/rename`
-// draft renames the session through a request that carries no attachment, so it sends while
-// the file is still uploading. Every other draft waits, including a Claude `/rename`, because
-// the Claude CLI runs that command as a prompt and a prompt needs its files ready.
+// Codex `/rename` sends no attachments and does not wait for staging.
+// All other drafts wait, including Claude `/rename`, which runs as a prompt.
 export function sendWaitsForStaging(agent: string, text: string, staging: boolean): boolean {
   return staging && renameRequest(agent, text) === null;
 }
@@ -546,9 +541,8 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
     skillMarks = [];
   };
   const drawSkills = (edit?: SkillEdit | null, restored?: readonly SkillMark[]) => {
-    // A Codex entry is drawn when the catalog marks it a skill. A Claude entry is drawn when
-    // it is not a panel control, not in `CLAUDE_NATIVE_COMMANDS`, and its working directory's skill
-    // list names it, or no list has arrived yet.
+    // Codex skills receive highlights. Claude commands qualify when the skill list names them or has not arrived.
+    // Claude panel controls and CLAUDE_NATIVE_COMMANDS receive no command highlights.
     const entries = [
       ...new Map(
         (current?.commands ?? [])
@@ -600,9 +594,8 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       const identity = `${entry.command}\0${slash}\0${end}`;
       const key = reusable.get(identity) ?? `skill-${nextSkillKey++}`;
       nextMarks.push({ command: entry.command, start: slash, end, key });
-      // A Claude entry carries a path only where the host found a `SKILL.md` on disk for it.
-      // The mark, its accessible name, and the popover below all draw the pathless forms
-      // whenever it did not, the same as a Codex entry whose catalog gave none.
+      // Claude entries carry paths only when the host finds their SKILL.md.
+      // Entries without paths use pathless marks, accessible names and popovers.
       parts.push(
         h(
           'span',
@@ -1283,9 +1276,7 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
     if (slashKeydown(event) || handleHistoryKey(event)) {
       return;
     }
-    // The chord sends whatever the box holds. It is read after the completion menu, which
-    // takes plain Enter and Tab alone, so a reader with the menu open sends the text they
-    // typed rather than the row they were offered. Enter there completes instead.
+    // The send chord submits the typed text even when completion is open. Plain Enter and Tab accept a completion first.
     if (isSendChord(event, options.platform)) {
       event.preventDefault();
       controller.send(true);
@@ -1319,20 +1310,9 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       drawSlash(true);
     }
   });
-  // The send chord anywhere on the page. Saving a comment returns focus to the card it came
-  // from. The reader who wrote several comments is therefore never in the box when they send.
-  //
-  // Every editable target is left alone. That keeps the box from sending twice, and it keeps
-  // rail filters and request forms as they are. An already answered press is refused before
-  // that, so a later handler on a target that is not editable does not have to be found here.
-  //
-  // An open comment editor refuses the press whole. Its text area is editable, but its Save
-  // and Close buttons are not. A send from one of those would leave the written comment behind
-  // and attach it to the next prompt instead.
-  //
-  // The press is swallowed only once the prompt goes. Chromium activates a focused link on
-  // this chord, though it does not activate a button, so a refused send would otherwise eat a
-  // summary link's own press and open nothing.
+  // The page-level send chord also works after comment saving returns focus to a card.
+  // Editable controls and open comment editors retain their keys. Already handled keys remain handled.
+  // Prevent the default only after sending succeeds, so refused sends retain native link activation.
   options.events.document('keydown', (raw) => {
     const event = raw as KeyboardEvent;
     if (event.defaultPrevented || event.isComposing || event.keyCode === 229) {
@@ -1348,8 +1328,7 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       event.preventDefault();
     }
   });
-  // Capture whether a transient was open before its owner closes it. The bubble listener is
-  // the Stop fallback only when the key began with no menu, dialog, hint or popover open.
+  // Capture open popovers before their owners close them. Escape stops work only when no popover was open.
   const transientEscapes = new WeakSet<Event>();
   options.events.window(
     'keydown',
@@ -1392,8 +1371,8 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       drawSlash();
     }
   });
-  // VS Code can briefly focus its outer webview frame after the click that activates its
-  // window. Recover only that prompt click, and preserve the caret the click already placed.
+  // VS Code sometimes focuses its outer webview frame after a window-activation click.
+  // Restore that prompt click with its existing caret or selection.
   options.events.window('blur', () => {
     if (hostActivation === null) {
       return;
@@ -1588,6 +1567,8 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       if (!box.actionEnabled && view.files.length) {
         return false;
       }
+      // Key sends use local comments before the host's annotation count arrives.
+      // The host rejects comments already assigned to queued submissions, so this check does not guarantee delivery.
       if (!fromKey) {
         if (box.actionControl === 'stop') {
           if (aim !== null) {
@@ -1598,13 +1579,6 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
         if (!box.actionEnabled) {
           return false;
         }
-        // `view.annotations` is built by the extension host and arrives one message later than
-        // the comment the reader just saved. A chord pressed before that message lands would be
-        // refused with no signal, so the local comment store answers for the same session.
-        //
-        // This over-counts when every comment for the session already rides a queued submission.
-        // The host is the authority there and refuses the send, so an already empty box is
-        // cleared and nothing goes out.
       } else if (!prompt.value.trim() && !(view.annotations || view.files.length || options.hasLocalComments(aim))) {
         return false;
       }

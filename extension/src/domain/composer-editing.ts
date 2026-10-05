@@ -305,12 +305,7 @@ export function matchCommandNames(names: readonly string[], typed: string): stri
   return [...starts, ...contains];
 }
 
-// The key chord that sends the composer from anywhere in the panel.
-//
-// A reader who comments on several turns leaves focus on the cards, not in the box. Plain
-// Enter reaches the box alone, so a comment-only prompt had no key at all. The modifier
-// follows the platform the same way `newSessionShortcut` does. Each platform rejects the
-// other one's modifier, so a Mac reader cannot send with Ctrl by accident.
+// macOS submission shortcuts use Command. Other platforms use Ctrl.
 function macPlatform(platform: string): boolean {
   return /^Mac/.test(platform || '');
 }

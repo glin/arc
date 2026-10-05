@@ -3,8 +3,7 @@ import { actionable } from './dom.ts';
 export interface SessionDetailsRow {
   id: string;
   label: string;
-  // The complete name, where it differs from the short label. The payload carries it for
-  // the chosen session alone, so every reader here falls back to the label.
+  // Full session name. Callers fall back to label when the payload omits it.
   fullLabel?: string;
   agent: string;
   resumeCommand: string | null;
@@ -26,15 +25,9 @@ export function createSessionDetails(
   fallback: () => HTMLElement | null,
 ) {
   let openId: string | null = null;
-  // The control that opened the dialog: a rail card for a session the timeline is not
-  // showing has no `.sessionrow` to place against or to send focus back to, so the arm that
-  // opened the native menu hands over the element it read the press from instead.
+  // Opening control. Sessions opened from the session list need not have a timeline heading.
   let openAnchor: HTMLElement | null = null;
-  // Whether the press that opened the dialog landed on the session heading rather than a
-  // rail card. A heading route re-finds its row by session id, because the panel can redraw
-  // the row under it while the dialog is open. A card route never does that: the shown
-  // session's own heading is a different control than the card the reader actually pressed,
-  // so this session having a drawn row is not by itself a reason to place or focus there.
+  // Heading openers resolve their current row after redraws. Session list openers retain their original control.
   let openedFromHeading = false;
   let dialogPrint = '';
   let rows = new Map<string, SessionDetailsRow>();
@@ -74,11 +67,7 @@ export function createSessionDetails(
     if (!returnFocus) {
       return;
     }
-    // The heading, when it is what opened the dialog and the session it names is still
-    // drawn, the way it has always been. Every other case, a rail card, or a heading route
-    // whose row is gone, returns focus to the control the press actually landed on: a rail
-    // card carries no name of its own for the reader to see restored, and a session the
-    // timeline also shows is not the control the reader pressed.
+    // Return to the current heading only for a heading opener. Otherwise use the original control or fallback.
     const target =
       (fromHeading ? sessionRow(id || '')?.querySelector<HTMLElement>('.session') : null) ||
       (opener?.isConnected ? opener : null) ||
@@ -90,10 +79,7 @@ export function createSessionDetails(
     if (dialog.hidden || !openId) {
       return;
     }
-    // The row, when it is what opened the dialog and is still drawn, so the dialog keeps
-    // aligning to the whole heading rather than to the narrower control inside it the arm
-    // remembers. Every other case falls back to that control, because a session the timeline
-    // also shows draws a heading that is not the control the reader pressed.
+    // Align heading-opened dialogs with the current row. Otherwise use the original control.
     const anchor = (openedFromHeading ? sessionRow(openId) : null) || (openAnchor?.isConnected ? openAnchor : null);
     if (!anchor) {
       close(true);

@@ -206,7 +206,7 @@ test('a panel saved before the rail row shipped writes no rail-row words', () =>
   // A reader who unticked every Quick filters box saves an empty choice, not a missing one.
   const empty = createSavedState(undefined, browserState, { send() {} }).save({ ...values(), railQuickFilters: [] });
   assert.deepEqual(empty.railQuickFilters, []);
-  // The field a build without the Running lens wrote is read on load and never written again.
+  // Saving omits the legacy railHeadLenses field.
   assert.equal('railHeadLenses' in empty, false);
 });
 

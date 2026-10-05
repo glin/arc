@@ -35,11 +35,7 @@ import { recordCommits } from '../transcript.ts';
 import { turn } from '../turnfixtures.ts';
 import { commitCard, dispatchedAgentCard } from '../turncard.ts';
 
-// A DOM built only for this file: the handful of calls Preact makes while mounting and updating
-// plain elements, buttons, and text, so a press on the Files section's toggle can be simulated
-// without a browser. `FakeDocument.activeElement` mirrors the one browser rule the focus test
-// leans on: removing the focused node from the document clears it, the same way a real page
-// loses focus when a button unmounts.
+// Click events used by the file's minimal DOM implementation.
 interface FakeClickEvent {
   type: string;
   stopPropagation(): void;
@@ -70,8 +66,7 @@ class FakeElement extends FakeNode {
   readonly children: FakeNode[] = [];
   readonly attributes = new Map<string, string>();
   readonly style: Record<string, string> = {};
-  // Present only so Preact's prop setter finds `'onclick' in dom` and lowercases the event name
-  // to 'click', the same fast path a real HTMLElement takes because it already declares it.
+  // Preact detects this property and registers lowercase `click` listeners.
   readonly onclick: null = null;
   private readonly listeners = new Map<string, Set<(event: FakeClickEvent) => void>>();
 
@@ -129,9 +124,7 @@ class FakeElement extends FakeNode {
       this.children.splice(at, 1);
     }
     child.parentNode = null;
-    // A real page clears focus whenever the focused node is removed, whether it is the node
-    // handed to `removeChild` or one buried in the subtree that node carries: Preact often
-    // removes a parent wrapper rather than the focused button itself.
+    // Removing a focused node or its ancestor clears focus, including when Preact removes a wrapper.
     if (child instanceof FakeElement && child.containsFocused(this.doc.activeElement)) {
       this.doc.activeElement = null;
     }
@@ -142,8 +135,7 @@ class FakeElement extends FakeNode {
     this.doc.activeElement = this;
   }
 
-  // Simulates a user's press: calls the proxy Preact registered for 'click' the same way a real
-  // dispatch would, with `this` bound to the element the way a browser binds an event listener.
+  // Call registered click listeners with this element as their receiver.
   press(): void {
     const event: FakeClickEvent = {
       type: 'click',
@@ -197,8 +189,7 @@ class FakeElement extends FakeNode {
     return count;
   }
 
-  // True where `node` is this element or sits anywhere under it, so a caller can tell whether
-  // removing this element's whole subtree would take the focused node with it.
+  // Check whether this subtree contains the focused node.
   containsFocused(node: FakeElement | null): boolean {
     if (!node) {
       return false;
@@ -223,9 +214,7 @@ class FakeDocument {
   }
 }
 
-// Installs a fresh `FakeDocument` as the global `document` for exactly the span of `run`, since
-// Preact reads the DOM it mounts into off that global rather than off the container it is given.
-// Always restores the previous value, so a fake document never leaks into another test.
+// Set the global document for Preact during `run`, then restore its previous value.
 async function withFakeDocument<T>(run: (doc: FakeDocument) => T | Promise<T>): Promise<T> {
   const doc = new FakeDocument();
   const globals = globalThis as { document?: Document };
@@ -238,9 +227,7 @@ async function withFakeDocument<T>(run: (doc: FakeDocument) => T | Promise<T>): 
   }
 }
 
-// The text a mounted fake element and its descendants read, the same way a screen reader walks
-// a heading: every text node, whether or not the element around it hides visually, since the
-// point is what an accessible-name test can prove reaches the reader.
+// Collect all descendant text, including visually hidden text used in accessible names.
 function fakeText(node: FakeNode): string {
   if (node instanceof FakeText) {
     return node.data;
@@ -289,18 +276,14 @@ test('record headings use singular accessible labels for one file or subagent', 
   assert.equal(recordSectionLabel('Subagents', 3, false), 'Subagents, 3 subagents, Expand Subagents');
 });
 
-// Dispatched is a past participle, not a plural, so its count word is the title itself for one
-// session and for several. Cutting the last letter off it made a one-row section say `1 dispatche`.
+// Dispatched is a participle and keeps the same count word for one session and several.
 test('a Dispatched heading speaks `dispatched` for one session and for several', () => {
   assert.equal(recordSectionLabel('Dispatched', 1, true), 'Dispatched, 1 dispatched, Collapse Dispatched');
   assert.equal(recordSectionLabel('Dispatched', 2, false), 'Dispatched, 2 dispatched, Expand Dispatched');
 });
 
 test('the Commits heading speaks a figure that already carries its own words as it stands, and gives a bare figure the same unit its peers get', () => {
-  // A figure that names landings apart, such as `12 · 3 merged`, already carries its own words,
-  // so the spoken name carries it whole instead of appending a pluralized title word that a
-  // bare number would still need. A bare figure, such as the plain digit string a Commits
-  // heading with no landings draws, gets that word just as a number would.
+  // Figures with words retain them. Bare counts receive the title's singular or plural unit.
   assert.equal(recordSectionLabel('Commits', '12 · 3 merged', true), 'Commits, 12 · 3 merged, Collapse Commits');
   assert.equal(recordSectionLabel('Commits', '1 merged', false), 'Commits, 1 merged, Expand Commits');
   assert.equal(recordSectionLabel('Commits', '12', true), 'Commits, 12 commits, Collapse Commits');
@@ -367,10 +350,7 @@ test('a press on the Commits collapse button hides its rows, and a second press 
 });
 
 test('the Commits heading keeps its branch fact and the merged word readable outside the collapse button', async () => {
-  // The same rows `card.test.ts`'s subagent-record fixture already proves group into one
-  // branch that arrived by merge: `commitHeadFact` and `arrivalTitle`/`arrivalSpoken` turn that
-  // into the fact and the hidden words a screen reader must still reach once the button owns
-  // its own short collapse label.
+  // One branch's rows include its merge arrival. The branch fact stays beside the collapse button.
   const rows = [
     {
       kind: 'commit',
@@ -430,8 +410,7 @@ test('the Commits heading keeps its branch fact and the merged word readable out
     const hiddenWords = findByClass(fact, 'sr-only');
     assert.ok(hiddenWords, 'the merged word carried no hidden words');
     assert.equal(fakeText(hiddenWords), ' into main at 2:30 PM, as 89abcde');
-    // The heading's own accessible name walks through the fact into the merged word's hidden
-    // words, the same words the button's short aria-label above dropped.
+    // Hidden arrival text remains in the fact beside the button's shorter accessible name.
     assert.equal(fakeText(fact), '· on topic · merged into main at 2:30 PM, as 89abcde');
   });
 });
@@ -456,8 +435,7 @@ test('the Files section cap hides rows past its count and gives every row back o
   assert.deepEqual(collapsed.shown, files.slice(0, FILES_SECTION_CAP));
   assert.equal(collapsed.capped, true);
   assert.equal(collapsed.hiddenCount, 5);
-  // `capped` and `hiddenCount` name the cut at rest and hold steady once expanded, so the
-  // button that reads them keeps its own hidden count while its list is shown in full.
+  // Expanded lists retain the collapsed list's cap status and hidden count.
   assert.deepEqual(cappedFileRows(files, FILES_SECTION_CAP, true), { shown: files, capped: true, hiddenCount: 5 });
   const underCap = files.slice(0, 3);
   assert.deepEqual(cappedFileRows(underCap, FILES_SECTION_CAP, false), {
@@ -466,8 +444,7 @@ test('the Files section cap hides rows past its count and gives every row back o
     hiddenCount: 0,
   });
   assert.deepEqual(cappedFileRows(files, undefined, false), { shown: files, capped: false, hiddenCount: 0 });
-  // A caller passed no cap, or a list at or under it, gets the same array back rather than a
-  // copy of it.
+  // Uncapped and short lists return the original array.
   assert.equal(cappedFileRows(files, undefined, false).shown, files);
   assert.equal(cappedFileRows(underCap, FILES_SECTION_CAP, false).shown, underCap);
 });
@@ -511,8 +488,7 @@ test('the Files section button vnode carries the shared expander class, a toggle
 });
 
 test('the Files section button reports aria-expanded from how much of the list is on screen, not from whether the label says fewer', () => {
-  // A turn of thousands of files reaches "any batch past the first" long before the label
-  // itself swaps to "Show fewer files", so the two must be free to disagree.
+  // A partly revealed list reports expansion before its label offers to collapse.
   const midBatch = filesMoreButton('k', 20, false, true, 2_460, () => {}, 'rows-k') as {
     props: { [key: string]: unknown };
   };
@@ -626,8 +602,7 @@ test('two presses fired before Preact re-renders each still add their own batch,
     render(h(DetailRowList, { rows, post: () => {}, cap: FILES_SECTION_CAP }), container as unknown as Element);
     const toggle = container.find(`files-more:${rows.key}`);
     assert.ok(toggle, 'the toggle was not drawn for a Files section past its cap');
-    // Both presses run against the one handler Preact committed for the first render, before
-    // either state update has been applied, the same as two clicks landing in one dispatch.
+    // Both presses use the first render's handler before Preact applies either state update.
     await act(() => {
       toggle?.press();
       toggle?.press();
@@ -679,8 +654,7 @@ test('a press on the Files show-more toggle stays on the toggle, walks the list 
     assert.ok(rowsHost, "the toggle's aria-controls named no element in the drawn tree");
     assert.equal(rowsHost?.countButtons(), FILES_SECTION_CAP, 'the first batch did not stop at the cap');
     const toggleLabel = () => (toggle?.firstChild as unknown as FakeText | null)?.data;
-    // Before the first press: the label promises the first batch, aria-expanded is false, and
-    // the accessible name adds every file the cap still keeps off screen.
+    // The initial label names the next batch. The accessible name includes all hidden files.
     assert.equal(toggleLabel(), filesMoreLabel(FILES_SECTION_CAP, false));
     assert.equal(toggle?.attributes.get('aria-expanded'), 'false');
     assert.equal(
@@ -690,8 +664,7 @@ test('a press on the Files show-more toggle stays on the toggle, walks the list 
 
     toggle?.focus();
     await act(() => toggle?.press());
-    // An intermediate batch: still revealing, but aria-expanded is already true because a
-    // batch past the first is now on screen, well ahead of the label's own switch to "fewer".
+    // The intermediate batch reports expansion while its label still offers more files.
     assert.equal(container.find(`files-more:${rows.key}`), toggle, 'the toggle unmounted after the first press');
     assert.equal(doc.activeElement, toggle, 'focus left the toggle after the first press');
     assert.equal(rowsHost?.countButtons(), FILES_SECTION_CAP * 2, 'the second batch did not add one more cap of rows');
@@ -708,8 +681,7 @@ test('a press on the Files show-more toggle stays on the toggle, walks the list 
     );
 
     await act(() => toggle?.press());
-    // The final partial batch reaches the end of the list: the label swaps to "fewer" and the
-    // accessible name drops its hidden count because nothing is hidden any more.
+    // Revealing the final batch selects the collapse label and removes the hidden count.
     assert.equal(
       container.find(`files-more:${rows.key}`),
       toggle,
@@ -742,9 +714,7 @@ test('a fully revealed Files list stays fully revealed when a redraw grows it, a
     const filesOf = (count: number) => Array.from({ length: count }, (_, index) => fileRowFixture(index));
     const draw = async (count: number) => {
       const rows: DetailRows = { kind: 'files', key: 'card-live', files: filesOf(count), turnDiff: false };
-      // `act` flushes the effects the component schedules to persist or reset its sticky and
-      // batch state, so each redraw below observes the settled state the previous one left,
-      // the same way a real host commit settles before the next payload redraws the card.
+      // Flush effects that preserve or reset expansion state before the next redraw.
       await act(() => render(h(DetailRowList, { rows, post: () => {}, cap }), container as unknown as Element));
     };
 
@@ -774,8 +744,7 @@ test('a fully revealed Files list stays fully revealed when a redraw grows it, a
     assert.equal(container.find('files-more:card-live'), null, 'a list at the cap must draw no toggle at all');
     assert.equal(container.countButtons(), cap);
 
-    // A later regrowth past the cap must start the reader back at the first batch rather than
-    // resume the stale expansion, which would otherwise mount every row with no press at all.
+    // Regrowth past the cap starts with the first batch instead of restoring a stale expansion.
     await draw(cap * 5);
     toggle = container.find('files-more:card-live');
     assert.ok(toggle, 'the toggle was not redrawn once the list grew past the cap again');
@@ -914,8 +883,7 @@ test('a subagent record drops a maker line that only names the subagent it is al
     );
   const rows = recordOf({ name: mine, session: 's-mine' })?.().rows;
   const shown = rows?.kind === 'commits' ? rows.commits : [];
-  // The record is already open under that subagent's name, so its own row loses the maker line
-  // and the press into the session it is already open under. A row made by another keeps both.
+  // The child's own commit omits its maker line. Another child's commit retains it.
   assert.deepEqual(
     shown.map((row) => [row.madeBy, row.madeBySession]),
     [
@@ -933,9 +901,7 @@ test('a subagent record drops a maker line that only names the subagent it is al
 });
 
 test('two subagents with an identical description keep their own maker line', () => {
-  // Two distinct subagents dispatched under the same description, each with its own session.
-  // The record is open under the first subagent's session, so only its own row loses the maker
-  // line. The second subagent's row keeps its maker line even though the name reads the same.
+  // Matching descriptions with different session IDs must retain the second child's maker line.
   const shared = 'Review the diff';
   const commits = [
     {
@@ -982,10 +948,7 @@ test('two subagents with an identical description keep their own maker line', ()
 });
 
 test('two subagents with an identical description and no session id each keep their own maker line', () => {
-  // Child artifacts can exist without a session id at all, so two subagents dispatched under
-  // the same description and neither carrying one cannot be told apart by session. A shared
-  // description then proves nothing, and every row keeps its maker line rather than risking
-  // one subagent's row losing it to the other.
+  // Matching descriptions without session IDs establish no identity. Both maker lines remain.
   const shared = 'Review the diff';
   const commits = [
     {
@@ -1055,9 +1018,7 @@ test('a subagent commits record picks its rows when a reader opens it', () => {
     [],
     counted,
   );
-  // A card draws its subagent rows on every render, and a reader opens one subagent's record
-  // now and then, so the walk over the turn's commits belongs inside the record and not beside
-  // it. Building the record walks the list no times, and opening it walks the list once.
+  // Building the record leaves the commits unfiltered. Opening it filters them once.
   assert.equal(walks, 0, "the record walked the turn's commits while the row was only drawn");
   record?.();
   assert.equal(walks, 1);
@@ -1082,7 +1043,7 @@ function drawnText(node: unknown): string {
 
 type DrawnNode = { type?: unknown; props?: Record<string, unknown> & { class?: string; children?: unknown } };
 
-// Every element a vnode tree draws, component calls expanded, that the test picks.
+// Find matching elements after expanding component calls in the vnode tree.
 function findAll(node: unknown, pick: (node: DrawnNode) => boolean): DrawnNode[] {
   if (node === null || node === undefined || typeof node !== 'object') {
     return [];
@@ -1269,8 +1230,7 @@ test('a grouped Commits record draws a heading per branch, and a one-branch reco
   const grouping = groupCommitRows(commits);
   const drawn = h(CommitGroups, { cardKey: 'k', groups: grouping.groups, post: () => {} });
   const groups = findAll(drawn, (node) => node.props?.class === 'commitgroup');
-  // The card's own repository's groups lead, ahead of the nested repository's group though its
-  // one commit landed between the two own-repository groups in time.
+  // The card's repository groups lead despite the nested repository's intervening commit.
   assert.deepEqual(
     groups.map((group) => group.props?.['aria-label']),
     ['ship/commit-record-repairs, merged into main at 4:49 PM', 'main', '.claude/plans, main'],
@@ -1280,8 +1240,7 @@ test('a grouped Commits record draws a heading per branch, and a one-branch reco
     'main',
     '.claude/plans · main',
   ]);
-  // The tied landing is the arrival on its branch's heading, never a row. The one no branch
-  // explains is a row under the branch that moved.
+  // A known branch's landing appears on its heading. An unresolved landing remains a row.
   assert.deepEqual(
     findAll(drawn, (node) => node.props?.class === 'row commitrow').map((node) => node.props?.['data-commit']),
     ['184751b0', 'd00dfeed', '5e0c1d2a'],
@@ -1338,15 +1297,12 @@ test('commit and landing rows share a record while keeping distinct identities',
   const sections = recordSections(card, { post: () => {} } as never) as Array<{
     props: { title: string; count?: number | string };
   }>;
-  // The heading keeps the word and the figure its two peers keep. One commit and one landing
-  // must never read "2" behind that word, so the figure names the landing apart, as the card
-  // head's commits chip does for the same rows.
+  // The Commits heading counts written commits separately from landings.
   assert.deepEqual(
     sections.map((section) => [section.props.title, section.props.count]),
     [['Commits', '1 · 1 merged']],
   );
-  // A turn that only landed reads Commits over its rows too. No region is headed Landings, and
-  // the figure is the only thing that says the turn wrote nothing.
+  // A landing-only record retains the Commits heading and names its merged count.
   const onlyLanded = recordSections(
     { key: 'card-2', commits: [landing] } as CardView,
     { post: () => {} } as never,
@@ -1375,11 +1331,8 @@ test('a figure draws only the line counts that moved', () => {
 });
 
 test('a subagent files figure that is a floor draws no partial word or mark', () => {
-  // Built the way `dispatchedAgentCard` builds a floor figure in production, from a child
-  // whose artifacts record ended early, so the fixture goes red if a face mark or a spoken
-  // partial status returns to the figure `agentFigures` produces. One row carries no count at
-  // all, and the other kept its counts but is still a floor, the two ways `settleCounts` leaves
-  // a row short, so the figure is a real floor and not a name that happens to say so.
+  // The child has one file with unknown counts and one with partial counts.
+  // Its artifacts are incomplete. The Files figure leaves these limitations in the detail footer.
   const spend = {
     found: true,
     partial: false,
@@ -1413,8 +1366,7 @@ test('a subagent files figure that is a floor draws no partial word or mark', ()
   const card = dispatchedAgentCard('sess', 'Review the card', spend, 'done', 1000, 65000, 2);
   const figure = card.figures.find((one) => one.metric === 'files');
   assert.ok(figure, 'dispatchedAgentCard drew no files figure for a child with file artifacts');
-  // `StaticStatChip` reads its record from a callback, the shape `card-rows.ts` builds one in
-  // for the panel. The figure itself carries the record as a plain list.
+  // Adapt the figure's plain record to the callback used by `StaticStatChip`.
   const record = figure.record;
   const stat = { ...figure, record: record ? () => record : undefined };
   const drawn = h(StaticStatChip, { stat, contextClass: () => '' });
@@ -1500,9 +1452,7 @@ test('the card body follows each Timeline layout', () => {
   }
 });
 
-// Every case of the commits record's fixture matrix, drawn from the card the host builds for it.
-// The record draws its rows under group headings where the turn touched several branches, and
-// straight under its own heading otherwise, the way the record's row list decides.
+// Draw the host-built commit fixtures with group headings only for multiple groups.
 test('the commits record draws every case of its fixture matrix', () => {
   const cards = commitRecordCards();
   const rowsOf = (name: CommitRecordCase) => cards[name].commits as unknown as CommitRowView[];
@@ -1528,8 +1478,7 @@ test('the commits record draws every case of its fixture matrix', () => {
   assert.deepEqual(texts('longest', 'commitmakerlink'), [`Open ${LONGEST_MAKER} session`]);
   assert.equal(heading('common')?.fact, '· on main');
   assert.deepEqual(texts('common', 'commitmakerword'), ['made by']);
-  // The owner's turn: the branch that merged carries the arrival, and the nested repository is a
-  // muted prefix on its own heading.
+  // The merged branch carries its arrival. The nested repository prefixes its own heading.
   assert.equal(heading('grouped')?.fact, undefined, 'a grouped record named one branch on its heading');
   assert.deepEqual(texts('grouped', 'commitgroupname'), ['ship/commit-record-repairs', 'main']);
   assert.deepEqual(texts('grouped', 'commitgrouprepo'), ['.claude/plans ·']);
@@ -1549,8 +1498,7 @@ test('the commits record draws every case of its fixture matrix', () => {
     [7, 6],
     'the run did not group into six merged branches and the plans repository',
   );
-  // The turn spans two branches, so its own record draws group headings. The subagent wrote on
-  // one of them, so the record it opens names that branch beside its figure instead.
+  // The turn spans two branches. The subagent record names its single branch beside the figure.
   assert.equal(heading('subagentRecord')?.fact, undefined);
   const child = cards.subagentRecord.agents?.[0] as unknown as AgentRowView;
   const figure = child.figures.find((one) => one.metric === 'commits');

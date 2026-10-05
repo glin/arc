@@ -100,44 +100,19 @@ import { ARC_IDENTITY } from './identity';
 import { codexHome } from './agentpaths';
 import { parseQuestionReply, type QuestionReply } from './codexreply';
 
-// Reads OpenAI Codex session rollouts (JSONL under ~/.codex/sessions/YYYY/MM/DD/) and
-// groups them into the same `Turn` shape the Claude Code reader produces, so everything
-// downstream draws both without knowing which agent wrote which. Read-only: nothing here
-// writes to a rollout.
-//
-// Three differences from the Claude reader govern the whole file.
-//
-// Turn boundaries are recorded rather than inferred. `task_started` and `task_complete`
-// carry one `turn_id`, so none of the queued-prompt machinery in `transcript.ts` is needed
-// here.
-//
-// A directory name says nothing about which project a session belongs to, because the tree
-// is sharded by date. Every file has to be opened to find out, which makes the safe answer
-// the only answer available.
-//
-// Token counts are the other way round. OpenAI's `input_tokens` includes the cached part
-// and Anthropic's excludes it, so reading the field straight across would charge every
-// cached token twice.
+// Reads Codex rollouts into the shared `Turn` shape without writing to the source files.
+// `task_started` and `task_complete` supply explicit turn boundaries through `turn_id`.
+// Date-sharded directories supply no project identity. Each rollout's opening record supplies its cwd.
+// OpenAI's `input_tokens` includes cached input. Subtract cached input before using the shared usage fields.
 
-// Where Codex writes its session rollouts. Date sharded as YYYY/MM/DD with no per-project
-// directory, so unlike Claude Code's tree the name of a directory says nothing about which
-// project a session belongs to.
+// The configured rollout root, or the sessions directory under the Codex home.
 export function codexSessionsRoot(): string {
   return process.env[`${ARC_IDENTITY.environmentPrefix}CODEX_ROOT`] || path.join(codexHome(), 'sessions');
 }
 
-// What a rollout's opening record says about the session: which project it ran in, how it
-// was launched, and whether it is one of Codex's internal threads. Read from the head,
-// because the first line carries all three and the file behind it runs to hundreds of
-// megabytes.
-//
-// The record holds a good deal more, none of which anything reads: the originator, the git
-// branch and commit, and the nickname a subagent was given. They are left where they are
-// rather than carried here, so nothing on this type is
-// a field waiting for a reader.
-//
-// A stored copy of this record outlives the build that read it. A field added or taken out
-// here bumps `CODEX_META_VERSION` in `codexopenings.ts`.
+// Opening metadata identifies the session, workspace, launch source, and child relationships.
+// Read it from the first record without loading the full rollout.
+// Changes to persisted fields require a `CODEX_META_VERSION` change in `codexopenings.ts`.
 export interface CodexSessionMeta {
   sessionId: string | null;
   cwd: string | null;
@@ -153,48 +128,33 @@ export interface CodexSessionMeta {
   replayBoundaryAt: number | null;
   // A verified native spawn's creation clock. Rounded starts still require its own bill.
   nativeSpawnedAt?: number | null;
-  // The public entrypoint that started the rollout. `exec` is Codex's headless entrypoint;
-  // `vscode` and `cli` are sessions a reader can hold directly.
+  // The public entrypoint. `exec` starts headless work. `vscode` and `cli` identify interactive entrypoints.
   launchSource: string | null;
-  // 'subagent' for a thread Codex spawned for itself, 'user' where the writer said so.
-  // Absent on sessions written before the field existed, which are all the user's own.
+  // The recorded thread source, such as `subagent` or `user`. Null when the opening omits it.
   threadSource: string | null;
-  // The thread this rollout was spawned under. Only a non-empty string counts: a thread
-  // with a parent is one something else started, whatever its thread_source says.
+  // The non-empty parent thread id, from the opening payload or its native spawn metadata.
   parentThreadId: string | null;
   // The stable path Codex assigned this child, such as `/root/review_sol`. Null for a user
   // session and for internal services such as the background guardian.
   agentPath: string | null;
   // The structured subtype inside `source.subagent.other`, when Codex wrote one.
   subagentKind: string | null;
-  // Whether `source` is an object holding a `subagent` object, which is the shape Codex
-  // gives a thread it started for itself. A user session writes `source` as a string
-  // ('vscode', 'exec', 'cli'), so a string never counts, and nothing inside the subagent
-  // object is read for structural classification.
+  // True when `source.subagent` is an object. String sources never establish this structural child relationship.
   hasSubagentSource: boolean;
 }
 
-// How many opening records `CodexMetaCache.prime` reads at once. Enough to keep Node's file
-// system threads busy, and few enough that a cold pass holds only this many head buffers.
+// Default concurrency limit for opening reads in `CodexMetaCache.prime`.
 export const COLD_OPENING_READS = 8;
 
-// How long walks wait to read a rollout again after a refused read, from the second refusal on.
-// A failed open costs tens of microseconds on the main thread, so thousands of refused rollouts
-// read on every walk would cost each walk over 100 ms.
+// Retry interval after repeated refused opening reads.
 export const REFUSED_OPENING_RETRY_MS = 30_000;
 
-// How long walks wait to read a rollout again after its first refused read. A writer or a scanner
-// that holds a new rollout for a moment then delays its session by about a second, not by a full
-// retry interval. The short wait costs each refused rollout one more failed open.
+// Short retry interval after the first refused opening read.
 export const REFUSED_OPENING_FIRST_RETRY_MS = 1_000;
 
-// Opening metadata is immutable once a rollout has written it, so a readable record never
-// needs another head read or stat. A rollout can briefly exist before its first line is
-// complete, though: retry an initial miss once after measuring it, then only after growth.
-// A malformed file that stays still therefore pays two head reads, not one per poll. A read
-// the file system refuses leaves a refusal entry and no size marker, so a finished rollout that
-// never grows is read again. The next read waits `REFUSED_OPENING_FIRST_RETRY_MS`, and each read
-// after a later refusal waits `REFUSED_OPENING_RETRY_MS`. The clock is monotonic by default.
+// Readable openings stay cached until invalidation. An unreadable head gets one retry, then waits for file growth.
+// Refused reads retain no size marker. They use the first retry interval, then the repeated-refusal interval.
+// The default clock is monotonic.
 export class CodexMetaCache {
   private entries = new Map<
     string,
@@ -217,8 +177,7 @@ export class CodexMetaCache {
     }
     let size: number | null = null;
     if (hit && hit.meta === undefined) {
-      // A clock that stepped back behind the last read makes the read due, so a readable rollout
-      // never stays hidden longer than its wait.
+      // A clock value before the last attempt makes the retry due immediately.
       const elapsed = this.now() - hit.triedAt;
       if (elapsed >= 0 && elapsed < hit.wait) {
         return null;
@@ -230,9 +189,7 @@ export class CodexMetaCache {
       }
     }
     const meta = this.readMeta(file);
-    // A refused read leaves no size marker, because a file another process holds for a moment
-    // says nothing about its head. The refusal entry holds when this read ran and how long walks
-    // wait before the next one.
+    // Refused reads keep an attempt time and retry interval instead of a file-size marker.
     if (meta === undefined) {
       const wait = hit && hit.meta === undefined ? REFUSED_OPENING_RETRY_MS : REFUSED_OPENING_FIRST_RETRY_MS;
       this.entries.set(file, { meta: undefined, triedAt: this.now(), wait });
@@ -245,16 +202,10 @@ export class CodexMetaCache {
     return meta;
   }
 
-  // Reads the opening record of every file this cache holds no answer for, `limit` at a time, and
-  // settles once every read has. Each read leaves the main thread free while the disk works, so
-  // a machine of cold rollouts no longer stalls the editor. A file that `get` read meanwhile
-  // keeps that answer. A read that finds no record leaves the retry marker a first `get` leaves,
-  // with the size measured off the main thread. `get` then reads the file again only after it
-  // grows. A file `get` found refused, before or during the pass, has no answer, so the pass reads
-  // it and its answer replaces the refusal entry. A read that rejects leaves the entry as it was,
-  // because a file another process holds for a moment says nothing about its head. The next `get`
-  // reads a file with no entry as a file the pass never reached, and a file with a refusal entry
-  // after that entry's wait. True when the pass added a row the stored records lacked.
+  // Read missing and refused openings asynchronously, with at most `limit` concurrent reads.
+  // Preserve any non-refusal entry `get` supplies during the read.
+  // A missing record keeps its measured size. Later `get` calls retry after growth.
+  // Rejected reads leave existing entries unchanged. Return true when a readable opening was added.
   async prime(
     files: readonly string[],
     readAsync: (file: string, buf: Buffer) => Promise<CodexSessionMeta | null> = readCodexSessionMetaAsync,
@@ -335,9 +286,7 @@ async function fileSizeAsync(file: string): Promise<number | null> {
   }
 }
 
-// Background review is automation rather than a session somebody dispatched. It has
-// the same parent and subagent metadata as an ordinary child, so its explicit source is the
-// distinction that keeps it out of the rail.
+// Guardian review is background automation. Its explicit source keeps it out of the session list.
 export function isHiddenThread(meta: CodexSessionMeta): boolean {
   return isGuardianSource(meta.threadSource, meta.subagentKind);
 }
@@ -348,10 +297,8 @@ function isGuardianSource(threadSource: string | null, subagentKind: string | nu
   return threadSource === 'guardian_review' || (threadSource === 'subagent' && subagentKind === 'guardian');
 }
 
-// Whether another agent started this rollout. Codex records either a headless entrypoint or
-// structural child metadata. The structural forms are checked independently because versions
-// have written different subsets of them. Unknown values with none of these signs stay in the
-// reader's day buckets.
+// Headless entrypoints and structural child metadata identify agent runs independently.
+// Unknown values without either sign remain in the reader's day buckets.
 export function isAgentRun(meta: CodexSessionMeta): boolean {
   return (
     meta.launchSource === 'exec' ||
@@ -361,9 +308,7 @@ export function isAgentRun(meta: CodexSessionMeta): boolean {
   );
 }
 
-// Enough of the head to hold the opening record whole. It carries the model's base
-// instructions, so it is tens of kilobytes rather than the few hundred bytes a Claude
-// transcript opens with.
+// Maximum opening-record size. The opening includes the model's base instructions.
 const META_BYTES = 128 * 1024;
 
 // How far into a rollout the first prompt can sit. Everything the model was told opens the
@@ -371,9 +316,8 @@ const META_BYTES = 128 * 1024;
 export const CODEX_TITLE_BYTES = 1024 * 1024;
 export const CODEX_COMMIT_REPOSITORY_PARSER_VERSION = 4;
 
-// How many directory levels below the sessions root to look for rollouts. The tree is
-// YYYY/MM/DD today, which is three, and the fourth is the room a shard could be added in
-// without the reader going blind. Bounded so a stray link cannot walk the disk.
+// Maximum directory depth below the rollout root. Four levels include YYYY/MM/DD and one additional shard.
+// The limit bounds directory traversal.
 const WALK_DEPTH = 4;
 
 // The first read of a rollout's head. Most opening records end inside it.
@@ -383,8 +327,7 @@ const FIRST_LINE_WINDOW = 16 * 1024;
 // two reads share it at once. Asynchronous reads each carry their own.
 let headBuffer: Buffer | null = null;
 
-// What one read of a head window settles. A string is the first line, null is a head with no
-// first line, and undefined asks for the next, larger window.
+// Returns the first line, null when no complete line is available, or undefined when another window is needed.
 function firstLineStep(buf: Buffer, have: number, read: number, want: number): string | null | undefined {
   // Bounded to this file's bytes, because the buffer past them holds an earlier file.
   const newline = buf.subarray(0, have + read).indexOf(0x0a, have);
@@ -397,10 +340,8 @@ function firstLineStep(buf: Buffer, have: number, read: number, want: number): s
   return have + read >= META_BYTES ? null : undefined;
 }
 
-// The first line of a file, read in growing windows up to `META_BYTES` and decoded only up to
-// its newline. A file that ends before a newline and inside `META_BYTES` is one line. A head
-// with no newline inside `META_BYTES` has no first line, which is what `headLines` answers. A
-// failed open or read throws.
+// Read the first line in growing windows up to `META_BYTES`. Decode only through its newline.
+// Accept an unterminated line when the file ends below the bound. Failed opens and reads throw.
 function firstLineOf(file: string): string | null {
   let fd = -1;
   try {
@@ -429,9 +370,8 @@ function firstLineOf(file: string): string | null {
   }
 }
 
-// `firstLineOf` with the file system calls handed to the thread pool. `buf` holds
-// `META_BYTES` and belongs to this read until it settles. A failed open or read rejects, so
-// `CodexMetaCache.prime` can tell a refused read from a head with no record.
+// Read the first line asynchronously. This read owns its `META_BYTES` buffer until settlement.
+// Failed opens and reads reject, distinguishing refusal from a head with no opening record.
 async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | null> {
   let handle: fs.promises.FileHandle | null = null;
   try {
@@ -453,12 +393,8 @@ async function firstLineOfAsync(file: string, buf: Buffer): Promise<string | nul
   }
 }
 
-// The opening record of a rollout, null when the file does not start with one, or undefined when
-// the file system refuses the read.
-//
-// Every rollout's record is stored once per machine and never read again. A change to what
-// this returns, or to a helper it derives a stored field with, bumps `CODEX_META_VERSION` in
-// `codexopenings.ts`. Its comment names the helpers.
+// Returns opening metadata, null for a head without it, or undefined for a refused read.
+// Changes to persisted fields or their deriving helpers require a `CODEX_META_VERSION` change in `codexopenings.ts`.
 function readCodexOpeningRecord(file: string): CodexSessionMeta | null | undefined {
   let line: string | null;
   try {
@@ -483,13 +419,8 @@ export function openingRecordOf(line: string | null): CodexSessionMeta | null {
     return null;
   }
   const p = o.payload;
-  // `id` rather than `session_id`, which reads like the better name and is not: it is shared
-  // between rollouts, 237 distinct values over 605 records on this machine against one per
-  // file for `id`. Two files under one id would draw as one session on the panel.
-  //
-  // Nothing here reads `context_window` either, whatever the name suggests. It holds an
-  // object naming the compaction window the session is in, and the size a turn ran against
-  // is recorded per turn, on `task_started` and on every `token_count`.
+  // Prefer the rollout's `id`. `session_id` is a fallback and can be shared across rollouts.
+  // Context-window sizes come from turn and token-count records, not the opening's `context_window` object.
   const source = p.source;
   const subagent = isRecord(source) && isRecord(source.subagent) ? source.subagent : null;
   const spawn = subagent && isRecord(subagent.thread_spawn) ? subagent.thread_spawn : null;
@@ -609,8 +540,7 @@ function nativeSpawnPayloadAt(openedAt: number | null, payload: Record<string, u
 // Verified native spawns use their creation clock without the direct-session allowance.
 // Unsupported child sources keep the envelope allowance.
 const CODEX_REPLAY_CLOCK_SLACK_MS = 5_000;
-// A turn records its start rounded down to the whole second, so a guardian's own first turn
-// can read up to a second before the clock in the guardian's payload.
+// Turn starts round down to whole seconds. A guardian's first turn can precede its payload clock by under one second.
 const CODEX_TURN_START_ROUNDING_MS = 1_000;
 
 // A guardian's payload clock is its exact opening time, and its envelope can follow its own
@@ -635,14 +565,8 @@ function codexReplayBoundaryAt(
 // record did not name one.
 const ROLLOUT_NAME = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 
-// Every rollout under `root`, whatever it holds.
-//
-// The whole tree is walked, and nothing prunes it by the date a directory is named after.
-// Two reasons, and the second is the one that lasts. A directory holds a session's *start*
-// date while its mtime tracks its last activity, so a cutoff would drop a session resumed
-// days later while it sat at the top of the list by mtime. And the walk is cheap enough
-// that it does not have to be right about how Codex resumes a session at all: pruning
-// would be correct only for as long as that implementation detail held.
+// List every rollout under `root` within `WALK_DEPTH`.
+// Directory dates describe session starts, not their latest activity. Do not prune resumed sessions by those dates.
 export function rolloutFiles(root: string): string[] {
   const out: string[] = [];
   // `depth` counts the levels already descended, so the root itself is zero and a directory
@@ -669,21 +593,14 @@ export function rolloutFiles(root: string): string[] {
   return out;
 }
 
-// What one listing found: the sessions belonging to the workspace, and every rollout the
-// walk passed over on the way to them.
-//
-// Both halves are needed. The caller caches an opening record per rollout, so it has to
-// know which rollouts still exist, and that is a much longer list than the sessions: on
-// this machine, 506 against 5. A cache trimmed to the sessions would be emptied on every
-// repaint, and the head reads it exists to prevent would all run again.
+// Workspace sessions and the complete walked rollout list.
+// Trim opening caches against `walked`, which also includes rollouts from other workspaces.
 export interface CodexListing {
   sessions: SessionFile[];
-  // Every rollout whose recorded cwd belongs to this workspace, including automation that
-  // is intentionally absent from the session rail.
+  // Workspace rollout sources, including automation omitted from the session list.
   sources: { file: string }[];
-  // Structural child rollouts belonging to these folders, retained for parent spend lookup.
-  // This lightweight record carries no stat; a visible dispatched child separately appears
-  // in `sessions`, where it is statted like any other session.
+  // Structural children for parent spend lookup. These entries carry no stat.
+  // Visible dispatched children also appear in `sessions` with their stat.
   subagents: CodexSubagentFile[];
   walked: string[];
 }
@@ -702,15 +619,7 @@ export interface CodexSubagentFile {
   backgroundReview: boolean;
 }
 
-// Every Codex session belonging to these workspace folders, newest activity first.
-//
-// Membership is decided per file, from the cwd that file recorded, and never from anything
-// else. There is no directory name to be wrong about here, which makes the safe rule the
-// only one available, and nothing should later be added to shortcut it.
-//
-// `metaOf` is injected for the same reason the Claude reader injects `cwdOf`: a session's
-// opening record never changes once written, so the panel reads it once per file rather
-// than once per poll.
+// File metadata used to order and admit rollouts.
 export interface RolloutStat {
   mtimeMs: number;
   size: number;
@@ -732,10 +641,8 @@ export const CODEX_STAT_ACTIVE_MS = 10 * 60_000;
 // until the held stat is this old. The age limit covers an event the watcher never delivers.
 export const CODEX_STAT_REVALIDATE_MS = 60_000;
 
-// The stat of each listed rollout, so a listing does not stat every idle session on every
-// poll. The panel marks a file when the watcher reports it, and clears the cache whenever a
-// watcher closes or fails, because events can be lost then. Stopping the poll clears it too,
-// because a hidden panel opens no watcher and reads no stat from here while it waits.
+// Cache rollout stats between listings. Watcher events invalidate affected files.
+// Closing or failing watchers and stopped polling clear the cache because filesystem changes can go unobserved.
 export class CodexStatCache {
   private readonly entries = new Map<string, { stat: RolloutStat; readAt: number }>();
 
@@ -796,7 +703,8 @@ export async function coldOpeningPass(cache: CodexMetaCache, root: string): Prom
   return { walked, read: await cache.prime(walked) };
 }
 
-// `walked` is a rollout list the caller already holds. Without it, the listing walks `root`.
+// List workspace sessions by newest activity, using each opening's recorded cwd for membership.
+// Callers supply cached opening and stat readers. `walked` defaults to a fresh traversal of `root`.
 export function codexSessionFiles(
   root: string,
   folders: string[],
@@ -811,12 +719,7 @@ export function codexSessionFiles(
   const sources: { file: string }[] = [];
   const subagents: CodexSubagentFile[] = [];
   for (const file of walked) {
-    // Membership is settled before the file is touched again, and that order is what makes
-    // this affordable to repeat. A rollout's opening record never changes, so `metaOf`
-    // answers from the caller's cache after the first pass, while `mtimeMs` has to be read
-    // fresh every time because it moves as a session grows. Statting first would put a
-    // system call on every rollout on the machine, on every poll, to learn nothing new
-    // about the ones that belong to another project.
+    // Check cached opening metadata before requesting a stat. Other workspaces need no stat read here.
     const meta = metaOf(file);
     // No readable opening record means no cwd, and the path holds none either, so there is
     // nothing that puts the session in this workspace.
@@ -824,9 +727,8 @@ export function codexSessionFiles(
       continue;
     }
     sources.push({ file });
-    // Structural children stay available for their parent's spend lookup. Dispatched work
-    // also stays on the rail as an agent-run session; only background automation is
-    // omitted from the visible session list.
+    // Retain structural children for parent spend lookup. Dispatched work also appears in the session list.
+    // Background automation remains hidden there.
     const structuralChild = meta.threadSource === 'subagent' || meta.parentThreadId !== null || meta.hasSubagentSource;
     if (structuralChild && meta.sessionId) {
       subagents.push({
@@ -840,9 +742,8 @@ export function codexSessionFiles(
         backgroundReview: isHiddenThread(meta),
       });
     }
-    // Background review is omitted before the stat, so automation never reaches the recent
-    // list, the picker, the search corpus, the cards, or any per-session figure. A dispatched
-    // child stays visible and is marked below for the folded agent bucket.
+    // Omit guardian review from visible sessions before requesting its stat.
+    // Dispatched children remain visible in Run by agents.
     if (isHiddenThread(meta)) {
       continue;
     }
@@ -858,31 +759,22 @@ export function codexSessionFiles(
       mtimeMs: stat.mtimeMs,
       size: stat.size,
       cwd: meta.cwd,
-      // A manually launched `codex exec` has the same record as a headless dispatch and is
-      // grouped the same way; there is no parent field with which to tell them apart.
+      // Manually launched `codex exec` sessions also count as agent runs because their entrypoint is headless.
       agentRun: isAgentRun(meta),
     });
   }
   return { sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs), sources, subagents, walked };
 }
 
-// Which cached opening records a listing has left behind, so the caller can drop them.
-//
-// Against what the walk saw, never against the sessions it returned. The cache holds an
-// entry for every rollout on the machine, because membership is decided by reading one, and
-// nearly all of them belong to other projects. Trimmed to the sessions, it would keep five
-// entries out of five hundred and the whole head-read pass would run again on the next poll,
-// which is the pass the cache exists to make happen once.
+// Find cached openings absent from the complete walk.
+// Workspace sessions alone omit other projects and cannot establish which rollout files disappeared.
 export function staleMetas(cached: Iterable<string>, walked: Iterable<string>): string[] {
   const seen = new Set(walked);
   return [...cached].filter((file) => !seen.has(file));
 }
 
-// What to call a Codex session in a list of them.
-//
-// The first typed prompt supplies a fallback until the session index supplies a name.
-// Read from the head rather than the tail, because that first prompt is the one wanted and
-// a tail window wide enough to be sure of reaching it would be the whole file.
+// Read the first typed prompt as a fallback session title.
+// The index later supplies the thread name independently of rollout activity.
 export function readCodexSessionTitle(file: string, bytes = CODEX_TITLE_BYTES): string | null {
   return readCodexSessionTitlePair(file, bytes).short;
 }
@@ -923,9 +815,7 @@ export interface CodexSessionActivityOptions {
   meta: CodexSessionMeta | null;
 }
 
-// The title comes from a rollout's head, but its last activity and newest turn outcome are
-// both in the tail. Keep those answers together so naming every rail row does not read it
-// twice.
+// Read last activity and the newest turn outcome together from the rollout tail.
 export function readCodexSessionActivity(
   file: string,
   bytes = 256 * 1024,
@@ -947,25 +837,15 @@ export function readCodexSessionActivity(
   };
 }
 
-// Where Codex records the name it gives a thread.
-//
-// Beside the sessions tree rather than inside it, and one file for every session on the
-// machine. A rollout is written while the session runs, and the name is decided from a
-// summary of it afterwards and appended here, so the two files move independently: a rollout
-// that will never be written to again still gains a name minutes later.
+// The thread-name index beside the sessions directory.
+// Names and renames append independently of rollouts, including after a rollout stops growing.
 export function codexSessionIndexPath(): string {
   return path.join(path.dirname(codexSessionsRoot()), 'session_index.jsonl');
 }
 
-// The name Codex has given each thread, by session id.
-//
-// Append-only JSONL, so renaming a thread adds a row rather than rewriting the one already
-// there and the last row for an id wins. A row with no name leaves any earlier name standing,
-// because an id that appears twice is a rename and not an erasure.
-//
-// Capped and flattened like the prompt titles beside it. A name is Codex's own short summary
-// and has always been one line, but every display path draws a title as text, so a stray
-// newline in one would otherwise reach the rail verbatim.
+// Read thread names by id from append-only JSONL. The last valid name wins.
+// Missing or empty names leave earlier names intact. A whitespace-only name removes the held title.
+// Normalize short and full titles for single-line display.
 function parseThreadNamePairs(text: string): Pick<ThreadNames, 'names' | 'fullNames'> {
   const names = new Map<string, string>();
   const fullNames = new Map<string, string>();
@@ -1003,20 +883,14 @@ export function parseThreadNames(text: string): Map<string, string> {
 
 // What a read of the index found, with the state of the file it came from.
 export interface ThreadNames {
-  // The file's size and mtime when it was read, or empty where there is no file. Compared
-  // rather than the names themselves: it is both what says a re-read is needed and what
-  // tells the panel a name landed.
+  // The index's size and mtime, or empty when absent. Changes trigger rereads and session-name updates.
   stamp: string;
   names: Map<string, string>;
   fullNames: Map<string, string>;
 }
 
-// The thread names, re-read only when the file behind them moved.
-//
-// The stamp is the only signal there is. A name arrives after its rollout has stopped being
-// written, so nothing about the rollout changes when a session is named, and a reader
-// watching only the rollouts would hold the nameless answer for as long as the session sat
-// still.
+// Reread thread names when the index's size or mtime changes.
+// A thread name can arrive without any change to its rollout.
 export function readThreadNames(file: string, held: ThreadNames | null): ThreadNames {
   let stamp = '';
   try {
@@ -1039,12 +913,7 @@ export function readThreadNames(file: string, held: ThreadNames | null): ThreadN
   }
 }
 
-// What to call a Codex session: the name Codex gave the thread, else its first prompt.
-//
-// The name wins wherever there is one. It is Codex's own summary of the session, which
-// is the same thing the Claude reader's title is; the first prompt stands in only because
-// Codex used to name nothing, and it reads as a truncated sentence beside a real name.
-//
+// Use the indexed thread name, falling back to the first prompt when no indexed name exists.
 export function codexTitleFor(
   names: Map<string, string>,
   sessionId: string,
@@ -1067,13 +936,9 @@ export function codexPrompt(raw: string): string {
 // is how a unified diff writes a single-line region.
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
-// The hunks of a `unified_diff`, in the shape the whole diff view already speaks.
-//
-// The one trap is the blank line. `unified_diff` ends with a newline, so splitting on it
-// yields a trailing empty string that is not a line of the file at all, while a genuinely
-// blank line inside a hunk is written as a single space. Treating a bare empty string as a
-// blank context line puts a line into the hunk that its header did not count, and every
-// hunk after it is then off by however many it collected.
+// Parse unified-diff hunks into the shared patch shape.
+// A trailing empty split item is not a context line. A blank context line starts with a space.
+// Ignore bare empty items so parsed hunk lengths match their headers.
 export function hunksFromUnifiedDiff(diff: string): PatchHunk[] {
   const hunks: PatchHunk[] = [];
   let current: PatchHunk | null = null;
@@ -1098,14 +963,8 @@ export function hunksFromUnifiedDiff(diff: string): PatchHunk[] {
   return hunks;
 }
 
-// Which kind of work a Codex tool call is, for the turn's tool mix.
-//
-// There is no read tool and no search tool: both run as shell commands inside `exec`, so a
-// Codex turn's read and search counts stay at zero however much of the repo it read. A
-// panel that draws a zero there is saying the tool does not exist, not that the turn used
-// it none.
-//
-// Web searches arrive as separate records and share the activity category table.
+// Tool categories for the turn's tool mix. Shell wrappers count as commands even when they read or search files.
+// Web searches use the shared activity category.
 export const TOOL_KIND: Readonly<Record<string, keyof ToolCounts>> = {
   apply_patch: 'edits',
   web_search: 'web',
@@ -1125,12 +984,8 @@ function emptyToolCounts(): ToolCounts {
   return { edits: 0, reads: 0, searches: 0, commands: 0, agents: 0, coordination: 0, web: 0, other: 0 };
 }
 
-// The exec sandbox reports a thrown script under this heading. It is not by itself a
-// failure: a `tools.shell_command` whose command exits non-zero throws too, and a `grep`
-// that matched nothing exits 1 on every successful search. What follows the heading is what
-// tells the two apart, so only the ones that are not an exit code are counted. Codex
-// records no flag for a failed tool call, and under-reporting a failure is better than a
-// card claiming a clean turn went wrong.
+// Script-error headings also wrap non-zero shell exit codes, including searches with no matches.
+// Count a script failure only when its detail is not an exit-code report.
 const SCRIPT_ERROR = 'Script error:';
 const EXIT_CODE = /^Exit code:/;
 
@@ -1176,8 +1031,7 @@ function spawnResult(output: string): SpawnResult | null {
     if (typeof result !== 'object' || result === null) {
       return null;
     }
-    // The original collaboration protocol only acknowledged the task name. Its thread
-    // identity arrives separately in sub_agent_activity.
+    // Task-name-only acknowledgements obtain their thread identity from separate sub_agent_activity records.
     if (typeof result.task_name === 'string') {
       return { id: null, description: null };
     }
@@ -1210,12 +1064,7 @@ function currentSpawnFailure(output: string): string | null {
   return null;
 }
 
-// What a failed request said, as a sentence a reader can act on.
-//
-// Most of them are already one. Two of the fifteen recorded on this machine are the
-// service's wire envelope instead, with the sentence nested inside it, and a card carrying
-// the envelope shows a status code and a type name where it should say that the model is
-// not available on this account.
+// Extract the error message from a JSON envelope, or use the first line of plain error text.
 export function errorMessage(raw: string): string {
   const text = raw.trim();
   if (text.startsWith('{')) {
@@ -1237,16 +1086,10 @@ function stamp(value: unknown): number {
   return Number.isNaN(t) ? 0 : t;
 }
 
-// A subagent hands its answer back as a message to whoever spawned it, and that message is
-// the only thing a rollout records about the run finishing. There is no completion event.
-// The message names its sender as a path, `/root/review_sol`, whose last part is the name
-// the spawn asked for.
+// Legacy child-answer messages identify their sender by agent path. Its final segment matches the requested task name.
 const FINAL_ANSWER = 'FINAL_ANSWER';
 
-// What the turn is left saying about a subagent whose answer never arrived in the window.
-// Not 'running': the turn it belonged to ended, and a card drawing it as work still in
-// flight would be wrong about every turn ever recorded. What the rollout supports is that
-// the turn launched it, and no more.
+// A recorded launch without a terminal result has unknown completion status. Do not label it as running.
 const LAUNCHED = 'launched';
 
 interface Entry {
@@ -1320,8 +1163,7 @@ export interface CodexUsageReducerState {
   pendingCompactionBilling: number | null;
   // The very first non-copied turn's startedAt, epoch milliseconds. Set once and never moved.
   firstTurnAt: number | null;
-  // The most recently closed counted turn's endedAt, or its startedAt if it never completed.
-  // Updated on every close, unlike firstTurnAt, since it stands for the latest, not the first.
+  // The latest counted turn's end, or its start when it never completed. Updated on each counted close.
   lastTurnAt: number | null;
   // The most recently begun non-copied turn's startedAt, and its endedAt once it has completed.
   currentTurnStartedAt: number | null;
@@ -1580,8 +1422,7 @@ export function recordedDatePredatesOpening(
   if (value !== previousDate) {
     return false;
   }
-  // A local date can still be the previous UTC date near midnight. After midday UTC no
-  // supported timezone remains on that date; before then, require a foreign replay record.
+  // Near midnight, a local date still precedes the UTC date. Before midday UTC, require a foreign replay record.
   const utcHour = new Date(state.openingTimestamp).getUTCHours();
   return utcHour >= 12 || state.foreignSessionMeta;
 }
@@ -1703,9 +1544,7 @@ function applyCodexTurnDate(state: CodexUsageReducerState, payload: Record<strin
   if (state.countedTurnIds[turnId]) {
     state.closedTurns = Math.max(0, state.closedTurns - 1);
     delete state.countedTurnIds[turnId];
-    // The retracted turn may have set either boundary, and its own start and end are gone
-    // from the state that remains. Reporting a stale span would disagree with the turn
-    // count above, so both boundaries drop together and wait for the next turn that counts.
+    // Retracting a counted turn invalidates both span boundaries. Rebuild them from subsequent counted turns.
     state.firstTurnAt = null;
     state.lastTurnAt = null;
     state.lastTurnStartedAt = null;
@@ -1905,10 +1744,8 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
   if (kind === 'compacted') {
     if (!state.currentTurnCopied) {
       state.compactionCount++;
-      // A compacted record carries the compaction request's own usage. It does not carry that
-      // request's billing identity, which current rollouts supply in the following settings
-      // record. The model and window this turn ran under are retained, and the provider and
-      // service tier are left for a reader that resolves them the way the session reader does.
+      // Retain the compaction's own request usage and the turn's model and window.
+      // The following settings record supplies the request's billing identity, provider, and service tier.
       const turnId = state.currentTurnId;
       const requestUsage = codexRequestUsage(
         isRecord(payload.latest_token_usage_record) ? payload.latest_token_usage_record.usage : null,
@@ -1934,7 +1771,7 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
           ordinals.shift();
         }
       }
-      // Only a compaction that billed a request of its own has an identity worth waiting for.
+      // Wait for billing identity only when the compaction carries its own request usage.
       state.pendingCompactionBilling = requestUsage ? state.compactionCount : null;
     }
     return [];
@@ -2193,17 +2030,14 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
   return [event];
 }
 
-// Kept for callers that process one token_count at a time. Incremental scanners should use
-// the plural reducer because one late turn_context can release several held requests.
+// Returns the first released usage event. Incremental scanners must use the plural reducer to retain every released request.
 export function reduceCodexUsageRecord(state: CodexUsageReducerState, record: CodexUsageRecord): UsageEvent | null {
   return reduceCodexUsageEvents(state, record)[0] ?? null;
 }
 
-// One line of a rollout, reduced to what kind of record it is and what it carries.
-//
-// `session_meta`, `turn_context`, `compacted` and `token_usage_record` name themselves on the record.
-// Other kinds are wrapped in an `event_msg` or a `response_item` and name themselves on the payload,
-// so the kind is read from whichever of the two said something.
+// Read a rollout record's kind, timestamp, and payload.
+// Metadata, context, compaction, and usage records name their kind at the top level.
+// Wrapped events and response items name it in the payload.
 export function parseRecord(line: string): Entry | null {
   let o: { type?: string; timestamp?: unknown; payload?: unknown };
   try {
@@ -2261,9 +2095,8 @@ export interface CodexUsageLineReducer {
   newestTurnOutcome(): TurnOutcome | null;
 }
 
-// The current turn counts toward turnCount() as soon as it starts, on the optimistic
-// assumption that it will do something before it closes. firstTurnAt() must apply the same
-// test, or the span it reports can start before the turn turnCount() actually counted.
+// Count an uncopied current turn while it remains open or has recorded work.
+// Use the same condition for the first-turn boundary and turn count.
 function currentCodexTurnCounts(state: CodexUsageReducerState): boolean {
   return (
     Boolean(state.currentTurnId) &&
@@ -2276,7 +2109,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
   const state: CodexUsageReducerState = restored
     ? {
         ...(JSON.parse(JSON.stringify(restored)) as CodexUsageReducerState),
-        // Ledgers written before delayed-context buffering have no pending map.
+        // Missing pending maps restore as empty collections.
         pendingRequests: JSON.parse(JSON.stringify(restored.pendingRequests ?? {})) as Record<string, UsageEvent[]>,
         pendingRequestKeys: [...(restored.pendingRequestKeys ?? [])],
         pendingRequestSources: JSON.parse(
@@ -2364,13 +2197,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
   };
 }
 
-// The developer instructions listing every skill Codex can use, and where each one's
-// instructions live.
-//
-// Codex has no skill tool and no read tool. It publishes this list once and then reads a
-// `SKILL.md` with an ordinary shell command, so this record is the only one that says which
-// files on disk are skills at all. Nothing else in a rollout distinguishes reading a skill
-// from reading any other markdown file.
+// Developer instructions that publish skill names and paths. Match completed file reads against this catalog.
 const CODEX_SKILL_CATALOG = '<skills_instructions>';
 
 // One skill the catalog published.
@@ -2380,24 +2207,19 @@ interface CodexSkill {
   // The description before it is cut to the row's length, for a hover that shows it whole.
   fullDescription: string;
   path: string;
-  // The same path in the form a command's text is compared against. The catalog writes
-  // forward slashes and a shell on Windows writes backslashes, and either can write the
-  // drive letter in either case.
+  // The normalized path for matching commands. Windows paths match across slash styles and drive-letter case.
   compare: string;
 }
 
 // A root of the short paths below, written as `` - `r0` = `C:/Users/dev/.agents/skills` ``.
 const CODEX_SKILL_ROOT = /^-\s+`([^`]+)`\s*=\s*`([^`]+)`$/;
 
-// One published skill, written as `- name: description (file: r0/name/SKILL.md)`. A name can
-// hold a colon of its own, which a plugin's skill does, so the description starts at the
-// first colon with a space after it rather than at the first colon.
+// A skill entry has the form `- name: description (file: r0/name/SKILL.md)`.
+// Split at the first colon followed by whitespace so plugin names retain their own colon.
 const CODEX_SKILL_ENTRY = /^-\s+(\S+?):\s+(.*?)\s+\(file:\s*([^)]+)\)$/;
 
-// The file one catalog entry names. Current catalogs write a short path whose first segment
-// names a published root, and older ones write the absolute path itself. A short path naming
-// a root the catalog never published resolves to nothing: a skill the panel cannot open is
-// better than one it opens in the wrong place.
+// Resolve a catalog path through its published root, or retain an absolute path.
+// Unknown short-path roots resolve to no path.
 function codexSkillPath(written: string, roots: Map<string, string>): string {
   const cut = written.indexOf('/');
   const root = cut > 0 ? roots.get(written.slice(0, cut)) : undefined;
@@ -2428,8 +2250,7 @@ function codexSkillCatalog(text: string): Map<string, CodexSkill> {
     const published = entry[2].trim() || 'no detail given';
     skills.set(entry[1], {
       name: entry[1],
-      // One line, cut where a step's detail is cut. The published descriptions run to a
-      // paragraph each, and the row under the heading draws one line of it.
+      // Keep a shortened first line for the row and the full description for its tooltip.
       description: shortenTo(firstLine(published), STEP_DETAIL_LIMIT, STEP_CUT),
       fullDescription: published,
       path,
@@ -2439,48 +2260,20 @@ function codexSkillCatalog(text: string): Map<string, CodexSkill> {
   return skills;
 }
 
-// The programs that exist to print a file. Naming a skill's file anywhere else in a command
-// says the file was named, which is not the same as reading it: a search over it, a hash of
-// it, and a test that it exists all name it and take none of its instructions.
-//
-// This list refuses a load it cannot recognize, and the other shape of the rule refuses
-// nothing it has not been told about. Measured over this machine's rollouts, June to
-// September, commands naming a catalogued file: 27 searched it with `rg`, 17 with
-// `Select-String`, 27 hashed it and 20 tested it. Every one of those becomes a skill the card
-// says the turn loaded, under a list of programs to refuse. A skill missing from the card is
-// the cost of the list that refuses instead, and the sentence under the row promises the
-// instructions were read.
+// Recognized file-printing commands for skill reads. Searches, hashes, and existence checks do not establish a read.
+// Unrecognized readers remain unclassified.
 const CODEX_FILE_READERS = new Set(['get-content', 'gc', 'cat', 'type', 'head', 'tail', 'sed', 'bat', 'more', 'less']);
 
-// Where one command ends and the next begins. These four characters are the whole of it, and
-// the pairs `&&`, `||` and `|&` part on their own characters. A statement that keeps a
-// neighbour's text carries a neighbour's program, which is how a search rides in behind a
-// reader that never touched the file.
-//
-// Three candidates were checked and left out. A comma parts a PowerShell argument rather than
-// a command, and parting there would break `Get-Content a,b`. A redirection names a file and
-// starts nothing. A line continuation, a backtick in PowerShell or a backslash in a POSIX
-// shell, joins two lines rather than parting them, and joining those back together is the one
-// change here that could turn a silence into a false claim: a line ending inside a path would
-// fold a search into whatever reader stood in front of it.
-//
-// A read reached through a substitution or a variable, as `rg -n TODO $(cat x)` or
-// `$x = Get-Content x; rg -n TODO $x`, is not read here. Following a value through a shell is
-// more machinery than one row is worth, and what it leaves is the same silence as the script
-// loops above.
+// Split commands at newlines, semicolons, pipes, and ampersands. Evaluate each statement independently.
+// Commas and redirects remain within a statement. Shell continuations are not joined.
+// Substitutions and variable assignments do not establish reads through this fallback.
 const CODEX_COMMAND_SEPARATORS = /[\n;|&]/;
 
-// Whether one command read one file, decided at each place the command names it rather than
-// once for the whole command. A command that searches one skill's file and reads another is
-// ordinary, and either answer taken for the whole command is wrong about one of them.
-//
-// The shell text is the last resort. The client's own parser resolves a read for roughly two
-// mentions in five, and every other one arrives inside a segment it classified as unknown,
-// with nothing but the text to read it from.
+// Match a skill path within a statement whose leading program is a recognized file reader.
+// This fallback supplements paths supplied by the client's command parser.
 function commandReadsFile(command: string, compare: string): boolean {
-  // A Windows-shaped key is lower case on every platform. A statement starts with its program,
-  // not its drive letter, so normalizeFsPath folds its case only on Windows, and a statement
-  // read on another platform needs the same fold before the key can match it.
+  // Windows paths compare in lower case even when this reader runs on another platform.
+  // Normalize the statement's case separately because it begins with a program, not a drive letter.
   const windows = /^[a-z]:\//.test(compare);
   for (const statement of command.split(CODEX_COMMAND_SEPARATORS)) {
     const written = statement.trim();
@@ -2488,9 +2281,7 @@ function commandReadsFile(command: string, compare: string): boolean {
     if (!(windows ? searched.toLowerCase() : searched).includes(compare)) {
       continue;
     }
-    // What the statement runs, which is its first word unless a quote holds the word together.
-    // A Windows program is called through a directory with a space in it often enough that
-    // splitting on whitespace alone would lose the name of the program on those lines.
+    // Read the leading program as one word or quoted path. Quoted paths retain spaces in Windows directories.
     const opening = written.replace(/^\(+/, '');
     const quoted = /^"([^"]*)"|^'([^']*)'/.exec(opening);
     const first = (quoted?.[1] ?? quoted?.[2] ?? opening.split(/\s+/)[0]).toLowerCase();
@@ -2505,13 +2296,8 @@ function commandReadsFile(command: string, compare: string): boolean {
   return false;
 }
 
-// Every catalogued skill one completed command read.
-//
-// The command is the whole of the evidence, which is why it is best effort: it proves Codex
-// read the instructions and says nothing about why Codex selected them. A command that failed
-// read nothing worth reporting, and a command the rollout never completed proves nothing yet.
-// The match is on the command's own text, never on its output, so a search that prints a
-// skill path is not a read of one.
+// Attribute catalogued skill reads to successful completed commands.
+// Match parser-reported read paths or recognized reader statements, never paths printed in command output.
 function recordCodexSkillUses(
   state: CodexSessionParserState,
   turn: Building,
@@ -2527,8 +2313,7 @@ function recordCodexSkillUses(
       continue;
     }
     addTurnSkillUse(turn, {
-      // One command can read several of these files, and every load it made shares the
-      // command's identity and clock, because the command is the only record of any of them.
+      // Several skill reads from one command share its source identity and timestamp.
       sourceId: command.sourceId ?? `${turn.promptId}:command:${at}`,
       name: skill.name,
       description: skill.description,
@@ -2540,9 +2325,7 @@ function recordCodexSkillUses(
   }
 }
 
-// Context the Codex client adds around a turn. Older current-format rollouts do not always
-// carry `content_item_kinds`, so the wrapper itself is the only distinction left between
-// this product-owned context and text the reader entered.
+// Client-injected context wrappers. These distinguish context from typed prompts when `content_item_kinds` is absent.
 const INJECTED_USER_CONTEXT = [
   '<recommended_plugins>',
   '# AGENTS.md instructions for ',
@@ -2559,12 +2342,8 @@ function isInjectedUserContext(text: string): boolean {
   return INJECTED_USER_CONTEXT.some((prefix) => trimmed.startsWith(prefix));
 }
 
-// The text the reader typed, across both rollout shapes Codex has written.
-//
-// Older versions use `event_msg/user_message`. Current versions use the ordinary message
-// response item. The role, input block and `user.text` metadata distinguish the prompt from
-// developer instructions, assistant commentary, output blocks and user-role context injected
-// before the text the reader wrote.
+// Read typed prompts from legacy user-message events or user-role response items.
+// Role, input block, and `user.text` metadata distinguish prompts from instructions, tool output, and injected context.
 function userMessage(record: Entry): string | null {
   if (record.kind === 'user_message') {
     const text = str(record.payload.message);
@@ -2651,8 +2430,7 @@ function answerInTaskComplete(record: Entry): string {
   return record.kind === 'task_complete' ? (str(record.payload.last_agent_message) ?? '') : '';
 }
 
-// All whitespace removed, to compare two serializations of the same message that can differ
-// only in a trailing newline or in what character joins several content blocks.
+// Remove whitespace before comparing message serializations with different newlines or content-block separators.
 function stripWhitespace(text: string): string {
   return text.replace(/\s+/g, '');
 }
@@ -2832,9 +2610,8 @@ function codexOutcomeIn(lines: string[], agentPath: string | null): TurnOutcome 
   return latestDrawable;
 }
 
-// The current prompt shape cannot put the generic words `message` or `input_text` into the
-// fast list below: both occur on large assistant and tool-output records that the reader is
-// deliberately avoiding. Requiring all three markers admits only the user message line.
+// Admit legacy user messages or response messages carrying all three user-input markers.
+// Generic message markers alone also occur in large assistant and tool-output records.
 function carriesUserMessage(line: string): boolean {
   return (
     line.indexOf('user_message') >= 0 ||
@@ -2854,9 +2631,7 @@ interface CompletedCommand {
   startedAt: number | null;
   completedAt: number | null;
   failed: boolean;
-  // The files the client's own parser says this command read, in the compared spelling. It
-  // classifies a segment as a read and gives the file it resolved, which is the only place a
-  // rollout states that a command read a file rather than merely naming one.
+  // Normalized file paths classified as reads by the client's command parser.
   readPaths: readonly string[];
 }
 
@@ -3617,12 +3392,8 @@ function localCommandCwd(value: unknown): string | null {
   return /^\/[a-z]:\//i.test(pathname) ? pathname.slice(1) : pathname;
 }
 
-// One command the exec runtime says it completed.
-//
-// `parsed_cmd` is the shell text without the runtime executable and its invocation flags.
-// Only one parsed command is unambiguous. A direct string in `command` is unambiguous too;
-// an argv array without the parsed form is not, because the reader would have to decide
-// which elements are shell plumbing and which are the command the reader recognises.
+// Read one completed command from a single parsed command or a direct command string.
+// An argv array without a single parsed command supplies no command text here.
 export function completedCommand(payload: Record<string, unknown>): CompletedCommand | null {
   const item = payload.item as Record<string, unknown> | undefined;
   if (!item || str(item.type) !== 'CommandExecution') {
@@ -3703,9 +3474,8 @@ function blocksText(value: unknown): string {
     .join('\n');
 }
 
-// An assistant message item, read from either an `item_completed` event's nested `item` or
-// a `response_item` naming the message directly. `phase` distinguishes commentary written
-// while the model worked from the final answer that closed the turn.
+// Read assistant messages from completed nested items or direct response items.
+// `phase` distinguishes Activity commentary from final answers.
 function parsedMessageItem(
   payload: Record<string, unknown>,
 ): { sourceId: string | null; phase: string | null; text: string } | null {
@@ -3722,13 +3492,9 @@ function parsedMessageItem(
   return text ? { sourceId: str(item.id), phase: str(item.phase), text } : null;
 }
 
-// A message the model sent without ending its turn: `delivery: "async"` on a completed
-// `AgentMessage` item, which `request_user_input_async` and `send_message_to_user_async`
-// both write with `phase: "final_answer"`. The `item_completed` case reads it as Activity,
-// and `parsedFinalAnswer` refuses it in every record shape. A question reads
-// as its title with one option per line behind `- `, the text the live wire records for the
-// same item id, so a reload draws the row the running turn drew. A message with no titled
-// question reads as its own text.
+// Read asynchronous AgentMessage items as Activity, even when their phase says final_answer.
+// Question details use a title followed by one option per line. Other messages retain their own text.
+// `parsedFinalAnswer` excludes asynchronous delivery from turn-ending answers.
 function parsedAsyncMessage(payload: Record<string, unknown>): ParsedUpdate | null {
   const item = isRecord(payload.item) ? payload.item : null;
   if (!item || str(item.type) !== 'AgentMessage' || str(item.delivery) !== 'async') {
@@ -3770,12 +3536,8 @@ function parsedUpdate(payload: Record<string, unknown>): ParsedUpdate | null {
   return text ? { sourceId: str(item.id), kind: 'reasoning', text } : null;
 }
 
-// The text of a message the model closed a turn with before a later prompt kept the turn
-// open. `task_complete` still supplies the turn's `summary`, so a final answer that matches
-// it is the response and every earlier one is kept only so the card can show it as a reply,
-// the same way the Claude reader keeps a reply that a later message overtook. A message
-// with `delivery: "async"` carries `phase: "final_answer"` without ending the turn, so it is
-// never an answer.
+// Read a final-answer message. Asynchronous delivery never supplies a turn-ending answer.
+// The turn completion later identifies which recorded answer supplies its response.
 function parsedFinalAnswer(payload: Record<string, unknown>): { sourceId: string | null; text: string } | null {
   const item = isRecord(payload.item) ? payload.item : payload;
   if (str(item.delivery) === 'async') {
@@ -3785,9 +3547,7 @@ function parsedFinalAnswer(payload: Record<string, unknown>): { sourceId: string
   return message && message.phase === 'final_answer' ? { sourceId: message.sourceId, text: message.text } : null;
 }
 
-// All billed requests in one spawned Codex rollout. Usage is collected by turn first,
-// because a turn's model and its token events are separate records and either can arrive
-// first in a format written as an append-only event stream.
+// Read a child rollout's billed requests, grouped by turn. Model settings and token events can arrive in either order.
 function readCodexOwnSpend(file: string): {
   spend: AgentSpend;
   facts: Pick<AgentSpend, 'startedAt' | 'endedAt' | 'toolUses' | 'commits' | 'commitIntents' | 'person'>;
@@ -3917,11 +3677,7 @@ function readCodexOwnSpend(file: string): {
       sameCommit: sameCommitSha,
     },
   );
-  // A guardian's duration figure already reads its Started from the payload clock, so its
-  // record must open on the same clock. `meta.startedAt` carries that value and the same
-  // fallback to the opening record `codexStartedAt` uses, so the record takes Started from
-  // the same payload clock its figure starts from. Every other child keeps the span its own
-  // turns recorded.
+  // Guardian records and duration figures use the same catalog start clock. Other children retain their recorded turn span.
   if (meta && isHiddenThread(meta) && meta.startedAt !== null) {
     artifacts.startedAt = meta.startedAt;
   }
@@ -4535,9 +4291,7 @@ export function readCodexDispatchedSpend(
   };
 }
 
-// The child file one row names. The thread id is the exact association. The path is only a
-// fallback for older tails that did not reach the activity event carrying that id, and it is
-// accepted only when one child under the parent has that path.
+// Resolve a child by exact thread id. Fall back to an agent path only when it identifies one child under the parent.
 export function codexSubagentFor(
   children: readonly CodexSubagentFile[],
   parentThreadId: string,
@@ -4546,9 +4300,7 @@ export function codexSubagentFor(
   return codexSpendIndex(children).resolve(parentThreadId, ref);
 }
 
-// A turn being built. `files` is a map so several edits to one file collapse into one row,
-// keyed by the compared form of the path rather than the written one: Codex writes the same
-// file with either case of drive letter, and two keys would draw it as two files.
+// Group a turn's file edits by normalized path. Drive-letter case differences must not create duplicate file rows.
 type Building = Omit<Turn, 'files'> & {
   files: Map<string, TurnFileChange>;
   fileChanges: Set<string>;
@@ -4616,9 +4368,7 @@ const CODEX_HIDDEN_POLICY: HiddenStatePolicy = {
   redefinesDetail: true,
 };
 
-// Every record kind the reader acts on. A line holding none of these is skipped before it
-// reaches JSON.parse, which is what keeps the reasoning blocks and the model's opening
-// instructions from being parsed only to be thrown away.
+// Record markers that admit lines for parsing. Skip unrelated reasoning and opening instructions before JSON.parse.
 const NEEDLES = [
   'session_meta',
   'task_started',
@@ -4635,16 +4385,13 @@ const NEEDLES = [
   'compacted',
   'web_search_call',
   'CommandExecution',
-  // The record naming the billing tier and the provider. The usage reader admits it and the
-  // session reader did not, so a session on a tier this table cannot price still reached
-  // a figure quoted at the standard rate.
+  // Settings identify the billing provider and service tier for both usage and session readers.
   'thread_settings_applied',
   'AgentMessage',
   'Reasoning',
   'item_completed',
   FINAL_ANSWER,
-  // The published skill list. Nothing else in a rollout names the files that are skills, so
-  // a window that drops this record cannot tell a skill read from any other file read.
+  // Retain the skill catalog so completed file reads can match published skill paths.
   CODEX_SKILL_CATALOG,
 ];
 
@@ -4665,11 +4412,8 @@ export function codexSessionLineMayAffectRead(line: string): boolean {
   return line.length >= 20 && carriesRecord(line);
 }
 
-// Current response items use generic names for assistant prose, so admit only the narrow
-// shapes that can become visible activity or a final answer instead of parsing every message
-// line. A phased `response_item` message or `event_msg` agent_message needs this check too:
-// neither one carries any of the other NEEDLES, so a final answer written only in one of
-// those shapes would otherwise never reach the parser that reads its phase.
+// Admit phased assistant messages and reasoning summaries through their specific markers.
+// Generic message names alone also occur in unrelated records.
 function carriesAssistantUpdate(line: string): boolean {
   const phased =
     (line.indexOf('"phase":"commentary"') >= 0 || line.indexOf('"phase":"final_answer"') >= 0) &&
@@ -4679,26 +4423,9 @@ function carriesAssistantUpdate(line: string): boolean {
   return phased || reasoning;
 }
 
-// When each turn in the tail of one rollout began, and whether the window reached the start
-// of the file. The Claude side's `readSessionTurnStarts`, for a rollout.
-//
-// A Codex turn's boundary is recorded rather than inferred, so this reads `task_started`
-// where the Claude side has to decide what a human prompt is. A turn whose start is inside
-// the window and whose prompt is not is still a turn the reader has not seen, and both
-// readers answer the same question: how many times did this session begin work.
-//
-// A turn that recorded nothing is not counted. Compacting and a session left in realtime
-// mode can each open and close a turn with nothing inside it. Counting those puts an unread
-// mark on a session where no card exists to clear it by opening.
-//
-// `worthDrawing` itself needs the built turn, which is the parse this exists to avoid, so
-// the boundary reader and the incremental index share the record-level equivalent below.
-// It admits typed prompts, visible assistant updates, tool calls, visible file changes,
-// answered or failed completions, and interruptions.
-//
-// A completed command is not on the list, though the session reader draws a row from one.
-// The call that ran it is a `custom_tool_call`, and a rollout writes that call before the
-// command it completes, so the outer call has already counted the turn by then.
+// Detect visible work without building a turn. Boundary readers and incremental indexes share this record-level rule.
+// Empty completed turns supply no unread card. Token usage alone does not establish visible work.
+// Completed commands rely on their preceding tool calls to establish work.
 function codexTurnRecordDidSomething(record: Entry, agentPath: string | null = null): boolean {
   const asked = userMessage(record);
   if (asked !== null) {
@@ -4778,9 +4505,7 @@ function codexBoundaryState(lines: readonly string[], agentPath: string | null):
 
 function turnStartsIn(lines: string[], agentPath: string | null): number[] {
   const starts: number[] = [];
-  // The start being built, held until a record proves the turn did something. A start still
-  // held when the window ends is kept: the turn is the one running now, and a running turn
-  // that has not yet recorded its prompt is still a turn the reader has not seen.
+  // Hold the start until visible work arrives. Keep an unclosed start at the window's end.
   let open: number | null = null;
   for (const line of lines) {
     if (line.length < 20 || !carriesRecord(line)) {
@@ -4791,16 +4516,14 @@ function turnStartsIn(lines: string[], agentPath: string | null): number[] {
       continue;
     }
     if (record.kind === 'task_started') {
-      // `stamp` answers 0 for a time it cannot read, and a 0 would sort as the oldest turn
-      // the session ever had, so an unreadable one is dropped rather than counted.
+      // Drop unreadable timestamps. `stamp` returns zero, which would incorrectly place the turn before recorded work.
       open = record.at || null;
       continue;
     }
     if (open === null) {
       continue;
     }
-    // An answer counts, and an empty one does not: a compaction's own turn closes with no
-    // `last_agent_message`, which is exactly the turn being kept out.
+    // Keep completions with visible work. Empty compaction completions do not establish a turn to draw.
     if (record.kind === 'task_complete' || record.kind === 'turn_aborted') {
       if (codexTurnRecordDidSomething(record, agentPath)) {
         starts.push(open);
@@ -4895,9 +4618,7 @@ export interface CodexSessionParserState {
   turnLimitStart: number | null;
   contexts: Map<string, { model: string | null; effort: string | null; start: number; end: number }>;
   toolNames: Map<string, string>;
-  // The skills the client published, by name. Session state rather than turn state: the
-  // catalog is written before the first turn starts, and the command that reads one of its
-  // files can come many turns later, so it is held here and survives a reread of the tail.
+  // Retain published skills across turns and tail rereads. A command can read a skill long after catalog publication.
   skillCatalog: Map<string, CodexSkill>;
   stepById: Map<string, TurnStep>;
   updateById: Map<string, TurnUpdate>;
@@ -4912,8 +4633,7 @@ export interface CodexSessionParserState {
   seenClaudeCommands: Record<string, { accepted: boolean; invocationId: string }>;
   usageState: CodexUsageReducerState;
   lastContext: number;
-  // The last lifetime this session recorded. A request that only reads the prefix back
-  // names none of its own and still sits inside the one an earlier request bought.
+  // The last known cache lifetime. Read-only requests retain the lifetime without establishing a new write.
   lastLifetime: CacheLifetime | null;
   lastContextSource: { start: number; end: number } | null;
   lastModel: string | null;
@@ -4927,8 +4647,7 @@ export interface CodexSessionParserState {
   provider: string | null;
   agentPath: string | null;
   opening: { openedAt: number | null; sessionId: string | null };
-  // What the retained turns hold on symbol keys and non-enumerable fields, lifted into plain
-  // state. `snapshot` writes it, and a reducer built from a restored state puts it back.
+  // Plain snapshot of symbol-keyed and non-enumerable turn fields. Restored reducers reattach those fields.
   hidden?: HiddenParserState;
 }
 
@@ -5419,18 +5138,9 @@ function addCodexRequest(
   // end level.
   if (requestAfterCompaction || (compaction && state.open !== turn && turn.endedAt < compaction.at)) {
     turn.contextTokens = contextTokens;
-    // The request behind that level, dated and priced as itself. A write Codex could not put
-    // in a lifetime is held apart as unclassified, so a recorded prompt-cache write is the
-    // only thing here that names one. A request that wrote nothing still sits inside the
-    // lifetime an earlier one bought.
-    //
-    // How long that lifetime is belongs to the model, and `pricing.ts` carries it on the price
-    // row beside the rate it applies to. OpenAI documents thirty minutes for the GPT-5.6
-    // family and GPT-6 only, so a row naming none records none and the panel shows both
-    // bounds rather than quoting the cheap rate over a cache that has already gone.
-    //
-    // The model is read with the same precedence the bookkeeping below uses: this request's own model, then
-    // the one its turn context named, then the last model the rollout recorded.
+    // Store the request behind the context level with the lifetime its model's pricing row defines.
+    // A recorded cache write updates `lastLifetime`. An unknown lifetime remains null.
+    // Model precedence is request, turn context, then the last recorded model.
     const requestModel = event.model ?? state.contexts.get(turn.promptId)?.model ?? state.lastModel;
     const lifetime = cacheLifetimeFor(requestModel, state.provider);
     const wrote = event.usage.cacheWrite30m ? lifetime : null;
@@ -5528,8 +5238,7 @@ function reduceCodexSessionLine(
   if (state.usageState.currentTurnRepeated && state.usageState.nativeSpawnedAt !== null && kind !== 'task_started')
     return;
 
-  // Read before the open-turn guard below, because the catalog arrives before the first
-  // turn starts and is what every later turn's skill reads are recognized by.
+  // Read the skill catalog before requiring an open turn. Catalog publication can precede the first turn.
   if (kind === 'message' && str(payload.role) === 'developer') {
     const published = blocksText(payload.content);
     if (published.trimStart().startsWith(CODEX_SKILL_CATALOG)) {
@@ -5786,8 +5495,7 @@ function reduceCodexSessionLine(
     state.lastContextSource = null;
     if (state.open) {
       state.open.contextTokens = 0;
-      // The request that set it goes with it. Nothing reads a request whose level is gone,
-      // and a fact left behind its own subject is one a later reader has to rule out.
+      // Clear the request together with the context level it described.
       state.open.contextRequest = undefined;
     }
     boundCodexTurns(state, opts.maxTurns ?? 40);
@@ -5821,28 +5529,20 @@ function reduceCodexSessionLine(
   if (!state.open) {
     releaseUsageSources();
     return;
-  } // a turn that began before the window; nothing to attach to
+  } // No open turn exists in this window to receive the record.
   const turn = state.open;
   extendCodexSourceRange(turn, sourceStart, sourceEnd);
 
   switch (kind) {
     case 'task_complete': {
-      // `last_agent_message` and the recorded final_answer can serialize the same message
-      // differently: one can carry a trailing newline the other lacks, and a message with
-      // several content blocks can be joined with newlines in one and with nothing in the
-      // other. `responseAnswerIndex` needs `summary` exactly equal to the answer it came
-      // from to keep the response out of the turn's earlier-answers list, so when the two
-      // texts agree apart from whitespace, `summary` takes the recorded answer's own text
-      // rather than the newly read one. A turn whose last recorded answer is a different
-      // message entirely, such as a final_answer read out of order with commentary, keeps
-      // reading `last_agent_message` untouched.
+      // Preserve the recorded answer's exact text when the completion summary differs only in whitespace.
+      // `responseAnswerIndex` needs exact equality to exclude the response from earlier answers.
+      // A different completion message keeps its own text.
       const rawSummary = answerInTaskComplete(record);
       const lastAnswer = turn.answers[turn.answers.length - 1];
       turn.summary =
         lastAnswer && stripWhitespace(lastAnswer.text) === stripWhitespace(rawSummary) ? lastAnswer.text : rawSummary;
-      // The request that ended the turn, when one failed: a usage limit reached, or the
-      // service refusing the call. It is written as an object rather than as text, and
-      // only the message inside it is worth putting on a card.
+      // Extract a failed completion's error message from its object payload.
       const failed = str((payload.error as { message?: unknown } | undefined)?.message);
       turn.error = failedCodexTurn(record) && failed ? errorMessage(failed) : null;
       turn.finished = finishedCodexTurn(record);
@@ -5852,10 +5552,8 @@ function reduceCodexSessionLine(
     case 'turn_aborted': {
       turn.interrupted = interruptedCodexTurn(record);
       turn.finished = false;
-      // `task_complete` never arrives to supply `summary`, so a final answer the turn
-      // wrote before the stop would otherwise draw only in Activity while the headline
-      // reads as though the turn never answered. The last recorded answer becomes the
-      // summary instead, the same text `responseAnswerIndex` then excludes from Activity.
+      // Without a completion summary, use the last recorded answer as the response.
+      // `responseAnswerIndex` then excludes that answer from Activity.
       const lastAnswer = turn.answers[turn.answers.length - 1];
       if (!turn.summary && lastAnswer) {
         turn.summary = lastAnswer.text;
@@ -5874,11 +5572,7 @@ function reduceCodexSessionLine(
         turn.endedAt = Math.max(turn.endedAt, at);
         break;
       }
-      // A turn holds one prompt in nearly every session recorded, but not in all of
-      // them, and a second one dropped is a card saying less than the turn was asked.
-      // The first one opens the turn and the rest are what the reader typed while it
-      // ran, kept apart with their times so the card can draw them where they happened.
-      // The Claude reader says the same thing about the same event.
+      // The first prompt opens the turn. Preserve later prompts with their timestamps as follow-up messages.
       const raw = userMessage(record);
       if (raw !== null) {
         const asked = codexPrompt(raw);
@@ -6093,8 +5787,7 @@ function reduceCodexSessionLine(
         break;
       }
       const command = completedCommand(payload);
-      // Before the pairing below, which decides which Activity row the command expands. A
-      // command whose row is ambiguous still ran and still read whatever it read.
+      // Attribute skill reads before pairing the command with an Activity row. Ambiguous row pairing does not block attribution.
       if (command) {
         recordCodexSkillUses(state, turn, command, at);
         const readable = command.cwd !== null;
@@ -6166,10 +5859,8 @@ function reduceCodexSessionLine(
       const callId = str(payload.call_id) ?? '';
       const ran = state.stepById.get(callId);
       const expanded = state.pendingExec.get(callId)?.expanded === true;
-      // The output belongs to the outer JavaScript call, while completed-command records
-      // have no outer call id and one outer call can run several commands. That is not a
-      // sound command-to-output pairing for the commit filter, so legacy Codex output is
-      // still read as unreadable and a commit Codex made keeps its row.
+      // Outer JavaScript output has no reliable association with one completed command.
+      // Keep its commit evidence unresolved rather than assigning a command's repository.
       recordCommits(turn, text, at, 'unreadable');
       const child = state.launched.get(callId);
       const result = spawnResult(text);
@@ -6247,7 +5938,7 @@ function reduceCodexSessionLine(
         recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      // The commentary the model writes as it works carries no sender, and is not this.
+      // Senderless assistant commentary is not a child-answer message.
       if (!finalChildMessage(record)) {
         break;
       }
@@ -6362,8 +6053,7 @@ export function structuralAgentStatus(
   const chunkBytes = 256 * 1024;
   const cutRecordLimit = 1024 * 1024;
   const tail = tailOf(child.file, chunkBytes, true);
-  // Include the record cut by the fixed tail. It may be a large terminal record followed by
-  // a delayed duplicate, so lifecycle events must be reduced in their original order.
+  // Include the record cut by the tail window. Large terminal records and delayed duplicates must retain their original order.
   let cutLine: string | null = null;
   let cursor = tail.cursor;
   let cutBytes = 0;
@@ -6394,8 +6084,7 @@ export function structuralAgentStatus(
     reduce(line);
   }
   const { status, endedAt } = lifecycle.value();
-  // A guardian can write its opening record after its own first turn starts, so the row counts
-  // from the child's start clock rather than from that record.
+  // Measure duration from the child's start clock. A guardian's opening envelope can follow its first turn.
   const durationMs =
     child.startedAt !== null && endedAt !== null && endedAt >= child.startedAt ? endedAt - child.startedAt : null;
   return { status, durationMs };
@@ -6426,9 +6115,7 @@ function markStructuralAgent(agent: StructuralTurnAgent): void {
   Object.defineProperty(agent, CODEX_STRUCTURAL_AGENT, { value: true });
 }
 
-// The id of every row this file attached from a child's own opening record. A structured
-// clone keeps none of the marks below, so a caller that sends turns across the worker
-// boundary reads these ids and names them again on the way back.
+// Identify child rows attached from opening metadata. Reapply these identities after structured cloning drops their hidden marks.
 export function codexStructuralAgentIds(turns: readonly Turn[]): string[] {
   const ids: string[] = [];
   for (const turn of turns) {
@@ -6478,9 +6165,8 @@ function restoreStructuralBase(agent: StructuralTurnAgent): void {
   agent.effort = base.effort;
 }
 
-// Background Codex work can identify its parent only in the child's opening record. Attach
-// that structural edge to one turn by the child's opening clock, while preserving any richer
-// row the parent protocol recorded for the same thread id.
+// Attach structural children to the turn containing their opening clock.
+// Preserve richer parent-recorded rows for matching thread ids.
 function attachCodexStructuralAgents(
   turns: Turn[],
   parentThreadId: string | null,
@@ -6589,12 +6275,9 @@ function attachCodexStructuralAgents(
   }
 }
 
-// Reapply child facts to turns retained outside the transcript tail. The host calls this
-// when a child or descendant changes without changing its parent rollout.
-//
-// `structuralIds` names the rows a reader attached from a child's own opening record, for
-// turns that crossed a structured clone and lost their mark. Without it those rows read as
-// parent-recorded, and a child that finished and started again keeps the finished status.
+// Refresh child facts on retained turns when descendants change without changing the parent rollout.
+// `structuralIds` restores structural ownership after structured cloning drops hidden marks.
+// Parent-recorded rows retain their separate refresh rules.
 export function refreshCodexStructuralAgents(
   turns: Turn[],
   parentThreadId: string,
@@ -6638,8 +6321,7 @@ function codexHiddenSlots(state: CodexSessionParserState) {
   return { turns: state.turns, open: state.open, pending: null };
 }
 
-// The snapshot a caller may send across the progressive worker boundary, where a structured
-// clone drops every symbol key and non-enumerable field the reducer hangs on its turns.
+// Preserve hidden reducer fields in a snapshot that crosses a structured-clone worker boundary.
 function codexSnapshot(state: CodexSessionParserState): CodexSessionParserState {
   const copy = cloneParserState(state);
   copy.hidden = hiddenParserState(codexHiddenSlots(copy), CODEX_HIDDEN_POLICY);
@@ -6787,16 +6469,8 @@ function readCodexSessionLines(
   return reducer.finish(readBytes);
 }
 
-// Whether a turn recorded anything a reader could look at.
-//
-// Not every `task_started` is work. Compacting opens and closes a turn of its own with no
-// prompt, no answer and no tool call inside it, and so does a session that was left in
-// realtime mode; a quarter of the turns in the rollouts on this machine are one or the
-// other. Drawing them puts an empty card beside the compaction the panel already shows.
-//
-// Token counts are deliberately not on this list. A compaction turn has them, because
-// summarising the session costs tokens, and they are what the compaction card is
-// priced from rather than a sign that the turn did something.
+// Draw a turn only when it contains a prompt, assignment, response, tool use, file change, update, error, or interruption.
+// Empty compaction and realtime turns create no card. Token usage alone does not qualify.
 function worthDrawing(turn: Building): boolean {
   return (
     turn.prompt !== '' ||
@@ -6867,11 +6541,7 @@ function newTurn(
   };
 }
 
-// One thing the turn did, kept in order. The same rule as the Claude side, in this file
-// because a rollout names its calls differently: the arguments of a `function_call` are a
-// JSON string, and a `custom_tool_call` carries a JavaScript program the exec sandbox ran
-// rather than fields. Only an unambiguous `tools.<name>(` is read from that wrapper. A later
-// completed item can replace its preview when the association is unambiguous.
+// Optional source identity and unabridged detail for an Activity step.
 interface StepMetadata {
   sourceId?: string;
   fullDetail?: string;
@@ -6960,22 +6630,11 @@ function recordUpdate(
   byText.set(textKey, update);
 }
 
-// A final answer, kept in the order the turn closed it. Codex writes the same message twice,
-// once as an `item_completed` event carrying an `item-N` id and once as the matching
-// `response_item` carrying a `msg_...` id, one to ten ms apart, so neither the id nor an
-// exact timestamp pairs them the way `recordUpdate` pairs a commentary message. The second
-// write of the same text, arriving within the pairing window of the turn's last recorded
-// answer with no later prompt between the two, is that same message rather than a new one.
-// `responseAnswerIndex` picks the one `task_complete` reused as `summary` back out of this
-// list, the same rule the Claude reader uses to keep its response out of its own
-// earlier-answers list.
+// Pair identical final-answer text across records with different ids when no intervening prompt exists.
+// Matching records must fall within this window. The response remains excluded from earlier answers through `responseAnswerIndex`.
 const ANSWER_PAIRING_WINDOW_MS = 2000;
 
-// The turn's last recorded answer, when its text matches and it arrived inside the pairing
-// window with no later prompt between the two records. A prompt in between means the reader
-// typed between two genuinely separate answers that happen to share text, which stays rare
-// enough that this dedup does not need to guard same-text answers any further apart than the
-// window.
+// Match the latest answer by exact text and time window, provided no later prompt intervened.
 function recentMatchingAnswer(turn: Building, text: string, at: number): TurnAnswer | null {
   const last = turn.answers[turn.answers.length - 1];
   if (!last || last.text !== text || Math.abs(at - last.at) > ANSWER_PAIRING_WINDOW_MS) {
@@ -7008,9 +6667,7 @@ function recordAnswer(
   byId.set(sourceId, answer);
 }
 
-// What a call acted on, from the arguments a rollout wrote as a string. Anything that is
-// not the JSON object this expects leaves the detail empty, which is what a step with
-// nothing readable to say should say.
+// Read a tool's subject from JSON-string arguments. Invalid or unsupported arguments produce empty detail.
 function callDetail(name: string, raw: unknown): { detail: string; fullDetail?: string } {
   if (typeof raw !== 'string' || !raw.trim()) {
     return { detail: '' };
@@ -7172,10 +6829,8 @@ function wrappedToolInput(name: string, raw: string): Record<string, unknown> {
   return input;
 }
 
-// A custom exec call is the wrapper used for tools exposed by this client. The completed
-// item carries the useful detail for commands and edits, but calls such as update_plan have
-// no second record. Keep the nested tool name when the wrapper names exactly one kind of
-// tool, so the activity row says what happened instead of showing a bare exec.
+// Extract a nested tool name when a custom exec wrapper names exactly one tool kind.
+// Completed items supply command and edit details. Calls without completed items retain this wrapper-derived name.
 function nestedToolName(raw: unknown): string | null {
   if (typeof raw !== 'string') {
     return null;
@@ -7213,8 +6868,7 @@ function wrappedCommand(raw: unknown): string | null {
   }
 }
 
-// A subagent Codex spawned for itself. Its own work goes to a rollout of its own, so
-// nothing of it reaches this file except the launch and what the parent was told after.
+// Record a subagent launch from the parent's tool-call arguments. Child work is read separately from its rollout.
 function recordSpawn(turn: Building, call: Record<string, unknown>, at: number): TurnAgent {
   let args: Record<string, unknown> = {};
   try {
@@ -7345,9 +6999,7 @@ function finishSpawn(state: CodexSessionParserState, row: TurnAgent, status: Chi
   }
 }
 
-// The files one applied patch changed. Codex records structured changes in `patch_apply_end`
-// and completed `FileChange` items, rather than in the tool call that produced them. The
-// plumbing moved once already, from a top-level `apply_patch` call to one made inside the exec sandbox.
+// Select a change's destination path and exclude ephemeral paths.
 function visibleCodexChangePath(written: string, raw: unknown): string | null {
   const change = (raw || {}) as Record<string, unknown>;
   const filePath = str(change.move_path) ?? written;
@@ -7398,9 +7050,7 @@ function recordChanges(turn: Building, changes: Record<string, unknown>): void {
         }
       }
     }
-    // A file added or removed whole carries its text rather than a patch, so the count of
-    // lines in that text is the whole of what moved. A trailing newline ends the last line
-    // rather than opening another, and an empty file has none at all.
+    // Added and deleted files carry complete text. Count its lines without treating a trailing newline as an extra line.
     if (kind === 'add') {
       added = countLines(content || '');
     }
@@ -7428,17 +7078,9 @@ function recordChanges(turn: Building, changes: Record<string, unknown>): void {
   }
 }
 
-// Whether a turn may have changed more files than it recorded.
-//
-// A file written by shell redirection, by `Set-Content`, or by a script the agent ran leaves
-// no `patch_apply_end` behind, and nothing else in a rollout can recover it. So a Codex turn
-// that ran commands and recorded no patch is not necessarily a turn that changed nothing,
-// and a panel drawing it as a confident zero would be saying more than it knows.
-//
-// The answer for any other agent is no, and the agent is tested here rather than at the
-// call site so that a reader of the mark is told what the question means. Claude Code
-// records every edit as a tool result, so a turn of its own that ran commands and changed
-// nothing changed nothing.
+// A Codex turn with commands but no recorded file changes has uncertain edit coverage.
+// Shell commands and scripts can write files without emitting structured file-change records.
+// Other agents do not receive this Codex-specific coverage marker.
 export function mayHaveUnrecordedEdits(turn: Pick<Turn, 'agent' | 'toolCounts' | 'files'>): boolean {
   return turn.agent === 'codex' && turn.toolCounts.commands > 0 && turn.files.length === 0;
 }

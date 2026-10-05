@@ -117,8 +117,7 @@ export interface CardRendererOptions {
   read: ReadStateOwner;
   comments: CommentRenderer;
   statDetails: StatDetailRenderer;
-  // The second popover instance, which a subagent row's figure opens over the first one. Absent
-  // where no caller draws subagent rows, and a figure then stays a run of text.
+  // Subagent figure records open this popover above the parent popover. Without it, figures remain text.
   figureDetails?: StatDetailRenderer;
   // The reader's Timeline layout, as the last render carried it.
   layout(): TimelineLayout;
@@ -176,8 +175,7 @@ function Section({
   ]);
 }
 
-// The branch fact and the merged word beside a one-branch Commits heading, such as
-// `main · merged`, muted after the figure and drawn as a sibling of the collapse button.
+// Draw branch facts and merge-arrival text beside a single-group Commits heading's collapse button.
 function factSpan(fact: { text: string; arrival?: { key: string; title: string; spoken: string } }): ComponentChildren {
   return h('span', { class: 'commitheadfact' }, [
     fact.text,
@@ -193,19 +191,15 @@ function factSpan(fact: { text: string; arrival?: { key: string; title: string; 
   ]);
 }
 
-// `count` is a plain number for Subagents, Dispatched and Files, and the Commits heading's own
-// figure otherwise, such as `12` alone or `12 · 3 merged`. A bare number, whether it arrives as
-// a number or as a digit-only string, still gets the title's own pluralized word appended, the
-// way Files says "12 files" rather than a naked "12". A figure that already carries its own
-// words, such as the merged count, rides into the spoken name as it stands.
+// Add the title's singular or plural unit to bare numeric counts.
+// Commits figures that already contain words retain their complete text.
 export function recordSectionLabel(title: string, count: number | string, shown: boolean): string {
   const action = shown ? `Collapse ${title}` : `Expand ${title}`;
   const bare = typeof count === 'number' ? count : /^\d+$/.test(count) ? Number(count) : null;
   if (bare === null) {
     return `${title}, ${count}, ${action}`;
   }
-  // Dispatched is a participle rather than a plural, so it reads the same for one session and
-  // for several. Every other title drops its plural `s` for one.
+  // Dispatched keeps the same count word for one session and several.
   const countLabel = title === 'Dispatched' || bare !== 1 ? title.toLowerCase() : title.slice(0, -1).toLowerCase();
   return `${title}, ${bare} ${countLabel}, ${action}`;
 }
@@ -222,8 +216,7 @@ function RecordSection({
   card: CardView;
   title: string;
   count: number | string;
-  // What a one-group Commits record says about its branch, muted after the figure, and the
-  // merged word with its hover and its hidden words when the branch was merged.
+  // Branch facts and merge-arrival details for a single-group Commits heading.
   fact?: { text: string; arrival?: { key: string; title: string; spoken: string } };
   children?: ComponentChildren;
   className?: string;
@@ -256,11 +249,8 @@ function RecordSection({
             h('span', { class: 'count' }, String(count)),
           ]),
         ),
-        // The branch fact and the merged word sit beside the button rather than inside it, so
-        // the heading can wrap a long branch name, the branch name and the merged word's hover
-        // and hidden words stay reachable outside a control CLAUDE.md bars from carrying a
-        // native title, and a click on the fact presses nothing, since the button no longer
-        // wraps it.
+        // Facts sit outside the button so long names wrap and merge tooltips remain reachable.
+        // Pressing the fact does not toggle the section.
         fact ? factSpan(fact) : null,
       ]),
     ),
@@ -417,20 +407,16 @@ function AskRows({
   );
 }
 
-// The prompt drawn above the response, when the Prompt position setting asks for it. The question is
-// read before the answer, so it is clamped short, and what the reader typed while the turn ran
-// folds behind one press. A saved comment on one of those asks shows them until the reader
-// presses, so the comment is drawn on its line rather than on a block nobody can see. A card
-// with no first prompt draws its first ask as its first prompt block, so a comment on that ask
-// is stored under `prompt`, and a comment on the You asked heading draws on that ask.
+// Draw the prompt above the response with later prompts behind one toggle.
+// Saved comments on later prompts reveal them until the reader changes the toggle.
+// Without an opening prompt, comments on `prompt` or the prompt heading anchor to the first later prompt.
 function PromptLead({ card, expanded, options }: { card: CardView; expanded: boolean; options: CardRendererOptions }) {
   const [full, setFull] = useState(false);
   const [asksChoice, setAsksChoice] = useState<boolean | null>(null);
   const onOverflowChange = useCallback(() => {}, []);
   const asks = card.laterPrompts ?? [];
   const opening = card.prompt || card.delegation;
-  // With no first prompt, the first ask is the prompt block that a comment on the prompt or on
-  // the drawn You asked heading lands on.
+  // Without an opening prompt, the first later prompt receives prompt and prompt-heading comments.
   const onAsk = ({ part, quote }: { part: string; quote?: string }) =>
     part.startsWith('prompt:') ||
     (!opening && (part === 'prompt' || (part === 'summary' && quotesPromptHeading(quote || ''))));
@@ -527,12 +513,8 @@ export function recordSections(card: CardView, options: CardRendererOptions): Co
       ),
     );
   }
-  // One section for the repository work, commits and landings together, in the order they
-  // happened. The heading keeps the shape its two peers keep, the section's word and a figure
-  // beside it, and counts the landings apart from the commits the way the commits chip above
-  // the card does, so a landing among the rows is never counted as a commit here and left out
-  // of the figure there. A record of one branch draws no group heading, so the heading names
-  // the branch beside the figure.
+  // The Commits section holds written commits and landings, with separate figures.
+  // A single group's section heading carries its branch facts instead of drawing a group heading.
   const commits = card.commits ?? [];
   if (commits.length) {
     const landings = commits.filter((commit) => commit.kind === 'landing').length;
@@ -585,23 +567,12 @@ export function recordSections(card: CardView, options: CardRendererOptions): Co
   return sections;
 }
 
-// The controls a rendered message can hold: the links in it, the copy button on each code
-// block, and the button a picture or a visualization is drawn as.
+// Focusable controls within a rendered message.
 const MESSAGE_CONTROLS = 'a[href], a[data-link], button, input, select, textarea, summary, [tabindex]';
 
-// Take everything under a bounded block's cut out of the tab order, and give it back when the
-// bound lifts.
-//
-// `overflow: hidden` clips the drawing and leaves what it clipped focusable. A reader walking
-// a long message with the keyboard would otherwise land on a link, a copy button and a picture
-// they cannot see, one after another, before ever reaching the control that would show them.
-//
-// Geometry rather than a count, for the reason the bound itself is measured. A control the cut
-// runs through keeps its place: half of it is on screen and pressable, which is the rest of
-// the block's own rule.
-//
-// The value each control had is kept beside it, so giving it back restores what was there
-// rather than what a control of that kind usually has.
+// Remove wholly clipped controls from the Tab order while a message is bounded.
+// `overflow: hidden` alone leaves hidden controls focusable. Partly visible controls retain their stop.
+// Restoring visibility restores each control's original `tabindex`.
 function clipFocus(node: HTMLElement, bounded: boolean): void {
   const edge = bounded ? node.getBoundingClientRect().bottom : 0;
   for (const control of Array.from(node.querySelectorAll<HTMLElement>(MESSAGE_CONTROLS))) {
@@ -621,48 +592,28 @@ function clipFocus(node: HTMLElement, bounded: boolean): void {
   }
 }
 
-// Every bounded message in a card body, clipped again.
-//
-// Run after the comment marks are written. Writing them removes and remakes the marks inside
-// the blocks they sit on, so a mark under a cut comes back as a fresh element carrying neither
-// the tab stop taken off its predecessor nor the note of what it had. Nothing else would put
-// it back: a mark is drawn over the text rather than in it, so remaking one resizes neither
-// the block nor its content and the block never measures again.
+// Reapply focus clipping after comment marks are replaced.
+// New marks lack their predecessors' saved Tab state and do not resize the message.
 function reclipMessages(body: HTMLElement): void {
   for (const text of Array.from(body.querySelectorAll<HTMLElement>('.saidtext'))) {
     clipFocus(text, text.scrollHeight > text.clientHeight + 2);
   }
 }
 
-// The bound each kind of message opens at, as a multiple of the block's own font size. Six
-// lines of the summary's 1.5 line height for a narration, and the 36em a reply has had since
-// the section shipped. The same two figures are the fallbacks in `.saidtext`'s `max-height`.
-// That draws the bound for the one frame before the block has measured itself.
+// Message bounds in units of the block's font size. Narration spans six lines at 1.5 line height.
+// Replies use 36em. Matching CSS fallbacks apply before the first measurement.
 const SAID_BOUND = { narration: 9, reply: 36 };
 
-// Where a bounded block cuts, moved up to the bottom of the last whole unit above the bound.
-// A unit is a line box of text, a whole table row, or a picture.
-//
-// Measured rather than counted, for the reason the bound itself is measured. Markdown has no
-// line grid. A paragraph's margin, a code block's padding and a table's borders all move the
-// line boxes off any multiple of the line height. So a bound rounded to whole lines would
-// still cut through one. A clamp cannot do it either, because `-webkit-line-clamp` clips
-// nothing at all in a block holding a `pre`.
-//
-// Text inside a button is skipped. A code block's Copy control is drawn over the text and its
-// box ends where no line does. A picture is never skipped, although the renderer wraps every
-// one of them in a button so the reader can open it. There the button is the picture.
-//
-// Returns 0 when no whole unit fits above the bound, and the bare bound then stands.
+// Find the last complete text line, table row or image within the bound.
+// Markdown spacing prevents a line-height multiple from locating complete lines.
+// Skip button text because overlaid Copy buttons do not align with text lines. Images remain complete units.
+// Return zero when no complete unit fits, leaving the original bound in place.
 function snapCut(node: HTMLElement, bound: number): number {
   const top = node.getBoundingClientRect().top;
-  // Half a pixel of room. A rect bottom and the bound are both fractional. A unit ending
-  // exactly on the bound is otherwise refused by the last fraction of either.
+  // Allow half a pixel for fractional rectangle and bound coordinates.
   const limit = top + bound + 0.5;
-  // Started at the block's own top, which is where a cut of nothing falls. These are viewport
-  // coordinates, and a block scrolled above the top of the window has a negative one. Started
-  // at zero, every unit in such a block loses to the window's own edge and the walk answers
-  // with the distance to it.
+  // Start at the block's viewport top, which is negative when scrolled above the window.
+  // Starting at zero would measure the window edge instead of the last fitting unit.
   let best = top;
   const consider = (bottom: number) => {
     if (bottom <= limit && bottom > best) {
@@ -670,9 +621,7 @@ function snapCut(node: HTMLElement, bound: number): number {
     }
   };
   let row: Element | null = null;
-  // A table row is one unit, taken once. Its cells wrap to different depths, so the row ends
-  // where its tallest cell ends. A cut above that reads as a broken table. Both branches below
-  // hand a row here, and whichever meets it first takes it.
+  // Count each table row once. Its bottom includes the tallest wrapped cell.
   const considerRow = (cell: Element) => {
     if (cell === row) {
       return;
@@ -683,9 +632,7 @@ function snapCut(node: HTMLElement, bound: number): number {
   const walk = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
   for (let at = walk.nextNode(); at; at = walk.nextNode()) {
     if (at.nodeType === Node.ELEMENT_NODE) {
-      // A picture is one unit however tall it is, and it holds no text to take a range over.
-      // In a table row it is part of the row, and the row is the unit. Its own bottom sits
-      // above the row's, so taking it would cut through the cells beside it.
+      // Treat an image inside a table as part of its row to avoid cutting adjacent cells.
       const element = at as HTMLElement;
       if (element.tagName !== 'IMG') {
         continue;
@@ -716,31 +663,9 @@ function snapCut(node: HTMLElement, bound: number): number {
   return best > top ? best - top : 0;
 }
 
-// One mid-turn message, bounded so a long one does not push the rest of the card off screen.
-//
-// The bound is measured rather than counted: a message is markdown, so the same text is one
-// height rendered and another as characters. It is worked out from the block's own font size
-// and never read back off the box, so the observer's own write cannot loop: a write that
-// changes the box fires the observer, the measure produces the same value, and nothing is
-// written.
-//
-// Measured whenever the block changes size, and not only when the card draws it again. A
-// message settles at a new height with nothing rendering: the reader narrows the panel or
-// drags the rail wider, and a picture in a message takes its own size once it has loaded.
-// Measured on render alone, a message that fitted when it was drawn is clipped with no control
-// under it, and the reader cannot reach the rest of it at all.
-//
-// The text inside is watched as well as the block. A bounded block stops growing at its own
-// edge, so content settling taller than the bound moves nothing an observer on the block would
-// see.
-//
-// Measured only while both disclosures are open. A hidden block is drawn at no height at all,
-// which reads as a block that fits, and the control would then be missing from every message
-// on a card the reader opens later.
-//
-// Whether the block overflowed goes up to the section as well as staying here. The head's
-// Shift press has to know whether anything is cut before the reader presses it, and only the
-// block can measure that.
+// Bounds each mid-turn message by its font size and measures overflow while both disclosures are open.
+// Observes the block and its body so resizing and loaded images update the cut.
+// Writes a changed cut only, preventing observer loops. Reports clipping to the section for its Shift action.
 function SaidBlock({
   card,
   entry,
@@ -765,9 +690,7 @@ function SaidBlock({
   const shrank = useRef(false);
   const [overflow, setOverflow] = useState(false);
   const answer = entry.kind === 'answer';
-  // The message id joins its parts with colons. An element id is read back through a CSS
-  // selector, where a colon opens a pseudo-class. The `data-control` attribute keeps the raw
-  // id, because nothing ever puts that in a selector.
+  // Sanitize the element ID for CSS selectors. Keep the raw message ID in `data-control`.
   const blockId = `${disclosureId(card, 'said')}-${entry.id.replace(/[^\w-]/g, '-')}`;
   useLayoutEffect(() => {
     const node = block.current;
@@ -777,11 +700,8 @@ function SaidBlock({
     const measure = () => {
       const size = parseFloat(getComputedStyle(node).fontSize);
       const bound = size * (answer ? SAID_BOUND.reply : SAID_BOUND.narration);
-      // Whether the message is longer than its bound is a fact about the message. Whether it
-      // is cut is that fact and the reader's own press together. The control under it reads
-      // the first. A message that fits draws no control, however the record was written. A
-      // bulk press opens every message, and one that fits must not then offer Show less.
-      // Pressing that control would hide it under the reader's own focus.
+      // Measure overflow independently of the reader's expansion choice.
+      // Messages that fit must not show a toggle that disappears when pressed.
       const over = node.scrollHeight > bound + 2;
       const clipped = !full && over;
       if (clipped) {
@@ -813,8 +733,7 @@ function SaidBlock({
       node.removeEventListener('toggle', measure, true);
     };
   }, [expanded, shown, full, entry.summaryHtml, entry.id, answer, onCut]);
-  // A press that shuts a long message takes every line under the button away at once. The
-  // reader is left looking at the middle of the message above it. Focus stays on the button.
+  // Keep the collapse button in view after shortening the message. Focus remains on the button.
   useLayoutEffect(() => {
     if (!shrank.current) {
       return;
@@ -827,19 +746,14 @@ function SaidBlock({
   return h(
     'div',
     {
-      // `data-answer` is the index the card's own `earlierAnswers` carries, newest first, which
-      // is what a comment left on one anchors by. The class and the attribute together are what
-      // the panel reads to name that part, so every note written before this section existed
-      // still resolves to the answer it was left on.
+      // data-answer retains the newest-first earlierAnswers index used by response comments.
       class: `actrow message commentary done said${answer ? ' answer' : ''}`,
       'data-message': entry.id,
       'data-answer': answer ? String(entry.answerIndex ?? 0) : undefined,
     },
     [
-      // The time sits on the bubble and not on the row. A title on the row is inherited by
-      // everything inside it, so the same timestamp answered a hover over any word of the
-      // message and over every link in it, and a link's own address never showed. The
-      // screen reader keeps the time from the line below, which the bubble does not carry.
+      // Put the time tooltip on the bubble so links retain their own tooltips.
+      // The separate saidonly text supplies the screen-reader timestamp.
       h('span', {
         class: 'actglyph',
         'aria-hidden': 'true',
@@ -1016,12 +930,8 @@ function ActivityToolCount({
   );
 }
 
-// How many skills the turn loaded, and the way into the list of them.
-//
-// The same control as a tool-category count, on the same shared popover. What it opens is a
-// dialog rather than a tooltip, because each skill the record named a file for reads its own
-// name as the press that opens it. The renderer owns that difference, so this component
-// declares the list and nothing else.
+// Open the turn's skill list through the shared Activity popover.
+// The detail renderer supplies a dialog because identified skill paths open from their names.
 function ActivitySkillCount({
   card,
   detail,
@@ -1081,8 +991,7 @@ function ActivitySection({
   const onLineOpen = useCallback((id: string, open: boolean) => {
     setLineOpen((choices) => ({ ...choices, [id]: open }));
   }, []);
-  // Set while a Shift press arrives from the keyboard. A browser that fires a synthetic click
-  // for a key whose default was prevented would otherwise run the bulk press twice.
+  // Suppress synthetic clicks during a keyboard Shift action to avoid applying the bulk action twice.
   const keyed = useRef(false);
   const listId = disclosureId(card, 'activity');
   const shown = shownChoice ?? true;
@@ -1156,8 +1065,7 @@ function ActivitySection({
       return {
         label,
         lines: [
-          // A skill description arrives already cut to one line, so the title carries the
-          // whole sentence the row cannot show.
+          // The row shows the shortened description. Its tooltip carries the full description.
           ...(skill.description
             ? [
                 {
@@ -1167,8 +1075,7 @@ function ActivitySection({
                 },
               ]
             : []),
-          // Where the file went, or the sentence saying that it has gone. A row that simply
-          // dropped its path would read as a skill the record never named a file for.
+          // Show the recorded path or the unavailable-path message.
           skill.shownPath
             ? {
                 text: skill.shownPath,
@@ -1192,8 +1099,7 @@ function ActivitySection({
         ],
       };
     }),
-    // Said once for the whole list, and only where a Codex skill sits in it, rather than
-    // naming what the evidence does not prove on every row that carries it.
+    // Describe best-effort evidence once in the footer when any skill carries that evidence.
     footer: skills.some(bestEffort) ? [cardWords().activitySkillsBestEffort] : undefined,
   });
   const rowButtons = () =>
@@ -1232,9 +1138,7 @@ function ActivitySection({
   };
   const anyMore = messages.some((entry) => cut[entry.id] && !full[entry.id]);
   const anyFull = messages.some((entry) => full[entry.id]);
-  // Reported up by each block rather than measured here, and written only on a real change. A
-  // write that changed nothing renders the section again, which measures every block again,
-  // which writes again.
+  // Blocks report clipping. Retain unchanged state to avoid repeated section renders and measurements.
   const onCut = useCallback((id: string, clipped: boolean) => {
     setCut((held) => (!!held[id] === clipped ? held : { ...held, [id]: clipped }));
   }, []);
@@ -1321,15 +1225,12 @@ function ActivitySection({
           {
             class: 'actword',
             ref: word,
-            // The name ends on what a plain press does, the way a session heading's name ends
-            // on its own action. What a Shift press does reaches a screen reader through the hint's
-            // detail line instead.
+            // The accessible name describes a plain press. Hint detail describes the Shift action.
             'aria-label': `${card.activityName}${filterName}, ${plainAction}`,
             'aria-controls': listId,
             'aria-expanded': String(shown),
             'data-control': `activity:${card.key}`,
-            // Hint detail is optional. This control intentionally supplies both fields because its
-            // detail is the only visible explanation of the Shift action.
+            // Supply hint detail when the Shift action needs an explanation.
             'data-hint': shiftAction ? plainAction : undefined,
             'data-hint-detail': shiftAction || undefined,
             onClick(event: MouseEvent) {
@@ -1360,9 +1261,7 @@ function ActivitySection({
               }
               keyed.current = false;
             },
-            // A key pressed on the head and released somewhere else never reaches the handler above.
-            // The refusal would then outlive the press it was written for. Every later press of the
-            // mouse on this head would do nothing at all.
+            // Clear suppression on focus departure because keyup can arrive outside this control.
             onBlur() {
               keyed.current = false;
             },
@@ -1676,8 +1575,8 @@ function CardsBody({ card, expanded, options }: { card: CardView; expanded: bool
     return record;
   };
   const columns = cardBodyColumns(layout, record.length > 0).map((names) => names.flatMap(part));
-  // Two columns puts the record beside the prose. The grid applies only where the card is wide
-  // enough for both columns, so a narrow card stacks the record under Activity as One column does.
+  // Two columns places the record beside the prose on wide cards.
+  // Narrow cards stack the record below Activity, as One column does.
   if (columns.length === 2) {
     return h(
       'div',
@@ -1713,9 +1612,7 @@ interface CardOpenState {
   expandedChanged(): void;
 }
 
-// A record chip draws the turn's files, subagents or commits, and the card beside it already
-// carries those arrays. The host sends no second copy, so the rows are put on the chip's own
-// list here, where both are in hand.
+// Attach the card's record arrays to the chip detail list without a second host payload copy.
 function withRecordRows(card: CardView, chip: ChipView): ChipView {
   const rows = chip.detailList ? detailRowsFor(card, chip.detailList.layout) : null;
   if (!rows || !chip.detailList) {
@@ -1899,13 +1796,8 @@ function Card({
   ]);
 }
 
-// The card's clock-worded fields, written in place.
-//
-// The print that decides whether a card is drawn again leaves every clock-worded value out,
-// so a poll tick alone and a day boundary alone both read as no change at all. That is what
-// lets a text selection survive the poll. These fields still have to follow the clock, and
-// each one is a tooltip, an accessible name or the instant a visible age is drawn from, so
-// none of them can wait for the next content change.
+// Update clock-derived labels, tooltips and timestamp attributes without redrawing the card.
+// The content fingerprint excludes clock-derived fields so poll updates preserve text selections.
 function writeCardClock(host: CardHost, card: CardView): void {
   const head = host.querySelector('.head');
   if (head && card.label && head.getAttribute('aria-label') !== card.label) {
@@ -1961,8 +1853,7 @@ function writeCardClock(host: CardHost, card: CardView): void {
       spoken.textContent = words;
     }
   }
-  // A group heading and a one-group section heading say when their branch was merged, in the
-  // group's accessible name, the merged word's hover and its hidden words.
+  // Refresh merge-arrival times in group names, tooltips and hidden heading text.
   const groupHeads = host.querySelectorAll<HTMLElement>('.commitgroup[data-group], [data-arrival]');
   if (groupHeads.length) {
     const groups = new Map(commitGrouping(card.commits ?? []).groups.map((group) => [group.key, group]));

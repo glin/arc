@@ -134,9 +134,9 @@ function readLines(file: string): Record<string, unknown>[] {
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-// The setting is off for every reader who never went looking for it, so off has to cost
-// nothing at all. A clock that throws proves the writer never even reached a timestamp, and
-// the missing directory proves it never reached the disk.
+// Disabled logging must not read the clock or create its directory.
+// The throwing clock catches timestamp reads while logging is disabled.
+// The directory assertion catches filesystem creation.
 test('a log nobody turned on formats nothing and touches no disk', () => {
   const directory = path.join(tempDir('diagnostics-off'), 'logs');
   const log = createDiagnosticsLog({
@@ -153,7 +153,7 @@ test('a log nobody turned on formats nothing and touches no disk', () => {
   log.log('message', { kind: 'render', bytes: 100 });
   assert.equal(log.file(), null, 'a log that is off named a file');
   assert.equal(fs.existsSync(directory), false, 'a log that is off made its directory');
-  // What a counter asks before it builds a record at all.
+  // Callers check enabled() before constructing diagnostic data.
   assert.equal(log.enabled(), false, 'a log that is off told a caller to build records');
   const silent = silentDiagnosticsLog();
   assert.equal(silent.enabled(), false);
@@ -194,8 +194,8 @@ test('every line carries the identity a reader merges two files by', () => {
   assert.equal(lines[1].event, 'refresh');
 });
 
-// Two windows of one editor instance are two host processes. One shared file would interleave
-// appends from processes that do not coordinate, and nothing could read it back.
+// Each host process writes a separate file with its own identity.
+// Separate files prevent uncoordinated appends to a shared log.
 test('two hosts write two files under two identities', () => {
   const directory = tempDir('diagnostics-two');
   const one = createDiagnosticsLog({
@@ -308,8 +308,8 @@ test('a new log prunes the directory it owns before it writes', () => {
   ]);
 });
 
-// A signal nobody enables reaches nobody, which is how a panel took 89 seconds to draw with
-// every counter recording it and no surface saying so.
+// Startup threshold warnings remain available when detailed logging is disabled.
+// Each milestone reports its threshold breach once.
 test('a slow milestone is reported once, whatever the setting says', () => {
   const directory = tempDir('diagnostics-threshold');
   const watch = new StartupThresholdWatch();
@@ -337,8 +337,8 @@ test('a slow milestone is reported once, whatever the setting says', () => {
   assert.equal(readLines(log.file() as string)[0].event, 'startupThreshold');
 });
 
-// A record holding a circular reference or a BigInt has no JSON form. The counter that handed
-// it over is on the panel's own path, so a throw here would reach the extension host.
+// Circular references and BigInt values cannot be serialized as JSON.
+// Invalid diagnostic data must not throw into the extension host.
 test('a record with no JSON form loses its line and nothing else', () => {
   const directory = tempDir('diagnostics-unserializable');
   const log = createDiagnosticsLog({

@@ -1,4 +1,4 @@
-// extension/src/pricing.test.ts
+// Model pricing and cache costs.
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
@@ -32,9 +32,8 @@ import {
 import { TurnUsage } from './transcript.ts';
 import { COMPACTION_SAMPLES, previousContextOf, type CompactionCalibrationRow } from './turnfixtures.ts';
 
-// The model ids this table is meant to price. Written out rather than read back out of the
-// table, so a promotion naming a row that has quietly gone is caught rather than agreeing with
-// its own absence.
+// Keep expected model ids independent of the price table so missing rows fail the test.
+
 const MODEL_IDS = [
   'claude-fable-5-1',
   'claude-mythos-5-1',
@@ -74,7 +73,7 @@ const usage = (over: Partial<TurnUsage> = {}): TurnUsage => ({
   ...over,
 });
 
-// Independent provider evidence. Exact patterns cover aliases and suffixes as well as new rows.
+// Expected provider policies cover model aliases and suffixes.
 const RECORDED_POLICY = {
   kind: 'recorded',
   sources: [
@@ -365,8 +364,8 @@ test('a dated snapshot and the long-context variant are billed as their generati
 });
 
 test('a model the table has never heard of has no rate, rather than its sibling one', () => {
-  // The rate for these differed by several times from the current generation, so a
-  // family-only match would show a confident wrong figure.
+  // Unsupported generations must not inherit a sibling rate.
+
   assert.equal(rateFor('claude-opus-4-1-20250805'), null);
   assert.equal(rateFor('claude-sonnet-3-7'), null);
   assert.equal(rateFor('claude-opus-4-88'), null);
@@ -382,8 +381,8 @@ test('a model the table has never heard of has no rate, rather than its sibling 
 });
 
 test('the Codex generations in use are priced, and unverified siblings are not', () => {
-  // The rate sol is billed at, not the standard one it is discounted from. Written out
-  // rather than described, so a row moved back to standard has to be moved here too.
+  // Keep expected rates explicit so table changes require corresponding fixture changes.
+
   assert.deepEqual(rateFor('gpt-5.6-sol'), { input: 4, cacheWrite30m: 5, cacheRead: 0.4, output: 20 });
   assert.deepEqual(rateFor('gpt-5.6'), { input: 4, cacheWrite30m: 5, cacheRead: 0.4, output: 20 });
   assert.deepEqual(rateFor('gpt-5.6-terra'), { input: 2, cacheWrite30m: 2.5, cacheRead: 0.2, output: 12 });
@@ -716,7 +715,7 @@ test('a direct GPT-5.6 turn prices cache writes as well as reads', () => {
 });
 
 test('each cache tier is billed at its own multiple of the input rate', () => {
-  // 1M each at $5: uncached 5, 1h write 10, 5m write 6.25, read 0.50; 1M out at $25.
+  // One million tokens per category costs $5 input, $10 one-hour writes, $6.25 five-minute writes, $0.50 reads, and $25 output.
   const cost = estimateCost(
     usage({
       input: 1_000_000,
@@ -736,9 +735,8 @@ test('Fable and Mythos 5.1 use their quarter-price cache read', () => {
   assert.equal(estimateCacheReadCost(usage({ cacheRead: 1_000_000 }), 'claude-fable-5'), 1);
 });
 
-// Opus 5.5 reads at a twentieth of its input rate, against the tenth every row without a
-// published read charges. Its writes stay on the shared multiples, so the row is the one
-// place the two facts can disagree.
+// Opus 5.5 has a 0.05x cache-read rate. Its write rates use the shared input multipliers.
+
 test('Opus 5.5 reads at its published twentieth and writes at the shared multiples', () => {
   assert.equal(estimateCacheReadCost(usage({ cacheRead: 1_000_000 }), 'claude-opus-5-5'), 0.2);
   assert.equal(estimateCost(usage({ cacheWrite5m: 1_000_000 }), 'claude-opus-5-5'), 5);
@@ -907,9 +905,8 @@ test('a turn keeps request bands when several requests are priced together', () 
 });
 
 test('what a turn paid to re-read the session is the cache tier of its own cost', () => {
-  // 2M read on opus-5: $5 per MTok input at a tenth is $0.50 per MTok, so $1.00. Written
-  // out rather than derived, because the whole point of the function is that one multiplier
-  // is not written down twice.
+  // Two million Opus 5 cached input tokens cost one dollar at $0.50 per million.
+
   assert.equal(estimateCacheReadCost(usage({ cacheRead: 2_000_000 }), 'claude-opus-5'), 1);
   assert.equal(estimateCacheReadCost(usage({ requests: 1, cacheRead: 100_000 }), 'gpt-5.6-sol'), 0.04);
   const mixed = usage({
@@ -937,12 +934,12 @@ test('what a turn paid to re-read the session is the cache tier of its own cost'
   );
   // Nothing read back, nothing paid for reading it back.
   assert.equal(estimateCacheReadCost(usage({ input: 1_000_000, output: 1_000_000 }), 'claude-opus-5'), 0);
-  // A model the table does not name has no figure at all, the same answer the whole cost
-  // gives, rather than a guess at its sibling's rate.
+  // Unsupported models have no cache-read estimate.
+
   assert.equal(estimateCacheReadCost(usage({ cacheRead: 2_000_000 }), 'claude-opus-4-1'), null);
   assert.equal(estimateCacheReadCost(usage({ cacheRead: 2_000_000 }), null), null);
-  // And on a usage carrying nothing but a cache read the two agree exactly. Two multipliers
-  // that drifted apart would charge one turn two different amounts for the same tokens.
+  // Cache-only usage must have the same cost through both estimators.
+
   for (const model of ['claude-opus-5', 'claude-haiku-4-5', 'gpt-5.6-terra']) {
     const only = usage({ cacheRead: 3_500_000 });
     assert.equal(
@@ -1001,13 +998,13 @@ test("a dated snapshot and a bracketed suffix carry their generation's window", 
 });
 
 test('a model the window table has never heard of has no window, rather than its sibling one', () => {
-  // A family-only pattern would match these on their newest sibling and show a window
-  // that generation was never given.
+  // Unsupported generations must not inherit a sibling context window.
+
   assert.equal(contextWindowFor('claude-opus-4-1-20250805'), null);
   assert.equal(contextWindowFor('claude-sonnet-3-7'), null);
   assert.equal(contextWindowFor('claude-opus-4-88'), null);
-  // Haiku is the one row carrying a different window, so its boundary is the one that
-  // matters most: loosened, this id would be handed the 200K window.
+  // Reject the near-match Haiku id instead of assigning the supported generation's 200k window.
+
   assert.equal(contextWindowFor('claude-haiku-4-55'), null);
   assert.equal(contextWindowFor('claude-sonnet-4-4'), null);
   assert.equal(contextWindowFor('gpt-5'), null);
@@ -1131,8 +1128,8 @@ test('a compaction estimate needs both recorded figures and a priced model', () 
     null,
     'nothing read means nothing ran',
   );
-  // An older transcript records the read but not the summary. Pricing the read alone puts
-  // a confident figure on the card that is short by the whole output side of the call.
+  // A compaction estimate requires both the input and summary token counts.
+
   assert.equal(
     estimateCompactionCost({ model: 'claude-opus-5', at, contextBefore: 629_292, contextAfter: 0 }),
     null,
@@ -1180,13 +1177,8 @@ test('a retention lifetime without a write price keeps ordinary cold input', () 
 });
 
 test('a promotional rate is checked again once the date it was held to has passed', () => {
-  // A wrong price looks exactly like a right one, so nothing else would ever say a promotion
-  // ended: the row would keep charging the discount for months. This is the thing that arrives
-  // three months later when nobody is looking for it.
-  //
-  // Going red does not mean the code is broken. It means a rate needs looking up. The row's
-  // own note says what to check and what it goes back to, so the fix is the table rather than
-  // an afternoon of research.
+  // Expired promotions require a rate review. Each promotion names its standard rate and review source.
+
   const today = new Date().toISOString().slice(0, 10);
   const over = PROMOTIONS.filter((p) => p.promo.until < today);
   assert.deepEqual(
@@ -1204,8 +1196,8 @@ test('a promotional rate is checked again once the date it was held to has passe
 });
 
 test('every promotion names a row that exists, and every rate it names is real', () => {
-  // A promotion whose pattern matches no row is a note about nothing, and it would go red one
-  // day for a model the table stopped pricing.
+  // A promotion must match a supported model row.
+
   for (const { pattern, promo } of PROMOTIONS) {
     const named = MODEL_IDS.filter((id) => pattern.test(id));
     assert.ok(named.length > 0, `${pattern} is promotional but prices no model this table knows`);
@@ -1214,8 +1206,8 @@ test('every promotion names a row that exists, and every rate it names is real',
     }
     assert.ok(promo.standard.input > 0 && promo.standard.output > 0, `${pattern} has no standard rate to go back to`);
     assert.match(promo.until, /^\d{4}-\d{2}-\d{2}$/, `${pattern} has no date it is held to`);
-    // A promotion over a row already at its standard rate promotes nothing, and would go
-    // red one day only to say the rate was right all along.
+    // A promotional row must differ from its stated standard rate.
+
     for (const id of named) {
       assert.notDeepEqual(
         rateFor(id),
@@ -1227,8 +1219,8 @@ test('every promotion names a row that exists, and every rate it names is real',
 });
 
 test('Sonnet 5 and Sonnet 4.6 are priced apart, because their published rates differ', () => {
-  // One row for both charged every Sonnet 5 turn half as much again as it cost. Written out,
-  // because two rows agreeing is exactly what the bug looked like.
+  // Sonnet 5 and Sonnet 4.6 have distinct expected rates.
+
   assert.deepEqual(rateFor('claude-sonnet-5'), { input: 2, output: 10 });
   assert.deepEqual(rateFor('claude-sonnet-4-6'), { input: 3, output: 15 });
   assert.notDeepEqual(rateFor('claude-sonnet-5'), rateFor('claude-sonnet-4-6'));
@@ -1324,8 +1316,8 @@ const EVERY_CLAUDE_CATEGORY = usage({
   output: 1_000_000,
 });
 
-// The three models Anthropic sells fast mode on, each at its published fast rate. The cache
-// multiples apply on top of the fast input rate, including Opus 5.5's own 0.05x read.
+// Fast cache prices use the model's fast input rate, including the explicit Opus 5.5 cache-read rate.
+
 test('every model that sells fast mode quotes its fast rate, cache reads and writes included', () => {
   const opus55 = { input: 8, cacheRead: 0.4, output: 40 };
   const opus5 = { input: 10, output: 50 };
@@ -1375,8 +1367,8 @@ test('a speed that is neither standard nor fast quotes no cost', () => {
   assert.equal(quoteUsage({ ...input, serviceTier: 'turbo' }), null);
 });
 
-// Anthropic sells fast mode on its own API alone, so a Claude turn a provider names never
-// reaches the fast rate.
+// A named provider prevents the direct Claude fast-rate estimate.
+
 test('a fast Claude turn on a named provider quotes no cost', () => {
   for (const provider of ['amazon-bedrock', 'google-vertex', 'anthropic']) {
     assert.equal(
@@ -1528,8 +1520,8 @@ test('reported cost and configured rates retain their own provenance', () => {
   );
 });
 
-// The guide names the provider and model beside each cache multiple. Keep those rows aligned
-// with the pricer without forcing provider-specific rates into the token glossary.
+// The cost guide states cache multiples by provider and model.
+
 test('the cost guide states the provider-specific cache multiples the pricer charges', () => {
   const guide = readFileSync(path.join(__dirname, '..', '..', 'docs', 'agent-cost-guide.md'), 'utf8');
   const cellsFor = (model: string): string[] => {
@@ -1582,8 +1574,8 @@ test('the cost guide states the provider-specific cache multiples the pricer cha
   assert.deepEqual(multiplesIn(sol61[2]), [ratio('gpt-6.1-sol', { cacheWrite30m: 1_000_000 })]);
 });
 
-// The next turn's floor. Every turn re-presents the whole session, so the context on the
-// record has a price before the reader types.
+// The next-turn starting price includes the existing context before any new prompt text.
+
 test('the floor prices the whole context at the rate the next request pays', () => {
   const floor = nextTurnFloor({ contextTokens: 620_000, model: 'claude-opus-5', tier: '1h' });
   assert.ok(floor, 'opus-5 is in the table, so this figure is not optional');
@@ -1607,19 +1599,18 @@ test('the floor charges the cold bound at the tier the record names', () => {
 });
 
 test('a record naming no lifetime is priced the way its own provider charges the context again', () => {
-  // Claude charges a write premium whatever the record says, and an unnamed write is charged
-  // at the hour, which is the fallback `claudeUsage` already applies.
+  // Claude falls back to the one-hour write price when the record names no lifetime.
+
   const claude = nextTurnFloor({ contextTokens: 620_000, model: 'claude-opus-5', tier: null });
   assert.equal(claude?.coldRate, 10);
   assert.equal(claude?.tier, null, 'an assumed lifetime is reported as one the record named');
-  // A row carrying an explicit write price sells that product, so that is what sending the
-  // context again costs.
+  // An explicit cache-write price supplies the cold bound.
+
   const astra = nextTurnFloor({ contextTokens: 100_000, model: 'gpt-6-astra', provider: 'openai', tier: null });
   assert.equal(astra?.coldRate, 12.5);
   assert.equal(astra?.warmRate, 1);
-  // And a row with no write product at all charges ordinary input for it. Absence of a
-  // 30-minute price is not evidence of an hour, and charging twice input here would double a
-  // figure the reader acts on.
+  // A model without a cache-write price uses ordinary input pricing for the cold bound.
+
   const plain = nextTurnFloor({ contextTokens: 100_000, model: 'gpt-5.5', provider: 'openai', tier: null });
   assert.equal(plain?.coldRate, plain?.inputRate, 'a provider selling no cache write is charged a cache write');
   assert.equal(plain?.tier, null);
@@ -1643,8 +1634,8 @@ test('the floor is absent rather than wrong where it cannot be worked out', () =
 test('the cold multiple is the cache tier the estimator already charges', () => {
   const tokens = 1_000_000;
   const floor = nextTurnFloor({ contextTokens: tokens, model: 'claude-opus-5', tier: '1h' });
-  // The same tokens through the ordinary estimator, so the floor cannot drift into a second
-  // copy of the multipliers.
+  // The next-turn bounds must match the ordinary cache-write and cache-read estimates.
+
   assert.equal(floor?.cold, estimateCost(usage({ cacheWrite1h: tokens }), 'claude-opus-5'));
   assert.equal(floor?.warm, estimateCost(usage({ cacheRead: tokens }), 'claude-opus-5'));
 });
@@ -1654,11 +1645,10 @@ test('every cache tier carries the lifetime the provider sells', () => {
   assert.equal(CONSERVATIVE_CACHE_BOUNDARY_MS, 90_000);
 });
 
-// How long a provider keeps a prompt cache is a fact about the model, so it belongs on the
-// price row beside the rate it decides. Held anywhere else it becomes one figure written over
-// every model of a vendor, which is what quoted the cache-read rate over caches that had gone.
+// Each model row carries its own cache lifetime. A missing lifetime remains unknown.
+
 test('a price row carries its own cache lifetime, and a row without one says nothing', () => {
-  // OpenAI documents thirty minutes as a minimum for these two generations.
+  // These model rows use a thirty-minute cache lifetime.
   assert.equal(cacheLifetimeFor('gpt-6-astra', 'openai'), '30m');
   assert.equal(cacheLifetimeFor('gpt-6-sol', 'openai'), '30m');
   assert.equal(cacheLifetimeFor('gpt-6-luna', 'openai'), '30m');
@@ -1671,8 +1661,8 @@ test('a price row carries its own cache lifetime, and a row without one says not
   // Claude records the lifetime it bought on the request itself, so no Claude row answers here.
   assert.equal(cacheLifetimeFor('claude-opus-5'), null);
   assert.equal(cacheLifetimeFor('a-model-nobody-priced'), null);
-  // Every Bedrock row is a GPT-5.6, and its prompt-cache writes are priced at Amazon's own
-  // documented 30-minute rate.
+  // The supported Bedrock GPT-5.6 row uses a thirty-minute cache lifetime.
+
   assert.equal(cacheLifetimeFor('global.openai.gpt-5.6-sol', 'amazon-bedrock'), '30m');
 });
 
@@ -1682,7 +1672,7 @@ test('a next-turn price rounds up to the displayed cent', () => {
   assert.equal(formatConservativeCost(10.01), '$11');
 });
 
-// Amazon Bedrock bills a Claude request on every profile except global. at 1.1 times list.
+// The Bedrock regional inference class multiplies Claude rates by 1.1.
 test('a regional Bedrock Claude request pays 1.1 times list, at standard and fast speed', () => {
   const tokens = usage({ input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 });
   const bedrock = quoteUsage({ usage: tokens, model: 'claude-opus-5-5', inferenceClass: 'bedrock-regional' });

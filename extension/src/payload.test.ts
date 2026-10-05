@@ -33,46 +33,25 @@ import { railStatChips, type RailStatus } from './view/rail.ts';
 import { parseHostToPanel } from './webview/protocol.ts';
 import { StaticStatChip } from './webview/stat-chip.ts';
 
-// A workspace the size the owner is aiming at. The corpus on this machine indexes 1,624
-// sources today, so a thousand sessions is under the real target and still an order of
-// magnitude past what any other test here builds.
+// Use a thousand sessions to check payload scaling.
+
 const SESSIONS = 1000;
 
-// Mirrors RAIL_NAME_LIMIT in `panelhost.ts`. Kept as its own constant rather than an
-// import, so a change to the production bound shows up here as a mismatch to reconcile
-// rather than silently resizing this fixture's worst case along with it.
+// Keep this name bound independent of RAIL_NAME_LIMIT so a production change does not resize the fixture automatically.
+
 const RAIL_NAME_BOUND = 200;
 
-// What the panel is sent, and what it may cost.
-//
-// These are ceilings, not measurements. Each one sits just above what the payload weighs
-// today, so the suite goes red the moment a field grows, and `SLACK` below refuses a
-// ceiling parked far above the real number. A step that cuts the payload lowers the
-// ceiling it moved in the same commit and quotes the new figure in its message.
+// Byte ceilings bound each payload field. SLACK also limits excess room above the measured fixture.
+
 const CEILINGS = {
-  // The render total covers the corpus fields and the fixed cost of the cards below, so its
-  // room holds the corpus room alone: the cards' own bytes are added to it, and a corpus field
-  // that grows still fails under its own name before it reaches this one.
-  //
-  // Raised here, alongside renderRail, railMessageTotal and railRow, when the rail's own
-  // name field first carried a bounded worst-case name on every row instead of on one row
-  // alone: a real workspace names most sessions from a first prompt, so most rows hit the
-  // 200-character rail bound `panelhost.ts` derives from having no maximum rail width to
-  // measure against, not the short label's 60. Lowered once the name stopped riding
-  // the wire twice per row: `name` is sent only where it differs from `label`, and the
-  // clauses in `nameBeforeAge` no longer repeat it, so a row with a long name pays for that
-  // name once rather than twice. Lowered again once the unsent-input clause stopped riding
-  // the wire twice per row as well: `nameBeforeAge` no longer folds in the same text the
-  // card's own `unsentName` field already carries, so `railCardName` appends that field once.
+  // The render total includes session data and the fixed card fixture. Session names and unsent text each travel once per row.
+
   renderTotal: 3_105_039,
   renderRail: 1_146_658,
   renderStats: 1_516_000,
   renderSessions: 305_000,
-  // The heavy fixture's commits carry their branch, their repository at a real checkout's depth
-  // and their maker's session, as every real commit row does, so this ceiling also bounds what
-  // grouping the Commits record costs a row. The same fixture weighs 108,927 bytes without those
-  // fields and 112,227 with them, a growth of 3%, under the 5% at which a card would send each
-  // repository once rather than on every row.
+  // The card ceiling includes commit branches, repository paths, and author sessions.
+
   renderCards: 113_000,
   selectionTotal: 8_134,
   railMessageTotal: 2_678_977,
@@ -80,8 +59,8 @@ const CEILINGS = {
   duplicateWaste: 278_000,
 };
 
-// How far above the measured figure a ceiling may sit. A ceiling with room in it is a
-// ceiling that lets the payload grow back, so every step has to re-record what it cut.
+// Each ceiling stays within five percent of its measured fixture.
+
 const SLACK = 1.05;
 
 function usage(scale: number): TurnUsage {
@@ -141,8 +120,8 @@ function statFacts(scale: number, at: number): SessionStatFacts {
   };
 }
 
-// The prompt line a session is named by. Real labels are the reader's first sentence,
-// so they are long and they do not repeat.
+// Give each session a distinct prompt-based label.
+
 function sessionLabel(index: number): string {
   const subjects = [
     'the rail filter losing its selection on a rebuild',
@@ -160,9 +139,8 @@ function sessionId(index: number): string {
 }
 
 interface FixtureSessionRow extends PayloadSessionRow {
-  // The complete name answers a question about one session at a time, so the extension
-  // sends it on the chosen session alone. No row carries a resume command at all, because
-  // the panel words one from the agent key and the id every row already holds.
+  // Only the selected session carries fullLabel. The panel constructs resume commands from the agent key and session id.
+
   fullLabel?: string;
   agentKey: string;
   shown: boolean;
@@ -198,10 +176,8 @@ function fixture(count = SESSIONS): Fixture {
       persisted: true,
       label,
       ...(index === 0 ? { fullLabel: `${label}, including its complete first prompt` } : {}),
-      // Every row carries a rail name at the bound, not only the shown session: a real
-      // workspace names most of its sessions from a first prompt, so most rows hit
-      // RAIL_NAME_LIMIT (`panelhost.ts`) rather than staying at `label`'s length. A fixture
-      // that gave this to one row alone would measure a payload no real workspace sends.
+      // Give every session a name at RAIL_NAME_BOUND to measure the maximum per-row name cost.
+
       railName: shortenTo(`${label} ${label} ${label}`, RAIL_NAME_BOUND, '...'),
       agent: agentKey === 'codex' ? 'Codex' : 'Claude',
       agentKey,
@@ -241,8 +217,8 @@ function fixture(count = SESSIONS): Fixture {
       lifetimeCosts[id] = { dollars: cost.dollars, partial: cost.partial === true };
     }
     labels[id] = index % 4 === 0 ? ['performance', 'panel'] : index % 4 === 1 ? ['review'] : [];
-    // The decorative cache mark is two clock boundaries. Written here rather than derived,
-    // because what it costs on the wire is two numbers whatever the pricing rule decides.
+    // The cache mark carries expiry and nearly-gone timestamps.
+
     caches[id] = index % 3 === 0 ? { expiresAt: at + 5 * 60_000, nearlyGoneAt: at + 4 * 60_000 } : null;
   }
 
@@ -283,12 +259,8 @@ function fixture(count = SESSIONS): Fixture {
   };
 }
 
-// Two cards of the session on screen, each carrying several subagents with enough commits and
-// files behind them to weigh what a subagent row's own figures cost. `cards` never scales with
-// `SESSIONS`, because the host sends the cards for the shown session alone, so this stays a
-// fixed fixture rather than a function of `count`. Two cards are a fraction of the field's own
-// top: the host sends up to `TRANSCRIPT_TURN_LIMIT` turns and keeps retained older pages
-// beyond that, so this weighs the cost of a row and not the cost of a full window.
+// Two fixed cards exercise subagent commits and files. Their size does not represent a full selected-session history window.
+
 function sessionCards(): TurnCard[] {
   return [
     toCard(heavySubagentTurn(4, 13, 5), true, Date.UTC(2026, 8, 5, 12, 0, 0)),
@@ -296,10 +268,8 @@ function sessionCards(): TurnCard[] {
   ];
 }
 
-// The host strips `railName` from the `sessions` array it sends: that field exists for
-// `railSessions` to read while it builds the rail's own cards, and it would otherwise ride
-// this array a second time for no reader here to use. Mirrored here so this fixture weighs
-// what a real render actually carries rather than a copy it never sends.
+// Match the host payload by omitting railName from sessions. The session list cards carry it separately.
+
 function withoutRailName(sessions: readonly FixtureSessionRow[]): object[] {
   return sessions.map(({ railName: _railName, ...row }) => row);
 }
@@ -321,10 +291,8 @@ function renderMessage(input: Fixture): Record<string, unknown> {
       diagnosis: null,
       timelineLayout: { cardLayout: 'compact', promptPosition: 'above' },
     }),
-    // The two fields the host adds per webview. The cards belong to the session on screen, so
-    // they carry no corpus scaling, and a subagent row's own figures still cost bytes the
-    // `renderCards` ceiling has to cover. Two cards weigh a row. They do not weigh the field,
-    // whose top is the host's turn window plus every retained older page.
+    // Cards belong only to the selected session. This fixed fixture measures card detail without scaling it by session count.
+
     cards: sessionCards(),
     stats: rail.stats,
     iconFonts: [],
@@ -376,8 +344,8 @@ function report(message: unknown, label: string): string {
   return `${label} is ${bytes(message)} bytes over ${SESSIONS} sessions; largest fields: ${top}`;
 }
 
-// The numbers a commit message quotes. Printed on every run, because the payload work
-// lowers a ceiling per step and the step has to say what it measured.
+// Report payload field sizes and duplicate strings.
+
 test('the payload weighs what the ceilings record', () => {
   const input = fixture();
   const render = renderMessage(input);
@@ -421,9 +389,8 @@ test('every field that grows with the corpus stays under its own ceiling', () =>
   }
 });
 
-// `cards` carries no corpus scaling, so its ceiling stands apart from the fields above. It
-// bounds what a subagent row's own figures cost, which is the per-figure record, its paths and
-// its full-length shas, rather than what a thousand sessions cost.
+// The card ceiling covers subagent details, paths, and full commit hashes.
+
 test('the cards a session draws stay under their byte ceiling', () => {
   const message = renderMessage(fixture());
   const measured = fieldBytes(message, 'cards');
@@ -575,15 +542,13 @@ test('structured stat detail follows selection while rail tooltips keep their te
         heading.some((chip) => !!chip.detailList),
         row.id === selected,
       );
-      // The figures the rail draws are taken out of the same record, so their native
-      // tooltip text is the heading's own and no card carries a second copy of it.
+      // Session list figures use the heading tooltip text.
+
       const drawn = railStatChips(heading);
       assert.ok(drawn.length > 0);
       assert.ok(drawn.every((chip) => chip.detail.length > 0));
-      // What the reader meets on the drawn figure. The rail hands the chip to the figure
-      // component as it stands, so a record the heading grows later reaches the rail too.
-      // A figure given both halves of a hint pair takes the keyboard, opens a hint box, and
-      // loses the tooltip text a reader hovers for.
+      // Read-only figures expose native tooltips without becoming focus stops or opening hint popovers.
+
       for (const chip of drawn) {
         const figure = StaticStatChip({ stat: chip, contextClass: () => '' }).props as unknown as Record<
           string,
@@ -615,8 +580,8 @@ test('every rail row finds its figures under its own id', () => {
     const keyed = message.stats as Record<string, unknown[]>;
     assert.ok(rows.length > 0, `the ${label} message carries no rail row to check`);
     for (const row of rows) {
-      // A row whose id the record misses draws the empty fallback and hides its figures,
-      // while the name the host worded still says the cost, the turns and the context.
+      // Every session list row requires figures under its own id.
+
       assert.ok(
         Array.isArray(keyed[row.id]) && keyed[row.id].length > 0,
         `the ${label} message draws a row for ${row.id} with no figures under that id`,
@@ -647,9 +612,8 @@ test('the measured sessions carry the full production row shape', () => {
       assert.ok(field in session, `the measured session is missing ${field}`);
     }
   }
-  // The scoped field and the dropped one. The extension sends a complete name for the
-  // chosen session, and it sends no resume command to any row, so a fixture that put either
-  // on every row would weigh a payload the panel is never sent.
+  // Only the selected session has a full label. No session row carries a resume command.
+
   assert.deepEqual(
     sessions.map((session) => 'fullLabel' in session),
     [true, false, false],
@@ -667,9 +631,8 @@ test('the measured sessions carry the full production row shape', () => {
   );
 });
 
-// A ceiling with room in it lets the payload grow back to it without anything going red,
-// which is how the last megabyte arrived. So each ceiling has to sit close to the figure it
-// covers, and a step that cuts a field has to lower its ceiling in the same commit.
+// Limit unused ceiling room so payload growth cannot remain hidden below a loose bound.
+
 test('no ceiling sits far above what the payload actually weighs', () => {
   const input = fixture();
   const render = renderMessage(input);
@@ -686,8 +649,8 @@ test('no ceiling sits far above what the payload actually weighs', () => {
     ['railRow', railRowBytes(railPayload(input).rail), CEILINGS.railRow],
     ['duplicateWaste', totalWastedBytes(duplicateStrings(render)), CEILINGS.duplicateWaste],
   ];
-  // Every ceiling is reported, not only the first one that has room in it. A cut moves
-  // several at once, and a run that names one of them costs a run for each of the rest.
+  // Report all ceilings with excess room in one assertion.
+
   const roomy = measured
     .filter(([, actual, ceiling]) => ceiling > Math.ceil(actual * SLACK) && ceiling !== 0)
     .map(

@@ -6,8 +6,7 @@ import { railHoverLines, railRunningWord, type RailHoverCard } from '../view/rai
 import { CARD_ACTIONS } from '../view/card-words.ts';
 import { railHoverCard } from './rail-hover.ts';
 
-// A node that counts its own text writes. The count is the point: a figure the clock rewrites
-// when the wording has not moved replaces the text node the reader is selecting.
+// Count text writes to detect updates that replace selected text without changing its wording.
 class FakeNode {
   dataset: Record<string, string>;
   writes = 0;
@@ -73,8 +72,7 @@ test('a running subagent time reads as the session rail words a running session'
 });
 
 test('the clock leaves a figure alone while its wording has not moved', () => {
-  // The tick runs sixty times for every time a minute figure changes. A rewrite each time
-  // drops the selection the reader is holding inside the line.
+  // Unchanged minute figures must retain their text across second ticks to preserve selections.
   const running = new FakeNode({ since: String(NOW - 300_000) });
   const age = new FakeNode({ at: String(NOW - 300_000) });
   const drawn = page({ '[data-since]': [running], '[data-at]:not(.railwhen)': [age] });
@@ -93,8 +91,7 @@ test('the clock leaves a figure alone while its wording has not moved', () => {
 });
 
 test('the clock never rewords a rail age', () => {
-  // The rail rewords its own cards, because an age moving there can also move the card's
-  // cache band. Two writers would answer that with two different draws.
+  // The session-list renderer updates its ages and cache bands together.
   const drawn = page({});
   writeRelativeTimes(drawn.document, NOW);
   assert.deepEqual(drawn.asked, ['[data-since]', '[data-running-since]', '[data-at]:not(.railwhen)']);
@@ -171,8 +168,7 @@ test('a tick with no instant reads the clock once for every listener', () => {
   assert.deepEqual(seen, [NOW + 1, NOW + 1]);
 });
 
-// The few members a hover card's build and the clock touch. Every element the page creates is
-// kept, so the page can find the ones the clock asks for.
+// Minimal element members for hover-card rendering and clock updates.
 class CardElement {
   className = '';
   title = '';

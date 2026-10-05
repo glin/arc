@@ -1,11 +1,5 @@
-// extension/src/turnrail.ts
-//
-// The session rail: which sessions it lists, how they are bucketed by time, what each one says and how wide the column may be.
-//
-// Split out of turnview.ts, which was 3,965 lines of pure functions with no shared state and
-// no seam anyone could find. Nothing here was edited on the way: every declaration is the one
-// that was there, in the order it was in. turnview.ts re-exports this module, so an import
-// written against it still resolves.
+// Projects the session list, its statuses, cache marks, labels, and parent relationships.
+// `turnview.ts` re-exports these helpers for existing callers.
 
 import {
   AgentKind,
@@ -70,9 +64,8 @@ export interface RevisionedRailCacheMark {
 
 export const RAIL_CACHE_NEARLY_GONE_MIN_MS = 3 * 60_000;
 
-// The rail needs a cache answer before its session joins the parse cut. It uses the
-// same request and price lookup as the composer, but carries only the two clock boundaries
-// the browser needs to redraw the decorative mark.
+// Provides session cache facts before full selected parsing.
+// The shared request and pricing lookup supplies the browser's decorative cache-mark clock boundaries.
 interface RailCacheFacts {
   turns: readonly {
     startedAt: number;
@@ -146,10 +139,8 @@ export function railCachesOf(
   return caches;
 }
 
-// Cards leave here already grouped: all of one session's together, in the order they
-// arrived, with the sessions themselves ordered by their first card. The panel draws one
-// heading per run of the same id, so a list that interleaves two sessions repeats their
-// headings all the way down instead of drawing each one once.
+// Group cards by session, preserving their arrival order. Order sessions by their first card.
+// The panel draws a heading for each run of one session id. Interleaving sessions would repeat their headings.
 export function groupBySession<T extends { sessionId: string }>(cards: T[]): T[] {
   const order: string[] = [];
   for (const c of cards) {
@@ -160,11 +151,9 @@ export function groupBySession<T extends { sessionId: string }>(cards: T[]): T[]
   return order.flatMap((id) => cards.filter((c) => c.sessionId === id));
 }
 
-// The sessions to parse: the recent cut, plus every session pinned to the rail's
-// top that the cut left out. A pinned session stays parsed however old it gets,
-// which is what pinning promises, so the parse budget grows by the pins rather than the
-// pins evicting live sessions from it. Fed the pool that already survived hiding, so a
-// stale state holding a session as both hidden and pinned reads as hidden.
+// Adds visible pinned sessions absent from the recent parse cut.
+// Pins extend the parse budget instead of evicting recent sessions.
+// The caller must exclude hidden sessions from the visible pool.
 export function withPinned<T extends { sessionId: string }>(
   cut: T[],
   visible: T[],
@@ -174,16 +163,9 @@ export function withPinned<T extends { sessionId: string }>(
   return [...cut, ...visible.filter((s) => pinnedTop.has(s.sessionId) && !have.has(s.sessionId))];
 }
 
-// The sessions left after the hidden ones are taken out. It runs before the panel cuts the
-// list down to the few it will parse, which is the point of it: hiding a session that
-// has finished frees one of those slots for a live one, and starting three agents is enough
-// to push the session being read out of the list.
-//
-// A session pinned in the picker comes through whether or not it is hidden. Otherwise
-// hiding the one that is pinned would take it off the list and leave nothing to pick it
-// back with, and archiving the session on screen would empty the panel the reader is
-// reading. `railSessions` has no such exemption, on purpose: the card is what the reader
-// meant to put away, and the turns are not.
+// Excludes hidden sessions before choosing the parse cut, except the selected session.
+// Archiving the selected session therefore retains its timeline.
+// `railSessions` separately places its card in the archived group.
 export function hideSessions<T extends { sessionId: string }>(
   sessions: T[],
   hidden: ReadonlySet<string>,
@@ -192,15 +174,8 @@ export function hideSessions<T extends { sessionId: string }>(
   return sessions.filter((s) => !hidden.has(s.sessionId) || s.sessionId === pinned);
 }
 
-// The figures for every session on screen, by session id.
-//
-// Which turns feed which session's figures is a decision, so it lives here beside
-// `groupBySession` and `newestPerSession` rather than in the panel: those two exist for
-// exactly this and are tested, and a grouping written in `panelhost.ts` is one nothing reads.
-// The compactions are grouped the same way and handed to each session's own figures. They
-// are required rather than optional, so the one caller in `panelhost.ts` has to answer for
-// them: an optional list would default to empty there and the count would read zero on
-// every session with no test able to see it.
+// Groups turns and compactions by session before preparing session statistics.
+// Callers must supply compactions so their counts cannot silently default to zero.
 export function statsBySession(turns: Turn[], compactions: Compaction[]): Record<string, SessionStatChip[]> {
   const mine = new Map<string, Turn[]>();
   for (const t of turns) {
@@ -264,19 +239,9 @@ export function sessionStatsOf(
   );
 }
 
-// The rail's order while it stays open. A refresh brings the sessions newest activity
-// first, but activity is also what every running session changes repeatedly. Keep
-// every session already on the rail where it was, append a session found since
-// the last refresh, then move the running group above the inactive group without changing
-// either group's internal order. A session that starts running therefore joins after
-// the ones already running instead of making them trade places on every write.
-//
-// The order is reconciled over every known session rather than the cards `railSessions`
-// returns. Remembering the first session is what lets the next one join beneath it
-// instead of taking its place above it.
-// The statuses `stableRailOrder` lifts into the running group. A `subagents` session still has
-// work in progress, and a `background` session waits on a command that wakes it, so both sort
-// with the running ones.
+// Statuses lifted into the running group by `stableRailOrder`.
+// Sessions waiting on requests, subagents, or background commands join running sessions.
+// The caller supplies the previous order, which remains stable within each group.
 const RUNNING_GROUP: ReadonlySet<string> = new Set<RailStatus>(['background', 'running', 'subagents', 'waiting']);
 
 export function stableRailOrder<T extends { id: string }>(
@@ -308,9 +273,8 @@ export function stableRailOrder<T extends { id: string }>(
   ];
 }
 
-// The reader's words that have not left one session yet. Prompt text is a boolean
-// because its length says nothing useful on the rail; comments keep their count so the
-// card's accessible name can say exactly what is waiting.
+// Unsent prompt presence and comment count for one session.
+// The accessible name includes the number of waiting comments.
 export interface UnsentInput {
   prompt: boolean;
   comments: number;
@@ -344,8 +308,7 @@ export function unsentBySession(
   return out;
 }
 
-// The detail a rail card says and shows on hover. The visible word stays singular and
-// compact; this names what opening the session will find.
+// Accessible and tooltip wording for unsent input.
 export function unsentInputName(input: UnsentInput | undefined): string | null {
   if (!input || (!input.prompt && input.comments < 1)) {
     return null;
@@ -359,62 +322,40 @@ export function unsentInputName(input: UnsentInput | undefined): string | null {
   }
   return comments;
 }
-// One card on the session rail: a session, named, and what is new in it.
+// One session list card and its session metadata.
 export interface RailCard {
   id: string;
   // Whether the session has a saved record. A provisional new session has none, so nothing
   // can rename it.
   persisted: boolean;
-  // The short form of the session's name. The card's own action buttons (pin, archive,
-  // label) are announced by it, because an accessible name for a control the reader
-  // presses on every card should not grow with how much the reader once typed.
+  // Short session name used in card action accessible names.
   label: string;
-  // The card's own drawn name: `.railname` shows this, cut to 200 characters rather than
-  // to `label`'s 60, so the row fills whatever width the reader drags the rail to before
-  // the CSS ellipsis takes over. The rail has no maximum width, and 200 characters fills a
-  // rail of about 1,300px at the panel's own type size, far wider than a normal rail.
-  // Present only where it differs from `label`, so a session whose name never grew past the
-  // sixty-character label costs nothing extra on the wire. A reader draws `name ?? label`.
+  // Longer session name for `.railname`, omitted when it equals `label`.
+  // The panel renders `name ?? label` and clips text to the available width.
   name?: string;
   agent: string;
-  // How long ago the session was last active, feeding the accessible name only:
-  // the drawn time is worded by the panel from `at` through the ticker's own ladder,
-  // because this string is only as fresh as the refresh that posted it. The clock time
-  // rides the hover as `absolute`, the same trade every turn card makes. Named for what
-  // it holds: the session row's own `when` is the clock, and a card field called the
-  // same thing holding the opposite reading was a trap.
+  // Relative activity age for the accessible name.
+  // The panel formats visible age from `at` using its current clock.
+  // `absolute` supplies the full time tooltip.
   relative: string;
   at: number;
   absolute: string;
-  // Whether this is the session the panel is showing alone. The rail is the chooser
-  // at the widths it exists at, so the card carries the state a note above the list used
-  // to say in a sentence; the note read as noise and went.
+  // Whether this is the selected session shown in the session view.
   current: boolean;
-  // Whether the reader pinned this session to the rail's top. Drawn as the star on
-  // the card's own control and said in the name; the ordering below is where it acts.
+  // Whether the reader pinned this session at the session list's top.
   pinnedTop: boolean;
-  // Whether the reader archived this session. An archived card is not dropped from
-  // the rail: it goes to the Archived bucket at the foot, folded, where one session
-  // can be brought back on its own. The word is in the accessible name as well, because
-  // the dimmer card says it to the eye alone.
+  // Whether the session is archived. Its card enters the archived group
+  // and its accessible name includes that state.
   archived: boolean;
-  // Whether another agent started this session rather than the reader. The cards
-  // gather in a bucket of their own, folded, and leave the day buckets and the unread
-  // counts to sessions somebody had. Archived wins over this for the bucket, so an
-  // archived agent-run card carries `agentRun: false` and sits in the Archived bucket.
+  // Whether the card belongs to the agent-run group. Archived cards set this to false.
   agentRun: boolean;
-  // The same fact `agentRun` names, apart from which bucket the card sits in. Archiving
-  // never changes it, so the lens figures and the `is:agentrun` term can skip a
-  // card an agent runs whether or not the Archived switch is also on.
+  // The `agentRun` fact, independent of its bucket. Archiving does not change it.
+  // Lens figures and `is:agentrun` exclude agent runs whether or not the Archived switch is on.
   runByAgent: boolean;
-  // What the card draws in the one slot its meta line keeps for the agent's name: the
-  // name, or the phrase saying an agent ran it. Decided here rather than in the panel
-  // because the panel would need its own copy of a rule with words in it, and the words
-  // and the rule that picks them are worth testing together.
+  // Agent wording for the card meta row. Pinned agent runs use the agent-run phrase.
   agentWord: string;
-  // The newest turn's status, or null where none is knowable. The card wears it as the
-  // same left-border colour a turn card wears its own, and the name says it as a word,
-  // because a colour reads out as nothing.
+  // The newest turn's status, or null when unknown.
+  // The card uses the corresponding turn card border color. Its accessible name also states the status as text.
   status: RailStatus | null;
   // How many background children still work, where the status is `subagents`, else null.
   subagents: number | null;
@@ -425,145 +366,67 @@ export interface RailCard {
   // The prompt-cache mark's clock boundaries. The browser owns the current clock and turns
   // these into its two visual faces without asking the extension to refresh each minute.
   cache: RailCacheMark | null;
-  // The clauses that surround the relative age, split from it because the browser inserts
-  // or removes its cache state there. Neither carries the card's own name: `railCardName`
-  // prepends `name` when it composes the accessible name, so the name rides the wire once
-  // rather than once here and once again in `name` below.
+  // Accessible name clauses around the relative age. The browser inserts or removes cache state between them.
+  // `railCardName` prepends the card name. These clauses omit it to avoid duplicating the separate `name` field.
   nameBeforeAge: string;
   nameAfterAge: string;
   // One compact word on the meta row, and the exact detail on its hover. Both are decided
   // here so the panel draws values rather than counting drafts or comments for itself.
   unsentWord: string | null;
   unsentName: string | null;
-  // The recorded cost, independent from the figure the card draws for it. A heading over a run
-  // of cards adds it, and the filter compares it with a typed threshold.
-  //
-  // Null where the session has no priced cost. Exact zero remains zero even though the
-  // display rule omits its chip.
+  // Recorded session cost for aggregation and filters, independent of the visible figure.
+  // Null means no priced cost. Exact zero remains zero even when no figure is drawn.
   costDollars: number | null;
   // Whether that figure is a floor rather than a total. A visible cost chip says the same
   // fact with `+`. Only a card carrying a figure can be a floor.
   costAtLeast: boolean;
-  // The exact count of cache-expiry returns from lifetime primary-session indexed facts, read
-  // the same way `costDollars` is. Null where the source cannot answer, which the `cache-expiry:`
-  // filter reads as a match for neither comparison. Carried for the filter alone; the card draws
-  // no stat for it.
+  // Lifetime indexed cache-expiry count for filters, or null when unavailable.
+  // The card draws no cache-expiry figure.
   cacheExpiryCount: number | null;
-  // Whether that count is a floor rather than the whole answer, read the same way `costAtLeast`
-  // is. True wherever the classifier could not judge every adjacent pair, since an unjudged pair
-  // may itself have been a qualifying return the count has not added in. Only a card carrying a
-  // count can be a floor.
+  // Whether the cache-expiry count is a known minimum.
+  // Unclassified adjacent request pairs can contain further returns. A missing count is never a minimum.
   cacheExpiryAtLeast: boolean;
-  // Every label the session carries, in the order the reader applied them.
-  //
-  // The whole list rather than the drawn cut, because two readers of the card ask about the
-  // whole of it. The rail filter answers a `label:` term off this, and the session heading
-  // draws every label on a line that has the width the rail does not.
+  // All session labels in applied order, used by filters and the session heading.
   labels: string[];
-  // The labels the row draws, the front of the list above. The row takes a fixed number of
-  // them, `RAIL_LABELS_SHOWN`, whatever width the rail has been dragged to: a count that
-  // moved with the width would redraw the line on every drag, and the card would say a
-  // different thing about the session at each one. What the row left out is counted in
-  // the field below and said in full in the name. The card draws fewer than it holds and
-  // claims nothing less.
+  // The first `RAIL_LABELS_SHOWN` labels for display, independent of session list width.
   labelChips: string[];
-  // How many labels the row left out, drawn as a count with a leading plus, and null when it
-  // left none out. Worded here rather than in the panel. The count and the chips beside it
-  // are then cut by one rule, and cannot disagree about how many are missing.
+  // Folded label count with a leading plus, or null when none are folded.
   labelsMore: string | null;
-  // The labels the count stands for, so the chip drawn from it carries the whole of what it
-  // hides on its hover. A count on its own is the one thing on the line a reader cannot read
-  // their way out of: the chips beside it say words, and it says a number.
+  // Comma-separated folded label names for the count's tooltip.
   labelsMoreName: string | null;
-  // "3 new", or null when there is nothing to say. Two silences, and they differ: a parsed
-  // session with nothing new, and one never parsed, whose count is not knowable. The
-  // accessible name below tells them apart; the drawn card stays quiet for both.
+  // Unread indicator, or null for a known zero or unavailable count.
+  // The accessible name distinguishes those two cases.
   indicator: string | null;
-  // The same count as a number, and null for both silences the indicator is quiet for.
-  // Nothing on the rail draws it: the card would be saying in a figure what its heading
-  // already says in words, and a figure cannot word the difference between a known zero
-  // and no count at all. It is what `unread` is decided from, and the name is worded
-  // beside it, so the mark and the count cannot disagree.
+  // Numeric unread count, or null for a known zero or unavailable count.
+  // The unread mark follows this value.
   newCount: number | null;
-  // Whether the reader has anything waiting in this session. The card's leading dot
-  // and its name in bold both follow this one field, so the two marks of the same thing
-  // cannot fall out of step. False where the count is not knowable: an unread mark is a
-  // claim, and the panel makes none it cannot support.
+  // Whether the count identifies unread turns. The leading dot and bold name share this state.
   unread: boolean;
-  // When this session's newest parsed turn started, or null where none was parsed.
-  //
-  // The watermark "mark the session read" writes, carried on the card because the
-  // panel cannot work it out for itself: while one session is shown alone the others
-  // have no card drawn, and a watermark taken from the drawn turns would leave the entry
-  // with nothing to mark. It is the newest *parsed* turn, the same list the count and the
-  // status are read from, so a session the rail can describe is one the rail can mark.
+  // Newest known turn start, or null when no read-action boundary is available.
+  // The session read action uses this watermark, including fallback window starts.
   newestTurnAt: number | null;
-  // The section the card names itself by for the editor's own context menu. Every card names
-  // one: a session nothing has parsed can answer no read entry, and labelling a
-  // session needs no parsed turn, so it names the plain section rather than carrying no
-  // context at all. Decided here rather than in the panel, so the panel spells no section
-  // name of its own; see RAIL_MENU_SECTIONS.
+  // Native context-menu section, including a plain section when no read watermark exists.
+  // Label actions remain available without parsed turns.
   menuSection: string;
 }
 
-// The section a rail card names itself by for the editor's own context menu, so a whole
-// session can be marked read or unread from the rail. The section is the one piece of a
-// webview's context a menu's when clause can match, so the read state is spelled into the
-// name the way a turn card's is.
-//
-// Two of the names carry the state a card is in, and the menu then offers the one the
-// session has not already taken. A session whose count is not knowable takes
-// neither: it was never parsed, so there is no newest turn to set a watermark from, and the
-// entry would do nothing.
-//
-// The third name is what that card takes instead. Filing a session under a label needs
-// no parsed turn, so a card that can answer no read entry still has something a right-click
-// reaches, and every card names itself. The read and the unread entries go on gating on the
-// two named states, so the third adds no entry that would act on nothing.
+// Native session list context-menu sections for read, unread, and unknown states.
+// The plain section retains label actions but supplies no session read action.
 export const RAIL_MENU_SECTIONS = {
   unread: 'arcRailUnread',
   read: 'arcRailRead',
   plain: 'arcRail',
 } as const;
 
-// The section a session heading names itself by for the editor's own context menu, so a
-// session can be archived from the heading its turns are drawn under.
-//
-// The heading used to carry a cross of its own at the right-hand end. It was faint enough
-// to be missed and close enough to the title to be pressed by mistake, and archiving is a
-// rail action: the rail's own card carries the control, and the heading now only has to
-// answer the reader who is below the rail's width, where no rail is drawn at all.
-//
-// Two names, for the two states a session can be in, so the menu offers the one it has
-// not already taken. Both are reachable here: `hideSessions` exempts the session being
-// shown, so archiving it leaves the heading and its turns on screen.
+// Native session heading context-menu sections for archive state.
+// The selected timeline remains visible when its session is archived.
 export { SESSION_MENU_SECTIONS } from './view/card-menu';
 
-// The status a session wears on its rail card, so a glance says which sessions are
-// running, finished or failed without opening any. Two things answer, and they answer in this
-// order: an agent working in the session now, then the newest turn on the cards. A closed
-// turn then yields to the background children it left at work, as `subagents`.
-//
-// The cards alone cannot say. They come off the transcript, so a session reads as
-// running only once its agent has written the prompt to disk and the panel has parsed it,
-// which is seconds behind the press. A compaction never gets there at all: it writes no turn,
-// so the rail said the session had finished for the whole of one.
-//
-// The honesty rule is about what the cards can support, and it still holds over them: only a
-// turn answers, a compaction has no status of its own, and a session whose cards say
-// nothing wears nothing rather than a guess. A busy child is not a guess. It is the same
-// claim the composer's own Stop is drawn from, it is true of a session outside the
-// parsed window as much as one inside it, and that is the session a reader can least
-// afford the rail to stay quiet about.
-//
-// It is not proof either, and `busySince` is what bounds it. Every record answer ages out
-// through TURN_QUIET_MS, and a busy child used to answer for as long as the child lived. One
-// lost ending was enough: the turn stayed in the session's open set, the child called itself
-// busy for the rest of the window, and the rail wore `running` over sessions whose
-// transcripts had said `done` for hours. So a claim is dropped once the record has caught up
-// past the press it was made for. The record must both close the turn and close it after the
-// child became busy, which is the case the transcript's lag cannot produce: while the panel
-// waits for a press to reach disk, the newest closed turn is the one before it.
+// Projects session status from recorded outcomes, drawn turns, and live agent state.
+// A recorded turn closed after `busySince` ends the corresponding running claim.
+// A missing busy timestamp leaves the claim unbounded.
+// Live children and background commands extend a closed turn's session status.
+// Open requests take precedence as the waiting state. Compactions contribute no turn status.
 export function sessionStatusOf(
   cards: {
     sessionId: string;
@@ -603,9 +466,7 @@ export function sessionStatusOf(
     }
   }
   const out = new Map<string, RailStatus>();
-  // When the record says the session's newest turn closed, for the bound below. Written
-  // in the same order the statuses are, so the record that answers the bound is the record
-  // that answered the word.
+  // Closure times use the same outcome precedence as projected statuses.
   const closed = new Map<string, number>();
   for (const [id, outcome] of outcomes) {
     if (!outcome) {
@@ -660,22 +521,15 @@ export function sessionStatusOf(
   return out;
 }
 
-// A finished child writes its last transcript record a short while after the parent records
-// the close, because the two writers finish independently. This margin keeps that trailing
-// write from reopening the child, while a real resume clears it by writing seconds or minutes
-// later.
+// Grace period for a child's final transcript write after its parent records closure.
+// Only a later write beyond this margin can reopen a closed child.
 export const CHILD_CLOSE_MARGIN_MS = 1000;
 
-// Which of each session's background children are alive, by session, in launch order. An
-// open child remains alive while its transcript is fresh. A closed child becomes alive again
-// when its transcript was written more than CHILD_CLOSE_MARGIN_MS after its close time and
-// remains fresh. A legacy close with no time stays closed. TURN_QUIET_MS ages out open and
-// resumed children alike.
-//
-// Two records end every child at once. A recorded process end means the process that held
-// them is gone. A host process that Arc started and that exited after the newest turn began
-// is the same fact, told by the host rather than the transcript. A child whose write time is
-// unknown is not counted, so the count can only be low.
+// Live background children by session, in launch order. Open children count while their transcripts are fresh.
+// Closed children resume when a fresh transcript write exceeds their close time by CHILD_CLOSE_MARGIN_MS. Legacy closes without times remain closed.
+// TURN_QUIET_MS expires both open and resumed children.
+// A recorded process end closes every child. An Arc-hosted process exit after the newest turn began does the same.
+// Children with unknown write times do not count, so missing timestamps can undercount children.
 export function liveOpenChildren(
   outcomes: ReadonlyMap<string, TurnOutcome | null>,
   writtenAt: (session: string, child: string) => number | undefined,
@@ -713,15 +567,11 @@ export function liveOpenChildren(
   return out;
 }
 
-// How long a background command keeps its session in the `background` state when no end
-// record arrives. A terminal that closes kills its command and writes no end record, so the
-// state needs a bound, and the rail reads it on the clock alone.
+// Maximum background-command age without an ending record.
 export const BACKGROUND_COMMAND_CAP_MS = 60 * 60 * 1000;
 
-// How many background commands each session still waits on, by session. A command counts
-// from its launch until its end record, and for BACKGROUND_COMMAND_CAP_MS at most. A recorded
-// process end, or an exit of a host process Arc started after the newest turn began, ends
-// every command, as it ends every background child.
+// Background command counts by session. Commands count from launch until their end record, bounded by BACKGROUND_COMMAND_CAP_MS.
+// A recorded process end closes every command. An Arc-hosted process exit after the newest turn began does the same.
 export function liveBackgroundCommands(
   outcomes: ReadonlyMap<string, TurnOutcome | null>,
   hostExitedAt: ReadonlyMap<string, number>,
@@ -755,9 +605,8 @@ export function liveOpenChildCounts(...input: Parameters<typeof liveOpenChildren
   return openChildCounts(liveOpenChildren(...input));
 }
 
-// One spelling of the live open children and the live background command counts, so the
-// refresh can tell whether a child went quiet or a command reached its cap since the cards
-// were built. Neither change moves a file.
+// Encode live open children and background command counts for refresh comparison.
+// Children become quiet and commands reach their cap without changing files. This key detects both changes.
 export function openChildrenKey(
   live: ReadonlyMap<string, readonly string[]>,
   commands: ReadonlyMap<string, number> = new Map(),
@@ -766,16 +615,11 @@ export function openChildrenKey(
   return JSON.stringify(commands.size ? [sorted(live), sorted(commands)] : sorted(live));
 }
 
-// The tail outcome with the open children two wider reads hold. The tail read sees only the
-// end of the transcript, so a launch before it is missing there. The lifetime facts read the
-// whole file, and the parsed window reads the turns the timeline holds. Each adds its open
-// children only when it describes the same newest turn up to the same last record, so a read
-// that lags behind the tail cannot bring back a closed child. A child that any of the three
-// reads closed stays closed. The reads match a completion notice to its child in different
-// ways, so one read can miss a notice that another read saw.
-//
-// `tailCommands` are the background commands a tail read found with no typed prompt in it. The
-// wider outcome of that same turn carries them, because no other read records commands.
+// Combine the tail outcome with open children from lifetime facts and the parsed window.
+// The tail can omit earlier launches. Lifetime facts read the whole file, while the parsed window covers timeline turns.
+// Accept children only from outcomes describing the same newest turn through the same last record. Older reads cannot reopen closed children.
+// A child closed by any read remains closed. Completion matching differs between readers, so their closed sets can differ.
+// `tailCommands` come from tail reads without a typed prompt. Wider outcomes retain those commands for the same turn because other readers omit commands.
 export function outcomeWithWiderChildren(
   tail: TurnOutcome | null,
   lifetime: TurnOutcome | null,
@@ -877,8 +721,7 @@ export function claudeChildWriteIndex(
   return out;
 }
 
-// How a session came to be started by another: a shell command in the other session
-// dispatched it, or the other session's agent started it as a subagent.
+// How another session started this session: through a dispatched shell command or as a subagent.
 export type SessionParentRelation = 'dispatched' | 'subagent';
 
 // The session that started a session, and how. `owned` is set on a dispatched edge whose
@@ -889,20 +732,12 @@ export interface SessionParentEdge {
   owned?: true;
 }
 
-// The session that started each session, as child id to edge. A dispatched Claude session, a
-// Claude subagent and a Codex subagent each open as a session with a heading of their own,
-// and the heading names the session that started it.
-//
-// A dispatch claims from its reference. A Claude subagent claims from its resolved child
-// file, never from the reference that named it: a forked parent transcript repeats the
-// `Agent` result of the session it forked from, and that reference names a file that never
-// resolves. A Codex background review has no session row, so it has no entry here.
-//
-// Two claims from one parent by one relation, such as two tool results naming one launch,
-// are one parent. The edge is owned when either claim is, because a second tool result that
-// names the same launch without a receipt does not take back what the receipt recorded. A
-// child that two distinct parents claim, or one parent claims by two relations, has no parent
-// here, the way `resolveClaudeDispatchReferences` drops a prefix that two sessions match.
+// Indexes parent relationships by child session id.
+// Dispatch references, resolved Claude child files, and Codex children supply edges.
+// Exclude unresolved Claude references because copied launch results cannot establish a child file.
+// Codex background reviews supply no session edge.
+// Duplicate claims with the same parent and relation combine reader ownership.
+// Conflicting parents or relations remove the edge.
 export function sessionParentIndex(
   references: readonly { kind?: string; parentSessionId: string; sessionId: string; owned?: boolean }[],
   claudeChildren: readonly { sessionId: string; parentSessionId: string }[] = [],
@@ -944,10 +779,8 @@ export function sessionParentIndex(
   return parents;
 }
 
-// The edges of the index above whose child and parent both have a session row. An edge with
-// either end missing changes no heading and no rail card, so the heading, the Run by agents
-// filing, the refresh key and the parent's lifetime cost all read this one set, and an edge
-// that moves one of them moves the key too.
+// Parent edges whose child and parent both have session rows. Missing endpoints affect no heading or session list card.
+// Headings, Run by agents filing, the refresh key, and parent lifetime cost share these edges. An edge change also changes the key.
 export function sessionParentEdgesAmong(
   parents: ReadonlyMap<string, SessionParentEdge>,
   rows: ReadonlySet<string>,
@@ -961,10 +794,8 @@ export function sessionParentEdgesAmong(
   return edges;
 }
 
-// The dispatched edges alone, as child id to parent id. A dispatched session joins its parent's
-// lifetime cost from these, and files under Run by agents unless the reader owns it. A
-// subagent's own transcript already files it as a run, and its file already counts in its
-// parent's delegated work, so a subagent edge must reach neither.
+// Dispatched edges as child id to parent id. They add dispatched session costs to parents and file them under Run by agents unless reader-owned.
+// Exclude subagent edges. Subagent transcripts already establish their run status, and their files already contribute to their parents' delegated work.
 export function dispatchedParents(edges: ReadonlyMap<string, SessionParentEdge>): Map<string, string> {
   const parents = new Map<string, string>();
   for (const [child, edge] of edges) {
@@ -985,9 +816,9 @@ export function sessionParentsKey(edges: ReadonlyMap<string, SessionParentEdge>)
     .join(',');
 }
 
-// The edges among one catalog, the dispatched part of them, and their key, built together.
-// `rows` holds the catalog's ids, or null when the index is empty and the rows cannot change
-// the answer. Each id maps to the pass that last saw it, which `sameIdSet` writes.
+// A catalog's parent edges, dispatched edges, and refresh key.
+// `rows` stores catalog ids, or null when an empty index makes them irrelevant.
+// Each id maps to the latest pass that saw it, as written by `sameIdSet`.
 export interface SessionParentEdgeSet {
   parents: ReadonlyMap<string, SessionParentEdge>;
   rows: Map<string, number> | null;
@@ -996,10 +827,9 @@ export interface SessionParentEdgeSet {
   key: string;
 }
 
-// The set above for `parents` over `sessions`, reusing `held` when neither moved. A selection
-// renders the catalog it last walked, so it pays one pass over the ids and no new set, sort or
-// join. The render, the spend sources and the search each hand over the catalog in their own
-// order, so the ids are compared as a set: the edges read only which ids have a row.
+// Reuse `held` when `parents` and the session id set remain unchanged.
+// Selection reuses its catalog with one pass over ids, without allocating, sorting, or joining a new set.
+// Render, spend, and search catalogs arrive in different orders. Compare their ids as a set because edges depend only on row membership.
 export function sessionParentEdgeSet(
   held: SessionParentEdgeSet | null | undefined,
   parents: ReadonlyMap<string, SessionParentEdge>,
@@ -1049,11 +879,9 @@ export interface SessionParent {
   relation: SessionParentRelation | 'reader';
 }
 
-// The parent of one session: its id, the label the parent's own row draws, and the relation.
-// Only the heading of the shown session draws it, so the host asks for that row alone and
-// the payload stays flat in the number of children. A parent with no row gets none, because
-// a selection of an id the workspace lacks falls to the newest session, and a press that
-// opens the wrong session is worse than none.
+// A session's parent id, displayed parent label, and relation.
+// Only the displayed session heading needs this payload, keeping its size independent of child count.
+// Omit parents without rows. Selecting a missing session falls back to the newest session, which would open the wrong parent.
 export function sessionParentOf(
   rows: readonly { id: string; label: string }[],
   edges: ReadonlyMap<string, SessionParentEdge>,
@@ -1078,11 +906,9 @@ export function writeTimeOfVersion(version: string): number | null {
   return parts[1] !== '' && Number.isFinite(at) ? at : null;
 }
 
-// Record the hosted sessions whose process has exited, from the host's full list of exited
-// keys. A key that was not exited on the previous call exited now, and its time replaces any
-// older exit, so a session that was resumed and exited again reads its latest exit. A key
-// that stays exited keeps its time. Answers the keys exited now, for the next call, and
-// whether any exit time moved.
+// Record Arc-hosted process exits from the host's full exited-key list.
+// Newly exited keys receive the current time, replacing any exit before a resume. Keys that remain exited keep their time.
+// Return the exited keys for the next call and whether any exit time changed.
 export function recordExits(
   exitedAt: Map<string, number>,
   wasExited: ReadonlySet<string>,
@@ -1137,16 +963,8 @@ export function sessionRunningSince(
   return starts;
 }
 
-// The unread badge's wording, for the rail card and the main session heading alike: one
-// copy, or the two views could say different things about one session. Null both for zero
-// and for no count at all; which silence it was is worded in the accessible name, from
-// CARD_ACTIONS.sessionNothingNew, only where the count is known.
-//
-// A floor is said in words, not in a mark. `12+` is read out as "twelve plus" only by luck,
-// and the badge is the one thing on a rail card a reader without a pointer has to be told.
-// A floor of zero cannot happen, because a count of zero means every turn in the window was
-// read and a read turn is what makes the figure a total; it is guarded anyway, so a wording
-// this cannot produce cannot be produced by a caller either.
+// Unread-indicator wording for the session list.
+// Zero and unavailable counts return null. Known minimum counts use words rather than a plus mark.
 export function newIndicator(entry: NewCount | undefined): string | null {
   if (!entry || !entry.count) {
     return null;
@@ -1189,32 +1007,10 @@ export function syntheticDraftRows(drafts: readonly RailDraftRow[]): (RailDraftR
   }));
 }
 
-// Whether another agent ran a session, out of the guess read from its transcript and
-// the sessions this window started itself.
-//
-// `agentRunIn` in transcript.ts reads the absence of a person, because a Claude transcript
-// names nobody as the one who started it. A panel session whose prompts carry no human origin
-// wears that same absence: one prompt and no question asked, and outside an SDK-only
-// transcript also a first turn that finished and no file changed. So the reader started a
-// session and the rail filed it under Run by agents. The window that started it holds the
-// one positive fact the record never carries, and that fact outranks the guess.
-// `syntheticDraftRows` above says the same thing for the stage before the session has an id
-// at all.
-//
-// Only the window that started it can answer this way. Another window reads the transcript,
-// where the guess is all there is.
-//
-// A child transcript is always an agent run: the parent's `Agent` call that started it is a
-// positive fact, and it outranks the guessed reading and any cached answer that disagrees.
-// A dispatched session is one too: the parent's shell command that started it is the same
-// kind of fact, read from the dispatched edges. A session this window started stays the
-// reader's even when a dispatch edge names it, because an opted-in wrapper's receipt can name
-// any session.
-//
-// `readerOwned` is the positive fact the other way, for a dispatched session alone: its
-// launch recorded that the reader asked for it, or a person spoke in its transcript. It
-// outranks the transcript's guess the way `startedHere` does, because a `claude --bg` session
-// whose one turn finished with no sign of a person still guesses as a run.
+// Classifies agent runs using transcript evidence and retained launch ownership.
+// A child transcript is always an agent run.
+// Reader-started sessions and reader-owned dispatches are not agent runs.
+// Other dispatches count as agent runs. Remaining sessions retain the transcript classification.
 export function agentRunAnswer(
   guessed: boolean,
   sessionId: string,
@@ -1232,27 +1028,14 @@ export function agentRunAnswer(
   return dispatched || guessed;
 }
 
-// The card's complete accessible name. `view/rail.ts` owns the wording, `webview/rail.ts`
-// draws it with the two clauses the browser's own clock moves, and the wording rules here
-// are read through the same function with neither clause.
+// The card's complete accessible name. `view/rail.ts` supplies the wording.
+// `webview/rail.ts` supplies the two clauses affected by its clock. Wording checks call the same function without those clauses.
 export { railCardName } from './view/rail.ts';
 
-// The rail's cards: which sessions, in what order, saying what.
-//
-// The pinned-to-top sessions come first in the sessions list's own order, and the
-// rest follow in that same order. The host hands this function a list whose running and
-// inactive runs are already stable, so a pinned session that starts running rises
-// above inactive pinned sessions without disturbing the running sessions already
-// there. Archived sessions come last, flagged rather than dropped, so the Archived
-// bucket has cards to hold. Fewer than two live cards is no rail at all: a rail naming one
-// session duplicates the heading drawn beside it, and an archive of forty behind a
-// fold does not make a chooser out of it.
-//
-// The shown session is not exempt here, and it is exempt in `hideSessions`. The two
-// answer different questions on purpose. This one decides what the rail draws, and a
-// reader who archives the session they are reading means the card to go. That one
-// decides what is parsed, and the turns stay on screen: archiving is a view, and it must
-// not empty the list the reader is looking at.
+// Prepares session list cards in supplied order, with live pinned sessions first and archived sessions last.
+// Archiving does not exempt the selected card from its archived state.
+// The separate parse filter retains the selected timeline.
+// An empty card list remains meaningful to the browser's navigation structure.
 export function railSessions(
   sessions: {
     id: string;
@@ -1275,13 +1058,8 @@ export function railSessions(
   pinnedTop: ReadonlySet<string>,
   unsent: ReadonlyMap<string, UnsentInput>,
   statsById: Readonly<Record<string, readonly SessionStatChip[]>>,
-  // Every session's labels, by session id, whole rather than already cut. The card
-  // words its name from all of them and draws the first few. One list feeds both, which is
-  // what keeps the two from disagreeing about what the session carries.
-  //
-  // Required rather than optional, for the reason `statsBySession` gives about its
-  // compactions. An optional record would default to empty at the one caller that has one.
-  // Every card in the panel would then read as unlabelled, with no test able to see it.
+  // Complete session labels by id, shared by display fields and accessible names.
+  // Callers must supply this map instead of silently defaulting all sessions to unlabelled.
   labelsById: Readonly<Record<string, readonly string[]>>,
   cacheById: Readonly<Record<string, RailCacheMark | null>> = {},
   costById: Readonly<Record<string, SessionCostTotal>> = {},
@@ -1306,15 +1084,11 @@ export function railSessions(
     const newCount = count === undefined || count === 0 ? null : count;
     const unread = newCount !== null;
     const current = s.id === pinned;
-    // Archiving wins over pinning wherever the two collide, which is the rule the panel's
-    // own hide already follows by unpinning. Read here as well, because stored state can
-    // hold a session as both, and a card that arrived pinned and archived would take
-    // the rail's top from inside a folded bucket.
+    // Archiving takes precedence over pinning, matching the unpinning performed when the panel archives a session.
+    // Stored state can contain both flags. A pinned archived card must stay in its folded bucket rather than occupying the list top.
     const onTop = pinnedTop.has(s.id) && !archived;
-    // Archiving and pinning are the reader's own word about a session, so both
-    // outrank a guess about who started it. An archived run stays in the Archived bucket
-    // and a pinned one keeps the top, and only a pinned one draws the phrase, because it
-    // is the only marked card that sits under no heading saying so.
+    // Archiving and pinning take precedence over inferred session origins. Archived runs stay in Archived. Pinned runs stay at the top.
+    // Only pinned runs need the origin phrase because they appear without a heading that supplies it.
     const agentRun = s.agentRun === true && !archived;
     const runByAgent = s.agentRun === true;
     const status = statuses.get(s.id) ?? null;
@@ -1335,9 +1109,8 @@ export function railSessions(
     const costDollars = rawCost?.dollars ?? costChip?.dollars ?? null;
     // A missing total is never a floor. Where a chip exists, its `+` says the same fact.
     const costAtLeast = costDollars !== null && (rawCost?.partial ?? costChip?.partial);
-    // Read straight off the lifetime index, the same source `costById` reads, and never off a
-    // filtered stat chip: `railStatChips` drops the cache-expiry metric from the drawn row, but
-    // the filter still needs the exact count underneath it.
+    // Read the lifetime index used by `costById`.
+    // `railStatChips` omits the cache-expiry figure from display, but filtering still requires its exact count.
     const cacheExpiryFact = cacheExpiryById[s.id] ?? null;
     const cacheExpiryCount = cacheExpiryFact?.count ?? null;
     // A missing count is never a floor, the same way a missing cost is not.
@@ -1349,21 +1122,11 @@ export function railSessions(
           ? stat.compactLabel
           : `current context ${stat.compactLabel}`,
     );
-    // The row and the name are read off one list. The row takes the front of it and counts
-    // what it left. The name says all of it, because a reader who cannot see the chips hears
-    // the folded ones nowhere else.
-    //
-    // The clause closes the name, because it is the only one of them that is a list. The
-    // name is joined on commas, so a clause after it is read as one more label, and the
-    // reader goes looking for a label called "showing now".
-    // Named for the clause and not for the label, because `turnlabels.ts` exports a
-    // `labelName` of its own and `turnview.ts` re-exports it. A local of that name here
-    // shadows it everywhere in this file, and the day an import reaches for it the error
-    // lands on a line that has nothing to do with the change that caused it.
+    // Use one full label list for visible fields and the accessible label clause.
+    // Keep the label clause last so later comma-separated text is not read as another label.
     const { labelClause, ...labelFields } = railLabelFields(labelsOf(labelsById, s.id), CARD_ACTIONS.railLabelled);
-    // The relative wording goes into the name; the panel words the drawn time from the
-    // timestamp itself, and the clock time rides on the hover. The status is said as a
-    // word here, through the same table every head row reads.
+    // Use relative age in the accessible name. The panel formats visible age from the timestamp.
+    // Use the full clock time for the tooltip and shared status wording for the state.
     const statusName =
       status === 'waiting'
         ? NEEDS_INPUT
@@ -1376,14 +1139,8 @@ export function railSessions(
               : null;
     const cache = cacheById[s.id] ?? null;
     const cardName = s.railName ?? s.label;
-    // The name itself is left out here: `railCardName` prepends `card.name` (or `label`
-    // where it is absent) when it composes the accessible name, so this string carries only
-    // the clauses that follow the name, and the wire never carries the name twice.
-    // `unsentName` is left out too, for the same reason: it already rides its own field below,
-    // and `railCardName` appends it after this clause. Folded in here, it turned this whole
-    // string into one of a handful of phrases repeated across every session sharing an agent,
-    // a status, and an unsent state, so the same text rode the wire once per matching session
-    // instead of once per distinct phrase.
+    // Exclude the session name and unsent detail from these clauses.
+    // `railCardName` adds their separate fields when composing the accessible name.
     const nameBeforeAge = [
       archived ? 'archived' : null,
       onTop ? 'pinned' : null,
@@ -1401,20 +1158,12 @@ export function railSessions(
     ]
       .filter(Boolean)
       .join(', ');
-    // The newest parsed turn's start, and which read entry the card's own context menu
-    // offers. One fact decides both, because both answer whether the session was
-    // parsed: a card that offered the entry with no timestamp behind it would be a press
-    // that marks nothing, and one that carried a timestamp behind no entry would be a mark
-    // nobody can reach. So the section is derived from the timestamp rather than from a
-    // second lookup, and a card with no timestamp names the plain section, which offers the
-    // labels every session can carry and no entry that reads a turn.
+    // Choose the native read-action section from the available newest-turn watermark.
+    // No watermark uses the plain section, which still permits label actions.
     const newestTurnAt = newest.get(s.id) ?? null;
     const menuSection =
       newestTurnAt === null ? RAIL_MENU_SECTIONS.plain : unread ? RAIL_MENU_SECTIONS.unread : RAIL_MENU_SECTIONS.read;
-    // The phrase is drawn only where no heading says it, which after the ordering below
-    // means a pinned run and nothing else. Inside its own bucket the heading has said it
-    // once for every card under it, and repeating it per card would spend the agent's
-    // name to say a thing the reader has already read.
+    // Pinned agent runs use the agent-run phrase because they sit outside the agent-run heading.
     const agentWord = agentRun && onTop ? CARD_ACTIONS.agentRun : s.agent;
     out.push({
       id: s.id,

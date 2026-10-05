@@ -62,9 +62,7 @@ export interface PerformanceCounterSnapshot {
 
 export type StartupMilestone = 'shellReady' | 'catalogReady' | 'railReady' | 'firstCard' | 'completeRender';
 
-// How far each catalog refresh got: started its catalog work, waited behind the refresh in
-// flight, found nothing to repaint, posted its render to the panel, or was abandoned past its
-// deadline.
+// Catalog refresh stages include started work, coalesced requests, unchanged content, posted renders, and deadline abandonment.
 export type RefreshStage = 'started' | 'coalesced' | 'unchanged' | 'rendered' | 'abandoned';
 
 function operationCounts(): OperationCounts {
@@ -95,8 +93,7 @@ function finiteDuration(durationMs: number): number {
   return Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : 0;
 }
 
-// How big a message is on the wire. The shared ready-host boundary calls this once after
-// each actual post, so an unready host pays no serialization cost.
+// Measure serialized message bytes. The host calls this after posting a budgeted message.
 export function serializedMessageBytes(message: unknown): number | null {
   try {
     const text = JSON.stringify(message);
@@ -110,18 +107,14 @@ export function messageByteBudget(type: string): number | null {
   return MESSAGE_BYTE_BUDGETS[type] ?? null;
 }
 
-// Where a counted operation goes when somebody is watching. The counters already know what
-// each operation is and what it cost, so routing the same facts to a log measures nothing
-// new.
+// Receive operation facts from the counters without additional measurement.
 export interface PerformanceEventSink {
-  // Whether anything reads what the sink is given. Each counter asks before it builds a
-  // record, because a log nobody turned on has to cost nothing on a path that runs for every
-  // message the panel posts. The writer's own early return comes too late for that.
+  // Counters check this before building detailed event records to avoid work when logging is disabled.
   enabled(): boolean;
   emit(event: string, record: Record<string, unknown>): void;
 }
 
-// What a host that watches nothing hands over. It builds no record and calls nothing.
+// Default sink disables detailed events and ignores emitted startup milestones.
 const UNWATCHED: PerformanceEventSink = { enabled: () => false, emit: () => {} };
 
 export class PanelPerformanceCounters {
@@ -180,14 +173,12 @@ export class PanelPerformanceCounters {
 
   recordStartup(milestone: StartupMilestone, at: number): void {
     this.startup ??= { id: 1, milestones: {} };
-    // The first time a milestone lands is the one a reader wants. A later host repeating it
-    // is the same startup seen twice.
+    // Retain the first occurrence of each startup milestone.
     if (this.startup.milestones[milestone] !== undefined) {
       return;
     }
     this.startup.milestones[milestone] = finiteDuration(at);
-    // A milestone emits whatever the sink reads, because the startup threshold rides on this
-    // event and that one signal runs while the log is off. A whole panel start emits five.
+    // Emit startup milestones even when detailed events are disabled, so the sink can retain startup history.
     this.sink.emit('startup', { milestone, elapsedMs: Math.round(finiteDuration(at)) });
   }
 
@@ -226,9 +217,7 @@ export class PanelPerformanceCounters {
     const current = this.messages.get(type) ?? messageCounts();
     recordMessageCount(current, serializedBytes);
     this.messages.set(type, current);
-    // `bytes` is null for a message that carries no budget. Its size is never measured,
-    // because measuring it would serialize the message a second time on the path every post
-    // takes.
+    // The host passes null for unbudgeted messages to avoid measuring their serialized size.
     if (this.sink.enabled()) {
       this.sink.emit('message', { kind: type, bytes: serializedBytes });
     }
@@ -461,9 +450,7 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
   };
 }
 
-// The environment variable that holds a directory for a capture to write into. Each capture makes
-// its own stamped file there, so a run that captures more than once keeps every snapshot, and a
-// harness gets a file without a reader at the dialog.
+// Environment variable for the capture directory. Each capture writes a separate timestamped file.
 export const PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE = `${ARC_IDENTITY.environmentPrefix}PERF_OUT_DIR`;
 
 export function performanceDiagnosticsFileName(capturedAt: number): string {
@@ -471,8 +458,8 @@ export function performanceDiagnosticsFileName(capturedAt: number): string {
 }
 
 export type PerformanceDiagnosticsDestination =
-  // `argument` is the file a caller named. `variable` is the stamped file under the directory the
-  // environment named. The reader sees neither one coming, so only `variable` is announced.
+  // An argument names the destination file. The variable selects a timestamped file in its directory.
+  // Successful variable-selected captures announce their destination.
   | { kind: 'file'; file: string; source: 'argument' | 'variable' }
   | { kind: 'ask'; suggested: string | null }
   | { kind: 'refuse'; given: string };
@@ -484,10 +471,7 @@ export interface PerformanceDiagnosticsTarget {
   capturedAt: number;
 }
 
-// A relative path is read against the open folder. A window with no folder open has nothing to
-// read it against, and the writer takes a plain string that it does not resolve either, so a
-// relative path would land at the root of the file system under a name its caller cannot open.
-// The capture stops instead, and says why.
+// Resolve relative paths against the open folder. Refuse them when no folder is open.
 function against(folder: string | null, given: string): string | null {
   if (path.isAbsolute(given)) {
     return path.normalize(given);
@@ -495,9 +479,7 @@ function against(folder: string | null, given: string): string | null {
   return folder ? path.resolve(folder, given) : null;
 }
 
-// An argument names the file to write. The variable names a directory to write a stamped file
-// into. An argument wins over the variable, because a caller that names one file says more than a
-// variable set once for a whole editor process. With neither, the reader picks the file.
+// An explicit file takes precedence over the environment directory. With neither, the reader selects a file.
 export function performanceDiagnosticsDestination(
   request: PerformanceDiagnosticsTarget,
 ): PerformanceDiagnosticsDestination {
@@ -523,9 +505,7 @@ export function performanceDiagnosticsDestination(
   return { kind: 'ask', suggested };
 }
 
-// What a capture that wrote nothing tells the reader, and what it tells the diagnostics log. The
-// message is for the window. The file and the reason are for an automated run, which has no
-// window to read.
+// Failure details include the reader's message and the destination and reason supplied to diagnostic logging.
 export interface PerformanceDiagnosticsFailure {
   file: string | null;
   reason: string;
@@ -540,13 +520,9 @@ export interface PerformanceDiagnosticsSave extends PerformanceDiagnosticsTarget
   announce(file: string): void;
 }
 
-// Returns the file it wrote. Returns null when the reader closes the dialog, when a relative path
-// has no folder to be read against, and when the write fails, so a caller that named a path learns
-// that nothing is there to read. A closed dialog is the reader saying no and goes unreported. The
-// other two are reported, because a file was asked for and none arrived.
-//
-// A run aimed by the variable announces the file it wrote. That reader pressed a command, got no
-// dialog, and has no other way to learn where the snapshot went.
+// Return the written path, or null when the dialog closes, the destination is refused, or writing fails.
+// Refused destinations and write failures are reported. Closing the dialog leaves no failure report.
+// Successful variable-selected captures announce the written path.
 export async function savePerformanceDiagnosticsSnapshot(request: PerformanceDiagnosticsSave): Promise<string | null> {
   const destination = performanceDiagnosticsDestination(request);
   if (destination.kind === 'refuse') {

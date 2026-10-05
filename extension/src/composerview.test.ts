@@ -227,9 +227,8 @@ const TWO_QUESTIONS: QuestionAsk = {
   toolUseId: 'tu3',
 };
 
-// Three questions, which is the smallest number that puts a question between the first and
-// the last. The middle one carries no header, so its tab falls back to a number, and the last
-// asks for a secret.
+// Three questions cover an unlabeled middle tab and a final secret answer.
+
 const THREE_QUESTIONS: QuestionAsk = {
   kind: 'question',
   id: 'ask-5',
@@ -280,7 +279,7 @@ const FREE_TEXT_QUESTION: QuestionAsk = {
   toolUseId: 'tu4',
 };
 
-// A machine the tests can describe exactly. `has` lists the paths that exist on it.
+// `has` lists the paths that exist on the fixture machine.
 function machine(
   platform: string,
   has: string[] = [],
@@ -455,9 +454,8 @@ test('Windows ARM falls back to the official x64 Claude binary', () => {
 });
 
 test('an npm install is run as its own script under Node, because its name on PATH is a shim', () => {
-  // Windows resolves a bare name against .com and .exe only, so `claude` from npm is never
-  // found, and the `claude.cmd` beside it throws EINVAL when given arguments. The script the
-  // shim points at has neither problem.
+  // Windows batch shims cannot start directly, so launch the npm script through Node.
+
   assert.deepEqual(claudeLaunch('', machine('win32', [CLAUDE_NPM])), {
     command: 'C:\\Code.exe',
     leadingArgs: [CLAUDE_NPM],
@@ -489,14 +487,12 @@ test('nothing is guessed away from Windows, where a name on PATH starts on its o
     problem: null,
     env: {},
   });
-  // Even on a machine where every path exists, nothing is returned away from Windows.
-  // npm's prefix elsewhere is /usr/local, or an nvm-versioned directory, or whatever the
-  // reader set, so a path built from a Windows layout would name a file that is not the
-  // agent, and a guess that misses is worse than no guess.
+  // Non-Windows npm prefixes do not follow the Windows installation layout.
+
   const anything: Machine = { ...machine('linux'), exists: () => true };
   assert.equal(npmPackageScript(anything, ['@openai', 'codex']), null);
-  // Including the platform package's own program: away from Windows the install is wherever
-  // npm's prefix is, and a path built from a Windows layout names a file that is not it.
+  // Codex also uses its PATH launcher outside Windows.
+
   assert.deepEqual(codexLaunch('', anything), { command: 'codex', leadingArgs: [], problem: null, env: {} });
 });
 
@@ -515,15 +511,14 @@ test('Codex falls back to its launcher when the program itself is not where it s
 });
 
 test('the Codex program is started itself, not through the launcher that would spawn it', () => {
-  // The launcher spawns the program with `stdio: "inherit"` and no `windowsHide`, so the
-  // program gets a console window of its own that flashes on screen. The panel's own
-  // `windowsHide` covers the launcher and not the program behind it.
+  // Launch the Codex binary directly so the host's `windowsHide` applies to it.
+
   assert.deepEqual(codexLaunch('', machine('win32', [CODEX_NPM, CODEX_BINARY])), {
     command: CODEX_BINARY,
     leadingArgs: [],
     problem: null,
-    // Both are what the launcher would have set. Without them the program is told nothing
-    // about how it was installed.
+    // Direct launches retain the npm launcher's package environment.
+
     env: { CODEX_MANAGED_PACKAGE_ROOT: CODEX_ROOT, CODEX_MANAGED_BY_NPM: '1' },
   });
 });
@@ -542,10 +537,10 @@ test('the official editor extension program wins over an older npm Codex', () =>
 
 test('a machine of another shape is named for it, and one nobody named is left to the launcher', () => {
   assert.equal(codexLaunch('', machine('win32', [CODEX_BINARY_ARM], 'arm64')).command, CODEX_BINARY_ARM);
-  // The x64 program on an arm64 machine is not the program for that machine.
+  // An arm64 machine cannot select the x64 binary.
   assert.equal(codexLaunch('', machine('win32', [CODEX_BINARY, CODEX_NPM], 'arm64')).command, 'C:\\Code.exe');
-  // An architecture with no build named here is not guessed at: every path would be one
-  // this file made up, and the launcher already works out which package a machine needs.
+  // Unsupported architectures use the npm launcher to resolve their package.
+
   assert.deepEqual(codexLaunch('', machine('win32', [CODEX_BINARY, CODEX_BINARY_ARM, CODEX_NPM], 'ia32')), {
     command: 'C:\\Code.exe',
     leadingArgs: [CODEX_NPM],
@@ -654,8 +649,8 @@ test('a permission card carries immediate answers and says the agent is waiting 
     ['Allow', 'Deny'],
   );
   assert.deepEqual(card.actions[0].answer, { decision: 'allow' });
-  // The head row's own words. The waiting one is the rail's, so the session marked
-  // `needs input` in the list and the card at its foot say one thing.
+  // The request card and session list share the waiting-state wording.
+
   assert.equal(card.stateWord, 'needs input');
   assert.equal(card.sendingWord, 'sending your answer');
 });
@@ -679,19 +674,19 @@ test('a question card draws every question and explains when its answer is incom
     card.actions.map((action) => action.label),
     ['Decline'],
   );
-  // Nothing under the title. The sentence there said that the agent would continue after an
-  // answer, which is the whole of what the state word says in two words.
+  // The waiting state supplies the explanation, so the card detail stays empty.
+
   assert.equal(card.detail, '');
   assert.equal(card.stateWord, 'needs input');
   assert.equal(card.sendingWord, 'sending your answer');
-  // The agent's own short label for each question, which the card draws as a chip before the
-  // question rather than as a line under it.
+  // Question headers supply the labels before each question.
+
   assert.deepEqual(
     card.questions.map((question) => question.key),
     ['Colour', 'Size'],
   );
-  // How many the reader may take. It is the one thing the controls do not say themselves: a
-  // set of checkboxes and a set of radios read alike until one of them is pressed.
+  // The hint states whether the reader can select one answer or several.
+
   assert.deepEqual(
     card.questions.map((question) => question.hint),
     ['Choose one.', 'Choose any that apply.'],
@@ -825,7 +820,7 @@ test('a required permission subject never falls back to the empty approval promp
 test('a question without choices can still be declined', () => {
   const card = askCard(FREE_TEXT_QUESTION, 'Codex');
   const fallback = askPrompt(FREE_TEXT_QUESTION);
-  // Nothing the agent offered, and the reader's own answer, which every question carries.
+  // A question without options still accepts a written answer.
   assert.deepEqual(
     card.questions[0].choices.map((choice) => choice.label),
     ['Other'],
@@ -889,7 +884,7 @@ test("every question offers an answer in the reader's own words, after the agent
     ['Red', 'Other'],
   );
   for (const question of card.questions) {
-    // Last, and the only one carrying no label to send: what the reader types is the answer.
+    // The final choice sends the written answer instead of a label.
     assert.deepEqual(
       question.choices.map((choice) => choice.written),
       [...question.choices.slice(0, -1).map(() => false), true],
@@ -990,7 +985,7 @@ test("a tab wears the agent's own label, and the question's number where the age
     card.questions.map((question) => question.tabAnsweredName),
     ['Colour, answered', 'Question 2, answered', 'Checks, answered'],
   );
-  // A secret answer is kept off the tab, so the card is told which question asks for one.
+  // Secret questions carry a flag so tab summaries can omit their answers.
   assert.deepEqual(
     card.questions.map((question) => question.secret),
     [false, false, true],
@@ -1024,8 +1019,8 @@ test('Send says it will answer the requests waiting above the box, and its own n
 });
 
 test('the sentence beside Send says compaction where the box holds the compaction command', () => {
-  // The press answers the request either way, and a compaction sends no prompt at all, so
-  // the sentence names the one thing that will happen rather than the one that will not.
+  // The send description names compaction after answering pending requests.
+
   const compacting = composerView(composerState({ draft: '/compact', asks: [QUESTION] }));
   assert.equal(compacting?.sendOverAsk, 'Send answers the request above before it compacts.');
   const two = composerView(composerState({ draft: ' /COMPACT ', asks: [QUESTION, PERMISSION] }));
@@ -1034,35 +1029,35 @@ test('the sentence beside Send says compaction where the box holds the compactio
     'Send answers the 2 requests above before it compacts.',
     'the command is recognized the way the press recognizes it',
   );
-  // A sentence mentioning the command is an ordinary prompt, and goes as one.
+  // Mentioning the command within a sentence sends ordinary prompt text.
   const mentioned = composerView(composerState({ draft: 'run /compact for me', asks: [QUESTION] }));
   assert.equal(mentioned?.sendOverAsk, 'Send answers the request above with this prompt.');
 });
 
 test('Send promises nothing about a waiting request when the press will not send', () => {
-  // The control is Stop while a turn runs over an empty box. That press stops the turn and
-  // leaves every request where it was.
+  // Stop leaves pending requests unanswered.
+
   const stopping = composerView(composerState({ running: true, draft: '', asks: [QUESTION] }));
   assert.equal(stopping?.box.actionControl, 'stop');
   assert.equal(stopping?.sendOverAsk, '');
   assert.doesNotMatch(stopping?.box.actionName ?? '', /answers the request/);
-  // A Send with nothing to send is refused, so it answers nothing either. Said beside a
-  // control that will not act, the sentence is a promise the press does not keep.
+  // An empty prompt cannot answer a request.
+
   const empty = composerView(composerState({ draft: '', asks: [QUESTION] }));
   assert.equal(empty?.box.actionControl, 'send');
   assert.equal(empty?.box.actionEnabled, false);
   assert.equal(empty?.sendOverAsk, '');
   assert.doesNotMatch(empty?.box.actionName ?? '', /answers the request/);
-  // A command the panel answers itself never reaches the agent. `/mcp` opens the server list
-  // and clears the box, and the request is still open afterwards.
+  // `/mcp` opens the server list without answering pending requests.
+
   const opens = composerView(composerState({ draft: '/mcp', asks: [QUESTION] }));
   assert.equal(opens?.box.actionEnabled, true);
   assert.equal(opens?.sendOverAsk, '');
   assert.doesNotMatch(opens?.box.actionName ?? '', /answers the request/);
-  // A Codex `/rename` renames the session and sends nothing, so the request stays open too.
+  // Codex `/rename` leaves pending requests unanswered.
   const renames = composerView(composerState({ agent: 'codex', draft: '/rename quest', asks: [QUESTION] }));
   assert.equal(renames?.sendOverAsk, '');
-  // An ordinary prompt that merely mentions one still promises the answer it gives.
+  // A prompt mentioning `/mcp` still answers the request.
   const mentions = composerView(composerState({ draft: 'run /mcp for me', asks: [QUESTION] }));
   assert.match(mentions?.sendOverAsk ?? '', /answers the request above/);
 });
@@ -1099,15 +1094,14 @@ test('a prompt sent over an open request says the reader answered in it, not tha
     ANSWERED_IN_PROMPT.decision === 'deny' ? ANSWERED_IN_PROMPT.reason : '',
     'The reader did not answer this here and replied in their next message instead.',
   );
-  // A permission offers Allow and Deny, so a sentence about the choices on offer is untrue
-  // of half the requests this answer resolves.
+  // Answer wording also covers permission requests, which offer Allow and Deny.
+
   assert.doesNotMatch(ANSWERED_IN_PROMPT.decision === 'deny' ? ANSWERED_IN_PROMPT.reason : '', /choice/i);
 });
 
 test('the answer a prompt gives a request survives the boundary it comes back through', () => {
-  // Every answer from the panel is run through this before it reaches an agent, including
-  // the one the send path gives, and any other denial is narrowed to the panel's refusal.
-  // Narrowed too, the agent reads that the reader said no to a request they answered.
+  // Prompt answers retain their reason through validation. Other denials use the panel refusal reason.
+
   assert.deepEqual(acceptedAskAnswer(TWO_QUESTIONS, ANSWERED_IN_PROMPT), ANSWERED_IN_PROMPT);
   assert.deepEqual(acceptedAskAnswer(PERMISSION, ANSWERED_IN_PROMPT), ANSWERED_IN_PROMPT);
   const panelRefusal = { decision: 'deny', reason: 'The reader refused this from the panel.' };
@@ -1135,8 +1129,8 @@ const COMMANDS: PromptEntry[] = [
   { kind: 'command', name: 'model', description: 'Pick a model', argumentHint: '' },
 ];
 
-// What a command carries when the agent describes it fully, when it takes an argument, and
-// when it publishes neither.
+// Command fixtures cover descriptions, argument hints, and absent metadata.
+
 const WORDED: PromptEntry[] = [
   {
     kind: 'command',
@@ -1159,8 +1153,8 @@ test('a command is worded with the slash the reader types and the space that end
     ['commit', 'compact', 'polish'],
     'the name a press carries back is the agent own, with no slash on it',
   );
-  // The trailing space is what ends the name, which is what shuts the menu. Without it the
-  // next Enter completes the same command again and the command can never be sent.
+  // A trailing space closes completion so the next Enter sends the command.
+
   assert.deepEqual(
     entries.map((e) => e.completion),
     ['/commit ', '/compact ', '/polish '],
@@ -1175,8 +1169,8 @@ test('a command row says everything the eye reads and nothing the panel wrote', 
   const [commit, compact, polish] = promptEntries('claude', WORDED);
   assert.equal(commit.name, '/commit <message>. Write a commit for what is in the working tree');
   assert.equal(compact.name, '/compact. Summarise the session and keep going');
-  // Nothing published, so nothing said. A row that read "/polish. " would announce a full
-  // stop over a command the agent described with silence.
+  // A command without a description has no trailing spoken punctuation.
+
   assert.equal(polish.name, '/polish');
 });
 
@@ -1188,7 +1182,7 @@ test('the composer hands the panel every command in the agent own order', () => 
     'the panel narrows the list itself, so it is handed the agent list and its own command, unsorted',
   );
   assert.equal(view.completionName, 'Completions available for Claude');
-  // An agent that published none still gets the command this panel can answer itself.
+  // The panel provides `/mcp` even when the agent publishes no commands.
   const none = drawn({ commands: [] });
   assert.deepEqual(
     none.commands.map((command) => command.command),
@@ -1245,18 +1239,17 @@ test('matching is on the name, so a command never appears for a word it does not
 });
 
 test('a command the panel draws itself opens a control rather than going to the agent', () => {
-  // `/mcp` draws a list of servers in the agent's own terminal, so the CLI answers a panel
-  // with nothing at all. Sent as a prompt it went out and nothing came back, which is a
-  // command that did nothing in front of a reader who had just picked it off a menu.
+  // The panel handles `/mcp` by opening its server controls.
+
   assert.equal(panelCommand('/mcp'), 'mcp');
   assert.equal(panelCommand('  /mcp  '), 'mcp', 'the words are trimmed the way a sent prompt is');
   assert.equal(panelCommand('/MCP'), 'mcp', 'the reader typed the name, not its case');
-  // An argument is dropped rather than refused. The command takes none, and a reader who
-  // typed one has still asked for the servers.
+  // `/mcp` ignores arguments.
+
   assert.equal(panelCommand('/mcp unity'), 'mcp');
 
-  // Everything the agent can actually answer is left to the agent. `/compact` is the case
-  // that shows the difference: the CLI reads it and compacts.
+  // Agent commands and ordinary prompts pass through to the agent.
+
   assert.equal(panelCommand('/compact'), null);
   assert.equal(panelCommand('/commit a fix'), null);
   assert.equal(panelCommand('read the mcp docs'), null, 'a prompt about mcp is not the command');
@@ -1269,7 +1262,7 @@ test('a command the panel draws itself opens a control rather than going to the 
 });
 
 test('a prompt prefix opens a matching catalog entry for its agent', () => {
-  // At the front of the box, which is where most are typed.
+  // A command prefix at the start opens completion.
   assert.deepEqual(promptToken('claude', '/comp', 5), { prefix: '/', typed: 'comp', start: 0, end: 5 });
   assert.deepEqual(
     promptToken('claude', '/', 1),
@@ -1277,41 +1270,41 @@ test('a prompt prefix opens a matching catalog entry for its agent', () => {
     'a slash on its own is the reader asking what there is',
   );
 
-  // In the middle of a sentence, which is the whole point: the run under the caret is what is
-  // offered, and the words on either side of it are somebody else's.
+  // Completion replaces the token under the caret and preserves surrounding words.
+
   assert.deepEqual(promptToken('claude', 'take a look at /rev', 19), { prefix: '/', typed: 'rev', start: 15, end: 19 });
   assert.deepEqual(
     promptToken('claude', '/rev and then stop', 4),
     { prefix: '/', typed: 'rev', start: 0, end: 4 },
     'the run ends at the space, so the words after it are not swallowed into the name',
   );
-  // A newline opens a word the way a space does. A prompt written over several lines starts
-  // each of them at a boundary.
+  // A newline also starts a completion token.
+
   assert.deepEqual(promptToken('claude', 'first line\n/comp', 16), { prefix: '/', typed: 'comp', start: 11, end: 16 });
 
-  // Back inside a name already written. The run is taken whole rather than cut at the caret,
-  // so the reader is offered the name they are standing in and not its first two letters.
+  // Completion reads the whole token when the caret sits inside it.
+
   assert.deepEqual(promptToken('claude', '/compact', 3), { prefix: '/', typed: 'compact', start: 0, end: 8 });
 
-  // A slash inside a word is a path or a fraction. That it does not open a word is what tells
-  // it apart from a command, with no command's name needed to do it.
+  // A slash within a word does not start a command token.
+
   assert.equal(promptToken('claude', 'look at src/a.ts', 16), null);
   assert.equal(promptToken('claude', 'a/b', 3), null);
   assert.equal(promptToken('claude', '', 0), null);
   assert.equal(promptToken('claude', 'just a sentence', 15), null);
 
-  // The argument after a chosen command is not a command. The caret is past the space, so the
-  // run it stands in opens on a letter.
+  // A command argument does not start command completion.
+
   assert.equal(promptToken('claude', '/compact now', 12), null, 'the command is chosen; this is its argument');
-  // And going back into the name offers it again, which is what makes a typo fixable.
+  // Moving the caret back into the command name reopens completion.
   assert.deepEqual(promptToken('claude', '/compact now', 4), { prefix: '/', typed: 'compact', start: 0, end: 8 });
 
-  // A run that opens a word and names nothing is left to the matching rather than refused
-  // here. `/usr/local` offers no command, and a menu with no rows is not drawn.
+  // Token parsing accepts unmatched names. Command matching excludes names absent from the catalog.
+
   assert.deepEqual(promptToken('claude', 'see /usr/local', 14), { prefix: '/', typed: 'usr/local', start: 4, end: 14 });
   assert.deepEqual(matchCommands(COMMANDS, 'usr/local'), []);
 
-  // A caret past either end is clamped rather than read off the end of the string.
+  // Caret positions beyond either end clamp to the text bounds.
   assert.deepEqual(promptToken('claude', '/comp', 99), { prefix: '/', typed: 'comp', start: 0, end: 5 });
   assert.deepEqual(promptToken('claude', '/comp', -5), { prefix: '/', typed: 'comp', start: 0, end: 5 });
   assert.deepEqual(promptToken('codex', '$audit', 6), { prefix: '$', typed: 'audit', start: 0, end: 6 });
@@ -1340,9 +1333,8 @@ test('Codex skills keep both invocation prefixes while commands keep slash only'
 });
 
 test('each agent is asked in its own words, not in one vocabulary invented for both', () => {
-  // Both label sets are copied from that agent's own official extension, which is a
-  // published surface the reader has already seen. Nothing here is written by this panel,
-  // so nothing here can drift on its own.
+  // Each agent has its own permission labels.
+
   assert.deepEqual(
     CLAUDE_ASK_MODES.map((m) => m.label),
     ['Auto', 'Manual', 'Edit automatically', 'Plan'],
@@ -1353,14 +1345,14 @@ test('each agent is asked in its own words, not in one vocabulary invented for b
   );
   assert.deepEqual(askModes('claude'), CLAUDE_ASK_MODES);
   assert.deepEqual(askModes('codex'), CODEX_ASK_MODES);
-  // No label is shared, so one agent's control can never be read as the other's.
+  // The two agents share no permission labels.
   const shared = CLAUDE_ASK_MODES.filter((m) => CODEX_ASK_MODES.some((c) => c.label === m.label));
   assert.deepEqual(shared, []);
 });
 
 test('Claude offers four modes, each carrying its own permission-mode value and sentence', () => {
-  // `bypassPermissions` runs everything with no check, and `dontAsk` denies anything that
-  // would prompt. Arc leaves both out.
+  // Claude omits `bypassPermissions` and `dontAsk` from its choices.
+
   assert.deepEqual(
     CLAUDE_ASK_MODES.map((m) => m.value),
     ['auto', 'manual', 'acceptEdits', 'plan'],
@@ -1369,8 +1361,8 @@ test('Claude offers four modes, each carrying its own permission-mode value and 
     CLAUDE_ASK_MODES.map((m) => m.claude),
     ['auto', 'manual', 'acceptEdits', 'plan'],
   );
-  // Each sentence states what the mode runs without asking, drawn from Claude Code's
-  // permission-modes documentation rather than copied from any one surface.
+  // Claude descriptions state the actions each permission mode permits.
+
   assert.deepEqual(
     CLAUDE_ASK_MODES.map((m) => m.description),
     [
@@ -1386,9 +1378,8 @@ test('Claude offers four modes, each carrying its own permission-mode value and 
 });
 
 test('Codex offers the same four permission presets as its CLI', () => {
-  // Approval policy decides which requests may surface. The reviewer decides whether those
-  // requests stop for the reader or are assessed automatically, so "Approve for me" needs
-  // both settings even though its approval policy remains `on-request`.
+  // Approve for me combines an approval policy with automatic review.
+
   assert.deepEqual(
     CODEX_ASK_MODES.map((m) => m.value),
     ['read-only', 'untrusted', 'on-request', 'never'],
@@ -1415,7 +1406,7 @@ test('Codex offers the same four permission presets as its CLI', () => {
     ],
   );
   for (const mode of CODEX_ASK_MODES) {
-    // Codex's extension does publish a sentence per mode, so each one carries it.
+    // Each Codex permission mode has a description.
     assert.ok(mode.description, `${mode.value} says nothing about what it does`);
     assert.equal(mode.claude, undefined, `${mode.value} carries a Claude setting on a Codex mode`);
   }
@@ -1491,19 +1482,19 @@ test('custom Codex permissions name their approval and access behavior', () => {
 test('the menu opens with the question that agent is actually being asked', () => {
   assert.ok(ASK_MODE_HEADS.claude.includes('Claude'));
   assert.ok(ASK_MODE_HEADS.codex.includes('Codex'));
-  // Two different questions, because the two controls are not the same control.
+  // Each agent has a distinct permission question.
   assert.notEqual(ASK_MODE_HEADS.claude, ASK_MODE_HEADS.codex);
 });
 
 test('Codex keeps no Arc fallback when the reader has not picked a mode', () => {
-  // Claude retains its product default. Codex must leave an absent or retired stored value
-  // empty so the app-server can apply the user's configuration.
+  // An absent Codex mode leaves configuration to app-server. Claude retains its default.
+
   assert.equal(askMode('claude', undefined)?.value, 'auto');
   assert.equal(askMode('codex', undefined), undefined);
   assert.equal(askMode('claude', 'edits').value, 'auto', 'a value this version dropped is not a mode');
   assert.equal(askMode('claude', ''), defaultAskMode('claude'));
-  // One agent's value is not the other's, and picking it up would start a child on a
-  // setting the reader never chose.
+  // Each agent rejects the other agent's permission values.
+
   assert.equal(askMode('claude', 'on-request').value, 'auto');
   assert.equal(askMode('codex', 'acceptEdits'), undefined);
   assert.equal(askMode('claude', 'plan').value, 'plan');
@@ -1568,10 +1559,8 @@ const MODELS: ModelChoice[] = [
   { value: 'haiku-5', label: 'Haiku 5', description: 'The quick one', efforts: [] },
 ];
 
-// An agent this version has no table for. `ComposerState.agent` is typed to the two the
-// panel drives, so no caller can write this and the cast is the only way in. The fallbacks
-// it reaches are defence rather than a path in use, and they are tested because a third
-// agent is one release away and a silent empty menu is how it would arrive.
+// The cast supplies an unsupported agent value to exercise fallback handling.
+
 const UNKNOWN_AGENT = 'gemini' as unknown as ComposerState['agent'];
 
 test('session settings change one Codex session without touching its sibling', () => {
@@ -1634,9 +1623,8 @@ test('a rejected live model change leaves the prior confirmed settings intact', 
 });
 
 test('settings read after the agent answers replace ones worked out before it', async () => {
-  // The effort level belongs to the model, so a model change settles it only once the model
-  // request is answered. The reader can pick a level while that request is in flight, and
-  // the panel stores the level it told the child rather than the one it set out with.
+  // A pending model change keeps the effort chosen while the request runs.
+
   let book: SessionSettingBook = {
     session: {
       selectedModel: 'opus',
@@ -1819,8 +1807,8 @@ function composerState(over: ComposerStateInput = {}): ComposerState {
   const { model: _model, effort: _effort, ran: _ran, settings, ...rest } = over;
   return {
     agent: 'claude',
-    // The box and the draft hold the same words except while the walk is standing, so a test
-    // that names one names both.
+    // The fixture initializes displayed text and retained draft from the same input.
+
     onScreen: over.draft ?? '',
     session: 'Embedded agent input',
     models: MODELS,
@@ -1870,15 +1858,15 @@ function queued(
   };
 }
 
-// The one card a fixture with one press in flight opens, and null where it opens none.
-// Every test but the one about two presses at once makes a single press.
+// Read a single live card and reject fixtures containing multiple cards.
+
 function liveOf(over: ComposerStateInput = {}): ComposerLive | null {
   const cards = drawn(over).live;
   assert.ok(cards.length < 2, 'the fixture opened more than one card, so this reads the wrong one');
   return cards[0] ?? null;
 }
 
-// The composer as drawn, for a test that has already said it expects one.
+// Require a Prompt box view for these assertions.
 function drawn(over: ComposerStateInput = {}): ComposerView {
   const view = composerView(composerState(over));
   if (!view) {
@@ -1895,23 +1883,23 @@ test('a window with nothing to type into draws no composer at all', () => {
 
 test('the composer says which session the prompt goes to without spending a line on it', () => {
   const view = drawn();
-  // The rail names the session at the top of the panel, so a second copy over the box
-  // said what the reader was already looking at. Nothing is drawn for it now.
+  // The Prompt box omits a separate target line.
+
   assert.equal('to' in view, false, 'the target line is drawn again, over a name the rail already carries');
   assert.equal('target' in view, false);
-  // A reader who cannot see the rail is the one who needs it, so it stays as a spoken name
-  // and carries the agent too: which agent the prompt reaches is nowhere else on screen.
+  // Its accessible target name identifies both the session and agent.
+
   assert.ok(view.targetName.includes('Embedded agent input'));
   assert.ok(view.targetName.includes('Claude'));
 });
 
 test('how full the window is is a share of that model own window, not of a constant', () => {
-  // The same count against the two windows one account runs: 1,000,000 on the long context
-  // build and 200,000 on the small one.
+  // The same usage count occupies different shares of the two window sizes.
+
   assert.equal(drawn({ context: { used: 100_000, max: 1_000_000 } }).context?.percent, 10);
   assert.equal(drawn({ context: { used: 100_000, max: 200_000 } }).context?.percent, 50);
-  // Rounded to nearest, so the figure agrees with the one the CLI reports for the same
-  // window rather than sitting a point under it.
+  // The displayed percentage rounds to the nearest integer.
+
   assert.equal(drawn({ context: { used: 419_999, max: 1_000_000 } }).context?.percent, 42);
 });
 
@@ -1921,9 +1909,8 @@ test('the context figure wears the context chip bands rather than a scale of its
     assert.equal(at.context?.level, band.level, `${band.at} of a window should read as ${band.level}`);
     assert.ok(at.context?.name.includes(band.word), 'the band word is what a reader who cannot see the bar gets');
   }
-  // A point under the first threshold, and a point is what the figure is drawn in: the band
-  // is read off the printed percentage, so a share that rounds up to the threshold is toned
-  // at the threshold and a chip cannot print one number in two colours.
+  // Context bands use the displayed rounded percentage.
+
   const quiet = drawn({ context: { used: Math.round((CONTEXT_BANDS[0].at - 0.01) * 1000), max: 1000 } });
   assert.equal(quiet.context?.level, null, 'a window with half of it left is as quiet as any other figure');
   const rounded = drawn({ context: { used: Math.round(CONTEXT_BANDS[0].at * 1000) - 1, max: 1000 } });
@@ -1967,8 +1954,8 @@ test('the controls row is model, then effort, then how much the agent asks', () 
 });
 
 test('every control says both what it is and what it is set to', () => {
-  // A screen reader gets the name and nothing else, so a name reading "Auto" names no
-  // question and a name reading "Model" says nothing about the answer.
+  // Accessible control names identify both the setting and its value.
+
   for (const pick of drawn({ agent: 'codex', askMode: 'never' }).picks) {
     assert.ok(pick.name.length > pick.label.length, `${pick.control} names only what it is set to`);
     assert.ok(pick.name.includes(pick.label), `${pick.control} does not say what it is set to`);
@@ -1979,15 +1966,14 @@ test('every control says both what it is and what it is set to', () => {
   assert.ok(fullAccess);
   assert.ok(asking.name.startsWith(ASK_MODE_HEADS.codex));
   assert.equal(asking.label, 'Full Access');
-  // The hover carries the chosen mode's own sentence, not the head question a mode with no
-  // sentence would fall back to. An emptied description reverts the hover with the row still
-  // showing every other word right, so this has to check the sentence itself.
+  // The tooltip uses the selected mode's description.
+
   assert.equal(asking.detail, fullAccess.description);
-  // A reader who cannot see the hover must still hear the same sentence, so the name carries
-  // it too rather than stopping at the label.
+  // The accessible name also includes the selected mode's description.
+
   assert.ok(asking.name.includes(fullAccess.description), 'the accessible name drops the sentence the hover carries');
-  // The same check on Claude's own table, so a fix that only reaches the Codex branch of
-  // `askModePick` still leaves this red.
+  // Claude's accessible name includes its mode description too.
+
   const claudeAsking = drawn({ agent: 'claude', askMode: 'manual' }).picks[2];
   assert.ok(claudeAsking.name.startsWith(ASK_MODE_HEADS.claude));
   assert.ok(
@@ -1996,39 +1982,33 @@ test('every control says both what it is and what it is set to', () => {
   );
 });
 
-// The rendered-DOM guard for chip hints lives in composer.browser.test.ts, next to
-// 'a pressable composer chip carries the panel hint and a read-only one keeps a native
-// title'. A source-text scan here could only catch an object-literal `title:`, and missed
-// both `context.title = ...` and a title set through a helper, so it moved to a browser
-// test that checks the attribute the reader's screen reader actually sees.
+// `composer.browser.test.ts` checks the rendered hint and title attributes.
 
 test('no model list means no menu is opened on an empty list', () => {
   const waiting = drawn({ models: [], model: undefined });
   assert.equal(waiting.picks[0].label, 'Model not reported');
   assert.equal(waiting.picks[0].disabled, true);
   assert.ok(waiting.picks[0].name.includes('Claude'), 'the reader is told who has not answered yet');
-  // A stored pick is drawn as the reader stored it. Calling it the default would name a
-  // model the next turn will not run on.
+  // A stored model value stays visible while its catalog is unavailable.
+
   const stored = drawn({ models: [], model: 'opus-5' });
   assert.equal(stored.picks[0].label, 'opus-5');
   assert.equal(stored.picks[0].disabled, true);
-  // How much the agent asks is answerable before any of that: it is what the next child
-  // gets started with as much as what a running one is doing.
+  // Permission choices remain available before model metadata arrives.
+
   assert.equal(waiting.picks[2].disabled, false);
 });
 
 test('a pick nobody has made is the empty string, and it draws the default rather than nothing', () => {
-  // What the extension actually sends. `pickedModel` and `pickedEffort` answer '' for a
-  // reader who has never opened either menu, and every other test here passes `undefined`,
-  // which is a value the panel is never given. The empty string is not nullish, so a
-  // fallback written with `??` steps straight over it and the control is drawn blank.
+  // Unselected settings arrive as empty strings, which do not trigger nullish defaults.
+
   for (const models of [[], MODELS]) {
     const fresh = drawn({ models, model: '', effort: '' });
     assert.equal(fresh.picks[0].label, 'Model not reported', 'the model control is drawn with no words in it');
     assert.ok(fresh.picks[0].name.includes('Model not reported'));
     assert.ok(fresh.picks[1].label, 'the effort control is drawn with no words in it');
   }
-  // A list that arrived is a list the reader can pick from, however little has been picked.
+  // An available catalog enables model selection without a prior choice.
   assert.equal(drawn({ models: MODELS, model: '', effort: '' }).picks[0].disabled, false);
 });
 
@@ -2038,8 +2018,8 @@ test('a model that takes no effort setting says so instead of offering an empty 
   assert.equal(quick.picks[1].disabled, true);
   assert.equal(quick.picks[1].label, 'No effort setting');
   assert.ok(quick.picks[1].name.includes('Haiku 5'), 'the reader is told which model takes none');
-  // The model control beside it is still pressable: that is how the reader gets back to a
-  // model that does take one.
+  // The model control stays enabled when the selected model has no effort setting.
+
   assert.equal(quick.picks[0].disabled, false);
 });
 
@@ -2049,12 +2029,12 @@ test('the effort control offers the chosen model own efforts and nobody else eff
     ['high', 'low'],
   );
   assert.equal(chosenModel(MODELS, 'opus-5')?.label, 'Opus 5');
-  // No model settled on is no effort to set: a list pooled from every model would offer
-  // settings the running one does not take.
+  // Effort choices require a selected catalog model.
+
   assert.equal(chosenModel(MODELS, undefined), null);
   assert.deepEqual(effortChoices(MODELS, undefined), []);
   assert.equal(drawn({ model: undefined, effort: undefined }).picks[1].disabled, true);
-  // A model this version of the agent no longer lists is nobody's model either.
+  // A model absent from the catalog has no effort choices.
   assert.equal(chosenModel(MODELS, 'opus-4'), null);
   assert.deepEqual(effortChoices(MODELS, 'opus-4'), []);
 });
@@ -2065,27 +2045,23 @@ test('an effort nobody has chosen is the model default rather than a blank contr
   assert.equal(drawn({ effort: 'low' }).picks[1].label, 'low');
 });
 
-// One agent's servers as the panel holds them: one up and one that will not start. Every
-// word the control says is written in `mcpview.ts` and held there. What is held here is
-// whether the control reaches the row at all, where on the row it lands, and whether what it
-// was given survives the trip.
+// The server fixtures include one connected server and one failed server.
+
 const SERVERS: McpServer[] = [
   { name: 'files', status: 'connected', error: '', tools: ['read', 'write'], scope: 'project', title: 'file-server' },
   { name: 'search', status: 'failed', error: 'Connection closed', tools: [], scope: 'user', title: '' },
 ];
 
 test('an agent with no servers is drawn no servers control at all', () => {
-  // Nothing rather than a control counting to zero. The row already carries three settings,
-  // and a fourth answering a question nobody asked would open on an empty box.
+  // A session with no servers omits the servers control.
+
   assert.deepEqual(
     drawn().picks.map((p) => p.control),
     ['model', 'effort', 'askmode'],
   );
   assert.equal(drawn({ mcpServers: [] }).picks.length, 3);
-  // The menu is still built, and that is deliberate rather than an oversight. The reader
-  // reaches it by typing the agent's own `/mcp` as well as by pressing a control, and a menu
-  // that refused to open made that command do nothing at all. `mcpview.test.ts` holds what it
-  // says to an agent with no servers.
+  // Typing `/mcp` can still open an empty server menu.
+
   const menu = pickMenu('mcp', composerState());
   assert.ok(menu, 'typing /mcp on an agent with no servers opens nothing');
   assert.deepEqual(menu.items, [], 'a menu with no servers drew a row anyway');
@@ -2097,36 +2073,36 @@ test('the servers control sits after the three settings the next turn runs under
     view.picks.map((p) => p.control),
     ['model', 'effort', 'askmode', 'mcp'],
   );
-  // Last because it is the one control that is not always there. Anywhere else and the model
-  // and effort controls would move sideways the moment an agent turned out to have servers.
+  // The optional servers control follows the three settings.
+
   const servers = view.picks[3];
   assert.ok(servers.label.includes('2 servers'), 'the control says how many servers there are');
   assert.ok(servers.name.includes(servers.label), 'the control does not say what it is set to');
   assert.ok(servers.detail.includes('Claude'), 'the hover does not say whose servers these are');
-  // Never drawn unpressable, unlike the two beside it: it is on the row only where there is
-  // something behind it, so there is no state in which it opens on nothing.
+  // A visible servers control remains enabled.
+
   assert.equal(servers.disabled, false);
   assert.equal(pickMenu('mcp', composerState({ mcpServers: SERVERS }))?.control, 'mcp');
 });
 
 test('a server that has failed tones the control, and nothing else on the row is toned', () => {
   const failing = drawn({ mcpServers: SERVERS });
-  // The tone is the only place a failure is on the row, and the panel reads it off the pick
-  // rather than off the words, so it has to be carried rather than worked out again.
+  // Server failures set the control's caution flag.
+
   assert.equal(failing.picks[3].caution, true, 'a server that is down does not reach the button');
   assert.deepEqual(
     failing.picks.slice(0, 3).map((p) => p.caution),
     [false, false, false],
     'a setting the reader chose is not a warning',
   );
-  // Every server up is the ordinary case and carries no tone. A control that was always toned
-  // would make a real failure one more thing the eye has learned to skip.
+  // Connected servers leave the control without caution.
+
   const healthy = drawn({ mcpServers: [SERVERS[0]] });
   assert.equal(healthy.picks[3].caution, false);
   assert.equal(healthy.picks[3].label, '1 server');
 });
 
-// The menu a control opens, for a test that has already said it expects one.
+// Require an open menu for these assertions.
 function menu(control: string, over: ComposerStateInput = {}): Menu {
   const opened = pickMenu(control, composerState(over));
   if (!opened) {
@@ -2149,8 +2125,8 @@ test('a control the panel does not draw opens nothing, and neither does a window
 test('each menu opens with the question its own control is asking', () => {
   assert.equal(menu('askmode').head, ASK_MODE_HEADS.claude);
   assert.equal(menu('askmode', { agent: 'codex' }).head, ASK_MODE_HEADS.codex);
-  // The other two are the panel's own questions, so they say which agent and which model
-  // they are about rather than naming the setting twice.
+  // Model and effort menu headings identify their agent or model.
+
   assert.ok(menu('model').head.includes('Claude'));
   assert.ok(menu('effort').head.includes('Opus 5'), 'the effort is the chosen model own');
   assert.ok(menu('effort', { model: undefined, effort: undefined }).head.includes('model'));
@@ -2173,7 +2149,7 @@ test('the modes on offer are the agent own, in the agent own words', () => {
       askModes(agent).map((mode) => mode.description),
     );
   }
-  // Each Claude row carries what that mode runs without asking.
+  // Claude permission rows include their mode descriptions.
   assert.deepEqual(
     menu('askmode')
       .items.slice(1)
@@ -2212,12 +2188,12 @@ test('a menu ticks what the session is set to, and ticks exactly one row', () =>
     ),
     [''],
   );
-  // A stored answer this version no longer offers is the default as well: a menu with every
-  // row unticked says the session is set to nothing, which is never true.
+  // A stored permission value absent from the choices selects the default row.
+
   assert.deepEqual(ticked(menu('askmode', { askMode: 'bypassPermissions' })), ['']);
   assert.deepEqual(ticked(menu('model')), ['opus-5']);
   assert.deepEqual(ticked(menu('effort')), ['high']);
-  // The agent runs its own default for an effort nobody picked, and no row can claim it.
+  // Unselected effort has no checked row.
   assert.deepEqual(ticked(menu('effort', { effort: undefined })), []);
   assert.deepEqual(ticked(menu('model', { model: undefined })), []);
 });
@@ -2296,14 +2272,13 @@ test('a default-selected Claude session names its reported mode while its menu c
 });
 
 test('no ask-mode row is ever drawn as a caution', () => {
-  // A picker with one amber row among four reads as a danger rank, and none of the four
-  // modes is a danger: every one is a setting the reader chose. The servers control is the
-  // only place the caution tone still means anything, where it says a server has failed.
+  // Permission rows carry no caution tone.
+
   const risky = (opened: Menu) => opened.items.filter((row) => row.caution).map((row) => row.value);
   assert.deepEqual(risky(menu('askmode', { agent: 'codex' })), []);
   assert.deepEqual(risky(menu('askmode')), []);
-  // An agent this version has no table for is lent Claude's rows, and lent the same absence
-  // of a caution tone.
+  // The unsupported-agent fallback also carries no caution tone.
+
   assert.deepEqual(risky(menu('askmode', { agent: UNKNOWN_AGENT })), []);
   assert.deepEqual(risky(menu('model')), []);
   assert.deepEqual(risky(menu('effort')), []);
@@ -2325,7 +2300,7 @@ test('a row says everything a reader who cannot see it would otherwise miss', ()
     edits.name,
     'Edit automatically. Claude edits files and runs common file commands without asking, and prompts for everything else. Current setting.',
   );
-  // A sentence that arrived with a full stop is not given a second one.
+  // Descriptions ending in a full stop receive no extra punctuation.
   const stopped = menu('model', {
     models: [{ value: 'm', label: 'M', description: 'It answers.', efforts: [] }],
     model: 'm',
@@ -2345,7 +2320,7 @@ test('the model menu offers the agent own list, and says who has not answered wh
   );
   assert.equal(listed.empty, '', 'a menu with rows in it has nothing to say in their place');
 
-  // A list nobody has answered yet is not a blank box put in front of the reader.
+  // An empty model menu identifies the agent whose catalog is unavailable.
   const waiting = menu('model', { models: [], model: undefined });
   assert.deepEqual(waiting.items, []);
   assert.ok(waiting.empty.includes('Claude'), 'the reader is not told who has not answered');
@@ -2354,16 +2329,16 @@ test('the model menu offers the agent own list, and says who has not answered wh
 });
 
 test('an effort menu with nothing to offer says which of the two reasons it is', () => {
-  // A model that takes no effort setting, named, so the reader knows which one takes none.
+  // A model without effort choices receives a model-specific explanation.
   const quick = menu('effort', { model: 'haiku-5', effort: undefined });
   assert.deepEqual(quick.items, []);
   assert.ok(quick.empty.includes('Haiku 5'));
-  // No model settled on at all, which is a different reason and reads as one.
+  // An absent model receives a separate explanation.
   const unsettled = menu('effort', { model: undefined, effort: undefined });
   assert.deepEqual(unsettled.items, []);
   assert.ok(unsettled.empty.includes('Claude'));
   assert.notEqual(unsettled.empty, quick.empty, 'two reasons are given one line, so one of them is wrong');
-  // The levels a model does offer are its own, in its own words.
+  // Effort rows retain the selected model's labels and descriptions.
   const levels = menu('effort');
   assert.deepEqual(
     levels.items.map((row) => row.value),
@@ -2377,9 +2352,8 @@ test('an effort menu with nothing to offer says which of the two reasons it is',
 });
 
 test('a live Claude session offers the same effort rows Codex does', () => {
-  // The panel changes the level of the child that is running, on both agents, so neither
-  // menu offers to start anything. The rows are the model's own levels, and the one in
-  // force is ticked.
+  // Live Claude sessions offer the selected model's effort choices.
+
   const live = menu('effort', { agent: 'claude' });
   assert.equal(live.head, 'How much should Opus 5 work on a turn?');
   assert.deepEqual(
@@ -2414,8 +2388,8 @@ test('a control that cannot be pressed is exactly a control with nothing behind 
     { agent: 'codex', askMode: 'never' },
     { agent: UNKNOWN_AGENT },
     { agent: 'codex', models: [], model: undefined },
-    // A draft answers the same rule from its own profile, and its row carries a fourth
-    // control the live row has never drawn.
+    // Draft profiles also determine control availability.
+
     { profile: draftProfile() },
     { profile: draftProfile({ model: '', effort: '' }), models: [] },
     { profile: draftProfile({ model: 'haiku-5', effort: '' }) },
@@ -2431,23 +2405,23 @@ test('a control that cannot be pressed is exactly a control with nothing behind 
     for (const pick of view.picks) {
       const opened = pickMenu(pick.control, composerState(over));
       assert.ok(opened, `${pick.control} is drawn on the row but opens no menu, at ${where}`);
-      // A pressable button that opens on nothing and an unpressable one with choices behind
-      // it are both worse than either being wrong on its own.
+      // Disabled controls correspond to menus without choices.
+
       assert.equal(
         pick.disabled,
         opened.items.length === 0,
         `${pick.control} is ${pick.disabled ? 'unpressable with' : 'pressable with no'} choices, at ${where}`,
       );
-      // The line in place of the rows is written for the case where there are none, and a
-      // menu that has rows and a line as well would draw both.
+      // Menus with choices omit the empty-menu explanation.
+
       assert.equal(
         opened.empty === '',
         opened.items.length > 0,
         `${pick.control} says the wrong thing about what it has to offer, at ${where}`,
       );
       assert.ok(opened.head, `${pick.control} opens on no question at all, at ${where}`);
-      // A control the reader cannot press still says why on hover, and the menu behind it is
-      // where that line comes from.
+      // Disabled controls include the empty-menu explanation in their accessible name.
+
       if (pick.disabled) {
         assert.ok(pick.name.includes(opened.empty), `${pick.control} keeps the reason to itself, at ${where}`);
       }
@@ -2455,7 +2429,7 @@ test('a control that cannot be pressed is exactly a control with nothing behind 
   }
 });
 
-// A note a reader left on a turn, with everything `normalizeComment` insists on.
+// A normalized comment fixture supplies all required fields.
 function comment(over: Partial<TurnComment> = {}): TurnComment {
   return {
     id: 'c1',
@@ -2477,26 +2451,23 @@ const COMMENT_NOW = 3_000_000;
 test('a blank box sends nothing, unless comments are waiting to go with it', () => {
   assert.equal(sendAction(composerState({ draft: '' })), 'nothing');
   assert.equal(sendAction(composerState({ draft: '   \n\t ' })), 'nothing');
-  // A running turn does not turn a blank box into something worth queueing. An Enter hit by
-  // accident would otherwise put an empty prompt in front of the agent.
+  // A running turn still rejects a blank prompt.
+
   assert.equal(sendAction(composerState({ draft: '', running: true })), 'nothing');
   assert.equal(sendAction(composerState({ draft: '  ', running: true })), 'nothing');
 });
 
 test('comments alone are a prompt, so an empty box with marks on the cards still sends', () => {
-  // The reader marks three lines, presses Send, and nothing happens. That was the whole of the
-  // report. `promptToSend` has always built a prompt out of comments alone and hands them back
-  // as the entire text when the box is empty, so the words were assembled and then refused by
-  // the one control that could send them.
+  // Comments alone make the selected session's prompt sendable.
+
   const waiting = composerState({ draft: '', comments: [comment()] });
   assert.equal(
     sendAction(waiting),
     'send',
     'an empty box with comments on the cards refuses to send, so the marks cannot be answered',
   );
-  // What actually goes, rather than the expression the code already is. Asserting
-  // `emitComments(attachedComments(...))` would restate the implementation, so both sides
-  // would move together under any edit and the assertion would never bite.
+  // The sent prompt includes the comment text and quote.
+
   const sent = promptToSend(waiting, COMMENT_NOW);
   assert.ok(
     sent.includes(waiting.comments[0].note),
@@ -2512,17 +2483,16 @@ test('comments alone are a prompt, so an empty box with marks on the cards still
     'the prompt sent from an empty box opens with the blank space where the draft would have been',
   );
 
-  // Another session's comments are not this box's reason to send. They ride out on the
-  // session they were written on and nowhere else.
+  // Comments attached to another session do not enable Send.
+
   assert.equal(
     sendAction(composerState({ draft: '', comments: [comment({ sessionId: 'session-2' })] })),
     'nothing',
     'a comment on another session makes this box sendable, and would send an empty prompt',
   );
 
-  // The control the reader actually presses, not only the answer behind it. A test that stops
-  // at `sendAction` passes while the button stays wired to something else, which is how the
-  // key path shipped still refusing this exact case.
+  // The Prompt box exposes an enabled Send control for comments alone.
+
   const box = drawn({ draft: '', comments: [comment(), comment({ id: 'c2' })] }).box;
   assert.equal(box.actionControl, 'send', 'the control the reader presses is not a send');
   assert.equal(
@@ -2535,21 +2505,21 @@ test('comments alone are a prompt, so an empty box with marks on the cards still
     /Send 2 comments to Claude, with nothing typed in the box/,
     'the send control does not say that a press mails comments written elsewhere on the screen',
   );
-  // The singular is its own wording, because "Send 1 comments" is what a count read out of a
-  // template says when nobody wrote the other half.
+  // The accessible name uses the singular for one comment.
+
   const one = drawn({ draft: '', comments: [comment()] }).box;
   assert.match(one.actionName, /Send 1 comment to/, 'the send control says "1 comments" over a single comment');
   assert.doesNotMatch(one.actionName, /1 comments/, 'the send control says "1 comments"');
-  // And a box with something typed in it says nothing about comments: the reader can see what
-  // they typed, and the chip beside the button already counts what rides with it.
+  // A typed prompt omits the empty-box wording.
+
   assert.doesNotMatch(
     drawn({ draft: 'go', comments: [comment()] }).box.actionName,
     /with nothing typed/,
     'a box with a prompt in it is announced as though it were empty',
   );
 
-  // A regular running turn is no reason to hold comments back. Both agents take a prompt
-  // mid-turn, so neither queues here.
+  // Both supported agents accept comments during a running turn.
+
   for (const agent of ['claude', 'codex'] as const) {
     assert.equal(
       sendAction(composerState({ draft: '', comments: [comment()], running: true, agent })),
@@ -2558,8 +2528,8 @@ test('comments alone are a prompt, so an empty box with marks on the cards still
     );
   }
 
-  // Ordinary text queues still refuse an empty prompt. Comments use a distinct queue entry
-  // so they can wait without being copied out of the cards they remain attached to.
+  // A comment-only queue entry retains comment identities without copying their text.
+
   assert.deepEqual(
     queueAfter([], 'empty', '', 1),
     [],
@@ -2778,10 +2748,8 @@ test('read attachment refusal names the unreadable file', () => {
 
 test('a prompt typed while a turn runs goes to whichever queue will actually hold it', () => {
   assert.equal(sendAction(composerState({ draft: 'read the config' })), 'send');
-  // Claude keeps a queue of its own. Measured against a real child: a prompt written to
-  // stdin 1.2 seconds into a turn drew no error, and the CLI answered the running turn
-  // first and the new one after it. Holding it in the panel would be a second queue in
-  // front of a working one, and every fault in the panel's own is a prompt lost.
+  // Claude accepts prompts during a running turn through its native queue.
+
   assert.equal(takesMidTurnPrompt('claude'), true);
   assert.equal(sendAction(composerState({ agent: 'claude', draft: 'read the config', running: true })), 'send');
   assert.equal(
@@ -2796,15 +2764,15 @@ test('a prompt typed while a turn runs goes to whichever queue will actually hol
     'send',
     'a local control request turns Claude native mid-turn delivery into a second local queue',
   );
-  // Codex was measured the same way and takes it too: ONE at 5.8 seconds, TWO at 7.0, no
-  // error and no refusal.
+  // Codex also accepts prompts during a running turn.
+
   assert.equal(takesMidTurnPrompt('codex'), true);
   assert.equal(sendAction(composerState({ agent: 'codex', draft: 'read the config', running: true })), 'send');
-  // An agent nobody has measured keeps the panel's queue, which is the answer that cannot
-  // lose a prompt to a server which refuses it.
+  // Unsupported agents use the panel queue.
+
   assert.equal(takesMidTurnPrompt(UNKNOWN_AGENT), false);
   assert.equal(sendAction(composerState({ agent: UNKNOWN_AGENT, draft: 'read the config', running: true })), 'queue');
-  // A blank box sends nothing either way, so an Enter hit by accident asks nobody anything.
+  // Blank prompts remain unsendable during a running turn.
   assert.equal(sendAction(composerState({ agent: 'claude', draft: '  ', running: true })), 'nothing');
 });
 
@@ -2923,8 +2891,8 @@ test('Codex prompts wait behind a manual compaction turn', () => {
 });
 
 test('the box says what will happen to a prompt typed while a turn runs', () => {
-  // The one moment the answer is not obvious: the reader is watching the agent work and the
-  // button beside them says Stop.
+  // The running placeholder explains when the agent answers a new prompt.
+
   assert.equal(
     drawn({ agent: 'claude', running: true }).box.placeholder,
     'Ask Claude anything. It answers after this turn',
@@ -2933,13 +2901,13 @@ test('the box says what will happen to a prompt typed while a turn runs', () => 
     drawn({ agent: 'codex', running: true }).box.placeholder,
     'Ask Codex anything. It answers after this turn',
   );
-  // An agent nobody has measured is held by the panel, and the box says that instead.
+  // Unsupported agents use the panel's waiting-prompt wording.
   assert.equal(
     drawn({ agent: UNKNOWN_AGENT, running: true }).box.placeholder.endsWith('. It waits until this turn ends'),
     true,
   );
-  // Between turns there is nothing to explain, so the box spends its line on the key that
-  // opens the command menu instead.
+  // The idle placeholder names the command completion prefix.
+
   assert.equal(drawn({ agent: 'claude' }).box.placeholder, 'Ask Claude anything, or type / for its commands');
   assert.equal(
     drawn({ agent: 'claude', commands: [] }).box.placeholder,
@@ -2954,13 +2922,13 @@ test('the one button follows the box: Stop over an empty one, Send the moment an
   }).box;
   assert.equal(idle.actionLabel, 'Send');
   assert.equal(idle.actionControl, 'send');
-  // The panel tones the button off the kind, so it never has to read the label to know
-  // which of the two it is drawing.
+  // Button styling uses the action kind.
+
   assert.equal(idle.actionKind, 'send');
   assert.ok(idle.actionName.includes('Claude'), 'the send name does not say which agent receives the prompt');
   assert.doesNotMatch(idle.actionName, /A very long session title/, 'the send name repeats the session title');
 
-  // A turn running and nothing typed: stopping is the only thing left to do.
+  // An empty running Prompt box offers Stop.
   const watching = drawn({ draft: '', running: true }).box;
   assert.equal(watching.actionLabel, 'Stop');
   assert.equal(watching.actionControl, 'stop');
@@ -2971,10 +2939,8 @@ test('the one button follows the box: Stop over an empty one, Send the moment an
     'stop',
     'whitespace alone turns the stop into a send',
   );
-  // And comments do not turn it into a send either. The button follows the box, and a reader
-  // with one comment written would otherwise have no way to stop the turn for as long as the
-  // comment existed, which is the whole of it. Mid-turn the key sends and the button stops,
-  // which is the panel's rule for both and is why this is safe.
+  // Comments preserve the Stop button during a running turn. The send chord can still submit them.
+
   assert.equal(
     drawn({ draft: '', running: true, comments: [comment()] }).box.actionControl,
     'stop',
@@ -2986,16 +2952,16 @@ test('the one button follows the box: Stop over an empty one, Send the moment an
     'a written comment takes the Stop button away for the whole of a running turn',
   );
 
-  // The same turn, with something typed. The reader has said what they want and it is not
-  // to stop, and both agents take the prompt now, so the send is real rather than a queue.
+  // Typed text changes the running Prompt box action to Send.
+
   const typing = drawn({ draft: 'read the config', running: true }).box;
   assert.equal(typing.actionLabel, 'Send');
   assert.equal(typing.actionControl, 'send');
   assert.equal(typing.actionKind, 'send');
   assert.ok(typing.actionName.includes('Claude'), 'the send name does not say which agent receives the prompt');
 
-  // An agent the panel holds the queue for reads the same way: the press sends, and where it
-  // lands is `sendAction`'s business rather than the button's.
+  // Queue routing does not change the button's Send label.
+
   assert.equal(drawn({ agent: UNKNOWN_AGENT, draft: 'read the config', running: true }).box.actionControl, 'send');
 });
 
@@ -3003,10 +2969,10 @@ test('the button refuses an empty box, and never refuses a stop', () => {
   assert.equal(drawn({ draft: '' }).box.actionEnabled, false);
   assert.equal(drawn({ draft: '   ' }).box.actionEnabled, false);
   assert.equal(drawn({ draft: 'read the config' }).box.actionEnabled, true);
-  // Stopping a turn needs no draft, so a running turn is pressable with an empty box.
+  // Stopping a turn requires no draft.
   assert.equal(drawn({ draft: '', running: true }).box.actionEnabled, true);
   assert.equal(drawn({ draft: 'read the config', running: true }).box.actionEnabled, true);
-  // A button the reader cannot press still says why, the way the pickers beside it do.
+  // A disabled Send control explains that the prompt is empty.
   assert.ok(/nothing/i.test(drawn({ draft: '' }).box.actionName), 'the refused button keeps its reason to itself');
 });
 
@@ -3016,16 +2982,16 @@ test('the empty box names who is being asked, and promises nothing the box does 
   assert.ok(claude.includes('Claude'), 'the box does not name who is being asked');
   assert.ok(codex.includes('Codex'));
   assert.notEqual(claude, codex, 'both agents are given one line, so one of them is being told the wrong word');
-  // The box names the slash key where a menu will open. The panel's own MCP command means
-  // even an agent that publishes no list still has one useful row.
+  // The panel provides `/mcp` even without an agent command catalog.
+
   for (const said of [claude, codex, drawn({ agent: UNKNOWN_AGENT }).box.placeholder]) {
     assert.ok(said.includes('/'), `the box does not name the key that opens the menu: ${said}`);
   }
   for (const agent of ['claude', 'codex'] as const) {
     assert.ok(drawn({ agent, commands: [] }).box.placeholder.includes('/'));
   }
-  // While a turn runs the line says what becomes of the prompt instead. That is the one thing
-  // the reader cannot work out from the screen, and it is worth the row more than the key is.
+  // The running placeholder explains delivery instead of command completion.
+
   const busy = drawn({ running: true }).box.placeholder;
   assert.ok(!busy.includes('/'), `the running box spends its line on the menu: ${busy}`);
 });
@@ -3037,8 +3003,8 @@ test('the box says how to send and how to make a new line', () => {
 test('the reader words go first and their notes go under them', () => {
   const notes = [comment(), comment({ id: 'c2', note: 'And this one drops the guard.', at: 2_500 })];
   const state = composerState({ draft: '  look at both of these  ', comments: notes });
-  // The notes are the markdown the copy control already produces, rather than a second
-  // assembler that could order or word them differently.
+  // Prompt assembly uses the same comment Markdown as Copy comments.
+
   assert.equal(
     promptToSend(state, COMMENT_NOW),
     `look at both of these\n\n${emitComments(notes, 'session-1', COMMENT_NOW)}`,
@@ -3046,8 +3012,8 @@ test('the reader words go first and their notes go under them', () => {
 });
 
 test('a prompt with nothing attached goes out exactly as it was typed', () => {
-  // No heading, no separator and no empty section. The agent reads all three as something
-  // the reader meant.
+  // A prompt without comments receives no extra headings or separators.
+
   assert.equal(promptToSend(composerState({ draft: 'read the config' })), 'read the config');
   assert.equal(promptToSend(composerState({ draft: '  read the config \n' })), 'read the config');
 });
@@ -3088,7 +3054,7 @@ test('the chip counts comments with singular and plural labels', () => {
 
 test('a session with nothing on it draws no chip at all', () => {
   assert.equal(drawn({ comments: [] }).annotations, null);
-  // Notes exist, but none of them belong to this session, which is the same thing here.
+  // Another session's comments do not create an attached-comments figure.
   assert.equal(drawn({ comments: [comment({ sessionId: 'session-2' })] }).annotations, null);
 });
 
@@ -3099,12 +3065,12 @@ test('the chip hover names what is attached, and stops naming them before it run
   const chip = drawn({ comments: many }).annotations;
   assert.equal(chip?.count, ATTACHED_DETAIL_ROWS + 3);
   const lines = chip?.detail.split('\n') ?? [];
-  // The named ones, then one line summing the rest. A reader with forty notes wants the
-  // count, not forty lines of hover.
+  // The tooltip limits individual comments and counts the remaining entries.
+
   assert.equal(lines.length, ATTACHED_DETAIL_ROWS + 1);
   assert.ok(lines[0].includes('Note number 0'), 'the hover does not say what is attached');
   assert.equal(lines[ATTACHED_DETAIL_ROWS], 'and 3 more');
-  // A set that fits is named in full, with no line summing nothing.
+  // A tooltip that lists every comment omits the remainder count.
   const few = drawn({ comments: many.slice(0, 2) }).annotations;
   assert.equal(few?.detail.split('\n').length, 2);
   assert.ok(!/more/.test(few?.detail ?? ''), 'a hover that named everything still claims there is more');
@@ -3115,11 +3081,11 @@ test('a queued prompt keeps the same name across a repaint', () => {
   const first = drawn({ queued: submissions }).queue.map((row) => row.id);
   const second = drawn({ queued: submissions }).queue.map((row) => row.id);
   assert.deepEqual(first, second, 'the queue is renamed on every repaint, so the reader focus moves under them');
-  // Two prompts with the same words are two rows, and a row a reader is standing on is not
-  // the other one.
+  // Equal prompt text still creates distinct queue rows.
+
   const twins = drawn({ queued: [queued('same words'), queued('same words')] }).queue;
   assert.notEqual(twins[0].id, twins[1].id, 'two queued prompts share one name');
-  // A row whose prompt changed is a different row, so nothing follows the words that left.
+  // Replacing a queue entry changes that row's identity.
   const changed = drawn({ queued: [submissions[0], queued('read something else')] }).queue;
   assert.equal(changed[0].id, first[0]);
   assert.notEqual(changed[1].id, first[1]);
@@ -3201,17 +3167,16 @@ test('a queued prompt is one line, however many the reader typed', () => {
   assert.ok(!row.label.includes('\n'), 'the queue draws a paragraph where it has room for a line');
   assert.ok(row.label.length <= 60, 'the queue row is longer than a line');
   assert.ok(row.label.startsWith('Look at the reader'));
-  // The row says what it is and what pressing it does, because neither is anywhere else for
-  // a reader who cannot see the queue.
+  // A queue row's accessible name identifies its prompt and disclosure action.
+
   assert.ok(row.openName.includes(row.label), 'the row name does not say which prompt it is');
   assert.ok(/press/i.test(row.openName), 'the row name does not say what pressing it does');
   assert.equal(row.control, `queued:${row.id}`);
 });
 
 test('a queued prompt carries the whole of itself, because nothing else on screen holds it', () => {
-  // Sending a prompt into the queue clears the box, so until the turn ends this row is the
-  // only copy the reader has. A row that draws its first line and keeps the rest hides the
-  // one thing they would want to check before it goes out.
+  // A queued row retains complete prompt text beyond its shortened label.
+
   const long = `Look at the reader
 
 ${'and keep going '.repeat(20)}`;
@@ -3221,8 +3186,8 @@ ${'and keep going '.repeat(20)}`;
   assert.equal(row.long, true, 'a prompt of several paragraphs says it has nothing to open');
   assert.ok(row.openName && row.shutName, 'the disclosure is unnamed in one of its two states');
   assert.notEqual(row.openName, row.shutName, 'the row says the same thing open and shut');
-  // A prompt that already fits opens onto its own words, so it is drawn as text with no
-  // control. A press that answers nothing is worse than no press.
+  // A prompt that fits its label has no disclosure control.
+
   const short = drawn({ queued: [queued('read the config')] }).queue[0];
   assert.equal(short.long, false);
   assert.equal(short.text, 'read the config');
@@ -3231,9 +3196,8 @@ ${'and keep going '.repeat(20)}`;
 });
 
 test('a queued prompt can be put back in the box and copied, each by its own control', () => {
-  // The reader wrote it, and until the turn ends the row is the only copy on screen. Editing
-  // puts it back where they typed it rather than opening a second editor: the box carries the
-  // caret, the selection and the undo history, and all three are what changing a prompt needs.
+  // Edit returns a queued prompt to the Prompt text field.
+
   const row = drawn({ queued: [queued('read the config and say what it holds')] }).queue[0];
   assert.equal(row.editControl, `edit:${row.id}`);
   assert.equal(row.copyControl, `copy:${row.id}`);
@@ -3247,8 +3211,8 @@ test('a queued prompt can be put back in the box and copied, each by its own con
 });
 
 test('dropping a queued prompt is its own control, not the whole row', () => {
-  // The row opens to be read. If reading it also dropped it, the reader would lose the
-  // prompt by checking it, which is the one thing they opened it to avoid.
+  // Reading a queued prompt leaves it queued. Drop has a separate control.
+
   for (const text of [
     'read the config',
     `a long one
@@ -3265,7 +3229,7 @@ ${'x '.repeat(80)}`,
 test('an empty prompt is never queued, and the queue is left as it was', () => {
   const first = queued('first', { id: 'first' });
   assert.deepEqual(queueAfter([first], 'second', 'second', 2), [first, queued('second', { id: 'second', at: 2 })]);
-  // Trimmed on the way in, so the queue never holds a prompt padded out with whitespace.
+  // Queue insertion trims surrounding whitespace.
   assert.deepEqual(queueAfter([], 'read', '  read the config \n', 1), [queued('read the config', { id: 'read' })]);
   assert.deepEqual(queueAfter([first], 'empty', '', 2), [first]);
   assert.deepEqual(queueAfter([first], 'blank', '   \n\t ', 2), [first]);
@@ -3279,7 +3243,7 @@ test('a queued prompt is taken out by the name its own row carries', () => {
   const rows = drawn({ queued: submissions }).queue;
   assert.deepEqual(queueWithout(submissions, rows[1].id), [submissions[0], submissions[2]]);
   assert.deepEqual(queueWithout(submissions, rows[0].id), [submissions[1], submissions[2]]);
-  // A name from no row takes nothing out, rather than taking the first thing it sees.
+  // An unknown row identity removes no queue entry.
   assert.deepEqual(queueWithout(submissions, 'no-such-row'), submissions);
   assert.deepEqual(
     submissions.map((entry) => entry.text),
@@ -3297,15 +3261,13 @@ test('the composer keeps everything it drew before the box arrived', () => {
   );
   assert.equal(view.context?.percent, 41);
   assert.equal(view.agent, 'claude');
-  // And a window with no session still draws nothing at all, box and queue included.
+  // An absent session draws no Prompt box or queue.
   assert.equal(composerView(composerState({ session: '', draft: 'read the config' })), null);
 });
 
 test('a comment that has been sent is not a comment that has gone', () => {
-  // A comment that has gone out is gone. It was said and the agent has it, so every comment
-  // this session holds rides out with the next prompt and nothing is left behind to be
-  // filtered. The removal happens on the extension side, which is what the marks clearing on
-  // the cards is the sign of.
+  // Attached comments include every retained comment for this session. The host removes delivered comments.
+
   const one = comment({ id: 'c1', note: 'this was ignored' });
   const two = comment({ id: 'c2', note: 'and so was this' });
   const both = composerState({ comments: [one, two], draft: 'go' });
@@ -3317,7 +3279,7 @@ test('a comment that has been sent is not a comment that has gone', () => {
   assert.ok(promptToSend(both).includes(one.note), 'the prompt drops a comment the reader wrote');
   assert.ok(promptToSend(both).includes(two.note), 'the prompt drops a comment the reader wrote');
 
-  // Another session's are never gathered, whatever else is held.
+  // Comment attachment excludes other sessions.
   const mixed = composerState({ comments: [one, comment({ id: 'c9', sessionId: 'other' })], draft: 'go' });
   assert.deepEqual(
     attachedComments(mixed).map((c) => c.id),
@@ -3325,15 +3287,15 @@ test('a comment that has been sent is not a comment that has gone', () => {
     'the prompt gathers a comment from another session, which sends one agent a review of another',
   );
 
-  // A session nothing is written on draws no chip, rather than a chip reading zero.
+  // A session without comments has no attached-comments figure.
   assert.equal(
     drawn({ comments: [], draft: 'go' }).annotations,
     null,
     'a session with no comments still draws a chip about them',
   );
 
-  // And the chip says out loud what a reader who can see it works out by watching: the marks
-  // on the cards go when the prompt does.
+  // The figure's accessible name states that delivery clears the comments.
+
   const chip = drawn({ comments: [one, two], draft: 'go' }).annotations;
   assert.ok(chip, 'two written comments are attached to nothing');
   assert.match(chip.name, /cleared/, 'the chip does not say that sending clears the comments from the turns');
@@ -3345,13 +3307,8 @@ test('a comment that has been sent is not a comment that has gone', () => {
 });
 
 test('a prompt that reached no agent takes none of the comments it would have carried', () => {
-  // The reader writes on three turns and presses Send. Nothing reaches an agent: no folder is
-  // open, or the path to the agent is wrong, or the session's child has already exited.
-  // The panel says so and the reader presses Send again. Their comments have to still be there.
-  //
-  // This is the whole of the send's failure path. The panel hands the prompt off through two
-  // awaits and hears an answer back, and everything it does to the comments hangs off that
-  // answer. A refusal preserves the comments for another submission.
+  // Rejected delivery preserves all carried comments for another submission.
+
   const one = comment({ id: 'c1', note: 'this was ignored' });
   const two = comment({ id: 'c2', note: 'and so was this' });
   const three = comment({ id: 'c3', note: 'and this one too' });
@@ -3363,15 +3320,15 @@ test('a prompt that reached no agent takes none of the comments it would have ca
     ['c1', 'c2', 'c3'],
     'a prompt that reached no agent still destroyed every comment it would have carried',
   );
-  // And the answer is the only thing that decides it. Delivered, they go.
+  // Successful delivery removes the carried comments.
   assert.deepEqual(
     commentsAfterSend(held, carried, true),
     [],
     'a delivered prompt leaves its comments on the cards, so the reader sends them twice',
   );
 
-  // Only the set that actually rode out. A comment written while the prompt was in flight was
-  // in no prompt, and it stays whichever way the send ended.
+  // Comments added during delivery remain attached.
+
   const late = comment({ id: 'c4', note: 'written while it was going' });
   assert.deepEqual(
     commentsAfterSend([...held, late], carried, true).map((c) => c.id),
@@ -3379,7 +3336,7 @@ test('a prompt that reached no agent takes none of the comments it would have ca
     'a comment written while the prompt was in flight goes out with it unsent',
   );
 
-  // A session nothing rode out of is left exactly as it was, rather than emptied.
+  // A delivery that carries no comments removes none.
   assert.deepEqual(
     commentsAfterSend(held, [], true).map((c) => c.id),
     ['c1', 'c2', 'c3'],
@@ -3398,10 +3355,8 @@ test('a prompt that reached no agent takes none of the comments it would have ca
 });
 
 test('a turn running in one session does not make another one of the same agent look busy', () => {
-  // The panel reported which agents were busy, and the composer read that as its own
-  // session being busy. One agent with several sessions is the ordinary case
-  // here, so the box aimed at a quiet one drew Stop, and the press then resolved a
-  // session that was not running and stopped nothing at all.
+  // Running state belongs to the agent and session pair.
+
   const running = [runningKey('claude', 'session-a')];
   assert.equal(sessionRunning(running, 'claude', 'session-a'), true);
   assert.equal(
@@ -3418,10 +3373,8 @@ test('a turn running in one session does not make another one of the same agent 
 });
 
 test('a row is matched to work in flight by its key, never by the name it draws', () => {
-  // A rail row carries the agent twice. `agent` is `Claude Code`, which the reader sees, and
-  // `agentKey` is `claude`, which is what a running key holds. Matched on the name, the key
-  // reads `Claude Code:session-a`, matches nothing, and says so to nobody: the session
-  // the reader is watching quietly stops being drawn as running.
+  // Running-state keys use `agentKey`, not the displayed agent name.
+
   const rows = [
     { id: 'session-a', agentKey: 'claude', agent: 'Claude Code' },
     { id: 'session-b', agentKey: 'claude', agent: 'Claude Code' },
@@ -3429,11 +3382,11 @@ test('a row is matched to work in flight by its key, never by the name it draws'
   ];
   const running = [runningKey('claude', 'session-a'), runningKey('codex', 'session-c')];
   assert.deepEqual([...runningSessions(rows, running)], ['session-a', 'session-c']);
-  // The quiet session of a busy agent is not one of them, which is the fault
-  // `runningKey` exists for in the first place.
+  // A quiet session of the same agent remains quiet.
+
   assert.equal(runningSessions(rows, running).has('session-b'), false);
-  // A key naming a session no row lists answers nothing, because the rows are what the
-  // rail draws.
+  // Running-state keys without matching session rows produce no result.
+
   assert.deepEqual([...runningSessions(rows, [runningKey('claude', 'session-gone')])], []);
   assert.deepEqual([...runningSessions(rows, [])], []);
 });
@@ -3448,16 +3401,15 @@ test('when each running session started is joined on the same key as the set its
     [runningKey('claude', 'session-gone'), 2_000],
   ]);
   assert.deepEqual([...runningSessionsSince(rows, since)], [['session-a', 1_000]]);
-  // A key built from the name a reader sees matches nothing, which is the fault `runningKey`
-  // exists for. The rail would then bound no claim at all and say nothing about it.
+  // Start-time keys also use the agent identifier.
+
   const byName = new Map([[runningKey('Claude Code', 'session-a'), 1_000]]);
   assert.deepEqual([...runningSessionsSince(rows, byName)], []);
 });
 
 test('a session is reached by the session it is in, not by the key it was started under', () => {
-  // A child started from the box is keyed by its session and one started from the
-  // palette by its folder. Both end up in the same session once the CLI names it, so a
-  // rule that matched on the key reached only half of them.
+  // Child lookup uses session identity independently of its launch key.
+
   const states = [
     { key: 'claude:C:ws', agent: 'claude', sessionId: 'session-a', busy: true, exited: false },
     { key: 'claude:session-b', agent: 'claude', sessionId: 'session-b', busy: false, exited: false },
@@ -3479,55 +3431,53 @@ test('a session is reached by the session it is in, not by the key it was starte
 });
 
 test('an effort nobody has picked is the default, for the empty string the panel actually sends', () => {
-  // The model half of this rule had a guard and the effort half did not. `effortPick`
-  // answers before the fallback whenever no model is settled on, so a case with no model
-  // never reaches the line: the model has to be chosen for the effort to be drawn at all.
+  // The fixture selects a model so the empty-effort fallback is reachable.
+
   const settled = drawn({ models: MODELS, model: 'opus-5', effort: '' });
   assert.equal(settled.picks[1].label, 'Effort not reported', 'the effort control is drawn with no words in it');
   assert.equal(settled.picks[1].disabled, false);
   assert.ok(settled.picks[1].name.includes('Effort not reported'));
-  // A stored level this version of the model no longer offers is drawn as the reader stored
-  // it, on the same rule the model control uses.
+  // Stored effort values remain visible when absent from the catalog.
+
   assert.equal(drawn({ models: MODELS, model: 'opus-5', effort: 'ludicrous' }).picks[1].label, 'ludicrous');
 });
 test('the controls say what the session is running on when the reader picked nothing', () => {
-  // The row read "Default model" over a session the transcript recorded as Opus, and
-  // the effort control beside it said there was no effort to set while the same turn
-  // recorded running at high. Both facts were on the page already. Nothing read them.
+  // Unselected controls display the model and effort recorded on the last turn.
+
   const ran = { model: 'claude-opus-5-20260115', effort: 'high' };
   const live = drawn({ models: MODELS, model: '', effort: '', ran });
   assert.equal(live.picks[0].label, 'Opus 5', 'the model control calls a running Opus the default');
   assert.equal(live.picks[1].label, 'high', 'the effort control says there is no effort to set');
   assert.equal(live.picks[1].disabled, false, 'the effort menu cannot be opened on a running model');
-  // The reader is told it is a reading rather than their own pick, in both places they can
-  // hear it. The panel reports what it read and never calls it a choice.
+  // Accessible names distinguish last-turn readings from explicit choices.
+
   assert.ok(live.picks[0].name.includes('last turn'), 'a reading is announced as a pick');
   assert.ok(live.picks[1].name.includes('last turn'));
   assert.ok(live.picks[0].detail.includes('Nothing has been picked'));
-  // A pick the reader did make still wins over what ran.
+  // An explicit model choice takes precedence over the last turn.
   const picked = drawn({ models: MODELS, model: 'haiku-5', effort: '', ran });
   assert.equal(picked.picks[0].label, 'Haiku 5');
   assert.ok(!picked.picks[0].name.includes('last turn'), 'the reader own pick is called a reading');
 });
 
 test('a recorded model id is matched to the list only when one alias names it', () => {
-  // `list_models` answers in the CLI's aliases and a transcript records the resolved API id,
-  // so the two never compare equal and the link between them is the alias inside the id.
+  // Model matching connects CLI aliases with recorded API model identifiers.
+
   assert.equal(modelRan(MODELS, 'claude-opus-5-20260115')?.value, 'opus-5', 'no alias is found inside the id');
   assert.equal(modelRan(MODELS, 'claude-haiku-5-20251001')?.value, 'haiku-5');
-  // Nothing to match, and nothing matched, are both no answer rather than a guess.
+  // Missing or unmatched model identifiers return no model.
   assert.equal(modelRan(MODELS, null), null);
   assert.equal(modelRan(MODELS, 'gpt-5.6-sol'), null);
   assert.equal(modelRan([], 'claude-opus-5-20260115'), null);
-  // `default` is the CLI's word for making no choice. It names no model and must never match.
+  // The `default` catalog entry names no concrete model.
   const withDefault = [{ value: 'default', label: 'Default', description: '', efforts: [] }, ...MODELS];
   assert.equal(modelRan(withDefault, 'claude-opus-5-20260115')?.value, 'opus-5');
   assert.equal(modelRan(withDefault, 'anything-at-all'), null);
-  // Two aliases inside one id is a guess about which, so it is not taken. Naming the wrong
-  // model puts the wrong effort levels behind the control beside it.
+  // Multiple matching aliases leave the recorded model unresolved.
+
   const both = [...MODELS, { value: 'opus', label: 'Opus', description: '', efforts: [] }];
   assert.equal(modelRan(both, 'claude-opus-5-20260115'), null, 'one of two matching aliases is guessed at');
-  // The window suffix is the CLI's own, not part of any id.
+  // Model matching ignores the CLI window suffix.
   const long = [{ value: 'opus-5[1m]', label: 'Opus 5 (1M)', description: '', efforts: [] }];
   assert.equal(modelRan(long, 'claude-opus-5-20260115')?.value, 'opus-5[1m]');
 });
@@ -3537,7 +3487,7 @@ test('the settled model is the pick, then what ran, and the effort menu follows 
   assert.equal(settledModel(composerState({ models: MODELS, model: 'haiku-5', ran }))?.value, 'haiku-5');
   assert.equal(settledModel(composerState({ models: MODELS, model: '', ran }))?.value, 'opus-5');
   assert.equal(settledModel(composerState({ models: MODELS, model: '', ran: null })), null);
-  // The menu opens on the settled model's own levels, and ticks the one that is running.
+  // The effort menu uses the settled model and checks the recorded effort.
   const menu = pickMenu('effort', composerState({ models: MODELS, model: '', effort: '', ran }));
   assert.deepEqual(
     menu?.items.map((i) => i.value),
@@ -3552,7 +3502,7 @@ test('the settled model is the pick, then what ran, and the effort menu follows 
     'opus-5',
     'the legal effort loses the transcript-inferred model before it reaches validation',
   );
-  // A model that takes no effort setting still says so, whatever the transcript recorded.
+  // Models without an effort setting retain that explanation.
   const quick = drawn({
     models: MODELS,
     model: '',
@@ -3613,27 +3563,26 @@ test('the context figure names inspection and keeps compaction capability in the
 });
 
 test('how to send rides the send control rather than a line of its own', () => {
-  // It sat under the box and spent a row of a narrow panel on something a reader learns
-  // once. The control that does the thing is where somebody who has not learnt it looks.
+  // The Send control includes the send-key hint.
+
   const box = drawn({ draft: 'take the sandbox' }).box;
   assert.equal(box.hint, 'Enter sends, Shift and Enter for a new line');
   assert.ok(box.actionName.includes(box.hint), 'the send control does not say how it is reached from the box');
   assert.ok(box.actionName.includes('Claude'), 'the send control no longer names which agent receives the prompt');
-  // Stopping is not sending, so the stop control does not explain the send key. It is a stop
-  // exactly when the box is empty, which is the only time the reader has nothing to send.
+  // The Stop control omits the send-key hint.
+
   const stopping = drawn({ draft: '', running: true }).box;
   assert.equal(stopping.actionLabel, 'Stop');
   assert.equal(stopping.actionName.includes(stopping.hint), false);
-  // Typing during that same turn turns it back into a send, and the send explains the key.
+  // Typing during a running turn restores Send and its key hint.
   const typing = drawn({ draft: 'take the sandbox', running: true }).box;
   assert.ok(typing.actionName.includes(typing.hint));
 });
 
 test('taking a waiting prompt back into the box does not destroy what the box held', () => {
-  // Editing overwrote the box. A reader who had typed something lost it with no undo, and a
-  // reader editing a second waiting prompt lost the first outright: it had already left the
-  // queue, so the box was the only copy of it.
-  // Named the way the drawn row names it, which is the only name a press ever carries.
+  // Editing a queued prompt swaps it with the retained draft.
+
+  // The edit identity comes from the rendered queue row.
   const idOf = (list: ComposerState['queued'], index: number) => drawn({ queued: list }).queue[index].id;
   const submissions = [queued('and update the docs'), queued('then run the smoke test')];
   const first = idOf(submissions, 0);
@@ -3644,15 +3593,15 @@ test('taking a waiting prompt back into the box does not destroy what the box he
     { queued: [replacement, submissions[1]], submission: submissions[0] },
     'what the box held is gone, or the queue lost its order',
   );
-  // Pressing the same control again puts everything back where it started, which is what
-  // makes the swap safe to press by mistake.
+  // A second swap restores both entries.
+
   const back = queueEdit(swapped!.queued, idOf(swapped!.queued, 0), submissions[0]);
   assert.deepEqual(back, { queued: submissions, submission: replacement });
-  // An empty box puts nothing back, so the prompt simply leaves the queue.
+  // An empty draft removes the edited entry without replacing it.
   assert.deepEqual(queueEdit(submissions, first, null), { queued: [submissions[1]], submission: submissions[0] });
-  // A row that has gone names nothing, and nothing happens.
+  // An unknown row identity leaves the queue unchanged.
   assert.equal(queueEdit(submissions, 'no-such-row', replacement), null);
-  // The prompt that was not named is untouched wherever it sits.
+  // Editing one entry leaves the others unchanged.
   const second = queueEdit(submissions, idOf(submissions, 1), replacement);
   assert.deepEqual(second, { queued: [submissions[0], replacement], submission: submissions[1] });
 });
@@ -3744,34 +3693,29 @@ test('editing reset recovery blocks the Composer content swapped into its place'
 });
 
 test('the composer carries the session it is aimed at, not only its name', () => {
-  // The panel files the draft under this and names it on every message about the box. It was
-  // absent from the view, so the panel read `undefined`: every session shared one draft
-  // slot, and a prompt was filed against whichever session happened to be newest when
-  // the message reached the extension rather than the one the reader typed into.
+  // The view carries the session identity used for drafts and Prompt box actions.
+
   assert.equal(drawn({ sessionId: 'session-7' }).sessionId, 'session-7');
   assert.equal(drawn().sessionId, 'session-1');
 });
 
 test('a stored pick outlives a reload, and the hover never denies a pick that was made', () => {
-  // The model list is read from a child and the pick is read from storage, so on every
-  // reload there is a window with a pick and no list. `chosen` is null through it, and what
-  // the last turn ran on was being drawn over the reader's own choice: the control named a
-  // model the next turn will not run on, and the hover said nothing had been picked.
+  // A stored model choice remains visible before its catalog arrives.
+
   const ran = { model: 'claude-opus-5', effort: '' };
   const pick = drawn({ models: [], model: 'haiku-5', ran }).picks[0];
   assert.equal(pick.label, 'haiku-5', 'the transcript is drawn over the reader own pick');
   assert.ok(!pick.detail.includes('Nothing has been picked'), 'the hover denies a pick that was made');
-  // With nothing picked, the last turn is still what the control reads. The list has to be
-  // there for the name to say so: an empty one draws the menu's own reason instead.
+  // An unselected control uses the last-turn model when the catalog resolves it.
+
   const fresh = drawn({ models: MODELS, model: '', ran }).picks[0];
   assert.ok(fresh.name.includes('the last turn'), 'a control with no pick says nothing about what ran');
   assert.ok(fresh.detail.includes('Nothing has been picked'));
 });
 
 test('the compact command is the agent own, and an agent with none is sent nothing', () => {
-  // It travels its own way and never through the prompt path: a prompt carries the reader's
-  // comments and takes them away once the agent has them, and those were written for the
-  // next turn rather than for the instruction that throws the session away.
+  // Compaction uses its control path without attaching or clearing reader comments.
+
   assert.equal(compactCommand('claude'), '/compact');
   assert.equal(compactCommand('codex'), '/compact');
   assert.equal(compactCommand(UNKNOWN_AGENT), '', 'an agent with no command is handed one anyway');
@@ -4156,7 +4100,7 @@ test('a restored Codex new stays recoverable and keeps later prompts blocked', (
 
 const PRESS_AT = new Date(2026, 7, 29, 11, 0, 0).getTime();
 
-// A press the panel is still waiting on, in the shape `send` and `compact` record one.
+// A live submission fixture supplies the state retained during delivery.
 function press(over: Partial<LivePress> = {}): LivePress {
   return {
     sessionId: 'session-1',
@@ -4216,10 +4160,8 @@ test('a prompt refusal is worded for the action the reader can take', () => {
 });
 
 test('a press draws a card in the same frame, and the card says which of the three it is in', () => {
-  // The panel was silent from the press to the reply. The box emptied, the prompt went to a
-  // child, and nothing changed on screen until the poll read the reader's own words back off
-  // disk seconds later, so the one thing they could tell was that a keystroke had gone
-  // nowhere.
+  // A live card represents the submission before the transcript records it.
+
   const sent = liveOf({ live: [press()] });
   assert.ok(sent, 'a press was made and the composer draws nothing about it');
   assert.equal(sent.state, 'sent');
@@ -4227,14 +4169,14 @@ test('a press draws a card in the same frame, and the card says which of the thr
   assert.ok(sent.headline.includes('take the sandbox'), 'the card does not carry what was sent');
   assert.equal(sent.since, PRESS_AT, 'the card counts up from something other than the press');
 
-  // The child reported itself busy, which is a round trip after the press. This is the only
-  // state the panel had before, and it had it as a placeholder and a button word.
+  // The running flag moves the live card from sent to running.
+
   const running = liveOf({ live: [press()], running: true });
   assert.ok(running);
   assert.equal(running.state, 'running');
   assert.notEqual(running.status, sent.status, 'a turn that has started reads the same as one that has not');
 
-  // And a prompt that reached no agent says so. It used to look exactly like one that landed.
+  // Failed delivery reports its cause and stops the elapsed clock.
   const failed = liveOf({ live: [press({ failed: true, reason: 'Codex could not open this session.' })] });
   assert.ok(failed);
   assert.equal(failed.state, 'failed');
@@ -4247,14 +4189,13 @@ test('a press draws a card in the same frame, and the card says which of the thr
     'the primary recovery control does not include the reason in its accessible name',
   );
 
-  // Nothing at all between presses, which is most of the time.
+  // A session with no live submission draws no live card.
   assert.deepEqual(drawn().live, [], 'a session with no press in flight still draws a card');
 });
 
 test('the card carries what actually went, never what the box held', () => {
-  // Comments alone are a prompt: the reader marks three lines, leaves the box empty and
-  // presses Enter. A card drawn from the box draws nothing at all for that press, which is
-  // the one press the marks exist for.
+  // The live card carries the assembled comment-only prompt even when the draft is empty.
+
   const comment: TurnComment = {
     id: 'c1',
     sessionId: 'session-1',
@@ -4277,9 +4218,8 @@ test('the card carries what actually went, never what the box held', () => {
 });
 
 test('a compaction gets the same card, worded for a compaction', () => {
-  // The press the owner named first. It drew nothing at any point until the compaction card
-  // arrived off the transcript, which is a whole session's work with no sign that
-  // anything had been asked for.
+  // A live compaction card has compaction wording and no prompt headline.
+
   const asking = liveOf({ live: [press({ kind: 'compact', text: '' })] });
   assert.ok(asking);
   assert.equal(asking.headline, '', 'the compaction card leads with reader words, and a compaction has none');
@@ -4302,15 +4242,8 @@ test('a compaction gets the same card, worded for a compaction', () => {
   assert.ok(refused && refused.status !== asking.status, 'a compaction that reached no child reads as one on its way');
 });
 
-// What the owner hit: compaction pressed on a Codex session whose provider sign-in had
-// expired. The card said `Codex was not asked to compact this session` over
-// `The session was not compacted. the agent would not compact the session: the
-// compaction failed`. One fact told over and over, the first telling of it false, and no
-// mention of the sign-in anywhere.
-//
-// This reads the whole card rather than any one layer, because no single sentence there was
-// wrong: the failure was that correct sentences stood on top of each other until nothing was
-// left for the cause.
+// Expired authentication supplies the failed compaction's cause.
+
 test('a failed compaction says why once, and never says twice that it failed', () => {
   const said = failedCompactionDelivery(
     'codex',
@@ -4322,9 +4255,8 @@ test('a failed compaction says why once, and never says twice that it failed', (
   });
   assert.ok(card);
 
-  // Read before the exact wording below, because it is the assertion that must name the
-  // fault. Each pattern is how one layer said the outcome again, and the card has room for
-  // the outcome and the cause and nothing else, so every repeat costs the reader the cause.
+  // The combined status and reason omit repeated failure statements.
+
   for (const again of [
     /was not asked to compact/i,
     /was not compacted/i,
@@ -4344,13 +4276,13 @@ test('a failed compaction says why once, and never says twice that it failed', (
     'The security token included in the request has expired. Try compacting again once that is resolved.',
   );
 
-  // The reader whose agent said nothing is told that, rather than given a cause the panel
-  // made up. An invented one reads exactly like a real one and sends them looking for it.
+  // An empty agent error receives a retry message without an invented cause.
+
   const silent = failedCompactionDelivery('codex', new Error('')).reason;
   assert.equal(silent, 'No reason came back. Try compacting again.');
 
-  // A compaction has nothing to restore, so the writer-lock words drop the prompt's way out
-  // and keep the one move that is left.
+  // A locked compaction offers retry instructions without prompt restoration.
+
   const locked = failedCompactionDelivery('codex', new Error('session already has an active writer')).reason;
   assert.equal(locked, 'Codex already has this session open in another client. Close it there and try again.');
   assert.doesNotMatch(locked, /restore/i, 'a compaction offers no Restore, so its words must not name one');
@@ -4374,25 +4306,20 @@ test('a failed clear says how to retry without offering Restore', () => {
 });
 
 test('a prompt sent while a compaction runs draws a card of its own', () => {
-  // What the owner hit: press compact, type a follow-up, send it, and the follow-up is gone
-  // from the screen until the compaction finishes and the transcript catches up with it,
-  // which is a whole session's work later. The prompt was being called a mid-turn
-  // prompt, and a mid-turn prompt draws no card because the running turn's card carries it.
-  // A compaction is not a turn: it carries none of the reader's words, and the card it
-  // becomes carries no prompts, so there was nothing anywhere for the follow-up to be in.
+  // A prompt sent during compaction receives its own live card.
+
   const compacting = press({ kind: 'compact', text: '' });
   assert.equal(pressIsMidTurn('prompt', true, [compacting]), false);
   const followUp = liveOf({ live: [press({ midTurn: pressIsMidTurn('prompt', true, [compacting]) })], running: true });
   assert.ok(followUp, 'the follow-up sent during a compaction draws no card, so it is off the screen entirely');
   assert.ok(followUp.headline.includes('take the sandbox'), 'the card carries none of what was sent');
 
-  // A compaction pressed while a turn runs is its own piece of work as well, and it was
-  // being folded into that turn for the same wrong reason.
+  // Compaction remains a separate operation during a running turn.
+
   assert.equal(pressIsMidTurn('compact', true, []), false);
 
-  // And the one press that really is answered inside work already going still opens no card:
-  // a prompt sent into a running turn, whose card is on screen carrying the reply and, a
-  // moment later, the prompt itself.
+  // A prompt accepted during an ordinary turn uses that turn's card.
+
   assert.equal(pressIsMidTurn('prompt', true, [press()]), true);
   assert.equal(pressIsMidTurn('prompt', true, []), true);
   assert.equal(
@@ -4401,11 +4328,8 @@ test('a prompt sent while a compaction runs draws a card of its own', () => {
     'a prompt sent with nothing running is folded into a turn that does not exist',
   );
 
-  // A failed press is not in flight, whatever the slot still holds. Nothing sweeps one:
-  // livePressOver keeps it for the reader to dismiss, so a compaction that never reached an
-  // agent sits in the slot until they press Dismiss. Read as work still going, it would turn
-  // every later prompt into one of its neighbours, and each would draw a card of its own
-  // beside the running turn card that is already carrying the prompt.
+  // A failed compaction stays dismissible but does not count as work in progress.
+
   const refused = press({ kind: 'compact', text: '', failed: true });
   assert.equal(
     livePressOver(refused, PRESS_AT + 1, true, PRESS_AT + LIVE_PRESS_LIMIT_MS * 2, false),
@@ -4420,12 +4344,8 @@ test('a prompt sent while a compaction runs draws a card of its own', () => {
 });
 
 test('a prompt sent during a compaction stands beside it, and neither card takes the other away', () => {
-  // What the owner hit: press compact, and while the agent is still compacting, send a
-  // follow-up. The panel held one press per session, so the follow-up took the slot and
-  // the compaction card came off the screen. Nothing then said a compaction was running, and
-  // the card that was left said the agent was working on the follow-up, which it was not: the
-  // CLI queues that prompt behind the compaction and answers it minutes later. Both cards
-  // only came back when the compaction ended and the transcript caught up.
+  // A follow-up prompt preserves the concurrent compaction card.
+
   const compacting = press({ kind: 'compact', text: '', ran: true, started: true });
   const followUp = press({ text: 'and while you are there, read the plan', at: PRESS_AT + 12_000, ran: true });
   const held = pressesAfter([compacting], followUp);
@@ -4437,8 +4357,8 @@ test('a prompt sent during a compaction stands beside it, and neither card takes
 
   const cards = drawn({ live: held, running: true }).live;
   assert.equal(cards.length, 2, 'the two pieces of work do not both say they are happening');
-  // Newest first, the order the column draws turns in: the press made last stands above the
-  // one it was sent behind.
+  // Live cards appear newest first.
+
   assert.equal(cards[0].kind, 'prompt');
   assert.equal(cards[1].kind, 'compact');
   assert.ok(cards[0].headline.includes('read the plan'), 'the follow-up card carries none of what was sent');
@@ -4446,17 +4366,16 @@ test('a prompt sent during a compaction stands beside it, and neither card takes
     cards[1].status.toLowerCase().includes('compact'),
     'the compaction card no longer says a compaction is running',
   );
-  // And the follow-up says what is true of it. The CLI has taken it and will answer it when
-  // the compaction ends, so a card drawn from the session's running flag alone claimed
-  // work on it that had not started.
+  // The follow-up remains waiting until the compaction finishes.
+
   assert.match(
     cards[0].status,
     /has this and is finishing something else first/,
     'the follow-up card says the agent is working on it while it is still compacting',
   );
 
-  // A second follow-up takes the first one place and leaves the compaction alone. Two prompts
-  // are not two pieces of work: the second is answered inside whatever the first one started.
+  // A newer follow-up replaces the earlier prompt card while preserving compaction.
+
   const again = press({ text: 'one more thing', at: PRESS_AT + 30_000 });
   assert.deepEqual(
     pressesAfter(held, again),
@@ -4464,36 +4383,33 @@ test('a prompt sent during a compaction stands beside it, and neither card takes
     'every prompt typed during a compaction opens a card of its own',
   );
 
-  // And a compaction pressed while a prompt is in flight joins it rather than replacing it,
-  // which is the same rule read the other way round.
+  // Starting compaction also preserves an existing prompt card.
+
   assert.deepEqual(pressesAfter([followUp], compacting), [followUp, compacting]);
 });
 
 test('the words being streamed are written on the press the reader is waiting on', () => {
-  // One press is the common case and there is nothing to choose. A prompt waiting behind a
-  // compaction is the case that has to choose, and the words then belong to the prompt: it is
-  // the newest press, and it is the answer the reader is watching for.
+  // Reply text belongs to the newest successful submission.
+
   const compacting = press({ kind: 'compact', text: '' });
   const followUp = press({ text: 'and while you are there, read the plan', at: PRESS_AT + 12_000 });
   assert.equal(pressForReply([compacting]), compacting);
   assert.equal(pressForReply([compacting, followUp]), followUp);
   assert.equal(pressForReply([]), null, 'a session with no press in flight is handed one anyway');
-  // A press that never reached an agent is not one the words can belong to.
+  // Failed submissions cannot receive reply text.
   assert.equal(pressForReply([{ ...followUp, failed: true }]), null);
   assert.equal(pressForReply([compacting, { ...followUp, failed: true }]), compacting);
 
-  // And the card drawn under "You asked" on a running turn reads the prompt press alone. A
-  // compaction carries none of the reader words, so a compaction pressed after a mid-turn
-  // prompt would otherwise take that prompt off the turn card.
+  // The running turn's prompt slot reads prompt submissions independently of compaction.
+
   assert.equal(pressOfKind([followUp, compacting], 'prompt'), followUp);
   assert.equal(pressOfKind([compacting], 'prompt'), null);
   assert.equal(pressOfKind([compacting], 'compact'), compacting);
 });
 
 test('the card comes down when the transcript draws the real turn', () => {
-  // A card that outlives its turn draws the prompt twice, and the reader cannot tell which of
-  // the two the agent actually has. Both CLIs write the reader's words to the transcript
-  // before they answer, so the real turn is what ends the card.
+  // The recorded turn replaces its matching live card.
+
   const one = press();
   assert.equal(
     livePressOver(one, null, false, PRESS_AT + 1000, false),
@@ -4559,7 +4475,7 @@ test('the card comes down when the transcript draws the real turn', () => {
 });
 
 test('a stopped turn keeps its card until the accepted selected window contains it', () => {
-  // Running state cannot stand in for the selected parser's accepted result.
+  // Running state does not establish that the selected parser accepted a turn.
   const started = press({ ran: true, started: true });
   assert.equal(
     livePressOver(started, null, true, PRESS_AT + 1000, false),
@@ -4571,17 +4487,15 @@ test('a stopped turn keeps its card until the accepted selected window contains 
     false,
     'the turn stopped before its accepted record replaced the live card',
   );
-  // A press the agent has taken and not begun is not one that stopped. This is the prompt sent
-  // during a compaction: the CLI takes it at once and answers it when the compaction ends, so
-  // read off `ran` the end of the compaction took its card down before its own turn began.
+  // An accepted prompt waiting behind compaction retains its card before its turn starts.
+
   assert.equal(
     livePressOver(press({ ran: true }), null, false, PRESS_AT + 1000, false),
     false,
     'a prompt waiting behind a compaction loses its card the moment the compaction ends',
   );
-  // A press that has not been seen in flight yet is not one that has stopped. Without this a
-  // card is taken away in the gap between the press and the child reporting itself busy,
-  // which is the whole gap the card exists to fill.
+  // An unacknowledged submission also retains its live card.
+
   assert.equal(
     livePressOver(press(), null, false, PRESS_AT + 1000, false),
     false,
@@ -4597,9 +4511,8 @@ test('only the press the agent is working on is marked as begun', () => {
     [compacting, behind],
     'a quiet session began work the agent has not started',
   );
-  // The oldest press the agent has taken, and only that one. An agent works one thing at a
-  // time in a session, and the prompt behind a compaction is taken at once and answered
-  // when the compaction ends.
+  // Only the oldest accepted submission begins when the session becomes busy.
+
   const going = pressesAfterRunning([compacting, behind], true);
   assert.deepEqual(
     going,
@@ -4611,14 +4524,14 @@ test('only the press the agent is working on is marked as begun', () => {
     going,
     'the press already working is marked again, so a second one begins beside it',
   );
-  // The compaction over and its card gone, the prompt is what the agent is on.
+  // After compaction leaves, the waiting prompt can begin.
   assert.deepEqual(pressesAfterRunning([behind], true), [{ ...behind, started: true }]);
   assert.deepEqual(
     pressesAfterRunning([press()], true),
     [press()],
     'a press the agent never took is marked as work it began',
   );
-  // A failed press is neither working nor in the way of the one that is.
+  // Failed submissions neither begin nor block later work.
   const dead = press({ kind: 'compact', text: '', failed: true });
   assert.deepEqual(
     pressesAfterRunning([dead, behind], true),
@@ -4628,9 +4541,8 @@ test('only the press the agent is working on is marked as begun', () => {
 });
 
 test('a prompt waiting behind a compaction says so rather than claiming the agent is on it', () => {
-  // The CLI takes it at once and answers it when the compaction ends. Drawn from the
-  // session's own running flag, the card said the agent was working on the prompt while
-  // it was still compacting, which is the claim these cards exist to stop the panel making.
+  // Accepted but unstarted prompts retain waiting wording.
+
   const waiting = liveOf({ running: true, live: [press({ ran: true })] });
   assert.ok(waiting);
   assert.match(
@@ -4641,7 +4553,7 @@ test('a prompt waiting behind a compaction says so rather than claiming the agen
   const going = liveOf({ running: true, live: [press({ ran: true, started: true })] });
   assert.ok(going);
   assert.match(going.status, /is working on this/, 'the press the agent is actually on reads as waiting');
-  // Words already arriving say the work began, whatever the flags read.
+  // Reply text establishes that the submission started.
   const replying = liveOf({ running: true, live: [press({ ran: true, reply: 'on it' })] });
   assert.ok(replying);
   assert.match(
@@ -4684,9 +4596,8 @@ test('a busy signal before the handoff answer cannot erase a rejected prompt', (
   const accepted = pressesAfterHandoff([waiting], PRESS_AT, { delivered: true, reason: '' })[0];
   assert.equal(accepted.ran, true, 'an accepted prompt cannot finish with the turn');
   assert.equal(accepted.failed, false);
-  // Taken is not begun. The agent takes a prompt sent during a compaction at once and answers
-  // it when the compaction ends, so a session going quiet in between is the compaction
-  // stopping and not this prompt.
+  // Acceptance alone does not establish that a prompt's turn started or ended.
+
   assert.equal(
     livePressOver(accepted, null, false, PRESS_AT + 1000, false),
     false,
@@ -4736,8 +4647,8 @@ test('only the Codex writer-lock refusal is offered continuation recovery', () =
 });
 
 test('a compaction keeps its time limit and a prompt stays until its recorded turn arrives', () => {
-  // The ceiling covers a compaction answered in a way this version does not read. Past it the
-  // panel has no evidence, and a card still claiming work is a claim it cannot support.
+  // An inactive compaction without a recorded replacement expires at its time limit.
+
   const compacting = press({ kind: 'compact', text: '' });
   assert.equal(
     livePressOver(compacting, null, false, PRESS_AT + LIVE_PRESS_LIMIT_MS - 1, false),
@@ -4749,9 +4660,8 @@ test('a compaction keeps its time limit and a prompt stays until its recorded tu
     true,
     'a card with no evidence behind it is drawn for ever',
   );
-  // Not while the session is working. The ceiling stands in for evidence and a working
-  // session is that evidence, so a compaction longer than the ceiling keeps its card
-  // instead of taking it and every prompt sent behind it off the screen.
+  // A running session keeps its compaction card beyond the time limit.
+
   assert.equal(
     livePressOver(compacting, null, true, PRESS_AT + LIVE_PRESS_LIMIT_MS * 2, false),
     false,
@@ -4768,8 +4678,8 @@ test('a compaction keeps its time limit and a prompt stays until its recorded tu
     false,
     'a stopped prompt with no recorded turn disappears after five minutes',
   );
-  // A failed card is the reader's to clear and nothing takes it away. It is the one card that
-  // says something they have to act on, and a notice that removes itself is one they miss.
+  // Failed cards remain until the reader dismisses them.
+
   const gone = press({ failed: true });
   assert.equal(
     livePressOver(gone, PRESS_AT + 500, true, PRESS_AT + LIVE_PRESS_LIMIT_MS * 4, true),
@@ -4779,8 +4689,8 @@ test('a compaction keeps its time limit and a prompt stays until its recorded tu
 });
 
 test('only a failed card offers a way to clear it', () => {
-  // Every other card is taken down by the poll, and a control that does what the panel is
-  // about to do anyway is a press that answers nothing.
+  // Successful submissions wait for automatic replacement and offer no dismiss control.
+
   for (const which of [press(), press({ ran: true })]) {
     const card = liveOf({ live: [which] });
     assert.ok(card);
@@ -4806,9 +4716,8 @@ test('only a failed card offers a way to clear it', () => {
 });
 
 test('the card is keyed on the session, and worded in that session agent name', () => {
-  // One agent runs several sessions at once. A press filed under the agent draws its
-  // card over whichever of them the reader is looking at, which is the fault `runningKey`
-  // exists for and the fault this card has available to it.
+  // Each live submission retains its session identity and agent wording.
+
   const codex = liveOf({ agent: 'codex', live: [press({ agent: 'codex', sessionId: 'session-9' })] });
   assert.ok(codex);
   assert.ok(codex.status.includes('Codex'), 'the card names the wrong agent');
@@ -4820,8 +4729,8 @@ test('which state a card is in is decided here, so the panel tones it and reads 
   assert.equal(liveState(press(), false), 'sent');
   assert.equal(liveState(press(), true), 'running');
   assert.equal(liveState(press({ failed: true }), false), 'failed');
-  // Failed wins over running: a prompt the handoff refused is a prompt no turn is running for,
-  // whatever else the session is busy with.
+  // Failed delivery takes precedence over the session's running state.
+
   assert.equal(liveState(press({ failed: true }), true), 'failed');
 });
 
@@ -4853,42 +4762,36 @@ test('completed commentary leaves the provisional response line', () => {
 });
 
 test('a reply arriving says the turn is running, whatever the child has reported', () => {
-  // The two signals travel different routes and the streamed one is often first: the words
-  // are written before any child has been asked whether it is busy. A card that still said
-  // Sending while the answer was being written on it would be wrong about the one thing the
-  // reader can see for themselves.
+  // Streamed reply text establishes running state before the busy signal arrives.
+
   assert.equal(liveState(press({ reply: 'one, two' }), false), 'running');
   assert.equal(liveState(press({ reply: '' }), false), 'sent');
   assert.equal(liveState(press({ reply: 'one, two' }), true), 'running');
-  // A press the handoff refused reached no agent, so anything on it is not an answer to it.
+  // Failed delivery takes precedence over any retained reply text.
   assert.equal(liveState(press({ reply: 'one, two', failed: true }), false), 'failed');
 });
 
 test('a prompt sent into a running turn draws no card of its own', () => {
-  // It starts no turn, so there is nothing for a card to become: the agent answers it inside
-  // the turn already going, and that turn's card is on screen carrying the reply, the log and
-  // the prompt itself once the transcript has it. A card as well would be one turn drawn
-  // twice, one of them above the session heading, which is what the reader saw.
+  // A prompt sent during an ordinary turn uses that turn's card.
+
   assert.equal(liveOf({ live: [press({ midTurn: true })], running: true }), null);
   assert.equal(
     liveOf({ live: [press({ midTurn: true, reply: 'part of an answer' })] }),
     null,
     'a reply streaming into a running turn opens a second card for the same turn',
   );
-  // A fresh press still draws one. It is the case with no turn card to fold into.
+  // A prompt without a running turn receives a live card.
   assert.ok(liveOf({ live: [press()] }), 'a press with no turn to belong to says nothing at all');
-  // And a press that never reached the agent draws one wherever it was sent from: it is the
-  // one card that says something the reader has to act on, and no turn card carries that.
+  // Failed delivery receives a recovery card even for a mid-turn prompt.
+
   const failed = liveOf({ live: [press({ midTurn: true, failed: true })] });
   assert.ok(failed, 'a prompt that never left is swallowed because a turn happened to be running');
   assert.equal(failed.state, 'failed');
 });
 
 test('the card holds the reader words and the reply at once, and the words whole', () => {
-  // The card stands where the turn's own card will stand, so it carries what the turn card
-  // will carry: the prompt in full, clamped by the stylesheet, and the reply as it arrives
-  // under it. The prompt is not dropped when the reply starts, because a placeholder that
-  // stops showing what was asked is a card the reader cannot check.
+  // A live card retains the prompt while displaying streamed reply text.
+
   const quiet = liveOf({ live: [press()] });
   assert.ok(quiet);
   assert.equal(quiet.reply, '', 'a card with nothing back yet draws a reply line anyway');
@@ -4902,10 +4805,8 @@ test('the card holds the reader words and the reply at once, and the words whole
 });
 
 test('the card leads with the line the turn will lead with', () => {
-  // The press card and the turn card that replaces it stand in the same place and lead with
-  // the same slot, so they have to lead with the same words. A card carrying the whole prompt
-  // would draw those words and a paragraph more of them, and the column below it would move
-  // the moment the poll caught up.
+  // Live and recorded cards use the same first-line headline.
+
   const many = liveOf({ live: [press({ text: 'first line\nsecond line\n\nand a third' })] });
   assert.ok(many);
   assert.equal(many.headline, 'first line');
@@ -4923,12 +4824,11 @@ test('a streamed reply keeps its paragraphs and indentation for the panel', () =
 });
 
 test('the composer carries the unsent prompt so a new panel can put it back', () => {
-  // The panel builds its box from this view and from nothing else. Without the draft on it,
-  // a window reopened draws an empty box over a prompt the extension is still holding, and
-  // the reader has no way to reach what they typed.
+  // The view carries the retained draft for panel restoration.
+
   assert.equal(drawn({ draft: 'check the store for a leak' }).draft, 'check the store for a leak');
   assert.equal(drawn({ draft: '' }).draft, '', 'an untyped box is an empty draft, not a missing field');
-  // Handed over as typed. The box is a textarea, so the whitespace is the reader's.
+  // Draft whitespace remains unchanged.
   const many = 'one\ntwo\n\n  three';
   assert.equal(drawn({ draft: many }).draft, many);
 });
@@ -4945,7 +4845,7 @@ test('a new session draft snapshots the launch profile without mutable aliases',
   profile.model = 'sonnet';
   assert.equal(draft.profile.model, 'opus');
   assert.equal(draft.sourceSession, 'old');
-  // A draft is made by the panel and by nobody else, so none of it is the reader's work yet.
+  // Programmatic draft creation starts with `handChanged` false.
   assert.equal(draft.handChanged, false, 'a draft nobody has pressed counts as work the reader did');
   assert.equal(
     newSessionDraft('draft-2', 'C:\\ws', 'old', 10, profile, null, true).handChanged,
@@ -5044,7 +4944,7 @@ test('the launcher preserves the stored Codex override instead of copying the ef
   assert.equal(matched.primary?.profile.permissionMode, '');
   assert.ok(matched.primary?.detail.includes('Codex default'));
 
-  // With nothing stored, the row takes the new setup permission, never the effective mode.
+  // Without a stored permission override, the launcher uses the new-session default.
   const unpicked = sessionLauncherView({ ...matching, askMode: undefined }, [], LAUNCH_MODELS);
   assert.equal(unpicked.primary?.profile.permissionMode, 'on-request');
 
@@ -5226,7 +5126,7 @@ test('pinned setup rows keep their ids and mark missing catalog values', () => {
   assert.equal(launcherProfile(view, { kind: 'row', key: 'pin:missing' }), null);
 });
 
-// Ten distinct Claude setups the launcher catalog offers, the newest first.
+// Ten distinct offered Claude profiles are ordered newest first.
 const TEN_RECENTS: SessionProfile[] = ['plan', 'manual', 'acceptEdits', 'auto', '']
   .flatMap((permissionMode) => ['', 'high'].map((effort) => ({ effort, permissionMode })))
   .map(({ effort, permissionMode }) => ({
@@ -5333,7 +5233,7 @@ test('a pinned row names its section and an unavailable one names its missing va
   assert.ok(model.name.endsWith(`. ${view.words.missingReasons.model}`), model.name);
   assert.ok(model.detail.endsWith(view.words.missingReasons.model), model.detail);
   assert.ok(mode.name.endsWith(`. ${view.words.missingReasons.permission}`), mode.name);
-  // The catalog's fallback names a different permission, so the row shows the stored one.
+  // Unavailable pinned permissions retain their stored value.
   assert.equal(mode.detail, `Claude · Opus 5 · high · retired · ${view.words.missingReasons.permission}`);
   assert.equal(mode.name, `Pinned setups: Claude · Opus 5 · high · retired. ${view.words.missingReasons.permission}`);
 });
@@ -5376,7 +5276,7 @@ test('the custom picker carries agent models, model efforts, and permission choi
   );
   assert.equal(codex.permissions[0].label, 'Codex default');
   assert.equal(claude.permissions[0].label, 'Claude default');
-  // A setup with no remembered permission preselects the common workflow, not the agent default.
+  // A setup without a remembered permission selects the agent's new-session default.
   assert.equal(codex.defaultPermission, 'on-request');
   assert.equal(claude.defaultPermission, 'auto');
   assert.ok(codex.permissions[1].name.includes('read files'));
@@ -5459,12 +5359,12 @@ test('a draft and its create action expose the complete snapshotted profile', ()
     draft.picks.map((pick) => pick.label),
     ['Codex', 'GPT-5.6', 'High', 'Full Access'],
   );
-  // The setup is the draft's own until it starts, so every control on it can be pressed.
+  // Draft settings remain editable before launch.
   assert.ok(
     draft.picks.every((pick) => !pick.disabled),
     'a draft draws a setting the reader cannot change',
   );
-  // The four facts the controls draw, in one line, for the hover.
+  // The draft tooltip includes agent, model, effort, and permission.
   assert.deepEqual(draft.draftTag, {
     word: 'New draft',
     detail: 'Codex · GPT-5.6 · High · Full Access',
@@ -5564,15 +5464,14 @@ test('session aliases expire and retain only the newest provisional identities',
 });
 
 test('a command the agent answers itself takes its own card away', () => {
-  // `/clear`, `/model` and `/context` all end this way: the agent reports a turn with no turn
-  // in it and writes nothing a poll can find. Nothing else takes the card, so the reader is
-  // told an agent is working for as long as the panel stays open.
+  // Local command answers remove cards without waiting for an unrecorded turn.
+
   for (const command of ['/model', '/context', '/clear']) {
     const asked = press({ text: command });
     assert.deepEqual(pressesAfterLocalAnswer([asked]), [], `the card for local answer ${command} is still on screen`);
   }
-  // A press with a real turn behind it keeps its card. The transcript owes that card its
-  // replacement, and taking it here leaves the reader looking at nothing until the poll.
+  // A started turn keeps its card until a recorded replacement arrives.
+
   const working = press({ ran: true, started: true });
   assert.deepEqual(
     pressesAfterLocalAnswer([working]),
@@ -5586,11 +5485,11 @@ test('a command the agent answers itself takes its own card away', () => {
     [compacting],
     'a local answer removed the started compaction beside it',
   );
-  // A failed press is the reader's to dismiss, wherever the answer came from.
+  // A local answer leaves failed cards dismissible.
   const dead = press({ failed: true, reason: 'no' });
   assert.deepEqual(pressesAfterLocalAnswer([dead]), [dead], 'a failure the reader has to act on removed itself');
-  // The oldest press that has not begun is the one that ended. A compaction the agent turns
-  // down reports the same empty turn, and the prompt waiting behind it has not been answered.
+  // An empty local answer removes only the oldest unstarted submission.
+
   const refused = press({ kind: 'compact', text: '' });
   const behind = press({ at: PRESS_AT + 1000 });
   assert.deepEqual(
@@ -5602,9 +5501,8 @@ test('a command the agent answers itself takes its own card away', () => {
 });
 
 test('a cleared session carries the reader forward and leaves its own turns behind', () => {
-  // `/clear` keeps the child and starts a new session inside it. The source keeps every
-  // turn it has and stays resumable, so this is not the rename above: both ids are real and
-  // both have to stay reachable.
+  // Clear preserves the source session while the child continues under a new session identity.
+
   const settings = {
     selectedModel: 'opus',
     selectedEffort: '',
@@ -5633,17 +5531,17 @@ test('a cleared session carries the reader forward and leaves its own turns behi
     'old',
     'new',
   );
-  // Everything the source can no longer answer for travels with the reader.
+  // Live submissions, queue, draft text, and selection move to the new session.
   assert.equal(moved.live.old, undefined);
   assert.equal(moved.live.new[0].sessionId, 'new', 'the card is still filed under a session the child has left');
   assert.deepEqual(Object.keys(moved.queues), ['new']);
   assert.deepEqual(moved.boxText, { new: 'half a sentence' });
   assert.equal(moved.showing, 'new', 'the panel is still watching the file nobody writes to');
-  // The model pick is copied rather than moved. The source is still there to be reopened.
+  // Settings remain available on the source session and are copied to its successor.
   assert.equal(moved.settings.old, settings, 'reopening the cleared session finds no model');
   assert.equal(moved.settings.new, settings);
   assert.equal(moved.profiles.old, profile);
-  // Beside the session it came from, and the source keeps its place.
+  // The new session appears beside the source without moving the source row.
   assert.deepEqual(moved.railOrder, ['first', 'new', 'old', 'last']);
 });
 
@@ -5747,8 +5645,8 @@ test('origin metadata moves with an adopted draft and leaves with an untouched o
   assert.deepEqual(abandoned?.origins, {});
 });
 
-// The setup a draft will start on. The default is the one the launcher leads with: the
-// current session's, carried over.
+// The draft profile fixture defaults to an inherited current-session setup.
+
 function draftProfile(over: Partial<SessionProfile> = {}): SessionProfile {
   return {
     agent: 'claude',
@@ -5760,14 +5658,13 @@ function draftProfile(over: Partial<SessionProfile> = {}): SessionProfile {
   };
 }
 
-// A draft as the panel holds one: a profile, and nothing else out of the ordinary fixture,
-// because a draft is drawn by the same composer and the point of most of these tests is
-// which of the two it reads.
+// Add a draft profile to the shared Prompt box fixture.
+
 function draftDrawn(over: ComposerStateInput = {}, profile: Partial<SessionProfile> = {}): ComposerView {
   return drawn({ profile: draftProfile(profile), ...over });
 }
 
-// One menu a draft's control opens, for a test that has already said it expects one.
+// Require an open draft menu for these assertions.
 function draftMenu(control: string, over: ComposerStateInput = {}, profile: Partial<SessionProfile> = {}): Menu {
   const opened = pickMenu(control, composerState({ profile: draftProfile(profile), ...over }));
   if (!opened) {
@@ -5790,9 +5687,8 @@ test('a draft wears its setup controls followed by its agent servers', () => {
     view.picks.map((pick) => pick.disabled),
     [false, false, false, false],
   );
-  // Every name says what the control is, what it is set to, and that the press reaches this
-  // draft alone. A draft sits in the rail beside the session its setup came from, and a
-  // reader who cannot see the tag above the row has nothing else that tells them apart.
+  // Draft control names identify the setting, selected value, and target draft.
+
   assert.deepEqual(
     view.picks.map((pick) => pick.name),
     [
@@ -5804,7 +5700,7 @@ test('a draft wears its setup controls followed by its agent servers', () => {
         'Press to change it.',
     ],
   );
-  // The draft chip's hover carries the chosen mode's own sentence too.
+  // The draft permission tooltip includes the selected mode description.
   assert.equal(view.picks[3].detail, askMode('claude', 'auto').description);
   const withServers = draftDrawn({ mcpServers: SERVERS });
   assert.deepEqual(
@@ -5822,8 +5718,8 @@ test('a draft wears its setup controls followed by its agent servers', () => {
 });
 
 test('a draft reads its own setup and never the session it was copied from', () => {
-  // The state carries the source session's picks and its stored ask level. A draft reads
-  // neither: its profile is the only answer about what it will start on.
+  // The draft profile takes precedence over source-session settings.
+
   const view = draftDrawn(
     { model: 'haiku-5', effort: '', askMode: 'acceptEdits' },
     { model: 'opus-5', effort: 'low', permissionMode: 'plan' },
@@ -5852,8 +5748,8 @@ test('a draft control with nothing behind it cannot be pressed and says why', ()
     quick.picks.map((pick) => pick.disabled),
     [false, false, true, false],
   );
-  // Which agent starts it and how much that agent asks are answerable before any catalog has
-  // arrived, so those two are never the controls that go grey.
+  // Agent and permission choices remain enabled while model metadata is unavailable.
+
   assert.deepEqual(
     waiting.picks.map((pick) => pick.disabled),
     [false, true, true, false],
@@ -5861,9 +5757,8 @@ test('a draft control with nothing behind it cannot be pressed and says why', ()
 });
 
 test('a draft draws no context figure, whatever it was handed', () => {
-  // Any figure reaching a draft is the source session's window. A draft has run no turn
-  // and filled nothing, so drawing it would say a session with nothing in it is most of
-  // the way full.
+  // Drafts omit context figures because they have no turn usage.
+
   const context = { used: 118_000, max: 200_000 };
   assert.equal(draftDrawn({ context }).context, null);
   assert.equal(
@@ -5878,9 +5773,8 @@ test('the tag says what the draft is and leaves the setup to the controls', () =
     word: 'New draft',
     detail: 'Claude · Opus 5 · high · Auto',
   });
-  // The same word wherever the setup came from and whatever the reader has since done to it.
-  // The four controls under the tag draw every value, so words on the tag about the setup add
-  // no fact, and the ones naming the source built a sentence out of a session title.
+  // The New draft label stays the same for inherited, recent, and custom profiles.
+
   for (const source of ['inherited', 'recent', 'custom'] as const) {
     assert.deepEqual(
       draftDrawn({}, { source }).draftTag,
@@ -5911,8 +5805,8 @@ test('the agent menu opens on a draft and on nothing else', () => {
   );
   assert.equal(opened.session, 'session-1');
   assert.equal(opened.agent, 'claude');
-  // A session with a child behind it is that agent's session and cannot become
-  // another agent's, so the control exists on a draft alone.
+  // Only drafts offer an agent menu.
+
   assert.equal(pickMenu('agent', composerState()), null);
 });
 
@@ -5929,8 +5823,8 @@ test('a draft menu opens with the default row and ticks what the draft is set to
     models.items.filter((row) => row.checked).map((row) => row.value),
     ['opus-5'],
   );
-  // A draft runs on the agent's own default until the reader picks a model, so that row is a
-  // choice like any other and carries the tick while nothing else is chosen.
+  // An unselected draft model leaves every model row unchecked.
+
   const fresh = draftMenu('model', {}, { model: '', effort: '' });
   assert.deepEqual(
     fresh.items.filter((row) => row.checked).map((row) => row.value),
@@ -5952,8 +5846,8 @@ test('a draft menu opens with the default row and ticks what the draft is set to
     ['high'],
   );
 
-  // How much the agent asks is the profile's answer as well, not the level stored for the
-  // agent and applied to every child it is running.
+  // The draft permission menu reads its profile's permission value.
+
   const modes = draftMenu('askmode', { askMode: 'acceptEdits' }, { permissionMode: 'plan' });
   assert.equal(modes.head, ASK_MODE_HEADS.claude);
   assert.equal(modes.session, 'session-1');
@@ -5964,8 +5858,8 @@ test('a draft menu opens with the default row and ticks what the draft is set to
 });
 
 test('a draft effort menu asks its own question off its own profile', () => {
-  // A draft's rows come from the profile it will start on, and never from the session state
-  // beside it, whose model and levels belong to a child the draft has not started.
+  // Draft effort choices read the profile independently of source-session state.
+
   const opened = draftMenu('effort', { model: 'haiku-5', effort: 'low' });
   assert.equal(opened.head, 'How much should Opus 5 work on a turn?');
   assert.deepEqual(
@@ -5975,8 +5869,8 @@ test('a draft effort menu asks its own question off its own profile', () => {
   assert.equal(draftMenu('effort', {}, { model: '', effort: '' }).head, 'How much should the model work on a turn?');
 });
 
-// One agent's catalog where two models take the same effort level, which `MODELS` has no
-// pair of. It is what says whether a model change keeps an effort the new model also offers.
+// The catalog includes two models sharing an effort level.
+
 const SHARED_EFFORT_MODELS: Record<string, ModelChoice[]> = {
   claude: [
     MODELS[0],
@@ -6005,7 +5899,7 @@ test('a draft pick changes the one value it names and calls the setup the reader
     permissionMode: 'plan',
     source: 'custom',
   });
-  // The agent's own default is a choice, and picking it is a change like any other.
+  // Choosing the applied default model clears the explicit model override.
   assert.deepEqual(
     draftProfileAfterPick(inherited, 'model', 'haiku-5', LAUNCH_MODELS, {
       base: { status: 'ready', model: 'haiku-5', effort: null, reason: '' },
@@ -6018,8 +5912,8 @@ test('a draft pick changes the one value it names and calls the setup the reader
       source: 'custom',
     },
   );
-  // An effort belongs to a model. One the new model does not take would be sent to a child
-  // that refuses it, and one it does take is the reader's answer and stays.
+  // Model changes retain only effort values offered by the new model.
+
   assert.deepEqual(draftProfileAfterPick(inherited, 'model', 'haiku-5', LAUNCH_MODELS), {
     agent: 'claude',
     model: 'haiku-5',
@@ -6071,8 +5965,8 @@ test('selecting an agent default changes no model or effort field', () => {
 });
 
 test('re-picking the value already set leaves the setup and its source alone', () => {
-  // The source is what the tag says, and a reader pressing the row that is already ticked has
-  // changed nothing to call custom.
+  // Selecting the current value preserves the profile and its source.
+
   const inherited = draftProfile();
   for (const [control, value] of [
     ['agent', 'claude'],
@@ -6104,8 +5998,8 @@ test('a draft refuses a value no menu of its own offered', () => {
       `${control} took a value it never offered`,
     );
   }
-  // The default rows are offered only where there is a catalog behind them to default from,
-  // so neither is a value a draft accepts when its menu drew no rows at all.
+  // A draft accepts default values only when its menu offers them.
+
   assert.equal(draftProfileAfterPick(inherited, 'model', '', {}), null);
   assert.equal(
     draftProfileAfterPick({ ...inherited, model: 'haiku-5', effort: '' }, 'effort', '', LAUNCH_MODELS),
@@ -6133,12 +6027,12 @@ test('a draft pick moves the draft entry in the settings book and no other', () 
     pendingModel: null,
     pendingEffort: null,
   });
-  // The draft was copied from this session and sits beside it in the rail. A pick that
-  // reached it would change what a running session's next turn runs on.
+  // A draft pick leaves source-session settings unchanged.
+
   assert.deepEqual(sessionSettings(changed, 'session-1'), source);
   assert.deepEqual(book, { 'session-1': source }, 'the prior book was changed in place');
-  // The effort's model is recorded where an effort was chosen, because an effort belongs to a
-  // model and naming one under no effort would claim a choice nobody made.
+  // An explicit effort choice also records its model.
+
   assert.equal(sessionSettingsForProfile(draftProfile()).effortModel, 'opus-5');
 });
 
@@ -6150,17 +6044,15 @@ test('a draft sends nothing until its box holds something', () => {
 });
 
 test('a draft whose first prompt has gone keeps its setup and refuses every press', () => {
-  // The prompt is handed over as a frozen copy, and the child is spawned from that copy while
-  // the panel waits for its real session id. A press in that window would move new values
-  // under the id the panel then adopts, and the row would name a setup the running child never
-  // had. Changing the agent is the worst of it: the row can then name an agent it is not.
+  // Accepted draft submission freezes the launch setup until session adoption.
+
   const started = draftDrawn({ live: [press()] });
   assert.deepEqual(
     started.picks.map((pick) => pick.disabled),
     [true, true, true, true],
   );
-  // The value stays on the control and in its name. Only the offer of a press goes, and what
-  // replaces it says why there is none to make.
+  // Disabled draft controls retain their values and explain that launch has started.
+
   assert.deepEqual(
     started.picks.map((pick) => pick.label),
     ['Claude', 'Opus 5', 'high', 'Auto'],
@@ -6176,8 +6068,8 @@ test('a draft whose first prompt has gone keeps its setup and refuses every pres
         'It is starting and its setup cannot change now.',
     ],
   );
-  // A failed press never reached an agent, so nothing is being started and the reader must be
-  // able to change the setup and try again.
+  // Failed delivery restores draft setup editing.
+
   const failed = draftDrawn({ live: [press({ failed: true })] });
   assert.deepEqual(
     failed.picks.map((pick) => pick.disabled),
@@ -6187,14 +6079,13 @@ test('a draft whose first prompt has gone keeps its setup and refuses every pres
   assert.equal(draftStarted([]), false);
   assert.equal(draftStarted([press({ failed: true })]), false);
   assert.equal(draftStarted([press()]), true);
-  // A compaction and a prompt sent during it are two presses. One that went is enough.
+  // Any successful submission marks the draft as started.
   assert.equal(draftStarted([press({ failed: true }), press()]), true);
 });
 
 test('a draft with no model settled calls its effort the default rather than none', () => {
-  // The agent reset empties the model, and the tag beside the row then reads Default effort.
-  // A control reading No effort setting in that same composer says the question is answered
-  // when the reader has not reached it, and names an effort the child is not started on.
+  // An absent draft model reports unavailable effort without claiming the model has no effort setting.
+
   const fresh = draftDrawn({}, { model: '', effort: '' });
   assert.equal(fresh.draftTag?.detail, 'Claude · Model not reported · Effort not reported · Auto');
   assert.equal(fresh.picks[2].label, 'Effort not reported');
@@ -6202,17 +6093,17 @@ test('a draft with no model settled calls its effort the default rather than non
     fresh.picks[2].name,
     "Effort: Effort not reported, for this draft. The effort is the model's, and Claude has no model settled on yet.",
   );
-  // There is still nothing to pick until a model settles, so the control stays unpressable.
+  // The effort control remains disabled until a model resolves.
   assert.equal(fresh.picks[2].disabled, true);
-  // A settled model that takes no effort setting has answered the question, and says so.
+  // A model with no effort setting receives a distinct explanation.
   const quick = draftDrawn({}, { model: 'haiku-5', effort: '' });
   assert.equal(quick.picks[2].label, 'No effort setting');
   assert.equal(quick.picks[2].name, 'Effort: none to set, for this draft. Haiku 5 takes no effort setting.');
 });
 
 test('a setup the reader changed by hand keeps a draft the way their typing does', () => {
-  // Four picks are the reader's work as much as the words in the box are. Pressing another
-  // session in the rail must not throw them away without a word.
+  // Reader changes retain a draft when another session is selected.
+
   const book = (source: SessionProfile['source']): Parameters<typeof abandonSessionDraft>[0] => ({
     drafts: { 'draft-1': '' },
     queues: {},
@@ -6227,16 +6118,15 @@ test('a setup the reader changed by hand keeps a draft the way their typing does
     null,
     'a draft carrying a setup the reader picked leaves with no word',
   );
-  // The launcher's own form stamps a custom source on a setup chosen before any draft
-  // existed. A draft made through Create draft holds no typed text and no press, so a rule
-  // reading the source leaves one row on the rail for every use of that form.
+  // An untouched draft from the custom launcher can still be abandoned.
+
   assert.deepEqual(
     abandonSessionDraft(book('custom'), 'draft-1', false)?.profiles,
     {},
     'a draft the launcher custom form made can never be dismissed',
   );
-  // A profile the panel chose carries nothing of the reader's, so a draft holding only that
-  // still leaves the moment they look elsewhere.
+  // Untouched inherited and recent drafts can also be abandoned.
+
   assert.deepEqual(abandonSessionDraft(book('inherited'), 'draft-1', false)?.profiles, {});
   assert.deepEqual(abandonSessionDraft(book('recent'), 'draft-1', false)?.profiles, {});
 });
@@ -6261,7 +6151,7 @@ test('turn ends release one Claude prompt batch and every Codex batch', () => {
   assert.equal(turnEndCompletesEveryPrompt('unknown'), false);
 });
 
-// The prompts the Up arrow walks back through.
+// The Up arrow walks retained and recorded prompt history.
 
 test('a prompt in both sources is offered once', () => {
   const list = promptHistory(['fix the parser', 'add a test'], ['fix the parser']);
@@ -6269,10 +6159,8 @@ test('a prompt in both sources is offered once', () => {
 });
 
 test('the recorded copy of a prompt sent with comments under it is offered as what was typed', () => {
-  // What went to the agent was the typed text with the reader's notes beneath it, and what
-  // the reader wants back is the words they typed. Assembled by `promptToSend` rather than
-  // written out here, because a comments block this test invented is one the panel never
-  // sends and a rule read against it answers nothing.
+  // The fixture uses production prompt assembly to include a real comments block.
+
   const held = comment();
   const state = composerState({ draft: 'read the diff', sessionId: held.sessionId, comments: [held] });
   const recorded = [promptToSend(state)];
@@ -6281,16 +6169,15 @@ test('the recorded copy of a prompt sent with comments under it is offered as wh
 });
 
 test('a recorded prompt that only starts with the same words is kept', () => {
-  // The dropped copy is the sent prompt with the comments on the lines beneath it. A longer
-  // prompt that opens on the same words is a different prompt, and the reader still wants it.
+  // A longer prompt with the same prefix remains a distinct history entry.
+
   const list = promptHistory(['read the diff and say why'], ['read the diff']);
   assert.deepEqual(list, ['read the diff', 'read the diff and say why']);
 });
 
 test('a recorded prompt whose first line matches a short one sent is kept', () => {
-  // The failure the tighter rule exists for. `continue` and `go on` are prompts a reader
-  // sends over and over, and a rule that dropped anything opening on one took whole prompts
-  // out of the walk.
+  // Matching first lines do not deduplicate prompts with different remaining text.
+
   const list = promptHistory(['continue\nfrom where you stopped'], ['continue']);
   assert.deepEqual(
     list,
@@ -6300,14 +6187,13 @@ test('a recorded prompt whose first line matches a short one sent is kept', () =
 });
 
 test('a prompt typed in a terminal after one sent from the panel is offered first', () => {
-  // The record decides the order wherever it holds the send at all. Only a send the record
-  // has not caught up with goes in front of everything, because that one is the newest thing
-  // the session has.
+  // Recorded order takes precedence once the transcript contains a submission.
+
   const list = promptHistory(['P2 from the terminal', 'P1 from the panel'], ['P1 from the panel']);
   assert.deepEqual(list, ['P2 from the terminal', 'P1 from the panel'], 'Up gave the older of the two prompts first');
 });
 
-// Prompts and mid-turn asks with the times that put them in order, oldest first.
+// Prompt fixtures use increasing timestamps and oldest-first input order.
 function typedAt(...texts: string[]): { text: string; at: number }[] {
   return texts.map((text, i) => ({ text, at: 1_000 + i }));
 }
@@ -6323,17 +6209,17 @@ test('the prompts of one session build up over its turns, newest first', () => {
 });
 
 test('a turn holding two prompts offers them one at a time, newest first', () => {
-  // A prompt that got no response of its own is carried into the next turn and joined to its
-  // prompt. Offered whole, one press of Up puts both in the box and Enter sends both.
-  // The mid-turn ask belongs to the turn that was carried, so it is older than the prompt
-  // that carried it. Ordered by list rather than by time, Up hands back the one before last.
+  // Carried prompts remain separate history entries.
+
+  // Timestamps place mid-turn prompts between their surrounding submissions.
+
   const said = promptsAcross([], typedAt('and add a test', 'now commit'), [{ text: 'asked while it ran', at: 1_000 }]);
   assert.deepEqual(said, ['now commit', 'asked while it ran', 'and add a test']);
 });
 
 test('a submission that sent comments alone is not offered back as a prompt', () => {
-  // The reader marked lines, left the box empty and pressed Send. The transcript records the
-  // assembled notes as the prompt, and none of it is anything they typed.
+  // Prompt history excludes assembled comment-only submissions.
+
   const held = comment();
   const notes = promptToSend(composerState({ draft: '', sessionId: held.sessionId, comments: [held] }));
   assert.ok(/^\*\*.+\*\* \(.+\)/.test(notes), 'the assembler no longer opens a comments block with a heading');
@@ -6341,8 +6227,8 @@ test('a submission that sent comments alone is not offered back as a prompt', ()
 });
 
 test('a prompt of the reader own that opens on the same words is kept', () => {
-  // Two things have to agree before a prompt is read as notes, because one wrongly dropped
-  // disappears from the walk and nothing on screen says why.
+  // A generated comment heading requires both bold text and a parenthesized suffix.
+
   const noTail = '**Blocker**: it drops CRLF. Fix it.\n\nsay which one is faster';
   assert.deepEqual(
     promptHistory([noTail], []),
@@ -6358,8 +6244,8 @@ test('a prompt of the reader own that opens on the same words is kept', () => {
 });
 
 test('the prompts of one session spend the limit on prompts that differ', () => {
-  // A reader who sends `continue` eight times had eight of these places taken by one word,
-  // and older prompts fell outside the limit and were never offered.
+  // Repeated prompt text consumes one history slot.
+
   let held: string[] = [];
   for (let i = 0; i < 8; i++) {
     held = promptsAcross(held, typedAt('continue'), []);
@@ -6373,9 +6259,8 @@ test('the prompts of one session spend the limit on prompts that differ', () => 
 });
 
 test('a session of pasted documents still offers the prompts between them', () => {
-  // The size test is in both places. Left to `promptHistory` alone, the pastes filled every
-  // place and the walk then threw all of them away, so Up on a full session said there
-  // was no earlier prompt.
+  // Oversized prompts are excluded before they consume history slots.
+
   const paste = 'x'.repeat(PROMPT_HISTORY_ENTRY_CHARS + 8);
   let held: string[] = [];
   for (let i = 0; i < PROMPT_HISTORY_LIMIT; i += 1) {
@@ -6401,8 +6286,8 @@ test('the prompts of one session stop at the limit', () => {
 });
 
 test('the send control follows the box while the draft keeps the reader own words', () => {
-  // A walk standing over an empty box on a running turn. Read off the draft, the control
-  // still says Stop, and the press meant to send the recalled prompt kills the turn.
+  // Send follows recalled text on screen while the retained draft stays empty.
+
   const walking = composerState({ draft: '', onScreen: 'fix the parser', running: true });
   assert.equal(
     composerView(walking)?.box.actionControl,
@@ -6419,18 +6304,15 @@ test('the send control follows the box while the draft keeps the reader own word
 });
 
 test('a submission the cleaning leaves empty is not offered as a prompt', () => {
-  // The list is filtered on the cleaned key rather than on the raw text. A wrapper the editor
-  // added holds characters and cleans to nothing, and offered on its text it reaches the box
-  // as a prompt the reader never wrote.
+  // History excludes submitted text whose cleaned key is empty.
+
   const wrapper = '<ide_selection>lines 4 to 9</ide_selection>';
   assert.deepEqual(promptHistory(['fix the parser'], [wrapper]), ['fix the parser']);
 });
 
 test('a prompt in front of a terminal one keeps the place the record gives it', () => {
-  // The two lists are matched against each other in order, so they have to agree on how many
-  // times a prompt appears. The record drops a repeat, and so does the submitted list: with
-  // one holding it twice, every prompt behind it pairs with the wrong record and is hoisted
-  // in front of work started in a terminal since.
+  // Recorded and submitted histories deduplicate through the same prompt key.
+
   let sent: string[] = [];
   for (const one of ['A', 'B', 'A']) {
     sent = sentAfter(sent, one);
@@ -6443,24 +6325,22 @@ test('a prompt in front of a terminal one keeps the place the record gives it', 
 });
 
 test('a send the record no longer holds does not put every newer one in front of it', () => {
-  // The record holds only its own newest, so a long window's oldest sends fall out of it.
-  // Stopped at the first send with no record, the match put every send in front of work
-  // started in a terminal since.
+  // An older submission missing from the record does not reorder newer recorded prompts.
+
   const sent = ['P3', 'P2', 'P1'];
   assert.deepEqual(
     promptHistory(['T', 'P3', 'P2'], sent),
     ['T', 'P3', 'P2'],
     'the panel sends were offered in front of a prompt typed in a terminal after them',
   );
-  // The same shape when the record drops a send for its size rather than for the ceiling.
+  // Oversized missing submissions also preserve recorded ordering.
   const big = 'x'.repeat(PROMPT_HISTORY_ENTRY_CHARS + 1);
   assert.deepEqual(promptHistory(['T', 'A'], ['A', big]), ['T', 'A']);
 });
 
 test('the assembled form of a send is never offered as a prompt the reader typed', () => {
-  // One send with comments attached is offered as the words the reader typed. Sending the
-  // same words again leaves the first record with nothing to pair with, and offered raw it
-  // puts the reader's own notes markup in the box.
+  // Repeated submissions with comment blocks return only the typed prompt.
+
   const notes = (which: string) => `A
 
 **${which}** (6:00 PM)
@@ -6471,8 +6351,8 @@ something`;
 });
 
 test('two sends the record reads as one prompt keep one place', () => {
-  // `cleanPrompt` wrote the record and collapses runs of spaces, so these are one prompt to
-  // it. Told apart by their raw text, the submitted list held two and the pairing slipped.
+  // Prompt keys collapse whitespace before matching submissions to records.
+
   let sent: string[] = [];
   for (const one of ['fix  it', 'B', 'fix it']) {
     sent = sentAfter(sent, one);
@@ -6486,9 +6366,8 @@ test('two sends the record reads as one prompt keep one place', () => {
 });
 
 test('a prompt sent again after others is the first thing the walk offers', () => {
-  // The record catches up in the order the prompts went, so its copy of a repeated prompt
-  // belongs to the first send. Matched on the text alone, the second send took the first
-  // send's place and Up handed back the middle of the list.
+  // A recorded repeat pairs with the oldest matching submission.
+
   const list = promptHistory(['E', 'D', 'C', 'continue'], ['continue', 'E', 'D', 'C']);
   assert.deepEqual(
     list,
@@ -6498,8 +6377,8 @@ test('a prompt sent again after others is the first thing the walk offers', () =
 });
 
 test('the send control name follows the box while the draft keeps the reader own words', () => {
-  // A walk standing over an empty draft, with marks waiting to go. Read off the draft, the
-  // button tells a reader who cannot see the box that nothing is typed in it.
+  // The Send name describes recalled on-screen text rather than the retained draft.
+
   const held = comment();
   const state = composerState({
     draft: '',
@@ -6517,15 +6396,15 @@ test('the send control name follows the box while the draft keeps the reader own
 });
 
 test('a send the record has not caught up with is the first thing the walk offers', () => {
-  // Claude Code writes a queued prompt to the file when the agent picks it up, up to a minute
-  // after it goes, and recalling the prompt just sent is the commonest press there is.
+  // A submitted prompt precedes recorded history until its record arrives.
+
   const list = promptHistory(['an older prompt'], ['the one just sent']);
   assert.deepEqual(list, ['the one just sent', 'an older prompt']);
 });
 
 test('a prompt and its recorded copy match through the cleaning the record went through', () => {
-  // `cleanPrompt` wrote the recorded copy. It collapses runs of spaces, so the two texts are
-  // equal only after the same rule has run over both.
+  // Both histories use `cleanPrompt` when comparing prompt text.
+
   const list = promptHistory(['fix this: const x = 1'], ['fix this:   const x = 1']);
   assert.deepEqual(list, ['fix this:   const x = 1'], 'the same prompt is offered twice');
 });
@@ -6582,9 +6461,8 @@ test('pruning a session down to nothing drops its entry rather than leaving it e
 });
 
 test('a sent prompt recorded with a comments block under it is pruned the same way promptHistory pairs it', () => {
-  // `promptHistory` matches a record either on the prompt alone or on the prompt with a
-  // generated comments block beneath it. Exact-key equality misses the second shape, so a
-  // prompt sent with comments attached would sit in the saved book forever.
+  // Saved submissions are pruned when their recorded copy includes an assembled comments block.
+
   const sent = { s1: ['fix the flaky test'] };
   const recorded = new Map([['s1', ['fix the flaky test\n\n**Comments** (6:00 PM)\n\nsomething']]]);
   assert.deepEqual(
@@ -6594,16 +6472,11 @@ test('a sent prompt recorded with a comments block under it is pruned the same w
   );
 });
 
-// The two regression cases below walk the same path the extension does across a reload: a
-// send files the prompt through `sentAfter`, `writeDrafts` saves it through
-// `sentPromptsToSave`, a reload rebuilds that saved state from storage through
-// `normalizePanelState`, and the provider restores its in-memory copy through
-// `restoredSentPrompts`. Both call the exact functions `panelhost.ts` calls, so a broken call
-// site there fails here too, not only in a hand-rebuilt copy of what it should do.
+// These tests compose persistence and restoration helpers. They do not execute the host call sites.
+
 test('a sent prompt with no transcript record survives a save then a restore', () => {
-  // The failure this proves against: an agent process that dies before it writes the
-  // transcript takes the only other copy of the prompt with it, unless the panel's own copy
-  // outlives the window.
+  // A submission without a transcript record survives saved-state restoration.
+
   const sentPrompts: Record<string, string[]> = {};
   sentPrompts['session-1'] = sentAfter(sentPrompts['session-1'] ?? [], 'fix the flaky test');
   const saved = sentPromptsToSave(sentPrompts, new Map());
@@ -6619,8 +6492,8 @@ test('a sent prompt with no transcript record survives a save then a restore', (
 test('a sent prompt the transcript records is absent from the saved state, and history shows it once', () => {
   const sentPrompts: Record<string, string[]> = {};
   sentPrompts['session-1'] = sentAfter(sentPrompts['session-1'] ?? [], 'fix the flaky test');
-  // The transcript catches up: the same prompt, now recorded, the way the reader's own turn
-  // read it back.
+  // The fixture supplies a recorded copy so saved-state pruning removes the duplicate.
+
   const recordedBySession = new Map([['session-1', promptsAcross([], [{ text: 'fix the flaky test', at: 1 }], [])]]);
   const saved = sentPromptsToSave(sentPrompts, recordedBySession);
   const stored = normalizePanelState({ sentPrompts: saved });
@@ -6642,8 +6515,8 @@ test('one turn offers its later prompts before the one that opened it', () => {
 });
 
 test('the walk reads out the head of a prompt rather than the whole of it', () => {
-  // This box wraps, so a pasted paragraph is one line and thousands of characters. Read out
-  // whole, the reader hears the prompt instead of hearing where they are.
+  // History announcements shorten long prompt text independently of its displayed wrapping.
+
   const long = 'x'.repeat(HISTORY_SAID_CHARS * 3);
   const said = historySaid(2, 7, long, true);
   assert.ok(said.length < HISTORY_SAID_CHARS + 40, 'the whole of a pasted prompt was read out');
@@ -6662,8 +6535,8 @@ test('the walk says which prompt it landed on, and says when it landed on none',
 });
 
 test('a real id already carrying either new book is refused', () => {
-  // Every book moves together or none does. A book left out of the collision check is one
-  // `move` overwrites in silence.
+  // Session adoption rejects collisions in sent-prompt history or Prompt box text.
+
   const profiles = {
     'draft:1': {
       agent: 'codex' as const,
@@ -6757,9 +6630,8 @@ test('history stops once it holds as many prompts as the walk offers', () => {
 });
 
 test('a prompt too big to share the message is left out of the walk', () => {
-  // The failure this is for: one prompt just under the whole budget was offered first and
-  // left room for nothing behind it, so Up twice said there was no earlier prompt on a
-  // session holding plenty.
+  // History excludes an entry larger than its per-entry limit.
+
   const big = 'x'.repeat(PROMPT_HISTORY_ENTRY_CHARS + 1);
   assert.deepEqual(promptHistory([big, 'y'.repeat(100), 'z'], []), ['y'.repeat(100), 'z']);
 });
@@ -6779,8 +6651,8 @@ test('a press without a walk needs the caret at the start of the box', () => {
     { at: 0, take: false },
     'a caret inside the draft belongs to the box, which moves it a line',
   );
-  // The box wraps, so a long prompt with no newline in it draws over several rows. A rule
-  // that read the first line took this press and replaced the draft under the caret.
+  // Recall starts at text offset zero, independent of visual line wrapping.
+
   assert.deepEqual(historyPress(3, 0, true, 60, false), { at: 0, take: false });
 });
 
@@ -6814,9 +6686,8 @@ test('the composer carries the prompts already sent so the box can offer them', 
   assert.deepEqual(view.history, ['the last prompt']);
 });
 
-// What the next turn costs before the reader types. Every turn re-presents the whole
-// session, so the context already on the record has a price fixed before the prompt
-// exists, and the reader decides whether to send against it.
+// Starting-price fixtures describe the context retained before a new prompt.
+
 const AT = Date.parse('2026-09-05T12:00:00Z');
 
 const FLOOR_BASIS: NextTurnBasis = {
@@ -7013,11 +6884,8 @@ test('a pick with a later dated snapshot than the recorded one reads cold, not w
   );
 });
 
-// The live Claude CLI model list holds `opus`, `claude-opus-5`, and `opus[1m]`, whose alias
-// text all occur inside the recorded id `claude-opus-5-5`, so a substring search over that
-// list cannot tell which alias is the honest match. Comparing the pick's resolved model id
-// against the recorded id, rather than searching for its alias text, reads each pick here
-// against what actually ran.
+// The aliases overlap in text, so resolved model identifiers distinguish the matching model.
+
 const AMBIGUOUS_OPUS_MODELS: ModelChoice[] = [
   { value: 'opus', resolvedModel: 'claude-opus-5-5', label: 'Opus 5.5', description: '', efforts: [] },
   { value: 'claude-opus-5', resolvedModel: 'claude-opus-5', label: 'Opus 5', description: '', efforts: [] },
@@ -7077,9 +6945,8 @@ test('a [1m] pick in an ambiguous list still reads the warm cache of the model i
   );
 });
 
-// A transcript never records the CLI's `[1m]` window suffix, whether or not the 1M window
-// ran. A `[1m]` pick that resolves to the model the last request ran reads warm, the same as
-// any other pick of that model would.
+// Matching ignores the CLI `[1m]` suffix when resolving the recorded model.
+
 test('a [1m] pick that resolves to the model the last request ran reads the warm cache', () => {
   const models: ModelChoice[] = [
     { value: 'sonnet', resolvedModel: 'claude-sonnet-5', label: 'Sonnet 5', description: '', efforts: [] },
@@ -7158,8 +7025,8 @@ test('the line names one figure and its cached status while it is warm', () => {
   assert.ok(figure?.warm, 'a recorded lifetime carries a warm face');
   assert.equal(figure.warm.lead, 'Next turn starts at ');
   assert.equal(figure.warm.price, '$0.31');
-  // The remaining time is its own node so the panel's ticker rewords it in place every second.
-  // The whole lifetime is the detail behind it, and rides a native title rather than the line.
+  // The panel ticker updates the remaining cache time in place.
+  // The complete cache lifetime appears in a native tooltip.
   assert.deepEqual(figure.warm.trail, {
     lead: ', cached for another ',
     count: 'left',
@@ -7201,16 +7068,16 @@ test('ordinary cache ages use the shared formatter away from the boundary', () =
   assert.equal(formatCacheSpan(3 * 86_400_000), '3d');
 });
 
-// After a compaction nothing has cached the replacement session, so the next request
-// writes it again. That is a fact the record carries, not a state the clock must settle.
+// The compaction flag makes the replacement context uncached.
+
 test('a compacted session is cold rather than a range', () => {
   const figure = nextTurnOf({ tier: null, readBack: false, afterCompaction: true });
   assert.ok(figure?.cold, 'a compacted session must carry a cold face');
   assert.equal(figure.warm, null, 'nothing has cached the replacement, so no warm face is offered');
   assert.equal(figure.coldAt, null, 'a lifetime was invented for a session that bought none');
   assert.equal(figure.cold.price, '$6.20');
-  // No lifetime ran out here, so the sentence has no elapsed time to claim and carries no
-  // figure the ticker has to keep current.
+  // A cold compaction face has no elapsed cache-lifetime figure.
+
   assert.equal(figure.cold.trail, ', uncached');
 });
 
@@ -7268,8 +7135,8 @@ test('a compacted session does not add a cache lifetime to its working', () => {
   );
 });
 
-// The word the reader saw was `floor`, which names a building's ground and not a price. One
-// vocabulary runs through the line, the working and the rail hover.
+// Reader-facing price wording uses starting price.
+
 test('the working never says floor to the reader', () => {
   const figure = nextTurnOf();
   const lineWords = (line: NextTurnLine): string => (typeof line === 'string' ? line : `${line.lead}${line.trail}`);
@@ -7340,20 +7207,20 @@ test('the starting price is quoted at the rate the session actually ran at', () 
   const standard = nextTurnOf();
   const inRegion = nextTurnOf({ inferenceClass: 'in-region' });
   assert.equal(standard?.warm?.price, '$0.31');
-  // An in-region request is charged 10% more, and the panel prices every other figure that
-  // way. A price quoted at the standard rate would be low against the cost chip beside it.
+  // The in-region pricing fixture applies a ten-percent surcharge.
+
   assert.equal(inRegion?.warm?.price, '$0.35');
 });
 
 test('no line at all where the panel has no public rate for the tier the request ran on', () => {
-  // The same answer the whole-session cost gives: a tier this table cannot price shows
-  // no figure rather than the standard one.
+  // Unsupported service tiers supply no starting-price figure.
+
   assert.equal(nextTurnOf({ serviceTier: 'priority' }), null);
   assert.ok(nextTurnOf({ serviceTier: 'standard' }), 'the standard tier is priced');
 });
 
 test('a fast session quotes its starting price at the fast rate', () => {
-  // Opus 5 at fast speed charges $10 input, so a warm read is $1 and a one-hour write $20 per million tokens.
+  // The fast-speed fixture uses $1 cached input and $20 one-hour writes per million tokens.
   const fast = nextTurnOf({ tokens: 100_000, serviceTier: 'fast' });
   assert.equal(fast?.warm?.price, '$0.10');
   assert.equal(fast?.cold?.price, '$2.00');

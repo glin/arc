@@ -2,8 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { createNavigation, navigationIndex, plainNavigationKey, ROVING_SELECTOR } from './navigation.ts';
 
-// A page built here rather than by a browser. Nothing in it comes from this realm, so a check
-// against this realm's own Element or HTMLElement answers no for every node in it.
+// Plain objects model nodes from another realm, which do not pass local Element or HTMLElement instanceof checks.
 function fakePage(className: string) {
   const attributes = new Map<string, string>();
   const control = {

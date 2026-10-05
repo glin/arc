@@ -3,10 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { test } from 'vitest';
 
-// createComposerAction renders through a real document, so the button it returns needs a
-// browser to inspect. These text scans confirm its disabled state, accessible name, hint and
-// shortcut all read the same sendWaitsForStaging decision that gates send() in composer.ts,
-// rather than reading attachments.isStaging(...) on its own the way the button once did.
+// These text scans check the send button's staging decision and draft-update subscriptions without mounting a browser document.
 
 function functionBody(source: string, startMarker: string, nextMarker: string | null): string {
   const at = source.indexOf(startMarker);

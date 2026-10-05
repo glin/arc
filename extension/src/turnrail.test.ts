@@ -1,8 +1,5 @@
-// extension/src/turnrail.test.ts
-//
-// The tests for turnrail.ts. One that reads a second seam's names lives in turnview.test.ts
-// instead, because neither file owns it. The builders a test is written against are here
-// while only this file needs them, and in turnfixtures.ts once a second file does.
+// Session list projections, status precedence, grouping, and parent relationships.
+
 import { test } from 'vitest';
 import assert from 'node:assert';
 import { matchSessions } from './domain/session-query.ts';
@@ -65,8 +62,8 @@ import {
 } from './turnfixtures.ts';
 import type { CompactionFact } from './projectspend.ts';
 
-// The day grouping that replaced the flat three-day cut. Dates are built with calendar
-// arithmetic so the answers hold in any timezone and on any day the tests are run.
+// Calendar arithmetic keeps day-group boundaries local to each timezone.
+
 const bucketNow = new Date(2026, 7, 24, 15, 0).getTime();
 
 const railAt = (at: number, over: { pinnedTop?: boolean; current?: boolean; archived?: boolean } = {}) => ({
@@ -100,22 +97,21 @@ test('groupBySession makes every session contiguous, keeping first-seen order', 
 });
 
 test('a rail card gives its time slot to waiting, running, or failed state', () => {
-  // The phrase the reader sees, which is the phrase the accessible name says below. A card
-  // that read `waiting` gave the reader no verb and no subject, and the rail drew it in the
-  // same tone as a running session.
+  // Waiting uses needs input for the visible word and accessible name.
+
   assert.deepEqual(railTimeSlot('waiting'), { word: 'needs input', time: false });
-  // Running says so and gives no time: the number is stale as it is drawn, and the fact
-  // that it is running is the one the reader wants.
+  // Running replaces the age slot with its status word.
+
   assert.deepEqual(railTimeSlot('running'), { word: 'running', time: false });
   // Failed says so and keeps the time, because when it failed is the next question.
   assert.deepEqual(railTimeSlot('failed'), { word: 'failed', time: true });
-  // Every other status is the time alone: a word on every card distinguishes none of them.
+  // Done, interrupted, and stopped show only age.
   assert.deepEqual(railTimeSlot('done'), { word: null, time: true });
   assert.deepEqual(railTimeSlot('interrupted'), { word: null, time: true });
   assert.deepEqual(railTimeSlot('stopped'), { word: null, time: true });
   // A session with no knowable status wears no word, the way its card wears no colour.
   assert.deepEqual(railTimeSlot(null), { word: null, time: true });
-  // Unsent input takes the less useful time slot but never takes a status word.
+  // Unsent input replaces age while retaining any status word.
   assert.deepEqual(railTimeSlot('done', true), { word: null, time: false });
   assert.deepEqual(railTimeSlot('failed', true), { word: 'failed', time: false });
   assert.deepEqual(railTimeSlot('running', true), { word: 'running', time: false });
@@ -193,7 +189,7 @@ test('unsent input is filed by session and worded for the rail', () => {
 test('the parse cut stretches to hold every pinned session', () => {
   const s = (sessionId: string) => ({ sessionId });
   const all = [s('a'), s('b'), s('c'), s('d')];
-  // The cut took the two newest; the pins add the old ones it left out, once each.
+  // The limit retains the two newest sessions. Pins add excluded visible sessions once each.
   assert.deepEqual(
     withPinned(all.slice(0, 2), all, new Set(['a', 'd'])).map((x) => x.sessionId),
     ['a', 'b', 'd'],
@@ -203,8 +199,8 @@ test('the parse cut stretches to hold every pinned session', () => {
     withPinned(all.slice(0, 2), all, new Set()).map((x) => x.sessionId),
     ['a', 'b'],
   );
-  // A pin naming a session that is not in the pool adds nothing: the pool has
-  // already dropped hidden sessions, and hiding wins.
+  // Pins outside the visible pool add nothing.
+
   assert.deepEqual(
     withPinned(all.slice(0, 1), all.slice(0, 1), new Set(['zzz'])).map((x) => x.sessionId),
     ['a'],
@@ -216,8 +212,8 @@ test('hiding a session takes it off the list, and pinning it brings it back', ()
   assert.deepEqual(hideSessions(sessions, new Set()), sessions);
   assert.deepEqual(hideSessions(sessions, new Set(['b'])), [{ sessionId: 'a' }, { sessionId: 'c' }]);
   assert.deepEqual(hideSessions(sessions, new Set(['a', 'b', 'c'])), []);
-  // Pinning is how a session nobody would otherwise reach is read, so hiding the pinned one
-  // must not take it away: there would then be no way back to it from the picker.
+  // The picker's pinned session remains available when hidden.
+
   assert.deepEqual(hideSessions(sessions, new Set(['b']), 'b'), sessions);
   assert.deepEqual(hideSessions(sessions, new Set(['a', 'b']), 'b'), [{ sessionId: 'b' }, { sessionId: 'c' }]);
   // An id nobody has is not an error, since the set outlives the sessions in it.
@@ -225,12 +221,12 @@ test('hiding a session takes it off the list, and pinning it brings it back', ()
 });
 
 test('hiding runs before the list is cut, so a hidden session gives up its slot', () => {
-  // The order is the whole point: hide, then take the first few. Cutting first leaves the
-  // hidden one occupying a slot the live session needed.
+  // Hide sessions before applying the parse limit so hidden sessions consume no slots.
+
   const sessions = [{ sessionId: 'old' }, { sessionId: 'older' }, { sessionId: 'live' }];
   const MAX = 2;
   assert.deepEqual(hideSessions(sessions, new Set(['old', 'older'])).slice(0, MAX), [{ sessionId: 'live' }]);
-  // What it would be the other way round, written out so the difference is on the page.
+  // Applying the limit first leaves no visible session in this fixture.
   assert.deepEqual(hideSessions(sessions.slice(0, MAX), new Set(['old', 'older'])), []);
 });
 
@@ -239,16 +235,15 @@ test('a session heading says how many turns it holds', () => {
   assert.equal(sessionCount(2), '2 turns');
   assert.equal(sessionCount(0), '0 turns');
   assert.equal(sessionCount(12), '12 turns');
-  // It used to count how many of those turns were waiting on the reader as well, read out
-  // of the rows each summary closed with. Nothing in the wording asks the reader for
-  // anything now, so a heading cannot make a claim out of the agent's own prose.
+  // Turn-count wording contains no waiting or needs-input claim.
+
   assert.doesNotMatch(sessionCount(9), /waiting|needs/);
 });
 
 test('the rail reads a newest outcome outside the parse cut without guessing through a partial tail', () => {
   const outcome = { finished: false, error: true, interrupted: false, endedAt: 1_000 };
-  // `unparsed` stays outside the cards, so the fallback remains required whenever the parse
-  // budget leaves a listed session unread.
+  // Unparsed listed sessions require metadata status outside the card list.
+
   const read = new Map([
     ['unparsed', outcome],
     ['partial', null],
@@ -301,12 +296,11 @@ test('a busy child stops answering once the record closes the turn it was presse
     'running',
     'a caller that cannot say when the press was made keeps the unbounded claim',
   );
-  // The child says busy and the transcript says the turn it is busy with ended. One ending
-  // the child never received leaves it saying that for the rest of its life, so the record
-  // answers instead.
+  // A closed turn bounds a busy claim whose press predates that turn's end.
+
   assert.equal(sessionStatusOf(done, busy, new Map(), 4_000, new Set(), new Map([['a', 1_000]])).get('a'), 'done');
-  // A transcript behind a press is the case the claim exists for. The newest closed turn is
-  // then the one before the press, and the card keeps the word.
+  // A later press keeps running state despite the earlier closed turn.
+
   assert.equal(sessionStatusOf(done, busy, new Map(), 4_000, new Set(), new Map([['a', 3_500]])).get('a'), 'running');
   // A request still open outranks both, because it is the action the reader can take now.
   assert.equal(
@@ -421,9 +415,8 @@ test('a closed child becomes live when its transcript moves after the close', ()
   );
 });
 
-// A finished child writes its trailing transcript record a short while after the parent
-// records the close. That trailing write must not reopen the child. A real resume, like the
-// one above, writes seconds or minutes later and clears the close margin easily.
+// Child writes within CHILD_CLOSE_MARGIN_MS do not reopen the closed child.
+
 test('a trailing child transcript write after the close does not reopen it', () => {
   const hour = 60 * 60 * 1000;
   const now = 10 * hour;
@@ -476,8 +469,8 @@ test('subagents and background sessions sort with the running sessions', () => {
   );
 });
 
-// The host reports every exited key on each state change. A key that stays exited keeps its
-// time, and a session that was resumed and exited again reads the second exit.
+// Repeated exit reports retain the first timestamp. An exit after a resume replaces it.
+
 test('a hosted session that exits again after a resume reads its latest exit', () => {
   const exits = new Map<string, number>();
   let held = recordExits(exits, new Set(), ['claude:a'], 100);
@@ -503,8 +496,8 @@ test('a hosted session that exits again after a resume reads its latest exit', (
   );
 });
 
-// The tail read misses a launch older than its window. The lifetime facts hold it, and they
-// answer only while they describe the same newest turn to the same last record.
+// Lifetime child facts supplement the tail only when both describe the same newest turn through the same end.
+
 test('the lifetime facts add an open child the tail read cannot see', () => {
   const tail: TurnOutcome = { finished: true, error: false, interrupted: false, startedAt: 10, endedAt: 20 };
   const lifetime: TurnOutcome = { ...tail, openChildren: ['old'] };
@@ -678,8 +671,8 @@ test('a pending request overrides running and is announced as needs input', () =
     {},
   );
   assert.equal(rail[0].status, 'waiting');
-  // The card says one phrase to both readers. The drawn word and the spoken name are built
-  // from the same constant, so a change to one cannot leave the other saying something else.
+  // Visible waiting text and the accessible name share the needs input phrase.
+
   assert.equal(railTimeSlot(rail[0].status).word, 'needs input');
   assert.match(railCardName(rail[0]), /needs input/);
   assert.doesNotMatch(
@@ -740,8 +733,8 @@ test('rail context falls back beyond the parse cut while lifetime figures never 
     label: compactLabel,
     detail: compactLabel,
   });
-  // The fourth session is the reported shape: maxSessions parsed the three above it,
-  // but the rail still needs the facts already recovered by the metadata pass.
+  // Metadata supplies figures for a session outside the parse limit.
+
   const parsed = {
     newest: [chip('cost', '$1.00'), chip('context', '30% ctx')],
     noTotalYet: [chip('cost', '$9.00'), chip('context', '40% ctx')],
@@ -878,8 +871,8 @@ test('the open heading and rail use one lifetime cost and turn count', () => {
 });
 
 test('a rail width is clamped through one rule, whatever shape it arrives in', () => {
-  // Every answer written out: the default for anything that is not a finite number, the
-  // bounds for anything past them, and whole pixels for anything between.
+  // Width normalization defaults non-finite values, rounds finite numbers, and enforces the minimum width.
+
   assert.equal(clampRailWidth(undefined), RAIL_WIDTH_DEFAULT);
   assert.equal(clampRailWidth('220'), RAIL_WIDTH_DEFAULT);
   assert.equal(clampRailWidth(NaN), RAIL_WIDTH_DEFAULT);
@@ -895,8 +888,8 @@ test('rail activity updates do not move existing sessions and new ones join at t
   const row = (id: string) => ({ id, value: `row ${id}` });
   const quiet = new Map();
 
-  // A cold rail keeps the newest-first order it was handed. The first session is
-  // remembered even though a rail with one live session is not drawn yet.
+  // The first list retains incoming order even with only one session.
+
   const first = stableRailOrder([row('a')], [], quiet);
   assert.deepEqual(
     first.map((session) => session.id),
@@ -927,8 +920,8 @@ test('rail activity updates do not move existing sessions and new ones join at t
   );
   assert.equal(noisy[0].value, 'row a', 'the stable order keeps an old row instead of its current data');
 
-  // A session that leaves is forgotten. If it returns later it is new to this rail
-  // and joins after the sessions that stayed.
+  // A returning removed session appends after the sessions that stayed.
+
   const withoutC = stableRailOrder(
     [row('b'), row('a')],
     noisy.map((session) => session.id),
@@ -966,9 +959,8 @@ test('running sessions rise once and keep their order, including among pinned ca
   const bRunning = stableRailOrder(source, ids(first), statuses('b'));
   assert.deepEqual(ids(bRunning), ['b', 'a', 'c', 'd'], 'a session that starts running stays below inactive sessions');
 
-  // Starting another session moves it once, after the run already at the top. Later
-  // activity order changes neither running card, and a newly found running session
-  // joins after both rather than becoming their new leader.
+  // New running sessions follow existing running sessions without later activity reordering them.
+
   const bcRunning = stableRailOrder(source, ids(bRunning), statuses('b', 'c'));
   assert.deepEqual(ids(bcRunning), ['b', 'c', 'a', 'd']);
   const noisy = stableRailOrder([...source].reverse(), ids(bcRunning), statuses('b', 'c'));
@@ -976,9 +968,8 @@ test('running sessions rise once and keep their order, including among pinned ca
   const withE = stableRailOrder([row('e'), ...source], ids(noisy), statuses('b', 'c', 'e'));
   assert.deepEqual(ids(withE), ['b', 'c', 'e', 'a', 'd']);
 
-  // Pinning remains the outer bucket rule. Inside that bucket the already-running pinned
-  // card stays first, a newly running pinned card follows it, and the inactive pin moves
-  // below both.
+  // Pinned grouping remains outermost. Running pinned sessions retain their order ahead of inactive pins.
+
   const pinned = new Set(['a', 'c', 'e']);
   const rail = railSessions(
     withE,
@@ -1042,13 +1033,13 @@ test('a rail card carries its count as a figure, and marks unread only where it 
   );
   assert.equal(rail[0].newCount, 3);
   assert.equal(rail[0].unread, true);
-  // Parsed with nothing new: a known zero, and a zero drawn in a pill reads as a claim.
+  // A known zero draws no unread count.
   assert.equal(rail[1].newCount, null);
   assert.equal(rail[1].unread, false);
   // Never parsed: the count is not knowable, so the card makes no unread claim either.
   assert.equal(rail[2].newCount, null);
   assert.equal(rail[2].unread, false);
-  // The wording the pill replaces is untouched, so the two cannot disagree.
+  // Accessible wording retains the same unread count.
   assert.equal(rail[0].indicator, '3 new');
   assert.equal(railCardName(rail[0]), 'Session a, Claude, 3 hours ago, 3 new');
   assert.equal(railCardName(rail[1]), 'Session b, Claude, 3 hours ago, nothing new');
@@ -1473,8 +1464,8 @@ test('a rail card carries the number behind its cost chip, so several can be add
   assert.deepEqual([rail[0].costDollars, rail[0].costAtLeast], [1.87, false]);
   // A floor says so, and one part the index left unpriced makes the whole sum a floor.
   assert.deepEqual([rail[1].costDollars, rail[1].costAtLeast], [4.2, true]);
-  // No figure at all is not a low figure. The card says it has none and claims nothing about
-  // how much was left out, and the caller that adds several cards decides what that means.
+  // An absent cost has null dollars without a lower-bound claim.
+
   assert.deepEqual([rail[2].costDollars, rail[2].costAtLeast], [null, false]);
 });
 
@@ -1561,10 +1552,8 @@ test('the rail carries the exact cache-expiry return count, keeping zero distinc
     floor: { count: 1, atLeast: true },
   });
   const byId = Object.fromEntries(rail.map((card) => [card.id, [card.cacheExpiryCount, card.cacheExpiryAtLeast]]));
-  // A recorded zero is a known answer, distinct from a session the index has not reached at
-  // all and from one it recorded as explicitly unavailable. All three are `null` off the card
-  // except the recorded zero, which stays zero. A floor carries its count alongside
-  // `cacheExpiryAtLeast`, the same pairing `costDollars` and `costAtLeast` carry.
+  // Recorded zero stays zero. Unindexed and unavailable counts stay null. Lower bounds retain their count and cacheExpiryAtLeast flag.
+
   assert.deepEqual(byId, {
     many: [3, false],
     zero: [0, false],
@@ -1580,17 +1569,15 @@ test('the rail carries the exact cache-expiry return count, keeping zero distinc
     matchSessions(rail, 'cache-expiry:<1').map((card) => card.id),
     ['zero'],
   );
-  // A floor never answers `<`, because the pairs the classifier could not judge might turn out
-  // to have been qualifying returns the count has not added in yet. `zero` still answers it,
-  // because its count is exact rather than a floor.
+  // Lower bounds cannot match less-than comparisons. Exact zero can match them.
+
   assert.deepEqual(
     matchSessions(rail, 'cache-expiry:<2').map((card) => card.id),
     ['zero'],
   );
 
-  // The same session, matched again once its facts arrive: the rail draws its cards from one
-  // list on every redraw, so a session whose index catches up must start matching a query the
-  // reader already typed, with no touch of the box.
+  // Updated indexed facts change query matches without changing the query text.
+
   const before = buildRail({});
   assert.deepEqual(matchSessions(before, 'cache-expiry:>0'), []);
   const after = buildRail({ many: { count: 3, atLeast: false } });
@@ -1623,38 +1610,31 @@ test('a rail card shows the labels it has room for, counts the rest, and says al
     labels,
   );
 
-  // The row draws the front of the list and stands a count in for the rest. The order is
-  // the order the labels were applied. What the reader filed the session under first is
-  // what stays on screen.
+  // Visible labels keep application order and fold the remainder into a count.
+
   assert.deepEqual(rail[0].labelChips, ['composer', 'release 0.4']);
   assert.equal(rail[0].labelsMore, '+1');
-  // The card carries the whole list beside the cut, because two readers ask about the whole
-  // of it: the filter answers a `label:` term off this, and the session heading draws every
-  // label on a line that has the width the rail does not. The cut is a limit on the row and
-  // never a claim about what the session carries.
+  // The full label list supplies filtering and the session heading independently of the row's display limit.
+
   assert.deepEqual(rail[0].labels, ['composer', 'release 0.4', 'perf']);
-  // The count names what it stands for, so the chip drawn from it can hover with the whole
-  // of what it hides. A number is the one thing on that line a reader cannot read their way
-  // out of, and the chips beside it say words.
+  // The fold count carries the names it hides.
+
   assert.equal(rail[0].labelsMoreName, 'perf');
-  // And the name says every one of them, in a clause that closes the name. A reader who
-  // cannot see the chips is told what the fold took, or the folded label exists for them
-  // only as a number. The clause goes last because it is the only one that is a list: the
-  // name is joined on commas, so anything after it is heard as one more label.
+  // The accessible name ends with every label so later comma-separated fields cannot read as more labels.
+
   assert.equal(
     railCardName(rail[0]),
     'Session a, Claude, 3 hours ago, showing now, labelled composer, release 0.4, perf',
   );
-  // A session whose labels all fit folds nothing. No count is drawn at all, so the panel
-  // has one thing to test before it draws one.
+  // Labels that fit produce no fold count or hidden-label name.
+
   assert.deepEqual(rail[1].labelChips, ['release 0.4']);
   assert.deepEqual(rail[1].labels, ['release 0.4']);
   assert.equal(rail[1].labelsMore, null);
   assert.equal(rail[1].labelsMoreName, null, 'a card that folded nothing named something to hide');
   assert.equal(railCardName(rail[1]), 'Session b, Claude, 3 hours ago, labelled release 0.4');
-  // An unlabelled session says nothing about labels either way. The word would be on
-  // every card in a workspace nobody has filed, which is where the reader needs the name
-  // shortest.
+  // Unlabelled sessions omit label wording.
+
   assert.deepEqual(rail[2].labelChips, []);
   assert.deepEqual(rail[2].labels, []);
   assert.equal(rail[2].labelsMore, null);
@@ -1671,9 +1651,8 @@ test('a rail card names the read entry its session can take, and none where it c
     at: 4200,
     relative: '3 hours ago',
   });
-  // The section is the whole of what the menu matches on, so the read state is spelled into
-  // it. Three answers and each written out: something new, nothing new, and no count at all.
-  // `c` was listed and never parsed, so it has no newest turn either.
+  // Menu sections distinguish unread, read, and unparsed sessions. The unparsed session has no newest turn timestamp.
+
   const newest = new Map([
     ['a', 4000],
     ['b', 3000],
@@ -1697,9 +1676,8 @@ test('a rail card names the read entry its session can take, and none where it c
   assert.equal(rail[0].menuSection, 'arcRailUnread');
   assert.equal(rail[1].menuSection, RAIL_MENU_SECTIONS.read);
   assert.equal(rail[1].menuSection, 'arcRailRead');
-  // Never parsed: the plain section, which reaches the labels a session carries whether
-  // or not anything read it. There is no newest turn to mark this one up to, so it names
-  // neither read state and the entry that would mark nothing is never drawn.
+  // A session with no newest turn gets label actions but no read-state action.
+
   assert.equal(rail[2].menuSection, RAIL_MENU_SECTIONS.plain);
   assert.equal(rail[2].menuSection, 'arcRail');
   // The three names are distinct, or one entry would appear on two states at once.
@@ -1709,15 +1687,13 @@ test('a rail card names the read entry its session can take, and none where it c
     'two sections share a name, so an entry written for one is offered on the other',
   );
 
-  // The watermark the entry writes rides the card, from the newest parsed turn rather than
-  // from anything drawn: while one session is shown alone the others have no card on
-  // screen, and the press has to work on them all the same.
+  // The newest parsed turn timestamp supplies read actions even when that session has no drawn turn card.
+
   assert.equal(rail[0].newestTurnAt, 4000);
   assert.equal(rail[1].newestTurnAt, 3000);
   assert.equal(rail[2].newestTurnAt, null);
-  // And the two answer one question. A card offering the entry with nothing to mark is the
-  // press that says it did something and did not, so the section is derived from the
-  // timestamp and the plain name is worn by exactly the cards with no turn behind them.
+  // The plain menu section corresponds exactly to a missing newest-turn timestamp.
+
   for (const card of rail) {
     assert.equal(
       card.menuSection === RAIL_MENU_SECTIONS.plain,
@@ -1728,11 +1704,11 @@ test('a rail card names the read entry its session can take, and none where it c
 });
 
 test('a rail bucket boundary is local midnight, not a count of hours back', () => {
-  // One minute either side of today's midnight lands in the two different days it is
-  // the boundary between.
+  // The minute before local midnight belongs to yesterday and the minute after belongs to today.
+
   assert.equal(bucketOf(new Date(2026, 7, 24, 0, 1).getTime()), 'today');
   assert.equal(bucketOf(new Date(2026, 7, 23, 23, 59).getTime()), 'yesterday');
-  // Yesterday's own midnight starts yesterday; the minute before it is already the week.
+  // Yesterday starts at its local midnight. The previous minute belongs to Last 7 days.
   assert.equal(bucketOf(new Date(2026, 7, 23, 0, 0).getTime()), 'yesterday');
   assert.equal(bucketOf(new Date(2026, 7, 22, 23, 59).getTime()), 'week');
   // The week reaches back to midnight seven days ago, and stops there.
@@ -1755,15 +1731,14 @@ test('the rail names each day it groups by, and draws no heading over an empty o
     all.buckets.map((b) => b.id),
     ['top', 'today', 'yesterday', 'week', 'older'],
   );
-  // The words live here because a label written in the panel is one nothing can test. Every
-  // bucket carries one, the pinned run included: each heading is the disclosure that shuts
-  // its own bucket, and a bucket with no heading is one the reader cannot shut.
+  // Every nonempty bucket supplies its disclosure label, including Pinned.
+
   assert.deepEqual(
     all.buckets.map((b) => b.label),
     ['Pinned', 'Today', 'Yesterday', 'Last 7 days', 'Older'],
   );
-  // A pinned session is in the top run whatever its age, in the order it arrived,
-  // and in no day bucket as well.
+  // Pinned sessions retain incoming order and appear in no day bucket.
+
   const pinnedTwice = railBuckets(
     [
       railAt(new Date(2019, 0, 1, 9, 0).getTime(), { pinnedTop: true }),
@@ -1808,12 +1783,12 @@ test('the older sessions start folded, unless folding would hide what matters', 
   // The session on screen must stay visible in the chooser that points at it.
   const shownOld = railAt(new Date(2026, 7, 1, 9, 0).getTime(), { current: true });
   assert.equal(railBuckets([today, alsoToday, shownOld], bucketNow).olderFolded, false);
-  // A reader back after days away must not open to a nearly empty rail, so a fold that
-  // would leave fewer than two cards on screen does not happen.
+  // Older remains open when folding would leave fewer than two visible cards.
+
   assert.equal(railBuckets([today, old, olderStill], bucketNow).olderFolded, false);
   // Two left standing is enough for the fold to hold.
   assert.equal(railBuckets([today, alsoToday, old, olderStill], bucketNow).olderFolded, true);
-  // Pinned cards count as cards left standing: they are drawn above the headings.
+  // Pinned cards count toward the visible-card threshold.
   assert.equal(
     railBuckets(
       [
@@ -1828,9 +1803,8 @@ test('the older sessions start folded, unless folding would hide what matters', 
   // Nothing old is nothing to fold.
   assert.equal(railBuckets([today, alsoToday], bucketNow).olderFolded, false);
   assert.equal(railBuckets([], bucketNow).olderFolded, false);
-  // An archived session is not a card left standing. It sits behind a fold of its
-  // own, so a rail of one live session and two archived ones would otherwise read as
-  // three and hold the Older fold shut over the only other live card.
+  // Archived cards do not count toward the visible-card threshold because they have their own fold.
+
   const archivedOld = railAt(new Date(2026, 7, 1, 9, 0).getTime(), { archived: true });
   const archivedToday = railAt(new Date(2026, 7, 24, 9, 0).getTime(), { archived: true });
   assert.equal(railBuckets([today, archivedToday, archivedOld, old], bucketNow).olderFolded, false);
@@ -1840,8 +1814,8 @@ test('archived sessions go to one bucket at the foot, whatever day they belong t
   const today = railAt(new Date(2026, 7, 24, 9, 0).getTime());
   const alsoToday = railAt(new Date(2026, 7, 24, 8, 0).getTime());
   const old = railAt(new Date(2026, 7, 1, 9, 0).getTime());
-  // The day a session was last active stops being the question once it is put away:
-  // one bucket holds every archived one, under every other bucket.
+  // All archived sessions share the last bucket regardless of activity date.
+
   const mixed = railBuckets(
     [
       today,
@@ -1860,8 +1834,8 @@ test('archived sessions go to one bucket at the foot, whatever day they belong t
       ['archived', 'Archived', 2],
     ],
   );
-  // Archiving wins over pinning, so an archived card cannot take the rail's top from
-  // inside a folded bucket. railSessions clears the pin as well; this is the second door.
+  // Archived grouping overrides pinned grouping.
+
   const pinnedAndArchived = railBuckets(
     [today, alsoToday, railAt(new Date(2026, 7, 24, 7, 0).getTime(), { archived: true, pinnedTop: true })],
     bucketNow,
@@ -1895,8 +1869,8 @@ test("each session gets the figures for its own turns and nobody else's", () => 
   assert.match(ctxOf('a'), /Context after the latest compaction/);
   assert.doesNotMatch(ctxOf('a'), /Compactions:|Compaction: requested/);
   assert.doesNotMatch(ctxOf('b'), /Compactions:|Compaction: requested/);
-  // Two turns at $1.00 each in a, one in b. Written out rather than summed here, so a
-  // grouping that put every turn in one session cannot agree with this by accident.
+  // Session a contains two $1 turns and session b contains one.
+
   assert.equal(all.a.find((c) => c.label.startsWith('$'))?.label, '$2.00');
   assert.equal(all.b.find((c) => c.label.startsWith('$'))?.label, '$1.00');
   assert.equal(all.a.find((c) => c.label.endsWith('commits'))?.label, '3 commits');
@@ -1931,8 +1905,8 @@ test('rail context follows each session newest recorded boundary', () => {
 
 test('a session with no turns is not in the table at all', () => {
   assert.deepEqual(statsBySession([], []), {});
-  // Nor is one that compacted and had no turn read: the figures are worked out over turns,
-  // and a heading with none has nothing to say about itself.
+  // Compactions without turns produce no session stats entry.
+
   assert.deepEqual(statsBySession([], [compaction({ sessionId: 'a' })]), {});
 });
 
@@ -1945,9 +1919,8 @@ test('a synthetic draft row names a session before it has a transcript', () => {
 });
 
 test("a synthetic draft row carries a real timestamp for the age's tooltip", () => {
-  // A draft has no transcript, but its age is drawn in the same heading as every other
-  // session's, through the same span. A blank `when` there is a tooltip that never
-  // opens, while every other session's age opens one.
+  // Draft creation time supplies the same formatted timestamp used by saved-session age tooltips.
+
   const row = syntheticDraftRows([{ draftId: 'draft-a', createdAt: 10, agent: 'Codex', agentKey: 'codex' }])[0];
   assert.equal(row.when, formatWhen(10));
 });
@@ -1962,9 +1935,8 @@ test('synthetic draft rows retain their creation order', () => {
   );
 });
 
-// The transcript of a session the panel started and sent one prompt to, written the
-// way the Claude store writes it. One prompt, a first turn that finished, no file changed
-// and no question put to the reader.
+// The Claude fixture contains one completed prompt with no file change or question.
+
 const startedFromThePanel = [
   {
     type: 'user',
@@ -1986,9 +1958,8 @@ const startedFromThePanel = [
 ].map((line) => JSON.stringify(line));
 
 test("a session this window started is the reader's, whatever its transcript looks like", () => {
-  // The reported fault: a session started from the panel was filed under Run by
-  // agents. Nothing in this record separates it from a print-mode run, so the transcript
-  // rule marks it, and marking it folds the session the reader just started.
+  // The transcript classifies this fixture as an agent run. Window-owned creation must override that classification.
+
   assert.equal(
     agentRunIn(startedFromThePanel, true),
     true,
@@ -2007,8 +1978,8 @@ test("a session this window started is the reader's, whatever its transcript loo
 });
 
 test('a child transcript answers as an agent run even against a stale cached false', () => {
-  // A child transcript's cached entry can hold `agentRun: false` from a stale scan. This
-  // checks that the child flag still answers true, whatever value the entry guessed.
+  // Child-transcript identity overrides a cached false agentRun value.
+
   assert.equal(
     agentRunAnswer(false, 'sess-child', new Set(), true, false),
     true,
@@ -2044,9 +2015,8 @@ test('a child transcript answers as an agent run even against a stale cached fal
   );
 });
 
-// The report-level check for the SDK file-change exception: a finished single-prompt
-// sdk-cli transcript that wrote one file reads as an agent run, and files under the agent
-// bucket rather than under today's.
+// A completed single-prompt sdk-cli transcript with a file change groups under agent runs.
+
 test('a finished sdk-cli run that wrote a file files under the agent bucket', () => {
   const lines = sdkFileChangeTranscript().map((l) => JSON.stringify(l));
   assert.equal(agentRunIn(lines, true), true, 'a finished sdk-cli run that wrote a file was not read as an agent run');
@@ -2219,10 +2189,8 @@ test('a resumed SDK review files under the agent bucket', () => {
 });
 
 test('a session this window started stays parsed while the reader reads another', () => {
-  // The parse cut in panelhost.ts takes the runs out before the limit, and exempts only the
-  // session on screen: `visible.filter((s) => !this.agentRunFor(s) || s.sessionId ===
-  // this.showing)`. The started session is not the one on screen here, so the override
-  // is the whole of what keeps it.
+  // A reader-started session outside the selected view stays eligible for parsing through its ownership override.
+
   const guessed = new Map([
     ['sess-new', true],
     ['sess-run', true],
@@ -2240,8 +2208,8 @@ test('a session this window started stays parsed while the reader reads another'
   );
 });
 
-// The heading of a dispatched session names the session that started it, from the parent's own
-// row. The references are the resolved ones the worker hands the host.
+// Resolved dispatch references link the child heading to its parent row.
+
 const dispatchRows = [
   { id: 'parent-a', label: 'Plan the dispatch' },
   { id: 'parent-b', label: 'Review the plan' },
@@ -2306,8 +2274,8 @@ test('a dispatched session or subagent names no parent when the parent is unknow
   );
 });
 
-// One child claimed as dispatched and as a subagent is contested the way two parents are, so
-// the heading names neither rather than guessing which relation is true.
+// Conflicting dispatch and subagent relationships suppress parent navigation even when they name the same parent.
+
 test('a child claimed by a dispatch and as a subagent names no parent', () => {
   const none = { 'parent-a': null, 'parent-b': null, child: null };
   assert.deepEqual(
@@ -2322,9 +2290,8 @@ test('a child claimed by a dispatch and as a subagent names no parent', () => {
   );
 });
 
-// A subagent opens as a session of its own from its parent's Subagents section, so its heading
-// names the session that started it the way a dispatched session's does. The relation rides
-// on the row, so the heading can say which one it is.
+// A listed subagent carries its parent session and subagent relationship.
+
 test('a Claude subagent and a Codex subagent with a session row name the session that started them', () => {
   assert.deepEqual(parentsOf([], [subagentOf('parent-b', 'child')]).child, {
     id: 'parent-b',
@@ -2354,9 +2321,8 @@ test('a Claude subagent and a Codex subagent with a session row name the session
   );
 });
 
-// A session forked from the subagent's parent repeats the parent's `Agent` result, so the
-// worker reads a second subagent reference naming the fork. Its file never resolves, and the
-// child file keeps the parent that owns it, so the fork must not contest the child.
+// An unresolved reference copied by a fork cannot contest ownership from the resolved child file.
+
 test('a forked parent that repeats an Agent result leaves the subagent its real parent', () => {
   const fromFork = { kind: 'subagent' as const, parentSessionId: 'parent-a', sessionId: 'child' };
   const fromParent = { kind: 'subagent' as const, parentSessionId: 'parent-b', sessionId: 'child' };
@@ -2368,12 +2334,8 @@ test('a forked parent that repeats an Agent result leaves the subagent its real 
   assert.equal(parentsOf([fromFork]).child, null, 'a subagent reference whose file never resolved named a parent');
 });
 
-// A dispatched session was started by another session's shell command, which is a positive
-// fact the child's own transcript never carries, so a transcript that guesses a person does
-// not move it. A session this window started is the reader's even when a dispatch edge names
-// it, because another session can resume it with `claude -p --resume`. So is a dispatched
-// session the reader owns, through its receipt or a person typing into it, even when its
-// transcript guesses a run. The host wiring is tested in panel.webview.test.ts.
+// Dispatch establishes agent-run identity. Window-owned creation or reader ownership overrides it for dispatched sessions.
+
 test('a dispatched session is a run unless this window started it or the reader owns it', () => {
   const filed = (agentRun: boolean) => {
     const now = new Date(2026, 0, 2).getTime();
@@ -2412,8 +2374,8 @@ test('a dispatched session is a run unless this window started it or the reader 
   );
 });
 
-// Two tool results can name one launch. The edge is owned when either names it owned, in any
-// order, and ownership moves the parents key so the rail files the child again.
+// Either matching dispatch reference can establish reader ownership regardless of reference order.
+
 test('a dispatched edge is owned when either reference to it is', () => {
   const owned = { ...dispatchOf('parent-a', 'child'), owned: true };
   for (const references of [
@@ -2456,9 +2418,8 @@ test('a dispatch reference with no parent or child row does not change the paren
   );
 });
 
-// A subagent edge moves the heading, so it moves the refresh key. It never reaches the Run by
-// agents filing or the parent's lifetime cost, which read the dispatched edges alone: the
-// subagent's own transcript files it as a run, and its file already counts as delegated work.
+// Subagent relationships update heading refresh keys but stay outside dispatched edges used for grouping and cost.
+
 test('a subagent edge moves the parents key and stays out of the dispatched edges', () => {
   const rows = new Set(dispatchRows.map((row) => row.id));
   const edges = sessionParentEdgesAmong(sessionParentIndex([], [subagentOf('parent-a', 'child')]), rows);
@@ -2471,9 +2432,8 @@ test('a subagent edge moves the parents key and stays out of the dispatched edge
   assert.deepEqual([...dispatchedParents(both)], [['parent-a', 'parent-b']]);
 });
 
-// A selection renders the catalog the last walk listed, so it reuses the edges, their
-// dispatched part and their key instead of building a set of every id and sorting the key.
-// The callers list the catalog in different orders, so only a change to the ids rebuilds.
+// Parent edge sets reuse their projection and key while the parent index and catalog IDs stay the same. Empty indexes ignore catalog changes.
+
 test('the parent edge set is reused until the index or the catalog ids move', () => {
   const sessions = dispatchRows.map((row) => ({ sessionId: row.id }));
   const parents = sessionParentIndex([dispatchOf('parent-a', 'child')], [subagentOf('parent-b', 'parent-a')]);

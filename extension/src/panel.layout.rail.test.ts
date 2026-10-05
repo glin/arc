@@ -1,4 +1,4 @@
-// The panel's rail: session headings, hints, popovers, and the labels drawn on a rail card.
+// Browser checks for session-list headings, hints, popovers, and labels.
 // Shared measurement helpers live in `../test/layout.ts`.
 
 import { test } from 'vitest';
@@ -23,8 +23,8 @@ import {
   SessionLabelLine,
 } from '../test/layout.ts';
 
-// The rail head rests on its count and its two tools. A test that measures the filter box
-// opens it with the magnifying glass, the way a reader does.
+// Open the session-list filter through its search control.
+
 async function openRailBox(page: Page): Promise<void> {
   await page.locator('[data-control="railsearch"]').click();
   await page.evaluate(SETTLED);
@@ -41,8 +41,8 @@ test('the rail taking room from the session re-fits the strip', { timeout: 60_00
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await page.setContent(themed(pageHtml()));
-    // Wide enough for the rail to be drawn, and narrow enough that the widest rail leaves the
-    // strip less room than it needs.
+    // Use a panel width where the session list is visible and widening it reduces the question strip space.
+
     const laid = await layoutAt(page, 780, [], [], [], [], [SIX_QUESTION_ASK]);
     assert.ok(laid.rail, 'the rail is not drawn at 780px, so there is no sash to drag');
     await answerSixQuestions(page);
@@ -52,9 +52,8 @@ test('the rail taking room from the session re-fits the strip', { timeout: 60_00
       { marked: false, rows: 2 },
       `the strip already gave up its values before the rail took any room, so this measures nothing`,
     );
-    // The drag itself, through the sash the reader drags. Setting the width on the element
-    // measures nothing here: the rail tells the panel its layout moved, and that message is
-    // what the strip has to be re-fitted from.
+    // Drag the divider to exercise layout notification and question-strip fitting. Setting the element width alone bypasses that notification.
+
     const sash = (await page.evaluate(`(() => {
       const box = document.getElementById('railsash').getBoundingClientRect();
       return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
@@ -86,9 +85,8 @@ test('a rail bucket heading rests under the rail box and never over it', { timeo
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
 
-    // Enough pinned sessions that the bucket is taller than the box above it. A bucket
-    // of one card is scrolled past in a single step, and the heading under it reaches the
-    // line at the same moment, so nothing measured there says which of the two was sticky.
+    // Use enough pinned sessions to scroll within the Pinned section before the next heading reaches the filter bar.
+
     const pinned = ['s2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
     const wide = await layoutAt(page, 1350, [], [], [], [], [], pinned);
     assert.deepEqual(failures, [], 'the panel threw while drawing');
@@ -108,14 +106,12 @@ test('a rail bucket heading rests under the rail box and never over it', { timeo
       );
     }
 
-    // Halfway through the pinned bucket, where its own cards are under the line and the next
-    // heading has not reached it. A heading that is not sticky is drawn a whole scroll higher
-    // than this, above the box and off the top of the rail.
+    // Scroll halfway through the Pinned section to check its sticky heading independently of the next heading.
+
     const half = Math.round((rest.heads[0].offset + rest.heads[1].offset) / 2);
     const mid = await railRows(page, half);
-    // Read before the line itself, because this is the fault the reader reported: the pinned
-    // heading came to rest at the top of the rail, which is where the box already is, and was
-    // drawn over the filter and the project cost.
+    // Sticky section headings must stay below the filter bar and Project cost.
+
     for (const head of mid.heads) {
       assert.ok(
         head.top >= mid.boxBottom - 1,
@@ -133,11 +129,8 @@ test('a rail bucket heading rests under the rail box and never over it', { timeo
       `${mid.heads[1].name} has already reached the line at this scroll, so nothing here says Pinned held it`,
     );
 
-    // Far enough that the second heading has taken the line. The headings and the cards are
-    // siblings, so the one before it stays at the line underneath rather than being pushed
-    // off, exactly as the list's session headings do. The reader sees only the newer one,
-    // which holds while the two are drawn in the same place: a heading a pixel taller or
-    // shorter than the one it covers leaves a strip of the old words showing around it.
+    // Scroll until the next heading overlaps Pinned. Their edges must align so the covered heading leaves no visible strip.
+
     const past = await railRows(page, rest.heads[1].offset + 40);
     assert.ok(
       Math.abs(past.heads[1].top - past.boxBottom) <= 1,
@@ -152,12 +145,8 @@ test('a rail bucket heading rests under the rail box and never over it', { timeo
         'so a strip of the heading it replaced shows around it',
     );
 
-    // The same height, every one of them, at the narrowest the sash can leave the column and
-    // with the longest label the rail has drawn. The check above holds two headings against
-    // each other and both of them say one short word, so it passes on a page where nothing
-    // could have wrapped. This is the page where one does: a label that broke onto a second
-    // line was drawn taller than the heading it comes to rest under, and the words underneath
-    // showed around it.
+    // At minimum session-list width, use a heading long enough to truncate. Every sticky heading must retain the same height.
+
     await layoutAt(page, 1350, ['s13', 's14'], [], ['s10', 's11', 's12'], [], [], pinned);
     await page.evaluate(`document.getElementById('rail').style.flexBasis = '${RAIL_WIDTH_MIN}px'`);
     const tight = await railRows(page);
@@ -406,14 +395,8 @@ test('the new-session menu stays reachable at wide and narrow widths', { timeout
   }
 });
 
-// The setup form hangs off the foot, and the foot is redrawn by every usage message and by
-// every poll that finds a transcript has moved. Redrawn with it, the form throws away the
-// field the reader has open, the browser shuts its list of choices, and the focus goes back
-// to the first field. That is every couple of seconds while an agent runs, which is the
-// whole time the form is worth opening.
-//
-// Only a browser can answer this. The element has to survive as the same element, and no
-// text scan over the script can see that.
+// Usage refreshes must preserve the open New session menu, its field element, and focus.
+
 test('a repaint leaves the open setup form and its focus alone', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -431,8 +414,8 @@ test('a repaint leaves the open setup form and its focus alone', { timeout: 60_0
 
     await page.click('#rail .railnewmenu');
     await page.evaluate(SETTLED);
-    // The field the reader stands on, held by reference. A rebuild makes another element
-    // answering to the same name, so comparing names would pass over the very bug this is for.
+    // Retain the field element itself. Its control name cannot detect replacement by an identically named field.
+
     const fieldControl = (await page.evaluate(`(() => {
       const field = document.querySelector('#launcher [data-control="launch-permissions"]');
       field.focus();
@@ -462,8 +445,8 @@ test('a repaint leaves the open setup form and its focus alone', { timeout: 60_0
       'a render rebuilds the open setup form and takes the reader off the field',
     );
 
-    // And the guard is a print rather than a freeze: a launcher that really says something
-    // new is drawn again while it is open.
+    // Changed setup rows must still update the open menu.
+
     assert.equal(
       await page.evaluate(`document.querySelectorAll('#launcher .launchlist .launchrow').length`),
       1,
@@ -485,9 +468,8 @@ test('a repaint leaves the open setup form and its focus alone', { timeout: 60_0
       'a setup menu that gained a row loses the row or the control the reader was standing on',
     );
 
-    // The redraw that takes the control away with it. A panel left with no session to
-    // inherit from draws no Same-setup row, and the reader standing on that row has to land
-    // on another one: the body reaches none of them, because the walk is inside the popover.
+    // Remove the inherited setup while its row holds focus. Focus must move to another menu control.
+
     await page.evaluate(`document.querySelector('#launcher [data-control="launch:current"]').focus()`);
     const orphaned = JSON.parse(usage) as { launcher: { inherited: unknown; primary: unknown } };
     orphaned.launcher.inherited = null;
@@ -503,9 +485,8 @@ test('a repaint leaves the open setup form and its focus alone', { timeout: 60_0
       'a redraw that removes the row under the reader leaves the setup menu unreachable',
     );
 
-    // The composer's own menu, which the foot empties beside the setup form. The foot's print
-    // covers everything the composer draws, so a figure moving in the status bar reaches this
-    // menu unless it asks for itself. The reader walks it with the arrow keys.
+    // Changing usage-bar age must preserve the open prompt-box picker and its focus.
+
     await page.keyboard.press('Escape');
     await page.evaluate(SETTLED);
     await page.click('.cpick');
@@ -765,8 +746,8 @@ test('Escape from a hint does not also close another panel float', { timeout: 60
       false,
       'the hint did not open over the pinned chip float',
     );
-    // This catches the hint painting under a pinned stat when both floats overlap. Existing
-    // assertions only prove both remain open and cannot identify the visible top layer.
+    // Check painting order where the control hint overlaps a pinned figure popover. Open state alone cannot identify the top layer.
+
     const floatStack = (await page.evaluate(`(() => {
       const stat = document.getElementById('chippop');
       const hint = document.getElementById('hintpop');
@@ -789,7 +770,7 @@ test('Escape from a hint does not also close another panel float', { timeout: 60
       ['hintpop', 'chippop'],
       'the pinned stat paints over the overlapping control hint',
     );
-    // The hint's layer ranks only among the body's children, so the box must stay one of them.
+    // The hint must remain a body child for its stacking order to apply.
     assert.equal(
       await page.evaluate(`document.getElementById('hintpop').parentElement === document.body`),
       true,
@@ -1312,9 +1293,8 @@ test('a commented line wears its mark in the card own indent', { timeout: 60_000
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
 
-    // The narrowest sidebar the panel is drawn in, and an editor tab. The indent the mark
-    // hangs in is written in em units, so it is the same at both, and a rule that squeezed it
-    // would put the mark over the response text at the narrow one first.
+    // Check comment-mark indentation at sidebar and editor-tab widths.
+
     for (const width of [300, 1350]) {
       const at = await markedLayout(page, width);
       assert.deepEqual(failures, [], `the panel threw while drawing the marks at ${width}px`);
@@ -1329,8 +1309,8 @@ test('a commented line wears its mark in the card own indent', { timeout: 60_000
           `at ${width}px a mark is drawn at no size, so nothing on the line says a comment is there`,
         );
         assert.equal(mark.visibility, 'visible', `at ${width}px a mark is drawn invisible`);
-        // Inside the card and left of the text. A mark that ran under the card's own left
-        // edge would be cut off by it, and one that reached the text would sit on top of it.
+        // Keep each mark inside the card and left of the response text.
+
         assert.ok(
           mark.left >= at.card.left,
           `at ${width}px a mark starts at ${Math.round(mark.left)} with the card at ` +
@@ -1343,8 +1323,8 @@ test('a commented line wears its mark in the card own indent', { timeout: 60_000
         `at ${width}px the mark ends at ${Math.round(onSummary.right)} and the line it marks starts at ` +
           `${Math.round(at.para.left)}, so the mark is drawn over the response`,
       );
-      // On the line it marks, not a line above or below it. This is what `top: auto` buys,
-      // and a rule that gave the mark a measured top would drift here first.
+      // Each mark must align with the line it annotates.
+
       assert.ok(
         Math.abs(onSummary.top - at.para.top) <= 4,
         `at ${width}px the mark sits at ${Math.round(onSummary.top)} and its line at ` +
@@ -1355,30 +1335,29 @@ test('a commented line wears its mark in the card own indent', { timeout: 60_000
         `at ${width}px the mark on the prompt sits at ${Math.round(onPrompt.top)} and the prompt at ` +
           `${Math.round(at.prompt.top)}. The prompt is drawn clamped, and a mark inside that clamp is cut away`,
       );
-      // The mark is drawn out of the flow, so the line it marks starts where an unmarked line
-      // starts. A mark back in the flow would push every commented line sideways.
+      // Comment marks must leave the text position unchanged.
+
       assert.ok(
         Math.abs(at.para.left - at.prompt.left) <= 1,
         `at ${width}px the marked response starts at ${Math.round(at.para.left)} and the prompt at ` +
           `${Math.round(at.prompt.left)}, so a mark moves the line it is on`,
       );
-      // And the mark puts no word inside the line. The walk that placed it reads the line back.
+      // The mark count must stay outside the annotated text used for quote matching.
       assert.ok(
         !at.paraText.includes('2'),
         'the mark wrote its count into the line, so the walk that placed it can no longer find the line',
       );
 
-      // Nothing else here renders a turn with comments on it, and a mark hangs in a negative
-      // offset outside the text, so this is the one place a mark widening the card would show.
+      // Marks extend left of the text without widening the panel.
+
       assert.ok(
         at.documentWidth <= at.viewportWidth + 1,
         `at ${width}px the panel scrolls sideways once a turn has comments on it: ` +
           `${at.documentWidth} wide in a ${at.viewportWidth} viewport`,
       );
 
-      // Pressed, the mark opens the comments on that line, on the screen and inside it. The
-      // panel is placed by the same rules the comment box is, and at 300px an unclamped one
-      // runs off the right edge where nothing scrolls it back.
+      // Opening a mark must place its comment list inside the narrow panel.
+
       const opened = (await page.evaluate(`(() => {
         document.querySelector('.linemark').click();
         const float = document.querySelector('.markfloat');
@@ -1464,16 +1443,8 @@ test('archive sits left of the rightmost pin on a rail card', { timeout: 60_000 
   }
 });
 
-// The session's own labels on the session heading, measured where the reader reads them.
-//
-// The rail card draws a cut of the list because a card is only as wide as the reader dragged
-// the rail. This line has the width of the panel and draws every label, so it is the one that
-// has to wrap: a run that cannot wrap pushes its chips out past the panel or pushes the first
-// turn card down the page, and neither shows in a scan of the stylesheet.
-//
-// The press on it opens the same editor the rail card's control opens, and the popover has to
-// land against this control. Placed against the rail while the reader is standing in the list,
-// it is a popover about a session drawn beside a column that says nothing about it.
+// The session heading shows every label and allows wrapping. Its label editor must open beside the heading control.
+
 test(
   'the session labels sit under the heading figures and open the editor against their own line',
   { timeout: 60_000 },
@@ -1540,15 +1511,15 @@ test(
 
       const wide = (await page.evaluate(LINE)) as SessionLabelLine | null;
       assert.ok(wide, 'the session heading draws no label line, so the main view offers no way into the editor');
-      // Every label, and no fold. The card beside it folds; this line is where the reader
-      // reads the whole of what the session carries.
+      // The session heading shows all labels, including those folded on its session-list card.
+
       assert.deepEqual(
         wide.chips,
         ['composer', 'release 0.4', 'perf'],
         'the heading drew something other than every label the fixture filed the session under',
       );
-      // Real buttons at this width. The rail is up, so a press has a list to file, and a chip
-      // drawn as a word offers the reader nothing to press and no stop to reach it by.
+      // While the session list is visible, heading labels are accessible filter buttons.
+
       assert.deepEqual(
         wide.tags,
         wide.chips.map(() => 'button'),
@@ -1579,8 +1550,8 @@ test(
         'the label line runs ' + Math.round(wide.overCard ?? 0) + 'px into the first turn card at 1350px',
       );
 
-      // The rail message carries the labels, so a write lands on this line in the browser and
-      // not only in a lifted copy of the writer. The long one is what makes the row wrap.
+      // Send changed labels through the session-list message. Include a long label to test wrapping.
+
       const posted = renderPayload() as {
         rail: { id: string }[];
         stats: unknown;
@@ -1605,10 +1576,8 @@ test(
         ['composer', 'release 0.4', 'perf', long],
         'a label written on the session on screen never reached the heading over it',
       );
-      // The whole name on each chip's hint. The longest one here is longer than the line has
-      // room for at every width below, and two labels that agree up to the cut draw the same
-      // chip with nothing to tell the eye them apart. The panel's own hint and never a native
-      // one, because the chip is a control the reader can press.
+      // Label buttons expose full names through panel hints and omit native tooltips.
+
       assert.deepEqual(
         written.hints,
         written.chips,
@@ -1620,10 +1589,8 @@ test(
         'a label chip wears a native hover as well as the panel hint, so the reader is offered two',
       );
 
-      // The press, run in the browser against the real rail. A chip drawn as a button with no
-      // listener on it, or one that writes a term the grammar reads as a title word, reads
-      // exactly like a working one to every scan of the source and to every measure above.
-      // The label pressed here carries a space, which is the case the quoting exists for.
+      // Press a label containing a space to test quoted label filtering.
+
       const filed = (await page.evaluate(`(() => {
         const chip = [...document.querySelectorAll('#list .sessionrow button.sessionlabel')]
           .find((node) => node.textContent === 'release 0.4');
@@ -1644,27 +1611,24 @@ test(
         'label:"release 0.4"',
         'a press on a heading label chip wrote something other than the term that files that label',
       );
-      // The box is where a filter is edited and cleared, so the press leaves the reader in it.
-      // A list filed from a control that then says nothing about what it did is a list the
-      // reader cannot get back out of.
+      // Filtering by a label must focus the filter field so the reader can edit or clear the query.
+
       assert.equal(
         filed.focused,
         true,
         'a press on a heading label chip left the focus off the box that holds what it wrote',
       );
-      // The term is a whole label and not a word part way through being typed.
+      // A complete label-filter term must not open suggestions.
       assert.equal(filed.offers, false, 'the suggestion list opened over a term the press wrote whole');
-      // The list actually narrowed. A filter written into the box that nothing reads is the
-      // defect this measures, and the drawn box looks identical either way.
+      // Check the visible sessions as well as the filter text.
+
       assert.ok(
         filed.shown.length > 0 && filed.shown.length < posted.rail.length,
         `the press left ${filed.shown.length} of ${posted.rail.length} cards on screen, so the rail never read what it wrote`,
       );
 
-      // The panel narrowed past the width the rail exists at, in the browser, so the listener
-      // that redraws the line is measured rather than the writer it calls. A chip left as a
-      // button here keeps a stop on the walk for a press that can file nothing, and every
-      // measure taken by calling the writer directly passes while it happens.
+      // Resize below the session-list breakpoint. Heading labels must become read-only text without adding keyboard stops.
+
       const CHIPS = `(() => {
         const chips = [...document.querySelectorAll('#list .sessionrow .sessionlabel')];
         const stops = [...document.querySelectorAll(${JSON.stringify(rovingSelector())})]
@@ -1697,15 +1661,15 @@ test(
         written.chips,
         'a chip drawn as a word carries no hover, so a cut name cannot be read at all',
       );
-      // Exactly one, or the walk is not a walk. Zero means Tab cannot reach the list at all.
+      // The timeline roving walk keeps exactly one Tab stop.
       assert.equal(
         shrunk.stops,
         1,
         `the narrowed page holds ${shrunk.stops} tab stops on the roving walk rather than one`,
       );
 
-      // And back out. The chips come back as controls, and none of them takes a stop of its
-      // own: a native button is a tab stop from the moment it exists.
+      // Widen the panel to restore label buttons without adding independent Tab stops.
+
       await page.setViewportSize({ width: 1350, height: 900 });
       await page.waitForFunction(`(() => {
         const chips = [...document.querySelectorAll('#list .sessionrow .sessionlabel')];
@@ -1733,17 +1697,14 @@ test(
         `the widened page holds ${regrown.stops} tab stops on the roving walk rather than one`,
       );
 
-      // The figures rewritten where they stand, which is a different path from the build that
-      // drew them. It takes the drawn row out and puts a fresh one back, and an append put the
-      // new row under the label line: the heading reordered itself the first time a figure
-      // moved, which an agent finishing a turn does on its own.
+      // Change the session cost through a session-list update. The figures must retain their position above the labels.
+
       const priced = JSON.parse(JSON.stringify(posted.stats)) as Record<string, { metric: string; label: string }[]>;
       const cost = priced.s1.find((chip) => chip.metric === 'cost');
       assert.ok(cost, 'the fixture gives the session on screen no cost, so no figure here can move');
       cost.label = '$9.99';
-      // The saved views ride every rail message. The boundary refuses one without them, and a
-      // refused message reaches no renderer, so the figures below would measure the first build
-      // for ever and never the rewrite this part of the guard exists for.
+      // Include saved views and filter state so the protocol accepts the session-list update.
+
       await page.evaluate(
         `window.postMessage({ type: 'rail', rail: ${JSON.stringify(moved)}, stats: ${JSON.stringify(priced)}, labels: ${JSON.stringify(posted.labels)}, views: ${JSON.stringify(posted.views)}, railFilters: ${JSON.stringify(posted.railFilters)}, hidden: ${JSON.stringify(posted.hidden)}, pinnedTop: ${JSON.stringify(posted.pinnedTop)} }, '*')`,
       );
@@ -1769,8 +1730,8 @@ test(
         'the label line is drawn above the figures once they have been rewritten',
       );
 
-      // Narrow, where the rail is gone and the list is the whole panel. The run is wider than
-      // the row, so it has to wrap, and every chip has to stay inside the row it wrapped in.
+      // At sidebar width, wrap the labels and keep each one inside its row.
+
       await page.setViewportSize({ width: 340, height: 900 });
       await page.evaluate(SETTLED);
       const narrow = (await page.evaluate(LINE)) as SessionLabelLine | null;
@@ -1793,8 +1754,8 @@ test(
         'the wrapped label line runs into the first turn card at 340px',
       );
 
-      // The press, back at the width the rail is drawn at. The editor opens on the answer and
-      // not on the press, because the record lives on the extension side.
+      // The heading requests label-editor rows from the host before opening the editor.
+
       await page.setViewportSize({ width: 1350, height: 900 });
       await page.evaluate(SETTLED);
       await page.evaluate('window.__posted.length = 0');
@@ -1855,22 +1816,15 @@ test(
         'true',
         'the press says nothing about the editor it opened, so a reader who cannot see it is told nothing',
       );
-      // One control on the rail says the editor is open, and it is the control the editor hangs
-      // off. Any other card saying so would be a control claiming a popover about something
-      // else, and a second copy of this card saying so would be two controls claiming one.
-      //
-      // The elements are counted rather than the sessions behind them. A session two
-      // saved views both match draws a card under each of their sections, so folding the list
-      // down to its sessions is exactly what hides the defect this guard is here for.
+      // Count expanded label controls by DOM element. A session appearing in several saved views must still have only one expanded control.
+
       assert.deepEqual(
         opened.openOnRail,
         ['s1'],
         'the rail has no control claiming this editor, or more than one claims it',
       );
-      // Against this button, not against the rail. The two edges cannot agree exactly: the
-      // popover ends at the control's right edge and starts no further left than the heading
-      // row, and here the row's edge is the one that wins. What has to hold is that it stands
-      // clear of the rail and still shares a run with the control it hangs off.
+      // The label editor must clear the session-list column and overlap its heading anchor horizontally.
+
       assert.ok(
         opened.railRight !== null && opened.pop.left >= opened.railRight,
         'the popover covers the rail while it edits a session the rail is listing',
@@ -1885,14 +1839,14 @@ test(
           `and shares nothing with the button it opened from, which runs from ` +
           `${Math.round(opened.button.left)} to ${Math.round(opened.button.right)}px`,
       );
-      // Clear of the whole heading row, labels included. One drawn across it covers the
-      // session it is about.
+      // The editor must sit below the complete session heading without covering it.
+
       assert.equal(opened.overRow, false, 'the popover covers the heading of the session it names');
       assert.ok(opened.underRow >= -1, 'the popover is drawn above the heading it belongs to');
       assert.equal(opened.offScreen, 0, 'the popover hangs ' + Math.round(opened.offScreen) + 'px off the panel');
 
-      // A full repaint keeps this control alive while another session changes. The
-      // popover and focus stay anchored to the control the reader pressed.
+      // Switch the shown session away and back without changing session data. The original session label control must retain its element.
+
       const again = renderPayload() as Record<string, unknown> & { sessions: { id: string }[] };
       const elsewhere = again.sessions.map((one) => one.id).find((id) => id !== 's1');
       assert.ok(elsewhere, 'the fixture draws one session, so nothing here can force a rebuild');
@@ -1906,8 +1860,8 @@ test(
         true,
         'the repaint replaced the label control instead of preserving its keyed session',
       );
-      // The popover is placed against its anchor when the window moves, so a resize is what
-      // asks it where it belongs now.
+      // Resize to update the popover position against its retained anchor.
+
       await page.setViewportSize({ width: 1360, height: 900 });
       await page.evaluate(SETTLED);
       const repainted = (await page.evaluate(OPENED)) as typeof opened;
@@ -1925,9 +1879,8 @@ test(
       await page.setViewportSize({ width: 1350, height: 900 });
       await page.evaluate(SETTLED);
 
-      // Escape hands the reader back the control they opened it from, and the repaint above
-      // must not have moved which one that is. Without it the keyboard is left on the body
-      // with nothing said.
+      // Escape closes the label editor and restores focus to the retained heading control.
+
       await page.keyboard.press('Escape');
       await page.evaluate(SETTLED);
       assert.deepEqual(
@@ -1966,9 +1919,8 @@ test('a rail card meta line stays on one line at the narrowest the rail can be',
 
     const payload = renderPayload() as { rail: Record<string, unknown>[] };
     assert.ok(payload.rail.length >= 3, 'the fixture built no rail, so this measures nothing');
-    // Written on to the card the panel is handed, because the rail arrives as this array
-    // and the panel draws what is in it. Which session earns which word is decided in
-    // `railSessions` and tested there; what is measured here is how one lays out.
+    // Set presentation fields directly on the session-list payload to exercise metadata layout.
+
     payload.rail[0] = {
       ...payload.rail[0],
       pinnedTop: true,
@@ -1982,7 +1934,7 @@ test('a rail card meta line stays on one line at the narrowest the rail can be',
     };
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
-    // The narrowest the sash can leave the column, set the way the drag itself sets it.
+    // Set the minimum session-list width through flex-basis, matching divider placement.
     await page.evaluate(`document.getElementById('rail').style.flexBasis = '${RAIL_WIDTH_MIN}px'`);
     await page.evaluate(SETTLED);
 
@@ -2011,8 +1963,8 @@ test('a rail card meta line stays on one line at the narrowest the rail can be',
       assert.ok(line.overflow <= 1, `${said} runs ${Math.round(line.overflow)}px past the card it sits on`);
     }
 
-    // The widest line has to be one the column cannot hold whole, or every check above it
-    // passes on a stylesheet that wraps.
+    // The longest metadata line must exceed the available width so the test detects wrapping.
+
     assert.ok(
       worst.clipped,
       `${JSON.stringify(worst.words.join(' '))} fits inside ${RAIL_WIDTH_MIN}px whole, ` +
@@ -2042,14 +1994,13 @@ test(
 
       const payload = renderPayload() as { rail: Record<string, unknown>[] };
       assert.ok(payload.rail.length > 1, 'the fixture has no second card to measure a one-line reference height from');
-      // Long enough to still overflow the widest rail column this panel draws, so both
-      // widths measured below are exercising the ellipsis and neither happens to draw whole.
+      // Use a name long enough to overflow at both tested session-list widths.
+
       const long = Array.from({ length: 40 }, (_, n) => `word${n}`).join(' ');
       const id = payload.rail[0].id as string;
       const referenceId = payload.rail[1].id as string;
-      // `label` is set apart from `name` and stays short: a card that fell back to drawing
-      // `label` here would draw whole with no ellipsis at either width, so the gap and margin
-      // assertions below would go red rather than pass on a name this test never set.
+      // Keep label short and name long. Drawing the wrong field must fail the clipping and width checks.
+
       payload.rail[0] = { ...payload.rail[0], label: 'Short label', name: long };
       await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
       await page.evaluate(SETTLED);
@@ -2091,8 +2042,8 @@ test(
       assert.ok(wide, `the rail drew no card for ${id} at 480px`);
 
       assert.deepEqual(failures, [], 'the panel threw while drawing a long rail name');
-      // One line at both widths, matching a short name's own one-line height: the row never
-      // wraps the name onto a second line at either width.
+      // Compare the name height with a short one-line reference at both widths.
+
       assert.ok(
         Math.abs(narrow.nameHeight - narrow.referenceNameHeight) <= 1,
         `the name drew ${narrow.nameHeight}px tall against a one-line reference of ${narrow.referenceNameHeight}px at ${RAIL_WIDTH_MIN}px`,
@@ -2101,13 +2052,13 @@ test(
         Math.abs(wide.nameHeight - wide.referenceNameHeight) <= 1,
         `the name drew ${wide.nameHeight}px tall against a one-line reference of ${wide.referenceNameHeight}px at 480px`,
       );
-      // Cut at the narrow width, so this name is exercising the ellipsis rather than fitting
-      // by chance.
+      // Check that the long name truncates at minimum width.
+
       const narrowGap = narrow.scrollWidth - narrow.clientWidth;
       const wideGap = wide.scrollWidth - wide.clientWidth;
       assert.ok(narrowGap > 0, `the name fit whole at ${RAIL_WIDTH_MIN}px, so widening it proves nothing here`);
-      // A wider rail draws more of the name, not the same fixed cut regardless of the column
-      // it is given.
+      // Widening the session list must reveal more of the name.
+
       assert.ok(
         wideGap < narrowGap,
         `the name left ${Math.round(narrowGap)}px cut at ${RAIL_WIDTH_MIN}px and ${Math.round(wideGap)}px cut at 480px, ` +
@@ -2117,15 +2068,14 @@ test(
         wide.clientWidth > narrow.clientWidth,
         'the name column did not grow with the rail, so nothing here measures the claim',
       );
-      // The name's own right edge reaches close to the card's right edge, not to a fixed
-      // column narrower than the row: this would fail against a rule such as
-      // `.railname { max-width: 20em }`, which leaves most of a 480px card empty.
+      // The name must use the available card width rather than stop at a fixed maximum.
+
       const wideMargin = wide.cardWidth - wide.clientWidth;
       assert.ok(
         wideMargin <= 50,
         `the name column left ${Math.round(wideMargin)}px of the ${Math.round(wide.cardWidth)}px card unused at 480px`,
       );
-      // Widening the rail moves the name, never the meta line drawn under it.
+      // Widening the session list must preserve the metadata line position.
       assert.equal(narrow.metaTop, wide.metaTop, 'widening the rail moved the meta line under a card name');
     } finally {
       await browser.close();
@@ -2337,8 +2287,8 @@ test(
       const failures: string[] = [];
       page.on('pageerror', (e) => failures.push(String(e)));
       await page.setContent(themed(pageHtml()));
-      // Enough labels to fold, one name longer than the menu is wide, and a saved filter
-      // whose query runs past the row, so every cut the menu makes is drawn.
+      // Use enough labels to fold, an overflowing label name, and an overflowing saved-filter query.
+
       const payload = renderPayload() as { labels: unknown[] };
       payload.labels = [
         ...Array.from({ length: 16 }, (_, index) => ({
@@ -2348,8 +2298,8 @@ test(
         })),
         { name: 'x'.repeat(60), count: 1, countName: 'carried by one session' },
       ];
-      // The rail is wide from RAIL_MIN_WIDTH up, and the funnel lives on the rail, so the
-      // narrowest menu a reader can open is at that panel width on the narrowest rail.
+      // Test the smallest visible session list at the panel breakpoint and minimum column width.
+
       for (const [width, railWidth] of [
         [1350, RAIL_WIDTH_DEFAULT],
         [RAIL_MIN_WIDTH, RAIL_WIDTH_MIN],
@@ -2541,10 +2491,8 @@ test(
   },
 );
 
-// A session whose main agent is idle while its background subagents still work, or while a
-// command it started in the background still runs. It sorts and filters with running sessions,
-// so its card wears the running card's busy edge and its word the busy tone. The hint and the
-// name say what the word alone cannot.
+// Subagent and background-command states use the busy card edge and text tone. Their hints and accessible names identify the running work.
+
 test(
   'a session waiting on its subagents or a background command wears the busy edge, the busy word and its hint',
   { timeout: 60_000 },
@@ -2683,8 +2631,8 @@ test(
   },
 );
 
-// Saved state that leaves the Running count unticked, for the head measures that read one count
-// beside the tools while a session runs.
+// Save only the Active quick filter so the Running count stays hidden.
+
 const ONE_COUNT = JSON.stringify({ railQuickFilters: ['active'] });
 
 test(
@@ -2700,10 +2648,10 @@ test(
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on('pageerror', (e) => failures.push(String(e)));
-      // The Running count is unticked, so the running s2 draws no count of its own.
+      // Session s2 runs, but the saved quick-filter selection omits Running.
       await page.setContent(themed(pageHtml().replace('const SAVED_STATE = {};', `const SAVED_STATE = ${ONE_COUNT};`)));
       await page.setViewportSize({ width: 1350, height: 900 });
-      // The configured Active button draws alone beside the tools. Shots cover the wrapped head at 220px.
+      // The Active button is the only configured quick-filter count.
       const statuses = new Map<string, RailStatus>([['s2', 'running']]);
       await page.evaluate(
         `window.postMessage(${JSON.stringify(renderPayload([], [], [], [], [], [], statuses))}, '*')`,
@@ -2746,9 +2694,8 @@ test(
         };
         assert.ok(measured, `the rail head row drew no count or no tools at ${width}px`);
         assert.equal(measured.railWidth, width);
-        // The row wraps at a narrow rail, so the rule that holds at every width is that no
-        // control runs off the rail. The one line, the order and the gap are measured at the
-        // wide rail, where the row has the space for all of it.
+        // Header controls must stay inside the session list at both tested widths.
+
         assert.ok(
           measured.outside <= 1,
           `a head-row control runs ${Math.round(measured.outside)}px outside the ${width}px rail`,
@@ -2767,10 +2714,8 @@ test(
   },
 );
 
-// Stops the page clock at its own current time and returns that time. The page clock runs in
-// real time, and any read inside the page moves it on, so a time read out first can fall behind
-// it before `pauseAt` lands. A fixed time holds still until the pause, and the system time then
-// lets `runFor` move the paused clock again.
+// Freeze the page time before pausing to prevent clock advancement between calls. Restore system time so runFor advances the paused clock.
+
 async function pauseClock(page: Page): Promise<number> {
   const time = (await page.evaluate('Date.now()')) as number;
   await page.clock.setFixedTime(time);
@@ -2779,8 +2724,8 @@ async function pauseClock(page: Page): Promise<number> {
   return time;
 }
 
-// Presses Active over a query that keeps only session `s1`, which sits 20 seconds inside the
-// Active window with no warm cache, so a 25-second clock run moves it out of the lens.
+// Select Active over a query containing only s1. Its recency expires in 20 seconds, so a 25-second clock advance removes it.
+
 async function pressActiveOverLeavingSession(
   page: Page,
 ): Promise<() => Promise<{ pressed: string | null; drawn: number }>> {
@@ -2789,8 +2734,8 @@ async function pressActiveOverLeavingSession(
   const payload = renderPayload() as { rail: { id: string; at: number; cache: unknown }[] };
   const target = payload.rail.find((card) => card.id === 's1');
   assert.ok(target, 'the fixture dropped session s1, so this measures nothing');
-  // `railCardActive` holds a card on a live cache alone, whatever its age, so the cache goes
-  // and only the recency window governs the card.
+  // Remove the warm cache so only recency controls Active membership.
+
   target.cache = null;
   target.at = now - (ACTIVE_WINDOW_MS - 20_000);
   await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
@@ -2824,8 +2769,8 @@ test('the selected Active shortcut disappears when a tick drops its last session
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
     const read = await pressActiveOverLeavingSession(page);
-    // Paused first, so the advance is exact however long the setup took, then run forward so
-    // every timer due along the way fires.
+    // Pause before advancing so due timers run over an exact interval.
+
     await pauseClock(page);
     await page.clock.runFor(25_000);
     const after = await read();
@@ -2856,15 +2801,15 @@ test('ending naming refreshes held cache information at the current time', { tim
     target.at = now - (ACTIVE_WINDOW_MS - 20_000);
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
-    // A query that reads no clock, so no clock fact moves the list under the name.
+    // Use a query without time conditions so only the cache reading changes during naming.
     await page.locator('[data-control="railsearch"]').click();
     await page.locator('[data-control="railfilter"]').fill('embedded');
     await page.evaluate(SETTLED);
     const active = page.locator('[data-control="railcount:active"]');
     assert.ok((await active.getAttribute('aria-label'))?.includes(CARD_ACTIONS.railCountCacheWarm));
     await page.locator('[data-control="railviewsave"]').click();
-    // The clock stops, then its time moves past the session's window with no timer firing, so
-    // only the end of naming can refresh the cache information.
+    // Advance paused system time without firing timers. Ending naming must refresh cache information.
+
     const paused = await pauseClock(page);
     await page.clock.setSystemTime(paused + 25_000);
     await page.keyboard.press('Escape');
@@ -2927,8 +2872,8 @@ test('releasing a held text selection removes the zero-match Active shortcut', {
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
     const read = await pressActiveOverLeavingSession(page);
-    // A tick that lands while a selection is held inside the rail defers its whole repaint,
-    // head and list alike, rather than move text the reader is pointing at.
+    // A held session-list text selection defers both header and list repaint.
+
     await page.evaluate(`(() => {
         const range = document.createRange();
         range.selectNodeContents(document.querySelector('.railcard[data-session="s1"]'));
@@ -2937,8 +2882,8 @@ test('releasing a held text selection removes the zero-match Active shortcut', {
       })()`);
     await pauseClock(page);
     await page.clock.runFor(25_000);
-    // `releaseSelection` answers the browser's own `selectionchange` event. Polled rather than
-    // settled on a frame, because the page's clock is paused.
+    // Wait for selectionchange to release the deferred update. The paused clock cannot advance an animation-frame wait.
+
     await page.evaluate('getSelection().removeAllRanges()');
     await page.waitForFunction(`document.querySelector('.railcard[data-session="s1"]') === null`);
     const after = await read();
@@ -2975,7 +2920,7 @@ test(
           `the ${control} button wears ${JSON.stringify(style)} under the pointer, not the session action hover chip`,
         );
       }
-      // Both sides of each tool follow the text, so a larger text step grows each side with it.
+      // Doubling header text size must scale both dimensions of each tool.
       const sized = async () =>
         await Promise.all(
           ['railsearch', 'railfilters'].map(

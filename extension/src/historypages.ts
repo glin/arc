@@ -1,66 +1,35 @@
-// extension/src/historypages.ts
-//
-// Older session history, one page at a time.
-//
-// `history.ts` and the two source adapters read a semantic page off a transcript. This
-// module owns what the provider does with one: which session may ask for a page, what
-// a page adds once its adapter has proved both of its edges, when a request stops reading,
-// how much retained history a session keeps, and what the control at the end of the
-// list says.
-//
-// A request reads disjoint ranges, chains from the cursor the last page returned, and stops
-// at the beginning of the file. Its cost does not grow with the session, because no
-// range is read twice and no tail is parsed again.
-//
-// Nothing here imports `vscode`, so every rule below is tested. `panelhost.ts` is the
-// orchestration seam and `webview/panel.ts` is the rendering seam, and neither decides
-// anything this file decides.
+// Retain older session pages, admit new turn identities, and manage the older-history control.
+// Requests chain from source-adapter cursors. Retained pages share the selected-session history budget.
 
 import { Compaction, Turn } from './transcript';
 import { turnKey } from './turnread';
 import { settingDefault } from './settings';
 
-// How many complete turns one page aims at. Large enough that a reader scrolling steadily is
-// not waiting on a read, and small enough that one page stays a bounded piece of work.
+// Target number of complete turns per older-history page.
 export const HISTORY_PAGE_TURNS = 20;
 
-// The supported range of the `sessionCacheMiB` setting, in MiB. `historyBudgetBytes` clamps
-// to this range and `package.json` contributes the same bounds.
+// Supported `sessionCacheMiB` range. `historyBudgetBytes` clamps values to these bounds.
 export const HISTORY_BUDGET_MIN_MIB = 1;
 export const HISTORY_BUDGET_MAX_MIB = 256;
 
-// Bytes of retained history the `sessionCacheMiB` setting allows, in bytes of serialized
-// turns and compactions. Raw transcript chunks are transient and never enter it. Floors a
-// fractional MiB value, clamps it to the supported range, and falls back to the setting's
-// default when the value is not a finite number.
+// Convert `sessionCacheMiB` to bytes. Floor finite values, clamp them, and use the setting default for nonfinite values.
+// Retained pages charge serialized turns and compactions. Raw read buffers are excluded.
 export function historyBudgetBytes(mib: number): number {
   const value = Number.isFinite(mib) ? Math.floor(mib) : settingDefault('sessionCacheMiB');
   return Math.min(HISTORY_BUDGET_MAX_MIB, Math.max(HISTORY_BUDGET_MIN_MIB, value)) * 1024 * 1024;
 }
 
-// The most pages one request will read while it looks for a turn the session does not
-// already hold. The first request starts at the end of the file and walks back through
-// everything the ordinary tail already listed, so it pays about one page read per page of
-// loaded turns. Every later request chains from the stored cursor and reaches new turns on
-// its first read.
+// Maximum page reads per request. `historyPageReads` scales the allowance with loaded turns, up to this ceiling.
 export const HISTORY_PAGE_READ_CEILING = 8;
 
-// How many requests in a row may return no new turn before the sentinel stops asking on its
-// own. Without it a request that adds nothing leaves the sentinel on screen, and the panel
-// asks again the moment it settles. The button stays, so the reader can still go further.
-//
-// Requests, not reads. One request reads several pages while it walks back past the turns
-// the ordinary tail already lists, and counting those would switch the automatic trigger off
-// on the first press of a long session.
+// Stop automatic requests after this many consecutive requests retain no page.
+// The button remains available. Each request can read several pages.
 export const HISTORY_EMPTY_RUN_LIMIT = 3;
 
-// What one retained turn or compaction is charged when the serializer refuses to measure it.
-// Set above what an ordinary record costs, so a value nobody can measure is never treated as
-// the cheapest thing in the cache.
+// Charge this many bytes per turn or compaction when JSON serialization fails.
 export const HISTORY_UNMEASURED_RECORD_BYTES = 2048;
 
-// One accepted older page: the turns and compactions its adapter proved complete at both
-// semantic edges, and what they cost the retained budget.
+// Accepted turns and compactions with their serialized byte charge.
 export interface HistoryPage {
   turns: Turn[];
   compactions: Compaction[];
@@ -68,19 +37,17 @@ export interface HistoryPage {
   fromWindow?: true;
 }
 
-// The bounded evidence behind a completed-prefix claim. The final semantic page proves the
-// source range, while the ordinary tail owns the turn identities beyond that range.
+// Source coverage and tail turn identities needed to confirm the completed prefix.
 export interface HistoryCoverage {
   ownedRange: { start: number; end: number };
   openRange: { start: number; end: number } | null;
   tailTurnKeys: string[];
 }
 
-// What one session has loaded beyond its ordinary tail.
+// Retained history beyond the ordinary tail for one session.
 export interface SessionHistory<Cursor> {
   sessionId: string;
-  // The file generation the pages were read from. `historyAfterRevision` decides what a
-  // move of either figure does to them.
+  // Source size and modification time used by `historyAfterRevision`.
   size: number;
   mtimeMs: number;
   pages: HistoryPage[];
@@ -91,12 +58,11 @@ export interface SessionHistory<Cursor> {
   // Tail-owned turns encountered while a backward scan is in progress. A completed
   // coverage claim depends on these identities until a later page retains them.
   scanTailTurnKeys: string[];
-  // Every completed read attempt, including the ones that failed. The panel compares it
-  // before it asks on its own, so a request that changed nothing cannot be repeated.
+  // Completed page-read attempts, including stale and failed reads. The control token includes this count.
   requests: number;
   emptyRuns: number;
   failed: boolean;
-  // When the reader last had this session on screen, which is what decides eviction.
+  // Last viewing time used to order unprotected sessions for eviction.
   usedAt: number;
 }
 
@@ -120,9 +86,7 @@ export function startSessionHistory<Cursor>(
   };
 }
 
-// Whether older history exists to ask for, before any page has been read. Two things say so.
-// The ordinary tail does not reach the beginning of the file, or its parser discarded an
-// older turn at the turn limit.
+// Older history exists when the read excludes bytes or the parser reached its turn limit.
 export function olderHistoryPossible(state: { size: number; readBytes: number; turnLimitReached: boolean }): boolean {
   return state.size > state.readBytes || state.turnLimitReached;
 }
@@ -149,12 +113,8 @@ function tailHasTurnKeys(keys: readonly string[], tail: { turns: readonly Turn[]
   return keys.every((key) => current.has(key));
 }
 
-// What happens to retained pages when the transcript moves under them.
-//
-// An append leaves every retained byte where it was, so the pages still describe the file
-// and only the revision the cursor records has to move with it. A session nobody is
-// reading starts over instead: nothing validates its bytes while it is off screen, and its
-// pages are a convenience rather than what is on the reader's screen.
+// Keep unchanged history unless selected-tail coverage has expired.
+// Rebase a selected session on growth. Reset changed sessions otherwise.
 export function historyAfterRevision(
   held: Pick<
     SessionHistory<unknown>,
@@ -185,8 +145,7 @@ export function historyAfterRevision(
   return 'reset';
 }
 
-// Apply the revision decision as one state transition. The provider calls this after it
-// admits a stable tail, so tests can cover the same append path that updates its map.
+// Apply the revision decision to retained pages and their cursor.
 export function historyStateAfterRevision<
   Cursor extends {
     revision: { size: number; mtimeMs: number };
@@ -247,18 +206,13 @@ export function restartHistoryCoverage<Cursor>(
   };
 }
 
-// A compaction's identity, spelled the way the card's key spells it. Two pages can carry the
-// same compaction when their ranges meet at a boundary record.
+// Match the compaction card key to deduplicate records across page boundaries.
 function compactionKey(compaction: Compaction): string {
   return `${compaction.sessionId}:compact:${compaction.at}`;
 }
 
-// The turns and compactions a page adds, less the ones the session already holds.
-//
-// The first request reads from the end of the file, so its pages overlap the ordinary tail
-// by design. The retained tail also grows as the file does, so a page admitted while it was
-// outside the tail can be inside it later. A turn admitted twice draws two cards for one
-// piece of work, which is why identity decides this and byte ranges do not.
+// Admit each turn or compaction identity once across the supplied page and retained identities.
+// Initial older pages overlap the ordinary tail. Later appends can move retained records into that tail.
 export function admitHistoryRecords(
   held: Iterable<string>,
   page: { turns: readonly Turn[]; compactions: readonly Compaction[] },
@@ -285,7 +239,7 @@ export function admitHistoryRecords(
   return { turns, compactions };
 }
 
-// Every identity the retained pages hold, in the spelling `admitHistoryRecords` compares.
+// Collect the identities used by `admitHistoryRecords`.
 export function historyRecordKeys(pages: readonly HistoryPage[]): string[] {
   const keys: string[] = [];
   for (const page of pages) {
@@ -299,8 +253,7 @@ export function historyRecordKeys(pages: readonly HistoryPage[]): string[] {
   return keys;
 }
 
-// What the retained pages add to the list, less anything the ordinary tail already lists.
-// The order here decides nothing: the caller sorts every turn by its start time.
+// Return retained turns and compactions absent from the ordinary tail. Callers sort the combined turns.
 export function historyRecordsOutside(
   pages: readonly HistoryPage[],
   tail: { turns: readonly Turn[]; compactions: readonly Compaction[] },
@@ -322,9 +275,8 @@ export function historyRecordsOutside(
   return { turns, compactions };
 }
 
-// Keep completed turns that the reader saw before an append moved them out of the bounded
-// read. Explicit older pages stay intact. This one recent page is bounded by the ordinary
-// turn limit and the selected session's cache budget.
+// Retain completed turns displaced by an append without changing explicit older pages.
+// Limit the recent page by remaining turn slots and byte budget, allowing one oversized newest turn.
 export function retainDisplacedWindow<Cursor>(
   held: SessionHistory<Cursor>,
   previous: { turns: readonly Turn[]; compactions: readonly Compaction[] },
@@ -392,9 +344,8 @@ export function retainDisplacedWindow<Cursor>(
   };
 }
 
-// What a page costs the retained budget. Serialized once, when the page is admitted,
-// because what a page retains varies by orders of magnitude between a bare prompt and a
-// turn carrying recorded file text.
+// Measure serialized turns and compactions for the retained budget.
+// Use the fallback per-record charge when serialization fails.
 export function historyPageBytes(page: { turns: readonly Turn[]; compactions: readonly Compaction[] }): number {
   try {
     return Buffer.byteLength(JSON.stringify({ turns: page.turns, compactions: page.compactions }));
@@ -407,7 +358,7 @@ export function historyBytes(pages: readonly HistoryPage[]): number {
   return pages.reduce((total, page) => total + page.bytes, 0);
 }
 
-// How many pages one request may read before it gives up on finding a new turn.
+// Scale the page-read allowance with loaded turns, up to `HISTORY_PAGE_READ_CEILING`.
 export function historyPageReads(loadedTurns: number, targetTurns: number = HISTORY_PAGE_TURNS): number {
   const covered = Math.ceil(Math.max(0, loadedTurns) / Math.max(1, targetTurns));
   return Math.max(1, Math.min(HISTORY_PAGE_READ_CEILING, covered + 1));
@@ -425,17 +376,8 @@ export type HistoryPageOutcome<Cursor> =
   | { kind: 'stale' }
   | { kind: 'failed' };
 
-// What one completed read does to a session's retained history.
-//
-// A page that adds nothing still advances the cursor, or the next request reads the same
-// bytes and answers the same way for ever. A page that adds nothing is not stored, because
-// the cards it holds are already on the list.
-//
-// A stale read is the common answer on a live session: the agent appended while the page
-// was being read. The pages still describe the file, so they stay, the cursor stays, and the
-// request counts as one that added nothing. The next one reads from the rebased cursor. Only
-// a read that cannot be repeated marks the session as failed and puts the reader in
-// charge of the retry.
+// Advance the cursor and retain identities absent from the tail and older pages.
+// Stale reads preserve pages and cursor. Failed reads set the retry state. Both increment the attempt count.
 export function afterHistoryPage<Cursor>(
   held: SessionHistory<Cursor>,
   outcome: HistoryPageOutcome<Cursor>,
@@ -500,11 +442,8 @@ export function afterHistoryPage<Cursor>(
   };
 }
 
-// Whether a request reads another page.
-//
-// It stops on the first page that carries a turn the session did not hold, at the
-// beginning of the file, and on any answer that is not a page. A stale answer means the file
-// moved under the read, so the next request reads it through rather than this one.
+// Continue after a page adds no turn and leaves older history available.
+// Stale and failed outcomes stop the current request.
 export function historyRequestContinues<Cursor>(
   outcome: HistoryPageOutcome<Cursor>,
   applied: { history: SessionHistory<Cursor>; added: number },
@@ -512,8 +451,7 @@ export function historyRequestContinues<Cursor>(
   return outcome.kind === 'page' && applied.added === 0 && !applied.history.atBeginning;
 }
 
-// What a finished request leaves behind. `afterHistoryPage` counts the reads inside it, and
-// this counts the request itself, which is what the automatic trigger is bounded by.
+// Reset the empty-request count when a request retains a page. Increment it otherwise.
 export function afterHistoryRequest<Cursor>(
   held: SessionHistory<Cursor>,
   before: SessionHistory<Cursor>,
@@ -522,14 +460,8 @@ export function afterHistoryRequest<Cursor>(
   return { ...held, emptyRuns: added ? 0 : before.emptyRuns + 1 };
 }
 
-// Whether a stale answer means the cursor can never be used again.
-//
-// A stale answer normally means the agent appended while the page was read. The next refresh
-// rebases the cursor onto the file as it is now, and the next request reads it through. When
-// the file did not move at all, the cursor names a generation the file no longer has, which
-// no rebase can repair: a transcript copied over its own path keeps its size and its write
-// time and takes a new inode. Every later request would answer stale for ever, and the reader
-// would press a button that does nothing. The session starts over instead.
+// A stale cursor needs a restart when size and modification time remain unchanged.
+// Rebasing those figures cannot resolve a changed file identity.
 export function staleCursorIsStuck(
   held: { size: number; mtimeMs: number },
   current: { size: number; mtimeMs: number },
@@ -537,13 +469,8 @@ export function staleCursorIsStuck(
   return held.size === current.size && held.mtimeMs === current.mtimeMs;
 }
 
-// Which sessions give up their retained history.
-//
-// Protection first, then the budget, then recency. Sessions on screen are never evicted:
-// they are what the reader is looking at, and active values larger than the budget keep their
-// places while every optional one goes. Every optional session stays while all of them
-// together fit the budget, so a walk from one session to another and back finds the first
-// one still parsed. Past that, the least recently used optional session goes first.
+// Evict the least recently used unprotected sessions until retained bytes fit the budget.
+// Protected sessions remain even when their combined size exceeds the budget.
 export function historyEvictions(
   entries: readonly { sessionId: string; bytes: number; usedAt: number }[],
   protectedSessions: ReadonlySet<string>,
@@ -564,15 +491,9 @@ export function historyEvictions(
   return [...drop].sort();
 }
 
-// The control at the end of the selected session's list.
-//
-// `kind` decides what the panel draws. `load` and `retry` are real buttons, so the whole
-// control works from the keyboard whatever the viewport does. `busy` and `beginning` are
-// status lines, because there is nothing left to press.
-//
-// `auto` is what allows the panel to ask when the sentinel comes near the viewport, and
-// `token` is what stops it asking twice for the same answer. A retry never asks on its own:
-// a read that failed once fails again, in a loop nobody pressed for.
+// Older-history presentation returned to the browser.
+// `auto` permits viewport-triggered requests. `token` distinguishes completed attempts and loaded-turn counts.
+// Failed reads require a button press to retry.
 export interface OlderHistoryControl {
   kind: 'load' | 'busy' | 'retry' | 'beginning';
   label: string;

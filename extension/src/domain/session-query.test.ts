@@ -28,9 +28,7 @@ const costSessions = [
 ];
 
 test("a free-text term matches the rail card's drawn name, not only the capped label", () => {
-  // The label carries the 60-character cut a session's title takes everywhere but the rail
-  // card; the name carries the fuller text `.railname` actually draws. A word that sits past
-  // character 60 is visible on the card and must still find it.
+  // Search includes the fuller session list name, including words beyond the 60-character label.
   const label = 'a'.repeat(60);
   const name = `${'a'.repeat(60)} distinctword`;
   const rows = [
@@ -219,8 +217,7 @@ const cacheExpirySessions = [
   { id: 'unavailable', label: 'Unavailable', agent: 'Claude', cacheExpiryCount: null },
 ];
 
-// A floor: the classifier could not judge every adjacent pair, so the recorded count may
-// undercount the true total, the same way an unpriced portion of a cost total does.
+// Incomplete adjacent-request evidence gives a lower bound on cache-expiry returns.
 const cacheExpiryFloorSessions = [
   { id: 'exact-high', label: 'Exact high', agent: 'Claude', cacheExpiryCount: 9, cacheExpiryAtLeast: false },
   { id: 'exact-low', label: 'Exact low', agent: 'Codex', cacheExpiryCount: 2, cacheExpiryAtLeast: false },
@@ -289,10 +286,7 @@ test('a negated cache-expiry term keeps the sessions the comparison drops', () =
   assert.deepEqual(ids('-cache-expiry:five'), []);
 });
 
-// A floor is a count built while the classifier could not judge every adjacent pair, so an
-// unjudged pair may itself have been a qualifying return the count has not added in. It
-// matches `>` only when the known count already exceeds the threshold, and it never matches
-// `<`, the same way a lower-bound cost total behaves.
+// A lower bound matches > only after its known count exceeds the threshold. It never establishes a < match.
 test('a cache-expiry floor matches only the comparison a lower bound can answer', () => {
   const ids = (query: string): string[] => matchSessions(cacheExpiryFloorSessions, query).map((session) => session.id);
   assert.deepEqual(ids('cache-expiry:>5'), ['exact-high', 'floor-high']);

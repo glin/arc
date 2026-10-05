@@ -564,8 +564,8 @@ test('ordinary appends keep completed coverage while its witnessed turn remains 
 });
 
 test('an append during a page read keeps the pages and leaves the reader nothing to press', () => {
-  // The commonest answer on a live session. The pages still describe bytes the append did
-  // not touch, so they stay, the cursor stays, and the next request reads from the rebased one.
+  // An append leaves earlier page bytes intact, so those pages and their cursor remain usable.
+  // The next request uses the rebased cursor.
   const first = afterHistoryPage(
     held({ cursor: 'older', pages: [{ ...page([30]), bytes: 9 }] }),
     {
@@ -643,9 +643,9 @@ test('a request stops on the first page that adds a turn, and on anything that i
 });
 
 test('the automatic trigger counts requests, never the reads inside one', () => {
-  // One request reads several pages while it walks back past the turns the ordinary tail
-  // already lists. Counting those would switch the trigger off on the first press of a long
-  // session, which is the press this whole path exists to answer.
+  // One request can read several pages already present in the ordinary tail.
+  // Count empty requests rather than internal reads when limiting automatic loading.
+  // Internal reads must not exhaust the limit within a single request.
   const before = held({ emptyRuns: 1 });
   const walked = held({ emptyRuns: 1, requests: 8, pages: [] });
   assert.equal(
@@ -961,9 +961,9 @@ test('the sentinel token moves whenever another request could answer differently
   );
 });
 
-// A generated transcript for each source, long enough that the ordinary tail lists only its
-// newest turns and three older pages are needed to reach the beginning. Kept here rather than
-// in turnfixtures.ts because this is the only file that reads it.
+// Generate transcripts whose ordinary tail excludes older turns.
+// Loading their earlier history requires at least three page requests.
+// These fixtures serve the page-loading tests in this file.
 let generated = 0;
 
 function transcriptDir(): string {
@@ -1107,9 +1107,9 @@ function codexTranscript(turns: number, bodyBytes: number, dispatchFirst = false
   return file;
 }
 
-// One page request, driven exactly the way `loadOlderHistory` in panelhost.ts drives it: read
-// until a page carries a turn the session does not already hold, and never more reads
-// than `historyPageReads` allows.
+// Match loadOlderHistory's request loop in panelhost.ts.
+// Read until a page adds a turn not already held by the session.
+// historyPageReads limits the number of internal reads.
 async function requestOlderPage(
   source: 'claude' | 'codex',
   file: string,
@@ -1153,8 +1153,8 @@ async function requestOlderPage(
 
 for (const source of ['claude', 'codex'] as const) {
   test(`three ${source} pages add each turn exactly once and reach the first turn`, async () => {
-    // Twelve complete turns, a tail that lists the newest four, and a page of two. Three
-    // accepted pages then reach turn 6, and reading on reaches the first turn of the file.
+    // Twelve complete turns exceed the four-turn tail and two-turn page targets.
+    // At least three page requests must add older history before loading reaches the beginning.
     const turns = 12;
     const body = 6 * 1024;
     const file = source === 'codex' ? codexTranscript(turns, body, true) : claudeTranscript(turns, body);
@@ -1248,11 +1248,11 @@ for (const source of ['claude', 'codex'] as const) {
   });
 }
 
-// A turn read as a history page goes through the backward adapter, not through the forward
-// reducer that builds the tail. That adapter reads a background agent's completion notice
-// from the record itself, so it needs the same rule for the attachment shape Claude Code
-// writes while the main agent works. Without it a paged turn keeps the status its launch
-// wrote and never learns the child id, so the child's cost stays out of the turn total.
+// History pages use the backward adapter rather than the tail's forward reducer.
+// The adapter reads a background subagent's completion attachment from the transcript.
+// Completion updates the subagent's status and identifies its child session.
+// The child identity makes its usage available for the launching turn's total.
+// Both attachment and launch must survive page boundaries.
 test('a paged turn reads a background agent that reported back as an attachment', async () => {
   const file = path.join(transcriptDir(), 'sess.jsonl');
   const body = 8 * 1024;
@@ -1318,10 +1318,10 @@ test('a paged turn reads a background agent that reported back as an attachment'
         },
       }),
     );
-    // The agent reports back in the turn after the one that launched it. A page breaks on a
-    // typed prompt alone, so a notice next to its launch rides in the same page and that
-    // page's own forward reducer answers it. This one falls in a later page, which is the
-    // only arrangement the backward adapter has to answer for.
+    // The completion attachment belongs to a later turn than its launch.
+    // A typed prompt separates their pages.
+    // An attachment beside its launch is handled by the page's forward reducer.
+    // Separating them exercises the backward adapter's child-status update.
     if (index === 2) {
       lines.push(
         JSON.stringify({

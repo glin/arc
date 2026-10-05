@@ -10,8 +10,7 @@ export const LABEL_NOTES = {
 
 export type LabelNote = keyof typeof LABEL_NOTES;
 
-// Labels use the reader's locale for case identity. Whitespace remains significant here;
-// the editor owns trimming while a name is being entered.
+// Label identity uses the reader's locale. The name editor owns whitespace trimming.
 export function labelKey(name: string): string {
   return name.toLocaleLowerCase();
 }

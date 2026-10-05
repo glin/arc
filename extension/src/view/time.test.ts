@@ -100,12 +100,11 @@ test('a duration keeps its tiers, its rounding and the space between hours and m
     // 59m30s. The minutes are rounded before the split, so this is an hour and not 1h 60m.
     [3_570_000, '1h 0m'],
     [106 * 60_000, '1h 46m'],
-    // A single-digit minute count, which is the case the space is here for: run together and
-    // padded this reads 2h08m, and the eye takes that as one number.
+    // A space separates the hour and minute counts. Leave single-digit minutes unpadded.
     [128 * 60_000, '2h 8m'],
     // Past a day, where the hours keep counting up rather than becoming days.
     [25 * 3_600_000, '25h 0m'],
-    // A negative span is a clock that disagrees with itself, not a turn that ran backwards.
+    // Clamp negative spans to zero.
     [-5_000, '0s'],
   ];
   for (const [ms, words] of said) {

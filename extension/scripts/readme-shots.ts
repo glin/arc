@@ -111,8 +111,7 @@ async function prepare(page: Page, scene: (typeof README_SCENES)[number], demoDi
   await page.evaluate(SETTLED);
 }
 
-// The editor draws its context menu outside the webview, so a capture draws the stand-in the
-// web demo uses, with every entry the manifest offers.
+// The editor's native menu sits outside the webview. Captures use the web demo stand-in with every manifest entry.
 async function installMenu(page: Page): Promise<void> {
   const script = esbuild.buildSync({
     stdin: {
@@ -135,9 +134,7 @@ window.__arcInstallMenu = installMenu;`,
   }, entries);
 }
 
-// The browser draws a fixed dialog on whole pixels, while an element shot widens a fractional
-// box outward and takes a strip of the panel behind it. The clip rounds each edge the way the
-// dialog is drawn.
+// Round the dialog clip to whole pixels to exclude surrounding panel pixels from a fractional element box.
 async function dialogCrop(page: Page, selector: string, file: string): Promise<void> {
   const box = await page.locator(selector).boundingBox();
   if (!box) throw new Error(`${selector} is not visible.`);
@@ -153,8 +150,7 @@ async function dialogCrop(page: Page, selector: string, file: string): Promise<v
   });
 }
 
-// The README alt text promises a 5h and a 7d limit for each agent, so the fixture and the
-// drawn detail are both held to that list.
+// Require the 5h and 7d usage limits for both agents named in the README alt text.
 export function missingUsageLimits(groups: { agent: string; limits: string[] }[]): string[] {
   return ['Claude', 'Codex'].flatMap((agent) => {
     const limits = groups.find((group) => group.agent === agent)?.limits ?? [];
@@ -162,8 +158,7 @@ export function missingUsageLimits(groups: { agent: string; limits: string[] }[]
   });
 }
 
-// The usage bar spans the panel, so the crop stops past the last agent's figures rather than at
-// the bar's end. Its top is the popover's edge, so no rail text is cut.
+// Crop from the popover's top through the last agent's figures, excluding unused usage bar width.
 async function usageCrop(page: Page, file: string): Promise<void> {
   const bar = await page.locator('.sbrow').boundingBox();
   const figures = await page.locator('.sbrow .sbagent').last().boundingBox();
@@ -181,8 +176,7 @@ async function usageCrop(page: Page, file: string): Promise<void> {
   });
 }
 
-// The crop runs past the right edge of the response column, which every line of the prompt and
-// the response wraps inside, so no line stops mid-word.
+// Include the response column's right edge so the crop preserves complete wrapped lines.
 async function menuCrop(page: Page, file: string): Promise<void> {
   const row = await page.locator('#list .sessionrow').first().boundingBox();
   const menu = await page.locator('.demo-menu').boundingBox();
@@ -374,15 +368,13 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
   }
 }
 
-// These crops frame the timeline out to its right edge. Their viewport is 80px wider than the other
-// panel scenes, so the wide capture rail leaves the timeline room for every figure the crop frames.
+// Give timeline crops 80 extra viewport pixels so the wide session list leaves room for timeline figures.
 const TIMELINE_CROPS = new Set<string>(['session-menu', 'response-menu', 'cache-expiry']);
 
 async function main(): Promise<void> {
   buildPanel();
   const { launchAnyBrowser } = await import('../test/browserchannels.mjs');
-  // GPU rasterization varies a few antialiased pixels between runs, so the capture rasterizes on
-  // the CPU and a repeated capture writes the same bytes.
+  // Disable GPU rasterization to reduce antialiasing differences between captures.
   const launched = await launchAnyBrowser({ args: ['--disable-gpu-rasterization'] });
   if (!launched) throw new Error('README screenshots require Edge, Chrome, or bundled Chromium.');
   const staged = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-readme-shots-'));

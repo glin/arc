@@ -150,13 +150,11 @@ test('the Running count sums running, subagents and background over the shown se
     // switches say.
     testCard('read-done', { status: 'done', unread: false, at: stale }),
     testCard('archived-waiting', { status: 'waiting', archived: true, at: recent }),
-    // `runByAgent` rides beside `agentRun` the way `turnrail.ts` always sets it, so this card
-    // never adds to `running` or `active`, whether or not `showRuns` draws it in the list.
+    // Set both agent-run fields as turnrail does for unarchived sessions. Agent runs never contribute to Running or Active counts.
     testCard('agent-running', { status: 'running', agentRun: true, runByAgent: true, at: recent }),
   ];
-  // Neither Show switch moves a figure here: `archived` and `runByAgent` are absolute exclusions
-  // from every figure, and `read-done` is excluded from `active` by the window alone. `active` therefore reads 5 (every card but
-  // `read-done`, `archived-waiting` and `agent-running`) under every Show combination.
+  // Archived sessions and agent runs never contribute to these counts. The stale read-done session also falls outside Active.
+  // The five remaining sessions count as Active under every Show combination.
   assert.deepEqual(railCounts(cards, { showArchived: true, showRuns: true }, countsNow), {
     running: 3,
     warm: 0,
@@ -165,7 +163,7 @@ test('the Running count sums running, subagents and background over the shown se
     unread: 1,
     input: 1,
   });
-  // A hidden bucket's sessions are outside the count, the same press that empties the list.
+  // Hiding Archived leaves the counts unchanged because archived sessions are already excluded.
   assert.deepEqual(railCounts(cards, { showArchived: false, showRuns: true }, countsNow), {
     running: 3,
     warm: 0,
@@ -192,14 +190,9 @@ test('the Running count sums running, subagents and background over the shown se
   });
 });
 
-// The figures on the head row and the rows in the list have to name one set of sessions.
-// `RAIL_SHOWN_BUCKETS` is where the rail says which buckets it draws and `railSections` is
-// what it draws, so the counts the panel prints are measured against every card the sections
-// hold. A session the rail draws in two places is counted once, because the pinned copy is
-// one session under two headings.
+// Count sessions from the drawn sections, using RAIL_SHOWN_BUCKETS. Deduplicate pinned copies by session id.
 test('the head row counts exactly the sessions the rail draws', () => {
-  // `n3` and `r2` sit outside the hour-long Active window, so the figure has to fall short of
-  // the list's size, not equal it, and the equality check below still has to hold.
+  // Keep n3 and r2 outside Active so its count differs from the total drawn list.
   const cards: RailSectionCard[] = workspace().map((card) => ({
     ...card,
     status: card.id === 'arch' ? 'waiting' : card.id === 'n4' ? 'running' : card.id === 'c1' ? 'subagents' : 'done',
@@ -242,9 +235,7 @@ const SHOW_COMBOS = [
   { showArchived: false, showRuns: false },
 ] as const;
 
-// `expiring` is a clause on the Active figure, so it counts a nearly gone cache only on a
-// session that holds the Active lens. A card an agent runs and a card the reader archived never
-// count, whatever the two Show switches say, because the clause names work to act on.
+// Count expiring caches only within Active. Exclude archived sessions and agent runs under every Show combination.
 test('the expiring clause counts nearly gone caches on Active sessions only', () => {
   const recent = countsNow - 5 * 60_000;
   const nearlyGone = { expiresAt: countsNow + 5 * 60_000, nearlyGoneAt: countsNow - 60_000 };
@@ -268,9 +259,7 @@ test('the expiring clause counts nearly gone caches on Active sessions only', ()
   assert.equal(railCounts(cards, RAIL_SHOWN_BUCKETS, countsNow + 10 * 60_000).expiring, 0);
 });
 
-// The session ids the rail draws after a count press: the press writes its lens's words into
-// the query, `railShownCards` keeps that query's matches, and `railSections` settles the two
-// Show switches. A pinned card is drawn twice, so the ids are read as a set.
+// Return drawn session ids after applying the lens query and Show settings. Deduplicate pinned copies.
 function drawnUnderLens(
   cards: readonly RailSectionCard[],
   query: string,
@@ -285,8 +274,7 @@ function drawnUnderLens(
   return [...new Set(ids)].sort();
 }
 
-// A lens press writes words into the query. Its figure counts inside the rest of the query, and
-// its press draws the matches of the rest with its words, so the two agree with any query, in
+// A lens count uses the remaining query terms. Pressing its button adds the lens terms to that same query.
 test('the lens figure equals what its press draws, with and without a query', () => {
   const now = countsNow;
   const recent = now - 5 * 60_000;
@@ -441,9 +429,7 @@ test('the Running count equals what its press draws', () => {
   assert.equal(railHeadCounts(cards, RAIL_SHOWN_BUCKETS, now, { query: '' }).running, 3);
 });
 
-// The minute tick hands the list and the figures one clock. A session that leaves the recency
-// window between two ticks is out of the pressed lens's list and out of its figure at the same
-// reading, so the row never counts a session its own press no longer keeps.
+// Use one clock for the lens list and count. Crossing the recency boundary removes a session from both.
 test('a session leaving the recency window leaves the lens list and its figure on the same tick', () => {
   const before = countsNow;
   const after = countsNow + 60_000;
@@ -496,8 +482,7 @@ test('the Active button carries its session count and one aggregate cache state'
   assert.deepEqual(said({ active: 1, warm: 0, expiring: 0 }), [null, none, `Active, 1 session. ${none}`]);
 });
 
-// The pair the Active bolt reads is counted in the Active pass itself, so a session outside
-// Active's scope never lights the bolt, and a cache that ran out counts as none.
+// Count warm and expiring caches within Active. Expired caches contribute to neither count.
 test('railCounts counts warm and expiring caches only over the Active sessions in scope', () => {
   const recent = countsNow - 5 * 60_000;
   const warm = { expiresAt: countsNow + 10 * 60_000, nearlyGoneAt: countsNow + 8 * 60_000 };
@@ -600,15 +585,14 @@ test('railCardActive reads the live cache and the hour-long recency window', () 
     railCardActive({ at: now - 5 * 60_000, cache: { expiresAt: now - 60_000, nearlyGoneAt: null } }, now),
     true,
   );
-  // Neither an expired cache nor stale activity leaves a session outside both.
+  // An expired cache and stale activity leave the session outside Active.
   assert.equal(
     railCardActive({ at: now - 5 * ACTIVE_WINDOW_MS, cache: { expiresAt: now - 60_000, nearlyGoneAt: null } }, now),
     false,
   );
 });
 
-// A query has to ask about a clock fact before the rail spends anything stamping it on, so a
-// typed or saved `is:active` reads the same as `is:warm` does today.
+// Clock-dependent query terms require clock-derived card fields, whether the query is typed or saved.
 test('railQueryReadsCache answers true for both clock terms and false otherwise', () => {
   assert.equal(railQueryReadsCache('is:active'), true);
   assert.equal(railQueryReadsCache('-is:active'), true);
@@ -634,8 +618,7 @@ test('railLensHolds answers the way is:active -is:archived -is:agentrun does', (
     const activeMatch = matchSessions([stamped], 'is:active -is:archived -is:agentrun').length > 0;
     assert.equal(railLensHolds(card, now), activeMatch, `Active disagrees for ${card.id}`);
   }
-  // The exclusion this proves: an archived or agent-run card never holds the lens, however
-  // recent its activity. Breaking the `runByAgent` guard in `railLensHolds` turns this red.
+  // An archived session or agent run never matches Active, regardless of recent activity.
   assert.equal(
     railLensHolds(
       cards.find((c) => c.id === 'agent-waiting')!,
@@ -643,8 +626,7 @@ test('railLensHolds answers the way is:active -is:archived -is:agentrun does', (
     ),
     false,
   );
-  // The same check, run over the shared workspace fixture rather than the six cards built
-  // above, with `n3` and `r2` outside the window and every other card inside it.
+  // Repeat the comparison with the shared workspace fixture. Keep n3 and r2 outside the recency window.
   const workCards: RailSectionCard[] = workspace().map((card) => ({
     ...card,
     at: card.id === 'n3' || card.id === 'r2' ? now - 2 * ACTIVE_WINDOW_MS : now - 5 * 60_000,
@@ -660,9 +642,7 @@ test('railLensHolds answers the way is:active -is:archived -is:agentrun does', (
   );
 });
 
-// The count the head row would draw has to equal what typing the lens words would keep, so
-// a reader who types `is:active -is:archived -is:agentrun` sees the same size list the figure
-// already promised.
+// The Active count equals the sessions matched by the complete typed lens query.
 test('railCounts.active equals the typed lens query', () => {
   const now = 10_000_000;
   const cards: RailSectionCard[] = [
@@ -797,7 +777,7 @@ test('a lens count is pressed while the query holds its words, whatever wrote th
     // Deleting one of the words unpresses it.
     assert.equal(railCountPressed(lens, { ...ALL_LENS, query: words.replace(' -is:agentrun', '') }), false);
   }
-  // The words the retired Needs you count wrote do not press Active.
+  // The Needs you query does not select the Active count.
   assert.equal(railCountPressed('active', { ...ALL_LENS, query: 'is:needsyou -is:archived -is:agentrun' }), false);
 });
 
@@ -871,8 +851,7 @@ test('the rail head draws the Unread or Needs input lens the rail is on pressed,
     );
     assert.equal(head(query)[1].pressed, pressed, query);
   }
-  // An older build's Needs you query holds two lenses whole, so it holds no lens. The head draws
-  // no count pressed, the Filter row checks All, and the query reads as text.
+  // A query containing two complete lenses selects no count and checks All. Its typed query remains intact.
   const old = 'is:input is:unread -is:archived -is:agentrun label:ui';
   const [first] = head(old);
   assert.deepEqual(
@@ -884,9 +863,7 @@ test('the rail head draws the Unread or Needs input lens the rail is on pressed,
   assert.equal(pressRailLens(old, first.kind), `${RAIL_LENS_WORDS.running} label:ui`);
 });
 
-// Each head figure equals what its press draws. A typed bare `is:input` completes the Needs
-// input lens's other words, and an Unread press removes it, so the Unread figure counts both
-// unread sessions and not only the waiting one.
+// An Unread press replaces the typed Needs input lens. Its count includes both unread sessions, regardless of waiting state.
 test('each head figure equals what its own press draws under a typed bare is:input', () => {
   const now = countsNow;
   const cards: RailSectionCard[] = [
@@ -921,8 +898,7 @@ test('the Quick filters boxes name each lens and tick the chosen lenses', () => 
   assert.deepEqual(withRailHeadLensToggled(['active', 'input'], 'active'), ['input']);
 });
 
-// A build without the Running lens stored `railHeadLenses` and drew a running figure on every
-// rail, so its list reads with Running added. `railQuickFilters` is the reader's own choice.
+// Legacy railHeadLenses imports add Running. Explicit railQuickFilters values preserve the selected list, including an empty list.
 test('normalizeRailQuickFilters adds Running to a legacy list and keeps a new empty choice', () => {
   const all = ['running', 'active', 'unread', 'input'];
   assert.deepEqual(normalizeRailQuickFilters(undefined), ['running', 'active', 'input']);
@@ -963,8 +939,7 @@ test('the rail-row saved words fall back to what a panel drawn before this build
   assert.equal(normalizeRailShowRuns(false), false);
 });
 
-// A compact row prints the short age and a comfortable row the long one, and the tick compares
-// with the same formatter, so a compact row's age moves on the minute it changes.
+// Compact rows use short ages. Full rows use long ages. The tick uses the same formatter as the drawn row.
 test('each density draws its own age, and the tick compares with it', () => {
   const now = Date.UTC(2026, 8, 24, 12, 0);
   const at = now - 2 * 3600 * 1000;
@@ -999,9 +974,7 @@ test("a compact card's hover opens the card under its name, and a state hint sta
   assert.deepEqual(bare, { hint: card.label, detail: state.detail, lines: false, body: 'railcard' });
 });
 
-// The accessible name already says the agent word, the figures and the labels, in both
-// densities, so a compact card's linked description must never repeat them. A `subagents` or
-// `background` card's state explanation is not in the name, so the description keeps it.
+// Accessible names include the agent, figures and labels in both densities. Descriptions omit those repeated words and retain the state explanation.
 test("a compact card's linked description never repeats what the name already says", () => {
   const card = { label: 'Fix login', agentWord: 'Codex', nameAfterAge: '$1.20 estimated, 4 turns, labelled release' };
   assert.equal(railCardHint(card, 'comfortable', null).description, undefined);
@@ -1015,8 +988,7 @@ test("a compact card's linked description never repeats what the name already sa
   assert.ok(!compactState.description!.includes(card.nameAfterAge), compactState.description);
 });
 
-// A compact card that drops only one word has nothing left for a second line, so it carries
-// no detail and no description, and its hover is the card alone.
+// A compact row with only an agent word needs no second detail line or linked description. Its hover still shows the card.
 test('a compact card with one dropped word carries no detail and no description', () => {
   const hint = railCardHint({ label: 'Fix login', agentWord: 'Codex', nameAfterAge: '' }, 'compact', null);
   assert.equal(hint.hint, 'Fix login');
@@ -1419,8 +1391,7 @@ test('a view keeps archived sessions only when it says it does', () => {
     named(railSections(workspace(), sectionNow, [kept]).sections, viewFoldId(kept)).cards.map((card) => card.id),
     ['pin', 'c1', 'c2', 'arch'],
   );
-  // The Archived fold keeps the card either way, because putting one away is the reader's own
-  // word about it and a view does not undo that.
+  // The Archived section retains its session whether the view includes archived sessions or excludes them.
   assert.deepEqual(
     named(railSections(workspace(), sectionNow, [kept]).sections, RAIL_FOLDS.archived).cards.map((card) => card.id),
     ['arch'],
@@ -1638,8 +1609,7 @@ test('a cache tooltip travels as a text to write, and its state change asks for 
   assert.equal(railCacheTitle(cached.cache!, drawnAt + 44 * 60_000), 'Cache expiring about now');
 });
 
-// The workspace above, grouped. `pin` carries Composer and is pinned, `c2` carries two labels,
-// `r2` and `n4` are Codex's, `n4` is run by an agent and `arch` is archived.
+// Group the shared workspace. pin is pinned, c2 has two labels, r2 and n4 use Codex, n4 is agent-run, and arch is archived.
 const grouped = (groupBy: RailGroupBy, extra: Partial<RailGrouping> = {}) =>
   railSections(workspace(), sectionNow, [], 'latest', RAIL_SHOWN_BUCKETS, { groupBy, ...extra });
 
@@ -1786,8 +1756,7 @@ test('a row key names its section, so a row that changes section is a new row', 
     grouped(groupBy).sections.flatMap((one) =>
       one.cards.filter((card) => card.id === id).map(() => railRowKey(one.id, id)),
     );
-  // The same session regrouped from Time to Status keeps no key, so no focus or open editor
-  // passes from the row under one heading to the row under another.
+  // Changing sections changes the row key. The new row receives no focus or editor state from the old row.
   assert.deepEqual(key('time', 'c1'), [`c1:${RAIL_FOLDS.today}`]);
   assert.deepEqual(key('status', 'c1'), ['c1:railgroup:status:read']);
   assert.deepEqual(key('label', 'pin'), [`pin:${RAIL_FOLDS.top}`, 'pin:railgroup:label:composer']);

@@ -56,7 +56,7 @@ export function createRetainedVisibility(ports: RetainedVisibilityPorts) {
     const release = () => {
       if (disposed || !visible || generation !== expected || !painted) return;
       const box = ports.box();
-      // Without IntersectionObserver, the existing paint boundary keeps the retained page usable.
+      // Without an observer, release the retained page after paint.
       if (ports.observe && (!observed?.full || box.width <= 0 || box.height <= 0 || !sameBox(observed.box, box)))
         return;
       ports.setOpacity(originalOpacity!);

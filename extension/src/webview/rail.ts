@@ -298,10 +298,8 @@ interface RailOptions {
   archiveSession(session: string): void;
   unarchiveSession(session: string): void;
   setPinned(session: string, pinned: boolean, openPinned?: boolean): void;
-  // A row's native context menu, carrying the section its read state names, the pinned and
-  // archived facts the session heading answers from its own state, and whether the session
-  // is saved. The session heading and the rail card read the pin and archive state from the
-  // same place, so a press on either answers the other's menu correctly on the next open.
+  // Native menu context carries read-state section, pin state, archive state, and saved-session status.
+  // Session headings and session list rows use the same pin and archive state.
   rowContext(sessionId: string, menuSection: string, persisted: boolean): string;
   onLayoutChange(): void;
   onVisibilityChange(visible: boolean, filterable: boolean): void;
@@ -314,15 +312,12 @@ interface RailOptions {
   redrawHint(kind: string): void;
   contextClass(level: string): string;
   launcher: LauncherPorts;
-  // A test-only counter of full rail draws. Production never supplies it, so the count
-  // adds no cost and no state outside a test that asks for it.
+  // Optional full-list draw counter for tests. Production supplies no callback.
   onDraw?(): void;
 }
 
-// A rail card with the two facts the query grammar cannot read off it. `is:warm` asks whether
-// the prompt cache still has time on it, and `is:active` asks whether the session sits inside
-// its own recency window. Both are read against the browser's clock, so the rail stamps the
-// answers on before it matches.
+// Query matching reads cache warmth and recent activity against the browser clock.
+// Attach these facts to session list cards before matching.
 type RailMatchCard = RailCardView & { cacheWarm?: boolean; active?: boolean };
 
 // Session counts and Active's visible cache information change on the clock.
@@ -351,8 +346,8 @@ export interface RailSnapshot {
   density: RailDensity;
 }
 
-// releaseSelection, tick, reset, filterByLabel and receiveLabelEditor each end in the rail's
-// own full list draw. Calling one in a loop over sessions costs a full draw per session.
+// releaseSelection, tick, reset, filterByLabel, and receiveLabelEditor can redraw the full session list.
+// Call these methods after processing a batch rather than inside a session loop.
 export interface RailRenderer {
   updateLoading(text: string | null): void;
   readonly element: HTMLElement;
@@ -363,8 +358,7 @@ export interface RailRenderer {
     labels: readonly LabelSuggestionCount[] | null | undefined,
     views: readonly SavedView[] | null | undefined,
     railFilters: readonly SavedRailFilter[] | null | undefined,
-    // The session figures the message keyed by session id. The rail draws three of them on
-    // each card, so it reads the same record the session heading reads.
+    // Figures keyed by session id. Session list cards and session headings read the same source.
     stats: Readonly<Record<string, readonly PanelStat[]>>,
     catalogAvailable?: boolean,
   ): void;
@@ -391,11 +385,10 @@ export interface RailRenderer {
   handleHotkey(event: KeyboardEvent, from: HTMLElement): boolean;
   place(): void;
   setViewSort(value: string): void;
-  // Redraws one row's native context menu in place, after a pin or an archive changes what
-  // it offers. Timeline-renderer's own `drawRowContext` answers the same call for the
-  // session heading.
+  // Refresh one session's native menu context after a pin or archive change.
+  // The timeline renderer exposes the same operation for session headings.
   drawRowContext(session: string): void;
-  // The same rewrite for many sessions at once, drawing once for the whole batch.
+  // Refresh menu context for a session batch and redraw the list once.
   drawRowContexts(sessions: readonly string[]): void;
 }
 
@@ -413,10 +406,8 @@ interface FilterOffer {
 
 interface OpenLabels {
   session: string;
-  // The fold id of the section the press came from, and null for a press made outside the rail.
-  // A session two saved views both match draws a row under each, so the session alone
-  // does not say which control the popover hangs off, which row reports it open, or which press
-  // shuts it rather than moving it.
+  // Section fold id, or null for an action outside the session list.
+  // Repeated sessions need a section identity to anchor, report, and toggle the correct label popover.
   section: string | null;
   anchor: HTMLElement | null;
   control: string | null;
@@ -438,20 +429,18 @@ interface LabelArm {
   at: number;
 }
 
-// The view the editor is open over, and what the reader has done to it so far.
+// Saved-view editor state.
 interface OpenView {
   view: string;
   name: string;
   sort: string;
-  // Whether the delete button is on its second press. It disarms on Escape and on Cancel, so a
-  // reader who armed it and walked away comes back to a button that reads what it does.
+  // The first Delete press arms confirmation. Escape or Cancel disarms it.
   armed: boolean;
   anchor: HTMLElement | null;
   control: string;
 }
 
-// What the reader is naming, once they press the row under the filter box. The query is held
-// here rather than read back off the box, because the box is now the name field.
+// Hold the query separately while the filter box contains the new view name.
 interface NamingView {
   // Naming captures the query and sort. Payloads and ticks leave the captured lens alone.
   lens: RailFilterLens;
@@ -465,8 +454,7 @@ interface RailFilterNameMode {
 
 const MENU_ARM_MS = 30_000;
 
-// Whether the native menu over this node offers Rename session. The context names the session
-// as saved, so a provisional new session never offers it.
+// Saved-session context enables Rename. Provisional drafts have no saved record.
 function renameOffered(node: HTMLElement): boolean {
   try {
     return (JSON.parse(node.dataset.vscodeContext ?? '{}') as { sessionPersisted?: unknown }).sessionPersisted === true;
@@ -474,8 +462,7 @@ function renameOffered(node: HTMLElement): boolean {
     return false;
   }
 }
-// The draft adoptions the rail remembers. A draft is adopted once, on its first answered prompt,
-// so a handful covers every draft a reader can have open.
+// Retain a bounded set of provisional-to-durable draft identities.
 const ADOPTIONS_KEPT = 16;
 
 function railCardClass(card: RailCardView): string {
@@ -525,8 +512,8 @@ function labelIcon(): ComponentChildren {
   return icon('M8.5 2H14v5.5L7.5 14 2 8.5zM11 5h.01');
 }
 
-// A cache bolt. A row's bolt names its own cache's span in its title. The Active count's bolt
-// has no span and no title, because the count's own name says what the bolt means.
+// A row's cache bolt names its cache lifetime in a native title.
+// Active's count bolt uses the count's accessible name and has no separate title.
 function cacheIcon(state: 'warm' | 'nearly-gone', cache: RailCacheMark | null, now: number): ComponentChildren {
   const path = h('path', { d: 'M6.9 1.3 2.6 7h2.8L5 10.7 9.4 5H6.6z' });
   return h(
@@ -544,8 +531,7 @@ function cacheIcon(state: 'warm' | 'nearly-gone', cache: RailCacheMark | null, n
   );
 }
 
-// The drawn name: the wording `view/rail.ts` owns, with the two clauses this file's clock
-// supplies. The name a card is read by has one owner, and this is where its clauses arrive.
+// Combine the shared card name with clock-dependent running and cache text, then the full activity time.
 function drawnRailCardName(card: RailCardView, now: number): string {
   const state = railCacheState(card.cache, now);
   const cacheName = state === 'nearly-gone' ? 'cache nearly gone' : state === 'warm' ? 'cache warm' : null;
@@ -561,12 +547,8 @@ function drawnRailCardName(card: RailCardView, now: number): string {
 
 const NO_RAIL_STATS: readonly RailStat[] = [];
 
-// The three figures every card draws, out of the record a message keyed by session id. A
-// figure the host sent without a metric or without a compact form has nothing to draw with.
-//
-// The whole record is projected once, where the rail takes it, rather than once inside each
-// row. Every row redraws on a clock tick, and a workspace of several thousand sessions would
-// otherwise repeat this search behind each of them on every tick.
+// Project the figures once when adopting a payload. Rows reuse this result on clock redraws.
+// Only figures with metric and compactLabel fields enter the projection.
 function drawnRailStats(record: Readonly<Record<string, readonly PanelStat[]>>): Record<string, readonly RailStat[]> {
   const drawn: Record<string, readonly RailStat[]> = {};
   for (const [session, chips] of Object.entries(record)) {
@@ -632,9 +614,8 @@ function RailRow({
   density: RailDensity;
   labelsOpen: { session: string; section: string | null } | null;
 }): ComponentChildren {
-  // One control says the editor is open, and it is the one the editor hangs off. A press made
-  // outside the rail names no section, and the first row drawing the session answers for
-  // it, because that row is the one `labelAnchorFor` reaches first.
+  // Mark the row that anchors the open label editor.
+  // An action outside the session list uses the first occurrence, matching labelAnchorFor.
   const labelsHere =
     !!labelsOpen &&
     labelsOpen.session === card.id &&
@@ -780,14 +761,9 @@ function RailRow({
   );
 }
 
-// The press under a section that draws the next `RAIL_ROW_STEP` of its cards. A section draws
-// at most that many rows until it is pressed, so a keystroke over a large workspace draws a
-// bounded list. It is one keyed element per section, so it stays the same button, and keeps
-// focus, while the rows drawn above it grow.
-//
-// Several groups can each end in a press with the same text, so the
-// accessible name adds the section. The press carries its section id the way a row does, so a
-// press a poll draw removes hands the focus to its own section, not to the top of the rail.
+// Show more adds the next RAIL_ROW_STEP rows to its section.
+// The keyed button preserves focus as rows appear above it. Its accessible name includes the group.
+// Its section id also identifies the focus fallback when a redraw removes it.
 function RailMoreRow({
   section,
   label,
@@ -814,12 +790,8 @@ function RailMoreRow({
   );
 }
 
-// The heading over one run of sessions, whether a saved view gathered them or the clock
-// did. The section answers for its own count and the whole of what a reader who cannot see it
-// is told.
-//
-// A view's heading opens its name and order editor or deletion, so it carries the context the
-// editor's own commands read. A time bucket is not the reader's to name, so it carries none.
+// Each group heading reports its own name and total count.
+// Saved-view headings carry context for rename and delete commands. Time-bucket headings carry no editing context.
 function BucketHead({
   bucket,
   folded,
@@ -831,8 +803,7 @@ function BucketHead({
   bucket: RailSection<RailCardView>;
   folded: boolean;
   view: SavedView | null;
-  // How many of the section's cards the draw put on screen. The rest wait under its Show more
-  // press, and a heading names no row that is not on the page.
+  // Number of mounted session rows. Folded and empty groups expose no controlled list.
   drawn: number;
   owner: { toggleBucket(id: string): void };
   options: RailOptions;
@@ -1030,12 +1001,8 @@ function LabelPopover({
   ]);
 }
 
-// The View menu the funnel opens: the find box, the lens the rail narrows to, how the rail
-// groups, sorts and lays out its rows, which buckets it draws, the label chips, and the saved
-// filters, in that order.
-//
-// Every press inside the menu leaves it open with focus on the pressed control, so a reader
-// changes one thing after another and watches the rail answer each.
+// The funnel opens the View menu: find, Filter, Group by, Sort by, Rows, Show, labels, and saved filters.
+// Setting presses leave the menu open with focus on the pressed control.
 function RailFilterPicker({
   owner,
   open,
@@ -1099,8 +1066,7 @@ function RailFilterPicker({
   const exact = current ? sameRailFilterLens(current, lens) : false;
   const wanted = labelKey(search);
   const shownFilters = wanted ? filters.filter((filter) => labelKey(filter.name).includes(wanted)) : filters;
-  // A label the query already negates has no chip, because pressing it would write the term
-  // beside its own negation and empty the rail.
+  // Omit chips for negated labels. Adding the positive term would contradict the query and empty the session list.
   const chips = railMenuLabelChips(
     labels.filter((label) => !railFilterTermNegated(lens.query, 'labels', label.name)),
     search,
@@ -1193,8 +1159,7 @@ function RailFilterPicker({
         ),
       ),
     ]),
-    // How the rail groups its sessions. A value carries no count, because pressing it filters
-    // nothing.
+    // Group by rearranges sessions without filtering them, so its values carry no counts.
     h('div', { class: 'railfiltersection', key: 'groupby' }, [
       h('div', { class: 'railfiltersectionname', id: 'railgroupbyname' }, options.words.railGroupBy),
       h(
@@ -1232,8 +1197,7 @@ function RailFilterPicker({
               key: sort,
               'aria-checked': String(lens.sort === sort),
               'data-control': `railfilter-order:${sort}`,
-              // The value shows the short name. Its accessible name and its hint carry the whole
-              // one, so a value drawn with an arrow still says which way it runs.
+              // The visible sort name is abbreviated. Accessible names and hints carry the full direction.
               'data-hint': railSortName(sort),
               onClick: () => menu.setRailFilterSort(sort),
             },
@@ -1245,8 +1209,7 @@ function RailFilterPicker({
         ),
       ),
     ]),
-    // How much of each session a row draws. Every value is the same card markup, and the
-    // stylesheet reads `data-density` on the rail to lay it out.
+    // Both row densities use the same card markup. The stylesheet reads the session list's data-density.
     h('div', { class: 'railfiltersection', key: 'rows' }, [
       h('div', { class: 'railfiltersectionname', id: 'railrowsname' }, options.words.railRowsName),
       h(
@@ -1270,9 +1233,8 @@ function RailFilterPicker({
         ),
       ),
     ]),
-    // Which buckets the rail draws at all. These are not filters: a filter narrows by
-    // something a session is, and these two show or hide a run of sessions the rail already
-    // keeps apart. A bucket that is off leaves the list and every figure together.
+    // Show switches hide archived sessions or agent runs together with their counted figures.
+    // They control group visibility rather than query matching.
     h('div', { class: 'railfiltersection', key: 'show' }, [
       h('div', { class: 'railfiltersectionname' }, options.words.railFilterShow),
       ...(
@@ -1300,9 +1262,7 @@ function RailFilterPicker({
         ]),
       ),
     ]),
-    // A workspace with no labels shows the note and no Match line. A workspace with labels
-    // always shows Match, because it governs every term in the query, and draws the chip group
-    // only when the query or the find box leaves a chip to draw.
+    // Show Match whenever the workspace has labels. Draw chips only when the query and find box leave matches.
     h('div', { class: 'railfiltersection', key: 'labels' }, [
       h('div', { class: 'railfiltersectionname' }, options.words.railFilterLabels),
       chips.chips.length
@@ -1457,15 +1417,10 @@ function RailFilterPicker({
   ]);
 }
 
-// The whole of what the reader can change about a saved view: its name, and whether it stays.
-//
-// Rename and delete commands on a view heading's context menu open this editor.
-// A view keeps the query captured when saved, so this editor changes only its name or deletes it.
-//
-// The keyboard walks the way the label editor's does: the arrows and Home and End move between
-// the name box and the three actions, and Escape gives up an armed delete before it gives up the
-// form. Two popovers in one panel answering the arrow keys differently is a difference the
-// reader meets rather than one the code has a reason for.
+// Rename and delete context commands open this saved-view editor.
+// It edits the name and sort order, or deletes the view. The saved query stays unchanged.
+// Arrow keys and Home or End move between fields and enabled actions outside the native sort selector.
+// Escape disarms Delete before closing the editor.
 function ViewEditor({
   owner,
   open,
@@ -1495,8 +1450,7 @@ function ViewEditor({
         class: 'labelfind',
         value: open.name,
         'data-control': 'view-name',
-        // The notes under the box, named by the box, for the reason the rail's own naming box
-        // names its own.
+        // Associate the name field with its validation notes.
         'aria-describedby': 'viewnotes',
         'aria-invalid': notes.some((note) => note === 'unnamed' || note === 'taken') ? 'true' : undefined,
         ref: setInput,
@@ -1703,13 +1657,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   let latestCards: readonly RailCardView[] = [];
   let drawnCards: readonly RailCardView[] = [];
   let railKept: RailKept | null = null;
-  // The figures the newest message carries, keyed by session id, and the three each drawn row
-  // takes out of them. The drawn figures move with `drawnCards`, because a row the rail
-  // retained carries the accessible name the host worded from the figures it was drawn with.
+  // Keep the newest figures separately from the drawn figures. Retained rows must use the figures in their current accessible names.
   let latestStats: Readonly<Record<string, readonly PanelStat[]>> = {};
   let drawnStats: Record<string, readonly RailStat[]> = {};
-  // A compact row's hover card, built from the card and figures the rail last drew. A session
-  // the rail no longer holds has no card, and the hint closes.
+  // Build compact hover cards from the drawn rows and figures. Missing sessions close the hint.
   options.hintBody('railcard', (anchor) => {
     const id = anchor.dataset.session;
     const card = drawnCards.find((candidate) => candidate.id === id);
@@ -1721,8 +1672,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   let hasPayload = false;
   let countsKnown = false;
   let repaintOwed = false;
-  // A pointer held down inside the rail is a drag the reader is still making. The rows it
-  // covers stay until the button comes up, whoever asked for the session change.
+  // Retain rows during a pointer drag until release, including when the selected session changes.
   let dragging = false;
   let railToTop = false;
   let filterFrame: number | null = null;
@@ -1737,46 +1687,34 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   let labelInput: HTMLInputElement | null = null;
   let labelsOpen: OpenLabels | null = null;
   let labelsPending: PendingLabels | null = null;
-  // Durable ids by the provisional id each draft ran under, newest last. A heading or a reply
-  // can still name the provisional id after the adoption, and the label editor answers it as
-  // the durable session.
+  // Map provisional draft ids to durable ids, newest last. Delayed heading actions and label replies resolve through this map.
   const adopted = new Map<string, string>();
   const current = (session: string) => adopted.get(session) ?? session;
   let labelFilter = '';
   let labelsMade: string[] = [];
   let labelArm: LabelArm | null = null;
-  // The right-click this host saw on a view heading, and when. The editor's own commands reach
-  // every open panel, so without this a right-click in the sidebar opens the editor in the
-  // editor tab as well and pulls the reader's focus into a name box they cannot see. The label
-  // editor answers its own command the same way.
+  // Remember this panel's view context-menu target and time.
+  // Commands reach all panels, so only the panel that opened the menu must open the editor.
   let viewArm: { view: string; node: HTMLElement; at: number } | null = null;
   let views: readonly SavedView[] = [];
   let naming: NamingView | null = null;
   let viewOpen: OpenView | null = null;
   let viewInput: HTMLInputElement | null = null;
-  // The right-click this host saw on a saved session's rail row or heading, for the reason
-  // `viewArm` exists. A provisional session arms nothing, so the command opens nothing from it.
+  // Remember this panel's saved-session context-menu target. Provisional drafts cannot arm Rename.
   let renameArm: { session: string; node: HTMLElement; at: number } | null = null;
   let renameOpen: OpenRename | null = null;
   let renameInput: HTMLInputElement | null = null;
-  // The id the last rename request carried. The host sends it back, so the editor can tell the
-  // answer it waits on from the answer to a rename the reader walked away from. Each page load
-  // starts the count at a random point, so an answer to a rename an earlier page sent never
-  // matches a rename this page sends.
+  // The host echoes each rename request id. Ignore answers for editors that closed or sent a later request.
+  // Randomize the starting id to reduce collisions with answers from an earlier page load.
   let renameRequests = Math.floor(Math.random() * 2 ** 40);
   let now = Date.now();
-  // The rows the last draw put on screen, and the time whose wording they carry. The clock
-  // tick reads these instead of the page: a row under a shut heading is not among them, so it
-  // cannot ask for a repaint nobody would see.
+  // Retain mounted rows and their wording time for clock comparisons. Folded rows require no redraw.
   let drawnRows: RailTickRow[] = [];
-  // The Show more presses a reader made, per query and section. The key holds the query, so a
-  // new query starts every section at its first step with no reset, and a query the reader
-  // returns to keeps what they pressed for. Each entry is one small number, so a query change
-  // drops none. A reset clears the map, and a deleted view takes its own entries with it.
+  // Remember Show more steps per query and section. Returning to a query restores its steps.
+  // Reset clears the map. Deleting a view removes its entries.
   const railRaised = new Map<string, number>();
   const railRaisedKey = (section: string) => `${filter}\u0000${section}`;
-  // The section whose Show more press the next draw answers, once. The draw raises it from the
-  // layout it computes anyway, so a press costs one layout.
+  // The next draw consumes this Show more request and computes one layout.
   let raisePending: string | null = null;
   let drawnTitlesAt = now;
   // Naming holds the last drawn cache information until the reader saves or cancels.
@@ -1803,8 +1741,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   let railFilterNameInput: HTMLInputElement | null = null;
   let railFilterNameMode: RailFilterNameMode | null = null;
   let railFilterDeleteArmed = false;
-  // Set by a press outside the open View menu and read when that press ends, once the
-  // browser has moved focus to wherever the press landed.
+  // An outside press defers focus restoration until the browser finishes moving focus.
   let railFilterFocusBack = false;
   // Whether the View menu draws every label chip rather than the most used twelve. It folds
   // again whenever the menu closes.
@@ -1825,10 +1762,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     density: railDensity,
   });
   const visible = () => hasPayload && media.matches;
-  // Whether anything the pool reaches asks about the cache or the recency window. The text
-  // box is one reader of it and every saved view is another, because `railSections` runs each
-  // view's query over these same cards. A view holding `is:warm` or `is:active` therefore
-  // keeps nothing while the box is empty unless the fact is stamped for it as well.
+  // Stamp clock facts whenever the filter or any saved-view query reads cache warmth or recent activity.
   const poolReadsCache = (): boolean =>
     railQueryReadsCache(filter) || views.some((view) => railQueryReadsCache(view.query));
   const narrowing = (): RailNarrowing => ({ query: filter });
@@ -1841,13 +1775,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
     filter = query;
   };
-  // The cards the query keeps. `is:warm`, `is:active` and `is:needsyou` are the terms whose
-  // answer the card does not carry, so `railShownCards` stamps both clock facts on only for
-  // the draws where the box or a saved view asks about one of them.
-  //
-  // Under the Unread or Needs input lens the rail keeps what it drew, so a session the reader
-  // reads or answers stays until the query changes. `railKept` is that set. It lives only here,
-  // so a panel reload starts it empty, and `setRailQuery` empties it.
+  // Match drawn cards after attaching required clock facts for the filter and saved views.
+  // Unread and Needs input lenses retain read or answered sessions until the query changes.
+  // The retained set is local to this page. setRailQuery clears it.
   const shownCards = (): RailMatchCard[] => {
     const rail = narrowing();
     const shown = railShownCards(drawnCards, rail, now, poolReadsCache(), railKept);
@@ -1881,11 +1811,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     return counts;
   };
   const viewOfSection = (id: string): SavedView | null => views.find((view) => viewFoldId(view) === id) ?? null;
-  // The rail's sections and which of them are shut.
-  //
-  // `railSections` answers what the sections are and how each one starts, and the reader's own
-  // presses are laid over that. A narrowing filter opens everything the reader did not press themselves,
-  // because a query that reaches into a shut section would otherwise find nothing on screen.
+  // Build ordered groups and apply reader-owned folds.
+  // A narrowing filter opens groups unless the reader has folded them under that filter.
   const layout = () => {
     const grouped = railSections(shownCards(), now, views, 'latest', shownBuckets(), { groupBy: railGroupBy });
     const ordered = grouped.sections.map((section) => {
@@ -1907,11 +1834,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     text: (filterInput?.value ?? filter).slice(word.start, word.end),
   });
   const filterOffers = (word: QueryToken): FilterOffer[] => {
-    // A word opening on the negation mark asks for the sessions its term drops. The list
-    // reads the rest of the word as any other, writes the mark back onto every row it
-    // offers, and says `Filter out` where it would otherwise say `Filter by`. A reader who
-    // has typed the mark alone is offered every axis under it, which is where the box
-    // teaches the mark.
+    // Negated tokens offer ordinary completions with the negation mark restored and Filter out wording.
+    // The mark alone offers every supported axis.
     const negated = (word.prefix || word.value).startsWith(NEGATE_MARK);
     const prefix = negated && word.prefix ? word.prefix.slice(1) : word.prefix;
     const value = negated && !word.prefix ? word.value.slice(1) : word.value;
@@ -1960,9 +1884,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }));
   };
   const currentFilterRows = (): FilterOffer[] => {
-    // The box holds a name while a view is being saved, and a name is not a query. An offer
-    // taken over one replaces the word under the caret, which is the name the reader typed,
-    // and the query being saved is not in the box to put back.
+    // Suppress query completions while the box holds a view name. Accepting one would replace the typed name.
     if (naming) {
       return [];
     }
@@ -2042,9 +1964,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       filterAt = 0;
     }
     filterPop.hidden = rows.length === 0;
-    // The box is a combobox over the offers, and while it is taking a view name it is not one
-    // at all. The state written here would outlive the roles the draw took off, and a box
-    // reporting a list it does not have is a box a reader is told the wrong thing about.
+    // View naming removes combobox roles. Remove aria-expanded too, so the field cannot report an absent suggestions list.
     if (naming) {
       filterInput?.removeAttribute('aria-expanded');
     } else {
@@ -2060,9 +1980,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     placeFilterPop();
     filterPop.querySelector('.filterrow.on')?.scrollIntoView?.({ block: 'nearest' });
   };
-  // One frame for a burst of typing. It saves the query, reads the clock once, counts the head
-  // for the new query and draws the list. A keystroke's own head draw keeps the figures already
-  // on screen, so a burst runs the count match once.
+  // Coalesce typing into one frame that saves the query, reads the clock, counts matches, and draws the list.
+  // Immediate keystroke draws preserve the current counts until this frame.
   const drawFilterFrame = () => {
     filterFrame = null;
     options.save();
@@ -2095,9 +2014,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     focusFilterRow();
     drawFilterPop();
   };
-  // Where focus lands after the box empties or closes. A box still on the head keeps it. A box
-  // that has closed hands focus back to the magnifying glass that opened it, so a close never
-  // drops the reader on the page.
+  // Focus the open filter box, else Search, else the funnel.
   const focusFilterRow = () => {
     (filterInput ?? found(topMount, 'railsearch') ?? railFilterButton)?.focus();
   };
@@ -2133,15 +2050,12 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
     return findRailFilter(railFilters, railFilterId);
   };
-  // Whether the rail is still on the saved lens its id names. The funnel words a rail that
-  // is not Custom.
+  // Whether the current query and sort match the selected saved filter.
   const railFilterSelected = (): boolean => {
     const expected = selectedRailFilterLens();
     return Boolean(expected && sameRailFilterLens(expected, liveRailFilter()));
   };
-  // A query over All sessions that holds one lens's words and nothing else is named for the
-  // lens, whatever the word order and whatever sort the reader chose, because a lens press keeps
-  // the sort. Other words beside the lens's words read Custom.
+  // All sessions displays a recognized status lens name regardless of term order or sort. Other edited queries display Custom.
   const railFilterWord = (): string => {
     const lens = railFilterId === ALL_RAIL_FILTER_ID ? railQueryLens(filter) : null;
     if (lens !== null) {
@@ -2222,8 +2136,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     setRailQuery(railFilterQuery(lens.query));
     railSort = lens.sort;
     railFilterId = id;
-    // While the reader names a view the box holds the name, and `naming` holds the query being
-    // named, so a filter change leaves the box alone.
+    // Preserve the typed view name while naming holds the captured query separately.
     if (filterInput && !naming) {
       filterInput.value = filter;
     }
@@ -2241,9 +2154,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     drawList();
     drawFilterPop();
   };
-  // A filter press sets or clears its lens words and preserves other query words, sort order, and selected filter identity.
-  // Focus moves to the selected button, else the first button, else the funnel.
-  // Removing a shortcut uses the same focus rule.
+  // Restore focus to the selected filter button, else the first button, else the funnel.
   const restoreRailCountFocus = () => {
     const count = drawnCountButtons.find((each) => each.pressed) ?? drawnCountButtons[0];
     ((count ? found(topMount, count.control) : null) ?? found(topMount, 'railfilters'))?.focus();
@@ -2314,12 +2225,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   // The count presentation stays until ordinary input's frame draws fresh figures.
   // Naming holds this presentation while the box takes the name.
   let drawnCountButtons: RailCountButton[] = [];
-  // Whether the counts hold figures from before the reader started naming a view. Neither a
-  // keystroke nor a tick counts them then, so the draw that ends naming counts at the current time.
+  // Naming holds existing counts. Refresh them at the current time when naming ends.
   let countsHeld = false;
-  // `counted` carries figures a caller already matched, such as the clock tick, so the head
-  // draws them without running the same match again. `keepCounts` draws the figures already on
-  // screen, for a keystroke whose frame counts the new query.
+  // Reuse supplied clock counts. keepCounts preserves displayed figures until the scheduled typing frame refreshes them.
   const drawTop = (counted?: RailCounts, keepCounts = false) => {
     const view = launcherView;
     const primaryName = view
@@ -2334,8 +2242,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         ? focused
         : null;
     const invalidCost = naming ? null : costNote(filter);
-    // Read the same way `invalidCost` is: an invalid `cache-expiry:` value gets its own note
-    // and DOM id, so the box never conflates the two axes' corrections.
+    // Invalid cache-expiry values have a separate note and DOM id from invalid cost values.
     const invalidCacheExpiry = naming ? null : cacheExpiryNote(filter);
     const open = boxOpen();
     // Active reads current cache information within the query and shown buckets.
@@ -2422,13 +2329,11 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     render(
       h(Fragment, null, [
         h('div', { class: 'filterwrap railbox railfilterrow', key: 'filter' }, [
-          // The rail head: the Sessions heading, the box while it is open, then the two tools and
-          // the New split. The heading is read-only text and adds no stop to the tab order.
+          // The action row holds Sessions or the filter box, Search or Clear, the funnel, then New.
+          // Sessions is a read-only heading with no tab stop.
           h('div', { class: `railhead${open ? ' boxopen' : ''}`, key: 'head' }, [
             h('span', { class: 'railheadlabel', key: 'label' }, railLabel),
-            // One box, and two things to type into it. While the reader is naming a view it holds
-            // the name, because the query it held a press ago is what they are naming and a
-            // second box over the top of it would cover the thing being named.
+            // Reuse the filter box for the view name while naming retains the captured query.
             open
               ? h(
                   'div',
@@ -2444,10 +2349,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                     'aria-controls': naming ? undefined : 'filterpop',
                     'aria-expanded': naming ? undefined : 'false',
                     'aria-label': naming ? options.words.railViewName : options.words.railFilter,
-                    // What is wrong with the name, and what the key under it does, both pointed at from
-                    // the box the reader is typing in. A note drawn beside a box and not named by it is
-                    // a note a reader without a pointer never meets. Both axes can be invalid at once,
-                    // and the box must name both notes it draws.
+                    // Associate the field with naming guidance or every visible query-validation note. Both query axes can be invalid together.
                     'aria-describedby': naming
                       ? 'railviewnotes'
                       : [invalidCost ? 'railcostnote' : null, invalidCacheExpiry ? 'railcacheexpirynote' : null]
@@ -2529,8 +2431,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                 ? h(
                     'button',
                     {
-                      // Clears the query and closes the box. The name says which of the two the press
-                      // does to the reader's query.
+                      // Naming cancels the name. Filtering clears the query and closes the box. The accessible name describes the current action.
                       class: 'filterclear',
                       type: 'button',
                       key: 'clear',
@@ -2551,8 +2452,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                       type: 'button',
                       'data-control': 'railsearch',
                       key: 'search',
-                      // The button carries no `aria-expanded`. The box replaces the count rather than
-                      // opening under the button, so there is nothing here for a reader to watch expand.
+                      // Search is replaced by Clear when the box opens. It has no expandable child.
                       'aria-label': options.words.railSearch,
                       'data-hint': options.words.railSearchHint,
                       onClick: openFilterBox,
@@ -2571,9 +2471,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                   ),
               filtersButton,
             ]),
-            // The New split closes the head, after the funnel, so a reader tabbing through the rail meets
-            // the filters before the launcher. Its key keeps the node, and the `railNew` ref and any
-            // focus on it, across every redraw of the head.
+            // New follows the filters in tab order. Its stable key preserves the button, ref, and focus across header redraws.
             h('span', { class: 'railnewsplit', key: 'new-split' }, [
               h(
                 'button',
@@ -2614,8 +2512,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
               ),
             ]),
           ]),
-          // Both axes draw their own note when both are invalid, so a reader correcting one
-          // value is not left wondering whether the other has been read at all.
+          // Cost and cache-expiry each report their own invalid value.
           [
             invalidCost
               ? h(
@@ -2642,10 +2539,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                 )
               : null,
           ],
-          // The offer to keep the query, under the box it was typed into and only while the box
-          // is open. A count press leaves the count on the head with the box closed, and an
-          // offer there would ask the reader to name something the head already gives them in
-          // one press. A rail nobody has filtered pays nothing for this.
+          // Offer to save a valid filtering query only while the box is open and not already naming a view.
           open && !naming && viewFiles(filter) && !invalidCost && !invalidCacheExpiry
             ? h(
                 'button',
@@ -2660,9 +2554,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                 [h('span', { class: 'launchname' }, options.words.railViewSave)],
               )
             : null,
-          // What is wrong with the name and what the key under it does, in one region the box
-          // names. It reports itself, so a note that arrives while the reader types is spoken
-          // rather than waiting for them to go looking for it.
+          // The field names this status region. It announces naming guidance as the reader types.
           naming
             ? h(
                 'div',
@@ -2695,8 +2587,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                   'aria-pressed': String(count.pressed),
                   'aria-label': count.name,
                   'data-hint': count.hint,
-                  // The cache sentence already ends the name, so the hint shows it without a
-                  // description that would say it twice.
+                  // Cache detail already appears in the accessible name. Show it in the hint without repeating the spoken description.
                   'data-hint-detail': count.cacheDetail ?? undefined,
                   'data-hint-description': count.cacheDetail ? '' : undefined,
                   disabled: Boolean(naming),
@@ -2719,44 +2610,21 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
   };
 
-  // The whole list goes to the host on every change, the way a session's labels do, and
-  // the panel adopts it at once rather than waiting to be told. The rail redraws under the
-  // reader's press, and the next rail message replaces what is held here.
-  // Every write posts the whole list, where a label write posts one session.
-  //
-  // Two panels can hold the list at once, so a write built on a stale copy drops what the other
-  // one saved. The window is one message: the host stores the list and posts the rail back to
-  // every panel inside the same turn, so a second panel is level again before a reader reaches
-  // a control. Closing it properly needs a tombstone per deleted view, to tell a delete from a
-  // panel that never saw the view at all, and that is state this feature does not otherwise
-  // need.
+  // Adopt and post the complete saved-view list on each change. The next host payload replaces this local copy.
+  // Concurrent edits from panels holding different copies can overwrite another panel's saved views.
   const postViews = (next: SavedView[]) => {
     pruneViewFolds(next);
     views = next;
     options.sendToHost({ type: 'setViews', views: next });
   };
-  // What the box has to say about the name in it. Read in two places, the box's own state and
-  // the region under it, so the two cannot disagree about whether the name is good.
+  // Share naming notes between field validation and the status region.
   const namingNotes = (): readonly ViewNote[] =>
     naming ? [...viewQueryNotes(naming.lens.query), ...viewTypedNotes(views, naming.name, '')] : [];
-  // Whether the name in the box is one the save will refuse. The limit note is advice about a
-  // cut the reader cannot see, and the name it warns about is stored, so it marks nothing
-  // invalid: a box that reports invalid over a name it then accepts teaches the reader to
-  // ignore the state.
+  // Empty and taken names block saving. The length-limit note describes truncation and does not mark an accepted name invalid.
   const namingRefused = (): boolean => namingNotes().some((note) => note === 'unnamed' || note === 'taken');
-  // Where the reader is left once the view they deleted takes its heading with it.
-  //
-  // The popover hung off that heading, so an ordinary close has nothing to hand focus back to
-  // and drops the reader on the document. Three answers in order: the first heading the rail
-  // still draws, then the filter box, then whatever the panel
-  // offers when the rail itself is down. A rail with no heading and no box is a panel with no
-  // rail, and the last of the three is the same fallback every other rail path uses.
-  // The folds of views the list no longer holds. `nextViewId` fills the gap a delete left, so a
-  // view made after one is deleted takes the same id, and a fold nobody swept would hand it the
-  // deleted view's open or shut state. The local delete drops its own, and this catches the
-  // delete another panel made. The Show more presses under a gone view go the same way, or the
-  // next view to take its id would open with the rows the deleted one was raised to.
-  // Prune before replacing the saved views list.
+  // Remove folds for deleted views and Show more steps for deleted views or changed queries.
+  // View ids can be reused, so retained entries would give a new view the deleted view's presentation state.
+  // Run before replacing the saved-view list.
   const pruneViewFolds = (next: readonly SavedView[]): void => {
     const live = new Set(next.map((one) => viewFoldId(one)));
     const before = new Map(views.map((one) => [viewFoldId(one), one]));
@@ -2782,10 +2650,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
     }
   };
+  // Restore focus after deleting a view: first surviving group heading, then the visible filter box, then the panel fallback.
   const focusAfterViewGone = (): void => {
     const heading = listControls().find((node) => node.classList.contains('railfold')) ?? null;
-    // A hidden control takes focus and shows the reader nothing. Below the breakpoint the whole
-    // rail is away, so the box is there and cannot be reached.
+    // Skip a filter box inside a hidden session list.
     const box = filterInput?.isConnected && !filterInput.closest('[hidden]') ? filterInput : null;
     const next = heading ?? box ?? options.fallbackFocus();
     if (!next) {
@@ -2797,8 +2665,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (!viewCanSave(filter)) {
       return;
     }
-    // A keystroke's frame still owed draws now, so the counts that hold still under the name
-    // are the ones for the query being named.
+    // Flush pending typing before freezing counts for the query being named.
     if (filterFrame !== null) {
       cancelAnimationFrame(filterFrame);
       drawFilterFrame();
@@ -2813,8 +2680,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     drawFilterPop();
     filterInput?.focus();
   };
-  // Out of naming and back to the query, which the box holds again. The filter never moved
-  // while the name was being typed, so the rail under it did not either.
+  // Restore the current query in the box when naming ends.
   const stopNaming = () => {
     naming = null;
     if (filterInput) {
@@ -2824,12 +2690,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     drawFilterPop();
     focusFilterRow();
   };
-  // Whether a query files anything. A query of spaces alone, or one holding only `find:` and
-  // `in:` words, leaves the grammar no term, and `matchSessions` answers with every
-  // session to a query that has none. A view over one is the whole rail under a name.
-  // The query as it will be stored, because the record cuts it at its own ceiling. A long
-  // query whose only term sits past that cut reaches storage with no term at all, and a view
-  // with no term is the whole rail under a name.
+  // Save the captured query only if its bounded form contains a session-filter term.
+  // Spaces, find terms, and in terms alone would create a view matching every session.
   const saveNamedView = () => {
     if (!naming || !viewCanSave(naming.lens.query)) {
       return;
@@ -2882,8 +2744,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       return;
     }
     const visibleControls = listControls();
-    // A row keys by its section, so a row that moved section is a new element. The focus
-    // follows its session, to the copy in the section it sat in when one is still drawn.
+    // Restore the same control in its original group when available, then another occurrence of that control.
     const matchingStop = activeControl
       ? (visibleControls.find(
           (node) =>
@@ -2897,8 +2758,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       ? (visibleControls.find((node) => node.classList.contains('railfold') && node.dataset.control === activeBucket) ??
         null)
       : null;
-    // A Show more press sits under its section's last drawn row. When a draw removes it and the
-    // section has no surviving fold heading, that row is where the press was.
+    // When Show more and its heading disappear, fall back to the last selector in that section.
     const sectionEnd =
       activeBucket && activeControl?.startsWith('railmore:')
         ? (visibleControls
@@ -2913,8 +2773,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     const nearbyRow = selectors[Math.min(Math.max(0, rowIndex), selectors.length - 1)] ?? null;
     (matchingStop || bucketStop || sectionEnd || nearbyRow || headerFocus())?.focus();
   };
-  // A press draws the section's next step. The press stays under the new rows and keeps focus.
-  // A press that draws the section's last row removes itself, and the draw focuses that row.
+  // Show more retains focus while rows remain. Drawing the final row removes the button and focuses that row.
   const raiseRail = (section: string) => {
     raisePending = section;
     drawList();
@@ -2950,16 +2809,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     );
     const drawnIn = (section: string, count: number) =>
       railRowsDrawn(section, railRaised.get(railRaisedKey(section)) ?? 0, count, currentAt.get(section) ?? -1);
-    // A press counts from what its section drew, which the current row can have taken past
-    // the presses alone. Every answer but the whole section is a whole number of steps.
+    // Advance from the drawn extent, including rows revealed for the current session. Round to a whole step.
     const raisedCount = raising
       ? railLayout.sections.find((section) => section.id === raising)?.cards.length
       : undefined;
     if (raising && raisedCount !== undefined) {
       railRaised.set(railRaisedKey(raising), Math.ceil(drawnIn(raising, raisedCount) / RAIL_ROW_STEP));
     }
-    // One list, read twice. The rows drawn here are the rows the clock compares later, so a
-    // card left out of the draw cannot ask the clock for a repaint of a row nobody can see.
+    // Use the mounted rows for drawing and later clock comparisons. Omitted rows cannot request a clock redraw.
     const { rows, left } = railDrawnRows(railLayout.sections, railLayout.folded, repeated, railRowId, drawnIn);
     const rowsByBucket = new Map<string, RailDrawnRow<RailCardView>[]>();
     for (const row of rows) {
@@ -2986,8 +2843,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       );
       const bucketRows = rowsByBucket.get(bucket.id);
       if (!bucketRows) {
-        // A view whose query reaches nothing keeps its heading, because that heading is the
-        // way to edit and delete it. Opened, it says why it holds no card.
+        // An empty saved view keeps its heading for editing and deletion when no filter is active.
+        // Its unfolded body explains the empty result.
         if (!railLayout.folded[bucket.id] && !bucket.cards.length) {
           children.push(
             h(
@@ -3055,8 +2912,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       nav.scrollTop = scroll;
     }
     railToTop = false;
-    // A press that drew its section's last row has gone, and the focus moves straight to that
-    // row instead of through a fallback.
+    // Focus the final row directly when Show more disappears.
     const lastRaised = raising && !left.has(raising) ? rowsByBucket.get(raising)?.at(-1) : undefined;
     const target = lastRaised
       ? (document.getElementById(lastRaised.id)?.querySelector<HTMLElement>('.railcard') ?? null)
@@ -3073,9 +2929,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         }
       }
     }
-    // The scroll kept above holds the rows over the press still, so the rows a press adds push
-    // the press down past the fold. Only a draw a press caused brings its control back into
-    // view. Any other draw keeps the rail where the reader left it.
+    // Preserve scroll on ordinary redraws. A Show more redraw scrolls its surviving button or final row into view.
     const focused = document.activeElement as HTMLElement | null;
     if (raising && focused && (focused === target || focused.dataset.control === `railmore:${raising}`)) {
       focused.scrollIntoView?.({ block: 'nearest' });
@@ -3110,20 +2964,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       options.sendToHost({ type: 'setLabels', session: labelsOpen.session, names: labelAppliedNames() });
     }
   };
-  // The control a label editor hangs off, looked for inside the row the press came from before
-  // anywhere else.
-  //
-  // A session two saved views both match draws a row under each of them, so a lookup on
-  // the session alone finds two controls and takes whichever is drawn first. The reader
-  // who pressed `L` on the second copy then watches the editor open over the first. The row is
-  // passed in wherever the press knows it, and the whole-page lookup is what remains for a rail
-  // rebuilt from nothing between the ask and the answer.
+  // Find the section identity of the row containing this control.
   const sectionOf = (node: HTMLElement | null | undefined): string | null =>
     node?.closest<HTMLElement>('.railrow')?.dataset.railBucket ?? null;
-  // The row a section's fold id names, so a re-anchor after a rebuild goes back to the row the
-  // press came from rather than to whichever copy is drawn first.
+  // Find the first mounted row in a section after rebuilding the list.
   const sectionRow = (section: string | null): HTMLElement | null =>
     section ? document.querySelector<HTMLElement>(`.railrow[data-rail-bucket="${CSS.escape(section)}"]`) : null;
+  // Prefer the initiating row when finding a label-editor anchor. Fall back to session controls elsewhere if rebuilding removed that row.
   const labelAnchorFor = (session: string, control?: string | null, within?: HTMLElement | null): HTMLElement | null =>
     (within && control ? found(within, control) : null) ||
     (within ? found(within, `raillabels:${session}`) : null) ||
@@ -3153,8 +3000,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (!anchor) {
       return;
     }
-    // The editor opens clear of the whole row, above or below it, so it never covers the
-    // session it labels.
+    // Place the label editor outside the session list row or session heading.
     const row = anchor.closest<HTMLElement>('.railrow') || anchor.closest<HTMLElement>('.sessionrow');
     placeFloat(window, labelPop, anchor, { around: row ?? anchor, align: 'end', gap: 4, overflow: 'flip-or-stay' });
   };
@@ -3206,7 +3052,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
   };
   const openLabelEditor = (session: string, anchor?: HTMLElement | null) => {
-    // Two popovers must never float at once, so the view editor gives way to this one.
+    // Close other popovers before opening the label editor.
     if (viewOpen) {
       closeViewEditor(false);
     }
@@ -3316,8 +3162,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
   };
 
-  // The rail row or heading control the rename editor was opened from, found again after a
-  // redraw replaced it. A heading control has no rail section, so the whole page is searched.
+  // Keep a connected rename anchor outside hidden elements. Otherwise, try its control in the section's first row.
+  // If that fails, use the first session list occurrence. Anchors without a section use a whole-page lookup.
   const renameAnchor = (): HTMLElement | null => {
     if (!renameOpen) {
       return null;
@@ -3367,17 +3213,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
     placeRenamePop();
   };
-  // Whether the reader is still in the rename editor, or focus went nowhere because a
-  // control in it was disabled. Only then may an answer move focus.
+  // An answer moves focus only while it remains in the rename editor or has fallen back to the page body.
   const focusInRename = (): boolean => {
     const active = document.activeElement;
     return !active || active === document.body || renamePop.contains(active);
   };
-  // Closes the editor. Escape, a press outside, and another popover close it even while a
-  // rename waits, so a lost answer never strands the reader. That rename still finishes, and
-  // its late answer finds no editor waiting on it and changes nothing. Focus goes back to the
-  // rail row or heading control the editor opened from when it can take focus. Below the rail
-  // breakpoint a rail row is still in the page but hidden, so focus goes to the timeline.
+  // Close the rename editor even while its request is pending. Late answers find no waiting editor.
+  // Return focus to its visible anchor when requested, else the panel fallback.
   const closeSessionRename = (returnFocus: boolean) => {
     if (!renameOpen) {
       return;
@@ -3406,8 +3248,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (!sent) {
       return;
     }
-    // Save turns disabled while the rename waits, so a press on it would drop focus out of the
-    // editor and out of reach of Escape. The box keeps it instead.
+    // Keep focus in the name box when Save becomes disabled during the request.
     const held = focusInRename();
     renameRequests += 1;
     renameOpen = sent;
@@ -3458,18 +3299,12 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
           setLiveRailFilter({ query: '', sort: railDefaultSort }, ALL_RAIL_FILTER_ID, false);
         }
       }
-      // A view the reader deleted in another host takes its editor with it, because the form
-      // would otherwise rename something that is gone.
-      //
-      // The rescue is owed rather than taken here. The reader holding the form has to land
-      // somewhere, and the headings it lands on are the ones drawn after this message, not the
-      // ones on screen now, which still include the section about to go.
+      // Close an editor whose saved view disappeared. Restore its focus after drawing the surviving headings.
       const rescue = !!viewOpen && !findView(views, viewOpen.view) && viewPop.contains(document.activeElement);
       if (viewOpen && !findView(views, viewOpen.view)) {
         closeViewEditor(false);
       }
-      // A session that left the rail takes its rename editor with it. A reader typing in it
-      // lands on the timeline, because the row they came from is gone.
+      // A removed session closes its rename editor. Move focus to the panel fallback if the editor held it.
       if (renameOpen && !latestCards.some((card) => card.id === renameOpen?.session)) {
         const typing = renamePop.contains(document.activeElement);
         closeSessionRename(false);
@@ -3481,8 +3316,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawFilterPop();
       drawTop();
       drawRailFilterPop();
-      // The reader opened another session. The highlight names where they are now, so
-      // it follows them even while a selection in the row they left is still alive.
+      // Move the current-session highlight despite retained text selection, unless a pointer drag is still active.
       const movedOn = currentOf(latestCards) !== currentOf(drawnCards) && !dragging;
       if (!movedOn && options.selectionWithin(nav)) {
         repaintOwed = true;
@@ -3499,8 +3333,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       if (rescue) {
         focusAfterViewGone();
       }
-      // A figure or a state can change while every attribute on the row stays the same, so
-      // an open hover card is drawn again from what the rail now holds.
+      // Refresh an open hover card after figure or state changes that leave the row's attributes unchanged.
       options.redrawHint('railcard');
     },
     updateLauncher(view) {
@@ -3513,9 +3346,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     },
     drawRowContexts(sessions) {
       const wanted = new Set(sessions);
-      // A saved view can draw a second row for the same session, so every match is patched
-      // rather than the first: the session heading returns after one because it draws at
-      // most one row per session, and the rail does not share that limit.
+      // Refresh every occurrence of each requested session, including repeated saved-view rows.
       for (const row of nav.querySelectorAll<HTMLElement>('[data-vscode-context]')) {
         const session = row.dataset.session;
         if (session === undefined || !wanted.has(session)) {
@@ -3529,13 +3360,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         const menuSection = typeof old.webviewSection === 'string' ? old.webviewSection : '';
         row.dataset.vscodeContext = options.rowContext(session, menuSection, persisted);
       }
-      // Preact keeps the props it last committed, not the attribute the patch above just
-      // wrote. A later draw that happens to recompute the value the patch replaced would see
-      // no difference from what it remembers and skip the write, so the row would answer a
-      // press that reopens its menu with what the patch said rather than the state the press
-      // is actually about. Drawing again now folds the patch into what Preact remembers before
-      // a later draw can lose it. Cards keep the bucket the last host payload placed them in:
-      // this only redraws what a card already carries, it does not move any row.
+      // Redraw after patching menu context so Preact's retained props match the DOM.
+      // Otherwise a later redraw can skip an attribute write and leave stale menu actions.
+      // Use drawnCards so this refresh preserves the groups from the last adopted payload.
       drawList();
     },
     releaseSelection() {
@@ -3546,20 +3373,15 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawnStats = drawnRailStats(latestStats);
       now = Date.now();
       repaintOwed = false;
-      // A tick this selection deferred left the head's figures as they were, so the head draws
-      // again with the list.
+      // Refresh header counts deferred by the selection together with the list.
       drawTop();
       drawList();
       options.redrawHint('railcard');
     },
     tick(at = Date.now()) {
       const work = railTickWork(drawnRows, now, at, drawnTitlesAt, railAgeFormat(railDensity));
-      // A cache tooltip is written where it stands. The row around it says the same words as
-      // before, and a redraw for a tooltip nobody has open would remount the node the tooltip
-      // hangs off while the pointer rests on it.
-      //
-      // The row is looked for inside the rail. A row id names one element of the rail, and an
-      // element elsewhere on the page carrying that id owns none of this wording.
+      // Update cache titles in place to preserve the hovered node.
+      // Restrict row lookups to the session list even if another page element has the requested id.
       let written = 0;
       for (const { id, text } of work.titles) {
         const row = document.getElementById(id);
@@ -3572,8 +3394,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
           title.textContent = text;
         }
       }
-      // The baseline moves only when every owed tooltip reached its mark. A row the rail has
-      // not mounted is owed its wording again on the next tick.
+      // Advance the tooltip clock only when every requested title was found. Retry missing titles on the next tick.
       if (written && written === work.titles.length) {
         drawnTitlesAt = at;
       }
@@ -3603,17 +3424,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     },
     reset() {
       setRailQuery('');
-      // The box goes with the query. A rail that has forgotten everything rests on its
-      // count, and an empty box left on the row would hold the place it belongs.
+      // Reset closes the filter box together with clearing its query.
       filterRowOpen = false;
       railFilterId = ALL_RAIL_FILTER_ID;
       railFilters = [];
       width = RAIL_WIDTH_DEFAULT;
       railSort = 'latest';
       railDefaultSort = 'latest';
-      // The two bucket switches go back on with the rest. A reader asking the panel to forget
-      // everything is asking for the rail they started with, and a switch left off keeps a
-      // whole bucket of sessions off a rail that says it has forgotten what hid them.
+      // Restore default Show switches so reset reveals both archived sessions and agent runs.
       railShowArchived = RAIL_SHOWN_BUCKETS.showArchived;
       railShowRuns = RAIL_SHOWN_BUCKETS.showRuns;
       railQuickFilters = [...DEFAULT_RAIL_QUICK_FILTERS];
@@ -3669,22 +3487,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     newButton: () => railNew,
     newMenu: () => railNewMenu,
     labelOpen: (session) => labelsOpen?.session === current(session),
-    // Whether a filter set from elsewhere would be on screen to see.
-    //
-    // The width alone, and not `visible`, which also asks whether a payload has arrived. The
-    // session heading is drawn from the same payload the rail is, and `render` builds the
-    // headings first, so a heading asking `visible` on the first paint is told the rail is
-    // down and draws its chips as words. They would stay words until something else redrew
-    // the line.
+    // Uses width alone so headings enable label filters before the first session list payload arrives.
     filterable: () => media.matches,
-    // File the rail by one label, from a press the reader made somewhere else.
-    //
-    // The session heading's chips call this. The filter box is where the reader edits and
-    // clears a filter, so the press writes the term into that box and leaves the focus on it,
-    // rather than filing the list from a control that then says nothing about what it did.
-    //
-    // Nothing happens while the rail is down. The heading draws its chips as plain words at
-    // those widths for that reason, so no press reaches here with no list to file.
+    // Filter by a session heading's label and focus the filter box. Ignore the action while the session list is hidden.
     filterByLabel(name) {
       if (!visible()) {
         return;
@@ -3699,8 +3504,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         cancelAnimationFrame(filterFrame);
         filterFrame = null;
       }
-      // The term is a whole label and not a word part way through being typed, so the offers
-      // stay shut over it, the way they do when the reader takes one of the rows themselves.
+      // Suppress suggestions for this completed label term.
       filterShutOn = { start: 0, text: written };
       filterAt = 0;
       options.save();
@@ -3717,11 +3521,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       if (!selected) {
         return;
       }
-      // An armed Delete and an open name box belong to the lens they were opened on, so a
-      // press on another row drops both before that row's own actions draw. So does a press on
-      // the selected row while the rail is Custom, because the press puts the saved lens back
-      // and a name typed for the edited lens would save a copy of the stored one. A press on
-      // the row already selected and unedited keeps both, with any name the reader has typed.
+      // Switching filters or restoring a Custom query clears naming and armed deletion.
+      // Pressing the selected, unchanged filter preserves its typed name and delete state.
       if (id !== railFilterId || !railFilterSelected()) {
         railFilterDeleteArmed = false;
         railFilterNameMode = null;
@@ -3739,8 +3540,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       selectRailFilterSort(value as RailSort);
     },
-    // A Filter press sets one lens in the query, or none for All, and keeps every other word,
-    // the sort and the selected filter id. The menu stays open on the pressed value.
+    // Set the selected status lens while preserving other terms, sort, and saved-filter identity. Keep the menu open on that value.
     setRailLens(value) {
       const lens = value === 'all' ? null : RAIL_LENSES.find((each) => each === value);
       if (lens === undefined) {
@@ -3752,8 +3552,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
       drawRailFilterPop(`raillens:${value}`);
     },
-    // A grouping press changes only the list and the menu's own checked value. It is view
-    // state, saved with the rail like the sort and the Show switches.
+    // Save group presentation independently of the query. Redraw the list and menu.
     setRailGroupBy(value) {
       const next = normalizeRailGroupBy(value);
       if (next !== value || next === railGroupBy) {
@@ -3764,8 +3563,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawList();
       drawRailFilterPop(`railgroupby:${next}`);
     },
-    // A density press changes how each row is laid out and which age it prints. It is
-    // presentation state saved with the rail width, and no saved filter or view holds it.
+    // Density changes row layout and age format. Save it with session list presentation, independently of saved filters and views.
     setRailDensity(value) {
       const next = normalizeRailDensity(value);
       if (next !== value || next === railDensity) {
@@ -3777,8 +3575,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawList();
       drawRailFilterPop(`raildensity:${next}`);
     },
-    // A bucket press changes what the rail draws and what every figure counts, so the list,
-    // the row and the menu are all redrawn, and the choice is saved with the rail.
+    // Save group visibility and refresh list rows, header counts, and the menu.
     toggleRailShow(value) {
       if (value === 'archived') {
         railShowArchived = !railShowArchived;
@@ -3896,9 +3693,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawRailFilterPop('railfilter-save-as');
     },
     toggleLabelEditor(session, anchor) {
-      // The press shuts the editor only when it is the press that opened it. A session two
-      // saved views both match has a control under each, and the second one moves the editor to
-      // its own row rather than closing an editor the reader is looking at elsewhere.
+      // The same session occurrence toggles its editor closed. Another occurrence moves the editor to that row.
       const here = labelsOpen?.session === current(session) && labelsOpen.section === sectionOf(anchor);
       if (here) {
         closeLabelEditor(true);
@@ -3945,11 +3740,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         options.sendToHost({ type: 'labelEditor', session: labelsOpen.session });
       }
     },
-    // A draft took its durable id. The open editor and an unanswered ask move to that id, so
-    // the anchor lookup finds the controls drawn under the new id and each change is sent for
-    // the session that owns the labels. A press or a reply that still names the provisional id
-    // reaches the same editor through the adoption record. The held anchor stays until a
-    // redraw replaces it.
+    // Move open and pending label-editor state to the durable session id. Preserve the anchor until redraw replaces it.
+    // Delayed provisional actions resolve through the retained identity map.
     adoptSessionIdentity(provisional, durable) {
       adopted.delete(provisional);
       adopted.set(provisional, durable);
@@ -3975,8 +3767,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         return;
       }
       labelArm = null;
-      // The node the right-click landed on wins. It names the row the reader meant, which a
-      // lookup by session cannot do once two sections draw that session.
+      // Prefer the context-menu target over session lookup, which cannot distinguish repeated rows.
       openLabelEditor(session, arm.node.isConnected ? arm.node : labelAnchorFor(session));
     },
     handleHotkey(event, from) {
@@ -4015,8 +3806,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       placeRenamePop();
       placeRailFilterPop();
     },
-    // The edit and delete commands, which the editor answers on the heading they were pressed
-    // on. Two popovers must never float at once, so the label editor gives way to this one.
+    // Open the saved-view editor only for this panel's recent context-menu target. Close other popovers first.
     openViewEditor(view, mode) {
       const arm = viewArm;
       viewArm = null;
@@ -4046,8 +3836,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       };
       drawViewPop(mode === 'delete' ? 'view-delete' : 'view-name');
     },
-    // Rename session on a saved session's rail row or heading context menu. Every host is
-    // told, and only the one that saw the right-click opens the editor.
+    // Open Rename only in the panel holding the matching recent context-menu target.
     openSessionRename(session, title) {
       const arm = renameArm;
       renameArm = null;
@@ -4078,9 +3867,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawRenamePop(true);
       renameInput?.select();
     },
-    // The host's answer. Success closes the editor, because the rail and the heading already
-    // carry the new name. Focus moves only when the reader is still in the editor, so an
-    // answer never pulls them out of a box they moved on to.
+    // Apply the matching rename answer. Success closes the editor.
+    // Move focus only if it remains in the editor or has fallen back to the body.
     receiveSessionRenameResult(answer) {
       const next = answeredRename(renameOpen, answer);
       if (next === 'ignore') {
@@ -4126,8 +3914,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       closeViewEditor(true);
       drawList();
     },
-    // Two presses on one button. The first changes the word, so the reader reads what the next
-    // press does rather than answering a box drawn over the view they are deleting.
+    // The first Delete press asks for confirmation on the same button. The second deletes the view.
     pressDeleteView() {
       const saved = viewOpen ? findView(views, viewOpen.view) : null;
       if (!viewOpen || !saved) {
@@ -4138,8 +3925,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         drawViewPop('view-delete');
         return;
       }
-      // The section's fold and presses go with it. Nothing draws a heading under that key any
-      // more, and the record keeps a bounded number of them.
+      // Posting the updated list removes this view's folds and Show more steps.
       postViews(views.filter((view) => view.id !== saved.id));
       closeViewEditor(false);
       options.save();
@@ -4255,12 +4041,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     event.preventDefault();
   });
 
-  // Escape alone. Everything inside is a box or a button, and Tab already walks those, so this
-  // popover builds no walk of its own. The label editor beside it does build one, because its
-  // list of checkboxes grows to whatever the workspace has filed.
-  //
-  // An armed delete gives way first. A reader who armed it and changed their mind presses the
-  // key that means no, and losing the whole form to that press would take the rename with it.
+  // Native Tab walks the editor fields and actions. Arrow keys and Home or End supplement it outside the sort selector.
+  // Escape disarms Delete first, then closes the editor.
   viewPop.addEventListener('keydown', (event) => {
     if (!viewOpen || event.isComposing || event.keyCode === 229) {
       return;
@@ -4294,8 +4076,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if ((event.key === 'Home' || event.key === 'End') && document.activeElement === viewInput) {
       return;
     }
-    // A disabled button is not a stop. Save is disabled while the name is empty or taken, and a
-    // walk that landed on it would leave the reader holding nothing at the end of the list.
+    // Skip disabled buttons, including Save for an empty or taken name.
     const stops = [...viewPop.querySelectorAll<HTMLElement>('.labelfind, .launchactions button')].filter(
       (node) => !(node as HTMLButtonElement).disabled,
     );
@@ -4444,9 +4225,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
   });
   options.events.document('selectionchange', () => owner.releaseSelection());
-  // A press outside the View menu gives focus to the control it landed on. A press on
-  // anything that takes no focus leaves focus on the body or in the hidden menu, so the
-  // funnel takes it back there.
+  // After an outside press, preserve focus on the pressed control. Restore the funnel if focus remains on the body or closed menu.
   const settleRailFilterFocus = () => {
     if (!railFilterFocusBack) {
       return;
@@ -4521,9 +4300,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if (!session) {
       return;
     }
-    // The arm reads the context the menu reads, so the editor opens exactly where the menu
-    // offers Rename session. A heading's anchor is the control the press came from: the
-    // Session actions button, or else the disclosure.
+    // Arm Rename only where saved-session context offers it.
+    // Session headings anchor to Session actions or the disclosure that opened the menu.
     if (renameOffered(card ?? row)) {
       const heading = row.classList.contains('sessionrow')
         ? target?.closest<HTMLElement>('.sessionheading > .sessionmenu:not(.sessionlayout):not(.sessionpin)') ||
@@ -4538,8 +4316,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   options.events.window('resize', () => owner.place());
 
   if (typeof ResizeObserver === 'function') {
-    // The head includes Project cost. Its height offsets the sticky bucket headings and the
-    // scroll padding, so a row reached from the keyboard stays below the head.
+    // Measure the full header, including Project cost, for sticky group offsets and keyboard scroll padding.
     const measured = new ResizeObserver(() => {
       nav.style.setProperty('--rail-top', `${top.getBoundingClientRect().height}px`);
     });
