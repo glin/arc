@@ -275,6 +275,8 @@ body {
 }
 
 .demo-menu {
+  display: flex;
+  flex-direction: column;
   position: fixed;
   z-index: 40;
   box-sizing: border-box;
