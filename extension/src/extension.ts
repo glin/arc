@@ -90,6 +90,7 @@ import { AgentUsage, UsageBook, UsageResetTimer, UsageWriteQueue, USAGE_AGENT_OR
 import { UsageRecorder, USAGE_STORE_DIRECTORY } from './usagerecord';
 import { sameSkillList, withDirectorySkills } from './domain/claude-skills';
 import { normalizeWorkspace } from './projectspend';
+import { ConfigWatches } from './configwatch';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
 declare const EXTENSION_VERSION: string;
@@ -747,12 +748,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   let defaultsRevision = 0;
   const defaultRequests = new Map<string, Promise<AppliedDefaults>>();
-  const defaultWatchers = new Map<string, vscode.Disposable[]>();
   let defaultsDisposed = false;
-  const releaseDefaultWatchers = () => {
-    for (const disposables of defaultWatchers.values()) for (const disposable of disposables) disposable.dispose();
-    defaultWatchers.clear();
-  };
+  const configWatches = new ConfigWatches({
+    watch: (base, pattern, listener) => {
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, pattern));
+      const disposables = [
+        watcher,
+        watcher.onDidCreate((uri) => listener('create', uri.fsPath)),
+        watcher.onDidChange((uri) => listener('change', uri.fsPath)),
+        watcher.onDidDelete((uri) => listener('delete', uri.fsPath)),
+      ];
+      return {
+        dispose() {
+          for (const disposable of disposables) disposable.dispose();
+        },
+      };
+    },
+    isDirectory: (target) => fs.promises.stat(target).then((stats) => stats.isDirectory()),
+    invalidate: () => invalidateDefaults(),
+    path,
+    ignoreCase: process.platform === 'win32' || process.platform === 'darwin',
+  });
   panel.onWatchDefaults = (cwds) => {
     if (defaultsDisposed) return;
     const roots = new Set(cwds.map((cwd) => path.resolve(cwd)));
@@ -760,43 +776,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const [, cwd] = JSON.parse(key) as string[];
       if (!roots.has(path.resolve(cwd))) defaultRequests.delete(key);
     }
-    const folders = new Set<string>();
-    for (const cwd of cwds) {
-      let folder = path.resolve(cwd);
-      for (;;) {
-        folders.add(folder);
-        const parent = path.dirname(folder);
-        if (parent === folder) break;
-        folder = parent;
-      }
-    }
-    for (const [folder, disposables] of defaultWatchers) {
-      if (!folders.has(folder)) {
-        for (const disposable of disposables) disposable.dispose();
-        defaultWatchers.delete(folder);
-      }
-    }
-    for (const folder of folders) {
-      if (defaultWatchers.has(folder)) continue;
-      const disposables: vscode.Disposable[] = [];
-      for (const pattern of ['.claude/settings*.json', '.codex/config.toml']) {
-        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, pattern));
-        disposables.push(
-          watcher,
-          watcher.onDidChange(invalidateDefaults),
-          watcher.onDidCreate(invalidateDefaults),
-          watcher.onDidDelete(invalidateDefaults),
-        );
-      }
-      defaultWatchers.set(folder, disposables);
-    }
+    configWatches.update(cwds);
   };
   context.subscriptions.push({
     dispose() {
       defaultsDisposed = true;
       defaultsRevision++;
       defaultRequests.clear();
-      releaseDefaultWatchers();
+      configWatches.dispose();
       panel.onWatchDefaults = null;
     },
   });

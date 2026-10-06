@@ -1,4 +1,5 @@
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
+import { ConfigWatches } from './configwatch.ts';
 import {
   WorkspaceCachePartition,
   normalizedWorkspaceIdentity,
@@ -7225,6 +7226,8 @@ test('default metadata watches external ancestors and ignores unrelated editor s
     'spawnCli',
     'unavailableDefaults',
     'settingName',
+    'fs',
+    'ConfigWatches',
     compiled,
   )(
     loaded,
@@ -7244,14 +7247,20 @@ test('default metadata watches external ancestors and ignores unrelated editor s
     () => {},
     () => ({}),
     (key: string) => `arc.${key}`,
+    { promises: { stat: () => Promise.reject(new Error('missing')) } },
+    ConfigWatches,
   );
   loaded.exports.wire({ subscriptions }, panel);
   const cwd = path.resolve('external', 'project', 'child');
   panel.onWatchDefaults([cwd]);
-  for (const folder of [cwd, path.dirname(cwd), path.dirname(path.dirname(cwd))]) {
-    for (const pattern of ['.claude/settings*.json', '.codex/config.toml'])
-      assert.ok(watchers.some((watcher) => watcher.pattern.base === folder && watcher.pattern.pattern === pattern));
-  }
+  // VS Code watches the base of a pattern that holds `/` or `**` recursively.
+  const recursive = watchers.filter(({ pattern }) => pattern.pattern.includes('/') || pattern.pattern.includes('**'));
+  assert.deepEqual(
+    recursive.map(({ pattern }) => `${pattern.base} ${pattern.pattern}`),
+    [],
+  );
+  for (const folder of [cwd, path.dirname(cwd), path.parse(cwd).root])
+    assert.ok(watchers.some(({ pattern }) => pattern.base === folder && pattern.pattern === '{.claude,.codex}'));
   const change = (key: string) => configuration({ affectsConfiguration: (value: string) => value === key });
   panel.onReadDefaults('claude', cwd, '');
   change('workbench.colorTheme');
@@ -7263,11 +7272,17 @@ test('default metadata watches external ancestors and ignores unrelated editor s
   assert.deepEqual(accepted, []);
   change('arc.codexPath');
   assert.equal(cleared, 2);
-  const external = watchers.find((watcher) => watcher.pattern.base === cwd);
-  external.change();
-  external.create();
-  external.delete();
+  const external = watchers.find(({ pattern }) => pattern.base === cwd);
+  const claude = path.join(cwd, '.claude');
+  external.create({ fsPath: claude });
+  assert.equal(cleared, 3);
+  const settings = watchers.find(({ pattern }) => pattern.base === claude);
+  assert.equal(settings.pattern.pattern, 'settings*.json');
+  settings.change({ fsPath: path.join(claude, 'settings.json') });
+  assert.equal(cleared, 4);
+  external.delete({ fsPath: claude });
   assert.equal(cleared, 5);
+  assert.equal(settings.disposed, true);
   panel.onReadDefaults('claude', cwd, '');
   panel.onWatchDefaults([path.resolve('different')]);
   assert.equal(external.disposed, true);
