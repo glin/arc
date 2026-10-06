@@ -1739,6 +1739,85 @@ test('stable partial Codex parents yield to a later dispatch and resume after an
       appended.value.referenceEntries.find(([, entry]) => entry.sessionId === 'parent-0')?.[1].complete,
       true,
     );
+    // The parent stops growing. Discovery then settles, so the session list can complete.
+    let settled = appended;
+    for (let pass = 6; pass <= 12 && settled.value.kind === 'claude-children' && settled.value.continuation; pass++) {
+      const next = await discoveryState(
+        worker,
+        { ...request, parents, referenceEntries: settled.value.referenceEntries },
+        pass,
+        new AbortController().signal,
+      );
+      assert.ok(next?.value.kind === 'claude-children');
+      settled = next;
+    }
+    assert.ok(settled.value.kind === 'claude-children');
+    assert.equal(settled.value.continuation, false, 'a parent that grew once and then stopped kept discovery pending');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a Codex parent that grows after its scan keeps discovery pending until the next pass reads the new bytes', async () => {
+  const directory = tempDir('panel-progressive-codex-grown-');
+  const childId = '6b8c18d2-c0d0-4e07-8fc3-9f02a710a992';
+  const child = path.join(directory, `${childId}.jsonl`);
+  fs.writeFileSync(child, JSON.stringify({ type: 'user', cwd: directory }) + String.fromCharCode(10));
+  const file = path.join(directory, 'parent.jsonl');
+  const line = (record: object) => JSON.stringify(record) + String.fromCharCode(10);
+  fs.writeFileSync(
+    file,
+    line({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
+      line({ type: 'event_msg', timestamp: timestamp(1), payload: { type: 'task_started', turn_id: 'turn' } }) +
+      line({ type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: 'turn' } }),
+  );
+  const launch = line({
+    type: 'event_msg',
+    timestamp: timestamp(3),
+    payload: {
+      type: 'item_completed',
+      item: {
+        type: 'CommandExecution',
+        id: 'launch',
+        parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch' }],
+        stdout: `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${childId}"}`,
+      },
+    },
+  });
+  // The launch lands after the parent scan and before the walk that checks every parent again.
+  const mutate = path.join(directory, 'mutate');
+  const parts = source.split('found = walk();');
+  assert.equal(parts.length, 3, 'the worker no longer walks once before and once after its parent scans');
+  const grow = `if (require('node:fs').existsSync(${JSON.stringify(mutate)})) { require('node:fs').appendFileSync(${JSON.stringify(file)}, ${JSON.stringify(launch)}); require('node:fs').unlinkSync(${JSON.stringify(mutate)}); }`;
+  const worker = new ProgressiveWorker(parts[0] + 'found = walk();' + parts[1] + grow + 'found = walk();' + parts[2]);
+  const childStat = fs.statSync(child);
+  const request = (referenceEntries?: unknown) => {
+    const stat = fs.statSync(file);
+    return {
+      kind: 'claude-children' as const,
+      parents: [{ agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
+      catalog: [
+        { agent: 'claude' as const, file: child, sessionId: childId, size: childStat.size, mtimeMs: childStat.mtimeMs },
+      ],
+      repositoryRoots: [directory],
+      ...(referenceEntries ? { referenceEntries } : {}),
+    } as import('./progressiveworker').ProgressiveRequest;
+  };
+  try {
+    fs.writeFileSync(mutate, 'grow');
+    const grown = await discoveryState(worker, request(), 1, new AbortController().signal);
+    assert.ok(grown?.value.kind === 'claude-children');
+    assert.equal(fs.existsSync(mutate), false, 'the parent did not grow during the pass');
+    assert.equal(grown.value.continuation, true, 'a parent that grew during the pass claimed discovery complete');
+    assert.equal(grown.value.references.length, 0, 'the pass read bytes written after its scan');
+    const next = await discoveryState(worker, request(grown.value.referenceEntries), 2, new AbortController().signal);
+    assert.ok(next?.value.kind === 'claude-children');
+    assert.ok(
+      next.value.references.some((reference) => reference.sessionId === childId),
+      'the next pass treated the grown bytes as already read',
+    );
+    assert.equal(next.value.continuation, false, 'the parent stopped growing but discovery stayed pending');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

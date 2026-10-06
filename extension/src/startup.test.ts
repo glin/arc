@@ -2769,6 +2769,138 @@ test('complete discovery publishes one final rail without changing its selection
   }
 });
 
+// A host with real eviction and session-list status. Every source holds a current metadata read, its turn starts, a
+// working directory, and a human-prompt scan, as a restored derived cache does.
+function heldFactsHarness(held: Array<{ file: string; size: number; mtimeMs: number; sessionId: string }>): any {
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    ['evictCache', 'pruneDerivedTitles', 'protectedHistorySessions', 'metaFor', 'workspaceFoldersChanged'],
+    { historyBytes, historyEvictions },
+  );
+  provider.sessionCacheBudgetBytes = () => Number.MAX_SAFE_INTEGER;
+  provider.hostSessions = new Map();
+  provider.walkedClaude = [];
+  provider.carriedNames = new Map();
+  provider.claudeChildrenDiscovered = true;
+  provider.titles = new Map(
+    held.map((session) => [
+      session.file,
+      {
+        size: session.size,
+        mtimeMs: session.mtimeMs,
+        label: session.sessionId,
+        fullLabel: session.sessionId,
+        foldedLabel: session.sessionId,
+        activityMs: 1,
+        agentRun: false,
+        outcome: null,
+        stats: null,
+        expandedStatsRead: true,
+        starts: { starts: [1], whole: true },
+      },
+    ]),
+  );
+  provider.cwds = new Map(held.map((session) => [session.file, { cwd: 'project' }]));
+  provider.humanScans = new Map(held.map((session) => [session.file, { found: true }]));
+  return provider;
+}
+
+test('a selected-only refresh before the catalog keeps every held title, and the authoritative refresh completes and prunes', async () => {
+  const selected = {
+    file: 'selected.jsonl',
+    sessionId: 'selected',
+    agent: 'claude',
+    activity: 300,
+    size: 1,
+    mtimeMs: 1,
+  };
+  const codex = { file: 'rollout-codex.jsonl', sessionId: 'codex', agent: 'codex', activity: 200, size: 1, mtimeMs: 1 };
+  const child = {
+    file: 'subagents/agent-child.jsonl',
+    sessionId: 'child',
+    agent: 'claude',
+    childTranscript: true,
+    activity: 100,
+    size: 1,
+    mtimeMs: 1,
+  };
+  const gone = { file: 'gone.jsonl', sessionId: 'gone', agent: 'codex', activity: 50, size: 1, mtimeMs: 1 };
+  const provider = heldFactsHarness([selected, codex, child, gone]);
+  const heldFiles = (map: Map<string, unknown>) => [...map.keys()].sort();
+  const everyFile = [selected, codex, child, gone].map((session) => session.file).sort();
+
+  // Reload: the selected window lands before discovery, so the list holds only the selected session.
+  provider.earlySelectedSources = new Map([[selected.sessionId, selected]]);
+  provider.showing = selected.sessionId;
+  await provider.refresh(true, true, true, true);
+  assert.equal(provider.authoritativeCatalog, null, 'the fixture no longer refreshes before the catalog');
+  assert.deepEqual(heldFiles(provider.titles), everyFile, 'a selected-only refresh dropped titles of unlisted sources');
+  assert.ok(
+    [codex, child].every((session) => provider.titles.get(session.file).starts),
+    'a selected-only refresh dropped held turn starts',
+  );
+  assert.deepEqual(heldFiles(provider.cwds), everyFile, 'a selected-only refresh dropped working directories');
+  assert.deepEqual(heldFiles(provider.humanScans), everyFile, 'a selected-only refresh dropped human-prompt scans');
+
+  // Discovery completes. The authoritative catalog lacks the deleted source. Every listed source and the selected window
+  // are current.
+  provider.partial = [selected, codex, child];
+  provider.catalog = { sessions: provider.partial };
+  provider.discovery = Promise.resolve(true);
+  provider.progressiveCurrent = () => true;
+  await provider.refresh(true);
+  assert.ok(provider.authoritativeCatalog, 'the full refresh did not set the authoritative catalog');
+  const listed = [selected, codex, child].map((session) => session.file).sort();
+  assert.deepEqual(heldFiles(provider.titles), listed, 'the authoritative refresh kept the deleted source title');
+  assert.deepEqual(heldFiles(provider.cwds), listed, 'the authoritative refresh kept the deleted source directory');
+  assert.deepEqual(heldFiles(provider.humanScans), listed, 'the authoritative refresh kept the deleted source scan');
+  assert.equal(
+    provider.messages.at(-1).startup?.complete,
+    true,
+    'the session list stayed loading although every listed source holds current facts',
+  );
+
+  // A workspace folder change clears the catalog and the early selected sources. Once the new repository scope answers,
+  // its full refresh waits in discovery while the selected window refreshes. That selected-only refresh lists no session
+  // at all and keeps the old scope's facts. The new scope's authoritative refresh then prunes the sources outside it.
+  provider.repositoryScope = { snapshot() {} };
+  provider.allowThemeFiles = () => {};
+  provider.partial = [selected];
+  provider.catalog = { sessions: provider.partial };
+  let finishWalk: (walked: boolean) => void = () => {};
+  const walk = new Promise<boolean>((resolve) => {
+    finishWalk = resolve;
+  });
+  let walking = false;
+  provider.prepareClaudeChildren = () => {
+    walking = true;
+    return walk;
+  };
+  provider.workspaceFoldersChanged();
+  assert.equal(provider.authoritativeCatalog, null, 'the workspace folder change kept the old catalog');
+  assert.equal(provider.earlySelectedSources.size, 0, 'the workspace folder change kept the early selected sources');
+  provider.repositoryScopeReady = true;
+  const scoped = provider.refresh(true);
+  await vi.waitFor(() => assert.ok(walking, 'the new scope refresh did not start discovery'));
+  await provider.refresh(true, true, true, true);
+  assert.deepEqual(heldFiles(provider.titles), listed, 'a selected-only refresh after a scope change dropped titles');
+  assert.deepEqual(
+    heldFiles(provider.cwds),
+    listed,
+    'a selected-only refresh after a scope change dropped directories',
+  );
+  assert.deepEqual(
+    heldFiles(provider.humanScans),
+    listed,
+    'a selected-only refresh after a scope change dropped scans',
+  );
+  finishWalk(true);
+  await scoped;
+  assert.ok(provider.authoritativeCatalog, 'the new scope refresh did not set the authoritative catalog');
+  assert.deepEqual(heldFiles(provider.titles), [selected.file], 'the new scope kept titles outside it');
+});
+
 test('a cold start walks the catalog once every opening record is read', async () => {
   const sessions = [
     { file: 'codex.jsonl', sessionId: 'codex-b', agent: 'codex', activity: 100, size: 1, mtimeMs: 1 },

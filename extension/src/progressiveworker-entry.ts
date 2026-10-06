@@ -490,8 +490,16 @@ async function execute(
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
           source: parent.agent,
           ...revision,
-          size: complete && claudeCursor ? claudeCursor.target : compatible ? held.size : revision.size,
-          mtimeMs: complete ? revision.mtimeMs : compatible ? held.mtimeMs : revision.mtimeMs,
+          // A Codex scan that reaches the end of the file describes the current revision. The stored size then matches the next
+          // stat, so a parent that stops growing lets discovery settle.
+          size:
+            complete && claudeCursor
+              ? claudeCursor.target
+              : compatible && !(cursor && reachedTarget)
+                ? held.size
+                : revision.size,
+          mtimeMs:
+            complete || (cursor && reachedTarget) ? revision.mtimeMs : compatible ? held.mtimeMs : revision.mtimeMs,
           sessionId: parent.sessionId,
           childTranscript: parent.childTranscript === true,
           complete: parent.agent === 'codex' ? complete : accepted,

@@ -9727,19 +9727,24 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.dropOlderHistory(sessionId);
     }
-    // Include filtered Claude peer-wake files when retaining working-directory and human-prompt scan caches.
-    const present = new Set([...known.map((s) => s.file), ...this.walkedClaude]);
-    if (this.pruneDerivedTitles(present)) {
-      this.derivedCacheCheckpointState.markChanged();
-    }
-    for (const file of [...this.cwds.keys()]) {
-      if (!present.has(file)) {
-        this.cwds.delete(file);
+    // Per-source facts are pruned only while the catalog is authoritative. Before the first one, or after a workspace folder
+    // change clears it, a selected-only refresh lists at most the selected sessions. A refresh that renders before metadata
+    // lists a catalog that is not yet authoritative. Neither list shows that any other source is gone.
+    if (this.authoritativeCatalog !== null) {
+      // Include filtered Claude peer-wake files when retaining working-directory and human-prompt scan caches.
+      const present = new Set([...known.map((s) => s.file), ...this.walkedClaude]);
+      if (this.pruneDerivedTitles(present)) {
+        this.derivedCacheCheckpointState.markChanged();
       }
-    }
-    for (const file of [...this.humanScans.keys()]) {
-      if (!present.has(file)) {
-        this.humanScans.delete(file);
+      for (const file of [...this.cwds.keys()]) {
+        if (!present.has(file)) {
+          this.cwds.delete(file);
+        }
+      }
+      for (const file of [...this.humanScans.keys()]) {
+        if (!present.has(file)) {
+          this.humanScans.delete(file);
+        }
       }
     }
     const presentIds = new Set(known.map((session) => session.sessionId));
