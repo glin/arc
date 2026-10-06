@@ -1,5 +1,6 @@
 import { test, vi } from 'vitest';
 import { createPanelVisibility } from './panelvisibility';
+import { outcomesFor } from './timelinestate';
 import { resolveSelectedSource, validateSelectedSource, selectedDependencies } from './selectedsource';
 import { projectSlug } from './transcript';
 import { performance } from 'node:perf_hooks';
@@ -1119,7 +1120,7 @@ function completeDiscoveryHarness(
       ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
   );
   assert.ok(owner);
-  scope = { sameSessionRevision, ...scope };
+  scope = { sameSessionRevision, outcomesFor, ...scope };
   const names = [
     'show',
     'createDraft',

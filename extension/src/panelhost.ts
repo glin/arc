@@ -182,10 +182,9 @@ import {
   visitPlace,
 } from './turnplaces';
 import type { DraftOrigin } from './composerview';
+import { liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
 import {
   agentRunAnswer,
-  childWriteKey,
-  claudeChildWriteIndex,
   sessionParentEdgeSet,
   sessionParentIndex,
   sessionParentOf,
@@ -193,8 +192,6 @@ import {
   type SessionParentEdge,
   type SessionParentEdgeSet,
   liveBackgroundCommands,
-  liveOpenChildren,
-  openChildCounts,
   openChildrenKey,
   outcomeWithWiderChildren,
   railCacheMarkOf,
@@ -6872,18 +6869,15 @@ export class PanelProvider implements vscode.Disposable {
     statuses: ReturnType<typeof sessionStatusOf>;
     openChildren: Map<string, number>;
   } {
-    const openChildren = openChildCounts(this.liveOpenChildren(now));
-    const statuses = sessionStatusOf(
-      [],
-      this.runningSessions(),
+    return timelineRailState(
       this.sessionOutcomes,
-      now,
+      this.liveOpenChildren(now),
+      this.runningSessions(),
       this.waitingSessions(),
       this.runningSince(),
-      openChildren,
       this.liveBackgroundCommands(now),
+      now,
     );
-    return { statuses, openChildren };
   }
 
   // Derive background command counts from held outcomes, exit times, and the supplied clock.
@@ -6897,18 +6891,11 @@ export class PanelProvider implements vscode.Disposable {
 
   // Derive live child IDs from held outcomes and cached write times without reading files during rendering.
   private liveOpenChildren(now: number): Map<string, string[]> {
-    let index: Map<string, number> | null = null;
-    const writtenAt = (session: string, child: string): number | undefined => {
-      index ??= claudeChildWriteIndex(
-        this.claudeChildren,
-        this.claudeChildReferences.flatMap((reference) => (reference.kind === 'dispatch' ? [] : [reference])),
-        this.claudeChildStatWrites,
-      );
-      return index.get(childWriteKey(session, child));
-    };
-    return liveOpenChildren(
+    return liveTimelineChildren(
       this.sessionOutcomes,
-      writtenAt,
+      this.claudeChildren,
+      this.claudeChildReferences,
+      this.claudeChildStatWrites,
       runningSessionsSince(this.sessionRows, this.exitedSinceKeys),
       now,
     );
@@ -8676,21 +8663,11 @@ export class PanelProvider implements vscode.Disposable {
   // The tail outcome with the open children the lifetime facts and the parsed window hold.
   // The parsed window is the read already in memory, so this reads no file.
   private outcomesFor(sessions: readonly SessionFile[]): Map<string, TurnOutcome | null> {
-    const lifetime = this.lifetimeRailFacts();
-    return new Map(
-      sessions.map((session) => {
-        const parsed = this.cache.get(session.file)?.read;
-        const meta = this.metaFor(session);
-        return [
-          session.sessionId,
-          outcomeWithWiderChildren(
-            meta.outcome ?? null,
-            lifetime[session.sessionId]?.outcome ?? null,
-            parsed ? sessionOutcomeOf(parsed) : null,
-            meta.backgroundCommands,
-          ),
-        ];
-      }),
+    return outcomesFor(
+      sessions,
+      this.lifetimeRailFacts(),
+      (file) => this.cache.get(file)?.read,
+      (session) => this.metaFor(session),
     );
   }
 

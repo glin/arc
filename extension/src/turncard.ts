@@ -4019,6 +4019,18 @@ function latestCommentaryOf(turn: Turn): TurnUpdate | null {
   return null;
 }
 
+// The newest eligible card counts live child IDs absent from its own subagent rows.
+export function carriedSubagentCount(
+  turn: Pick<Turn, 'agents'>,
+  isLatest: boolean,
+  status: TurnStatus,
+  liveChildren: ReadonlySet<string>,
+): number {
+  return isLatest && childrenOutliveTurn(status)
+    ? [...liveChildren].filter((id) => !turn.agents.some((agent) => agent.id === id)).length
+    : 0;
+}
+
 export function toCard(
   turn: Turn,
   isLatest: boolean,
@@ -4096,11 +4108,7 @@ export function toCard(
   const landingCards = (turn.landings ?? []).map((landing) => landingCard(landing, folders, now));
   const subagentCommitCount = commitCards.filter((commit) => Boolean(commit.madeBy)).length;
   const subagentFileCount = changed.filter((file) => Boolean(file.madeBy)).length;
-  // The newest eligible card carries live child IDs absent from its own child rows.
-  const carried =
-    isLatest && childrenOutliveTurn(status)
-      ? [...liveChildren].filter((id) => !turn.agents.some((agent) => agent.id === id)).length
-      : 0;
+  const carried = carriedSubagentCount(turn, isLatest, status, liveChildren);
   const chips = chipsOf(
     turn,
     status,

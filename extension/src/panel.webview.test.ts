@@ -15069,8 +15069,13 @@ test('the panel dates a session by what it recorded, not by its file being touch
   );
   sourceMatch(
     panelHostSource,
-    /sessionStatusOf\(\s*\[\], this\.runningSessions\(\), this\.sessionOutcomes, now, this\.waitingSessions\(\),\s*this\.runningSince\(\), openChildren, this\.liveBackgroundCommands\(now\),?\s*\)/,
+    /return timelineRailState\(\s*this\.sessionOutcomes,\s*this\.liveOpenChildren\(now\),\s*this\.runningSessions\(\),\s*this\.waitingSessions\(\),\s*this\.runningSince\(\),\s*this\.liveBackgroundCommands\(now\),\s*now,?\s*\)/,
     'the rail reads selected cards before their progressive result is accepted',
+  );
+  sourceMatch(
+    fs.readFileSync(path.join(__dirname, 'timelinestate.ts'), 'utf8'),
+    /sessionStatusOf\(\[\], running, outcomes, now, waiting, runningSince, openChildren, backgroundCommands\)/,
+    'session-list state no longer derives status from the accepted outcomes',
   );
 
   // Session rows derive calendar, timestamp, and relative-age fields from activityFor.
