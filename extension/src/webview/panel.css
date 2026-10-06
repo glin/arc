@@ -2035,9 +2035,8 @@ button.sessionparent:focus-visible .sessionparenttitle {
 /* A subagent row is two lines wherever it is drawn. The state mark holds the first column, one
    em wide, and both lines share the second, so the name, the facts under it and every wrapped
    line start on one left edge rather than on an indent that has to be kept in step by hand.
-   Line one is the name, which wraps rather than ending in an ellipsis because the name is what
-   the row answers, and the model run, which keeps the right end of the line while the name
-   wraps inside its own box. Line two is the facts at the row's own size, one rank under the
+   Line one holds the name and the model run. The name ends in an ellipsis before the model.
+   The name's hover carries its full text. Line two is the facts at the row's own size, one rank under the
    name in the tint `.chippoppath` mixes. The state word keeps the state's tone.
    The row sets its own row gap to zero, because `.row` sets a half-em gap on both axes and a
    grid honours the vertical one, which parts the two lines by half a line of empty space. The
@@ -2063,9 +2062,8 @@ button.sessionparent:focus-visible .sessionparenttitle {
 }
 /* The model and its reasoning effort are one run, because `Opus` alone on a line and `· high`
    alone on the next read as two facts. The run holds the right end of line one and never
-   yields its width, so a long name wraps inside its own box instead of pushing the run onto a
-   line of its own. The head's own gap parts the run from the name, so the model drops the
-   margin it carries on the card head, where it has no such gap to sit in. */
+   yields its width. A long name ends before the model run. The head's gap separates the name
+   and model run. The model drops the margin it carries on the card head. */
 .agentrow .agentmodelrun {
   flex: none;
   white-space: nowrap;
@@ -2075,11 +2073,13 @@ button.sessionparent:focus-visible .sessionparenttitle {
   margin-left: 0;
 }
 .agentrow .agenthead .name {
+  /* Keep the hidden accessible suffix inside the clipped name's box. */
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
-  overflow: visible;
-  white-space: normal;
-  text-overflow: clip;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 /* The name is the row's one press, into the child session. It reads as the row's text at rest
    and takes the link colour under the pointer or the keyboard, the way the session heading
@@ -3933,6 +3933,7 @@ button.cctx:hover {
   pointer-events: none;
 }
 .hinttitle {
+  overflow-wrap: anywhere;
   font-weight: 600;
 }
 .hintkey {

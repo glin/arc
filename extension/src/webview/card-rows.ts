@@ -538,8 +538,7 @@ export function AgentRow({
                 {
                   class: 'name namelink',
                   'data-control': `session:${cardKey}:${agent.sessionId}`,
-                  'data-hint':
-                    agent.kind === 'dispatch' ? CARD_ACTIONS.openDispatchedSession : CARD_ACTIONS.openSubagentSession,
+                  'data-hint': `${agent.description}: ${agent.kind === 'dispatch' ? CARD_ACTIONS.openDispatchedSession : CARD_ACTIONS.openSubagentSession}`,
                   ...record,
                   onClick(event: MouseEvent) {
                     stop(event);
@@ -552,7 +551,10 @@ export function AgentRow({
                   h('span', { class: 'sr-only' }, ' session,'),
                 ],
               )
-            : h('span', { class: 'name' }, [agent.description, h('span', { class: 'sr-only' }, ',')]),
+            : h('span', { class: 'name', title: agent.description }, [
+                agent.description,
+                h('span', { class: 'sr-only' }, ','),
+              ]),
           agent.model || agent.effort
             ? h(
                 'span',

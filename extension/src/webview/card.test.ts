@@ -1397,6 +1397,36 @@ test('a subagent files figure that is a floor draws no partial word or mark', ()
   );
 });
 
+test('a long subagent name keeps its complete hover and accessible text', () => {
+  const description = 'code_implement_2_deslop_tests_first_remaining_sol_retry_2';
+  for (const sessionId of ['child-session', null]) {
+    const agent: AgentRowView = {
+      description,
+      model: 'gpt-6.1-sol',
+      effort: 'high',
+      state: 'done',
+      stateWord: '',
+      since: null,
+      hintDetail: '23 tools',
+      sessionId,
+      figures: [],
+    };
+    const row = h(AgentRow, { cardKey: 'k', agent, post: () => {} });
+    const name = findNode(row, (node) => (node.props?.class ?? '').split(' ').includes('name'));
+    assert.ok(name);
+    assert.ok(drawnText(name).includes(description));
+    if (sessionId) {
+      assert.equal(name.type, 'button');
+      assert.equal(name.props?.['data-hint'], `${description}: ${CARD_ACTIONS.openSubagentSession}`);
+      assert.equal(name.props?.['data-hint-detail'], '23 tools');
+      assert.equal(name.props?.title, undefined);
+    } else {
+      assert.equal(name.type, 'span');
+      assert.equal(name.props?.title, description);
+    }
+  }
+});
+
 test('a subagent row preserves compound text separators', () => {
   const agent: AgentRowView = {
     description: 'Review child',

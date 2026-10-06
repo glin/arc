@@ -22177,6 +22177,23 @@ type Holds<T extends true> = T;
 
 export type SubagentFigureMirror = Holds<Mirrors<Omit<HostFigure, 'record'>, Omit<WireFigure, 'record'>>>;
 
+test('a subagent name truncates before its model without losing the model run', () => {
+  const name = /\.agentrow \.agenthead \.name \{([^}]*)\}/.exec(styleSource)?.[1];
+  const model = /\.agentrow \.agentmodelrun \{([^}]*)\}/.exec(styleSource)?.[1];
+  assert.ok(name);
+  assert.ok(model);
+  assert.match(name, /position:\s*relative\s*;/);
+  assert.match(name, /min-width:\s*0\s*;/);
+  assert.match(name, /overflow:\s*hidden\s*;/);
+  assert.match(name, /white-space:\s*nowrap\s*;/);
+  assert.match(name, /text-overflow:\s*ellipsis\s*;/);
+  assert.match(model, /flex:\s*none\s*;/);
+  assert.match(model, /white-space:\s*nowrap\s*;/);
+  const hint = /\.hinttitle \{([^}]*)\}/.exec(styleSource)?.[1];
+  assert.ok(hint);
+  assert.match(hint, /overflow-wrap:\s*anywhere\s*;/);
+});
+
 // Each commit subject and maker selector has one truncation rule.
 test('one rule truncates a commit row subject, and one rule truncates its maker name', () => {
   const rules = [...styleSource.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g)];

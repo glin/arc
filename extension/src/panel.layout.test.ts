@@ -848,15 +848,18 @@ test(
       assert.deepEqual(
         pop.map((row) => [row.linkHint, row.linkDetail]),
         [
-          [CARD_ACTIONS.openSubagentSession, REVIEW_CHILD_HINT],
-          [CARD_ACTIONS.openSubagentSession, '2 tools'],
-          [CARD_ACTIONS.openSubagentSession, null],
+          [`Review child: ${CARD_ACTIONS.openSubagentSession}`, REVIEW_CHILD_HINT],
+          [`Broken child: ${CARD_ACTIONS.openSubagentSession}`, '2 tools'],
+          [`Busy child: ${CARD_ACTIONS.openSubagentSession}`, null],
           // A child without a session has a plain name and no session action.
           [null, null],
-          [CARD_ACTIONS.openSubagentSession, null],
-          [CARD_ACTIONS.openSubagentSession, null],
-          [CARD_ACTIONS.openSubagentSession, null],
-          [CARD_ACTIONS.openSubagentSession, '412 tools'],
+          [`Cut child: ${CARD_ACTIONS.openSubagentSession}`, null],
+          [`Left child: ${CARD_ACTIONS.openSubagentSession}`, null],
+          [`Open child: ${CARD_ACTIONS.openSubagentSession}`, null],
+          [
+            `Review the panel implementation for correctness, maintainability, and interaction design findings: ${CARD_ACTIONS.openSubagentSession}`,
+            '412 tools',
+          ],
         ],
       );
       // Figures share one keyboard stop. Arrow keys reach other actionable figures.
@@ -896,7 +899,7 @@ test(
           await page.locator('#hintpop .hintdetail').textContent(),
           await name.getAttribute('aria-describedby'),
         ],
-        [CARD_ACTIONS.openSubagentSession, REVIEW_CHILD_HINT, 'hintdetail'],
+        [`Review child: ${CARD_ACTIONS.openSubagentSession}`, REVIEW_CHILD_HINT, 'hintdetail'],
       );
 
       // Figure details use a nested popover so they preserve the enclosing subagent list.
