@@ -895,7 +895,11 @@ function ActivityStep({
             : null,
       ],
     ),
-    cut ? h('div', { class: 'actfull', id: detailId, hidden: !open }, row.title) : null,
+    cut
+      ? row.kind === 'step' && !!row.code
+        ? h('pre', { class: 'actfull', id: detailId, hidden: !open }, h('code', {}, row.title))
+        : h('div', { class: 'actfull', id: detailId, hidden: !open }, row.title)
+      : null,
   ]);
 }
 

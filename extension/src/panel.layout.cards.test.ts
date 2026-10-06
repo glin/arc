@@ -2450,6 +2450,7 @@ test('shortened reasoning opens its full text from the keyboard', { timeout: 60_
     assert.equal(await row.getAttribute('aria-expanded'), 'true');
     const detail = page.locator(`[id="${await row.getAttribute('aria-controls')}"]`);
     assert.equal(await detail.isVisible(), true);
+    assert.equal(await detail.evaluate((node) => node.tagName), 'DIV');
     assert.equal(await detail.textContent(), text);
     await page.keyboard.press('Escape');
     assert.equal(await row.getAttribute('aria-expanded'), 'false');
@@ -2474,7 +2475,11 @@ test(
       await page.setContent(pageHtml());
       const payload = renderPayload() as { cards: Array<Record<string, unknown> & { sessionId: string }> };
       const card = payload.cards[0];
-      const exact = 'npm test -- ' + 'long-command-argument '.repeat(20);
+      const exact = [
+        'npm test -- "name <value> & `tick`" C:\\work\\file',
+        '\tpwsh -Command "Write-Output \'done\'"',
+        '  ' + 'long-command-argument '.repeat(20),
+      ].join('\n');
       const first = {
         ordinal: 1,
         name: 'Bash',
@@ -2516,6 +2521,11 @@ test(
       assert.equal(await page.locator('#list .turn button.actrow.run').getAttribute('aria-expanded'), 'true');
       const detail = page.locator(`[id="${await command.getAttribute('aria-controls')}"]`);
       assert.equal(await detail.isVisible(), true);
+      assert.equal(await detail.evaluate((node) => node.tagName), 'PRE');
+      const code = detail.locator(':scope > code');
+      assert.equal(await code.count(), 1);
+      assert.equal(await code.locator('*').count(), 0, 'the command text was parsed as markup');
+      assert.equal(await code.textContent(), exact);
       assert.equal(await detail.textContent(), exact);
     } finally {
       await browser.close();

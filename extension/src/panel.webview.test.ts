@@ -13516,6 +13516,8 @@ const FIGURE_SIZES = [
   '.actview { font-size: var(--t-small) }',
   '.actviewaction { font: inherit }',
   '.actrow { font-size: 0.92em }',
+  'pre.actfull { font-size: 0.92em }',
+  'pre.actfull code { font: inherit }',
   '.asklabel { font-size: var(--t-small) }',
   '.actmore { font-size: var(--t-small) }',
   '.actrow.message { font-size: 1em }',
