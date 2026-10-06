@@ -1140,6 +1140,9 @@ function completeDiscoveryHarness(
     'sessionLoadingState',
     'postSessionLoading',
     'sendSessionLoading',
+    'withSourceCount',
+    'settleSourceCount',
+    'sourceCountOf',
     'failSessionLoading',
     'unresolvedLoadingFailure',
     ...extraMethods,
@@ -7290,9 +7293,16 @@ function exhaustedLoadingHarness(): any {
     allowThemeFiles() {},
     prepareRailEnrichment: async () => ({ changed: false, catalogCurrent: true }),
   });
-  const discovery: { pending: boolean; fail: boolean; before?: (generation: number, signal: AbortSignal) => void } = {
+  const discovery: {
+    pending: boolean;
+    fail: boolean;
+    // Further parents the discovery checkpoint reports, each one a known source beyond the healthy Claude source.
+    more: { file: string }[];
+    before?: (generation: number, signal: AbortSignal) => void;
+  } = {
     pending: false,
     fail: false,
+    more: [],
   };
   provider.progressiveWorker.run = async (_request: unknown, generation: number, signal: AbortSignal) => {
     discovery.before?.(generation, signal);
@@ -7300,8 +7310,8 @@ function exhaustedLoadingHarness(): any {
     const checkpoint = {
       epoch: randomUUID(),
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
-      parents: [healthy],
-      catalog: [healthy],
+      parents: [healthy, ...discovery.more],
+      catalog: [healthy, ...discovery.more],
       repositoryRoots: ['project'],
       completed: [healthy.file],
       sequence: 1,
@@ -7325,14 +7335,14 @@ function exhaustedLoadingHarness(): any {
     };
   };
   // Each poll runs relationship discovery again and reports its full source count.
-  const poll = async () => {
+  const poll = async (known = 1) => {
     provider.dispatchDiscoveryPending = true;
     provider.startupProgressAt = Date.now() - 250;
     await provider.refresh(false, true);
     const posts = provider.posts.filter(
       (message: { generation: number }) => message.generation === provider.refreshGeneration,
     );
-    const progress = posts.find((message: { known: number }) => message.known === 1);
+    const progress = posts.find((message: { known: number }) => message.known === known);
     assert.ok(progress, 'the poll posted no source count');
     return { progress: progress.failed, last: posts.at(-1) };
   };
@@ -7415,6 +7425,309 @@ test('relationship progress keeps unresolved metadata failures until each failed
     Object.assign(provider, { repositoryScopeReady: true, repositoryScopeRoots: ['project'] });
     catalog([appended]);
     assert.equal((await poll()).progress, undefined, 'a new scope reported the previous scope failure');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+// Every status the host sent for one generation: relationship and loading posts, then the render stamp.
+function loadingStatuses(
+  provider: any,
+  generation: number,
+): { complete?: boolean; failed?: boolean; completed?: number; known?: number }[] {
+  return [
+    ...provider.posts.filter(
+      (message: { type: string; generation: number }) =>
+        message.type === 'startupProgress' && message.generation === generation,
+    ),
+    ...provider.messages
+      .filter((message: { startup?: { generation: number } }) => message.startup?.generation === generation)
+      .map((message: { startup: object }) => message.startup),
+  ];
+}
+
+test('pending loading statuses keep the last relationship source count until completion or a scope change', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, settled, recovering, catalog, discovery, poll } =
+      exhaustedLoadingHarness();
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    const pending = (generation: number) =>
+      loadingStatuses(provider, generation).filter((status) => !status.complete && !status.failed);
+
+    // Each poll is a new generation. The count-free render and loading posts must carry the source count.
+    for (const label of ['first poll', 'second poll', 'third poll']) {
+      await poll();
+      const statuses = pending(provider.refreshGeneration);
+      assert.ok(statuses.length >= 2, `${label} sent too few pending statuses to compare`);
+      assert.deepEqual(
+        statuses.map((status) => [status.completed, status.known]),
+        statuses.map(() => [1, 1]),
+        `${label} replaced the source count with a count-free status`,
+      );
+    }
+
+    // A render posts its own loading stamp, which repeats the count too.
+    provider.useRefreshGate(() => true);
+    await provider.refresh(false);
+    provider.useRefreshGate(() => false);
+    const stamp = provider.messages.at(-1).startup;
+    assert.equal(stamp.generation, provider.refreshGeneration);
+    assert.deepEqual([stamp.completed, stamp.known], [1, 1], 'the render stamp replaced the source count');
+
+    // A newer count replaces the older one in the same generation and the next.
+    discovery.more = [{ file: 'extra.jsonl' }];
+    await poll(2);
+    assert.deepEqual(
+      pending(provider.refreshGeneration).map((status) => [status.completed, status.known]),
+      pending(provider.refreshGeneration).map(() => [1, 2]),
+      'a newer source count did not replace the older count',
+    );
+
+    // Discovery that a newer generation overtakes posts nothing and keeps the retained count.
+    discovery.more = [{ file: 'extra.jsonl' }, { file: 'extra-two.jsonl' }];
+    provider.startupProgressAt = 0;
+    const posted = provider.posts.length;
+    const overtaken = provider.refreshGeneration;
+    discovery.before = () => {
+      provider.refreshGeneration += 1;
+    };
+    await provider.prepareClaudeChildren(overtaken, new AbortController().signal);
+    discovery.before = undefined;
+    discovery.more = [];
+    assert.equal(provider.posts.length, posted, 'overtaken discovery posted a source count');
+    const signal = new AbortController().signal;
+    provider.refreshGeneration += 1;
+    provider.postSessionLoading(provider.partial, provider.refreshGeneration, signal);
+    assert.equal(provider.posts.at(-1).known, 2, 'an older generation changed the retained count');
+
+    // A scope change drops the count.
+    provider.workspaceFoldersChanged();
+    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+    Object.assign(provider, { repositoryScopeReady: true, repositoryScopeRoots: ['project'] });
+    provider.refreshGeneration += 1;
+    provider.postSessionLoading(provider.partial, provider.refreshGeneration, signal);
+    assert.deepEqual(
+      [provider.posts.at(-1).completed, provider.posts.at(-1).known],
+      [0, 0],
+      'a scope change kept the previous scope source count',
+    );
+
+    // Completion drops the count, so the next pending state starts from none.
+    catalog([healthy, first, second]);
+    await poll();
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    await poll();
+    assert.equal(provider.posts.at(-1).complete, true, 'settled sources did not complete loading');
+    provider.titles.set(first.file, recovering(first));
+    provider.refreshGeneration += 1;
+    provider.postSessionLoading(provider.partial, provider.refreshGeneration, signal);
+    assert.deepEqual(
+      [provider.posts.at(-1).completed, provider.posts.at(-1).known],
+      [0, 0],
+      'completion kept the source count for the next pending state',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+// Two panels on one session list: one shows a session whose newest turns are current, the other one still reads its newest turns.
+function twoPanelLoading(harness: any, loadingFirst: boolean) {
+  const { provider, healthy, second } = harness;
+  const current = provider.hosts[0];
+  const reading = { webview: { postMessage: () => Promise.resolve(true) }, active: () => false, visible: () => true };
+  provider.hosts = loadingFirst ? [reading, current] : [current, reading];
+  provider.readyHosts = new Set(provider.hosts);
+  provider.hostSessions = new Map([
+    [current, healthy.sessionId],
+    [reading, second.sessionId],
+  ]);
+  // The host reads loadingNewest only for the shown session, so the reading panel shows it.
+  provider._showing = second.sessionId;
+  provider.progressiveCurrent = (session: { sessionId: string }) => session.sessionId !== second.sessionId;
+  const sent: { host: unknown; startup: any }[] = [];
+  provider.sendToHost = (host: unknown, message: { startup?: object }) => {
+    if (message.startup) sent.push({ host, startup: message.startup });
+    return Promise.resolve();
+  };
+  const statuses = (host: unknown) =>
+    sent.filter((entry) => entry.host === host && entry.startup.generation === provider.refreshGeneration);
+  return { current, reading, sent, statuses };
+}
+
+test.for([true, false])(
+  'the source count ends with the session list for every panel when the reading panel comes first: %s',
+  async (loadingFirst) => {
+    vi.useFakeTimers();
+    try {
+      const harness = exhaustedLoadingHarness();
+      const { provider, healthy, first, second, settled, recovering, catalog, poll } = harness;
+      provider.titles.set(first.file, recovering(first));
+      provider.titles.set(second.file, recovering(second));
+      await provider.refresh(true);
+      provider.useRefreshGate(() => false);
+      const { current, reading, sent, statuses } = twoPanelLoading(harness, loadingFirst);
+      const render = async () => {
+        provider.useRefreshGate(() => true);
+        await provider.refresh(false);
+        provider.useRefreshGate(() => false);
+      };
+      const counts = (host: unknown) => statuses(host).map((entry) => [entry.startup.completed, entry.startup.known]);
+
+      // While the list reads, both panels repeat the count.
+      await poll();
+      await render();
+      for (const host of [current, reading]) {
+        assert.ok(statuses(host).length > 0, 'a panel received no status');
+        assert.deepEqual(
+          counts(host),
+          statuses(host).map(() => [1, 1]),
+        );
+      }
+
+      // The list completes while one panel still reads its newest turns. Neither panel's order changes what the count does.
+      catalog([healthy, first, second]);
+      provider.titles.set(first.file, settled(first));
+      provider.titles.set(second.file, settled(second));
+      sent.length = 0;
+      await poll();
+      await render();
+      assert.deepEqual(
+        statuses(current).map((entry) => entry.startup.complete),
+        statuses(current).map(() => true),
+        'the current panel did not complete with the list',
+      );
+      assert.ok(statuses(reading).length > 0, 'the reading panel received no status');
+      assert.deepEqual(
+        counts(reading),
+        statuses(reading).map(() => [undefined, undefined]),
+        'the reading panel kept the count of a list that completed',
+      );
+      assert.deepEqual(
+        statuses(reading).map((entry) => entry.startup.complete),
+        statuses(reading).map(() => false),
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('a render that leaves the loading status pending still ends the source count when the list completes', async () => {
+  vi.useFakeTimers();
+  try {
+    const harness = exhaustedLoadingHarness();
+    const { provider, healthy, first, second, settled, recovering, catalog, poll } = harness;
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    const signal = new AbortController().signal;
+    const pendingCount = () => {
+      provider.titles.set(first.file, recovering(first));
+      provider.refreshGeneration += 1;
+      provider.postSessionLoading(provider.partial, provider.refreshGeneration, signal);
+      return [provider.posts.at(-1).completed, provider.posts.at(-1).known];
+    };
+
+    // The only panel still reads its newest turns, so the render marks its own status pending while the list completes.
+    twoPanelLoading(harness, true);
+    provider.hosts = [provider.hosts[0]];
+    provider.readyHosts = new Set(provider.hosts);
+    await poll();
+    assert.deepEqual(pendingCount(), [1, 1], 'the count was not retained while the list was reading');
+    catalog([healthy, first, second]);
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    await poll();
+    assert.deepEqual(pendingCount(), [0, 0], 'a render with a pending panel status kept the count of a completed list');
+
+    // A completed list that was already sent still ends the count when the same state is sent again.
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await poll();
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    const generation = provider.refreshGeneration;
+    provider.startupLoadingSent = JSON.stringify(provider.sessionLoadingState(provider.partial, generation));
+    const posted = provider.posts.length;
+    provider.postSessionLoading(provider.partial, generation, signal);
+    assert.equal(provider.posts.length, posted, 'a repeated completed state posted again');
+    assert.deepEqual(pendingCount(), [0, 0], 'duplicate suppression skipped the end of the source count');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('the source count follows the latest accepted checkpoint even when its progress post is throttled', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, first, second, recovering, discovery, poll } = exhaustedLoadingHarness();
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await poll();
+
+    // A checkpoint with more sources arrives inside the throttle window. It posts no progress and still replaces the older count.
+    discovery.more = [{ file: 'extra.jsonl' }, { file: 'extra-two.jsonl' }];
+    provider.dispatchDiscoveryPending = true;
+    const throttledAt = Date.now() - 100;
+    provider.startupProgressAt = throttledAt;
+    await provider.refresh(false, true);
+    const generation = provider.refreshGeneration;
+    assert.equal(provider.startupProgressAt, throttledAt, 'the checkpoint passed the throttle');
+    const statuses = loadingStatuses(provider, generation).filter((status) => !status.complete && !status.failed);
+    assert.ok(statuses.length > 0, 'no pending status followed the throttled checkpoint');
+    assert.deepEqual(
+      statuses.map((status) => [status.completed, status.known]),
+      statuses.map(() => [1, 3]),
+      'a throttled checkpoint left an older source count on screen',
+    );
+
+    // The count is derived again after the checkpoint changes in place.
+    const checkpoint = { sequence: 1, parents: [{ file: 'a' }], catalog: [{ file: 'b' }], completed: ['a'] };
+    assert.deepEqual(provider.sourceCountOf(checkpoint), { completed: 1, known: 2 });
+    checkpoint.completed.push('b');
+    assert.deepEqual(
+      provider.sourceCountOf(checkpoint),
+      { completed: 2, known: 2 },
+      'a changed checkpoint kept its count',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('the source count is ignored under a discovery scope other than the one it was counted for', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, first, second, recovering, poll } = exhaustedLoadingHarness();
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await poll();
+    const signal = new AbortController().signal;
+    const pendingCount = () => {
+      provider.refreshGeneration += 1;
+      provider.postSessionLoading(provider.partial, provider.refreshGeneration, signal);
+      return [provider.posts.at(-1).completed, provider.posts.at(-1).known];
+    };
+    assert.deepEqual(pendingCount(), [1, 1]);
+    // The roots change without a workspace folder change, as a repository scope refresh does.
+    provider.repositoryScopeRoots = ['project', 'worktree'];
+    assert.deepEqual(pendingCount(), [0, 0], 'a count from another discovery scope stayed on screen');
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();

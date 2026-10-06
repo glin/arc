@@ -1690,6 +1690,18 @@ export class PanelProvider implements vscode.Disposable {
   // Relationship progress rechecks only these entries, so a full source count keeps the failure on screen.
   private exhaustedLoadingSessions: SessionFile[] = [];
   private startupLoadingSent = '';
+  // The latest accepted discovery checkpoint and the scope roots it belongs to. Pending loading statuses repeat its source count, so
+  // a render or loading post that has no count of its own never replaces the counter the panel is showing. A scope change makes it stale.
+  private startupSourceCheckpoint: {
+    scope: string;
+    checkpoint: import('./progressiveworker').DiscoveryCheckpoint;
+  } | null = null;
+  // The count last derived from a checkpoint, so a status post does not walk the catalog again while the checkpoint is unchanged.
+  private startupSourceCounted: {
+    checkpoint: object;
+    key: string;
+    count: { completed: number; known: number };
+  } | null = null;
   private readonly warnedMessageBudgets = new Set<string>();
   private performanceOutput: vscode.OutputChannel | null = null;
 
@@ -2310,6 +2322,7 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork = null;
     this.authoritativeCatalog = null;
     this.exhaustedLoadingSessions = [];
+    this.startupSourceCheckpoint = null;
     this.discoveryCheckpoint = undefined;
     this.discoveryCompleted = undefined;
     this.discoveryAcknowledgment = undefined;
@@ -6499,6 +6512,8 @@ export class PanelProvider implements vscode.Disposable {
         this.performanceCounters.recordRefreshStage('rendered');
       }
       let largestRenderBytes: number | null = null;
+      // The session list decides when the source count ends, once for every panel.
+      this.settleSourceCount(this.sessionLoadingState(all, generation));
       const metadataAcceptedHosts = new Set<PanelHost>();
       for (const host of this.hosts) {
         const hostSession = this.hostSessions?.get(host) ?? this.showing;
@@ -6606,10 +6621,10 @@ export class PanelProvider implements vscode.Disposable {
             startup:
               selectedOnly && this.authoritativeCatalog === null
                 ? undefined
-                : {
+                : this.withSourceCount({
                     ...this.sessionLoadingState(all, generation),
                     complete: !loadingNewest && this.sessionLoadingState(all, generation).complete,
-                  },
+                  }),
             usage:
               typeof this.usagePayloadForSession === 'function'
                 ? this.usagePayloadForSession(hostSession, host.webview)
@@ -8021,6 +8036,10 @@ export class PanelProvider implements vscode.Disposable {
       } else this.discoveryCompleted = undefined;
       this.discoveryCheckpoint = progress.kind !== 'claude-children' ? checkpoint : undefined;
       this.derivedCacheCheckpointState.markChanged();
+      if (!signal.aborted && result.generation === this.refreshGeneration && checkpoint) {
+        // Every accepted checkpoint is kept, so a post the throttle skips cannot leave an older count on screen.
+        this.startupSourceCheckpoint = { scope: JSON.stringify(this.repositoryScopeRoots), checkpoint };
+      }
       if (
         !signal.aborted &&
         result.generation === this.refreshGeneration &&
@@ -8028,15 +8047,14 @@ export class PanelProvider implements vscode.Disposable {
         checkpoint
       ) {
         this.startupProgressAt = Date.now();
-        const known = new Set([...checkpoint.parents, ...checkpoint.catalog].map((row) => normalizeFsPath(row.file)));
-        const completed = new Set(checkpoint.completed.map(normalizeFsPath).filter((file) => known.has(file))).size;
+        const { completed, known } = this.sourceCountOf(checkpoint);
         void this.post({
           type: 'startupProgress',
           generation: result.generation,
           epoch: String(generation),
           sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
           completed,
-          known: known.size,
+          known,
           ...(this.unresolvedLoadingFailure(result.generation) ? { failed: true } : {}),
         }).catch(() => {});
       }
@@ -8490,6 +8508,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private sendSessionLoading(state: { generation: number; complete: boolean; failed?: boolean }): void {
+    this.settleSourceCount(state);
     const key = JSON.stringify(state);
     if (key === this.startupLoadingSent) return;
     this.startupLoadingSent = key;
@@ -8500,7 +8519,45 @@ export class PanelProvider implements vscode.Disposable {
       sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
       completed: 0,
       known: 0,
+      ...this.withSourceCount(state),
     }).catch(() => {});
+  }
+
+  // Drops the retained checkpoint once the session list completes. Panel statuses never call it, because one panel can be complete
+  // while another still reads its newest turns.
+  private settleSourceCount(list: { complete: boolean }): void {
+    if (list.complete) this.startupSourceCheckpoint = null;
+  }
+
+  // Counts the known and checked sources of a checkpoint. The result is reused until the checkpoint changes.
+  private sourceCountOf(checkpoint: import('./progressiveworker').DiscoveryCheckpoint): {
+    completed: number;
+    known: number;
+  } {
+    const key = [
+      checkpoint.sequence,
+      checkpoint.parents.length,
+      checkpoint.catalog.length,
+      checkpoint.completed.length,
+    ].join(':');
+    const held = this.startupSourceCounted;
+    if (held && held.checkpoint === checkpoint && held.key === key) return held.count;
+    const known = new Set([...checkpoint.parents, ...checkpoint.catalog].map((row) => normalizeFsPath(row.file)));
+    const completed = new Set(checkpoint.completed.map(normalizeFsPath).filter((file) => known.has(file))).size;
+    const count = { completed, known: known.size };
+    this.startupSourceCounted = { checkpoint, key, count };
+    return count;
+  }
+
+  // Adds the retained source count to a pending, unfailed status. It adds nothing for a count kept under another scope, and a failure
+  // shows its own message. It never changes the retained count.
+  private withSourceCount<T extends { complete: boolean; failed?: boolean }>(
+    state: T,
+  ): T | (T & { completed: number; known: number }) {
+    const held = this.startupSourceCheckpoint;
+    if (!held || state.complete || state.failed || held.scope !== JSON.stringify(this.repositoryScopeRoots))
+      return state;
+    return { ...state, ...this.sourceCountOf(held.checkpoint) };
   }
 
   // Reports the current generation's work failure or a recorded exhausted session that no source change or accepted read has cleared.

@@ -158,9 +158,18 @@ export interface RenderMessage extends Record<string, unknown> {
   projectSpend: ProjectSpend | null;
   diagnosis: PanelDiagnosis | null;
   usage: PanelUsage | null;
-  startup: { generation: number; complete: boolean; failed?: boolean } | null;
+  startup: PanelStartup | null;
   // The initial render carries Timeline layout settings. Configuration changes arrive as layout messages.
   timelineLayout: TimelineLayout;
+}
+
+// Session loading status. A pending status repeats the last relationship source count when the host holds one.
+export interface PanelStartup {
+  generation: number;
+  complete: boolean;
+  failed?: boolean;
+  completed?: number;
+  known?: number;
 }
 
 export interface SelectionMessage {
@@ -175,7 +184,7 @@ export interface SelectionMessage {
   olderHistory: PanelOlderHistory;
   diagnosis: PanelDiagnosis | null;
   usage: PanelUsage | null;
-  startup: { generation: number; complete: boolean; failed?: boolean } | null;
+  startup: PanelStartup | null;
 }
 
 export interface PanelSessionAdoption {

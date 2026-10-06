@@ -404,6 +404,87 @@ test.for([
   }
 });
 
+test('a pending status that carries the source count keeps the counter until completion', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    page.setDefaultTimeout(5000);
+    await page.setContent(themed(pageHtml()));
+    const post = (message: object) => page.evaluate((value) => window.postMessage(value, '*'), message);
+    const progress = (generation: number, sequence: number, completed: number, known: number, extra = {}) =>
+      post({ type: 'startupProgress', generation, epoch: String(generation), sequence, completed, known, ...extra });
+    const render = (startup: object) => post({ ...renderPayload(), startup });
+    const counter = (completed: number, known: number) =>
+      `Reading sessions… ${completed.toLocaleString()} of ${known.toLocaleString()} known sources checked.`;
+    const failure = 'Some sessions were not read. Select a session to try again.';
+    const status = page.locator('nav [data-session-loading-status]');
+    const shown = (text: string) =>
+      page.waitForFunction(
+        (expected) => document.querySelector('nav [data-session-loading-status]')?.textContent === expected,
+        text,
+      );
+    await render({ generation: 6, complete: false });
+    await page.waitForFunction(() => document.querySelectorAll('article.turn').length > 0);
+    // Record every status text the reader sees, in order.
+    await page.evaluate(() => {
+      const texts: string[] = [];
+      (window as any).__loadingTexts = texts;
+      const record = () => {
+        const element = document.querySelector<HTMLElement>('nav [data-session-loading-status]');
+        const text = element && !element.hidden ? (element.textContent ?? '') : '';
+        if (texts.at(-1) !== text) texts.push(text);
+      };
+      record();
+      new MutationObserver(record).observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+      });
+    });
+
+    // Each generation posts its count, then a render and a loading post that repeat it.
+    for (const generation of [7, 8]) {
+      await progress(generation, 1, 4, 6);
+      await shown(counter(4, 6));
+      await render({ generation, complete: false, completed: 4, known: 6 });
+      await progress(generation, 2, 4, 6, { complete: false });
+      await page.evaluate(SETTLED);
+    }
+    await progress(8, 3, 5, 7);
+    await shown(counter(5, 7));
+    await render({ generation: 8, complete: false, completed: 5, known: 7 });
+    // An older generation cannot restore an older count or a bare status.
+    await progress(7, 99, 1, 2);
+    await render({ generation: 7, complete: false });
+    await page.evaluate(SETTLED);
+    assert.equal(await status.textContent(), counter(5, 7));
+    // A failure takes precedence over the count, and the same generation resolves it later.
+    await progress(8, 4, 5, 7, { failed: true });
+    await shown(failure);
+    await progress(8, 5, 5, 7);
+    await shown(counter(5, 7));
+    await render({ generation: 8, complete: true });
+    await page.waitForFunction(
+      () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden !== false,
+    );
+    await progress(8, 6, 5, 7);
+    await page.evaluate(SETTLED);
+    assert.equal(await status.isVisible(), false, 'a pending count after completion brought the status back');
+    assert.deepEqual(
+      (await page.evaluate(() => (window as any).__loadingTexts)) as string[],
+      ['Reading sessions…', counter(4, 6), counter(5, 7), failure, counter(5, 7), ''],
+      'the status fell back to bare text between source counts',
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
 test('repeated full source counts keep an unresolved failure on screen until its sources resolve', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

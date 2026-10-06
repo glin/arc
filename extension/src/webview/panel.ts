@@ -632,7 +632,19 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       },
     },
   });
-  function applySessionLoading(stamp: { generation: number; complete?: boolean; failed?: boolean }, text?: string) {
+  // The session list status line. A stamp that carries a source count shows it, and any other pending stamp shows the bare text.
+  function loadingText(stamp: { completed?: number; known?: number }): string {
+    return stamp.known
+      ? `Reading sessions… ${(stamp.completed ?? 0).toLocaleString()} of ${stamp.known.toLocaleString()} known sources checked.`
+      : 'Reading sessions…';
+  }
+  function applySessionLoading(stamp: {
+    generation: number;
+    complete?: boolean;
+    failed?: boolean;
+    completed?: number;
+    known?: number;
+  }) {
     if (stamp.generation < loadingGeneration || (stamp.generation === loadingGeneration && loadingComplete)) return;
     if (stamp.generation > loadingGeneration) {
       loadingGeneration = stamp.generation;
@@ -645,7 +657,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         ? 'Some sessions were not read. Select a session to try again.'
         : stamp.complete
           ? null
-          : (text ?? 'Reading sessions…'),
+          : loadingText(stamp),
     );
   }
 
@@ -1144,18 +1156,16 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
                 (msg.epoch !== progressStamp.epoch || msg.sequence <= progressStamp.sequence))))
         )
           return;
-        const text =
-          msg.known > 0
-            ? `Reading sessions… ${msg.completed.toLocaleString()} of ${msg.known.toLocaleString()} known sources checked.`
-            : 'Reading sessions…';
-        applySessionLoading(msg, text);
+        applySessionLoading(msg);
         progressStamp = msg;
         if (msg.complete && latest) {
           latest.startup = { generation: msg.generation, complete: true };
           acknowledgePaint();
         }
         if (startupStatus?.isConnected)
-          startupStatus.textContent = msg.failed ? 'Some sessions were not read. Select a session to try again.' : text;
+          startupStatus.textContent = msg.failed
+            ? 'Some sessions were not read. Select a session to try again.'
+            : loadingText(msg);
       },
       focusProjectSpend: function () {
         projectSpend.focus();
