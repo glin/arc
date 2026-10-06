@@ -1133,11 +1133,12 @@ button.head:hover .durationfact {
    It shrinks, and so does the line in front of it. Neither may push the row past the card,
    and a path has no wrapping point in it, so the row would run off the edge if either held
    its width. */
-/* The editor's own code face, one step smaller: shared with a skill's file path in its own
-   popover row, the other place raw text reads better set the way the editor sets it. */
+/* The editor's own code face, one step smaller: shared with expanded Activity commands and
+   a skill's file path in its own popover row, where raw text reads better in the editor face. */
 .actcode,
-.chippoppath {
-  font-family: var(--vscode-editor-font-family);
+.chippoppath,
+pre.actfull code {
+  font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.92em;
 }
 .actcode {
@@ -1283,12 +1284,7 @@ button.acthead:focus-visible .actword,
   overflow-wrap: anywhere;
 }
 pre.actfull {
-  font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 0.92em;
   background: var(--vscode-textCodeBlock-background);
-}
-pre.actfull code {
-  font: inherit;
 }
 .actfull[hidden] {
   display: none;
