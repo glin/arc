@@ -258,7 +258,9 @@ export function ChoicePicker(props: ChoicePickerProps): ComponentChildren {
         focused.current = true;
       },
       onBlur() {
-        focused.current = false;
+        // Chromium 151 and earlier fire blur inside the disabled setter, before the layout effect above runs.
+        // Keep the focus flag so that effect still hands focus to the next enabled control.
+        if (!trigger.current?.disabled) focused.current = false;
         close(true);
       },
     },
