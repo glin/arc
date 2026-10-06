@@ -1136,9 +1136,12 @@ function completeDiscoveryHarness(
     'parentOfShown',
     'dispatchEdges',
     'storeTitleEntry',
+    'recordLoadingFailures',
     'sessionLoadingState',
     'postSessionLoading',
+    'sendSessionLoading',
     'failSessionLoading',
+    'unresolvedLoadingFailure',
     ...extraMethods,
   ];
   if (realSelectedWindow) {
@@ -7117,6 +7120,268 @@ test.each([false, true])(
     }
   },
 );
+
+// Two Codex sources and one healthy Claude source behind relationship discovery that reports a full source count on each poll.
+function exhaustedLoadingHarness(): any {
+  const provider = paintHarness(['workspaceFoldersChanged']);
+  provider.progressiveCurrent = () => true;
+  const healthy = provider.partial[0];
+  const codex = (name: string, activity: number) => ({
+    file: `${name}.jsonl`,
+    sessionId: name,
+    agent: 'codex',
+    activity,
+    size: 1,
+    mtimeMs: 1,
+  });
+  const first = codex('codex-a', 90);
+  const second = codex('codex-b', 80);
+  const settled = (session: { size: number; mtimeMs: number }) => ({
+    ...session,
+    label: 'Session',
+    fullLabel: 'Session',
+    foldedLabel: 'session',
+    stats: null,
+    outcome: null,
+    starts: { starts: [], whole: true },
+    expandedStatsRead: true,
+  });
+  const recovering = (session: { size: number; mtimeMs: number }) => ({
+    ...settled(session),
+    expandedStatsRead: false,
+    metadataWindow: { whole: false, windowBytes: 1 },
+  });
+  const exhausted = (session: { size: number; mtimeMs: number }) => ({
+    ...recovering(session),
+    metadataWindow: { whole: false, windowBytes: 1, exhausted: true },
+  });
+  const catalog = (sessions: unknown[]) => {
+    provider.partial = sessions;
+    provider.catalog = { sessions };
+  };
+  catalog([healthy, first, second]);
+  provider.titles.set(healthy.file, settled(healthy));
+  provider.titles.set(first.file, exhausted(first));
+  provider.titles.set(second.file, exhausted(second));
+  provider.metaFor = (session: { file: string }) => provider.titles.get(session.file);
+  provider.prepareClaudeChildren = bumpedCatalogHarness().provider.prepareClaudeChildren;
+  Object.assign(provider, {
+    claudeParents: [healthy],
+    claudeChildren: [],
+    claudeChildReferences: [],
+    claudeChildReferenceEntries: new Map(),
+    claudeChildStatWrites: new Map(),
+    hasHumanPrompt: () => true,
+    updateSessionSpendSources() {},
+    pruneDerivedTitles: () => false,
+    repositoryScope: { snapshot() {} },
+    allowThemeFiles() {},
+    prepareRailEnrichment: async () => ({ changed: false, catalogCurrent: true }),
+  });
+  const discovery: { pending: boolean; fail: boolean; before?: (generation: number, signal: AbortSignal) => void } = {
+    pending: false,
+    fail: false,
+  };
+  provider.progressiveWorker.run = async (_request: unknown, generation: number, signal: AbortSignal) => {
+    discovery.before?.(generation, signal);
+    if (discovery.fail) return null;
+    const checkpoint = {
+      epoch: randomUUID(),
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      parents: [healthy],
+      catalog: [healthy],
+      repositoryRoots: ['project'],
+      completed: [healthy.file],
+      sequence: 1,
+      position: 1,
+    };
+    return {
+      generation,
+      value: discovery.pending
+        ? { kind: 'claude-children-progress', checkpoint, referenceEntries: [], continuation: true }
+        : {
+            kind: 'claude-children',
+            checkpoint,
+            complete: true,
+            continuation: false,
+            references: [],
+            dispatchFacts: [],
+            children: [],
+            referenceEntries: [],
+            roots: provider.partial,
+          },
+    };
+  };
+  // Each poll runs relationship discovery again and reports its full source count.
+  const poll = async () => {
+    provider.dispatchDiscoveryPending = true;
+    provider.startupProgressAt = Date.now() - 250;
+    await provider.refresh(false, true);
+    const posts = provider.posts.filter(
+      (message: { generation: number }) => message.generation === provider.refreshGeneration,
+    );
+    const progress = posts.find((message: { known: number }) => message.known === 1);
+    assert.ok(progress, 'the poll posted no source count');
+    return { progress: progress.failed, last: posts.at(-1) };
+  };
+  return { provider, healthy, first, second, codex, settled, recovering, exhausted, catalog, discovery, poll };
+}
+
+test('relationship progress keeps unresolved metadata failures until each failed source resolves', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, settled, recovering, exhausted, catalog, discovery, poll } =
+      exhaustedLoadingHarness();
+    await provider.refresh(true);
+    assert.equal(provider.messages.at(-1).startup.failed, true);
+    provider.useRefreshGate(() => false);
+
+    for (const label of ['first poll', 'second poll']) {
+      const { progress, last } = await poll();
+      assert.equal(progress, true, `${label} replaced the unresolved failure with reading text`);
+      assert.equal(last.failed, true, `${label} lost the unresolved failure`);
+    }
+    const appended = { ...healthy, size: 2, mtimeMs: 2 };
+    catalog([appended, first, second]);
+    provider.titles.set(healthy.file, settled(appended));
+    assert.equal((await poll()).progress, true, 'an unrelated append cleared the failure');
+    discovery.pending = true;
+    assert.equal((await poll()).progress, true, 'pending discovery treated absent sources as removed');
+    discovery.pending = false;
+
+    provider.titles.set(first.file, recovering(first));
+    let status = await poll();
+    assert.equal(status.progress, true, 'an accepted retry of one source cleared the other failure');
+    assert.equal(status.last.failed, true);
+    provider.titles.set(first.file, exhausted(first));
+    assert.equal((await poll()).last.failed, true, 'a repeated failure did not return to failure');
+    provider.titles.set(first.file, settled(first));
+    status = await poll();
+    assert.equal(status.progress, true, 'a successful retry of one source cleared the other failure');
+    assert.equal(status.last.failed, true);
+
+    provider.titles.set(second.file, settled(second));
+    assert.equal((await poll()).progress, undefined, 'an accepted read of the last failed source kept its failure');
+    provider.titles.set(second.file, exhausted(second));
+    assert.equal((await poll()).last.failed, true);
+
+    const replaced = { ...second, size: 2, mtimeMs: 2 };
+    catalog([appended, first, replaced]);
+    // prepareMetadata replaces the title entry after relationship discovery has posted its source count.
+    const prepareMetadata = provider.prepareMetadata;
+    provider.prepareMetadata = () => {
+      provider.titles.set(second.file, recovering(replaced));
+      return Promise.resolve(true);
+    };
+    status = await poll();
+    provider.prepareMetadata = prepareMetadata;
+    assert.equal(status.progress, true, 'the source count ran after prepareMetadata replaced the entry');
+    assert.equal(status.last.failed, undefined, 'status kept the superseded failure after its entry was replaced');
+    assert.equal(status.last.complete, false, 'a pending read reported completion');
+    assert.equal((await poll()).progress, undefined, 'a replaced source kept its superseded failure');
+
+    provider.titles.set(second.file, exhausted(replaced));
+    assert.equal((await poll()).last.failed, true);
+    const posted = provider.posts.length;
+    provider.startupProgressAt = 0;
+    const aborted = new AbortController();
+    aborted.abort();
+    await provider.prepareClaudeChildren(provider.refreshGeneration, aborted.signal);
+    await provider.prepareClaudeChildren(provider.refreshGeneration - 1, new AbortController().signal);
+    provider.failSessionLoading(provider.refreshGeneration, aborted.signal);
+    assert.equal(provider.posts.length, posted, 'cancelled or obsolete work published a status');
+
+    catalog([appended, first]);
+    assert.equal((await poll()).last.failed, undefined, 'an authoritative removal kept the removed failure');
+    assert.equal((await poll()).progress, undefined, 'progress kept the removed failure');
+
+    catalog([appended, first, replaced]);
+    assert.equal((await poll()).last.failed, true, 'a returned exhausted source lost its failure');
+    assert.equal((await poll()).progress, true);
+    provider.workspaceFoldersChanged();
+    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+    Object.assign(provider, { repositoryScopeReady: true, repositoryScopeRoots: ['project'] });
+    catalog([appended]);
+    assert.equal((await poll()).progress, undefined, 'a new scope reported the previous scope failure');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a discovery failure keeps an exhausted early selected source failed in the next source count', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, first, second, codex, settled, exhausted, discovery, poll } = exhaustedLoadingHarness();
+    const early = codex('codex-early', 70);
+    provider.earlySelectedSources.set(early.sessionId, early);
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    provider.titles.set(early.file, exhausted(early));
+    await provider.refresh(true);
+    assert.equal(provider.messages.at(-1).startup.failed, true, 'the render lost the early selected failure');
+    provider.useRefreshGate(() => false);
+
+    discovery.fail = true;
+    provider.dispatchDiscoveryPending = true;
+    await provider.refresh(false, true);
+    assert.equal(provider.posts.at(-1).generation, provider.refreshGeneration);
+    assert.equal(provider.posts.at(-1).failed, true, 'the discovery failure posted no failure');
+    discovery.fail = false;
+    const { progress, last } = await poll();
+    assert.equal(progress, true, 'the next source count dropped the early selected failure');
+    assert.equal(last.failed, true);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a selection-only render keeps an exhausted early selected source failed in the next source count', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, codex, settled, exhausted, poll } = exhaustedLoadingHarness();
+    const early = codex('codex-early', 70);
+    provider.earlySelectedSources.set(early.sessionId, early);
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    provider.titles.set(early.file, exhausted(early));
+    await provider.refresh(true);
+    assert.equal(provider.messages.at(-1).startup.failed, true, 'the render lost the early selected failure');
+
+    provider._showing = healthy.sessionId;
+    const rendered = provider.messages.length;
+    await provider.refresh(true, true, true, true);
+    assert.equal(provider.messages.length, rendered + 1, 'the selection refresh posted no render');
+    assert.equal(provider.messages.at(-1).startup.failed, true, 'the selection render lost the early selected failure');
+    provider.useRefreshGate(() => false);
+    const { progress, last } = await poll();
+    assert.equal(progress, true, 'the source count after a selection render dropped the early selected failure');
+    assert.equal(last.failed, true);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('relationship progress after a work failure in its generation keeps the failure', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, first, second, settled, discovery, poll } = exhaustedLoadingHarness();
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    await provider.refresh(true);
+    assert.equal(provider.messages.at(-1).startup.failed, undefined);
+    provider.useRefreshGate(() => false);
+
+    discovery.before = (generation: number, signal: AbortSignal) => provider.failSessionLoading(generation, signal);
+    const { progress } = await poll();
+    assert.equal(progress, true, 'a source count after a work failure replaced the failure with reading text');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
 
 test('current discovery failures are explicit before and after catalog publication while obsolete work stays silent', async () => {
   for (const published of [false, true]) {

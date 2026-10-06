@@ -403,3 +403,151 @@ test.for([
     await browser.close();
   }
 });
+
+test('repeated full source counts keep an unresolved failure on screen until its sources resolve', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  try {
+    vi.stubGlobal('PANEL_CSS', '');
+    vi.stubGlobal('PANEL_JS', '');
+    vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+    const { PanelProvider } = await import('./panelhost.ts');
+    const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+    const page = await browser.newPage();
+    page.setDefaultTimeout(5000);
+    await page.setContent(themed(pageHtml()));
+    await page.evaluate(
+      (payload) => window.postMessage({ ...payload, startup: { generation: 6, complete: false } }, '*'),
+      renderPayload(),
+    );
+    await page.waitForFunction(() => document.querySelectorAll('article.turn').length > 0);
+    // Record every status text the reader sees, in order.
+    await page.evaluate(() => {
+      const shown: string[] = [];
+      (window as any).__loadingTexts = shown;
+      const record = () => {
+        const status = document.querySelector<HTMLElement>('nav [data-session-loading-status]');
+        const text = status && !status.hidden ? (status.textContent ?? '') : '';
+        if (shown.at(-1) !== text) shown.push(text);
+      };
+      record();
+      new MutationObserver(record).observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+      });
+    });
+    const healthy = { file: 'claude.jsonl', sessionId: 'claude', agent: 'claude', size: 1, mtimeMs: 1 };
+    const first = { file: 'codex-a.jsonl', sessionId: 'codex-a', agent: 'codex', size: 1, mtimeMs: 1 };
+    const second = { file: 'codex-b.jsonl', sessionId: 'codex-b', agent: 'codex', size: 1, mtimeMs: 1 };
+    const sessions = [healthy, first, second];
+    const settled = {
+      foldedLabel: 'session',
+      stats: null,
+      starts: { starts: [], whole: true },
+      expandedStatsRead: true,
+    };
+    const exhausted = {
+      ...settled,
+      expandedStatsRead: false,
+      metadataWindow: { whole: false, windowBytes: 1, exhausted: true },
+    };
+    const entries = new Map<string, object>([
+      [healthy.file, { ...healthy, ...settled }],
+      [first.file, { ...first, ...exhausted }],
+      [second.file, { ...second, ...exhausted }],
+    ]);
+    const delivered: Promise<unknown>[] = [];
+    const checkpoint = () => ({
+      epoch: randomUUID(),
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      parents: [healthy],
+      catalog: [healthy],
+      repositoryRoots: ['project'],
+      completed: [normalizeFsPath(healthy.file)],
+      sequence: 2,
+      position: 1,
+    });
+    Object.assign(provider, {
+      refreshGeneration: 6,
+      authoritativeCatalog: sessions,
+      catalog: { sessions },
+      repositoryScopeRoots: ['project'],
+      claudeParents: [healthy],
+      claudeChildren: [],
+      claudeChildReferenceEntries: new Map(),
+      claudeChildStatWrites: new Map(),
+      derivedCacheCheckpointState: { markChanged() {} },
+      metaFor: (session: { file: string }) => entries.get(session.file),
+      post: (message: unknown) => {
+        const posted = page.evaluate((value) => window.postMessage(value, '*'), message);
+        delivered.push(posted);
+        return posted;
+      },
+      hasHumanPrompt: () => true,
+      activityFor: () => 1,
+      updateSessionSpendSources() {},
+      pruneDerivedTitles: () => false,
+      progressiveWorker: {
+        run: async (_request: unknown, generation: number) => ({
+          generation,
+          value: {
+            kind: 'claude-children',
+            checkpoint: checkpoint(),
+            complete: true,
+            continuation: false,
+            references: [],
+            dispatchFacts: [],
+            children: [],
+            referenceEntries: [],
+            roots: sessions,
+          },
+        }),
+      },
+    });
+    const signal = new AbortController().signal;
+    const failure = 'Some sessions were not read. Select a session to try again.';
+    provider.postSessionLoading(sessions, 6, signal);
+    for (const generation of [7, 8]) {
+      provider.refreshGeneration = generation;
+      provider.startupProgressAt = 0;
+      provider.dispatchDiscoveryPending = true;
+      assert.equal(await provider.prepareClaudeChildren(generation, signal), true);
+      provider.postSessionLoading(sessions, generation, signal);
+    }
+    await Promise.all(delivered);
+    await page.evaluate(SETTLED);
+    assert.deepEqual(
+      await page.evaluate(() => (window as any).__loadingTexts),
+      ['Reading sessions…', failure],
+      'a later source count replaced the unresolved failure',
+    );
+    const status = page.locator('nav [data-session-loading-status]');
+    entries.set(first.file, { ...first, ...settled });
+    provider.postSessionLoading(sessions, 8, signal);
+    entries.set(second.file, { ...second, ...settled });
+    provider.postSessionLoading(sessions, 8, signal);
+    await page.waitForFunction(
+      'window.__posted.some(message => message.type === "painted" && message.generation === 8 && message.stage === "completeRender")',
+    );
+    assert.equal(await status.isVisible(), false, 'resolved sources kept the failure of their generation');
+    await page.evaluate((value) => window.postMessage(value, '*'), {
+      type: 'startupProgress',
+      generation: 7,
+      epoch: '7',
+      sequence: 99,
+      completed: 0,
+      known: 0,
+      failed: true,
+    });
+    await page.evaluate(SETTLED);
+    assert.equal(await status.isVisible(), false, 'an obsolete failure replaced current completion');
+  } finally {
+    vi.unstubAllGlobals();
+    await browser.close();
+  }
+});

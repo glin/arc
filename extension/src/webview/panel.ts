@@ -123,7 +123,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   let workspaceCatalogAvailable = false;
   let progressStamp: Extract<HostToPanel, { type: 'startupProgress' }> | null = null;
   let loadingGeneration = -1;
-  let loadingTerminal = false;
+  // A completed generation stays complete. A failure gives way to later status from its generation, such as an accepted retry.
+  let loadingComplete = false;
   const acceptedHostMessageCounts = new Map<HostToPanel['type'], number>();
   let scheduledPaint: unknown = null;
   let paintedGeneration = -1;
@@ -632,13 +633,13 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     },
   });
   function applySessionLoading(stamp: { generation: number; complete?: boolean; failed?: boolean }, text?: string) {
-    if (stamp.generation < loadingGeneration || (stamp.generation === loadingGeneration && loadingTerminal)) return;
+    if (stamp.generation < loadingGeneration || (stamp.generation === loadingGeneration && loadingComplete)) return;
     if (stamp.generation > loadingGeneration) {
       loadingGeneration = stamp.generation;
-      loadingTerminal = false;
+      loadingComplete = false;
       progressStamp = null;
     }
-    loadingTerminal = stamp.complete === true || stamp.failed === true;
+    loadingComplete = stamp.complete === true && stamp.failed !== true;
     railRenderer.updateLoading(
       stamp.failed
         ? 'Some sessions were not read. Select a session to try again.'
@@ -1136,7 +1137,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       startupProgress: function (msg) {
         if (
           msg.generation < loadingGeneration ||
-          (msg.generation === loadingGeneration && loadingTerminal) ||
+          (msg.generation === loadingGeneration && loadingComplete) ||
           (progressStamp &&
             (msg.generation < progressStamp.generation ||
               (msg.generation === progressStamp.generation &&

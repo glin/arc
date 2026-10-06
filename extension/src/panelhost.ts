@@ -1685,6 +1685,9 @@ export class PanelProvider implements vscode.Disposable {
   private startupProgressAt = 0;
   private startupProgressSequence = 0;
   private startupFailureGeneration = -1;
+  // Sessions of the published set whose metadata recovery was exhausted when recordLoadingFailures last ran.
+  // Relationship progress rechecks only these entries, so a full source count keeps the failure on screen.
+  private exhaustedLoadingSessions: SessionFile[] = [];
   private startupLoadingSent = '';
   private readonly warnedMessageBudgets = new Set<string>();
   private performanceOutput: vscode.OutputChannel | null = null;
@@ -2305,6 +2308,7 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
     this.authoritativeCatalog = null;
+    this.exhaustedLoadingSessions = [];
     this.discoveryCheckpoint = undefined;
     this.discoveryCompleted = undefined;
     this.discoveryAcknowledgment = undefined;
@@ -6267,12 +6271,11 @@ export class PanelProvider implements vscode.Disposable {
           delete this.awaitingSessionRecords[session];
         }
       }
-      if (!selectedOnly) {
-        all = [
-          ...all,
-          ...[...(this.earlySelectedSources?.values() ?? [])].filter((source) => !recorded.has(source.sessionId)),
-        ];
-      }
+      // Publish early selected sources in every render. Selected revalidation returns the catalog without them.
+      all = [
+        ...all,
+        ...[...(this.earlySelectedSources?.values() ?? [])].filter((source) => !recorded.has(source.sessionId)),
+      ];
       const scopedDrafts = Object.values(this.newDrafts).filter((draft) =>
         isInside(draft.cwd, this.repositoryScopeRoots),
       );
@@ -6593,6 +6596,7 @@ export class PanelProvider implements vscode.Disposable {
             }
           }
         }
+        this.recordLoadingFailures(all);
         this.startupLoadingSent = JSON.stringify(this.sessionLoadingState(all, generation));
         void this.sendToHost(
           host,
@@ -8031,6 +8035,7 @@ export class PanelProvider implements vscode.Disposable {
           sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
           completed,
           known: known.size,
+          ...(this.unresolvedLoadingFailure(result.generation) ? { failed: true } : {}),
         }).catch(() => {});
       }
       return true;
@@ -8443,6 +8448,15 @@ export class PanelProvider implements vscode.Disposable {
     return { changed, catalogCurrent, progress };
   }
 
+  // The one place that writes exhaustedLoadingSessions. Callers pass the set the render publishes, the catalog plus early selected sources.
+  // Only an authoritative catalog decides membership. Partial discovery and a pending scope keep the recorded sessions.
+  private recordLoadingFailures(published: SessionFile[]): void {
+    if (!this.authoritativeCatalog) return;
+    this.exhaustedLoadingSessions = published.filter(
+      (session) => this.metaFor(session).metadataWindow?.exhausted === true,
+    );
+  }
+
   private sessionLoadingState(sessions: SessionFile[], generation: number) {
     const failed =
       this.startupFailureGeneration === generation ||
@@ -8466,26 +8480,39 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  private postSessionLoading(sessions: SessionFile[], generation: number, signal: AbortSignal): void {
+  private postSessionLoading(published: SessionFile[], generation: number, signal: AbortSignal): void {
     if (signal.aborted || generation !== this.refreshGeneration) return;
-    const state = this.sessionLoadingState(sessions, generation);
+    this.recordLoadingFailures(published);
+    this.sendSessionLoading(this.sessionLoadingState(published, generation));
+  }
+
+  private sendSessionLoading(state: { generation: number; complete: boolean; failed?: boolean }): void {
     const key = JSON.stringify(state);
     if (key === this.startupLoadingSent) return;
     this.startupLoadingSent = key;
     void this.post({
       type: 'startupProgress',
       ...state,
-      epoch: String(generation),
+      epoch: String(state.generation),
       sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
       completed: 0,
       known: 0,
     }).catch(() => {});
   }
 
+  // Reports the current generation's work failure or a recorded exhausted session that no source change or accepted read has cleared.
+  private unresolvedLoadingFailure(generation: number): boolean {
+    return (
+      this.startupFailureGeneration === generation ||
+      (this.exhaustedLoadingSessions ?? []).some((session) => this.metaFor(session).metadataWindow?.exhausted === true)
+    );
+  }
+
   private failSessionLoading(generation: number, signal: AbortSignal): void {
     if (signal.aborted || generation !== this.refreshGeneration) return;
     this.startupFailureGeneration = generation;
-    this.postSessionLoading(this.authoritativeCatalog ?? [], generation, signal);
+    // A work failure decides the state alone, so this walks no sessions and keeps the recorded exhausted sessions.
+    this.sendSessionLoading({ generation, complete: false, failed: true });
   }
 
   // Use accepted agent-specific names, then carried cache names, then an ID placeholder.
