@@ -381,7 +381,7 @@ test('a closed turn reads subagents while a background child it left open still 
   assert.equal(railCardName(rail[0]), 'Session a, Claude, 1 subagent still running');
 });
 
-test('a closed child becomes live when its transcript moves after the close', () => {
+test('a closed child becomes live when new work follows its close', () => {
   const hour = 60 * 60 * 1000;
   const now = 10 * hour;
   const outcome: TurnOutcome = {
@@ -392,8 +392,14 @@ test('a closed child becomes live when its transcript moves after the close', ()
     endedAt: now - 120_000,
     closedChildren: [{ id: 'resumed', closedAt: now - 120_000 }],
   };
-  const live = (value: TurnOutcome, writtenAt: number | undefined) =>
-    liveOpenChildCounts(new Map([['a', value]]), () => writtenAt, new Map(), now);
+  const live = (value: TurnOutcome, workAt: number | undefined) =>
+    liveOpenChildCounts(
+      new Map([['a', value]]),
+      () => now - 60_000,
+      new Map(),
+      now,
+      () => workAt,
+    );
 
   const resumed = live(outcome, now - 60_000);
   assert.deepEqual(resumed, new Map([['a', 1]]));
@@ -401,8 +407,8 @@ test('a closed child becomes live when its transcript moves after the close', ()
     sessionStatusOf([], new Set(), new Map([['a', outcome]]), now, new Set(), new Map(), resumed).get('a'),
     'subagents',
   );
-  assert.deepEqual(live(outcome, now - 180_000), new Map(), 'a write before the close stays closed');
-  assert.deepEqual(live(outcome, undefined), new Map(), 'an unknown write time stays closed');
+  assert.deepEqual(live(outcome, now - 180_000), new Map(), 'work before the close stays closed');
+  assert.deepEqual(live(outcome, undefined), new Map(), 'unknown work stays closed');
   assert.deepEqual(
     live({ ...outcome, closedChildren: ['resumed'] }, now - 60_000),
     new Map(),
@@ -415,9 +421,9 @@ test('a closed child becomes live when its transcript moves after the close', ()
   );
 });
 
-// Child writes within CHILD_CLOSE_MARGIN_MS do not reopen the closed child.
+// Child work within CHILD_CLOSE_MARGIN_MS does not reopen the closed child.
 
-test('a trailing child transcript write after the close does not reopen it', () => {
+test('a trailing child work record after the close does not reopen it', () => {
   const hour = 60 * 60 * 1000;
   const now = 10 * hour;
   const closedAt = now - 120_000;
@@ -429,25 +435,27 @@ test('a trailing child transcript write after the close does not reopen it', () 
     endedAt: closedAt,
     closedChildren: [{ id: 'trailing', closedAt }],
   };
-  const live = (writtenAt: number | undefined) =>
-    liveOpenChildCounts(new Map([['a', outcome]]), () => writtenAt, new Map(), now);
+  const live = (workAt: number | undefined) =>
+    liveOpenChildCounts(
+      new Map([['a', outcome]]),
+      () => now - 60_000,
+      new Map(),
+      now,
+      () => workAt,
+    );
 
   const withinMargin = live(closedAt + 80);
-  assert.deepEqual(withinMargin, new Map(), 'a write 80ms after the close lands inside the margin');
+  assert.deepEqual(withinMargin, new Map(), 'work 80ms after the close lands inside the margin');
   assert.equal(
     sessionStatusOf([], new Set(), new Map([['a', outcome]]), now, new Set(), new Map(), withinMargin).get('a'),
     'done',
     'the rail does not draw the session as having subagents',
   );
-  assert.deepEqual(
-    live(closedAt + CHILD_CLOSE_MARGIN_MS),
-    new Map(),
-    'a write exactly at the close margin stays closed',
-  );
+  assert.deepEqual(live(closedAt + CHILD_CLOSE_MARGIN_MS), new Map(), 'work exactly at the close margin stays closed');
   assert.deepEqual(
     live(closedAt + CHILD_CLOSE_MARGIN_MS + 1),
     new Map([['a', 1]]),
-    'a write just past the close margin reopens the child',
+    'work just past the close margin reopens the child',
   );
 });
 

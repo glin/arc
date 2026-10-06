@@ -1,4 +1,11 @@
-import { sessionOutcomeOf, type SessionFile, type SessionMeta, type SessionRead, type TurnOutcome } from './transcript';
+import {
+  readSessionWork,
+  sessionOutcomeOf,
+  type SessionFile,
+  type SessionMeta,
+  type SessionRead,
+  type TurnOutcome,
+} from './transcript';
 import {
   childWriteKey,
   claudeChildWriteIndex,
@@ -11,6 +18,25 @@ import type { SessionRailFacts } from './projectspend';
 import type { ClaudeChildSessionFile, ClaudeChildSessionReference } from './transcript';
 
 export { carriedSubagentCount } from './turncard';
+
+// Cache positive and absent work timestamps at the child's exact file version.
+export class ClaudeChildWorkCache {
+  private entries = new Map<string, { version: string; at: number | undefined }>();
+
+  read(file: string, version: string, reader = readSessionWork): number | undefined {
+    const held = this.entries.get(file);
+    if (held?.version === version) return held.at;
+    const at = reader(file) ?? undefined;
+    this.entries.set(file, { version, at });
+    return at;
+  }
+
+  retain(files: ReadonlySet<string>): void {
+    for (const file of this.entries.keys()) {
+      if (!files.has(file)) this.entries.delete(file);
+    }
+  }
+}
 
 // Combine accepted tail, lifetime, and parsed reads without reopening their files.
 export function outcomesFor(
@@ -44,6 +70,7 @@ export function liveTimelineChildren(
   statWrites: ReadonlyMap<string, number>,
   hostExitedAt: ReadonlyMap<string, number>,
   now: number,
+  workAt: (file: string) => number | undefined = () => undefined,
 ): Map<string, string[]> {
   let index: Map<string, number> | null = null;
   const writtenAt = (session: string, child: string): number | undefined => {
@@ -54,7 +81,18 @@ export function liveTimelineChildren(
     );
     return index.get(childWriteKey(session, child));
   };
-  return liveOpenChildren(outcomes, writtenAt, hostExitedAt, now);
+  let files: Map<string, string> | null = null;
+  const childWorkAt = (session: string, child: string): number | undefined => {
+    files ??= new Map([
+      ...children.map((child) => [childWriteKey(child.parentSessionId, child.sessionId), child.file] as const),
+      ...references
+        .filter((reference) => reference.kind !== 'dispatch')
+        .map((reference) => [childWriteKey(reference.parentSessionId, reference.sessionId), reference.file] as const),
+    ]);
+    const file = files.get(childWriteKey(session, child));
+    return file === undefined ? undefined : workAt(file);
+  };
+  return liveOpenChildren(outcomes, writtenAt, hostExitedAt, now, childWorkAt);
 }
 
 // Session-list status and child counts share the supplied observation clock and live child IDs.

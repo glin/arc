@@ -28,7 +28,14 @@ import { ARC_IDENTITY } from './identity.ts';
 // Synthetic clocks reproduce transcript closure, delayed writes, and resumed work.
 export function timelineCheckRecords(
   cwd: string,
-  options: { close?: number; resume?: number; foreground?: boolean; noId?: boolean; carried?: boolean } = {},
+  options: {
+    close?: number;
+    resume?: number;
+    lastWork?: number;
+    foreground?: boolean;
+    noId?: boolean;
+    carried?: boolean;
+  } = {},
 ) {
   const start = Date.parse('2026-10-03T03:00:00Z');
   const stamp = (at: number) => new Date(at).toISOString();
@@ -89,7 +96,7 @@ export function timelineCheckRecords(
     );
   const child: object[] = [
     prompt(start + 2000, 'Synthetic child work'),
-    assistant(start + 4000, [{ type: 'text', text: 'Child result.' }]),
+    assistant(options.lastWork ?? start + 4000, [{ type: 'text', text: 'Child result.' }]),
   ];
   if (options.resume !== undefined) child.push(prompt(options.resume, 'Resume synthetic work'));
   child.push({ type: 'system', subtype: 'turn_duration', timestamp: stamp(start + 7000), durationMs: 1 });

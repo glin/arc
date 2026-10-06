@@ -521,12 +521,11 @@ export function sessionStatusOf(
   return out;
 }
 
-// Grace period for a child's final transcript write after its parent records closure.
-// Only a later write beyond this margin can reopen a closed child.
+// Work recorded within this margin of the parent's closure does not reopen a child.
 export const CHILD_CLOSE_MARGIN_MS = 1000;
 
 // Live background children by session, in launch order. Open children count while their transcripts are fresh.
-// Closed children resume when a fresh transcript write exceeds their close time by CHILD_CLOSE_MARGIN_MS. Legacy closes without times remain closed.
+// Closed children resume when their newest work exceeds their close time by CHILD_CLOSE_MARGIN_MS. Legacy closes without times remain closed.
 // TURN_QUIET_MS expires both open and resumed children.
 // A recorded process end closes every child. An Arc-hosted process exit after the newest turn began does the same.
 // Children with unknown write times do not count, so missing timestamps can undercount children.
@@ -536,6 +535,7 @@ export function liveOpenChildren(
   // When the host process of each session that Arc hosts exited, by session.
   hostExitedAt: ReadonlyMap<string, number>,
   now: number,
+  workAt: (session: string, child: string) => number | undefined = () => undefined,
 ): Map<string, string[]> {
   const out = new Map<string, string[]>();
   for (const [id, outcome] of outcomes) {
@@ -552,7 +552,7 @@ export function liveOpenChildren(
       if (typeof child === 'string') {
         return [];
       }
-      const at = writtenAt(id, child.id);
+      const at = workAt(id, child.id);
       return at !== undefined && at > child.closedAt + CHILD_CLOSE_MARGIN_MS ? [child.id] : [];
     });
     const candidates = [...(outcome.openChildren ?? []).filter((child) => !closedIds.has(child)), ...reopened];

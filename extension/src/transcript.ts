@@ -1536,6 +1536,27 @@ export function readSessionActivity(file: string, bytes = 256 * 1024): number | 
   return activityIn(tailLines(file, bytes));
 }
 
+// Only user and assistant timestamps establish resumed child work.
+// Disjoint backward reads recover complete records beyond bookkeeping and split records.
+export function readSessionWork(file: string, bytes = 256 * 1024, now = Infinity): number | null {
+  const tail = tailOf(file, bytes, true);
+  if (!tail.success) return null;
+  let newest = activityIn(tail.lines, true, now);
+  let cursor = tail.cursor;
+  while (cursor && cursor.end > 0) {
+    const batch = readPreviousLines(file, cursor, bytes);
+    if (!batch) return null;
+    const at = activityIn(
+      batch.lines.map((line) => line.text),
+      true,
+      now,
+    );
+    if (at !== null) newest = Math.max(newest ?? -Infinity, at);
+    cursor = batch.cursor;
+  }
+  return newest;
+}
+
 export interface TurnOutcome {
   finished: boolean;
   error: boolean;
@@ -2586,23 +2607,27 @@ function outcomeIn(
   return { outcome, backgroundCommands: [...commands] };
 }
 
-export function activityIn(lines: string[]): number | null {
+export function activityIn(lines: string[], workOnly = false, now = Infinity): number | null {
   let newest: number | null = null;
   for (const line of lines) {
     if (line.indexOf('"timestamp"') < 0) {
       continue;
     }
-    let o: { timestamp?: unknown };
+    let o: { type?: string; timestamp?: unknown };
     try {
-      o = JSON.parse(line) as { timestamp?: unknown };
+      o = JSON.parse(line) as { type?: string; timestamp?: unknown };
     } catch {
       continue;
     }
-    if (o.timestamp === undefined || o.timestamp === null) {
+    if (
+      (workOnly && o.type !== 'user' && o.type !== 'assistant') ||
+      o.timestamp === undefined ||
+      o.timestamp === null
+    ) {
       continue;
     }
-    const t = Date.parse(String(o.timestamp));
-    if (Number.isNaN(t)) {
+    const t = workOnly && typeof o.timestamp === 'number' ? o.timestamp : Date.parse(String(o.timestamp));
+    if (!Number.isFinite(t) || t > now) {
       continue;
     }
     if (newest === null || t > newest) {

@@ -182,7 +182,7 @@ import {
   visitPlace,
 } from './turnplaces';
 import type { DraftOrigin } from './composerview';
-import { liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
+import { ClaudeChildWorkCache, liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
 import {
   agentRunAnswer,
   sessionParentEdgeSet,
@@ -1547,6 +1547,7 @@ export class PanelProvider implements vscode.Disposable {
   private exitedNow = new Set<string>();
   // Claude child transcript write times used to determine live child status. Discovery trims unreferenced files.
   private claudeChildStatWrites = new Map<string, number>();
+  private claudeChildWork = new ClaudeChildWorkCache();
   // Live child state used by the last card render. Clock-driven expiry can change it without a file revision.
   private drawnOpenChildren = '';
   // Reports agents whose parsed turns finished, including sessions started outside this window.
@@ -6893,7 +6894,7 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Derive live child IDs from held outcomes and cached write times without reading files during rendering.
+  // Closed children read work timestamps once per changed file version. Open children use held write times.
   private liveOpenChildren(now: number): Map<string, string[]> {
     return liveTimelineChildren(
       this.sessionOutcomes,
@@ -6902,6 +6903,7 @@ export class PanelProvider implements vscode.Disposable {
       this.claudeChildStatWrites,
       runningSessionsSince(this.sessionRows, this.exitedSinceKeys),
       now,
+      (file) => (this.claudeChildWork ??= new ClaudeChildWorkCache()).read(file, this.claudeChildVersion(file)),
     );
   }
 
@@ -8109,6 +8111,7 @@ export class PanelProvider implements vscode.Disposable {
         this.claudeChildStatWrites.delete(file);
       }
     }
+    this.claudeChildWork?.retain(referenced);
     const held = this.catalog?.sessions ?? [];
     const discoveryRoots =
       progress.roots ?? held.filter((session) => session.agent !== 'claude' || session.childTranscript !== true);

@@ -1,4 +1,56 @@
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
+import type { TurnOutcome } from './transcript';
+import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
+
+test('the host reads closed child work once per file version and never reads open child work', () => {
+  const start = panelHostSource.indexOf('private liveOpenChildren(');
+  const source = memberFrom(panelHostSource, start).replace('private liveOpenChildren(', 'function liveOpenChildren(');
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const now = Date.parse('2026-10-03T03:15:00Z');
+  const close = now - 120_000;
+  const reader = vi.fn<() => number>(() => close - 28);
+  class WorkCache extends ClaudeChildWorkCache {
+    override read(file: string, version: string): number | undefined {
+      return super.read(file, version, reader);
+    }
+  }
+  const read = new Function(
+    'liveTimelineChildren',
+    'ClaudeChildWorkCache',
+    'runningSessionsSince',
+    `${compiled}\nreturn liveOpenChildren;`,
+  )(liveTimelineChildren, WorkCache, () => new Map());
+  let version = 'v1';
+  const outcome = {
+    finished: true,
+    error: false,
+    interrupted: false,
+    endedAt: close,
+    openChildren: ['child'],
+    closedChildren: undefined as TurnOutcome['closedChildren'],
+  };
+  const host = {
+    sessionOutcomes: new Map([['parent', outcome]]),
+    claudeChildren: [{ parentSessionId: 'parent', sessionId: 'child', file: '/child', mtimeMs: close + 2000 }],
+    claudeChildReferences: [],
+    claudeChildStatWrites: new Map(),
+    claudeChildVersion: () => version,
+  };
+  assert.deepEqual(read.call(host, now), new Map([['parent', ['child']]]));
+  assert.equal(reader.mock.calls.length, 0);
+  outcome.closedChildren = [{ id: 'child', closedAt: close }];
+  assert.deepEqual(read.call(host, now), new Map());
+  assert.deepEqual(read.call(host, now), new Map());
+  assert.equal(reader.mock.calls.length, 1);
+  version = 'v2';
+  assert.deepEqual(read.call(host, now), new Map());
+  assert.equal(reader.mock.calls.length, 2);
+  version = 'v3';
+  reader.mockReturnValue(close + 2000);
+  assert.deepEqual(read.call(host, now), new Map([['parent', ['child']]]));
+  assert.deepEqual(read.call(host, now), new Map([['parent', ['child']]]));
+  assert.equal(reader.mock.calls.length, 3);
+});
 import { ConfigWatches } from './configwatch.ts';
 import {
   WorkspaceCachePartition,

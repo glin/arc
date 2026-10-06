@@ -13,15 +13,36 @@ import {
   type TimelineCheckState,
   type TimelineRule,
 } from './timelinecheck';
-import { createClaudeSessionReducer, projectSlug, sessionOutcomeOf, type ClaudeChildSessionFile } from './transcript';
-import { carriedSubagentCount, liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
+import {
+  createClaudeSessionReducer,
+  projectSlug,
+  readSessionWork,
+  sessionOutcomeOf,
+  type ClaudeChildSessionFile,
+} from './transcript';
+import {
+  ClaudeChildWorkCache,
+  carriedSubagentCount,
+  liveTimelineChildren,
+  outcomesFor,
+  timelineRailState,
+} from './timelinestate';
 import { toCard } from './turncard';
+import { CHILD_CLOSE_MARGIN_MS } from './turnrail';
+import * as transcript from './transcript';
 
 const NOW = Date.parse('2026-10-03T03:15:00Z');
 const CLOSE = Date.parse('2026-10-03T03:00:05Z');
 
-function fixture(options: Parameters<typeof timelineCheckRecords>[1] = {}, write = CLOSE) {
+function fixture(
+  options: Parameters<typeof timelineCheckRecords>[1] = {},
+  write = CLOSE,
+  work: { rows?: object[]; file?: string; cache?: ClaudeChildWorkCache } = {},
+) {
   const records = timelineCheckRecords('/repo', options);
+  const file = work.file ?? path.join(tempDir('timeline-child-'), 'child.jsonl');
+  const childRows = work.rows ?? records.child;
+  fs.writeFileSync(file, childRows.map((row) => JSON.stringify(row)).join('\n') + '\n');
   const parser = createClaudeSessionReducer('parent', { agentSessionTargetOf: (agent) => agent.id });
   const parent = createTimelineEvidenceReader(NOW, write);
   for (const record of records.parent) {
@@ -29,13 +50,13 @@ function fixture(options: Parameters<typeof timelineCheckRecords>[1] = {}, write
     parent.apply(record);
   }
   const child = createTimelineEvidenceReader(NOW, write);
-  for (const record of records.child) child.apply(record);
+  for (const record of childRows) child.apply(record);
   const read = parser.read();
   const session = { agent: 'claude' as const, file: '/parent', sessionId: 'parent', mtimeMs: write, size: 1 };
   const children: ClaudeChildSessionFile[] = [
     {
       ...session,
-      file: '/child',
+      file,
       sessionId: 'child',
       parentSessionId: 'parent',
       toolUseIds: ['launch'],
@@ -50,7 +71,10 @@ function fixture(options: Parameters<typeof timelineCheckRecords>[1] = {}, write
     () => read,
     () => ({ outcome: sessionOutcomeOf(read), backgroundCommands: [] }),
   );
-  const live = liveTimelineChildren(outcomes, children, [], new Map(), new Map(), NOW);
+  const cache = work.cache ?? new ClaudeChildWorkCache();
+  const live = liveTimelineChildren(outcomes, children, [], new Map(), new Map(), NOW, (target) =>
+    cache.read(target, `${write}:${fs.statSync(target).size}`),
+  );
   const liveChildren = new Set(live.get('parent') ?? []);
   const rail = timelineRailState(outcomes, live, new Set(), new Set(), new Map(), new Map(), NOW);
   const cards = read.turns.map((value, index) =>
@@ -71,10 +95,101 @@ function fixture(options: Parameters<typeof timelineCheckRecords>[1] = {}, write
 const result = (state: TimelineCheckState, rule: TimelineRule) =>
   checkTimeline(state, NOW).filter((finding) => finding.rule === rule);
 
+test('a delayed file write leaves the completed child, running figure, and session list closed', () => {
+  const close = Date.parse('2026-10-03T03:10:04.365Z');
+  const lastWork = Date.parse('2026-10-03T03:10:04.337Z');
+  const write = Date.parse('2026-10-03T03:10:05.899Z');
+  const state = fixture({ close, lastWork }, write);
+  assert.equal(state.cards[0].agents[0].state, 'done');
+  assert.equal(state.cards[0].chips.find((chip) => chip.metric === 'agents')?.running, undefined);
+  assert.equal(state.rail, 'done');
+  assert.deepEqual([...state.liveChildren], []);
+  const resumed = fixture({ close, lastWork, resume: close + 2000 }, close + 2001);
+  assert.equal(resumed.cards[0].agents[0].state, 'running');
+  assert.equal(resumed.cards[0].chips.find((chip) => chip.metric === 'agents')?.running, 1);
+  assert.equal(resumed.rail, 'subagents');
+});
+
+test('child work ignores bookkeeping and caches both known and absent work by file version', () => {
+  const file = path.join(tempDir('child-work-'), 'child.jsonl');
+  const write = (rows: object[]) => fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n'));
+  const work = CLOSE + 2000;
+  write([
+    { type: 'user', timestamp: new Date(CLOSE).toISOString() },
+    { type: 'assistant', timestamp: new Date(work).toISOString() },
+    { type: 'user', timestamp: new Date(work - 1).toISOString() },
+    { type: 'system', subtype: 'turn_duration', timestamp: new Date(NOW).toISOString() },
+    { type: 'assistant', timestamp: 'invalid' },
+  ]);
+  const cache = new ClaudeChildWorkCache();
+  const reader = vi.fn<typeof readSessionWork>(readSessionWork);
+  assert.equal(cache.read(file, 'v1', reader), work);
+  assert.equal(cache.read(file, 'v1', reader), work);
+  assert.equal(reader.mock.calls.length, 1);
+  write([{ type: 'system', subtype: 'turn_duration', timestamp: new Date(NOW).toISOString() }]);
+  assert.equal(cache.read(file, 'v2', reader), undefined);
+  assert.equal(cache.read(file, 'v2', reader), undefined);
+  assert.equal(reader.mock.calls.length, 2);
+  write([{ type: 'user', timestamp: work + 1000 }]);
+  assert.equal(cache.read(file, 'v3', reader), work + 1000);
+  assert.equal(reader.mock.calls.length, 3);
+  cache.retain(new Set());
+  assert.equal(cache.read(file, 'v3', reader), work + 1000);
+  assert.equal(reader.mock.calls.length, 4);
+});
+
+test.each(['user', 'assistant'])('large %s work reopens the child row, running figure, and session list', (type) => {
+  const resume = CLOSE + 2000;
+  const records = timelineCheckRecords('/repo', { close: CLOSE, resume });
+  const rows = records.child.map((row) =>
+    'timestamp' in row && row.timestamp === new Date(resume).toISOString()
+      ? { ...row, type, message: { role: type, content: 'Work '.repeat(70_000) } }
+      : row,
+  );
+  const state = fixture({ close: CLOSE, resume }, resume + 1, { rows });
+  assert.equal(state.cards[0].agents[0].state, 'running');
+  assert.equal(state.cards[0].chips.find((chip) => chip.metric === 'agents')?.running, 1);
+  assert.equal(state.rail, 'subagents');
+  assert.equal(result(state, 'R2')[0].result, 'pass');
+});
+
+test('large bookkeeping preserves accepted resumed child work across file versions', () => {
+  const resume = CLOSE + 2000;
+  const file = path.join(tempDir('timeline-child-'), 'child.jsonl');
+  const cache = new ClaudeChildWorkCache();
+  const options = { close: CLOSE, resume };
+  const before = fixture(options, resume + 1, { file, cache });
+  assert.equal(before.cards[0].agents[0].state, 'running');
+  const rows = [
+    ...timelineCheckRecords('/repo', options).child,
+    { type: 'system', timestamp: new Date(resume + 2).toISOString(), content: 'Bookkeeping '.repeat(30_000) },
+  ];
+  const after = fixture(options, resume + 2, { rows, file, cache });
+  assert.equal(after.cards[0].agents[0].state, 'running');
+  assert.equal(after.cards[0].chips.find((chip) => chip.metric === 'agents')?.running, 1);
+  assert.equal(after.rail, 'subagents');
+  assert.equal(result(after, 'R2')[0].result, 'pass');
+});
+
+test.each([CHILD_CLOSE_MARGIN_MS - 1, CHILD_CLOSE_MARGIN_MS, CHILD_CLOSE_MARGIN_MS + 1])(
+  'R2 applies the close margin to work %s milliseconds after closure',
+  (elapsed) => {
+    const state = fixture({ close: CLOSE, resume: CLOSE + elapsed }, CLOSE + 4000);
+    const reopens = elapsed > CHILD_CLOSE_MARGIN_MS;
+    assert.equal(state.cards[0].agents[0].state, reopens ? 'running' : 'done');
+    assert.equal(result(state, 'R2')[0].result, 'pass');
+    if (reopens) {
+      state.cards[0].agents[0].state = 'done';
+      assert.equal(result(state, 'R2')[0].result, 'violation');
+    }
+  },
+);
+
 test('R1 reports a closed child reopened by a write without new work', () => {
   const passing = fixture({ close: CLOSE });
   assert.equal(result(passing, 'R1')[0].result, 'pass');
   const broken = fixture({ close: CLOSE }, CLOSE + 2000);
+  broken.cards[0].agents[0].state = 'running';
   assert.equal(broken.cards[0].agents[0].state, 'running');
   assert.equal(result(broken, 'R1')[0].result, 'violation');
   broken.cards[0].agents.push({ ...broken.cards[0].agents[0] });
@@ -204,16 +319,31 @@ test('project sweep uses production child reopening and historical timestamp fil
   const before = [fs.readFileSync(disk.parent), fs.readFileSync(disk.child), fs.statSync(disk.child).mtimeMs];
   const report = await sweepTimeline(project, NOW - 7 * 86400000, NOW, disk.root);
   assert.equal(report.sessions, 2);
-  assert.ok(
-    report.violations.some(
-      (finding) => finding.rule === 'R1' && finding.session === 'parent' && finding.child === 'child',
-    ),
-  );
-  assert.equal(report.violations.filter((finding) => finding.rule === 'R3').length, 0);
+  assert.deepEqual(report.violations, []);
   assert.deepEqual(
     [fs.readFileSync(disk.parent), fs.readFileSync(disk.child), fs.statSync(disk.child).mtimeMs],
     before,
   );
+});
+
+test('project sweep detects resumed work missed by the production reader', async () => {
+  const project = tempDir('timeline-workspace-');
+  const resume = CLOSE + 3000;
+  const disk = diskFixture(project, { close: CLOSE, resume });
+  const original = transcript.readSessionWork;
+  const failed = vi
+    .spyOn(transcript, 'readSessionWork')
+    .mockImplementation((file, bytes, now) => (file === disk.child ? null : original(file, bytes, now)));
+  try {
+    const report = await sweepTimeline(project, NOW - 86400000, NOW, disk.root);
+    assert.ok(
+      report.violations.some(
+        (finding) => finding.rule === 'R2' && finding.child === 'child' && finding.lastWork === resume,
+      ),
+    );
+  } finally {
+    failed.mockRestore();
+  }
 });
 
 test.each(['opening', 'old turns'])('project sweep retains unknown coverage for incomplete %s', async (prefix) => {
@@ -314,9 +444,9 @@ test('npm prefix and extension-directory invocations default to the caller proje
         shell: process.platform === 'win32',
       },
     );
-    assert.equal(launch.status, 1, launch.stderr + launch.stdout);
+    assert.equal(launch.status, 0, launch.stderr + launch.stdout);
     assert.ok(launch.stdout.includes(`Project ${cwd}`), launch.stdout);
-    assert.ok(launch.stdout.includes('R1'), launch.stdout);
+    assert.ok(launch.stdout.includes('0 violations'), launch.stdout);
   }
 });
 

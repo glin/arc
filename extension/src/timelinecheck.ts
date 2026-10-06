@@ -6,6 +6,7 @@ import {
   createClaudeRelationshipReducer,
   createClaudeSessionReducer,
   projectsRoot,
+  readSessionWork,
   refreshClaudeAgentFacts,
   sessionFilesFor,
   sessionOutcomeOf,
@@ -17,6 +18,7 @@ import {
 import { carriedSubagentCount, liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
 import { toCard, TURN_QUIET_MS, type TurnCard } from './turncard';
 import { childrenOutliveTurn, type RailStatus } from './view/rail';
+import { CHILD_CLOSE_MARGIN_MS } from './turnrail';
 
 export type TimelineRule = 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
 export interface TimelineFinding {
@@ -156,7 +158,7 @@ export function checkTimeline(state: TimelineCheckState, now: number): TimelineF
       continue;
     }
     const fresh = now - evidence.lastWork <= TURN_QUIET_MS;
-    const resumed = close !== undefined && evidence.lastWork > close.at;
+    const resumed = close !== undefined && evidence.lastWork > close.at + CHILD_CLOSE_MARGIN_MS;
     const ended = state.parent.processEndedAt !== undefined && evidence.lastWork <= state.parent.processEndedAt;
     add(
       'R1',
@@ -308,7 +310,15 @@ export async function sweepTimeline(project: string, since: number, now: number,
     (file) => reads.get(file)?.read,
     (session) => ({ outcome: sessionOutcomeOf(reads.get(session.file)!.read), backgroundCommands: [] }),
   );
-  const live = liveTimelineChildren(outcomes, children, references, new Map(), new Map(), now);
+  const live = liveTimelineChildren(
+    outcomes,
+    children,
+    references,
+    new Map(),
+    new Map(),
+    now,
+    (file) => readSessionWork(file, undefined, now) ?? undefined,
+  );
   const rail = timelineRailState(outcomes, live, new Set(), new Set(), new Map(), new Map(), now);
   const findings: TimelineFinding[] = [];
   let checked = 0;
