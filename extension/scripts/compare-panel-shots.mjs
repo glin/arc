@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
+import { launchAnyBrowser } from '../test/browserchannels.mjs';
 
 export function compareRgba(before, after) {
   if (before.width !== after.width || before.height !== after.height) {
@@ -70,15 +70,9 @@ export function shotPairs(beforeDir, afterDir) {
   }));
 }
 
+// Use the shared launcher, which orders browsers to avoid the Edge and Chrome Windows sign-in failure.
 async function browserOrNone() {
-  for (const channel of ['msedge', 'chrome', undefined]) {
-    try {
-      return await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
-    } catch {
-      // Try the next browser installed on this machine.
-    }
-  }
-  return null;
+  return (await launchAnyBrowser())?.browser ?? null;
 }
 
 function imageDataUrl(file) {

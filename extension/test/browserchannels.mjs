@@ -5,7 +5,39 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-const CHANNELS = ['msedge', 'chrome', undefined];
+// Edge and Chrome 152 and later on Windows call LogonUser with an invalid password on every launch.
+// Each call counts as a failed sign-in for the Windows account. One browser lane run starts about
+// twenty browsers, and a lockout policy of ten failures in ten minutes locks the account mid-run.
+// https://issues.chromium.org/issues/541310282
+// https://github.com/MicrosoftEdge/WebView2Feedback/issues/5722
+// Playwright's bundled headless shell, the undefined channel, leaves out the browser layer that makes
+// the call, so it comes first. Install it with `npx playwright-core install chromium-headless-shell`.
+// Edge and Chrome stay as fallbacks with the feature that makes the call turned off.
+// Restore the order Edge, Chrome, bundled and drop EDGE_SIGN_IN_WORKAROUND once a fixed Edge and Chrome ship.
+export const BROWSER_CHANNELS = [undefined, 'msedge', 'chrome'];
+
+// Playwright passes its own --disable-features list, and Chromium keeps only the last copy of a switch.
+// The workaround therefore repeats Playwright's list, so its automation settings stay off too.
+// scripts/extension-test-runner.test.js fails when a Playwright upgrade changes that list.
+export const PLAYWRIGHT_DISABLED_FEATURES = [
+  'AvoidUnnecessaryBeforeUnloadCheckSync',
+  'BoundaryEventDispatchTracksNodeRemoval',
+  'DestroyProfileOnBrowserClose',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'HttpsUpgrades',
+  'LensOverlay',
+  'MediaRouter',
+  'PaintHolding',
+  'ThirdPartyStoragePartitioning',
+  'BlockOriginHeaderModificationOnRedirect',
+  'Translate',
+  'AutoDeElevate',
+  'OptimizationHints',
+  'msForceBrowserSignIn',
+  'msEdgeUpdateLaunchServicesPreferredVersion',
+];
+export const EDGE_SIGN_IN_WORKAROUND = `--disable-features=${[...PLAYWRIGHT_DISABLED_FEATURES, 'AutofillAiWalletPrivatePasses'].join(',')}`;
 const BROWSER_LAUNCH_TIMEOUT_MS = 10_000;
 export const BROWSER_SLOT_COUNT = 16;
 // Use the machine temporary directory saved before Vitest redirects TEMP for its run.
@@ -229,12 +261,13 @@ export async function launchAnyBrowser({
     return null;
   }
   const permit = await acquireSlot();
-  for (const channel of CHANNELS) {
+  for (const channel of BROWSER_CHANNELS) {
+    const channelArgs = channel ? [...args, EDGE_SIGN_IN_WORKAROUND] : args;
     try {
       const browser = await chromium.launch({
         headless: true,
         timeout: BROWSER_LAUNCH_TIMEOUT_MS,
-        ...(args.length ? { args } : {}),
+        ...(channelArgs.length ? { args: channelArgs } : {}),
         ...(channel ? { channel } : {}),
       });
       try {

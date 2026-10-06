@@ -41,7 +41,7 @@ Use the diagnostic capture script in [Performance capture](docs/development.md#p
 
 Follow the Fast iteration section of `docs/development.md` to test a change while you work and before handoff.
 
-The `panel.layout*.test.ts` files run the panel in Edge or Chrome. Each skips when neither browser exists. Read the skip result after changing `extension/src/webview/panel.css`.
+The `panel.layout*.test.ts` files run the panel in bundled Chromium, Edge, or Chrome. Each skips when no browser exists. Read the skip result after changing `extension/src/webview/panel.css`.
 
 Build before viewing changes to `extension/src/webview/panel.css`, `extension/src/webview/panel.ts`, `extension/src/webview/main.ts`, or `extension/src/panelbundle.ts`:
 

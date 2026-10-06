@@ -12,7 +12,6 @@ import * as path from 'node:path';
 import { estimateCodexContext } from '../src/codexcontext.ts';
 import { normalizeContext } from '../src/domain/context-detail.ts';
 import { codexContextRecords } from '../src/turnfixtures.ts';
-import { chromium } from 'playwright-core';
 import type { Browser, Page } from 'playwright-core';
 import { composerView, sessionLauncherView, type LivePress } from '../src/composerview.ts';
 import {
@@ -793,20 +792,10 @@ function activityPayload(which: NonNullable<Shot['activity']>): Record<string, u
 // Use a string because transpiled functions can reference helpers unavailable inside the page.
 export const SETTLED = 'new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))';
 
-// Try installed Edge, Chrome, then bundled Chromium. Download no browser.
+// Use the shared launcher, which orders browsers to avoid the Edge and Chrome Windows sign-in failure.
 export async function browserOrNone(): Promise<Browser | null> {
-  for (const channel of ['msedge', 'chrome', undefined]) {
-    try {
-      return await chromium.launch({
-        headless: true,
-        args: ['--hide-scrollbars'],
-        ...(channel ? { channel } : {}),
-      });
-    } catch {
-      // Try the next installed browser.
-    }
-  }
-  return null;
+  const { launchAnyBrowser } = await import('../test/browserchannels.mjs');
+  return (await launchAnyBrowser({ args: ['--hide-scrollbars'] }))?.browser ?? null;
 }
 
 export function firstProjectPayload(draft: boolean): Record<string, unknown> {

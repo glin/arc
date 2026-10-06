@@ -211,7 +211,7 @@ test('a launched browser releases its slot when it closes', async () => {
     }),
     loadChromium: async () => ({ launch: async () => browser }),
   });
-  assert.equal(result.channel, 'msedge');
+  assert.equal(result.channel, undefined);
   assert.equal(releases, 0);
   await result.browser.close();
   await result.browser.close();
@@ -255,7 +255,7 @@ test('stalled browser channels reach an available fallback before the mockup tes
       loadChromium: async () => ({
         launch: ({ channel, timeout = 180_000 }) => {
           channels.push(channel);
-          if (!channel) return Promise.resolve(browser);
+          if (channel === 'chrome') return Promise.resolve(browser);
           return new Promise((_, reject) => {
             setTimeout(() => reject(new Error('browser did not start')), timeout);
           });
@@ -268,7 +268,7 @@ test('stalled browser channels reach an available fallback before the mockup tes
     });
     await vi.advanceTimersByTimeAsync(30_000);
     assert.ok(result, 'stalled preferred channels prevented the available browser from launching');
-    assert.deepEqual(channels, ['msedge', 'chrome', undefined]);
+    assert.deepEqual(channels, [undefined, 'msedge', 'chrome']);
     assert.equal(result.browser, browser);
     assert.equal(releases, 0);
     await result.browser.close();
@@ -276,6 +276,38 @@ test('stalled browser channels reach an available fallback before the mockup tes
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('Edge and Chrome launches turn off the feature that fails Windows sign-in', async () => {
+  const launches = [];
+  await browserChannels.launchAnyBrowser({
+    args: ['--hide-scrollbars'],
+    acquireSlot: async () => ({ release: () => true }),
+    loadChromium: async () => ({
+      launch: async ({ channel, args }) => {
+        launches.push({ channel, args });
+        throw new Error('unavailable');
+      },
+    }),
+  });
+  const workaround = browserChannels.EDGE_SIGN_IN_WORKAROUND;
+  assert.match(workaround, /AutofillAiWalletPrivatePasses/);
+  assert.deepEqual(launches, [
+    { channel: undefined, args: ['--hide-scrollbars'] },
+    { channel: 'msedge', args: ['--hide-scrollbars', workaround] },
+    { channel: 'chrome', args: ['--hide-scrollbars', workaround] },
+  ]);
+});
+
+test('the Edge sign-in workaround repeats the installed Playwright disabled-feature list', () => {
+  const bundle = fs.readFileSync(
+    require.resolve('playwright-core/lib/coreBundle', { paths: [path.join(__dirname, '../extension')] }),
+    'utf8',
+  );
+  const list = /disabledFeatures = \[([\s\S]*?)\]\.filter/.exec(bundle);
+  assert.ok(list, 'Playwright no longer declares disabledFeatures in coreBundle.js');
+  const installed = [...list[1].replace(/\/\/.*$/gm, '').matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(browserChannels.PLAYWRIGHT_DISABLED_FEATURES, installed);
 });
 
 function lockFixture() {

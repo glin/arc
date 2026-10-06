@@ -7,6 +7,10 @@ const { randomUUID } = require('node:crypto');
 const { fork, spawnSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..', '..', '..');
 const { chromium } = require(path.join(root, 'extension', 'node_modules', 'playwright-core'));
+// Share the test launcher's browser order and Edge sign-in workaround. BROWSER_CHANNELS in browserchannels.mjs explains both.
+const { BROWSER_CHANNELS, EDGE_SIGN_IN_WORKAROUND } = require(
+  path.join(root, 'extension', 'test', 'browserchannels.mjs'),
+);
 const COMMAND_TIMEOUT_MS = 60_000;
 const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
 const BROWSER_LAUNCH_TIMEOUT_MS = Number(process.env.ARC_RENDER_LAUNCH_TIMEOUT_MS) || 30_000;
@@ -85,7 +89,10 @@ async function runBrowserOwner(channelName) {
     server = await chromium.launchServer({
       headless: true,
       timeout: BROWSER_LAUNCH_TIMEOUT_MS,
-      args: [`${BROWSER_OWNERSHIP_ARGUMENT}${process.env.ARC_RENDER_BROWSER_TOKEN}`],
+      args: [
+        `${BROWSER_OWNERSHIP_ARGUMENT}${process.env.ARC_RENDER_BROWSER_TOKEN}`,
+        ...(channelName === 'bundled' ? [] : [EDGE_SIGN_IN_WORKAROUND]),
+      ],
       ...(channelName === 'bundled' ? {} : { channel: channelName }),
       ...(testHost ? { host: testHost } : {}),
     });
@@ -301,7 +308,7 @@ async function render() {
   const testSequence = process.env.ARC_RENDER_TEST_SEQUENCE === 'partial-connect-normal';
   const testChannel =
     process.env.ARC_RENDER_TEST_CHANNEL === 'bundled' ? undefined : process.env.ARC_RENDER_TEST_CHANNEL;
-  const channels = testSequence ? [testChannel, testChannel, testChannel] : ['msedge', 'chrome', undefined];
+  const channels = testSequence ? [testChannel, testChannel, testChannel] : BROWSER_CHANNELS;
   for (const [attempt, channel] of channels.entries()) {
     let owner;
     try {

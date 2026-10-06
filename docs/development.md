@@ -12,7 +12,10 @@ Install extension and CLI dependencies before building or testing:
 npm install
 npm --prefix extension install
 npm --prefix cli install
+npm --prefix extension exec -- playwright-core install chromium-headless-shell
 ```
+
+The last command installs Playwright's bundled Chromium in the per-user Playwright cache, outside the repository. The browser tests and screenshot scripts use it first. [Verification](#verification) gives the reason.
 
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
@@ -28,7 +31,7 @@ From `extension/`, run the README capture command:
 npx tsx scripts/readme-shots.ts
 ```
 
-The command builds the panel and writes the README images to `docs/images/`. Pass an output directory to keep comparison captures outside the repository. Edge, Chrome, or bundled Chromium and ImageMagick 7 must be available. Captures use a fixed clock, `en-US` locale, `America/Chicago` timezone, and two device pixels per CSS pixel. GPU rasterization is off.
+The command builds the panel and writes the README images to `docs/images/`. Pass an output directory to keep comparison captures outside the repository. Bundled Chromium, Edge, or Chrome and ImageMagick 7 must be available. Captures use a fixed clock, `en-US` locale, `America/Chicago` timezone, and two device pixels per CSS pixel. GPU rasterization is off.
 
 The main image captures the exported web demo with its session list narrowed to 270 CSS pixels. The panel viewport is 1120 by 740 CSS pixels. The exported demo supplies the decorative VS Code title bar, activity strip, and Arc tab. The frame adds 16 CSS pixels of transparent spacing and a soft shadow. Its final image is 2372 by 1652 pixels. The capture hides the header through the shared shell stylesheet. The exported demo keeps its header and session list width.
 
@@ -177,11 +180,11 @@ npm --prefix extension run test:browser
 
 Each browser process that waits for a shared slot prints `Browser test slot wait: <milliseconds> ms.` after it acquires one. The figure uses a monotonic clock and covers only time waiting for a slot. An immediate acquisition prints no wait line.
 
-The shared browser launcher tries Edge, Chrome, and bundled Chromium in that order. Each launch attempt has a ten-second timeout before the launcher tries the next channel. This bounds stalled launches before the panel-mockup scale test's sixty-second deadline.
+The shared browser launcher tries bundled Chromium, Edge, and Chrome in that order. Edge and Chrome on Windows record one failed sign-in for the Windows account on every launch, and one browser lane run reaches a lockout threshold of ten failures. Bundled Chromium leaves out the browser layer that makes that call. Edge and Chrome launches turn off the feature that makes the call. They also repeat Playwright's own `--disable-features` list, because Chromium keeps only the last copy of a switch. The comment on `BROWSER_CHANNELS` in `extension/test/browserchannels.mjs` links the browser defect reports. Each launch attempt has a ten-second timeout before the launcher tries the next channel. This bounds stalled launches before the panel-mockup scale test's sixty-second deadline.
 
 A browser lane that waits for the machine-wide lock prints one line naming the PID, the extension directory, and the start time of the run holding it, once, when the wait begins. The lane prints a second line once it resumes, naming how long it waited. An immediate acquisition prints neither line.
 
-The `panel.layout*.test.ts` files and the other browser files build the panel and measure it in Edge, Chrome, or bundled Chromium. Each test skips when no browser exists. Full mode names the browser executable it found before the browser lane runs, or states that the lane found no browser. Read the skip result after changing panel styles.
+The `panel.layout*.test.ts` files and the other browser files build the panel and measure it in bundled Chromium, Edge, or Chrome. Each test skips when no browser exists. Full mode names the browser executable it found before the browser lane runs, or states that the lane found no browser. Read the skip result after changing panel styles.
 
 Build before opening the panel after changing its stylesheet, browser script, browser entry, or bundle input:
 
