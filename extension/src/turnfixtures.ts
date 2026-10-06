@@ -25,6 +25,77 @@ import type { LivePress } from './composerview.ts';
 import { toCard, type TurnCard } from './turncard.ts';
 import { ARC_IDENTITY } from './identity.ts';
 
+// Synthetic clocks reproduce transcript closure, delayed writes, and resumed work.
+export function timelineCheckRecords(
+  cwd: string,
+  options: { close?: number; resume?: number; foreground?: boolean; noId?: boolean; carried?: boolean } = {},
+) {
+  const start = Date.parse('2026-10-03T03:00:00Z');
+  const stamp = (at: number) => new Date(at).toISOString();
+  const assistant = (at: number, content: unknown[]) => ({
+    type: 'assistant',
+    cwd,
+    timestamp: stamp(at),
+    message: { role: 'assistant', content, stop_reason: 'end_turn' },
+  });
+  const prompt = (at: number, text: string) => ({
+    type: 'user',
+    cwd,
+    timestamp: stamp(at),
+    message: { role: 'user', content: text },
+  });
+  const parent: object[] = [
+    prompt(start, 'Run the synthetic worker'),
+    assistant(start + 1000, [
+      {
+        type: 'tool_use',
+        id: 'launch',
+        name: 'Agent',
+        input: { description: 'Synthetic worker', subagent_type: 'general-purpose' },
+      },
+    ]),
+  ];
+  if (!options.noId)
+    parent.push({
+      type: 'user',
+      cwd,
+      timestamp: stamp(start + 2000),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'launch', content: 'launched' }] },
+      toolUseResult: {
+        agentId: 'child',
+        status: options.foreground ? 'completed' : 'running',
+        description: 'Synthetic worker',
+        totalToolUseCount: 0,
+        isAsync: !options.foreground,
+      },
+    });
+  if (!options.noId) parent.push(assistant(start + 3000, [{ type: 'text', text: 'The worker started.' }]));
+  if (options.close !== undefined)
+    parent.push({
+      type: 'user',
+      cwd,
+      timestamp: stamp(options.close),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<task-notification><tool-use-id>launch</tool-use-id><task-id>child</task-id><status>completed</status></task-notification>',
+      },
+    });
+  if (options.carried)
+    parent.push(
+      prompt(start + 5000, 'Another synthetic turn'),
+      assistant(start + 6000, [{ type: 'text', text: 'Finished.' }]),
+    );
+  const child: object[] = [
+    prompt(start + 2000, 'Synthetic child work'),
+    assistant(start + 4000, [{ type: 'text', text: 'Child result.' }]),
+  ];
+  if (options.resume !== undefined) child.push(prompt(options.resume, 'Resume synthetic work'));
+  child.push({ type: 'system', subtype: 'turn_duration', timestamp: stamp(start + 7000), durationMs: 1 });
+  return { parent, child, start };
+}
+
 export const counts = (over: Partial<ToolCounts> = {}): ToolCounts => ({
   edits: 0,
   reads: 0,

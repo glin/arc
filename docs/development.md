@@ -102,6 +102,14 @@ To compare test results between two commits, run both in checkouts set up the sa
 
 Run `npm run test:iterate` while you iterate. It runs typecheck and then the extension node lane.
 
+Run the read-only Claude timeline sweep when a state needs checking:
+
+```bash
+npm --prefix extension run check:timeline -- --since 7d
+```
+
+The project defaults to the folder where the caller ran npm. Pass `--project <folder>` to select another project. Pass `--now <ISO-time>` to replay timestamped records at that time. Historical file write times remain unavailable. Violations exit with status 1. Invalid arguments or command failures exit with status 2.
+
 Name the browser test files for the area you changed and run them directly with `node extension/test.mjs browser <files>`. Each named file narrows the lane to just that file, relative to `extension/` or to the repository root. A name that is not a browser test file fails with a clear message instead of running the whole lane.
 
 After all edits, format your changes and run the tests once before handoff. In an isolated worktree, format the whole repository and run the full suite:

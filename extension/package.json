@@ -685,6 +685,7 @@
     ]
   },
   "scripts": {
+    "check:timeline": "tsx scripts/check-timeline.ts",
     "build": "node esbuild.mjs",
     "typecheck": "node --import tsx scripts/check-webview-globals.ts && tsc --noEmit -p tsconfig.json && tsc --noEmit -p src/webview/tsconfig.json",
     "watch": "node esbuild.mjs --watch",

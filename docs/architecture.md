@@ -178,6 +178,7 @@ The first column is checked against the shipped extension directory by `architec
 | `sessiondetails.ts` | Narrows a card list to the session the panel is showing | no |
 | `panelhost.ts` | Extension-host side of the panel webview, per-host readiness, durable initial catalog demand, staged loading, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance | yes |
 | `timelinestate.ts` | Combines accepted tail, lifetime, and parsed outcomes, assembles child write times and live child IDs, projects session-list status and counts, and exposes the card's carried-subagent count | no |
+| `timelinecheck.ts` | Reads raw Claude work and close evidence independently, checks timeline consistency, and assembles read-only project sweeps through the shared timeline state and card projections | no |
 | `progressiveworker.ts` | Typed worker requests, cancellation, discovery checkpoints and quantum deltas, transport counters, revision and generation acceptance, and host-lifetime commit evidence reservations | no |
 | `selectedsource.ts` | Selected filename resolution, bounded native identity and workspace validation, and selected descendant transport | no |
 | `progressiveworker-entry.ts` | Worker execution of metadata, one protected live metadata recovery, bounded Claude relationship quanta, recursive catalog closure, Codex dispatch discovery, and source-local dispatched figures, incremental readers, and semantic page adapters | no |
@@ -356,6 +357,8 @@ Subagent row names contain absolutely positioned accessible text. The clipped na
 The editor boundary is `extension.ts`, `panelhost.ts`, `uris.ts`, and `config.ts`. Other production modules avoid `vscode`, so tests can import their decisions directly. `extension/src/imports.test.ts` enforces package direction and runtime cycles.
 
 `panelhost.ts` supplies accepted reads, child write times, process exits, and the observation clock to `timelinestate.ts`. Dispatched rows and Git commit recovery stay in the host. `turncard.ts` owns the carried-subagent count that `timelinestate.ts` exports, keeping card rendering independent of session-list assembly.
+
+`extension/scripts/check-timeline.ts` reads project Claude transcripts and child file timestamps on request. `timelinecheck.ts` drops later timestamped records and supplies clamped write times to the production derivation. Current filesystem timestamps cannot reconstruct historical write times. Unknown background identity, missing work timestamps, and incomplete evidence produce unknown results. An incomplete admitted source remains counted when no applicable turn was readable. Raw parent process ends exempt preceding child work from the resumed-running check. Later child work retains that check. The figure and session-list checks compare outputs of one derivation. They do not establish independent truth. Codex, dispatched rows, and commit counts are outside the sweep.
 
 `payload.ts` shapes host-to-panel render messages. The panel runs in another process, so a host import cannot supply browser code. Shared rules live in browser-safe `domain/` and `view/` modules. Host-only decisions travel as data over `webview/protocol.ts`.
 
