@@ -163,11 +163,13 @@ export interface RenderMessage extends Record<string, unknown> {
   timelineLayout: TimelineLayout;
 }
 
-// Session loading status. A pending status repeats the last relationship source count when the host holds one.
+// Session loading status. A pending status repeats the last relationship source count when the host holds one. A held status
+// is pending work after the session list completed, which keeps the loading line hidden.
 export interface PanelStartup {
   generation: number;
   complete: boolean;
   failed?: boolean;
+  held?: boolean;
   completed?: number;
   known?: number;
 }
@@ -203,6 +205,7 @@ export type HostToPanel =
       known: number;
       complete?: boolean;
       failed?: boolean;
+      held?: boolean;
     }
   | { type: 'contextDetail'; detail: ContextDetail }
   | { type: 'focusProjectSpend' }
@@ -594,6 +597,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     case 'startupProgress':
       return (m.complete === undefined || typeof m.complete === 'boolean') &&
         (m.failed === undefined || typeof m.failed === 'boolean') &&
+        (m.held === undefined || typeof m.held === 'boolean') &&
         Number.isSafeInteger(m.generation) &&
         Number.isSafeInteger(m.sequence) &&
         isString(m.epoch) &&

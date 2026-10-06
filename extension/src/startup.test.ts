@@ -27,6 +27,7 @@ import { CodexOpeningsWriter, loadCodexOpenings } from './codexopenings';
 import { tempDir } from './temproot.ts';
 import { buildSync, transformSync } from 'esbuild';
 import { messageByteBudget, PanelPerformanceCounters, serializedMessageBytes } from './performancediagnostics';
+import { SessionLoadingLine } from './sessionloadingline';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
   agentRunScanUnread,
@@ -999,6 +1000,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const RAIL_NAME_LIMIT = 200;
     export class Harness {
       failSessionLoading() {}
+      loadingLine = new SessionLoadingLine(() => {});
       hosts = []; readyHosts = new Set(); panelVisibility = createPanelVisibility(); reads = 0; polls = 0; usageRequests = [];
       queuedEditOffers = new Map(); queuedEditReservations = new Set();
       railOrder = []; boxText = {}; sessionRows = [{ id: 'selected', agentKey: 'claude' }]; refreshGeneration = 0; refreshController = null;
@@ -1036,6 +1038,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'orderSessionCatalog',
     'mergeRefreshRequests',
     'CATALOG_REFRESH_DEADLINE_MS',
+    'SessionLoadingLine',
     compiled,
   )(
     module,
@@ -1044,6 +1047,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     orderSessionCatalog,
     mergeRefreshRequests,
     CATALOG_REFRESH_DEADLINE_MS,
+    SessionLoadingLine,
   );
   const provider = new module.exports.Harness();
   if (registerRefreshHandler) {
@@ -1139,6 +1143,7 @@ function completeDiscoveryHarness(
     'storeTitleEntry',
     'recordLoadingFailures',
     'sessionLoadingState',
+    'sessionLoadingBlocker',
     'postSessionLoading',
     'sendSessionLoading',
     'withSourceCount',
@@ -1197,6 +1202,7 @@ function completeDiscoveryHarness(
     let railPayload = () => ({ rail: [], labels: [], views: [], railFilters: [], stats: {} });
     export class Harness {
       failSessionLoading() {}
+      loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       authoritativeCatalog = null; earlySelectedSources = new Map(); attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
@@ -1319,6 +1325,7 @@ function completeDiscoveryHarness(
     'isDeepStrictEqual',
     'invalidateClaudeCostSupplements',
     'countedDispatchedCosts',
+    'SessionLoadingLine',
     ...Object.keys(scope),
     compiled,
   )(
@@ -1359,6 +1366,7 @@ function completeDiscoveryHarness(
     isDeepStrictEqual,
     invalidateClaudeCostSupplements,
     countedDispatchedCosts,
+    SessionLoadingLine,
     ...Object.values(scope),
   );
   return new module.exports.Harness();
@@ -7352,8 +7360,14 @@ test.each([false, true])(
         const messages = provider.posts.filter(
           (message: { generation: number }) => message.generation === provider.refreshGeneration,
         );
+        // The list completed before this generation, so a later work failure keeps its state but holds the line hidden.
         assert.equal(messages.at(-1).complete, !failed);
         assert.equal(messages.at(-1).failed, failed ? true : undefined);
+        assert.equal(
+          messages.at(-1).held,
+          failed ? true : undefined,
+          'a work failure after completion showed the loading line',
+        );
         assert.equal(
           new Set(messages.map((message: { epoch: string }) => message.epoch)).size,
           1,
@@ -7371,7 +7385,7 @@ test.each([false, true])(
 
 // Two Codex sources and one healthy Claude source behind relationship discovery that reports a full source count on each poll.
 function exhaustedLoadingHarness(): any {
-  const provider = paintHarness(['workspaceFoldersChanged']);
+  const provider = paintHarness(['workspaceFoldersChanged', 'repositoryScopeChanged']);
   provider.progressiveCurrent = () => true;
   const healthy = provider.partial[0];
   const codex = (name: string, activity: number) => ({
@@ -7476,8 +7490,10 @@ function exhaustedLoadingHarness(): any {
       (message: { generation: number }) => message.generation === provider.refreshGeneration,
     );
     const progress = posts.find((message: { known: number }) => message.known === known);
-    assert.ok(progress, 'the poll posted no source count');
-    return { progress: progress.failed, last: posts.at(-1) };
+    // Once the list completes, the line holds completion and the poll posts no source count.
+    if (!provider.loadingLine.held(JSON.stringify(provider.repositoryScopeRoots)))
+      assert.ok(progress, 'the poll posted no source count');
+    return { progress: progress?.failed, last: posts.at(-1) };
   };
   return { provider, healthy, first, second, codex, settled, recovering, exhausted, catalog, discovery, poll };
 }
@@ -7500,6 +7516,7 @@ test('exhausted metadata sources settle the session list without a failure', asy
     provider.titles.set(first.file, recovering(first));
     let status = await poll();
     assert.equal(status.last.complete, false, 'a reopened read reported completion');
+    assert.equal(status.last.held, true, 'a reopened read after completion showed the loading line');
     assert.equal(status.last.failed, undefined);
     provider.titles.set(first.file, exhausted(first));
     status = await poll();
@@ -7703,9 +7720,10 @@ test.for([true, false])(
         statuses(reading).map(() => [undefined, undefined]),
         'the reading panel kept the count of a list that completed',
       );
+      // The reading panel's newest turns keep its stamps pending, and the list completion holds its line hidden.
       assert.deepEqual(
-        statuses(reading).map((entry) => entry.startup.complete),
-        statuses(reading).map(() => false),
+        statuses(reading).map((entry) => [entry.startup.complete, entry.startup.held]),
+        statuses(reading).map(() => [false, true]),
       );
     } finally {
       vi.clearAllTimers();
@@ -7851,6 +7869,7 @@ test('an exhausted early selected source stays settled through selection renders
     await provider.refresh(false, true);
     assert.equal(provider.posts.at(-1).generation, provider.refreshGeneration);
     assert.equal(provider.posts.at(-1).failed, true, 'the discovery failure posted no failure');
+    assert.equal(provider.posts.at(-1).held, true, 'a discovery failure after completion showed the loading line');
     discovery.fail = false;
     const { progress, last } = await poll();
     assert.equal(progress, undefined, 'the next source count kept a failure');
@@ -7864,9 +7883,9 @@ test('an exhausted early selected source stays settled through selection renders
 test('relationship progress after a work failure in its generation keeps the failure', async () => {
   vi.useFakeTimers();
   try {
-    const { provider, first, second, settled, discovery, poll } = exhaustedLoadingHarness();
-    provider.titles.set(first.file, settled(first));
-    provider.titles.set(second.file, settled(second));
+    const { provider, first, second, recovering, discovery, poll } = exhaustedLoadingHarness();
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
     await provider.refresh(true);
     assert.equal(provider.messages.at(-1).startup.failed, undefined);
     provider.useRefreshGate(() => false);
@@ -7878,6 +7897,352 @@ test('relationship progress after a work failure in its generation keeps the fai
     vi.clearAllTimers();
     vi.useRealTimers();
   }
+});
+
+// Every loading state the panel receives, in delivery order: status posts and the stamps on renders and selections.
+// A stamp shows the line unless it is complete, failed, or held, as the panel's applySessionLoading decides. The panel acknowledges
+// completion for a stamp that is complete.
+type LoadingEntry = { kind: string; generation: number; visible: boolean; complete: boolean };
+function loadingStream(provider: any): LoadingEntry[] {
+  const stream: LoadingEntry[] = [];
+  const entry = (
+    kind: string,
+    stamp: { generation: number; complete?: boolean; failed?: boolean; held?: boolean },
+  ) => ({
+    kind,
+    generation: stamp.generation,
+    visible: stamp.complete !== true && stamp.failed !== true && stamp.held !== true,
+    complete: stamp.complete === true,
+  });
+  const post = provider.post.bind(provider);
+  provider.post = (message: any) => {
+    if (message.type === 'startupProgress') stream.push(entry('progress', message));
+    return post(message);
+  };
+  const send = provider.sendToHost.bind(provider);
+  provider.sendToHost = (host: unknown, message: any) => {
+    if (message.startup) stream.push(entry(message.type, message.startup));
+    return send(host, message);
+  };
+  return stream;
+}
+
+test('the loading line stays hidden after the session list completes until the scope changes', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, codex, settled, recovering, catalog, discovery, poll } =
+      exhaustedLoadingHarness();
+    const stream = loadingStream(provider);
+    const render = async () => {
+      provider.useRefreshGate(() => true);
+      await provider.refresh(false);
+      provider.useRefreshGate(() => false);
+    };
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await poll();
+    await poll();
+    assert.ok(
+      stream.some((entry) => entry.visible),
+      'the first load never showed the loading line',
+    );
+    assert.deepEqual(
+      stream.filter((entry) => !entry.visible),
+      [],
+      'the incomplete first load claimed completion',
+    );
+
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    await poll();
+    assert.equal(stream.at(-1)?.visible, false, 'the settled list did not complete');
+    const completedAt = stream.length;
+    const hiddenSince = (label: string) =>
+      assert.deepEqual(
+        stream.slice(completedAt).filter((entry) => entry.visible),
+        [],
+        `${label} showed the loading line after completion`,
+      );
+
+    for (let index = 0; index < 3; index++) await poll();
+    hiddenSince('an ordinary poll');
+
+    // A live append grows a source, so its held metadata no longer matches its revision.
+    const grown = { ...first, size: 2, mtimeMs: 2 };
+    catalog([healthy, grown, second]);
+    await render();
+    await poll();
+    hiddenSince('a live revision');
+
+    // A new session arrives before its start times are read.
+    const added = codex('codex-c', 70);
+    provider.titles.set(added.file, { ...settled(added), starts: undefined });
+    catalog([healthy, grown, second, added]);
+    await render();
+    await poll();
+    hiddenSince('a new session without start times');
+
+    // A source's metadata read reopens without a catalog change, so no render runs.
+    provider.titles.set(second.file, recovering(second));
+    await poll();
+    provider.titles.set(second.file, settled(second));
+    hiddenSince('a reopened metadata read');
+
+    // A work failure, then its retry.
+    discovery.fail = true;
+    await poll();
+    discovery.fail = false;
+    await poll();
+    hiddenSince('a work failure and its retry');
+
+    // Discovery asks for further passes.
+    discovery.pending = true;
+    await poll();
+    await poll();
+    discovery.pending = false;
+    hiddenSince('a discovery continuation');
+
+    // The selected session's newest turn is loading.
+    provider._showing = healthy.sessionId;
+    provider.progressiveCurrent = () => false;
+    await render();
+    await provider.refresh(true, true, true, true);
+    hiddenSince('a loading newest turn');
+    assert.ok(stream.length - completedAt >= 10, 'too few posts followed completion to compare');
+
+    // New workspace folders read again, so the render of their unsettled list shows the line.
+    provider.workspaceFoldersChanged();
+    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+    Object.assign(provider, { repositoryScopeReady: true, repositoryScopeRoots: ['project'] });
+    provider.titles.set(second.file, recovering(second));
+    const changedAt = stream.length;
+    await render();
+    assert.ok(
+      stream.slice(changedAt).some((entry) => entry.kind === 'render' && entry.visible),
+      'a scope change kept the previous scope complete',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('the startup acknowledgement waits for the selected newest turn when the list first completes', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, settled } = exhaustedLoadingHarness();
+    const stream = loadingStream(provider);
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    provider._showing = healthy.sessionId;
+    provider.progressiveCurrent = () => false;
+    await provider.refresh(true);
+    provider.postSessionLoading(provider.partial, provider.refreshGeneration, new AbortController().signal);
+    assert.ok(
+      provider.loadingLine.held(JSON.stringify(provider.repositoryScopeRoots)),
+      'the complete list did not hold the line',
+    );
+    assert.ok(
+      stream.some((entry) => entry.kind !== 'progress'),
+      'the first load posted no render stamp',
+    );
+    assert.deepEqual(
+      stream.filter((entry) => entry.complete),
+      [],
+      'the panel was told to acknowledge completion while the newest turn loaded',
+    );
+    assert.equal(stream.at(-1)?.visible, false, 'the complete list kept the loading line');
+    provider.progressiveCurrent = () => true;
+    await provider.refresh(true, true, true, true);
+    assert.equal(stream.at(-1)?.complete, true, 'the current newest turn did not complete the render');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('new repository scope roots show loading until a list listed under them completes', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, settled, poll } = exhaustedLoadingHarness();
+    const stream = loadingStream(provider);
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    provider._showing = healthy.sessionId;
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await poll();
+    assert.ok(provider.loadingLine.held(JSON.stringify(['project'])), 'the settled list did not hold the line');
+    const signal = new AbortController().signal;
+    // The selected window's render lists the catalog the previous roots built, then pending discovery for the new roots posts.
+    const pendingShows = async (label: string) => {
+      const before = stream.length;
+      provider.useRefreshGate(() => true);
+      await provider.refresh(true, true, true, true);
+      provider.useRefreshGate(() => false);
+      assert.ok(stream.length > before, `${label} posted no selection render`);
+      const at = stream.length;
+      provider.dispatchDiscoveryPending = true;
+      provider.postSessionLoading(provider.partial, provider.refreshGeneration, signal);
+      provider.dispatchDiscoveryPending = false;
+      assert.deepEqual(
+        stream.slice(at).map((entry) => entry.visible),
+        [true],
+        `${label} held the new roots complete before their list loaded`,
+      );
+    };
+
+    // Roots change on a path that releases nothing.
+    provider.repositoryScopeRoots = ['project', 'worktree'];
+    await pendingShows('a roots change without a release');
+
+    // The repository scope callback fires while the full refresh for the new roots is still pending.
+    provider.repositoryScopeRoots = ['project'];
+    assert.ok(provider.loadingLine.held(JSON.stringify(['project'])), 'unchanged roots lost their hold');
+    provider.selectionWorks = new Map();
+    provider.refreshFrom = () => {};
+    provider.repositoryScopeRoots = ['project', 'worktree'];
+    provider.repositoryScopeChanged();
+    assert.equal(provider.loadingLine.held(JSON.stringify(['project'])), false, 'the scope callback kept the hold');
+    await pendingShows('a selection render after the repository scope callback');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('the diagnostics log records each loading line change and stays quiet through repeated polls', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, healthy, first, second, settled, recovering, catalog, poll } = exhaustedLoadingHarness();
+    const lines: { event: string; record: any }[] = [];
+    provider.diagnostics = {
+      ...provider.diagnostics,
+      warn: (event: string, record: any) => {
+        if (event.startsWith('sessionLoading')) lines.push({ event, record });
+      },
+    };
+    const events = () =>
+      lines.map(({ event, record }) =>
+        event === 'sessionLoadingLine'
+          ? `${record.visible ? 'shown' : 'hidden'} by ${record.path}${record.reason ? `: ${record.reason}` : ''}`
+          : `${event} ${record.reason ?? record.cause ?? record.path}`,
+      );
+    provider.titles.set(first.file, recovering(first));
+    provider.titles.set(second.file, recovering(second));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await poll();
+    await poll();
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    await poll();
+    for (let index = 0; index < 3; index++) await poll();
+    const grown = { ...first, size: 2, mtimeMs: 2 };
+    catalog([healthy, grown, second]);
+    for (let index = 0; index < 3; index++) await poll();
+    provider.workspaceFoldersChanged();
+    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+
+    assert.deepEqual(events(), [
+      'shown by discovery progress: discovery complete',
+      'sessionLoadingHeld session loading',
+      'hidden by session loading',
+      'sessionLoadingWithheld discovery complete',
+      'sessionLoadingWithheld revision changed',
+      'sessionLoadingReleased workspace folders',
+    ]);
+    const shown = lines[0].record;
+    assert.deepEqual([shown.completed, shown.known], [1, 1], 'the shown line lost its source count');
+    const withheld = lines.find((line) => line.record.reason === 'revision changed')?.record;
+    assert.equal(withheld?.file, grown.file, 'the withheld line did not name the blocking source');
+    assert.equal(withheld?.path, 'session loading');
+    // Each record names its scope, so lines from different roots stay apart.
+    const held = lines.find((line) => line.event === 'sessionLoadingHeld')?.record;
+    const released = lines.find((line) => line.event === 'sessionLoadingReleased')?.record;
+    assert.deepEqual([held?.roots, released?.roots, withheld?.roots, shown.roots], [1, 1, 1, 1]);
+    assert.match(held?.scope ?? '', /^[0-9a-f]{8}$/);
+    assert.deepEqual([released?.scope, withheld?.scope, shown.scope], [held?.scope, held?.scope, held?.scope]);
+
+    // A host writes a bounded number of lines however often the line changes. Withheld work spends its own budget, so it cannot
+    // silence a later change of the line.
+    const written: { event: string; record: Record<string, unknown> }[] = [];
+    const line = new SessionLoadingLine((event, record) => written.push({ event, record }), { line: 3, withheld: 2 });
+    const blocker = () => ({ reason: 'starts missing' as const });
+    line.hold('scope', 0, 'render');
+    for (let generation = 0; generation < 10; generation++)
+      line.withhold(
+        'render',
+        { generation, complete: false },
+        'scope',
+        generation % 2 ? blocker : () => ({ reason: 'label missing' as const }),
+      );
+    line.release('scope change');
+    for (let generation = 0; generation < 10; generation++) {
+      line.present('render', { generation, complete: false }, 'scope', blocker);
+      line.present('render', { generation, complete: false, failed: true }, 'scope', blocker);
+    }
+    assert.equal(
+      written.filter(({ event }) => event === 'sessionLoadingWithheld').length,
+      2,
+      'withheld work passed its limit',
+    );
+    assert.deepEqual(
+      written.filter(({ event }) => event !== 'sessionLoadingWithheld').map(({ event }) => event),
+      ['sessionLoadingHeld', 'sessionLoadingReleased', 'sessionLoadingLine'],
+      'withheld work silenced a change of the line, or the line wrote past its limit',
+    );
+    assert.equal(written.at(-1)?.record.limitReached, true);
+
+    // Each post path counts its own repeats between its withheld lines.
+    const counted: Record<string, unknown>[] = [];
+    const repeats = new SessionLoadingLine((event, record) => {
+      if (event === 'sessionLoadingWithheld') counted.push(record);
+    });
+    const stamp = { generation: 1, complete: false };
+    const reason = (found: 'starts missing' | 'label missing') => () => ({ reason: found });
+    repeats.hold('scope', 1, 'render');
+    repeats.withhold('render', stamp, 'scope', reason('starts missing'));
+    repeats.withhold('selection', stamp, 'scope', reason('starts missing'));
+    repeats.withhold('render', stamp, 'scope', reason('starts missing'));
+    repeats.withhold('render', stamp, 'scope', reason('starts missing'));
+    repeats.withhold('selection', stamp, 'scope', reason('label missing'));
+    repeats.withhold('render', stamp, 'scope', reason('label missing'));
+    assert.deepEqual(
+      counted.map((record) => [record.path, record.repeats]),
+      [
+        ['render', 0],
+        ['selection', 0],
+        ['selection', 0],
+        ['render', 2],
+      ],
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('the startup record counts a complete discovery reply that asks for another pass as a continuation', async () => {
+  const { provider } = bumpedCatalogHarness();
+  const counters = new PanelPerformanceCounters(1000);
+  provider.performanceCounters = counters;
+  const run = provider.progressiveWorker.run;
+  let continuation = true;
+  provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number) => {
+    const result = await run(request, generation);
+    return { ...result, value: { ...result.value, continuation } };
+  };
+  const signal = new AbortController().signal;
+  for (const pass of [true, true, false]) {
+    continuation = pass;
+    provider.refreshGeneration += 1;
+    await provider.prepareClaudeChildren(provider.refreshGeneration, signal);
+  }
+  const { continuations, publications } = counters.snapshot().discovery;
+  assert.deepEqual({ continuations, publications }, { continuations: 2, publications: 1 });
 });
 
 test('current discovery failures are explicit before and after catalog publication while obsolete work stays silent', async () => {

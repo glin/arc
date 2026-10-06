@@ -69,6 +69,46 @@ test('startup acknowledgements follow DOM application and a rendering opportunit
       { type: 'painted', generation: 3, stage: 'firstCard' },
       { type: 'painted', generation: 3, stage: 'completeRender' },
     ]);
+    // A held stamp hides the loading line, and only a complete stamp of its generation finishes the render.
+    await page.evaluate((value) => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { ...value, startup: { generation: 4, complete: false, held: true, completed: 3, known: 3 } },
+        }),
+      );
+    }, payload);
+    await page.evaluate('window.__stepFrame()');
+    await page.evaluate('window.__stepFrame()');
+    const stages = (generation: number): Promise<string[]> =>
+      page.evaluate(
+        `window.__posted.filter(m => m.type === "painted" && m.generation === ${generation}).map(m => m.stage)`,
+      );
+    assert.deepEqual(await stages(4), ['railReady', 'firstCard'], 'a held stamp finished the render');
+    assert.equal(
+      await page.evaluate(
+        () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden !== false,
+      ),
+      true,
+      'a held stamp showed the loading line',
+    );
+    await page.evaluate(() =>
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'startupProgress',
+            generation: 4,
+            epoch: '4',
+            sequence: 1,
+            completed: 0,
+            known: 0,
+            complete: true,
+          },
+        }),
+      ),
+    );
+    await page.evaluate('window.__stepFrame()');
+    await page.evaluate('window.__stepFrame()');
+    assert.deepEqual(await stages(4), ['railReady', 'firstCard', 'completeRender']);
   } finally {
     await browser.close();
   }

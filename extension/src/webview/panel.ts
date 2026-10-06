@@ -642,6 +642,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     generation: number;
     complete?: boolean;
     failed?: boolean;
+    held?: boolean;
     completed?: number;
     known?: number;
   }) {
@@ -653,8 +654,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     }
     // A failed stamp hides the line. The host marks every later status of that generation failed too, so the line
     // returns with the next generation.
+    // A held stamp hides the line after the session list has completed, but it stays pending, so its generation still accepts
+    // the completion that the startup acknowledgement waits for.
     loadingComplete = stamp.complete === true && stamp.failed !== true;
-    railRenderer.updateLoading(stamp.failed || stamp.complete ? null : loadingText(stamp));
+    railRenderer.updateLoading(stamp.failed || stamp.complete || stamp.held ? null : loadingText(stamp));
   }
 
   const sessionDetails = createSessionDetails(
@@ -1159,7 +1162,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           acknowledgePaint();
         }
         // A failed stamp clears the placeholder text.
-        if (startupStatus?.isConnected) startupStatus.textContent = msg.failed ? '' : loadingText(msg);
+        if (startupStatus?.isConnected && !msg.held) startupStatus.textContent = msg.failed ? '' : loadingText(msg);
       },
       focusProjectSpend: function () {
         projectSpend.focus();

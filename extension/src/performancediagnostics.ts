@@ -131,11 +131,15 @@ export class PanelPerformanceCounters {
     continuations: 0,
     publications: 0,
   };
-  recordDiscovery(charges: import('./progressiveworker').DiscoveryCharges | undefined, complete: boolean): void {
+  // A complete reply that still asks for another pass counts as a continuation, so back-to-back passes show in the record.
+  recordDiscovery(
+    charges: import('./progressiveworker').DiscoveryCharges | undefined,
+    reply: { complete: boolean; continuation: boolean },
+  ): void {
     if (charges)
       for (const key of ['readBytes', 'hits', 'resets', 'quanta', 'dispatchRetries'] as const)
         this.discovery[key] += charges[key];
-    this.discovery[complete ? 'publications' : 'continuations']++;
+    this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
   }
   private watcherOperationCount = 0;
   private ledgerSaveCount = 0;
