@@ -160,6 +160,7 @@ export type ProgressiveRequest =
       eligible: string[];
       retainedBytes?: number;
       recordBytes?: number;
+      reduceAboveBytes?: number;
     }
   | { kind: 'starts'; session: SessionFile; agentRunScan?: AgentRunScan }
   | { kind: 'window'; input: ProgressiveInput; checkpoint?: ProgressiveCheckpoint }

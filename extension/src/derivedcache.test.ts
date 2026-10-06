@@ -71,6 +71,7 @@ import {
   limitCodexDispatchCursors,
   needsAgentRunScan,
   railEnrichmentNeeds,
+  METADATA_EXHAUSTED_RULE,
   saveDerivedCache,
   scanForRailEnrichment,
   withAgentRunScanProgress,
@@ -87,10 +88,25 @@ test('partial empty and positive metadata remains eligible and exhaustion surviv
     const entry = { ...title, stats, outcome: null, starts: { starts: [], whole: false } };
     const partial = withMetadataCoverage(entry, { whole: false, windowBytes: 16 * 1024 * 1024 });
     assert.deepEqual(railEnrichmentNeeds(partial, partial), { starts: false, metadata: false, recovery: true });
-    const limited = { ...partial, metadataWindow: { ...partial.metadataWindow!, exhausted: true } };
-    saveDerivedCache(file, [['session.jsonl', limited]]);
+    const earlier = { ...partial, metadataWindow: { ...partial.metadataWindow!, exhausted: true } };
+    const limited = {
+      ...partial,
+      metadataWindow: { ...earlier.metadataWindow, exhaustedRule: METADATA_EXHAUSTED_RULE },
+    };
+    saveDerivedCache(file, [
+      ['session.jsonl', limited],
+      ['earlier.jsonl', earlier],
+    ]);
     const loaded = loadDerivedCache(file).titles.get('session.jsonl')!;
     assert.equal(railEnrichmentNeeds(loaded, loaded), null);
+    assert.equal(derivedTitleNeedsRailFacts(loaded), false);
+    const reopened = loadDerivedCache(file).titles.get('earlier.jsonl')!;
+    assert.equal(
+      railEnrichmentNeeds(reopened, reopened)?.recovery,
+      true,
+      'an entry exhausted under the earlier rule stayed closed',
+    );
+    assert.equal(derivedTitleNeedsRailFacts(reopened), true);
     assert.equal(loaded.expandedStatsRead, undefined);
     assert.equal(
       railEnrichmentNeeds(
@@ -103,6 +119,12 @@ test('partial empty and positive metadata remains eligible and exhaustion surviv
         loaded,
       )?.recovery,
       true,
+    );
+    const read = { turns: [], compactions: [], readBytes: 1, turnLimitReached: false };
+    assert.deepEqual(
+      enrichDerivedTitleEntry(loaded, read).metadataWindow,
+      { whole: false, windowBytes: 16 * 1024 * 1024, exhausted: false },
+      'an accepted read cleared the exhaustion and kept its rule',
     );
   }
 });

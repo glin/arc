@@ -1,6 +1,6 @@
 import { test, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } from './derivedcache';
+import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION, METADATA_EXHAUSTED_RULE } from './derivedcache';
 import { normalizeFsPath } from './transcript';
 import assert from 'node:assert/strict';
 import { browserOrNone, SETTLED } from '../test/browser';
@@ -267,15 +267,20 @@ test('startup progress ignores stale epochs and never replaces usable selected c
       await page.evaluate(SETTLED);
       assert.equal(await background.isVisible(), false, 'obsolete progress or failure resurrected status');
     }
-    await page.evaluate((value) => window.postMessage(value, '*'), { ...progress, generation: 5, failed: true });
-    await page.waitForFunction(() =>
-      document.querySelector('[data-session-loading-status]')?.textContent?.includes('not read'),
+    await page.evaluate((value) => window.postMessage(value, '*'), { ...progress, generation: 5, sequence: 1 });
+    await page.waitForFunction(
+      () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden === false,
     );
-    assert.equal(
-      await background.isVisible(),
-      true,
-      'background failure disappeared after selected content became usable',
+    await page.evaluate((value) => window.postMessage(value, '*'), {
+      ...progress,
+      generation: 5,
+      sequence: 2,
+      failed: true,
+    });
+    await page.waitForFunction(
+      () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden !== false,
     );
+    assert.equal(await background.isVisible(), false, 'a work failure kept the status line');
     assert.equal(await page.locator('#list').textContent(), before);
     await page.evaluate((value) => window.postMessage(value, '*'), { ...progress, generation: 6, complete: true });
     await page.waitForFunction(
@@ -385,10 +390,10 @@ test.for([
     else provider.postSessionLoading([session], 7, signal);
     const background = page.locator('nav [data-session-loading-status]');
     if (failed) {
-      await page.waitForFunction(() =>
-        document.querySelector('[data-session-loading-status]')?.textContent?.includes('not read'),
+      await page.waitForFunction(
+        () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden !== false,
       );
-      assert.equal(await background.isVisible(), true);
+      assert.equal(await background.isVisible(), false, 'a work failure kept the status line');
     } else {
       await page.waitForFunction(
         'window.__posted.some(message => message.type === "painted" && message.generation === 7 && message.stage === "completeRender")',
@@ -400,6 +405,31 @@ test.for([
     assert.notEqual(messages.at(-1).epoch, checkpoint.epoch);
   } finally {
     vi.unstubAllGlobals();
+    await browser.close();
+  }
+});
+
+test('a work failure before the first render clears the startup placeholder', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    page.setDefaultTimeout(5000);
+    await page.setContent(themed(pageHtml()));
+    const progress = { type: 'startupProgress', generation: 2, epoch: '2', sequence: 1, completed: 1, known: 3 };
+    await page.evaluate((value) => window.postMessage(value, '*'), progress);
+    await page.waitForFunction(() =>
+      document.querySelector('[data-startup-status]')?.textContent?.includes('known sources'),
+    );
+    await page.evaluate((value) => window.postMessage(value, '*'), { ...progress, sequence: 2, failed: true });
+    await page.waitForFunction(
+      () => !document.querySelector('[data-startup-status]')?.textContent?.includes('Reading sessions'),
+    );
+    assert.equal(await page.locator('[data-startup-status]').textContent(), '');
+  } finally {
     await browser.close();
   }
 });
@@ -420,7 +450,6 @@ test('a pending status that carries the source count keeps the counter until com
     const render = (startup: object) => post({ ...renderPayload(), startup });
     const counter = (completed: number, known: number) =>
       `Reading sessions… ${completed.toLocaleString()} of ${known.toLocaleString()} known sources checked.`;
-    const failure = 'Some sessions were not read. Select a session to try again.';
     const status = page.locator('nav [data-session-loading-status]');
     const shown = (text: string) =>
       page.waitForFunction(
@@ -463,21 +492,23 @@ test('a pending status that carries the source count keeps the counter until com
     await render({ generation: 7, complete: false });
     await page.evaluate(SETTLED);
     assert.equal(await status.textContent(), counter(5, 7));
-    // A failure takes precedence over the count, and the same generation resolves it later.
+    // A work failure hides the line for the rest of its generation, and the next generation brings the count back.
     await progress(8, 4, 5, 7, { failed: true });
-    await shown(failure);
-    await progress(8, 5, 5, 7);
-    await shown(counter(5, 7));
-    await render({ generation: 8, complete: true });
     await page.waitForFunction(
       () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden !== false,
     );
-    await progress(8, 6, 5, 7);
+    await progress(9, 1, 5, 7);
+    await shown(counter(5, 7));
+    await render({ generation: 9, complete: true });
+    await page.waitForFunction(
+      () => document.querySelector<HTMLElement>('nav [data-session-loading-status]')?.hidden !== false,
+    );
+    await progress(9, 2, 5, 7);
     await page.evaluate(SETTLED);
     assert.equal(await status.isVisible(), false, 'a pending count after completion brought the status back');
     assert.deepEqual(
       (await page.evaluate(() => (window as any).__loadingTexts)) as string[],
-      ['Reading sessions…', counter(4, 6), counter(5, 7), failure, counter(5, 7), ''],
+      ['Reading sessions…', counter(4, 6), counter(5, 7), '', counter(5, 7), ''],
       'the status fell back to bare text between source counts',
     );
   } finally {
@@ -485,7 +516,7 @@ test('a pending status that carries the source count keeps the counter until com
   }
 });
 
-test('repeated full source counts keep an unresolved failure on screen until its sources resolve', async (t) => {
+test('exhausted sources complete the session list through repeated full source counts', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -535,7 +566,7 @@ test('repeated full source counts keep an unresolved failure on screen until its
     const exhausted = {
       ...settled,
       expandedStatsRead: false,
-      metadataWindow: { whole: false, windowBytes: 1, exhausted: true },
+      metadataWindow: { whole: false, windowBytes: 1, exhausted: true, exhaustedRule: METADATA_EXHAUSTED_RULE },
     };
     const entries = new Map<string, object>([
       [healthy.file, { ...healthy, ...settled }],
@@ -591,7 +622,6 @@ test('repeated full source counts keep an unresolved failure on screen until its
       },
     });
     const signal = new AbortController().signal;
-    const failure = 'Some sessions were not read. Select a session to try again.';
     provider.postSessionLoading(sessions, 6, signal);
     for (const generation of [7, 8]) {
       provider.refreshGeneration = generation;
@@ -600,22 +630,18 @@ test('repeated full source counts keep an unresolved failure on screen until its
       assert.equal(await provider.prepareClaudeChildren(generation, signal), true);
       provider.postSessionLoading(sessions, generation, signal);
     }
-    await Promise.all(delivered);
-    await page.evaluate(SETTLED);
-    assert.deepEqual(
-      await page.evaluate(() => (window as any).__loadingTexts),
-      ['Reading sessions…', failure],
-      'a later source count replaced the unresolved failure',
-    );
-    const status = page.locator('nav [data-session-loading-status]');
-    entries.set(first.file, { ...first, ...settled });
-    provider.postSessionLoading(sessions, 8, signal);
-    entries.set(second.file, { ...second, ...settled });
-    provider.postSessionLoading(sessions, 8, signal);
     await page.waitForFunction(
       'window.__posted.some(message => message.type === "painted" && message.generation === 8 && message.stage === "completeRender")',
     );
-    assert.equal(await status.isVisible(), false, 'resolved sources kept the failure of their generation');
+    await Promise.all(delivered);
+    await page.evaluate(SETTLED);
+    const shown = (await page.evaluate(() => (window as any).__loadingTexts)) as string[];
+    assert.equal(shown.at(-1), '', 'exhausted sources kept the status line');
+    assert.ok(
+      shown.every((text) => !text.includes('not read')),
+      `the status line showed a read failure: ${JSON.stringify(shown)}`,
+    );
+    const status = page.locator('nav [data-session-loading-status]');
     await page.evaluate((value) => window.postMessage(value, '*'), {
       type: 'startupProgress',
       generation: 7,

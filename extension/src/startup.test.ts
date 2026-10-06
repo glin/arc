@@ -36,6 +36,7 @@ import {
   loadDerivedCache,
   onlyGrew,
   railEnrichmentNeeds,
+  METADATA_EXHAUSTED_RULE,
   saveDerivedCache,
   scanForRailEnrichment,
   SessionFactFigures,
@@ -7268,7 +7269,7 @@ function exhaustedLoadingHarness(): any {
   });
   const exhausted = (session: { size: number; mtimeMs: number }) => ({
     ...recovering(session),
-    metadataWindow: { whole: false, windowBytes: 1, exhausted: true },
+    metadataWindow: { whole: false, windowBytes: 1, exhausted: true, exhaustedRule: METADATA_EXHAUSTED_RULE },
   });
   const catalog = (sessions: unknown[]) => {
     provider.partial = sessions;
@@ -7349,61 +7350,34 @@ function exhaustedLoadingHarness(): any {
   return { provider, healthy, first, second, codex, settled, recovering, exhausted, catalog, discovery, poll };
 }
 
-test('relationship progress keeps unresolved metadata failures until each failed source resolves', async () => {
+test('exhausted metadata sources settle the session list without a failure', async () => {
   vi.useFakeTimers();
   try {
-    const { provider, healthy, first, second, settled, recovering, exhausted, catalog, discovery, poll } =
-      exhaustedLoadingHarness();
+    const { provider, first, recovering, exhausted, poll } = exhaustedLoadingHarness();
     await provider.refresh(true);
-    assert.equal(provider.messages.at(-1).startup.failed, true);
+    const stamp = provider.messages.at(-1).startup;
+    assert.equal(stamp.complete, true, 'exhausted sources kept the session list pending');
+    assert.equal(stamp.failed, undefined, 'exhausted sources marked the render failed');
     provider.useRefreshGate(() => false);
 
     for (const label of ['first poll', 'second poll']) {
       const { progress, last } = await poll();
-      assert.equal(progress, true, `${label} replaced the unresolved failure with reading text`);
-      assert.equal(last.failed, true, `${label} lost the unresolved failure`);
+      assert.equal(progress, undefined, `${label} reported exhausted sources as a failure`);
+      assert.equal(last.complete, true, `${label} left the session list pending`);
     }
-    const appended = { ...healthy, size: 2, mtimeMs: 2 };
-    catalog([appended, first, second]);
-    provider.titles.set(healthy.file, settled(appended));
-    assert.equal((await poll()).progress, true, 'an unrelated append cleared the failure');
-    discovery.pending = true;
-    assert.equal((await poll()).progress, true, 'pending discovery treated absent sources as removed');
-    discovery.pending = false;
-
     provider.titles.set(first.file, recovering(first));
     let status = await poll();
-    assert.equal(status.progress, true, 'an accepted retry of one source cleared the other failure');
-    assert.equal(status.last.failed, true);
+    assert.equal(status.last.complete, false, 'a reopened read reported completion');
+    assert.equal(status.last.failed, undefined);
     provider.titles.set(first.file, exhausted(first));
-    assert.equal((await poll()).last.failed, true, 'a repeated failure did not return to failure');
-    provider.titles.set(first.file, settled(first));
     status = await poll();
-    assert.equal(status.progress, true, 'a successful retry of one source cleared the other failure');
-    assert.equal(status.last.failed, true);
+    assert.equal(status.last.complete, true, 'a repeated exhaustion left the session list pending');
+    assert.equal(
+      provider.posts.some((message: { failed?: boolean }) => message.failed),
+      false,
+      'an exhausted source posted a failure',
+    );
 
-    provider.titles.set(second.file, settled(second));
-    assert.equal((await poll()).progress, undefined, 'an accepted read of the last failed source kept its failure');
-    provider.titles.set(second.file, exhausted(second));
-    assert.equal((await poll()).last.failed, true);
-
-    const replaced = { ...second, size: 2, mtimeMs: 2 };
-    catalog([appended, first, replaced]);
-    // prepareMetadata replaces the title entry after relationship discovery has posted its source count.
-    const prepareMetadata = provider.prepareMetadata;
-    provider.prepareMetadata = () => {
-      provider.titles.set(second.file, recovering(replaced));
-      return Promise.resolve(true);
-    };
-    status = await poll();
-    provider.prepareMetadata = prepareMetadata;
-    assert.equal(status.progress, true, 'the source count ran after prepareMetadata replaced the entry');
-    assert.equal(status.last.failed, undefined, 'status kept the superseded failure after its entry was replaced');
-    assert.equal(status.last.complete, false, 'a pending read reported completion');
-    assert.equal((await poll()).progress, undefined, 'a replaced source kept its superseded failure');
-
-    provider.titles.set(second.file, exhausted(replaced));
-    assert.equal((await poll()).last.failed, true);
     const posted = provider.posts.length;
     provider.startupProgressAt = 0;
     const aborted = new AbortController();
@@ -7412,19 +7386,6 @@ test('relationship progress keeps unresolved metadata failures until each failed
     await provider.prepareClaudeChildren(provider.refreshGeneration - 1, new AbortController().signal);
     provider.failSessionLoading(provider.refreshGeneration, aborted.signal);
     assert.equal(provider.posts.length, posted, 'cancelled or obsolete work published a status');
-
-    catalog([appended, first]);
-    assert.equal((await poll()).last.failed, undefined, 'an authoritative removal kept the removed failure');
-    assert.equal((await poll()).progress, undefined, 'progress kept the removed failure');
-
-    catalog([appended, first, replaced]);
-    assert.equal((await poll()).last.failed, true, 'a returned exhausted source lost its failure');
-    assert.equal((await poll()).progress, true);
-    provider.workspaceFoldersChanged();
-    await vi.waitFor(() => assert.equal(provider.refreshController, null));
-    Object.assign(provider, { repositoryScopeReady: true, repositoryScopeRoots: ['project'] });
-    catalog([appended]);
-    assert.equal((await poll()).progress, undefined, 'a new scope reported the previous scope failure');
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();
@@ -7734,17 +7695,23 @@ test('the source count is ignored under a discovery scope other than the one it 
   }
 });
 
-test('a discovery failure keeps an exhausted early selected source failed in the next source count', async () => {
+test('an exhausted early selected source stays settled through selection renders and a discovery failure', async () => {
   vi.useFakeTimers();
   try {
-    const { provider, first, second, codex, settled, exhausted, discovery, poll } = exhaustedLoadingHarness();
+    const { provider, healthy, first, second, codex, settled, exhausted, discovery, poll } = exhaustedLoadingHarness();
     const early = codex('codex-early', 70);
     provider.earlySelectedSources.set(early.sessionId, early);
     provider.titles.set(first.file, settled(first));
     provider.titles.set(second.file, settled(second));
     provider.titles.set(early.file, exhausted(early));
     await provider.refresh(true);
-    assert.equal(provider.messages.at(-1).startup.failed, true, 'the render lost the early selected failure');
+    assert.equal(provider.messages.at(-1).startup.failed, undefined, 'the render failed an exhausted early source');
+
+    provider._showing = healthy.sessionId;
+    const rendered = provider.messages.length;
+    await provider.refresh(true, true, true, true);
+    assert.equal(provider.messages.length, rendered + 1, 'the selection refresh posted no render');
+    assert.equal(provider.messages.at(-1).startup.failed, undefined, 'the selection render failed an exhausted source');
     provider.useRefreshGate(() => false);
 
     discovery.fail = true;
@@ -7754,35 +7721,8 @@ test('a discovery failure keeps an exhausted early selected source failed in the
     assert.equal(provider.posts.at(-1).failed, true, 'the discovery failure posted no failure');
     discovery.fail = false;
     const { progress, last } = await poll();
-    assert.equal(progress, true, 'the next source count dropped the early selected failure');
-    assert.equal(last.failed, true);
-  } finally {
-    vi.clearAllTimers();
-    vi.useRealTimers();
-  }
-});
-
-test('a selection-only render keeps an exhausted early selected source failed in the next source count', async () => {
-  vi.useFakeTimers();
-  try {
-    const { provider, healthy, first, second, codex, settled, exhausted, poll } = exhaustedLoadingHarness();
-    const early = codex('codex-early', 70);
-    provider.earlySelectedSources.set(early.sessionId, early);
-    provider.titles.set(first.file, settled(first));
-    provider.titles.set(second.file, settled(second));
-    provider.titles.set(early.file, exhausted(early));
-    await provider.refresh(true);
-    assert.equal(provider.messages.at(-1).startup.failed, true, 'the render lost the early selected failure');
-
-    provider._showing = healthy.sessionId;
-    const rendered = provider.messages.length;
-    await provider.refresh(true, true, true, true);
-    assert.equal(provider.messages.length, rendered + 1, 'the selection refresh posted no render');
-    assert.equal(provider.messages.at(-1).startup.failed, true, 'the selection render lost the early selected failure');
-    provider.useRefreshGate(() => false);
-    const { progress, last } = await poll();
-    assert.equal(progress, true, 'the source count after a selection render dropped the early selected failure');
-    assert.equal(last.failed, true);
+    assert.equal(progress, undefined, 'the next source count kept a failure');
+    assert.equal(last.failed, undefined);
   } finally {
     vi.clearAllTimers();
     vi.useRealTimers();

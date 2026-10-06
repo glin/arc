@@ -455,6 +455,7 @@ import {
   derivedTitleCacheStats,
   derivedTitleStats,
   loadDerivedCache,
+  METADATA_EXHAUSTED_RULE,
   onlyGrew,
   railEnrichmentNeeds,
   withMetadataCoverage,
@@ -1686,9 +1687,6 @@ export class PanelProvider implements vscode.Disposable {
   private startupProgressAt = 0;
   private startupProgressSequence = 0;
   private startupFailureGeneration = -1;
-  // Sessions of the published set whose metadata recovery was exhausted when recordLoadingFailures last ran.
-  // Relationship progress rechecks only these entries, so a full source count keeps the failure on screen.
-  private exhaustedLoadingSessions: SessionFile[] = [];
   private startupLoadingSent = '';
   // The latest accepted discovery checkpoint and the scope roots it belongs to. Pending loading statuses repeat its source count, so
   // a render or loading post that has no count of its own never replaces the counter the panel is showing. A scope change makes it stale.
@@ -2321,7 +2319,6 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
     this.authoritativeCatalog = null;
-    this.exhaustedLoadingSessions = [];
     this.startupSourceCheckpoint = null;
     this.discoveryCheckpoint = undefined;
     this.discoveryCompleted = undefined;
@@ -6612,7 +6609,6 @@ export class PanelProvider implements vscode.Disposable {
             }
           }
         }
-        this.recordLoadingFailures(all);
         this.startupLoadingSent = JSON.stringify(this.sessionLoadingState(all, generation));
         void this.sendToHost(
           host,
@@ -8450,6 +8446,7 @@ export class PanelProvider implements vscode.Disposable {
                     whole: false,
                     windowBytes: previous.metadataWindow?.windowBytes ?? RAIL_ENRICHMENT_READ_BYTES,
                     exhausted: true,
+                    exhaustedRule: METADATA_EXHAUSTED_RULE,
                   },
                 };
           next = this.observeStoredName(active, next);
@@ -8469,19 +8466,9 @@ export class PanelProvider implements vscode.Disposable {
     return { changed, catalogCurrent, progress };
   }
 
-  // The one place that writes exhaustedLoadingSessions. Callers pass the set the render publishes, the catalog plus early selected sources.
-  // Only an authoritative catalog decides membership. Partial discovery and a pending scope keep the recorded sessions.
-  private recordLoadingFailures(published: SessionFile[]): void {
-    if (!this.authoritativeCatalog) return;
-    this.exhaustedLoadingSessions = published.filter(
-      (session) => this.metaFor(session).metadataWindow?.exhausted === true,
-    );
-  }
-
+  // A source whose background metadata read reached its limit counts as settled. Only a work failure marks the generation failed.
   private sessionLoadingState(sessions: SessionFile[], generation: number) {
-    const failed =
-      this.startupFailureGeneration === generation ||
-      sessions.some((session) => this.metaFor(session).metadataWindow?.exhausted === true);
+    const failed = this.startupFailureGeneration === generation;
     return {
       generation,
       complete:
@@ -8503,7 +8490,6 @@ export class PanelProvider implements vscode.Disposable {
 
   private postSessionLoading(published: SessionFile[], generation: number, signal: AbortSignal): void {
     if (signal.aborted || generation !== this.refreshGeneration) return;
-    this.recordLoadingFailures(published);
     this.sendSessionLoading(this.sessionLoadingState(published, generation));
   }
 
@@ -8560,18 +8546,15 @@ export class PanelProvider implements vscode.Disposable {
     return { ...state, ...this.sourceCountOf(held.checkpoint) };
   }
 
-  // Reports the current generation's work failure or a recorded exhausted session that no source change or accepted read has cleared.
+  // Reports the current generation's work failure.
   private unresolvedLoadingFailure(generation: number): boolean {
-    return (
-      this.startupFailureGeneration === generation ||
-      (this.exhaustedLoadingSessions ?? []).some((session) => this.metaFor(session).metadataWindow?.exhausted === true)
-    );
+    return this.startupFailureGeneration === generation;
   }
 
   private failSessionLoading(generation: number, signal: AbortSignal): void {
     if (signal.aborted || generation !== this.refreshGeneration) return;
     this.startupFailureGeneration = generation;
-    // A work failure decides the state alone, so this walks no sessions and keeps the recorded exhausted sessions.
+    // A work failure decides the state alone, so this walks no sessions.
     this.sendSessionLoading({ generation, complete: false, failed: true });
   }
 

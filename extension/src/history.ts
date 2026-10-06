@@ -11,6 +11,7 @@ import {
   readPreviousLines,
 } from './transcript';
 import { cloneParserState, ParserLine, BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS } from './parserstate';
+import { OversizedRecordReducer } from './oversizedrecord';
 
 export interface FileIdentity {
   dev: number;
@@ -73,9 +74,13 @@ export interface ForwardRecoveryControl {
   retainedCharge: number;
   retainedLimit: number;
   recordLimit: number;
+  // An unfinished record larger than this is reduced while it is read, and the record limit applies to the reduced bytes.
+  reduceAbove: number;
   accepts(text: string): boolean;
   fragments: Buffer[];
+  // Source bytes of the unfinished record, whether held whole or reduced.
   fragmentBytes: number;
+  oversized?: OversizedRecordReducer | null;
 }
 
 export class ForwardRecoveryLimit extends Error {}
@@ -102,23 +107,39 @@ function* frameRecovery<State>(
   const consume = function* (end: number, complete: boolean): Generator<void> {
     const length = end - start;
     const total = control.fragmentBytes + length;
-    if (total > control.recordLimit) {
+    if (!control.oversized && total > control.reduceAbove) {
+      control.oversized = new OversizedRecordReducer();
+      for (const fragment of control.fragments) control.oversized.push(fragment);
+      control.fragments = [];
+    }
+    const oversized = control.oversized;
+    if (oversized && length) oversized.push(body.subarray(start, end));
+    const held = oversized ? oversized.bytes : total;
+    if (held > control.recordLimit) {
       throw new ForwardRecoveryLimit('Metadata recovery payload limit');
     }
-    yield* reserve(total);
+    yield* reserve(held);
     if (!complete) {
-      if (length) control.fragments.push(Buffer.from(body.subarray(start, end)));
+      if (length && !oversized) control.fragments.push(Buffer.from(body.subarray(start, end)));
       control.fragmentBytes = total;
       return;
     }
-    yield* reserve(total * 4);
-    const bytes = control.fragments.length
-      ? Buffer.concat([...control.fragments, body.subarray(start, end)], total)
-      : body.subarray(start, end);
+    let bytes: Buffer;
+    if (oversized) {
+      control.oversized = null;
+      // A record that reduces to incomplete JSON passes on, and the parser drops it as it drops any unparseable line.
+      bytes = oversized.finish().bytes;
+      yield* reserve(bytes.length * 4);
+    } else {
+      yield* reserve(total * 4);
+      bytes = control.fragments.length
+        ? Buffer.concat([...control.fragments, body.subarray(start, end)], total)
+        : body.subarray(start, end);
+    }
     const text = bytes.toString('utf8');
     if (control.accepts(text)) {
       // Charge retained source text conservatively for strings and reducer associations.
-      const charge = total * 8 + 256;
+      const charge = bytes.length * 8 + 256;
       yield* reserve(charge);
       control.retainedCharge += charge;
       reducer.pushLine({ text, start: appliedThrough, end: baseOffset + end });

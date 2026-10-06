@@ -220,6 +220,7 @@ async function execute(
         retainedCharge: 0,
         retainedLimit: request.retainedBytes ?? 64 * 1024 * 1024,
         recordLimit: request.recordBytes ?? 16 * 1024 * 1024,
+        reduceAbove: request.reduceAboveBytes ?? 1024 * 1024,
         accepts: session.agent === 'codex' ? codexSessionLineMayAffectRead : claudeSessionLineMayAffectRead,
         fragments: [],
         fragmentBytes: 0,

@@ -294,6 +294,7 @@ import {
   loadDerivedCache,
   saveDerivedCache,
   railEnrichmentNeeds,
+  METADATA_EXHAUSTED_RULE,
   type DerivedTitleEntry,
 } from './derivedcache.ts';
 import {
@@ -355,6 +356,47 @@ test('accepted explicit session reads reopen persisted exhausted metadata recove
     assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
     await fixture.provider.completeSelectedWindow('0', fixture.provider.selectionGeneration);
     assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+  } finally {
+    fixture.worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an entry exhausted under the earlier recovery rule reads once more and then stays exhausted', async () => {
+  const directory = tempDir('panel-metadata-earlier-rule-');
+  const file = path.join(directory, 'session.jsonl');
+  const record = (payload: object) =>
+    JSON.stringify({ type: 'event_msg', timestamp: '2026-08-26T13:30:37Z', payload }) + '\n';
+  fs.writeFileSync(
+    file,
+    record({ type: 'task_started', turn_id: 'large' }) +
+      record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
+      (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
+  );
+  const stat = fs.statSync(file);
+  const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+  const fixture = metadataEnrichmentFixture([session]);
+  const run = fixture.worker.run.bind(fixture.worker);
+  fixture.worker.run = (request, generation, signal) =>
+    run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
+  const recoveries = () => fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
+  try {
+    await fixture.pass();
+    const exhausted = fixture.provider.titles.get(file);
+    assert.deepEqual(
+      [exhausted.metadataWindow.exhausted, exhausted.metadataWindow.exhaustedRule],
+      [true, METADATA_EXHAUSTED_RULE],
+    );
+    // A cache saved before the rule field existed carries the bare exhausted flag.
+    const { exhaustedRule: _rule, ...earlier } = exhausted.metadataWindow;
+    fixture.provider.titles.set(file, { ...exhausted, metadataWindow: earlier });
+    const before = recoveries();
+    await fixture.pass();
+    assert.ok(recoveries() > before, 'the earlier exhaustion was not read again');
+    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhaustedRule, METADATA_EXHAUSTED_RULE);
+    const retried = recoveries();
+    await fixture.pass();
+    assert.equal(recoveries(), retried, 'the same revision was read again under the current rule');
   } finally {
     fixture.worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

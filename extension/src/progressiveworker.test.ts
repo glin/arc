@@ -16,7 +16,15 @@ import {
   type ProgressiveCheckpoint,
   type ProgressiveResult,
 } from './progressiveworker';
-import { readSession, normalizeFsPath, sessionOutcomeOf, type AgentKind, type Turn } from './transcript';
+import {
+  readSession,
+  normalizeFsPath,
+  sessionOutcomeOf,
+  sessionStatFactsOf,
+  type AgentKind,
+  type SessionRead,
+  type Turn,
+} from './transcript';
 import { readCodexSession } from './codex';
 import { scanCodexDispatchReferences } from './codex';
 import { railCacheMarkOf } from './turnrail';
@@ -791,6 +799,8 @@ test('metadata recovery reconciles two supported records before refusing retenti
         session: { file, sessionId: 'session', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs },
         eligible: ['session'],
         sliceBytes: 16 * 1024 * 1024,
+        // Hold the record whole, so its full charge forces the reconciliation this test covers.
+        reduceAboveBytes: 16 * 1024 * 1024,
       },
       1,
       new AbortController().signal,
@@ -839,6 +849,7 @@ test('metadata recovery does no retained replay-map traversal for ignored chunks
       retainedCharge: 0,
       retainedLimit: 64 * 1024 * 1024,
       recordLimit: 16 * 1024 * 1024,
+      reduceAbove: 1024 * 1024,
       accepts: codexSessionLineMayAffectRead,
       fragments: [] as Buffer[],
       fragmentBytes: 0,
@@ -1223,6 +1234,371 @@ test.each(['record', 'retained'] as const)(
     }
   },
 );
+
+// A Codex rollout whose tool output carries a spawn result and a large inline screenshot, as captured from real sessions.
+function giantImageRollout(file: string, imageBytes: number): void {
+  const records = [
+    ...opening('codex'),
+    { type: 'turn_context', timestamp: timestamp(1), payload: { turn_id: 'prompt', model: 'gpt-5.6' } },
+    {
+      type: 'response_item',
+      timestamp: timestamp(2),
+      payload: { type: 'function_call', name: 'spawn_agent', call_id: 'spawn', arguments: '{}' },
+    },
+    {
+      type: 'response_item',
+      timestamp: timestamp(3),
+      payload: {
+        type: 'custom_tool_call_output',
+        call_id: 'spawn',
+        output: [
+          { type: 'input_text', text: JSON.stringify({ agent_id: 'child', nickname: 'Child' }) },
+          ...(imageBytes
+            ? [{ type: 'input_image', image_url: 'data:image/png;base64,' + 'iVBOR'.repeat(imageBytes / 5) }]
+            : []),
+        ],
+      },
+    },
+    {
+      type: 'event_msg',
+      timestamp: timestamp(4),
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 12000, output_tokens: 50, cached_input_tokens: 500 },
+          total_token_usage: { input_tokens: 12000, output_tokens: 50, cached_input_tokens: 500 },
+          model_context_window: 200000,
+        },
+      },
+    },
+    {
+      type: 'event_msg',
+      timestamp: timestamp(5),
+      payload: { type: 'task_complete', turn_id: 'prompt', last_agent_message: 'Finished' },
+    },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+}
+
+async function recoverInWorker(file: string, extra: object = {}, agent: AgentKind = 'codex') {
+  const worker = new ProgressiveWorker(source);
+  try {
+    const stat = fs.statSync(file);
+    for (let slice = 0; slice < 100; slice++) {
+      const result = await worker.run(
+        {
+          kind: 'metadata-recovery',
+          session: { file, sessionId: 'session', agent, size: stat.size, mtimeMs: stat.mtimeMs },
+          eligible: ['session'],
+          sliceBytes: 16 * 1024 * 1024,
+          ...extra,
+        },
+        1,
+        new AbortController().signal,
+      );
+      assert.ok(result?.value.kind === 'metadata-recovery');
+      if (result.value.status !== 'pending') return result.value;
+    }
+    throw new Error('metadata recovery did not finish');
+  } finally {
+    worker.stop();
+  }
+}
+
+test('metadata recovery reads a rollout whose tool output holds a 12 MB screenshot', async () => {
+  const directory = tempDir('metadata-giant-record-');
+  try {
+    const giant = path.join(directory, 'giant.jsonl');
+    const plain = path.join(directory, 'plain.jsonl');
+    giantImageRollout(giant, 12 * 1024 * 1024);
+    giantImageRollout(plain, 0);
+    const recovered = await recoverInWorker(giant);
+    assert.equal(recovered.status, 'complete');
+    // Slices that end inside the record carry its reduction across worker requests.
+    const sliced = await recoverInWorker(giant, { sliceBytes: 2 * 1024 * 1024 });
+    assert.equal(sliced.status, 'complete');
+    assert.deepEqual(sessionStatFactsOf(sliced.read!), sessionStatFactsOf(recovered.read!));
+    const expected = readCodexSession(plain, 'session', { tailBytes: fs.statSync(plain).size });
+    const read = recovered.read!;
+    assert.deepEqual(sessionStatFactsOf(read), sessionStatFactsOf(expected));
+    assert.deepEqual(sessionOutcomeOf(read), sessionOutcomeOf(expected));
+    assert.deepEqual(
+      read.turns.map((turn) => [turn.prompt, turn.startedAt, turnCost(turn)]),
+      expected.turns.map((turn) => [turn.prompt, turn.startedAt, turnCost(turn)]),
+    );
+    assert.equal(read.turns[0].prompt, 'Keep this open');
+    assert.ok((turnCost(read.turns[0]).dollars ?? 0) > 0, 'the recovered turn lost its cost');
+    const outcome = sessionOutcomeOf(read)!;
+    assert.ok(
+      [
+        ...(outcome.openChildren ?? []),
+        ...(outcome.closedChildren ?? []).map((child) => (typeof child === 'string' ? child : child.id)),
+      ].includes('child'),
+      'the spawn result before the screenshot was lost',
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('metadata recovery of a 12 MB record holds a small retained charge', () => {
+  const directory = tempDir('metadata-giant-charge-');
+  try {
+    const file = path.join(directory, 'giant.jsonl');
+    giantImageRollout(file, 12 * 1024 * 1024);
+    const control = {
+      through: 0,
+      readBytes: 0,
+      retainedCharge: 0,
+      retainedLimit: 64 * 1024 * 1024,
+      recordLimit: 16 * 1024 * 1024,
+      reduceAbove: 1024 * 1024,
+      accepts: codexSessionLineMayAffectRead,
+      fragments: [] as Buffer[],
+      fragmentBytes: 0,
+    };
+    const scan = beginForwardSessionRecovery(
+      file,
+      'codex',
+      'session',
+      () => createCodexSessionReducer('session', { maxTurns: 40 }),
+      {
+        chunkBytes: 256 * 1024,
+        recovery: control,
+      },
+    );
+    let peak = 0;
+    let held = 0;
+    for (let next = scan.next(); ; next = scan.next()) {
+      peak = Math.max(peak, control.retainedCharge);
+      held = Math.max(
+        held,
+        control.fragments.reduce((total, fragment) => total + fragment.length, 0),
+      );
+      if (next.done) {
+        assert.ok(next.value.read, 'recovery published no answer');
+        break;
+      }
+    }
+    // Reduction starts once the unfinished record passes 1 MiB, so at most 1 MiB and one chunk of it is held whole.
+    assert.ok(held <= 1024 * 1024 + 256 * 1024, `recovery held ${held} bytes of one record`);
+    assert.ok(peak < 64 * 1024, `the reduced record charged ${peak} bytes`);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('metadata recovery keeps compaction usage and Claude facts past reduced records', async () => {
+  const directory = tempDir('metadata-reduced-records-');
+  const limits = { reduceAboveBytes: 4096, recordBytes: 256 * 1024 };
+  const write = (file: string, records: object[]) =>
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const compacted = (history: object[]) => [
+    ...opening('codex'),
+    { type: 'turn_context', timestamp: timestamp(1), payload: { turn_id: 'prompt', model: 'gpt-5.6' } },
+    {
+      type: 'compacted',
+      timestamp: timestamp(2),
+      payload: {
+        message: '',
+        replacement_history: history,
+        latest_token_usage_record: { usage: { input_tokens: 30000, output_tokens: 10, cached_input_tokens: 0 } },
+      },
+    },
+    {
+      type: 'event_msg',
+      timestamp: timestamp(3),
+      payload: { type: 'task_complete', turn_id: 'prompt', last_agent_message: 'Finished' },
+    },
+  ];
+  const document = (data: string) => [
+    {
+      type: 'user',
+      promptId: 'prompt',
+      timestamp: timestamp(0),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Read this report' },
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } },
+        ],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp: timestamp(1),
+      requestId: 'request',
+      message: {
+        id: 'message',
+        model: 'claude-opus-4-6',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Read it' }],
+        usage: { input_tokens: 4000, output_tokens: 20 },
+      },
+    },
+  ];
+  try {
+    const files = Object.fromEntries(
+      ['codex-giant', 'codex-plain', 'claude-giant', 'claude-plain'].map((name) => [
+        name,
+        path.join(directory, name + '.jsonl'),
+      ]),
+    );
+    const history = Array.from({ length: 64 }, (_, i) => ({
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'Earlier ] "work" ' + i + ' ' + 'x'.repeat(32 * 1024) }],
+    }));
+    write(files['codex-giant'], compacted(history));
+    write(files['codex-plain'], compacted([]));
+    write(files['claude-giant'], document('JVBER'.repeat(440 * 1024)));
+    write(files['claude-plain'], document('JVBER'));
+    assert.ok(fs.statSync(files['codex-giant']).size > 2 * 1024 * 1024);
+    assert.ok(fs.statSync(files['claude-giant']).size > 2 * 1024 * 1024);
+
+    const codex = await recoverInWorker(files['codex-giant'], limits);
+    assert.equal(codex.status, 'complete');
+    const codexExpected = readCodexSession(files['codex-plain'], 'session', {
+      tailBytes: fs.statSync(files['codex-plain']).size,
+    });
+    assert.deepEqual(sessionStatFactsOf(codex.read!), sessionStatFactsOf(codexExpected));
+    assert.equal(codex.read!.compactions.length, 1);
+    assert.equal(codex.read!.compactions[0].contextBefore, 30000, 'the compaction lost its usage');
+
+    const claude = await recoverInWorker(files['claude-giant'], limits, 'claude');
+    assert.equal(claude.status, 'complete');
+    const claudeExpected = readSession(files['claude-plain'], 'session', {
+      tailBytes: fs.statSync(files['claude-plain']).size,
+    });
+    assert.deepEqual(sessionStatFactsOf(claude.read!), sessionStatFactsOf(claudeExpected));
+    assert.deepEqual(sessionOutcomeOf(claude.read!), sessionOutcomeOf(claudeExpected));
+    assert.ok(claude.read!.turns[0].usage, 'the Claude turn lost its usage');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('metadata recovery drops a broken reduced record and reads a reduced last record', async () => {
+  const directory = tempDir('metadata-reduced-edges-');
+  const limits = { reduceAboveBytes: 4096, recordBytes: 256 * 1024 };
+  const usage = (input: number, padding = '') => ({
+    type: 'event_msg',
+    timestamp: timestamp(3),
+    payload: {
+      type: 'token_count',
+      info: {
+        last_token_usage: { input_tokens: input, output_tokens: 50, cached_input_tokens: 0 },
+        total_token_usage: { input_tokens: input, output_tokens: 50, cached_input_tokens: 0 },
+        model_context_window: 200000,
+        ...(padding ? { padding } : {}),
+      },
+    },
+  });
+  const lines = (...records: (object | string)[]) =>
+    records.map((record) => (typeof record === 'string' ? record : JSON.stringify(record)));
+  const turn = [
+    ...opening('codex'),
+    { type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: 'prompt', model: 'gpt-5.6' } },
+  ];
+  const broken = '{"type":"compacted","payload":{"message":"' + 'x'.repeat(8192);
+  const padding = 'x'.repeat(8192);
+  const files: Record<string, string> = {
+    plain: lines(...turn, usage(12000)).join('\n') + '\n',
+    brokenMiddle: lines(...turn, broken, usage(12000)).join('\n') + '\n',
+    brokenLast: lines(...turn, usage(12000), broken).join('\n'),
+    paddedLast: lines(...turn, usage(12000, padding)).join('\n'),
+  };
+  try {
+    const recovered: Record<string, Awaited<ReturnType<typeof recoverInWorker>>> = {};
+    for (const [name, text] of Object.entries(files)) {
+      const file = path.join(directory, name + '.jsonl');
+      fs.writeFileSync(file, text);
+      recovered[name] = await recoverInWorker(file, limits);
+    }
+    const expected = sessionStatFactsOf(recovered.plain.read!);
+    assert.ok(
+      expected?.turns.some((turn) => turn.contextTokens),
+      'the plain rollout has no context figure to compare',
+    );
+    for (const name of ['brokenMiddle', 'brokenLast', 'paddedLast']) {
+      assert.equal(recovered[name].status, 'complete', name);
+      assert.deepEqual(sessionStatFactsOf(recovered[name].read!), expected, name);
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('metadata recovery keeps the end of a long Agent result in a child transcript', async () => {
+  const directory = tempDir('metadata-reduced-agent-tail-');
+  const file = path.join(directory, 'child.jsonl');
+  const id = 'a6dc23d1b0eaed94d';
+  const report =
+    'Report line with \\ "quotes" and é\n'.repeat(12_000) +
+    `agentId: ${id} (use SendMessage with to: '${id}', summary: '<5-10 word recap>' to continue this agent)\n` +
+    '<usage>subagent_tokens: 63920\ntool_uses: 57\nduration_ms: 221257</usage>';
+  const sidechain = { isSidechain: true, agentId: 'child-1', cwd: 'c:/repo' };
+  const records = [
+    {
+      ...sidechain,
+      type: 'user',
+      timestamp: timestamp(0),
+      message: { role: 'user', content: 'launch a nested agent' },
+    },
+    {
+      ...sidechain,
+      type: 'assistant',
+      timestamp: timestamp(1),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        content: [{ type: 'tool_use', id: 'launch', name: 'Agent', input: { description: 'Nested sweep' } }],
+      },
+    },
+    {
+      ...sidechain,
+      type: 'user',
+      timestamp: timestamp(2),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'launch', content: [{ type: 'text', text: report }] }],
+      },
+    },
+    {
+      ...sidechain,
+      type: 'assistant',
+      timestamp: timestamp(3),
+      message: { role: 'assistant', model: 'claude-opus-5', content: [{ type: 'text', text: 'The sweep finished.' }] },
+    },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  try {
+    assert.ok(Buffer.byteLength(report) > 4 * 64 * 1024, 'the report is too short to lose its middle');
+    const stat = fs.statSync(file);
+    const session = { file, sessionId: 'child-1', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
+    const recovered = await recoverInWorker(
+      file,
+      { reduceAboveBytes: 4096, session: { ...session, childTranscript: true }, eligible: ['child-1'] },
+      'claude',
+    );
+    assert.equal(recovered.status, 'complete');
+    const rows = (read: SessionRead) =>
+      read.turns.flatMap((turn) =>
+        turn.agents.map(({ id, status, tokens, toolUses, durationMs }) => ({
+          id,
+          status,
+          tokens,
+          toolUses,
+          durationMs,
+        })),
+      );
+    const expected = rows(readSession(file, 'child-1', { tailBytes: stat.size, childTranscript: true }));
+    assert.deepEqual(expected, [{ id, status: 'completed', tokens: 63920, toolUses: 57, durationMs: 221257 }]);
+    assert.deepEqual(rows(recovered.read!), expected, 'the reduced result lost the end its child id is read from');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('Claude worker requests leave the Codex catalog canonical paths untouched', async () => {
   const directory = tempDir('worker-claude-codex-paths-');

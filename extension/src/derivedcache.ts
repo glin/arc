@@ -45,7 +45,7 @@ export interface DerivedTitleEntry {
   // Displays earlier facts while current stats lack positive context usage.
   heldStats?: SessionStatFacts;
   expandedStatsRead?: boolean;
-  metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean };
+  metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean; exhaustedRule?: number };
   sourceIdentity?: { dev: number; ino: number };
   starts?: TurnStarts;
   foldedLabel?: string;
@@ -404,7 +404,8 @@ export class DerivedCacheCheckpointState {
 
 export function enrichDerivedTitleEntry(entry: DerivedTitleEntry, read: SessionRead): DerivedTitleEntry {
   if (entry.metadataWindow?.exhausted) {
-    entry = { ...entry, metadataWindow: { ...entry.metadataWindow, exhausted: false } };
+    const { exhaustedRule: _rule, ...window } = entry.metadataWindow;
+    entry = { ...entry, metadataWindow: { ...window, exhausted: false } };
   }
   if (entry.stats !== null && entry.outcome !== null) {
     return entry;
@@ -417,9 +418,16 @@ export function enrichDerivedTitleEntry(entry: DerivedTitleEntry, read: SessionR
   return { ...entry, stats, outcome };
 }
 
+// The metadata recovery rule an exhausted entry was read under. An entry exhausted under an earlier rule is read again.
+export const METADATA_EXHAUSTED_RULE = 2;
+
+export function metadataRecoveryExhausted(entry: DerivedTitleEntry): boolean {
+  return entry.metadataWindow?.exhausted === true && entry.metadataWindow.exhaustedRule === METADATA_EXHAUSTED_RULE;
+}
+
 export function derivedTitleNeedsRailFacts(entry: DerivedTitleEntry): boolean {
   return (
-    (unresolvedMetadata(entry) && entry.expandedStatsRead !== true && entry.metadataWindow?.exhausted !== true) ||
+    (unresolvedMetadata(entry) && entry.expandedStatsRead !== true && !metadataRecoveryExhausted(entry)) ||
     entry.starts === undefined ||
     entry.foldedLabel === undefined
   );
@@ -438,7 +446,7 @@ export function railEnrichmentNeeds(
     unresolvedMetadata(entry) &&
     entry.expandedStatsRead !== true &&
     entry.metadataWindow?.whole === false &&
-    entry.metadataWindow.exhausted !== true;
+    !metadataRecoveryExhausted(entry);
   return starts || metadata || recovery ? { starts, metadata, ...(recovery ? { recovery: true } : {}) } : null;
 }
 
@@ -721,7 +729,8 @@ function titleEntry(value: unknown): value is DerivedTitleEntry {
       (record(value.metadataWindow) &&
         typeof value.metadataWindow.whole === 'boolean' &&
         nonNegative(value.metadataWindow.windowBytes) &&
-        (value.metadataWindow.exhausted === undefined || typeof value.metadataWindow.exhausted === 'boolean'))) &&
+        (value.metadataWindow.exhausted === undefined || typeof value.metadataWindow.exhausted === 'boolean') &&
+        (value.metadataWindow.exhaustedRule === undefined || nonNegative(value.metadataWindow.exhaustedRule)))) &&
     (value.sourceIdentity === undefined ||
       (record(value.sourceIdentity) && finite(value.sourceIdentity.dev) && finite(value.sourceIdentity.ino))) &&
     (value.starts === undefined || turnStarts(value.starts)) &&

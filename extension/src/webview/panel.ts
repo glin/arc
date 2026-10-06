@@ -651,14 +651,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       loadingComplete = false;
       progressStamp = null;
     }
+    // A failed stamp hides the line. The host marks every later status of that generation failed too, so the line
+    // returns with the next generation.
     loadingComplete = stamp.complete === true && stamp.failed !== true;
-    railRenderer.updateLoading(
-      stamp.failed
-        ? 'Some sessions were not read. Select a session to try again.'
-        : stamp.complete
-          ? null
-          : loadingText(stamp),
-    );
+    railRenderer.updateLoading(stamp.failed || stamp.complete ? null : loadingText(stamp));
   }
 
   const sessionDetails = createSessionDetails(
@@ -1162,10 +1158,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           latest.startup = { generation: msg.generation, complete: true };
           acknowledgePaint();
         }
-        if (startupStatus?.isConnected)
-          startupStatus.textContent = msg.failed
-            ? 'Some sessions were not read. Select a session to try again.'
-            : loadingText(msg);
+        // A failed stamp clears the placeholder text.
+        if (startupStatus?.isConnected) startupStatus.textContent = msg.failed ? '' : loadingText(msg);
       },
       focusProjectSpend: function () {
         projectSpend.focus();
