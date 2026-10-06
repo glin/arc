@@ -2,17 +2,6 @@
 // `claude-opus-5-5[1m]` a model attachment records. A reply's API id never carries one.
 export const WINDOW_SUFFIX = /\[[^\]]*\]$/;
 
-// Claude families whose ordinary window is 1M on the Anthropic API.
-// Only bare, versioned ids qualify. Deployment prefixes and snapshot dates stay exact.
-export function hasNativeClaudeOneMillionWindow(id: string): boolean {
-  if (snapshotDateOf(id) !== null) return false;
-  const match = /^claude-(fable|sonnet|opus)-(\d+)(?:-(\d+))?$/.exec(id);
-  if (!match) return false;
-  const major = Number(match[2]);
-  const minor = Number(match[3] ?? 0);
-  return match[1] === 'opus' ? major > 4 || (major === 4 && minor >= 7) : major >= 5;
-}
-
 const DATE_SUFFIX = /-(\d{4}-\d{2}-\d{2}|\d{8})$/;
 
 // The inference profile prefix Bedrock puts before a Claude model id, as in
@@ -50,4 +39,16 @@ export function sameModelIdentity(a: string | null | undefined, b: string | null
   const leftDate = snapshotDateOf(left);
   const rightDate = snapshotDateOf(right);
   return leftDate === null || rightDate === null || leftDate === rightDate;
+}
+
+// A deployment suffix that sameModelIdentity keeps, such as Bedrock's `-v1:0` or Vertex's `@20250805`.
+const DEPLOYMENT_SUFFIX = /^(?:-v\d+(?::\d+)?|@[\w-]+)$/;
+
+// Whether `resolved` names the model `id` names with a deployment suffix after it.
+export function namesDeploymentOf(resolved: string | null | undefined, id: string | null | undefined): boolean {
+  const strip = (value: string | null | undefined) =>
+    (value ?? '').trim().toLowerCase().replace(WINDOW_SUFFIX, '').replace(BEDROCK_PREFIX, '');
+  const full = strip(resolved);
+  const base = strip(id);
+  return base !== '' && full.startsWith(base) && DEPLOYMENT_SUFFIX.test(full.slice(base.length));
 }

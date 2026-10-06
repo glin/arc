@@ -1,6 +1,7 @@
-import type { ModelChoice } from '../domain/model-catalog';
-import { hasNativeClaudeOneMillionWindow, WINDOW_SUFFIX } from '../domain/model-identity';
+import { windowedChoice, type ModelChoice } from '../domain/model-catalog';
+import { modelWindowOf, namesDeploymentOf, sameModelIdentity, WINDOW_SUFFIX } from '../domain/model-identity';
 export type { ModelChoice } from '../domain/model-catalog';
+export { windowedChoice } from '../domain/model-catalog';
 
 export interface AppliedDefaults {
   status: 'loading' | 'ready' | 'unavailable';
@@ -25,22 +26,82 @@ export function modelIdentity(model: ModelChoice): string {
   return model.resolvedModel || model.value;
 }
 
+// Resolve a recorded or applied model id to one explicit catalog row. Empty and default rows name no concrete model.
+// A row with a resolved model matches on model identity, so a Bedrock prefix or a snapshot date still finds it.
+// A known window prefers the row with the same window, then accepts a row with that identity in any window.
+// An unknown window accepts a row in any window only when one model answers, so a catalog that lists both windows stays unresolved.
+// Several rows with one identity resolve to the first shown, which is the row modelPicks holds and the launcher lists.
+// Several rows with different identities resolve only to the row whose value is the recorded id.
+// Without an identity match, a `claude-` alias matches on identity before a short alias matches as a substring.
+// The alias pass reads every explicit row, so a resolved model with a deployment suffix still answers to its alias.
+export function recordedChoice(
+  models: readonly ModelChoice[],
+  recorded: string | null,
+  windowKnown: boolean,
+): ModelChoice | null {
+  if (!recorded) {
+    return null;
+  }
+  const id = recorded.trim().toLowerCase();
+  const window = modelWindowOf(id);
+  const windowOf = (m: ModelChoice) => modelWindowOf(m.resolvedModel || m.value);
+  const explicit = models.filter((m) => m.value !== '' && m.value.toLowerCase() !== 'default');
+  const one = (found: readonly ModelChoice[]): ModelChoice | null | undefined => {
+    if (found.length <= 1) return found[0];
+    const identity = modelIdentity(found[0]).toLowerCase();
+    if (found.every((m) => modelIdentity(m).toLowerCase() === identity))
+      return found.find((m) => !m.hidden) ?? found[0];
+    return found.find((m) => m.value.toLowerCase() === id) ?? null;
+  };
+  const identified = explicit.filter((m) => m.resolvedModel && sameModelIdentity(m.resolvedModel, id));
+  const sameWindow = windowKnown ? one(identified.filter((m) => windowOf(m) === window)) : undefined;
+  if (sameWindow !== undefined) {
+    return sameWindow;
+  }
+  const exact = one(explicit.filter((m) => m.value.toLowerCase() === id));
+  if (exact !== undefined) {
+    return exact;
+  }
+  const anyWindow = one(identified);
+  if (anyWindow !== undefined) {
+    return anyWindow;
+  }
+  // A row with a resolved model answers to a short alias only when that model adds a deployment suffix to the id.
+  const bare = id.replace(WINDOW_SUFFIX, '');
+  const aliased = explicit.map((m) => [m, m.value.toLowerCase().replace(WINDOW_SUFFIX, '').trim()] as const);
+  const full = aliased.filter(([, alias]) => alias.startsWith('claude-') && sameModelIdentity(alias, bare));
+  const short = aliased.filter(
+    ([m, alias]) =>
+      alias !== '' &&
+      !alias.startsWith('claude-') &&
+      bare.includes(alias) &&
+      (!m.resolvedModel || namesDeploymentOf(m.resolvedModel, bare)),
+  );
+  const named = (full.length ? full : short).map(([m]) => m);
+  const windowed = windowKnown ? named.filter((m) => windowOf(m) === window) : [];
+  return one(windowed.length ? windowed : named) ?? null;
+}
+
 // Project the applied default onto a catalog row without changing any saved or wire value.
+// The projection uses the recorded-model resolver, so a model reads the same label before and after its first turn.
 export function defaultIdentity(models: readonly ModelChoice[], context: DefaultContext = {}): string | null {
   const applied = context.base?.status === 'ready' ? context.base.model : null;
   if (!applied || models.some((item) => modelIdentity(item) === applied)) return applied;
-  const bare = applied.replace(WINDOW_SUFFIX, '');
-  return hasNativeClaudeOneMillionWindow(bare) && models.some((item) => modelIdentity(item) === bare) ? bare : applied;
+  const row = recordedChoice(models, applied, true);
+  return row ? modelIdentity(row) : applied;
+}
+
+function exactChoice(models: readonly ModelChoice[], identity: string | null): ModelChoice | null {
+  return (
+    models.find((item) => item.value === identity) ?? models.find((item) => modelIdentity(item) === identity) ?? null
+  );
 }
 export function resolvedChoice(
   models: readonly ModelChoice[],
   value: string,
   context: DefaultContext = {},
 ): ModelChoice | null {
-  const identity = value || defaultIdentity(models, context);
-  return (
-    models.find((item) => item.value === identity) ?? models.find((item) => modelIdentity(item) === identity) ?? null
-  );
+  return exactChoice(models, value || defaultIdentity(models, context)) ?? windowedChoice(models, value);
 }
 
 export interface ModelPick extends ModelChoice {
@@ -112,7 +173,8 @@ export function defaultsForModel(
   context: DefaultContext = {},
 ): AppliedDefaults | undefined {
   if (!model) return context.base;
-  const choice = resolvedChoice(models, model, context);
+  // Per-model defaults resolve exactly, so a value with an added window reads no other row's default.
+  const choice = exactChoice(models, model);
   const identity = choice ? modelIdentity(choice) : model;
   return (
     context.models?.[model] ??

@@ -8,6 +8,8 @@ import {
   defaultsForModel,
   modelAfterPick,
   effortAfterPick,
+  recordedChoice,
+  windowedChoice,
   type DefaultContext,
 } from './view/model-picks';
 import { CARD_ACTIONS } from './view/card-words';
@@ -38,13 +40,7 @@ import { PermissionMode } from './claudewire';
 // `mcpview.ts` prepares the Servers control and menu. This module places the control
 // on the row. Type-only imports there prevent a runtime dependency cycle.
 import { mcpMenu, mcpPick } from './mcpview';
-import {
-  WINDOW_SUFFIX,
-  modelWindowOf,
-  normalizeModelIdentity,
-  sameModelIdentity,
-  snapshotDateOf,
-} from './domain/model-identity';
+import { WINDOW_SUFFIX, modelWindowOf, sameModelIdentity } from './domain/model-identity';
 import { AgentKind, Turn, cleanPrompt } from './transcript';
 import { LINE_BREAK, matchCommandNames, renameRequest } from './domain/composer-editing';
 import { isLocalLinkPath } from './domain/link-path';
@@ -1100,60 +1096,23 @@ const DEFAULT_EFFORT_LABEL = 'Effort not reported';
 // Effort label when the menu has no supported setting.
 const NO_EFFORT_LABEL = 'No effort setting';
 
-// Find the selected catalog value, then its resolved model. Return null when neither matches.
+// Find the selected catalog value, its resolved model, then the value without an added window. Return null when none matches.
 export function chosenModel(models: readonly ModelChoice[], model: string | undefined): ModelChoice | null {
   return (
-    models.find((m) => m.value === model) ?? (model ? models.find((m) => m.resolvedModel === model) : undefined) ?? null
+    models.find((m) => m.value === model) ??
+    (model ? models.find((m) => m.resolvedModel === model) : undefined) ??
+    windowedChoice(models, model)
   );
 }
 
-// Match a recorded model id against catalog aliases without their window suffixes. Ignore empty and default aliases. Require exactly one match.
+// Resolve a reply's API model id, which never names its window.
 export function modelRan(models: readonly ModelChoice[], ran: string | null): ModelChoice | null {
-  if (!ran) {
-    return null;
-  }
-  const id = ran.toLowerCase();
-  const named = models.filter((m) => {
-    const alias = m.value.toLowerCase().replace(WINDOW_SUFFIX, '').trim();
-    return alias !== '' && alias !== 'default' && id.includes(alias);
-  });
-  return named.length === 1 ? named[0] : null;
+  return recordedChoice(models, ran, false);
 }
 
-// Resolve an attachment by resolved model, exact value, then an alias without a resolved model. Each match must preserve the window suffix. Ambiguous matches stop resolution. Exclude empty and default choices.
+// Resolve a model attachment, which names its window.
 export function modelAttached(models: readonly ModelChoice[], attached: string | null): ModelChoice | null {
-  if (!attached) {
-    return null;
-  }
-  const id = attached.trim().toLowerCase();
-  const window = modelWindowOf(id);
-  const explicit = models.filter((m) => m.value !== '' && m.value.toLowerCase() !== 'default');
-  const one = (found: readonly ModelChoice[]): ModelChoice | null | undefined =>
-    found.length === 1 ? found[0] : found.length ? null : undefined;
-  const resolved = one(
-    explicit.filter(
-      (m) => m.resolvedModel && modelWindowOf(m.resolvedModel) === window && sameModelIdentity(m.resolvedModel, id),
-    ),
-  );
-  if (resolved !== undefined) {
-    return resolved;
-  }
-  const exact = one(explicit.filter((m) => m.value.toLowerCase() === id));
-  if (exact !== undefined) {
-    return exact;
-  }
-  const bare = id.replace(WINDOW_SUFFIX, '');
-  const named = explicit.filter((m) => {
-    const value = m.value.toLowerCase();
-    const alias = value.replace(WINDOW_SUFFIX, '').trim();
-    return (
-      !m.resolvedModel &&
-      alias !== '' &&
-      modelWindowOf(value) === window &&
-      (alias.startsWith('claude-') ? sameModelIdentity(alias, bare) : bare.includes(alias))
-    );
-  });
-  return named.length === 1 ? named[0] : null;
+  return recordedChoice(models, attached, true);
 }
 
 // Use a recorded model attachment when present. Only an absent attachment permits fallback to the recorded API model id.
@@ -1165,6 +1124,24 @@ function recordedModel(state: ComposerState): ModelChoice | null {
 // Use the selected catalog model, then the recorded model. The recorded fallback supplies effort choices without creating a selection.
 export function settledModel(state: ComposerState): ModelChoice | null {
   return chosenModel(state.models, state.settings.selectedModel) ?? recordedModel(state);
+}
+
+// The launch value of the settled model. A recorded window survives a row listed in another window, so a 1M session inherits `opus[1m]` from `opus`.
+function settledValue(state: ComposerState): string | undefined {
+  const selected = state.settings.selectedModel;
+  const chosen = chosenModel(state.models, selected);
+  if (chosen) {
+    return chosen.value === selected || chosen.resolvedModel === selected ? chosen.value : selected;
+  }
+  const row = recordedModel(state);
+  const attached = state.settings.confirmedModelAttachment;
+  if (!row || !attached) {
+    return row?.value;
+  }
+  const window = modelWindowOf(attached);
+  return modelWindowOf(row.resolvedModel || row.value) === window
+    ? row.value
+    : `${row.value.replace(WINDOW_SUFFIX, '')}${window}`;
 }
 
 function modelPending(state: ComposerState): boolean {
@@ -1308,7 +1285,7 @@ function launchProfileRow(
 // Inherit the model and supported effort. Use the agent's preselected permission when none is stored. Preserve an explicit default as an empty value.
 function inheritedProfile(state: ComposerState): SessionProfile {
   const stored = state.askMode;
-  const model = state.profile ? state.profile.model : (settledModel(state)?.value ?? state.settings.selectedModel);
+  const model = state.profile ? state.profile.model : (settledValue(state) ?? state.settings.selectedModel);
   const effort = state.settings.selectedEffort || state.settings.confirmedEffort || '';
   return {
     agent: state.agent,
@@ -2040,13 +2017,8 @@ export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn |
     return { basis, coldOnly: null };
   }
   if (selected.resolvedModel) {
-    // Compare resolved pricing identities exactly after normalization. Require equal snapshot dates when both ids carry a date. An undated id permits a dated match. Window suffixes do not affect this comparison.
-    const pickedId = normalizeModelIdentity(selected.resolvedModel);
-    const recordedId = normalizeModelIdentity(basis.model);
-    const pickedDate = snapshotDateOf(selected.resolvedModel);
-    const recordedDate = snapshotDateOf(basis.model);
-    const sameSnapshot = pickedDate === null || recordedDate === null || pickedDate === recordedDate;
-    if (pickedId !== '' && pickedId === recordedId && sameSnapshot) {
+    // Compare model identities apart from window and Bedrock prefix. Two dated snapshots must name the same date.
+    if (sameModelIdentity(selected.resolvedModel, basis.model)) {
       return { basis, coldOnly: null };
     }
   } else {
@@ -2191,11 +2163,13 @@ function modelEmpty(name: string): string {
   return `${name} has not said yet which models it runs.`;
 }
 
-// Distinguish an unresolved model from a model without effort settings.
-function effortEmpty(model: ModelChoice | null, name: string): string {
+// Distinguish an unresolved model from a model without effort settings. A named effort keeps an unlisted model from reading as no model.
+function effortEmpty(model: ModelChoice | null, name: string, named = false): string {
   return model
     ? `${model.label} takes no effort setting.`
-    : `The effort is the model's, and ${name} has no model settled on yet.`;
+    : named
+      ? `The effort cannot change until ${name} lists the model this session runs on.`
+      : `The effort is the model's, and ${name} has no model settled on yet.`;
 }
 
 function modelMenu(state: ComposerState, name: string): Menu {
@@ -2242,7 +2216,10 @@ function effortMenu(state: ComposerState, name: string): Menu {
     // Name the settled model in the question, or use the generic model label.
     head: `How much should ${model ? model.label : 'the model'} work on a turn?`,
     items: efforts.map((effort) => menuItem(effort, effort === chosen)),
-    empty: efforts.length === 0 ? effortEmpty(model, name) : '',
+    empty:
+      efforts.length === 0
+        ? effortEmpty(model, name, Boolean(state.settings.selectedEffort || state.settings.confirmedEffort))
+        : '',
   };
 }
 
@@ -2403,10 +2380,17 @@ function effortPick(state: ComposerState, name: string): ComposerPick {
   const model = settledModel(state);
   const menu = effortMenu(state, name);
   if (!model || menu.items.length === 0) {
+    // An effort stays readable when its model matches no catalog row. The menu stays closed.
+    const pending = effortPending(state);
+    const read =
+      (!state.settings.selectedEffort || (!pending && state.settings.pendingEffort !== null)) &&
+      Boolean(state.settings.confirmedEffort);
+    const named = model ? '' : read ? state.settings.confirmedEffort : state.settings.selectedEffort;
+    const application = pending ? ', selected for the next turn' : read ? ', which is what the last turn ran at' : '';
     return {
       control: 'effort',
-      label: NO_EFFORT_LABEL,
-      name: `Effort: none to set. ${menu.empty}`,
+      label: named || NO_EFFORT_LABEL,
+      name: named ? `Effort: ${named}${application}. ${menu.empty}` : `Effort: none to set. ${menu.empty}`,
       detail: menu.empty,
       disabled: true,
       caution: false,

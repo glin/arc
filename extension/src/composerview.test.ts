@@ -9,12 +9,13 @@ import {
   selectedModelPick,
   defaultIdentity,
 } from './view/model-picks';
-import { hasNativeClaudeOneMillionWindow } from './domain/model-identity';
 import { test, vi } from 'vitest';
 import { marked } from 'marked';
 import { launcherCustomRequest } from './view/launcher';
 
 import assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   claudeLaunch,
   codexLaunch,
@@ -150,7 +151,7 @@ import {
   nextTurnStateAt,
   prospectiveNextTurn,
 } from './composerview.ts';
-import { Ask } from './claudewire.ts';
+import { Ask, readModels } from './claudewire.ts';
 import { formatCacheSpan } from './view/time.ts';
 import { McpServer, ModelChoice, PromptEntry, QuestionAsk } from './agentwire.ts';
 import { createClaudeSessionReducer } from './transcript.ts';
@@ -7267,6 +7268,40 @@ test('path completion rows carry visible and accessible filesystem words', () =>
   );
 });
 
+// Drive one finished Claude turn through the transcript reader and return its recorded model, attachment and effort.
+function recordedRuntime(modelId: string | null, model: string, effort: string) {
+  const at = (second: number) => new Date(Date.UTC(2026, 8, 30, 10, 0, second)).toISOString();
+  const reducer = createClaudeSessionReducer('labeled');
+  const records = [
+    ...(modelId
+      ? [{ type: 'attachment', timestamp: at(0), attachment: { type: 'model', identity: { modelId } } }]
+      : []),
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at(1),
+      message: { role: 'user', content: [{ type: 'text', text: 'Go' }] },
+    },
+    {
+      type: 'assistant',
+      timestamp: at(2),
+      effort,
+      message: {
+        role: 'assistant',
+        id: 'm1',
+        model,
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Done' }],
+      },
+    },
+  ];
+  for (const record of records) {
+    reducer.pushLine(JSON.stringify(record));
+  }
+  const [runtime] = composerRuntimeBySession(reducer.read().turns, new Map()).values();
+  return runtime;
+}
+
 test('a labeled 1M Opus session with no picks starts a new session with its setup', () => {
   const efforts = [
     { value: 'medium', label: 'Medium', description: '' },
@@ -7286,42 +7321,11 @@ test('a labeled 1M Opus session with no picks starts a new session with its setu
     choice('opus[1m]', 'claude-opus-5-5[1m]', 'Opus (1M)'),
     choice('sonnet[1m]', 'claude-sonnet-5-5[1m]', 'Sonnet (1M)'),
   ];
-  const at = (second: number) => new Date(Date.UTC(2026, 8, 30, 10, 0, second)).toISOString();
-  const runtimeOf = (modelId: string | null) => {
-    const reducer = createClaudeSessionReducer('labeled');
-    const records = [
-      ...(modelId
-        ? [{ type: 'attachment', timestamp: at(0), attachment: { type: 'model', identity: { modelId } } }]
-        : []),
-      {
-        type: 'user',
-        promptId: 'p1',
-        timestamp: at(1),
-        message: { role: 'user', content: [{ type: 'text', text: 'Go' }] },
-      },
-      {
-        type: 'assistant',
-        timestamp: at(2),
-        effort: 'high',
-        message: {
-          role: 'assistant',
-          id: 'm1',
-          model: 'claude-opus-5-5',
-          stop_reason: 'end_turn',
-          content: [{ type: 'text', text: 'Done' }],
-        },
-      },
-    ];
-    for (const record of records) {
-      reducer.pushLine(JSON.stringify(record));
-    }
-    const [runtime] = composerRuntimeBySession(reducer.read().turns, new Map()).values();
-    return runtime;
-  };
-  const inherited = (models: ModelChoice[], modelId: string | null, picked = '') => {
+  const runtimeOf = (modelId: string | null) => recordedRuntime(modelId, 'claude-opus-5-5', 'high');
+  const stateOf = (models: ModelChoice[], modelId: string | null, picked = '') => {
     const runtime = runtimeOf(modelId);
     const base = composerState({ model: picked, effort: picked ? 'high' : '' });
-    const state = {
+    return {
       ...base,
       models,
       settings: {
@@ -7331,7 +7335,9 @@ test('a labeled 1M Opus session with no picks starts a new session with its setu
         confirmedEffort: runtime.confirmedEffort,
       },
     };
-    const profile = launcherProfile(sessionLauncherView(state, [], { claude: models }), {
+  };
+  const inherited = (models: ModelChoice[], modelId: string | null, picked = '') => {
+    const profile = launcherProfile(sessionLauncherView(stateOf(models, modelId, picked), [], { claude: models }), {
       kind: 'row',
       key: 'current',
     });
@@ -7353,20 +7359,166 @@ test('a labeled 1M Opus session with no picks starts a new session with its setu
     );
     assert.deepEqual(inherited(models, 'claude-opus-5-5[1m]', 'sonnet[1m]'), { model: 'sonnet[1m]', effort: 'high' });
   }
+  const windowless = catalog.filter((one) => one.value !== 'opus[1m]' && one.value !== 'claude-opus-5');
   assert.deepEqual(
-    inherited(
-      catalog.filter((one) => one.value !== 'opus[1m]' && one.value !== 'claude-opus-5'),
-      'claude-opus-5-5[1m]',
-    ),
-    { model: '', effort: '' },
-    'a 1M session with no listed 1M model took the ordinary window from its API id',
+    inherited(windowless, 'claude-opus-5-5[1m]'),
+    { model: 'opus[1m]', effort: 'high' },
+    'a 1M session lost its window, or its model, when the catalog listed no separate 1M row for it',
+  );
+  const row = sessionLauncherView(stateOf(windowless, 'claude-opus-5-5[1m]'), [], { claude: windowless }).inherited;
+  assert.equal(row?.label, 'Same setup as current');
+  assert.deepEqual(
+    row?.detail.split(' · ').slice(1, 3),
+    ['Opus', 'High'],
+    'an inherited value with an added window did not read as its catalog row',
   );
   const duplicated = [...catalog, choice('claude-opus-5-5[1m]', 'claude-opus-5-5[1m]', 'Opus 5.5 (1M)')];
   assert.deepEqual(
     inherited(duplicated, 'claude-opus-5-5[1m]'),
-    { model: '', effort: '' },
-    'two listed models with one exact identity resolved by list order',
+    { model: 'opus[1m]', effort: 'high' },
+    'two listed rows for one model did not resolve to the row the launcher lists',
   );
+});
+
+// The Claude Code 2.1.289 `list_models` answer, decoded by the production reader.
+const CLAUDE_CATALOG: ModelChoice[] = readModels(
+  JSON.parse(fs.readFileSync(path.join(__dirname, '../test/fixtures/claude-list-models-2.1.289.json'), 'utf8')),
+  0,
+)!.models;
+
+// The model and effort control labels after one finished turn, with nothing picked.
+function finishedTurnLabels(models: ModelChoice[], modelId: string | null, model: string, effort = 'high') {
+  const runtime = recordedRuntime(modelId, model, effort);
+  const base = composerState({ models, model: '', effort: '' });
+  const view = composerView({
+    ...base,
+    settings: {
+      ...base.settings,
+      confirmedModel: runtime.confirmedModel,
+      confirmedModelAttachment: runtime.confirmedModelAttachment,
+      confirmedEffort: runtime.confirmedEffort,
+    },
+  })!;
+  const label = (control: string) => view.picks.find((item) => item.control === control)?.label;
+  return [label('model'), label('effort')];
+}
+
+test('a finished Opus 1M turn keeps its catalog label and effort when the catalog lists no 1M rows', () => {
+  assert.deepEqual(finishedTurnLabels(CLAUDE_CATALOG, 'claude-opus-5-5[1m]', 'claude-opus-5-5'), ['Opus 5.5', 'high']);
+  assert.deepEqual(finishedTurnLabels(CLAUDE_CATALOG, null, 'claude-opus-5-5'), ['Opus 5.5', 'high']);
+  assert.deepEqual(finishedTurnLabels(CLAUDE_CATALOG, 'claude-opus-5[1m]', 'claude-opus-5'), ['Opus 5', 'high']);
+});
+
+test('an effort whose model is not listed reads the saved pick and never claims no model', () => {
+  const base = composerState({ models: CLAUDE_CATALOG, model: 'claude-retired-1', effort: 'max' });
+  const settings = { ...base.settings, confirmedModel: 'claude-retired-1', confirmedEffort: 'high' };
+  const effort = composerView({ ...base, settings })!.picks.find((item) => item.control === 'effort')!;
+  assert.equal(effort.label, 'max');
+  assert.ok(effort.disabled);
+  for (const text of [effort.name, effort.detail]) assert.ok(!text.includes('no model settled'), text);
+  const ran = composerView({ ...base, settings: { ...settings, selectedEffort: '' } })!.picks.find(
+    (item) => item.control === 'effort',
+  )!;
+  assert.equal(ran.label, 'high');
+  assert.ok(ran.name.startsWith('Effort: high, which is what the last turn ran at.'), ran.name);
+});
+
+// The model control label before any turn, when the applied default is the given id.
+function defaultModelLabel(models: ModelChoice[], applied: string) {
+  const defaults = { base: { status: 'ready' as const, model: applied, effort: 'high', reason: '' } };
+  const state = composerState({ models, model: '', effort: '', defaults });
+  return composerView(state)!.picks.find((item) => item.control === 'model')?.label;
+}
+
+test('recorded models resolve in every catalog shape without naming a current model', () => {
+  const efforts = ['medium', 'high'].map((value) => ({ value, label: value, description: '' }));
+  const row = (value: string, resolvedModel: string, label: string): ModelChoice => ({
+    value,
+    ...(resolvedModel ? { resolvedModel } : {}),
+    label,
+    description: '',
+    efforts,
+  });
+  const unresolved = (models: ModelChoice[]) => models.map(({ resolvedModel: _resolved, ...rest }) => rest);
+  // Each shape lists a future model, an older model whose id is a prefix of it, and a default row.
+  const shape = (id: string, windowRows: boolean): ModelChoice[] => [
+    row('default', id, 'Default (recommended)'),
+    row('opus', id, 'Opus 9.2'),
+    row('claude-opus-9', id.replace('opus-9-2', 'opus-9'), 'Opus 9'),
+    ...(windowRows ? [row('opus[1m]', `${id}[1m]`, 'Opus 9.2 (1M)')] : []),
+  ];
+  // A newer model holds the short alias, and the recorded model is listed only by its full id.
+  const older = unresolved([
+    row('default', '', 'Default (recommended)'),
+    row('opus', '', 'Opus 10'),
+    row('claude-opus-9-2', '', 'Opus 9.2'),
+    row('claude-opus-9', '', 'Opus 9'),
+  ]);
+  const bedrock = 'global.anthropic.claude-opus-9-2';
+  const dated = 'claude-opus-9-2-20270301';
+  const shapes: [string, string, ModelChoice[], string, string, string][] = [
+    ['bare rows', 'claude-opus-9-2', shape('claude-opus-9-2', false), 'Opus 9.2', 'Opus 9.2', 'Opus 9.2'],
+    ['1M rows', 'claude-opus-9-2', shape('claude-opus-9-2', true), 'Opus 9.2 (1M)', 'Opus 9.2', 'opus-9-2'],
+    ['Bedrock prefix', bedrock, shape(bedrock, false), 'Opus 9.2', 'Opus 9.2', 'Opus 9.2'],
+    ['Bedrock prefix with 1M rows', bedrock, shape(bedrock, true), 'Opus 9.2 (1M)', 'Opus 9.2', bedrock],
+    ['dated snapshot', dated, shape(dated, false), 'Opus 9.2', 'Opus 9.2', 'Opus 9.2'],
+    ['dated snapshot with 1M rows', dated, shape(dated, true), 'Opus 9.2 (1M)', 'Opus 9.2', 'opus-9-2'],
+    [
+      'aliases without resolved models',
+      'claude-opus-9-2',
+      unresolved(shape('claude-opus-9-2', true)),
+      'Opus 9.2 (1M)',
+      'Opus 9.2',
+      'opus-9-2',
+    ],
+    [
+      'alias and full-id rows for one model',
+      'claude-opus-9-2',
+      [...shape('claude-opus-9-2', false), row('claude-opus-9-2', 'claude-opus-9-2', 'Opus 9.2')],
+      'Opus 9.2',
+      'Opus 9.2',
+      'Opus 9.2',
+    ],
+    ['full-id alias beside a newer short alias', 'claude-opus-9-2', older, 'Opus 9.2', 'Opus 9.2', 'Opus 9.2'],
+    ['dated id beside a newer short alias', dated, older, 'Opus 9.2', 'Opus 9.2', 'Opus 9.2'],
+  ];
+  for (const [name, id, models, attached1m, attached, reply] of shapes) {
+    for (const order of [models, [...models].reverse()]) {
+      assert.deepEqual(finishedTurnLabels(order, `${id}[1m]`, id), [attached1m, 'high'], `${name}: 1M attachment`);
+      assert.equal(defaultModelLabel(order, `${id}[1m]`), attached1m, `${name}: 1M default before the first turn`);
+      assert.deepEqual(finishedTurnLabels(order, id, id), [attached, 'high'], `${name}: attachment`);
+      assert.equal(defaultModelLabel(order, id), attached, `${name}: default before the first turn`);
+      // A reply id cannot tell the windows apart, so a catalog with both windows shows the recorded id.
+      assert.deepEqual(finishedTurnLabels(order, null, id), [reply, 'high'], `${name}: reply id`);
+    }
+  }
+  // A resolved model with a deployment suffix still answers to its alias. A different model never does.
+  const suffixed = [row('opus', 'claude-opus-9-2-v1:0', 'Opus 9.2'), row('claude-opus-9', 'claude-opus-9', 'Opus 9')];
+  assert.deepEqual(finishedTurnLabels(suffixed, null, 'claude-opus-9-2'), ['Opus 9.2', 'high']);
+  assert.deepEqual(finishedTurnLabels(suffixed, 'claude-opus-8-1[1m]', 'claude-opus-8-1'), ['opus-8-1', 'high']);
+});
+
+test('a saved pick on the recorded model keeps the next-turn cache warm with or without resolved models', () => {
+  const state = (model: string) =>
+    composerState({
+      models: CLAUDE_CATALOG,
+      model,
+      ran: { model: 'claude-opus-5-5', effort: 'high' },
+      nextTurn: { ...FLOOR_BASIS, model: 'claude-opus-5-5' },
+    });
+  assert.equal(prospectiveNextTurn(state('opus'))?.coldOnly, null);
+  assert.equal(prospectiveNextTurn(state('sonnet'))?.coldOnly, 'model-change');
+  const bedrock = CLAUDE_CATALOG.map((item) =>
+    item.value === 'opus' ? { ...item, resolvedModel: `global.anthropic.${item.resolvedModel}` } : item,
+  );
+  assert.equal(
+    prospectiveNextTurn({ ...state('opus'), models: bedrock })?.coldOnly,
+    null,
+    'a Bedrock prefix on the picked model read as a model change',
+  );
+  const aliasOnly = CLAUDE_CATALOG.map(({ resolvedModel: _resolved, ...rest }) => rest);
+  assert.equal(prospectiveNextTurn({ ...state('opus'), models: aliasOnly })?.coldOnly, null);
+  assert.equal(prospectiveNextTurn({ ...state('claude-opus-5'), models: aliasOnly })?.coldOnly, 'model-change');
 });
 
 test('concrete default rows preserve saved bytes and restore inheritance only after a change', () => {
@@ -7466,36 +7618,6 @@ const NATIVE_WINDOW_DEFAULTS = {
   models: { opus: { status: 'ready' as const, model: 'claude-opus-5-5', effort: 'medium', reason: '' } },
 };
 
-test('native Claude 1M families require a bare id at their version threshold', () => {
-  for (const [id, native] of [
-    ['claude-opus-4-6', false],
-    ['claude-opus-4-7', true],
-    ['claude-opus-4-8', true],
-    ['claude-opus-5', true],
-    ['claude-fable-4-9', false],
-    ['claude-fable-5', true],
-    ['claude-fable-5-1', true],
-    ['claude-fable-6', true],
-    ['claude-sonnet-4-6', false],
-    ['claude-sonnet-5', true],
-    ['claude-sonnet-5-5', true],
-    ['claude-sonnet-6', true],
-    ['claude-haiku-5', false],
-    ['opus', false],
-    ['claude-opus-current', false],
-    ['claude-opus-5-5[1m]', false],
-    ['claude-opus-5-5-20261001', false],
-    ['claude-opus-4-20250514', false],
-    ['claude-opus-5-20260115', false],
-    ['claude-sonnet-5-20260115', false],
-    ['claude-fable-5-20260115', false],
-    ['global.anthropic.claude-opus-5-5', false],
-    ['gpt-5.5', false],
-    ['', false],
-  ] as const)
-    assert.equal(hasNativeClaudeOneMillionWindow(id), native, id);
-});
-
 test('native Claude window defaults label and select the catalog model in drafts and the launcher', () => {
   const profile = draftProfile({ model: '', effort: '' });
   const state = composerState({
@@ -7583,14 +7705,14 @@ test('native Claude window defaults restore omission only when a different model
   }
   const explicit = draftProfile({ model: 'opus[1m]', effort: 'high' });
   const state = composerState({ models, profile: explicit, defaults });
-  assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'opus[1m]');
+  assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'Opus 5.5');
   assert.equal(defaultsForModel(models, 'opus[1m]', defaults), undefined);
   const launcher = sessionLauncherView(state, [], { claude: models }, [], { claude: defaults });
   assert.equal(launcher.inherited?.profile.model, 'opus[1m]');
   assert.equal(sessionSettingsForProfile(explicit, models, defaults).selectedModel, 'opus[1m]');
 });
 
-test('Claude defaults keep exact window rows and synthesize defaults outside native window families', () => {
+test('Claude defaults keep exact window rows and project other windows onto their listed model', () => {
   const exact = {
     ...NATIVE_WINDOW_MODELS[1],
     value: 'opus[1m]',
@@ -7603,24 +7725,31 @@ test('Claude defaults keep exact window rows and synthesize defaults outside nat
     ['opus[1m]'],
   );
   assert.equal(rows[0].label, 'Opus 5.5');
-  for (const model of [
-    'claude-opus-4-6[1m]',
-    'claude-sonnet-4-6[1m]',
-    'claude-haiku-5[1m]',
-    'claude-opus-current[1m]',
-    'claude-opus-5-5-20261001[1m]',
-    'global.anthropic.claude-opus-5-5[1m]',
-    'opus[1m]',
+  const catalog = [
+    ...NATIVE_WINDOW_MODELS,
+    { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6', description: '', efforts: [] },
+    { value: 'claude-haiku-5', label: 'Haiku 5', description: '', efforts: [] },
+  ];
+  for (const [model, label] of [
+    ['claude-opus-4-6[1m]', 'Opus 4.6'],
+    ['claude-sonnet-4-6[1m]', 'Sonnet 4.6'],
+    ['claude-haiku-5[1m]', 'Haiku 5'],
+    ['claude-opus-5-5-20261001[1m]', 'Opus 5.5'],
+    ['global.anthropic.claude-opus-5-5[1m]', 'Opus 5.5'],
   ]) {
     const defaults = { base: { ...NATIVE_WINDOW_DEFAULTS.base, model } };
-    const catalog = [
-      ...NATIVE_WINDOW_MODELS,
-      { value: model.replace('[1m]', ''), label: 'Bare model', description: '', efforts: [] },
-    ];
-    assert.equal(defaultIdentity(catalog, defaults), model);
-    assert.equal(modelPicks(catalog, defaults).find((item) => item.configuredDefault)?.value, model);
-    assert.equal(modelPicks(catalog, defaults).find((item) => item.value === 'opus')?.configuredDefault, false);
+    assert.equal(modelLabel(catalog, '', defaults), label, model);
+    assert.deepEqual(
+      modelPicks(catalog, defaults)
+        .filter((item) => item.configuredDefault)
+        .map((item) => item.readingLabel),
+      [label],
+      model,
+    );
   }
+  const unknown = { base: { ...NATIVE_WINDOW_DEFAULTS.base, model: 'claude-mythos-1[1m]' } };
+  assert.equal(defaultIdentity(catalog, unknown), 'claude-mythos-1[1m]');
+  assert.equal(modelPicks(catalog, unknown).find((item) => item.configuredDefault)?.value, 'claude-mythos-1[1m]');
   assert.equal(defaultIdentity([], NATIVE_WINDOW_DEFAULTS), 'claude-opus-5-5[1m]');
   for (const status of ['loading', 'unavailable'] as const) {
     const defaults = { base: { ...NATIVE_WINDOW_DEFAULTS.base, status } };
@@ -7630,22 +7759,18 @@ test('Claude defaults keep exact window rows and synthesize defaults outside nat
 });
 
 test.each(['claude-opus-4-20250514', 'claude-opus-5-20260115', 'claude-sonnet-5-20260115', 'claude-fable-5-20260115'])(
-  'dated Claude window defaults keep exact picker rows for %s',
+  'dated Claude window defaults label their catalog row for %s',
   (id) => {
-    const model = `${id}[1m]`;
     const catalog = [{ ...NATIVE_WINDOW_MODELS[1], value: 'snapshot', resolvedModel: id, label: 'Dated model' }];
-    const defaults = { base: { ...NATIVE_WINDOW_DEFAULTS.base, model } };
+    const defaults = { base: { ...NATIVE_WINDOW_DEFAULTS.base, model: `${id}[1m]` } };
     const profile = draftProfile({ model: '', effort: '' });
     const state = composerState({ models: catalog, model: '', effort: '', profile, defaults });
     const menu = pickMenu('model', state)!;
     assert.deepEqual(
       menu.items.map((item) => [item.value, item.label, item.checked]),
-      [
-        ['snapshot', 'Dated model', false],
-        [model, `${model} (default)`, true],
-      ],
+      [['snapshot', 'Dated model (default)', true]],
     );
-    assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, model);
+    assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'Dated model');
     const launcher = sessionLauncherView(null, [profile], { claude: catalog }, [], { claude: defaults });
     assert.deepEqual(
       launcher.agents.find((item) => item.value === 'claude')?.models.map((item) => item.label),
@@ -7654,9 +7779,9 @@ test.each(['claude-opus-4-20250514', 'claude-opus-5-20260115', 'claude-sonnet-5-
     const live = pickMenu('model', composerState({ models: catalog, model: '', effort: '', defaults }))!;
     assert.deepEqual(
       live.items.map((item) => [item.value, item.label, item.checked]),
-      [['snapshot', 'Dated model', false]],
+      [['snapshot', 'Dated model (default)', true]],
     );
-    assert.deepEqual(modelAfterPick(catalog, '', '', 'snapshot', defaults), { model: 'snapshot', effort: '' });
+    assert.deepEqual(modelAfterPick(catalog, '', '', 'snapshot', defaults), { model: '', effort: '' });
   },
 );
 

@@ -1,3 +1,4 @@
+import { windowedChoice } from './model-catalog';
 export type SetupAgent = 'claude' | 'codex';
 
 export interface SetupValues {
@@ -102,7 +103,9 @@ export function missingSetupValues(values: SetupValues, agents: readonly SetupCa
   }
   const missing: SetupValueName[] = [];
   if (!agent.modelsPending) {
-    const model = (agent.supportedModels ?? agent.models).find((one) => one.value === values.model);
+    const models = agent.supportedModels ?? agent.models;
+    // A value can add a window to a listed value, as `opus[1m]` adds one to `opus`.
+    const model = models.find((one) => one.value === values.model) ?? windowedChoice(models, values.model);
     if (!model) {
       missing.push('model');
     }

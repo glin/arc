@@ -1,3 +1,5 @@
+import { WINDOW_SUFFIX } from './model-identity';
+
 export interface EffortChoice {
   value: string;
   label: string;
@@ -17,4 +19,13 @@ export interface ModelChoice {
   label: string;
   description: string;
   efforts: EffortChoice[];
+}
+
+// A saved or inherited value can add a window to a listed value, as `opus[1m]` adds one to `opus`.
+// It matches the one row whose value is the same without its window.
+export function windowedChoice<T extends { value: string }>(models: readonly T[], value: string | undefined): T | null {
+  const bare = (value ?? '').toLowerCase().replace(WINDOW_SUFFIX, '').trim();
+  if (bare === '' || bare === 'default') return null;
+  const found = models.filter((item) => item.value.toLowerCase().replace(WINDOW_SUFFIX, '').trim() === bare);
+  return found.length === 1 ? found[0] : null;
 }
