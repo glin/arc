@@ -9,6 +9,7 @@ import {
   type IncrementalSessionResult,
 } from './history';
 import { parentPort } from 'node:worker_threads';
+import { closeReadWindow, openReadWindow } from './readmeter';
 import {
   readClaudeHistoryPageAsync,
   readClaudeSessionIncrementalAsync,
@@ -320,12 +321,42 @@ async function execute(
     const completed = new Set(epoch.completed);
     const completionChanges = new Map<string, boolean>();
     let header = request.discovery?.epoch === epoch.epoch ? undefined : { ...epoch, completed: [...completed] };
-    const charges: DiscoveryCharges = { readBytes: 0, hits: 0, resets: 0, quanta: 0, dispatchRetries: 0 };
+    const charges: DiscoveryCharges = {
+      readBytes: 0,
+      hits: 0,
+      resets: 0,
+      quanta: 0,
+      dispatchRetries: 0,
+      parentChecks: 0,
+      parentCheckMs: 0,
+      childHeadFiles: 0,
+      childHeadBytes: 0,
+      childHeadMs: 0,
+      dispatchSpendVisits: 0,
+      dispatchSpendRereads: 0,
+      dispatchSpendFiles: 0,
+      dispatchSpendBytes: 0,
+      dispatchSpendMs: 0,
+    };
+    // A parent check is one stat of a candidate source, so it reads no bytes.
+    const parentCheck = <T>(check: () => T): T => {
+      const startedAt = performance.now();
+      try {
+        return check();
+      } finally {
+        charges.parentChecks++;
+        charges.parentCheckMs += performance.now() - startedAt;
+      }
+    };
+    const checkParent = (file: string) => parentCheck(() => revisionOf(file));
+    const checkMissing = (file: string) => parentCheck(() => missingFile(file));
     let continuation = false;
     let incomplete = false;
     const candidates = new Map<string, import('./transcript').SessionFile>();
+    // The child head charge covers the whole walk, whose file work is a stat and a bounded head read per subagent transcript.
     const walk = () => {
       candidates.clear();
+      const reads = openReadWindow();
       try {
         return discoverClaudeChildSessions(
           epoch.parents,
@@ -341,6 +372,11 @@ async function execute(
       } catch {
         incomplete = true;
         return { references: [], children: [] };
+      } finally {
+        const tally = closeReadWindow(reads);
+        charges.childHeadFiles += tally.files;
+        charges.childHeadBytes += tally.bytes;
+        charges.childHeadMs += tally.ms;
       }
     };
     const pending = (source?: string) => {
@@ -388,9 +424,9 @@ async function execute(
     for (const [key, parent] of ordered) {
       if (completed.has(key) || (epoch.protectedFile && key !== epoch.protectedFile)) continue;
       epoch.position = (rows.findIndex(([file]) => file === key) + 1) % Math.max(1, rows.length);
-      const revision = revisionOf(parent.file);
+      const revision = checkParent(parent.file);
       if (!revision) {
-        if (missingFile(parent.file)) {
+        if (checkMissing(parent.file)) {
           completed.add(key);
           completionChanges.set(key, true);
           claudeChildReferences.delete(key);
@@ -565,10 +601,10 @@ async function execute(
     for (const [file] of candidates) {
       const entry = claudeChildReferences.get(file);
       if (!entry) {
-        continuation ||= !missingFile(file);
+        continuation ||= !checkMissing(file);
         continue;
       }
-      const current = revisionOf(file);
+      const current = checkParent(file);
       if (!onlyGrew(entry, current) || (current!.size === entry.size && current!.mtimeMs !== entry.mtimeMs)) {
         completed.delete(file);
         claudeChildReferences.set(file, {
@@ -621,174 +657,185 @@ async function execute(
     const references = resolveClaudeDispatchReferences(found.references, epoch.catalog);
     const dispatched: DispatchSessionFacts[] = [];
     const seen = new Set<string>();
-    const subagentMetas = claudeSubagentMetaReader();
-    for (const reference of references) {
-      if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
-        continue;
-      }
-      seen.add(reference.sessionId);
-      const revision = revisionOf(reference.file);
-      if (!revision) {
-        continue;
-      }
-      const heldValue = dispatchFacts.get(reference.file);
-      const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
-      const held =
-        heldValue &&
-        heldValue.sourceGeneration === sourceGeneration &&
-        onlyGrew(heldValue.revision, revision) &&
-        (heldValue.revision.size < revision.size || sameRevision(heldValue.revision, revision))
-          ? heldValue
-          : undefined;
-      const now = Date.now();
-      let codexDependencies = held?.codexDependencies ?? [reference.file];
-      const sourceFile = reference.file;
-      const codexVersion = () =>
-        codexAgentSpendVersion(
-          sourceFile,
-          codexSpendIndex(request.codexChildren ?? []),
-          reference.sessionId,
-          codexDependencies,
-        );
-      const tree =
-        reference.agent === 'codex'
-          ? childSpendRevisionKey('completed', codexVersion(), now)
-          : claudeAgentSpendVersion(reference.file, false, subagentMetas);
-      if (
-        held &&
-        sameRevision(held.revision, revision) &&
-        held.tree === tree &&
-        now < held.refreshAt &&
-        (!held.codexPerson || held.codexPerson.bytes >= revision.size)
-      ) {
-        dispatched.push(held.facts);
-        continue;
-      }
-      const previousPerson =
-        held &&
-        held.revision.dev === revision.dev &&
-        held.revision.ino === revision.ino &&
-        (held.revision.size < revision.size || sameRevision(held.revision, revision))
-          ? held.codexPerson
-          : undefined;
-      const previousBytes = previousPerson?.bytes ?? 0;
-      const codexPerson =
-        reference.agent === 'codex'
-          ? scanForCodexPerson(reference.file, revision.size, previousPerson, reference.sessionId)
-          : undefined;
-      if (!sameRevision(revision, revisionOf(reference.file))) {
-        charges.dispatchRetries++;
-        continuation = true;
-        const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
-        dispatched.push(
-          compatible
-            ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
-            : {
-                sessionId: reference.sessionId,
-                revision,
-                refreshAt: now,
-                startedAt: null,
-                endedAt: null,
-                toolUses: 0,
-                person: false,
-                spend: { models: [], found: false, partial: true, effort: null },
-              },
-        );
-        dispatchFacts.delete(reference.file);
-        continue;
-      }
-      continuation ||= !!codexPerson && codexPerson.bytes < revision.size && codexPerson.bytes > previousBytes;
-      const completion = codexPerson?.dispatchCompletion;
-      const completed =
-        codexPerson?.bytes === revision.size &&
-        codexPerson.fragment.length === 0 &&
-        completion?.terminal !== null &&
-        !!completion?.terminal &&
-        !completion.invalid &&
-        !completion.skipping;
-      const activity =
-        reference.agent === 'codex'
-          ? { activeUntil: completed ? 0 : revision.mtimeMs + TURN_QUIET_MS, unfinished: !completed }
-          : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
-      const refreshAt = activity.activeUntil;
-      const active = now < refreshAt;
-      const spend: AgentSpend = active
-        ? { models: [], found: false, partial: false, effort: null }
-        : reference.agent === 'codex'
-          ? readCodexDispatchedSpend([reference.file], request.codexChildren ?? [], now, (files) => {
-              codexDependencies = files;
-            })
-          : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
-      if (!active && activity.unfinished) {
-        spend.unfinished = true;
-        if (spend.artifacts) {
-          spend.artifacts.complete = false;
+    // The dispatch loop holds no await, so the window sees only its own reads.
+    const dispatchReads = openReadWindow();
+    try {
+      const subagentMetas = claudeSubagentMetaReader();
+      for (const reference of references) {
+        if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
+          continue;
         }
+        seen.add(reference.sessionId);
+        charges.dispatchSpendVisits++;
+        const revision = revisionOf(reference.file);
+        if (!revision) {
+          continue;
+        }
+        const heldValue = dispatchFacts.get(reference.file);
+        const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
+        const held =
+          heldValue &&
+          heldValue.sourceGeneration === sourceGeneration &&
+          onlyGrew(heldValue.revision, revision) &&
+          (heldValue.revision.size < revision.size || sameRevision(heldValue.revision, revision))
+            ? heldValue
+            : undefined;
+        const now = Date.now();
+        let codexDependencies = held?.codexDependencies ?? [reference.file];
+        const sourceFile = reference.file;
+        const codexVersion = () =>
+          codexAgentSpendVersion(
+            sourceFile,
+            codexSpendIndex(request.codexChildren ?? []),
+            reference.sessionId,
+            codexDependencies,
+          );
+        const tree =
+          reference.agent === 'codex'
+            ? childSpendRevisionKey('completed', codexVersion(), now)
+            : claudeAgentSpendVersion(reference.file, false, subagentMetas);
+        if (
+          held &&
+          sameRevision(held.revision, revision) &&
+          held.tree === tree &&
+          now < held.refreshAt &&
+          (!held.codexPerson || held.codexPerson.bytes >= revision.size)
+        ) {
+          dispatched.push(held.facts);
+          continue;
+        }
+        charges.dispatchSpendRereads++;
+        const previousPerson =
+          held &&
+          held.revision.dev === revision.dev &&
+          held.revision.ino === revision.ino &&
+          (held.revision.size < revision.size || sameRevision(held.revision, revision))
+            ? held.codexPerson
+            : undefined;
+        const previousBytes = previousPerson?.bytes ?? 0;
+        const codexPerson =
+          reference.agent === 'codex'
+            ? scanForCodexPerson(reference.file, revision.size, previousPerson, reference.sessionId)
+            : undefined;
+        if (!sameRevision(revision, revisionOf(reference.file))) {
+          charges.dispatchRetries++;
+          continuation = true;
+          const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
+          dispatched.push(
+            compatible
+              ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
+              : {
+                  sessionId: reference.sessionId,
+                  revision,
+                  refreshAt: now,
+                  startedAt: null,
+                  endedAt: null,
+                  toolUses: 0,
+                  person: false,
+                  spend: { models: [], found: false, partial: true, effort: null },
+                },
+          );
+          dispatchFacts.delete(reference.file);
+          continue;
+        }
+        continuation ||= !!codexPerson && codexPerson.bytes < revision.size && codexPerson.bytes > previousBytes;
+        const completion = codexPerson?.dispatchCompletion;
+        const completed =
+          codexPerson?.bytes === revision.size &&
+          codexPerson.fragment.length === 0 &&
+          completion?.terminal !== null &&
+          !!completion?.terminal &&
+          !completion.invalid &&
+          !completion.skipping;
+        const activity =
+          reference.agent === 'codex'
+            ? { activeUntil: completed ? 0 : revision.mtimeMs + TURN_QUIET_MS, unfinished: !completed }
+            : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
+        const refreshAt = activity.activeUntil;
+        const active = now < refreshAt;
+        const spend: AgentSpend = active
+          ? { models: [], found: false, partial: false, effort: null }
+          : reference.agent === 'codex'
+            ? readCodexDispatchedSpend([reference.file], request.codexChildren ?? [], now, (files) => {
+                codexDependencies = files;
+              })
+            : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
+        if (!active && activity.unfinished) {
+          spend.unfinished = true;
+          if (spend.artifacts) {
+            spend.artifacts.complete = false;
+          }
+        }
+        // Claude scans active appends. Codex retains its bounded prompt cursor across quiet
+        // reads because a cached spend can precede delayed copied-turn context.
+        const scan =
+          active && reference.agent === 'claude'
+            ? scanForPerson(reference.file, revision.size, held?.person, held ? held.revision.size : revision.size)
+            : undefined;
+        const person =
+          reference.agent === 'codex'
+            ? codexPerson && codexPerson.bytes >= revision.size
+              ? codexPerson.person
+              : spend.person === true || codexPerson?.person === true
+            : held?.facts.person === true || (scan ? scan.person : spend.person === true);
+        if (!sameRevision(revision, revisionOf(reference.file))) {
+          charges.dispatchRetries++;
+          continuation = true;
+          const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
+          dispatched.push(
+            compatible
+              ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
+              : {
+                  sessionId: reference.sessionId,
+                  revision,
+                  refreshAt: now,
+                  startedAt: null,
+                  endedAt: null,
+                  toolUses: 0,
+                  person: false,
+                  spend: { models: [], found: false, partial: true, effort: null },
+                },
+          );
+          dispatchFacts.delete(reference.file);
+          continue;
+        }
+        const collectedTree =
+          reference.agent === 'codex'
+            ? childSpendRevisionKey('completed', codexVersion(), now)
+            : claudeAgentSpendVersion(reference.file, false, subagentMetas);
+        if (collectedTree !== tree) {
+          charges.dispatchRetries++;
+          continuation = true;
+          spend.partial = true;
+          if (spend.artifacts) spend.artifacts.complete = false;
+        }
+        const facts: DispatchSessionFacts = {
+          sessionId: reference.sessionId,
+          refreshAt: active ? refreshAt : null,
+          revision,
+          spend,
+          startedAt: spend.startedAt ?? null,
+          endedAt: spend.endedAt ?? null,
+          toolUses: spend.toolUses ?? 0,
+          person,
+        };
+        dispatchFacts.set(reference.file, {
+          sourceGeneration,
+          revision,
+          tree: reference.agent === 'codex' ? childSpendRevisionKey('completed', codexVersion(), now) : tree,
+          codexDependencies,
+          facts,
+          refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
+          person: scan,
+          codexPerson,
+        });
+        dispatched.push(facts);
       }
-      // Claude scans active appends. Codex retains its bounded prompt cursor across quiet
-      // reads because a cached spend can precede delayed copied-turn context.
-      const scan =
-        active && reference.agent === 'claude'
-          ? scanForPerson(reference.file, revision.size, held?.person, held ? held.revision.size : revision.size)
-          : undefined;
-      const person =
-        reference.agent === 'codex'
-          ? codexPerson && codexPerson.bytes >= revision.size
-            ? codexPerson.person
-            : spend.person === true || codexPerson?.person === true
-          : held?.facts.person === true || (scan ? scan.person : spend.person === true);
-      if (!sameRevision(revision, revisionOf(reference.file))) {
-        charges.dispatchRetries++;
-        continuation = true;
-        const compatible = held && onlyGrew(held.revision, revisionOf(reference.file));
-        dispatched.push(
-          compatible
-            ? { ...held.facts, spend: { ...held.facts.spend, partial: true } }
-            : {
-                sessionId: reference.sessionId,
-                revision,
-                refreshAt: now,
-                startedAt: null,
-                endedAt: null,
-                toolUses: 0,
-                person: false,
-                spend: { models: [], found: false, partial: true, effort: null },
-              },
-        );
-        dispatchFacts.delete(reference.file);
-        continue;
-      }
-      const collectedTree =
-        reference.agent === 'codex'
-          ? childSpendRevisionKey('completed', codexVersion(), now)
-          : claudeAgentSpendVersion(reference.file, false, subagentMetas);
-      if (collectedTree !== tree) {
-        charges.dispatchRetries++;
-        continuation = true;
-        spend.partial = true;
-        if (spend.artifacts) spend.artifacts.complete = false;
-      }
-      const facts: DispatchSessionFacts = {
-        sessionId: reference.sessionId,
-        refreshAt: active ? refreshAt : null,
-        revision,
-        spend,
-        startedAt: spend.startedAt ?? null,
-        endedAt: spend.endedAt ?? null,
-        toolUses: spend.toolUses ?? 0,
-        person,
-      };
-      dispatchFacts.set(reference.file, {
-        sourceGeneration,
-        revision,
-        tree: reference.agent === 'codex' ? childSpendRevisionKey('completed', codexVersion(), now) : tree,
-        codexDependencies,
-        facts,
-        refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
-        person: scan,
-        codexPerson,
-      });
-      dispatched.push(facts);
+    } finally {
+      const dispatchTally = closeReadWindow(dispatchReads);
+      charges.dispatchSpendFiles += dispatchTally.files;
+      charges.dispatchSpendBytes += dispatchTally.bytes;
+      charges.dispatchSpendMs += dispatchTally.ms;
     }
     const currentFiles = new Set(
       references.flatMap((reference) => (reference.kind === 'dispatch' && reference.file ? [reference.file] : [])),

@@ -117,6 +117,28 @@ export interface PerformanceEventSink {
 // Default sink disables detailed events and ignores emitted startup milestones.
 const UNWATCHED: PerformanceEventSink = { enabled: () => false, emit: () => {} };
 
+type DiscoveryCharges = import('./progressiveworker').DiscoveryCharges;
+
+// A record over every charge field fails typecheck when a field is missing, so no charge goes unsummed.
+const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]: true } = {
+  readBytes: true,
+  hits: true,
+  resets: true,
+  quanta: true,
+  dispatchRetries: true,
+  parentChecks: true,
+  parentCheckMs: true,
+  childHeadFiles: true,
+  childHeadBytes: true,
+  childHeadMs: true,
+  dispatchSpendVisits: true,
+  dispatchSpendRereads: true,
+  dispatchSpendFiles: true,
+  dispatchSpendBytes: true,
+  dispatchSpendMs: true,
+};
+const DISCOVERY_CHARGE_KEYS = Object.keys(DISCOVERY_CHARGE_FIELDS) as (keyof DiscoveryCharges)[];
+
 export class PanelPerformanceCounters {
   readonly sourceId: string;
   private readonly sink: PerformanceEventSink;
@@ -128,6 +150,16 @@ export class PanelPerformanceCounters {
     resets: 0,
     quanta: 0,
     dispatchRetries: 0,
+    parentChecks: 0,
+    parentCheckMs: 0,
+    childHeadFiles: 0,
+    childHeadBytes: 0,
+    childHeadMs: 0,
+    dispatchSpendVisits: 0,
+    dispatchSpendRereads: 0,
+    dispatchSpendFiles: 0,
+    dispatchSpendBytes: 0,
+    dispatchSpendMs: 0,
     continuations: 0,
     publications: 0,
   };
@@ -136,9 +168,7 @@ export class PanelPerformanceCounters {
     charges: import('./progressiveworker').DiscoveryCharges | undefined,
     reply: { complete: boolean; continuation: boolean },
   ): void {
-    if (charges)
-      for (const key of ['readBytes', 'hits', 'resets', 'quanta', 'dispatchRetries'] as const)
-        this.discovery[key] += charges[key];
+    if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key];
     this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
   }
   private watcherOperationCount = 0;

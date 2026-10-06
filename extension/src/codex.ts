@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { meterRead } from './readmeter';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -351,7 +352,7 @@ function firstLineOf(file: string): string | null {
     let window = FIRST_LINE_WINDOW;
     for (;;) {
       const want = window - have;
-      const read = fs.readSync(fd, buf, have, want, have);
+      const read = meterRead(file, fs.readSync(fd, buf, have, want, have));
       const line = firstLineStep(buf, have, read, want);
       if (line !== undefined) {
         return line;
@@ -906,8 +907,9 @@ export function readThreadNames(file: string, held: ThreadNames | null): ThreadN
     return { stamp, names: new Map(), fullNames: new Map() };
   }
   try {
-    const text = fs.readFileSync(file, 'utf8');
-    return { stamp, ...parseThreadNamePairs(text) };
+    const bytes = fs.readFileSync(file);
+    meterRead(file, bytes.length);
+    return { stamp, ...parseThreadNamePairs(bytes.toString('utf8')) };
   } catch {
     return { stamp: '', names: new Map(), fullNames: new Map() };
   }
@@ -4155,7 +4157,7 @@ export function scanForCodexPerson(
   try {
     fd = fs.openSync(file, 'r');
     const chunk = Buffer.allocUnsafe(Math.min(Math.max(0, size - scan.bytes), 256 * 1024));
-    const read = fs.readSync(fd, chunk, 0, chunk.length, scan.bytes);
+    const read = meterRead(file, fs.readSync(fd, chunk, 0, chunk.length, scan.bytes));
     scan.bytes += read;
     let bytes = Buffer.concat([scan.fragment, chunk.subarray(0, read)]);
     const completion = scan.dispatchCompletion;

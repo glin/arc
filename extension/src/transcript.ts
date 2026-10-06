@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { meterRead } from './readmeter';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import {
@@ -1074,7 +1075,7 @@ function scanSessionCwd(file: string, onUnreadable?: () => void): string | null 
   try {
     fd = fs.openSync(file, 'r');
     const buf = Buffer.allocUnsafe(64 * 1024);
-    const read = fs.readSync(fd, buf, 0, buf.length, 0);
+    const read = meterRead(file, fs.readSync(fd, buf, 0, buf.length, 0));
     for (const line of buf.subarray(0, read).toString('utf8').split('\n')) {
       if (line.indexOf('"cwd"') < 0) {
         continue;
@@ -1175,7 +1176,7 @@ export function readTurnStartsFromTail(
       const chunk = Buffer.allocUnsafe(length);
       let read = 0;
       while (read < length) {
-        const next = fs.readSync(fd, chunk, read, length - read, nextStart + read);
+        const next = meterRead(file, fs.readSync(fd, chunk, read, length - read, nextStart + read));
         if (next <= 0) {
           throw new Error('Turn-start glance stopped before its requested range.');
         }
@@ -1291,7 +1292,7 @@ export function readCompleteLines(
     let pos = bytes;
     const chunk = Buffer.allocUnsafe(256 * 1024);
     while (pos < size) {
-      const read = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos));
       if (read <= 0) {
         break;
       }
@@ -1361,9 +1362,10 @@ export function readCustomTitleSidecar(sessionFile: string, bytes = CUSTOM_TITLE
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(sessionId) || bytes <= 0) {
     return null;
   }
+  const sidecar = path.join(path.dirname(sessionFile), sessionId, 'custom-title.json');
   let fd = -1;
   try {
-    fd = fs.openSync(path.join(path.dirname(sessionFile), sessionId, 'custom-title.json'), 'r');
+    fd = fs.openSync(sidecar, 'r');
     // The size is checked on the open file, so a file that grows after a stat cannot make
     // this read more than the bound.
     const size = fs.fstatSync(fd).size;
@@ -1373,7 +1375,7 @@ export function readCustomTitleSidecar(sessionFile: string, bytes = CUSTOM_TITLE
     const content = Buffer.alloc(size);
     let offset = 0;
     while (offset < size) {
-      const read = fs.readSync(fd, content, offset, size - offset, offset);
+      const read = meterRead(sidecar, fs.readSync(fd, content, offset, size - offset, offset));
       if (read <= 0) {
         return null;
       }
@@ -1484,7 +1486,7 @@ function headOf(file: string, bytes: number): { lines: string[]; key?: string } 
   try {
     fd = fs.openSync(file, 'r');
     const buf = Buffer.allocUnsafe(bytes);
-    const read = fs.readSync(fd, buf, 0, bytes, 0);
+    const read = meterRead(file, fs.readSync(fd, buf, 0, bytes, 0));
     const text = buf.subarray(0, read).toString('utf8');
     const lines = text.split('\n');
     if (read === bytes) {
@@ -2163,7 +2165,7 @@ function holdsUserRecord(file: string, size: number): boolean {
     const chunk = Buffer.allocUnsafe(4 * 1024);
     let pos = 0;
     while (pos < size) {
-      const read = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos));
       if (read <= 0) {
         break;
       }
@@ -3900,7 +3902,7 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
     const start = Math.max(0, size - bytes);
     const len = size - start;
     const buf = Buffer.allocUnsafe(len);
-    const read = fs.readSync(fd, buf, 0, len, start);
+    const read = meterRead(file, fs.readSync(fd, buf, 0, len, start));
     const body = buf.subarray(0, read);
     const lines = body.toString('utf8').split('\n');
     if (start > 0) {
@@ -3947,7 +3949,7 @@ function readBackwardRange(file: string, start: number, length: number, revision
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const next = fs.readSync(fd, buffer, read, length - read, start + read);
+      const next = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read));
       if (next <= 0) {
         return null;
       }
@@ -7198,7 +7200,9 @@ export function readClaudeSubagentMetas(directory: string): ClaudeSubagentMeta[]
     if (!meta) {
       let record: unknown;
       try {
-        record = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+        const bytes = fs.readFileSync(metaFile);
+        meterRead(metaFile, bytes.length);
+        record = JSON.parse(bytes.toString('utf8'));
       } catch {
         continue;
       }

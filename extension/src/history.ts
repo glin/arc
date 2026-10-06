@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { meterRead } from './readmeter';
 
 import {
   AgentKind,
@@ -272,7 +273,7 @@ function readStableRange(file: string, start: number, length: number, revision: 
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const count = fs.readSync(fd, buffer, read, length - read, start + read);
+      const count = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read));
       if (count <= 0) {
         return null;
       }

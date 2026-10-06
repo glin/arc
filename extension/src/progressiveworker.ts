@@ -130,12 +130,26 @@ export interface DiscoveryCheckpoint {
   sequence: number;
   protectedFile?: string;
 }
+// `readBytes` counts relationship scan bytes and bounds each request, so the other relationship file work has its own fields.
+// A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
+// The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
+// Times are wall milliseconds.
 export interface DiscoveryCharges {
   readBytes: number;
   hits: number;
   resets: number;
   quanta: number;
   dispatchRetries: number;
+  parentChecks: number;
+  parentCheckMs: number;
+  childHeadFiles: number;
+  childHeadBytes: number;
+  childHeadMs: number;
+  dispatchSpendVisits: number;
+  dispatchSpendRereads: number;
+  dispatchSpendFiles: number;
+  dispatchSpendBytes: number;
+  dispatchSpendMs: number;
 }
 export type ProgressiveRequest =
   | { kind: 'codex-context'; session: SessionFile }

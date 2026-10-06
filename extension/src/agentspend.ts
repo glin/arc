@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { meterRead } from './readmeter';
 import { StringDecoder } from 'node:string_decoder';
 import type { ChildArtifacts } from './childartifacts';
 import type { CommitIntent, TurnCommit, TurnUsage, TurnUsagePart, UsageContextBand, UsageCounts } from './transcript';
@@ -271,7 +272,7 @@ export function scanLines(file: string, visit: (line: string) => unknown): boole
       return visit(line.endsWith('\r') ? line.slice(0, -1) : line) === true;
     };
     while (!stopped) {
-      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, chunk.length, null));
       if (read === 0) {
         break;
       }

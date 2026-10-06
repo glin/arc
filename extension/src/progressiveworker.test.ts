@@ -7640,3 +7640,184 @@ test.each(['stable', 'stale', 'cancelled'])(
     }
   },
 );
+
+test.each(['claude', 'codex'] as const)(
+  'a reload charges parent checks, subagent head reads, and %s dispatched spend rereads to their own counters',
+  async (agent) => {
+    const directory = tempDir('relationship-read-counters-');
+    const id = '4f4bf298-958f-4751-8782-d8688ff808a6';
+    const parentFile = path.join(directory, 'parent.jsonl');
+    const dispatchedFile = path.join(directory, id + '.jsonl');
+    const nativeFile = path.join(directory, 'native.jsonl');
+    const goneFile = path.join(directory, 'gone.jsonl');
+    const childDirectory = path.join(directory, 'parent', 'subagents');
+    const childFile = path.join(childDirectory, 'agent-child.jsonl');
+    const write = (file: string, rows: unknown[]) =>
+      fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    fs.mkdirSync(childDirectory, { recursive: true });
+    write(parentFile, [
+      ...(agent === 'claude'
+        ? claudeDispatchTranscript('claude --bg review', 'backgrounded · 4f4bf298 · Review')
+        : claudeDispatchTranscript(
+            'python launch.py --arc-dispatch',
+            `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}"}`,
+          )),
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Agent', id: 'launch' }] } },
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+        toolUseResult: { agentId: 'child' },
+      },
+    ]);
+    write(childFile, [{ type: 'user', cwd: directory, message: { content: 'child work' } }]);
+    const rollout = (threadId: string, output: number) => [
+      {
+        type: 'session_meta',
+        timestamp: timestamp(0),
+        payload: { id: threadId, cwd: directory, source: 'exec', model_provider: 'openai' },
+      },
+      { type: 'event_msg', timestamp: timestamp(1), payload: { type: 'task_started', turn_id: threadId } },
+      { type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: threadId, model: 'gpt-6-sol' } },
+      { type: 'event_msg', timestamp: timestamp(2), payload: { type: 'user_message', message: 'work' } },
+      {
+        type: 'event_msg',
+        timestamp: timestamp(3),
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 10, output_tokens: output, total_tokens: 10 + output },
+            total_token_usage: { input_tokens: 10, output_tokens: output, total_tokens: 10 + output },
+            model_context_window: 258400,
+          },
+        },
+      },
+      { type: 'event_msg', timestamp: timestamp(4), payload: { type: 'task_complete', turn_id: threadId } },
+    ];
+    if (agent === 'claude') {
+      write(dispatchedFile, [
+        { type: 'user', cwd: directory, timestamp: timestamp(0), message: { role: 'user', content: 'Review' } },
+        {
+          type: 'assistant',
+          timestamp: timestamp(2),
+          message: {
+            role: 'assistant',
+            stop_reason: 'end_turn',
+            content: 'Finished',
+            model: 'claude-sonnet-4-20250514',
+            usage: { input_tokens: 7, output_tokens: 1 },
+          },
+        },
+      ]);
+    } else {
+      write(dispatchedFile, rollout(id, 3));
+      const native = rollout('native', 5);
+      (native[0].payload as { parent_thread_id?: string }).parent_thread_id = id;
+      write(nativeFile, native);
+      fs.utimesSync(dispatchedFile, 100, 100);
+      fs.utimesSync(nativeFile, 100, 100);
+    }
+
+    const session = (file: string, sessionId: string) => {
+      const stat = fs.statSync(file);
+      return { file, sessionId, agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
+    };
+    const dispatched = { ...session(dispatchedFile, id), agent };
+    // A parent whose file is gone is checked again for absence, before its scan and again before publication.
+    const gone = { file: goneFile, sessionId: 'gone', agent: 'claude' as const, size: 1, mtimeMs: 1 };
+    // A Codex dispatched session is a catalog entry with a native descendant, never a relationship parent.
+    const parents = [session(parentFile, 'parent'), gone, ...(agent === 'claude' ? [dispatched] : [])];
+    const request = {
+      kind: 'claude-children' as const,
+      parents,
+      catalog: [session(parentFile, 'parent'), dispatched],
+      codexChildren:
+        agent === 'codex'
+          ? [
+              {
+                file: nativeFile,
+                threadId: 'native',
+                parentThreadId: id,
+                agentPath: '/native',
+                openedAt: 0,
+                startedAt: 0,
+                threadSource: 'subagent',
+                backgroundReview: false,
+              },
+            ]
+          : [],
+      repositoryRoots: [directory],
+    };
+    const candidates = agent === 'claude' ? 3 : 2;
+    // Every clock read advances one millisecond, and every byte the worker reads is summed independently of the counters.
+    const observedSource =
+      `const observedFs = require('node:fs');
+    const observedRead = observedFs.readSync; const observedReadFile = observedFs.readFileSync;
+    let observedBytes = 0; let observedTick = 0;
+    performance.now = () => ++observedTick;
+    observedFs.readSync = function (...args) { const count = observedRead.apply(this, args); observedBytes += count; return count; };
+    observedFs.readFileSync = function (...args) { const value = observedReadFile.apply(this, args);
+      observedBytes += typeof value === 'string' ? Buffer.byteLength(value) : value.length; return value; };
+    const observedPort = require('node:worker_threads').parentPort;
+    const observedPost = observedPort.postMessage;
+    observedPort.postMessage = function (message) { if (message.result) Object.assign(message.result, { observedBytes });
+      return observedPost.call(this, message); };` + source;
+    const first = new ProgressiveWorker(source);
+    const reloaded = new ProgressiveWorker(observedSource);
+    try {
+      const found = await completeDiscovery(first, request, 1, new AbortController().signal);
+      assert.ok(found?.value.kind === 'claude-children');
+      assert.deepEqual(
+        found.value.children.map((child) => child.sessionId),
+        ['child'],
+      );
+      assert.equal(found.value.dispatchFacts.length, 1);
+      const run = async (referenceEntries: typeof found.value.referenceEntries, generation: number) => {
+        const result = await reloaded.run({ ...request, referenceEntries }, generation, new AbortController().signal);
+        assert.ok(result?.value.kind === 'claude-children', 'cached relationships needed another pass');
+        assert.ok(result.value.charges, 'the reply carried no discovery charges');
+        return {
+          charges: result.value.charges,
+          entries: result.value.referenceEntries,
+          observed: result as typeof result & { observedBytes: number },
+        };
+      };
+      const cold = await run(found.value.referenceEntries, 1);
+      assert.equal(cold.charges.readBytes, 0, 'cached relationships charged relationship scan bytes');
+      assert.equal(cold.charges.hits, candidates);
+      assert.equal(
+        cold.charges.parentChecks,
+        2 * candidates + 3,
+        'each candidate is checked before its scan and again before publication, and the gone parent once more',
+      );
+      assert.equal(cold.charges.parentCheckMs, 2 * candidates + 3);
+      assert.equal(cold.charges.childHeadFiles, 1);
+      assert.equal(cold.charges.childHeadBytes, fs.statSync(childFile).size);
+      assert.equal(cold.charges.childHeadMs, 2, 'each of the two walks spans one clock read');
+      assert.equal(cold.charges.dispatchSpendVisits, 1);
+      assert.equal(cold.charges.dispatchSpendRereads, 1);
+      assert.equal(cold.charges.dispatchSpendFiles, agent === 'claude' ? 1 : 2);
+      assert.ok(
+        cold.charges.dispatchSpendBytes >= fs.statSync(dispatchedFile).size,
+        'the spend reread missed the transcript',
+      );
+      assert.ok(cold.charges.dispatchSpendMs >= 1);
+      assert.equal(
+        cold.charges.childHeadBytes + cold.charges.dispatchSpendBytes,
+        cold.observed.observedBytes,
+        'a relationship read escaped the counters',
+      );
+      const warm = await run(cold.entries, 2);
+      assert.equal(warm.observed.observedBytes, cold.observed.observedBytes, 'held relationship facts read again');
+      assert.equal(warm.charges.childHeadFiles, 0);
+      assert.equal(warm.charges.childHeadBytes, 0);
+      assert.equal(warm.charges.dispatchSpendVisits, 1);
+      assert.equal(warm.charges.dispatchSpendRereads, 0, 'held dispatched facts counted as a reread');
+      assert.equal(warm.charges.dispatchSpendFiles, 0);
+      assert.equal(warm.charges.dispatchSpendBytes, 0);
+    } finally {
+      first.stop();
+      reloaded.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);

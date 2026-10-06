@@ -217,6 +217,7 @@ import {
   CUSTOM_TITLE_SIDECAR_BYTES,
 } from './transcript.ts';
 import { RETAINED_REQUESTS } from './parserstate.ts';
+import { closeReadWindow, openReadWindow } from './readmeter.ts';
 import { SessionNames } from './sessionnames.ts';
 import {
   loadDerivedCache,
@@ -14575,4 +14576,44 @@ test('decoded PowerShell scripts preserve literal directory quotes and trailing 
     inspectCommitCommand(`pwsh -Command 'Set-Location "$repo"; git commit -m saved'`, 'C:/start', 'bash').complete,
     false,
   );
+});
+
+test('a subagent head read counts its bounded bytes once and a cached head counts none', () => {
+  const directory = tempDir('claude-child-head-meter-');
+  const file = path.join(directory, 'agent-child.jsonl');
+  fs.writeFileSync(
+    file,
+    [
+      { type: 'user', cwd: directory },
+      { type: 'assistant', padding: 'x'.repeat(100 * 1024) },
+    ]
+      .map((record) => JSON.stringify(record) + '\n')
+      .join(''),
+  );
+  const reference = {
+    kind: 'subagent' as const,
+    file,
+    sessionId: 'child',
+    parentSessionId: 'parent',
+    toolUseIds: ['launch'],
+  };
+  const cache = new ClaudeChildSessionCache();
+  let clock = 10;
+  try {
+    const cold = openReadWindow(() => clock);
+    assert.equal(cache.read(reference, [directory])?.cwd, directory);
+    clock = 13;
+    assert.deepEqual(
+      closeReadWindow(cold, () => clock),
+      { files: 1, bytes: 64 * 1024, ms: 3 },
+    );
+    const warm = openReadWindow(() => clock);
+    assert.equal(cache.read(reference, [directory])?.cwd, directory);
+    assert.deepEqual(
+      closeReadWindow(warm, () => clock),
+      { files: 0, bytes: 0, ms: 0 },
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

@@ -2,6 +2,7 @@
 // `turnview.ts` re-exports these helpers for existing callers.
 
 import * as fs from 'node:fs';
+import { meterRead } from './readmeter';
 import * as crypto from 'node:crypto';
 import { TurnStarts } from './transcript';
 import type { Compaction, Turn } from './transcript';
@@ -247,7 +248,7 @@ export function retainedRangeFingerprint(file: string, start: number, end: numbe
     const buffer = Buffer.allocUnsafe(Math.min(RETAINED_FINGERPRINT_CHUNK_BYTES, Math.max(1, end - start)));
     for (let position = start; position < end; position += buffer.length) {
       const length = Math.min(buffer.length, end - position);
-      const read = fs.readSync(fd, buffer, 0, length, position);
+      const read = meterRead(file, fs.readSync(fd, buffer, 0, length, position));
       if (read !== length) {
         return null;
       }

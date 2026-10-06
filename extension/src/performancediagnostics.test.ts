@@ -91,7 +91,25 @@ test('performance counters correlate posts and replies for every open panel', ()
   counters.recordLedgerSave({ reason: 'maximum', durationMs: 20, succeeded: true });
 
   assert.deepEqual(counters.snapshot(), {
-    discovery: { readBytes: 0, hits: 0, resets: 0, quanta: 0, dispatchRetries: 0, continuations: 0, publications: 0 },
+    discovery: {
+      readBytes: 0,
+      hits: 0,
+      resets: 0,
+      quanta: 0,
+      dispatchRetries: 0,
+      parentChecks: 0,
+      parentCheckMs: 0,
+      childHeadFiles: 0,
+      childHeadBytes: 0,
+      childHeadMs: 0,
+      dispatchSpendVisits: 0,
+      dispatchSpendRereads: 0,
+      dispatchSpendFiles: 0,
+      dispatchSpendBytes: 0,
+      dispatchSpendMs: 0,
+      continuations: 0,
+      publications: 0,
+    },
     sourceId: 'window-a',
     startedAt: '1970-01-01T00:00:01.000Z',
     captureCount: 0,
@@ -585,4 +603,46 @@ test('a path that cannot be written is reported, and answers with no file', asyn
     sink.reported[0].message.includes('EACCES: permission denied'),
     'the failure does not carry what the file system said',
   );
+});
+
+test('discovery counters sum relationship read charges across worker replies', () => {
+  const counters = new PanelPerformanceCounters(1000, 'window-a');
+  const charges = {
+    readBytes: 0,
+    hits: 3,
+    resets: 0,
+    quanta: 0,
+    dispatchRetries: 0,
+    parentChecks: 6,
+    parentCheckMs: 1.5,
+    childHeadFiles: 1,
+    childHeadBytes: 4096,
+    childHeadMs: 2,
+    dispatchSpendVisits: 1,
+    dispatchSpendRereads: 1,
+    dispatchSpendFiles: 2,
+    dispatchSpendBytes: 90000,
+    dispatchSpendMs: 7,
+  };
+  counters.recordDiscovery(charges, { complete: false, continuation: true });
+  counters.recordDiscovery(charges, { complete: true, continuation: false });
+  assert.deepEqual(counters.snapshot().discovery, {
+    readBytes: 0,
+    hits: 6,
+    resets: 0,
+    quanta: 0,
+    dispatchRetries: 0,
+    parentChecks: 12,
+    parentCheckMs: 3,
+    childHeadFiles: 2,
+    childHeadBytes: 8192,
+    childHeadMs: 4,
+    dispatchSpendVisits: 2,
+    dispatchSpendRereads: 2,
+    dispatchSpendFiles: 4,
+    dispatchSpendBytes: 180000,
+    dispatchSpendMs: 14,
+    continuations: 1,
+    publications: 1,
+  });
 });
