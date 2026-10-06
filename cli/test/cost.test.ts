@@ -109,6 +109,16 @@ test('cost preserves native usage, metadata-only sessions, and incomplete traili
       JSON.stringify({ type: 'session_meta', payload: { id: 'metadata', cwd: root, source: 'cli' } }),
     );
     assert.equal(JSON.parse(runCost([rollout, '--source-only'])).parent.requests, 0);
+    fs.writeFileSync(
+      rollout,
+      JSON.stringify({ type: 'session_meta', payload: { session_id: 'native-session', source: 'cli' } }),
+    );
+    for (const flags of [[], ['--source-only']]) {
+      const report = JSON.parse(runCost([rollout, ...flags]));
+      assert.equal(report.source.kind, 'codex');
+      assert.equal(report.source.sessionId, 'native-session');
+      assert.equal(report.parent.requests, 0);
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

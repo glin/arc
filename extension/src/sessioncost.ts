@@ -5,6 +5,7 @@ import {
   codexRequestUsage,
   codexSessionsRoot,
   createCodexUsageLineReducer,
+  openingRecordOf,
   readCodexSessionMeta,
   recordedDatePredatesOpening,
   rolloutFiles,
@@ -1521,10 +1522,9 @@ export function readSessionRequests(
           unsupported = 'stream';
           return;
         }
-        const payload = record.payload as Record<string, unknown> | undefined;
         const message = record.message as Record<string, unknown> | undefined;
         if (codex) {
-          nativeRecords ||= record.type === 'session_meta' && typeof payload?.id === 'string';
+          nativeRecords ||= record.type === 'session_meta' && openingRecordOf(line)?.sessionId != null;
         } else {
           nativeRecords ||=
             ((record.type === 'assistant' || record.type === 'user') &&
