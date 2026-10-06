@@ -93,7 +93,10 @@ test('extracted source builds without Git and never inherits an enclosing reposi
     encoding: 'utf8',
   });
   assert.equal(archived.status, 0, archived.stderr);
-  const extracted = spawnSync('tar', ['-xf', archive, '-C', sourceRoot], { encoding: 'utf8' });
+  const extracted = spawnSync('tar', ['-xf', path.basename(archive), '-C', path.relative(root, sourceRoot)], {
+    cwd: root,
+    encoding: 'utf8',
+  });
   assert.equal(extracted.status, 0, extracted.stderr);
   const source = path.join(sourceRoot, 'extension');
   fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
