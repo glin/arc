@@ -71,15 +71,7 @@ import {
 } from './transcript';
 import { formatClock, formatDuration, formatRelative, formatTokens, formatWhen, shortModel } from './turnformat';
 import { turnKey } from './turnread';
-import {
-  ModelSpend,
-  addUsage,
-  agentSpendIsOpen,
-  emptyUsage,
-  spendTokens,
-  usageTokens,
-  type AgentSpend,
-} from './agentspend';
+import { addUsage, agentSpendIsOpen, emptyUsage, heaviestModel, spendTokens, type AgentSpend } from './agentspend';
 import { childFileTotals, settleCounts, type ChildFileChange } from './childartifacts';
 import { readableRichText, renderInlineMarkdown, visibleTextOf } from './richtext';
 import type { WireActivity } from './agentwire';
@@ -846,22 +838,11 @@ export function activitySkillsOf(uses: readonly TurnSkillUse[]): ActivitySkill[]
   return [...rows.values()];
 }
 
-// Uses the explicitly requested model when present.
-// Otherwise selects the spend part with the largest token count and a known model.
+// Names the model the child ran. The call can name only an alias such as `opus`, so the child's own
+// heaviest model answers first. The spend total includes nested subagents, so its heaviest model
+// answers only when neither the child nor the call names one.
 function agentModel(agent: TurnAgent): string | null {
-  if (agent.model) {
-    return agent.model;
-  }
-  let heaviest: ModelSpend | null = null;
-  for (const part of agent.spend) {
-    if (!part.model) {
-      continue;
-    }
-    if (!heaviest || usageTokens(part.usage) > usageTokens(heaviest.usage)) {
-      heaviest = part;
-    }
-  }
-  return heaviest ? heaviest.model : null;
+  return agent.ownModel ?? agent.model ?? heaviestModel(agent.spend);
 }
 
 // Maps recorded child status to a display state.
@@ -1336,6 +1317,7 @@ export function dispatchedAgentCard(
     description,
     agentType: null,
     model: null,
+    ...(spend.ownModel ? { ownModel: spend.ownModel } : {}),
     effort: spend.effort,
     spend: spend.models,
     spendFound: spend.found,

@@ -22,6 +22,10 @@ export interface ModelSpend {
 
 export interface AgentSpend {
   models: ModelSpend[];
+  // The model the transcript's own requests used most, by token count. Nested subagents never
+  // count toward it, although `models` includes them. Only the Claude reader sets it, because a
+  // Codex spawn call already names the exact model its child runs.
+  ownModel?: string | null;
   effort: string | null;
   startedAt?: number | null;
   endedAt?: number | null;
@@ -129,6 +133,17 @@ export function addModelUsage(
   byModel.set(model, held);
 }
 
+// The known model with the largest token count. Usage that names no model never answers.
+export function heaviestModel(parts: readonly ModelSpend[]): string | null {
+  let heaviest: ModelSpend | null = null;
+  for (const part of parts) {
+    if (part.model && (!heaviest || usageTokens(part.usage) > usageTokens(heaviest.usage))) {
+      heaviest = part;
+    }
+  }
+  return heaviest?.model ?? null;
+}
+
 export function modelSpends(byModel: Map<string | null, TurnUsage>, provider: string | null = null): ModelSpend[] {
   return [...byModel]
     .filter(([, usage]) => usageTokens(usage) > 0)
@@ -221,6 +236,7 @@ export function readChildSpend(
   }
   return {
     models: spend.models,
+    ...(spend.ownModel ? { ownModel: spend.ownModel } : {}),
     found: spend.found,
     partial: spend.partial,
     effort: spend.effort,

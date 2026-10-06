@@ -15,6 +15,7 @@ import {
   addModelUsage,
   addUsage,
   agentSpendIsOpen,
+  heaviestModel,
   childSpendRevisionKey,
   modelSpends,
   scanLines,
@@ -126,7 +127,11 @@ export interface TurnAgent {
   childSessionId?: string;
   description: string;
   agentType: string | null;
+  // The model named on the launch call. It can be an alias such as `opus`.
   model: string | null;
+  // The model the child's own requests used most, from `AgentSpend.ownModel`. Absent for a child
+  // whose spend reader does not record it.
+  ownModel?: string;
   effort: string | null;
   // Recorded child usage grouped by pricing identity. Empty when no request usage is available.
   spend: ModelSpend[];
@@ -3671,6 +3676,29 @@ export function claudeChildReferenceFor(
       reference.toolUseIds.includes(agent.toolUseId as string),
   );
   return matches.length === 1 ? matches[0] : null;
+}
+
+// The transcript of the Claude child that one row launched. A discovery reference answers first.
+// A child that discovery has not listed yet resolves from its `agent-<id>.meta.json` beside the
+// session, and only when that meta file names the row's launch call. The worker and the host both
+// call this, so a window and its dependency key agree on the child's file.
+export function claudeChildFileFor(
+  references: readonly ClaudeChildSessionReference[],
+  session: Pick<SessionFile, 'file' | 'sessionId' | 'childTranscript'>,
+  agent: Pick<import('./agentspend').AgentSpendRef, 'id' | 'toolUseId'>,
+  metas: ClaudeSubagentMetaReader = readClaudeSubagentMetas,
+): string | null {
+  const reference = claudeChildReferenceFor(references, session.sessionId, agent);
+  if (reference) {
+    return reference.file;
+  }
+  if (!agent.id || !agent.toolUseId) {
+    return null;
+  }
+  const matches = claudeDirectSubagents(session.file, session.childTranscript === true, metas).filter(
+    (meta) => meta.id === agent.id && meta.toolUseId === agent.toolUseId,
+  );
+  return matches.length === 1 ? matches[0].file : null;
 }
 
 export function discoverClaudeChildSessions(
@@ -7546,7 +7574,9 @@ function readClaudeSpendTree(
   }));
   const record = own.record ? structuredClone(own.record) : {};
   // Descendant spend remains partial until its own record supplies a closed last turn.
-  return { spend: { models, found: true, partial, effort: own.effort, ...record }, finished: own.finished };
+  // The row names the model this transcript ran, so a nested subagent's heavier model never answers.
+  const ownModel = heaviestModel(modelSpends(new Map(own.byModel)));
+  return { spend: { models, ownModel, found: true, partial, effort: own.effort, ...record }, finished: own.finished };
 }
 
 // Turns in the tail of one session transcript, oldest first.
@@ -9593,6 +9623,11 @@ export function refreshClaudeAgentFacts(
       }
       const spend = lookup(ref);
       agent.spend = spend.models;
+      if (spend.ownModel) {
+        agent.ownModel = spend.ownModel;
+      } else {
+        delete agent.ownModel;
+      }
       if (!agent.effort) {
         agent.effort = spend.effort;
       }

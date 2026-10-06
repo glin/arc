@@ -108,7 +108,7 @@ import { readMovedOnlyFor } from './domain/read.ts';
 import {
   agentSpendDependencyKey,
   childSpendVersion,
-  claudeChildReferenceFor,
+  claudeChildFileFor,
   claudeSubagentMetaReader,
   normalizeFsPath,
   createClaudeUsageLineReducer,
@@ -1626,7 +1626,7 @@ function selectedWindowHarness(
     'newestTurnLoading',
     'agentSpendIsOpen',
     'spendFileVersion',
-    'claudeChildReferenceFor',
+    'claudeChildFileFor',
     'codexSubagentFor',
     'writeTimeOfVersion',
     'visitPlace',
@@ -1656,7 +1656,7 @@ function selectedWindowHarness(
     newestTurnLoading,
     agentSpendIsOpen,
     spendFileVersion,
-    claudeChildReferenceFor,
+    claudeChildFileFor,
     codexSubagentFor,
     writeTimeOfVersion,
     visitPlace,
@@ -5708,6 +5708,118 @@ test('a nested subagent that appears or grows after its launcher finished moves 
     requests,
     ['window', 'retained', 'retained'],
     'the cost key the window filed disagreed with the one the panel compares, so a read made an extra round trip',
+  );
+});
+
+test('a subagent that discovery has not listed keys its cost through its meta file', async () => {
+  const folder = tempDir('panel-startup-meta-child-');
+  const session = path.join(folder, 'selected.jsonl');
+  const subagents = path.join(folder, 'selected', 'subagents');
+  const child = path.join(subagents, 'agent-a1.jsonl');
+  fs.mkdirSync(subagents, { recursive: true });
+  const line = (record: object) => JSON.stringify(record) + '\n';
+  const answer = (id: string) =>
+    line({
+      type: 'assistant',
+      isSidechain: true,
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: {
+        role: 'assistant',
+        id,
+        model: 'claude-haiku-4-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Done.' }],
+        usage: { input_tokens: 1000, output_tokens: 0 },
+      },
+    });
+  fs.writeFileSync(
+    child,
+    line({
+      type: 'user',
+      isSidechain: true,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'review in the background' },
+    }) + answer('m1'),
+  );
+  fs.writeFileSync(path.join(subagents, 'agent-a1.meta.json'), JSON.stringify({ toolUseId: 'launch-1' }));
+  const read: any = {
+    turns: [
+      {
+        sessionId: 'selected',
+        turnId: 'turn',
+        startedAt: 1,
+        agents: [
+          {
+            id: 'a1',
+            description: 'Review in the background',
+            agentType: null,
+            status: 'completed',
+            toolUseId: 'launch-1',
+            spend: [],
+            spendFound: true,
+            spendPartial: false,
+          },
+        ],
+      },
+    ],
+    compactions: [],
+    readBytes: 10,
+    turnLimitReached: false,
+  };
+  const priced = (turns: any[]) =>
+    turns.map((turn) => ({
+      ...turn,
+      agents: turn.agents.map((agent: any) => {
+        const spend = readClaudeAgentSpend(child);
+        return { ...agent, spend: spend.models, spendPartial: spend.partial };
+      }),
+    }));
+  const requests: string[] = [];
+  let provider: any;
+  provider = selectedWindowHarness(
+    async (request, generation) => {
+      requests.push(request.kind);
+      const revision = provider.revisionOf(provider.session);
+      if (request.kind === 'retained') {
+        return {
+          generation,
+          revision,
+          value: { kind: 'retained', pages: request.pages.map((page) => ({ ...page, turns: priced(page.turns) })) },
+        };
+      }
+      const result = windowResult(generation, revision);
+      assert.ok(result.value.kind === 'window');
+      result.value.read = { ...read, turns: priced(read.turns) };
+      // The worker resolves the child through the same meta file.
+      result.value.agentKey = agentSpendDependencyKey(
+        result.value.read.turns,
+        () => child,
+        (file) => childSpendVersion('claude', file),
+        '',
+        [],
+        Date.now(),
+      );
+      return result;
+    },
+    ['agentSpendKey', 'agentFile', 'codexStructuralChildren', 'refreshAgentFacts'],
+  );
+  provider.session = { ...provider.session, file: session };
+  provider.claudeChildReferences = [];
+  provider.claudeChildren = [];
+  provider.codexSubagents = [];
+  const input = () => provider.cache.get(session).read.turns[0].agents[0].spend[0]?.usage.input;
+
+  await provider.completeSelectedWindow('selected', 1);
+  await provider.completeSelectedWindow('selected', 1);
+  assert.equal(input(), 1000);
+  fs.appendFileSync(child, answer('m2'));
+  await provider.completeSelectedWindow('selected', 1);
+  assert.equal(input(), 2000, 'a child append left the row at its old cost');
+  await provider.completeSelectedWindow('selected', 1);
+  assert.deepEqual(
+    requests,
+    ['window', 'retained'],
+    'the panel keyed the child differently from the window, so a read made an extra round trip',
   );
 });
 

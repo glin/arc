@@ -65,7 +65,7 @@ import {
   linkTargetIsMarkdown,
   agentSpendDependencyKey,
   childSpendVersion,
-  claudeChildReferenceFor,
+  claudeChildFileFor,
   claudeSubagentMetaReader,
   type ClaudeChildSessionFile,
   type ClaudeChildSessionReference,
@@ -9535,9 +9535,9 @@ export class PanelProvider implements vscode.Disposable {
     return result.value.kind === 'page' ? result.value.page : { kind: 'stale' };
   }
 
-  private agentFile(session: SessionFile, agent: AgentSpendRef): string | null {
+  private agentFile(session: SessionFile, agent: AgentSpendRef, metas: ClaudeSubagentMetaReader): string | null {
     if (session.agent === 'claude') {
-      return claudeChildReferenceFor(this.claudeChildReferences, session.sessionId, agent)?.file ?? null;
+      return claudeChildFileFor(this.claudeChildReferences, session, agent, metas);
     }
     return codexSubagentFor(this.codexSubagents, session.sessionId, agent)?.file ?? null;
   }
@@ -9610,7 +9610,7 @@ export class PanelProvider implements vscode.Disposable {
     const metas = claudeSubagentMetaReader();
     return agentSpendDependencyKey(
       read.turns,
-      (ref) => this.agentFile(session, ref),
+      (ref) => this.agentFile(session, ref, metas),
       (file) => this.spendVersion(session, file, versions, metas),
       structuralKey,
       this.codexStructuralChildren(session).map((child) => child.file),

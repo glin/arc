@@ -45,7 +45,7 @@ import {
   ClaudeChildSessionCache,
   childSpendVersion,
   claudeAgentSpendVersion,
-  claudeChildReferenceFor,
+  claudeChildFileFor,
   claudeSubagentMetaReader,
   discoverClaudeChildSessions,
   discoverClaudeNewestTurn,
@@ -870,14 +870,14 @@ async function execute(
             candidate.toolUseIds.includes(agent.toolUseId as string),
         )
       : undefined;
-  const agentFile = (agent: AgentSpendRef) =>
-    session.agent === 'claude'
-      ? (claudeChildReferenceFor(references, session.sessionId, agent)?.file ?? null)
-      : (codexSubagentFor(children, session.sessionId, agent)?.file ?? null);
   const versions = new Map<string, string>();
   const codexIndex = session.agent === 'codex' ? codexSpendIndex(children) : null;
   const readCodexSpend = codexIndex ? codexAgentSpendReader(codexIndex) : null;
   const subagentMetas = claudeSubagentMetaReader();
+  const agentFile = (agent: AgentSpendRef) =>
+    session.agent === 'claude'
+      ? claudeChildFileFor(references, session, agent, subagentMetas)
+      : (codexSubagentFor(children, session.sessionId, agent)?.file ?? null);
   const versionOf = (file: string): string => {
     let version = versions.get(file);
     if (version === undefined) {

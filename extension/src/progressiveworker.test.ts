@@ -4097,6 +4097,305 @@ test('Claude child spend uses the paired transcript when navigation scope reject
   }
 });
 
+// A background child that no discovery pass has listed yet. Claude Code writes its meta file
+// beside the child transcript when the child starts, and the meta names the launch call. With
+// `nested`, the child launches a haiku grandchild that reads more than the child itself, and its
+// meta file sits in the same folder with `parentAgentId`. `view: 'child'` reads the child
+// transcript as its own session. With `running`, the parent has no completion notice yet.
+async function undiscoveredBackgroundChild(
+  metaToolUseId: string,
+  {
+    nested = false,
+    view = 'parent',
+    running = false,
+  }: { nested?: boolean; view?: 'parent' | 'child'; running?: boolean } = {},
+) {
+  const directory = tempDir('panel-progressive-claude-meta-child-');
+  const parent = path.join(directory, 'parent.jsonl');
+  const childDirectory = path.join(directory, 'parent', 'subagents');
+  fs.mkdirSync(childDirectory, { recursive: true });
+  const grandchildNotice =
+    '<task-notification><task-id>grandchild</task-id><tool-use-id>launch-grandchild</tool-use-id>' +
+    '<status>completed</status><subagent_tokens>504000</subagent_tokens>' +
+    '<tool_uses>3</tool_uses><duration_ms>35000</duration_ms></task-notification>';
+  const grandchildLaunch = [
+    {
+      type: 'assistant',
+      isSidechain: true,
+      timestamp: timestamp(3),
+      cwd: 'C:/repo',
+      message: {
+        role: 'assistant',
+        id: 'child-launch',
+        model: 'claude-opus-5-5',
+        stop_reason: 'tool_use',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'launch-grandchild',
+            name: 'Agent',
+            input: { description: 'Search the tests', model: 'haiku', run_in_background: true },
+          },
+        ],
+        usage: { input_tokens: 1_000, output_tokens: 100 },
+      },
+    },
+    {
+      type: 'user',
+      isSidechain: true,
+      timestamp: timestamp(4),
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'launch-grandchild',
+            content: 'Async agent launched successfully.\nagentId: grandchild',
+          },
+        ],
+      },
+      toolUseResult: {
+        isAsync: true,
+        status: 'async_launched',
+        agentId: 'grandchild',
+        description: 'Search the tests',
+      },
+    },
+    { type: 'queue-operation', operation: 'enqueue', timestamp: timestamp(41), content: grandchildNotice },
+    {
+      type: 'user',
+      isSidechain: true,
+      timestamp: timestamp(42),
+      origin: { kind: 'task-notification' },
+      message: { role: 'user', content: grandchildNotice },
+    },
+  ];
+  const completionNotice = [
+    {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      timestamp: timestamp(60),
+      content:
+        '<task-notification><task-id>child</task-id><tool-use-id>launch-child</tool-use-id>' +
+        '<status>completed</status><subagent_tokens>116028</subagent_tokens>' +
+        '<tool_uses>12</tool_uses><duration_ms>780000</duration_ms></task-notification>',
+    },
+    {
+      type: 'user',
+      timestamp: timestamp(61),
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content:
+          '<task-notification><task-id>child</task-id><tool-use-id>launch-child</tool-use-id>' +
+          '<status>completed</status><subagent_tokens>116028</subagent_tokens>' +
+          '<tool_uses>12</tool_uses><duration_ms>780000</duration_ms></task-notification>',
+      },
+    },
+  ];
+  fs.writeFileSync(
+    parent,
+    jsonLines([
+      {
+        type: 'user',
+        promptId: 'prompt',
+        timestamp: timestamp(0),
+        cwd: 'C:/repo',
+        message: { role: 'user', content: [{ type: 'text', text: 'Review in the background' }] },
+      },
+      {
+        type: 'assistant',
+        timestamp: timestamp(1),
+        message: {
+          role: 'assistant',
+          id: 'launch',
+          model: 'claude-opus-5-5',
+          stop_reason: 'tool_use',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'launch-child',
+              name: 'Agent',
+              input: { description: 'Review child', model: 'opus', run_in_background: true },
+            },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: timestamp(2),
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'launch-child',
+              content: 'Async agent launched successfully.\nagentId: child',
+            },
+          ],
+        },
+        toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'child', description: 'Review child' },
+      },
+      {
+        type: 'assistant',
+        timestamp: timestamp(3),
+        message: {
+          role: 'assistant',
+          id: 'waiting',
+          model: 'claude-opus-5-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'The review runs in the background.' }],
+        },
+      },
+      ...(running ? [] : completionNotice),
+    ]),
+  );
+  fs.writeFileSync(
+    path.join(childDirectory, 'agent-child.jsonl'),
+    jsonLines([
+      {
+        type: 'user',
+        isSidechain: true,
+        timestamp: timestamp(2),
+        cwd: 'C:/repo',
+        message: { role: 'user', content: [{ type: 'text', text: 'Review the change' }] },
+      },
+      ...(nested ? grandchildLaunch : []),
+      {
+        type: 'assistant',
+        isSidechain: true,
+        timestamp: timestamp(59),
+        cwd: 'C:/repo',
+        effort: 'high',
+        message: {
+          role: 'assistant',
+          id: 'child-answer',
+          model: 'claude-opus-5-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Review complete.' }],
+          usage: { input_tokens: 100_000, output_tokens: 16_000 },
+        },
+      },
+    ]),
+  );
+  fs.writeFileSync(
+    path.join(childDirectory, 'agent-child.meta.json'),
+    JSON.stringify({
+      agentType: 'general-purpose',
+      toolUseId: metaToolUseId,
+      requestShape: 'background',
+      model: 'opus',
+    }),
+  );
+  if (nested) {
+    fs.writeFileSync(
+      path.join(childDirectory, 'agent-grandchild.jsonl'),
+      jsonLines([
+        {
+          type: 'user',
+          isSidechain: true,
+          timestamp: timestamp(5),
+          cwd: 'C:/repo',
+          message: { role: 'user', content: [{ type: 'text', text: 'Search the tests' }] },
+        },
+        {
+          type: 'assistant',
+          isSidechain: true,
+          timestamp: timestamp(40),
+          cwd: 'C:/repo',
+          message: {
+            role: 'assistant',
+            id: 'grandchild-answer',
+            model: 'claude-haiku-4-5',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Search complete.' }],
+            usage: { input_tokens: 500_000, output_tokens: 4_000 },
+          },
+        },
+      ]),
+    );
+    fs.writeFileSync(
+      path.join(childDirectory, 'agent-grandchild.meta.json'),
+      JSON.stringify({ agentType: 'Explore', toolUseId: 'launch-grandchild', parentAgentId: 'child' }),
+    );
+  }
+  const viewed = view === 'child' ? path.join(childDirectory, 'agent-child.jsonl') : parent;
+  const worker = new ProgressiveWorker(source);
+  try {
+    const { mtimeMs, size } = fs.statSync(viewed);
+    const result = await worker.run(
+      {
+        kind: 'window',
+        input: {
+          session:
+            view === 'child'
+              ? { agent: 'claude', file: viewed, sessionId: 'agent-child', mtimeMs, size, childTranscript: true }
+              : { agent: 'claude', file: viewed, sessionId: 'parent', mtimeMs, size },
+          folders: ['C:/repo'],
+          children: [],
+          claudeChildren: [],
+          claudeChildReferences: [],
+          maxTurns: 40,
+          tailBytes: 1 << 20,
+        },
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(result?.value.kind === 'window');
+    const [turn] = result.value.read.turns;
+    return { agent: turn.agents[0], row: toCard(turn, false, Date.parse(timestamp(120)), ['C:/repo']).agents[0] };
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test('a Claude background child prices from its own meta file before discovery lists it', async () => {
+  const { agent, row } = await undiscoveredBackgroundChild('launch-child');
+  assert.equal(agent.spendFound, true, 'the child transcript was not found without a discovery reference');
+  assert.match(row.figures[0]?.compactLabel ?? '', /^\$/, 'the row fell back to the notice token count');
+  assert.equal(row.effort, 'high', 'the row lost the effort the child recorded');
+});
+
+test('a Claude child row names its own model when a nested subagent read more under another', async () => {
+  const { agent, row } = await undiscoveredBackgroundChild('launch-child', { nested: true });
+  assert.ok(
+    agent.spend.some((part) => part.model === 'claude-haiku-4-5'),
+    'the nested subagent spend did not reach the row',
+  );
+  assert.equal(row.model, 'opus-5-5', 'the row named a model only a nested subagent ran');
+  assert.equal(row.effort, 'high');
+});
+
+test('a running Claude background child row names the model it ran beside its cost', async () => {
+  const { agent, row } = await undiscoveredBackgroundChild('launch-child', { running: true });
+  assert.equal(agent.status, 'running', 'the fixture child finished');
+  assert.equal(agent.model, 'opus');
+  assert.equal(row.model, 'opus-5-5', 'the running row named the Agent call alias');
+  const [cost] = row.figures;
+  assert.equal(cost?.compactLabel, '$0.72+');
+  assert.match(cost?.detail ?? '', /Cost by usage · opus-5-5: \$0\.72/);
+});
+
+test('a Claude child viewed as its own session prices its nested launch from the shared meta folder', async () => {
+  const { agent, row } = await undiscoveredBackgroundChild('launch-child', { nested: true, view: 'child' });
+  assert.equal(agent.id, 'grandchild');
+  assert.equal(agent.spendFound, true, 'the nested child transcript was not found without a discovery reference');
+  assert.match(row.figures[0]?.compactLabel ?? '', /^\$/, 'the row fell back to the notice token count');
+  assert.equal(row.model, 'haiku-4-5');
+});
+
+test('a Claude child meta file that names another launch attaches no spend', async () => {
+  const { agent, row } = await undiscoveredBackgroundChild('another-launch');
+  assert.equal(agent.spendFound, false, 'a meta file for another launch supplied this row its spend');
+  assert.deepEqual(
+    row.figures.map((figure) => figure.compactLabel),
+    ['13m', '116k tokens'],
+  );
+  assert.equal(row.effort, null);
+});
+
 test('Claude child commits cross the worker boundary and refresh on retained pages and workspace changes', async () => {
   const directory = tempDir('panel-progressive-claude-commits-');
   const parent = path.join(directory, 'parent.jsonl');

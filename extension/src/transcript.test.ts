@@ -8592,6 +8592,7 @@ test('a Claude child transcript keeps model rates apart, reports nested work, an
           },
         },
       ],
+      ownModel: 'claude-opus-5',
       found: true,
       partial: true,
       effort: 'high',

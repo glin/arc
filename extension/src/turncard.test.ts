@@ -3878,20 +3878,31 @@ test('a subagent that changed model names the one it spent most under', () => {
   assert.equal(card.agents[0].model, 'opus-5');
 });
 
-test('a model named on the call outranks what the child billed', () => {
-  const card = toCard(
-    turn({
-      agents: [
-        agent({
-          model: 'claude-opus-5',
-          spend: [ran('claude-haiku-4-5', 90_000)],
-        }),
-      ],
-    }),
-    true,
-    NOW,
+test('a subagent row names the model the child ran, not the alias on the call or a nested model', () => {
+  // The spend includes a nested subagent that read more under haiku than the child did under opus.
+  const launched = turn({
+    steps: [step({ name: 'Agent', id: 'agent-1', detail: 'Audit the parser' })],
+    stepCount: 1,
+    agents: [
+      agent({
+        toolUseId: 'agent-1',
+        model: 'opus',
+        ownModel: 'claude-opus-5-5',
+        effort: 'high',
+        spend: [ran('claude-opus-5-5', 30_000), ran('claude-haiku-4-5', 60_000)],
+      }),
+    ],
+  });
+  const card = toCard(launched, true, NOW);
+  assert.equal(card.agents[0].model, 'opus-5-5');
+  assert.equal(logOf(launched).rows[0].figure, 'opus-5-5 · high');
+  assert.equal(
+    card.chips.find((chip) => chip.metric === 'agents')?.detail.split('\n')[1],
+    '  opus-5-5 · high · 90k in',
   );
-  assert.equal(card.agents[0].model, 'opus-5');
+  // A child with no recorded spend keeps the model named on the call.
+  const unpriced = toCard(turn({ agents: [agent({ model: 'opus', spend: [] })] }), true, NOW);
+  assert.equal(unpriced.agents[0].model, 'opus');
 });
 
 test('billed usage that names no model never outweighs usage that does', () => {
