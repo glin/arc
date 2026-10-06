@@ -49,6 +49,71 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
     assert.deepEqual(detail[key], ordinary[key]);
 }
 
+test('cost rejects unsupported formats before applying an empty request window', () => {
+  const { root, file } = fixture();
+  const assistant = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const init = { type: 'system', subtype: 'init', session_id: 'stream-session', tools: [] };
+  const streamed = { ...assistant, parent_tool_use_id: null };
+  const result = { type: 'result', subtype: 'success', total_cost_usd: 1, modelUsage: {} };
+  const stream = [init, streamed, result];
+  const cases = [
+    [JSON.stringify(stream), /JSON arrays.*Claude stream logs/],
+    [JSON.stringify(stream, null, 2), /JSON arrays.*Claude stream logs/],
+    [JSON.stringify([1, { unrelated: true }]), /JSON arrays/],
+    [stream.map((record) => JSON.stringify(record)).join('\n'), /Claude stream logs/],
+    [JSON.stringify(streamed), /Claude stream logs/],
+    [JSON.stringify(result), /Claude stream logs/],
+    [JSON.stringify({ type: 'stream_event', event: { type: 'message_delta' } }), /Claude stream logs/],
+    ['', /No native transcript records/],
+    [' \n\t', /No native transcript records/],
+    ['not JSON\n{"unfinished":', /No native transcript records/],
+    [JSON.stringify({ unrelated: true }), /No native transcript records/],
+    [JSON.stringify({ type: 'assistant' }), /No native transcript records/],
+  ] as const;
+  try {
+    const failures: string[] = [];
+    for (const [index, [content, error]] of cases.entries()) {
+      fs.writeFileSync(file, content);
+      for (const flags of [[], ['--source-only'], ['--since', '2027-01-01T00:00:00Z']]) {
+        try {
+          assert.throws(() => runCost([file, ...flags]), error, content);
+        } catch (failure) {
+          failures.push(`Case ${index}, flags ${flags.join(' ')}: ${String(failure)}`);
+        }
+      }
+    }
+    assert.deepEqual(failures, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cost preserves native usage, metadata-only sessions, and incomplete trailing lines', () => {
+  const { root, file, codex, projects } = fixture();
+  try {
+    const native = fs.readFileSync(file, 'utf8');
+    fs.appendFileSync(file, '{"type":"assistant","message":');
+    assert.equal(JSON.parse(runCost([file, '--source-only'])).parent.requests, 1);
+    assert.equal(JSON.parse(runCost([file, '--since', '2027-01-01T00:00:00Z'])).parent.requests, 0);
+    fs.writeFileSync(file, JSON.stringify({ type: 'custom-title', sessionId: 'session-1', customTitle: 'Saved' }));
+    assert.equal(JSON.parse(runCost([file])).parent.requests, 0);
+    const child = path.join(projects, 'sample', 'session-1', 'subagents', 'agent-child.jsonl');
+    fs.mkdirSync(path.dirname(child), { recursive: true });
+    fs.writeFileSync(child, native);
+    const withChild = JSON.parse(runCost([file, '--projects', projects, '--codex-sessions', codex]));
+    assert.equal(withChild.children.length, 1);
+    assert.equal(withChild.combined.requests, 1);
+    const rollout = path.join(codex, 'rollout-metadata.jsonl');
+    fs.writeFileSync(
+      rollout,
+      JSON.stringify({ type: 'session_meta', payload: { id: 'metadata', cwd: root, source: 'cli' } }),
+    );
+    assert.equal(JSON.parse(runCost([rollout, '--source-only'])).parent.requests, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('cost attributes a delayed native child once through colliding parent session ids', () => {
   const { root, projects, codex } = fixture();
   try {

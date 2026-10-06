@@ -128,6 +128,27 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     assert.equal(failure.status, 1);
     assert.equal(failure.stdout, '');
     assert.match(failure.stderr, /No transcript found/);
+    const native = readFileSync(file, 'utf8');
+    const stream = [
+      { type: 'system', subtype: 'init', session_id: 'stream', tools: [] },
+      { ...JSON.parse(native), parent_tool_use_id: null },
+      { type: 'result', subtype: 'success', total_cost_usd: 1 },
+    ];
+    for (const content of [
+      JSON.stringify(stream),
+      JSON.stringify(stream, null, 2),
+      stream.map((record) => JSON.stringify(record)).join('\n'),
+      '',
+      'not JSON',
+      '{"unrelated":true}',
+    ]) {
+      writeFileSync(file, content);
+      const unsupported = spawnSync(process.execPath, [cli, 'cost', file, '--source-only'], { env, encoding: 'utf8' });
+      assert.equal(unsupported.status, 1, content);
+      assert.equal(unsupported.stdout, '');
+      assert.match(unsupported.stderr, /Claude stream logs|No native transcript records/);
+      assert.equal(unsupported.stderr.includes(file), true);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -228,7 +249,20 @@ test('the packed package installs both commands globally, replaces the old packa
       readFileSync(new URL('../../LICENSE', import.meta.url)),
     );
     const transcript = join(consumer, 'session.jsonl');
-    copyFileSync(new URL('./fixtures/stream/five-requests-jsonl.jsonl', import.meta.url), transcript);
+    writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-09-26T00:00:01Z',
+        message: {
+          id: 'installed-request',
+          model: 'claude-opus-5',
+          role: 'assistant',
+          content: [],
+          usage: { input_tokens: 1000, output_tokens: 100 },
+        },
+      }) + '\n',
+    );
     const costArgs = ['cost', transcript, '--source-only', '--by-model'];
     const expectedCost = JSON.parse(execFileSync(process.execPath, [cli, ...costArgs], options));
     const installedInput = JSON.stringify({

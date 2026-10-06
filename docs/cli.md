@@ -1,5 +1,7 @@
 # Arc CLI
 
+The Arc CLI is experimental. npm publication is deferred.
+
 The Arc CLI reports session cost from disk and renders Claude Code status-line input. It performs no cache write or network request.
 
 `cost` reads a Claude transcript or Codex rollout and its discovered children. `statusline` reads one Claude Code JSON object from stdin.
@@ -259,7 +261,7 @@ Text rounds positive next-turn starting prices below $10 upward to cents and pri
 
 Successful commands write output to stdout and exit with status 0. Errors write one line prefixed with `arc-status:` to stderr and exit with status 1. Errors produce no report on stdout.
 
-Cost rejects unknown options, missing option values, multiple targets, invalid times, unreadable transcripts, invalid regex syntax, and unresolved Agent launches. Status-line input must contain one JSON object. Empty input, malformed JSON, and incompatible output modes produce errors.
+Cost rejects unknown options, missing option values, multiple targets, invalid times, unreadable transcripts, invalid regex syntax, and unresolved Agent launches. JSON arrays and identifiable Claude stream logs are unsupported. Empty files and files without native transcript records produce errors. Metadata-only native sessions and empty request windows remain valid. Status-line input must contain one JSON object. Empty input, malformed JSON, and incompatible output modes produce errors.
 
 These complete stderr examples require no path substitutions:
 

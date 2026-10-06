@@ -1472,6 +1472,8 @@ export function readSessionRequests(
   const costSnapshots: CodexCostSnapshot[] = [];
   const costBoundaries: { timestamp: number; segment: number; turnId: string | null; order: number }[] = [];
   let sourceOrder = 0;
+  let nativeRecords = false;
+  let unsupported: 'array' | 'stream' | null = null;
   let costSegment = 0;
   const copiedTurns = new Set<string>();
   const seenTurns = new Set<string>();
@@ -1496,8 +1498,53 @@ export function readSessionRequests(
     return toolCalls;
   };
   const complete = scanLines(file, (line) => {
-    if (!line) return;
+    if (!line.trim() || unsupported) return;
+    if (sourceOrder === 0 && line.trimStart().startsWith('[')) {
+      unsupported = 'array';
+      return;
+    }
     sourceOrder++;
+    try {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      if (record && typeof record === 'object' && !Array.isArray(record)) {
+        if (
+          (record.type === 'system' && record.subtype === 'init' && typeof record.session_id === 'string') ||
+          ((record.type === 'assistant' || record.type === 'user') &&
+            'parent_tool_use_id' in record &&
+            record.message !== null &&
+            typeof record.message === 'object') ||
+          (record.type === 'result' &&
+            typeof record.subtype === 'string' &&
+            ('modelUsage' in record || 'total_cost_usd' in record || 'usage' in record)) ||
+          (record.type === 'stream_event' && record.event !== null && typeof record.event === 'object')
+        ) {
+          unsupported = 'stream';
+          return;
+        }
+        const payload = record.payload as Record<string, unknown> | undefined;
+        const message = record.message as Record<string, unknown> | undefined;
+        if (codex) {
+          nativeRecords ||= record.type === 'session_meta' && typeof payload?.id === 'string';
+        } else {
+          nativeRecords ||=
+            ((record.type === 'assistant' || record.type === 'user') &&
+              message !== null &&
+              typeof message === 'object' &&
+              (typeof record.timestamp === 'string' ||
+                typeof record.uuid === 'string' ||
+                typeof record.sessionId === 'string')) ||
+            (record.type === 'custom-title' && typeof record.customTitle === 'string') ||
+            (record.type === 'ai-title' && typeof record.aiTitle === 'string') ||
+            ((record.type === 'system' ||
+              record.type === 'attachment' ||
+              record.type === 'progress' ||
+              record.type === 'queue-operation') &&
+              typeof record.sessionId === 'string');
+        }
+      }
+    } catch {
+      // Native transcripts can end with an incomplete line.
+    }
     const pendingOwnershipBefore =
       codex && line.includes('token_usage_record')
         ? (reducer as ReturnType<typeof createCodexUsageLineReducer>).snapshot().pendingOwnership
@@ -1954,7 +2001,12 @@ export function readSessionRequests(
       });
     }
   });
+  if (unsupported === 'array')
+    throw new Error(`JSON arrays, including Claude stream logs, are unsupported: ${file}. Use a native transcript.`);
+  if (unsupported === 'stream')
+    throw new Error(`Claude stream logs are unsupported: ${file}. Use a native transcript.`);
   if (!complete) throw new Error(`Cannot read transcript: ${file}`);
+  if (!nativeRecords) throw new Error(`No native transcript records in ${file}`);
   if (failedToolTimestamps)
     for (const { turnId, timestamp } of failureCandidates)
       if (!turnId || !copiedTurns.has(turnId)) failedToolTimestamps.push(timestamp);

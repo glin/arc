@@ -1,15 +1,12 @@
 # Arc CLI
 
+The Arc CLI is experimental. npm publication is deferred.
+
 Show context, prompt-cache status, and the next turn's starting price in Claude Code. Read estimated costs for saved Claude Code and Codex sessions.
 
 ## Install
 
-Requires Node.js 18 or later. Registry installation is available after publication:
-
-```sh
-npm install --global @glin/arc
-arc --version
-```
+Requires Node.js 18 or later. [Build from source](#build-from-source) and install the local tarball.
 
 The package installs `arc` and the compatible `arc-status` alias. If you use the old `arc-agent-status` package, uninstall it first:
 
