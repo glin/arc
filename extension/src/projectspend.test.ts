@@ -5890,3 +5890,35 @@ describe('Claude background cost accounting', () => {
     assert.equal(baselineRead.models[0].usage.input, 200);
   });
 });
+
+test('Bedrock Astra rebuilds literal parser generation 37 at unchanged EOF before saved spend is priced', () => {
+  const folder = dir();
+  const file = path.join(folder, 'bedrock-astra.jsonl');
+  const events = [100_000, 100_000].map((input, index) =>
+    event(stamp(`2026-10-01T1${index}:00:00`), {
+      agent: 'codex',
+      provider: 'amazon-bedrock',
+      model: 'openai.gpt-6-astra',
+      serviceTier: 'default',
+      usage: { ...usage(), input, cacheWrite30m: 20_000, cacheRead: 100_000, output: 10_000 },
+    }),
+  );
+  fs.writeFileSync(file, events.map((request) => JSON.stringify(request)).join('\n') + '\n');
+  const current = indexSpendFile(undefined, file, 'w', reducer, 1).record;
+  const unpriced = current.buckets.map((bucket) => ({ ...bucket, contextBand: null, inferenceClass: null }));
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [{ ...current, parserGeneration: 37, buckets: unpriced, lifetimeBuckets: unpriced }]);
+  const before = fs.statSync(file);
+  const loaded = loadSpendLedger(storage, 'w').files[0];
+  assert.equal(loaded.offset, loaded.size);
+  const rebuilt = indexSpendFile(loaded, file, 'w', reducer, 2);
+  assert.equal(rebuilt.rebuilt, true);
+  assert.equal(rebuilt.record.buckets[0]?.requests, 2);
+  assert.equal(rebuilt.record.buckets[0]?.contextBand, 'short');
+  saveSpendLedger(storage, 'w', [rebuilt.record]);
+  const restored = loadSpendLedger(storage, 'w').files[0];
+  assert.ok(Math.abs(publicProjectSpendPrice(restored.buckets[0])!.dollars - 4.07) < 1e-12);
+  assert.equal(indexSpendFile(restored, file, 'w', reducer, 3).rebuilt, false);
+  assert.equal(fs.statSync(file).size, before.size);
+  assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+});

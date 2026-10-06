@@ -1,3 +1,4 @@
+import { bedrockAstraRecords } from '../../extension/src/turnfixtures.ts';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -1260,6 +1261,38 @@ test('tool-kind classification keeps redirected cat and its heredoc opening line
       report.byToolKind.rows.find((row: { kind: string }) => row.kind === 'file read'),
       undefined,
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cost prices Bedrock Astra parent and native Plato without counting shared billing twice', () => {
+  const { root, projects, codex } = fixture();
+  try {
+    for (const [id, child] of [
+      ['bedrock-astra-parent', false],
+      ['bedrock-astra-plato', true],
+    ] as const)
+      fs.writeFileSync(
+        path.join(codex, `rollout-${id}.jsonl`),
+        bedrockAstraRecords(child)
+          .map((record) => JSON.stringify(record))
+          .join('\n') + '\n',
+      );
+    const report = JSON.parse(
+      runCost(['bedrock-astra-parent', '--projects', projects, '--codex-sessions', codex, '--by-model']),
+    );
+    assert.equal(report.children.length, 1);
+    for (const [row, count, cost] of [
+      [report.parent, 33, 6.5229],
+      [report.children[0], 11, 2.5627],
+      [report.combined, 44, 9.0856],
+    ]) {
+      assert.equal(row.requests, count);
+      assert.equal(row.pricedRequests, count);
+      assert.equal(row.unpricedRequests, 0);
+      assert.ok(Math.abs(row.costUsd - cost) < 1e-10);
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

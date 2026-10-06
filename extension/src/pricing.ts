@@ -35,7 +35,7 @@ interface BedrockSupport {
   regionalMultiplier: number;
   window: number;
   cachePolicy: CachePolicy;
-  effectiveDate: string;
+  effectiveDate: string | null;
   profileEffectiveDate?: string;
   // Omit this only when the published global rates equal the shared rates.
   rate?: Rate;
@@ -211,6 +211,17 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     providers: ['openai'],
     maxPricedContext: 272_000,
     longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html
+    bedrock: {
+      prefixes: /^(?:us|global)?$/,
+      regionalMultiplier: 1.1,
+      window: 1_050_000,
+      cachePolicy: {
+        kind: 'unknown',
+        sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html'],
+      },
+      effectiveDate: null,
+    },
   },
   // https://developers.openai.com/api/docs/models/gpt-6.1-sol
   {

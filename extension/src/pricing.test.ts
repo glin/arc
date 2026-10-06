@@ -207,6 +207,16 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
     { input: 10, cacheWrite30m: 12.5, cacheRead: 1, output: 50 },
     1_050_000,
     '30m',
+    {
+      prefixes: /^(?:us|global)?$/,
+      regionalMultiplier: 1.1,
+      window: 1_050_000,
+      cachePolicy: {
+        kind: 'unknown',
+        sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html'],
+      },
+      effectiveDate: null,
+    },
   ),
   openaiSupport(
     /^gpt-6\.1-sol$/,
@@ -440,7 +450,6 @@ test('GPT-6 Astra uses its published rate and context window only for its exact 
   for (const provider of ['amazon-bedrock', 'unknown-provider']) {
     assert.equal(rateFor('gpt-6-astra', provider), null, provider);
   }
-  assert.equal(rateFor('openai.gpt-6-astra', 'amazon-bedrock'), null);
 });
 
 test('GPT-6.1 Sol prices its exact OpenAI ID in both request bands', () => {
@@ -558,7 +567,6 @@ test('Bedrock GPT-6.1 Sol prices supported routes with its documented cache life
     'openai.gpt-6.11-sol',
     'openai.gpt-6.2-sol',
     'openai.gpt-5.6',
-    'openai.gpt-6-astra',
   ]) {
     assert.equal(rateFor(model, provider), null, model);
     assert.equal(contextWindowFor(model, provider), null, model);
@@ -1565,7 +1573,7 @@ test('the cost guide states the provider-specific cache multiples the pricer cha
     ratio('claude-fable-5-1', { cacheWrite1h: 1_000_000 }),
   ]);
 
-  const openai = cellsFor('Other priced OpenAI GPT-5.6 and GPT-6 models');
+  const openai = cellsFor('Other priced direct OpenAI GPT-5.6 and GPT-6 models');
   assert.deepEqual(multiplesIn(openai[1]), [ratio('gpt-5.6-sol', { cacheRead: 1_000_000 })]);
   assert.deepEqual(multiplesIn(openai[2]), [ratio('gpt-5.6-sol', { cacheWrite30m: 1_000_000 })]);
 
@@ -1747,4 +1755,63 @@ test('explicit unknown and unsupported policies never invent a provider lifetime
       assert.equal(cacheLifetimeFor(model, provider), null);
     }
   }
+});
+
+test('Bedrock Astra prices exact routes and request thresholds without inventing cache expiry or effective dates', () => {
+  for (const [model, multiplier] of [
+    ['openai.gpt-6-astra', 1.1],
+    ['us.openai.gpt-6-astra', 1.1],
+    ['global.openai.gpt-6-astra', 1],
+  ] as const) {
+    const resolved = resolveModelPricing(model, 'amazon-bedrock');
+    assert.equal(resolved?.window, 1_050_000);
+    assert.equal(resolved?.cachePolicy.kind, 'unknown');
+    assert.equal(resolved?.cacheLifetime, null);
+    assert.equal(resolved?.effectiveDate, null);
+    assert.equal(cacheLifetimeFor(model, 'amazon-bedrock'), null);
+    for (const [tokens, inputRate, outputRate] of [
+      [272_000, 10, 50],
+      [272_001, 20, 75],
+    ]) {
+      for (const serviceTier of [null, 'default', 'standard']) {
+        const quote = quoteUsage({
+          model,
+          provider: 'amazon-bedrock',
+          serviceTier,
+          requestTokens: tokens,
+          usage: usage({ input: 1000, cacheWrite30m: 2000, cacheRead: 3000, output: 4000 }),
+        });
+        assert.deepEqual(quote?.rate, {
+          input: inputRate * multiplier,
+          cacheWrite30m: Number((inputRate * 1.25 * multiplier).toPrecision(15)),
+          cacheRead: Number((inputRate * 0.1 * multiplier).toPrecision(15)),
+          output: Number((outputRate * multiplier).toPrecision(15)),
+        });
+        assert.equal(quote?.effectiveDate, null);
+      }
+    }
+    for (const serviceTier of ['fast', 'priority', 'flex', 'batch', 'reserved', 'unknown'])
+      assert.equal(
+        quoteUsage({
+          model,
+          provider: 'amazon-bedrock',
+          serviceTier,
+          requestTokens: 1000,
+          usage: usage({ input: 1000 }),
+        }),
+        null,
+      );
+  }
+  for (const model of [
+    'gpt-6-astra',
+    'eu.openai.gpt-6-astra',
+    'ap.openai.gpt-6-astra',
+    'US.openai.gpt-6-astra',
+    'openai.gpt-6-astra-extra',
+    'openai.gpt-6-astra[1m]',
+    'openai.gpt-6-astral',
+  ])
+    assert.equal(resolveModelPricing(model, 'amazon-bedrock'), null, model);
+  for (const provider of [null, 'openai', 'router', 'unknown'])
+    assert.equal(resolveModelPricing('openai.gpt-6-astra', provider), null);
 });

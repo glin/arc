@@ -13,13 +13,13 @@ Claude Code and Codex are clients that write usage records. The billing provider
 | Claude API estimates from Claude Code records | `claude-fable-5-1`, `claude-mythos-5-1`, `claude-fable-5`, `claude-mythos-5`, `claude-opus-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5`, `claude-sonnet-5-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-haiku-4-5` |
 | Direct OpenAI estimates from Codex records | `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-2026-04-23`, `gpt-5.4`, `gpt-5.4-2026-03-05` |
 | Claude on Amazon Bedrock | The recognized Claude identities above, with recorded Bedrock request evidence. This estimate does not establish AWS availability for each model. |
-| OpenAI on Amazon Bedrock | `openai.gpt-6.1-sol`, `openai.gpt-6-sol`, `openai.gpt-6-luna`, `openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`, `openai.gpt-5.6-luna`, with the accepted prefixes below |
+| OpenAI on Amazon Bedrock | `openai.gpt-6-astra`, `openai.gpt-6.1-sol`, `openai.gpt-6-sol`, `openai.gpt-6-luna`, `openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`, `openai.gpt-5.6-luna`, with the accepted prefixes below |
 | Codex automatic review | `codex-auto-review`, priced from the OpenAI Codex rate card |
 | OpenRouter, Azure, Vertex, and other providers | No built-in provider pricing support |
 
 Recognized Claude identities accept dated snapshots with an eight-digit date suffix and bracketed context suffixes. Direct OpenAI support accepts only the identities listed here.
 
-GPT-6.1 Sol pricing on Bedrock recognizes the bare `openai.` identity and the `us.` or `global.` prefix. The [AWS model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html) describes launch routes separately from pricing references. A recognized billing identity does not establish current execution availability. Other supported Bedrock OpenAI identities accept bare, `global.`, and lowercase two-letter prefixes. Bedrock OpenAI pricing requires the recorded provider `amazon-bedrock`.
+GPT-6 Astra and GPT-6.1 Sol pricing on Bedrock recognize the bare `openai.` identity and the `us.` or `global.` prefix. The [GPT-6.1 Sol AWS model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html) describes launch routes separately from pricing references. A recognized billing identity does not establish current execution availability. Other supported Bedrock OpenAI identities accept bare, `global.`, and lowercase two-letter prefixes. Bedrock OpenAI pricing requires the recorded provider `amazon-bedrock`.
 
 Claude transcript requests identify Bedrock through a `msg_bdrk_` message identifier. The latest model attachment identifies a global inference profile. A missing profile uses the regional estimate. Completed Claude results use their recorded model identity to identify Bedrock. The cache table below describes the applicable rates.
 
@@ -81,7 +81,8 @@ These multipliers describe the exact model rows Arc prices. Provider rates and s
 | [Claude on Amazon Bedrock](https://aws.amazon.com/bedrock/pricing/) | The Claude API multiple of the Bedrock base input rate, which is 1.1x list on every profile except `global.` | The Claude API multiples of the Bedrock base input rate | The request selects five minutes or one hour. |
 | [OpenAI GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | 0.05x the base input rate | 1.25x the base input rate | The minimum is thirty minutes. |
 | [GPT-6.1 Sol on Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html) | 0.05x the route's base input rate | 1.25x the route's base input rate | Thirty minutes is the default and only supported lifetime. |
-| [Other priced OpenAI GPT-5.6 and GPT-6 models](https://developers.openai.com/api/docs/guides/prompt-caching) | 0.1x the base input rate | 1.25x the base input rate | The minimum is thirty minutes. |
+| [GPT-6 Astra on Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html) | 0.1x the route's base input rate | 1.25x the route's base input rate | The rate card prices thirty-minute writes. Fallback cache duration is unknown. |
+| [Other priced direct OpenAI GPT-5.6 and GPT-6 models](https://developers.openai.com/api/docs/guides/prompt-caching) | 0.1x the base input rate | 1.25x the base input rate | The minimum is thirty minutes. |
 
 GPT-5.5 and `gpt-5.5-2026-04-23` support only `24h` retention. The [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime) describes typical retention around thirty minutes, with variable retention up to twenty-four hours. Arc uses thirty minutes for estimated cache timing. This estimate establishes no configured TTL, minimum lifetime, or guaranteed expiry deadline.
 

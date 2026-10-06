@@ -115,7 +115,7 @@ import {
 } from './projectspend.ts';
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
 import { estimateCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
-import { codexContextRecords } from './turnfixtures.ts';
+import { bedrockAstraRecords, codexContextRecords } from './turnfixtures.ts';
 
 test('Codex categories use retained ordinary and compacted histories without lifetime or cached-input duplication', async () => {
   const ordinary = estimateCodexContext(codexContextRecords(), 's1')!;
@@ -4199,6 +4199,9 @@ test('a Bedrock turn separates cache writes from uncached input and keeps its pr
 
 test('Bedrock GPT-6.1 and GPT-6 recorded usage retains routes and costs in both request bands', () => {
   for (const [model, expected] of [
+    ['openai.gpt-6-astra', [2.035, 2.035, 5.005]],
+    ['us.openai.gpt-6-astra', [2.035, 2.035, 5.005]],
+    ['global.openai.gpt-6-astra', [1.85, 1.85, 4.55]],
     ['openai.gpt-6.1-sol', [0.396, 0.396, 0.968]],
     ['us.openai.gpt-6.1-sol', [0.396, 0.396, 0.968]],
     ['global.openai.gpt-6.1-sol', [0.36, 0.36, 0.88]],
@@ -4241,7 +4244,7 @@ test('Bedrock GPT-6.1 and GPT-6 recorded usage retains routes and costs in both 
       assert.equal(turn.model, model);
       assert.equal(turn.provider, 'amazon-bedrock');
       assert.equal(turn.contextWindow, 258_400);
-      assert.equal(turn.contextRequest?.lifetime, '30m');
+      assert.equal(turn.contextRequest?.lifetime, model.endsWith('astra') ? null : '30m');
       assert.equal(turn.usage.input, index === 2 ? 150_000 : 100_000);
       assert.equal(turn.usage.cacheWrite30m, 20_000);
       assert.equal(turn.usage.cacheRead, index === 2 ? 150_000 : 100_000);
@@ -14475,3 +14478,38 @@ test('a read-only Bedrock request refreshes the context request clock without an
     assert.equal(turn.usage.cacheWrite30m, 100_000, model);
   }
 });
+
+for (const [child, count, expected] of [
+  [false, 33, 6.52286635],
+  [true, 11, 2.56272115],
+] as const) {
+  test(`Bedrock Astra ${child ? 'native Plato' : 'parent'} preserves short bills and unknown expiry in saved readers`, () => {
+    const file = writeRollout(bedrockAstraRecords(child));
+    const id = child ? 'bedrock-astra-plato' : 'bedrock-astra-parent';
+    const [turn] = readCodexSession(file, id).turns;
+    assert.equal(turn.usage.requests, count);
+    assert.equal(turn.contextRequest?.lifetime, null);
+    assert.equal(turn.usageParts?.[0]?.contextBand, 'short');
+    assert.equal(turn.usageParts?.[0]?.inferenceClass, 'in-region');
+    assert.ok(Math.abs(turnCost(turn).dollars! - expected) < 1e-10);
+    const indexed = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1).record;
+    const stale = {
+      ...indexed,
+      parserGeneration: 37,
+      buckets: indexed.buckets.map((bucket) => ({ ...bucket, contextBand: null, inferenceClass: null })),
+      lifetimeBuckets: (indexed.lifetimeBuckets ?? []).map((bucket) => ({
+        ...bucket,
+        contextBand: null,
+        inferenceClass: null,
+      })),
+    };
+    const before = fs.statSync(file);
+    const rebuilt = indexSpendFile(stale, file, 'workspace', createCodexUsageLineReducer, 2);
+    assert.equal(rebuilt.rebuilt, true);
+    assert.equal(fs.statSync(file).size, before.size);
+    assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+    assert.equal(rebuilt.record.buckets[0]?.contextBand, 'short');
+    assert.equal(rebuilt.record.buckets[0]?.requests, count);
+    assert.ok(Math.abs(publicProjectSpendPrice(rebuilt.record.buckets[0])!.dollars - expected) < 1e-10);
+  });
+}

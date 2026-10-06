@@ -1329,3 +1329,104 @@ export function codexContextRecords(session = 's1', compacted = false): Array<Re
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
   }));
 }
+
+// Native child billing shares the parent's session_id and keeps its own thread_id.
+export function bedrockAstraRecords(child = false): object[] {
+  const parentId = 'bedrock-astra-parent';
+  const id = child ? 'bedrock-astra-plato' : parentId;
+  const turnId = child ? 'plato-turn' : 'parent-turn';
+  const count = child ? 11 : 33;
+  const totals = child ? [462, 678_914, 100_169, 7882, 3688] : [1386, 2_854_856, 195_229, 12_416, 4455];
+  const at = (second: number) => new Date(Date.UTC(2026, 9, 6, 20, child ? 1 : 0, second)).toISOString();
+  const records: object[] = [
+    {
+      type: 'session_meta',
+      timestamp: at(0),
+      payload: {
+        id,
+        session_id: parentId,
+        timestamp: at(0),
+        model_provider: 'amazon-bedrock',
+        cwd: '/workspace',
+        ...(child
+          ? {
+              parent_thread_id: parentId,
+              thread_source: 'subagent',
+              agent_nickname: 'Plato',
+              source: { subagent: { thread_spawn: { parent_thread_id: parentId, depth: 1, agent_nickname: 'Plato' } } },
+            }
+          : { source: 'cli' }),
+      },
+    },
+    {
+      type: 'event_msg',
+      timestamp: at(1),
+      payload: { type: 'task_started', turn_id: turnId, model_context_window: 258_400 },
+    },
+    {
+      type: 'turn_context',
+      timestamp: at(2),
+      payload: { turn_id: turnId, model: 'openai.gpt-6-astra', effort: 'high' },
+    },
+    {
+      type: 'response_item',
+      timestamp: at(3),
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'price the work' }] },
+    },
+  ];
+  const cumulative = {
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: 0,
+  };
+  for (let index = 0; index < count; index += 1) {
+    const [input, read, write, output, thinking] = totals.map(
+      (total) => Math.floor(total / count) + (index < total % count ? 1 : 0),
+    );
+    const usage = {
+      input_tokens: input + read + write,
+      cached_input_tokens: read,
+      cache_write_input_tokens: write,
+      output_tokens: output,
+      reasoning_output_tokens: thinking,
+      total_tokens: input + read + write + output,
+    };
+    for (const key of Object.keys(cumulative) as (keyof typeof cumulative)[]) cumulative[key] += usage[key];
+    records.push(
+      {
+        type: 'token_usage_record',
+        timestamp: at(index * 2 + 4),
+        payload: {
+          thread_id: id,
+          session_id: parentId,
+          turn_id: turnId,
+          response_id: `${id}-${index}`,
+          usage,
+          thread_token_usage: { ...cumulative },
+          turn_token_usage: { ...cumulative },
+        },
+      },
+      {
+        type: 'event_msg',
+        timestamp: at(index * 2 + 5),
+        payload: {
+          type: 'token_count',
+          info: {
+            model_context_window: 258_400,
+            last_token_usage: usage,
+            total_token_usage: { ...cumulative },
+          },
+        },
+      },
+    );
+  }
+  records.push({
+    type: 'event_msg',
+    timestamp: at(count * 2 + 6),
+    payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'completed' },
+  });
+  return records;
+}

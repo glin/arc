@@ -221,7 +221,7 @@ import {
 import { spawn } from 'node:child_process';
 import type { AgentRunScan, SessionRead, SessionStatFacts, TurnOutcome } from './transcript.ts';
 import { readSessionMeta, scanForAgentRun } from './transcript.ts';
-import { runningSdkTranscript, powershellDispatchExecution } from './turnfixtures.ts';
+import { bedrockAstraRecords, runningSdkTranscript, powershellDispatchExecution } from './turnfixtures.ts';
 import { railBuckets } from './view/rail.ts';
 
 const folder = () => tempDir('derived-cache-');
@@ -2318,4 +2318,56 @@ test('version 42 null Bedrock lifetimes rebuild and persist with unchanged sourc
     assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
     assert.equal(JSON.parse(fs.readFileSync(cache, 'utf8')).version, VERSION);
   }
+});
+
+test('Bedrock Astra discards literal derived generation 44 and rebuilds unchanged short-request source facts', async () => {
+  const { readCodexSession } = await import('./codex.ts');
+  const { sessionStatFactsOf } = await import('./transcript.ts');
+  const directory = folder();
+  const source = path.join(directory, 'rollout-astra.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  fs.writeFileSync(
+    source,
+    bedrockAstraRecords()
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const clock = new Date('2026-10-06T20:00:00Z');
+  fs.utimesSync(source, clock, clock);
+  const before = fs.statSync(source);
+  const fresh = sessionStatFactsOf(readCodexSession(source, 'bedrock-astra-parent'));
+  assert.ok(fresh);
+  const usage = fresh.turns[0].usage;
+  assert.equal(usage.requests, 33);
+  assert.ok(usage.input + usage.cacheRead + (usage.cacheWrite30m ?? 0) > 272_000);
+  assert.equal(usage.byContextBand?.short?.requests, 33);
+  const stale: DerivedTitleEntry = {
+    ...title,
+    size: before.size,
+    mtimeMs: before.mtimeMs,
+    stats: {
+      ...fresh,
+      turns: fresh.turns.map((turn) => ({
+        ...turn,
+        contextWindow: null,
+        contextRequest: null,
+        usage: { ...turn.usage, byContextBand: undefined },
+      })),
+    },
+  };
+  fs.writeFileSync(cache, JSON.stringify({ version: 44, codexMetas: [], titles: [{ file: source, entry: stale }] }));
+  const loaded = loadDerivedCache(cache);
+  assert.equal(loaded.titles.size, 0);
+  assert.equal(loaded.reuse?.reason, 'generation-mismatch');
+  assert.deepEqual(loaded.carriedNames.get(source), { label: title.label, fullLabel: title.fullLabel });
+  const rebuilt = { ...stale, stats: sessionStatFactsOf(readCodexSession(source, 'bedrock-astra-parent')) };
+  saveDerivedCache(cache, [[source, rebuilt]]);
+  const persisted = loadDerivedCache(cache).titles.get(source);
+  assert.equal(persisted?.stats?.turns[0].contextWindow, 258_400);
+  assert.equal(persisted?.stats?.turns[0].contextRequest?.lifetime, null);
+  assert.equal(persisted?.stats?.turns[0].usage.byContextBand?.short?.requests, 33);
+  assert.equal(persisted?.size, before.size);
+  assert.equal(persisted?.mtimeMs, before.mtimeMs);
+  assert.equal(fs.statSync(source).size, before.size);
+  assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
 });

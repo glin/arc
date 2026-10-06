@@ -1,3 +1,4 @@
+import { bedrockAstraRecords } from './turnfixtures';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -3355,5 +3356,31 @@ test('Bedrock cache expiry uses documented duration for write-only, read-only an
       assert.equal(report.cacheExpiry?.inputCostAfterExpiryUsd, null);
       assert.equal(report.requests, 2);
     }
+  }
+});
+
+test('Bedrock Astra parent and native Plato each price their own requests exactly once', () => {
+  const root = directory();
+  const sessions = path.join(root, 'sessions');
+  const parent = write(path.join(sessions, 'rollout-bedrock-astra-parent.jsonl'), bedrockAstraRecords());
+  write(path.join(sessions, 'rollout-bedrock-astra-plato.jsonl'), bedrockAstraRecords(true));
+  const report = sessionCostReport(parent, {
+    roots: { codexSessions: sessions, projects: path.join(root, 'projects') },
+    byModel: true,
+  });
+  assert.equal(report.children.length, 1);
+  for (const [row, count, cost, quantities] of [
+    [report.parent, 33, 6.5229, [1386, 2_854_856, 195_229, 12_416]],
+    [report.children[0], 11, 2.5627, [462, 678_914, 100_169, 7882]],
+    [report.combined, 44, 9.0856, [1848, 3_533_770, 295_398, 20_298]],
+  ] as const) {
+    assert.equal(row.requests, count);
+    assert.equal(row.pricedRequests, count);
+    assert.equal(row.unpricedRequests, 0);
+    assert.ok(row.costUsd !== null && Math.abs(row.costUsd! - cost) < 1e-10);
+    assert.deepEqual(
+      [row.uncachedInputTokens, row.cachedInputTokens, row.cacheWriteInputTokens, row.outputTokens],
+      quantities,
+    );
   }
 });
