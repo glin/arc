@@ -99,7 +99,7 @@ import {
   createCodexUsageLineReducer,
 } from './codex';
 import { AgentSpendRef, spendFileVersion, type AgentSpend } from './agentspend';
-import { RepositoryCommits, nodeGitRunner } from './gitcommits';
+import { RepositoryCommits, nodeGitRunner, type GitRunner } from './gitcommits';
 import { CommitRepositoryReservations, commitRepositorySourceKey } from './progressiveworker';
 import {
   COMMIT_REPOSITORY_PARSER_VERSION,
@@ -1692,7 +1692,7 @@ export class PanelProvider implements vscode.Disposable {
   private startupFailureGeneration = -1;
   private startupLoadingSent = '';
   // What the session-list loading line publishes. It holds the line hidden for the scope roots that completed the list, and it writes
-  // each change of the line to the diagnostics log. The first use creates it.
+  // each change of the line and each repository scope decision to the diagnostics log. The first use creates it.
   private loadingLineState?: SessionLoadingLine;
   private get loadingLine(): SessionLoadingLine {
     return (this.loadingLineState ??= new SessionLoadingLine((event, record) => this.diagnostics?.warn(event, record)));
@@ -1730,7 +1730,7 @@ export class PanelProvider implements vscode.Disposable {
     startupDirectory?: string,
   ) {
     this.performanceOutput = performanceOutput ?? null;
-    this.repositoryScope = new RepositoryScope(nodeGitRunner(), () => this.repositoryScopeChanged());
+    this.repositoryScope = this.createRepositoryScope(nodeGitRunner());
     this.watchScheduler = new BoundedTrailingScheduler(TRANSCRIPT_WAKE_MS, TRANSCRIPT_WAKE_MAX_MS, (event) =>
       this.runPendingWatch(event),
     );
@@ -2308,6 +2308,17 @@ export class PanelProvider implements vscode.Disposable {
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.workspaceFoldersChanged()));
   }
 
+  // Builds the repository scope over a Git runner. A change of its roots runs repositoryScopeChanged, and each decision it makes about a
+  // Git answer reaches the diagnostics log beside the loading line's records.
+  private createRepositoryScope(runner: GitRunner): RepositoryScope {
+    return new RepositoryScope(
+      runner,
+      () => this.repositoryScopeChanged(),
+      Date.now,
+      (decision) => this.loadingLine.scopeDecision(decision),
+    );
+  }
+
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
     // A catalog listed under the previous roots cannot render the current scope.
@@ -2316,7 +2327,9 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWorks.clear();
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
-    this.loadingLine.release('repository scope');
+    // Removing roots needs no new loading, so the hold stays unless the new roots add one outside the held scope.
+    const scope = this.repositoryScope.snapshot(this.folders());
+    this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
     this.abandonCatalogRefresh();
     this.refreshFrom('repository-scope', true);
   }

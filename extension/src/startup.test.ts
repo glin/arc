@@ -28,6 +28,7 @@ import { tempDir } from './temproot.ts';
 import { buildSync, transformSync } from 'esbuild';
 import { messageByteBudget, PanelPerformanceCounters, serializedMessageBytes } from './performancediagnostics';
 import { SessionLoadingLine } from './sessionloadingline';
+import { REPOSITORY_SCOPE_CONFIRM_MS, REPOSITORY_SCOPE_REFRESH_MS, RepositoryScope } from './repositoryscope';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
   agentRunScanUnread,
@@ -7384,8 +7385,8 @@ test.each([false, true])(
 );
 
 // Two Codex sources and one healthy Claude source behind relationship discovery that reports a full source count on each poll.
-function exhaustedLoadingHarness(): any {
-  const provider = paintHarness(['workspaceFoldersChanged', 'repositoryScopeChanged']);
+function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<string, unknown> = {}): any {
+  const provider = paintHarness(['workspaceFoldersChanged', 'repositoryScopeChanged', ...extraMethods], scope);
   provider.progressiveCurrent = () => true;
   const healthy = provider.partial[0];
   const codex = (name: string, activity: number) => ({
@@ -7446,6 +7447,8 @@ function exhaustedLoadingHarness(): any {
     // Further parents the discovery checkpoint reports, each one a known source beyond the healthy Claude source.
     more: { file: string }[];
     before?: (generation: number, signal: AbortSignal) => void;
+    // The repository scope roots the checkpoint was counted under.
+    roots?: () => string[];
   } = {
     pending: false,
     fail: false,
@@ -7459,7 +7462,7 @@ function exhaustedLoadingHarness(): any {
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       parents: [healthy, ...discovery.more],
       catalog: [healthy, ...discovery.more],
-      repositoryRoots: ['project'],
+      repositoryRoots: discovery.roots?.() ?? ['project'],
       completed: [healthy.file],
       sequence: 1,
       position: 1,
@@ -8104,6 +8107,7 @@ test('new repository scope roots show loading until a list listed under them com
     provider.selectionWorks = new Map();
     provider.refreshFrom = () => {};
     provider.repositoryScopeRoots = ['project', 'worktree'];
+    provider.repositoryScope = { snapshot: () => ({ ready: true, revision: 2, roots: ['project', 'worktree'] }) };
     provider.repositoryScopeChanged();
     assert.equal(provider.loadingLine.held(JSON.stringify(['project'])), false, 'the scope callback kept the hold');
     await pendingShows('a selection render after the repository scope callback');
@@ -8111,6 +8115,291 @@ test('new repository scope roots show loading until a list listed under them com
     vi.clearAllTimers();
     vi.useRealTimers();
   }
+});
+
+// A host whose repository scope reads scripted Git answers for the open folder `project`. Each answer lists `project` and the named
+// worktrees. The scope's own timers ask Git again, and every refresh reads the roots from the scope, as the host does.
+function gitScopedLoadingHarness() {
+  const harness = exhaustedLoadingHarness(['createRepositoryScope'], { RepositoryScope });
+  const { provider, first, second, settled, discovery } = harness;
+  const answers: string[][] = [];
+  provider.repositoryScope = provider.createRepositoryScope({
+    run: async () => {
+      const trees = answers.shift();
+      if (!trees) return null;
+      return ['project', ...trees].map((root) => `worktree ${root}\0HEAD a\0`).join('\0') + '\0';
+    },
+  });
+  provider.allSessions = () => {
+    const scope = provider.repositoryScope.snapshot(provider.folders());
+    provider.repositoryScopeReady = scope.ready;
+    provider.repositoryScopeRoots = scope.ready ? scope.roots : [];
+    return provider.partial;
+  };
+  discovery.roots = () => provider.repositoryScopeRoots;
+  const scopeChanges: string[][] = [];
+  const changed = provider.repositoryScopeChanged.bind(provider);
+  provider.repositoryScopeChanged = () => {
+    scopeChanges.push(provider.repositoryScope.snapshot(provider.folders()).roots);
+    changed();
+  };
+  // A scope change starts a full refresh, which each test runs itself so it can count it.
+  const fullRefreshes: string[] = [];
+  provider.selectionWorks = new Map();
+  provider.refreshFrom = (reason: string) => fullRefreshes.push(reason);
+  const lines: { event: string; record: any }[] = [];
+  provider.diagnostics = {
+    ...provider.diagnostics,
+    warn: (event: string, record: any) => lines.push({ event, record }),
+  };
+  provider.titles.set(first.file, settled(first));
+  provider.titles.set(second.file, settled(second));
+  const stream = loadingStream(provider);
+  // Loads the list under the first Git answer until it completes and holds the line.
+  const complete = async (trees: string[]) => {
+    answers.push(trees);
+    provider.repositoryScope.snapshot(provider.folders());
+    await vi.advanceTimersByTimeAsync(0);
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await harness.poll();
+    assert.ok(
+      provider.loadingLine.held(JSON.stringify(provider.repositoryScopeRoots)),
+      'the settled list did not hold the line',
+    );
+    assert.deepEqual(provider.repositoryScopeRoots, ['project', ...trees]);
+    scopeChanges.length = 0;
+    fullRefreshes.length = 0;
+    return stream.length;
+  };
+  // Lets the regular scope interval pass, so the next scope read asks Git for its next answer, and lets that answer arrive.
+  const interval = async () => {
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
+    provider.repositoryScope.snapshot(provider.folders());
+    await vi.advanceTimersByTimeAsync(0);
+  };
+  const decisions = () =>
+    lines.filter(({ event }) => event === 'repositoryScopeDecision').map(({ record }) => record.decision);
+  const shownSince = (at: number) => stream.slice(at).filter((entry) => entry.visible);
+  const { poll, recovering } = harness;
+  return {
+    provider,
+    first,
+    settled,
+    recovering,
+    discovery,
+    poll,
+    answers,
+    scopeChanges,
+    fullRefreshes,
+    lines,
+    stream,
+    complete,
+    interval,
+    decisions,
+    shownSince,
+  };
+}
+
+const SCOPE_TREES = ['wt-a', 'wt-b'];
+
+test('one short worktree list after the hold keeps the loading line hidden and the session list loaded', async () => {
+  vi.useFakeTimers();
+  try {
+    const git = gitScopedLoadingHarness();
+    const completedAt = await git.complete(SCOPE_TREES);
+    // Git briefly lists only the main checkout, and its next answer lists every worktree again.
+    git.answers.push([], SCOPE_TREES);
+    await git.interval();
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
+    for (let index = 0; index < 3; index++) await git.poll();
+
+    assert.deepEqual(git.shownSince(completedAt), [], 'a short worktree list showed the loading line');
+    assert.deepEqual(git.scopeChanges, [], 'a short worktree list changed the repository scope');
+    assert.deepEqual(git.fullRefreshes, [], 'a short worktree list started a full refresh');
+    assert.ok(
+      git.provider.loadingLine.held(JSON.stringify(['project', ...SCOPE_TREES])),
+      'a short worktree list released the hold',
+    );
+    assert.deepEqual(git.decisions(), ['accepted', 'held for confirmation', 'discarded']);
+    const held = git.lines.find(({ record }) => record.decision === 'held for confirmation')?.record;
+    assert.deepEqual(
+      [held?.oldRoots, held?.newRoots, held?.answeredRoots, held?.removed, held?.removedCount, held?.addedCount],
+      [3, 3, 1, SCOPE_TREES, 2, 0],
+    );
+    assert.ok(held?.stdoutLength > 0);
+    assert.match(held?.oldScope ?? '', /^[0-9a-f]{8}$/);
+    const heldLine = git.lines.find(({ event }) => event === 'sessionLoadingHeld')?.record;
+    assert.equal(
+      held?.oldScope,
+      heldLine?.scope,
+      'the scope decision hashed its roots differently from the loading line',
+    );
+    assert.deepEqual(
+      git.lines.filter(({ record }) => record.decision === 'discarded').map(({ record }) => record.restored),
+      [SCOPE_TREES],
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('two agreeing short worktree lists shrink the scope and keep the loading line hidden', async () => {
+  vi.useFakeTimers();
+  try {
+    const git = gitScopedLoadingHarness();
+    const { provider, first, recovering, settled } = git;
+    const completedAt = await git.complete(SCOPE_TREES);
+    git.answers.push([], []);
+    await git.interval();
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
+    assert.deepEqual(git.scopeChanges, [['project']], 'the confirmed removal did not change the repository scope');
+    assert.deepEqual(git.fullRefreshes, ['repository-scope']);
+    assert.deepEqual(git.decisions(), ['accepted', 'held for confirmation', 'confirmed']);
+
+    // The reload under the smaller scope finds a source still reading its metadata.
+    provider.titles.set(first.file, recovering(first));
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await git.poll();
+    provider.titles.set(first.file, settled(first));
+    await git.poll();
+    assert.deepEqual(provider.repositoryScopeRoots, ['project']);
+    assert.deepEqual(git.shownSince(completedAt), [], 'the reload under the smaller scope showed the loading line');
+    assert.ok(provider.loadingLine.held(JSON.stringify(['project'])), 'the smaller scope lost the hold');
+    assert.deepEqual(
+      git.lines
+        .filter(({ event }) => ['sessionLoadingHeld', 'sessionLoadingKept', 'sessionLoadingReleased'].includes(event))
+        .map(({ event, record }) => [event, record.cause]),
+      [
+        ['sessionLoadingHeld', undefined],
+        ['sessionLoadingKept', 'repository scope'],
+      ],
+    );
+
+    // A workspace folder change still releases the hold.
+    provider.workspaceFoldersChanged();
+    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+    assert.ok(
+      git.lines.some(({ event, record }) => event === 'sessionLoadingReleased' && record.cause === 'workspace folders'),
+      'a workspace folder change kept the hold',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a worktree list that adds a root releases the hold and shows loading for it', async () => {
+  vi.useFakeTimers();
+  try {
+    const git = gitScopedLoadingHarness();
+    const { provider, discovery } = git;
+    const completedAt = await git.complete(SCOPE_TREES);
+    git.answers.push([...SCOPE_TREES, 'wt-c']);
+    await git.interval();
+    assert.deepEqual(git.scopeChanges, [['project', ...SCOPE_TREES, 'wt-c']]);
+    assert.deepEqual(git.decisions(), ['accepted', 'accepted']);
+    assert.ok(
+      git.lines.some(
+        ({ event, record }: { event: string; record: any }) =>
+          event === 'sessionLoadingReleased' && record.cause === 'repository scope',
+      ),
+      'a new worktree kept the hold',
+    );
+    assert.deepEqual(git.shownSince(completedAt), []);
+
+    // Discovery for the new root is still running.
+    discovery.pending = true;
+    await provider.refresh(true);
+    assert.ok(git.shownSince(completedAt).length > 0, 'loading for the new worktree stayed hidden');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a worktree list that adds one root and drops another releases the hold', async () => {
+  vi.useFakeTimers();
+  try {
+    const git = gitScopedLoadingHarness();
+    await git.complete(SCOPE_TREES);
+    git.answers.push(['wt-a', 'wt-c']);
+    await git.interval();
+    // The dropped worktree waits for confirmation, while the new one applies at once.
+    assert.deepEqual(git.scopeChanges, [['project', ...SCOPE_TREES, 'wt-c']]);
+    assert.deepEqual(git.decisions(), ['accepted', 'held for confirmation']);
+    assert.ok(
+      git.lines.some(({ event, record }) => event === 'sessionLoadingReleased' && record.cause === 'repository scope'),
+      'an answer that also added a worktree kept the hold',
+    );
+    assert.equal(git.provider.loadingLine.held(JSON.stringify(['project', ...SCOPE_TREES, 'wt-c'])), false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a hold covers no empty scope, and a scope that is not ready releases it', () => {
+  const written: string[] = [];
+  const line = new SessionLoadingLine((event, record) => written.push(`${event} ${record.cause ?? ''}`.trim()));
+  line.hold(JSON.stringify(['project', 'wt-a']), 1, 'session loading');
+  assert.equal(line.held(JSON.stringify([])), false, 'the hold covered a scope with no roots');
+  assert.equal(line.held(JSON.stringify(['wt-a'])), true);
+  line.rescope(null, 'repository scope');
+  assert.equal(line.held(JSON.stringify(['wt-a'])), false, 'a scope that is not ready kept the hold');
+  assert.deepEqual(written, ['sessionLoadingHeld', 'sessionLoadingReleased repository scope']);
+});
+
+test('scope decisions and the reasons of a shown line write bounded records', () => {
+  const written: { event: string; record: Record<string, any> }[] = [];
+  const line = new SessionLoadingLine((event, record) => written.push({ event, record }), { scope: 2, blocked: 2 });
+  const many = Array.from({ length: 8 }, (_, index) => `wt-${index}`);
+  for (let index = 0; index < 4; index++)
+    line.scopeDecision({
+      decision: 'held for confirmation',
+      previous: ['project', ...many],
+      answered: ['project'],
+      applied: ['project', ...many],
+      restored: [],
+      stdoutLength: 40,
+      failed: 0,
+    });
+  const decisions = written.filter(({ event }) => event === 'repositoryScopeDecision').map(({ record }) => record);
+  assert.equal(decisions.length, 2, 'scope decisions passed their limit');
+  assert.deepEqual(
+    [decisions[0].removed.length, decisions[0].removedCount],
+    [5, 8],
+    'a decision named every removed root',
+  );
+  assert.equal(decisions[1].limitReached, true);
+
+  // A shown line writes once for each change of a path's blocking reason, and counts that path's repeats in between.
+  const stamp = { generation: 1, complete: false };
+  const reason = (found: 'starts missing' | 'label missing' | 'discovery pending') => () => ({ reason: found });
+  line.present('discovery progress', stamp, 'scope', reason('discovery pending'));
+  line.present('discovery progress', stamp, 'scope', reason('discovery pending'));
+  line.present('session loading', stamp, 'scope', reason('starts missing'));
+  line.present('session loading', stamp, 'scope', reason('starts missing'));
+  line.present('session loading', stamp, 'scope', reason('label missing'));
+  for (let index = 0; index < 10; index++)
+    line.present('render', stamp, 'scope', reason(index % 2 ? 'starts missing' : 'label missing'));
+  assert.deepEqual(
+    written
+      .filter(({ event }) => event === 'sessionLoadingBlocked')
+      .map(({ record }) => [record.path, record.reason, record.repeats]),
+    [
+      ['session loading', 'starts missing', 0],
+      ['session loading', 'label missing', 1],
+    ],
+    'a shown line logged an unchanged reason, or its reasons passed their limit',
+  );
+  assert.deepEqual(
+    written.filter(({ event }) => event === 'sessionLoadingLine').map(({ record }) => [record.visible, record.reason]),
+    [[true, 'discovery pending']],
+    'reason records silenced a change of the line',
+  );
 });
 
 test('the diagnostics log records each loading line change and stays quiet through repeated polls', async () => {
@@ -8148,6 +8437,9 @@ test('the diagnostics log records each loading line change and stays quiet throu
 
     assert.deepEqual(events(), [
       'shown by discovery progress: discovery complete',
+      // The render and the session-list status each name their first reason while the line is shown.
+      'sessionLoadingBlocked enrichment needed',
+      'sessionLoadingBlocked enrichment needed',
       'sessionLoadingHeld session loading',
       'hidden by session loading',
       'sessionLoadingWithheld discovery complete',
