@@ -170,6 +170,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   // Sonnet definitions list supported generations explicitly. Unlisted Sonnet generations remain unpriced.
   {
     pattern: /^claude-sonnet-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
+    // The public rate has no history. For a Sonnet 5.5 request before effectiveDate, an estimate from this row prices cache reads at half the former $0.20 list rate.
     rate: { input: 2, cacheRead: 0.1, output: 10 },
     cachePolicy: CLAUDE_CACHE_POLICY,
     window: 1_000_000,
