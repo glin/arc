@@ -48,6 +48,7 @@ const MODEL_IDS = [
   'claude-sonnet-5',
   'claude-sonnet-4-6',
   'claude-sonnet-4-5',
+  'claude-haiku-5-5',
   'claude-haiku-4-5',
   'gpt-5.5',
   'gpt-5.4',
@@ -177,8 +178,10 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
   claudeSupport(
     /^claude-sonnet-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
     ['claude-sonnet-5-5'],
-    { input: 2, output: 10 },
+    { input: 2, cacheRead: 0.1, output: 10 },
     1_000_000,
+    undefined,
+    '2026-10-07',
   ),
   claudeSupport(
     /^claude-sonnet-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
@@ -200,6 +203,20 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
     { input: 3, output: 15 },
     200_000,
   ),
+  {
+    models: ['claude-haiku-5-5'],
+    definition: {
+      ...claudeSupport(
+        /^claude-haiku-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
+        [],
+        { input: 0.1, output: 0.5 },
+        1_000_000,
+        undefined,
+        '2026-10-07',
+      ).definition,
+      longContext: { threshold: 100_000, inputMultiplier: 5, outputMultiplier: 5 },
+    },
+  },
   claudeSupport(/^claude-haiku-4-5(?:-\d{8})?(?:\[[^\]]+\])?$/, ['claude-haiku-4-5'], { input: 1, output: 5 }, 200_000),
   openaiSupport(
     /^gpt-6-astra$/,
@@ -352,7 +369,7 @@ test('every supported pricing route has independently reviewed complete pricing 
 test('a rate is found by family and generation together', () => {
   assert.deepEqual(rateFor('claude-opus-5-5'), { input: 4, cacheRead: 0.2, output: 20 });
   assert.deepEqual(rateFor('claude-opus-5'), { input: 5, output: 25 });
-  assert.deepEqual(rateFor('claude-sonnet-5-5'), { input: 2, output: 10 });
+  assert.deepEqual(rateFor('claude-sonnet-5-5'), { input: 2, cacheRead: 0.1, output: 10 });
   assert.deepEqual(rateFor('claude-sonnet-5'), { input: 2, output: 10 });
   assert.deepEqual(rateFor('claude-haiku-4-5'), { input: 1, output: 5 });
   assert.deepEqual(rateFor('claude-fable-5'), { input: 10, output: 50 });
@@ -1236,10 +1253,15 @@ test('Sonnet 5 and Sonnet 4.6 are priced apart, because their published rates di
   assert.deepEqual(rateFor('claude-sonnet-5-20260101'), { input: 2, output: 10 });
 });
 
-test('Sonnet 5.5 takes the Sonnet 5 standing rate through a dated snapshot and a context suffix', () => {
-  assert.deepEqual(rateFor('claude-sonnet-5-5-20260901'), { input: 2, output: 10 });
-  assert.deepEqual(rateFor('claude-sonnet-5-5[1m]'), { input: 2, output: 10 });
-  assert.equal(quoteUsage({ usage: usage(), model: 'claude-sonnet-5-5' })?.effectiveDate, null);
+test('Sonnet 5.5 reads cache at $0.10 through a dated snapshot and a context suffix', () => {
+  assert.deepEqual(rateFor('claude-sonnet-5-5-20260901'), { input: 2, cacheRead: 0.1, output: 10 });
+  assert.deepEqual(rateFor('claude-sonnet-5-5[1m]'), { input: 2, cacheRead: 0.1, output: 10 });
+  assert.equal(quoteUsage({ usage: usage(), model: 'claude-sonnet-5-5' })?.effectiveDate, '2026-10-07');
+  const reads = usage({ requests: 1, cacheRead: 1_000_000 });
+  assert.equal(quoteUsage({ usage: reads, model: 'claude-sonnet-5-5' })?.cost, 0.1);
+  // A recorded charge keeps the amount billed, at the earlier rate or any other.
+  const recorded = quoteUsage({ usage: reads, model: 'claude-sonnet-5-5', reportedCost: 0.2 });
+  assert.deepEqual([recorded?.cost, recorded?.source], [0.2, 'reported']);
 });
 
 test('Sonnet 5 is no longer a dated promotion', () => {
@@ -1362,6 +1384,7 @@ test('a fast turn on a model with no published fast rate quotes no cost', () => 
     'claude-fable-5-1',
     'claude-sonnet-5-5',
     'claude-sonnet-5',
+    'claude-haiku-5-5',
     'claude-haiku-4-5',
   ]) {
     const input = { usage: usage({ input: 1_000_000 }), model };
@@ -1552,19 +1575,19 @@ test('the cost guide states the provider-specific cache multiples the pricer cha
     return priced.cost / base.cost;
   };
 
-  const claude = cellsFor('Claude Sonnet 5.5, Claude Sonnet 5 and Claude Opus 5');
-  assert.deepEqual(multiplesIn(claude[1]), [ratio('claude-opus-5', { cacheRead: 1_000_000 })]);
-  assert.deepEqual(multiplesIn(claude[2]), [
-    ratio('claude-opus-5', { cacheWrite5m: 1_000_000 }),
-    ratio('claude-opus-5', { cacheWrite1h: 1_000_000 }),
-  ]);
-
-  const opus55 = cellsFor('Claude Opus 5.5');
-  assert.deepEqual(multiplesIn(opus55[1]), [ratio('claude-opus-5-5', { cacheRead: 1_000_000 })]);
-  assert.deepEqual(multiplesIn(opus55[2]), [
-    ratio('claude-opus-5-5', { cacheWrite5m: 1_000_000 }),
-    ratio('claude-opus-5-5', { cacheWrite1h: 1_000_000 }),
-  ]);
+  // Each Claude row names its models as "Claude Opus 5.5", which is the identity claude-opus-5-5.
+  for (const label of ['Claude Sonnet 5 and Claude Opus 5', 'Claude Opus 5.5 and Claude Sonnet 5.5']) {
+    const cells = cellsFor(label);
+    for (const name of label.split(' and ')) {
+      const model = name.toLowerCase().replace(/[ .]/g, '-');
+      assert.deepEqual(multiplesIn(cells[1]), [ratio(model, { cacheRead: 1_000_000 })], model);
+      assert.deepEqual(
+        multiplesIn(cells[2]),
+        [ratio(model, { cacheWrite5m: 1_000_000 }), ratio(model, { cacheWrite1h: 1_000_000 })],
+        model,
+      );
+    }
+  }
 
   const fable = cellsFor('Claude Fable 5.1');
   assert.deepEqual(multiplesIn(fable[1]), [ratio('claude-fable-5-1', { cacheRead: 1_000_000 })]);
@@ -1698,9 +1721,53 @@ test('a regional Bedrock Claude request pays 1.1 times list, at standard and fas
 test('a regional Bedrock Sonnet 5.5 request pays 1.1 times list', () => {
   const tokens = usage({ input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 });
   const bedrock = quoteUsage({ usage: tokens, model: 'claude-sonnet-5-5', inferenceClass: 'bedrock-regional' });
-  assert.deepEqual(bedrock?.rate, { input: 2.2, output: 11 });
-  assert.equal(bedrock?.cost, 13.42);
-  assert.equal(quoteUsage({ usage: tokens, model: 'claude-sonnet-5-5' })?.cost, 12.2);
+  assert.deepEqual(bedrock?.rate, { input: 2.2, cacheRead: 0.11, output: 11 });
+  assert.equal(bedrock?.cost, 13.31);
+  assert.equal(quoteUsage({ usage: tokens, model: 'claude-sonnet-5-5' })?.cost, 12.1);
+});
+
+// The published Haiku 5.5 rates per million tokens, for prompts up to 100,000 tokens and over it.
+const HAIKU_55_CELLS: Array<[Partial<TurnUsage>, number, number]> = [
+  [{ input: 1_000_000 }, 0.1, 0.5],
+  [{ cacheWrite5m: 1_000_000 }, 0.125, 0.625],
+  [{ cacheWrite1h: 1_000_000 }, 0.2, 1],
+  [{ cacheRead: 1_000_000 }, 0.01, 0.05],
+  [{ output: 1_000_000 }, 0.5, 2.5],
+];
+const near = (actual: number | null | undefined, expected: number, label: string) =>
+  assert.ok(actual != null && Math.abs(actual - expected) < 1e-12, `${label}: ${actual} is not ${expected}`);
+
+test('Haiku 5.5 prices a request over 100,000 input tokens at five times every rate', () => {
+  const model = 'claude-haiku-5-5';
+  for (const [category, short, long] of HAIKU_55_CELLS) {
+    const label = Object.keys(category)[0];
+    near(quoteUsage({ usage: usage(category), model, contextBand: 'short' })?.cost, short, `short ${label}`);
+    near(quoteUsage({ usage: usage(category), model, contextBand: 'long' })?.cost, long, `long ${label}`);
+  }
+  assert.equal(contextBandForRequest(model, null, 100_000), 'short');
+  assert.equal(contextBandForRequest(model, null, 100_001), 'long');
+  assert.equal(contextBandForRequest('claude-haiku-5-5-20261007[1m]', null, 100_001), 'long');
+  // The cache read alone carries this request over 100,000 tokens, so its new input pays the long rate too.
+  const request = usage({ requests: 1, input: 1_000, cacheRead: 99_001 });
+  near(estimateCost(request, model), (1_000 * 0.5 + 99_001 * 0.05) / 1_000_000, 'cache-read request');
+  near(
+    estimateCost({ ...request, cacheRead: 99_000 }, model),
+    (1_000 * 0.1 + 99_000 * 0.01) / 1_000_000,
+    'short request',
+  );
+});
+
+test('a regional Bedrock Haiku 5.5 request pays 1.1 times list in both prompt bands', () => {
+  const tokens = usage({ input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 });
+  for (const [band, list] of [
+    ['short', 0.1 + 0.01 + 0.5],
+    ['long', 0.5 + 0.05 + 2.5],
+  ] as const) {
+    const input = { usage: tokens, model: 'claude-haiku-5-5', contextBand: band };
+    assert.equal(quoteUsage(input)?.cost.toFixed(9), list.toFixed(9), `${band} list`);
+    const regional = quoteUsage({ ...input, inferenceClass: 'bedrock-regional' });
+    assert.equal(regional?.cost.toFixed(9), (list * 1.1).toFixed(9), `${band} regional`);
+  }
 });
 
 test('the next-turn floor and the compaction estimate carry the regional Bedrock charge', () => {

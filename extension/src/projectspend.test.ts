@@ -4407,7 +4407,7 @@ test('a Claude Sonnet 5.5 bucket is priced from its stored usage, cache writes i
     }),
   ]);
   assert.equal(bucket.reportedCost, null);
-  assert.equal(publicProjectSpendPrice(bucket)?.dollars, 2 + 0.2 + 2.5 + 4 + 10);
+  assert.equal(publicProjectSpendPrice(bucket)?.dollars, 2 + 0.1 + 2.5 + 4 + 10);
 });
 
 test('Claude uses its public price without a billing route and accepts a configured override', () => {

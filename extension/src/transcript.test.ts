@@ -123,7 +123,7 @@ import {
   readChildSpend,
   spendTokens,
 } from './agentspend.ts';
-import { quoteUsage } from './pricing.ts';
+import { estimateCost, quoteUsage } from './pricing.ts';
 import { renderInlineMarkdown } from './richtext.ts';
 import type { BackwardRangeReader, TurnCommit } from './transcript.ts';
 import {
@@ -381,6 +381,44 @@ function writeTranscript(lines: object[]): string {
   fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
   return file;
 }
+
+// Haiku 5.5 prices each request in its own prompt-length band, so a turn total must keep both bands.
+test('a Haiku 5.5 turn prices each request in its own band', () => {
+  const request = (second: number, usage: Record<string, number>, stop?: string) => {
+    const record = assistantText(`step ${second}`, second, usage, undefined, stop);
+    record.message.model = 'claude-haiku-5-5';
+    return record;
+  };
+  const records = [
+    userPrompt('Summarize the logs', 0),
+    request(1, { input_tokens: 10_000, cache_read_input_tokens: 40_000, output_tokens: 1_000 }),
+    request(2, { input_tokens: 1, cache_read_input_tokens: 100_000, output_tokens: 2_000 }, 'end_turn'),
+  ];
+  // 50,000 input at the short rates, then 100,001 input at five times them.
+  const short = (10_000 * 0.1 + 40_000 * 0.01 + 1_000 * 0.5) / 1_000_000;
+  const long = (1 * 0.5 + 100_000 * 0.05 + 2_000 * 2.5) / 1_000_000;
+  const near = (cost: number | null, label: string) =>
+    assert.ok(cost !== null && Math.abs(cost - (short + long)) < 1e-12, `${label} priced at ${cost}`);
+  const file = writeTranscript(records);
+  const [turn] = readSession(file, 'sess').turns;
+  const partCost = (turn.usageParts ?? []).reduce(
+    (total, part) =>
+      total +
+      (estimateCost(part.usage, part.model, part.provider, part.contextWindow, null, {
+        inferenceClass: part.inferenceClass,
+        serviceTier: part.serviceTier,
+      }) ?? Number.NaN),
+    0,
+  );
+  near(estimateCost(turn.usage, turn.model), 'the turn total');
+  near(partCost, 'the request parts');
+  const child = readClaudeAgentSpend(file, [], true).models;
+  assert.deepEqual(
+    child.map((spend) => spend.model),
+    ['claude-haiku-5-5'],
+  );
+  near(estimateCost(child[0].usage, child[0].model), 'the child model total');
+});
 
 test('a Claude turn retains usage under each request pricing identity', () => {
   const first = assistantText('one', 1) as Record<string, unknown>;

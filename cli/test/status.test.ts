@@ -100,6 +100,21 @@ test('the next-turn starting price includes the latest answer that becomes input
   assert.equal(snapshot.nextTurn.coldDollars?.toFixed(2), '1.20');
 });
 
+test('a cold re-cache of part of a long Haiku 5.5 prompt pays the long-prompt write rate', () => {
+  const input = payload();
+  input.model.id = 'claude-haiku-5-5';
+  input.context_window.context_window_size = 1_000_000;
+  // The next request sends 99,001 context tokens and the 1,000-token answer, which is over 100,000.
+  input.context_window.total_input_tokens = 99_001;
+  input.context_window.total_output_tokens = 1_000;
+  input.prompt_cache.recache_tokens_if_cold = 50_000;
+  input.prompt_cache.warm = false;
+  const snapshot = snapshotFromClaude(input, NOW);
+  assert.equal(snapshot.nextTurn.state, 'cold');
+  // 51,000 tokens written for one hour at twice the long-prompt input rate of $0.50 per million.
+  assert.equal(snapshot.nextTurn.coldDollars?.toFixed(6), '0.051000');
+});
+
 test('expired native cache state selects the cold recache floor', () => {
   const input = payload();
   input.prompt_cache.expires_at = 1_738_428_899;

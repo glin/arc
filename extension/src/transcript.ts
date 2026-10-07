@@ -48,7 +48,12 @@ import {
   type HiddenStatePolicy,
 } from './parserstate';
 import { withoutRichContent } from './richtext';
-import { compactionEstimate, type CompactionPreviousRequest } from './pricing';
+import {
+  compactionEstimate,
+  contextBandForRequest,
+  requestInputTokens,
+  type CompactionPreviousRequest,
+} from './pricing';
 import { activityDetail, ActivityDetailFormat, ActivityDetailPolicy, describeToolInput } from './activitydetail';
 import { shortenTo } from './domain/text.ts';
 import { ARC_IDENTITY } from './identity';
@@ -6906,7 +6911,8 @@ export function reduceClaudeUsageRecord(
     provider: null,
     model,
     contextWindow: null,
-    contextBand: null,
+    // A Claude model with request-band pricing prices each request by its total input. Other models get no band.
+    contextBand: contextBandForRequest(model, null, requestInputTokens(counted)),
     billingClass: 'unknown',
     inferenceClass,
     serviceTier,
@@ -6960,7 +6966,7 @@ function claudeCompactionEstimateEvent(state: ClaudeUsageReducerState): UsageEve
     provider: null,
     model: previous.model,
     contextWindow: null,
-    contextBand: null,
+    contextBand: contextBandForRequest(previous.model, null, requestInputTokens(usage)),
     billingClass: 'unknown',
     inferenceClass: previous.inferenceClass ?? null,
     serviceTier: previous.serviceTier ?? null,
@@ -7543,7 +7549,7 @@ function readClaudeOwnSpend(
   const byRequest = Object.values(usageState.requestEvents ?? {});
   const byModel = new Map<string | null, TurnUsage>();
   for (const request of byRequest) {
-    addModelUsage(byModel, request.model, request.usage);
+    addModelUsage(byModel, request.model, request.usage, request.contextBand);
   }
   const exact = { usageParts: [] as TurnUsagePart[] };
   for (const request of [...byRequest, ...estimates]) {
@@ -9156,7 +9162,7 @@ function reduceClaudeSessionLine(
         : null;
     const events = opts.childTranscript ? replaceClaudeUsageEvent(state.usageState, usageEvent) : [usageEvent];
     for (const event of events) {
-      addUsage(cur.usage, event.usage);
+      addUsage(cur.usage, event.usage, event.contextBand);
       addTurnUsagePart(cur, event);
     }
   }

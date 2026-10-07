@@ -88,8 +88,22 @@ function addUsageCounts(into: UsageCounts, add: UsageCounts): void {
   into.thinking += add.thinking;
 }
 
+function noUsage(usage: TurnUsage): boolean {
+  return usageTokens(usage) === 0 && (usage.requests ?? 0) === 0 && usage.thinking === 0;
+}
+
+// A total keeps request bands only while they cover every request in it. Adding usage without a
+// band, such as a request from a model without band pricing, drops them. The usage parts keep
+// the exact price of each request.
 export function addUsage(into: TurnUsage, add: TurnUsage, contextBand: UsageContextBand | null = null): void {
+  const banded =
+    (into.byContextBand !== undefined || noUsage(into)) &&
+    (contextBand !== null || add.byContextBand !== undefined || noUsage(add));
   addUsageCounts(into, add);
+  if (!banded) {
+    delete into.byContextBand;
+    return;
+  }
   if (contextBand) {
     const held = into.byContextBand?.[contextBand] ?? emptyUsage();
     addUsageCounts(held, add);

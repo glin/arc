@@ -303,6 +303,69 @@ test('prior derived generations drop saved figures and carry valid names for bou
   }
 });
 
+// Version 46 saved Claude turn usage with no request band, so its Haiku 5.5 totals cannot be priced.
+test('a derived cache saved before Claude request bands rereads its Haiku 5.5 usage', () => {
+  const file = path.join(folder(), 'cache.json');
+  const [turn] = stats.turns;
+  const haiku = {
+    ...title,
+    stats: {
+      ...stats,
+      turns: [
+        {
+          ...turn,
+          model: 'claude-haiku-5-5',
+          usage: { ...turn.usage, requests: 2, input: 10_001, cacheRead: 140_000 },
+        },
+      ],
+    },
+  };
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      version: 46,
+      codexMetaVersion: CODEX_META_VERSION,
+      titles: [{ file: '/haiku.jsonl', entry: haiku }],
+    }),
+  );
+  const loaded = loadDerivedCache(file);
+  assert.equal(loaded.titles.size, 0, 'a turn total saved without its request bands was read');
+  assert.equal(loaded.carriedNames.get('/haiku.jsonl')?.label, title.label);
+});
+
+// Only Haiku 5.5 requests carry a band, so a turn that also holds a Sonnet request has a total no band covers.
+test('a turn of Haiku 5.5 and Sonnet requests survives a save and reload of the derived cache', async () => {
+  const { readSession, sessionStatFactsOf } = await import('./transcript.ts');
+  const directory = folder();
+  const source = path.join(directory, 'mixed.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  const at = (second: number) => new Date(Date.UTC(2026, 9, 7, 12, 0, second)).toISOString();
+  const request = (second: number, model: string, stop: string) => ({
+    type: 'assistant',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id: `m${second}`,
+      model,
+      stop_reason: stop,
+      content: [{ type: 'text', text: `step ${second}` }],
+      usage: { input_tokens: 50_000, output_tokens: 1_000 },
+    },
+  });
+  const records = [
+    { type: 'user', promptId: 'p1', timestamp: at(0), message: { role: 'user', content: 'Summarize the logs' } },
+    request(1, 'claude-haiku-5-5', 'tool_use'),
+    request(2, 'claude-sonnet-5-5', 'end_turn'),
+  ];
+  fs.writeFileSync(source, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const stats = sessionStatFactsOf(readSession(source, 'mixed'));
+  assert.equal(stats?.turns[0].usage.requests, 2);
+  assert.equal(stats?.turns[0].usage.input, 100_000);
+  const entry: DerivedTitleEntry = { ...title, stats };
+  saveDerivedCache(cache, [[source, entry]]);
+  assert.deepEqual(loadDerivedCache(cache).titles.get(source), entry, 'the saved mixed-model turn was rejected');
+});
+
 test('a full parse fills missing derived facts without replacing facts already cached', () => {
   const read = {
     turns: [

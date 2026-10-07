@@ -120,6 +120,7 @@ export type UsagePriceContext = Pick<UsageQuoteInput, 'inferenceClass' | 'servic
 // Claude generation boundaries reject longer generation numbers but accept dated snapshots and bracketed context suffixes.
 // OpenAI patterns list supported snapshot identities explicitly because other suffixes can identify different products.
 // Claude 5 definitions use a one-million-token fallback window. Supported Claude 4.5 definitions use 200,000 tokens.
+// Claude Haiku 5.5 is the one Claude definition with a request band. Its whole request pays the long rate above 100,000 input tokens.
 // Adding a definition requires published rates, window capacity, and cache policy for that model.
 // Codex definitions supply advertised windows. Consumers use recorded request windows when available.
 // Supported OpenAI models apply long-context multipliers to the whole request above 272,000 input tokens.
@@ -169,9 +170,10 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   // Sonnet definitions list supported generations explicitly. Unlisted Sonnet generations remain unpriced.
   {
     pattern: /^claude-sonnet-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
-    rate: { input: 2, output: 10 },
+    rate: { input: 2, cacheRead: 0.1, output: 10 },
     cachePolicy: CLAUDE_CACHE_POLICY,
     window: 1_000_000,
+    effectiveDate: '2026-10-07',
   },
   {
     pattern: /^claude-sonnet-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
@@ -191,6 +193,17 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     rate: { input: 3, output: 15 },
     cachePolicy: CLAUDE_CACHE_POLICY,
     window: 200_000,
+  },
+  // https://platform.claude.com/docs/en/about-claude/pricing
+  // A prompt over 100,000 tokens pays five times every rate. The threshold counts total request
+  // input, cache reads and writes included, as the shared request band does for every banded model.
+  {
+    pattern: /^claude-haiku-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
+    rate: { input: 0.1, output: 0.5 },
+    longContext: { threshold: 100_000, inputMultiplier: 5, outputMultiplier: 5 },
+    cachePolicy: CLAUDE_CACHE_POLICY,
+    window: 1_000_000,
+    effectiveDate: '2026-10-07',
   },
   {
     pattern: /^claude-haiku-4-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
@@ -815,7 +828,7 @@ export function nextTurnFloor(input: NextTurnFloorInput): NextTurnFloor | null {
   };
 }
 
-function requestInputTokens(usage: TurnUsage): number {
+export function requestInputTokens(usage: TurnUsage): number {
   return usage.input + usage.cacheWrite1h + usage.cacheWrite5m + (usage.cacheWrite30m ?? 0) + usage.cacheRead;
 }
 

@@ -155,7 +155,12 @@ export function snapshotFromClaude(input: unknown, now = Date.now()): StatusSnap
   const contextFloor = sharedFloorInput ? nextTurnFloor(sharedFloorInput) : null;
   const coldFloor =
     sharedFloorInput && recacheTokensIfCold !== null
-      ? nextTurnFloor({ ...sharedFloorInput, contextTokens: recacheTokensIfCold })
+      ? nextTurnFloor({
+          ...sharedFloorInput,
+          contextTokens: recacheTokensIfCold,
+          // The re-cache count can be part of the prompt. The whole next request selects the price band.
+          requestTokens: sharedFloorInput.contextTokens + latestOutputTokens,
+        })
       : contextFloor;
   const warmDollars = state === 'not-observed' ? null : (contextFloor?.warm ?? null);
   const coldDollars = state === 'not-observed' ? null : (coldFloor?.cold ?? null);
