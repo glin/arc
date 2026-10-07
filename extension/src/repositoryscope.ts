@@ -1,5 +1,5 @@
 import type { GitRunner } from './gitcommits';
-import { normalizeFsPath } from './transcript';
+import { isInside, normalizeFsPath } from './transcript';
 
 const WORKTREE_LIST_ARGS = ['worktree', 'list', '--porcelain', '-z'];
 
@@ -25,7 +25,7 @@ export interface RepositoryScopeDecision {
   decision: RepositoryScopeDecisionKind;
   // The roots the scope published before the answer.
   previous: string[];
-  // The roots the answer lists, including the open folders.
+  // The roots the answer lists, including the open folders, without the registered roots nested inside another of them.
   answered: string[];
   // The roots the scope publishes after the answer.
   applied: string[];
@@ -70,6 +70,17 @@ function rootKey(root: string): string {
   return normalized.length > 1 ? normalized.replace(/\/$/, '') : normalized;
 }
 
+// Drops each registered root that lies strictly inside another root of the list. Membership already admits a session under an
+// enclosing root, so a nested worktree adds no session and must not move the scope. Open folders always stay. Containment runs only
+// from a root toward its ancestors, so an open subfolder keeps its enclosing repository root.
+function withoutNestedRoots(roots: string[], folders: string[]): string[] {
+  const open = new Set(folders.map(rootKey));
+  return roots.filter(
+    (root) =>
+      open.has(rootKey(root)) || !roots.some((other) => rootKey(other) !== rootKey(root) && isInside(root, [other])),
+  );
+}
+
 function rootsEqual(left: string[], right: string[]): boolean {
   return (
     left.length === right.length && left.every((root, index) => normalizeFsPath(root) === normalizeFsPath(right[index]))
@@ -78,7 +89,8 @@ function rootsEqual(left: string[], right: string[]): boolean {
 
 // Resolves the registered worktrees of the repositories containing the open folders.
 // Listing stays synchronous: it uses the last successful answer for each folder while Git
-// refreshes in the background. A failed read retains that folder's prior roots, because a
+// refreshes in the background. Each folder keeps its raw Git answer, and the published roots leave out a registered worktree nested
+// inside another root. A failed read retains that folder's prior roots, because a
 // temporary Git failure must not remove sessions or reader state from the panel. After the first
 // answer, an answer that removes a root keeps it until a second answer also removes it, because Git
 // can briefly list fewer worktrees than the repository has. An answer that adds roots applies at once.
@@ -86,6 +98,9 @@ export class RepositoryScope {
   private folderKey: string | null = null;
   private folders: string[] = [];
   private roots: string[] = [];
+  // The roots before nested ones are left out. Removal confirmation compares each answer with these, so a nested root that a removed
+  // ancestor hid still needs two answers that omit it.
+  private retained: string[] = [];
   private rootsByFolder = new Map<string, string[]>();
   private ready = false;
   private revision = 0;
@@ -114,6 +129,7 @@ export class RepositoryScope {
       this.folderKey = nextKey;
       this.folders = nextFolders;
       this.roots = nextFolders;
+      this.retained = nextFolders;
       for (const key of this.rootsByFolder.keys()) {
         if (!nextFolderKeys.has(key)) {
           this.rootsByFolder.delete(key);
@@ -188,8 +204,10 @@ export class RepositoryScope {
           answers.filter((answer) => answer.stdout === null).map((answer) => rootKey(answer.folder)),
         );
         const failed = failedKeys.size;
-        const previous = this.roots;
+        const previous = this.retained;
+        const previousPublished = this.roots;
         const answered = uniqueRoots([...folders, ...candidate.values()].flat());
+        const published = withoutNestedRoots(answered, folders);
         const answeredKeys = new Set(answered.map(rootKey));
         // The roots that a folder whose Git read succeeded lists in this answer. A failed folder contributes only its stored roots.
         const listedKeys = new Set(
@@ -216,7 +234,7 @@ export class RepositoryScope {
             decision = fresh.length < removed.length ? 'confirmed' : 'held for confirmation';
           } else if (restored.length > 0) {
             decision = 'discarded';
-          } else if (!rootsEqual(answered, previous)) {
+          } else if (!rootsEqual(published, previousPublished)) {
             decision = 'accepted';
           }
           if (fresh.length > 0 || unverified.length === 0) {
@@ -251,18 +269,28 @@ export class RepositoryScope {
             held ? uniqueRoots([...roots, ...prior.filter((root) => held.has(rootKey(root)))]) : roots,
           );
         }
-        const moved = !rootsEqual(next, previous);
+        // Removal confirmation and failed-read retention above read the raw answers and the retained roots. Only the published roots
+        // leave out nested ones.
+        this.retained = next;
+        const publishedNext = withoutNestedRoots(next, folders);
+        const moved = !rootsEqual(publishedNext, previousPublished);
         this.ready = true;
         this.checking = false;
         if (moved) {
-          this.roots = next;
+          this.roots = publishedNext;
           this.revision++;
         }
-        if (decision) {
+        // A removal that names only nested roots keeps its hold and recheck, but it records no decision unless the published roots move.
+        const publishedKeys = new Set(previousPublished.map(rootKey));
+        const nestedRemovalOnly =
+          (decision === 'held for confirmation' || decision === 'confirmed') &&
+          !moved &&
+          !removed.some((root) => publishedKeys.has(rootKey(root)));
+        if (decision && !nestedRemovalOnly) {
           this.report({
             decision,
-            previous: [...previous],
-            answered,
+            previous: [...previousPublished],
+            answered: published,
             applied: [...this.roots],
             restored,
             stdoutLength: answers.reduce((length, answer) => length + (answer.stdout?.length ?? 0), 0),

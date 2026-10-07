@@ -416,18 +416,20 @@ test.for([
     });
     const signal = new AbortController().signal;
     if (pendingFirst) {
-      provider.postSessionLoading([session], 7, signal);
+      provider.postSessionLoading(7, signal);
       await page.waitForFunction(
         () => document.querySelector('[data-session-loading-status]')?.textContent === 'Reading sessions…',
       );
     }
     assert.equal(await provider.prepareClaudeChildren(7, signal), true);
     assert.equal(provider.discoveryCheckpoint, undefined, 'final worker acknowledgment retained its checkpoint');
+    // The render publishes the catalog that the complete reply built.
+    provider.completeCatalogScope = provider.discoveryComplete?.scope;
     await page.waitForFunction(() =>
       document.querySelector('[data-session-loading-status]')?.textContent?.includes('1 of 1'),
     );
     if (failed) provider.failSessionLoading(7, signal);
-    else provider.postSessionLoading([session], 7, signal);
+    else provider.postSessionLoading(7, signal);
     const background = page.locator('nav [data-session-loading-status]');
     if (failed) {
       await page.waitForFunction(
@@ -662,13 +664,15 @@ test('exhausted sources complete the session list through repeated full source c
       },
     });
     const signal = new AbortController().signal;
-    provider.postSessionLoading(sessions, 6, signal);
+    provider.postSessionLoading(6, signal);
     for (const generation of [7, 8]) {
       provider.refreshGeneration = generation;
       provider.startupProgressAt = 0;
       provider.dispatchDiscoveryPending = true;
       assert.equal(await provider.prepareClaudeChildren(generation, signal), true);
-      provider.postSessionLoading(sessions, generation, signal);
+      // The render publishes the catalog that the complete reply built.
+      provider.completeCatalogScope = provider.discoveryComplete?.scope;
+      provider.postSessionLoading(generation, signal);
     }
     await page.waitForFunction(
       'window.__posted.some(message => message.type === "painted" && message.generation === 8 && message.stage === "completeRender")',

@@ -4538,7 +4538,7 @@ test('the first authoritative render precedes Project cost restoration and prici
   );
   sourceMatch(
     panelHostSource,
-    /listLoading = this\.sessionLoadingState\(all, generation, listBlocker\)[\s\S]*startup: [\s\S]*complete: !loadingNewest && listLoading\.complete/,
+    /listLoading = this\.sessionLoadingState\(generation, listBlocker\)[\s\S]*startup: [\s\S]*complete: !loadingNewest && listLoading\.complete/,
     'session rendering still waits for Project cost hydration before it reports completion',
   );
 });
@@ -20548,7 +20548,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   assert.ok(rail >= 0 && worker > rail, 'selected worker work starts before the host posts the rail and loading state');
   sourceMatch(
     refresh,
-    /listLoading = this\.sessionLoadingState\(all, generation, listBlocker\)[\s\S]*startup: [\s\S]*complete: !loadingNewest && listLoading\.complete/,
+    /listLoading = this\.sessionLoadingState\(generation, listBlocker\)[\s\S]*startup: [\s\S]*complete: !loadingNewest && listLoading\.complete/,
     'the render does not give the browser the generation and completion state it must acknowledge',
   );
   sourceMatch(

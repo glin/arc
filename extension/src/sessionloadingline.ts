@@ -14,15 +14,10 @@ export type SessionLoadingReason =
   | 'catalog missing'
   | 'discovery pending'
   | 'discovery complete'
-  | 'revision changed'
-  | 'label missing'
-  | 'starts missing'
-  | 'enrichment needed'
   | 'newest turn loading';
 
 export interface SessionLoadingBlocker {
   reason: SessionLoadingReason;
-  file?: string;
 }
 
 export interface SessionLoadingStamp {
@@ -243,7 +238,6 @@ export class SessionLoadingLine {
       ...scopeOf(scope),
       ...(stamp.known !== undefined ? { completed: stamp.completed ?? 0, known: stamp.known } : {}),
       ...(found ? { reason: found.reason } : {}),
-      ...(found?.file ? { file: found.file } : {}),
     };
   }
 

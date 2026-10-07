@@ -1113,6 +1113,8 @@ export class PanelProvider implements vscode.Disposable {
   private previousSelection: string | null = null;
   private selectionWork: SelectionWork | null = null;
   private selectionWorks = new Map<string, SelectionWork>();
+  // Native sources of selected sessions that the published catalog does not list. The selection path adds a source only while a
+  // catalog is published, so while the catalog is null every reader finds none.
   private earlySelectedSources = new Map<string, SelectedSource>();
   private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
   // The newest session menu's host. Native commands carry no webview identity.
@@ -1183,8 +1185,10 @@ export class PanelProvider implements vscode.Disposable {
   private walkedClaude: string[] = [];
   private claudeParents: SessionFile[] = [];
   private dispatchDiscoveryPending = false;
-  // The repository scope of the latest complete discovery reply. Follow-up passes under it do not keep the session list loading.
-  private discoveryCompleteScope?: string;
+  // The repository scope of a complete discovery reply whose catalog is not yet published, and the session files of the catalog it
+  // answered. An incomplete reply or a scope change clears it. The next catalog publication under that scope turns it into the
+  // completion stamp only when the reply answered every published session.
+  private discoveryComplete?: { scope: string; files: ReadonlySet<string> };
   private discoveryRequestSequence = 0;
   private discoveryAcknowledgment?: {
     scope: string;
@@ -1656,6 +1660,12 @@ export class PanelProvider implements vscode.Disposable {
   private authoritativeCatalog: SessionFile[] | null = null;
   // The repository scope roots the authoritative catalog was listed under. Only a list complete under these roots holds the loading line.
   private authoritativeCatalogScope?: string;
+  // The repository scope roots under which the published catalog was built from a complete discovery reply. A catalog reused after an
+  // incomplete pass keeps the stamp it had, and a scope change clears it. The session list is complete when it equals the current roots.
+  private completeCatalogScope?: string;
+  // The file and kind of each failed session read that is logged. A failed metadata, turn start, enrichment, or recovery read is logged
+  // once per file and kind until that kind of read succeeds, and it never keeps the session list loading.
+  private sessionReadFailures = new Set<string>();
   // Whether the latest catalog refresh read filesystem revisions. Project cost reuses those revisions only after a filesystem walk.
   private catalogWalked = true;
   // Diff sides by URI, in insertion order. The byte budget evicts the oldest entries.
@@ -2338,6 +2348,9 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWorks.clear();
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
+    // A catalog completed under the previous roots never completes the new ones, even when the roots later return to it.
+    this.discoveryComplete = undefined;
+    this.completeCatalogScope = undefined;
     // Removing roots needs no new loading, so the hold stays unless the new roots add one outside the held scope.
     const scope = this.repositoryScope.snapshot(this.folders());
     this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
@@ -2357,12 +2370,14 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork = null;
     this.authoritativeCatalog = null;
     this.authoritativeCatalogScope = undefined;
+    this.completeCatalogScope = undefined;
+    this.sessionReadFailures?.clear();
     this.startupSourceCheckpoint = null;
     this.loadingLine.release('workspace folders');
     this.discoveryCheckpoint = undefined;
     this.discoveryCompleted = undefined;
     this.discoveryAcknowledgment = undefined;
-    this.discoveryCompleteScope = undefined;
+    this.discoveryComplete = undefined;
     this.claudeChildReferenceEntries = new Map();
     this.enumeratedSpendSources = undefined;
     // Cancel catalog work started for different workspace folders.
@@ -2663,8 +2678,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Build prompt box state for a specified session, including sessions outside the current view.
-  // An early selected source is accepted while the catalog is missing, and delivery validates it again.
-  // A catalog that omits it rejects it, except for locally started sessions.
+  // A published catalog that omits an early selected source rejects it, except for locally started sessions.
   private stateFor(session: string): ComposerState | null {
     if (!this.repositoryScopeReady) {
       return null;
@@ -6395,8 +6409,20 @@ export class PanelProvider implements vscode.Disposable {
       }
       all = orderSessionCatalog(all, (session) => this.activityFor(session));
       if (!selectedOnly && !metadataAfterRender) {
+        const catalogScope = JSON.stringify(this.repositoryScopeRoots);
         this.authoritativeCatalog = all;
-        this.authoritativeCatalogScope = JSON.stringify(this.repositoryScopeRoots);
+        this.authoritativeCatalogScope = catalogScope;
+        const answered = this.discoveryComplete?.scope === catalogScope ? this.discoveryComplete.files : undefined;
+        if (answered && all.every((session) => answered.has(session.file))) {
+          this.completeCatalogScope = catalogScope;
+        } else if (answered) {
+          // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
+          // completes, and the follow-up refresh this schedules lets the line clear.
+          const discoveryWaiting = this.dispatchedDiscoveryWaiting();
+          this.dispatchDiscoveryPending = true;
+          if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
+        }
+        this.discoveryComplete = undefined;
       }
       const recorded = new Set(all.map((session) => session.sessionId));
       for (const session of Object.keys(this.awaitingSessionRecords)) {
@@ -6528,7 +6554,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!selectedOnly) {
           this.scheduleProjectSpendHydration(generation);
           const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
-          this.postSessionLoading(all, generation, controller.signal);
+          this.postSessionLoading(generation, controller.signal);
           if (
             (enrichment.changed || enrichment.progress) &&
             !controller.signal.aborted &&
@@ -6633,8 +6659,8 @@ export class PanelProvider implements vscode.Disposable {
       let largestRenderBytes: number | null = null;
       // The session list decides when the source count ends and when the loading line starts its hold, once for every panel.
       // The walk that names the list's first blocker also decides its state, so a withheld render reads its reason without a second walk.
-      const listBlocker = this.sessionLoadingBlocker(all, generation);
-      const listLoading = this.sessionLoadingState(all, generation, listBlocker);
+      const listBlocker = this.sessionLoadingBlocker(generation);
+      const listLoading = this.sessionLoadingState(generation, listBlocker);
       const loadingScope = JSON.stringify(this.repositoryScopeRoots);
       this.settleSourceCount(listLoading);
       if (listLoading.complete && this.authoritativeCatalogScope === loadingScope)
@@ -6837,7 +6863,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.refresh(true, true, true);
       } else {
         const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
-        this.postSessionLoading(all, generation, controller.signal);
+        this.postSessionLoading(generation, controller.signal);
         if (
           (enrichment.changed || enrichment.progress) &&
           !controller.signal.aborted &&
@@ -8249,6 +8275,7 @@ export class PanelProvider implements vscode.Disposable {
     const discoveryWaiting = this.dispatchedDiscoveryWaiting();
     if (progress.kind !== 'claude-children' || !progress.complete) {
       this.dispatchDiscoveryPending = true;
+      this.discoveryComplete = undefined;
       this.checkpointDerivedCache();
       if (this.catalog) this.catalog = { ...this.catalog, sessions: this.authoritativeCatalog ?? [] };
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
@@ -8257,7 +8284,6 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeChildReferences = progress.references;
     this.startupHistory?.stage('relationshipsComplete');
     this.dispatchDiscoveryPending = progress.continuation;
-    this.discoveryCompleteScope = JSON.stringify(this.repositoryScopeRoots);
     const facts = new Map((progress.dispatchFacts ?? []).map((facts) => [facts.sessionId, facts]));
     const figures = (entries: Map<string, DispatchSessionFacts> | undefined) =>
       [...(entries?.values() ?? [])]
@@ -8298,6 +8324,10 @@ export class PanelProvider implements vscode.Disposable {
     }
     const codex = roots.filter((session) => session.agent === 'codex');
     const sessions = orderSessionCatalog([...roots, ...this.claudeChildren], (session) => this.activityFor(session));
+    this.discoveryComplete = {
+      scope: JSON.stringify(this.repositoryScopeRoots),
+      files: new Set(sessions.map((session) => session.file)),
+    };
     this.updateSessionSpendSources(codex, sessions);
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
@@ -8393,7 +8423,7 @@ export class PanelProvider implements vscode.Disposable {
         )
         .catch(() => null);
       const currentRevision = this.revisionOf(session);
-      if (!result) this.failSessionLoading(generation, signal);
+      this.noteSessionRead(session, 'metadata', result !== null, generation, signal);
       const grewAfterRead = Boolean(
         result?.revision &&
         result.value.kind === 'metadata' &&
@@ -8454,13 +8484,11 @@ export class PanelProvider implements vscode.Disposable {
       remaining -= bytes;
       let next = previous;
       if (needsStarts) {
-        const result = await this.progressiveWorker.run(
-          { kind: 'starts', session, agentRunScan: previous.agentRunScan },
-          generation,
-          signal,
-        );
+        const result = await this.progressiveWorker
+          .run({ kind: 'starts', session, agentRunScan: previous.agentRunScan }, generation, signal)
+          .catch(() => null);
+        this.noteSessionRead(session, 'starts', result !== null, generation, signal);
         if (!result || signal.aborted) {
-          if (!result) this.failSessionLoading(generation, signal);
           break;
         }
         if (!acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(session))) {
@@ -8502,8 +8530,8 @@ export class PanelProvider implements vscode.Disposable {
             signal,
           )
           .catch(() => null);
+        this.noteSessionRead(session, 'enrichment', result !== null, generation, signal);
         if (!result || signal.aborted) {
-          if (!result) this.failSessionLoading(generation, signal);
           if (signal.aborted || generation !== this.refreshGeneration) break;
           continue;
         }
@@ -8564,6 +8592,7 @@ export class PanelProvider implements vscode.Disposable {
           signal,
         )
         .catch(() => null);
+      this.noteSessionRead(active, 'recovery', result !== null, generation, signal);
       if (
         result &&
         acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(active)) &&
@@ -8618,7 +8647,6 @@ export class PanelProvider implements vscode.Disposable {
           }
         }
       } else {
-        if (!result) this.failSessionLoading(generation, signal);
         this.metadataRecoverySession = null;
         this.metadataRecoveryQueue.push(active.sessionId);
         if (result && result.generation === generation && result.value.kind === 'stale') catalogCurrent = false;
@@ -8627,12 +8655,10 @@ export class PanelProvider implements vscode.Disposable {
     return { changed, catalogCurrent, progress };
   }
 
-  // A source whose background metadata read reached its limit counts as settled. Only a work failure marks the generation failed.
-  // A caller that already holds the list's blocker passes it, so the list is walked once.
+  // Only a discovery or catalog refresh failure marks the generation failed. A caller that already holds the list's blocker passes it.
   private sessionLoadingState(
-    sessions: SessionFile[],
     generation: number,
-    blocker: SessionLoadingBlocker | null = this.sessionLoadingBlocker(sessions, generation),
+    blocker: SessionLoadingBlocker | null = this.sessionLoadingBlocker(generation),
   ) {
     const failed = this.startupFailureGeneration === generation;
     return {
@@ -8642,34 +8668,41 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
-  // Names the first check that keeps the session list loading, and the file of the first session that fails a check. It returns
-  // null when the list is complete.
-  private sessionLoadingBlocker(sessions: SessionFile[], generation: number): SessionLoadingBlocker | null {
+  // Names the check that keeps the session list loading, or returns null when the list is complete. The list is complete once the
+  // published catalog was built from a complete discovery reply under the current roots. Names, metadata, turn starts, and recovery
+  // reads keep running after that and never keep the list loading, so a session an agent keeps writing cannot hold the line up.
+  private sessionLoadingBlocker(generation: number): SessionLoadingBlocker | null {
     if (this.startupFailureGeneration === generation) return { reason: 'failure' };
     if (this.authoritativeCatalog === null) return { reason: 'catalog missing' };
-    if (this.dispatchDiscoveryPending && this.discoveryCompleteScope !== JSON.stringify(this.repositoryScopeRoots))
-      return { reason: 'discovery pending' };
-    for (const session of sessions) {
-      const entry = this.metaFor(session);
-      const reason = !sameSessionRevision(entry, session)
-        ? 'revision changed'
-        : entry.foldedLabel === undefined
-          ? 'label missing'
-          : entry.starts === undefined
-            ? 'starts missing'
-            : railEnrichmentNeeds(entry, session)
-              ? 'enrichment needed'
-              : null;
-      if (reason) return { reason, file: session.file };
-    }
+    if (this.completeCatalogScope !== JSON.stringify(this.repositoryScopeRoots)) return { reason: 'discovery pending' };
     return null;
   }
 
-  private postSessionLoading(published: SessionFile[], generation: number, signal: AbortSignal): void {
+  // Logs a failed session read once per file and kind, and forgets the failure when that kind of read succeeds. The session keeps its
+  // prior facts. A cancelled read resolves without a result too, so a read of an aborted or replaced refresh logs nothing.
+  private noteSessionRead(
+    session: SessionFile,
+    read: 'metadata' | 'starts' | 'enrichment' | 'recovery',
+    succeeded: boolean,
+    generation: number,
+    signal: AbortSignal,
+  ): void {
+    this.sessionReadFailures ??= new Set();
+    const key = `${session.file}\0${read}`;
+    if (succeeded) {
+      this.sessionReadFailures.delete(key);
+      return;
+    }
+    if (signal.aborted || generation !== this.refreshGeneration || this.sessionReadFailures.has(key)) return;
+    this.sessionReadFailures.add(key);
+    this.diagnostics?.warn('sessionReadFailed', { read, file: session.file });
+  }
+
+  private postSessionLoading(generation: number, signal: AbortSignal): void {
     if (signal.aborted || generation !== this.refreshGeneration) return;
-    const found = this.sessionLoadingBlocker(published, generation);
+    const found = this.sessionLoadingBlocker(generation);
     this.sendSessionLoading(
-      this.sessionLoadingState(published, generation, found),
+      this.sessionLoadingState(generation, found),
       'session loading',
       () => found ?? { reason: 'failure' },
     );
@@ -9287,8 +9320,15 @@ export class PanelProvider implements vscode.Disposable {
     // Track worker requests so an unchanged cached result does not trigger another render.
     let roundTrip = false;
     try {
+      // Before the catalog is published, a selected session waits for it, and the render that publishes the catalog completes the
+      // window. A published catalog can miss a session created after its snapshot, such as a new subagent, so that session resolves
+      // from its opening records, becomes an early source, and opens at once. A catalog cleared during the resolve adds no source.
       let session = this.currentSelectedSession(work);
-      if (!session && (work.host || (this.showing === sessionId && this.selectionGeneration === generation))) {
+      if (
+        !session &&
+        this.authoritativeCatalog !== null &&
+        (work.host || (this.showing === sessionId && this.selectionGeneration === generation))
+      ) {
         const scope = this.repositoryScope?.snapshot(this.folders());
         if (!scope?.ready) return;
         this.repositoryScopeReady = true;
@@ -9304,7 +9344,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!source) return;
         work.source = source;
         session = this.currentSelectedSession(work);
-        if (!session) return;
+        if (!session || this.authoritativeCatalog === null) return;
         this.earlySelectedSources.set(sessionId, source);
       }
       if (!session) return;

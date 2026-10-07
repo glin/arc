@@ -455,8 +455,8 @@ test('a folder whose Git read always fails does not keep a held removal for anot
 
 test('a failed read keeps the held roots of its folder and names none of them restored', () =>
   withScopeTimers(async () => {
-    // /z's answer removes /z/t, then /z's read fails while /repo's answer newly removes /trees/c.
-    const git = scriptedScope([ALL, ALL, ['/trees/a', '/trees/b'], ['/trees/a', '/trees/b']], [['/z/t'], [], null, []]);
+    // /z's answer removes /zt, then /z's read fails while /repo's answer newly removes /trees/c.
+    const git = scriptedScope([ALL, ALL, ['/trees/a', '/trees/b'], ['/trees/a', '/trees/b']], [['/zt'], [], null, []]);
     git.scope.snapshot(['/repo', '/z']);
     await settle();
     await git.interval();
@@ -464,7 +464,7 @@ test('a failed read keeps the held roots of its folder and names none of them re
     const third = git.decisions[2];
     assert.equal(third.decision, 'held for confirmation');
     assert.deepEqual(third.restored, [], 'a root of a failed folder was named restored');
-    assert.deepEqual(git.roots(), ['/repo', ...ALL, '/z', '/z/t']);
+    assert.deepEqual(git.roots(), ['/repo', ...ALL, '/z', '/zt']);
     await git.confirmation();
     assert.deepEqual(
       git.roots(),
@@ -526,4 +526,148 @@ test('an answer that adds worktrees applies at once', () =>
       git.decisions.map(({ decision }) => decision),
       ['accepted', 'accepted'],
     );
+  }));
+
+// A scope whose open folders answer from their own scripts. Each answer lists the folder itself and the named worktrees, null stands
+// for a failed Git read, and a folder whose script runs out fails.
+function foldersScope(scripts: Record<string, (string[] | null)[]>) {
+  let now = 0;
+  const folders = Object.keys(scripts);
+  const runner: GitRunner = {
+    run: async (folder) => {
+      const next = scripts[folder].shift();
+      return next ? porcelain([folder, ...next]) : null;
+    },
+  };
+  let changed = 0;
+  const decisions: RepositoryScopeDecision[] = [];
+  const scope = new RepositoryScope(
+    runner,
+    () => {
+      changed++;
+    },
+    () => now,
+    (decision) => decisions.push(decision),
+  );
+  return {
+    changed: () => changed,
+    decisions,
+    snapshot: () => scope.snapshot(folders),
+    start: async () => {
+      scope.snapshot(folders);
+      await settle();
+    },
+    interval: async () => {
+      now += REPOSITORY_SCOPE_REFRESH_MS;
+      scope.snapshot(folders);
+      await settle();
+    },
+    confirmation: async () => {
+      now += REPOSITORY_SCOPE_CONFIRM_MS;
+      await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
+      await settle();
+    },
+  };
+}
+
+for (const platform of ['win32', 'darwin', 'linux'] as const) {
+  test(`a registered worktree nested inside a kept root leaves the published scope unchanged on ${platform}`, () =>
+    withScopeTimers(async () => {
+      vi.stubGlobal('process', { ...process, platform });
+      try {
+        // A drive path compares without case on every platform. A POSIX path compares without case only on Windows.
+        const drive = foldersScope({
+          'C:\\Work\\Repo': [[], ['c:/work/repo/.claude/worktrees/Fix', 'C:\\Work\\Repo\\wt']],
+        });
+        await drive.start();
+        const before = drive.snapshot();
+        await drive.interval();
+        assert.deepEqual(drive.snapshot(), { ...before, ready: true }, 'a nested drive worktree moved the scope');
+        assert.equal(drive.changed(), 1, 'a nested drive worktree changed the scope');
+        assert.equal(drive.decisions.length, 1, 'a nested drive worktree reported a decision');
+
+        const posix = foldersScope({
+          '/Work/Repo': [[], ['/Work/Repo/.claude/worktrees/Same', '/work/repo/.claude/worktrees/Cased']],
+        });
+        await posix.start();
+        const revision = posix.snapshot().revision;
+        await posix.interval();
+        const cased = platform === 'win32' ? [] : ['/work/repo/.claude/worktrees/Cased'];
+        assert.deepEqual(
+          posix.snapshot().roots,
+          ['/Work/Repo', ...cased].sort((a, b) => a.localeCompare(b)),
+        );
+        assert.equal(posix.snapshot().revision, platform === 'win32' ? revision : revision + 1);
+        assert.equal(posix.changed(), platform === 'win32' ? 1 : 2);
+
+        // An open subfolder keeps its enclosing repository root, and a worktree inside that root stays out.
+        const sub = foldersScope({
+          '/Work/Repo/extension': [['/Work/Repo'], ['/Work/Repo', '/Work/Repo/.claude/worktrees/Fix']],
+        });
+        await sub.start();
+        assert.deepEqual(sub.snapshot().roots, ['/Work/Repo', '/Work/Repo/extension']);
+        const subRevision = sub.snapshot().revision;
+        await sub.interval();
+        assert.deepEqual(sub.snapshot().roots, ['/Work/Repo', '/Work/Repo/extension']);
+        assert.equal(sub.snapshot().revision, subRevision, 'a nested worktree under an open subfolder moved the scope');
+        assert.equal(sub.changed(), 1);
+
+        // A worktree outside every root, including one whose path only shares a prefix, still changes the scope.
+        const external = foldersScope({ '/Work/Repo': [[], ['/Work/Repo-wt']] });
+        await external.start();
+        await external.interval();
+        assert.deepEqual(external.snapshot().roots, ['/Work/Repo', '/Work/Repo-wt']);
+        assert.equal(external.changed(), 2, 'an external worktree left the scope unchanged');
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    }));
+}
+
+test('removal confirmation and failed-read retention read each folder raw answer, so a nested root appears once its ancestor goes', () =>
+  withScopeTimers(async () => {
+    // /repo lists the external worktree /r, and /z lists /r/n inside it. Then /repo stops listing /r while /z's reads fail.
+    const git = foldersScope({ '/repo': [['/r'], [], []], '/z': [['/r/n'], null, null] });
+    await git.start();
+    assert.deepEqual(git.snapshot().roots, ['/r', '/repo', '/z']);
+    await git.interval();
+    assert.equal(git.decisions.at(-1)?.decision, 'held for confirmation');
+    assert.deepEqual(git.snapshot().roots, ['/r', '/repo', '/z'], 'one answer removed the ancestor');
+    await git.confirmation();
+    assert.equal(git.decisions.at(-1)?.decision, 'confirmed');
+    assert.deepEqual(git.snapshot().roots, ['/r/n', '/repo', '/z'], 'the failed folder lost its nested root');
+  }));
+
+test('removing a worktree nested inside the open folder holds and confirms it without a scope decision', () =>
+  withScopeTimers(async () => {
+    const answers: (string[] | null)[] = [['/repo/w'], [], []];
+    const git = foldersScope({ '/repo': answers });
+    await git.start();
+    assert.deepEqual(git.snapshot().roots, ['/repo']);
+    await git.interval();
+    await git.confirmation();
+    assert.equal(answers.length, 0, 'the removal of a nested worktree was not checked again');
+    assert.deepEqual(git.snapshot().roots, ['/repo']);
+    assert.deepEqual(
+      git.decisions.map(({ decision }) => decision),
+      ['accepted'],
+      'the removal of a nested worktree reported a scope decision',
+    );
+  }));
+
+test('a nested root keeps its removal confirmation after its ancestor leaves the scope', () =>
+  withScopeTimers(async () => {
+    // /repo lists /r and /r/n inside it, then only /r/n, then neither. /r/n leaves only after two answers omit it.
+    const git = foldersScope({ '/repo': [['/r', '/r/n'], ['/r/n'], [], []] });
+    await git.start();
+    assert.deepEqual(git.snapshot().roots, ['/r', '/repo']);
+    await git.interval();
+    assert.equal(git.decisions.at(-1)?.decision, 'held for confirmation');
+    assert.deepEqual(git.snapshot().roots, ['/r', '/repo'], 'one answer removed the ancestor');
+    await git.confirmation();
+    assert.equal(git.decisions.at(-1)?.decision, 'confirmed');
+    assert.deepEqual(git.snapshot().roots, ['/r/n', '/repo'], 'the first answer that omits the nested root removed it');
+    await git.confirmation();
+    assert.equal(git.decisions.at(-1)?.decision, 'confirmed');
+    assert.deepEqual(git.snapshot().roots, ['/repo']);
   }));
