@@ -23297,6 +23297,164 @@ test('submitted recovery refuses failed storage, changed scope and disposed orig
   }
 });
 
+// An early selected Claude session in a linked worktree, before the catalog lists any session.
+function earlySendProvider(opening: 'worktree' | 'workspace' = 'worktree') {
+  const root = tempDir('early-selected-send-');
+  const workspace = path.join(root, 'workspace');
+  const worktree = path.join(root, 'worktree');
+  const session = 'early-selected';
+  const opened = opening === 'workspace' ? workspace : worktree;
+  const file = path.join(root, `${session}.jsonl`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: 'user', sessionId: session, cwd: opened, message: { content: 'Hello' } }) + '\n',
+  );
+  const stat = fs.statSync(file);
+  const early = {
+    agent: 'claude' as const,
+    file,
+    sessionId: session,
+    cwd: opened,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ino: stat.ino,
+    dev: stat.dev,
+  };
+  const { provider } = queueRecoveryProvider();
+  delete provider.cwdForSession;
+  const host = { webview: {} };
+  const posted: Array<Record<string, unknown>> = [];
+  const delivered: Array<{ session: string; cwd: string; text: string }> = [];
+  Object.assign(provider, {
+    authoritativeCatalog: null,
+    catalog: null,
+    earlySelectedSources: new Map([[session, early]]),
+    repositoryScopeRoots: [workspace, worktree],
+    folders: () => [workspace],
+    hosts: [host],
+    hostSessions: new Map([[host, session]]),
+    sessionRows: [{ id: session, label: 'Early', agentKey: 'claude' }],
+    post(message: Record<string, unknown>) {
+      posted.push(message);
+      return Promise.resolve();
+    },
+    onSendPrompt: async (_agent: string, target: string, cwd: string, prompt: { text: string }) => {
+      delivered.push({ session: target, cwd, text: prompt.text });
+      return { delivered: true, reason: '', session: target };
+    },
+  });
+  // A rewrite that moves the opening outside the repository scope makes the source fail validation.
+  const invalidate = () =>
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ type: 'user', sessionId: session, cwd: path.join(root, 'outside') }) + '\n',
+    );
+  return { provider, host, session, worktree, posted, delivered, invalidate };
+}
+
+test('a send to an early selected worktree session reaches the agent while the session list loads', async () => {
+  const { provider, host, session, worktree, posted, delivered } = earlySendProvider();
+  const attempt = { id: 'early-send', order: 1, source: session, revision: 1, text: 'hello while loading' };
+  await provider.acceptSubmission(attempt.text, session, 1, session, host, attempt);
+  await vi.waitFor(() => assert.equal(delivered.length, 1));
+  assert.deepEqual(delivered, [{ session, cwd: worktree, text: attempt.text }]);
+  assert.deepEqual(
+    posted.filter((message) => message.type === 'restoreDraft'),
+    [],
+    'the prompt box was emptied and refilled',
+  );
+});
+
+test('a send to an early selected session whose source no longer validates is refused', async () => {
+  const { provider, host, session, posted, delivered, invalidate } = earlySendProvider();
+  invalidate();
+  const attempt = { id: 'early-invalid', order: 1, source: session, revision: 1, text: 'refused prompt' };
+  await provider.acceptSubmission(attempt.text, session, 1, session, host, attempt);
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(
+    posted.filter((message) => message.type === 'restoreDraft').map((message) => message.text),
+    [attempt.text],
+  );
+});
+
+test('a queued prompt for an early selected session waits when its source fails or its scope or destination moves', async () => {
+  for (const change of ['invalid', 'scope', 'alias'] as const) {
+    const { provider, session, delivered, invalidate } = earlySendProvider();
+    provider.queues[session] = queueSubmissionAfter([], 'queued', 'queued prompt', [], [], 1, false, {
+      agent: 'claude',
+      owner: session,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let writes = 0;
+    provider.memento = { update: () => (++writes === 1 ? held : Promise.resolve()) };
+    if (change === 'invalid') invalidate();
+    provider.flushQueue(session);
+    release();
+    // The validation stat cannot settle within microtasks, so these changes land during its await.
+    for (let index = 0; index < 10; index++) await Promise.resolve();
+    if (change === 'scope') provider.repositoryScopeRoots = [...provider.repositoryScopeRoots, 'other'];
+    if (change === 'alias') provider.sessionAliases.set(session, 'replacement');
+    await vi.waitFor(() => assert.ok(provider.pendingQueueDrains.has(session), `${change} did not stop delivery`));
+    assert.equal(provider.queueHandoffs.size, 0);
+    assert.equal(provider.queues[session][0].delivery.phase, 'queued');
+    assert.deepEqual(delivered, [], `${change} delivered the queued prompt`);
+  }
+});
+
+test('an early selected delivery waits when the scope changes or another session is selected while the prompt is saved', async () => {
+  for (const mode of ['send', 'queue'] as const) {
+    for (const change of ['scope', 'select'] as const) {
+      // The session opened in the main folder, so the fallback working folder matches the one the delivery started with.
+      const { provider, host, session, posted, delivered } = earlySendProvider('workspace');
+      Object.assign(provider, {
+        selectionWorks: new Map(),
+        selectionWork: null,
+        repositoryScope: { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots }) },
+        loadingLineState: { rescope() {} },
+        abandonCatalogRefresh() {},
+        refreshFrom() {},
+      });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let writes = 0;
+      provider.memento = { update: () => (++writes === 1 ? held : Promise.resolve()) };
+      const text = `${mode} during ${change}`;
+      let sent: Promise<void> | undefined;
+      if (mode === 'queue') {
+        provider.queues[session] = queueSubmissionAfter([], 'queued', text, [], [], 1, false, {
+          agent: 'claude',
+          owner: session,
+        });
+        provider.flushQueue(session);
+      } else {
+        const attempt = { id: `early-${change}`, order: 1, source: session, revision: 1, text };
+        sent = provider.acceptSubmission(text, session, 1, session, host, attempt);
+      }
+      await vi.waitFor(() => assert.equal(writes, 1));
+      // Selecting another session drops the early source of a session no panel shows.
+      if (change === 'scope') provider.repositoryScopeChanged();
+      else provider.earlySelectedSources.delete(session);
+      release();
+      if (mode === 'queue') {
+        await vi.waitFor(() => assert.ok(provider.pendingQueueDrains.has(session), `${change} did not stop delivery`));
+        assert.equal(provider.queues[session][0].delivery.phase, 'queued');
+      } else {
+        await sent;
+        assert.deepEqual(
+          posted.filter((message) => message.type === 'restoreDraft').map((message) => message.text),
+          [text],
+        );
+      }
+      assert.deepEqual(delivered, [], `${change} during the save delivered the ${mode} prompt`);
+    }
+  }
+});
+
 test('serializer recovery imports durably before stale-option disposal and remains accessible when storage fails without old draft descriptors', async () => {
   const editorWindow = vscode.window as unknown as Record<string, unknown>;
   const originalNotice = editorWindow.showInformationMessage;

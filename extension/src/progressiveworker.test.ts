@@ -1915,6 +1915,145 @@ test('a rotated scan hides a changed parent until it reads the replacement recei
   }
 });
 
+test('a pass after a complete reply that asks for another pass starts its count at the unchanged finished sources', async () => {
+  const directory = tempDir('panel-progressive-seeded-pass-');
+  const line = (record: object) => JSON.stringify(record) + String.fromCharCode(10);
+  const parents = Array.from({ length: 5 }, (_unused, index) => {
+    const file = path.join(directory, `parent-${index}.jsonl`);
+    fs.writeFileSync(file, line({ type: 'user', cwd: directory, message: { content: `prompt ${index}` } }));
+    const stat = fs.statSync(file);
+    return { agent: 'claude' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
+  });
+  const worker = new ProgressiveWorker(source);
+  try {
+    const request = () =>
+      ({
+        kind: 'claude-children',
+        parents,
+        repositoryRoots: [directory],
+      }) as import('./progressiveworker').ProgressiveRequest;
+    const first = await completeDiscovery(worker, request(), 1, new AbortController().signal);
+    assert.equal(first?.value.kind, 'claude-children');
+    // An active session writes to its transcript, so the follow-up pass finds one grown parent.
+    fs.appendFileSync(parents[0].file, line({ type: 'user', cwd: directory, message: { content: 'follow-up' } }));
+    const grown = fs.statSync(parents[0].file);
+    parents[0] = { ...parents[0], size: grown.size, mtimeMs: grown.mtimeMs };
+    const counts: number[] = [];
+    const completed = new Set<string>();
+    const second = await worker.run(request(), 2, new AbortController().signal, (result) => {
+      if (result.value.kind !== 'claude-children-delta') return true;
+      for (const file of result.value.checkpoint?.completed ?? []) completed.add(file);
+      for (const [file, complete] of result.value.completed) if (complete) completed.add(file);
+      counts.push(completed.size - Number(completed.has(normalizeFsPath(parents[0].file))));
+      return true;
+    });
+    assert.equal(second?.value.kind, 'claude-children');
+    if (second?.value.kind !== 'claude-children') return;
+    assert.equal(counts[0], 4, 'the follow-up count restarted below the unchanged finished sources');
+    assert.equal(second.value.charges?.quanta, 1, 'the follow-up pass read an unchanged finished source');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a pass keeps an active transcript that grows after its seed check', async () => {
+  const directory = tempDir('panel-progressive-seed-growth-');
+  const line = (record: object) => JSON.stringify(record) + String.fromCharCode(10);
+  const files = ['finished', 'active'].map((name) => {
+    const file = path.join(directory, `${name}.jsonl`);
+    fs.writeFileSync(file, line({ type: 'user', cwd: directory, message: { content: name } }));
+    return file;
+  });
+  const parents = () =>
+    files.map((file, index) => {
+      const stat = fs.statSync(file);
+      return { agent: 'claude' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
+    });
+  // The worker appends to the active transcript right after its next stat, as an agent writing between two checks would.
+  const marker = files[1] + '.grow';
+  const growing = buildSync({
+    entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    write: false,
+    banner: {
+      js: `(() => {
+        const fs = require('node:fs');
+        const stat = fs.statSync;
+        fs.statSync = function (file, ...rest) {
+          const value = stat.call(this, file, ...rest);
+          if (String(file) === ${JSON.stringify(files[1])} && fs.existsSync(${JSON.stringify(marker)})) {
+            fs.unlinkSync(${JSON.stringify(marker)});
+            fs.appendFileSync(file, ${JSON.stringify(line({ type: 'user', cwd: directory, message: { content: 'more' } }))});
+          }
+          return value;
+        };
+      })();`,
+    },
+  }).outputFiles[0].text;
+  const worker = new ProgressiveWorker(growing);
+  try {
+    const request = (): import('./progressiveworker').ProgressiveRequest => ({
+      kind: 'claude-children',
+      parents: parents(),
+      repositoryRoots: [directory],
+    });
+    const first = await completeDiscovery(worker, request(), 1, new AbortController().signal);
+    assert.equal(first?.value.kind, 'claude-children');
+    // The finished source changes, so the next pass creates an epoch and seeds it.
+    fs.appendFileSync(files[0], line({ type: 'user', cwd: directory, message: { content: 'again' } }));
+    fs.appendFileSync(files[1], line({ type: 'user', cwd: directory, message: { content: 'again' } }));
+    fs.writeFileSync(marker, '');
+    const second = await worker.run(request(), 2, new AbortController().signal);
+    assert.equal(fs.existsSync(marker), false, 'the worker never checked the active transcript');
+    assert.equal(second?.value.kind, 'claude-children', 'growth after the seed check reset the active transcript');
+    if (second?.value.kind !== 'claude-children') return;
+    assert.equal(second.value.charges?.resets, 0);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a pass after a complete reply reads an unchanged Codex rollout that stopped before its end', async () => {
+  const directory = tempDir('panel-progressive-seeded-codex-');
+  const file = path.join(directory, 'parent.jsonl');
+  const filler = JSON.stringify({ type: 'ignored', payload: 'x'.repeat(1024) }) + String.fromCharCode(10);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: 'session_meta', timestamp: timestamp(0), payload: { id: 'parent', cwd: directory } }) +
+      String.fromCharCode(10) +
+      filler.repeat(160),
+  );
+  const stat = fs.statSync(file);
+  const parent = { agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
+  const worker = new ProgressiveWorker(source);
+  try {
+    const request = {
+      kind: 'claude-children' as const,
+      parents: [parent],
+      repositoryRoots: [directory],
+      discoveryBytes: 64 * 1024,
+    };
+    const first = await worker.run(request, 1, new AbortController().signal);
+    assert.ok(first?.value.kind === 'claude-children');
+    assert.equal(first.value.continuation, true, 'the first pass reached the end of the rollout');
+    const stopped = first.value.referenceEntries[0][1];
+    assert.equal(stopped.visitedEof, false);
+    const second = await worker.run(request, 2, new AbortController().signal);
+    assert.ok(second?.value.kind === 'claude-children');
+    assert.equal(second.value.charges?.hits, 0, 'an unfinished Codex rollout counted as finished');
+    assert.equal(second.value.charges?.quanta, 1, 'the follow-up pass skipped an unfinished Codex rollout');
+    assert.ok(second.value.referenceEntries[0][1].cursor!.offset > stopped.cursor!.offset);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('unfinished cursor overflow keeps discovery and saved progress alive', async () => {
   const directory = tempDir('panel-progressive-codex-overflow-');
   const childId = '5a7b07c1-bfcf-4d96-9eb2-8ef1fb609881';

@@ -1801,7 +1801,14 @@ test('selected native content reaches its host before held history and after pos
     assert.equal(queueDrains, 0);
     assert.ok(provider.awaitingSessionRecords[fixture.sessionId], 'early membership authorized adoption settlement');
     delete provider.awaitingSessionRecords[fixture.sessionId];
-    assert.equal(provider.stateFor(fixture.sessionId), null, 'early visibility granted prompt or queue authority');
+    // An early selected session takes prompts while the catalog loads. Delivery validates its source again.
+    provider.rowForSession = (id: string) => ({ id, label: 'Selected', agentKey: agent });
+    provider.stateForRow = (row: { id: string }) => ({ sessionId: row.id });
+    assert.equal(
+      provider.stateFor(fixture.sessionId)?.sessionId,
+      fixture.sessionId,
+      'an early selected session refused prompts while the catalog loaded',
+    );
     provider.awaitingSessionRecords[fixture.sessionId] = {
       sessionId: fixture.sessionId,
       cwd: fixture.worktree,
@@ -2493,6 +2500,154 @@ test('host delta checkpoints retain completion and source progress through cance
     assert.equal(provider.claudeChildReferenceEntries.get(pendingFile).sourceGeneration, held.sourceGeneration);
     assert.deepEqual(provider.discoveryCheckpoint.completed, [normalizeFsPath(parents[0].file)]);
     assert.equal(provider.catalog.sessions, parents);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a reload of a partial follow-up checkpoint starts its count at the unchanged finished sources', async () => {
+  const directory = tempDir('host-discovery-follow-up-');
+  const newline = String.fromCharCode(10);
+  const write = (name: string, text: string) => {
+    const file = path.join(directory, name + '.jsonl');
+    fs.writeFileSync(file, text);
+    return file;
+  };
+  // A rollout that ends inside a record being written reaches its end without completing, so discovery accepts it through visitedEof.
+  const rollout = (id: string) =>
+    JSON.stringify({ type: 'session_meta', payload: { id, cwd: directory } }) +
+    newline +
+    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn' } }).slice(0, 24);
+  const files = {
+    codexA: write('codex-a', rollout('codex-a')),
+    codexB: write('codex-b', rollout('codex-b')),
+    big: write('big', JSON.stringify({ type: 'user', cwd: directory, message: { content: 'big' } }) + newline),
+    small: write('small', JSON.stringify({ type: 'user', cwd: directory, message: { content: 'small' } }) + newline),
+  };
+  const rows = () =>
+    (
+      [
+        ['codex', files.codexA, 'codex-a'],
+        ['codex', files.codexB, 'codex-b'],
+        ['claude', files.big, 'big'],
+        ['claude', files.small, 'small'],
+      ] as const
+    ).map(([agent, file, sessionId]) => {
+      const { size, mtimeMs } = fs.statSync(file);
+      return { file, sessionId, agent, size, mtimeMs };
+    });
+  const { provider } = bumpedCatalogHarness();
+  const listed = (parents: ReturnType<typeof rows>) =>
+    Object.assign(provider, {
+      authoritativeCatalog: parents,
+      catalog: { sessions: parents },
+      claudeParents: parents,
+    });
+  Object.assign(provider, {
+    refreshGeneration: 4,
+    repositoryScopeRoots: [directory],
+    claudeChildReferenceEntries: new Map(),
+    enumeratedSpendSources: { claude: [], codex: [], children: [] },
+    checkpointDerivedCache() {},
+  });
+  listed(rows());
+  let worker = titleWorker();
+  let watch: ((result: ProgressiveResult) => void) | undefined;
+  provider.progressiveWorker = {
+    run: (
+      request: ProgressiveRequest,
+      generation: number,
+      signal: AbortSignal,
+      accept: (result: ProgressiveResult) => boolean,
+    ) =>
+      worker.run(request, generation, signal, (result) => {
+        if (accept(result)) watch?.(result);
+      }),
+  };
+  const finished = [files.codexA, files.codexB].map(normalizeFsPath);
+  try {
+    assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
+    for (const file of finished) {
+      const entry = provider.claudeChildReferenceEntries.get(file);
+      assert.ok(
+        entry.visitedEof === true && entry.complete === false,
+        'the rollout fixture was not accepted at its end',
+      );
+    }
+    // Both Claude sources grow, so a follow-up pass reads them. The large append leaves one source unfinished.
+    fs.appendFileSync(files.big, JSON.stringify({ type: 'ignored', text: 'x'.repeat(2 * 1024 * 1024) }) + newline);
+    fs.appendFileSync(
+      files.small,
+      JSON.stringify({ type: 'user', cwd: directory, message: { content: 'again' } }) + newline,
+    );
+    listed(rows());
+    const followUp = new AbortController();
+    watch = (result) => {
+      if (
+        result.value.kind === 'claude-children-delta' &&
+        result.value.referenceEntries[0]?.[0] === normalizeFsPath(files.big)
+      )
+        followUp.abort();
+    };
+    assert.equal(await provider.prepareClaudeChildren(4, followUp.signal), false);
+    assert.ok(provider.discoveryCheckpoint, 'the follow-up pass left no partial checkpoint');
+    const cacheFile = path.join(directory, 'checkpoint.json');
+    saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries, [], undefined, provider.discoveryCheckpoint);
+    const restored = loadDerivedCache(cacheFile);
+    Object.assign(provider, {
+      discoveryCheckpoint: restored.discovery,
+      discoveryCompleted: undefined,
+      discoveryAcknowledgment: undefined,
+      claudeChildReferenceEntries: restored.claudeChildReferences,
+    });
+    worker.stop();
+    worker = titleWorker();
+    const counts: string[][] = [];
+    const resumed = new AbortController();
+    watch = (result) => {
+      if (result.value.kind !== 'claude-children-delta' || counts.length) return;
+      const read = result.value.referenceEntries[0]?.[0];
+      counts.push(provider.discoveryCheckpoint.completed.filter((file: string) => file !== read).sort());
+      resumed.abort();
+    };
+    await provider.prepareClaudeChildren(4, resumed.signal);
+    assert.deepEqual(counts, [finished.sort()], 'the reload count restarted below the unchanged finished sources');
+
+    // A saved checkpoint that has not counted a finished rollout, and whose remainder holds only Codex sources, reports the
+    // seeded count before it reads them.
+    fs.appendFileSync(
+      files.codexA,
+      newline + JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'later' } }).slice(0, 24),
+    );
+    listed(rows());
+    const claudeFiles = [files.big, files.small].map(normalizeFsPath);
+    saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries, [], undefined, {
+      ...provider.discoveryCheckpoint,
+      completed: claudeFiles,
+    });
+    const remainder = loadDerivedCache(cacheFile);
+    Object.assign(provider, {
+      discoveryCheckpoint: remainder.discovery,
+      discoveryCompleted: undefined,
+      discoveryAcknowledgment: undefined,
+      claudeChildReferenceEntries: remainder.claudeChildReferences,
+    });
+    worker.stop();
+    worker = titleWorker();
+    const seeded: string[][] = [];
+    const codexOnly = new AbortController();
+    watch = () => {
+      if (seeded.length) return;
+      seeded.push([...provider.discoveryCheckpoint.completed].sort());
+      codexOnly.abort();
+    };
+    await provider.prepareClaudeChildren(4, codexOnly.signal);
+    assert.deepEqual(
+      seeded,
+      [[...claudeFiles, normalizeFsPath(files.codexB)].sort()],
+      'a Codex-only remainder kept the seeded count from the host',
+    );
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -7508,6 +7663,8 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
   const discovery: {
     pending: boolean;
     fail: boolean;
+    // A complete reply asks for another pass.
+    continuation?: boolean;
     // Further parents the discovery checkpoint reports, each one a known source beyond the healthy Claude source.
     more: { file: string }[];
     before?: (generation: number, signal: AbortSignal) => void;
@@ -7539,7 +7696,7 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
             kind: 'claude-children',
             checkpoint,
             complete: true,
-            continuation: false,
+            continuation: discovery.continuation === true,
             references: [],
             dispatchFacts: [],
             children: [],
@@ -8089,6 +8246,58 @@ test('the loading line stays hidden after the session list completes until the s
     assert.ok(
       stream.slice(changedAt).some((entry) => entry.kind === 'render' && entry.visible),
       'a scope change kept the previous scope complete',
+    );
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a complete discovery reply that asks for another pass hides the loading line through the follow-up pass', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, first, second, settled, discovery, poll } = exhaustedLoadingHarness();
+    const stream = loadingStream(provider);
+    const scope = JSON.stringify(['project']);
+    provider.titles.set(first.file, settled(first));
+    provider.titles.set(second.file, settled(second));
+    discovery.pending = true;
+    await provider.refresh(true);
+    provider.useRefreshGate(() => false);
+    await poll();
+    assert.equal(stream.at(-1)?.visible, true, 'pending discovery did not show the loading line');
+    assert.equal(provider.loadingLine.held(scope), false);
+
+    // A dispatched file changed during the read, so the complete reply asks for another pass.
+    discovery.pending = false;
+    discovery.continuation = true;
+    await poll();
+    assert.equal(provider.dispatchDiscoveryPending, true, 'the complete reply asked for no further pass');
+    assert.equal(stream.at(-1)?.visible, false, 'the complete reply kept the loading line');
+    assert.ok(provider.loadingLine.held(scope), 'the complete reply did not hold the line');
+    const completedAt = stream.length;
+
+    // The follow-up pass posts its own discovery progress.
+    discovery.pending = true;
+    for (let index = 0; index < 3; index++) await poll();
+    discovery.pending = false;
+    await poll();
+    assert.ok(stream.length > completedAt, 'the follow-up pass posted nothing to compare');
+    assert.deepEqual(
+      stream.slice(completedAt).filter((entry) => entry.visible),
+      [],
+      'the follow-up pass showed the loading line',
+    );
+
+    // A follow-up pass under a root the list has not loaded shows the line again.
+    provider.repositoryScopeRoots = ['project', 'worktree'];
+    const at = stream.length;
+    provider.dispatchDiscoveryPending = true;
+    provider.postSessionLoading(provider.partial, provider.refreshGeneration, new AbortController().signal);
+    assert.deepEqual(
+      stream.slice(at).map((entry) => entry.visible),
+      [true],
+      'an unseen root kept the loading line hidden',
     );
   } finally {
     vi.clearAllTimers();

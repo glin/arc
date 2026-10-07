@@ -177,6 +177,23 @@ function sameRevision(left: FileRevision | null, right: FileRevision | null): bo
   );
 }
 
+// A source is finished and unchanged when its saved entry has the same identity and revision, and either completed or
+// reached the end of a Codex rollout. An entry short of its target is never finished.
+function unchangedFinished(
+  held: ClaudeChildReferenceCacheEntry | undefined,
+  parent: { agent: string; sessionId: string; childTranscript?: boolean },
+  revision: FileRevision,
+): boolean {
+  return (
+    held?.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION &&
+    held.source === parent.agent &&
+    held.sessionId === parent.sessionId &&
+    held.childTranscript === (parent.childTranscript === true) &&
+    sameRevision(held, revision) &&
+    (held.complete === true || (held.source === 'codex' && held.visitedEof === true))
+  );
+}
+
 function revive(checkpoint: ProgressiveCheckpoint | undefined): ProgressiveCheckpoint | undefined {
   if (!checkpoint) {
     return undefined;
@@ -297,6 +314,7 @@ async function execute(
       }
     }
     const scope = JSON.stringify(request.repositoryRoots);
+    const heldEpoch = discoveryEpoch;
     if (
       request.discovery &&
       request.discovery.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION &&
@@ -318,9 +336,10 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
+    // A created epoch, or a saved one this worker did not hold, starts with every unchanged finished source marked complete.
+    const seeding = heldEpoch?.epoch !== epoch.epoch;
     const completed = new Set(epoch.completed);
     const completionChanges = new Map<string, boolean>();
-    let header = request.discovery?.epoch === epoch.epoch ? undefined : { ...epoch, completed: [...completed] };
     const charges: DiscoveryCharges = {
       readBytes: 0,
       hits: 0,
@@ -379,13 +398,16 @@ async function execute(
         charges.childHeadMs += tally.ms;
       }
     };
-    const pending = (source?: string) => {
+    // A delta without a source carries completion changes alone, such as the seed's.
+    const pending = (source?: string, delta = source !== undefined) => {
       epoch.sequence++;
       // Request boundaries return whole checkpoints. Quanta reuse the host's frozen header.
-      if (source) {
+      if (delta) {
         const value = {
           kind: 'claude-children-delta' as const,
-          referenceEntries: [[source, claudeChildReferences.get(source)!] as [string, ClaudeChildReferenceCacheEntry]],
+          referenceEntries: source
+            ? [[source, claudeChildReferences.get(source)!] as [string, ClaudeChildReferenceCacheEntry]]
+            : [],
           checkpoint: header,
           epoch: epoch.epoch!,
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -411,6 +433,33 @@ async function execute(
     };
     let found = walk();
     if (epoch.protectedFile && !candidates.has(epoch.protectedFile)) delete epoch.protectedFile;
+    // The seed shares the hit test with the parent loop below. The loop stats each present source again, because an active
+    // transcript can grow between the two, and a seed revision would pair the scan's size with a stale modification time. A
+    // source the seed found missing goes straight to the loop's missing check.
+    const seedMissing = new Set<string>();
+    if (seeding) {
+      let checked = 0;
+      for (const [key, parent] of candidates) {
+        if (completed.has(key)) continue;
+        if (++checked % 256 === 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (signal.aborted) break;
+        }
+        const revision = checkParent(parent.file);
+        if (!revision) seedMissing.add(key);
+        if (revision && unchangedFinished(claudeChildReferences.get(key), parent, revision)) {
+          charges.hits++;
+          completed.add(key);
+          completionChanges.set(key, true);
+          if (epoch.protectedFile === key) delete epoch.protectedFile;
+        }
+      }
+      epoch.completed = [...completed];
+    }
+    let header = request.discovery?.epoch === epoch.epoch ? undefined : { ...epoch, completed: [...completed] };
+    if (signal.aborted) return pending();
+    // The seeded count reaches the host at once, whatever agent the remaining sources belong to.
+    if (completionChanges.size) acknowledge?.(pending(undefined, true));
     const requestBytes = Math.min(request.discoveryBytes ?? CODEX_DISPATCH_REQUEST_BYTES, CODEX_DISPATCH_REQUEST_BYTES);
     const quantumBytes = Math.min(request.quantumBytes ?? 1024 * 1024, 1024 * 1024);
     const pendingCharge = (entry: ClaudeChildReferenceCacheEntry | undefined) =>
@@ -424,7 +473,7 @@ async function execute(
     for (const [key, parent] of ordered) {
       if (completed.has(key) || (epoch.protectedFile && key !== epoch.protectedFile)) continue;
       epoch.position = (rows.findIndex(([file]) => file === key) + 1) % Math.max(1, rows.length);
-      const revision = checkParent(parent.file);
+      const revision = seedMissing.delete(key) ? null : checkParent(parent.file);
       if (!revision) {
         if (checkMissing(parent.file)) {
           completed.add(key);
@@ -443,12 +492,7 @@ async function execute(
         held.source === parent.agent &&
         held.sessionId === parent.sessionId &&
         held.childTranscript === (parent.childTranscript === true);
-      if (
-        identity &&
-        held &&
-        sameRevision(held, revision) &&
-        (held.complete === true || (held.source === 'codex' && held.visitedEof === true))
-      ) {
+      if (unchangedFinished(held, parent, revision)) {
         charges.hits++;
         completed.add(key);
         completionChanges.set(key, true);

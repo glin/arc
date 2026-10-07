@@ -562,6 +562,15 @@ interface CacheEntry {
   bytes?: number;
   checkpointBytes?: number;
 }
+
+// An early selected source with the repository scope, destination and working folder a delivery to it started under.
+interface EarlyDelivery {
+  source: SelectedSource;
+  scope: string;
+  destination: string;
+  cwd: string | null;
+}
+
 interface AwaitingSessionRecord {
   sessionId: string;
   createdAt: number;
@@ -1174,6 +1183,8 @@ export class PanelProvider implements vscode.Disposable {
   private walkedClaude: string[] = [];
   private claudeParents: SessionFile[] = [];
   private dispatchDiscoveryPending = false;
+  // The repository scope of the latest complete discovery reply. Follow-up passes under it do not keep the session list loading.
+  private discoveryCompleteScope?: string;
   private discoveryRequestSequence = 0;
   private discoveryAcknowledgment?: {
     scope: string;
@@ -2351,6 +2362,7 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryCheckpoint = undefined;
     this.discoveryCompleted = undefined;
     this.discoveryAcknowledgment = undefined;
+    this.discoveryCompleteScope = undefined;
     this.claudeChildReferenceEntries = new Map();
     this.enumeratedSpendSources = undefined;
     // Cancel catalog work started for different workspace folders.
@@ -2651,14 +2663,16 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Build prompt box state for a specified session, including sessions outside the current view.
-  // Reject early selected sources until catalog discovery accepts them, except locally started sessions.
+  // An early selected source is accepted while the catalog is missing, and delivery validates it again.
+  // A catalog that omits it rejects it, except for locally started sessions.
   private stateFor(session: string): ComposerState | null {
     if (!this.repositoryScopeReady) {
       return null;
     }
     if (
+      this.authoritativeCatalog &&
       this.earlySelectedSources?.has(session) &&
-      !this.authoritativeCatalog?.some((source) => source.sessionId === session) &&
+      !this.authoritativeCatalog.some((source) => source.sessionId === session) &&
       !this.newDrafts[session] &&
       !this.awaitingSessionRecords[session]
     )
@@ -2719,7 +2733,55 @@ export class PanelProvider implements vscode.Disposable {
     const session = this.catalog?.sessions.find(
       (candidate) => candidate.agent === agent && candidate.sessionId === sessionId,
     );
-    return session?.cwd ?? this.newDrafts[sessionId]?.cwd ?? this.awaitingSessionRecords[sessionId]?.cwd ?? null;
+    const early = this.earlySelectedSources?.get(sessionId);
+    return (
+      session?.cwd ??
+      (early?.agent === agent ? early.cwd : undefined) ??
+      this.newDrafts[sessionId]?.cwd ??
+      this.awaitingSessionRecords[sessionId]?.cwd ??
+      null
+    );
+  }
+
+  // The early selected source of a session the catalog does not list yet. Delivery to it validates the source first.
+  private unlistedEarlySource(session: string): SelectedSource | undefined {
+    const early = this.earlySelectedSources?.get(session);
+    if (!early || this.authoritativeCatalog?.some((source) => source.sessionId === session)) return undefined;
+    return early;
+  }
+
+  // Captures an unlisted early selected source with the repository scope, destination and working folder its delivery
+  // starts under. Delivery captures it before the prompt is saved, so a change during the save cannot skip validation.
+  private captureEarlyDelivery(session: string, agent: string, destination: () => string): EarlyDelivery | undefined {
+    const source = this.unlistedEarlySource(session);
+    if (!source) return undefined;
+    return {
+      source,
+      scope: JSON.stringify(this.repositoryScopeRoots),
+      destination: destination(),
+      cwd: this.cwdForSession(agent, session),
+    };
+  }
+
+  // Validates a captured early delivery after the prompt is saved. It fails when the source no longer validates, or when the
+  // repository scope, the destination session or the working folder moved, or the early source left without the catalog
+  // listing the session.
+  private async earlyDeliveryStillValid(
+    session: string,
+    agent: string,
+    early: EarlyDelivery,
+    destination: () => string,
+  ): Promise<boolean> {
+    const unchanged = () =>
+      this.repositoryScopeReady &&
+      JSON.stringify(this.repositoryScopeRoots) === early.scope &&
+      destination() === early.destination &&
+      (this.earlySelectedSources.get(session) === early.source ||
+        this.authoritativeCatalog?.some((source) => source.sessionId === session) === true) &&
+      this.cwdForSession(agent, session) === early.cwd;
+    if (!unchanged()) return false;
+    const valid = await validateSelectedSource(early.source, this.repositoryScopeRoots, new AbortController().signal);
+    return valid !== null && unchanged();
   }
 
   private recordedCwdForSession(agent: string, sessionId: string): string | null {
@@ -4237,24 +4299,44 @@ export class PanelProvider implements vscode.Disposable {
     }
     const attempted = this.queues[state.sessionId].find((entry) => entry.id === next.id) ?? next;
     this.queueHandoffs.add(next.id);
+    // The membership test keeps a queue without early sources off the capture.
+    const destination = () => this.panelSession(state.sessionId);
+    const early = this.earlySelectedSources?.has(state.sessionId)
+      ? this.captureEarlyDelivery(state.sessionId, state.agent, destination)
+      : undefined;
     void this.writeDrafts()
       .then(() => {
-        if (!this.stateFor(state.sessionId)) {
-          this.queueHandoffs.delete(next.id);
-          this.pendingQueueDrains.add(state.sessionId);
-          this.queues[state.sessionId] = (this.queues[state.sessionId] ?? []).map((entry) =>
-            entry.id === next.id ? { ...entry, delivery: { phase: 'queued', owner: state.sessionId } } : entry,
-          );
-          return this.writeDrafts().then(() => this.flushQueue(state.sessionId));
-        }
-        if (compactSubmission(state.agent, text) && !carried.length && !assets.length) {
-          this.startCompaction(ready, attempted);
-        } else if (clearSubmission(state.agent, text)) {
-          this.startClear(ready, attempted, text);
-        } else {
-          this.send(ready, text, attempted);
-        }
-        return undefined;
+        const handOff = (deliverable: boolean): Promise<void> | undefined => {
+          // A refused early source keeps the prompt waiting for the next drain.
+          if (!deliverable) {
+            this.queueHandoffs.delete(next.id);
+            this.pendingQueueDrains.add(state.sessionId);
+            this.queues[state.sessionId] = (this.queues[state.sessionId] ?? []).map((entry) =>
+              entry.id === next.id ? { ...entry, delivery: { phase: 'queued', owner: state.sessionId } } : entry,
+            );
+            return this.writeDrafts();
+          }
+          if (!this.stateFor(state.sessionId)) {
+            this.queueHandoffs.delete(next.id);
+            this.pendingQueueDrains.add(state.sessionId);
+            this.queues[state.sessionId] = (this.queues[state.sessionId] ?? []).map((entry) =>
+              entry.id === next.id ? { ...entry, delivery: { phase: 'queued', owner: state.sessionId } } : entry,
+            );
+            return this.writeDrafts().then(() => this.flushQueue(state.sessionId));
+          }
+          if (compactSubmission(state.agent, text) && !carried.length && !assets.length) {
+            this.startCompaction(ready, attempted);
+          } else if (clearSubmission(state.agent, text)) {
+            this.startClear(ready, attempted, text);
+          } else {
+            this.send(ready, text, attempted);
+          }
+          return undefined;
+        };
+        // An early selected source that the catalog did not list when the drain began validates again after the save.
+        return early
+          ? this.earlyDeliveryStillValid(state.sessionId, state.agent, early, destination).then(handOff)
+          : handOff(true);
       })
       .catch((error) => {
         this.queueHandoffs.delete(next.id);
@@ -4680,6 +4762,9 @@ export class PanelProvider implements vscode.Disposable {
     const state = this.stateFor(session);
     const draft = this.newDrafts[session];
     const cwd = state ? this.cwdForSession(state.agent, session) : null;
+    const early = state
+      ? this.captureEarlyDelivery(session, state.agent, () => this.panelSession(source, host))
+      : undefined;
     const captured = state
       ? {
           ...state,
@@ -4722,6 +4807,14 @@ export class PanelProvider implements vscode.Disposable {
       if (validated.length !== 1 || attempt.text !== text || attempt.source !== source || attempt.revision !== revision)
         throw new Error('The prompt could not be retained.');
       await this.importPromptRecovery(validated);
+      if (
+        captured &&
+        early &&
+        !(await this.earlyDeliveryStillValid(session, captured.agent, early, () => this.panelSession(source, host)))
+      ) {
+        restore();
+        return;
+      }
       if (
         !captured ||
         !this.hosts.includes(host) ||
@@ -8164,6 +8257,7 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeChildReferences = progress.references;
     this.startupHistory?.stage('relationshipsComplete');
     this.dispatchDiscoveryPending = progress.continuation;
+    this.discoveryCompleteScope = JSON.stringify(this.repositoryScopeRoots);
     const facts = new Map((progress.dispatchFacts ?? []).map((facts) => [facts.sessionId, facts]));
     const figures = (entries: Map<string, DispatchSessionFacts> | undefined) =>
       [...(entries?.values() ?? [])]
@@ -8553,7 +8647,8 @@ export class PanelProvider implements vscode.Disposable {
   private sessionLoadingBlocker(sessions: SessionFile[], generation: number): SessionLoadingBlocker | null {
     if (this.startupFailureGeneration === generation) return { reason: 'failure' };
     if (this.authoritativeCatalog === null) return { reason: 'catalog missing' };
-    if (this.dispatchDiscoveryPending) return { reason: 'discovery pending' };
+    if (this.dispatchDiscoveryPending && this.discoveryCompleteScope !== JSON.stringify(this.repositoryScopeRoots))
+      return { reason: 'discovery pending' };
     for (const session of sessions) {
       const entry = this.metaFor(session);
       const reason = !sameSessionRevision(entry, session)
