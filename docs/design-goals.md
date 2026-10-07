@@ -34,7 +34,7 @@ Context and prompt-cache information help the reader choose whether to continue,
 
 ## Boundaries
 
-Arc uses VS Code for the file tree, editor, diff viewer, terminal, theme, and platform controls. It adds a graphical agent surface inside that editor. It has no account or server of its own.
+Arc uses VS Code for the file tree, editor, diff viewer, terminal, theme, and platform controls. It adds a graphical agent surface inside that editor. It has no account or hosted service. Each window opens a local channel for the reader's own agents, and the channel closes with the window.
 
 Arc has no code-hosting integration for pull requests, issues, reviews, or remotes. It adds no persistent VS Code status bar UI. The panel covers the open project and its registered worktrees, not every repository on the machine or several unrelated workspaces. It opens existing worktrees but creates and deletes none. The CLI remains a read-only status companion, not a terminal application. Arc has no standalone desktop or web application.
 

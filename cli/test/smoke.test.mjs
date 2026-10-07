@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { WindowChannel } from '../../extension/src/sessionrequests.ts';
 import {
   copyFileSync,
   lstatSync,
@@ -20,6 +22,54 @@ const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.me
 fixture.prompt_cache.expires_at = Math.ceil(Date.now() / 1000) + 300;
 const input = JSON.stringify(fixture);
 const cli = fileURLToPath(new URL('../dist/arc-status.cjs', import.meta.url));
+
+test('the bundled windows command reaches authenticated hosts and keeps secrets out of both output formats', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-windows-smoke-'));
+  const first = new WindowChannel(home);
+  const second = new WindowChannel(home);
+  const env = { ...process.env, ARC_HOME: home };
+  const run = promisify(execFile);
+  try {
+    await first.update({
+      folders: ['C:/Project With Spaces'],
+      scopeReady: true,
+      panelReady: true,
+      panelVisible: false,
+    });
+    await second.update({ folders: [], scopeReady: false, panelReady: false, panelVisible: false });
+    const json = await run(process.execPath, [cli, 'windows', '--json'], { env, encoding: 'utf8' });
+    const report = JSON.parse(json.stdout);
+    assert.equal(report.version, 1);
+    assert.equal(report.complete, true);
+    assert.equal(report.windows.length, 2);
+    assert.equal(report.windows.find((window) => window.hostId === first.hostId).panelReady, true);
+    assert.equal(report.windows.find((window) => window.hostId === second.hostId).scopeReady, false);
+    assert.equal(json.stdout.includes('token'), false);
+    assert.equal(json.stdout.includes('address'), false);
+    const human = await run(process.execPath, [cli, 'windows'], { env, encoding: 'utf8' });
+    assert.match(human.stdout, /scope ready  panel hidden  "C:\/Project With Spaces"/);
+    assert.match(human.stdout, /scope loading  panel not ready  \(no folders\)/);
+    for (const channel of [first, second]) {
+      const registration = readFileSync(join(home, 'hosts', `${channel.hostId}.json`), 'utf8');
+      assert.equal(human.stdout.includes(JSON.parse(registration).token), false);
+    }
+    await Promise.all([first.dispose(), second.dispose()]);
+    const empty = await run(process.execPath, [cli, 'windows', '--json'], { env, encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(empty.stdout), { version: 1, windows: [], complete: true });
+    for (let index = 0; index <= 1024; index++) {
+      writeFileSync(join(home, 'hosts', `unrelated-${index}`), '');
+    }
+    const incomplete = await run(process.execPath, [cli, 'windows', '--json'], { env, encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(incomplete.stdout), { version: 1, windows: [], complete: false });
+    const partial = await run(process.execPath, [cli, 'windows'], { env, encoding: 'utf8' });
+    assert.match(partial.stdout, /discovery is incomplete/);
+    assert.equal(partial.stdout.includes('No Arc windows are open.'), false);
+    await assert.rejects(run(process.execPath, [cli, 'windows', '--unknown'], { env }), /Usage: arc windows/);
+  } finally {
+    await Promise.all([first.dispose(), second.dispose()]);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test('the bundled CLI reports the package version', () => {
   const output = execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' });

@@ -1093,6 +1093,7 @@ import {
   SessionFiguresCache,
 } from './projectspend.ts';
 import type { PanelProvider as PanelProviderType } from './panelhost.ts';
+import type { WindowState } from './sessionrequests.ts';
 import { CommitRepositoryReservations } from './progressiveworker';
 import * as vscode from 'vscode';
 import { performance } from 'node:perf_hooks';
@@ -1128,6 +1129,112 @@ vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
 let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
 beforeAll(async () => {
   ({ PanelProvider } = await import('./panelhost.ts'));
+});
+
+test('window discovery restores provider state before publishing and distinguishes hidden ready panels', () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const restored = panelHostSource.indexOf('this.saved = normalizePanelState(withSweptDraftLabels(stored));');
+  const created = extensionSource.indexOf('const panel = registerPanel(');
+  const connected = extensionSource.indexOf('panel.setWindowStateHandler(');
+  assert.ok(restored > 0 && created >= 0 && connected > created);
+  const seen: WindowState[] = [];
+  const host = { visible: () => false };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    folders: () => [],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [] }) },
+    readyHosts: new Set(),
+    hosts: [host],
+    anyVisible: () => false,
+    sendToHost: () => Promise.resolve(),
+    panelVisibility: { current: () => ({}) },
+  });
+  provider.setWindowStateHandler((state: WindowState) => seen.push(state));
+  assert.deepEqual(seen, [{ folders: [], scopeReady: true, panelReady: false, panelVisible: false }]);
+  provider.browserReady(host);
+  assert.deepEqual(seen.at(-1), { folders: [], scopeReady: true, panelReady: true, panelVisible: false });
+  provider.anyVisible = () => true;
+  provider.publishWindowState();
+  assert.equal(seen.at(-1)?.panelVisible, true);
+  provider.readyHosts.clear();
+  provider.publishWindowState();
+  assert.equal(seen.at(-1)?.panelReady, false);
+  provider.disposed = true;
+  const before = seen.length;
+  provider.publishWindowState();
+  assert.equal(seen.length, before);
+});
+
+test('window state publication follows scope changes, workspace changes, browser reload, closure and visibility', () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  for (const method of ['repositoryScopeChanged', 'workspaceFoldersChanged', 'allSessions', 'attach', 'onMessage']) {
+    const body = declarationSource(panelHostSource, method);
+    sourceMatch(body, /this\.publishWindowState\(\)/, `${method} leaves outside agents with stale window state`);
+  }
+  const selected = declarationSource(panelHostSource, 'completeSelectedWindow');
+  sourceMatch(
+    selected,
+    /this\.publishWindowState\(\)/,
+    'selected-source scope readiness does not reach window discovery',
+  );
+  const lifecycle = declarationSource(extensionSource, 'deactivate');
+  sourceMatch(lifecycle, /windowChannel\?\.dispose\(\)/, 'deactivation returns before its channel closes');
+});
+
+test('channel construction failure leaves panel activation and provider registration available', () => {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const activation = declarationSource(extensionSource, 'activate');
+  const start = activation.indexOf('const activationAt');
+  const end = activation.indexOf('if (process.env[MEASUREMENT_ENVIRONMENT.blockAgents]');
+  assert.ok(start >= 0 && end > start);
+  const compiled = ts.transpileModule(activation.slice(start, end), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const providers: string[] = [];
+  let panels = 0;
+  let publish!: (state: unknown) => void;
+  const scope = {
+    context: { subscriptions: [] as unknown[] },
+    performance,
+    WindowChannel: function () {
+      throw new Error('The Arc window channel path is too long.');
+    },
+    windowChannel: null,
+    storeRoot: () => '/Arc/Store',
+    cacheRoot: () => '/Arc/Cache',
+    normalizedWorkspaceIdentity: () => 'workspace',
+    WorkspaceCachePartition: function () {
+      return {};
+    },
+    fs: { mkdirSync() {} },
+    SCHEME: 'arc-snapshot',
+    vscode: {
+      workspace: {
+        workspaceFolders: [],
+        registerTextDocumentContentProvider: (scheme: string) => {
+          providers.push(scheme);
+          return {};
+        },
+        createFileSystemWatcher: () => ({}),
+      },
+      RelativePattern: function () {
+        return {};
+      },
+      Uri: { file: (file: string) => file },
+    },
+    registerPanel: () => {
+      panels++;
+      return {
+        setWindowStateHandler: (handler: typeof publish) => {
+          publish = handler;
+        },
+      };
+    },
+  };
+  new Function(...Object.keys(scope), compiled)(...Object.values(scope));
+  assert.deepEqual(providers, ['arc-snapshot']);
+  assert.equal(panels, 1);
+  assert.doesNotThrow(() => publish({ folders: [], scopeReady: true, panelReady: false, panelVisible: false }));
 });
 
 test('folderless ownership survives tab closure, pending checkpoint, reclamation and reopening', async () => {

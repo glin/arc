@@ -91,6 +91,7 @@ import { UsageRecorder, USAGE_STORE_DIRECTORY } from './usagerecord';
 import { sameSkillList, withDirectorySkills } from './domain/claude-skills';
 import { normalizeWorkspace } from './projectspend';
 import { ConfigWatches } from './configwatch';
+import { WindowChannel } from './sessionrequests';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
 declare const EXTENSION_VERSION: string;
@@ -98,9 +99,23 @@ const CLIENT_INFO = { name: 'arc', title: 'Arc', version: EXTENSION_VERSION };
 const usageWrites = new UsageWriteQueue();
 const sessionSettingsWrites = new UsageWriteQueue();
 let usageRecorder: UsageRecorder | null = null;
+let windowChannel: WindowChannel | null = null;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const activationAt = performance.now();
+  let channel: WindowChannel | null = null;
+  try {
+    channel = new WindowChannel();
+  } catch {
+    /* Window discovery failure leaves panel activation available. */
+  }
+  windowChannel = channel;
+  if (channel)
+    context.subscriptions.push({
+      dispose: () => {
+        void channel?.dispose();
+      },
+    });
   const root = storeRoot();
   const workspaceFolders = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
   const workspaceIdentity = normalizedWorkspaceIdentity(
@@ -134,6 +149,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Register the panel that displays recorded turns.
   const panel = registerPanel(context, root, workspaceCache, activationAt);
+  panel.setWindowStateHandler((state) => {
+    void channel?.update(state).catch(() => {
+      void channel?.dispose();
+    });
+  });
   if (process.env[MEASUREMENT_ENVIRONMENT.blockAgents] === '1' && process.env[MEASUREMENT_ENVIRONMENT.state])
     panel.openInEditor();
 
@@ -1819,5 +1839,7 @@ async function copyLink(arg: unknown): Promise<void> {
 
 export function deactivate(): Thenable<void> {
   const recording = usageRecorder?.dispose();
-  return Promise.all([recording, usageWrites.drain(), sessionSettingsWrites.drain()]).then(() => undefined);
+  return Promise.all([recording, windowChannel?.dispose(), usageWrites.drain(), sessionSettingsWrites.drain()]).then(
+    () => undefined,
+  );
 }

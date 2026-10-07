@@ -1,6 +1,7 @@
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
 import { createPanelVisibility } from './panelvisibility';
+import type { WindowState } from './sessionrequests';
 import {
   resolveSelectedSource,
   validateSelectedSource,
@@ -1735,6 +1736,25 @@ export class PanelProvider implements vscode.Disposable {
 
   // Live panel state shared by attached hosts and persisted through the memento.
   private saved: PanelState = normalizePanelState(null);
+  private windowStateHandler: ((state: WindowState) => void) | null = null;
+
+  public setWindowStateHandler(handler: (state: WindowState) => void): void {
+    this.windowStateHandler = handler;
+    const scope = this.repositoryScope.snapshot(this.folders());
+    this.repositoryScopeReady = scope.ready;
+    this.repositoryScopeRoots = scope.ready ? scope.roots : [];
+    this.publishWindowState();
+  }
+
+  private publishWindowState(): void {
+    if (!this.windowStateHandler || this.disposed) return;
+    this.windowStateHandler({
+      folders: this.folders(),
+      scopeReady: this.repositoryScopeReady,
+      panelReady: this.readyHosts.size > 0,
+      panelVisible: this.anyVisible(),
+    });
+  }
 
   constructor(
     private storeRootDir: string,
@@ -1853,6 +1873,7 @@ export class PanelProvider implements vscode.Disposable {
   private disposeOwned(): void {
     this.startupHistory?.dispose();
     this.disposed = true;
+    this.windowStateHandler = null;
     for (const controller of this.attachmentHandoffs) controller.abort();
     this.attachmentHandoffs.clear();
     this.onPanelsClosed?.();
@@ -2353,6 +2374,11 @@ export class PanelProvider implements vscode.Disposable {
     this.completeCatalogScope = undefined;
     // Removing roots needs no new loading, so the hold stays unless the new roots add one outside the held scope.
     const scope = this.repositoryScope.snapshot(this.folders());
+    if (this.windowStateHandler) {
+      this.repositoryScopeReady = scope.ready;
+      this.repositoryScopeRoots = scope.ready ? scope.roots : [];
+      this.publishWindowState();
+    }
     this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
     this.abandonCatalogRefresh();
     this.refreshFrom('repository-scope', true);
@@ -2382,7 +2408,12 @@ export class PanelProvider implements vscode.Disposable {
     this.enumeratedSpendSources = undefined;
     // Cancel catalog work started for different workspace folders.
     this.abandonCatalogRefresh();
-    this.repositoryScope.snapshot(this.folders());
+    const scope = this.repositoryScope.snapshot(this.folders());
+    if (this.windowStateHandler) {
+      this.repositoryScopeReady = scope.ready;
+      this.repositoryScopeRoots = scope.ready ? scope.roots : [];
+    }
+    this.publishWindowState();
     for (const open of this.hosts) {
       this.allowThemeFiles(open.webview);
     }
@@ -2407,6 +2438,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!this.readyHosts.has(host)) {
           return;
         }
+        this.publishWindowState();
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
         // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.
         if (this.anyVisible()) {
@@ -2424,6 +2456,7 @@ export class PanelProvider implements vscode.Disposable {
     mine.push(
       host.onDidDispose(() => {
         this.readyHosts.delete(host);
+        this.publishWindowState();
         this.panelVisibility?.release(host);
         this.performanceCounters.releasePanel(host);
         this.hostSessions?.delete(host);
@@ -2479,6 +2512,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.readyHosts.add(host);
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
+    this.publishWindowState();
     this.onSetupRefresh?.();
     if (!host.visible()) {
       return;
@@ -7958,6 +7992,7 @@ export class PanelProvider implements vscode.Disposable {
     const scope = this.repositoryScope.snapshot(workspaceFolders);
     this.repositoryScopeReady = scope.ready;
     this.repositoryScopeRoots = scope.ready ? scope.roots : [];
+    this.publishWindowState();
     if (!scope.ready) {
       return [];
     }
@@ -9333,6 +9368,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!scope?.ready) return;
         this.repositoryScopeReady = true;
         this.repositoryScopeRoots = scope.roots;
+        this.publishWindowState();
         work.scope = JSON.stringify([this.folders(), this.repositoryScopeRoots]);
         const source = await resolveSelectedSource(
           sessionId,
@@ -10673,6 +10709,7 @@ export class PanelProvider implements vscode.Disposable {
       developmentReload: () => {
         if (PANEL_DEV_SERVER_URL) {
           this.readyHosts.delete(host);
+          this.publishWindowState();
           this.releaseQueuedEditOffer(host);
           if (!this.anyVisible()) {
             this.stopPolling();

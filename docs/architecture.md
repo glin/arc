@@ -43,7 +43,7 @@ flowchart LR
 
   panel[Panel webview]
   status[Claude status-line JSON]
-  cli[Arc status CLI]
+  cli[Arc CLI]
 
   claude --> transcripts
   codex --> rollouts
@@ -62,9 +62,11 @@ flowchart LR
   status --> cli
   transcripts --> cli
   rollouts --> cli
+  cli <--> channel[Local window channel]
+  channel <--> panelhost
 ```
 
-The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. The CLI reads Claude status-line JSON from stdin or one session's Claude or Codex records from disk. It performs no cache write or network request.
+The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. The CLI reads Claude status-line JSON from stdin or one session's Claude or Codex records from disk. Window discovery asks running extension hosts through their local channels.
 
 ## Data sources
 
@@ -87,6 +89,7 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Codex retained context | The selected rollout's newest complete replacement history or opening, plus subsequent response items and request usage | Locally estimated text categories, retained checkpoint tool text, and an explicit unattributed remainder, without attaching to a saved session |
 | Claude status-line JSON | CLI stdin | Current model, effort, context size and use, prompt-cache state and expiry, and session cost metadata |
 | CLI transcript target | `arc-status cost` path or session id | Windowed request usage and list-price cost for one session and its children |
+| Window registry | `${ARC_HOME:-~/.arc}/hosts/<host-id>.json` | Activation identity, process id, workspace folders, repository scope readiness, panel readiness and visibility, protocol version, channel address, and authentication token |
 | Claude snapshots | `~/.arc/snapshots/<session_id>/` | File content before the session first changed it, plus the files that still differ |
 | Claude transcripts | `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd-slug>/<session_id>.jsonl` | Prompts, responses, tool activity, usage, model attachments that name the context window, commits, subagent commits and subagent file changes, recorded edits, shell-command file changes inside a git repository, paired Bash dispatch receipts, durable process-invocation ends, background command launches, their end records and their stop calls, and session names from `custom-title` and `ai-title` records |
 | Claude child transcripts | `<transcript directory>/<parent_session_id>/subagents/agent-<agent_id>.jsonl`, and `agent-<agent_id>.jsonl` beside a child transcript for the subagents that child launched | A subagent's own usage, the commits it wrote, the files it changed with their line counts, its own tool and failed-call counts by name, when it started and ended, and whether its record reaches the end |
@@ -174,12 +177,12 @@ The first column is checked against the shipped extension directory by `architec
 
 | File | Job | Imports `vscode`? |
 | --- | --- | --- |
-| `extension.ts` | Activation, watcher registration, commands, editor integration, and the agent host | yes |
+| `extension.ts` | Activation, local window channel lifetime, watcher registration, commands, editor integration, and the agent host | yes |
 | `configwatch.ts` | Non-recursive applied-defaults configuration watches for queried folders and their ancestors, with directory checks and watch lifecycle | no |
 | `identity.ts` | Arc product, extension, command, storage, environment, and package identifiers, plus the saved-state keys and the multi-root spend workspace path | no |
 | `projectsetups.ts` | Canonical setup project identity, project-entry normalization, one-time legacy pin import, and serialized pin and accepted-profile persistence | no |
 | `sessiondetails.ts` | Narrows a card list to the session the panel is showing | no |
-| `panelhost.ts` | Extension-host side of the panel webview, per-host readiness, durable initial catalog demand, staged loading, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance | yes |
+| `panelhost.ts` | Extension-host side of the panel webview, window state publication, per-host readiness, durable initial catalog demand, staged loading, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance | yes |
 | `timelinestate.ts` | Combines accepted tail, lifetime, and parsed outcomes, assembles child write and work times and live child IDs, caches child work by file version, projects session-list status and counts, and exposes the card's carried-subagent count | no |
 | `timelinecheck.ts` | Reads raw Claude work and close evidence independently, checks timeline consistency, and assembles read-only project sweeps through the shared timeline state and card projections | no |
 | `progressiveworker.ts` | Typed worker requests, cancellation, discovery checkpoints and quantum deltas, transport counters, revision and generation acceptance, and host-lifetime commit evidence reservations | no |
@@ -271,6 +274,7 @@ The first column is checked against the shipped extension directory by `architec
 | `pricing.ts` | Shared model and provider resolution, recorded route classes, retained request-band quotes, promotion metadata, fallback windows, required sourced cache policies, and cost estimates | no |
 | `projectspend.ts` | Incremental transcript usage index, linked-result deduplication, lifetime session costs and turn counts, what each dispatched session adds to the turn cards of the sessions above it, ordered cache-expiry and compaction derivation, the history-limit offer decision, project-cost windows, retention, and display values | no |
 | `sessioncost.ts` | Resolves transcript sources and descendants. Recognizes native records during usage scans. Reconciles recorded Codex usage and reports windowed cost, model subtotals, failures, tool attribution, and cache-expiry evidence. Direct source reads skip catalogs and descendants. | no |
+| `sessionrequests.ts` | Per-activation window identity, private registry publication, authenticated bounded JSON-lines ping, live window discovery, and channel cleanup | no |
 | `claudecoststate.ts` | Captures cumulative Claude accounting snapshots, reconciles native child usage under bounded background budgets, and allocates supplemental lifetime and Project cost | no |
 | `projectspendstate.ts` | Runtime validation for persisted project-spend records and resumable parser checkpoints | no |
 | `derivedcache.ts` | Validates and atomically stores session metadata, complete relationship facts, and pending discovery checkpoints, and holds metadata figures until their facts change | no |
@@ -361,6 +365,12 @@ Claude supplemental accounting reads transcript `cost-state` counters and frozen
 Subagent row names contain absolutely positioned accessible text. The clipped name establishes its positioning box so hidden suffixes cannot widen the page.
 
 The editor boundary is `extension.ts`, `panelhost.ts`, `uris.ts`, and `config.ts`. Other production modules avoid `vscode`, so tests can import their decisions directly. `extension/src/imports.test.ts` enforces package direction and runtime cycles.
+
+`extension.ts` owns the window channel lifetime. Channel creation or publication failure leaves panel activation available. `panelhost.ts` publishes window state after restoring saved provider state, without parsing sessions for discovery. Repository scope initializes independently of panel visibility. Panel readiness means an attached browser has completed startup. Panel visibility separately identifies active watching. Independent windows on the same folders retain distinct activation identities. Folderless windows publish empty folder lists.
+
+`sessionrequests.ts` uses Windows named pipes and Unix sockets on macOS and Linux. Socket paths of 104 bytes or more use a short private directory under the host's temporary root, then `/tmp` if necessary. Its directory name derives from the Arc home, and its socket filename contains the host identity. Clients validate this published address independently of their temporary environment. Registry directories use mode 0700 and entries use mode 0600 on POSIX. Every request carries the registry token, including ping. A matching ping identity establishes liveness within a deadline. Refusal, timeout, and uncertain process state retain registration and socket ownership. Discovery removes a registration only after confirmed process death, address validation, and an unchanged-byte check. Only the owning host removes its socket and fallback directory. Invalid registrations supply no cleanup targets. Filesystem path replacement during cleanup remains outside these pathname checks.
+
+Discovery iterates at most 1,024 directory entries plus one coverage check, admits 256 valid hosts, and pings eight hosts concurrently. Invalid entries consume directory work, without consuming the host allowance. Unvisited entries or uncertain host responses mark discovery incomplete. Publication replaces one registration without scanning the shared directory for leftover atomic temporaries. Its current temporary closes with the write. An identical state publication restores a missing registration.
 
 `panelhost.ts` supplies accepted reads, child write times, process exits, and the observation clock to `timelinestate.ts`. Dispatched rows and Git commit recovery stay in the host. `turncard.ts` owns the carried-subagent count that `timelinestate.ts` exports, keeping card rendering independent of session-list assembly.
 

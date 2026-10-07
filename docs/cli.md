@@ -2,7 +2,7 @@
 
 The Arc CLI is experimental. npm publication is deferred.
 
-The Arc CLI reports session cost from disk and renders Claude Code status-line input. It performs no cache write or network request.
+The Arc CLI reports session cost from disk, renders Claude Code status-line input, and lists running Arc windows through local channels.
 
 `cost` reads a Claude transcript or Codex rollout and its discovered children. `statusline` reads one Claude Code JSON object from stdin.
 
@@ -29,6 +29,16 @@ arc cost SESSION_ID --by-model
 `SESSION_ID` stands for a saved session's identifier. Path examples below require an existing transcript or rollout that you select.
 
 `--version` takes precedence over every other argument. `--help`, the `help` command, and no arguments print usage without reading stdin or transcripts.
+
+## Windows
+
+```text
+arc windows [--json]
+```
+
+The command lists live window identifiers, workspace folders, repository scope readiness, panel readiness, and panel visibility. Folderless windows appear with no folders. Human output names the panel as visible, hidden, or not ready. Scope reads ready or loading. JSON contains `version: 1`, a `windows` array, and `complete`. Neither format includes channel addresses or tokens. An empty array means no verified live window. `complete: false` means discovery left entries unvisited or registered hosts unavailable. Human output names incomplete discovery, including when no host answered.
+
+`ARC_HOME` selects the registry root and defaults to `~/.arc`. [Architecture](architecture.md#module-boundaries) owns the registry, channel, coverage limits, and cleanup rules. A requester uses `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, and otherwise sends `null`.
 
 ## Cost arguments
 

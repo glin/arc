@@ -965,6 +965,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
   assert.ok(owner);
   const methods = [
     'attach',
+    'publishWindowState',
     'browserReady',
     'browserPainted',
     'anyVisible',
@@ -1129,6 +1130,7 @@ function completeDiscoveryHarness(
   scope = { sameSessionRevision, outcomesFor, ...scope };
   const names = [
     'show',
+    'publishWindowState',
     'createDraft',
     'refresh',
     'refreshFrom',
@@ -1564,6 +1566,7 @@ function selectedWindowHarness(
 
   const names = new Set([
     'currentSelectedSession',
+    'publishWindowState',
     'completeSelectedWindow',
     'commitRepositoryTurns',
     'commitRepositoryContexts',

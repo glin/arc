@@ -81,6 +81,17 @@ Pricing covers supported Anthropic and OpenAI models, including supported models
 
 Run `arc --help` for all options. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) explains output fields, custom session folders, and additional reports.
 
+## Running windows
+
+List running Arc windows, including windows without folders:
+
+```sh
+arc windows
+arc windows --json
+```
+
+The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#windows) explains discovery, output fields, and `ARC_HOME`.
+
 ## Build from source
 
 Source builds use Node.js 20.19+ (20.x) or 22.12+. From the [Arc repository](https://github.com/glin/arc), run:

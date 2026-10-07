@@ -700,6 +700,7 @@ test('terminal extension shutdown closes recorder admission before draining work
   vm.runInNewContext(shutdown, {
     module,
     exports,
+    windowChannel: { dispose: () => Promise.resolve() },
     usageRecorder: {
       dispose: () => {
         calls.push('closed');

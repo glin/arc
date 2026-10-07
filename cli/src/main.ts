@@ -1,5 +1,6 @@
 import { renderNextTurn, renderStatus, snapshotFromClaude } from './status.ts';
 import { runCost } from './cost.ts';
+import { runWindows } from './windows.ts';
 
 declare const ARC_VERSION: string;
 
@@ -9,6 +10,7 @@ const VERSION = typeof ARC_VERSION === 'string' ? ARC_VERSION : 'unknown';
 function help(): string {
   return [
     'Usage: arc statusline [--json | --next-turn] [--width COLUMNS]',
+    '       arc windows [--json]',
     '       arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
     '',
     'Reads Claude Code status-line JSON from stdin.',
@@ -16,6 +18,7 @@ function help(): string {
     'Cost reads one transcript and its children. It prints JSON by default.',
     '--source-only reads an exact transcript file path without discovering children.',
     '--by-model adds billing subtotals for each model to the parent and child sources.',
+    'Windows lists running Arc windows and their panel and repository readiness.',
   ].join('\n');
 }
 
@@ -47,6 +50,10 @@ async function run(): Promise<void> {
   }
   if (args[0] === 'cost') {
     process.stdout.write(`${runCost(args.slice(1))}\n`);
+    return;
+  }
+  if (args[0] === 'windows') {
+    process.stdout.write(`${await runWindows(args.slice(1))}\n`);
     return;
   }
   if (args[0] !== 'statusline') {
