@@ -1837,6 +1837,50 @@ test('literal native opening generation 2 rebuilds an unchanged delayed spawn cl
   assert.equal(window.cache.get(files[0])?.replayBoundaryAt, Date.parse(created) + 5000);
 });
 
+test('manual CLI compaction drops generation 45 running facts at unchanged EOF', () => {
+  const directory = folder();
+  const source = path.join(directory, 'compact.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  const records = [
+    {
+      type: 'user',
+      uuid: 'compact-opening',
+      timestamp: '2026-10-07T09:17:51.416Z',
+      message: { role: 'user', content: '/compact' },
+    },
+    {
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: '2026-10-07T09:18:03.839Z',
+      compactMetadata: { trigger: 'manual', preTokens: 62077, postTokens: 4336, durationMs: 12409 },
+    },
+    {
+      type: 'user',
+      isCompactSummary: true,
+      timestamp: '2026-10-07T09:18:03.827Z',
+      message: { role: 'user', content: 'Retained summary' },
+    },
+  ];
+  fs.writeFileSync(source, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const before = fs.statSync(source);
+  const stale: DerivedTitleEntry = {
+    ...title,
+    size: before.size,
+    mtimeMs: before.mtimeMs,
+    outcome: { finished: false, error: false, interrupted: false, endedAt: Date.parse(records[0].timestamp) },
+  };
+  fs.writeFileSync(cache, JSON.stringify({ version: 45, codexMetas: [], titles: [{ file: source, entry: stale }] }));
+  const loaded = loadDerivedCache(cache);
+  assert.equal(loaded.titles.size, 0);
+  assert.equal(loaded.reuse?.reason, 'generation-mismatch');
+  const fresh = { ...stale, outcome: readSessionMeta(source).outcome };
+  assert.equal(fresh.outcome, null);
+  saveDerivedCache(cache, [[source, fresh]]);
+  assert.equal(loadDerivedCache(cache).titles.get(source)?.outcome, null);
+  assert.equal(fs.statSync(source).size, before.size);
+  assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
+});
+
 test('literal native derived generation 38 discards saved missing-turn figures', () => {
   const file = path.join(folder(), 'cache.json');
   const stale = { ...title, stats: { turns: [], compactions: [] }, starts: { starts: [], whole: true } };

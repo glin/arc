@@ -239,6 +239,7 @@ import {
   throughStructuredClone,
 } from './turnfixtures.ts';
 import { nextTurnBasisOf, statusOf, toCard, TURN_QUIET_MS } from './turncard.ts';
+import { newCounts, newestTurnStarts } from './turnread.ts';
 import {
   childWriteKey,
   claudeChildWriteIndex,
@@ -9426,7 +9427,7 @@ const renameRecords = (): object[] => [
 const AFTER_COMMAND = ms(2) + 60_000;
 
 // What each reader of the newest turn's outcome says about it at one clock.
-function localAnswerStatuses(records: object[], now = AFTER_COMMAND) {
+function localAnswerStatuses(records: object[], now = AFTER_COMMAND, sessionSnapshots = false) {
   const file = writeTranscript(records);
   const turns = readSession(file, 'sess').turns;
   const rail = readSessionMeta(file).outcome;
@@ -9450,6 +9451,17 @@ function localAnswerStatuses(records: object[], now = AFTER_COMMAND) {
       [indexed.turnCount(), newest],
       `an index restored after record ${split} reads the turns differently`,
     );
+    if (sessionSnapshots) {
+      const session = createClaudeSessionReducer('sess');
+      records.slice(0, split).forEach((record) => session.pushLine(JSON.stringify(record)));
+      const restored = createClaudeSessionReducer('sess', {}, structuredClone(session.snapshot()));
+      records.slice(split).forEach((record) => restored.pushLine(JSON.stringify(record)));
+      assert.deepEqual(
+        restored.read().turns,
+        turns,
+        `a session restored after record ${split} reads the turns differently`,
+      );
+    }
   }
   return {
     turns,
@@ -9463,6 +9475,309 @@ function localAnswerStatuses(records: object[], now = AFTER_COMMAND) {
     indexOutcome: newest,
   };
 }
+
+function manualCompactRecords(reverse = false): object[] {
+  const boundary = {
+    type: 'system',
+    subtype: 'compact_boundary',
+    uuid: 'compact-boundary',
+    timestamp: at(14),
+    compactMetadata: {
+      trigger: 'manual',
+      preTokens: 62077,
+      postTokens: 4336,
+      cumulativeDroppedTokens: 57741,
+      durationMs: 12409,
+    },
+  };
+  const summary = {
+    ...userPrompt('This session is being continued from a previous conversation.\n\nSummary:\nKept context.', 13.988),
+    isCompactSummary: true,
+    parentUuid: 'compact-boundary',
+    uuid: 'compact-summary',
+  };
+  const [caveat, wrapped] = localCommand('/compact', '', 2.003, 'compact-wrapped', { stdout: 'Compacted' });
+  return [
+    userPrompt('/compact', 2, { uuid: 'compact-opening' }),
+    ...(reverse ? [summary, boundary] : [boundary, summary]),
+    { ...caveat, parentUuid: 'compact-summary' },
+    wrapped,
+    userPrompt('<local-command-stdout>Compacted</local-command-stdout>', 14.099, { parentUuid: 'compact-wrapped' }),
+  ];
+}
+
+test('completed manual CLI compaction removes the running command card in every reader', () => {
+  const prior = [
+    userPrompt('test', 0),
+    assistantText('Test received.', 1, { input_tokens: 100, output_tokens: 5 }, undefined, 'end_turn'),
+  ];
+  for (const reverse of [false, true]) {
+    const records = [...prior, ...manualCompactRecords(reverse)];
+    const file = writeTranscript(records);
+    const read = localAnswerStatuses(records);
+    assert.deepEqual(
+      read.turns.map((turn) => turn.prompt),
+      ['test'],
+    );
+    assert.deepEqual([read.full, read.rail, read.index, read.count], ['done', 'done', 'done', 1]);
+    assert.deepEqual(read.starts, [ms(0), ms(0), ms(0)]);
+    assert.deepEqual(readSessionTurnStarts(file).starts, [ms(0)]);
+    const full = readSession(file, 'sess');
+    const compact = full.compactions[0];
+    assert.deepEqual(
+      [compact.trigger, compact.contextBefore, compact.contextAfter, compact.droppedTokens, compact.durationMs],
+      ['manual', 62077, 4336, 57741, 12409],
+    );
+    assert.equal(full.turns[0].usage.input, 100);
+    assert.equal(full.turns[0].usage.output, 5);
+    const index = createClaudeUsageLineReducer();
+    const events = records.flatMap((record) => index.pushLine(JSON.stringify(record)));
+    assert.equal(index.compactionCount(), 1);
+    assert.equal(events.filter((event) => event.compactionEstimate).length, 1);
+    assert.equal(index.snapshot().visibleTurns, 2);
+    for (let split = 1; split < records.length; split++) {
+      const first = createClaudeSessionReducer('sess');
+      records.slice(0, split).forEach((record) => first.pushLine(JSON.stringify(record)));
+      const resumed = createClaudeSessionReducer('sess', {}, structuredClone(first.snapshot()));
+      records.slice(split).forEach((record) => resumed.pushLine(JSON.stringify(record)));
+      assert.deepEqual(resumed.read().turns, full.turns);
+      assert.deepEqual(
+        resumed.read().compactions,
+        full.compactions.map(({ firstRequestCacheRead: _read, ...compaction }) => compaction),
+      );
+    }
+    const appended = [
+      ...records,
+      userPrompt('next task', 70),
+      assistantText('Next answer.', 71, { input_tokens: 200, output_tokens: 6 }, undefined, 'end_turn'),
+    ];
+    const after = localAnswerStatuses(appended, ms(72));
+    assert.deepEqual(
+      after.turns.map((turn) => turn.prompt),
+      ['test', 'next task'],
+    );
+    assert.equal(after.count, 2);
+    const appendedIndex = createClaudeUsageLineReducer();
+    const appendedEvents = appended.flatMap((record) => appendedIndex.pushLine(JSON.stringify(record)));
+    assert.deepEqual(
+      appendedEvents.filter((event) => !event.compactionEstimate).map((event) => event.visibleTurnId),
+      ['claude-turn:1', 'claude-turn:3'],
+    );
+  }
+});
+
+test('completed manual CLI compaction without a preceding turn leaves no outcome', () => {
+  const records = manualCompactRecords();
+  const pending = localAnswerStatuses(records.slice(0, 1));
+  assert.deepEqual([pending.full, pending.rail, pending.index, pending.count], ['running', 'running', 'running', 1]);
+  const completed = localAnswerStatuses(records);
+  assert.deepEqual([completed.full, completed.rail, completed.index, completed.count], [null, null, null, 0]);
+  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)).starts, []);
+  const rename = localAnswerStatuses([
+    ...records,
+    ...localCommand('/rename', 'kept name', 16, 'rename-after', { stdout: 'Renamed' }),
+  ]);
+  assert.deepEqual([rename.full, rename.rail, rename.index, rename.count], [null, null, null, 0]);
+});
+
+test('manual compaction preserves real work before and after the command', () => {
+  const records = manualCompactRecords();
+  for (const after of [
+    assistantTool('Read', 15),
+    assistantText('Continuing work.', 15, { output_tokens: 4 }),
+    assistantAnswer('Continued work.', 15),
+  ]) {
+    const expected = 'stop_reason' in after.message && after.message.stop_reason ? 'done' : 'running';
+    const read = localAnswerStatuses([...records, after], AFTER_COMMAND, true);
+    assert.deepEqual(
+      read.turns.map((turn) => turn.prompt),
+      ['/compact'],
+    );
+    assert.equal(read.count, 1);
+    assert.deepEqual([read.full, read.rail, read.index], [expected, expected, expected]);
+    assert.deepEqual(readSessionTurnStarts(writeTranscript([...records, after])).starts, [ms(2)]);
+    const closed = [...records, after, assistantAnswer('Finished.', 16)];
+    const done = localAnswerStatuses(closed, AFTER_COMMAND, true);
+    assert.deepEqual([done.full, done.rail, done.index, done.count], ['done', 'done', 'done', 1]);
+    const later = localAnswerStatuses([...closed, assistantTool('Read', 17, 'later')], AFTER_COMMAND, true);
+    assert.deepEqual([later.full, later.rail, later.index], ['done', 'done', 'done']);
+  }
+  const prior = localAnswerStatuses([userPrompt('unfinished work', 0), ...records]);
+  assert.deepEqual(
+    prior.turns.map((turn) => turn.prompt),
+    ['unfinished work'],
+  );
+  assert.deepEqual([prior.full, prior.rail, prior.index], ['running', 'running', 'running']);
+  const resumedPrior = localAnswerStatuses([userPrompt('unfinished work', 0), ...records, userPrompt('next work', 16)]);
+  assert.equal(resumedPrior.turns.length, resumedPrior.count);
+  const queuedPrior = localAnswerStatuses([
+    userPrompt('unfinished work', 0),
+    typedMidTurn('queued before compact', 1),
+    ...records,
+  ]);
+  assert.deepEqual(
+    queuedPrior.turns.map((turn) => turn.prompt),
+    ['unfinished work'],
+  );
+  assert.equal(queuedPrior.turns[0].laterPrompts[0].text, 'queued before compact');
+  assert.deepEqual([queuedPrior.full, queuedPrior.rail, queuedPrior.index], ['running', 'running', 'running']);
+  const next = localAnswerStatuses([...records, userPrompt('new work', 16)]);
+  assert.deepEqual(
+    next.turns.map((turn) => turn.prompt),
+    ['new work'],
+  );
+  assert.deepEqual([next.full, next.rail, next.index], ['running', 'running', 'running']);
+});
+
+test('prompts queued after completed manual compaction retain their unread turn start', () => {
+  for (const prior of [[], [userPrompt('prior', 0), assistantAnswer('Finished.', 1)]]) {
+    const compact = [...prior, ...manualCompactRecords()];
+    const queue = [typedMidTurn('next task', 15), typedMidTurn('another task', 16)];
+    for (let length = 1; length <= queue.length; length++) {
+      const records = [...compact, ...queue.slice(0, length)];
+      const read = localAnswerStatuses(records, AFTER_COMMAND, true);
+      assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+      assert.equal(read.turns.length, prior.length ? 2 : 1);
+      assert.equal(read.count, read.turns.length);
+      assert.deepEqual(read.starts, [ms(15), ms(15), ms(15)]);
+      const starts = readSessionTurnStarts(writeTranscript(records));
+      assert.deepEqual(starts.starts, prior.length ? [ms(0), ms(15)] : [ms(15)]);
+      const windows = new Map([['sess', starts]]);
+      assert.deepEqual(newCounts([], windows, [], new Map([['sess', ms(1)]])).get('sess'), {
+        count: 1,
+        atLeast: false,
+      });
+      assert.equal(newestTurnStarts([], windows).get('sess'), ms(15));
+      for (const work of [assistantTool('Read', 17), assistantAnswer('Finished queued tasks.', 17)]) {
+        const restored = [...records, work];
+        const after = localAnswerStatuses(restored, AFTER_COMMAND, true);
+        const status = 'stop_reason' in work.message && work.message.stop_reason ? 'done' : 'running';
+        assert.deepEqual([after.full, after.rail, after.index], [status, status, status]);
+        assert.equal(after.count, after.turns.length);
+        assert.deepEqual(after.starts, [ms(2), ms(2), ms(2)]);
+        assert.deepEqual(
+          readSessionTurnStarts(writeTranscript(restored)).starts,
+          prior.length ? [ms(0), ms(2)] : [ms(2)],
+        );
+      }
+    }
+  }
+});
+
+test('manual compaction retains queued work when carried prompts reach the retention limit', () => {
+  const [opening, ...completed] = manualCompactRecords();
+  const records = [
+    userPrompt('unanswered prior', 0),
+    ...Array.from({ length: TURN_ASK_LIMIT }, (_, index) => typedMidTurn(`queued ${index + 1}`, 1 + index / 100)),
+    opening,
+    typedMidTurn('queued after opening', 3),
+    ...completed,
+  ];
+  for (const answer of [[], [assistantAnswer('Answer to prior and queued work.', 15)]]) {
+    const all = [...records, ...answer];
+    const read = localAnswerStatuses(all, AFTER_COMMAND, true);
+    const status = answer.length ? 'done' : 'running';
+    assert.deepEqual([read.full, read.rail, read.index, read.count], [status, status, status, 1]);
+    assert.equal(read.turns.length, 1);
+    assert.equal(read.turns[0].prompt, 'unanswered prior\n\n/compact');
+    assert.equal(read.turns[0].laterPrompts.length, TURN_ASK_LIMIT);
+    assert.equal(read.turns[0].laterPrompts.at(-1)?.text, 'queued after opening');
+    assert.equal(read.turns[0].summary, answer.length ? 'Answer to prior and queued work.' : '');
+    assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)]);
+    assert.deepEqual(readSessionTurnStarts(writeTranscript(all)).starts, [ms(0), ms(2)]);
+  }
+});
+
+test('manual compaction consumes no unrelated automatic malformed or sidechain work', () => {
+  const [opening, boundary, ...rest] = manualCompactRecords();
+  for (const change of [
+    { compactMetadata: { trigger: 'auto', preTokens: 62077, postTokens: 4336 } },
+    { compactMetadata: { preTokens: 62077, postTokens: 4336 } },
+    { compactMetadata: { trigger: 'manual', preTokens: '62077', postTokens: 4336 } },
+    { compactMetadata: { trigger: 'manual', preTokens: 62077, postTokens: -1 } },
+    { isSidechain: true },
+    { timestamp: 'invalid' },
+  ]) {
+    const read = localAnswerStatuses([opening, { ...boundary, ...change }, ...rest]);
+    assert.deepEqual([read.full, read.rail, read.index, read.count], ['running', 'running', 'running', 1]);
+  }
+  for (const prompt of ['please /compact', '/compact instructions', '/unknown']) {
+    const read = localAnswerStatuses([userPrompt(prompt, 2, { uuid: 'compact-opening' }), boundary, ...rest]);
+    assert.deepEqual(
+      read.turns.map((turn) => turn.prompt),
+      [prompt],
+    );
+    assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+  }
+  for (const work of [assistantTool('Read', 3), typedMidTurn('queued work', 3), userPrompt('later real prompt', 3)]) {
+    const read = localAnswerStatuses([opening, work, boundary, ...rest]);
+    assert.equal(read.full, 'running');
+    assert.equal(read.rail, 'running');
+    assert.equal(read.index, 'running');
+    assert.ok(
+      readSessionTurnStarts(writeTranscript([opening, work, boundary, ...rest])).starts.includes(ms(3)) ||
+        readSessionTurnStarts(writeTranscript([opening, work, boundary, ...rest])).starts.includes(ms(2)),
+    );
+  }
+  const child = manualCompactRecords().map((record, index) =>
+    index === 0 ? { ...record, isSidechain: true } : record,
+  );
+  const childFile = writeTranscript(child);
+  assert.equal(readSession(childFile, 'sess', { childTranscript: true }).turns.length, 1);
+  const childIndex = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  child.forEach((record) => childIndex.pushLine(JSON.stringify(record)));
+  assert.equal(childIndex.turnCount(), 1);
+});
+
+test('manual compaction retains preceding outcomes and independent background activity', () => {
+  const records = manualCompactRecords();
+  for (const prior of [
+    [userPrompt('prior work', 0), assistantAnswer('Finished.', 1)],
+    [userPrompt('prior work', 0), assistantTool('Read', 1)],
+    [userPrompt('prior work', 0), costState(ms(0), 1000)],
+    [userPrompt('prior work', 0), { ...assistantAnswer('API failed.', 1), isApiErrorMessage: true }],
+    [userPrompt('prior work', 0), userPrompt('[Request interrupted by user]', 1)],
+  ]) {
+    const before = localAnswerStatuses(prior);
+    const after = localAnswerStatuses([...prior, ...records]);
+    assert.deepEqual([after.full, after.rail, after.index], [before.full, before.rail, before.index]);
+    assert.deepEqual(after.railOutcome, before.railOutcome);
+    assert.deepEqual(after.indexOutcome, before.indexOutcome);
+  }
+  const launch = [
+    userPrompt('launch background work', 0),
+    assistantTool('Agent', 0.2, 'compact-child-call', { description: 'worker' }),
+    {
+      type: 'user',
+      timestamp: at(0.4),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'compact-child-call', content: 'launched' }],
+      },
+      toolUseResult: { agentId: 'compact-child', status: 'async_launched' },
+    },
+    assistantAnswer('Background work started.', 1),
+  ];
+  const child = localAnswerStatuses([...launch, ...records]);
+  assert.deepEqual(child.railOutcome?.openChildren, ['compact-child']);
+  assert.deepEqual(child.indexOutcome?.openChildren, ['compact-child']);
+  assert.equal(child.turns[0].agents[0].id, 'compact-child');
+  const commandRecords = [
+    ...backgroundCommandTurn,
+    ...records.map((record) => ({ ...record, timestamp: at(5 + records.indexOf(record)) })),
+  ];
+  const before = readSessionMeta(writeTranscript(backgroundCommandTurn)).outcome?.backgroundCommands;
+  const after = readSessionMeta(writeTranscript(commandRecords)).outcome?.backgroundCommands;
+  assert.deepEqual(after, before);
+  assert.equal(after?.length, 1);
+  const automatic = localAnswerStatuses([
+    userPrompt('real work', 0),
+    assistantTool('Read', 1),
+    { ...records[1], compactMetadata: { trigger: 'auto', preTokens: 62077, postTokens: 4336 } },
+    records[2],
+  ]);
+  assert.deepEqual([automatic.full, automatic.rail, automatic.index], ['running', 'running', 'running']);
+});
 
 test('a Claude local command answer makes no turn in the full read', () => {
   const file = writeTranscript(renameRecords());

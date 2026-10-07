@@ -1221,32 +1221,45 @@ export function readSessionTurnStarts(file: string, bytes = TURN_START_BYTES, ch
 
 function sessionTurnStartsIn(lines: string[], childTranscript = false): number[] {
   const starts: number[] = [];
+  let compact: { id: string; at: number; index: number; withdrawn: boolean; queued: boolean } | null = null;
   for (const line of lines) {
-    // Include peer prompts to count the same turns as `readSession`.
-    if (line.indexOf('"type":"user"') < 0) {
+    if (
+      !line.includes('"type":"user"') &&
+      (!compact ||
+        (!line.includes('"type":"assistant"') &&
+          !line.includes('"compact_boundary"') &&
+          !line.includes('"queued_command"') &&
+          !line.includes('"cost-state"')))
+    )
       continue;
-    }
-    let o: Record<string, unknown> | null = null;
     try {
-      const parsed = JSON.parse(line) as unknown;
-      if (parsed && typeof parsed === 'object') {
-        const record = parsed as Record<string, unknown>;
-        if (record.type === 'user' && isTypedPrompt(record, childTranscript)) {
-          o = record;
+      const o = JSON.parse(line) as Record<string, unknown>;
+      if (!o || typeof o !== 'object' || (o.isSidechain && !childTranscript)) continue;
+      if (o.type === 'user' && isTypedPrompt(o, childTranscript)) {
+        compact = null;
+        const at = Date.parse(String(o.timestamp));
+        if (!Number.isFinite(at)) continue;
+        const id = claudeRecordId(o);
+        if (id && claudeCompactPrompt(o)) compact = { id, at, index: starts.length, withdrawn: false, queued: false };
+        starts.push(at);
+      } else if (compact && readerQueuedAsk(o)) {
+        if (!compact.withdrawn) compact = null;
+        else if (!compact.queued) {
+          starts.push(readerQueuedAsk(o)!.at);
+          compact.queued = true;
         }
+      } else if (compact && !compact.withdrawn && claudeProcessEndedAt(o) !== null) {
+        compact = null;
+      } else if (compact && claudeCompactAnswer(o, compact.id, compact.at)) {
+        if (!compact.withdrawn) starts.splice(compact.index, 1);
+        compact.withdrawn = true;
+      } else if (compact && claudeModelWorks(o)) {
+        if (compact.withdrawn) starts.splice(compact.index, compact.queued ? 1 : 0, compact.at);
+        compact = null;
       }
     } catch {
       /* a partial line has no turn start */
     }
-    if (!o) {
-      continue;
-    }
-    // Skip unreadable timestamps. `stamp` returns zero, which is a valid epoch time.
-    const at = Date.parse(String(o.timestamp));
-    if (Number.isNaN(at)) {
-      continue;
-    }
-    starts.push(at);
   }
   return starts;
 }
@@ -2353,6 +2366,40 @@ export function claudeProcessEndedAt(record: unknown): number | null {
   return Number.isFinite(endedAt) && Number.isSafeInteger(endedAt) ? endedAt : null;
 }
 
+// Only the plain CLI command is provisional until its structured manual boundary arrives.
+function claudeCompactPrompt(record: Record<string, unknown>): boolean {
+  return (
+    !record.isSidechain && textOf((record.message as { content?: unknown } | undefined)?.content).trim() === '/compact'
+  );
+}
+
+function claudeCompactAnswer(
+  record: Record<string, unknown>,
+  command: string | null,
+  openedAt: number | null,
+): { at: number; parent: string } | null {
+  const metadata = record.compactMetadata as Record<string, unknown> | undefined;
+  const at = Date.parse(String(record.timestamp));
+  if (
+    !command ||
+    openedAt === null ||
+    record.isSidechain ||
+    record.type !== 'system' ||
+    record.subtype !== 'compact_boundary' ||
+    metadata?.trigger !== 'manual' ||
+    !Number.isFinite(at) ||
+    at < openedAt ||
+    typeof metadata.preTokens !== 'number' ||
+    !Number.isFinite(metadata.preTokens) ||
+    metadata.preTokens <= 0 ||
+    typeof metadata.postTokens !== 'number' ||
+    !Number.isFinite(metadata.postTokens) ||
+    metadata.postTokens <= 0
+  )
+    return null;
+  return { at, parent: command };
+}
+
 const LOCAL_COMMAND_OUTPUT = /<local-command-(?:stdout|stderr)>/;
 
 // CLI command answer with a parent record ID and local stdout or stderr tag.
@@ -2430,6 +2477,7 @@ function outcomeIn(
   // The typed record that opened the outcome, and whether the model has answered it yet.
   let command: string | null = null;
   let modelAnswered = false;
+  let compact = false;
   // The outcome that the newest typed prompt replaced. A local command answer withdraws the
   // command's outcome and puts this one back.
   let previous = null as { outcome: TurnOutcome | null; modelAnswered: boolean } | null;
@@ -2477,10 +2525,13 @@ function outcomeIn(
       queuedSinceAnswer = false;
       outcome = { finished: false, error: false, interrupted: false, endedAt: startedAt, startedAt };
       command = claudeRecordId(o);
+      compact = claudeCompactPrompt(o);
       modelAnswered = false;
       continue;
     }
-    const localAnswer = claudeLocalAnswer(o);
+    if (readerQueuedAsk(o) && !withdrawn) compact = false;
+    const compactAnswer = compact ? claudeCompactAnswer(o, command, outcome?.startedAt ?? null) : null;
+    const localAnswer = compactAnswer ?? claudeLocalAnswer(o);
     if (localAnswer !== null) {
       if (
         outcome &&
@@ -2497,7 +2548,7 @@ function outcomeIn(
         command = null;
         previous = null;
         queuedSinceAnswer = false;
-        if (outcome && !modelAnswered) {
+        if (outcome && !modelAnswered && !compactAnswer) {
           outcome = stoppedByLocalAnswer(outcome);
         }
       }
@@ -2521,6 +2572,7 @@ function outcomeIn(
       // a queued prompt stops the command, because the prompt joins the command's card.
       const queuedEnd = queuedSinceAnswer ? outcome?.processEndedAt : undefined;
       outcome = withdrawn;
+      outcome.finished = false;
       if (queuedEnd !== undefined) {
         outcome.processEndedAt = Math.max(outcome.processEndedAt ?? 0, queuedEnd);
       }
@@ -6195,6 +6247,7 @@ export interface ClaudeUsageReducerState {
   currentTurnOutcome: TurnOutcome | null;
   // Opening record ID used to pair a local command answer.
   currentTurnCommand?: string | null;
+  currentTurnCompact?: boolean;
   // The turn the current typed prompt followed, as it stood when that prompt arrived. A local
   // command answer withdraws the command's turn and puts this one back as the newest turn.
   // Null once anything answers the current turn, because no answer can withdraw it then.
@@ -6347,6 +6400,44 @@ export function retainNewestCompaction(
   }
 }
 
+function withdrawClaudeUsageTurn(
+  state: ClaudeUsageReducerState,
+  localAnswer: { at: number; parent: string },
+  compact = false,
+): void {
+  if (
+    !state.openTurnAnswered &&
+    state.currentTurnOutcome &&
+    state.currentTurnCommand &&
+    localAnswer.parent === state.currentTurnCommand
+  ) {
+    // Withdraw the unanswered command turn. Preserve its visible-turn sequence number for request identity.
+    const previous = state.currentTurnPrevious ?? null;
+    const outcome: TurnOutcome = {
+      ...state.currentTurnOutcome,
+      finished: true,
+      endedAt: Math.max(state.currentTurnOutcome.endedAt, localAnswer.at),
+    };
+    delete outcome.openChildren;
+    delete outcome.closedChildren;
+    const withdrawn: ClaudePreviousTurn = {
+      ...currentClaudeTurn(state),
+      endedAt: Math.max(state.currentTurnEndedAt ?? 0, localAnswer.at),
+      outcome,
+    };
+    if (previous?.open && previous.answered) {
+      state.closedTurns--;
+    }
+    restoreClaudeTurn(state, previous);
+    if (!compact && previous?.open && !previous.answered && state.currentTurnOutcome) {
+      state.currentTurnOutcome = stoppedByLocalAnswer(state.currentTurnOutcome);
+    }
+    // An unanswered prompt restored by the local answer keeps its own turn for the next prompt count.
+    state.openTurnAnswered = state.openTurn;
+    state.currentTurnWithdrawn = withdrawn;
+  }
+}
+
 function reduceClaudeTurnRecord(
   state: ClaudeUsageReducerState,
   record: Record<string, unknown>,
@@ -6354,6 +6445,13 @@ function reduceClaudeTurnRecord(
 ): void {
   if (record.isSidechain && !childTranscript) {
     return;
+  }
+  if (readerQueuedAsk(record) && !state.currentTurnWithdrawn) state.currentTurnCompact = false;
+  const compactAnswer = state.currentTurnCompact
+    ? claudeCompactAnswer(record, state.currentTurnCommand ?? null, state.currentTurnStartedAt)
+    : null;
+  if (compactAnswer && state.openTurn && !state.openTurnAnswered) {
+    withdrawClaudeUsageTurn(state, compactAnswer, true);
   }
   if (record.type === 'system' && record.subtype === 'compact_boundary') {
     const metadata = record.compactMetadata as Record<string, unknown> | undefined;
@@ -6439,6 +6537,7 @@ function reduceClaudeTurnRecord(
     state.currentTurnStartedAt = at;
     state.currentTurnEndedAt = at;
     state.currentTurnCommand = claudeRecordId(record);
+    state.currentTurnCompact = claudeCompactPrompt(record);
     // A typed prompt does not close a background child, so its id moves to the new turn.
     const openChildren = state.currentTurnOutcome?.openChildren;
     const closedChildren = state.currentTurnOutcome?.closedChildren;
@@ -6500,6 +6599,7 @@ function reduceClaudeTurnRecord(
     }
     const queuedEnd = state.currentTurnQueued ? state.currentTurnOutcome?.processEndedAt : undefined;
     restoreClaudeTurn(state, withdrawn);
+    if (state.currentTurnOutcome) state.currentTurnOutcome.finished = false;
     if (queuedEnd !== undefined && state.currentTurnOutcome) {
       state.currentTurnOutcome.processEndedAt = Math.max(state.currentTurnOutcome.processEndedAt ?? 0, queuedEnd);
     }
@@ -6509,37 +6609,7 @@ function reduceClaudeTurnRecord(
   }
   const localAnswer = claudeLocalAnswer(record);
   if (localAnswer !== null) {
-    if (
-      !state.openTurnAnswered &&
-      state.currentTurnOutcome &&
-      state.currentTurnCommand &&
-      localAnswer.parent === state.currentTurnCommand
-    ) {
-      // Withdraw the unanswered command turn. Preserve its visible-turn sequence number for request identity.
-      const previous = state.currentTurnPrevious ?? null;
-      const outcome: TurnOutcome = {
-        ...state.currentTurnOutcome,
-        finished: true,
-        endedAt: Math.max(state.currentTurnOutcome.endedAt, localAnswer.at),
-      };
-      delete outcome.openChildren;
-      delete outcome.closedChildren;
-      const withdrawn: ClaudePreviousTurn = {
-        ...currentClaudeTurn(state),
-        endedAt: Math.max(state.currentTurnEndedAt ?? 0, localAnswer.at),
-        outcome,
-      };
-      if (previous?.open && previous.answered) {
-        state.closedTurns--;
-      }
-      restoreClaudeTurn(state, previous);
-      if (previous?.open && !previous.answered && state.currentTurnOutcome) {
-        state.currentTurnOutcome = stoppedByLocalAnswer(state.currentTurnOutcome);
-      }
-      // An unanswered prompt restored by the local answer keeps its own turn for the next prompt count.
-      state.openTurnAnswered = state.openTurn;
-      state.currentTurnWithdrawn = withdrawn;
-    }
+    withdrawClaudeUsageTurn(state, localAnswer);
     return;
   }
   const notice = taskNotificationText(record);
@@ -7060,6 +7130,7 @@ export function createClaudeUsageLineReducer(
             currentTurnStartedAt: restored.currentTurnStartedAt ?? null,
             currentTurnEndedAt: restored.currentTurnEndedAt ?? null,
             currentTurnCommand: restored.currentTurnCommand ?? null,
+            currentTurnCompact: restored.currentTurnCompact ?? false,
             currentTurnPrevious: copyPreviousTurn(restored.currentTurnPrevious),
             currentTurnWithdrawn: copyPreviousTurn(restored.currentTurnWithdrawn),
             ...(restored.currentTurnQueued ? { currentTurnQueued: true } : {}),
@@ -7134,6 +7205,7 @@ export function createClaudeUsageLineReducer(
             currentTurnStartedAt: state.currentTurnStartedAt,
             currentTurnEndedAt: state.currentTurnEndedAt,
             currentTurnCommand: state.currentTurnCommand ?? null,
+            currentTurnCompact: state.currentTurnCompact ?? false,
             currentTurnPrevious: copyPreviousTurn(state.currentTurnPrevious),
             currentTurnWithdrawn: copyPreviousTurn(state.currentTurnWithdrawn),
             ...(state.currentTurnQueued ? { currentTurnQueued: true } : {}),
@@ -7778,6 +7850,8 @@ export interface ClaudeSessionParserState {
   // model works in it later, and a process end goes to the newest card instead.
   curCommand: string | null;
   curLocalAnswer: boolean;
+  // Reader prompts arriving after this command opened prevent manual compaction withdrawal.
+  curQueuedSinceOpening: boolean;
   // The unanswered turn that `cur` took in when its prompt was typed, with that turn's source
   // range as plain numbers, because a symbol does not cross the worker boundary. A local
   // command answer hands it back as a card of its own.
@@ -7872,6 +7946,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     cur: null,
     curCommand: null,
     curLocalAnswer: false,
+    curQueuedSinceOpening: false,
     curCarried: null,
     curInferredStop: null,
     queued: [],
@@ -8045,6 +8120,7 @@ function trimClaudeBefore(state: ClaudeSessionParserState, offset: number, maxTu
     state.cur = null;
     state.curCommand = null;
     state.curLocalAnswer = false;
+    state.curQueuedSinceOpening = false;
     state.curCarried = null;
     state.curInferredStop = null;
     state.currentModelSource = null;
@@ -8340,6 +8416,7 @@ function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): voi
   const answered = claudeTurnAnswered(turn);
   state.curCommand = null;
   state.curLocalAnswer = false;
+  state.curQueuedSinceOpening = false;
   state.curCarried = null;
   state.curInferredStop = null;
   if (localOnly) {
@@ -8380,6 +8457,64 @@ function settleClaudeSteps(state: ClaudeSessionParserState): void {
   state.awaited = [];
 }
 
+function applyClaudeLocalAnswer(
+  state: ClaudeSessionParserState,
+  answer: { at: number; parent: string },
+  sourceStart: number,
+  sourceEnd: number,
+  maxTurns: number,
+  compact = false,
+): void {
+  const cur = state.cur;
+  if (
+    cur &&
+    state.curCommand !== null &&
+    answer.parent === state.curCommand &&
+    !state.curLocalAnswer &&
+    !claudeTurnAnswered(cur)
+  ) {
+    // A prompt that was still waiting when the command was typed got no reply from it. It
+    // becomes its own unanswered card.
+    const carried = state.curCarried;
+    if (carried) {
+      state.curCarried = null;
+      const held = carried.turn as SourcedBuilding;
+      setSourceRange(held, carried.start, carried.end);
+      setMembershipStart(held, carried.membership);
+      // Infer an unanswered carried prompt stopped at its own end time. Later command model work can revoke this stop.
+      if (
+        !compact &&
+        !claudeTurnAnswered(held) &&
+        !held.finished &&
+        held.error === null &&
+        !held.interrupted &&
+        held.processEndedAt === undefined
+      ) {
+        held.processEndedAt = held.endedAt;
+        state.curInferredStop = held.processEndedAt;
+      }
+      emitClaudeTurn(state, held, maxTurns);
+      const heldParts = held.promptParts ?? [];
+      const own = (ask: TurnAsk) => !heldParts.some((part) => part.text === ask.text && part.at === ask.at);
+      const parts = (cur.promptParts ?? []).filter(own);
+      cur.promptParts = parts;
+      cur.prompt = parts.map((one) => one.text).join('\n\n');
+      cur.laterPrompts = cur.laterPrompts.filter(
+        (ask) => !held.laterPrompts.some((later) => later.text === ask.text && later.at === ask.at),
+      );
+      const start = cur[MEMBERSHIP_START] ?? sourceStart;
+      setSourceRange(cur, start, Math.max(cur[SOURCE_END] ?? start, start));
+    }
+    // Keep the answered command for later model work. Without that work, closure omits its card.
+    cur.finished = true;
+    cur.endedAt = Math.max(cur.endedAt, answer.at);
+    state.curLocalAnswer = true;
+    // The local answer clears pending typed-skill evidence.
+    state.pendingTypedSkill = null;
+    extendSourceRange(cur, sourceStart, sourceEnd);
+  }
+}
+
 function reduceClaudeSessionLine(
   state: ClaudeSessionParserState,
   input: string | ParserLine,
@@ -8418,7 +8553,13 @@ function reduceClaudeSessionLine(
   }
   if (line.indexOf('"compactMetadata"') >= 0) {
     try {
-      const o = JSON.parse(line) as { compactMetadata?: CompactMetadata; timestamp?: unknown };
+      const o = JSON.parse(line) as Record<string, unknown> & { compactMetadata?: CompactMetadata };
+      const opening = state.cur?.promptParts?.at(-1);
+      const answer =
+        opening?.text === '/compact' && !state.curQueuedSinceOpening
+          ? claudeCompactAnswer(o, state.curCommand, opening.at)
+          : null;
+      if (answer) applyClaudeLocalAnswer(state, answer, sourceStart, sourceEnd, maxTurns, true);
       if (o.compactMetadata) {
         const at = stamp(o.timestamp);
         expireClaudeCompactMetadata(state, at);
@@ -8513,6 +8654,7 @@ function reduceClaudeSessionLine(
       const attachment = o.attachment as Record<string, unknown> | undefined;
       const ask = attachmentLine && !o.isSidechain && state.cur ? readerQueuedAsk(o) : null;
       if (ask && state.cur) {
+        state.curQueuedSinceOpening = true;
         setClaudeRepeatNotice(state, false);
         state.cur.laterPrompts.push({ text: ask.text, at: ask.at, stepsBefore: state.cur.stepCount });
         if (state.cur.laterPrompts.length > TURN_ASK_LIMIT) {
@@ -8573,54 +8715,7 @@ function reduceClaudeSessionLine(
       const o = JSON.parse(line) as Record<string, unknown>;
       systemLine = o.type === 'system';
       const answer = claudeLocalAnswer(o);
-      const cur = state.cur;
-      if (
-        answer !== null &&
-        cur &&
-        state.curCommand !== null &&
-        answer.parent === state.curCommand &&
-        !state.curLocalAnswer &&
-        !claudeTurnAnswered(cur)
-      ) {
-        // A prompt that was still waiting when the command was typed got no reply from it. It
-        // becomes its own unanswered card.
-        const carried = state.curCarried;
-        if (carried) {
-          state.curCarried = null;
-          const held = carried.turn as SourcedBuilding;
-          setSourceRange(held, carried.start, carried.end);
-          setMembershipStart(held, carried.membership);
-          // Infer an unanswered carried prompt stopped at its own end time. Later command model work can revoke this stop.
-          if (
-            !claudeTurnAnswered(held) &&
-            !held.finished &&
-            held.error === null &&
-            !held.interrupted &&
-            held.processEndedAt === undefined
-          ) {
-            held.processEndedAt = held.endedAt;
-            state.curInferredStop = held.processEndedAt;
-          }
-          emitClaudeTurn(state, held, maxTurns);
-          const heldParts = held.promptParts ?? [];
-          const own = (ask: TurnAsk) => !heldParts.some((part) => part.text === ask.text && part.at === ask.at);
-          const parts = (cur.promptParts ?? []).filter(own);
-          cur.promptParts = parts;
-          cur.prompt = parts.map((one) => one.text).join('\n\n');
-          cur.laterPrompts = cur.laterPrompts.filter(
-            (ask) => !held.laterPrompts.some((later) => later.text === ask.text && later.at === ask.at),
-          );
-          const start = cur[MEMBERSHIP_START] ?? sourceStart;
-          setSourceRange(cur, start, Math.max(cur[SOURCE_END] ?? start, start));
-        }
-        // Keep the answered command for later model work. Without that work, closure omits its card.
-        cur.finished = true;
-        cur.endedAt = Math.max(cur.endedAt, answer.at);
-        state.curLocalAnswer = true;
-        // The local answer clears pending typed-skill evidence.
-        state.pendingTypedSkill = null;
-        extendSourceRange(cur, sourceStart, sourceEnd);
-      }
+      if (answer) applyClaudeLocalAnswer(state, answer, sourceStart, sourceEnd, maxTurns);
     } catch {
       /* skip malformed line */
     }
@@ -8649,6 +8744,9 @@ function reduceClaudeSessionLine(
   // Main reads exclude sidechain records. Child reads include them.
   if (o.isSidechain && !opts.childTranscript) {
     return;
+  }
+  if (state.curLocalAnswer && state.cur && !claudeModelWorked(state.cur) && claudeModelWorks(o)) {
+    state.cur.finished = false;
   }
   if (state.curInferredStop != null && state.curLocalAnswer && claudeModelWorks(o)) {
     // Model work after the answer makes the command a turn again, so the card it handed back
@@ -8794,8 +8892,9 @@ function reduceClaudeSessionLine(
     setSourceRange(next, carried?.[SOURCE_START] ?? sourceStart, sourceEnd);
     setMembershipStart(next, sourceStart);
     state.cur = next;
-    state.curCommand = claudeRecordId(o);
+    state.curCommand = o.isSidechain && rawText.trim() === '/compact' ? null : claudeRecordId(o);
     state.curLocalAnswer = false;
+    state.curQueuedSinceOpening = false;
     state.curInferredStop = null;
     state.curCarried = carried
       ? {
@@ -9529,6 +9628,7 @@ export function createClaudeSessionReducer(
   state.workedSinceReply ??= false;
   state.curCommand ??= null;
   state.curLocalAnswer ??= false;
+  state.curQueuedSinceOpening ??= false;
   state.curCarried ??= null;
   state.curInferredStop ??= null;
   return {

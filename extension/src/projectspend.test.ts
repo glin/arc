@@ -3677,6 +3677,64 @@ test('an old spend record without a turn count rebuilds once', () => {
   assert.equal(indexSpendFile(rebuilt.record, file, 'w', reducer, 3).rebuilt, false);
 });
 
+test('manual CLI compaction rebuilds generation 38 at unchanged EOF and preserves pending restart state', () => {
+  const directory = dir();
+  const file = path.join(directory, 'compact.jsonl');
+  const storage = dir();
+  const opening = {
+    type: 'user',
+    uuid: 'compact-opening',
+    timestamp: '2026-10-07T09:17:51.416Z',
+    message: { role: 'user', content: '/compact' },
+  };
+  const completion = [
+    {
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: '2026-10-07T09:18:03.839Z',
+      compactMetadata: { trigger: 'manual', preTokens: 62077, postTokens: 4336, durationMs: 12409 },
+    },
+    {
+      type: 'user',
+      isCompactSummary: true,
+      timestamp: '2026-10-07T09:18:03.827Z',
+      message: { role: 'user', content: 'Retained summary' },
+    },
+  ];
+  fs.writeFileSync(file, JSON.stringify(opening) + '\n');
+  const pending = indexSpendFile(undefined, file, 'w', createClaudeUsageLineReducer, 1).record;
+  saveSpendLedger(storage, 'w', [pending]);
+  const loaded = loadSpendLedger(storage, 'w').files[0];
+  assert.equal((loaded.parserState as ClaudeUsageReducerState).currentTurnCompact, true);
+  fs.appendFileSync(file, completion.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const current = indexSpendFile(loaded, file, 'w', createClaudeUsageLineReducer, 2).record;
+  assert.equal(current.turnCount, 0);
+  assert.equal(current.outcome, null);
+  assert.equal(current.compactionCount, 1);
+  const before = fs.statSync(file);
+  saveSpendLedger(storage, 'w', [
+    {
+      ...current,
+      parserGeneration: 38,
+      turnCount: 1,
+      outcome: { finished: false, error: false, interrupted: false, endedAt: Date.parse(opening.timestamp) },
+    },
+  ]);
+  const stale = loadSpendLedger(storage, 'w').files[0];
+  const rebuilt = indexSpendFile(stale, file, 'w', createClaudeUsageLineReducer, 3);
+  assert.equal(rebuilt.rebuilt, true);
+  assert.equal(rebuilt.record.turnCount, 0);
+  assert.equal(rebuilt.record.outcome, null);
+  assert.deepEqual(rebuilt.record.lifetimeBuckets, current.lifetimeBuckets);
+  saveSpendLedger(storage, 'w', [rebuilt.record]);
+  assert.equal(
+    indexSpendFile(loadSpendLedger(storage, 'w').files[0], file, 'w', createClaudeUsageLineReducer, 4).rebuilt,
+    false,
+  );
+  assert.equal(fs.statSync(file).size, before.size);
+  assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+});
+
 test('an older parser generation rebuilds an unchanged source once', () => {
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');

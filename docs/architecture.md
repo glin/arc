@@ -362,6 +362,8 @@ Claude supplemental accounting reads transcript `cost-state` counters and frozen
 
 ## Module boundaries
 
+Claude CLI manual compaction can record a plain command before its boundary, then a wrapped duplicate and user-form stdout. The stdout names the duplicate as its parent. The Claude session reducer tracks prompt arrivals separately because retained queued prompts have a size limit. [Claude turn boundaries](timeline.md#shared-turn-model) owns command withdrawal.
+
 Subagent row names contain absolutely positioned accessible text. The clipped name establishes its positioning box so hidden suffixes cannot widen the page.
 
 The editor boundary is `extension.ts`, `panelhost.ts`, `uris.ts`, and `config.ts`. Other production modules avoid `vscode`, so tests can import their decisions directly. `extension/src/imports.test.ts` enforces package direction and runtime cycles.

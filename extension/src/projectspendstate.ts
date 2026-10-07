@@ -51,6 +51,7 @@ const CLAUDE_STATE_KEYS = {
   currentTurnStartedAt: true,
   currentTurnEndedAt: true,
   currentTurnCommand: true,
+  currentTurnCompact: true,
   currentTurnPrevious: true,
   currentTurnWithdrawn: true,
   currentTurnQueued: true,
@@ -334,6 +335,7 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
     !(value.currentTurnStartedAt === null || timestamp(value.currentTurnStartedAt)) ||
     !(value.currentTurnEndedAt === null || timestamp(value.currentTurnEndedAt)) ||
     !(value.currentTurnCommand === undefined || nullableText(value.currentTurnCommand)) ||
+    !(value.currentTurnCompact === undefined || typeof value.currentTurnCompact === 'boolean') ||
     !(
       value.currentTurnPrevious === undefined ||
       value.currentTurnPrevious === null ||
