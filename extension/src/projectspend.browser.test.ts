@@ -2277,10 +2277,12 @@ test('the rail Project cost box keeps its controls reachable in a short panel', 
         () => true,
         () => false,
       );
+    // The resize places the box from the rail face again before the rail hides, so wait for the compact face.
     assert.ok(
       await settles(`(() => { const pop = document.getElementById('projectspendpop');
-        return !pop.hidden && pop.style.maxHeight !== ${JSON.stringify(limit)}; })()`),
-      `the compact box keeps the rail's ${limit} height limit, or it closed`,
+        const compact = document.querySelector('.projectspendcompacthost .projectspendbutton');
+        return !pop.hidden && !!compact && compact.getClientRects().length > 0 && pop.style.maxHeight === ''; })()`),
+      'the compact box keeps a rail height limit, or it closed',
     );
     for (
       let press = 0;
