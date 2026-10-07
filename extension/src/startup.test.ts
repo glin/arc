@@ -2552,7 +2552,9 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
     checkpointDerivedCache() {},
   });
   listed(rows());
-  let worker = titleWorker();
+  // The byte allowance controls cancellation even when one chunk takes longer than the cooperative deadline.
+  const quantumClock = 'let tick = 0; performance.now = () => ++tick;';
+  let worker = titleWorker(quantumClock);
   let watch: ((result: ProgressiveResult) => void) | undefined;
   provider.progressiveWorker = {
     run: (
@@ -2561,9 +2563,14 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
       signal: AbortSignal,
       accept: (result: ProgressiveResult) => boolean,
     ) =>
-      worker.run(request, generation, signal, (result) => {
-        if (accept(result)) watch?.(result);
-      }),
+      worker.run(
+        request.kind === 'claude-children' ? { ...request, quantumBytes: 1024 * 1024 } : request,
+        generation,
+        signal,
+        (result) => {
+          if (accept(result)) watch?.(result);
+        },
+      ),
   };
   const finished = [files.codexA, files.codexB].map(normalizeFsPath);
   try {
@@ -2592,6 +2599,11 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
     };
     assert.equal(await provider.prepareClaudeChildren(4, followUp.signal), false);
     assert.ok(provider.discoveryCheckpoint, 'the follow-up pass left no partial checkpoint');
+    assert.deepEqual(
+      [...provider.discoveryCheckpoint.completed].sort(),
+      [...finished].sort(),
+      'the partial checkpoint counted a changed source as finished',
+    );
     const cacheFile = path.join(directory, 'checkpoint.json');
     saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries, [], undefined, provider.discoveryCheckpoint);
     const restored = loadDerivedCache(cacheFile);
@@ -2602,7 +2614,7 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
       claudeChildReferenceEntries: restored.claudeChildReferences,
     });
     worker.stop();
-    worker = titleWorker();
+    worker = titleWorker(quantumClock);
     const counts: string[][] = [];
     const resumed = new AbortController();
     watch = (result) => {
@@ -2634,7 +2646,7 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
       claudeChildReferenceEntries: remainder.claudeChildReferences,
     });
     worker.stop();
-    worker = titleWorker();
+    worker = titleWorker(quantumClock);
     const seeded: string[][] = [];
     const codexOnly = new AbortController();
     watch = () => {
