@@ -2298,6 +2298,32 @@ export function finishedATurn(record: Record<string, unknown>): boolean {
   return typeof stop === 'string' && stop.length > 0 && stop !== 'tool_use';
 }
 
+// True for a tool result the harness marked as the end of the turn. A subagent transcript
+// records no stop reason, so its `SubagentHandback` result carries this mark instead.
+function toolEndedATurn(record: Record<string, unknown>): boolean {
+  return record.type === 'user' && record.toolEndsTurn === true;
+}
+
+interface ClaudeWakeOrigin {
+  kind: 'coordinator' | 'peer';
+  from?: unknown;
+  handback?: unknown;
+}
+
+// The origin of a coordinator or peer message, or null for any other origin. These messages
+// wake the agent.
+function claudeWakeOrigin(origin: unknown): ClaudeWakeOrigin | null {
+  const wake = origin as { kind?: unknown } | null | undefined;
+  return wake && typeof wake === 'object' && (wake.kind === 'coordinator' || wake.kind === 'peer')
+    ? (wake as ClaudeWakeOrigin)
+    : null;
+}
+
+// True for a coordinator or peer message. The turn it wakes continues.
+function claudeWakeMessage(record: Record<string, unknown>): boolean {
+  return record.type === 'user' && !!record.isMeta && claudeWakeOrigin(record.origin) !== null;
+}
+
 export function failedATurn(record: Record<string, unknown>): boolean {
   return record.isApiErrorMessage === true;
 }
@@ -2326,6 +2352,7 @@ const RESULT_ID = /"tool_use_id"\s*:\s*"([^"]+)"/;
 // Skip ordinary tool-result lines that contain no fields used by the timeline.
 // `wrote` admits results by call ID, including quiet commits and fast-forward merges.
 // Child reads also admit edit calls and Git commands whose results lack the parent transcript's structured fields.
+// A result that ends the turn is admitted in every transcript, because it decides turn completion.
 function skipsOrdinaryToolResult(line: string, isUser: boolean, wrote?: ReadonlySet<string>): boolean {
   if (!isUser || line.indexOf('"tool_result"') < 0) {
     return false;
@@ -2336,7 +2363,8 @@ function skipsOrdinaryToolResult(line: string, isUser: boolean, wrote?: Readonly
     line.indexOf('"totalToolUseCount"') >= 0 ||
     line.indexOf('"agentId"') >= 0 ||
     line.indexOf('"is_error":true') >= 0 ||
-    line.indexOf('"gitOperation"') >= 0
+    line.indexOf('"gitOperation"') >= 0 ||
+    line.indexOf('"toolEndsTurn"') >= 0
   ) {
     return false;
   }
@@ -2490,6 +2518,8 @@ function outcomeIn(
   let withdrawn: TurnOutcome | null = null;
   // Whether a prompt queued since that answer opened the outcome.
   let queuedSinceAnswer = false;
+  // Whether a result that ends the turn finished the outcome. A wake or later model work resumes it.
+  let toolEnded = false;
   let open: readonly string[] = [];
   let commands: readonly BackgroundCommand[] = [];
   const tasks = new Map<string, string>();
@@ -2529,6 +2559,7 @@ function outcomeIn(
       withdrawn = null;
       queuedSinceAnswer = false;
       outcome = { finished: false, error: false, interrupted: false, endedAt: startedAt, startedAt };
+      toolEnded = false;
       command = claudeRecordId(o);
       compact = claudeCompactPrompt(o);
       modelAnswered = false;
@@ -2553,6 +2584,7 @@ function outcomeIn(
         command = null;
         previous = null;
         queuedSinceAnswer = false;
+        toolEnded = false;
         if (outcome && !modelAnswered && !compactAnswer) {
           outcome = stoppedByLocalAnswer(outcome);
         }
@@ -2569,6 +2601,7 @@ function outcomeIn(
         outcome = { finished: false, error: false, interrupted: false, endedAt: queued.at, startedAt: queued.at };
         modelAnswered = false;
         queuedSinceAnswer = true;
+        toolEnded = false;
       }
       continue;
     }
@@ -2585,6 +2618,7 @@ function outcomeIn(
       command = null;
       previous = null;
       queuedSinceAnswer = false;
+      toolEnded = false;
     }
     const notice = taskNotificationText(o);
     const processEndedAt = claudeProcessEndedAt(o);
@@ -2598,11 +2632,12 @@ function outcomeIn(
     } else {
       addClosedChildNotice(closed, closedIndex, notice, claudeRecordAt(o));
     }
+    // A long child turn can have its prompt before the tail. A stop reason or a result that
+    // ends the turn still gives it an outcome.
     if (
       !outcome &&
       childTranscript &&
-      type === 'assistant' &&
-      (o.message as { stop_reason?: unknown } | undefined)?.stop_reason
+      ((type === 'assistant' && (o.message as { stop_reason?: unknown } | undefined)?.stop_reason) || toolEndedATurn(o))
     ) {
       const at = stamp(o.timestamp);
       outcome = {
@@ -2632,6 +2667,16 @@ function outcomeIn(
         modelAnswered = true;
         continue;
       }
+      if (toolEnded && claudeWakeMessage(o)) {
+        outcome.finished = false;
+        outcome.endedAt = Math.max(outcome.endedAt, at);
+        toolEnded = false;
+      }
+      if (toolEndedATurn(o)) {
+        outcome.finished = true;
+        toolEnded = true;
+        outcome.endedAt = Math.max(outcome.endedAt, at);
+      }
       if (o.toolUseResult && typeof o.toolUseResult === 'object') {
         outcome.endedAt = Math.max(outcome.endedAt, at);
       }
@@ -2655,7 +2700,12 @@ function outcomeIn(
     if (answeredATurn(o)) {
       outcome.error = false;
     }
-    if ((o.message as { stop_reason?: unknown } | undefined)?.stop_reason) {
+    // Model work after a result that ended the turn resumes it, unless its own stop reason
+    // ends it again. Otherwise a record without a stop reason leaves completion unchanged.
+    if (toolEnded) {
+      outcome.finished = finishedATurn(o);
+      toolEnded = false;
+    } else if ((o.message as { stop_reason?: unknown } | undefined)?.stop_reason) {
       outcome.finished = finishedATurn(o);
     }
   }
@@ -6265,6 +6315,9 @@ export interface ClaudeUsageReducerState {
   // queued after it, before model work or a typed prompt, joins that turn, as the full reader
   // puts them on one card. Absent or false otherwise.
   currentTurnQueued?: boolean;
+  // Whether a result that ends the turn finished currentTurnOutcome. A wake or later model work
+  // in the same turn resumes it. Absent or false otherwise.
+  currentTurnToolEnded?: boolean;
   // The index behind currentTurnOutcome.closedChildren. It is rebuilt once after a restore
   // and omitted from snapshots, like seenRequests above.
   closedChildIndex?: Map<string, number>;
@@ -6329,6 +6382,7 @@ function restoreClaudeTurn(state: ClaudeUsageReducerState, turn: ClaudePreviousT
   state.currentTurnCommand = null;
   state.currentTurnPrevious = null;
   state.currentTurnQueued = false;
+  state.currentTurnToolEnded = false;
 }
 
 // Anything that answers the current turn also means no local command answer can withdraw it.
@@ -6532,6 +6586,7 @@ function reduceClaudeTurnRecord(
     state.currentTurnPrevious = copyPreviousTurn(currentClaudeTurn(state));
     state.currentTurnWithdrawn = null;
     state.currentTurnQueued = false;
+    state.currentTurnToolEnded = false;
     if (state.openTurn && state.openTurnAnswered) {
       state.closedTurns++;
     }
@@ -6584,6 +6639,7 @@ function reduceClaudeTurnRecord(
     state.currentTurnCommand = null;
     state.currentTurnPrevious = null;
     state.currentTurnQueued = true;
+    state.currentTurnToolEnded = false;
     state.currentTurnOutcome = {
       finished: false,
       error: false,
@@ -6663,6 +6719,17 @@ function reduceClaudeTurnRecord(
       }
       return;
     }
+    if (state.currentTurnToolEnded && claudeWakeMessage(record) && state.currentTurnOutcome) {
+      state.currentTurnOutcome.finished = false;
+      state.currentTurnOutcome.endedAt = Math.max(state.currentTurnOutcome.endedAt, at);
+      state.currentTurnEndedAt = Math.max(state.currentTurnEndedAt ?? 0, at);
+      state.currentTurnToolEnded = false;
+    }
+    if (toolEndedATurn(record) && state.currentTurnOutcome) {
+      state.currentTurnOutcome.finished = true;
+      state.currentTurnOutcome.endedAt = Math.max(state.currentTurnOutcome.endedAt, at);
+      state.currentTurnToolEnded = true;
+    }
     if (record.toolUseResult && typeof record.toolUseResult === 'object' && state.currentTurnOutcome) {
       state.currentTurnOutcome.endedAt = Math.max(state.currentTurnOutcome.endedAt, at);
     }
@@ -6698,7 +6765,12 @@ function reduceClaudeTurnRecord(
   if (answeredATurn(record) && state.currentTurnOutcome) {
     state.currentTurnOutcome.error = false;
   }
-  if (message?.stop_reason && state.currentTurnOutcome) {
+  // Model work after a result that ended the turn resumes it, unless its own stop reason ends
+  // it again. Otherwise a record without a stop reason leaves completion unchanged.
+  if (state.currentTurnToolEnded && state.currentTurnOutcome) {
+    state.currentTurnOutcome.finished = finishedATurn(record);
+    state.currentTurnToolEnded = false;
+  } else if (message?.stop_reason && state.currentTurnOutcome) {
     state.currentTurnOutcome.finished = finishedATurn(record);
   }
 }
@@ -7140,6 +7212,7 @@ export function createClaudeUsageLineReducer(
             currentTurnPrevious: copyPreviousTurn(restored.currentTurnPrevious),
             currentTurnWithdrawn: copyPreviousTurn(restored.currentTurnWithdrawn),
             ...(restored.currentTurnQueued ? { currentTurnQueued: true } : {}),
+            ...(restored.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
             currentTurnOutcome: copyTurnOutcome(restored.currentTurnOutcome),
             // Only child reads retain request events for replacement. Parent reads discard repeated request keys.
             ...(opts.childTranscript && restored.requestEvents
@@ -7215,6 +7288,7 @@ export function createClaudeUsageLineReducer(
             currentTurnPrevious: copyPreviousTurn(state.currentTurnPrevious),
             currentTurnWithdrawn: copyPreviousTurn(state.currentTurnWithdrawn),
             ...(state.currentTurnQueued ? { currentTurnQueued: true } : {}),
+            ...(state.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
             currentTurnOutcome: copyTurnOutcome(state.currentTurnOutcome),
             ...(state.requestEvents ? { requestEvents: { ...state.requestEvents } } : {}),
           },
@@ -7865,6 +7939,9 @@ export interface ClaudeSessionParserState {
   // The stop time a local command answer gave the unanswered card it handed back, while `cur`
   // is that command. Model work in the command clears it from the newest card again.
   curInferredStop?: number | null;
+  // Whether a result that ends the turn finished `cur`. A wake or later model work in the same
+  // turn resumes it.
+  curToolEnded: boolean;
   queued: TurnAsk[];
   pending: { held: SourcedBuilding | null };
   suppliedTitle: string | null;
@@ -7955,6 +8032,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     curQueuedSinceOpening: false,
     curCarried: null,
     curInferredStop: null,
+    curToolEnded: false,
     queued: [],
     pending: { held: null },
     suppliedTitle,
@@ -8129,6 +8207,7 @@ function trimClaudeBefore(state: ClaudeSessionParserState, offset: number, maxTu
     state.curQueuedSinceOpening = false;
     state.curCarried = null;
     state.curInferredStop = null;
+    state.curToolEnded = false;
     state.currentModelSource = null;
     state.awaited = [];
   }
@@ -8425,6 +8504,7 @@ function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): voi
   state.curQueuedSinceOpening = false;
   state.curCarried = null;
   state.curInferredStop = null;
+  state.curToolEnded = false;
   if (localOnly) {
     // The CLI answered the command itself, so it leaves no card. Words queued ahead of the
     // command, or behind it, go on a card of their own. The command's own text is the last
@@ -8736,7 +8816,7 @@ function reduceClaudeSessionLine(
   }
   // Tool results are the bulk of a transcript and nearly all of its bytes, so a line is
   // only handed to JSON.parse when a cheap substring says it carries something the
-  // timeline reports: an edit, a subagent's result, a failure, or repository output.
+  // timeline reports: an edit, a subagent's result, a failure, repository output, or the end of a turn.
   if (skipsOrdinaryToolResult(line, isUser, state.wrote)) {
     return;
   }
@@ -8902,6 +8982,7 @@ function reduceClaudeSessionLine(
     state.curLocalAnswer = false;
     state.curQueuedSinceOpening = false;
     state.curInferredStop = null;
+    state.curToolEnded = false;
     state.curCarried = carried
       ? {
           turn: carried,
@@ -8962,6 +9043,11 @@ function reduceClaudeSessionLine(
     if (o.isMeta) {
       applyClaudePeerMessage(state, o.origin);
     }
+    if (state.curToolEnded && claudeWakeMessage(o)) {
+      cur.finished = false;
+      cur.endedAt = Math.max(cur.endedAt, stamp(o.timestamp));
+      state.curToolEnded = false;
+    }
     if (interruptedATurn(o)) {
       cur.interrupted = true;
       cur.endedAt = Math.max(cur.endedAt, stamp(o.timestamp));
@@ -9021,6 +9107,12 @@ function reduceClaudeSessionLine(
           message: firstLine(textOf(b.content) || String(b.content ?? '')),
         });
       }
+    }
+    // A subagent records no stop reason. The harness marks the result that ends its turn.
+    if (toolEndedATurn(o)) {
+      cur.finished = true;
+      cur.endedAt = Math.max(cur.endedAt, stamp(o.timestamp));
+      state.curToolEnded = true;
     }
     if (!result || typeof result !== 'object') {
       for (const id of completedToolIds) {
@@ -9120,8 +9212,12 @@ function reduceClaudeSessionLine(
   if (typeof o.effort === 'string' && o.effort) {
     cur.effort = o.effort;
   }
-  // A recorded stop reason updates completion. Missing stop reasons leave the held state unchanged.
-  if (message.stop_reason) {
+  // A recorded stop reason updates completion. Missing stop reasons leave the held state
+  // unchanged, except after a result that ended the turn: model work then resumes it.
+  if (state.curToolEnded) {
+    cur.finished = finishedATurn(o);
+    state.curToolEnded = false;
+  } else if (message.stop_reason) {
     cur.finished = finishedATurn(o);
   }
   const usageEvent = reduceClaudeUsageRecord(
@@ -9464,19 +9560,16 @@ function setClaudeRepeatNotice(state: ClaudeSessionParserState, repeat: boolean)
 // follow-up to its running subagent, wakes that subagent after its `SubagentHandback` call, so
 // the reply to it can be the response. Any other origin changes nothing.
 function applyClaudePeerMessage(state: ClaudeSessionParserState, origin: unknown): void {
-  const peer = origin as { kind?: unknown; from?: unknown; handback?: unknown } | null | undefined;
-  if (peer && typeof peer === 'object' && peer.kind === 'coordinator') {
-    state.handedBack = false;
-    state.closingReply = null;
+  const wake = claudeWakeOrigin(origin);
+  if (!wake) {
     return;
   }
-  if (!peer || typeof peer !== 'object' || peer.kind !== 'peer') {
-    return;
+  if (wake.kind === 'peer') {
+    if (wake.handback === true && typeof wake.from === 'string' && wake.from) {
+      state.handbacks.set(wake.from, false);
+    }
+    setClaudeRepeatNotice(state, false);
   }
-  if (peer.handback === true && typeof peer.from === 'string' && peer.from) {
-    state.handbacks.set(peer.from, false);
-  }
-  setClaudeRepeatNotice(state, false);
   state.handedBack = false;
   state.closingReply = null;
 }
@@ -9637,6 +9730,7 @@ export function createClaudeSessionReducer(
   state.curQueuedSinceOpening ??= false;
   state.curCarried ??= null;
   state.curInferredStop ??= null;
+  state.curToolEnded ??= false;
   return {
     pushLine: (line) => reduceClaudeSessionLine(state, line, sessionId, opts),
     retainedBytes: () => retainedParserPayload(state),

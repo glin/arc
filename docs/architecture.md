@@ -130,6 +130,8 @@ Written folderless partitions remain on Windows, macOS, and Linux. Node exposes 
 
 Closed Claude subagents reopen only when a user or assistant timestamp exceeds their close by more than one second. File writes and system bookkeeping never establish resumed work. On a changed version, the host scans disjoint 256 KiB chunks backward and reconstructs split records to find the maximum work timestamp. Read buffers hold a chunk and its unfinished record. The host caches absent timestamps too. An unchanged closed child costs no transcript read.
 
+The line filter in `transcript.ts` that keeps ordinary tool results out of JSON parsing must admit a result marked `toolEndsTurn`. A dropped result leaves a subagent session running, then stopped, and never done.
+
 Direct child activity is only a temporary overlay on the newest turn. Stable protocol ids let the transcript copy replace it. Work started in another window or terminal still comes from the transcript because this host does not own that process.
 
 Hosts record bounded usage history asynchronously and preserve duplicate readings. Each slot permits 4 MiB of compressed payload and 8 KiB of metadata, temporary, and lock bytes. A fixed format file keeps protocol-created logical content below 128 MiB. This limit excludes filesystem allocation and files added by external actors. The raw allowance is 64 MiB per UTC day. Retained dates are today and the preceding twenty-nine UTC dates. Project cost uses local calendar dates.

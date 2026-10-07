@@ -2756,13 +2756,15 @@ test('a note written after a subagent repeats its completion notice leaves the r
   assert.equal(searchableSummary(t).split(REPORT).length, 2, 'the search text holds the report once');
 });
 
-// A `SubagentHandback` call and its tool result, which carries no `toolUseResult`.
-function handBack(message: unknown, second: number, id = `tu-handback-${second}`) {
+// A `SubagentHandback` call and its tool result, which carries no `toolUseResult`. With
+// `endsTurn`, the result carries the `toolEndsTurn` flag the harness writes on it.
+function handBack(message: unknown, second: number, id = `tu-handback-${second}`, endsTurn = false) {
   return [
     assistantTool('SubagentHandback', second, id, { message }),
     {
       type: 'user',
       timestamp: at(second + 1),
+      ...(endsTurn ? { toolEndsTurn: true } : {}),
       message: {
         role: 'user',
         content: [
@@ -2852,6 +2854,116 @@ for (const [wake, record, answered] of [
     assert.equal(t.summary, answered ? reply : REPORT);
   });
 }
+
+// A subagent transcript records `stop_reason: null` on every assistant record. The harness
+// marks the hand-back's tool result with `toolEndsTurn` instead.
+function withNullStopReasons(records: object[]): object[] {
+  return records.map((record) => {
+    const one = record as { type?: unknown; message?: Record<string, unknown> };
+    return one.type === 'assistant' ? { ...one, message: { ...one.message, stop_reason: null } } : record;
+  });
+}
+const MINUTE = 60_000;
+
+test('a subagent that hands back with the turn-ending flag reads done in every reader', () => {
+  const records = withNullStopReasons([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    assistantTool('Grep', 1, 'tu-grep'),
+    toolResult('tu-grep', 2),
+    ...handBack(REPORT, 5, undefined, true),
+  ]);
+  for (const minutes of [30, 61]) {
+    const read = localAnswerStatuses(records, ms(6) + minutes * MINUTE, minutes === 30, { childTranscript: true });
+    assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done'], `${minutes} minutes after`);
+    assert.deepEqual(
+      [read.turns[0]?.endedAt, read.railOutcome?.endedAt, read.indexOutcome?.endedAt],
+      [ms(6), ms(6), ms(6)],
+      'the turn did not end at the flagged result',
+    );
+  }
+});
+
+test('the turn-ending flag finishes a main transcript turn whose result names no agent', () => {
+  const records = withNullStopReasons([
+    userPrompt('Report the cache fields.', 0),
+    ...handBack(REPORT, 1, undefined, true),
+  ]);
+  assert.ok(!JSON.stringify(records).includes('agentId'));
+  const read = localAnswerStatuses(records, ms(2) + 30 * MINUTE, true);
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+});
+
+for (const [resumption, wake] of [
+  ['a coordinator message', [metaUser('Commit the tests.', 8, { kind: 'coordinator' })]],
+  ['a peer message', [metaUser('Also list the writers.', 8, { kind: 'peer', from: 'lead' })]],
+  ['tool work', [assistantTool('Bash', 9, 'tu-commit')]],
+  [
+    'a coordinator message and tool work',
+    [metaUser('Commit the tests.', 8, { kind: 'coordinator' }), assistantTool('Bash', 9, 'tu-commit')],
+  ],
+] as const) {
+  test(`${resumption} after a flagged hand-back resumes the subagent turn in every reader`, () => {
+    const records = withNullStopReasons([
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      ...handBack(REPORT, 5, undefined, true),
+      ...wake,
+    ]);
+    const read = localAnswerStatuses(records, ms(9) + 30 * MINUTE, true, { childTranscript: true });
+    assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+  });
+}
+
+for (const origin of [{ kind: 'coordinator' }, { kind: 'peer', from: 'lead' }]) {
+  test(`a ${origin.kind} message two hours after a flagged hand-back resumes the subagent turn from the message`, () => {
+    const woke = 6 + 2 * 60 * 60;
+    const records = withNullStopReasons([
+      userPrompt('Find where the usage cache lives and report its fields.', 0),
+      ...handBack(REPORT, 5, undefined, true),
+      metaUser('Commit the tests.', woke, origin),
+    ]);
+    const read = localAnswerStatuses(records, ms(woke) + 30 * MINUTE, true, { childTranscript: true });
+    assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
+    assert.deepEqual(
+      [read.turns[0]?.endedAt, read.railOutcome?.endedAt, read.indexOutcome?.endedAt],
+      [ms(woke), ms(woke), ms(woke)],
+      'the resumed turn did not move its activity time to the message',
+    );
+  });
+}
+
+test('an answer that ends the turn after a flagged hand-back keeps the turn done in every reader', () => {
+  const records = [
+    userPrompt('Report the cache fields.', 0),
+    ...handBack(REPORT, 1, undefined, true),
+    assistantAnswer('The report went to the lead.', 3),
+  ];
+  const read = localAnswerStatuses(records, ms(3) + 30 * MINUTE, true);
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+});
+
+test('a long subagent transcript whose prompt is outside the tail window reads done after a flagged hand-back', () => {
+  const work = Array.from({ length: 12 }, (_, i) =>
+    assistantTool('Read', 1 + i, `tu-read-${i}`, { note: 'x'.repeat(2000) }),
+  );
+  const records = withNullStopReasons([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    ...work,
+    ...handBack(REPORT, 20, undefined, true),
+  ]);
+  const read = localAnswerStatuses(records, ms(21) + 30 * MINUTE, false, { childTranscript: true, tailBytes: 4096 });
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+});
+
+test('a subagent turn without the turn-ending flag reads running, then stopped', () => {
+  const records = withNullStopReasons([
+    userPrompt('Find where the usage cache lives and report its fields.', 0),
+    ...handBack(REPORT, 5),
+  ]);
+  const soon = localAnswerStatuses(records, ms(6) + 30 * MINUTE, false, { childTranscript: true });
+  assert.deepEqual([soon.full, soon.rail, soon.index], ['running', 'running', 'running']);
+  const late = localAnswerStatuses(records, ms(6) + 61 * MINUTE, false, { childTranscript: true });
+  assert.deepEqual([late.full, late.rail, late.index], ['stopped', 'stopped', 'stopped']);
+});
 
 test('a second hand-back in one turn makes the later report the response', () => {
   const later = 'The writers are the poller and the status hook.';
@@ -9464,23 +9576,31 @@ const renameRecords = (): object[] => [
 
 const AFTER_COMMAND = ms(2) + 60_000;
 
-// What each reader of the newest turn's outcome says about it at one clock.
-function localAnswerStatuses(records: object[], now = AFTER_COMMAND, sessionSnapshots = false) {
+// What each reader of the newest turn's outcome says about it at one clock. `childTranscript`
+// marks every record as a sidechain record and reads the file as a subagent's own transcript.
+// `tailBytes` narrows the session metadata read to that many bytes from the end.
+function localAnswerStatuses(
+  input: object[],
+  now = AFTER_COMMAND,
+  sessionSnapshots = false,
+  { childTranscript = false, tailBytes = 256 * 1024 }: { childTranscript?: boolean; tailBytes?: number } = {},
+) {
+  const records = childTranscript ? input.map((record) => ({ ...record, isSidechain: true })) : input;
   const file = writeTranscript(records);
-  const turns = readSession(file, 'sess').turns;
-  const rail = readSessionMeta(file).outcome;
-  const indexed = createClaudeUsageLineReducer();
+  const turns = readSession(file, 'sess', { childTranscript }).turns;
+  const rail = readSessionMeta(file, tailBytes, '', childTranscript).outcome;
+  const indexed = createClaudeUsageLineReducer(undefined, { childTranscript });
   for (const record of records) {
     indexed.pushLine(JSON.stringify(record));
   }
   const newest = indexed.newestTurnOutcome();
   // An index saved and restored between any two records reads the same newest turn and count.
   for (let split = 1; split < records.length; split++) {
-    const first = createClaudeUsageLineReducer();
+    const first = createClaudeUsageLineReducer(undefined, { childTranscript });
     for (const record of records.slice(0, split)) {
       first.pushLine(JSON.stringify(record));
     }
-    const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())));
+    const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())), { childTranscript });
     for (const record of records.slice(split)) {
       resumed.pushLine(JSON.stringify(record));
     }
@@ -9490,9 +9610,9 @@ function localAnswerStatuses(records: object[], now = AFTER_COMMAND, sessionSnap
       `an index restored after record ${split} reads the turns differently`,
     );
     if (sessionSnapshots) {
-      const session = createClaudeSessionReducer('sess');
+      const session = createClaudeSessionReducer('sess', { childTranscript });
       records.slice(0, split).forEach((record) => session.pushLine(JSON.stringify(record)));
-      const restored = createClaudeSessionReducer('sess', {}, structuredClone(session.snapshot()));
+      const restored = createClaudeSessionReducer('sess', { childTranscript }, structuredClone(session.snapshot()));
       records.slice(split).forEach((record) => restored.pushLine(JSON.stringify(record)));
       assert.deepEqual(
         restored.read().turns,
