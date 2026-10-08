@@ -100,7 +100,7 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Codex live skill catalog | `skills/list` on a connected app-server child, refreshed after `skills/changed` | The complete Codex command and skill list the Prompt box offers for that child's working directory |
 | Codex rollouts | `${CODEX_HOME:-~/.codex}/sessions/YYYY/MM/DD/*.jsonl` | The Codex form of the same turn record, including recent compaction request usage and shell-command dispatch receipts from each command's own stdout |
 | Claude print results in Codex commands | The completed `CommandExecution` inside its parent Codex rollout | Shell-child ownership, recorded model usage, duration, session identity, and list-price cost |
-| Agent child stdio | Process owned by the current extension host | Temporary live narration and activity before the disk record catches up |
+| Agent child stdio | Process owned by the current extension host | Temporary live narration and activity before the disk record catches up, and the live session's busy state and turn endings |
 | Claude attribution selection | Editor environment or `.env` in the child's working directory | The local request attribution selection described in [Agent launch commands](agent-protocols.md#claude-attribution-selection) |
 | Panel launch record | VS Code workspace state, beside the saved panel state | Which sessions the reader started from this panel |
 | Codex session index | `~/.codex/session_index.jsonl` | Thread names, which may arrive after a rollout stops changing |

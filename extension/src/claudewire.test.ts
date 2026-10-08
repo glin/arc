@@ -404,6 +404,23 @@ test('an init message with an explicit empty skill list reports it as a real ans
   );
 });
 
+test('the session state report reads idle, running and a turn waiting on a permission answer', () => {
+  const h = harness();
+  for (const state of ['running', 'requires_action', 'idle', 'unknown']) {
+    h.wire.receive(JSON.stringify({ type: 'system', subtype: 'session_state_changed', state, session_id: SESSION }));
+  }
+  h.wire.receive(JSON.stringify({ type: 'system', subtype: 'session_state_changed', session_id: SESSION }));
+  assert.deepEqual(
+    h.events.filter((e) => e.kind === 'sessionState'),
+    [
+      { kind: 'sessionState', state: 'running' },
+      { kind: 'sessionState', state: 'running' },
+      { kind: 'sessionState', state: 'idle' },
+    ],
+    'a state the CLI reported was dropped, or a state it never names was guessed',
+  );
+});
+
 test('a non-string skill entry is dropped rather than carried as a name', () => {
   const h = harness();
   h.wire.receive(
@@ -554,8 +571,13 @@ test('answering an ask that is not pending is reported rather than written to th
 test('an interrupted turn is not reported as a failure', () => {
   const h = harness();
   h.wire.receive(INTERRUPTED_RESULT);
-  const end = h.events.find((e) => e.kind === 'turnEnd') as { kind: 'turnEnd'; outcome: TurnOutcome };
-  assert.equal(end.outcome.status, 'interrupted');
+  // A Stop while a tool runs ends with aborted_tools.
+  h.wire.receive(INTERRUPTED_RESULT.replace('aborted_streaming', 'aborted_tools'));
+  const ends = h.events.filter((e) => e.kind === 'turnEnd') as { kind: 'turnEnd'; outcome: TurnOutcome }[];
+  assert.deepEqual(
+    ends.map((end) => end.outcome.status),
+    ['interrupted', 'interrupted'],
+  );
 });
 
 test('a turn that really failed is, and a plain turn carries its cost and text', () => {

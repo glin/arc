@@ -86,7 +86,8 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-// Stop results use terminal_reason: aborted_streaming. The wire reads that outcome as interrupted.
+// Stop results use terminal_reason: aborted_streaming, or aborted_tools when a tool was running.
+// The wire reads both outcomes as interrupted.
 
 const ABORTED_RESULT =
   JSON.stringify({
@@ -94,6 +95,15 @@ const ABORTED_RESULT =
     subtype: 'error_during_execution',
     is_error: true,
     terminal_reason: 'aborted_streaming',
+    result: '',
+  }) + '\n';
+const ABORTED_TOOLS_RESULT =
+  JSON.stringify({
+    type: 'result',
+    subtype: 'error_during_execution',
+    is_error: true,
+    stop_reason: 'tool_use',
+    terminal_reason: 'aborted_tools',
     result: '',
   }) + '\n';
 const COMPLETED_RESULT =
@@ -894,6 +904,338 @@ test('a busy Claude session accepts another prompt and stays busy through both t
   );
   assert.equal(session.state().busy, false);
   assert.equal(events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, secondTurnId);
+});
+
+// Claude's session state report, as the CLI writes it with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`.
+const sessionState = (state: string) =>
+  JSON.stringify({ type: 'system', subtype: 'session_state_changed', state }) + '\n';
+
+async function claudeSessionOpen() {
+  const fake = fakeHost();
+  const starting = fake.host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  const child = fake.children[0];
+  child.answerHandshake();
+  return { ...fake, child, session: await starting };
+}
+
+function idleReports(events: SessionEvent[]): (readonly number[] | undefined)[] {
+  return events.flatMap((entry) =>
+    entry.event.kind === 'sessionState' && entry.event.state === 'idle' ? [entry.event.settledTurnIds] : [],
+  );
+}
+
+test('a prompt that joins a running Claude turn ends when Claude reports idle', async () => {
+  const { child, session, events } = await claudeSessionOpen();
+  const firstTurnId = await session.prompt('first');
+  child.say(sessionState('running'));
+  const joinedTurnId = await session.prompt('joined');
+  void session.setEffort('low');
+  child.say(COMPLETED_RESULT);
+  assert.equal(events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, firstTurnId);
+  assert.equal(session.state().busy, true, 'the session read idle before Claude said so');
+  assert.deepEqual(effortSends(child), [], 'the held pick went out before Claude finished');
+
+  child.say(sessionState('idle'));
+  assert.deepEqual(idleReports(events), [[joinedTurnId]], 'the idle report did not name the joined prompt it ended');
+  assert.deepEqual(effortSends(child), ['/effort low'], 'the held pick never went out once the session was idle');
+  await tick();
+  child.say(COMPLETED_RESULT);
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false, 'the joined prompt kept the session busy after Claude went idle');
+  assert.deepEqual(idleReports(events).at(-1), [], 'a repeated idle report ended a turn again');
+
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  assert.deepEqual(await stopping, [], 'Stop still names a joined prompt the idle report ended');
+  await session.compact();
+  assert.equal(sentTexts(child).at(-1), '/compact');
+  assert.equal(session.state().busy, true);
+  child.say(sessionState('running'));
+  child.say(COMPLETED_RESULT);
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false);
+});
+
+test('a turn Claude starts by itself keeps the session busy until Claude reports idle', async () => {
+  const { child, session } = await claudeSessionOpen();
+  child.say(sessionState('running'));
+  assert.equal(session.state().busy, true, 'a background task notification turn read as idle');
+  child.say(COMPLETED_RESULT);
+  assert.equal(session.state().busy, true);
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false);
+});
+
+test('a Claude idle report leaves a prompt that is still being prepared open', async () => {
+  let accept: (() => void) | undefined;
+  let emit: ((event: WireEvent) => void) | undefined;
+  const plan: AgentPlan = {
+    agent: 'claude',
+    sessionId: 'session',
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: (_send, emitted) => {
+      emit = emitted;
+      return {
+        receive: () => undefined,
+        open: () => Promise.resolve([]),
+        prompt: () =>
+          new Promise<void>((resolve) => {
+            accept = resolve;
+          }),
+        compact: () => Promise.resolve(),
+        clear: () => Promise.resolve(),
+        answer: () => false,
+        interrupt: () => Promise.resolve(),
+        sessionId: () => 'session',
+        close: () => undefined,
+        interruptClearsOpenTurns: true,
+      };
+    },
+  };
+  const child = new FakeChild();
+  const reported: Array<{ event: WireEvent; turnId?: number }> = [];
+  const session = new AgentSession(
+    'preparing-idle',
+    plan,
+    () => child,
+    (event, turnId) => reported.push({ event, turnId }),
+    () => undefined,
+  );
+  await session.start();
+  const prompt = session.prompt('attachment prompt');
+  emit?.({ kind: 'sessionState', state: 'idle' });
+  assert.equal(session.state().busy, true, 'an idle report for earlier work ended a prompt still being prepared');
+  accept?.();
+  await prompt;
+  assert.equal(session.state().busy, true);
+  emit?.({ kind: 'sessionState', state: 'idle' });
+  assert.equal(session.state().busy, true, 'an idle report written before the CLI took the prompt ended it');
+  assert.deepEqual(
+    reported.map((entry) => entry.event),
+    [
+      { kind: 'sessionState', state: 'idle', settledTurnIds: [] },
+      { kind: 'sessionState', state: 'idle', settledTurnIds: [] },
+    ],
+  );
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+test('a prompt that reaches Claude between its result and its idle report keeps its own turn', async () => {
+  const { child, session, events } = await claudeSessionOpen();
+  const delta = (text: string) =>
+    child.say(
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+      }) + '\n',
+    );
+  const lastTurn = (kind: string) => events.filter((entry) => entry.event.kind === kind).at(-1)?.turnId;
+  await session.prompt('first');
+  child.say(sessionState('running'));
+  child.say(COMPLETED_RESULT);
+  const newer = await session.prompt('newer');
+  // The idle report for the first prompt was already on its way when the newer prompt went out.
+  child.say(sessionState('idle'));
+  assert.deepEqual(idleReports(events), [[]], 'the idle report for the first prompt settled the newer one');
+  assert.equal(session.state().busy, true, 'the newer prompt read idle before Claude took it');
+  child.say(sessionState('running'));
+  delta('Newer');
+  assert.equal(lastTurn('delta'), newer, 'the newer reply streamed to no turn');
+  child.say(COMPLETED_RESULT);
+  assert.equal(lastTurn('turnEnd'), newer, 'the newer prompt never got its own ending');
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false);
+
+  await session.prompt('third');
+  child.say(sessionState('running'));
+  child.say(COMPLETED_RESULT);
+  const late = await session.prompt('late');
+  child.say(sessionState('idle'));
+  child.say(sessionState('running'));
+  const stopping = session.interrupt();
+  child.answerControl('interrupt', {});
+  assert.deepEqual(await stopping, [late], 'Stop did not name the prompt it stopped');
+});
+
+test('a Claude effort pick held across an accepted Stop keeps its own turn', async () => {
+  const endings = (events: SessionEvent[]) =>
+    events.filter((entry) => entry.event.kind === 'turnEnd').map((entry) => entry.turnId);
+  const holdAndStop = async () => {
+    const opened = await claudeSessionOpen();
+    await opened.session.prompt('first');
+    opened.child.say(sessionState('running'));
+    void opened.session.setEffort('low');
+    const stopping = opened.session.interrupt();
+    opened.child.answerControl('interrupt', {});
+    await stopping;
+    assert.deepEqual(effortSends(opened.child), ['/effort low'], 'the held pick did not go out once Stop was accepted');
+    await tick();
+    return opened;
+  };
+
+  // Claude takes the effort command after the aborted result, and reports idle only after the command's result.
+  const queued = await holdAndStop();
+  queued.child.say(ABORTED_TOOLS_RESULT);
+  assert.equal(queued.session.state().busy, true, 'the Stop ending was taken for the effort command');
+  queued.child.say(COMPLETED_RESULT);
+  queued.child.say(sessionState('idle'));
+  const [stopped, effort] = endings(queued.events);
+  assert.equal(stopped, undefined, 'the Stop ending was taken for the effort command');
+  assert.notEqual(effort, undefined, 'the effort command never got its own ending');
+  assert.deepEqual(idleReports(queued.events), [[]]);
+  assert.equal(queued.session.state().busy, false);
+
+  // Claude wrote the aborted result and its idle report before it read the effort command.
+  const early = await holdAndStop();
+  early.child.say(ABORTED_RESULT);
+  early.child.say(sessionState('idle'));
+  assert.deepEqual(idleReports(early.events), [[]], 'the idle report for the stopped work settled the effort command');
+  assert.equal(early.session.state().busy, true, 'the session read idle while the effort command was on its way');
+  const compaction = await early.session.compact();
+  early.child.say(sessionState('running'));
+  early.child.say(COMPLETED_RESULT);
+  early.child.say(COMPLETED_RESULT);
+  assert.equal(endings(early.events).at(-1), compaction, 'the effort result was taken for the compaction');
+  early.child.say(sessionState('idle'));
+  assert.equal(early.session.state().busy, false);
+});
+
+const turnEnds = (events: SessionEvent[]) =>
+  events.filter((entry) => entry.event.kind === 'turnEnd').map((entry) => entry.turnId);
+
+// A task notification starts a Claude turn with no open turn behind it. The reader stops it.
+async function stopNotificationTurn(opened: Awaited<ReturnType<typeof claudeSessionOpen>>) {
+  const stopping = opened.session.interrupt();
+  opened.child.answerControl('interrupt', {});
+  assert.deepEqual(await stopping, [], 'Stop named a turn the reader never sent');
+}
+
+test('an effort pick held through a Stop of a turn Claude started by itself keeps its own turn', async () => {
+  const held = await claudeSessionOpen();
+  held.child.say(sessionState('running'));
+  void held.session.setEffort('low');
+  assert.deepEqual(effortSends(held.child), [], 'the pick went out while the notification turn ran');
+  await stopNotificationTurn(held);
+  assert.deepEqual(effortSends(held.child), ['/effort low'], 'the held pick did not go out once Stop was accepted');
+  await tick();
+  held.child.say(ABORTED_RESULT);
+  assert.equal(
+    held.session.state().busy,
+    true,
+    'the aborted notification turn ended the effort command, so a queued compaction would go out early',
+  );
+  held.child.say(COMPLETED_RESULT);
+  const [stopped, effort] = turnEnds(held.events);
+  assert.equal(stopped, undefined, 'the Stop ending was taken for the effort command');
+  assert.notEqual(effort, undefined, 'the effort command never got its own ending');
+  held.child.say(sessionState('idle'));
+  assert.equal(held.session.state().busy, false);
+});
+
+test('a prompt sent after a Stop of a turn Claude started by itself keeps its reply and its ending', async () => {
+  const plain = await claudeSessionOpen();
+  plain.child.say(sessionState('running'));
+  await stopNotificationTurn(plain);
+  const after = await plain.session.prompt('after stop');
+  plain.child.say(ABORTED_RESULT);
+  assert.equal(plain.session.state().busy, true, 'the aborted notification turn ended a prompt sent after the Stop');
+  plain.child.say(
+    JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'After' } },
+    }) + '\n',
+  );
+  assert.equal(
+    plain.events.filter((entry) => entry.event.kind === 'delta').at(-1)?.turnId,
+    after,
+    'the reply to a prompt sent after the Stop streamed to no turn',
+  );
+  plain.child.say(COMPLETED_RESULT);
+  assert.equal(turnEnds(plain.events).at(-1), after, 'the prompt sent after the Stop never got its own ending');
+  plain.child.say(sessionState('idle'));
+  assert.equal(plain.session.state().busy, false);
+});
+
+test('Claude Stop, accepted or refused, settles joined prompts with the idle report after it', async () => {
+  const accepted = await claudeSessionOpen();
+  await accepted.session.prompt('first');
+  accepted.child.say(sessionState('running'));
+  await accepted.session.prompt('joined');
+  const stopping = accepted.session.interrupt();
+  accepted.child.answerControl('interrupt', {});
+  await stopping;
+  assert.equal(accepted.session.state().busy, false, 'an accepted Stop waited for the CLI to say it was idle');
+  accepted.child.say(ABORTED_RESULT);
+  accepted.child.say(sessionState('idle'));
+  const after = await accepted.session.prompt('after stop');
+  accepted.child.say(sessionState('running'));
+  accepted.child.say(ABORTED_RESULT);
+  assert.equal(
+    accepted.events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId,
+    after,
+    'the ending the idle report settled was owed again to a prompt sent after it',
+  );
+  accepted.child.say(sessionState('idle'));
+  assert.equal(accepted.session.state().busy, false);
+
+  const refused = await claudeSessionOpen();
+  await refused.session.prompt('first');
+  refused.child.say(sessionState('running'));
+  await refused.session.prompt('joined');
+  const refusing = refused.session.interrupt();
+  refused.child.rejectControl('interrupt', 'not now');
+  await assert.rejects(refusing, /not now/);
+  assert.equal(refused.session.state().busy, true, 'a refused Stop cleared work that is still running');
+  refused.child.say(
+    JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'failed' }) + '\n',
+  );
+  assert.equal(refused.session.state().busy, true);
+  refused.child.say(sessionState('idle'));
+  assert.equal(refused.session.state().busy, false, 'a turn that ended in an error kept its joined prompt busy');
+});
+
+test('a Claude child that exits while running leaves a restarted session idle', async () => {
+  const { host, children, child, session } = await claudeSessionOpen();
+  await session.prompt('first');
+  child.say(sessionState('running'));
+  await session.prompt('joined');
+  child.exit(1);
+  assert.equal(session.state().busy, false);
+  const restarting = host.session('one', claudePlan(CLAUDE, { cwd: WS }));
+  children[1].answerHandshake();
+  const restarted = await restarting;
+  assert.notEqual(restarted, session);
+  assert.equal(restarted.state().busy, false);
+  children[1].say(sessionState('idle'));
+  assert.equal(restarted.state().busy, false);
+});
+
+test('a Claude clear and a failed compaction after joined prompts end with the idle report', async () => {
+  const { child, session } = await claudeSessionOpen();
+  await session.prompt('first');
+  child.say(sessionState('running'));
+  await session.prompt('joined');
+  await session.clear();
+  child.say(COMPLETED_RESULT);
+  child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'successor' }) + '\n');
+  child.say(COMPLETED_RESULT);
+  assert.equal(session.state().busy, true, 'the clear ending was taken for the joined prompt');
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false, 'the session replaced by clear stayed busy');
+  assert.equal(session.state().sessionId, 'successor');
+
+  await session.compact();
+  child.say(sessionState('running'));
+  child.say(
+    JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'too short' }) + '\n',
+  );
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false, 'a failed compaction left the session busy');
 });
 
 test('Claude turn identity follows wire acceptance when a later prompt is accepted first', async () => {
@@ -3109,8 +3451,8 @@ test('what a launch asks for in the environment reaches the child it starts', as
   await first;
   assert.deepEqual(
     envs[0],
-    { CODEX_MANAGED_BY_NPM: '1' },
-    'the agent is otherwise told nothing about how it was installed',
+    { CODEX_MANAGED_BY_NPM: '1', CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' },
+    'the agent is otherwise told nothing about how it was installed, and Claude is asked to report when it goes idle',
   );
 
   const second = host.session('two', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));

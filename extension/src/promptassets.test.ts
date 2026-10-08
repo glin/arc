@@ -105,6 +105,11 @@ test('Claude completion releases its exact batch and Stop releases every batch',
   assert.deepEqual(promptAssetReleaseIndexes([21, 22, 23], true), [0, 1, 2]);
 });
 
+test('a Claude idle report releases every batch it settled and none sent after it', () => {
+  assert.deepEqual(promptAssetReleaseIndexes([21, null, 22, 23], false, [21, 22]), [0, 2]);
+  assert.deepEqual(promptAssetReleaseIndexes([21, 22], false, []), []);
+});
+
 test('a completion arriving during acceptance stays with that attachment handoff', () => {
   const completions = new PromptAssetCompletionBook();
   completions.complete('session');

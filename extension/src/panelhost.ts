@@ -5411,20 +5411,22 @@ export class PanelProvider implements vscode.Disposable {
     this.deferredAssetDeletes[session] = [...(this.deferredAssetDeletes[session] ?? []), { turnId, assets: [] }];
   }
 
-  public releaseDeliveredPromptAssets(session: string, all: boolean = false, endedTurnId?: number): void {
+  // `ended` names one turn a result closed, or every turn an idle report settled.
+  public releaseDeliveredPromptAssets(session: string, all: boolean = false, ended?: number | readonly number[]): void {
     if (all) {
       this.assetCompletions.complete(session);
     }
     const batches = this.deferredAssetDeletes[session] ?? [];
-    const release = promptAssetReleaseIndexes(
-      batches.map((batch) => batch.turnId),
-      all,
-      endedTurnId,
-    );
-    if (!release.length) {
-      if (endedTurnId !== undefined) {
-        this.completedAssetTurns.add(endedTurnId);
+    const batchTurnIds = batches.map((batch) => batch.turnId);
+    const release = promptAssetReleaseIndexes(batchTurnIds, all, ended);
+    // A turn whose batch is not booked yet releases that batch when it arrives.
+    const endedTurnIds = ended === undefined ? [] : typeof ended === 'number' ? [ended] : ended;
+    if (!release.length || !all) {
+      for (const id of endedTurnIds) {
+        if (!batchTurnIds.includes(id)) this.completedAssetTurns.add(id);
       }
+    }
+    if (!release.length) {
       return;
     }
     if (!this.attachmentStorageDir) {

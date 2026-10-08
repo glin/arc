@@ -403,12 +403,17 @@ function readQuestions(v: unknown): Question[] {
   return out;
 }
 
-// Claude reports interrupts as failed results. `aborted_streaming` and `aborted` take precedence over `is_error`.
+// Claude reports interrupts as failed results. `aborted_streaming`, `aborted_tools` and `aborted` take precedence over `is_error`.
+// A Stop while a tool runs ends with `aborted_tools`.
 function readOutcome(m: Json): TurnOutcome {
   const terminal = str(m.terminal_reason);
   const failed = m.is_error === true;
   const status: TurnOutcome['status'] =
-    terminal === 'aborted_streaming' || terminal === 'aborted' ? 'interrupted' : failed ? 'error' : 'ok';
+    terminal === 'aborted_streaming' || terminal === 'aborted_tools' || terminal === 'aborted'
+      ? 'interrupted'
+      : failed
+        ? 'error'
+        : 'ok';
   const denied: string[] = [];
   for (const entry of arr(m.permission_denials)) {
     const d = obj(entry);
@@ -746,6 +751,15 @@ export class ClaudeWire {
         const subtype = str(m.subtype);
         if (subtype === 'thinking_tokens') {
           this.emit({ kind: 'thinking' });
+        }
+        // Sent only when the child runs with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`. `idle` follows
+        // the last `result` once no prompt waits in the CLI, and it does not wait for background
+        // tasks. `requires_action` is a running turn that waits on a permission answer.
+        if (subtype === 'session_state_changed') {
+          const state = str(m.state);
+          if (state === 'idle') this.emit({ kind: 'sessionState', state: 'idle' });
+          else if (state === 'running' || state === 'requires_action')
+            this.emit({ kind: 'sessionState', state: 'running' });
         }
         // The CLI sends `init` after the first prompt and repeats it for local commands.
         // Read its skill catalog whenever present. A missing or non-array `skills` value emits no catalog event.

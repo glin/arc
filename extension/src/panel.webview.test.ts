@@ -280,6 +280,8 @@ import {
   liveMcpTarget,
   retireDraftProfile,
   freshHostKey,
+  AgentSession,
+  claudePlan,
 } from './agenthost.ts';
 import { USAGE_AGENT_ORDER } from './usageview.ts';
 import { missingSetupValues } from './domain/session-setups.ts';
@@ -16030,12 +16032,12 @@ test('pasted and dropped files use the staged byte bridge without changing text 
   const releaseBody = memberFrom(panelHostSource, releaseAt);
   sourceMatch(
     releaseBody,
-    /promptAssetReleaseIndexes\([\s\S]*batch\.turnId\)[\s\S]*endedTurnId/,
+    /batches\.map\(\(batch\) => batch\.turnId\)[\s\S]*promptAssetReleaseIndexes\(batchTurnIds, all, ended\)/,
     'Claude turn end does not select the attachment batch owned by its exact submission',
   );
   sourceMatch(
     releaseBody,
-    /completedAssetTurns\.add\(endedTurnId\)/,
+    /if \(!batchTurnIds\.includes\(id\)\) this\.completedAssetTurns\.add\(id\)/,
     'a result that precedes its delivery answer cannot wait for that exact submission',
   );
   sourceMatch(
@@ -16047,6 +16049,11 @@ test('pasted and dropped files use the staged byte bridge without changing text 
     extensionSource,
     /panel\.releaseDeliveredPromptAssets\([\s\S]*ended, turnEndCompletesEveryPrompt\(agent \?\? ''\), turnId/,
     'turn end does not carry its exact Claude submission into attachment cleanup',
+  );
+  sourceMatch(
+    extensionSource,
+    /event\.kind === 'sessionState'[\s\S]*panel\.releaseDeliveredPromptAssets\(idle, false, event\.settledTurnIds\);\s*panel\.flushQueue\(idle\)/,
+    'a Claude idle report does not release the joined prompts it ended, or does not drain the queue',
   );
   const panelPromptAt = extensionSource.indexOf('panel.onSendPrompt = async');
   const panelPrompt = extensionSource.slice(panelPromptAt, extensionSource.indexOf('// Compaction is', panelPromptAt));
@@ -23932,6 +23939,91 @@ test('submitted recovery waits behind compaction started during storage', async 
   assert.equal(provider.drafts.source, 'newer B');
   assert.deepEqual(provider.saved.submittedPrompts[0].text, text);
 });
+
+// A Claude child behind the production panel queue. Events reach the panel the way
+// extension.ts forwards them: every event republishes the running set, and an ending or an
+// idle report drains the queue.
+async function claudeBehindPanel() {
+  const { provider } = queueRecoveryProvider();
+  const host = { webview: {} };
+  Object.assign(provider, {
+    hosts: [host],
+    hostSessions: new Map([[host, 'source']]),
+    readyHosts: new Set([host]),
+    sessionRows: [{ id: 'source', label: 'source', agentKey: 'claude' }],
+  });
+  const written: Record<string, any>[] = [];
+  let out: (chunk: string) => void = () => undefined;
+  const child = {
+    stdin: { write: (line: string) => void written.push(JSON.parse(line)), end: () => undefined },
+    stdout: {
+      setEncoding: () => undefined,
+      on: (_event: string, listener: (chunk: string) => void) => {
+        out = listener;
+      },
+    },
+    stderr: { setEncoding: () => undefined, on: () => undefined },
+    kill: () => undefined,
+    on: () => undefined,
+  };
+  const publish = () => provider.setRunning(session.state().busy ? ['claude:source'] : []);
+  const session: AgentSession = new AgentSession(
+    'source',
+    claudePlan({ command: 'claude', leadingArgs: [], env: {} }, { cwd: 'C:\\ws', resume: 'source' }),
+    () => child,
+    (event) => {
+      publish();
+      if (event.kind === 'turnEnd' || (event.kind === 'sessionState' && event.state === 'idle'))
+        provider.flushQueue('source');
+    },
+    publish,
+  );
+  const say = (line: object) => out(JSON.stringify(line) + '\n');
+  const opening = session.start();
+  say({ type: 'control_response', response: { subtype: 'success', request_id: written[0].request_id, response: {} } });
+  await opening;
+  const delivered = (): PromptDelivery => ({ delivered: true, reason: '', session: 'source' });
+  provider.onSendPrompt = async (_agent: string, _session: string, _cwd: string, prompt: { text: string }) => {
+    await session.prompt(prompt.text);
+    return delivered();
+  };
+  provider.onCompact = async () => {
+    await session.compact();
+    return delivered();
+  };
+  let revision = 0;
+  const type = async (text: string) => {
+    await provider.onMessage({ type: 'draft', session: 'source', text, keep: text, revision: ++revision }, host);
+    const attempt = { id: `typed-${revision}`, order: revision, source: 'source', revision: ++revision, text };
+    await provider.onMessage({ type: 'sendPrompt', session: 'source', text, revision, attempt }, host);
+  };
+  const sentTexts = () => written.filter((line) => line.type === 'user').map((line) => line.message.content[0].text);
+  return { provider, say, type, sentTexts };
+}
+
+test.each(['after', 'before'])(
+  'a /compact typed %s joined Claude work completes reaches the child once',
+  async (when) => {
+    const { provider, say, type, sentTexts } = await claudeBehindPanel();
+    await type('first');
+    say({ type: 'system', subtype: 'session_state_changed', state: 'running' });
+    await type('joined');
+    await vi.waitFor(() => assert.deepEqual(sentTexts(), ['first', 'joined']));
+    if (when === 'before') {
+      await type('/compact');
+      assert.equal(provider.queues.source?.length, 1, 'a /compact typed during the turn did not wait for it');
+    }
+    // Claude folds the joined prompt into the running turn and ends both with one result.
+    say({ type: 'result', is_error: false, terminal_reason: 'completed', result: 'both' });
+    say({ type: 'system', subtype: 'session_state_changed', state: 'idle' });
+    say({ type: 'system', subtype: 'session_state_changed', state: 'idle' });
+    if (when === 'after') await type('/compact');
+    await vi.waitFor(() =>
+      assert.deepEqual(sentTexts(), ['first', 'joined', '/compact'], 'the /compact never reached the idle child'),
+    );
+    assert.equal(provider.queues.source, undefined);
+  },
+);
 
 test.each([
   'queued edit',

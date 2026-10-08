@@ -379,6 +379,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           panel.flushQueue(ended);
         }
       }
+      // Claude's idle report ends the prompts that joined a running turn. The running set above
+      // already reflects the report, and the queue drains only once that set shows the session idle.
+      // That set refreshes the panel when it changes, and a repeated report changes nothing.
+      if (event.kind === 'sessionState') {
+        const idle = host.get(key)?.state().sessionId;
+        if (idle && event.state === 'idle') {
+          panel.releaseDeliveredPromptAssets(idle, false, event.settledTurnIds);
+          panel.flushQueue(idle);
+        }
+        return;
+      }
       void panel.refresh();
     },
     onStateChange: (state) => {

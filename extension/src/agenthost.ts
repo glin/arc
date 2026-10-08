@@ -288,7 +288,8 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
     command: launch.command,
     args: [...launch.leadingArgs, ...spawnArgs(options)],
     cwd: options.cwd,
-    env: launch.env,
+    // The CLI reports when it goes idle only when asked. That report ends prompts that joined a running turn.
+    env: { ...launch.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' },
     driver(send, emit) {
       // Seed Claude's session identity before the first prompt. A resumed CLI can defer reporting it until output begins.
       const wire = new ClaudeWire({ send, emit, sessionId: options.resume ?? options.sessionId });
@@ -714,6 +715,15 @@ export class AgentSession {
   private readonly responseOwners = new Map<string, number>();
   private readonly pendingResponses: WireEvent[] = [];
   private acceptingPrompts = 0;
+  // Claude reported `running` and has not reported `idle` since. It keeps the session busy
+  // through a turn the CLI started by itself. It also covers a prompt that reached the CLI
+  // just after its last `result` but before Arc read that `result`, which the `idle` after it settles.
+  private agentRunning = false;
+  // How many `result` events have ended a turn here, and how many had when each open turn
+  // reached the child. A turn can join only work that a later `result` ends, so an `idle`
+  // report settles only turns that were open when one arrived.
+  private turnEndings = 0;
+  private readonly openedAtEnding = new WeakMap<{ id: number }, number>();
   private interruptedTurnEnds = 0;
   // When the Stop that owes that ending was accepted, so an ending that never came stops
   // being owed. See STOP_ENDING_GRACE_MS.
@@ -886,7 +896,7 @@ export class AgentSession {
         if (!this.preparingTurns.delete(submitted)) {
           throw new Error('the prompt was stopped before it reached the agent');
         }
-        this.openTurns.add(submitted);
+        this.openTurn(submitted);
         this.busy = true;
         this.changed();
       }
@@ -899,7 +909,7 @@ export class AgentSession {
         this.busy = this.driver.hasOpenTurns();
       } else {
         this.preparingTurns.delete(submitted);
-        this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
+        this.busy = this.countedBusy();
       }
       const refusal = `the agent would not take the prompt: ${(error as Error).message}`;
       this.lastError = refusal;
@@ -953,7 +963,7 @@ export class AgentSession {
         if (!this.preparingTurns.delete(submitted)) {
           throw new Error(words.lost);
         }
-        this.openTurns.add(submitted);
+        this.openTurn(submitted);
         this.busy = true;
         this.changed();
       }
@@ -963,7 +973,7 @@ export class AgentSession {
         this.busy = this.driver.hasOpenTurns();
       } else {
         this.preparingTurns.delete(submitted);
-        this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
+        this.busy = this.countedBusy();
       }
       // Session state names the failed operation. The thrown error retains the provider's cause for the panel's operation-specific message.
       const cause = (error as Error).message;
@@ -1001,16 +1011,14 @@ export class AgentSession {
         if (!this.preparingTurns.delete(submitted)) {
           throw new Error('the clear was stopped before it reached the agent');
         }
-        this.openTurns.add(submitted);
+        this.openTurn(submitted);
         this.busy = true;
       }
       this.changed();
       return submitted.id;
     } catch (error) {
       this.preparingTurns.delete(submitted);
-      this.busy = this.driver.hasOpenTurns
-        ? this.driver.hasOpenTurns()
-        : this.preparingTurns.size > 0 || this.openTurns.size > 0;
+      this.busy = this.driver.hasOpenTurns ? this.driver.hasOpenTurns() : this.countedBusy();
       const cause = (error as Error).message;
       this.lastError = cause
         ? `the agent would not clear the session: ${cause}`
@@ -1043,12 +1051,14 @@ export class AgentSession {
     const responses = [...this.respondingTurns];
     const interrupted = this.driver.interruptClearsOpenTurns ? new Set(this.openTurns) : null;
     const preparing = this.driver.interruptClearsOpenTurns ? new Set(this.preparingTurns) : null;
+    // A turn Claude started by itself, such as one for a task notification, has no open turn.
+    const wasRunning = this.agentRunning;
     const stopping = this.driver.interrupt();
     if (preparing) {
       for (const turn of preparing) {
         this.preparingTurns.delete(turn);
       }
-      this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
+      this.busy = this.countedBusy();
       this.changed();
     }
     await stopping;
@@ -1056,17 +1066,21 @@ export class AgentSession {
       if (
         this.interruptedTurnEnds === 0 &&
         [...interrupted].every((turn) => this.openTurns.has(turn)) &&
-        interrupted.size
+        (interrupted.size || wasRunning)
       ) {
-        // Claude reports one ending for the active prompt after accepting Stop, but none for
-        // the queued prompts it canceled. Keep that ending away from a prompt sent afterward.
+        // Claude reports one ending for the active turn after accepting Stop, but none for the
+        // queued prompts it canceled. A turn Claude started by itself ends the same way. Keep
+        // that ending away from a turn sent afterward. When no ending comes, the `idle` report
+        // or STOP_ENDING_GRACE_MS drops the debt.
         this.interruptedTurnEnds += 1;
         this.interruptedTurnEndAt = this.now();
       }
       for (const turn of interrupted) {
         this.openTurns.delete(turn);
       }
-      this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
+      // An accepted Stop leaves the session idle before the CLI says so.
+      this.agentRunning = false;
+      this.busy = this.countedBusy();
       this.drainHeldEffort();
       this.changed();
     }
@@ -1195,10 +1209,41 @@ export class AgentSession {
     if (this.driver.hasOpenTurns) {
       return this.busy;
     }
-    if (this.openTurns.size > 0) {
+    if (this.openTurns.size > 0 || this.agentRunning) {
       return true;
     }
     return [...this.preparingTurns].some((turn) => !this.promptsBehindEffort.has(turn));
+  }
+
+  // Busy state for a driver that leaves turn counting to the host.
+  private countedBusy(): boolean {
+    return this.preparingTurns.size > 0 || this.openTurns.size > 0 || this.agentRunning;
+  }
+
+  private openTurn(turn: { id: number }): void {
+    this.openTurns.add(turn);
+    this.openedAtEnding.set(turn, this.turnEndings);
+  }
+
+  // Claude's `idle` report ends, in one pass, every prompt or command turn that was open when
+  // a `result` arrived. A joined prompt gets no `result`, so this is the only ending it gets.
+  // A turn that reached the child after the latest `result` cannot have joined the work it
+  // ended. It waits for its own `result`, so an `idle` written before the CLI took it settles
+  // nothing. The aborted `result` of a Stop does not count, because nothing joins a stopped
+  // turn. Prompts still being prepared have not reached the child and stay open. A Stop ending
+  // still owed can no longer arrive, because the CLI writes it before `idle`.
+  private settleIdle(): number[] {
+    const settled: number[] = [];
+    for (const turn of this.openTurns) {
+      if ((this.openedAtEnding.get(turn) ?? this.turnEndings) >= this.turnEndings) continue;
+      this.openTurns.delete(turn);
+      settled.push(turn.id);
+    }
+    for (const id of settled) this.respondingTurns.delete(id);
+    this.agentRunning = false;
+    this.interruptedTurnEnds = 0;
+    this.busy = this.countedBusy();
+    return settled;
   }
 
   // Returns MCP status or null when the driver exposes no status operation.
@@ -1259,6 +1304,22 @@ export class AgentSession {
   }
 
   private handle(event: WireEvent): void {
+    if (event.kind === 'sessionState') {
+      if (this.driver.hasOpenTurns) return;
+      if (event.state === 'running') {
+        if (this.agentRunning) return;
+        this.agentRunning = true;
+        this.busy = true;
+        this.changed();
+        return;
+      }
+      // Before the report, so that nothing reading this session sees it idle with a pick still waiting.
+      const settledTurnIds = this.settleIdle();
+      this.drainHeldEffort();
+      this.report({ kind: 'sessionState', state: 'idle', settledTurnIds });
+      this.changed();
+      return;
+    }
     let endedTurnId: number | undefined;
     if (event.kind === 'delta' || event.kind === 'text' || event.kind === 'turnEnd') {
       if (this.driver.hasOpenTurns) {
@@ -1308,21 +1369,22 @@ export class AgentSession {
         this.interruptedTurnEnds > 0 &&
         this.now() - this.interruptedTurnEndAt <= STOP_ENDING_GRACE_MS
       ) {
-        // Claude marks an interrupted Stop ending as `aborted_streaming`, which the wire translates to `interrupted`.
+        // Claude marks a Stop ending `aborted_streaming`, or `aborted_tools` when a tool was running. The wire translates both to `interrupted`.
         // Consume that ending's debt without closing a later prompt's turn.
         this.interruptedTurnEnds -= 1;
-        this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
+        this.busy = this.countedBusy();
       } else {
         // Expire old Stop-ending debt. An unrelated outcome does not establish that the interrupted ending will never arrive.
         if (this.now() - this.interruptedTurnEndAt > STOP_ENDING_GRACE_MS) {
           this.interruptedTurnEnds = 0;
         }
+        this.turnEndings += 1;
         const first = this.openTurns.values().next().value;
         if (first) {
           endedTurnId = first.id;
           this.openTurns.delete(first);
         }
-        this.busy = this.preparingTurns.size > 0 || this.openTurns.size > 0;
+        this.busy = this.countedBusy();
       }
       // Remove asks whose driver no longer waits for an answer after the turn ends.
       // Keep asks that the driver identifies as outliving their turn.
@@ -1356,6 +1418,7 @@ export class AgentSession {
     this.respondingTurns.clear();
     this.responseOwners.clear();
     this.pendingResponses.length = 0;
+    this.agentRunning = false;
     this.interruptedTurnEnds = 0;
     this.interruptedTurnEndAt = 0;
     this.busy = false;

@@ -297,16 +297,16 @@ export function promptAssetsSafeToDelete(
 export function promptAssetReleaseIndexes(
   batchTurnIds: readonly (number | null)[],
   all: boolean,
-  endedTurnId?: number,
+  ended?: number | readonly number[],
 ): number[] {
   if (all) {
     return batchTurnIds.map((_, index) => index);
   }
-  if (endedTurnId === undefined) {
+  if (ended === undefined) {
     return [];
   }
-  const matching = batchTurnIds.indexOf(endedTurnId);
-  return matching < 0 ? [] : [matching];
+  const endedTurnIds = new Set(typeof ended === 'number' ? [ended] : ended);
+  return batchTurnIds.flatMap((turnId, index) => (turnId !== null && endedTurnIds.has(turnId) ? [index] : []));
 }
 
 // Codex can report turn completion before the host's prompt-acceptance promise returns.
