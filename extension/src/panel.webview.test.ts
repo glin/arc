@@ -12529,7 +12529,11 @@ test('a stopped Codex turn keeps the last reported model in the Prompt box witho
   const read = readCodexSession(file, 'source');
   const current = currentRecordsBySession(read.turns, read.compactions);
   const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', {
-    runtime: composerRuntimeBySession(read.turns, current.newestCompactions),
+    runtime: composerRuntimeBySession(
+      read.turns,
+      current.newestCompactions,
+      new Map([['source', read.lastReportedModel ?? null]]),
+    ),
   });
   state.models = [{ value: 'gpt-6-astra', label: 'Astra', description: '', efforts: [] }];
   const view = composerView(state)!;
@@ -22918,9 +22922,14 @@ test('a static stopped Codex source continues model recovery through the host wi
     showing: 'source',
     selectionGeneration: 1,
     updateHistoryAfterAcceptedWindow() {},
+    codexSubagents: [],
     hydrateCommitRepositories: async () => false,
     progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 512 }),
-    progressiveCurrent: () => Boolean(provider.cache.get(file)?.read.lastReportedModel),
+    progressiveCurrent: PanelProvider.prototype['progressiveCurrent'],
+    structuralKey: PanelProvider.prototype['structuralKey'],
+    agentFactsCurrent: () => true,
+    agentSpendKey: () => provider.cache.get(file)?.agentKey ?? '',
+    commitRepositoryContexts: () => [],
   });
   provider.hostSessions.set(provider.hosts[0], 'source');
   try {
@@ -22936,9 +22945,6 @@ test('a static stopped Codex source continues model recovery through the host wi
     assert.equal(composerView(state)!.picks.find((pick) => pick.control === 'model')!.label, 'gpt-6-astra');
     assert.equal(state.context, null);
     assert.equal(state.nextTurn, null);
-    const start = panelHostSource.indexOf('private async finishHandoffRecovery(');
-    const handoff = memberFrom(panelHostSource, start);
-    assert.match(handoff, /session\.agent === 'codex' \|\| !value\.recoveryPending/);
   } finally {
     fixture.worker.stop();
   }
@@ -23280,6 +23286,120 @@ function pendingModelLauncher() {
   };
   return { provider, owner, created, release, result, completed: () => completion };
 }
+
+test('a Codex handoff creates its draft while display model recovery is pending', async () => {
+  const f = pendingModelLauncher();
+  const provider = f.provider;
+  provider.authoritativeCatalog[0].agent = 'codex';
+  provider.cache.clear();
+  provider.models = { codex: [{ value: 'gpt-6-astra', label: 'Astra', description: '', efforts: [] }] };
+  let windows = 0;
+  const window = provider.progressiveWorker.run;
+  provider.progressiveWorker.run = () => (++windows === 1 ? window() : Promise.resolve(null));
+  provider.composerStateFor = () => {
+    const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', {
+      runtime: provider.composerRuntime,
+    });
+    state.models = [{ value: 'gpt-6-astra', label: 'Astra', description: '', efforts: [] }];
+    state.settings.selectedModel = 'gpt-6-astra';
+    return state;
+  };
+  const completion = provider.finishHandoffRecovery('source', null, '', false, f.owner);
+  f.release({
+    ...f.result,
+    value: {
+      ...f.result.value,
+      read: {
+        turns: [turn({ agent: 'codex', sessionId: 'source', interrupted: true, model: null, effort: null })],
+        compactions: [],
+        readBytes: 512,
+        lastReportedModel: null,
+      },
+      checkpoint: { modelRecovery: { status: 'pending' } },
+      recoveryPending: true,
+    },
+  });
+  await completion;
+  assert.equal(f.created.length, 1);
+  assert.equal((f.created[0][4] as SessionProfile).model, 'gpt-6-astra');
+  assert.equal(provider.cache.get('source.jsonl').checkpoint.modelRecovery.status, 'pending');
+  assert.equal(provider.attachmentHandoffs.size, 0);
+});
+
+test('stopped Codex model recovery replaces obsolete context demand without creating runtime authority', async () => {
+  const fixture = liveProviderFixture(livePress({ sessionId: 'source', agent: 'codex' }));
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const stopped = turn({
+    agent: 'codex',
+    sessionId: 'source',
+    interrupted: true,
+    model: null,
+    effort: null,
+    contextWindow: 258400,
+  });
+  let reported: string | null = null;
+  let state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', {
+    runtime: composerRuntimeBySession([stopped], new Map(), new Map([['source', reported]])),
+  });
+  provider.stateFor = () => state;
+  provider.contextDemands = new WeakMap();
+  provider.contextRequests = new WeakMap();
+  const releases: Array<(raw: unknown) => void> = [];
+  provider.contextSource = () => ({
+    id: 'retained',
+    current: () => true,
+    read: () => new Promise((resolve) => releases.push(resolve)),
+  });
+  const pending = provider.requestContext(fixture.host, 'source', 1, 0);
+  await Promise.resolve();
+  const demand = provider.contextDemands.get(fixture.host);
+  const readDemand = demand.read.bind(demand);
+  const identities: Array<{ model: string }> = [];
+  demand.read = (identity: any, key: string, ...args: any[]) => {
+    identities.push(JSON.parse(key));
+    return readDemand(identity, key, ...args);
+  };
+  reported = 'gpt-6-astra';
+  state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', {
+    runtime: composerRuntimeBySession([stopped], new Map(), new Map([['source', reported]])),
+  });
+  const raw = {
+    kind: 'codex-retained-context',
+    session: 'source',
+    used: 100,
+    capacity: 200,
+    basis: 'request',
+    model: 'gpt-6-astra',
+    categories: [{ key: 'messages', name: 'Messages', relationship: 'used', tokens: 100 }],
+  };
+  releases[0](raw);
+  await pending;
+  assert.equal(fixture.posted.length, 0);
+  const fresh = provider.requestContext(fixture.host, 'source', 2, 0);
+  await Promise.resolve();
+  assert.equal(releases.length, 2);
+  releases[1](raw);
+  await fresh;
+  const detail = fixture.posted[0].detail as any;
+  assert.equal(detail.model, 'gpt-6-astra');
+  assert.equal(detail.request, 2);
+  assert.equal(detail.status, 'available');
+  assert.equal(detail.used, 100);
+  state.settings.confirmedModel = 'gpt-6.1-sol';
+  const changed = provider.requestContext(fixture.host, 'source', 3, 0);
+  await Promise.resolve();
+  assert.equal(releases.length, 3);
+  assert.deepEqual(
+    identities.map((identity) => identity.model),
+    ['gpt-6-astra', 'gpt-6.1-sol'],
+  );
+  releases[2]({ ...raw, model: 'gpt-6.1-sol' });
+  await changed;
+  assert.equal((fixture.posted[1].detail as any).model, 'gpt-6.1-sol');
+  assert.equal(state.context, null);
+  assert.equal(state.nextTurn, null);
+  assert.equal(stopped.model, null);
+});
 
 // The first child selection includes its reader-started parent on both creation routes.
 test.each([false, true])('the first reader child selection includes its parent (recovery %s)', async (recovery) => {

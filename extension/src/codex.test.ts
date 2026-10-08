@@ -2320,6 +2320,118 @@ test('stopped Codex display model prefers the newest settings without changing b
   );
 });
 
+test('stopped Codex recovery admits opening settings and blocks newer unproved ownership', async () => {
+  for (const kind of ['settings', 'foreign-settings', 'unproved', 'copied', 'model-less']) {
+    const child = 'stopped-native-child';
+    const opening = lateOpeningRollout(
+      child,
+      {
+        parent_thread_id: 'sess',
+        thread_source: 'subagent',
+        source: { subagent: { thread_spawn: { parent_thread_id: 'sess', agent_path: '/root/reviewer' } } },
+      },
+      [],
+    )[0];
+    const records: object[] = kind.includes('settings')
+      ? [
+          opening,
+          ...(kind === 'foreign-settings' ? [meta({ id: 'foreign' })] : []),
+          event('thread_settings_applied', 5, { thread_settings: { model: 'gpt-6-astra' } }),
+        ]
+      : [
+          opening,
+          event('task_started', 6, { turn_id: 'older' }),
+          turnContext(7, 'older', 'gpt-6-astra', 'high'),
+          event('task_complete', 8, { turn_id: 'older' }),
+          event('task_started', 9, { turn_id: 'newer', started_at: ms(kind === 'copied' ? -60 : 4) / 1000 }),
+          ...(kind === 'model-less' ? [] : [turnContext(10, 'newer', 'gpt-6.1-sol', 'high')]),
+          event('task_complete', 11, { turn_id: 'newer' }),
+        ];
+    records.push(
+      { type: 'ignored', payload: { text: 'x'.repeat(3000) } },
+      event('task_started', 20, { turn_id: 'stopped', started_at: ms(20) / 1000 }),
+      event('turn_aborted', 21, { turn_id: 'stopped', reason: 'interrupted' }),
+    );
+    const file = writeRollout(records);
+    const expected = kind === 'unproved' || kind === 'foreign-settings' ? null : 'gpt-6-astra';
+    const result = await readCodexSessionIncrementalAsync(
+      file,
+      child,
+      undefined,
+      { tailBytes: 512 },
+      { modelBudget: { maxMilliseconds: 1000 } },
+    );
+    assert.equal(result.recoveryPending, false);
+    assert.equal(result.read?.lastReportedModel, expected, kind);
+    assert.equal(
+      composerRuntimeBySession(
+        result.read!.turns,
+        new Map(),
+        new Map([[child, result.read!.lastReportedModel ?? null]]),
+      ).get(child)?.confirmedModel,
+      expected,
+      kind,
+    );
+    if (kind === 'settings') assert.equal(readCodexSession(file, child).lastReportedModel, expected);
+  }
+});
+
+test('stopped Codex display promotes confirmed native context in source order across checkpoints', () => {
+  for (const timing of ['none', 'older', 'newer']) {
+    const child = 'stopped-native-child';
+    const own = 'native-context';
+    const records = lateOpeningRollout(
+      child,
+      {
+        parent_thread_id: 'sess',
+        thread_source: 'subagent',
+        source: { subagent: { thread_spawn: { parent_thread_id: 'sess', agent_path: '/root/reviewer' } } },
+      },
+      [{ turnId: own, second: 4, input: 1000, endSecond: 18 }],
+    );
+    for (const row of records as Array<{ type: string; payload: Record<string, unknown> }>)
+      if (row.type === 'turn_context' && row.payload.turn_id === own) row.payload.model = 'gpt-6-astra';
+    if (timing === 'older')
+      records.splice(1, 0, event('thread_settings_applied', 13, { thread_settings: { model: 'gpt-6.1-sol' } }));
+    records.push(
+      event('task_started', 20, { turn_id: 'stopped', started_at: ms(20) / 1000, model_context_window: 258400 }),
+    );
+    if (timing === 'newer')
+      records.push(event('thread_settings_applied', 20, { thread_settings: { model: 'gpt-6.1-sol' } }));
+    records.push(event('turn_aborted', 21, { turn_id: 'stopped', reason: 'interrupted' }));
+    const file = writeRollout(records);
+    const initial = readCodexSessionIncremental(file, child);
+    assert.equal(initial.checkpoint!.parserState.usageState.pendingOwnership[own], true);
+    fs.appendFileSync(
+      file,
+      JSON.stringify({
+        type: 'token_usage_record',
+        timestamp: at(22),
+        payload: {
+          thread_id: child,
+          turn_id: own,
+          response_id: 'native-response',
+          usage: usage({ input_tokens: 1000, output_tokens: 1, total_tokens: 1001 }),
+        },
+      }) + '\n',
+    );
+    const resumed = readCodexSessionIncremental(file, child, throughStructuredClone(initial.checkpoint!));
+    const expected = timing === 'newer' ? 'gpt-6.1-sol' : 'gpt-6-astra';
+    assert.equal(resumed.read?.lastReportedModel, expected, timing);
+    assert.equal(readCodexSession(file, child).lastReportedModel, expected, timing);
+    const runtime = composerRuntimeBySession(
+      resumed.read!.turns,
+      new Map(),
+      new Map([[child, resumed.read!.lastReportedModel ?? null]]),
+    ).get(child)!;
+    assert.equal(runtime.confirmedModel, expected, timing);
+    assert.equal(runtime.context, null);
+    assert.equal(runtime.nextTurn, null);
+    assert.equal(resumed.read!.turns.find((row) => row.promptId === own)?.model, 'gpt-6-astra');
+    assert.equal(resumed.read!.turns.at(-1)?.model, null);
+  }
+});
+
 test('stopped Codex recovery rejects obsolete evidence after rewrites, replacement, truncation, and cancellation', async () => {
   const file = writeRollout([
     ...ordinaryTurn(),
@@ -2351,11 +2463,23 @@ test('stopped Codex recovery rejects obsolete evidence after rewrites, replaceme
     assert.equal(result.read?.lastReportedModel, change === 'truncate' ? null : 'gpt-6-astra');
   }
   const controller = new AbortController();
-  controller.abort();
-  const cancelled = await readCodexSessionIncrementalAsync(file, 'sess', result.checkpoint!, options, {
+  fs.writeFileSync(file, original.replace('x'.repeat(5000), 'x'.repeat(600 * 1024)));
+  let clocks = 0;
+  const cancelled = await readCodexSessionIncrementalAsync(file, 'sess', undefined, options, {
     signal: controller.signal,
+    modelBudget: {
+      maxBytes: 512 * 1024,
+      clock: () => {
+        if (++clocks === 3) controller.abort();
+        return 0;
+      },
+    },
   });
   assert.equal(cancelled.kind, 'cancelled');
+  assert.ok((cancelled.recoveryBytes ?? 0) > 0);
+  assert.ok((cancelled.recoveryBytes ?? 0) < 512 * 1024);
+  assert.equal(cancelled.read, null);
+  assert.equal(cancelled.checkpoint, null);
 });
 
 test('a Codex checkpoint keeps an active turn when it grows beyond the tail window', () => {
@@ -10764,7 +10888,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 17);
+  assert.equal(reset.checkpoint?.parserState.version, 18);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],

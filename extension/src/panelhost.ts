@@ -484,7 +484,7 @@ import {
   startSessionHistory,
 } from './historypages';
 import { ClaudeHistoryCursor } from './claudehistory';
-import { CodexHistoryCursor } from './codexhistory';
+import { CodexHistoryCursor, type CodexForwardCheckpoint } from './codexhistory';
 import {
   BoundedTrailingScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
@@ -9316,7 +9316,8 @@ export class PanelProvider implements vscode.Disposable {
       const requestedRevision = this.revisionOf(session);
       if (
         this.progressiveCurrent(session) &&
-        (previous?.checkpoint as ClaudeForwardCheckpoint | undefined)?.attachmentRecovery?.status !== 'pending'
+        (previous?.checkpoint as ClaudeForwardCheckpoint | undefined)?.attachmentRecovery?.status !== 'pending' &&
+        (previous?.checkpoint as CodexForwardCheckpoint | undefined)?.modelRecovery?.status !== 'pending'
       ) {
         this.acceptSelectedMetadataRead(session, generation);
         // Refresh a current retained window only when worker work or a displayed failure changed its presentation.

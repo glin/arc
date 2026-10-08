@@ -4593,7 +4593,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 17;
+  version: 18;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
   turnMembershipStarts: number[];
@@ -4642,6 +4642,8 @@ export interface CodexSessionParserState {
   lastModelSource: { start: number; end: number } | null;
   lastReportedModel?: string | null;
   lastReportedModelSource?: { start: number; end: number } | null;
+  pendingReportedModels?: Record<string, { model: string; start: number; end: number }>;
+  reportedModelSequence?: number;
   lastProviderSource: { start: number; end: number } | null;
   lastServiceTierSource: { start: number; end: number } | null;
   updateSequence: number;
@@ -4675,7 +4677,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 17,
+    version: 18,
     turns: [],
     turnRanges: [],
     turnMembershipStarts: [],
@@ -4749,6 +4751,7 @@ function retainCodexUsageKeys(state: CodexSessionParserState, keep: Set<string>)
   prune(usage.turnEfforts);
   prune(usage.turnWindows);
   prune(usage.pendingOwnership);
+  if (state.pendingReportedModels) prune(state.pendingReportedModels);
   prune(usage.pendingRequests);
   const pendingRequestKeys = new Set<string>();
   for (const events of Object.values(usage.pendingRequests)) {
@@ -5197,6 +5200,13 @@ function reduceCodexSessionLine(
     return;
   }
   const { kind, at, payload } = record;
+  const displaySequence = (state.reportedModelSequence ?? 0) + 1;
+  state.reportedModelSequence = displaySequence;
+  const displaySource = hasSourceOffset
+    ? { start: sourceStart, end: sourceEnd }
+    : { start: displaySequence, end: displaySequence };
+  const ownershipId = kind === 'token_usage_record' ? str(payload.turn_id) : null;
+  const ownershipPending = ownershipId !== null && state.usageState.pendingOwnership[ownershipId];
   const usageEvents = [
     ...reduceCodexUsageEvents(state.usageState, {
       kind,
@@ -5228,6 +5238,14 @@ function reduceCodexSessionLine(
   };
 
   if (kind === 'token_usage_record') {
+    if (ownershipId && ownershipPending && !state.usageState.pendingOwnership[ownershipId]) {
+      const context = state.pendingReportedModels?.[ownershipId];
+      if (context && (!state.lastReportedModelSource || context.start >= state.lastReportedModelSource.start)) {
+        state.lastReportedModel = context.model;
+        state.lastReportedModelSource = { start: context.start, end: context.end };
+      }
+      if (state.pendingReportedModels) delete state.pendingReportedModels[ownershipId];
+    }
     for (const event of usageEvents) {
       if (event.agent !== 'codex') continue;
       const id = event.visibleTurnId?.replace(/^codex-turn:/, '');
@@ -5341,13 +5359,16 @@ function reduceCodexSessionLine(
       if (context.model) {
         state.lastModel = context.model;
         state.lastModelSource = { start: sourceStart, end: sourceEnd };
+        if (state.usageState.pendingOwnership[id] && !state.usageState.foreignSessionMeta) {
+          (state.pendingReportedModels ??= {})[id] = { model: context.model, ...displaySource };
+        }
         if (
           !state.usageState.currentTurnCopied &&
           !state.usageState.foreignSessionMeta &&
           !state.usageState.pendingOwnership[id]
         ) {
           state.lastReportedModel = context.model;
-          state.lastReportedModelSource = { start: sourceStart, end: sourceEnd };
+          state.lastReportedModelSource = displaySource;
         }
       }
       const pending = removeLatestPendingClassification(state, id);
@@ -5406,7 +5427,7 @@ function reduceCodexSessionLine(
       state.lastModelSource = { start: sourceStart, end: sourceEnd };
       if (!state.usageState.currentTurnCopied && !state.usageState.foreignSessionMeta) {
         state.lastReportedModel = model;
-        state.lastReportedModelSource = { start: sourceStart, end: sourceEnd };
+        state.lastReportedModelSource = displaySource;
       }
     }
     if (provider) {
@@ -6352,7 +6373,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 17) {
+  if (state.version !== 18) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);

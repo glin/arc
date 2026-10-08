@@ -508,7 +508,7 @@ export function commitRepositoryTargets(
 
 function codexParserKey(opts: CodexReadOptions): string {
   return JSON.stringify({
-    version: 10,
+    version: 11,
     tailBytes: opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     maxTurns: opts.maxTurns ?? 40,
     sessionTitle: normalizeSessionTitle(opts.sessionTitle),
@@ -662,7 +662,12 @@ export async function readCodexSessionIncrementalAsync(
       }
       if (!recovery.candidate && (record.kind === 'turn_context' || record.kind === 'thread_settings_applied')) {
         const settings = record.kind === 'turn_context' ? record.payload : record.payload.thread_settings;
-        if (settings && typeof settings === 'object' && ('model' in settings || 'model_id' in settings))
+        if (
+          settings &&
+          typeof settings === 'object' &&
+          (('model' in settings && typeof settings.model === 'string' && settings.model.length > 0) ||
+            ('model_id' in settings && typeof settings.model_id === 'string' && settings.model_id.length > 0))
+        )
           recovery.candidate = {
             text: line.text,
             turnId:
@@ -686,8 +691,25 @@ export async function readCodexSessionIncrementalAsync(
           recovery.candidate = null;
           continue;
         }
+        if (
+          reducer.snapshot().usageState.pendingOwnership[record.payload.turn_id as string] ||
+          !reducer.snapshot().usageState.currentTurnCopied
+        ) {
+          recovery.status = 'complete';
+          break;
+        }
         recovery.candidate = null;
       } else if (record.kind === 'session_meta') {
+        meta ??= readCodexSessionMeta(file);
+        if (
+          recovery.candidate?.turnId === null &&
+          (record.payload.id ?? record.payload.session_id) === meta?.sessionId
+        ) {
+          const reducer = createCodexSessionReducer(sessionId, { maxTurns: 1 }, meta ?? null);
+          reducer.pushLine(line.text);
+          reducer.pushLine(recovery.candidate.text);
+          recovery.model = reducer.finish().lastReportedModel ?? null;
+        }
         recovery.status = 'complete';
         break;
       }
