@@ -1614,7 +1614,7 @@ function selectedWindowHarness(
       derivedCacheCheckpointState = { markChanged() {} };
       progressiveWorker;
       constructor(run) { this.progressiveWorker = { run }; }
-      get authoritativeCatalog() { return this.catalog ?? [this.session]; }
+      get authoritativeCatalog() { return Array.isArray(this.catalog) ? this.catalog : (this.catalog?.sessions ?? [this.session]); }
       revisionOf(session) { return { size: session.size, mtimeMs: session.mtimeMs, dev: session.dev, ino: session.ino }; }
       observeStoredName(_session, entry) { return entry; }
       observeStoredEntry() {}
@@ -1897,7 +1897,7 @@ test('a slow selected read keeps its request until selection cancels it', async 
     assert.equal(requests, 1, 'elapsed time restarted a valid selected read');
     assert.equal(provider.discoveryCheckpoint, progress);
     assert.equal(provider.refreshController.signal.aborted, false);
-    provider.catalog = [];
+    provider.catalog = { folders: '', sessions: [] };
     provider.show('other');
     assert.equal(first.controller.signal.aborted, true, 'switching kept an obsolete selected read');
     finish(windowResult(1, provider.revisionOf(provider.session)));
