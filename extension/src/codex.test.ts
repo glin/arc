@@ -1436,6 +1436,53 @@ test('a single-quoted Windows root path before Claude does not hide the executed
   assert.equal(claudeCommandResult((record as { payload: Record<string, unknown> }).payload)?.accepted, true);
 });
 
+test('usage reducer restoration owns nested outcomes and defaults missing outcomes to null', () => {
+  for (const value of [undefined, null]) {
+    const restored = createCodexUsageLineReducer({
+      ...emptyCodexUsageReducerState(),
+      currentTurnOutcome: value,
+      lastTurnOutcome: value,
+    } as ReturnType<typeof emptyCodexUsageReducerState>);
+    assert.equal(restored.snapshot().currentTurnOutcome, null);
+    assert.equal(restored.snapshot().lastTurnOutcome, null);
+    assert.equal(restored.newestTurnOutcome(), null);
+  }
+  for (const field of ['currentTurnOutcome', 'lastTurnOutcome'] as const) {
+    const outcome = {
+      finished: false,
+      error: true,
+      interrupted: true,
+      endedAt: ms(8),
+      startedAt: ms(1),
+      processEndedAt: ms(7),
+      openChildren: ['open-child'],
+      closedChildren: ['legacy-child', { id: 'closed-child', closedAt: ms(6) }],
+      backgroundCommands: [{ id: 'command', startedAt: ms(2) }],
+    };
+    const checkpoint = {
+      ...emptyCodexUsageReducerState(),
+      currentTurnId: field === 'currentTurnOutcome' ? 'turn-1' : null,
+      [field]: outcome,
+    };
+    const retained = structuredClone(checkpoint);
+    const restored = createCodexUsageLineReducer(checkpoint);
+    assert.deepEqual(restored.snapshot()[field], outcome);
+    const active = restored.newestTurnOutcome();
+    assert.deepEqual(active, outcome);
+    assert.notStrictEqual(active!.openChildren, outcome.openChildren);
+    assert.notStrictEqual(active!.closedChildren, outcome.closedChildren);
+    assert.notStrictEqual(active!.closedChildren![1], outcome.closedChildren[1]);
+    assert.notStrictEqual(active!.backgroundCommands, outcome.backgroundCommands);
+    assert.notStrictEqual(active!.backgroundCommands![0], outcome.backgroundCommands[0]);
+    active!.openChildren!.push('another-child');
+    const closed = active!.closedChildren![1];
+    assert.ok(typeof closed !== 'string');
+    closed.closedAt = ms(9);
+    active!.backgroundCommands![0].startedAt = ms(3);
+    assert.deepEqual(checkpoint, retained);
+  }
+});
+
 test('the incremental usage reducer persists Claude invocation deduplication', () => {
   const reducer = createCodexUsageLineReducer();
   for (const record of turnWithClaudeCommands().slice(0, 4)) {

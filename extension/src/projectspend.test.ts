@@ -3752,6 +3752,85 @@ test('an older parser generation rebuilds an unchanged source once', () => {
   assert.equal(loadSpendLedger(folder, 'w').parserGeneration, PROJECT_SPEND_PARSER_GENERATION);
 });
 
+test('Codex append indexing preserves retained checkpoint outcomes and display persistence', () => {
+  const folder = dir();
+  const file = path.join(folder, 'source.jsonl');
+  const startedAt = Date.parse('2026-10-03T03:10:08Z');
+  const finishedAt = startedAt + 30_000;
+  const line = (type: string, payload: Record<string, unknown>, at = startedAt) =>
+    JSON.stringify({ type, timestamp: new Date(at).toISOString(), payload });
+  fs.writeFileSync(
+    file,
+    [
+      line('session_meta', {
+        id: 'sess',
+        source: 'vscode',
+        model_provider: 'openai',
+        timestamp: new Date(startedAt - 1000).toISOString(),
+      }),
+      line('event_msg', { type: 'task_started', turn_id: 'turn-1', started_at: startedAt / 1000 }),
+      line('turn_context', { turn_id: 'turn-1', model: 'gpt-5.6-sol', effort: 'high' }),
+      line('response_item', {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Complete the task' }],
+        internal_chat_message_metadata_passthrough: { content_item_kinds: ['user.text'] },
+      }),
+      line('event_msg', {
+        type: 'token_count',
+        info: { last_token_usage: { input_tokens: 10, output_tokens: 1 } },
+      }),
+      '',
+    ].join('\n'),
+  );
+  fs.utimesSync(file, startedAt / 1000, startedAt / 1000);
+  const predecessor = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, startedAt).record;
+  const retained = structuredClone(predecessor);
+  const unfinished = { finished: false, error: false, interrupted: false, endedAt: startedAt, startedAt };
+  assert.equal(predecessor.turnCount, 1);
+  assert.deepEqual(predecessor.outcome, unfinished);
+  saveSpendLedger(folder, 'w', [predecessor]);
+  const savedBytes = fs.readFileSync(path.join(folder, ledgerName(folder)));
+
+  fs.appendFileSync(
+    file,
+    line('event_msg', { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Task complete' }, finishedAt) +
+      '\n',
+  );
+  fs.utimesSync(file, finishedAt / 1000, finishedAt / 1000);
+  const appended = indexSpendFile(predecessor, file, 'w', createCodexUsageLineReducer, finishedAt);
+  assert.equal(appended.rebuilt, false);
+  assert.equal(appended.complete, true);
+  assert.deepEqual(predecessor, retained, 'append indexing must preserve the retained predecessor');
+  saveSpendLedger(folder, 'w', [predecessor]);
+  assert.deepEqual(fs.readFileSync(path.join(folder, ledgerName(folder))), savedBytes);
+  const successor = appended.record;
+  const finished = { ...unfinished, finished: true, endedAt: finishedAt };
+  assert.deepEqual(successor.outcome, finished);
+  assert.deepEqual(
+    (successor.parserState as ReturnType<typeof emptyCodexUsageReducerState>).currentTurnOutcome,
+    finished,
+  );
+  assert.equal(successor.lastTurnAt, finishedAt);
+  saveSpendLedger(folder, 'w', [successor], [predecessor]);
+  const loaded = loadSpendLedger(folder, 'w');
+  assert.equal(loaded.files.length, 1);
+  assert.equal(loaded.completeFiles.length, 1);
+  assert.deepEqual(loaded.files[0].outcome, finished);
+  assert.deepEqual(loaded.completeFiles[0].outcome, unfinished);
+  assert.deepEqual(
+    (loaded.files[0].parserState as ReturnType<typeof emptyCodexUsageReducerState>).currentTurnOutcome,
+    finished,
+  );
+  assert.deepEqual(
+    (loaded.completeFiles[0].parserState as ReturnType<typeof emptyCodexUsageReducerState>).currentTurnOutcome,
+    unfinished,
+  );
+  const fresh = indexSpendFile(undefined, file, 'w', createCodexUsageLineReducer, finishedAt).record;
+  assert.deepEqual(successor.parserState, fresh.parserState);
+  assert.deepEqual(successor, fresh);
+});
+
 test('a saved delayed Codex opening rebuilds the missing first turn and its usage', () => {
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');

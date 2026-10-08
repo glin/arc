@@ -2159,11 +2159,11 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
         lastTurnAt: restored.lastTurnAt ?? null,
         currentTurnStartedAt: restored.currentTurnStartedAt ?? null,
         currentTurnEndedAt: restored.currentTurnEndedAt ?? null,
-        currentTurnOutcome: restored.currentTurnOutcome ?? null,
         lastTurnStartedAt: restored.lastTurnStartedAt ?? null,
-        lastTurnOutcome: restored.lastTurnOutcome ?? null,
       }
     : emptyCodexUsageReducerState();
+  state.currentTurnOutcome ??= null;
+  state.lastTurnOutcome ??= null;
   return {
     parserKind: 'codex',
     pushLine: (line) => {
