@@ -8,6 +8,8 @@ The Arc CLI reports session cost from disk, renders Claude Code status-line inpu
 
 ## Run the command
 
+Agents started by the panel can run `arc` from their shell commands through the extension's packaged launchers. [Agent runtime](agent-protocols.md#runtime-shape) owns their environment and window targeting.
+
 From a source checkout, build the CLI from the repository root:
 
 ```sh

@@ -14,6 +14,9 @@ const expectedFiles = [
   'extension/LICENSE.txt',
   'extension/dist/extension.js',
   'extension/dist/build-identity.json',
+  'extension/dist/cli.cjs',
+  'extension/dist/bin/arc',
+  'extension/dist/bin/arc.cmd',
   'extension/package.json',
 ];
 
@@ -30,6 +33,10 @@ async function readArchive(file) {
     zip.on('error', reject);
     zip.on('end', () => resolveEntries(entries));
     zip.on('entry', (entry) => {
+      if (entry.fileName === 'extension/dist/bin/arc') {
+        assert.equal(entry.versionMadeBy >> 8, 3, 'Arc launcher permissions need a Unix archive identity');
+        assert.equal((entry.externalFileAttributes >>> 16) & 0o777, 0o755, 'Arc launcher is not executable');
+      }
       zip.openReadStream(entry, async (error, stream) => {
         if (error) return reject(error);
         try {
@@ -63,4 +70,11 @@ assert.equal(
   sha256(await readFile(join(extensionRoot, 'dist', 'extension.js'))),
   'VSIX bundle differs from the current build',
 );
+for (const file of ['cli.cjs', 'bin/arc', 'bin/arc.cmd']) {
+  assert.equal(
+    sha256(entries.get(`extension/dist/${file}`)),
+    sha256(await readFile(join(extensionRoot, 'dist', file))),
+    `VSIX ${file} differs from the current build`,
+  );
+}
 console.log(`Checked ${basename(archive)}: glin.arc ${packaged.version} and ${entries.size} allowed files.`);

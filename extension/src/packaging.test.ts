@@ -8,6 +8,7 @@ import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildSync } from 'esbuild';
 import { browserBundle } from './panelbundle.ts';
+import { childEnv } from './agenthost.ts';
 import { callSources, declarationSource, sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
 
 const extensionRoot = path.join(__dirname, '..');
@@ -50,6 +51,7 @@ test('build identity covers host, browser, worker, and version inputs', () => {
       [
         ...sourceInputs('src/extension.ts'),
         ...sourceInputs('src/progressiveworker-entry.ts'),
+        ...sourceInputs('../cli/src/main.ts'),
         ...browserBundle().inputs,
         'src/webview/panel.css',
         'package.json',
@@ -88,7 +90,7 @@ test('extracted source builds without Git and never inherits an enclosing reposi
   const archive = path.join(root, 'source.tar');
   const sourceRoot = path.join(root, 'source');
   fs.mkdirSync(sourceRoot);
-  const archived = spawnSync('git', ['archive', '--format=tar', '-o', archive, 'HEAD', 'extension'], {
+  const archived = spawnSync('git', ['archive', '--format=tar', '-o', archive, 'HEAD', 'extension', 'cli'], {
     cwd: path.dirname(extensionRoot),
     encoding: 'utf8',
   });
@@ -167,6 +169,61 @@ test('watch startup invalidates identity from a preceding production build', asy
   }
 }, 30_000);
 
+test('CLI watching survives panel rebuilds and ends when the build closes', async () => {
+  const root = tempDir('arc-cli-watch-');
+  const archive = path.join(root, 'source.tar');
+  const sourceRoot = path.join(root, 'source');
+  fs.mkdirSync(sourceRoot);
+  const archived = spawnSync('git', ['archive', '--format=tar', '-o', archive, 'HEAD', 'extension', 'cli'], {
+    cwd: path.dirname(extensionRoot),
+    encoding: 'utf8',
+  });
+  assert.equal(archived.status, 0, archived.stderr);
+  const extracted = spawnSync('tar', ['-xf', path.basename(archive), '-C', path.relative(root, sourceRoot)], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+  assert.equal(extracted.status, 0, extracted.stderr);
+  const source = path.join(sourceRoot, 'extension');
+  fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
+  fs.symlinkSync(
+    path.join(extensionRoot, 'node_modules'),
+    path.join(source, 'node_modules'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  );
+  const script =
+    "import { buildExtension } from './esbuild.mjs'; const close = await buildExtension({watch:true}); console.log('watch ready'); process.stdin.once('data', async () => { await close(); process.stdin.destroy(); });";
+  const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: source,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  watcher.stdout.on('data', (chunk) => {
+    output += chunk;
+  });
+  watcher.stderr.on('data', (chunk) => {
+    output += chunk;
+  });
+  try {
+    await vi.waitFor(() => assert.match(output, /watch ready/), { timeout: 15_000 });
+    fs.appendFileSync(path.join(source, 'src/webview/panel.css'), '\n/* watch fixture */\n');
+    await vi.waitFor(() => assert.match(output, /rebuilt: the panel source changed/), { timeout: 15_000 });
+    fs.appendFileSync(path.join(sourceRoot, 'cli/src/main.ts'), "\nconsole.log('cli watch fixture');\n");
+    await vi.waitFor(
+      () => assert.ok(fs.readFileSync(path.join(source, 'dist/cli.cjs'), 'utf8').includes('cli watch fixture')),
+      { timeout: 15_000 },
+    );
+    watcher.stdin.end('close');
+    await vi.waitFor(() => assert.equal(watcher.exitCode, 0), { timeout: 15_000 });
+  } finally {
+    if (watcher.exitCode === null) {
+      const exited = new Promise<void>((resolve) => watcher.once('exit', () => resolve()));
+      watcher.kill();
+      await exited;
+    }
+  }
+}, 60_000);
+
 // A single-star ignore pattern does not cross directory separators. Excluded file types need recursive patterns.
 
 test('a file type the package leaves out is left out at every depth, not only at its top', () => {
@@ -213,9 +270,128 @@ test('the extension package contains exactly the intended files', () => {
     .sort();
   assert.deepEqual(
     packaged,
-    ['LICENSE', 'dist/build-identity.json', 'dist/extension.js', 'package.json'].sort(),
+    [
+      'LICENSE',
+      'dist/build-identity.json',
+      'dist/extension.js',
+      'dist/cli.cjs',
+      'dist/bin/arc',
+      'dist/bin/arc.cmd',
+      'package.json',
+    ].sort(),
     'the VSIX candidate list changed; review the new file and update this allowlist only when it belongs',
   );
+});
+
+test('bare arc launchers preserve arguments, stdin, exit status, and window targeting with spaced paths', () => {
+  const root = tempDir('arc-launchers-');
+  const installed = path.join(root, 'extension with spaces');
+  const bin = path.join(installed, 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  const editor = path.join(root, 'editor with spaces', process.platform === 'win32' ? 'Code.exe' : 'editor');
+  fs.mkdirSync(path.dirname(editor));
+  fs.copyFileSync(process.execPath, editor);
+  fs.chmodSync(editor, 0o755);
+  for (const file of ['arc', 'arc.cmd'])
+    fs.copyFileSync(path.join(extensionRoot, 'dist/bin', file), path.join(bin, file));
+  fs.chmodSync(path.join(bin, 'arc'), 0o755);
+  const bundle = path.join(installed, 'cli.cjs');
+  fs.copyFileSync(path.join(extensionRoot, 'dist/cli.cjs'), bundle);
+  const transcript = path.join(root, 'session with spaces.jsonl');
+  fs.writeFileSync(
+    transcript,
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-09-26T00:00:01Z',
+      message: {
+        id: 'request-1',
+        model: 'claude-opus-5',
+        role: 'assistant',
+        content: [],
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    }) + '\n',
+  );
+  const env = childEnv(
+    process.env,
+    { ELECTRON_RUN_AS_NODE: '0', ARC_HOME: path.join(root, 'empty home') },
+    undefined,
+    undefined,
+    {
+      directory: bin,
+      editorExecutable: editor,
+      windowId: 'this-window',
+    },
+  );
+  env.ELECTRON_RUN_AS_NODE = '0';
+  const shells =
+    process.platform === 'win32'
+      ? [
+          { command: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c'] },
+          { command: 'powershell.exe', args: ['-NoProfile', '-EncodedCommand'] },
+          {
+            command:
+              process.env.GIT_BASH_PATH ??
+              path.join(process.env.ProgramFiles ?? 'C:/Program Files', 'Git', 'bin', 'bash.exe'),
+            args: ['--noprofile', '--norc', '-c'],
+          },
+        ]
+      : [
+          { command: '/bin/sh', args: ['-c'] },
+          { command: 'bash', args: ['--noprofile', '--norc', '-c'] },
+        ];
+  for (const shell of shells) {
+    const run = (command: string, input?: string) => {
+      const script = shell.command === 'powershell.exe' ? Buffer.from(command, 'utf16le').toString('base64') : command;
+      const result = spawnSync(shell.command, [...shell.args, script], {
+        cwd: root,
+        env,
+        input,
+        encoding: 'utf8',
+        windowsVerbatimArguments: shell.args.includes('/c'),
+      });
+      assert.ifError(result.error);
+      return result;
+    };
+    const version = run('arc --version');
+    assert.equal(version.status, 0, `${shell.command}: ${version.stderr}`);
+    assert.equal(
+      version.stdout.trim(),
+      JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+    );
+    const windows = run('arc windows --json');
+    assert.equal(windows.status, 0, windows.stderr);
+    assert.deepEqual(JSON.parse(windows.stdout), { version: 1, windows: [], complete: true });
+    const status = run('arc statusline --json', '{}');
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
+    const cost = run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model`);
+    assert.equal(cost.status, 0, cost.stderr);
+    const report = JSON.parse(cost.stdout);
+    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.parent.requests, 1);
+    assert.equal(report.parent.modelCosts[0].model, 'claude-opus-5');
+    assert.match(report.buildCommit, /^[0-9a-f]{40}$/);
+    const failure = run('arc "unknown command"');
+    assert.equal(failure.status, 1, failure.stderr);
+    assert.match(failure.stderr, /Unknown command: unknown command/);
+  }
+  fs.writeFileSync(
+    bundle,
+    'console.log(JSON.stringify({node:process.env.ELECTRON_RUN_AS_NODE,window:process.env.ARC_WINDOW,args:process.argv.slice(2)}));',
+  );
+  for (const shell of shells) {
+    const command = 'arc "argument with spaces"';
+    const script = shell.command === 'powershell.exe' ? Buffer.from(command, 'utf16le').toString('base64') : command;
+    const result = spawnSync(shell.command, [...shell.args, script], {
+      cwd: root,
+      env,
+      encoding: 'utf8',
+      windowsVerbatimArguments: shell.args.includes('/c'),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { node: '1', window: 'this-window', args: ['argument with spaces'] });
+  }
 });
 
 test('the package command leaves out its single-bundle size notice', () => {
@@ -243,6 +419,57 @@ test('the package command leaves out its single-bundle size notice', () => {
       "the package command printed VSCE's single-bundle size notice",
     );
   } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('packaging patches the requested archive for overrides, equals options, and target defaults', () => {
+  const outputDir = tempDir('arc-output-options-');
+  const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8'));
+  const targetName = `${manifest.name}-linux-x64-${manifest.version}.vsix`;
+  const defaultArchive = path.join(extensionRoot, targetName);
+  const previous = fs.existsSync(defaultArchive) ? fs.readFileSync(defaultArchive) : null;
+  const stale = path.join(outputDir, 'stale.vsix');
+  const seeded = spawnSync(
+    process.execPath,
+    ['scripts/package.mjs', '--no-dependencies', '--allow-missing-repository', '-o', stale],
+    { cwd: extensionRoot, encoding: 'utf8' },
+  );
+  assert.ifError(seeded.error);
+  assert.equal(seeded.status, 0, seeded.stderr);
+  const staleBytes = fs.readFileSync(stale);
+  fs.utimesSync(stale, new Date('2000-01-01T00:00:00Z'), new Date('2000-01-01T00:00:00Z'));
+  const staleModified = fs.statSync(stale).mtimeMs;
+  const cases = [
+    { args: ['-o', stale, '-o', path.join(outputDir, 'final.vsix')], archive: path.join(outputDir, 'final.vsix') },
+    {
+      args: ['-o', stale, `--out=${path.join(outputDir, 'equals.vsix')}`],
+      archive: path.join(outputDir, 'equals.vsix'),
+    },
+    { args: ['--target=linux-x64'], archive: defaultArchive },
+    { args: ['--target', 'linux-x64', '--out', outputDir], archive: path.join(outputDir, targetName) },
+  ];
+  try {
+    for (const [index, item] of cases.entries()) {
+      const result = spawnSync(
+        process.execPath,
+        ['scripts/package.mjs', '--no-dependencies', '--allow-missing-repository', ...item.args],
+        { cwd: extensionRoot, encoding: 'utf8', env: { ...process.env, GITHUB_ACTIONS: index === 1 ? 'true' : '' } },
+      );
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, result.stderr);
+      const checked = spawnSync(process.execPath, ['scripts/check-vsix.mjs', item.archive], {
+        cwd: extensionRoot,
+        encoding: 'utf8',
+      });
+      assert.ifError(checked.error);
+      assert.equal(checked.status, 0, checked.stderr);
+      assert.deepEqual(fs.readFileSync(stale), staleBytes);
+      assert.equal(fs.statSync(stale).mtimeMs, staleModified, 'packaging rewrote the stale archive');
+    }
+  } finally {
+    if (previous) fs.writeFileSync(defaultArchive, previous);
+    else if (fs.existsSync(defaultArchive)) fs.unlinkSync(defaultArchive);
     fs.rmSync(outputDir, { recursive: true, force: true });
   }
 });

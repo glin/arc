@@ -20,7 +20,10 @@ import {
   SessionState,
   UsageReadQueue,
   askIdle,
+  askIdleMcp,
   askIdleMcpChange,
+  askIdleDefaults,
+  arcCliSpawner,
   childEnv,
   claudeAskMode,
   claudeIdlePlan,
@@ -73,7 +76,7 @@ import {
 } from './composerview.ts';
 import { USAGE_FRESH_MS } from './usageview.ts';
 import { tempDir } from './temproot.ts';
-import { statementFrom } from '../test/source-contract.ts';
+import { statementFrom, sourceMatch } from '../test/source-contract.ts';
 
 const CLAUDE = { command: 'C:\\claude.exe', leadingArgs: [], env: {} };
 const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
@@ -3561,6 +3564,194 @@ test('without an opt-in no child of any plan carries an inherited entrypoint', (
     ]) {
       assert.equal(removed in env, false, `${name} under a mixed-case inherited name kept ${removed}=${env[removed]}`);
     }
+  }
+});
+
+test('Arc CLI environments preserve PATH casing and replace inherited window targeting on each platform', () => {
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const windows = platform === 'win32';
+    for (const key of ['PATH', 'Path', 'pAtH']) {
+      const inherited = {
+        [key]: 'inherited',
+        Arc_Window: 'other-window',
+        ARC_WINDOW: 'stale',
+        Arc_Editor_Executable: 'stale',
+      };
+      const env = childEnv(inherited, {}, undefined, undefined, {
+        directory: 'launcher directory',
+        editorExecutable: 'C:\\Editor Files\\Code.exe',
+        windowId: 'own-window',
+        platform,
+      });
+      assert.equal(
+        env[windows ? key : 'PATH'],
+        'launcher directory' + (windows ? ';inherited' : key === 'PATH' ? ':inherited' : ''),
+      );
+      if (windows)
+        assert.deepEqual(
+          Object.keys(env).filter((name) => name.toUpperCase() === 'PATH'),
+          [key],
+        );
+      else if (key !== 'PATH') assert.equal(env[key], 'inherited');
+      assert.equal(env.ARC_WINDOW, 'own-window');
+      assert.equal('Arc_Window' in env, false);
+      assert.equal('Arc_Editor_Executable' in env, false);
+      assert.equal(env.ARC_EDITOR_EXECUTABLE, windows ? 'C:/Editor Files/Code.exe' : 'C:\\Editor Files\\Code.exe');
+    }
+    const env = childEnv(
+      { Path: 'old', PATH: 'node-selected', ARC_WINDOW: 'stale' },
+      { pAtH: 'new' },
+      undefined,
+      undefined,
+      {
+        directory: 'bin',
+        editorExecutable: '/editor',
+        windowId: null,
+        platform,
+      },
+    );
+    assert.equal(env.PATH, windows ? 'bin;new' : 'bin:node-selected');
+    assert.equal('ARC_WINDOW' in env, false);
+    assert.equal(
+      childEnv({}, {}, undefined, undefined, {
+        directory: 'bin',
+        editorExecutable: '/editor',
+        windowId: null,
+        platform,
+      }).PATH,
+      'bin',
+    );
+  }
+});
+
+test('the extension binds its packaged CLI and current window to every child entry point', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  sourceMatch(
+    source,
+    /const spawner = arcCliSpawner\(\(\) => \(\{\s*directory: path\.join\(context\.extensionPath, 'dist', 'bin'\),\s*editorExecutable: process\.execPath,\s*windowId: channel\?\.windowId \?\? null/,
+  );
+  sourceMatch(source, /const host = new AgentHost\(\{\s*spawner,/);
+  for (const helper of ['askIdle', 'askIdleMcp', 'askIdleMcpChange', 'askIdleDefaults'])
+    sourceMatch(source, new RegExp(helper + '\\(plan, spawner(?:[,\\)])'));
+});
+
+test('Arc CLI targeting reaches fresh, resumed, draft, idle, and rename children for both agents', async () => {
+  const cwd = tempDir('arc-child-env-');
+  const launch = { ...CLAUDE, env: { Arc_Window: 'foreign', PACKAGE_VALUE: 'kept' } };
+  const client = { cwd, clientInfo: CODEX_CLIENT };
+  const plans = [
+    claudePlan(launch, { cwd }),
+    claudePlan(launch, { cwd, resume: 'resumed' }),
+    claudePlan(launch, { cwd, sessionId: 'draft' }),
+    claudeIdlePlan(launch, cwd),
+    codexPlan(launch, client),
+    codexPlan(launch, { ...client, resume: 'resumed' }),
+    codexIdlePlan(launch, client),
+  ];
+  const seen: Record<string, string>[] = [];
+  const host = new AgentHost({
+    idleDurationMs: 60_000,
+    spawner: arcCliSpawner(
+      () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: 'own-window' }),
+      (_command, _args, _cwd, env, agent, cli) => {
+        assert.ok(cli);
+        seen.push(childEnv(process.env, env, agent, cwd, cli) as Record<string, string>);
+        throw new Error('captured environment');
+      },
+    ),
+    onEvent: () => {},
+    onStateChange: () => {},
+  });
+  try {
+    for (const [index, plan] of plans.entries())
+      await assert.rejects(host.session(`env-${index}`, plan), /captured environment/);
+    for (const [agent, plan] of [
+      ['claude', claudeRenamePlan(launch, { cwd, resume: 'renamed', title: 'Named' })],
+      ['codex', codexRenamePlan(launch, { ...client, threadId: 'renamed', title: 'Named' })],
+    ] as const)
+      await assert.rejects(
+        host.renameSession(agent, 'renamed', 'Named', () => plan),
+        /captured environment/,
+      );
+    assert.equal(seen.length, plans.length + 2);
+    for (const env of seen) {
+      assert.equal(env.ARC_WINDOW, 'own-window');
+      assert.equal('Arc_Window' in env, false);
+      assert.equal(env.ARC_EDITOR_EXECUTABLE, '/editor');
+      assert.equal(env.PACKAGE_VALUE, 'kept');
+      const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH')!;
+      assert.ok(env[key].startsWith('Arc bin' + path.delimiter));
+    }
+  } finally {
+    host.dispose();
+  }
+});
+
+test('all idle helper entry points replace foreign window targets with the current activation environment', async () => {
+  vi.stubEnv('ARC_WINDOW', 'foreign-window');
+  const cwd = tempDir('arc-idle-env-');
+  const seen: Record<string, string | undefined>[] = [];
+  let windowId: string | null = 'own-window';
+  const spawner = arcCliSpawner(
+    () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId }),
+    (_command, _args, directory, env, agent, cli) => {
+      assert.ok(cli);
+      seen.push(childEnv(process.env, env, agent, directory, cli));
+      throw new Error('captured environment');
+    },
+  );
+  try {
+    for (const target of ['own-window', null]) {
+      windowId = target;
+      for (const plan of [claudeIdlePlan(CLAUDE, cwd), codexIdlePlan(CODEX, { cwd, clientInfo: CODEX_CLIENT })]) {
+        await assert.rejects(askIdle(plan, spawner), /captured environment/);
+        await assert.rejects(askIdleMcp(plan, spawner), /captured environment/);
+        await assert.rejects(askIdleMcpChange(plan, spawner, []), /captured environment/);
+        await assert.rejects(askIdleDefaults(plan, spawner), /captured environment/);
+      }
+    }
+    assert.equal(seen.length, 16);
+    for (const [index, env] of seen.entries()) {
+      assert.equal(env.ARC_WINDOW, index < 8 ? 'own-window' : undefined);
+      assert.equal(env.ARC_EDITOR_EXECUTABLE, '/editor');
+      const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH')!;
+      assert.ok(env[key]?.startsWith('Arc bin' + path.delimiter));
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('a spawned child receives no inherited window target when this activation has no channel', async () => {
+  vi.stubEnv('ARC_WINDOW', 'another-window');
+  const child = spawnCli(
+    process.execPath,
+    [
+      '-e',
+      'console.log(JSON.stringify({window:process.env.ARC_WINDOW ?? null,path:process.env.PATH,editor:process.env.ARC_EDITOR_EXECUTABLE}));',
+    ],
+    tempDir('arc-spawn-env-'),
+    {},
+    'codex',
+    {
+      directory: 'Arc bin',
+      editorExecutable: process.execPath,
+      windowId: null,
+    },
+  );
+  let output = '';
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+  });
+  try {
+    await vi.waitFor(() => assert.ok(output.includes('\n')));
+    const env = JSON.parse(output);
+    assert.equal(env.window, null);
+    assert.ok(env.path.startsWith('Arc bin' + path.delimiter));
+    assert.equal(env.editor, process.platform === 'win32' ? process.execPath.replaceAll('\\', '/') : process.execPath);
+  } finally {
+    child.kill();
+    vi.unstubAllEnvs();
   }
 });
 

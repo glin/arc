@@ -1203,6 +1203,7 @@ test('channel construction failure leaves panel activation and provider registra
       throw new Error('The Arc window channel path is too long.');
     },
     windowChannel: null,
+    arcCliSpawner: () => () => {},
     storeRoot: () => '/Arc/Store',
     cacheRoot: () => '/Arc/Cache',
     normalizedWorkspaceIdentity: () => 'workspace',
@@ -7427,7 +7428,7 @@ test('default metadata watches external ancestors and ignores unrelated editor s
     'codexIdlePlan',
     'CLIENT_INFO',
     'askIdleDefaults',
-    'spawnCli',
+    'spawner',
     'unavailableDefaults',
     'settingName',
     'fs',
@@ -7920,7 +7921,7 @@ test('an MCP change without its exact live owner uses an isolated child and refr
   );
   sourceMatch(
     mcpChange,
-    /\} else \{[\s\S]*askIdleMcpChange\(plan, spawnCli, changes\)[\s\S]*noteMcp\(owner,/,
+    /\} else \{[\s\S]*askIdleMcpChange\(plan, spawner, changes\)[\s\S]*noteMcp\(owner,/,
     'an isolated MCP change did not refresh the selected owner',
   );
   sourceMatch(
@@ -8045,7 +8046,7 @@ function catalogRefreshFixture() {
     mcpSurfaceGeneration: 0,
     workspaceCwd: () => 'C:/workspace',
     idlePlanFor: () => (control.failure === 'plan' ? null : {}),
-    spawnCli() {},
+    spawner() {},
     askIdle: async () => {
       calls.push('catalog');
       if (control.failure === 'throw') throw new Error('read failed');

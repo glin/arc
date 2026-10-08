@@ -7,6 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot.ts';
+import { arcCliSpawner, childEnv } from './agenthost.ts';
 import {
   discoverWindows,
   hostAddress,
@@ -575,4 +576,84 @@ test('disposal during listener startup removes the listener without publishing a
   await start;
   assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
   assert.equal(fs.existsSync(hostAddress(home, channel.hostId)), false);
+});
+
+test('constructor failure leaves an activation spawner without a foreign window target', () => {
+  let channel: WindowChannel | null = null;
+  const create = vi.spyOn(network, 'createServer').mockImplementation(() => {
+    throw new Error('Listener unavailable');
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => {
+      channel = new WindowChannel(tempDir('window-constructor-failed-'));
+    }, /Listener unavailable/);
+    const spawner = arcCliSpawner(
+      () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: channel?.windowId ?? null }),
+      (_command, _args, cwd, wanted, agent, cli) => {
+        assert.equal(childEnv({ ARC_WINDOW: 'foreign-window' }, wanted, agent, cwd, cli).ARC_WINDOW, undefined);
+        return {} as never;
+      },
+    );
+    spawner('unused', [], '.', {});
+  } finally {
+    create.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('activation spawners clear their window target after asynchronous startup and later channel failures', async () => {
+  for (const failure of ['directory', 'listener-start', 'publish-start', 'listener-later', 'publish-later']) {
+    const home = tempDir('window-failed-target-');
+    const original = network.createServer;
+    let server: net.Server | null = null;
+    const create = vi
+      .spyOn(network, 'createServer')
+      .mockImplementation((...args: Parameters<typeof network.createServer>) => {
+        server = original(...args);
+        return server;
+      });
+    syncBuiltinESMExports();
+    let channel: WindowChannel;
+    try {
+      channel = new WindowChannel(home);
+      channels.push(channel);
+    } finally {
+      create.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const targets: (string | undefined)[] = [];
+    const spawner = arcCliSpawner(
+      () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: channel.windowId }),
+      (_command, _args, cwd, wanted, agent, cli) => {
+        targets.push(childEnv({ ARC_WINDOW: 'foreign-window' }, wanted, agent, cwd, cli).ARC_WINDOW);
+        return {} as never;
+      },
+    );
+    spawner('unused', [], '.', {});
+    const oversized = { ...state, folders: ['x'.repeat(100_000)] };
+    if (failure === 'directory') {
+      fs.writeFileSync(path.join(home, 'hosts'), 'not a directory');
+      await assert.rejects(channel.update(state));
+    } else if (failure === 'listener-start') {
+      const listen = vi.spyOn(server!, 'listen').mockImplementation(() => {
+        queueMicrotask(() => server!.emit('error', new Error('Listener unavailable')));
+        return server!;
+      });
+      try {
+        await assert.rejects(channel.update(state), /Listener unavailable/);
+      } finally {
+        listen.mockRestore();
+      }
+    } else if (failure === 'publish-start') {
+      await assert.rejects(channel.update(oversized), /too large/);
+    } else {
+      await channel.update(state);
+      if (failure === 'publish-later') await assert.rejects(channel.update(oversized), /too large/);
+      else server!.emit('error', new Error('Listener unavailable'));
+    }
+    spawner('unused', [], '.', {});
+    assert.deepEqual(targets, [channel.hostId, undefined], failure);
+    await channel.dispose();
+  }
 });

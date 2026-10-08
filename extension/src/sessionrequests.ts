@@ -220,13 +220,22 @@ export class WindowChannel {
   // The provider calls update only after it restores saved state.
   async update(state: WindowState): Promise<void> {
     if (this.closed) return Promise.resolve();
-    this.state = { ...state, folders: [...state.folders] };
-    if (this.listening) {
-      this.publish();
-      return Promise.resolve();
+    try {
+      this.state = { ...state, folders: [...state.folders] };
+      if (this.listening) {
+        this.publish();
+        return;
+      }
+      if (!this.starting) this.starting = this.listen();
+      await this.starting;
+    } catch (error) {
+      void this.dispose();
+      throw error;
     }
-    if (!this.starting) this.starting = this.listen();
-    return this.starting;
+  }
+
+  get windowId(): string | null {
+    return this.closed ? null : this.hostId;
   }
 
   private info(): WindowInfo {

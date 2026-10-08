@@ -67,6 +67,7 @@ export type Spawner = (
   cwd: string,
   env: Record<string, string>,
   agent?: AgentName,
+  cli?: ArcCliEnvironment,
 ) => ChildLike;
 
 // Returns a refusal for Windows batch shims, which cannot be spawned directly without a shell.
@@ -99,11 +100,19 @@ const HOST_IDENTITY_ENV_NAMES = [
   'CLAUDE_CODE_CONTAINER_ID',
 ];
 
+export interface ArcCliEnvironment {
+  directory: string;
+  editorExecutable: string;
+  windowId: string | null;
+  platform?: string;
+}
+
 export function childEnv(
   inherited: Record<string, string | undefined>,
   wanted: Record<string, string>,
   agent?: AgentName,
   cwd?: string,
+  cli?: ArcCliEnvironment,
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...inherited, ELECTRON_RUN_AS_NODE: '1' };
   for (const key of Object.keys(env)) {
@@ -112,6 +121,25 @@ export function childEnv(
     }
   }
   Object.assign(env, wanted);
+  if (cli) {
+    const windowKey = `${ARC_IDENTITY.environmentPrefix}WINDOW`;
+    const editorKey = `${ARC_IDENTITY.environmentPrefix}EDITOR_EXECUTABLE`;
+    const windows = (cli.platform ?? process.platform) === 'win32';
+    const pathKeys = (source: Record<string, string | undefined>) =>
+      Object.keys(source)
+        .filter((key) => (windows ? key.toUpperCase() === 'PATH' : key === 'PATH'))
+        .sort();
+    const inheritedKey = pathKeys(inherited)[0];
+    const wantedKey = pathKeys(wanted)[0];
+    const value = wantedKey ? wanted[wantedKey] : inheritedKey ? inherited[inheritedKey] : undefined;
+    for (const key of pathKeys(env)) delete env[key];
+    env[inheritedKey ?? 'PATH'] = cli.directory + (value ? (windows ? ';' : ':') + value : '');
+    for (const key of Object.keys(env)) {
+      if ([windowKey, editorKey].includes(key.toUpperCase())) delete env[key];
+    }
+    env[editorKey] = windows ? cli.editorExecutable.replaceAll('\\', '/') : cli.editorExecutable;
+    if (cli.windowId !== null) env[windowKey] = cli.windowId;
+  }
   // The editor environment takes precedence over the session directory's billing selector.
   const selectorKey = Object.keys(inherited).find(
     (key) => key.toUpperCase() === `${ARC_IDENTITY.environmentPrefix}CLAUDE_BILLING_LABEL`,
@@ -141,7 +169,7 @@ export function childEnv(
   return env;
 }
 
-export const spawnCli: Spawner = (command, args, cwd, env, agent) => {
+export const spawnCli: Spawner = (command, args, cwd, env, agent, cli) => {
   if (process.env[MEASUREMENT_ENVIRONMENT.blockAgents] === '1')
     throw new Error('Agent connections are disabled in this measurement window.');
   const refusal = unstartable(command, process.platform);
@@ -150,11 +178,15 @@ export const spawnCli: Spawner = (command, args, cwd, env, agent) => {
   }
   return nodeSpawn(command, args, {
     cwd,
-    env: childEnv(process.env, env, agent, cwd),
+    env: childEnv(process.env, env, agent, cwd, cli),
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
 };
+
+export function arcCliSpawner(environment: () => ArcCliEnvironment, spawner: Spawner = spawnCli): Spawner {
+  return (command, args, cwd, env, agent) => spawner(command, args, cwd, env, agent, environment());
+}
 
 export type AgentName = 'claude' | 'codex';
 

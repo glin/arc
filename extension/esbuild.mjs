@@ -89,16 +89,46 @@ async function createBuildContext(developmentServerUrl) {
   return { context, inputs: panel.inputs };
 }
 
+async function createCliContext() {
+  fs.mkdirSync('dist/bin', { recursive: true });
+  fs.writeFileSync(
+    'dist/bin/arc',
+    '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$ARC_EDITOR_EXECUTABLE" "${0%/*}/../cli.cjs" "$@"\n',
+    { mode: 0o755 },
+  );
+  fs.chmodSync('dist/bin/arc', 0o755);
+  fs.writeFileSync(
+    'dist/bin/arc.cmd',
+    '@echo off\r\nsetlocal\r\nset "ELECTRON_RUN_AS_NODE=1"\r\n"%ARC_EDITOR_EXECUTABLE%" "%~dp0..\\cli.cjs" %*\r\n',
+  );
+  return esbuild.context({
+    entryPoints: ['../cli/src/main.ts'],
+    bundle: true,
+    format: 'cjs',
+    platform: 'node',
+    target: 'node18',
+    outfile: 'dist/cli.cjs',
+    metafile: true,
+    define: {
+      ARC_VERSION: JSON.stringify(manifestVersion()),
+      ARC_BUILD_COMMIT: JSON.stringify(sourceIdentity().sourceCommit ?? 'unknown'),
+    },
+  });
+}
+
 export async function buildExtension({ watch = false, developmentServerUrl = null } = {}) {
   if (watch) fs.rmSync('dist/build-identity.json', { force: true });
+  const cli = await createCliContext();
   let current = await createBuildContext(developmentServerUrl);
   if (!watch) {
+    const cliResult = await cli.rebuild();
     const result = await current.context.rebuild();
     const inputs = [
       ...new Set(
         [
           ...current.inputs,
           ...Object.keys(result.metafile.inputs),
+          ...Object.keys(cliResult.metafile.inputs),
           'package.json',
           'esbuild.mjs',
           'src/panelbundle.ts',
@@ -124,10 +154,12 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
       }) + '\n',
     );
     await current.context.dispose();
+    await cli.dispose();
     return async () => undefined;
   }
 
   await current.context.watch();
+  await cli.watch();
   let watchers = [];
   let pending = null;
   const rebuildPanel = async () => {
@@ -162,6 +194,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
       watcher.close();
     }
     await current.context.dispose();
+    await cli.dispose();
   };
 }
 

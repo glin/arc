@@ -49,7 +49,7 @@ import {
   renameAgentSession,
   pickedEffort,
   pickedModel,
-  spawnCli,
+  arcCliSpawner,
   existingHostKey,
   freshHostKey,
   retireDraftProfile,
@@ -110,6 +110,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     /* Window discovery failure leaves panel activation available. */
   }
   windowChannel = channel;
+  const spawner = arcCliSpawner(() => ({
+    directory: path.join(context.extensionPath, 'dist', 'bin'),
+    editorExecutable: process.execPath,
+    windowId: channel?.windowId ?? null,
+  }));
   if (channel)
     context.subscriptions.push({
       dispose: () => {
@@ -275,6 +280,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // The commands event publishes the complete catalog. Skip the following state callback's redundant panel update.
   const commandStateChanges = new Set<string>();
   const host = new AgentHost({
+    spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
     onEvent: ({ key, event, turnId }) => {
       if (event.kind === 'activity') {
@@ -746,7 +752,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         throw new Error(`${named} cannot be started in this folder, so its servers cannot be changed.`);
       }
       const generation = mcpSurfaceGeneration;
-      const done = await askIdleMcpChange(plan, spawnCli, changes);
+      const done = await askIdleMcpChange(plan, spawner, changes);
       if (done.servers && noteMcp(owner, done.servers, revision, generation)) {
         publishMcp();
       }
@@ -835,7 +841,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           : codexIdlePlan(launch, { cwd, model, clientInfo: CLIENT_INFO });
       request = launch.problem
         ? Promise.resolve(unavailableDefaults('The agent could not report its settings.'))
-        : askIdleDefaults(plan, spawnCli);
+        : askIdleDefaults(plan, spawner);
       defaultRequests.set(key, request);
     }
     void request.then((defaults) => {
@@ -947,7 +953,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!plan) {
       return false;
     }
-    const servers = await askIdleMcp(plan, spawnCli);
+    const servers = await askIdleMcp(plan, spawner);
     if (!servers) {
       return false;
     }
@@ -1045,7 +1051,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           initialMcpRevision =
             wantMcp && resolvedMcpOwner ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision) : null;
           const commandRevision = commandLists.revision(agent);
-          const answers = await askIdle(plan, spawnCli);
+          const answers = await askIdle(plan, spawner);
           // Publish the idle child's commands before its usage and model catalog.
           commandsAsked.add(agent);
           publishCommands({ agent, commands: answers.commands, complete: false }, commandRevision);

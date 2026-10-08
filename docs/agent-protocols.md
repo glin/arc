@@ -4,6 +4,8 @@ Read this document when changing CLI launch, child ownership, resume, asks, stre
 
 ## Runtime shape
 
+Panel-started children receive the packaged `arc` launcher directory before their inherited PATH. Windows preserves the inherited PATH key's casing. `ARC_WINDOW` names this activation's window when its channel exists. Without a channel, children receive no `ARC_WINDOW`. `ARC_EDITOR_EXECUTABLE` names the editor binary. Both launchers set `ELECTRON_RUN_AS_NODE=1` and run `dist/cli.cjs` with that binary. The extensionless `arc` serves POSIX shells and Git Bash. `arc.cmd` serves Windows command shells. Fresh, resumed, draft, idle, and rename-only children share this environment.
+
 Each active session owns a child process in the window that started it. Children communicate over stdio and die with the extension host. Another window follows their work through the transcript on disk rather than by attaching to the child.
 
 Session identity outlives the process. The Panel sends each prompt to its named session, and the extension starts a fresh child with that id when no current child owns it. The transcript remains the record used by the timeline.
