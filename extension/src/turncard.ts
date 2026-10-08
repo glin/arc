@@ -4336,6 +4336,7 @@ export interface ComposerRuntimeFacts {
 export function composerRuntimeBySession(
   turns: readonly Turn[],
   newestCompactions: ReadonlyMap<string, Compaction>,
+  lastReportedModels: ReadonlyMap<string, string | null> = new Map(),
 ): Map<string, ComposerRuntimeFacts> {
   const turnsBySession = new Map<string, Turn[]>();
   for (const turn of turns) {
@@ -4363,7 +4364,13 @@ export function composerRuntimeBySession(
           ),
       ) ?? null;
     result.set(sessionId, {
-      confirmedModel: newest?.model ?? null,
+      confirmedModel:
+        newest?.model ??
+        (newest?.agent === 'codex' && newest.interrupted
+          ? lastReportedModels.has(sessionId)
+            ? (lastReportedModels.get(sessionId) ?? null)
+            : (ordered.find((turn) => turn.model)?.model ?? null)
+          : null),
       confirmedModelAttachment: newest?.modelAttachment ?? null,
       confirmedEffort: newest?.effort ?? null,
       context: currentContextOf(newest, compaction),

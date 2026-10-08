@@ -3214,9 +3214,10 @@ export class PanelProvider implements vscode.Disposable {
         const runtime = composerRuntimeBySession(
           value.read.turns,
           currentRecordsBySession(value.read.turns, value.read.compactions).newestCompactions,
+          new Map([[sessionId, value.read.lastReportedModel ?? null]]),
         ).get(sessionId);
         if (runtime) this.composerRuntime.set(sessionId, runtime);
-        if (!value.recoveryPending) {
+        if (session.agent === 'codex' || !value.recoveryPending) {
           if (launch) {
             this.newSession(launch.request, owner, launch);
             return;
@@ -9983,6 +9984,7 @@ export class PanelProvider implements vscode.Disposable {
     const turns: Turn[] = [];
     const compactions: Compaction[] = [];
     const parsedCacheRevisions = new Map<string, Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>>();
+    const lastReportedModels = new Map<string, string | null>();
     let listedMaxTurns = 0;
     this.readWindows.clear();
     // Update retained-page recency and apply the shared budget before collecting selected windows.
@@ -9990,6 +9992,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const session of sessions) {
       const window = this.readFor(session, ordinary.maxTurns, ordinary.tailBytes);
       const read = window.read;
+      lastReportedModels.set(session.sessionId, read.lastReportedModel ?? null);
       parsedCacheRevisions.set(session.sessionId, window.revision);
       // Include retained pages for each selected session. Unselected sessions retain pages without drawing them.
       const older = historyRecordsOutside(this.history.get(session.sessionId)?.pages ?? [], read);
@@ -10017,7 +10020,7 @@ export class PanelProvider implements vscode.Disposable {
     this.turnMarks = turns.map((t) => ({ id: turnKey(t), agent: t.agent, finished: t.finished }));
     const currentRecords = currentRecordsBySession(turns, compactions);
     this.newestBySession = currentRecords.newestTurns;
-    this.composerRuntime = composerRuntimeBySession(turns, currentRecords.newestCompactions);
+    this.composerRuntime = composerRuntimeBySession(turns, currentRecords.newestCompactions, lastReportedModels);
     // Build recorded prompt recall in newest-first order, including messages submitted during a turn.
     this.promptsBySession.clear();
     for (const t of turns) {

@@ -12505,6 +12505,45 @@ test("a Claude row with no recorded directory never falls back to the first work
   );
 });
 
+test('a stopped Codex turn keeps the last reported model in the Prompt box without borrowing runtime facts', () => {
+  const directory = tempDir('stopped-codex-model-');
+  const file = path.join(directory, 'source.jsonl');
+  const record = (type: string, second: number, payload: object) => ({
+    type,
+    timestamp: new Date(second * 1000).toISOString(),
+    payload,
+  });
+  fs.writeFileSync(
+    file,
+    [
+      record('session_meta', 0, { id: 'source', cwd: '/repo' }),
+      record('event_msg', 1, { type: 'task_started', turn_id: 'first' }),
+      record('turn_context', 2, { turn_id: 'first', model: 'gpt-6-astra', effort: 'high' }),
+      record('event_msg', 3, { type: 'task_complete', turn_id: 'first', last_agent_message: 'Done' }),
+      record('event_msg', 4, { type: 'task_started', turn_id: 'stopped', model_context_window: 258400 }),
+      record('event_msg', 5, { type: 'turn_aborted', turn_id: 'stopped', reason: 'interrupted' }),
+    ]
+      .map((value) => JSON.stringify(value))
+      .join('\n') + '\n',
+  );
+  const read = readCodexSession(file, 'source');
+  const current = currentRecordsBySession(read.turns, read.compactions);
+  const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', {
+    runtime: composerRuntimeBySession(read.turns, current.newestCompactions),
+  });
+  state.models = [{ value: 'gpt-6-astra', label: 'Astra', description: '', efforts: [] }];
+  const view = composerView(state)!;
+  const model = view.picks.find((pick) => pick.control === 'model')!;
+  assert.equal(model.label, 'Astra');
+  assert.match(model.name, /Astra/);
+  assert.equal(current.newestTurns.get('source')?.promptId, 'stopped');
+  assert.equal(current.newestTurns.get('source')?.interrupted, true);
+  assert.equal(read.turns.at(-1)?.model, null);
+  assert.equal(state.settings.confirmedEffort, null);
+  assert.equal(state.context, null);
+  assert.equal(state.nextTurn, null);
+});
+
 test('a failed turn without runtime facts keeps the Composer on the last recorded runtime', () => {
   const rows = [{ id: 'codex', label: 'Codex session', agentKey: 'codex' }];
   const recorded = turn({
@@ -15735,7 +15774,7 @@ test('the composer current context is selected against the newest compaction', (
 
   sourceMatch(
     panelHostSource,
-    /this\.composerRuntime = composerRuntimeBySession\(turns, currentRecords\.newestCompactions\);/,
+    /this\.composerRuntime = composerRuntimeBySession\(turns, currentRecords\.newestCompactions, lastReportedModels\);/,
     'the provider does not project Composer runtime facts from the accepted window',
   );
 
@@ -22835,6 +22874,73 @@ test('the hint box draws over every popover', () => {
         assert.doesNotMatch(source, pattern, `${folder}/${file} holds ${what}, which can draw over the hint box`);
       }
     }
+  }
+});
+
+test('a static stopped Codex source continues model recovery through the host without another refresh', async () => {
+  const directory = tempDir('host-stopped-model-');
+  const file = path.join(directory, 'source.jsonl');
+  const record = (type: string, second: number, payload: object) => ({
+    type,
+    timestamp: new Date(second * 1000).toISOString(),
+    payload,
+  });
+  fs.writeFileSync(
+    file,
+    [
+      record('session_meta', 0, { id: 'source', cwd: '/repo' }),
+      record('event_msg', 1, { type: 'task_started', turn_id: 'first' }),
+      record('turn_context', 2, { turn_id: 'first', model: 'gpt-6-astra', effort: 'high' }),
+      record('event_msg', 3, { type: 'task_complete', turn_id: 'first' }),
+      { type: 'ignored', payload: 'x'.repeat(4 * 1024 * 1024) },
+      record('event_msg', 4, { type: 'task_started', turn_id: 'stopped', model_context_window: 258400 }),
+      record('event_msg', 5, { type: 'turn_aborted', turn_id: 'stopped', reason: 'interrupted' }),
+    ]
+      .map((value) => JSON.stringify(value))
+      .join('\n') + '\n',
+  );
+  const stat = fs.statSync(file);
+  const session = { file, sessionId: 'source', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+  const fixture = metadataEnrichmentFixture([session]);
+  const provider = fixture.provider;
+  let pendingReplies = 0;
+  const run = fixture.worker.run.bind(fixture.worker);
+  fixture.worker.run = async (request, generation, signal) => {
+    const result = await run(request, generation, signal);
+    if (result?.value.kind === 'window' && result.value.recoveryPending) {
+      pendingReplies++;
+      assert.ok((result.value.recoveryBytes ?? 0) > 0);
+      assert.ok((result.value.recoveryBytes ?? 0) <= 1024 * 1024);
+    }
+    return result;
+  };
+  Object.assign(provider, {
+    showing: 'source',
+    selectionGeneration: 1,
+    updateHistoryAfterAcceptedWindow() {},
+    hydrateCommitRepositories: async () => false,
+    progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 512 }),
+    progressiveCurrent: () => Boolean(provider.cache.get(file)?.read.lastReportedModel),
+  });
+  provider.hostSessions.set(provider.hosts[0], 'source');
+  try {
+    await provider.completeSelectedWindow('source', 1);
+    assert.equal(provider.attachmentRecoveryPending('source'), false);
+    await vi.waitFor(() => assert.equal(provider.cache.get(file)?.read.lastReportedModel, 'gpt-6-astra'), {
+      timeout: 10000,
+    });
+    assert.ok(pendingReplies > 1);
+    const read = provider.cache.get(file).read;
+    const runtime = composerRuntimeBySession(read.turns, new Map(), new Map([['source', read.lastReportedModel]]));
+    const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', { runtime });
+    assert.equal(composerView(state)!.picks.find((pick) => pick.control === 'model')!.label, 'gpt-6-astra');
+    assert.equal(state.context, null);
+    assert.equal(state.nextTurn, null);
+    const start = panelHostSource.indexOf('private async finishHandoffRecovery(');
+    const handoff = memberFrom(panelHostSource, start);
+    assert.match(handoff, /session\.agent === 'codex' \|\| !value\.recoveryPending/);
+  } finally {
+    fixture.worker.stop();
   }
 });
 

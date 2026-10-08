@@ -1187,12 +1187,8 @@ async function execute(
     reset: result.kind === 'reset',
     appendFrom,
     readBytes: result.readBytes,
-    ...(session.agent === 'claude'
-      ? {
-          recoveryBytes,
-          recoveryPending: 'recoveryPending' in result && result.recoveryPending === true,
-        }
-      : {}),
+    recoveryBytes,
+    recoveryPending: 'recoveryPending' in result && result.recoveryPending === true,
     agentKey: agentSpendDependencyKey(
       result.read.turns,
       agentFile,

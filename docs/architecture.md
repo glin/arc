@@ -120,6 +120,8 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 
 Codex retained-context reads admit copied metadata only through the opening's declared fork ancestry. Tool pairs retain separate function, custom-tool, and client-search identities. Local-shell calls use function outputs. Server search outputs require no local call.
 
+Stopped Codex display-model recovery scans backward from the accepted forward boundary in cancellable slices. Recovery retains at most 256 KiB per record and skips oversized non-model bodies. Unproved model identity or ownership leaves the display identity absent. Completed recovery, including absence, is cached for that file revision. Replacement, truncation, and rewrites restart recovery. Worker replies carry recovery bytes and continuation state. Optional Codex display recovery does not delay attachment handoffs. Display identity stays separate from parser billing state and retained-context facts.
+
 The report for a turn comes from its transcript or rollout. A current-file diff may use a snapshot when the live file still differs from that snapshot. A per-turn diff never reads its after side from the live file because later work may already have changed it.
 
 A folderless window allocates a unique cache identity without creating a directory. Its first cache write publishes ownership before data. Ownership spans panel tab closure and reopening. Terminal provider disposal closes write admission, flushes synchronous cache writers, then publishes release. Resumed partition writes allocate a fresh generation and path.
@@ -256,7 +258,7 @@ The first column is checked against the shipped extension directory by `architec
 | `history.ts` | Exact-revision history cursors, semantic pages, transactional forward checkpoints, and opt-in metadata recovery slices with live source reduction and resumable payload accounting | no |
 | `oversizedrecord.ts` | Incremental byte reducer that cuts the bulky strings and compaction history of one oversized record while metadata recovery reads it | no |
 | `claudehistory.ts` | Claude semantic-page and forward-checkpoint adapter, with resumable revisioned model-attachment recovery | no |
-| `codexhistory.ts` | Codex semantic-page and forward-checkpoint adapter, and bounded raw parent/child commit ownership coverage | no |
+| `codexhistory.ts` | Codex semantic-page and forward-checkpoint adapter, bounded display-model recovery, and bounded raw parent/child commit ownership coverage | no |
 | `historypages.ts` | Per-session older-history pages, completed turns displaced from an accepted selected window, their retention budget, and end-of-list control | no |
 | `turnview.ts` | Saved panel state, parse budgets, list selection, empty states, and re-exports | no |
 | `turncard.ts` | Reduces a turn to the card the panel draws, merging each child's recorded files and commits into the card's own rows with the child's session, naming each commit's repository and branch, and re-exports shared card-menu projections | no |

@@ -908,6 +908,8 @@ interface CompactMetadata {
 }
 
 export interface SessionRead {
+  // Recorded Codex identity for display only. It establishes no request or context facts.
+  lastReportedModel?: string | null;
   turns: Turn[];
   compactions: Compaction[];
   // The transcript bytes covered by this parse. The provider retains it for the selected
@@ -3937,6 +3939,7 @@ export interface FileRevision {
 }
 
 export interface BackwardLineCursor {
+  discardedFragment?: boolean;
   revision: FileRevision;
   // The exclusive older edge of the bytes already inspected.
   end: number;
@@ -3946,6 +3949,7 @@ export interface BackwardLineCursor {
 }
 
 export interface BackwardLine {
+  oversized?: boolean;
   offset: number;
   text: string;
 }
@@ -4087,12 +4091,53 @@ export function readPreviousLines(
   cursor: BackwardLineCursor,
   bytes: number,
   readRange: BackwardRangeReader = readBackwardRange,
+  maxRecordBytes?: number,
 ): BackwardLineBatch | null {
   const length = Math.min(Math.max(1, bytes), cursor.end);
   const start = cursor.end - length;
   const chunk = readRange(file, start, length, cursor.revision);
   if (!chunk || chunk.length !== length) {
     return null;
+  }
+
+  if (maxRecordBytes !== undefined) {
+    const cap = Math.max(1, maxRecordBytes);
+    const lines: BackwardLine[] = [];
+    let fragment = cursor.fragment.subarray(0, cap);
+    let discarded = cursor.discardedFragment === true || cursor.fragment.length > cap;
+    let end = chunk.length;
+    while (end > 0) {
+      const newline = chunk.lastIndexOf(0x0a, end - 1);
+      const piece = chunk.subarray(newline + 1, end);
+      const oversized = discarded || piece.length + fragment.length > cap;
+      const prefix =
+        piece.length >= cap
+          ? Buffer.from(piece.subarray(0, cap))
+          : Buffer.concat([piece, fragment.subarray(0, cap - piece.length)]);
+      if (newline < 0 && start > 0) {
+        fragment = prefix;
+        discarded = oversized;
+        break;
+      }
+      lines.push({
+        offset: start + newline + 1,
+        text: prefix.toString('utf8'),
+        ...(oversized ? { oversized: true } : {}),
+      });
+      fragment = Buffer.alloc(0);
+      discarded = false;
+      if (newline < 0) break;
+      end = newline;
+    }
+    return {
+      lines,
+      cursor: {
+        revision: cursor.revision,
+        end: start,
+        fragment: start > 0 ? fragment : Buffer.alloc(0),
+        discardedFragment: start > 0 && discarded,
+      },
+    };
   }
 
   // The synthetic newline closes the fragment whose real newline was consumed by the

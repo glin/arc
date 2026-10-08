@@ -72,6 +72,8 @@ import {
   readCodexHistoryPage,
   readCodexHistoryPageAsync,
   readCodexSessionIncremental,
+  readCodexSessionIncrementalAsync,
+  type CodexForwardCheckpoint,
   createCommitRepositoryCursor,
   scanCommitRepositorySource,
   commitRepositoryTargets,
@@ -89,6 +91,7 @@ import {
 import { retainedTurnLimit, turnKey } from './turnread.ts';
 import {
   currentContextOf,
+  composerRuntimeBySession,
   costDetail,
   countedDispatchedCosts,
   logOf,
@@ -2222,6 +2225,139 @@ test('a Codex checkpoint slides its replay ledger without rereading the source w
   assert.deepEqual(appended.read, readCodexSession(file, 'sess', options));
 });
 
+test('stopped Codex model recovery crosses capped records and caches completed identity or absence', async () => {
+  for (const kind of ['ordinary', 'oversized', 'oversized-event', 'blocked', 'absent', 'copied', 'split']) {
+    const records = [
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      ...(kind === 'absent' ? [] : [turnContext(2, TURN, 'gpt-6-astra', 'high')]),
+      event('task_complete', 3, { turn_id: TURN, last_agent_message: 'Done' }),
+      ...(kind === 'copied'
+        ? [
+            meta({ id: 'foreign', session_id: 'foreign' }),
+            event('task_started', 1, { turn_id: 'copied', started_at: 1 }),
+            turnContext(2, 'copied', 'gpt-6.1-sol', 'high'),
+            event('task_complete', 3, { turn_id: 'copied' }),
+          ]
+        : []),
+      ...(kind === 'oversized-event'
+        ? [event('agent_message', 3, { message: 'x'.repeat(3 * 1024 * 1024) })]
+        : kind === 'split'
+          ? [{ type: 'ignored', payload: 'x'.repeat(400) }]
+          : kind === 'oversized'
+            ? [{ type: 'ignored', payload: 'x'.repeat(3 * 1024 * 1024) }]
+            : kind === 'blocked'
+              ? [
+                  {
+                    type: 'turn_context',
+                    padding: 'x'.repeat(3 * 1024 * 1024),
+                    payload: { turn_id: TURN, model: 'gpt-6.1-sol' },
+                  },
+                ]
+              : Array.from({ length: 180 }, () => ({ type: 'ignored', payload: 'x'.repeat(16384) }))),
+      event('task_started', 4, { turn_id: 'stopped', model_context_window: 258400 }),
+      event('turn_aborted', 5, { turn_id: 'stopped', reason: 'interrupted' }),
+    ];
+    const file = writeRollout(records);
+    const options = { tailBytes: 512 };
+    const work = { modelBudget: { maxBytes: kind === 'split' ? 64 : 128 * 1024, maxMilliseconds: 1000 } };
+    let result = await readCodexSessionIncrementalAsync(file, 'sess', undefined, options, work);
+    assert.ok(result.read);
+    assert.equal(result.recoveryPending, true);
+    let slices = 0;
+    while (result.recoveryPending && slices++ < 50) {
+      const checkpoint = result.checkpoint as CodexForwardCheckpoint;
+      assert.ok(checkpoint.modelRecovery!.cursor.fragment.length <= 256 * 1024);
+      assert.ok((result.recoveryBytes ?? 0) <= 128 * 1024);
+      result = await readCodexSessionIncrementalAsync(file, 'sess', throughStructuredClone(checkpoint), options, work);
+    }
+    assert.equal(result.recoveryPending, false);
+    const expected = kind === 'blocked' || kind === 'absent' || kind === 'copied' ? null : 'gpt-6-astra';
+    assert.equal(result.read?.lastReportedModel, expected, kind);
+    assert.equal(result.read?.turns.at(-1)?.model, null);
+    const runtime = composerRuntimeBySession(
+      result.read!.turns,
+      new Map(),
+      new Map([['sess', result.read!.lastReportedModel ?? null]]),
+    );
+    assert.equal(runtime.get('sess')?.confirmedModel, expected);
+    assert.equal(runtime.get('sess')?.context, null);
+    assert.equal(runtime.get('sess')?.nextTurn, null);
+    const reused = await readCodexSessionIncrementalAsync(file, 'sess', result.checkpoint!, options, work);
+    assert.equal(reused.recoveryBytes, 0);
+    assert.equal(reused.read?.lastReportedModel, expected);
+    fs.appendFileSync(file, JSON.stringify({ type: 'ignored', payload: 'append' }) + '\n');
+    const appended = await readCodexSessionIncrementalAsync(file, 'sess', reused.checkpoint!, options, work);
+    assert.equal(appended.read?.lastReportedModel, expected);
+  }
+});
+
+test('stopped Codex display model prefers the newest settings without changing billed turn identity', async () => {
+  const records = [
+    ...ordinaryTurn(),
+    event('thread_settings_applied', 9, { thread_settings: { model: 'gpt-6.1-sol' } }),
+    event('task_started', 10, { turn_id: 'stopped', model_context_window: 258400 }),
+    event('turn_aborted', 11, { turn_id: 'stopped', reason: 'interrupted' }),
+  ];
+  const result = await readCodexSessionIncrementalAsync(writeRollout(records), 'sess');
+  assert.equal(result.read?.lastReportedModel, 'gpt-6.1-sol');
+  assert.equal(result.recoveryBytes, undefined);
+  const stopped = result.read!.turns.at(-1)!;
+  const runtime = composerRuntimeBySession(
+    result.read!.turns,
+    new Map(),
+    new Map([['sess', result.read!.lastReportedModel ?? null]]),
+  );
+  assert.equal(runtime.get('sess')?.confirmedModel, 'gpt-6.1-sol');
+  assert.equal(stopped.model, null);
+  assert.equal(stopped.usage.requests, 0);
+  assert.equal(result.read!.turns[0].model, 'gpt-5.6-sol');
+  assert.equal(
+    composerRuntimeBySession([{ ...stopped, sessionId: 'other' }], new Map(), new Map([['sess', 'gpt-6-astra']])).get(
+      'other',
+    )?.confirmedModel,
+    null,
+  );
+});
+
+test('stopped Codex recovery rejects obsolete evidence after rewrites, replacement, truncation, and cancellation', async () => {
+  const file = writeRollout([
+    ...ordinaryTurn(),
+    { type: 'ignored', payload: 'x'.repeat(5000) },
+    event('task_started', 10, { turn_id: 'stopped' }),
+    event('turn_aborted', 11, { turn_id: 'stopped', reason: 'interrupted' }),
+  ]);
+  const options = { tailBytes: 512 };
+  let result = await readCodexSessionIncrementalAsync(file, 'sess', undefined, options, {
+    modelBudget: { maxBytes: 64 },
+  });
+  assert.equal(result.recoveryPending, true);
+  const original = fs.readFileSync(file, 'utf8');
+  for (const change of ['rewrite', 'replace', 'truncate']) {
+    const before = fs.statSync(file);
+    const replacement =
+      change === 'truncate'
+        ? original.slice(original.indexOf('{"timestamp":', original.lastIndexOf('x') + 1))
+        : original.replace('gpt-5.6-sol', 'gpt-6-astra');
+    if (change === 'replace') {
+      const temp = file + '.new';
+      fs.writeFileSync(temp, replacement);
+      fs.renameSync(temp, file);
+    } else fs.writeFileSync(file, replacement);
+    fs.utimesSync(file, before.atime, new Date(before.mtimeMs + 2000));
+    result = await readCodexSessionIncrementalAsync(file, 'sess', result.checkpoint!, options, {
+      modelBudget: { maxMilliseconds: 1000 },
+    });
+    assert.equal(result.read?.lastReportedModel, change === 'truncate' ? null : 'gpt-6-astra');
+  }
+  const controller = new AbortController();
+  controller.abort();
+  const cancelled = await readCodexSessionIncrementalAsync(file, 'sess', result.checkpoint!, options, {
+    signal: controller.signal,
+  });
+  assert.equal(cancelled.kind, 'cancelled');
+});
+
 test('a Codex checkpoint keeps an active turn when it grows beyond the tail window', () => {
   const file = writeRollout([
     meta(),
@@ -2255,7 +2391,10 @@ test('a Codex checkpoint keeps an active turn when it grows beyond the tail wind
   const completed = readCodexSessionIncremental(file, 'sess', oversized.checkpoint ?? undefined, options);
   assert.equal(completed.kind, 'appended');
   assert.deepEqual(completed.read?.turns, []);
-  assert.deepEqual(completed.read, readCodexSession(file, 'sess', options));
+  assert.deepEqual(
+    { ...completed.read, lastReportedModel: null },
+    { ...readCodexSession(file, 'sess', options), lastReportedModel: null },
+  );
 });
 
 test('a prompt submitted after an unclosed Codex turn keeps its card across a cloned checkpoint', () => {
@@ -2355,7 +2494,11 @@ test('Codex tail membership follows task_started while pages own earlier turn co
     );
     const fresh = readCodexSession(file, `codex-membership-${floor}`, options);
     assert.equal(resumed.checkpoint?.coveredFrom, floor);
-    assert.deepEqual(resumed.read, fresh, `tail floor ${floor}`);
+    assert.deepEqual(
+      { ...resumed.read, lastReportedModel: null },
+      { ...fresh, lastReportedModel: null },
+      `tail floor ${floor}`,
+    );
     if (floor >= contextStart && floor < taskStart) {
       assert.deepEqual(
         fresh.turns.map((turn) => [turn.prompt, turn.model, turn.effort]),
@@ -10621,7 +10764,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 16);
+  assert.equal(reset.checkpoint?.parserState.version, 17);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],

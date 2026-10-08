@@ -190,6 +190,8 @@ Context usage belongs here because it describes the selected session. Account ra
 
 A newer failed turn with no runtime facts keeps the last recorded model, effort, context, and next-turn estimate. A newer compaction with no recorded resulting level still removes context and price.
 
+A stopped Codex turn without a reported model displays the session's last reported model. This identity supplies no effort, context, or next-turn estimate. A newer reported model takes precedence, including a recorded settings change. Selected and pending choices retain their existing precedence.
+
 The line directly above the prompt text field says what the next turn costs before the reader types. The selected next-turn model drives that estimate as soon as the picker accepts it. A genuine model change starts uncached because the previous model's cache does not belong to the selected model. A selected choice without an exact public price removes the estimate until a later recorded turn supplies priced runtime facts. A muted comma clause says whether the cache is uncached or cached for another span. `composerview.ts` sends the warm and cold faces, with a conservative cold boundary before the nominal lifetime ends. The browser picks one face from its own clock. A compaction is cold from the moment it lands because nothing has cached the session it wrote. An open turn can hold tool results that no later request measured, so the line waits until the turn closes. The faces share one grid cell, so the line holds the height of the longest of them. The prompt text field under it never moves when the state changes.
 
 The next-turn estimate uses chip-height text in the muted foreground. Spacing separates it from the prompt text field.

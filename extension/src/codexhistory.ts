@@ -28,6 +28,8 @@ import {
   sameCommitSha,
   worktreeRelationships,
   type FileRevision,
+  readPreviousLines,
+  type BackwardLineCursor,
   type WorktreeRelationship,
 } from './transcript';
 import {
@@ -44,6 +46,7 @@ import {
   readSemanticHistoryPage,
   readSemanticHistoryPageAsync,
 } from './history';
+import { BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS } from './parserstate';
 
 interface CodexBackwardState {
   meta: CodexSessionMeta | null;
@@ -54,7 +57,18 @@ interface CodexBackwardState {
   evidenceReachedBeginning: boolean;
 }
 
-export type CodexForwardCheckpoint = ForwardParserCheckpoint<CodexSessionParserState>;
+export type CodexForwardCheckpoint = ForwardParserCheckpoint<CodexSessionParserState> & {
+  modelRecovery?: CodexModelRecovery;
+};
+interface CodexModelRecovery {
+  boundary: number;
+  cursor: BackwardLineCursor;
+  status: 'pending' | 'complete';
+  model: string | null;
+  candidate: { text: string; turnId: string | null } | null;
+  ownershipTurnId?: string;
+  admittedModel?: string;
+}
 export type CodexHistoryCursor = SourceHistoryCursor<CodexBackwardState>;
 export type CodexHistoryPageResult = SemanticHistoryResult<CodexBackwardState>;
 
@@ -494,7 +508,7 @@ export function commitRepositoryTargets(
 
 function codexParserKey(opts: CodexReadOptions): string {
   return JSON.stringify({
-    version: 9,
+    version: 10,
     tailBytes: opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     maxTurns: opts.maxTurns ?? 40,
     sessionTitle: normalizeSessionTitle(opts.sessionTitle),
@@ -526,15 +540,17 @@ export function readCodexSessionIncremental(
   return result;
 }
 
-export function readCodexSessionIncrementalAsync(
+export async function readCodexSessionIncrementalAsync(
   file: string,
   sessionId: string,
   checkpoint?: CodexForwardCheckpoint,
   opts: CodexReadOptions = {},
-  work: ForwardReadOptions = {},
-): Promise<IncrementalSessionResult<CodexSessionParserState>> {
+  work: ForwardReadOptions & {
+    modelBudget?: { maxBytes?: number; maxMilliseconds?: number; clock?: () => number };
+  } = {},
+): Promise<IncrementalSessionResult<CodexSessionParserState> & { recoveryBytes?: number; recoveryPending?: boolean }> {
   let meta: CodexSessionMeta | null | undefined;
-  return readForwardSessionAsync(
+  const result = await readForwardSessionAsync(
     file,
     'codex',
     sessionId,
@@ -550,6 +566,147 @@ export function readCodexSessionIncrementalAsync(
     opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     work,
   );
+  if (!result.read) return result;
+  const next = result.checkpoint as CodexForwardCheckpoint;
+  const newest = result.read.turns.at(-1);
+  if (!newest?.interrupted || newest.model || result.read.lastReportedModel) return result;
+  const previous = checkpoint?.modelRecovery;
+  const sameIdentity =
+    previous &&
+    next.revision.dev === previous.cursor.revision.dev &&
+    next.revision.ino === previous.cursor.revision.ino;
+  const compatible =
+    previous &&
+    sameIdentity &&
+    result.kind !== 'reset' &&
+    ((next.revision.size === previous.cursor.revision.size &&
+      next.revision.mtimeMs === previous.cursor.revision.mtimeMs) ||
+      (result.kind === 'appended' &&
+        next.reducedFrom === previous.boundary &&
+        result.appendFrom?.size === previous.cursor.revision.size &&
+        result.appendFrom?.mtimeMs === previous.cursor.revision.mtimeMs));
+  const boundary = next.reducedFrom ?? next.coveredFrom;
+  const fragment = next.skippedFragment ?? Buffer.alloc(0);
+  const recovery: CodexModelRecovery =
+    compatible && previous
+      ? {
+          ...previous,
+          cursor: { ...previous.cursor, revision: next.revision, fragment: Buffer.from(previous.cursor.fragment) },
+        }
+      : {
+          boundary,
+          cursor: {
+            revision: next.revision,
+            end: boundary,
+            fragment: Buffer.from(fragment.subarray(0, 256 * 1024)),
+            discardedFragment: fragment.length > 256 * 1024,
+          },
+          status: boundary === 0 ? 'complete' : 'pending',
+          model: null,
+          candidate: null,
+        };
+  const clock = work.modelBudget?.clock ?? (() => performance.now());
+  const deadline = clock() + (work.modelBudget?.maxMilliseconds ?? BACKGROUND_SCAN_MILLISECONDS);
+  const maxBytes = Math.max(1, work.modelBudget?.maxBytes ?? BACKGROUND_SCAN_BYTES);
+  let recoveryBytes = 0;
+  while (recovery.status === 'pending' && recovery.cursor.end > 0 && recoveryBytes < maxBytes && clock() < deadline) {
+    if (work.signal?.aborted)
+      return { kind: 'cancelled', read: null, checkpoint: null, readBytes: result.readBytes, recoveryBytes };
+    const before = recovery.cursor.end;
+    const batch = readPreviousLines(
+      file,
+      recovery.cursor,
+      Math.min(256 * 1024, maxBytes - recoveryBytes),
+      undefined,
+      256 * 1024,
+    );
+    if (!batch) return { kind: 'stale', read: null, checkpoint: null, readBytes: result.readBytes, recoveryBytes };
+    recoveryBytes += before - batch.cursor.end;
+    recovery.cursor = batch.cursor;
+    for (const line of batch.lines) {
+      if (line.oversized) {
+        const outerKind =
+          /^\s*\{\s*"type"\s*:\s*"([^"]+)"/.exec(line.text)?.[1] ??
+          /"type"\s*:\s*"([^"]+)"\s*,\s*"payload"\s*:/.exec(line.text)?.[1];
+        const kind =
+          outerKind === 'event_msg' ? /"payload"\s*:\s*\{\s*"type"\s*:\s*"([^"]+)"/.exec(line.text)?.[1] : outerKind;
+        if (
+          !kind ||
+          (!recovery.admittedModel && (kind === 'turn_context' || kind === 'thread_settings_applied')) ||
+          kind === 'task_started' ||
+          kind === 'session_meta'
+        ) {
+          recovery.status = 'complete';
+          recovery.candidate = null;
+          recovery.admittedModel = undefined;
+          break;
+        }
+        continue;
+      }
+      const record = parseRecord(line.text);
+      if (!record) continue;
+      if (recovery.admittedModel) {
+        if (record.kind === 'task_started' && record.payload.turn_id === recovery.ownershipTurnId) {
+          recovery.status = 'complete';
+          recovery.admittedModel = undefined;
+          break;
+        }
+        if (record.kind === 'session_meta') {
+          meta ??= readCodexSessionMeta(file);
+          if ((record.payload.id ?? record.payload.session_id) === meta?.sessionId)
+            recovery.model = recovery.admittedModel;
+          recovery.status = 'complete';
+          break;
+        }
+        continue;
+      }
+      if (!recovery.candidate && (record.kind === 'turn_context' || record.kind === 'thread_settings_applied')) {
+        const settings = record.kind === 'turn_context' ? record.payload : record.payload.thread_settings;
+        if (settings && typeof settings === 'object' && ('model' in settings || 'model_id' in settings))
+          recovery.candidate = {
+            text: line.text,
+            turnId:
+              record.kind === 'turn_context' && typeof record.payload.turn_id === 'string'
+                ? record.payload.turn_id
+                : null,
+          };
+      } else if (recovery.candidate && record.kind === 'task_started') {
+        if (recovery.candidate.turnId !== null && record.payload.turn_id !== recovery.candidate.turnId) {
+          recovery.status = 'complete';
+          break;
+        }
+        meta ??= readCodexSessionMeta(file);
+        const reducer = createCodexSessionReducer(sessionId, { maxTurns: 1 }, meta ?? null);
+        reducer.pushLine(line.text);
+        reducer.pushLine(recovery.candidate.text);
+        const admitted = reducer.finish().lastReportedModel;
+        if (admitted) {
+          recovery.admittedModel = admitted;
+          recovery.ownershipTurnId = typeof record.payload.turn_id === 'string' ? record.payload.turn_id : undefined;
+          recovery.candidate = null;
+          continue;
+        }
+        recovery.candidate = null;
+      } else if (record.kind === 'session_meta') {
+        recovery.status = 'complete';
+        break;
+      }
+    }
+  }
+  if (work.signal?.aborted)
+    return { kind: 'cancelled', read: null, checkpoint: null, readBytes: result.readBytes, recoveryBytes };
+  if (recovery.cursor.end === 0 && recovery.status === 'pending') {
+    if (recovery.admittedModel) recovery.model = recovery.admittedModel;
+    recovery.status = 'complete';
+  }
+  if (recovery.status === 'complete') {
+    recovery.cursor.fragment = Buffer.alloc(0);
+    recovery.candidate = null;
+  }
+  next.modelRecovery = recovery;
+  next.skippedFragment = Buffer.alloc(0);
+  result.read.lastReportedModel = recovery.model;
+  return { ...result, recoveryBytes, recoveryPending: recovery.status === 'pending' };
 }
 
 function codexAdapter(

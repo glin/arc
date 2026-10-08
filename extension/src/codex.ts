@@ -4593,7 +4593,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 16;
+  version: 17;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
   turnMembershipStarts: number[];
@@ -4640,6 +4640,8 @@ export interface CodexSessionParserState {
   lastContextSource: { start: number; end: number } | null;
   lastModel: string | null;
   lastModelSource: { start: number; end: number } | null;
+  lastReportedModel?: string | null;
+  lastReportedModelSource?: { start: number; end: number } | null;
   lastProviderSource: { start: number; end: number } | null;
   lastServiceTierSource: { start: number; end: number } | null;
   updateSequence: number;
@@ -4673,7 +4675,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 16,
+    version: 17,
     turns: [],
     turnRanges: [],
     turnMembershipStarts: [],
@@ -5339,6 +5341,14 @@ function reduceCodexSessionLine(
       if (context.model) {
         state.lastModel = context.model;
         state.lastModelSource = { start: sourceStart, end: sourceEnd };
+        if (
+          !state.usageState.currentTurnCopied &&
+          !state.usageState.foreignSessionMeta &&
+          !state.usageState.pendingOwnership[id]
+        ) {
+          state.lastReportedModel = context.model;
+          state.lastReportedModelSource = { start: sourceStart, end: sourceEnd };
+        }
       }
       const pending = removeLatestPendingClassification(state, id);
       const closedIndex = pending ? latestCodexTurnIndex(state, id) : classifiedAfterHorizon;
@@ -5394,6 +5404,10 @@ function reduceCodexSessionLine(
     if (model) {
       state.lastModel = model;
       state.lastModelSource = { start: sourceStart, end: sourceEnd };
+      if (!state.usageState.currentTurnCopied && !state.usageState.foreignSessionMeta) {
+        state.lastReportedModel = model;
+        state.lastReportedModelSource = { start: sourceStart, end: sourceEnd };
+      }
     }
     if (provider) {
       state.lastProviderSource = { start: sourceStart, end: sourceEnd };
@@ -6003,6 +6017,7 @@ function finishCodexSession(
   }
   return {
     turns: state.turns.filter((turn) => !state.usageState.pendingOwnership[turn.promptId]),
+    lastReportedModel: state.lastReportedModel ?? null,
     compactions: state.compactions,
     readBytes,
     turnLimitReached: state.turnLimitReached,
@@ -6337,7 +6352,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 16) {
+  if (state.version !== 17) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);
