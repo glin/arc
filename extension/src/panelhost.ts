@@ -2,12 +2,7 @@ import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
 import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
-import {
-  resolveSelectedSource,
-  validateSelectedSource,
-  selectedDependencies,
-  type SelectedSource,
-} from './selectedsource';
+import { selectedDependencies } from './selectedsource';
 import { LOADING_DEFAULTS, type AppliedDefaults, type DefaultContext } from './view/model-picks';
 import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
@@ -564,14 +559,6 @@ interface CacheEntry {
   checkpointBytes?: number;
 }
 
-// An early selected source with the repository scope, destination and working folder a delivery to it started under.
-interface EarlyDelivery {
-  source: SelectedSource;
-  scope: string;
-  destination: string;
-  cwd: string | null;
-}
-
 interface AwaitingSessionRecord {
   sessionId: string;
   createdAt: number;
@@ -1072,7 +1059,6 @@ interface SelectionWork {
   controller: AbortController;
   host?: PanelHost;
   scope?: string;
-  source?: SelectedSource;
 }
 
 export class PanelProvider implements vscode.Disposable {
@@ -1114,9 +1100,6 @@ export class PanelProvider implements vscode.Disposable {
   private previousSelection: string | null = null;
   private selectionWork: SelectionWork | null = null;
   private selectionWorks = new Map<string, SelectionWork>();
-  // Native sources of selected sessions that the published catalog does not list. The selection path adds a source only while a
-  // catalog is published, so while the catalog is null every reader finds none.
-  private earlySelectedSources = new Map<string, SelectedSource>();
   private selectionFailure: { sessionId: string; generation: number; revision: FileRevision } | null = null;
   // The newest session menu's host. Native commands carry no webview identity.
   private detailsMenuArm: { host: PanelHost; session: string; browserSession: string; at: number } | null = null;
@@ -1883,7 +1866,6 @@ export class PanelProvider implements vscode.Disposable {
     this.metadataRecoverySession = null;
     for (const work of this.selectionWorks?.values() ?? []) work.controller.abort();
     this.selectionWorks?.clear();
-    this.earlySelectedSources?.clear();
     this.responseSnapshots?.clear();
     this.pendingResponsePosts?.clear();
     for (const turnId of this.pendingResponseOwners?.keys() ?? []) this.forgetPendingResponses(turnId);
@@ -2364,7 +2346,6 @@ export class PanelProvider implements vscode.Disposable {
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
     // A catalog listed under the previous roots cannot render the current scope.
-    this.earlySelectedSources.clear();
     for (const work of this.selectionWorks.values()) work.controller.abort();
     this.selectionWorks.clear();
     this.selectionWork?.controller.abort();
@@ -2389,7 +2370,6 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendHydrationReady = false;
     this.repositoryScopeReady = false;
     this.repositoryScopeRoots = [];
-    this.earlySelectedSources?.clear();
     for (const work of this.selectionWorks?.values() ?? []) work.controller.abort();
     this.selectionWorks?.clear();
     this.selectionWork?.controller.abort();
@@ -2712,19 +2692,10 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Build prompt box state for a specified session, including sessions outside the current view.
-  // A published catalog that omits an early selected source rejects it, except for locally started sessions.
   private stateFor(session: string): ComposerState | null {
     if (!this.repositoryScopeReady) {
       return null;
     }
-    if (
-      this.authoritativeCatalog &&
-      this.earlySelectedSources?.has(session) &&
-      !this.authoritativeCatalog.some((source) => source.sessionId === session) &&
-      !this.newDrafts[session] &&
-      !this.awaitingSessionRecords[session]
-    )
-      return null;
     const row = this.rowForSession(session);
     return row ? this.stateForRow(row) : null;
   }
@@ -2781,55 +2752,7 @@ export class PanelProvider implements vscode.Disposable {
     const session = this.catalog?.sessions.find(
       (candidate) => candidate.agent === agent && candidate.sessionId === sessionId,
     );
-    const early = this.earlySelectedSources?.get(sessionId);
-    return (
-      session?.cwd ??
-      (early?.agent === agent ? early.cwd : undefined) ??
-      this.newDrafts[sessionId]?.cwd ??
-      this.awaitingSessionRecords[sessionId]?.cwd ??
-      null
-    );
-  }
-
-  // The early selected source of a session the catalog does not list yet. Delivery to it validates the source first.
-  private unlistedEarlySource(session: string): SelectedSource | undefined {
-    const early = this.earlySelectedSources?.get(session);
-    if (!early || this.authoritativeCatalog?.some((source) => source.sessionId === session)) return undefined;
-    return early;
-  }
-
-  // Captures an unlisted early selected source with the repository scope, destination and working folder its delivery
-  // starts under. Delivery captures it before the prompt is saved, so a change during the save cannot skip validation.
-  private captureEarlyDelivery(session: string, agent: string, destination: () => string): EarlyDelivery | undefined {
-    const source = this.unlistedEarlySource(session);
-    if (!source) return undefined;
-    return {
-      source,
-      scope: JSON.stringify(this.repositoryScopeRoots),
-      destination: destination(),
-      cwd: this.cwdForSession(agent, session),
-    };
-  }
-
-  // Validates a captured early delivery after the prompt is saved. It fails when the source no longer validates, or when the
-  // repository scope, the destination session or the working folder moved, or the early source left without the catalog
-  // listing the session.
-  private async earlyDeliveryStillValid(
-    session: string,
-    agent: string,
-    early: EarlyDelivery,
-    destination: () => string,
-  ): Promise<boolean> {
-    const unchanged = () =>
-      this.repositoryScopeReady &&
-      JSON.stringify(this.repositoryScopeRoots) === early.scope &&
-      destination() === early.destination &&
-      (this.earlySelectedSources.get(session) === early.source ||
-        this.authoritativeCatalog?.some((source) => source.sessionId === session) === true) &&
-      this.cwdForSession(agent, session) === early.cwd;
-    if (!unchanged()) return false;
-    const valid = await validateSelectedSource(early.source, this.repositoryScopeRoots, new AbortController().signal);
-    return valid !== null && unchanged();
+    return session?.cwd ?? this.newDrafts[sessionId]?.cwd ?? this.awaitingSessionRecords[sessionId]?.cwd ?? null;
   }
 
   private recordedCwdForSession(agent: string, sessionId: string): string | null {
@@ -4347,44 +4270,24 @@ export class PanelProvider implements vscode.Disposable {
     }
     const attempted = this.queues[state.sessionId].find((entry) => entry.id === next.id) ?? next;
     this.queueHandoffs.add(next.id);
-    // The membership test keeps a queue without early sources off the capture.
-    const destination = () => this.panelSession(state.sessionId);
-    const early = this.earlySelectedSources?.has(state.sessionId)
-      ? this.captureEarlyDelivery(state.sessionId, state.agent, destination)
-      : undefined;
     void this.writeDrafts()
       .then(() => {
-        const handOff = (deliverable: boolean): Promise<void> | undefined => {
-          // A refused early source keeps the prompt waiting for the next drain.
-          if (!deliverable) {
-            this.queueHandoffs.delete(next.id);
-            this.pendingQueueDrains.add(state.sessionId);
-            this.queues[state.sessionId] = (this.queues[state.sessionId] ?? []).map((entry) =>
-              entry.id === next.id ? { ...entry, delivery: { phase: 'queued', owner: state.sessionId } } : entry,
-            );
-            return this.writeDrafts();
-          }
-          if (!this.stateFor(state.sessionId)) {
-            this.queueHandoffs.delete(next.id);
-            this.pendingQueueDrains.add(state.sessionId);
-            this.queues[state.sessionId] = (this.queues[state.sessionId] ?? []).map((entry) =>
-              entry.id === next.id ? { ...entry, delivery: { phase: 'queued', owner: state.sessionId } } : entry,
-            );
-            return this.writeDrafts().then(() => this.flushQueue(state.sessionId));
-          }
-          if (compactSubmission(state.agent, text) && !carried.length && !assets.length) {
-            this.startCompaction(ready, attempted);
-          } else if (clearSubmission(state.agent, text)) {
-            this.startClear(ready, attempted, text);
-          } else {
-            this.send(ready, text, attempted);
-          }
-          return undefined;
-        };
-        // An early selected source that the catalog did not list when the drain began validates again after the save.
-        return early
-          ? this.earlyDeliveryStillValid(state.sessionId, state.agent, early, destination).then(handOff)
-          : handOff(true);
+        if (!this.stateFor(state.sessionId)) {
+          this.queueHandoffs.delete(next.id);
+          this.pendingQueueDrains.add(state.sessionId);
+          this.queues[state.sessionId] = (this.queues[state.sessionId] ?? []).map((entry) =>
+            entry.id === next.id ? { ...entry, delivery: { phase: 'queued', owner: state.sessionId } } : entry,
+          );
+          return this.writeDrafts().then(() => this.flushQueue(state.sessionId));
+        }
+        if (compactSubmission(state.agent, text) && !carried.length && !assets.length) {
+          this.startCompaction(ready, attempted);
+        } else if (clearSubmission(state.agent, text)) {
+          this.startClear(ready, attempted, text);
+        } else {
+          this.send(ready, text, attempted);
+        }
+        return undefined;
       })
       .catch((error) => {
         this.queueHandoffs.delete(next.id);
@@ -4811,9 +4714,6 @@ export class PanelProvider implements vscode.Disposable {
     const state = this.stateFor(session);
     const draft = this.newDrafts[session];
     const cwd = state ? this.cwdForSession(state.agent, session) : null;
-    const early = state
-      ? this.captureEarlyDelivery(session, state.agent, () => this.panelSession(source, host))
-      : undefined;
     const captured = state
       ? {
           ...state,
@@ -4856,14 +4756,6 @@ export class PanelProvider implements vscode.Disposable {
       if (validated.length !== 1 || attempt.text !== text || attempt.source !== source || attempt.revision !== revision)
         throw new Error('The prompt could not be retained.');
       await this.importPromptRecovery(validated);
-      if (
-        captured &&
-        early &&
-        !(await this.earlyDeliveryStillValid(session, captured.agent, early, () => this.panelSession(source, host)))
-      ) {
-        restore();
-        return;
-      }
       if (
         !captured ||
         !this.hosts.includes(host) ||
@@ -6239,10 +6131,6 @@ export class PanelProvider implements vscode.Disposable {
       this.selectionWork?.controller.abort();
       this.selectionWork = null;
     }
-    for (const id of this.earlySelectedSources?.keys() ?? []) {
-      if (id !== session && ![...(this.hostSessions?.values() ?? [])].includes(id))
-        this.earlySelectedSources.delete(id);
-    }
     this.selectionFailure = null;
     // Selection refreshes reuse the catalog because navigation changes no transcript.
     const seeded = this.selectionGeneration;
@@ -6375,14 +6263,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       const catalogStarted = performance.now();
       this.codexWalk = primedWalk ?? null;
-      let all = selectedOnly
-        ? [
-            ...(this.authoritativeCatalog ?? []),
-            ...[...(this.earlySelectedSources?.values() ?? [])].filter(
-              (source) => !this.authoritativeCatalog?.some((held) => held.sessionId === source.sessionId),
-            ),
-          ]
-        : this.allSessions(reuseCatalog);
+      let all = selectedOnly ? (this.authoritativeCatalog ?? []) : this.allSessions(reuseCatalog);
       if (
         selectedOnly &&
         this.authoritativeCatalog &&
@@ -6485,11 +6366,6 @@ export class PanelProvider implements vscode.Disposable {
           delete this.awaitingSessionRecords[session];
         }
       }
-      // Publish early selected sources in every render. Selected revalidation returns the catalog without them.
-      all = [
-        ...all,
-        ...[...(this.earlySelectedSources?.values() ?? [])].filter((source) => !recorded.has(source.sessionId)),
-      ];
       const scopedDrafts = Object.values(this.newDrafts).filter((draft) =>
         isInside(draft.cwd, this.repositoryScopeRoots),
       );
@@ -9311,7 +9187,6 @@ export class PanelProvider implements vscode.Disposable {
     controller: AbortController;
     host?: PanelHost;
     scope?: string;
-    source?: SelectedSource;
   }): SessionFile | null {
     if (
       work.controller.signal.aborted ||
@@ -9324,8 +9199,7 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       return null;
     }
-    const session =
-      this.authoritativeCatalog?.find((candidate) => candidate.sessionId === work.sessionId) ?? work.source;
+    const session = this.authoritativeCatalog?.find((candidate) => candidate.sessionId === work.sessionId);
     if (!session) return null;
     let revision: FileRevision;
     try {
@@ -9333,8 +9207,7 @@ export class PanelProvider implements vscode.Disposable {
     } catch {
       return null;
     }
-    if (revision.size < 0 || (work.source && (work.source.ino !== revision.ino || work.source.dev !== revision.dev)))
-      return null;
+    if (revision.size < 0) return null;
     return { ...session, ...revision };
   }
 
@@ -9356,54 +9229,10 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork = work;
     this.selectionWorks?.set(sessionId, work);
     let retryLatestRevision = false;
-    const deadline = setTimeout(() => {
-      if ((this.selectionWorks?.get(sessionId) ?? this.selectionWork) !== work) return;
-      this.selectionWorks?.delete(sessionId);
-      if (this.selectionWork === work) this.selectionWork = null;
-      controller.abort();
-      const owned = () =>
-        (work.host || (this.selectionGeneration === generation && this.showing === sessionId)) &&
-        this.anyVisible() &&
-        (!work.host ||
-          (this.hosts.includes(work.host) && (this.hostSessions?.get(work.host) ?? this.showing) === sessionId)) &&
-        (work.scope === undefined || work.scope === JSON.stringify([this.folders(), this.repositoryScopeRoots]));
-      if (owned()) {
-        queueMicrotask(() => {
-          if (owned()) void this.completeSelectedWindow(sessionId, generation);
-        });
-      }
-    }, 5_000);
     // Track worker requests so an unchanged cached result does not trigger another render.
     let roundTrip = false;
     try {
-      // Before the catalog is published, a selected session waits for it, and the render that publishes the catalog completes the
-      // window. A published catalog can miss a session created after its snapshot, such as a new subagent, so that session resolves
-      // from its opening records, becomes an early source, and opens at once. A catalog cleared during the resolve adds no source.
       let session = this.currentSelectedSession(work);
-      if (
-        !session &&
-        this.authoritativeCatalog !== null &&
-        (work.host || (this.showing === sessionId && this.selectionGeneration === generation))
-      ) {
-        const scope = this.repositoryScope?.snapshot(this.folders());
-        if (!scope?.ready) return;
-        this.repositoryScopeReady = true;
-        this.repositoryScopeRoots = scope.roots;
-        this.publishWindowState();
-        work.scope = JSON.stringify([this.folders(), this.repositoryScopeRoots]);
-        const source = await resolveSelectedSource(
-          sessionId,
-          scope.roots,
-          projectsRoot(),
-          codexSessionsRoot(),
-          controller.signal,
-        );
-        if (!source) return;
-        work.source = source;
-        session = this.currentSelectedSession(work);
-        if (!session || this.authoritativeCatalog === null) return;
-        this.earlySelectedSources.set(sessionId, source);
-      }
       if (!session) return;
       const history = this.history.get(sessionId);
       const historyVersions = new Map<string, string>();
@@ -9510,10 +9339,6 @@ export class PanelProvider implements vscode.Disposable {
         generation,
         controller.signal,
       );
-      if (work.source && !(await validateSelectedSource(work.source, this.repositoryScopeRoots, controller.signal))) {
-        if (this.earlySelectedSources.get(sessionId) === work.source) this.earlySelectedSources.delete(sessionId);
-        return;
-      }
       const current = this.currentSelectedSession(work);
       if (!current) {
         return;
@@ -9571,7 +9396,6 @@ export class PanelProvider implements vscode.Disposable {
         void this.refresh(true, true, true, true);
       }
     } finally {
-      clearTimeout(deadline);
       if (this.selectionWorks?.get(sessionId) === work) this.selectionWorks.delete(sessionId);
       if (this.selectionWork === work) {
         this.selectionWork = null;
@@ -9604,11 +9428,6 @@ export class PanelProvider implements vscode.Disposable {
       (a, b) => Number(b.sessionId === this.showing) - Number(a.sessionId === this.showing),
     );
     for (const session of ordered) {
-      if (
-        this.earlySelectedSources?.has(session.sessionId) &&
-        !this.authoritativeCatalog?.some((source) => source.sessionId === session.sessionId)
-      )
-        continue;
       if (signal.aborted) {
         return false;
       }

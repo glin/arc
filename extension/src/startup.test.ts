@@ -1,7 +1,7 @@
 import { test, vi } from 'vitest';
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
-import { resolveSelectedSource, validateSelectedSource, selectedDependencies } from './selectedsource';
+import { selectedDependencies } from './selectedsource';
 import { projectSlug } from './transcript';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -12,7 +12,6 @@ import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
 import {
-  openingRecordOf,
   CodexMetaCache,
   CodexStatCache,
   readCodexSessionTitlePair,
@@ -1209,7 +1208,7 @@ function completeDiscoveryHarness(
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
-      authoritativeCatalog = null; earlySelectedSources = new Map(); attachmentHandoffs = new Set(); titles = new Map();
+      authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
       hosts = [{ webview: { postMessage: (message) => { this.messages.push(message); return Promise.resolve(true); } }, active: () => false, visible: () => true }]; readyHosts = new Set(this.hosts); panelVisibility = createPanelVisibility();
@@ -1723,7 +1722,7 @@ function windowResult(
   };
 }
 
-function earlySourceFixture(agent: 'claude' | 'codex' = 'claude') {
+function selectedSourceFixture(agent: 'claude' | 'codex' = 'claude') {
   const root = tempDir('selected-opening-');
   const workspace = path.join(root, 'workspace');
   const worktree = path.join(root, 'registered');
@@ -1764,10 +1763,8 @@ test('selected transport excludes unrelated history while retaining nested cross
 
 test('a restored session waits for the published catalog before it opens', async () => {
   for (const agent of ['claude', 'codex'] as const) {
-    const fixture = earlySourceFixture(agent);
+    const fixture = selectedSourceFixture(agent);
     const provider = completeDiscoveryHarness(undefined, true, ['stateFor'], {
-      resolveSelectedSource,
-      validateSelectedSource,
       projectsRoot: () => fixture.projects,
       codexSessionsRoot: () => fixture.codex,
     });
@@ -1803,7 +1800,6 @@ test('a restored session waits for the published catalog before it opens', async
     // Discovery is pending, so the restored session is not read and nothing opens.
     await provider.completeSelectedWindow(fixture.sessionId, 0);
     assert.equal(requests, 0, 'a restored session was read before the catalog');
-    assert.equal(provider.earlySelectedSources.size, 0, 'a restored session became an early source');
     assert.equal(opened(), false, 'a restored session opened before the catalog');
 
     // The published catalog lists the session, so it opens.
@@ -1826,182 +1822,87 @@ test('a restored session waits for the published catalog before it opens', async
   }
 });
 
-test('a session created after the catalog snapshot opens, keeps its cards through a refresh that misses it, and stays selected', async () => {
+test('an imported session waits for catalog publication after discovery completes', async () => {
   for (const agent of ['claude', 'codex'] as const) {
-    const fixture = earlySourceFixture(agent);
-    const provider = completeDiscoveryHarness(
-      undefined,
-      true,
-      ['shownSessions', 'evictCache', 'pruneDerivedTitles', 'protectedHistorySessions'],
-      {
-        resolveSelectedSource,
-        validateSelectedSource,
-        projectsRoot: () => fixture.projects,
-        codexSessionsRoot: () => fixture.codex,
-        historyBytes,
-        historyEvictions,
-      },
-    );
+    const fixture = selectedSourceFixture(agent);
+    const provider = completeDiscoveryHarness(undefined, true, [], {
+      projectsRoot: () => fixture.projects,
+      codexSessionsRoot: () => fixture.codex,
+    });
     provider.folders = () => [fixture.workspace];
     provider.repositoryScopeRoots = [fixture.workspace, fixture.worktree];
-    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots, revision: 1 }) };
-    provider.sessionCacheBudgetBytes = () => 16 * 1024 * 1024;
-    provider.walkedClaude = [];
-    provider.carriedNames = new Map();
-    provider.cwds = new Map();
-    provider.humanScans = new Map();
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots }) };
     provider._showing = fixture.sessionId;
     provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
-    // The catalog was published before the session was created, and the folder walk does not list it either, as for a new
-    // subagent that only discovery lists.
     provider.authoritativeCatalog = [];
-    provider.partial = [];
-    provider.discovery = new Promise(() => {});
+    provider.completeCatalogScope = JSON.stringify(provider.repositoryScopeRoots);
     provider.revisionOf = (source: any) => {
       const stat = fs.statSync(source.file);
       return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
     };
-    provider.progressiveCurrent = (source: any) => Boolean(provider.cache.get(source.file));
-    let requests = 0;
-    provider.progressiveWorker = {
-      run: async (_request: ProgressiveRequest, generation: number) => {
-        requests++;
-        const result = windowResult(generation, provider.revisionOf({ file: fixture.file }));
-        if (result.value.kind === 'window')
-          result.value.read.turns = [
-            turn({ sessionId: fixture.sessionId, summary: 'Recorded response\n\nSecond paragraph' }),
-          ];
-        return result;
-      },
+    const requests: string[] = [];
+    provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number) => {
+      assert.equal(request.kind, 'window');
+      if (request.kind !== 'window') return null;
+      requests.push(request.input.session.sessionId);
+      return windowResult(generation, provider.revisionOf(request.input.session));
     };
-    // Cards come only from the windows of the sessions the refresh shows.
-    provider.collect = (sessions: any[]) =>
-      sessions.flatMap((session) => provider.cache.get(session.file)?.read.turns ?? []);
-    const hasCards = (message: any) =>
-      message.cards?.some((card: any) => card.summary === 'Recorded response\n\nSecond paragraph');
     await provider.completeSelectedWindow(fixture.sessionId, 0);
-    await vi.waitFor(() =>
-      assert.ok(
-        provider.messages.some((message: any) => message.type === 'selection' && hasCards(message)),
-        'a session created after the catalog snapshot did not open with its cards',
-      ),
-    );
-    assert.equal(requests, 1);
-    assert.equal(provider.authoritativeCatalog.length, 0, 'the selected session became catalog authority');
-
-    // A refresh that reuses the catalog walks the folders, and the walk does not list the session yet.
-    const before = provider.messages.length;
-    await provider.refresh(false, true);
-    assert.equal(provider.showing, fixture.sessionId, 'a refresh that missed the session moved the selection');
-    assert.ok(provider.cache.has(fixture.file), 'a refresh that missed the session evicted its window');
-    assert.ok(
-      provider.messages.slice(before).some(hasCards),
-      'a refresh that missed the session drew it without its cards',
-    );
-
-    // The next catalog lists the session and keeps it selected.
-    provider.partial = [
-      {
-        file: fixture.file,
-        sessionId: fixture.sessionId,
-        agent,
-        cwd: fixture.worktree,
-        activity: 1,
-        ...provider.revisionOf({ file: fixture.file }),
-      },
-    ];
-    provider.catalog = { sessions: provider.partial };
-    provider.discovery = Promise.resolve(true);
-    await provider.refresh(true);
-    assert.equal(provider.showing, fixture.sessionId);
-    assert.equal(provider.authoritativeCatalog.length, 1);
-    assert.ok(provider.cache.has(fixture.file), 'the listed session lost its window');
-  }
-});
-
-test('early selected membership independently rejects native identity, workspace, ambiguous source, and replacement', async () => {
-  for (const agent of ['claude', 'codex'] as const) {
-    const fixture = earlySourceFixture(agent);
-    const signal = new AbortController().signal;
-    const resolve = (roots = [fixture.workspace, fixture.worktree]) =>
-      resolveSelectedSource(fixture.sessionId, roots, fixture.projects, fixture.codex, signal);
-    const source = await resolve();
-    assert.ok(source, 'registered worktree was rejected');
-    assert.equal(await resolve([fixture.workspace]), null, 'unregistered cwd supplied early authority');
-    for (const opening of [
-      fixture.opening('wrong-native'),
-      fixture.opening(fixture.sessionId, path.join(fixture.root, 'outside')),
-      '{}\n',
-      '{invalid}\n',
-      ' '.repeat(132_000) + fixture.opening(),
-    ]) {
-      fs.writeFileSync(fixture.file, opening);
-      assert.equal(await resolve(), null, 'unvalidated opening was admitted');
-    }
-    if (agent === 'codex') {
-      const legacy =
-        JSON.stringify({ type: 'session_meta', payload: { session_id: fixture.sessionId, cwd: fixture.worktree } }) +
-        String.fromCharCode(10);
-      fs.writeFileSync(fixture.file, legacy);
-      assert.equal(await resolve(), null, 'legacy shared identity supplied early content');
-      assert.equal(
-        openingRecordOf(legacy)?.sessionId,
-        fixture.sessionId,
-        'authoritative compatibility fallback disappeared',
-      );
-    }
-    fs.writeFileSync(fixture.file, fixture.opening());
-    const duplicate =
-      agent === 'claude'
-        ? path.join(fixture.projects, projectSlug(fixture.workspace), path.basename(fixture.file))
-        : path.join(fixture.codex, '2026', '10', '05', path.basename(fixture.file));
-    fs.mkdirSync(path.dirname(duplicate), { recursive: true });
-    fs.writeFileSync(duplicate, fixture.opening());
-    assert.equal(await resolve(), null, 'ambiguous native source was admitted');
-    fs.unlinkSync(duplicate);
-    fs.renameSync(fixture.file, fixture.file + '.old');
-    fs.writeFileSync(fixture.file, fixture.opening());
+    assert.deepEqual(requests, [], 'an imported source opened outside the published catalog');
+    assert.equal(provider.cache.has(fixture.file), false);
+    assert.deepEqual(provider.awaitingSessionRecords, {}, 'an imported child became locally owned');
+    await provider.refresh(true, true, true, true);
     assert.equal(
-      await validateSelectedSource(source, [fixture.worktree], signal),
-      null,
-      'replaced source retained early authority',
+      provider.sessionRows.some((row: any) => row.id === fixture.sessionId),
+      false,
     );
+
+    const listed = {
+      file: fixture.file,
+      sessionId: fixture.sessionId,
+      agent,
+      cwd: fixture.worktree,
+      activity: 1,
+      ...provider.revisionOf({ file: fixture.file }),
+    };
+    provider.authoritativeCatalog = [listed];
+    provider.catalog = { sessions: [listed] };
+    provider._showing = fixture.sessionId;
+    await provider.completeSelectedWindow(fixture.sessionId, 0);
+    assert.deepEqual(requests, [fixture.sessionId]);
+    assert.ok(provider.cache.has(fixture.file));
+    assert.deepEqual(provider.awaitingSessionRecords, {});
   }
 });
 
-test('selected request deadline releases its own holder and rejects a late answer after another selection', async () => {
+test('a slow selected read keeps its request until selection cancels it', async () => {
   vi.useFakeTimers();
   try {
     let finish!: (result: ProgressiveResult) => void;
     let requests = 0;
-    const signals: AbortSignal[] = [];
-    const provider = selectedWindowHarness((_request, _generation, signal) => {
+    const provider = selectedWindowHarness(() => {
       requests++;
-      signals.push(signal);
       return new Promise((resolve) => {
-        if (requests === 1) finish = resolve;
+        finish = resolve;
       });
-    });
+    }, ['show']);
     const progress = { accepted: ['historical-progress'] };
     provider.discoveryCheckpoint = progress;
     provider.refreshController = new AbortController();
-    const old = provider.completeSelectedWindow('selected', 1);
+    const pending = provider.completeSelectedWindow('selected', 1);
     const first = provider.selectionWork;
-    await vi.advanceTimersByTimeAsync(5_000);
-    assert.equal(first.controller.signal.aborted, true);
-    assert.notEqual(provider.selectionWork, first);
-    assert.equal(requests, 2, 'deadline did not retry the selected request');
+    await vi.advanceTimersByTimeAsync(30_000);
+    assert.equal(first.controller.signal.aborted, false, 'elapsed time canceled a valid selected read');
+    assert.equal(provider.selectionWork, first);
+    assert.equal(requests, 1, 'elapsed time restarted a valid selected read');
     assert.equal(provider.discoveryCheckpoint, progress);
     assert.equal(provider.refreshController.signal.aborted, false);
-    provider.showing = 'other';
-    provider.selectionGeneration++;
+    provider.catalog = [];
+    provider.show('other');
+    assert.equal(first.controller.signal.aborted, true, 'switching kept an obsolete selected read');
     finish(windowResult(1, provider.revisionOf(provider.session)));
-    await old;
+    await pending;
     assert.equal(provider.cache.size, 0, 'obsolete response replaced the new selection');
-    await vi.advanceTimersByTimeAsync(25_000);
-    assert.equal(provider.selectionWork, null);
-    assert.equal(signals[1].aborted, true);
-    assert.equal(requests, 2);
   } finally {
     vi.useRealTimers();
   }
@@ -2009,10 +1910,8 @@ test('selected request deadline releases its own holder and rejects a late answe
 
 test('selected delivery rejects changed host ownership and scope after the worker read', async () => {
   for (const change of ['host', 'scope'] as const) {
-    const fixture = earlySourceFixture();
+    const fixture = selectedSourceFixture();
     const provider = completeDiscoveryHarness(undefined, true, [], {
-      resolveSelectedSource,
-      validateSelectedSource,
       projectsRoot: () => fixture.projects,
       codexSessionsRoot: () => fixture.codex,
     });
@@ -2050,13 +1949,11 @@ test('selected delivery rejects changed host ownership and scope after the worke
 });
 
 test('two visible hosts accept their own concurrent selected windows while a later discovery pass is held', async () => {
-  const fixture = earlySourceFixture();
+  const fixture = selectedSourceFixture();
   const secondId = 'second-native';
   const secondFile = path.join(path.dirname(fixture.file), `${secondId}.jsonl`);
   fs.writeFileSync(secondFile, fixture.opening(secondId));
   const provider = completeDiscoveryHarness(undefined, true, [], {
-    resolveSelectedSource,
-    validateSelectedSource,
     projectsRoot: () => fixture.projects,
     codexSessionsRoot: () => fixture.codex,
   });
@@ -3166,8 +3063,7 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   const heldFiles = (map: Map<string, unknown>) => [...map.keys()].sort();
   const everyFile = [selected, codex, child, gone].map((session) => session.file).sort();
 
-  // Reload: the selected window lands before discovery, so the list holds only the selected session.
-  provider.earlySelectedSources = new Map([[selected.sessionId, selected]]);
+  // Reload: a selected-only refresh before discovery keeps the held source facts.
   provider.showing = selected.sessionId;
   await provider.refresh(true, true, true, true);
   assert.equal(provider.authoritativeCatalog, null, 'the fixture no longer refreshes before the catalog');
@@ -3197,7 +3093,7 @@ test('a selected-only refresh before the catalog keeps every held title, and the
     'the session list stayed loading although every listed source holds current facts',
   );
 
-  // A workspace folder change clears the catalog and the early selected sources. Once the new repository scope answers,
+  // A workspace folder change clears the catalog. Once the new repository scope answers,
   // its full refresh waits in discovery while the selected window refreshes. That selected-only refresh lists no session
   // at all and keeps the old scope's facts. The new scope's authoritative refresh then prunes the sources outside it.
   provider.repositoryScope = { snapshot() {} };
@@ -3215,7 +3111,6 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   };
   provider.workspaceFoldersChanged();
   assert.equal(provider.authoritativeCatalog, null, 'the workspace folder change kept the old catalog');
-  assert.equal(provider.earlySelectedSources.size, 0, 'the workspace folder change kept the early selected sources');
   provider.repositoryScopeReady = true;
   const scoped = provider.refresh(true);
   await vi.waitFor(() => assert.ok(walking, 'the new scope refresh did not start discovery'));
@@ -8288,16 +8183,13 @@ test('the source count is ignored under a discovery scope other than the one it 
   }
 });
 
-test('an exhausted early selected source stays settled through selection renders and a discovery failure', async () => {
+test('an exhausted catalog source stays settled through selection renders and a discovery failure', async () => {
   vi.useFakeTimers();
   try {
-    const { completePass, provider, healthy, codex, exhausted, discovery, poll } = exhaustedLoadingHarness();
-    const early = codex('codex-early', 70);
-    provider.earlySelectedSources.set(early.sessionId, early);
+    const { completePass, provider, healthy, discovery, poll } = exhaustedLoadingHarness();
     completePass();
-    provider.titles.set(early.file, exhausted(early));
     await provider.refresh(true);
-    assert.equal(provider.messages.at(-1).startup.failed, undefined, 'the render failed an exhausted early source');
+    assert.equal(provider.messages.at(-1).startup.failed, undefined, 'the render failed an exhausted catalog source');
 
     provider._showing = healthy.sessionId;
     const rendered = provider.messages.length;
