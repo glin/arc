@@ -155,3 +155,15 @@ test('a session no source names yet draws a placeholder with its id', () => {
     fullLabel: 'Session 01234567',
   });
 });
+
+test('exact inode names retain delayed custom metadata and release a larger replacement with an earlier title', () => {
+  const names = new SessionNames();
+  names.observe('s', { ...name('Confirmed', 'custom'), at: 1500 }, { dev: '0', ino: '56576470320201115', size: 1600 });
+  names.observe('s', { ...name('Older', 'custom'), at: 500 }, { dev: '0', ino: '56576470320201115', size: 1000 });
+  assert.equal(names.get('s')?.label, 'Confirmed');
+  names.observeTurns(
+    [{ sessionId: 's', sessionTitle: 'Replacement', sessionTitleSource: 'custom', sessionTitleAt: 100 }],
+    () => transcriptIdentity({ dev: '0', ino: '56576470320201114', size: 2000 }),
+  );
+  assert.equal(names.get('s')?.label, 'Replacement');
+});

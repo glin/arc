@@ -1,0 +1,29 @@
+import { requestWindow } from '../../extension/src/sessionrequests.ts';
+
+export async function runSessions(command: 'sessions' | 'session', args: string[]): Promise<string> {
+  let window: string | undefined;
+  let sessionId: string | undefined;
+  let turns = 5;
+  let turnsSeen = false;
+  let jsonSeen = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--window' && window === undefined) {
+      window = args[++index];
+      if (!window || window.startsWith('--')) throw new Error('--window requires a window identifier.');
+    } else if (arg === '--turns' && command === 'session' && !turnsSeen) {
+      const raw = args[++index];
+      if (!raw || !/^[0-9]+$/.test(raw)) throw new Error('Turns must be between 1 and 20.');
+      turns = Number(raw);
+      turnsSeen = true;
+      if (!Number.isSafeInteger(turns) || turns < 1 || turns > 20) throw new Error('Turns must be between 1 and 20.');
+    } else if (arg === '--json' && !jsonSeen) {
+      jsonSeen = true;
+    } else if (!arg.startsWith('-') && command === 'session' && sessionId === undefined) {
+      sessionId = arg;
+    } else throw new Error(`Unknown or repeated argument: ${arg}`);
+  }
+  if (command === 'session' && !sessionId)
+    throw new Error('Usage: arc session ID [--turns 1-20] [--window ID] [--json]');
+  return JSON.stringify(await requestWindow(command, command === 'session' ? { sessionId, turns } : {}, window));
+}

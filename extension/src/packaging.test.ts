@@ -837,7 +837,7 @@ test('a session becoming busy immediately moves its Timeline card past Sending',
 
   sourceMatch(
     stateHandler,
-    /panel\.setRunning\(/,
+    /publishHostedSessions\(\)/,
     'busy changes are not published until Codex emits another event, so the card stays on Sending',
   );
 });

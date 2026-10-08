@@ -20,6 +20,7 @@ import {
   readCodexSessionMeta,
 } from './codex';
 import * as fs from 'node:fs';
+import { revisionOf } from './transcript';
 import {
   normalizeSessionTitle,
   normalizeFsPath,
@@ -145,7 +146,7 @@ export function commitRepositoryOccurrence(commit: CommitRepositoryRequest['comm
 
 export function commitSourceRevision(source: CommitRepositorySource): boolean {
   try {
-    const stat = fs.statSync(source.file);
+    const stat = revisionOf(fs.statSync(source.file, { bigint: true }));
     return Object.entries(source.revision).every(([key, value]) => stat[key as keyof typeof stat] === value);
   } catch {
     return false;

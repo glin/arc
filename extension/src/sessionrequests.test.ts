@@ -1,3 +1,5 @@
+import { revisionOf, supportedFileIdentity } from './transcript';
+import { sessionSourceAdmitted } from './sessionreads';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import filesystem from 'node:fs';
@@ -12,6 +14,15 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot.ts';
+import {
+  boundedSessionRead,
+  boundedSessionListing,
+  sessionAttention,
+  SESSION_READ_LIMITS,
+  type SessionListingRow,
+} from './sessionreads.ts';
+import { openReadWindow, closeReadWindow } from './readmeter.ts';
+import { requestWindow } from './sessionrequests.ts';
 import { arcCliSpawner, childEnv } from './agenthost.ts';
 import {
   discoverWindows,
@@ -131,6 +142,177 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
   ]) {
     assert.equal(parseSessionRequest(invalid), null);
   }
+});
+
+test('session requests reject paths, extra parameters, and invalid turn counts before dispatch', async () => {
+  const { home, channel, entry } = await fixture();
+  const valid = request(entry, { method: 'session', params: { sessionId: 'known', turns: 2 } });
+  assert.deepEqual(parseSessionRequest(valid), valid);
+  for (const params of [
+    { sessionId: 'known', turns: 0 },
+    { sessionId: 'known', turns: 21 },
+    { sessionId: 'known', turns: 1.5 },
+    { sessionId: 'known', turns: 1, file: '/other' },
+  ])
+    assert.equal(parseSessionRequest({ ...valid, params }), null);
+  channel.setRequestHandler((value) => {
+    if (value.params.sessionId !== 'known') throw new Error('Unknown session.');
+    return { session: value.params.sessionId, turns: value.params.turns, requester: value.requester };
+  });
+  const result = await requestWindow('session', valid.params, channel.hostId, home);
+  assert.equal((result as any).session, 'known');
+  await assert.rejects(
+    requestWindow('session', { sessionId: '/other/file', turns: 1 }, channel.hostId, home),
+    /Unknown session/,
+  );
+  const second = new WindowChannel(home);
+  channels.push(second);
+  await second.update(state);
+  await assert.rejects(requestWindow('sessions', {}, '', home), /Select one Arc window/);
+});
+
+test('bounded session reads preserve native provider turns and reject stale scope and source revisions', () => {
+  const directory = tempDir('session-read-');
+  for (const agent of ['claude', 'codex'] as const) {
+    const file = path.join(directory, `${agent}.jsonl`);
+    const head =
+      agent === 'claude'
+        ? {
+            type: 'user',
+            sessionId: 'known',
+            cwd: directory,
+            timestamp: '2026-10-08T12:00:00Z',
+            message: { role: 'user', content: 'first prompt' },
+          }
+        : {
+            type: 'session_meta',
+            timestamp: '2026-10-08T12:00:00Z',
+            payload: { id: 'known', cwd: directory, source: 'cli' },
+          };
+    const records: unknown[] = [head, { type: 'ignored', text: 'x'.repeat(SESSION_READ_LIMITS.bytes * 2) }];
+    for (let n = 1; n <= 3; n++) {
+      const timestamp = `2026-10-08T12:00:0${n}Z`;
+      if (agent === 'claude')
+        records.push(
+          {
+            type: 'user',
+            sessionId: 'known',
+            cwd: directory,
+            timestamp,
+            message: { role: 'user', content: `prompt ${n}` },
+          },
+          {
+            type: 'assistant',
+            timestamp,
+            message: {
+              id: `reply-${n}`,
+              role: 'assistant',
+              model: 'claude-opus-5-5',
+              content: [{ type: 'text', text: `answer ${n}` }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            },
+          },
+        );
+      else
+        records.push(
+          { type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: `turn-${n}` } },
+          { type: 'turn_context', timestamp, payload: { turn_id: `turn-${n}`, model: 'gpt-6.1-sol', effort: 'high' } },
+          { type: 'event_msg', timestamp, payload: { type: 'user_message', message: `prompt ${n}` } },
+          {
+            type: 'event_msg',
+            timestamp,
+            payload: { type: 'task_complete', turn_id: `turn-${n}`, last_agent_message: `answer ${n}` },
+          },
+        );
+    }
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const source = { agent, file, sessionId: 'known', size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+    const window = openReadWindow();
+    const result = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
+    const tally = closeReadWindow(window);
+    assert.ok(tally.bytes <= 512 * 1024, `${agent} read ${tally.bytes} bytes`);
+    assert.equal(result.state, 'current');
+    assert.equal(result.partial, true);
+    assert.equal(result.turns.length, 2);
+    assert.equal(result.turns[0].prompt, 'prompt 3');
+    assert.equal(result.turns[0].summary, 'answer 3');
+    assert.equal(result.requester, 'local-agent');
+    assert.equal(
+      boundedSessionRead({ ...source, dev: '999999999999999999999' }, 2, () => 'scope', null, [directory]).state,
+      'stale',
+    );
+    assert.equal(boundedSessionRead(source, 2, () => 'scope', null, [path.join(directory, 'other')]).state, 'stale');
+    let calls = 0;
+    const stale = boundedSessionRead(source, 2, () => (++calls === 1 ? 'before' : 'after'), null, [directory]);
+    assert.equal(stale.state, 'stale');
+    assert.deepEqual(stale.turns, []);
+    calls = 0;
+    const changed = boundedSessionRead(
+      source,
+      2,
+      () => {
+        if (++calls === 2) fs.appendFileSync(file, '\n');
+        return 'scope';
+      },
+      null,
+      [directory],
+    );
+    assert.equal(changed.state, 'stale');
+    assert.deepEqual(changed.turns, []);
+  }
+});
+
+test('session replies with valid large window metadata refuse excess envelope bytes without losing the channel', async () => {
+  const data = { content: 'x'.repeat(48 * 1024 - 1000) };
+  const { home, channel } = await fixture();
+  channel.setRequestHandler(() => data);
+  await channel.update({
+    ...state,
+    folders: Array.from({ length: 12 }, (_, n) => `C:/project-${n}/${'folder'.repeat(280)}`),
+  });
+  for (const method of ['sessions', 'session'] as const) {
+    await assert.rejects(
+      requestWindow(method, method === 'session' ? { sessionId: 'known', turns: 1 } : {}, channel.hostId, home),
+      /session response exceeds.*channel limit/,
+    );
+  }
+  channel.setRequestHandler(() => ({ complete: false, notes: ['Bounded listing.'] }));
+  assert.deepEqual(await requestWindow('sessions', {}, channel.hostId, home), {
+    complete: false,
+    notes: ['Bounded listing.'],
+  });
+});
+
+test('session output limits preserve unknown attention and report excluded content', () => {
+  assert.equal(sessionAttention(false, 'waiting', true), 'unknown');
+  assert.equal(sessionAttention(true, 'waiting', false), 'input');
+  for (const status of ['running', 'subagents', 'background'] as const)
+    assert.equal(sessionAttention(true, status, false), 'running');
+  assert.equal(sessionAttention(true, 'done', true), 'unread');
+  assert.equal(sessionAttention(true, 'done', false), 'idle');
+  assert.equal(sessionAttention(true, undefined, null), 'unknown');
+  const row: SessionListingRow = {
+    id: 's',
+    provider: 'claude',
+    name: 'x'.repeat(20000),
+    setup: { model: null, effort: null, source: 'unavailable' },
+    labels: [],
+    pinned: false,
+    archived: false,
+    runStatus: 'unknown',
+    attention: 'unknown',
+    lastActivity: null,
+    parent: null,
+    agentRun: null,
+    facts: 'unparsed',
+  };
+  const result = boundedSessionListing(Array(200).fill(row), true, null);
+  assert.equal(result.complete, false);
+  assert.ok(result.sessions.length < 200);
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= SESSION_READ_LIMITS.outputBytes);
+  assert.ok(result.notes.length > 0);
 });
 
 test('ARC_HOME selects the registry and independent same-folder hosts retain distinct identities', async () => {
@@ -906,5 +1088,38 @@ test('activation spawners clear their window target after asynchronous startup a
     spawner('unused', [], '.', {});
     assert.deepEqual(targets, [channel.hostId, undefined], failure);
     await channel.dispose();
+  }
+});
+
+test('exact decimal source identity distinguishes adjacent Windows inodes and keeps conservative fallback', () => {
+  const snapshot = fs.statSync(__filename, { bigint: true });
+  const before = revisionOf(
+    Object.assign(Object.create(snapshot), { dev: 0n, ino: 56576470320201115n, size: 100n, mtimeNs: 1234567890n }),
+  );
+  const after = revisionOf(
+    Object.assign(Object.create(snapshot), { dev: 0n, ino: 56576470320201114n, size: 150n, mtimeNs: 1234567890n }),
+  );
+  const source = { agent: 'claude' as const, file: 'source', sessionId: 's', ...before };
+  assert.equal(before.dev, '0');
+  assert.equal(before.ino, '56576470320201115');
+  assert.equal(before.mtimeMs, 1234.56789);
+  assert.notEqual(before.ino, after.ino, 'adjacent inodes collapsed');
+  assert.equal(supportedFileIdentity(before), true);
+  assert.equal(sessionSourceAdmitted(source, { ...before, size: 150 }), true);
+  assert.equal(sessionSourceAdmitted(source, after), false, 'a larger replacement acquired source ownership');
+  assert.equal(sessionSourceAdmitted({ ...source, dev: undefined, ino: undefined }, { ...before, size: 150 }), false);
+  assert.equal(sessionSourceAdmitted({ ...source, dev: undefined, ino: undefined }, before), true);
+  assert.equal(sessionSourceAdmitted({ ...source, dev: undefined, ino: 0 }, { ...before, ino: 0 }), true);
+  for (const ino of ['01', 'NaN', '-1', '1.5']) {
+    assert.equal(sessionSourceAdmitted({ ...source, ino }, { ...before, ino }), false);
+  }
+  for (const change of [
+    { size: -1 },
+    { size: 0.5 },
+    { size: Number.MAX_SAFE_INTEGER + 1 },
+    { mtimeMs: NaN },
+    { mtimeMs: Infinity },
+  ]) {
+    assert.equal(sessionSourceAdmitted(source, { ...before, ...change }), false);
   }
 });

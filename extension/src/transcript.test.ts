@@ -6391,6 +6391,10 @@ test('listSessionFiles returns non-empty jsonl transcripts, newest first', () =>
     listSessionFiles(dir).map((s) => s.agent),
     ['claude', 'claude'],
   );
+  for (const session of listSessionFiles(dir)) {
+    const stat = fs.statSync(session.file, { bigint: true });
+    assert.deepEqual([session.dev, session.ino], [stat.dev.toString(), stat.ino.toString()]);
+  }
 });
 
 test('a turn says the agent that recorded it, which decides what a card may claim about it', () => {

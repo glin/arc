@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { revisionOf } from './transcript';
 import {
   COMPACT_META_WINDOW_MS,
   ClaudeSessionParserState,
@@ -82,7 +83,7 @@ export function recoverClaudeAttachmentSlice(
 ): { kind: 'pending' | 'complete' | 'stale' | 'cancelled'; readBytes: number } {
   if (budget.signal?.aborted) return { kind: 'cancelled', readBytes: 0 };
   try {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     const revision = state.cursor.revision;
     if (
       stat.size !== revision.size ||

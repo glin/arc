@@ -43,7 +43,7 @@ import {
 import { ClaudeHistoryCursor, readClaudeHistoryPageAsync } from './claudehistory.ts';
 import { CodexHistoryCursor, readCodexHistoryPageAsync } from './codexhistory.ts';
 import { readCodexSession } from './codex.ts';
-import { Compaction, Turn, readSession } from './transcript.ts';
+import { Compaction, Turn, readSession, revisionOf } from './transcript.ts';
 import { compaction, turn } from './turnfixtures.ts';
 import { turnKey } from './turnread.ts';
 
@@ -75,7 +75,7 @@ test('commit ownership quanta count every range read and preserve split UTF-8 an
         },
       }),
   );
-  const { size, mtimeMs, dev, ino } = fs.statSync(file);
+  const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
   const cursor = createCommitRepositoryCursor(
     { file, sessionId: 'parent', revision: { size, mtimeMs, dev, ino } },
     null,
@@ -118,7 +118,7 @@ test('commit ownership quanta count every range read and preserve split UTF-8 an
 test('a processing deadline at the final record preserves resumable ownership coverage', async () => {
   const file = path.join(tempDir('commit-ownership-eof-'), 'parent.jsonl');
   fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: 'parent' } }) + '\n');
-  const { size, mtimeMs, dev, ino } = fs.statSync(file);
+  const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
   const cursor = createCommitRepositoryCursor(
     { file, sessionId: 'parent', revision: { size, mtimeMs, dev, ino } },
     null,
@@ -140,7 +140,7 @@ test('commit ownership record exhaustion and cancellation provide no complete co
       JSON.stringify({ type: 'ignored', payload: 'x'.repeat(COMMIT_REPOSITORY_RECORD_BYTES) }) +
       '\n',
   );
-  const { size, mtimeMs, dev, ino } = fs.statSync(file);
+  const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
   const source = { file, sessionId: 'parent', revision: { size, mtimeMs, dev, ino } };
   const cursor = createCommitRepositoryCursor(source, null);
   let outcome;
@@ -182,7 +182,7 @@ test('commit ownership record exhaustion and cancellation provide no complete co
       '',
     ].join('\n'),
   );
-  const revision = fs.statSync(file);
+  const revision = revisionOf(fs.statSync(file, { bigint: true }));
   const operations = createCommitRepositoryCursor(
     { ...source, revision: { size: revision.size, mtimeMs: revision.mtimeMs, dev: revision.dev, ino: revision.ino } },
     null,

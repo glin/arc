@@ -24,16 +24,27 @@ export interface SessionName {
 export interface SessionFileIdentity {
   size?: number;
   headKey?: string;
-  ino?: number;
+  dev?: number | string;
+  ino?: number | string;
 }
 
 // Builds the measured file identity. A missing or nonpositive inode is omitted.
 // Size and head fingerprint remain available without an inode.
-export function transcriptIdentity(measured: { size?: number; ino?: number }, headKey?: string): SessionFileIdentity {
+export function transcriptIdentity(
+  measured: { size?: number; dev?: number | string; ino?: number | string },
+  headKey?: string,
+): SessionFileIdentity {
   return {
     ...(measured.size === undefined ? {} : { size: measured.size }),
     ...(headKey === undefined ? {} : { headKey }),
-    ...(measured.ino !== undefined && measured.ino > 0 ? { ino: measured.ino } : {}),
+    ...(measured.dev === undefined ? {} : { dev: measured.dev }),
+    ...(typeof measured.ino === 'string'
+      ? /^[1-9][0-9]*$/.test(measured.ino)
+        ? { ino: measured.ino }
+        : {}
+      : Number.isSafeInteger(measured.ino) && measured.ino! > 0
+        ? { ino: measured.ino }
+        : {}),
   };
 }
 
@@ -72,7 +83,7 @@ export function resolveSessionName(
 export function replacedTranscript(held: SessionFileIdentity, next: SessionFileIdentity): boolean {
   const named = held.ino !== undefined && next.ino !== undefined;
   if (named) {
-    if (held.ino !== next.ino) {
+    if (held.ino !== next.ino || (held.dev !== undefined && next.dev !== undefined && held.dev !== next.dev)) {
       return true;
     }
   }

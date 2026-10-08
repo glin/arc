@@ -1,6 +1,7 @@
 import { renderNextTurn, renderStatus, snapshotFromClaude } from './status.ts';
 import { runCost } from './cost.ts';
 import { runWindows } from './windows.ts';
+import { runSessions } from './sessions.ts';
 
 declare const ARC_VERSION: string;
 
@@ -11,6 +12,8 @@ function help(): string {
   return [
     'Usage: arc statusline [--json | --next-turn] [--width COLUMNS]',
     '       arc windows [--json]',
+    '       arc sessions [--window ID] [--json]',
+    '       arc session ID [--turns 1-20] [--window ID] [--json]',
     '       arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
     '',
     'Reads Claude Code status-line JSON from stdin.',
@@ -19,6 +22,8 @@ function help(): string {
     '--source-only reads an exact transcript file path without discovering children.',
     '--by-model adds billing subtotals for each model to the parent and child sources.',
     'Windows lists running Arc windows and their panel and repository readiness.',
+    "Sessions lists the selected window's repository sessions as JSON. Session reads bounded turns without marking them read.",
+    '--window selects an Arc window. Otherwise ARC_WINDOW or one unambiguous live window selects it.',
   ].join('\n');
 }
 
@@ -54,6 +59,10 @@ async function run(): Promise<void> {
   }
   if (args[0] === 'windows') {
     process.stdout.write(`${await runWindows(args.slice(1))}\n`);
+    return;
+  }
+  if (args[0] === 'sessions' || args[0] === 'session') {
+    process.stdout.write(`${await runSessions(args[0], args.slice(1))}\n`);
     return;
   }
   if (args[0] !== 'statusline') {

@@ -85,7 +85,13 @@ import {
 test('partial empty and positive metadata remains eligible and exhaustion survives restart', () => {
   const file = path.join(folder(), 'cache.json');
   for (const stats of [null, { ...title.stats!, turns: [] }]) {
-    const entry = { ...title, stats, outcome: null, starts: { starts: [], whole: false } };
+    const entry = {
+      ...title,
+      sourceIdentity: { dev: '0', ino: '56576470320201115' },
+      stats,
+      outcome: null,
+      starts: { starts: [], whole: false },
+    };
     const partial = withMetadataCoverage(entry, { whole: false, windowBytes: 16 * 1024 * 1024 });
     assert.deepEqual(railEnrichmentNeeds(partial, partial), { starts: false, metadata: false, recovery: true });
     const earlier = { ...partial, metadataWindow: { ...partial.metadataWindow!, exhausted: true } };
@@ -98,6 +104,7 @@ test('partial empty and positive metadata remains eligible and exhaustion surviv
       ['earlier.jsonl', earlier],
     ]);
     const loaded = loadDerivedCache(file).titles.get('session.jsonl')!;
+    assert.deepEqual(loaded.sourceIdentity, entry.sourceIdentity, 'cache reload lost exact filesystem identity');
     assert.equal(railEnrichmentNeeds(loaded, loaded), null);
     assert.equal(derivedTitleNeedsRailFacts(loaded), false);
     const reopened = loadDerivedCache(file).titles.get('earlier.jsonl')!;

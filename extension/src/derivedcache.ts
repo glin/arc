@@ -15,6 +15,7 @@ import {
   MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
   normalizeFsPath,
   sameSessionRevision,
+  fileIdentityValue,
   sessionOutcomeOf,
   sessionStatFactsOf,
   type AgentRunScan,
@@ -46,7 +47,7 @@ export interface DerivedTitleEntry {
   heldStats?: SessionStatFacts;
   expandedStatsRead?: boolean;
   metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean; exhaustedRule?: number };
-  sourceIdentity?: { dev: number; ino: number };
+  sourceIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
   starts?: TurnStarts;
   foldedLabel?: string;
   agentRunScan?: AgentRunScan;
@@ -334,8 +335,8 @@ export interface ClaudeChildReferenceCacheEntry {
   validatedRevision?: import('./transcript').FileRevision;
   mtimeMs: number;
   size: number;
-  dev: number;
-  ino: number;
+  dev: number | string;
+  ino: number | string;
   sessionId: string;
   childTranscript: boolean;
   references: ClaudeChildSessionReference[];
@@ -732,7 +733,11 @@ function titleEntry(value: unknown): value is DerivedTitleEntry {
         (value.metadataWindow.exhausted === undefined || typeof value.metadataWindow.exhausted === 'boolean') &&
         (value.metadataWindow.exhaustedRule === undefined || nonNegative(value.metadataWindow.exhaustedRule)))) &&
     (value.sourceIdentity === undefined ||
-      (record(value.sourceIdentity) && finite(value.sourceIdentity.dev) && finite(value.sourceIdentity.ino))) &&
+      (record(value.sourceIdentity) &&
+        (finite(value.sourceIdentity.dev) ||
+          (typeof value.sourceIdentity.dev === 'string' && /^(0|[1-9][0-9]*)$/.test(value.sourceIdentity.dev))) &&
+        (finite(value.sourceIdentity.ino) ||
+          (typeof value.sourceIdentity.ino === 'string' && /^[1-9][0-9]*$/.test(value.sourceIdentity.ino))))) &&
     (value.starts === undefined || turnStarts(value.starts)) &&
     (value.foldedLabel === undefined || text(value.foldedLabel)) &&
     (value.agentRunScan === undefined || agentRunScan(value.agentRunScan)) &&
@@ -813,8 +818,8 @@ function codexDispatchCursor(value: unknown, parentSessionId: string, size: numb
     /^[0-9a-f]{64}$/.test(value.head) &&
     typeof value.anchor === 'string' &&
     /^[0-9a-f]{64}$/.test(value.anchor) &&
-    nonNegative(value.dev) &&
-    nonNegative(value.ino) &&
+    fileIdentityValue(value.dev) &&
+    fileIdentityValue(value.ino) &&
     value.parentSessionId === parentSessionId &&
     typeof value.terminalApplied === 'boolean' &&
     (value.openingTimestamp === null || nonNegative(value.openingTimestamp)) &&
@@ -866,12 +871,9 @@ function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCache
     (value.appliedCut === undefined || (nonNegative(value.appliedCut) && value.appliedCut <= (value.size as number))) &&
     (value.validatedRevision === undefined ||
       (record(value.validatedRevision) &&
-        [
-          value.validatedRevision.size,
-          value.validatedRevision.mtimeMs,
-          value.validatedRevision.dev,
-          value.validatedRevision.ino,
-        ].every(nonNegative))) &&
+        [value.validatedRevision.size, value.validatedRevision.mtimeMs].every(nonNegative) &&
+        fileIdentityValue(value.validatedRevision.dev) &&
+        fileIdentityValue(value.validatedRevision.ino))) &&
     (value.pendingReferences === undefined ||
       (Array.isArray(value.pendingReferences) &&
         value.pendingReferences.length <= MAX_CLAUDE_CHILD_REFERENCES_PER_FILE &&
@@ -883,8 +885,8 @@ function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCache
         (value.cursor === undefined || codexDispatchCursor(value.cursor, sessionId, value.size as number)))) &&
     nonNegative(value.mtimeMs) &&
     nonNegative(value.size) &&
-    nonNegative(value.dev) &&
-    nonNegative(value.ino) &&
+    fileIdentityValue(value.dev) &&
+    fileIdentityValue(value.ino) &&
     typeof value.childTranscript === 'boolean' &&
     Array.isArray(value.references) &&
     value.references.length <= MAX_CLAUDE_CHILD_REFERENCES_PER_FILE &&
@@ -910,9 +912,9 @@ function claudeRelationshipCursor(value: unknown, sessionId: string): boolean {
       value.fragmentBytes,
       value.revision.size,
       value.revision.mtimeMs,
-      value.revision.dev,
-      value.revision.ino,
     ].every(nonNegative) &&
+    fileIdentityValue(value.revision.dev) &&
+    fileIdentityValue(value.revision.ino) &&
     (value.applied as number) <= (value.offset as number) &&
     (value.offset as number) <= (value.target as number) &&
     (value.target as number) <= (value.revision.size as number) &&

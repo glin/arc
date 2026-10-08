@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Duplex } from 'node:stream';
 import { writeFileAtomically } from './atomicfile.ts';
+import { ARC_IDENTITY } from './identity.ts';
 import { arcHome } from './store.ts';
 import { WindowsPipeServer } from './windowpipe.ts';
 
@@ -48,12 +49,12 @@ export interface SessionRequest {
   id: string;
   version: typeof SESSION_REQUEST_VERSION;
   token: string;
-  method: 'ping';
+  method: 'ping' | 'sessions' | 'session';
   requester: string | null;
-  params: Record<string, never>;
+  params: { sessionId?: string; turns?: number };
 }
 
-export type SessionReply = { id: string | null; result: WindowInfo } | { id: string | null; error: string };
+export type SessionReply = { id: string | null; result: unknown } | { id: string | null; error: string };
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -85,15 +86,26 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     value.version !== SESSION_REQUEST_VERSION ||
     typeof value.token !== 'string' ||
     !TOKEN.test(value.token) ||
-    value.method !== 'ping' ||
+    !['ping', 'sessions', 'session'].includes(value.method as string) ||
     !(
       value.requester === null ||
       (typeof value.requester === 'string' && value.requester.length > 0 && value.requester.length <= 256)
     ) ||
-    !record(value.params) ||
-    Object.keys(value.params).length !== 0
+    !record(value.params)
   )
     return null;
+  if (value.method === 'session') {
+    if (
+      Object.keys(value.params).sort().join(',') !== 'sessionId,turns' ||
+      typeof value.params.sessionId !== 'string' ||
+      !value.params.sessionId.length ||
+      value.params.sessionId.length > 256 ||
+      !Number.isSafeInteger(value.params.turns) ||
+      (value.params.turns as number) < 1 ||
+      (value.params.turns as number) > 20
+    )
+      return null;
+  } else if (Object.keys(value.params).length !== 0) return null;
   return value as unknown as SessionRequest;
 }
 
@@ -207,6 +219,11 @@ export class WindowChannel {
   private closed = false;
   private inFlight = 0;
   private disposal: Promise<void> | null = null;
+  private requestHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
+
+  setRequestHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
+    this.requestHandler = handler;
+  }
 
   constructor(
     private readonly home = arcHome(),
@@ -347,10 +364,24 @@ export class WindowChannel {
       }
       this.inFlight++;
       void Promise.resolve()
-        .then(() => this.ping(this.info()))
+        .then<unknown>(() => {
+          if (this.closed) throw new Error('Window unavailable.');
+          if (request.method === 'ping') return this.ping(this.info());
+          if (!this.requestHandler) throw new Error('Session reads are unavailable in this window.');
+          return Promise.resolve(this.requestHandler(request)).then((data) => {
+            const result = { window: this.info(), data };
+            if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
+              throw new Error("The session response exceeds this window's channel limit.");
+            return result;
+          });
+        })
         .then(
           (result) => this.answer(socket, { id: request.id, result }),
-          () => this.answer(socket, { id: request.id, error: 'Window unavailable.' }),
+          (error: unknown) =>
+            this.answer(socket, {
+              id: request.id,
+              error: error instanceof Error ? error.message : 'Window unavailable.',
+            }),
         )
         .finally(() => {
           this.inFlight--;
@@ -435,23 +466,25 @@ function readRegistration(file: string): string {
   }
 }
 
-export async function pingWindow(
+async function exchangeWindow(
   entry: HostRegistration,
   deadlineMs = 1_000,
   registrationFile = '',
-): Promise<WindowInfo | null> {
+  method: SessionRequest['method'] = 'ping',
+  params: SessionRequest['params'] = {},
+): Promise<unknown | null> {
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
   const socket =
     process.platform === 'win32'
       ? await WindowsPipeServer.connect(entry.address, entry.pid, entry.transportPid!, registrationFile, deadlineMs)
       : net.createConnection(entry.address);
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const id = crypto.randomBytes(12).toString('hex');
     const challenge = crypto.randomBytes(32).toString('hex');
     let authenticated = false;
     let settled = false;
-    const finish = (info: WindowInfo | null) => {
+    const finish = (info: unknown | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
@@ -480,25 +513,45 @@ export async function pingWindow(
             id,
             version: SESSION_REQUEST_VERSION,
             token: entry.token,
-            method: 'ping',
+            method,
             requester: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || null,
-            params: {},
+            params,
           };
           socket.write(JSON.stringify(request) + '\n');
           return;
         }
+        if (record(reply) && reply.id === id && typeof reply.error === 'string') {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadline);
+          socket.destroy();
+          reject(new Error(reply.error));
+          return;
+        }
+        const info =
+          method === 'ping'
+            ? record(reply)
+              ? reply.result
+              : null
+            : record(reply) && record(reply.result)
+              ? reply.result.window
+              : null;
         if (
           !record(reply) ||
           reply.id !== id ||
-          !windowInfo(reply.result) ||
-          reply.result.hostId !== entry.hostId ||
-          reply.result.pid !== entry.pid
+          !windowInfo(info) ||
+          info.hostId !== entry.hostId ||
+          info.pid !== entry.pid
         ) {
           finish(null);
           return;
         }
-        const { hostId, pid, version, folders, scopeReady, panelReady, panelVisible } = reply.result;
-        finish({ hostId, pid, version, folders, scopeReady, panelReady, panelVisible });
+        const { hostId, pid, version, folders, scopeReady, panelReady, panelVisible } = info;
+        finish(
+          method === 'ping'
+            ? { hostId, pid, version, folders, scopeReady, panelReady, panelVisible }
+            : (reply.result as Record<string, unknown>).data,
+        );
       } catch {
         finish(null);
       }
@@ -507,6 +560,51 @@ export async function pingWindow(
       socket.write(JSON.stringify({ challenge }) + '\n');
     });
   });
+}
+
+export async function pingWindow(
+  entry: HostRegistration,
+  deadlineMs = 1_000,
+  registrationFile = '',
+): Promise<WindowInfo | null> {
+  return (await exchangeWindow(entry, deadlineMs, registrationFile).catch(() => null)) as WindowInfo | null;
+}
+
+export async function requestWindow(
+  method: 'sessions' | 'session',
+  params: SessionRequest['params'],
+  selector = process.env[`${ARC_IDENTITY.environmentPrefix}WINDOW`],
+  home = arcHome(),
+): Promise<unknown> {
+  let selected = selector;
+  if (!selected) {
+    const discovery = await discoverWindows(home);
+    if (!discovery.complete) throw new Error('Arc window discovery is incomplete. Select a window with --window.');
+    if (discovery.windows.length !== 1)
+      throw new Error(`Select one Arc window with --window or ${ARC_IDENTITY.environmentPrefix}WINDOW.`);
+    selected = discovery.windows[0].hostId;
+  }
+  if (!HOST_ID.test(selected)) throw new Error('Invalid Arc window identifier.');
+  const file = path.join(home, 'hosts', `${selected}.json`);
+  let entry: HostRegistration;
+  try {
+    const value: unknown = JSON.parse(readRegistration(file));
+    if (
+      !windowInfo(value) ||
+      !record(value) ||
+      value.hostId !== selected ||
+      typeof value.token !== 'string' ||
+      !TOKEN.test(value.token) ||
+      !validHostAddress(home, selected, value.address)
+    )
+      throw new Error();
+    entry = value as unknown as HostRegistration;
+  } catch {
+    throw new Error('The selected Arc window is unavailable.');
+  }
+  const result = await exchangeWindow(entry, 1_000, file, method, params);
+  if (result === null) throw new Error('The selected Arc window is unavailable.');
+  return result;
 }
 
 function processIsDead(pid: number): boolean {

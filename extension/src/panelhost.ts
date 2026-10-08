@@ -2,6 +2,20 @@ import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
 import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
+import {
+  boundedSessionListing,
+  boundedSessionRead,
+  sessionAttention,
+  sessionReadStatus,
+  observeSessionRun,
+  observeSessionExit,
+  sessionExitMatches,
+  sessionSourceAdmitted,
+  type HostedSessionObservation,
+  type SessionRunWitness,
+  SESSION_READ_LIMITS,
+  type SessionListingRow,
+} from './sessionreads';
 import { selectedDependencies } from './selectedsource';
 import { LOADING_DEFAULTS, type AppliedDefaults, type DefaultContext } from './view/model-picks';
 import type { ClaudeForwardCheckpoint } from './claudehistory';
@@ -50,6 +64,7 @@ import {
   watchDirs,
   TRANSCRIPT_WAKE_MS,
   sameSessionRevision,
+  revisionOf as fileRevisionOf,
   revalidatedCatalog,
   trustedListedRevisions,
   revalidatedCatalogPaths,
@@ -1172,7 +1187,11 @@ export class PanelProvider implements vscode.Disposable {
   // The repository scope of a complete discovery reply whose catalog is not yet published, and the session files of the catalog it
   // answered. An incomplete reply or a scope change clears it. The next catalog publication under that scope turns it into the
   // completion stamp only when the reply answered every published session.
-  private discoveryComplete?: { scope: string; files: ReadonlySet<string> };
+  private discoveryComplete?: {
+    scope: string;
+    files: ReadonlySet<string>;
+    revisions?: ReadonlyMap<string, SessionFile>;
+  };
   private discoveryRequestSequence = 0;
   private discoveryAcknowledgment?: {
     scope: string;
@@ -1350,8 +1369,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!listed) return null;
     const revision = () => {
       try {
-        const stat = fs.statSync(listed.file);
-        return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+        return fileRevisionOf(fs.statSync(listed.file, { bigint: true }));
       } catch {
         return null;
       }
@@ -1546,6 +1564,7 @@ export class PanelProvider implements vscode.Disposable {
   // Latest child exit times by running key. Status checks apply each exit only to turns that began before it.
   private exitedSinceKeys = new Map<string, number>();
   private exitedNow = new Set<string>();
+  private sessionRunWitnesses = new Map<string, SessionRunWitness>();
   // Claude child transcript write times used to determine live child status. Discovery trims unreferenced files.
   private claudeChildStatWrites = new Map<string, number>();
   private claudeChildWork = new ClaudeChildWorkCache();
@@ -1647,6 +1666,8 @@ export class PanelProvider implements vscode.Disposable {
   // The repository scope roots under which the published catalog was built from a complete discovery reply. A catalog reused after an
   // incomplete pass keeps the stamp it had, and a scope change clears it. The session list is complete when it equals the current roots.
   private completeCatalogScope?: string;
+  // Programmatic completeness belongs to the exact catalog revisions accepted from complete discovery.
+  private sessionReadDiscoveryRevision?: string;
   // The file and kind of each failed session read that is logged. A failed metadata, turn start, enrichment, or recovery read is logged
   // once per file and kind until that kind of read succeeds, and it never keeps the session list loading.
   private sessionReadFailures = new Set<string>();
@@ -1720,6 +1741,111 @@ export class PanelProvider implements vscode.Disposable {
   // Live panel state shared by attached hosts and persisted through the memento.
   private saved: PanelState = normalizePanelState(null);
   private windowStateHandler: ((state: WindowState) => void) | null = null;
+
+  public readSessionRequest(request: import('./sessionrequests').SessionRequest): unknown {
+    const scopeKey = (): string | null => {
+      if (this.disposed) return null;
+      const folders = this.folders();
+      const scope = this.repositoryScope.snapshot(folders);
+      return scope.ready ? JSON.stringify([folders, scope.roots, scope.revision]) : null;
+    };
+    const before = scopeKey();
+    if (before === null) throw new Error('The repository scope is still loading. Retry the command.');
+    const scope = this.repositoryScope.snapshot(this.folders());
+    const accepted = this.authoritativeCatalogScope === JSON.stringify(scope.roots) ? this.authoritativeCatalog : null;
+    const sessions = (accepted ?? []).filter((source) => !source.cwd || isInside(source.cwd, scope.roots));
+    if (before !== scopeKey()) throw new Error('The repository scope changed. Retry the command.');
+    if (request.method === 'session') {
+      if (!accepted)
+        throw new Error('The session catalog is unavailable for this repository scope. Open Arc and retry.');
+      const matches = sessions.filter((source) => source.sessionId === request.params.sessionId);
+      if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
+      return boundedSessionRead(matches[0], request.params.turns!, scopeKey, request.requester, scope.roots);
+    }
+    const edges = this.sessionParentEdgeSet?.edges ?? new Map<string, SessionParentEdge>();
+    const ids = new Set(sessions.map((source) => source.sessionId));
+    const visible = this.anyVisible();
+    const pending = this.pendingWatch.snapshot();
+    const fresh = visible && this.watching && !this.refreshController && !pending.eventCount && !pending.broadRequired;
+    const counts = visible ? this.unreadCounts() : null;
+    let revisionsCurrent = true;
+    const rows: SessionListingRow[] = sessions.slice(0, SESSION_READ_LIMITS.sessions).map((source) => {
+      const meta = this.titles.get(source.file);
+      const revision = this.revisionOf(source);
+      const sourceCurrent = sameProgressiveRevision(revision, source);
+      revisionsCurrent &&= sourceCurrent;
+      const current = fresh && sourceCurrent && meta !== undefined && sameSessionRevision(meta, source);
+      const outcome = sourceCurrent && meta && sameSessionRevision(meta, source) ? meta.outcome : undefined;
+      const held = this.cache.get(source.file);
+      const key = runningKey(source.agent, source.sessionId);
+      const witness = this.sessionRunWitnesses?.get(key);
+      const status = sessionReadStatus(
+        source.sessionId,
+        outcome,
+        sessionRunning([...(this.running ?? [])], source.agent, source.sessionId),
+        this.asks?.some((ask) => ask.session === source.sessionId) ?? false,
+        this.runningSinceKeys?.get(key) ?? witness?.startedAt,
+        witness?.exit?.at,
+        {
+          unchanged:
+            sourceCurrent &&
+            (!meta || sameSessionRevision(meta, source)) &&
+            sessionExitMatches(witness, source.file, revision, held?.revision),
+          mtimeMs: revision.mtimeMs,
+        },
+      );
+      const latest = current ? meta.stats?.turns.at(-1) : undefined;
+      const recorded =
+        current && held && sameSessionRevision(held.revision, source) ? held.read.turns.at(-1) : undefined;
+      const parentId = this.saved.readerParents?.[source.sessionId];
+      const parent = parentId && ids.has(parentId) ? parentId : undefined;
+      const heldEdge = edges.get(source.sessionId);
+      const edge = heldEdge && ids.has(heldEdge.parent) ? heldEdge : undefined;
+      const count = counts?.get(source.sessionId);
+      return {
+        id: source.sessionId,
+        provider: source.agent,
+        name: this.sessionLabel(source).fullLabel,
+        setup: {
+          model: recorded?.model ?? latest?.model ?? null,
+          effort: recorded?.effort ?? null,
+          source: recorded || latest ? 'recorded' : 'unavailable',
+        },
+        labels: labelsOf(this.saved.labels, source.sessionId).map((name) => ({ name, source: 'reader' })),
+        pinned: this.pinnedTop.has(source.sessionId),
+        archived: this.hidden.has(source.sessionId),
+        runStatus: status ?? 'unknown',
+        attention: sessionAttention(
+          visible,
+          status,
+          current && count && !(count.atLeast && count.count === 0) ? count.count > 0 : null,
+        ),
+        lastActivity: current ? meta.activityMs : null,
+        parent: parent
+          ? { id: parent, relation: 'reader' }
+          : edge
+            ? { id: edge.parent, relation: edge.relation }
+            : null,
+        agentRun: current ? this.agentRunFor(source, edges) : source.childTranscript === true ? true : null,
+        facts: current ? 'current' : meta ? 'stale' : 'unparsed',
+      };
+    });
+    return boundedSessionListing(
+      rows,
+      accepted !== null &&
+        fresh &&
+        !this.dispatchDiscoveryPending &&
+        revisionsCurrent &&
+        sessions.length === accepted.length &&
+        sessions.length <= SESSION_READ_LIMITS.sessions &&
+        this.sessionReadDiscoveryRevision ===
+          JSON.stringify([
+            JSON.stringify(scope.roots),
+            accepted.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino]),
+          ]),
+      request.requester,
+    );
+  }
 
   public setWindowStateHandler(handler: (state: WindowState) => void): void {
     this.windowStateHandler = handler;
@@ -1839,6 +1965,7 @@ export class PanelProvider implements vscode.Disposable {
 
   dispose(): void {
     if (this.disposed) return;
+    this.sessionRunWitnesses?.clear();
     const finish = () => {
       this.cacheShutdownFlushing = true;
       try {
@@ -2353,6 +2480,7 @@ export class PanelProvider implements vscode.Disposable {
     // A catalog completed under the previous roots never completes the new ones, even when the roots later return to it.
     this.discoveryComplete = undefined;
     this.completeCatalogScope = undefined;
+    this.sessionReadDiscoveryRevision = undefined;
     // Removing roots needs no new loading, so the hold stays unless the new roots add one outside the held scope.
     const scope = this.repositoryScope.snapshot(this.folders());
     if (this.windowStateHandler) {
@@ -2377,6 +2505,7 @@ export class PanelProvider implements vscode.Disposable {
     this.authoritativeCatalog = null;
     this.authoritativeCatalogScope = undefined;
     this.completeCatalogScope = undefined;
+    this.sessionReadDiscoveryRevision = undefined;
     this.sessionReadFailures?.clear();
     this.startupSourceCheckpoint = null;
     this.loadingLine.release('workspace folders');
@@ -3581,7 +3710,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Update running sessions by `runningKey`. An agent can run several sessions simultaneously.
-  public setRunning(keys: readonly string[]): void {
+  public setRunning(keys: readonly string[], hosted: readonly HostedSessionObservation[] = []): void {
+    if (hosted.length) this.observeHostedSessions(hosted);
     const next = new Set(keys);
     const moved = next.size !== this.running.size || [...next].some((key) => !this.running.has(key));
     // New running keys receive a start time. Removed keys discard it before a later run.
@@ -3607,8 +3737,48 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  private observeHostedSessions(hosted: readonly HostedSessionObservation[]): void {
+    if (!hosted.length) return;
+    this.sessionRunWitnesses ??= new Map();
+    const scope = this.repositoryScope.snapshot(this.folders());
+    const catalog =
+      scope.ready && this.authoritativeCatalogScope === JSON.stringify(scope.roots) ? this.authoritativeCatalog : null;
+    for (const observation of hosted) {
+      const previous = this.sessionRunWitnesses.get(observation.key);
+      let source: SessionRunWitness['source'];
+      if (observation.busy && !observation.exited && (previous?.token !== observation.token || !previous.source)) {
+        const matches = (catalog ?? []).filter(
+          (row) =>
+            runningKey(row.agent, row.sessionId) === observation.key && (!row.cwd || isInside(row.cwd, scope.roots)),
+        );
+        if (matches.length === 1) {
+          const row = matches[0];
+          const revision = this.revisionOf(row);
+          if (sessionSourceAdmitted(row, revision)) source = { file: row.file, revision };
+        }
+      }
+      this.sessionRunWitnesses.set(observation.key, observeSessionRun(previous, observation, source, Date.now()));
+    }
+  }
+
   // Record exited hosted sessions by `runningKey` and refresh their status.
-  public setExited(keys: readonly string[]): void {
+  public setExited(keys: readonly string[], hosted: readonly HostedSessionObservation[] = []): void {
+    if (hosted.length) this.observeHostedSessions(hosted);
+    let observedExit = false;
+    for (const observation of hosted) {
+      if (!observation.exited || !keys.includes(observation.key)) continue;
+      const witness = this.sessionRunWitnesses.get(observation.key);
+      if (!witness || witness.token !== observation.token || witness.exitObserved) continue;
+      const source = witness.source;
+      const ended = observeSessionExit(
+        witness,
+        source ? this.revisionOf({ file: source.file } as SessionFile) : undefined,
+        Date.now(),
+      );
+      this.sessionRunWitnesses.set(observation.key, ended);
+      if (ended.exit) this.exitedSinceKeys.set(observation.key, ended.exit.at);
+      observedExit = true;
+    }
     const { exited, moved } = recordExits(this.exitedSinceKeys, this.exitedNow, keys, Date.now());
     this.exitedNow = exited;
     for (const settlement of [...(this.clearSettlements?.values() ?? [])]) {
@@ -3617,7 +3787,7 @@ export class PanelProvider implements vscode.Disposable {
         this.cancelClearSettlement(settlement.session, 'The agent session closed before a new session opened.');
       }
     }
-    if (moved) {
+    if (moved || observedExit) {
       void this.refresh(true);
     }
   }
@@ -6275,7 +6445,7 @@ export class PanelProvider implements vscode.Disposable {
         all =
           revalidatedCatalog(this.authoritativeCatalog, this.showing, (file) => {
             try {
-              const stat = fs.statSync(file);
+              const stat = fileRevisionOf(fs.statSync(file, { bigint: true }));
               return { mtimeMs: stat.mtimeMs, size: stat.size };
             } catch {
               return null;
@@ -6352,6 +6522,16 @@ export class PanelProvider implements vscode.Disposable {
         const answered = this.discoveryComplete?.scope === catalogScope ? this.discoveryComplete.files : undefined;
         if (answered && all.every((session) => answered.has(session.file))) {
           this.completeCatalogScope = catalogScope;
+          const revisions = this.discoveryComplete?.revisions;
+          this.sessionReadDiscoveryRevision =
+            !this.dispatchDiscoveryPending &&
+            revisions &&
+            all.every((source) => {
+              const answeredSource = revisions.get(source.file);
+              return answeredSource && sameSessionRevision(answeredSource, source) && answeredSource.ino === source.ino;
+            })
+              ? JSON.stringify([catalogScope, all.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino])])
+              : undefined;
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
           // completes, and the follow-up refresh this schedules lets the line clear.
@@ -7012,8 +7192,15 @@ export class PanelProvider implements vscode.Disposable {
 
   // Forget the exit of a session that left the listing, since no rail card reads it again.
   private pruneExits(listed: readonly SessionFile[]): void {
-    if (!this.exitedSinceKeys.size) {
-      return;
+    for (const [key, witness] of this.sessionRunWitnesses ?? []) {
+      if (
+        !listed.some(
+          (source) =>
+            runningKey(source.agent, source.sessionId) === key &&
+            (!witness.source || source.file === witness.source.file),
+        )
+      )
+        this.sessionRunWitnesses.delete(key);
     }
     const keys = new Set(listed.map((session) => runningKey(session.agent, session.sessionId)));
     for (const key of this.exitedSinceKeys.keys()) {
@@ -7899,8 +8086,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.targetedRefreshPaths?.length && this.catalog && this.catalog.folders === folderPrint) {
       const held = revalidatedCatalogPaths(this.catalog.sessions, this.targetedRefreshPaths, (file) => {
         try {
-          const stat = fs.statSync(file);
-          return { mtimeMs: stat.mtimeMs, size: stat.size };
+          return fileRevisionOf(fs.statSync(file, { bigint: true }));
         } catch {
           return null;
         }
@@ -7916,8 +8102,7 @@ export class PanelProvider implements vscode.Disposable {
     if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint) {
       const held = revalidatedCatalog(this.catalog.sessions, this.showing, (file) => {
         try {
-          const stat = fs.statSync(file);
-          return { mtimeMs: stat.mtimeMs, size: stat.size };
+          return fileRevisionOf(fs.statSync(file, { bigint: true }));
         } catch {
           return null;
         }
@@ -8260,6 +8445,7 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryComplete = {
       scope: JSON.stringify(this.repositoryScopeRoots),
       files: new Set(sessions.map((session) => session.file)),
+      revisions: new Map(sessions.map((session) => [session.file, { ...session }])),
     };
     this.updateSessionSpendSources(codex, sessions);
     if (this.catalog) {
@@ -8786,7 +8972,10 @@ export class PanelProvider implements vscode.Disposable {
     this.sessionNames.observe(
       session.sessionId,
       storedSessionName(entry),
-      transcriptIdentity({ size: entry.size, ino: session.ino }, entry.headKey),
+      transcriptIdentity(
+        { size: entry.size, ...(entry.sourceIdentity ?? { dev: session.dev, ino: session.ino }) },
+        entry.headKey,
+      ),
     );
     const held = this.sessionNames.get(session.sessionId);
     return held ? withSessionName(entry, held) : entry;
@@ -8808,8 +8997,8 @@ export class PanelProvider implements vscode.Disposable {
       this.sessionNames.observeTurns(
         turns.filter((turn) => turn.agent === 'claude'),
         (sessionId) => {
-          const ino = byId.get(sessionId)?.ino;
-          return ino ? transcriptIdentity({ ino }) : undefined;
+          const file = byId.get(sessionId);
+          return file ? transcriptIdentity({ dev: file.dev, ino: file.ino }) : undefined;
         },
       ),
       (sessionId) => byId.get(sessionId),
@@ -9636,8 +9825,7 @@ export class PanelProvider implements vscode.Disposable {
   // Read current file identity and revision for stale-result and cursor checks.
   private revisionOf(session: SessionFile): FileRevision {
     try {
-      const stat = fs.statSync(session.file);
-      return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+      return fileRevisionOf(fs.statSync(session.file, { bigint: true }));
     } catch {
       return { size: -1, mtimeMs: -1, dev: -1, ino: -1 };
     }

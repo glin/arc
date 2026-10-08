@@ -1,3 +1,4 @@
+import { revisionOf } from './transcript';
 // extension/src/codex.test.ts
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
@@ -127,7 +128,12 @@ test('Codex active context explains pending tools and unmeasured results until a
     const file = writeRollout(records);
     const read = async () => {
       fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
-      return readCodexContext(file, 's1', fs.statSync(file), new AbortController().signal);
+      return readCodexContext(
+        file,
+        's1',
+        revisionOf(fs.statSync(file, { bigint: true })),
+        new AbortController().signal,
+      );
     };
     assert.equal((await read())?.kind, 'codex-retained-context');
     records.push({
@@ -181,7 +187,12 @@ test('Codex interrupted context stops reporting unanswered calls as pending and 
     const file = writeRollout(records);
     const read = async () => {
       fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
-      return readCodexContext(file, 's1', fs.statSync(file), new AbortController().signal);
+      return readCodexContext(
+        file,
+        's1',
+        revisionOf(fs.statSync(file, { bigint: true })),
+        new AbortController().signal,
+      );
     };
     assert.equal((await read())?.kind, 'codex-retained-context');
     records.push({
@@ -273,7 +284,7 @@ test('Codex categories use retained ordinary and compacted histories without lif
       .map((row) => JSON.stringify(row))
       .join('\n') + '\n',
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const revision = { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
   assert.deepEqual(await readCodexContext(file, 's1', revision, new AbortController().signal), compacted);
   assert.equal(await readCodexContext(file, 'other', revision, new AbortController().signal), null);
@@ -295,7 +306,7 @@ test('Codex categories use retained ordinary and compacted histories without lif
     '{"type":"event_msg","payload":{"type":"task_complete"}}\n'.repeat(20_001),
   ]) {
     fs.writeFileSync(file, saved.join('\n') + '\n' + suffix + '\n');
-    const bounded = fs.statSync(file);
+    const bounded = revisionOf(fs.statSync(file, { bigint: true }));
     assert.equal(await readCodexContext(file, 's1', bounded, new AbortController().signal), null);
   }
 });
@@ -447,7 +458,7 @@ test('Codex context retains copied fork ancestry and refuses unrelated metadata 
     null,
   );
   const file = writeRollout(fork);
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const revision = { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
   assert.deepEqual(await readCodexContext(file, 'fork', revision, new AbortController().signal), {
     ...estimateCodexContext(fork, 'fork')!,
@@ -942,10 +953,10 @@ test('a same-size middle rewrite replaces a dispatch receipt outside both cursor
     first.references.map((reference) => reference.sessionId),
     [firstId],
   );
-  const before = fs.statSync(file);
+  const before = revisionOf(fs.statSync(file, { bigint: true }));
   const old = fs.readFileSync(file, 'utf8');
   fs.writeFileSync(file, old.replace(firstId, secondId));
-  fs.utimesSync(file, before.atime, new Date(before.mtimeMs + 2000));
+  fs.utimesSync(file, new Date(before.mtimeMs), new Date(before.mtimeMs + 2000));
   assert.equal(fs.statSync(file).size, before.size);
   const refreshed = scanCodexDispatchReferences(file, 'parent', first.cursor);
   assert.deepEqual(
@@ -1581,7 +1592,7 @@ test('a Codex child spend marks a pending linked Claude result as nested partial
 function recordingCodexRangeReader(ranges: Array<[number, number]>): BackwardRangeReader {
   return (file, start, length, revision) => {
     ranges.push([start, start + length]);
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     if (stat.size !== revision.size || stat.mtimeMs !== revision.mtimeMs) {
       return null;
     }
@@ -3565,7 +3576,7 @@ test('Codex history keeps an open turn in checkpoint-owned state', () => {
   );
   assert.ok(checkpoint.read);
   assert.ok(page.page);
-  const revision = fs.statSync(file);
+  const revision = revisionOf(fs.statSync(file, { bigint: true }));
   const applied = afterHistoryPage(
     startSessionHistory({ sessionId: 'sess', size: revision.size, mtimeMs: revision.mtimeMs }, 1),
     {
@@ -6833,7 +6844,7 @@ test('a legacy commit is read out of output when its rollout carries no command 
 });
 
 function ownershipSource(file: string, sessionId: string): CommitRepositorySource {
-  const { size, mtimeMs, dev, ino } = fs.statSync(file);
+  const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
   return { file, sessionId, revision: { size, mtimeMs, dev, ino } };
 }
 
@@ -13407,8 +13418,16 @@ test('an idle rollout reuses its stat until the watcher reports it or the stat a
   fs.utimesSync(file, idle, idle);
   let now = idle.getTime() + 24 * 60 * 60_000;
   const stats = new CodexStatCache(undefined, () => now);
-  const size = () =>
-    codexSessionFiles(root, ['c:\\repo'], readCodexSessionMeta, (rollout) => stats.get(rollout)).sessions[0]?.size;
+  const identity = revisionOf(fs.statSync(file, { bigint: true }));
+  const uncached = codexSessionFiles(root, ['c:\\repo']).sessions[0];
+  const pair = [identity.dev, identity.ino];
+  assert.deepEqual([uncached.dev, uncached.ino], pair);
+  const size = () => {
+    const session = codexSessionFiles(root, ['c:\\repo'], readCodexSessionMeta, (rollout) => stats.get(rollout))
+      .sessions[0];
+    assert.deepEqual([session.dev, session.ino], pair);
+    return session.size;
+  };
   const grow = () => {
     fs.appendFileSync(file, JSON.stringify({ type: 'event_msg', payload: { type: 'token_count' } }) + '\n');
     fs.utimesSync(file, idle, idle);
@@ -14941,7 +14960,7 @@ for (const [child, count, expected] of [
         inferenceClass: null,
       })),
     };
-    const before = fs.statSync(file);
+    const before = revisionOf(fs.statSync(file, { bigint: true }));
     const rebuilt = indexSpendFile(stale, file, 'workspace', createCodexUsageLineReducer, 2);
     assert.equal(rebuilt.rebuilt, true);
     assert.equal(fs.statSync(file).size, before.size);

@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { readCodexContext } from '../codexcontext.ts';
 import { readCodexSession } from '../codex.ts';
+import { revisionOf } from '../transcript.ts';
 import { composerRuntimeBySession } from '../turncard.ts';
 import { codexContextRecords } from '../turnfixtures.ts';
 import { tempDir } from '../temproot.ts';
@@ -57,8 +58,7 @@ test(
         sendToHost: (_host: unknown, message: unknown) => post(page, message),
         progressiveWorker: {
           run: async (request: any, generation: number, signal: AbortSignal) => {
-            const stat = fs.statSync(file);
-            const revision = { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+            const revision = revisionOf(fs.statSync(file, { bigint: true }));
             return {
               generation,
               revision,

@@ -116,6 +116,7 @@ import {
   readClaudeAgentSpend,
   refreshClaudeAgentFacts,
   sameSessionRevision,
+  revisionOf,
   HEAD_KEY_BYTES,
   SESSION_HEAD_BYTES,
   type SessionFile,
@@ -1836,10 +1837,7 @@ test('an imported session waits for catalog publication after discovery complete
     provider.hostSessions = new Map([[provider.hosts[0], fixture.sessionId]]);
     provider.authoritativeCatalog = [];
     provider.completeCatalogScope = JSON.stringify(provider.repositoryScopeRoots);
-    provider.revisionOf = (source: any) => {
-      const stat = fs.statSync(source.file);
-      return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
-    };
+    provider.revisionOf = (source: any) => revisionOf(fs.statSync(source.file, { bigint: true }));
     const requests: string[] = [];
     provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number) => {
       assert.equal(request.kind, 'window');
@@ -3773,8 +3771,7 @@ function titleRollout(directory: string, id: string, title: string, bytes = 0) {
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const { size, mtimeMs, dev, ino } = fs.statSync(file);
-  return { file, sessionId: id, agent: 'codex', size, mtimeMs, dev, ino, activity: 1 };
+  return { file, sessionId: id, agent: 'codex', ...revisionOf(fs.statSync(file, { bigint: true })), activity: 1 };
 }
 
 function titleWorker(extraSource = '') {
@@ -5313,9 +5310,9 @@ test('a selected excluded-content append keeps loaded older turns after cold rec
   }).outputFiles[0].text;
   const worker = new ProgressiveWorker(source);
   const input = (): ProgressiveInput => {
-    const { mtimeMs, size } = fs.statSync(file);
+    const revision = revisionOf(fs.statSync(file, { bigint: true }));
     return {
-      session: { file, sessionId: 'selected', agent: 'claude', mtimeMs, size },
+      session: { file, sessionId: 'selected', agent: 'claude', ...revision },
       folders: [],
       children: [],
       maxTurns: 40,
@@ -5338,8 +5335,8 @@ test('a selected excluded-content append keeps loaded older turns after cold rec
 
     const provider = selectedWindowHarness(async () => recovered);
     const olderTurn = { sessionId: 'selected', turnId: 'older', startedAt: 1 };
-    const current = fs.statSync(file);
-    provider.session = { ...input().session, dev: current.dev, ino: current.ino };
+    provider.revisionOf = (session: SessionFile) => revisionOf(fs.statSync(session.file, { bigint: true }));
+    provider.session = input().session;
     provider.cache.set(file, {
       key: 'previous',
       agentKey: '',
@@ -5359,6 +5356,12 @@ test('a selected excluded-content append keeps loaded older turns after cold rec
 
     assert.equal(provider.dropped, 0, 'cold recovery dropped loaded turns from the proved append');
     assert.equal(provider.history.get('selected').pages[0].turns[0], olderTurn, 'the loaded older turn disappeared');
+    assert.deepEqual(
+      provider.cache.get(file).revision,
+      recovered.revision,
+      'the recovered selected window was not accepted',
+    );
+    await vi.waitFor(() => assert.equal(provider.selectionWork, null, 'the recovered selected work did not finish'));
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

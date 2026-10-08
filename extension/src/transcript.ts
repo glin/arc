@@ -725,9 +725,9 @@ export interface SessionFile {
   sessionId: string;
   mtimeMs: number;
   size: number;
-  // Filesystem inode from the listing stat, when available.
-  // Cache identity compares it to detect another file at the same path.
-  ino?: number;
+  // Filesystem identity from the listing stat, when supported.
+  dev?: number | string;
+  ino?: number | string;
   // Where the session ran, when its opening record says. Continuation uses this instead
   // of moving a session into whichever worktree the current editor window opened.
   cwd?: string;
@@ -2899,17 +2899,15 @@ export function listSessionFiles(dir: string): SessionFile[] {
     }
     const file = path.join(dir, name);
     try {
-      const stat = fs.statSync(file);
-      if (!stat.isFile() || stat.size === 0) {
+      const stat = fs.statSync(file, { bigint: true });
+      if (!stat.isFile() || stat.size === 0n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
         continue;
       }
       out.push({
         agent: 'claude',
         file,
         sessionId: name.slice(0, -'.jsonl'.length),
-        mtimeMs: stat.mtimeMs,
-        size: stat.size,
-        ...(stat.ino > 0 ? { ino: stat.ino } : {}),
+        ...revisionOf(stat),
       });
     } catch {
       /* vanished mid-scan */
@@ -3170,7 +3168,7 @@ export async function scanClaudeRelationshipQuantum(
   const fd = fs.openSync(parent.file, 'r');
   let readBytes = 0;
   try {
-    const { size, mtimeMs, dev, ino } = fs.fstatSync(fd);
+    const { size, mtimeMs, dev, ino } = revisionOf(fs.fstatSync(fd, { bigint: true }));
     const revision = { size, mtimeMs, dev, ino };
     const read = (at: number, length: number) => {
       const bytes = Buffer.allocUnsafe(length);
@@ -3269,7 +3267,7 @@ export async function scanClaudeRelationshipQuantum(
     cursor.anchor = digest(read(at, cursor.offset - at));
     // Recheck the opened prefix and path identity after yielding. Growth beyond the target
     // leaves the completed cut usable. A detectable rewrite invalidates this quantum.
-    const after = fs.statSync(parent.file);
+    const after = revisionOf(fs.statSync(parent.file, { bigint: true }));
     if (
       after.dev !== dev ||
       after.ino !== ino ||
@@ -3934,8 +3932,8 @@ export function tailLines(file: string, bytes: number): string[] {
 export interface FileRevision {
   size: number;
   mtimeMs: number;
-  dev: number;
-  ino: number;
+  dev: number | string;
+  ino: number | string;
 }
 
 export interface BackwardLineCursor {
@@ -3991,11 +3989,40 @@ export interface MetadataCoverage {
   windowBytes: number;
 }
 
-function revisionOf(stat: fs.Stats): FileRevision {
-  return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
+export function revisionOf(stat: fs.Stats | fs.BigIntStats): FileRevision {
+  const size =
+    typeof stat.size === 'bigint'
+      ? stat.size >= 0n && stat.size <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(stat.size)
+        : -1
+      : stat.size;
+  const ns = (stat as fs.BigIntStats).mtimeNs;
+  const mtimeMs =
+    typeof stat.mtimeMs === 'bigint'
+      ? ns === undefined
+        ? Number(stat.mtimeMs)
+        : Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1_000_000
+      : stat.mtimeMs;
+  return {
+    size,
+    mtimeMs,
+    dev: typeof stat.dev === 'bigint' ? stat.dev.toString() : stat.dev,
+    ino: typeof stat.ino === 'bigint' ? stat.ino.toString() : stat.ino,
+  };
 }
 
-function sameFileRevision(stat: fs.Stats, revision: FileRevision): boolean {
+export function fileIdentityValue(value: unknown, positive = false): boolean {
+  return typeof value === 'string'
+    ? (positive ? /^[1-9][0-9]*$/ : /^(0|[1-9][0-9]*)$/).test(value)
+    : typeof value === 'number' && Number.isSafeInteger(value) && (positive ? value > 0 : value >= 0);
+}
+
+export function supportedFileIdentity(value: { dev?: unknown; ino?: unknown }): boolean {
+  return fileIdentityValue(value.dev) && fileIdentityValue(value.ino, true);
+}
+
+function sameFileRevision(snapshot: fs.Stats | fs.BigIntStats, revision: FileRevision): boolean {
+  const stat = revisionOf(snapshot);
   return (
     stat.size === revision.size &&
     stat.mtimeMs === revision.mtimeMs &&
@@ -4008,7 +4035,7 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    const stat = fs.fstatSync(fd);
+    const stat = revisionOf(fs.fstatSync(fd, { bigint: true }));
     const size = stat.size;
     const start = Math.max(0, size - bytes);
     const len = size - start;
@@ -4024,13 +4051,13 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
     return {
       lines,
       whole: start === 0 && read === len,
-      success: read === len && sameFileRevision(fs.fstatSync(fd), revisionOf(stat)),
+      success: read === len && sameFileRevision(fs.fstatSync(fd, { bigint: true }), stat),
       readBytes: body.length,
       offset: start === 0 ? 0 : start + (firstNewline < 0 ? body.length : firstNewline + 1),
       ...(keepCursor && start > 0
         ? {
             cursor: {
-              revision: revisionOf(stat),
+              revision: stat,
               end: start,
               fragment: Buffer.from(fragment),
             },
@@ -4054,7 +4081,7 @@ function readBackwardRange(file: string, start: number, length: number, revision
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    if (!sameFileRevision(fs.fstatSync(fd), revision)) {
+    if (!sameFileRevision(fs.fstatSync(fd, { bigint: true }), revision)) {
       return null;
     }
     const buffer = Buffer.allocUnsafe(length);
@@ -4066,7 +4093,7 @@ function readBackwardRange(file: string, start: number, length: number, revision
       }
       read += next;
     }
-    if (!sameFileRevision(fs.fstatSync(fd), revision)) {
+    if (!sameFileRevision(fs.fstatSync(fd, { bigint: true }), revision)) {
       return null;
     }
     return buffer;

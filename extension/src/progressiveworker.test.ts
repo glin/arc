@@ -1,3 +1,4 @@
+import { revisionOf } from './transcript';
 import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -83,7 +84,7 @@ test(
     fs.writeFileSync(parentFile, '{"type":"session_meta","payload":{"id":"parent"}}\n');
     fs.writeFileSync(childFile, '{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}\n');
     const sourceOf = (file: string, sessionId: string) => {
-      const { size, mtimeMs, dev, ino } = fs.statSync(file);
+      const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
       return { file, sessionId, revision: { size, mtimeMs, dev, ino } };
     };
     const parent = sourceOf(parentFile, 'parent');
@@ -185,7 +186,7 @@ test('commit ownership workers resume a parent across children and reject change
     );
   writeChild('child');
   const sourceOf = (file: string, sessionId: string) => {
-    const { size, mtimeMs, dev, ino } = fs.statSync(file);
+    const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId, revision: { size, mtimeMs, dev, ino } };
   };
   const ledger = new CommitRepositoryReservations();
@@ -296,7 +297,7 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
     const port=require('node:worker_threads').parentPort; const post=port.postMessage; port.postMessage=function(message) { if(message.result) message.result.bytes={...bytes}; return post.call(this,message); };`;
   const worker = new ProgressiveWorker(prelude + source);
   const session = (file: string) => {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, agent: 'claude' as const, sessionId: path.basename(file), size: stat.size, mtimeMs: stat.mtimeMs };
   };
   try {
@@ -353,7 +354,7 @@ test('acknowledged Claude discovery resumes after worker restart while metadata 
       .map((row) => JSON.stringify(row))
       .join('\n') + '\n',
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: 'parent', agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
   let worker = new ProgressiveWorker(source);
   let entries: Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]> = [];
@@ -408,7 +409,7 @@ test('bounded Claude discovery visits all roots and serves selected history duri
   const parents = Array.from({ length: 1100 }, (_, index) => {
     const file = path.join(directory, `${index}.jsonl`);
     fs.writeFileSync(file, '{"type":"user","message":{"content":"hello"}}\n');
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId: String(index), agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
   });
   const worker = new ProgressiveWorker(source);
@@ -496,7 +497,7 @@ test.each(['deleted', 'unreachable'] as const)(
     for (const file of files)
       fs.writeFileSync(file, JSON.stringify({ type: 'ignored', text: 'x'.repeat(600000) }) + '\n');
     const parents = files.map((file) => {
-      const stat = fs.statSync(file);
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
       return { file, sessionId: path.basename(file), agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
     });
     let worker = new ProgressiveWorker(source);
@@ -555,7 +556,7 @@ test('a completed Claude quantum survives cancellation before a later colliding 
   for (const file of files)
     fs.writeFileSync(file, JSON.stringify({ type: 'ignored', text: 'x'.repeat(2 * 1024 * 1024) }) + '\n');
   const parents = files.map((file) => {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId: path.basename(file), agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
   });
   let worker = new ProgressiveWorker(source);
@@ -670,7 +671,7 @@ test('a detected larger same-inode Claude rewrite removes dispatched person and 
   ];
   write(file, rows(true));
   const session = (file: string, sessionId: string) => {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId, agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
   };
   const worker = new ProgressiveWorker(source);
@@ -684,9 +685,9 @@ test('a detected larger same-inode Claude rewrite removes dispatched person and 
     const first = await completeDiscovery(worker, request(), 1, new AbortController().signal);
     assert.ok(first?.value.kind === 'claude-children');
     assert.equal(first.value.dispatchFacts[0].person, true);
-    const before = fs.statSync(file);
+    const before = revisionOf(fs.statSync(file, { bigint: true }));
     write(file, [...rows(false), { type: 'ignored', text: 'x'.repeat(before.size + 1000) }]);
-    assert.equal(fs.statSync(file).ino, before.ino);
+    assert.equal(fs.statSync(file, { bigint: true }).ino.toString(), before.ino);
     assert.ok(fs.statSync(file).size > before.size);
     const next = await completeDiscovery(worker, request(), 2, new AbortController().signal);
     assert.ok(next?.value.kind === 'claude-children');
@@ -731,7 +732,7 @@ test('Claude recursive closure removes deleted descendants and restores later ap
   fs.writeFileSync(parentFile, records('child'));
   fs.writeFileSync(childFile, records('grand'));
   fs.writeFileSync(grandFile, records());
-  const stat = fs.statSync(parentFile);
+  const stat = revisionOf(fs.statSync(parentFile, { bigint: true }));
   const parent = {
     file: parentFile,
     sessionId: 'parent',
@@ -792,7 +793,7 @@ test('metadata recovery reconciles two supported records before refusing retenti
   );
   const worker = new ProgressiveWorker(source);
   try {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     const result = await worker.run(
       {
         kind: 'metadata-recovery',
@@ -889,7 +890,7 @@ test.each(['missing', 'changed', 'refused', 'pruned', 'cancelled', 'stopped'] as
       `\nconst nativeStat = require('node:fs').statSync; require('node:fs').statSync = (...args) => { if (args[0] === ${JSON.stringify(files[0])} && require('node:fs').existsSync(${JSON.stringify(marker)})) throw new Error('refused stat'); return nativeStat(...args); };`;
     const worker = new ProgressiveWorker(instrumented);
     const request = (i: number) => {
-      const stat = fs.statSync(files[i]);
+      const stat = revisionOf(fs.statSync(files[i], { bigint: true }));
       return {
         kind: 'metadata-recovery' as const,
         session: {
@@ -957,7 +958,7 @@ test('saved Codex categories cross the worker boundary only for the captured fil
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const { size, mtimeMs, ino } = fs.statSync(file);
+  const { size, mtimeMs, ino } = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, size, mtimeMs, ino, agent: 'codex' as const, sessionId: 'saved' };
   const worker = new ProgressiveWorker(source);
   try {
@@ -981,7 +982,11 @@ test('saved Codex categories cross the worker boundary only for the captured fil
       payload: { type: 'function_call', call_id: 'pending', name: 'read', arguments: '{}' },
     });
     fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
-    const { size: pendingSize, mtimeMs: pendingMtime, ino: pendingIno } = fs.statSync(file);
+    const {
+      size: pendingSize,
+      mtimeMs: pendingMtime,
+      ino: pendingIno,
+    } = revisionOf(fs.statSync(file, { bigint: true }));
     const pending = await worker.run(
       { kind: 'codex-context', session: { ...session, size: pendingSize, mtimeMs: pendingMtime, ino: pendingIno } },
       10,
@@ -1095,7 +1100,7 @@ test('generation 35 empty names reread an unchanged image-bearing rollout after 
     },
   );
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const { size, mtimeMs } = fs.statSync(file);
+  const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
   const empty: DerivedTitleEntry = {
     size,
     mtimeMs,
@@ -1303,7 +1308,7 @@ function giantImageRollout(file: string, imageBytes: number): void {
 async function recoverInWorker(file: string, extra: object = {}, agent: AgentKind = 'codex') {
   const worker = new ProgressiveWorker(source);
   try {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     for (let slice = 0; slice < 100; slice++) {
       const result = await worker.run(
         {
@@ -1594,7 +1599,7 @@ test('metadata recovery keeps the end of a long Agent result in a child transcri
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   try {
     assert.ok(Buffer.byteLength(report) > 4 * 64 * 1024, 'the report is too short to lose its middle');
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     const session = { file, sessionId: 'child-1', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
     const recovered = await recoverInWorker(
       file,
@@ -1633,7 +1638,7 @@ test('Claude worker requests leave the Codex catalog canonical paths untouched',
     `\nconst nativePath = require('node:fs').realpathSync.native; require('node:fs').realpathSync.native = (...args) => { require('node:fs').appendFileSync(${JSON.stringify(marker)}, String(args[0]) + '\\n'); return nativePath(...args); };`;
   const worker = new ProgressiveWorker(instrumented);
   try {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     const result = await worker.run(
       {
         kind: 'window',
@@ -1708,10 +1713,10 @@ test('stable partial Codex parents yield to a later dispatch and resume after an
           }) + '\n'
         : JSON.stringify({ type: 'ignored', payload: 'x'.repeat(5 * 1024) }).slice(0, -2);
     fs.writeFileSync(file, opening + tail);
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'codex' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
-  const childStat = fs.statSync(child);
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const worker = new ProgressiveWorker(dispatchWorkerSource(36));
   try {
     const request = {
@@ -1746,7 +1751,7 @@ test('stable partial Codex parents yield to a later dispatch and resume after an
     }
     assert.equal(found, true, 'unchanged partial parents starved the later dispatch');
     fs.appendFileSync(parents[0].file, '"}\n');
-    const stat = fs.statSync(parents[0].file);
+    const stat = revisionOf(fs.statSync(parents[0].file, { bigint: true }));
     parents[0] = { ...parents[0], size: stat.size, mtimeMs: stat.mtimeMs };
     const appended = await discoveryState(
       worker,
@@ -1811,9 +1816,9 @@ test('a Codex parent that grows after its scan keeps discovery pending until the
   assert.equal(parts.length, 3, 'the worker no longer walks once before and once after its parent scans');
   const grow = `if (require('node:fs').existsSync(${JSON.stringify(mutate)})) { require('node:fs').appendFileSync(${JSON.stringify(file)}, ${JSON.stringify(launch)}); require('node:fs').unlinkSync(${JSON.stringify(mutate)}); }`;
   const worker = new ProgressiveWorker(parts[0] + 'found = walk();' + parts[1] + grow + 'found = walk();' + parts[2]);
-  const childStat = fs.statSync(child);
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = (referenceEntries?: unknown) => {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return {
       kind: 'claude-children' as const,
       parents: [{ agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
@@ -1851,7 +1856,7 @@ test('a rotated scan hides a changed parent until it reads the replacement recei
   const catalog = [oldId, newId].map((sessionId) => {
     const file = path.join(directory, `${sessionId}.jsonl`);
     fs.writeFileSync(file, `${JSON.stringify({ type: 'user', cwd: directory })}\n`);
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'claude' as const, file, sessionId, size: stat.size, mtimeMs: stat.mtimeMs };
   });
   const receipt = (sessionId: string) =>
@@ -1885,7 +1890,7 @@ test('a rotated scan hides a changed parent until it reads the replacement recei
     `${JSON.stringify({ type: 'session_meta', payload: { id: 'parent-1', cwd: directory } })}\n`,
   );
   const parents = [firstFile, secondFile].map((file, index) => {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'codex' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
   const worker = new ProgressiveWorker(source);
@@ -1902,7 +1907,7 @@ test('a rotated scan hides a changed parent until it reads the replacement recei
     fs.writeFileSync(firstFile, original.replace(oldId, newId));
     const changed = new Date(parents[0].mtimeMs + 1000);
     fs.utimesSync(firstFile, changed, changed);
-    const stat = fs.statSync(firstFile);
+    const stat = revisionOf(fs.statSync(firstFile, { bigint: true }));
     parents[0] = { ...parents[0], size: stat.size, mtimeMs: stat.mtimeMs };
     assert.equal(stat.size, first.value.referenceEntries.find(([, entry]) => entry.sessionId === 'parent-0')?.[1].size);
     const waiting = await discoveryState(
@@ -1941,7 +1946,7 @@ test('a pass after a complete reply that asks for another pass starts its count 
   const parents = Array.from({ length: 5 }, (_unused, index) => {
     const file = path.join(directory, `parent-${index}.jsonl`);
     fs.writeFileSync(file, line({ type: 'user', cwd: directory, message: { content: `prompt ${index}` } }));
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'claude' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
   const worker = new ProgressiveWorker(source);
@@ -1956,7 +1961,7 @@ test('a pass after a complete reply that asks for another pass starts its count 
     assert.equal(first?.value.kind, 'claude-children');
     // An active session writes to its transcript, so the follow-up pass finds one grown parent.
     fs.appendFileSync(parents[0].file, line({ type: 'user', cwd: directory, message: { content: 'follow-up' } }));
-    const grown = fs.statSync(parents[0].file);
+    const grown = revisionOf(fs.statSync(parents[0].file, { bigint: true }));
     parents[0] = { ...parents[0], size: grown.size, mtimeMs: grown.mtimeMs };
     const counts: number[] = [];
     const completed = new Set<string>();
@@ -1987,7 +1992,7 @@ test('a pass keeps an active transcript that grows after its seed check', async 
   });
   const parents = () =>
     files.map((file, index) => {
-      const stat = fs.statSync(file);
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
       return { agent: 'claude' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
     });
   // The worker appends to the active transcript right after its next stat, as an agent writing between two checks would.
@@ -2048,7 +2053,7 @@ test('a pass after a complete reply reads an unchanged Codex rollout that stoppe
       String.fromCharCode(10) +
       filler.repeat(160),
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const parent = { agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
   const worker = new ProgressiveWorker(source);
   try {
@@ -2105,10 +2110,10 @@ test('unfinished cursor overflow keeps discovery and saved progress alive', asyn
             .join('')
         : `${JSON.stringify({ type: 'session_meta', payload: { id: `parent-${index}`, cwd: directory } })}\n${JSON.stringify({ type: 'ignored', payload: 'x'.repeat(100 * 1024) })}\n`,
     );
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'codex' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
-  const childStat = fs.statSync(child);
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = {
     kind: 'claude-children' as const,
     parents,
@@ -2186,8 +2191,8 @@ test('a cursorless incomplete parent keeps its child after cache reload and resu
   fs.writeFileSync(file, opening.map((record) => JSON.stringify(record) + '\n').join(''));
   for (let index = 0; index < 9; index++)
     fs.appendFileSync(file, `${JSON.stringify({ type: 'ignored', payload: 'x'.repeat(1024 * 1024) })}\n`);
-  const stat = fs.statSync(file);
-  const childStat = fs.statSync(child);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = {
     kind: 'claude-children' as const,
     parents: [{ agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
@@ -2264,8 +2269,8 @@ test('a classified dispatch beyond the first resumed budget stays visible throug
     })}\n`,
   );
   for (let index = 0; index < 9; index++) fs.appendFileSync(file, filler);
-  const stat = fs.statSync(file);
-  const childStat = fs.statSync(child);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = {
     kind: 'claude-children' as const,
     parents: [{ agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
@@ -2364,8 +2369,8 @@ test('a copied-turn retraction removes a held child during cursorless reconstruc
     `${JSON.stringify({ type: 'turn_context', payload: { turn_id: 'launch', current_date: '2026-08-26' } })}\n`,
   );
   fs.appendFileSync(file, '{"type":"ignored","payload":"tail"');
-  const stat = fs.statSync(file);
-  const childStat = fs.statSync(child);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = {
     kind: 'claude-children' as const,
     parents: [{ agent: 'codex' as const, file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs }],
@@ -2422,7 +2427,7 @@ test('a copied-turn retraction removes a held child during cursorless reconstruc
     assert.equal(result?.value.kind, 'claude-children');
     assert.deepEqual(result.value.references, [], 'stable partial EOF restored the copied receipt');
     fs.appendFileSync(file, '}\n');
-    const completedStat = fs.statSync(file);
+    const completedStat = revisionOf(fs.statSync(file, { bigint: true }));
     result = await discoveryState(
       worker,
       {
@@ -2475,7 +2480,7 @@ test('a large unfinished parent reaches its final receipt under production curso
       },
     })}\n`,
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const parent = { agent: 'codex' as const, file, sessionId: 'large-parent', size: stat.size, mtimeMs: stat.mtimeMs };
   const seed = scanCodexDispatchReferences(file, parent.sessionId, null, 0).cursor;
   const largeEntry: import('./derivedcache').ClaudeChildReferenceCacheEntry = {
@@ -2499,7 +2504,7 @@ test('a large unfinished parent reaches its final receipt under production curso
   const stableParents = Array.from({ length: 840 }, (_unused, index) => {
     const stable = path.join(directory, `stable-${index}.jsonl`);
     fs.writeFileSync(stable, stableText);
-    const revision = fs.statSync(stable);
+    const revision = revisionOf(fs.statSync(stable, { bigint: true }));
     return {
       agent: 'codex' as const,
       file: stable,
@@ -2533,7 +2538,7 @@ test('a large unfinished parent reaches its final receipt under production curso
       },
     ]),
   ];
-  const childStat = fs.statSync(child);
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = {
     kind: 'claude-children' as const,
     parents: [parent, ...stableParents],
@@ -2596,10 +2601,10 @@ test('a restart rediscovers PowerShell receipts from old complete and visited-EO
       .join(''),
   );
   fs.writeFileSync(child, JSON.stringify({ type: 'user', cwd: directory, message: { content: 'review' } }) + '\n');
-  const before = fs.statSync(file);
+  const before = revisionOf(fs.statSync(file, { bigint: true }));
   const cursor = scanCodexDispatchReferences(file, 'parent').cursor;
   const parent = { agent: 'codex' as const, file, sessionId: 'parent', size: before.size, mtimeMs: before.mtimeMs };
-  const childStat = fs.statSync(child);
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = {
     kind: 'claude-children' as const,
     parents: [parent],
@@ -2655,7 +2660,7 @@ test('a restart rediscovers PowerShell receipts from old complete and visited-EO
       }
     }
   }
-  const after = fs.statSync(file);
+  const after = revisionOf(fs.statSync(file, { bigint: true }));
   assert.deepEqual(
     [after.size, after.mtimeMs, after.dev, after.ino],
     [before.size, before.mtimeMs, before.dev, before.ino],
@@ -2689,8 +2694,8 @@ test('Codex dispatch discovery resumes beyond its request byte budget', async ()
     }) + '\n',
   );
   fs.writeFileSync(child, JSON.stringify({ type: 'user', cwd: directory, message: { content: 'hello' } }) + '\n');
-  const stat = fs.statSync(file);
-  const childStat = fs.statSync(child);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const parent = { agent: 'codex' as const, file, sessionId: 'parent', mtimeMs: stat.mtimeMs, size: stat.size };
   const catalog = [
     { agent: 'claude' as const, file: child, sessionId: id, mtimeMs: childStat.mtimeMs, size: childStat.size },
@@ -2764,10 +2769,10 @@ test('large partial Codex records keep bounded cursors across parents and a work
       },
     });
     fs.writeFileSync(file, records.map((record) => JSON.stringify(record) + '\n').join('') + last.slice(0, -1));
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'codex' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
-  const childStat = fs.statSync(child);
+  const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const catalog = [
     { agent: 'claude' as const, file: child, sessionId: childId, size: childStat.size, mtimeMs: childStat.mtimeMs },
   ];
@@ -2796,7 +2801,7 @@ test('large partial Codex records keep bounded cursors across parents and a work
     worker.stop();
     worker = new ProgressiveWorker(source);
     fs.appendFileSync(parents[3].file, '}\n');
-    const stat = fs.statSync(parents[3].file);
+    const stat = revisionOf(fs.statSync(parents[3].file, { bigint: true }));
     parents[3] = { ...parents[3], size: stat.size, mtimeMs: stat.mtimeMs };
     const resumed = await discoveryState(
       worker,
@@ -2851,7 +2856,7 @@ test('Claude child discovery runs in the worker and reuses unchanged transcript 
       );
     }
     fs.writeFileSync(file, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'claude' as const, file, sessionId, mtimeMs: stat.mtimeMs, size: stat.size };
   });
   const observedSource =
@@ -2928,7 +2933,7 @@ test('Claude child discovery runs in the worker and reuses unchanged transcript 
     );
     const appendedChild = path.join(directory, appendedParent.sessionId, 'subagents', `agent-${appendedChildId}.jsonl`);
     fs.writeFileSync(appendedChild, `${JSON.stringify({ type: 'user', cwd: 'C:/repo' })}\n`);
-    const appendedStat = fs.statSync(appendedParent.file);
+    const appendedStat = revisionOf(fs.statSync(appendedParent.file, { bigint: true }));
     parents[1] = { ...appendedParent, mtimeMs: appendedStat.mtimeMs, size: appendedStat.size };
     const changedWorker = new ProgressiveWorker(observedSource);
     let changedEntries: typeof first.value.referenceEntries = [];
@@ -2971,12 +2976,12 @@ test('Claude child discovery runs in the worker and reuses unchanged transcript 
 
     const replacedParent = parents[0];
     const replacement = path.join(directory, 'replacement.jsonl');
-    const replacedStat = fs.statSync(replacedParent.file);
+    const replacedStat = revisionOf(fs.statSync(replacedParent.file, { bigint: true }));
     fs.writeFileSync(replacement, Buffer.alloc(replacedStat.size, 0x20));
     fs.unlinkSync(replacedParent.file);
     fs.renameSync(replacement, replacedParent.file);
-    fs.utimesSync(replacedParent.file, replacedStat.atime, replacedStat.mtime);
-    const replacementStat = fs.statSync(replacedParent.file);
+    fs.utimesSync(replacedParent.file, new Date(replacedStat.mtimeMs), new Date(replacedStat.mtimeMs));
+    const replacementStat = revisionOf(fs.statSync(replacedParent.file, { bigint: true }));
     parents[0] = { ...replacedParent, mtimeMs: replacementStat.mtimeMs, size: replacementStat.size };
     const identityMatchedEntries: typeof changedEntries = changedEntries.map(([file, entry]) => [
       file,
@@ -3045,8 +3050,8 @@ test('Claude dispatch discovery resolves a unique catalog prefix without adding 
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const parentStat = fs.statSync(parentFile);
-  const childStat = fs.statSync(childFile);
+  const parentStat = revisionOf(fs.statSync(parentFile, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(childFile, { bigint: true }));
   const parent = {
     agent: 'claude' as const,
     file: parentFile,
@@ -3103,7 +3108,7 @@ test('Claude dispatch discovery resolves a unique catalog prefix without adding 
         message: { role: 'user', content: 'Use the other fixture' },
       }) + '\n',
     );
-    const grown = fs.statSync(childFile);
+    const grown = revisionOf(fs.statSync(childFile, { bigint: true }));
     const typed = await completeDiscovery(
       worker,
       {
@@ -3238,8 +3243,8 @@ test('an active dispatched transcript reads only its bounded metadata', async ()
     },
   );
   fs.writeFileSync(childFile, activeRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const parentStat = fs.statSync(parentFile);
-  const childStat = fs.statSync(childFile);
+  const parentStat = revisionOf(fs.statSync(parentFile, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(childFile, { bigint: true }));
   const parent = {
     agent: 'claude' as const,
     file: parentFile,
@@ -3366,7 +3371,7 @@ test('a running dispatched child reads as a person only from its whole file', as
     timestamp: activeAt,
     content: 'Starting',
   });
-  const parentStat = fs.statSync(parentFile);
+  const parentStat = revisionOf(fs.statSync(parentFile, { bigint: true }));
   const parent = {
     agent: 'claude' as const,
     file: parentFile,
@@ -3375,7 +3380,7 @@ test('a running dispatched child reads as a person only from its whole file', as
     size: parentStat.size,
   };
   const catalog = () => {
-    const stat = fs.statSync(childFile);
+    const stat = revisionOf(fs.statSync(childFile, { bigint: true }));
     return [
       parent,
       { agent: 'claude' as const, file: childFile, sessionId: childId, mtimeMs: stat.mtimeMs, size: stat.size },
@@ -3511,8 +3516,8 @@ test('a completed dispatched transcript beyond its metadata tail keeps its spend
       .join('\n') + '\n',
   );
   assert.ok(fs.statSync(childFile).size > 256 * 1024, 'fixture did not exceed the metadata tail');
-  const parentStat = fs.statSync(parentFile);
-  const childStat = fs.statSync(childFile);
+  const parentStat = revisionOf(fs.statSync(parentFile, { bigint: true }));
+  const childStat = revisionOf(fs.statSync(childFile, { bigint: true }));
   const parent = {
     agent: 'claude' as const,
     file: parentFile,
@@ -3561,8 +3566,8 @@ test('Claude child discovery retries interrupted and concurrently changed parent
   fs.writeFileSync(quietFile, `${JSON.stringify({ type: 'user', cwd: 'C:/repo' })}\n`);
   fs.writeFileSync(changingFile, `${JSON.stringify({ type: 'user', cwd: 'C:/repo' })}\n`);
   fs.writeFileSync(childFile, `${JSON.stringify({ type: 'user', cwd: 'C:/repo' })}\n`);
-  const quietStat = fs.statSync(quietFile);
-  const changingStat = fs.statSync(changingFile);
+  const quietStat = revisionOf(fs.statSync(quietFile, { bigint: true }));
+  const changingStat = revisionOf(fs.statSync(changingFile, { bigint: true }));
   const parents = [
     { agent: 'claude' as const, file: quietFile, sessionId: 'quiet', mtimeMs: quietStat.mtimeMs, size: quietStat.size },
     {
@@ -3613,7 +3618,7 @@ test('Claude child discovery retries interrupted and concurrently changed parent
             ]
           : [{ type: 'user', cwd: 'C:/repo' }];
       fs.writeFileSync(changingFile, `${initialRecords.map((record) => JSON.stringify(record)).join('\n')}\n`);
-      const stat = fs.statSync(changingFile);
+      const stat = revisionOf(fs.statSync(changingFile, { bigint: true }));
       parents[1] = { ...parents[1], mtimeMs: stat.mtimeMs, size: stat.size };
       const worker = new ProgressiveWorker(prelude(fault) + source);
       try {
@@ -3628,7 +3633,7 @@ test('Claude child discovery retries interrupted and concurrently changed parent
           {
             ...request,
             parents: parents.map((parent) => {
-              const current = fs.statSync(parent.file);
+              const current = revisionOf(fs.statSync(parent.file, { bigint: true }));
               return { ...parent, mtimeMs: current.mtimeMs, size: current.size };
             }),
           },
@@ -3687,7 +3692,7 @@ for (const agent of ['claude', 'codex'] as const) {
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const { mtimeMs, size } = fs.statSync(file);
+    const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
     const input: ProgressiveInput = {
       session: { file, sessionId: 'session', agent, mtimeMs, size },
       folders: [],
@@ -3784,7 +3789,7 @@ test('the Claude worker preserves the exact child close time', async () => {
     },
   ];
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const { mtimeMs, size } = fs.statSync(file);
+  const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
   const worker = new ProgressiveWorker(source);
   try {
     const result = await worker.run(
@@ -3871,7 +3876,7 @@ test('a Claude metadata entry carries the background commands the tail read foun
     },
   ];
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const { mtimeMs, size } = fs.statSync(file);
+  const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
   const worker = new ProgressiveWorker(source);
   try {
     const session = { file, size, mtimeMs, agent: 'claude' as const, sessionId: 'session' };
@@ -4064,8 +4069,8 @@ test('Claude relationship changes invalidate the current window and refresh reta
   );
   const worker = new ProgressiveWorker(source);
   try {
-    const parentStat = fs.statSync(parent);
-    const childStat = fs.statSync(child);
+    const parentStat = revisionOf(fs.statSync(parent, { bigint: true }));
+    const childStat = revisionOf(fs.statSync(child, { bigint: true }));
     const session = {
       agent: 'claude' as const,
       file: parent,
@@ -4168,7 +4173,7 @@ test.each([
         record('event_msg', 8, { type: 'task_complete', turn_id: 'turn', last_agent_message: 'delegated' }),
       ].join('\n') + '\n',
     );
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     const childFile = path.join(directory, 'child.jsonl');
     fs.writeFileSync(childFile, record('event_msg', 5, { type: 'task_started', turn_id: 'child-turn' }) + '\n');
     const input = {
@@ -4267,7 +4272,7 @@ test('a Codex child append moves the worker cost key and leaves the parent windo
   fs.writeFileSync(child, event(4, { type: 'task_started', turn_id: 'child-turn' }) + '\n');
   const worker = new ProgressiveWorker(source);
   try {
-    const stat = fs.statSync(parent);
+    const stat = revisionOf(fs.statSync(parent, { bigint: true }));
     const session = {
       agent: 'codex' as const,
       file: parent,
@@ -4435,7 +4440,7 @@ test('grandchild-only changes refresh warm Codex root costs and retained pages',
   ];
   const worker = new ProgressiveWorker(source);
   try {
-    const stat = fs.statSync(files[0]);
+    const stat = revisionOf(fs.statSync(files[0], { bigint: true }));
     const session = {
       agent: 'codex' as const,
       file: files[0],
@@ -4604,7 +4609,7 @@ test('grandchild-only changes refresh warm Codex root costs and retained pages',
       nickname: 'child',
     });
     fs.writeFileSync(files[0], rootRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
-    const changedRoot = fs.statSync(files[0]);
+    const changedRoot = revisionOf(fs.statSync(files[0], { bigint: true }));
     session.size = changedRoot.size;
     session.mtimeMs = changedRoot.mtimeMs;
     const explicit = await run(10);
@@ -4670,7 +4675,7 @@ test('Claude child spend uses the paired transcript when navigation scope reject
   );
   const worker = new ProgressiveWorker(source);
   try {
-    const parentStat = fs.statSync(parent);
+    const parentStat = revisionOf(fs.statSync(parent, { bigint: true }));
     const input = {
       session: {
         agent: 'claude' as const,
@@ -4936,7 +4941,7 @@ async function undiscoveredBackgroundChild(
   const viewed = view === 'child' ? path.join(childDirectory, 'agent-child.jsonl') : parent;
   const worker = new ProgressiveWorker(source);
   try {
-    const { mtimeMs, size } = fs.statSync(viewed);
+    const { mtimeMs, size } = revisionOf(fs.statSync(viewed, { bigint: true }));
     const result = await worker.run(
       {
         kind: 'window',
@@ -5112,7 +5117,7 @@ test('Claude child commits cross the worker boundary and refresh on retained pag
   );
   const worker = new ProgressiveWorker(source);
   try {
-    const parentStat = fs.statSync(parent);
+    const parentStat = revisionOf(fs.statSync(parent, { bigint: true }));
     const input = {
       session: {
         agent: 'claude' as const,
@@ -5259,7 +5264,7 @@ for (const agent of ['claude', 'codex'] as const) {
       source;
     const worker = new ProgressiveWorker(observedSource);
     try {
-      const { size, mtimeMs } = fs.statSync(file);
+      const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
       const session = { file, size, mtimeMs, agent, sessionId: 'session' };
       const result = await worker.run({ kind: 'metadata', session }, 1, new AbortController().signal);
       assert.ok(result?.value.kind === 'metadata');
@@ -5298,7 +5303,7 @@ for (const agent of ['claude', 'codex'] as const) {
     fs.writeFileSync(file, [...opening(agent), closed].map((record) => JSON.stringify(record)).join('\n') + '\n');
     const worker = new ProgressiveWorker(source);
     const input = (): ProgressiveInput => {
-      const { mtimeMs, size } = fs.statSync(file);
+      const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
       return {
         session: { file, sessionId: 'session', agent, mtimeMs, size },
         folders: [],
@@ -5362,7 +5367,7 @@ for (const agent of ['claude', 'codex'] as const) {
         fs.writeFileSync(file, lines([attachment(before), ...opening(agent), reply('answer')]));
         const worker = new ProgressiveWorker(source);
         const input = (): ProgressiveInput => {
-          const { mtimeMs, size } = fs.statSync(file);
+          const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
           return {
             session: { file, sessionId: 'session', agent, mtimeMs, size },
             folders: [],
@@ -5422,7 +5427,7 @@ for (const agent of ['claude', 'codex'] as const) {
       };
       fs.writeFileSync(file, [...opening(agent), closed].map((record) => JSON.stringify(record)).join('\n') + '\n');
       const input = (): ProgressiveInput => {
-        const { mtimeMs, size } = fs.statSync(file);
+        const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
         return {
           session: { file, sessionId: 'session', agent, mtimeMs, size },
           folders: [],
@@ -5437,7 +5442,7 @@ for (const agent of ['claude', 'codex'] as const) {
         assert.ok(initial?.value.kind === 'window');
         fs.appendFileSync(file, JSON.stringify({ type: 'ignored', text: 'x'.repeat(32 * 1024) }) + '\n');
         const requested = input();
-        const requestedIdentity = fs.statSync(file);
+        const requestedIdentity = revisionOf(fs.statSync(file, { bigint: true }));
         const stable = await initialWorker.run(
           { kind: 'window', input: requested, checkpoint: initial.value.checkpoint },
           2,
@@ -5469,7 +5474,7 @@ for (const agent of ['claude', 'codex'] as const) {
           );
           assert.equal(result?.value.kind, 'stale', 'a recovery read from a later rewrite was published');
           assert.equal('appendFrom' in (result?.value ?? {}), false, 'a stale result serialized append proof');
-          const rewritten = fs.statSync(file);
+          const rewritten = revisionOf(fs.statSync(file, { bigint: true }));
           assert.ok(rewritten.size > requested.session.size, 'the rewrite did not grow the same file');
           assert.deepEqual(
             { dev: rewritten.dev, ino: rewritten.ino },
@@ -5512,7 +5517,7 @@ for (const agent of ['claude', 'codex'] as const) {
         if (n) {
           fs.appendFileSync(file, JSON.stringify(activity(agent, n)) + '\n');
         }
-        const { mtimeMs, size } = fs.statSync(file);
+        const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
         const input: ProgressiveInput = {
           session: { file, sessionId: 'session', agent, mtimeMs, size },
           folders: [],
@@ -5592,7 +5597,7 @@ for (const agent of ['claude', 'codex'] as const) {
         if (n) {
           fs.appendFileSync(file, JSON.stringify(activity(agent, n)) + '\n');
         }
-        const { mtimeMs, size } = fs.statSync(file);
+        const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
         const input: ProgressiveInput = {
           session: { file, sessionId: 'session', agent, mtimeMs, size },
           folders: [],
@@ -5620,7 +5625,7 @@ for (const agent of ['claude', 'codex'] as const) {
         }
         checkpoint = result.value.checkpoint;
       }
-      const { mtimeMs, size } = fs.statSync(file);
+      const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
       const input: ProgressiveInput = {
         session: { file, sessionId: 'session', agent, mtimeMs, size },
         folders: [],
@@ -5668,7 +5673,7 @@ for (const agent of ['claude', 'codex'] as const) {
     const worker = new ProgressiveWorker(observedSource);
     try {
       const input = (): ProgressiveInput => {
-        const { mtimeMs, size } = fs.statSync(file);
+        const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
         return {
           session: { file, sessionId: 'session', agent, mtimeMs, size },
           folders: [],
@@ -5756,7 +5761,7 @@ test('a running identified Claude child does not make the worker read its transc
     };` + source;
   const worker = new ProgressiveWorker(guardedSource);
   try {
-    const { size, mtimeMs } = fs.statSync(file);
+    const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
     const result = await worker.run(
       {
         kind: 'window',
@@ -5811,7 +5816,7 @@ test('deferred metadata recovers the warm cache from an oversized newest Claude 
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   const worker = new ProgressiveWorker(source);
   try {
-    const { size, mtimeMs } = fs.statSync(file);
+    const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
     const session = { file, size, mtimeMs, agent: 'claude' as const, sessionId: 'session' };
     const bounded = await worker.run({ kind: 'metadata', session }, 1, new AbortController().signal);
     assert.ok(bounded?.value.kind === 'metadata');
@@ -5855,7 +5860,7 @@ test('a Codex start without a prompt completes one expanded metadata pass per fi
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   const worker = new ProgressiveWorker(source);
   try {
-    const revision = fs.statSync(file);
+    const revision = revisionOf(fs.statSync(file, { bigint: true }));
     const session = {
       file,
       sessionId: 'session',
@@ -5895,7 +5900,7 @@ test('a Codex start without a prompt completes one expanded metadata pass per fi
     );
 
     fs.appendFileSync(file, JSON.stringify({ type: 'ignored' }) + '\n');
-    const changedRevision = fs.statSync(file);
+    const changedRevision = revisionOf(fs.statSync(file, { bigint: true }));
     const changedSession = { ...session, mtimeMs: changedRevision.mtimeMs, size: changedRevision.size };
     const refreshed = await worker.run({ kind: 'metadata', session: changedSession }, 2, new AbortController().signal);
     const changedStarts = await worker.run(
@@ -5998,7 +6003,7 @@ test('a window that grows during its read returns stale at the current revision'
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const requested = fs.statSync(file);
+  const requested = revisionOf(fs.statSync(file, { bigint: true }));
   const marker = source.match(/const after = revisionOf\d*\(file\);/)?.[0];
   assert.ok(marker);
   const grownSource = source.replace(
@@ -6016,7 +6021,7 @@ test('a window that grows during its read returns stale at the current revision'
         mtimeMs: requested.mtimeMs,
         dev: requested.dev,
         ino: requested.ino,
-      } as ProgressiveInput['session'],
+      },
       folders: [],
       children: [],
       maxTurns: 40,
@@ -6030,7 +6035,7 @@ test('a window that grows during its read returns stale at the current revision'
       false,
       'the stale result kept the revision from before the mutation',
     );
-    assert.equal(sameProgressiveRevision(result.revision, fs.statSync(file)), true);
+    assert.equal(sameProgressiveRevision(result.revision, revisionOf(fs.statSync(file, { bigint: true }))), true);
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -6076,7 +6081,7 @@ test('catalog metadata keeps the revision that supplied its facts and survives l
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const requested = fs.statSync(file);
+  const requested = revisionOf(fs.statSync(file, { bigint: true }));
   const beforeMarker = source.match(/const before = revisionOf\d*\(file\);/)?.[0];
   const afterMarker = source.match(/const after = revisionOf\d*\(file\);/)?.[0];
   assert.ok(beforeMarker);
@@ -6095,7 +6100,7 @@ test('catalog metadata keeps the revision that supplied its facts and survives l
       mtimeMs: requested.mtimeMs,
     };
     const result = await worker.run({ kind: 'metadata', session }, 9, new AbortController().signal);
-    const current = fs.statSync(file);
+    const current = revisionOf(fs.statSync(file, { bigint: true }));
     assert.ok(result?.value.kind === 'metadata');
     assert.ok(result.revision);
     assert.equal(
@@ -6137,7 +6142,7 @@ test('shrinkage, replacement, and same-size rewrite make a completed window stal
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const requested = fs.statSync(file);
+    const requested = revisionOf(fs.statSync(file, { bigint: true }));
     const worker: ProgressiveWorker = new ProgressiveWorker(source.replace(marker, `${mutation} ${marker}`));
     try {
       const input: ProgressiveInput = {
@@ -6149,7 +6154,7 @@ test('shrinkage, replacement, and same-size rewrite make a completed window stal
           mtimeMs: requested.mtimeMs,
           dev: requested.dev,
           ino: requested.ino,
-        } as ProgressiveInput['session'],
+        },
         folders: [],
         children: [],
         maxTurns: 40,
@@ -6295,7 +6300,7 @@ test('a large Claude subagent session files under Run by agents, not Today', asy
       fs.statSync(file).size > CLAUDE_METADATA_TAIL_BYTES,
       'the fixture no longer exceeds the metadata tail the scan gates on',
     );
-    const { size, mtimeMs } = fs.statSync(file);
+    const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
     const session = {
       file,
       size,
@@ -6363,7 +6368,7 @@ async function railEntry(
   file: string,
   previous?: DerivedTitleEntry,
 ): Promise<DerivedTitleEntry> {
-  const { size, mtimeMs } = fs.statSync(file);
+  const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, size, mtimeMs, agent: 'claude' as const, sessionId: 'session' };
   const metadata = await worker.run({ kind: 'metadata', session }, 1, new AbortController().signal);
   assert.ok(metadata?.value.kind === 'metadata');
@@ -6519,7 +6524,7 @@ test('rail enrichment resumes after an append between starts and expanded metada
   try {
     const file = path.join(directory, 'session.jsonl');
     fs.writeFileSync(file, jsonLines(reviewRun()));
-    const before = fs.statSync(file);
+    const before = revisionOf(fs.statSync(file, { bigint: true }));
     const session = {
       file,
       size: before.size,
@@ -6627,7 +6632,7 @@ test('the agent-run scan resumes from its stored cursor and stops reading a pers
     // A file that shrank is read from the start.
     const shrunk = jsonLines(reviewRun()).slice(0, 300 * 1024);
     fs.writeFileSync(file, shrunk.slice(0, shrunk.lastIndexOf('\n') + 1));
-    const { size } = fs.statSync(file);
+    const { size } = revisionOf(fs.statSync(file, { bigint: true }));
     const rewritten = scanForAgentRun(file, size, { ...firstScan, bytes: size + 1 });
     assert.equal(rewritten.bytes, size);
     assert.equal(rewritten.prompts, 1);
@@ -6702,7 +6707,7 @@ test('the metadata read names a Claude session by one first prompt as it grows p
   const tailBytes = 4096;
   const worker = new ProgressiveWorker(source);
   const read = async () => {
-    const { size, mtimeMs } = fs.statSync(file);
+    const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
     const result = await worker.run(
       { kind: 'metadata', session: { file, size, mtimeMs, agent: 'claude', sessionId: 'session' }, tailBytes },
       1,
@@ -6769,7 +6774,7 @@ test('an orchestrator parent past the per-file reference limit stays cached acro
     return claudeDispatchTranscript(command, output, `dispatch-${result}`);
   }).flat();
   fs.writeFileSync(file, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const parents = [{ agent: 'claude' as const, file, sessionId: 'parent', mtimeMs: stat.mtimeMs, size: stat.size }];
   const counted =
     `const countedFs = require('node:fs'); const countedOpen = countedFs.openSync;
@@ -7774,7 +7779,7 @@ test.each(['stable', 'stale', 'cancelled'])(
     ` + execution;
     const worker = new ProgressiveWorker(instrumented);
     try {
-      const stat = fs.statSync(file);
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
       const result = await worker.run(
         {
           kind: 'window',
@@ -7877,7 +7882,7 @@ test.each(['claude', 'codex'] as const)(
     }
 
     const session = (file: string, sessionId: string) => {
-      const stat = fs.statSync(file);
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
       return { file, sessionId, agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
     };
     const dispatched = { ...session(dispatchedFile, id), agent };

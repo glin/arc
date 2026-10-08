@@ -76,6 +76,57 @@ test('the bundled CLI reports the package version', () => {
   assert.equal(output.trim(), packageJson.version);
 });
 
+test('bundled session commands select one window, reject unknown IDs, and bound turns before sending', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-session-smoke-'));
+  const channel = new WindowChannel(home);
+  const second = new WindowChannel(home);
+  const run = promisify(execFile);
+  let requests = 0;
+  channel.setRequestHandler((request) => {
+    requests++;
+    if (request.method === 'session' && request.params.sessionId !== 'known') throw new Error('Unknown session.');
+    return { method: request.method, params: request.params, requester: request.requester };
+  });
+  const env = {
+    ...process.env,
+    ARC_HOME: home,
+    ARC_WINDOW: channel.hostId,
+    CODEX_THREAD_ID: 'requesting-agent',
+    CLAUDE_CODE_SESSION_ID: '',
+  };
+  try {
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    await second.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    const listing = await run(process.execPath, [cli, 'sessions'], { env, encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(listing.stdout), { method: 'sessions', params: {}, requester: 'requesting-agent' });
+    const detail = await run(
+      process.execPath,
+      [cli, 'session', 'known', '--turns', '2', '--window', channel.hostId, '--json'],
+      { env: { ...env, ARC_WINDOW: second.hostId }, encoding: 'utf8' },
+    );
+    assert.equal(JSON.parse(detail.stdout).params.turns, 2);
+    await assert.rejects(run(process.execPath, [cli, 'session', 'unknown'], { env }), /Unknown session/);
+    const before = requests;
+    for (const args of [
+      ['session', 'known', '--turns', '21'],
+      ['session', 'known', '--turns', '0'],
+      ['session', 'known', '--turns', '1.5'],
+      ['sessions', '--turns', '1'],
+      ['session'],
+    ]) {
+      await assert.rejects(run(process.execPath, [cli, ...args], { env }));
+    }
+    assert.equal(requests, before);
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions'], { env: { ...env, ARC_WINDOW: '' } }),
+      /Select one Arc window/,
+    );
+  } finally {
+    await Promise.all([channel.dispose(), second.dispose()]);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('the bundled CLI reads Claude JSON and emits its versioned JSON contract', () => {
   const output = execFileSync(process.execPath, [cli, 'statusline', '--json'], {
     input,

@@ -1,6 +1,7 @@
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import type { TurnOutcome } from './transcript';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
+import { openReadWindow, closeReadWindow } from './readmeter';
 
 test('the host reads closed child work once per file version and never reads open child work', () => {
   const start = panelHostSource.indexOf('private liveOpenChildren(');
@@ -321,7 +322,7 @@ test('accepted explicit session reads reopen persisted exhausted metadata recove
       record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
       (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
   const fixture = metadataEnrichmentFixture([session]);
   const run = fixture.worker.run.bind(fixture.worker);
@@ -378,7 +379,7 @@ test('an entry exhausted under the earlier recovery rule reads once more and the
       record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
       (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
   const fixture = metadataEnrichmentFixture([session]);
   const run = fixture.worker.run.bind(fixture.worker);
@@ -422,7 +423,7 @@ test('restored exhausted selection stays suppressed through an ordinary refresh'
       '\n' +
       (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
   const fixture = metadataEnrichmentFixture([session]);
   const run = fixture.worker.run.bind(fixture.worker);
@@ -475,7 +476,7 @@ test('automatic Claude attachment continuation preserves exhausted metadata afte
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: '0', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
   const fixture = metadataEnrichmentFixture([session]);
   const run = fixture.worker.run.bind(fixture.worker);
@@ -564,7 +565,7 @@ test('accepted older history reopens recovery without replacing uncertain curren
       '\n' +
       (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
   const fixture = metadataEnrichmentFixture([session]);
   const run = fixture.worker.run.bind(fixture.worker);
@@ -651,7 +652,7 @@ test('completed Claude metadata recovery preserves genuine tail background comma
       records.map((record) => JSON.stringify(record)).join('\n') +
       '\n',
   );
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: '0', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
   const fixture = metadataEnrichmentFixture([session]);
   try {
@@ -731,7 +732,7 @@ function metadataEnrichmentFixture(sessions: any[], source = progressiveWorkerSo
     refreshGeneration: 1,
     metadataRecoverySession: null,
     derivedCacheCheckpointState: { markChanged() {} },
-    revisionOf: (session: any) => fs.statSync(session.file),
+    revisionOf: (session: any) => revisionOf(fs.statSync(session.file, { bigint: true })),
     observeStoredEntry() {},
     observeStoredName: (_session: any, entry: any) => entry,
     allSessions: () => sessions,
@@ -900,12 +901,21 @@ import {
   normalizeSessionTitle,
   readSession,
   readSessionMeta,
+  revisionOf,
   sessionOutcomeOf,
   sessionStatFactsOf,
   scanForPerson,
   shortenTo,
 } from './transcript.ts';
-import { codexSessionIndexPath, readCodexSession, readThreadNames } from './codex.ts';
+import {
+  codexSessionIndexPath,
+  codexSessionFiles,
+  CodexStatCache,
+  readCodexSession,
+  readThreadNames,
+  readCodexSessionMeta,
+} from './codex.ts';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
@@ -1136,6 +1146,880 @@ let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
 beforeAll(async () => {
   ({ PanelProvider } = await import('./panelhost.ts'));
 });
+
+test('window session reads leave reader state and live capabilities unchanged and reject unknown IDs', () => {
+  const directory = tempDir('window-session-state-');
+  const file = path.join(directory, 'known.jsonl');
+  fs.writeFileSync(
+    file,
+    [
+      {
+        type: 'user',
+        sessionId: 'known',
+        cwd: directory,
+        timestamp: '2026-10-08T12:00:00Z',
+        message: { role: 'user', content: 'read me' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-10-08T12:00:01Z',
+        message: {
+          id: 'reply',
+          model: 'claude-opus-5-5',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'reply' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const source = { agent: 'claude', sessionId: 'known', file, size: stat.size, mtimeMs: stat.mtimeMs };
+  const saved = {
+    labels: { known: ['Review'] },
+    readerParents: { known: 'parent' },
+    read: ['earlier'],
+    readTo: { known: 1 },
+  };
+  const untouched = {
+    saved,
+    showing: 'other',
+    drafts: { other: 'unsent prompt' },
+    hostSessions: new Map([['restored', 'other']]),
+    picks: { other: { model: 'chosen' } },
+    runtime: { other: { send: true } },
+    startedHere: new Set(['other']),
+    catalog: { folders: 'held', sessions: [source] },
+    catalogWalked: false,
+    titles: new Map(),
+    carriedNames: new Map([['held', 'Held title']]),
+    enumeratedSpendSources: { claude: [source], codex: [], children: [] },
+  };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), untouched, {
+    disposed: false,
+    folders: () => [directory],
+    repositoryScopeRoots: [directory],
+    completeCatalogScope: JSON.stringify([directory]),
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+    authoritativeCatalog: [source],
+    authoritativeCatalogScope: JSON.stringify([directory]),
+    pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
+    exitedSinceKeys: new Map(),
+    allSessions(this: any) {
+      this.catalogWalked = true;
+      this.titles.clear();
+      return [source];
+    },
+    sessionParentEdges: () => ({ edges: new Map() }),
+    anyVisible: () => false,
+    sessionLabel: () => ({ fullLabel: 'Known' }),
+    titles: new Map(),
+    pinnedTop: new Set(['known']),
+    hidden: new Set(['known']),
+    cache: new Map(),
+  });
+  const snapshot = JSON.stringify(untouched, (_key, value) =>
+    value instanceof Map || value instanceof Set ? [...value] : value,
+  );
+  const request: any = { method: 'sessions', params: {}, requester: 'requesting-agent' };
+  const listing = provider.readSessionRequest(request);
+  assert.equal(listing.sessions[0].attention, 'unknown');
+  assert.equal(listing.sessions[0].facts, 'unparsed');
+  assert.equal(listing.sessions[0].pinned, true);
+  assert.equal(listing.sessions[0].archived, true);
+  assert.deepEqual(listing.sessions[0].labels, [{ name: 'Review', source: 'reader' }]);
+  const read = provider.readSessionRequest({ ...request, method: 'session', params: { sessionId: 'known', turns: 1 } });
+  assert.equal(read.turns[0].summary, 'reply');
+  assert.throws(
+    () =>
+      provider.readSessionRequest({ ...request, method: 'session', params: { sessionId: '/other/file', turns: 1 } }),
+    /unknown or ambiguous/,
+  );
+  assert.equal(
+    JSON.stringify(Object.fromEntries(Object.keys(untouched).map((key) => [key, provider[key]])), (_key, value) =>
+      value instanceof Map || value instanceof Set ? [...value] : value,
+    ),
+    snapshot,
+  );
+});
+
+test('window session listings reject removed children and report pending, hidden, and changed discovery facts', () => {
+  const now = Date.parse('2026-10-08T14:30:00Z');
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    const directory = tempDir('window-session-freshness-');
+    const file = path.join(directory, 'parent.jsonl');
+    fs.writeFileSync(file, 'initial');
+    fs.utimesSync(file, new Date(now - 100), new Date(now - 100));
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const parent = {
+      agent: 'claude',
+      sessionId: 'parent',
+      cwd: directory,
+      file,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ino: stat.ino,
+    };
+    const child = {
+      ...parent,
+      sessionId: 'removed-child',
+      cwd: path.join(directory, 'removed'),
+      childTranscript: true,
+    };
+    let roots = [directory, child.cwd];
+    let visible = true;
+    let eventCount = 0;
+    const scopeKey = () => JSON.stringify(roots);
+    const outcome = {
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      finished: false,
+      error: false,
+      interrupted: false,
+      closedChildren: [{ id: 'closed', closedAt: Date.now() }],
+    };
+    const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+      disposed: false,
+      markStartedPresses: () => {},
+      dropSpentPresses: () => {},
+      post: async () => {},
+      usagePayload: () => ({}),
+      refresh: async () => {},
+      folders: () => [directory],
+      repositoryScopeRoots: roots,
+      repositoryScope: { snapshot: () => ({ ready: true, roots, revision: 1 }) },
+      authoritativeCatalog: [parent, child],
+      authoritativeCatalogScope: scopeKey(),
+      completeCatalogScope: scopeKey(),
+      sessionReadDiscoveryRevision: JSON.stringify([
+        scopeKey(),
+        [parent, child].map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino]),
+      ]),
+      anyVisible: () => visible,
+      watching: true,
+      refreshController: null,
+      dispatchDiscoveryPending: false,
+      pendingWatch: { snapshot: () => ({ eventCount, broadRequired: false }) },
+      saved: { read: [], readTo: {}, since: 0, labels: {} },
+      titles: new Map([[file, { ...parent, outcome, activityMs: Date.now() }]]),
+      cache: new Map(),
+      windows: new Map(),
+      pinnedTop: new Set(),
+      hidden: new Set(),
+      running: new Set(),
+      asks: [],
+      runningSinceKeys: new Map(),
+      exitedSinceKeys: new Map(),
+      exitedNow: new Set(),
+      sessionLabel: () => ({ fullLabel: 'Parent' }),
+      agentRunFor: () => false,
+      claudeChildren: [{ ...child, parentSessionId: 'parent', sessionId: 'closed' }],
+      allSessions: () => [parent, child],
+      sessionOutcomes: new Map([['parent', outcome]]),
+      sessionRows: [],
+      claudeChildReferences: [],
+      claudeChildStatWrites: new Map(),
+    });
+    let token = 0;
+    const publishExit = () => {
+      const busy = { key: 'claude:parent', token: ++token, busy: true, exited: false };
+      clock.mockReturnValue(now);
+      provider.setRunning(['claude:parent'], [busy]);
+      clock.mockReturnValue(now + 1);
+      const exited = { ...busy, busy: false, exited: true };
+      provider.setRunning([], [exited]);
+      provider.setExited(['claude:parent'], [exited]);
+    };
+    const request: any = { method: 'sessions', params: {}, requester: null };
+    const readWindow = openReadWindow();
+    assert.equal(provider.readSessionRequest(request).complete, true);
+    assert.equal(closeReadWindow(readWindow).bytes, 0);
+    provider.dispatchDiscoveryPending = true;
+    assert.equal(provider.readSessionRequest(request).complete, false);
+    provider.dispatchDiscoveryPending = false;
+    eventCount = 1;
+    assert.equal(provider.readSessionRequest(request).complete, false);
+    eventCount = 0;
+    provider.asks = [{ session: 'parent' }];
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'waiting');
+    eventCount = 1;
+    const pendingPermission = provider.readSessionRequest(request);
+    assert.equal(pendingPermission.complete, false);
+    assert.equal(pendingPermission.sessions[0].runStatus, 'waiting');
+    assert.equal(pendingPermission.sessions[0].attention, 'input');
+    assert.equal(pendingPermission.sessions[0].facts, 'stale');
+    eventCount = 0;
+    provider.refreshController = {};
+    const refreshingPermission = provider.readSessionRequest(request);
+    assert.equal(refreshingPermission.complete, false);
+    assert.equal(refreshingPermission.sessions[0].runStatus, 'waiting');
+    assert.equal(refreshingPermission.sessions[0].attention, 'input');
+    assert.equal(refreshingPermission.sessions[0].facts, 'stale');
+    provider.refreshController = null;
+    provider.asks = [];
+    provider.running.add('claude:parent');
+    publishExit();
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'stopped');
+    provider.exitedSinceKeys.clear();
+    provider.sessionRunWitnesses?.clear();
+    provider.running.clear();
+    visible = false;
+    const hidden = provider.readSessionRequest(request);
+    assert.equal(hidden.complete, false);
+    assert.equal(hidden.sessions[0].runStatus, 'unknown');
+    assert.equal(hidden.sessions[0].facts, 'stale');
+    visible = true;
+    const retained = {
+      ...outcome,
+      finished: true,
+      openChildren: ['open'],
+      closedChildren: [{ id: 'closed', closedAt: now }],
+      backgroundCommands: [{ id: 'command', startedAt: now }],
+    };
+    provider.titles.set(file, { ...parent, outcome: retained });
+    const childReadWindow = openReadWindow();
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'unknown');
+    publishExit();
+    const nativeClosedParent = provider.readSessionRequest(request);
+    assert.equal(nativeClosedParent.sessions[0].runStatus, 'done');
+    provider.exitedSinceKeys.clear();
+    provider.sessionRunWitnesses?.clear();
+    provider.titles.set(file, { ...parent, outcome: { ...retained, processEndedAt: now + 1 } });
+    const recordedClosedParent = provider.readSessionRequest(request);
+    assert.equal(recordedClosedParent.sessions[0].runStatus, 'done');
+    provider.running.add('claude:parent');
+    provider.runningSinceKeys.set('claude:parent', now + 2);
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'running');
+    provider.setRunning([]);
+    assert.equal(provider.runningSinceKeys.has('claude:parent'), false);
+    assert.equal(closeReadWindow(childReadWindow).bytes, 0);
+    provider.titles.set(file, { ...parent, outcome });
+    publishExit();
+    provider.setRunning([]);
+    fs.appendFileSync(file, ' resumed source');
+    fs.utimesSync(file, new Date(now + 3), new Date(now + 3));
+    const historicalExit = provider.readSessionRequest(request);
+    assert.equal(historicalExit.sessions[0].runStatus, 'unknown');
+    assert.equal(historicalExit.sessions[0].facts, 'stale');
+    assert.equal(historicalExit.complete, false);
+    provider.runningSinceKeys.set('claude:parent', now);
+    const advancedSourceExit = provider.readSessionRequest(request);
+    assert.equal(advancedSourceExit.sessions[0].runStatus, 'unknown');
+    provider.asks = [{ session: 'parent' }];
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'waiting');
+    provider.asks = [];
+    provider.running.add('claude:parent');
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'running');
+    provider.running.clear();
+    fs.utimesSync(file, new Date(parent.mtimeMs), new Date(parent.mtimeMs));
+    const coarseRevisionExit = provider.readSessionRequest(request);
+    assert.equal(coarseRevisionExit.sessions[0].runStatus, 'unknown');
+    fs.writeFileSync(file, 'initial');
+    fs.utimesSync(file, new Date(parent.mtimeMs), new Date(parent.mtimeMs));
+    publishExit();
+    provider.cache.set(file, {
+      revision: { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: '999999999999999999999' },
+      read: { turns: [] },
+    });
+    const changedIdentityExit = provider.readSessionRequest(request);
+    assert.equal(changedIdentityExit.sessions[0].runStatus, 'unknown');
+    provider.cache.clear();
+    fs.unlinkSync(file);
+    const missingSourceExit = provider.readSessionRequest(request);
+    assert.equal(missingSourceExit.sessions[0].runStatus, 'unknown');
+    fs.writeFileSync(file, 'initial');
+    fs.utimesSync(file, new Date(parent.mtimeMs), new Date(parent.mtimeMs));
+    parent.ino = fs.statSync(file, { bigint: true }).ino.toString();
+    provider.titles.set(file, { ...parent, outcome });
+    provider.runningSinceKeys.clear();
+    provider.exitedSinceKeys.clear();
+    provider.sessionRunWitnesses?.clear();
+    fs.appendFileSync(file, ' changed with a child launch');
+    fs.utimesSync(file, new Date(now + 3), new Date(now + 3));
+    const changed = provider.readSessionRequest(request);
+    assert.equal(changed.complete, false);
+    assert.equal(changed.sessions[0].facts, 'stale');
+    provider.running.add('claude:parent');
+    provider.runningSinceKeys.set('claude:parent', outcome.startedAt);
+    const staleRunning = provider.readSessionRequest(request);
+    assert.equal(staleRunning.complete, false);
+    assert.equal(staleRunning.sessions[0].facts, 'stale');
+    assert.equal(staleRunning.sessions[0].runStatus, 'running');
+    assert.equal(staleRunning.sessions[0].attention, 'running');
+    fs.writeFileSync(file, 'initial');
+    fs.utimesSync(file, new Date(parent.mtimeMs), new Date(parent.mtimeMs));
+    eventCount = 1;
+    publishExit();
+    const staleExit = provider.readSessionRequest(request);
+    assert.equal(staleExit.sessions[0].facts, 'stale');
+    assert.equal(staleExit.sessions[0].runStatus, 'stopped');
+    provider.exitedSinceKeys.clear();
+    provider.sessionRunWitnesses?.clear();
+    provider.titles.delete(file);
+    provider.running.clear();
+    provider.runningSinceKeys.clear();
+    provider.exitedSinceKeys.set('claude:parent', outcome.startedAt + 1);
+    const unknownRunExit = provider.readSessionRequest(request);
+    assert.equal(unknownRunExit.sessions[0].runStatus, 'unknown');
+    provider.runningSinceKeys.set('claude:parent', 0);
+    const zeroRunExit = provider.readSessionRequest(request);
+    assert.equal(zeroRunExit.sessions[0].runStatus, 'unknown');
+    provider.runningSinceKeys.set('claude:parent', outcome.startedAt);
+    fs.utimesSync(file, new Date(now + 3), new Date(now + 3));
+    const laterSource = { ...parent, mtimeMs: fs.statSync(file).mtimeMs };
+    provider.authoritativeCatalog = [laterSource];
+    const laterSourceExit = provider.readSessionRequest(request);
+    assert.equal(laterSourceExit.sessions[0].runStatus, 'unknown');
+    fs.utimesSync(file, new Date(parent.mtimeMs), new Date(parent.mtimeMs));
+    provider.authoritativeCatalog = [parent, child];
+    provider.exitedSinceKeys.clear();
+    provider.sessionRunWitnesses?.clear();
+    provider.running.add('claude:parent');
+    const unparsedRunning = provider.readSessionRequest(request);
+    assert.equal(unparsedRunning.sessions[0].facts, 'unparsed');
+    assert.equal(unparsedRunning.sessions[0].runStatus, 'running');
+    publishExit();
+    const unparsedExit = provider.readSessionRequest(request);
+    assert.equal(unparsedExit.complete, false);
+    assert.equal(unparsedExit.sessions[0].facts, 'unparsed');
+    assert.equal(unparsedExit.sessions[0].runStatus, 'stopped');
+    visible = false;
+    const hiddenExit = provider.readSessionRequest(request);
+    assert.equal(hiddenExit.sessions[0].runStatus, 'stopped');
+    assert.equal(hiddenExit.sessions[0].attention, 'unknown');
+    assert.equal(hiddenExit.complete, false);
+    clock.mockReturnValue(now + 2);
+    provider.setRunning(['claude:parent'], [{ key: 'claude:parent', token: ++token, busy: true, exited: false }]);
+    const hiddenRunning = provider.readSessionRequest(request);
+    assert.equal(hiddenRunning.sessions[0].runStatus, 'running');
+    assert.equal(hiddenRunning.sessions[0].attention, 'unknown');
+    assert.equal(hiddenRunning.complete, false);
+    provider.running.clear();
+    provider.exitedSinceKeys.clear();
+    provider.sessionRunWitnesses?.clear();
+    provider.runningSinceKeys.clear();
+    provider.running.add('codex:parent');
+    provider.asks = [{ session: 'outside-scope' }];
+    visible = true;
+    assert.equal(provider.readSessionRequest(request).sessions[0].runStatus, 'unknown');
+    provider.running.clear();
+    provider.asks = [];
+    const updatedParent = { ...parent, size: fs.statSync(file).size, mtimeMs: fs.statSync(file).mtimeMs };
+    provider.authoritativeCatalog = [updatedParent];
+    provider.titles.set(file, { ...updatedParent, outcome });
+    assert.equal(provider.readSessionRequest(request).complete, false);
+    roots = [path.join(directory, 'replacement')];
+    provider.repositoryScopeRoots = roots;
+    provider.completeCatalogScope = scopeKey();
+    const removed = provider.readSessionRequest(request);
+    assert.deepEqual(removed.sessions, []);
+    assert.equal(removed.complete, false);
+    // An incomplete refresh can retain old children while publishing a new scope.
+    provider.authoritativeCatalogScope = scopeKey();
+    assert.deepEqual(provider.readSessionRequest(request).sessions, []);
+    assert.throws(
+      () =>
+        provider.readSessionRequest({
+          ...request,
+          method: 'session',
+          params: { sessionId: child.sessionId, turns: 1 },
+        }),
+      /unknown or ambiguous/,
+    );
+    provider.authoritativeCatalog = null;
+    assert.equal(provider.readSessionRequest(request).complete, false);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test('hosted session publication keeps instance tokens through idle and both event paths', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const start = source.indexOf('  const sessionTokens =');
+  const end = source.indexOf('  const host = new AgentHost(', start);
+  assert.ok(start >= 0 && end > start);
+  const compiled = ts.transpileModule(source.slice(start, end), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  let state = { key: 'host-key', agent: 'claude', sessionId: 'parent', busy: true, exited: false };
+  let instance = { state: () => ({ ...state }) };
+  let snapshots = 0;
+  const calls: any[] = [];
+  const oldInstance = { state: () => ({ ...state, key: 'old-host', busy: false, exited: true }) };
+  let includeOld = false;
+  const host = {
+    states: () => {
+      snapshots++;
+      return includeOld ? [oldInstance.state(), { ...state }] : [{ ...state }];
+    },
+    get: (key: string) => (key === 'old-host' ? oldInstance : instance),
+  };
+  const panel = {
+    setRunning: (keys: string[], observed: any[]) => calls.push(['running', keys, observed]),
+    setExited: (keys: string[], observed: any[]) => calls.push(['exited', keys, observed]),
+  };
+  const publish = new Function('host', 'panel', 'runningKey', compiled + '\nreturn publishHostedSessions;')(
+    host,
+    panel,
+    (agent: string, id: string) => agent + ':' + id,
+  );
+  publish();
+  const token = calls[0][2][0].token;
+  assert.equal(calls[0][2], calls[1][2], 'one snapshot feeds both setters');
+  state.busy = false;
+  publish();
+  assert.equal(calls[2][2][0].token, token, 'idle preserves token');
+  state.busy = true;
+  publish();
+  assert.equal(calls[4][2][0].token, token, 'later busy preserves token');
+  state.exited = true;
+  publish();
+  assert.deepEqual(calls[6][1], []);
+  assert.deepEqual(calls[7][1], ['claude:parent']);
+  assert.equal(calls[7][2][0].token, token);
+  state.exited = false;
+  state.busy = false;
+  instance = { state: () => ({ ...state }) };
+  publish();
+  assert.notEqual(calls[8][2][0].token, token, 'idle replacement receives new token');
+  assert.equal(snapshots, 5, 'one synchronous snapshot per publication');
+  includeOld = true;
+  state.busy = true;
+  publish();
+  assert.equal(calls[10][2].length, 1, 'one observation per provider session');
+  assert.equal(calls[10][2][0].token, calls[8][2][0].token, 'exited sibling cannot replace current instance');
+  assert.deepEqual(calls[11][1], []);
+  for (const begin of ['onEvent:', 'onStateChange:']) {
+    const at = source.indexOf(begin);
+    const body = declarationSource(source, begin.slice(0, -1));
+    assert.ok(at >= 0 && body.includes('publishHostedSessions();'), begin + ' omits hosted publication');
+  }
+});
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((agent) => [
+    ...(['missing metadata', 'older reader window'] as const).map((symptom) => ({
+      agent,
+      symptom,
+      admission: 'growth',
+    })),
+    { agent, symptom: 'older reader window', admission: 'cached growth' },
+    ...[
+      'identity absent unchanged',
+      'identity absent replaced',
+      'identity absent growth',
+      'zero inode replaced',
+      'negative inode replaced',
+      'fractional inode replaced',
+      'nonfinite inode replaced',
+      'unsafe inode replaced',
+      'inode conflict',
+      'equal replacement',
+      'larger replacement',
+      'after exit equal replacement',
+      'after exit larger replacement',
+      'device conflict',
+      'failed busy stat',
+      'negative size',
+      'fractional size',
+      'unsafe size',
+      'nonfinite mtime',
+      'negative mtime',
+      'supported shrink',
+      'zero device growth',
+      'zero inode growth',
+      'negative inode growth',
+      'fractional inode growth',
+      'nonfinite inode growth',
+      'unsafe inode growth',
+      'negative device growth',
+      'fractional device growth',
+      'nonfinite device growth',
+      'unsafe device growth',
+      'cached growth',
+    ].map((admission) => ({ agent, symptom: 'missing metadata', admission })),
+  ]),
+)(
+  'window session listings preserve production exit closure for $agent with $symptom and $admission',
+  ({ agent, symptom, admission }) => {
+    const start = Date.parse('2026-10-08T15:00:00Z');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    const nodeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const nativeStat = nodeFs.statSync;
+    let statSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const directory = tempDir('window-session-lifecycle-');
+      const file = path.join(directory, 'parent.jsonl');
+      const initial =
+        agent === 'claude'
+          ? 'initial'
+          : JSON.stringify({
+              type: 'session_meta',
+              payload: { id: 'parent', cwd: directory, originator: 'codex_cli' },
+            }) + '\n';
+      fs.writeFileSync(file, initial + ' padding');
+      fs.utimesSync(file, new Date(start - 100), new Date(start - 100));
+      const unsupported: Record<string, number> = {
+        zero: 0,
+        negative: -1,
+        fractional: 0.5,
+        nonfinite: Infinity,
+        unsafe: Number.MAX_SAFE_INTEGER + 1,
+      };
+      const initialOverride: Record<string, number | string> = admission.startsWith('identity absent')
+        ? { ino: 0 }
+        : admission.endsWith('growth') && Object.hasOwn(unsupported, admission.split(' ')[0])
+          ? { [admission.includes('device') ? 'dev' : 'ino']: unsupported[admission.split(' ')[0]] }
+          : {};
+      let statOverride = initialOverride;
+      let failStat = false;
+      statSpy = vi.spyOn(nodeFs, 'statSync').mockImplementation(((target: any, ...args: any[]) => {
+        const current = (nativeStat as any)(target, ...args);
+        if (target !== file) return current;
+        if (failStat) throw new Error('fixture unavailable stat');
+        return Object.assign(Object.create(current), statOverride);
+      }) as any);
+      syncBuiltinESMExports();
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
+      const stats = new CodexStatCache(undefined, () => start + 24 * 60 * 60_000);
+      const listed = () =>
+        agent === 'claude'
+          ? listSessionFiles(directory)[0]
+          : codexSessionFiles(
+              directory,
+              [directory],
+              readCodexSessionMeta,
+              admission === 'cached growth' ? (rollout) => stats.get(rollout) : undefined,
+            ).sessions[0];
+      const source = { ...listed(), cwd: directory };
+      if (agent === 'codex' && admission === 'cached growth') {
+        const cached = listed();
+        assert.deepEqual([cached.dev, cached.ino], [stat.dev, stat.ino], 'cached catalog retains identity');
+      }
+      if (
+        admission.endsWith('growth') &&
+        Object.hasOwn(unsupported, admission.split(' ')[0]) &&
+        admission !== 'zero device growth'
+      ) {
+        Object.assign(source, { dev: stat.dev, ino: stat.ino });
+      }
+      if (admission.includes('inode replaced')) {
+        const ino = admission.startsWith('zero')
+          ? 0
+          : admission.startsWith('negative')
+            ? -1
+            : admission.startsWith('fractional')
+              ? 0.5
+              : admission.startsWith('nonfinite')
+                ? NaN
+                : Number.MAX_SAFE_INTEGER + 1;
+        Object.assign(source, { dev: stat.dev, ino });
+      }
+      if (admission === 'growth' || admission === 'zero device growth' || admission === 'cached growth') {
+        assert.equal(source.dev, stat.dev, 'production catalog retains device');
+        assert.equal(source.ino, stat.ino, 'production catalog retains inode');
+      }
+      const scope = JSON.stringify([directory]);
+      const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+        disposed: false,
+        folders: () => [directory],
+        repositoryScopeRoots: [directory],
+        repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+        authoritativeCatalog: [source],
+        authoritativeCatalogScope: scope,
+        completeCatalogScope: scope,
+        pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
+        anyVisible: () => true,
+        watching: true,
+        saved: { read: [], readTo: {}, since: 0, labels: {} },
+        titles: new Map(),
+        cache: new Map(),
+        windows: new Map(),
+        pinnedTop: new Set(),
+        hidden: new Set(),
+        running: new Set(),
+        runningSinceKeys: new Map(),
+        exitedSinceKeys: new Map(),
+        exitedNow: new Set(),
+        asks: [],
+        sessionRows: [],
+        sessionOutcomes: new Map(),
+        claudeChildren: [],
+        claudeChildReferences: [],
+        claudeChildStatWrites: new Map(),
+        sessionLabel: () => ({ fullLabel: 'Parent' }),
+        agentRunFor: () => false,
+        markStartedPresses: () => {},
+        dropSpentPresses: () => {},
+        post: async () => {},
+        usagePayload: () => ({}),
+        refresh: async () => {},
+      });
+      const key = agent + ':parent';
+      provider.saved.read = ['parent:turn'];
+      provider.saved.readTo = { parent: start - 500 };
+      provider.saved.labels = { parent: ['Keep'] };
+      provider.pinnedTop.add('parent');
+      provider.showing = 'parent';
+      provider.drafts = { parent: 'Unsent prompt' };
+      provider.windows.set('reader-window', { starts: [], sessionId: 'reader-window' });
+      const observation = { key, token: 1, busy: true, exited: false };
+      const request: any = { method: 'sessions', params: {}, requester: null };
+      if (symptom === 'older reader window') {
+        provider.cache.set(file, {
+          revision: { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino },
+          read: { turns: [] },
+        });
+      }
+      const readerBefore = structuredClone({
+        saved: provider.saved,
+        cache: provider.cache,
+        windows: provider.windows,
+        pinnedTop: provider.pinnedTop,
+        showing: provider.showing,
+        drafts: provider.drafts,
+      });
+      if (
+        admission.includes('replaced') ||
+        admission === 'inode conflict' ||
+        (admission.endsWith('replacement') && !admission.startsWith('after exit'))
+      ) {
+        fs.renameSync(file, file + '.original');
+        fs.writeFileSync(
+          file,
+          admission === 'inode conflict' || admission === 'equal replacement'
+            ? initial + ' padding'
+            : initial + ' larger replacement',
+        );
+        fs.utimesSync(file, new Date(stat.mtimeMs), new Date(stat.mtimeMs));
+        const replacement = revisionOf(nativeStat(file, { bigint: true }));
+        assert.equal(replacement.mtimeMs, stat.mtimeMs, 'replacement retains the original modification time');
+        assert.ok(admission === 'equal replacement' ? replacement.size === stat.size : replacement.size >= stat.size);
+        assert.notEqual(
+          nativeStat(file, { bigint: true }).ino,
+          nativeStat(file + '.original', { bigint: true }).ino,
+          'renamed original retains its inode',
+        );
+      } else if (admission.endsWith('growth')) {
+        fs.appendFileSync(file, ' pre-bind growth');
+        fs.utimesSync(file, new Date(start - 10), new Date(start - 10));
+      } else if (admission === 'supported shrink') {
+        fs.truncateSync(file, Buffer.byteLength(initial));
+      } else if (admission === 'device conflict') statOverride = { dev: '999999999999999999999' };
+      else if (admission === 'failed busy stat') failStat = true;
+      else if (admission === 'negative size') statOverride = { size: -1 };
+      else if (admission === 'fractional size') statOverride = { size: 0.5 };
+      else if (admission === 'unsafe size') statOverride = { size: Number.MAX_SAFE_INTEGER + 1 };
+      else if (admission === 'nonfinite mtime') statOverride = { mtimeMs: NaN };
+      else if (admission === 'negative mtime') statOverride = { mtimeMs: -1 };
+      provider.setRunning([key], [observation]);
+      provider.setExited([], [observation]);
+      const admitted =
+        admission === 'growth' ||
+        admission === 'zero device growth' ||
+        admission === 'cached growth' ||
+        admission.startsWith('after exit') ||
+        admission === 'identity absent unchanged';
+      if (!admitted)
+        assert.equal(provider.sessionRunWitnesses.get(key).source, undefined, admission + ' owns no source');
+      failStat = false;
+      statOverride = admission === 'device conflict' ? { dev: '999999999999999999999' } : initialOverride;
+      stats.markChanged(directory, path.basename(file));
+      Object.assign(source, listed());
+      if (symptom === 'older reader window') {
+        provider.titles.set(file, {
+          ...source,
+          outcome: {
+            startedAt: start,
+            endedAt: start + 10,
+            finished: true,
+            error: false,
+            interrupted: false,
+            openChildren: ['retained'],
+            closedChildren: [{ id: 'closed', closedAt: start + 10 }],
+            backgroundCommands: [{ id: 'command', startedAt: start }],
+          },
+        });
+      }
+      clock.mockReturnValue(start + 10);
+      const idle = { ...observation, busy: false };
+      provider.setRunning([], [idle]);
+      provider.setExited([], [idle]);
+      clock.mockReturnValue(start + 20);
+      const ended = { ...observation, busy: false, exited: true };
+      provider.setRunning([], [ended]);
+      provider.setExited([key], [ended]);
+      const reads = openReadWindow();
+      const listing = provider.readSessionRequest(request);
+      assert.equal(
+        listing.sessions[0].runStatus,
+        admitted ? (symptom === 'missing metadata' ? 'stopped' : 'done') : 'unknown',
+        admission,
+      );
+      assert.equal(closeReadWindow(reads).bytes, 0);
+      assert.deepEqual(
+        {
+          saved: provider.saved,
+          cache: provider.cache,
+          windows: provider.windows,
+          pinnedTop: provider.pinnedTop,
+          showing: provider.showing,
+          drafts: provider.drafts,
+        },
+        readerBefore,
+        'hosted lifecycle and listing preserve reader state',
+      );
+      if (symptom === 'missing metadata') {
+        assert.equal(listing.sessions[0].facts, 'unparsed');
+        assert.equal(listing.complete, false);
+      }
+      if (admission.startsWith('after exit')) {
+        const frozen = revisionOf(nativeStat(file, { bigint: true }));
+        const body = fs.readFileSync(file);
+        fs.renameSync(file, file + '.exited-original');
+        fs.writeFileSync(file, admission.includes('equal') ? body : Buffer.concat([body, Buffer.from(' larger')]));
+        fs.utimesSync(file, new Date(frozen.mtimeMs), new Date(frozen.mtimeMs));
+        const current = revisionOf(nativeStat(file, { bigint: true }));
+        assert.equal(current.mtimeMs, frozen.mtimeMs);
+        assert.notEqual(current.ino, frozen.ino);
+        assert.equal(
+          provider.readSessionRequest(request).sessions[0].runStatus,
+          'unknown',
+          'replacement after exit revokes old closure before discovery',
+        );
+        Object.assign(source, listed());
+        assert.equal(
+          provider.readSessionRequest(request).sessions[0].runStatus,
+          'unknown',
+          'fresh discovery cannot give a replacement the old closure',
+        );
+      }
+      if (admission !== 'growth') return;
+      const status = () => provider.readSessionRequest(request).sessions[0].runStatus;
+      const originalDevice = source.dev;
+      source.dev = '999999999999999999999';
+      assert.equal(status(), 'unknown', 'catalog device contradiction refuses closure');
+      source.dev = originalDevice;
+      const publish = (token: number, busy: boolean, exited: boolean) => {
+        const observations = [{ key, token, busy, exited }];
+        provider.setRunning(busy && !exited ? [key] : [], observations);
+        provider.setExited(exited ? [key] : [], observations);
+      };
+      // A replacement starts idle and cannot inherit the previous process exit.
+      clock.mockReturnValue(start + 30);
+      publish(2, false, false);
+      assert.equal(status(), 'unknown', 'idle replacement revokes closure');
+      clock.mockReturnValue(start + 40);
+      publish(2, true, false);
+      assert.equal(status(), 'running', 'replacement busy outranks old exit');
+      clock.mockReturnValue(start + 50);
+      publish(2, false, false);
+      clock.mockReturnValue(start + 60);
+      publish(2, true, false);
+      clock.mockReturnValue(start + 70);
+      publish(2, false, false);
+      clock.mockReturnValue(start + 80);
+      publish(2, false, true);
+      assert.equal(status(), symptom === 'missing metadata' ? 'stopped' : 'done', 'busy idle busy idle exit');
+      // A new token exits even if the host omitted the intermediate exited-key removal.
+      clock.mockReturnValue(start + 90);
+      provider.setRunning([key], [{ key, token: 3, busy: true, exited: false }]);
+      clock.mockReturnValue(start + 100);
+      provider.setRunning([], [{ key, token: 3, busy: false, exited: true }]);
+      provider.setExited([key], [{ key, token: 3, busy: false, exited: true }]);
+      assert.equal(provider.exitedSinceKeys.get(key), start + 100, 'replacement exit refreshes clock');
+      assert.equal(status(), symptom === 'missing metadata' ? 'stopped' : 'done');
+      const frozenMtime = source.mtimeMs;
+      fs.appendFileSync(file, ' post-exit append');
+      fs.utimesSync(file, new Date(frozenMtime), new Date(frozenMtime));
+      source.size = fs.statSync(file).size;
+      const meta = provider.titles.get(file);
+      if (meta) provider.titles.set(file, { ...meta, ...source });
+      clock.mockReturnValue(start + 110);
+      publish(3, false, true);
+      assert.equal(status(), 'unknown', 'refreshed catalog cannot recapture post-exit append');
+      provider.asks = [{ session: 'parent' }];
+      assert.equal(status(), 'waiting', 'request survives revoked closure');
+      provider.asks = [];
+      publish(4, true, false);
+      assert.equal(status(), 'running', 'native busy survives changed source');
+      publish(4, false, false);
+      provider.titles.delete(file);
+      clock.mockReturnValue(start + 120);
+      publish(4, false, true);
+      assert.equal(status(), 'stopped', 'older reader window admits missing metadata');
+      provider.cache.set(file, {
+        revision: { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: '999999999999999999999' },
+        read: { turns: [] },
+      });
+      assert.equal(status(), 'unknown', 'held identity contradiction refuses closure');
+      provider.cache.clear();
+      provider.anyVisible = () => false;
+      const hidden = provider.readSessionRequest(request);
+      assert.equal(hidden.sessions[0].runStatus, 'stopped');
+      assert.equal(hidden.sessions[0].attention, 'unknown');
+      assert.equal(hidden.complete, false);
+      provider.anyVisible = () => true;
+      clock.mockReturnValue(start + 130);
+      publish(5, true, false);
+      fs.unlinkSync(file);
+      clock.mockReturnValue(start + 140);
+      publish(5, false, true);
+      assert.equal(status(), 'unknown', 'failed first exit stat refuses closure');
+      fs.writeFileSync(file, 'replacement');
+      fs.utimesSync(file, new Date(start + 135), new Date(start + 135));
+      Object.assign(source, {
+        size: fs.statSync(file).size,
+        mtimeMs: fs.statSync(file).mtimeMs,
+        ino: fs.statSync(file, { bigint: true }).ino.toString(),
+      });
+      publish(5, false, true);
+      assert.equal(status(), 'unknown', 'failed first exit cannot renew later');
+      clock.mockReturnValue(start + 150);
+      publish(6, false, false);
+      clock.mockReturnValue(start + 160);
+      publish(6, false, true);
+      assert.equal(status(), 'unknown', 'unknown positive start refuses closure');
+      clock.mockReturnValue(0);
+      publish(7, true, false);
+      clock.mockReturnValue(start + 170);
+      publish(7, false, true);
+      assert.equal(status(), 'unknown', 'zero clock refuses closure');
+      clock.mockReturnValue(start + 180);
+      publish(8, true, false);
+      clock.mockReturnValue(start + 175);
+      publish(8, false, true);
+      assert.equal(status(), 'unknown', 'exit before busy refuses closure');
+      clock.mockReturnValue(start + 190);
+      publish(9, true, false);
+      fs.renameSync(file, file + '.old');
+      fs.writeFileSync(file, 'replacement identity');
+      fs.utimesSync(file, new Date(start + 195), new Date(start + 195));
+      Object.assign(source, {
+        size: fs.statSync(file).size,
+        mtimeMs: fs.statSync(file).mtimeMs,
+        ino: fs.statSync(file, { bigint: true }).ino.toString(),
+      });
+      clock.mockReturnValue(start + 200);
+      publish(9, false, true);
+      assert.equal(status(), 'unknown', 'start identity changed before exit');
+      clock.mockReturnValue(start + 210);
+      publish(10, true, false);
+      provider.pruneExits([{ ...source, file: file + '.old' }]);
+      assert.equal(provider.sessionRunWitnesses.size, 0, 'removed source prunes witness');
+      provider.pruneExits([]);
+      assert.equal(provider.sessionRunWitnesses.size, 0, 'removed catalog prunes witness');
+    } finally {
+      statSpy?.mockRestore();
+      syncBuiltinESMExports();
+      clock.mockRestore();
+    }
+  },
+);
 
 test('window discovery restores provider state before publishing and distinguishes hidden ready panels', () => {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
@@ -2763,7 +3647,7 @@ test('a Codex launch reaches the host card and the dispatched child heading afte
       .join(''),
   );
   const session = (file: string, sessionId: string, agent: 'codex' | 'claude') => {
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
   };
   const sessions = [session(parentFile, 'parent', 'codex'), session(childFile, childId, 'claude')];
@@ -3044,7 +3928,7 @@ test.each([
         .join(''),
     );
     const session = (file: string, sessionId: string, agent: 'codex' | 'claude') => {
-      const stat = fs.statSync(file);
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
       return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
     };
     const sessions = [session(parentFile, 'parent', parentAgent), session(childFile, childId, childAgent)];
@@ -12818,7 +13702,7 @@ test('an accepted Claude worker refresh moves the composer price from the newest
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   const worker = new ProgressiveWorker(progressiveWorkerSource);
   const input = (): ProgressiveInput => {
-    const { mtimeMs, size } = fs.statSync(file);
+    const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
     return {
       session: { file, sessionId: 'claude', agent: 'claude', mtimeMs, size },
       folders: [],
@@ -13998,7 +14882,7 @@ test('unsent input shares the new draft modified-work tone', () => {
 
 test('the rail is reworded when work starts or stops, and not on every event', () => {
   // Refresh session-list status only when the running-session set changes.
-  const marker = 'public setRunning(keys: readonly string[]): void {';
+  const marker = 'public setRunning(';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, 'setRunning is no longer where the rail hears about work in flight');
   const body = memberFrom(panelHostSource, from);
@@ -18718,7 +19602,7 @@ test('Codex context invalidation cancels every pending read across demand keys a
     const session = provider.showing;
     const file = path.join(tempDir('context-cancellation-'), 'rollout.jsonl');
     fs.writeFileSync(file, '{}\n');
-    const stat = fs.statSync(file);
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
     const state = provider.stateFor(session);
     state.agent = 'codex';
     state.context = { used: 100, max: 200 };
@@ -18782,7 +19666,7 @@ test('Codex host preserves active reasons and restores categories after a measur
   let replaceDuringRead = false;
   provider.progressiveWorker = {
     run: async (request: any, generation: number, signal: AbortSignal) => {
-      const estimate = await readCodexContext(file, session, fs.statSync(file), signal);
+      const estimate = await readCodexContext(file, session, revisionOf(fs.statSync(file, { bigint: true })), signal);
       if (replaceDuringRead) fs.appendFileSync(file, JSON.stringify(previous) + '\n');
       return { generation, value: { kind: 'codex-context', estimate } };
     },
@@ -21383,7 +22267,12 @@ function namedSessionProvider(
     mtimeMs: 10,
     cwd: 'C:\\ws',
     // Preserve the catalog's file identity with each reported revision.
-    ino: overrides.file ? fs.statSync(overrides.file).ino : undefined,
+    dev: overrides.file
+      ? listSessionFiles(path.dirname(overrides.file)).find((row) => row.file === overrides.file)?.dev
+      : undefined,
+    ino: overrides.file
+      ? listSessionFiles(path.dirname(overrides.file)).find((row) => row.file === overrides.file)?.ino
+      : undefined,
   };
   // Supply Codex parsed-turn names for heading projection.
   const codexTitles = new Map(overrides.codexTurnTitle ? [[session.sessionId, overrides.codexTurnTitle]] : []);
@@ -21400,7 +22289,7 @@ function namedSessionProvider(
   const byId = new Map([[session.sessionId, session]]);
   return {
     titles,
-    metadata(entry: Record<string, unknown>) {
+    metadata(entry: Record<string, unknown>, previous = titles.get(session.file)) {
       const stored = {
         size: session.size,
         mtimeMs: 10,
@@ -21414,7 +22303,7 @@ function namedSessionProvider(
       titles.set(
         session.file,
         carryDerivedTitleFacts(
-          titles.get(session.file) as DerivedTitleEntry | undefined,
+          previous as DerivedTitleEntry | undefined,
           stored as DerivedTitleEntry,
         ) as unknown as Record<string, unknown>,
       );
@@ -21441,7 +22330,7 @@ function namedSessionProvider(
     },
     // Update catalog identity and size before reading transcript metadata.
     readMetadata() {
-      const listed = fs.statSync(session.file);
+      const listed = listSessionFiles(path.dirname(session.file)).find((row) => row.file === session.file)!;
       session.ino = listed.ino;
       session.size = listed.size;
       const meta = readSessionMeta(session.file);
@@ -21453,7 +22342,8 @@ function namedSessionProvider(
         nameAt: meta.titleAt,
       });
     },
-    refresh(parsed: ReturnType<typeof turn>) {
+    refresh(parsed: ReturnType<typeof turn>, catalog?: ReturnType<typeof listSessionFiles>[number]) {
+      if (catalog) Object.assign(session, catalog);
       call('observeParsedNames', [parsed], byId);
       return {
         rail: (call('sessionLabel', session) as { label: string }).label,
@@ -21547,6 +22437,7 @@ test('renaming a session that already has a custom name draws the new name on it
   const file = renamedClaudeTranscript();
   const provider = namedSessionProvider([], { file });
   provider.readMetadata();
+  const olderCustomMetadata = { ...provider.titles.get(file) };
   assert.deepEqual(provider.drawn(), { rail: 'First name', heading: 'First name' });
   const { renders, result } = provider.rename(
     '  Second   name ',
@@ -21556,6 +22447,13 @@ test('renaming a session that already has a custom name draws the new name on it
     readerState(),
   );
   assert.deepEqual(await result, { title: 'Second name', error: '' });
+  provider.metadata(olderCustomMetadata, olderCustomMetadata);
+  assert.deepEqual(
+    provider.drawn(),
+    { rail: 'Second name', heading: 'Second name' },
+    'delayed custom metadata erased the confirmed rename',
+  );
+  assert.equal(provider.titles.get(file)?.label, 'Second name', 'delayed custom metadata persisted the old name');
   assert.deepEqual(
     renders,
     [{ reason: 'session-rename', paths: [file], rail: 'Second name', heading: 'Second name' }],
@@ -22088,6 +22986,30 @@ test('a transcript replaced after its turns were parsed takes its own name, and 
     provider.titles.get(replaced.file)?.label,
     'Second name',
     'the stored entry of the new transcript carries the old name into a restart',
+  );
+});
+
+test('a parsed replacement with an earlier custom title takes its own name without a metadata read', () => {
+  const replaced = replacedClaudeTranscript();
+  const provider = namedSessionProvider([], { file: replaced.file });
+  provider.readMetadata();
+  const first = readSession(replaced.file, 'named-session').turns.find((entry) => entry.sessionTitle === 'First name')!;
+  assert.ok(first);
+  assert.deepEqual(provider.refresh(first), { rail: 'First name', heading: 'First name' });
+  const original = revisionOf(fs.statSync(replaced.file, { bigint: true }));
+  fs.renameSync(replaced.file, replaced.file + '.retained');
+  replaced.replace();
+  const listed = listSessionFiles(path.dirname(replaced.file)).find((row) => row.file === replaced.file)!;
+  assert.notEqual(listed.ino, original.ino);
+  assert.ok(listed.size > original.size);
+  const next = readSession(replaced.file, 'named-session').turns.find((entry) => entry.sessionTitle === 'Second name')!;
+  assert.ok(next);
+  assert.ok(next.sessionTitleAt! < first.sessionTitleAt!);
+  assert.deepEqual(provider.refresh(next, listed), { rail: 'Second name', heading: 'Second name' });
+  assert.equal(
+    provider.titles.get(replaced.file)?.label,
+    'Second name',
+    'the parsed replacement persists its own name',
   );
 });
 
@@ -22978,7 +23900,7 @@ test('a small Claude worker tail carries recovered model evidence through host s
     ]),
   );
   const worker = new ProgressiveWorker(progressiveWorkerSource);
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const input: ProgressiveInput = {
     session: { file, sessionId: 'source', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs },
     folders: [],

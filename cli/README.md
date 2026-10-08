@@ -2,7 +2,7 @@
 
 The Arc CLI is experimental. npm publication is deferred.
 
-Show context, prompt-cache status, and the next turn's starting price in Claude Code. Read estimated costs for saved Claude Code and Codex sessions.
+Show context, prompt-cache status, and the next turn's starting price in Claude Code. Read estimated costs for saved Claude Code and Codex sessions. [Session commands](../docs/cli.md#sessions) list a running Arc window's repository sessions and read bounded turns.
 
 ## Install
 

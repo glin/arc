@@ -10,13 +10,14 @@ import {
   SessionRead,
   Turn,
   readPreviousLines,
+  revisionOf,
 } from './transcript';
 import { cloneParserState, ParserLine, BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS } from './parserstate';
 import { OversizedRecordReducer } from './oversizedrecord';
 
 export interface FileIdentity {
-  dev: number;
-  ino: number;
+  dev: number | string;
+  ino: number | string;
 }
 
 export interface ContentAnchor {
@@ -233,10 +234,6 @@ export interface SemanticHistoryOptions {
 const CONTENT_ANCHOR_BYTES = 4096;
 const DEFAULT_FORWARD_BYTES = 4 * 1024 * 1024;
 
-function revisionOf(stat: fs.Stats): FileRevision {
-  return { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
-}
-
 function sameRevision(a: FileRevision, b: FileRevision): boolean {
   return a.size === b.size && a.mtimeMs === b.mtimeMs && a.dev === b.dev && a.ino === b.ino;
 }
@@ -249,7 +246,7 @@ function revisionFor(file: string): FileRevision | null {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    return revisionOf(fs.fstatSync(fd));
+    return revisionOf(fs.fstatSync(fd, { bigint: true }));
   } catch {
     return null;
   } finally {
@@ -267,7 +264,7 @@ function readStableRange(file: string, start: number, length: number, revision: 
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    if (!sameRevision(revisionOf(fs.fstatSync(fd)), revision)) {
+    if (!sameRevision(revisionOf(fs.fstatSync(fd, { bigint: true })), revision)) {
       return null;
     }
     const buffer = Buffer.allocUnsafe(length);
@@ -279,7 +276,7 @@ function readStableRange(file: string, start: number, length: number, revision: 
       }
       read += count;
     }
-    if (!sameRevision(revisionOf(fs.fstatSync(fd)), revision)) {
+    if (!sameRevision(revisionOf(fs.fstatSync(fd, { bigint: true })), revision)) {
       return null;
     }
     return buffer;

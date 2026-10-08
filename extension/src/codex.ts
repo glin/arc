@@ -41,6 +41,7 @@ import {
   isInside,
   normalizeFsPath,
   sameCommitSha,
+  revisionOf,
   normalizeSessionTitle,
   normalizeFullSessionTitle,
   readTurnStartsFromTail,
@@ -310,7 +311,8 @@ export function isAgentRun(meta: CodexSessionMeta): boolean {
 }
 
 // Maximum opening-record size. The opening includes the model's base instructions.
-const META_BYTES = 128 * 1024;
+export const CODEX_OPENING_BYTES = 128 * 1024;
+const META_BYTES = CODEX_OPENING_BYTES;
 
 // How far into a rollout the first prompt can sit. Everything the model was told opens the
 // file ahead of it: the instructions, the sandbox rules and a snapshot of the workspace.
@@ -625,12 +627,17 @@ export interface RolloutStat {
   mtimeMs: number;
   size: number;
   isFile: boolean;
+  dev?: number | string;
+  ino?: number | string;
 }
 
 export function readRolloutStat(file: string): RolloutStat | null {
   try {
-    const stat = fs.statSync(file);
-    return { mtimeMs: stat.mtimeMs, size: stat.size, isFile: stat.isFile() };
+    const stat = fs.statSync(file, { bigint: true });
+    return {
+      ...revisionOf(stat),
+      isFile: stat.isFile(),
+    };
   } catch {
     return null;
   } // vanished mid-scan
@@ -760,6 +767,8 @@ export function codexSessionFiles(
       mtimeMs: stat.mtimeMs,
       size: stat.size,
       cwd: meta.cwd,
+      ...(stat.dev === undefined ? {} : { dev: stat.dev }),
+      ...(stat.ino === undefined ? {} : { ino: stat.ino }),
       // Manually launched `codex exec` sessions also count as agent runs because their entrypoint is headless.
       agentRun: isAgentRun(meta),
     });
@@ -2761,8 +2770,8 @@ export interface CodexDispatchCursor {
   skipLongLine: boolean;
   head: string;
   anchor: string;
-  dev: number;
-  ino: number;
+  dev: number | string;
+  ino: number | string;
   parentSessionId: string;
   terminalApplied: boolean;
   openingTimestamp: number | null;
@@ -2813,8 +2822,8 @@ function dispatchSeen(cursor: CodexDispatchCursor, id: string): boolean {
 
 export function codexDispatchCursor(
   head: string,
-  dev: number,
-  ino: number,
+  dev: number | string,
+  ino: number | string,
   parentSessionId: string,
 ): CodexDispatchCursor {
   return {
@@ -3000,7 +3009,7 @@ export function scanCodexDispatchReferences(
   complete: boolean;
   readBytes: number;
 } {
-  const stat = fs.statSync(file);
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const fd = fs.openSync(file, 'r');
   try {
     const headBuffer = Buffer.alloc(Math.min(stat.size, 256));

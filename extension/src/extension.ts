@@ -1,5 +1,6 @@
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { askIdleDefaults } from './agenthost';
+import type { HostedSessionObservation } from './sessionreads';
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import * as vscode from 'vscode';
 import * as fs from 'node:fs';
@@ -154,6 +155,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Register the panel that displays recorded turns.
   const panel = registerPanel(context, root, workspaceCache, activationAt);
+  channel?.setRequestHandler((request) => panel.readSessionRequest(request));
   panel.setWindowStateHandler((state) => {
     void channel?.update(state).catch(() => {
       void channel?.dispose();
@@ -279,6 +281,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // The commands event publishes the complete catalog. Skip the following state callback's redundant panel update.
   const commandStateChanges = new Set<string>();
+  const sessionTokens = new WeakMap<AgentSession, number>();
+  let nextSessionToken = 1;
+  const publishHostedSessions = () => {
+    const states = host.states();
+    const observations = new Map<string, HostedSessionObservation>();
+    for (const state of states) {
+      const instance = host.get(state.key);
+      const current = instance?.state();
+      if (!instance || current?.agent !== state.agent || current.sessionId !== state.sessionId) continue;
+      let token = sessionTokens.get(instance);
+      if (token === undefined) {
+        token = nextSessionToken++;
+        sessionTokens.set(instance, token);
+      }
+      if (!state.sessionId) continue;
+      const key = runningKey(state.agent, state.sessionId);
+      const held = observations.get(key);
+      if (!held || (held.exited && (!state.exited || token > held.token))) {
+        observations.set(key, { key, token, busy: state.busy, exited: state.exited });
+      }
+    }
+    const hosted = [...observations.values()];
+    panel.setRunning(
+      hosted.filter((one) => one.busy && !one.exited).map((one) => one.key),
+      hosted,
+    );
+    panel.setExited(
+      hosted.filter((one) => one.exited).map((one) => one.key),
+      hosted,
+    );
+  };
   const host = new AgentHost({
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
@@ -353,12 +386,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
       // Publish busy children by session ID. Exclude unnamed children so Stop never targets an unidentified session.
-      panel.setRunning(
-        host
-          .states()
-          .filter((one) => one.busy && !one.exited && one.sessionId)
-          .map((one) => runningKey(one.agent, one.sessionId ?? '')),
-      );
+      publishHostedSessions();
       // Move panel ownership when the child reports a successor session. `/clear` leaves the previous transcript on disk.
       // Use the session event's ID. The earlier reset message names a different ID from the successor transcript.
       if (event.kind === 'session' && event.previous && event.previous !== event.sessionId) {
@@ -403,18 +431,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       updateAgentAffordance();
-      panel.setRunning(
-        host
-          .states()
-          .filter((one) => one.busy && !one.exited && one.sessionId)
-          .map((one) => runningKey(one.agent, one.sessionId ?? '')),
-      );
-      panel.setExited(
-        host
-          .states()
-          .filter((one) => one.exited && one.sessionId)
-          .map((one) => runningKey(one.agent, one.sessionId ?? '')),
-      );
+      publishHostedSessions();
       if (state.exited) {
         if (state.sessionId) panel.invalidateContext(state.sessionId);
         if (state.sessionId) {

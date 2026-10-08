@@ -62,6 +62,7 @@ import {
   scanForAgentRun,
   scanForPerson,
   tailOf,
+  revisionOf as fileRevisionOf,
   type FileRevision,
   type PersonScan,
   type Turn,
@@ -150,8 +151,7 @@ function dispatchActivity(
 
 function revisionOf(file: string): FileRevision | null {
   try {
-    const { size, mtimeMs, dev, ino } = fs.statSync(file);
-    return { size, mtimeMs, dev, ino };
+    return fileRevisionOf(fs.statSync(file, { bigint: true }));
   } catch {
     return null;
   }
@@ -935,7 +935,7 @@ async function execute(
       kind: 'metadata',
       coverage: meta.coverage,
       entry: {
-        sourceIdentity: { dev: revisionOf(session.file)?.dev ?? -1, ino: revisionOf(session.file)?.ino ?? -1 },
+        sourceIdentity: { dev: session.dev ?? -1, ino: session.ino ?? -1 },
         mtimeMs: session.mtimeMs,
         size: session.size,
         label,
@@ -1355,9 +1355,7 @@ async function handleMessage(message: {
     // An active session can append after listing.
     // History windows and pages require the exact requested revision.
     const metadataRequest =
-      request.kind === 'metadata'
-        ? { ...request, session: { ...request.session, size: before.size, mtimeMs: before.mtimeMs } }
-        : null;
+      request.kind === 'metadata' ? { ...request, session: { ...request.session, ...before } } : null;
     if (
       !metadataRequest &&
       (before.size !== requested.size ||
