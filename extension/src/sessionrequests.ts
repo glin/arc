@@ -3,8 +3,10 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { Duplex } from 'node:stream';
 import { writeFileAtomically } from './atomicfile.ts';
 import { arcHome } from './store.ts';
+import { WindowsPipeServer } from './windowpipe.ts';
 
 export const SESSION_REQUEST_VERSION = 1;
 export const SESSION_REQUEST_LIMITS = {
@@ -34,6 +36,7 @@ export interface WindowInfo extends WindowState {
 export interface HostRegistration extends WindowInfo {
   address: string;
   token: string;
+  transportPid?: number;
 }
 
 export interface WindowDiscovery {
@@ -150,7 +153,7 @@ function privateDirectory(directory: string): void {
 
 // Each connection holds at most one bounded unfinished line. Its deadline never advances on partial input.
 function receiveLines(
-  socket: net.Socket,
+  socket: Duplex,
   limits: typeof SESSION_REQUEST_LIMITS | RequestLimits,
   line: (text: string) => void,
 ): void {
@@ -194,8 +197,9 @@ export class WindowChannel {
   private readonly token = crypto.randomBytes(32).toString('hex');
   private readonly address: string;
   private readonly registryFile: string;
-  private readonly sockets = new Set<net.Socket>();
+  private readonly sockets = new Set<Duplex>();
   private readonly server: net.Server;
+  private readonly windowsServer: WindowsPipeServer | null;
   private state: WindowState | null = null;
   private registeredBytes: string | null = null;
   private listening = false;
@@ -212,6 +216,9 @@ export class WindowChannel {
     this.address = hostAddress(home, this.hostId);
     this.registryFile = path.join(home, 'hosts', `${this.hostId}.json`);
     this.server = net.createServer((socket) => this.accept(socket));
+    this.windowsServer = process.platform === 'win32' ? new WindowsPipeServer() : null;
+    this.windowsServer?.on('connection', (socket: Duplex) => this.accept(socket));
+    this.windowsServer?.on('error', (error: Error) => this.server.emit('error', error));
     this.server.on('error', () => {
       void this.dispose();
     });
@@ -250,7 +257,12 @@ export class WindowChannel {
 
   private publish(): void {
     if (this.closed || !this.state) return;
-    const registration: HostRegistration = { ...this.info(), address: this.address, token: this.token };
+    const registration: HostRegistration = {
+      ...this.info(),
+      address: this.address,
+      token: this.token,
+      ...(this.windowsServer ? { transportPid: this.windowsServer.pid } : {}),
+    };
     if (!windowInfo(registration)) throw new Error('The Arc window state is too large.');
     const bytes = JSON.stringify(registration);
     if (Buffer.byteLength(bytes) > REGISTRY_BYTES) throw new Error('The Arc window state is too large.');
@@ -268,15 +280,20 @@ export class WindowChannel {
   private async listen(): Promise<void> {
     privateDirectory(path.dirname(this.registryFile));
     if (process.platform !== 'win32') privateDirectory(path.dirname(this.address));
-    await new Promise<void>((resolve, reject) => {
-      const failed = (error: Error) => reject(error);
-      this.server.once('error', failed);
-      this.server.listen(this.address, () => {
-        this.server.removeListener('error', failed);
-        this.listening = true;
-        resolve();
+    if (this.windowsServer) {
+      await this.windowsServer.listen(this.address);
+      this.listening = true;
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const failed = (error: Error) => reject(error);
+        this.server.once('error', failed);
+        this.server.listen(this.address, () => {
+          this.server.removeListener('error', failed);
+          this.listening = true;
+          resolve();
+        });
       });
-    });
+    }
     if (this.closed) return;
     try {
       if (process.platform !== 'win32') fs.chmodSync(this.address, 0o600);
@@ -287,7 +304,7 @@ export class WindowChannel {
     }
   }
 
-  private accept(socket: net.Socket): void {
+  private accept(socket: Duplex): void {
     if (this.closed || this.sockets.size >= this.limits.connections) {
       socket.on('error', () => {});
       socket.destroy();
@@ -301,6 +318,18 @@ export class WindowChannel {
         value = JSON.parse(text);
       } catch {
         this.answer(socket, { id: null, error: 'Invalid request.' });
+        return;
+      }
+      if (
+        record(value) &&
+        Object.keys(value).join(',') === 'challenge' &&
+        typeof value.challenge === 'string' &&
+        TOKEN.test(value.challenge)
+      ) {
+        const proof = crypto.createHmac('sha256', Buffer.from(this.token, 'hex')).update(value.challenge).digest('hex');
+        const bytes = JSON.stringify({ proof }) + '\n';
+        if (socket.writableLength + Buffer.byteLength(bytes) > this.limits.lineBytes) socket.destroy();
+        else socket.write(bytes);
         return;
       }
       const request = parseSessionRequest(value);
@@ -329,7 +358,7 @@ export class WindowChannel {
     });
   }
 
-  private answer(socket: net.Socket, reply: SessionReply): void {
+  private answer(socket: Duplex, reply: SessionReply): void {
     if (this.closed || socket.destroyed) return;
     const bytes = JSON.stringify(reply) + '\n';
     if (socket.writableLength + Buffer.byteLength(bytes) > this.limits.lineBytes) socket.destroy();
@@ -345,9 +374,10 @@ export class WindowChannel {
   }
 
   private async close(): Promise<void> {
-    // A listen already submitted to Node must finish before its listener can close.
+    // A submitted listener must finish before its channel can close.
     await this.starting?.catch(() => {});
-    if (this.listening) await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    if (this.windowsServer) this.windowsServer.close();
+    else if (this.listening) await new Promise<void>((resolve) => this.server.close(() => resolve()));
     removeOwnedRegistration(this.registryFile, this.registeredBytes, this.address, this.home);
     this.server.removeAllListeners();
   }
@@ -405,10 +435,21 @@ function readRegistration(file: string): string {
   }
 }
 
-export function pingWindow(entry: HostRegistration, deadlineMs = 1_000): Promise<WindowInfo | null> {
+export async function pingWindow(
+  entry: HostRegistration,
+  deadlineMs = 1_000,
+  registrationFile = '',
+): Promise<WindowInfo | null> {
+  if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
+    return null;
+  const socket =
+    process.platform === 'win32'
+      ? await WindowsPipeServer.connect(entry.address, entry.pid, entry.transportPid!, registrationFile, deadlineMs)
+      : net.createConnection(entry.address);
   return new Promise((resolve) => {
-    const socket = net.createConnection(entry.address);
     const id = crypto.randomBytes(12).toString('hex');
+    const challenge = crypto.randomBytes(32).toString('hex');
+    let authenticated = false;
     let settled = false;
     const finish = (info: WindowInfo | null) => {
       if (settled) return;
@@ -423,7 +464,36 @@ export function pingWindow(entry: HostRegistration, deadlineMs = 1_000): Promise
     receiveLines(socket, { ...SESSION_REQUEST_LIMITS, lineDeadlineMs: deadlineMs }, (text) => {
       try {
         const reply: unknown = JSON.parse(text);
-        if (!record(reply) || reply.id !== id || !windowInfo(reply.result) || reply.result.hostId !== entry.hostId) {
+        if (!authenticated) {
+          const expected = crypto.createHmac('sha256', Buffer.from(entry.token, 'hex')).update(challenge).digest('hex');
+          if (
+            !record(reply) ||
+            typeof reply.proof !== 'string' ||
+            !TOKEN.test(reply.proof) ||
+            !crypto.timingSafeEqual(Buffer.from(reply.proof, 'hex'), Buffer.from(expected, 'hex'))
+          ) {
+            finish(null);
+            return;
+          }
+          authenticated = true;
+          const request: SessionRequest = {
+            id,
+            version: SESSION_REQUEST_VERSION,
+            token: entry.token,
+            method: 'ping',
+            requester: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || null,
+            params: {},
+          };
+          socket.write(JSON.stringify(request) + '\n');
+          return;
+        }
+        if (
+          !record(reply) ||
+          reply.id !== id ||
+          !windowInfo(reply.result) ||
+          reply.result.hostId !== entry.hostId ||
+          reply.result.pid !== entry.pid
+        ) {
           finish(null);
           return;
         }
@@ -434,15 +504,7 @@ export function pingWindow(entry: HostRegistration, deadlineMs = 1_000): Promise
       }
     });
     socket.on('connect', () => {
-      const request: SessionRequest = {
-        id,
-        version: SESSION_REQUEST_VERSION,
-        token: entry.token,
-        method: 'ping',
-        requester: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || null,
-        params: {},
-      };
-      socket.write(JSON.stringify(request) + '\n');
+      socket.write(JSON.stringify({ challenge }) + '\n');
     });
   });
 }
@@ -494,7 +556,9 @@ export async function discoverWindows(home = arcHome()): Promise<WindowDiscovery
           typeof value.token !== 'string' ||
           !TOKEN.test(value.token) ||
           value.hostId !== name.slice(0, -5) ||
-          !validHostAddress(home, value.hostId, value.address)
+          !validHostAddress(home, value.hostId, value.address) ||
+          (process.platform === 'win32' &&
+            (!Number.isSafeInteger(value.transportPid) || (value.transportPid as number) <= 0))
         )
           continue;
         entry = value as unknown as HostRegistration;
@@ -504,7 +568,7 @@ export async function discoverWindows(home = arcHome()): Promise<WindowDiscovery
       admitted++;
       batch.push(
         (async () => {
-          const info = await pingWindow(entry).catch(() => null);
+          const info = await pingWindow(entry, 1_000, file).catch(() => null);
           if (info) live.push(info);
           else if (processIsDead(entry.pid)) {
             if (!removeOwnedRegistration(file, bytes, entry.address, home, false)) complete = false;

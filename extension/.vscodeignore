@@ -1,5 +1,6 @@
 .vscodeignore
 src/**
+resources/**
 test/**
 bench/**
 scripts/**

@@ -1,6 +1,7 @@
 import * as esbuild from 'esbuild';
 import * as fs from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
+import { copyWindowsPipe } from '../scripts/windowpipe-build.mjs';
 
 let buildCommit = 'unknown';
 try {
@@ -13,6 +14,7 @@ try {
 }
 
 const { version } = JSON.parse(await fs.readFile(new URL('./package.json', import.meta.url), 'utf8'));
+copyWindowsPipe('dist');
 
 await fs.rm('dist/arc-status.cjs.map', { force: true });
 

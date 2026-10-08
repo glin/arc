@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { require as tsRequire } from 'tsx/cjs/api';
+import { copyWindowsPipe } from '../scripts/windowpipe-build.mjs';
 
 // The scoped TypeScript loader lets Node import panelbundle.ts from this build script.
 const { browserBundle, browserStylesheet } = tsRequire('./src/panelbundle.ts', import.meta.url);
@@ -117,6 +118,7 @@ async function createCliContext() {
 }
 
 export async function buildExtension({ watch = false, developmentServerUrl = null } = {}) {
+  copyWindowsPipe('dist');
   if (watch) fs.rmSync('dist/build-identity.json', { force: true });
   const cli = await createCliContext();
   let current = await createBuildContext(developmentServerUrl);
@@ -132,6 +134,9 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
           'package.json',
           'esbuild.mjs',
           'src/panelbundle.ts',
+          'resources/windowpipe.exe',
+          'resources/windowpipe.json',
+          '../scripts/windowpipe-build.mjs',
         ].map((file) => path.relative(process.cwd(), path.resolve(file)).split(path.sep).join('/')),
       ),
     ];

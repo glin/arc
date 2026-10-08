@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import filesystem from 'node:fs';
 import * as net from 'node:net';
+import * as crypto from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import type { Duplex } from 'node:stream';
+import { WindowsPipeServer } from './windowpipe.ts';
+import { WINDOW_PIPE_SOURCE } from './windowpipe-source.ts';
 import network from 'node:net';
 import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
@@ -25,7 +30,7 @@ import {
 // These Node guards catch access, resource exhaustion, wrong-window discovery, and lifecycle leaks without browser startup.
 const state: WindowState = { folders: [], scopeReady: true, panelReady: false, panelVisible: false };
 const channels: WindowChannel[] = [];
-const sockets: net.Socket[] = [];
+const sockets: Duplex[] = [];
 afterEach(async () => {
   vi.useRealTimers();
   for (const socket of sockets.splice(0)) socket.destroy();
@@ -235,6 +240,7 @@ test('an unfinished line expires on its original deadline despite partial input'
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const socket = await connect(entry.address);
   const ended = closed(socket);
+  await vi.waitFor(() => assert.equal(vi.getTimerCount(), 1), { interval: 1 });
   socket.write('{');
   await vi.advanceTimersByTimeAsync(99);
   assert.equal(socket.destroyed, false);
@@ -294,6 +300,230 @@ test('discovery rejects the wrong ping identity and retains uncertain ownership 
   assert.equal(fs.readFileSync(arbitrary, 'utf8'), 'keep');
   assert.equal(fs.existsSync(file), true);
 });
+
+// These guards catch forged liveness and credential disclosure before transcript reads become available.
+test('discovery rejects a forged reply process identity from an otherwise authenticated window', async () => {
+  const { home, file, entry } = await fixture(undefined, (info) => ({ ...info, pid: info.pid + 1 }));
+  assert.equal(await pingWindow(entry), null);
+  assert.deepEqual(await discoverWindows(home), { windows: [], complete: false });
+  assert.equal(fs.existsSync(file), true);
+});
+
+test('an endpoint without server knowledge receives no token or requester', async () => {
+  const { entry } = await fixture();
+  const otherId = 'd'.repeat(24);
+  const address = hostAddress(tempDir('window-forged-'), otherId);
+  if (process.platform !== 'win32') fs.mkdirSync(path.dirname(address), { recursive: true });
+  const inputs: string[] = [];
+  const accepted = (socket: Duplex) => {
+    sockets.push(socket);
+    socket.on('data', (bytes) => {
+      inputs.push(bytes.toString());
+      socket.end(JSON.stringify({ proof: '0'.repeat(64) }) + '\n');
+    });
+  };
+  const server = process.platform === 'win32' ? new WindowsPipeServer() : net.createServer(accepted);
+  if (server instanceof WindowsPipeServer) {
+    server.on('connection', accepted);
+    await server.listen(address);
+  } else await new Promise<void>((resolve) => server.listen(address, resolve));
+  try {
+    assert.equal(await pingWindow({ ...entry, hostId: otherId, address }), null);
+    assert.equal(inputs.join('').includes(entry.token), false);
+    assert.equal(inputs.join('').includes('requester'), false);
+    assert.equal(inputs.length, 1);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    if (server instanceof WindowsPipeServer) server.close();
+    else await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test.skipIf(process.platform !== 'win32')('Windows rejects a forged endpoint before any bytes reach it', async () => {
+  const { entry } = await fixture();
+  const hostId = 'c'.repeat(24);
+  const address = hostAddress('', hostId);
+  const inputs: Buffer[] = [];
+  const server = net.createServer((socket) => {
+    sockets.push(socket);
+    socket.on('data', (bytes) => {
+      inputs.push(bytes);
+      socket.end('{"proof":"' + '0'.repeat(64) + '"}\n');
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(address, resolve));
+  try {
+    assert.equal(await pingWindow({ ...entry, hostId, address }), null);
+    assert.equal(inputs.length, 0);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test.skipIf(process.platform !== 'win32')('eight simultaneous clients reach one Windows listener', async () => {
+  const { entry, file } = await fixture();
+  for (let batch = 0; batch < 5; batch++) {
+    const replies = await Promise.all(Array.from({ length: 8 }, () => pingWindow(entry, 1_000, file)));
+    assert.deepEqual(
+      replies.map((info) => info?.hostId),
+      Array(8).fill(entry.hostId),
+    );
+  }
+});
+
+function nativeFixture(source: string) {
+  const directory = tempDir('window-native-');
+  const input = path.join(directory, 'bridge.cs');
+  const output = path.join(directory, 'bridge.exe');
+  fs.writeFileSync(input, source);
+  const built = spawnSync(
+    path.join(process.env.SystemRoot ?? 'C:/Windows', 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'),
+    ['/nologo', '/target:exe', `/out:${output}`, input],
+    { encoding: 'utf8', windowsHide: true },
+  );
+  assert.equal(built.status, 0, built.stdout + built.stderr);
+  const child = spawn(output, [], { stdio: 'pipe', windowsHide: true });
+  let text = '';
+  child.stdout.on('data', (bytes) => {
+    text += bytes.toString();
+  });
+  child.stderr.on('data', (bytes) => {
+    text += bytes.toString();
+  });
+  return {
+    child,
+    send: (line: string) => child.stdin.write(line + '\n'),
+    wait: async (pattern: RegExp) => {
+      await vi.waitFor(() => assert.match(text, pattern), { timeout: 5_000 });
+      return text.match(pattern)!;
+    },
+    close: async () => {
+      child.stdin.end();
+      await vi.waitFor(() => assert.equal(child.exitCode, 0), { timeout: 5_000 });
+    },
+  };
+}
+
+const gatedNativeSource = () =>
+  WINDOW_PIPE_SOURCE.replace(/\r\n/g, '\n')
+    .replace(
+      'class ArcPipe {',
+      'class ArcPipe { static readonly ManualResetEvent acceptGate = new ManualResetEvent(false);',
+    )
+    .replace('Output("listen:" + id); first = false;', 'Output("listen:" + id); acceptGate.WaitOne(); first = false;')
+    .replace('if(parts[0] == "listen")', 'if(parts[0] == "resume") acceptGate.Set(); else if(parts[0] == "listen")');
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows busy opens honor deadline and cancellation before availability returns',
+  async () => {
+    const source = gatedNativeSource().replace(
+      'if(error != 231 && error != 2)',
+      'Output("busy:" + id); if(error != 231 && error != 2)',
+    );
+    const native = nativeFixture(source);
+    const address = hostAddress('', crypto.randomBytes(12).toString('hex'));
+    const encoded = Buffer.from(address).toString('base64');
+    try {
+      native.send(`listen:1:${encoded}`);
+      await native.wait(/listen:1/);
+      const occupied = await connect(address);
+      native.send(`connect:2:${encoded}:${process.pid}:${native.child.pid!}::10000`);
+      await native.wait(/busy:2/);
+      native.send('close:2');
+      await native.wait(/close:2/);
+      native.send(`connect:3:${encoded}:${process.pid}:${native.child.pid!}::50`);
+      await native.wait(/busy:3/);
+      assert.equal((await native.wait(/close:3/))[0], 'close:3');
+      occupied.destroy();
+      native.send('resume:0');
+    } finally {
+      await native.close();
+    }
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows listening survives a disconnect before native acceptance',
+  async () => {
+    const native = nativeFixture(gatedNativeSource());
+    const address = hostAddress('', crypto.randomBytes(12).toString('hex'));
+    try {
+      native.send(`listen:1:${Buffer.from(address).toString('base64')}`);
+      await native.wait(/listen:1/);
+      const early = await connect(address);
+      const ended = closed(early);
+      early.destroy();
+      await ended;
+      native.send('resume:0');
+      const next = await WindowsPipeServer.connect(address, process.pid, native.child.pid!);
+      sockets.push(next);
+      await new Promise<void>((resolve, reject) => {
+        next.once('connect', resolve);
+        next.once('close', () => reject(new Error('Listener closed after the early disconnect.')));
+      });
+      assert.equal((await native.wait(/accept:1:/))[0], 'accept:1:');
+      next.destroy();
+    } finally {
+      await native.close();
+    }
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows close retains the native handle until pending I/O completes',
+  async () => {
+    const source = WINDOW_PIPE_SOURCE.replace(/\r\n/g, '\n')
+      .replace(
+        'class ArcPipe {',
+        'class ArcPipe { static readonly ManualResetEvent completionGate = new ManualResetEvent(false); [DllImport("kernel32.dll", SetLastError=true)] static extern uint GetFileType(IntPtr handle);',
+      )
+      .replace(
+        'if(bytes == null && error == 535) return true;',
+        'if(bytes == null && error == 535) return true; if(bytes != null && error == 997) { Output("pending:0"); completionGate.WaitOne(); }',
+      )
+      .replace(
+        'if(stream != null) stream.Close(); if(listener != null)',
+        'if(stream != null) { stream.Close(); Output("retained:" + GetFileType(stream.handle.DangerousGetHandle())); completionGate.Set(); } if(listener != null)',
+      );
+    const native = nativeFixture(source);
+    const address = hostAddress('', crypto.randomBytes(12).toString('hex'));
+    try {
+      native.send(`listen:1:${Buffer.from(address).toString('base64')}`);
+      await native.wait(/listen:1/);
+      const socket = await connect(address);
+      const accepted = await native.wait(/accept:1:(\d+)/);
+      await native.wait(/pending:0/);
+      native.send(`close:${accepted[1]}`);
+      assert.equal((await native.wait(/retained:3/))[0], 'retained:3');
+      await native.wait(new RegExp(`close:${accepted[1]}`));
+      socket.destroy();
+    } finally {
+      await native.close();
+    }
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows excludes the machine-name UNC pipe route on each instance',
+  async () => {
+    const { entry } = await fixture();
+    const unc = entry.address.replace('\\\\.\\pipe\\', `\\\\${process.env.COMPUTERNAME}\\pipe\\`);
+    for (let index = 0; index < 2; index++) {
+      assert.equal((await pingWindow(entry))?.hostId, entry.hostId);
+      const socket = net.createConnection(unc);
+      sockets.push(socket);
+      const result = await new Promise<string>((resolve) => {
+        socket.once('connect', () => {
+          socket.destroy();
+          resolve('connected');
+        });
+        socket.once('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? 'error'));
+      });
+      assert.notEqual(result, 'connected');
+    }
+  },
+);
 
 test('ping deadlines reject silent hosts and preserve a replaced registry during stale cleanup', async () => {
   const { home, file, entry } = await fixture(undefined, () => new Promise(() => {}));
@@ -418,9 +648,14 @@ test('connection creation failure retains live ownership and closes the registry
     closeCalls = () => close.mock.calls.length;
     return directory;
   });
-  const connection = vi.spyOn(network, 'createConnection').mockImplementation(() => {
-    throw Object.assign(new Error('Connection unavailable'), { code: 'EMFILE' });
-  });
+  const connection =
+    process.platform === 'win32'
+      ? vi.spyOn(WindowsPipeServer, 'connect').mockImplementation(async () => {
+          throw Object.assign(new Error('Connection unavailable'), { code: 'EMFILE' });
+        })
+      : vi.spyOn(network, 'createConnection').mockImplementation(() => {
+          throw Object.assign(new Error('Connection unavailable'), { code: 'EMFILE' });
+        });
   syncBuiltinESMExports();
   try {
     assert.deepEqual(await discoverWindows(home), { windows: [], complete: false });
@@ -530,11 +765,19 @@ test('ping identifies Claude and Codex requesters and leaves an absent requester
   const otherId = 'e'.repeat(24);
   const address = hostAddress(tempDir('window-requester-'), otherId);
   if (process.platform !== 'win32') fs.mkdirSync(path.dirname(address), { recursive: true });
-  const server = net.createServer((socket) => {
+  const accepted = (socket: Duplex) => {
     sockets.push(socket);
     socket.on('error', () => {});
     socket.on('data', (bytes) => {
       const input = JSON.parse(bytes.toString());
+      if (input.challenge) {
+        socket.write(
+          JSON.stringify({
+            proof: crypto.createHmac('sha256', Buffer.from(entry.token, 'hex')).update(input.challenge).digest('hex'),
+          }) + '\n',
+        );
+        return;
+      }
       requests.push(input);
       socket.end(
         JSON.stringify({
@@ -543,8 +786,12 @@ test('ping identifies Claude and Codex requesters and leaves an absent requester
         }) + '\n',
       );
     });
-  });
-  await new Promise<void>((resolve) => server.listen(address, resolve));
+  };
+  const server = process.platform === 'win32' ? new WindowsPipeServer() : net.createServer(accepted);
+  if (server instanceof WindowsPipeServer) {
+    server.on('connection', accepted);
+    await server.listen(address);
+  } else await new Promise<void>((resolve) => server.listen(address, resolve));
   try {
     const cases: [string, string, string | null][] = [
       ['claude-session', 'codex-session', 'claude-session'],
@@ -563,7 +810,8 @@ test('ping identifies Claude and Codex requesters and leaves an absent requester
   } finally {
     vi.unstubAllEnvs();
     for (const socket of sockets) socket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (server instanceof WindowsPipeServer) server.close();
+    else await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 
@@ -636,10 +884,13 @@ test('activation spawners clear their window target after asynchronous startup a
       fs.writeFileSync(path.join(home, 'hosts'), 'not a directory');
       await assert.rejects(channel.update(state));
     } else if (failure === 'listener-start') {
-      const listen = vi.spyOn(server!, 'listen').mockImplementation(() => {
-        queueMicrotask(() => server!.emit('error', new Error('Listener unavailable')));
-        return server!;
-      });
+      const listen =
+        process.platform === 'win32'
+          ? vi.spyOn(WindowsPipeServer.prototype, 'listen').mockRejectedValue(new Error('Listener unavailable'))
+          : vi.spyOn(server!, 'listen').mockImplementation(() => {
+              queueMicrotask(() => server!.emit('error', new Error('Listener unavailable')));
+              return server!;
+            });
       try {
         await assert.rejects(channel.update(state), /Listener unavailable/);
       } finally {

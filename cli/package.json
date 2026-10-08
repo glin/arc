@@ -25,6 +25,7 @@
   },
   "files": [
     "dist/arc-status.cjs",
+    "dist/windowpipe.exe",
     "README.md",
     "LICENSE"
   ],

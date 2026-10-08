@@ -57,6 +57,9 @@ test('build identity covers host, browser, worker, and version inputs', () => {
         'package.json',
         'esbuild.mjs',
         'src/panelbundle.ts',
+        'resources/windowpipe.exe',
+        'resources/windowpipe.json',
+        '../scripts/windowpipe-build.mjs',
       ].map((file) => path.relative(extensionRoot, path.resolve(extensionRoot, file)).split(path.sep).join('/')),
     ),
   ].sort();
@@ -85,6 +88,39 @@ test('build identity covers host, browser, worker, and version inputs', () => {
   }
 });
 
+test('native bridge correspondence accepts both checkout line endings and rejects source drift', () => {
+  const root = tempDir('arc-native-identity-');
+  const source = path.join(root, 'extension/src/windowpipe-source.ts');
+  const resources = path.join(root, 'extension/resources');
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  fs.mkdirSync(resources, { recursive: true });
+  fs.mkdirSync(path.join(root, 'scripts'));
+  fs.copyFileSync(
+    path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
+    path.join(root, 'scripts/windowpipe-build.mjs'),
+  );
+  fs.cpSync(path.join(extensionRoot, 'resources'), resources, { recursive: true });
+  const canonical = fs
+    .readFileSync(path.join(extensionRoot, 'src/windowpipe-source.ts'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  const script = "import {copyWindowsPipe} from './scripts/windowpipe-build.mjs'; copyWindowsPipe('./dist');";
+  const copy = () =>
+    spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: root, encoding: 'utf8' });
+  for (const ending of ['\n', '\r\n']) {
+    fs.writeFileSync(source, canonical.replace(/\n/g, ending));
+    const result = copy();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(
+      fs.readFileSync(path.join(root, 'dist/windowpipe.exe')),
+      fs.readFileSync(path.join(resources, 'windowpipe.exe')),
+    );
+  }
+  fs.appendFileSync(source, '\n// Different native source\n');
+  const drift = copy();
+  assert.notEqual(drift.status, 0);
+  assert.match(drift.stderr, /does not match its source/);
+});
+
 test('extracted source builds without Git and never inherits an enclosing repository identity', () => {
   const root = tempDir('arc-archive-build-');
   const archive = path.join(root, 'source.tar');
@@ -102,6 +138,13 @@ test('extracted source builds without Git and never inherits an enclosing reposi
   assert.equal(extracted.status, 0, extracted.stderr);
   const source = path.join(sourceRoot, 'extension');
   fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
+  fs.mkdirSync(path.join(sourceRoot, 'scripts'), { recursive: true });
+  fs.copyFileSync(
+    path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
+    path.join(sourceRoot, 'scripts/windowpipe-build.mjs'),
+  );
+  fs.cpSync(path.join(extensionRoot, 'resources'), path.join(source, 'resources'), { recursive: true });
+  fs.copyFileSync(path.join(extensionRoot, 'src/windowpipe-source.ts'), path.join(source, 'src/windowpipe-source.ts'));
   fs.symlinkSync(
     path.join(extensionRoot, 'node_modules'),
     path.join(source, 'node_modules'),
@@ -186,6 +229,13 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   assert.equal(extracted.status, 0, extracted.stderr);
   const source = path.join(sourceRoot, 'extension');
   fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
+  fs.mkdirSync(path.join(sourceRoot, 'scripts'), { recursive: true });
+  fs.copyFileSync(
+    path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
+    path.join(sourceRoot, 'scripts/windowpipe-build.mjs'),
+  );
+  fs.cpSync(path.join(extensionRoot, 'resources'), path.join(source, 'resources'), { recursive: true });
+  fs.copyFileSync(path.join(extensionRoot, 'src/windowpipe-source.ts'), path.join(source, 'src/windowpipe-source.ts'));
   fs.symlinkSync(
     path.join(extensionRoot, 'node_modules'),
     path.join(source, 'node_modules'),
@@ -275,6 +325,7 @@ test('the extension package contains exactly the intended files', () => {
       'dist/build-identity.json',
       'dist/extension.js',
       'dist/cli.cjs',
+      'dist/windowpipe.exe',
       'dist/bin/arc',
       'dist/bin/arc.cmd',
       'package.json',
