@@ -1123,9 +1123,10 @@ exec "$ARC_TEST_REAL_NODE" "$@"
     for (const [version, supported] of [
       ['18.18.0', false],
       ['20.18.1', false],
-      ['20.19.0', true],
+      ['20.19.0', false],
       ['21.0.0', false],
       ['22.0.0', false],
+      ['22.11.0', false],
       ['22.12.0', true],
       ['23.0.0', true],
     ]) {
@@ -1133,7 +1134,7 @@ exec "$ARC_TEST_REAL_NODE" "$@"
       assert.equal(r.status, supported ? 99 : 1, r.stderr);
       if (supported) assert.match(r.commands, /npm install/);
       else {
-        assert.match(r.stderr, /packaging tools need Node.js/);
+        assert.match(r.stderr, /installation needs Node.js 22\.12\+/);
         assert.doesNotMatch(r.commands, /npm/);
       }
     }

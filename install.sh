@@ -130,8 +130,8 @@ main() {
   for candidate in node npm mktemp; do
     command -v "$candidate" >/dev/null 2>&1 || { echo "error: $candidate is required. Install it and rerun install.sh." >&2; exit 1; }
   done
-  if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit((a===20&&b>=19)||(a===22&&b>=12)||a>22?0:1)'; then
-    echo "error: packaging tools need Node.js 20.19+ (20.x) or 22.12+ (found $(node --version))." >&2
+  if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit((a===22&&b>=12)||a>22?0:1)'; then
+    echo "error: installation needs Node.js 22.12+ (found $(node --version))." >&2
     exit 1
   fi
   node -e 'try { const u=new URL(process.argv[1]); if(u.protocol!=="https:"||u.username||u.password) process.exit(1); } catch { process.exit(1); }' "$marketplace_url" || {

@@ -702,7 +702,7 @@
     "@types/marked": "^4.3.2",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/vsce": "^3.0.0",
+    "@vscode/vsce": "^4.0.0",
     "diff": "^5.2.2",
     "esbuild": "^0.28.2",
     "playwright-core": "^1.62.1",

@@ -4,7 +4,7 @@ Use this guide for local setup, worktree safety, checks, and performance capture
 
 ## Dependencies
 
-Use Node.js 20.19+ (20.x) or 22.12+. The extension targets the editor's Node runtime, while the source build uses newer packaging dependencies.
+Use Node.js 22.12+. The extension targets the editor's Node runtime, while the source build uses newer packaging dependencies.
 
 Install extension and CLI dependencies before building or testing:
 

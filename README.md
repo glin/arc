@@ -13,7 +13,7 @@ Arc is a VS Code extension for working with Claude Code and Codex. **Experimenta
 
 ## Try it
 
-Arc is not on the VS Code Marketplace. For now, install it from source (requires Node 22+):
+Arc is not on the VS Code Marketplace. For now, install it from source (requires Node 22.12+):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
