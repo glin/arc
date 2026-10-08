@@ -18,11 +18,18 @@ export interface ContextCategory {
   relationship: 'used';
 }
 
+export type ContextUnavailableReason = 'pending-tools' | 'awaiting-measurement';
+
+export function contextUnavailableReason(value: unknown): value is ContextUnavailableReason {
+  return value === 'pending-tools' || value === 'awaiting-measurement';
+}
+
 export interface ContextDetail extends ContextIdentity {
   status: 'loading' | 'available' | 'mismatch' | 'unavailable' | 'stale';
   capturedAt: number;
   measurement: 'provider-estimate' | 'local-estimate';
   basis?: 'request' | 'retained-estimate';
+  reason?: ContextUnavailableReason;
   used: number | null;
   capacity: number | null;
   remaining: number | null;
@@ -132,6 +139,17 @@ function normalizeCodexContext(payload: unknown, identity: ContextIdentity, capt
   const unavailable = unavailableContext(identity);
   if (!contextIdentity(identity) || !payload || typeof payload !== 'object') return unavailable;
   const raw = payload as Record<string, unknown>;
+  if (raw.kind === 'codex-context-unavailable') {
+    if (
+      raw.session !== identity.session ||
+      !contextString(raw.model) ||
+      !raw.model ||
+      (identity.model && raw.model !== identity.model) ||
+      !contextUnavailableReason(raw.reason)
+    )
+      return unavailable;
+    return { ...unavailable, capturedAt, reason: raw.reason };
+  }
   if (
     raw.kind !== 'codex-retained-context' ||
     !['request', 'retained-estimate'].includes(String(raw.basis)) ||
@@ -176,6 +194,8 @@ export function validContextDetail(value: unknown): value is ContextDetail {
   const row = value as ContextDetail;
   if (
     !['loading', 'available', 'mismatch', 'unavailable', 'stale'].includes(row.status) ||
+    (row.reason !== undefined &&
+      (row.status !== 'unavailable' || row.provider !== 'codex' || !contextUnavailableReason(row.reason))) ||
     !contextNumber(row.capturedAt) ||
     !['provider-estimate', 'local-estimate'].includes(row.measurement) ||
     (row.measurement === 'local-estimate' && (row.provider !== 'codex' || row.reserve !== null)) ||

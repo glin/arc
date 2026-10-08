@@ -964,6 +964,7 @@ test('saved Codex categories cross the worker boundary only for the captured fil
     const result = await worker.run({ kind: 'codex-context', session }, 7, new AbortController().signal);
     assert.equal(result?.generation, 7);
     assert.ok(result?.value.kind === 'codex-context');
+    assert.ok(result.value.estimate?.kind === 'codex-retained-context');
     assert.equal(result.value.estimate?.used, 10100);
     assert.equal(result.value.estimate?.basis, 'request');
     assert.deepEqual(
@@ -974,6 +975,25 @@ test('saved Codex categories cross the worker boundary only for the captured fil
     const stale = await worker.run({ kind: 'codex-context', session }, 8, new AbortController().signal);
     assert.equal(stale?.value.kind, 'stale');
     assert.equal(await worker.run({ kind: 'codex-context', session }, 9, AbortSignal.abort()), null);
+    const records = codexContextRecords('saved', true);
+    records.push({
+      type: 'response_item',
+      payload: { type: 'function_call', call_id: 'pending', name: 'read', arguments: '{}' },
+    });
+    fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const { size: pendingSize, mtimeMs: pendingMtime, ino: pendingIno } = fs.statSync(file);
+    const pending = await worker.run(
+      { kind: 'codex-context', session: { ...session, size: pendingSize, mtimeMs: pendingMtime, ino: pendingIno } },
+      10,
+      new AbortController().signal,
+    );
+    assert.ok(pending?.value.kind === 'codex-context');
+    assert.deepEqual(pending.value.estimate, {
+      kind: 'codex-context-unavailable',
+      session: 'saved',
+      model: 'gpt-6.1-sol',
+      reason: 'pending-tools',
+    });
   } finally {
     worker.stop();
   }

@@ -181,7 +181,7 @@ export type ProgressiveRequest =
   | { kind: 'retained'; input: ProgressiveInput; pages: HistoryPage[]; structuralAgentIds?: readonly string[] }
   | { kind: 'page'; input: ProgressiveInput; cursor: ProgressiveCursor | null };
 export type ProgressiveValue =
-  | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextEstimate | null }
+  | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
   | ({ kind: 'commit-repositories' } & CommitRepositoryReply)
   | {
       kind: 'claude-children';

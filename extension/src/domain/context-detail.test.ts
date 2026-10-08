@@ -7,6 +7,7 @@ import {
   normalizeContext,
   validContextDetail,
   contextShare,
+  unavailableContext,
   type ContextIdentity,
 } from './context-detail';
 
@@ -29,6 +30,48 @@ const native = () => ({
     { name: 'Reserve', kind: 'buffer', tokens: 10000 },
     { name: 'Deferred tools', kind: 'deferred', tokens: 900000 },
   ],
+});
+
+test('Codex unavailable reasons stay bounded and recover from the same context demand', async () => {
+  const codex = { ...identity, provider: 'codex' as const, model: 'gpt-6.1-sol' };
+  const demand = new ContextDemand();
+  for (const reason of ['pending-tools', 'awaiting-measurement']) {
+    const raw = { kind: 'codex-context-unavailable', session: 's1', model: codex.model, reason };
+    const detail = await demand.read(
+      codex,
+      'same',
+      async () => raw,
+      () => true,
+    );
+    assert.equal(detail.status, 'unavailable');
+    assert.equal(detail.reason, reason);
+    assert.equal(validContextDetail(detail), true);
+    assert.equal(detail.used, null);
+    assert.deepEqual(detail.categories, []);
+    const recovered = await demand.read(
+      codex,
+      'same',
+      async () => estimateCodexContext(codexContextRecords(), 's1'),
+      () => true,
+    );
+    assert.equal(recovered.status, 'available');
+    assert.equal(recovered.reason, undefined);
+    demand.invalidate();
+    for (const invalid of [
+      { reason: 'unknown' },
+      { reason: ['pending-tools'] },
+      { session: 'foreign' },
+      { model: 'different' },
+    ])
+      assert.equal(normalizeContext({ ...raw, ...invalid }, codex).reason, undefined);
+  }
+  for (const invalid of [
+    { ...unavailableContext(codex), reason: 'unknown' },
+    { ...unavailableContext(identity), reason: 'pending-tools' },
+    { ...unavailableContext(codex, 'loading'), reason: 'pending-tools' },
+    { ...normalizeContext(estimateCodexContext(codexContextRecords(), 's1'), codex), reason: 'pending-tools' },
+  ])
+    assert.equal(validContextDetail(invalid), false);
 });
 
 test('Codex retained-context estimates keep local provenance, unknown shares and independent native validation', () => {

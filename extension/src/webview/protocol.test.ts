@@ -776,6 +776,20 @@ test('context wire refuses invalid identity and reduces oversized detail to matc
   assert.equal(parsePanelToHost({ type: 'contextDetail', session: 's1', request: -1, generation: 0 }), null);
 });
 
+test('context wire preserves bounded active reasons and rejects invented explanations', () => {
+  const identity = { ...CONTEXT_DETAIL, provider: 'codex' as const };
+  for (const reason of ['pending-tools', 'awaiting-measurement']) {
+    const detail = { ...unavailableContext(identity), reason };
+    assert.deepEqual(parseHostToPanel({ type: 'contextDetail', detail }), { type: 'contextDetail', detail });
+  }
+  for (const reason of ['unknown', '', null, ['pending-tools'], 'x'.repeat(32769)]) {
+    const parsed = parseHostToPanel({ type: 'contextDetail', detail: { ...unavailableContext(identity), reason } });
+    assert.ok(parsed?.type === 'contextDetail');
+    assert.equal(parsed.detail.status, 'unavailable');
+    assert.equal(parsed.detail.reason, undefined);
+  }
+});
+
 const MALFORMED_HOST_CONTAINERS: unknown[] = [
   { type: 'rail', rail: {}, stats: {}, labels: [], views: [] },
   { type: 'rail', rail: [], stats: [], labels: [], views: [] },

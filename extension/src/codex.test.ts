@@ -114,8 +114,132 @@ import {
   saveSpendLedger,
 } from './projectspend.ts';
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
-import { estimateCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
+import { estimateCodexContext, inspectCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
 import { bedrockAstraRecords, codexContextRecords } from './turnfixtures.ts';
+
+test('Codex active context explains pending tools and unmeasured results until a new complete measurement', async () => {
+  for (const compacted of [false, true]) {
+    const records = codexContextRecords('s1', compacted);
+    const previous = structuredClone(records.at(-1)!);
+    const file = writeRollout(records);
+    const read = async () => {
+      fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+      return readCodexContext(file, 's1', fs.statSync(file), new AbortController().signal);
+    };
+    assert.equal((await read())?.kind, 'codex-retained-context');
+    records.push({
+      type: 'response_item',
+      payload: { type: 'function_call', call_id: 'pending', name: 'read', arguments: '{}' },
+    });
+    assert.deepEqual(await read(), {
+      kind: 'codex-context-unavailable',
+      session: 's1',
+      model: 'gpt-6.1-sol',
+      reason: 'pending-tools',
+    });
+    assert.equal(estimateCodexContext(records, 's1'), null);
+    records.push({
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'pending', output: 'new result' },
+    });
+    assert.equal((await read())?.kind, 'codex-context-unavailable');
+    assert.deepEqual(inspectCodexContext(records, 's1'), {
+      kind: 'codex-context-unavailable',
+      session: 's1',
+      model: 'gpt-6.1-sol',
+      reason: 'awaiting-measurement',
+    });
+    records.push(previous);
+    assert.equal(estimateCodexContext(records, 's1'), null);
+    assert.equal((await read())?.kind, 'codex-context-unavailable');
+    const next = structuredClone(previous);
+    next.payload.info.last_token_usage.input_tokens += 50;
+    records.push(next);
+    const restored = await read();
+    assert.ok(restored?.kind === 'codex-retained-context');
+    assert.equal(restored.used, 10_150);
+    assert.ok(restored.categories.some((row) => row.name === 'Tool calls'));
+    for (const invalid of [
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'orphan', output: 'result' } },
+      { type: 'response_item', payload: { type: 'configuration_update' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [null] } },
+      { type: 'turn_context', payload: { model: 'different' } },
+      { type: 'session_meta', payload: { id: 'foreign' } },
+      { type: 'event_msg', payload: { type: 'thread_rolled_back' } },
+    ])
+      assert.equal(inspectCodexContext([...records, invalid], 's1'), null);
+  }
+});
+
+test('Codex interrupted context stops reporting unanswered calls as pending and recovers with complete retained history', async () => {
+  for (const compacted of [false, true]) {
+    const records = codexContextRecords('s1', compacted);
+    const previous = structuredClone(records.at(-1)!);
+    const file = writeRollout(records);
+    const read = async () => {
+      fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+      return readCodexContext(file, 's1', fs.statSync(file), new AbortController().signal);
+    };
+    assert.equal((await read())?.kind, 'codex-retained-context');
+    records.push({
+      type: 'response_item',
+      payload: { type: 'function_call', call_id: 'interrupted', name: 'read', arguments: '{}' },
+    });
+    assert.deepEqual(await read(), {
+      kind: 'codex-context-unavailable',
+      session: 's1',
+      model: 'gpt-6.1-sol',
+      reason: 'pending-tools',
+    });
+    records.push({
+      type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'context-turn', reason: 'interrupted' },
+    });
+    assert.equal(await read(), null);
+    const closed = readCodexSession(file, 's1');
+    assert.equal(closed.turns.at(-1)?.interrupted, true);
+    const reducer = createCodexSessionReducer('s1');
+    for (const record of records) reducer.pushLine(JSON.stringify(record));
+    assert.equal(reducer.openRange(), null);
+    const next = structuredClone(previous);
+    next.payload.info.last_token_usage.input_tokens += 50;
+    records.push(next);
+    assert.equal(await read(), null);
+    records.push({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'resumed' } });
+    records.push(...codexContextRecords('s1', true).filter((row) => row.type === 'compacted'));
+    records.push({ type: 'turn_context', payload: { turn_id: 'resumed', model: 'gpt-6.1-sol' } });
+    records.push(next);
+    const restored = await read();
+    assert.ok(restored?.kind === 'codex-retained-context');
+    assert.equal(restored.used, 10_150);
+    records.push({ type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'resumed', reason: 'interrupted' } });
+    records.push({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'next' } });
+    records.push({
+      type: 'response_item',
+      payload: { type: 'function_call', call_id: 'resumed', name: 'read', arguments: '{}' },
+    });
+    assert.deepEqual(await read(), {
+      kind: 'codex-context-unavailable',
+      session: 's1',
+      model: 'gpt-6.1-sol',
+      reason: 'pending-tools',
+    });
+    records.push({
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'resumed', output: 'new result' },
+    });
+    assert.deepEqual(await read(), {
+      kind: 'codex-context-unavailable',
+      session: 's1',
+      model: 'gpt-6.1-sol',
+      reason: 'awaiting-measurement',
+    });
+    const complete = structuredClone(next);
+    complete.payload.info.last_token_usage.input_tokens += 50;
+    records.push(complete);
+    assert.equal((await read())?.kind, 'codex-retained-context');
+  }
+});
 
 test('Codex categories use retained ordinary and compacted histories without lifetime or cached-input duplication', async () => {
   const ordinary = estimateCodexContext(codexContextRecords(), 's1')!;
@@ -322,10 +446,10 @@ test('Codex context retains copied fork ancestry and refuses unrelated metadata 
   const file = writeRollout(fork);
   const stat = fs.statSync(file);
   const revision = { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino };
-  assert.deepEqual(
-    (await readCodexContext(file, 'fork', revision, new AbortController().signal))?.categories,
-    expected,
-  );
+  assert.deepEqual(await readCodexContext(file, 'fork', revision, new AbortController().signal), {
+    ...estimateCodexContext(fork, 'fork')!,
+    categories: expected,
+  });
   assert.equal(await readCodexContext(file, 'parent', revision, new AbortController().signal), null);
 });
 

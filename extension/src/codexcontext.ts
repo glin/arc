@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { readPreviousLines, type BackwardLineCursor, type FileRevision } from './transcript';
-import { contextNumber, type ContextCategory } from './domain/context-detail';
+import { contextNumber, type ContextCategory, type ContextUnavailableReason } from './domain/context-detail';
 import { codexRetainedContextTokens } from './codex';
 
 export const CODEX_CONTEXT_BYTES = 16 * 1024 * 1024;
@@ -18,6 +18,15 @@ export interface CodexContextEstimate {
   categories: ContextCategory[];
 }
 
+export interface CodexContextUnavailable {
+  kind: 'codex-context-unavailable';
+  session: string;
+  model: string;
+  reason: ContextUnavailableReason;
+}
+
+export type CodexContextResult = CodexContextEstimate | CodexContextUnavailable;
+
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -26,12 +35,20 @@ function object(value: unknown): Record<string, unknown> | null {
 
 // Ordinary outputs precede live-history truncation. Replacement history already holds retained outputs.
 export function estimateCodexContext(records: readonly unknown[], session: string): CodexContextEstimate | null {
+  const result = inspectCodexContext(records, session);
+  return result?.kind === 'codex-retained-context' ? result : null;
+}
+
+export function inspectCodexContext(records: readonly unknown[], session: string): CodexContextResult | null {
   let items: Record<string, unknown>[] = [];
   let checkpointItems = new Set<Record<string, unknown>>();
+  let abortedThrough = 0;
   let model = '';
   let used: number | null = null;
   let capacity: number | null = null;
   let measured = false;
+  let measurementModel = '';
+  let unmeasuredInput = false;
   let incomplete = false;
   let compacted = false;
   let signature = '';
@@ -92,8 +109,10 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
       items = [];
       for (const item of payload.replacement_history) if (!add(item)) return null;
       checkpointItems = new Set(items);
+      abortedThrough = 0;
       used = null;
       measured = false;
+      unmeasuredInput = false;
       incomplete = false;
       compacted = true;
       signature = '';
@@ -115,10 +134,14 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
           'additional_tools',
           'configuration_update',
         ].includes(String(payload.type));
-      if (input) measured = false;
+      if (input) {
+        measured = false;
+        unmeasuredInput = true;
+      }
       if (payload.type === 'configuration_update') incomplete = true;
     } else if (record.type === 'event_msg') {
       if (payload.type === 'thread_rolled_back') return null;
+      if (payload.type === 'turn_aborted') abortedThrough = items.length;
       if (payload.type === 'thread_settings_applied') {
         const settings = object(payload.thread_settings);
         if (typeof settings?.model === 'string') {
@@ -154,6 +177,8 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
           basis = estimated ? 'retained-estimate' : 'request';
           capacity = info.model_context_window;
           measured = true;
+          measurementModel = model;
+          unmeasuredInput = false;
         }
       }
     } else if (
@@ -168,15 +193,15 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
       return null;
     }
   }
-  if (!measured || incomplete || used === null || capacity === null || !model || !contextNumber(used)) return null;
+  if (incomplete || used === null || capacity === null || !model || !contextNumber(used)) return null;
   const tokens = new Map<string, number>();
   const text = (name: string, value: string) => {
     tokens.set(name, (tokens.get(name) ?? 0) + Math.ceil(Buffer.byteLength(value, 'utf8') / 4));
   };
-  const calls = new Set<string>();
+  const calls = new Map<string, number>();
   const outputs = new Set<string>();
   const serverOutputs = new Set<string>();
-  for (const item of items) {
+  for (const [index, item] of items.entries()) {
     if (item.type === 'message' || item.type === 'agent_message') {
       if (item.role === 'system') continue;
       if (
@@ -195,7 +220,7 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
     } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
       const input = item.type === 'function_call' ? item.arguments : item.input;
       if (typeof item.call_id !== 'string' || typeof item.name !== 'string' || typeof input !== 'string') return null;
-      calls.add(`${item.type}:${item.call_id}`);
+      calls.set(`${item.type}:${item.call_id}`, index);
       text('Tool calls', item.name + (typeof item.namespace === 'string' ? item.namespace : '') + input);
     } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
       if (typeof item.call_id !== 'string') return null;
@@ -212,7 +237,7 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
     } else if (item.type === 'local_shell_call') {
       if (item.call_id !== undefined && item.call_id !== null) {
         if (typeof item.call_id !== 'string') return null;
-        calls.add(`function_call:${item.call_id}`);
+        calls.set(`function_call:${item.call_id}`, index);
       }
     } else if (item.type === 'tool_search_call' || item.type === 'tool_search_output') {
       if (item.execution !== 'server' && item.execution !== 'client') return null;
@@ -221,15 +246,26 @@ export function estimateCodexContext(records: readonly unknown[], session: strin
         continue;
       }
       const key = `tool_search_call:${item.call_id}`;
-      if (item.type === 'tool_search_call') calls.add(key);
+      if (item.type === 'tool_search_call') calls.set(key, index);
       else {
         outputs.add(key);
         if (item.execution === 'server') serverOutputs.add(key);
       }
     }
   }
-  if ([...calls].some((id) => !outputs.has(id)) || [...outputs].some((id) => !calls.has(id) && !serverOutputs.has(id)))
-    return null;
+  if ([...outputs].some((id) => !calls.has(id) && !serverOutputs.has(id))) return null;
+  if (model !== measurementModel) return null;
+  const pending = [...calls].filter(([id]) => !outputs.has(id));
+  if (pending.some(([, index]) => index < abortedThrough)) return null;
+  if (pending.length || !measured) {
+    if (!pending.length && !unmeasuredInput) return null;
+    return {
+      kind: 'codex-context-unavailable',
+      session,
+      model,
+      reason: pending.length ? 'pending-tools' : 'awaiting-measurement',
+    };
+  }
   const categories: ContextCategory[] = [...tokens]
     .filter(([, count]) => count > 0)
     .map(([name, count]) => ({ key: name, name, tokens: count, relationship: 'used' }));
@@ -250,7 +286,7 @@ export async function readCodexContext(
   session: string,
   revision: FileRevision,
   signal: AbortSignal,
-): Promise<CodexContextEstimate | null> {
+): Promise<CodexContextResult | null> {
   let descriptor = -1;
   try {
     descriptor = fs.openSync(file, 'r');
@@ -291,7 +327,7 @@ export async function readCodexContext(
     if (!boundary && cursor.end > 0) return null;
     records.reverse();
     if (boundary) records.unshift(opening);
-    return estimateCodexContext(records, session);
+    return inspectCodexContext(records, session);
   } catch {
     return null;
   } finally {

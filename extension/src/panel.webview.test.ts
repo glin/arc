@@ -287,7 +287,10 @@ import { USAGE_AGENT_ORDER } from './usageview.ts';
 import { missingSetupValues } from './domain/session-setups.ts';
 import { ProjectSetupStore, SetupProjects, normalizeProjectPath, projectSetupKey } from './projectsetups.ts';
 import { STORED_STATE_KEYS } from './identity.ts';
-import { claudeDispatchTranscript, turn as fixtureTurn } from './turnfixtures';
+import { claudeDispatchTranscript, codexContextRecords, turn as fixtureTurn } from './turnfixtures';
+import { readCodexContext } from './codexcontext';
+import { unavailableContext } from './domain/context-detail';
+import { drawContextDetail } from './webview/context-detail';
 
 import { beforeAll, test, vi } from 'vitest';
 import { SessionNames } from './sessionnames.ts';
@@ -16378,6 +16381,57 @@ test('Context detail keeps the percentage, window and used count together', () =
   );
 });
 
+test('active Context feedback explains its measurement boundary and preserves recorded figures and Compact', () => {
+  const document = {
+    createElement(tag: string) {
+      const node = fakeDocument.createElement(tag);
+      node.append = (...parts: Array<FakeElement | string>) => {
+        for (const part of parts) {
+          const child = typeof part === 'string' ? fakeDocument.createTextNode(part) : part;
+          node.appendChild(child);
+          child.parentNode = node;
+        }
+      };
+      return node;
+    },
+  } as unknown as Document;
+  for (const reason of ['pending-tools', 'awaiting-measurement'] as const) {
+    const host = document.createElement('div');
+    let compacted = false;
+    drawContextDetail(document, host, {
+      used: 209_336,
+      capacity: 258_400,
+      loading: false,
+      compact: true,
+      detail: {
+        ...unavailableContext({
+          session: 's1',
+          provider: 'codex',
+          model: 'gpt-6.1-sol',
+          source: 'rollout',
+          request: 1,
+          generation: 0,
+        }),
+        reason,
+      },
+      run: () => {
+        compacted = true;
+      },
+    });
+    const rendered = host as unknown as FakeElement;
+    const note = fakeFind(rendered, '.context-note')!.textContent;
+    assert.doesNotMatch(note, /saved context/i);
+    assert.match(note, reason === 'pending-tools' ? /tool calls.*pending/i : /measur.*new input/i);
+    assert.equal(fakeFind(rendered, '.chippopvalue')!.textContent, '81% of 258k (209k)');
+    const remaining = fakeFind(rendered, '.context-remaining')!;
+    assert.equal(fakeFind(remaining, '.chippopvalue')!.textContent, '49k');
+    const compact = fakeFind(rendered, 'button')!;
+    assert.equal(compact.getAttribute('aria-label'), 'Compact this session');
+    compact.listeners.click[0]({ stopPropagation() {} });
+    assert.equal(compacted, true);
+  }
+});
+
 test('compacting asks for a compaction, and never travels the prompt path', () => {
   // Compact sends a session control message without using prompt submission.
   sourceMatch(
@@ -18671,6 +18725,64 @@ test('Codex context invalidation cancels every pending read across demand keys a
     }
     assert.equal(provider.contextReadControllers.size, 0);
   }
+});
+
+test('Codex host preserves active reasons and restores categories after a measured source revision', async () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const session = provider.showing;
+  const records = codexContextRecords(session);
+  const previous = structuredClone(records.at(-1)!);
+  const file = path.join(tempDir('active-context-host-'), 'rollout.jsonl');
+  const state = provider.stateFor(session);
+  state.agent = 'codex';
+  state.settings.selectedModel = 'gpt-6.1-sol';
+  state.context = { used: 10_000, max: 20_000 };
+  provider.stateFor = (id: string) => (id === session ? state : null);
+  provider.catalog = { sessions: [{ agent: 'codex', sessionId: session, file }] };
+  provider.contextDemands = new WeakMap();
+  provider.contextRequests = new WeakMap();
+  let replaceDuringRead = false;
+  provider.progressiveWorker = {
+    run: async (request: any, generation: number, signal: AbortSignal) => {
+      const estimate = await readCodexContext(file, session, fs.statSync(file), signal);
+      if (replaceDuringRead) fs.appendFileSync(file, JSON.stringify(previous) + '\n');
+      return { generation, value: { kind: 'codex-context', estimate } };
+    },
+  };
+  provider.contextSource = (_agent: string, id: string) => provider.codexContextSource(id);
+  const request = async (id: number) => {
+    fs.writeFileSync(file, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    await provider.requestContext(fixture.host, session, id, provider.contextGenerations?.get(session) ?? 0);
+    return fixture.posted.at(-1)!.detail as any;
+  };
+  assert.equal((await request(1)).status, 'available');
+  records.push({
+    type: 'response_item',
+    payload: { type: 'function_call', call_id: 'pending', name: 'read', arguments: '{}' },
+  });
+  assert.equal((await request(2)).reason, 'pending-tools');
+  assert.deepEqual(state.context, { used: 10_000, max: 20_000 });
+  records.push({
+    type: 'response_item',
+    payload: { type: 'function_call_output', call_id: 'pending', output: 'result' },
+  });
+  records.push(previous);
+  assert.equal((await request(3)).reason, 'awaiting-measurement');
+  const next = structuredClone(previous);
+  next.payload.info.last_token_usage.input_tokens += 50;
+  records.push(next);
+  state.context.used += 50;
+  provider.invalidateContext(session);
+  const restored = await request(4);
+  assert.equal(restored.status, 'available');
+  assert.equal(restored.generation, 1);
+  assert.equal(restored.used, 10_150);
+  assert.equal(restored.reason, undefined);
+  replaceDuringRead = true;
+  const posted = fixture.posted.length;
+  await request(5);
+  assert.equal(fixture.posted.length, posted, 'a changed source published obsolete categories');
 });
 
 test('context host rejects obsolete identity and malformed replies and settles disconnected demand', async () => {

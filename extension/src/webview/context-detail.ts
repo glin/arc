@@ -96,9 +96,11 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
             ? 'Estimated breakdown. Categories do not cover the reported total.'
             : native?.used === 0
               ? 'Estimated breakdown. No context used.'
-              : value.detail?.provider === 'codex'
-                ? 'Category breakdown unavailable for this saved context.'
-                : 'Category breakdown unavailable.',
+              : value.detail?.reason === 'pending-tools'
+                ? 'Category breakdown unavailable while tool calls are pending.'
+                : value.detail?.reason === 'awaiting-measurement'
+                  ? 'Category breakdown unavailable until Codex measures the new input.'
+                  : 'Category breakdown unavailable.',
       ),
     );
     host.append(notes);

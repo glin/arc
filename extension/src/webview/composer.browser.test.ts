@@ -142,9 +142,61 @@ test(
         assert.equal(await detail.locator('.context-remaining').isVisible(), true);
         await page.keyboard.press('Escape');
       }
+      const activeRecords = codexContextRecords();
+      const previous = structuredClone(activeRecords.at(-1)!);
+      activeRecords.push({
+        type: 'response_item',
+        payload: { type: 'function_call', call_id: 'pending', name: 'read', arguments: '{}' },
+      });
+      const activePayload = renderPayload();
+      const publish = async (invalidate = true) => {
+        fs.writeFileSync(file, activeRecords.map((row) => JSON.stringify(row)).join('\n') + '\n');
+        if (invalidate) provider.invalidateContext('s1');
+        (activePayload.usage as { composer: any }).composer = composerView({
+          ...COMPOSER,
+          agent: 'codex',
+          context: state.context,
+          contextGeneration: provider.contextGenerations.get('s1'),
+        });
+        await post(page, activePayload);
+      };
+      await publish();
       await page.locator('#prompt').focus();
       await page.locator('.cctx').focus();
-      await page.locator('#composer-context-detail').getByRole('button', { name: 'Compact this session' }).click();
+      const activeDetail = page.locator('#composer-context-detail');
+      const compact = activeDetail.getByRole('button', { name: 'Compact this session' });
+      await compact.focus();
+      const answer = async () => {
+        const request = await page.evaluate<any>('window.__posted.filter(m => m.type === "contextDetail").at(-1)');
+        assert.equal(request.generation, provider.contextGenerations.get('s1'));
+        await provider.requestContext(host, 's1', request.request, request.generation);
+        assert.equal(await activeDetail.isVisible(), true, 'active same-session detail closed');
+        assert.equal(
+          await compact.evaluate((node) => node === document.activeElement),
+          true,
+          'active reply lost Compact focus',
+        );
+      };
+      await answer();
+      assert.equal(await activeDetail.locator('.context-categories li').count(), 0);
+      activeRecords.push(
+        { type: 'response_item', payload: { type: 'function_call_output', call_id: 'pending', output: 'result' } },
+        previous,
+      );
+      await publish();
+      await answer();
+      assert.equal(await activeDetail.locator('.context-categories li').count(), 0);
+      const next = structuredClone(previous);
+      next.payload.info.last_token_usage.input_tokens += 50;
+      activeRecords.push(next);
+      state.context = { used: 10_050, max: 20_000 };
+      await publish(false);
+      await answer();
+      await page.waitForFunction(
+        () => document.querySelectorAll('#composer-context-detail .context-categories li').length === 4,
+      );
+      assert.equal(await compact.evaluate((node) => node === document.activeElement), true);
+      await compact.click();
       assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "compact").length'), 1);
     } finally {
       await browser.close();
