@@ -14,6 +14,8 @@ VS Code can replay focus to its outer webview frame after a primary click activa
 
 Draft text is mirrored into normalized extension state so a hidden or restored panel can recover it. The live DOM remains the source while the reader types. A draft that cannot be stored safely is dropped rather than cut into a different prompt.
 
+Draft storage retains the newest whole prompts within 10,000,000 total characters. Each session's queued submissions fit within 1,280,000 total characters. A queued submission that exceeds its remaining storage capacity stays in the prompt box.
+
 ## Starting the first session
 
 Available remembered setups use the shared setup-value checks.
@@ -38,7 +40,7 @@ File attachments are staged under extension global storage and scoped by session
 
 ## Submitted prompt memory
 
-Arc saves the latest five workspace submissions before Enter clears the prompt box or sends to the extension host. Each submission keeps exact whitespace and line breaks up to 20,000 characters. Repeated text remains a separate submission. A longer prompt or failed browser save remains visible and sends nothing.
+Arc saves the latest five workspace submissions before Enter clears the prompt box or sends to the extension host. Prompts, drafts, and queued submissions accept up to 1,048,576 characters each. Each saved submission keeps exact whitespace and line breaks. Repeated text remains a separate submission. A longer prompt or failed browser save remains visible and sends nothing. The prompt box shows the refusal and clears it when the reader edits the text.
 
 Up in the prompt box recalls retained submissions before the selected session's recorded history. Down moves forward and restores the draft present before recall. Choose a session or create a draft before recalling text. Enter explicitly submits recalled text.
 

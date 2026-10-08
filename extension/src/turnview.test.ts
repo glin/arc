@@ -24,6 +24,8 @@ import {
   normalizeQueuedSubmissions,
   queuedSubmissionBookFits,
   DRAFT_TEXT_LIMIT,
+  DRAFT_BOOK_CHARS,
+  QUEUED_TEXT_CHARS,
   PROMPT_HISTORY_ENTRY_CHARS,
   READ_LIMIT,
   SESSION_LIMIT,
@@ -1559,6 +1561,20 @@ test('an unsent prompt survives the round trip through stored state', () => {
 
   const long = 'first line\nsecond line\n\n  indented `code` and "quotes"';
   assert.equal(normalizePanelState({ drafts: { s: long } }).drafts.s, long);
+  const pasted = '  ' + 'long prompt\n'.repeat(9_000) + '  ';
+  assert.equal(normalizePanelState({ drafts: { s: pasted } }).drafts.s, pasted);
+});
+
+test('draft storage retains newest whole prompts within the total text budget', () => {
+  const large = 'x'.repeat(DRAFT_TEXT_LIMIT);
+  const drafts = Object.fromEntries(Array.from({ length: 10 }, (_, index) => [`large-${index}`, large]));
+  const kept = normalizeDrafts({ earlier: 'small', ...drafts, newest: 'keep this prompt' });
+  assert.equal(kept.newest, 'keep this prompt');
+  assert.equal(kept['large-9'], large);
+  assert.equal(kept['large-0'], undefined);
+  assert.equal(kept.earlier, 'small');
+  assert.ok(Object.values(kept).reduce((sum, text) => sum + text.length, 0) <= DRAFT_BOOK_CHARS);
+  assert.deepEqual(normalizeDrafts(kept), kept);
 });
 
 test('a queued prompt survives stored state with its identity, comments, and files', () => {
@@ -1628,6 +1644,30 @@ test('queue admission refuses a new session before stored state evicts an older 
     true,
     'adding to a session already in the book is refused at the session ceiling',
   );
+});
+
+test('queue admission retains long text and refuses total text overflow without losing earlier prompts', () => {
+  const submission = (id: string, text: string) => ({
+    id,
+    text,
+    commentIds: [] as string[],
+    assets: [],
+    at: 1,
+    delivery: { phase: 'queued' as const, owner: 's' },
+  });
+  const text = 'long prompt\n'.repeat(9_000).trim();
+  const first = submission('long', text);
+  assert.deepEqual(normalizeQueuedSubmissions({ s: [first] }).s, [first]);
+  const retained = [first, submission('fill', 'x'.repeat(QUEUED_TEXT_CHARS - text.trim().length - 1))];
+  // Split the filler so each prompt also fits the individual bound.
+  retained[1].text = retained[1].text.slice(0, DRAFT_TEXT_LIMIT);
+  retained.push(submission('remainder', 'x'.repeat(QUEUED_TEXT_CHARS - text.trim().length - DRAFT_TEXT_LIMIT - 1)));
+  const book = { s: retained.map((entry) => ({ ...entry, text: entry.text.trim() })) };
+  assert.equal(queuedSubmissionBookFits(book, 's', [...book.s, submission('last', 'x')]), true);
+  assert.equal(queuedSubmissionBookFits(book, 's', [...book.s, submission('overflow', 'xx')]), false);
+  const overlong = submission('overlong', 'x'.repeat(DRAFT_TEXT_LIMIT + 1));
+  overlong.commentIds.push('comment');
+  assert.deepEqual(normalizeQueuedSubmissions({ s: [overlong] }), {});
 });
 
 test('an edited waiting prompt keeps its comment claim through stored state', () => {

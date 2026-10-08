@@ -14,6 +14,7 @@ import { browserOrNone, SETTLED } from '../../test/browser.ts';
 import { COMPOSER, LIVE_PRESS, pageHtml, renderPayload, statPopoverPayload, themed } from '../panelfixture.ts';
 import { composerView, pickMenu, newSessionDraft, type ComposerState } from '../composerview.ts';
 import type { SessionLauncherView } from '../view/launcher.ts';
+import { SUBMITTED_PROMPT_CHARS } from './state.ts';
 
 async function post(page: Page, message: unknown): Promise<void> {
   await page.evaluate(`window.postMessage(${JSON.stringify(message)}, '*')`);
@@ -6446,7 +6447,7 @@ test(
         );
         await page.setContent(recoveryPage({}));
         await post(page, { type: 'usage', usage: usageWith(renderPayload(), composer) });
-        const text = '  first prompt\n' + 'x'.repeat(4500) + '\n  ';
+        const text = '  first prompt\n' + 'x'.repeat(97_199) + '\n  ';
         const prompt = page.locator('#prompt');
         await prompt.fill(text);
         await prompt.press('Enter');
@@ -6529,9 +6530,11 @@ test(
           type: 'usage',
           usage: usageWith(renderPayload(), composerView({ ...COMPOSER, draft: '', onScreen: '' }, Date.now())),
         });
-        const text = failed ? 'keep this exact prompt\n  ' : 'x'.repeat(20001);
+        const text = failed ? 'keep this exact prompt\n  ' : 'x'.repeat(SUBMITTED_PROMPT_CHARS + 1);
         await page.locator('#prompt').fill(text);
         await page.locator('#prompt').press('Enter');
+        assert.equal(await page.locator('.cnotice').isVisible(), true);
+        assert.ok((await page.locator('.cnotice').textContent())!.length > 0);
         assert.equal(await page.locator('#prompt').inputValue(), text);
         assert.equal(
           await page.evaluate(
@@ -6539,6 +6542,8 @@ test(
           ),
           0,
         );
+        await page.locator('#prompt').fill('edited prompt');
+        assert.equal(await page.locator('.cnotice').count(), 0);
         await page.close();
       }
     } finally {

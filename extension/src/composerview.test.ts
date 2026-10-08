@@ -159,6 +159,7 @@ import { composerRuntimeBySession } from './turncard.ts';
 import {
   CONTEXT_BANDS,
   DRAFT_TEXT_LIMIT,
+  QUEUED_TEXT_CHARS,
   NextTurnBasis,
   PROMPT_HISTORY_ENTRY_CHARS,
   QUEUED_SUBMISSION_LIMIT,
@@ -2641,6 +2642,12 @@ test('a native mid-turn prompt cannot take comments owned by a local queue recor
 });
 
 test('a queue accepts only submissions that can make the stored round trip', () => {
+  const pasted = 'long prompt\n'.repeat(9_000);
+  const accepted = queueSubmissionAfter([], 'long', pasted, [], [], 1);
+  assert.equal(accepted[0].text, pasted.trim());
+  const filler = queueSubmissionAfter(accepted, 'filler', 'x'.repeat(DRAFT_TEXT_LIMIT), [], [], 2);
+  const remaining = QUEUED_TEXT_CHARS - filler.reduce((sum, entry) => sum + entry.text.length, 0);
+  assert.deepEqual(queueSubmissionAfter(filler, 'overflow', 'x'.repeat(remaining + 1), [], [], 3), filler);
   assert.deepEqual(
     queueSubmissionAfter([], 'too-long', 'x'.repeat(DRAFT_TEXT_LIMIT + 1), [], [], 1),
     [],

@@ -202,7 +202,7 @@ The first column is checked against the shipped extension directory by `architec
 | `webview/composer-controls.ts` | Preact owner for usage, Prompt box picker controls, permissions, MCP menus, context-detail demand, and their page-lifetime popover state | no |
 | `webview/composer-presentation.ts` | Typed owner for Prompt box body mounts, slots, next-turn presentation, shared-clock updates, footer measurement, box floor, session list-relative placement, and transient divider gesture hysteresis | no |
 | `webview/composer.ts` | Preact Prompt box owner for the stable shell, live prompt text field, native-menu selection highlight, inline skill and Claude-command detail controls, host-activation focus recovery, drafts, submitted-prompt recall, editing history, completion, the page-level send chord, and later-owner slots | no |
-| `webview/attachments.ts` | Preact owner for Prompt box attachment chips, browser file reads, staging tokens, paste and drop handling, notices, and both removable Prompt box chips and non-removable transient-card chips | no |
+| `webview/attachments.ts` | Preact owner for Prompt box attachment chips, browser file reads, staging tokens, paste and drop handling, attachment and submission-refusal notices, and both removable Prompt box chips and non-removable transient-card chips | no |
 | `webview/sessiondetails.ts` | Body-mounted non-modal session dialog opened by the native session context menu, including copy actions, focus return, and viewport placement | no |
 | `webview/dom.ts` | Authoritative browser DOM lookups, shared editable-target checks, float placement, accessibility wiring, and selected DOM conversion to Markdown | no |
 | `webview/hints.ts` | Page-lifetime delayed and keyboard hint service, body tooltip placement, the drawn body an anchor names with `data-hint-body` and its redraw port, and hint cleanup when anchors leave | no |
@@ -312,6 +312,7 @@ The first column is checked against the shipped extension directory by `architec
 | `domain/model-identity.ts` | Model id comparison shared by transcript turns and the Prompt box: window suffix, snapshot date, Bedrock prefix, and deployment suffix | no |
 | `domain/link-path.ts` | Browser-safe local-path versus URI-scheme classification | no |
 | `domain/prompt-assets.ts` | Browser-safe prompt attachment count and byte limits | no |
+| `domain/prompt-text.ts` | Browser-safe individual text limit shared by drafts, queued submissions, and submitted prompt recovery | no |
 | `domain/read.ts` | Browser-safe turn keys, read predicates, the count of new turns in each session, the retained read-key limit, and whether a saved read state moved one session alone | no |
 | `domain/rail-filters.ts` | Browser-safe saved session list filter records, normalization, live-filter identity, the lens words a lens press writes, the migration of older stored lenses into those words, naming, and query-term toggles | no |
 | `domain/rail-sort.ts` | Browser-safe session list sort values, normalization, and display names | no |

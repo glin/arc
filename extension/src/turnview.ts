@@ -1,4 +1,5 @@
 import { DRAFT_SESSION_PREFIX, normalizeSessionLabels, sweepDraftLabels } from './turnlabels';
+import { PROMPT_TEXT_CHARS } from './domain/prompt-text.ts';
 import { normalizeSavedViews, type SavedView } from './domain/views.ts';
 import { normalizeRailSort, type RailSort } from './domain/rail-sort.ts';
 import {
@@ -401,7 +402,9 @@ export function normalizeRailFolds(raw: unknown): Record<string, boolean> {
 
 // Maximum stored draft length in characters.
 // Drop oversized drafts rather than silently restoring a truncated prompt.
-export const DRAFT_TEXT_LIMIT = 20000;
+export const DRAFT_TEXT_LIMIT = PROMPT_TEXT_CHARS;
+export const DRAFT_BOOK_CHARS = SESSION_LIMIT * 20_000;
+export const QUEUED_TEXT_CHARS = 64 * 20_000;
 // Maximum prompt length offered by Up-arrow history.
 // `promptHistory` and `promptsAcross` exclude longer transcript and panel-submitted prompts.
 // `normalizeSentPrompts` applies the same limit to stored submissions.
@@ -426,6 +429,7 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
       continue;
     }
     const entries: QueuedSubmission[] = [];
+    let textChars = 0;
     const ids = new Set<string>();
     let precedingReset = '';
     for (const [index, rawEntry] of value.slice(-QUEUED_SUBMISSION_LIMIT).entries()) {
@@ -438,7 +442,10 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
       if (!entry) {
         continue;
       }
-      const text = typeof entry.text === 'string' && entry.text.length <= DRAFT_TEXT_LIMIT ? entry.text.trim() : '';
+      // Keep every admitted prompt whole. Admission refuses a book that would lose an entry.
+      if (typeof entry.text === 'string' && entry.text.length > DRAFT_TEXT_LIMIT) continue;
+      const text = typeof entry.text === 'string' ? entry.text.trim() : '';
+      if (textChars + text.length > QUEUED_TEXT_CHARS) continue;
       const id = typeof entry.id === 'string' && QUEUED_SUBMISSION_ID.test(entry.id) ? entry.id : '';
       if (!id || ids.has(id)) {
         continue;
@@ -601,6 +608,7 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
         delivery,
         ...(typeof entry.recoveryId === 'string' ? { recoveryId: entry.recoveryId } : {}),
       });
+      textChars += text.length;
       if (delivery.phase === 'queued' && delivery.resetId && !delivery.barrier) {
         precedingReset = delivery.resetId;
       } else if (
@@ -644,7 +652,10 @@ export function queuedSubmissionBookFits(
   }
   return expected.every(([session, entries]) => {
     const kept = normalized[session];
-    return kept?.length === entries.length && entries.every((entry, index) => kept[index]?.id === entry.id);
+    return (
+      kept?.length === entries.length &&
+      entries.every((entry, index) => kept[index]?.id === entry.id && kept[index]?.text === entry.text.trim())
+    );
   });
 }
 
@@ -675,9 +686,14 @@ export function normalizeDrafts(raw: unknown): Record<string, string> {
   const held = Object.entries(src).filter(
     ([, text]) => typeof text === 'string' && text !== '' && text.length <= DRAFT_TEXT_LIMIT,
   );
-  for (const [id, text] of held.slice(Math.max(0, held.length - SESSION_LIMIT))) {
-    out[id] = text as string;
+  let textChars = 0;
+  const kept: [string, string][] = [];
+  for (const [id, text] of held.slice(Math.max(0, held.length - SESSION_LIMIT)).reverse()) {
+    if (textChars + (text as string).length > DRAFT_BOOK_CHARS) continue;
+    textChars += (text as string).length;
+    kept.push([id, text as string]);
   }
+  for (const [id, text] of kept.reverse()) out[id] = text;
   return out;
 }
 

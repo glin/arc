@@ -4720,6 +4720,7 @@ export class PanelProvider implements vscode.Disposable {
     if (text === '' && clearing?.session === session && (this.draftRevisions?.get(session) ?? 0) > clearing.revision)
       return false;
     const moved = hasUnsentPrompt(this.drafts[session]) !== hasUnsentPrompt(text);
+    delete this.drafts[session];
     this.drafts[session] = text;
     // Reset displayed text with the saved draft. `setDraft` overrides this copy during history navigation.
     this.boxText[session] = text;
@@ -4999,7 +5000,15 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       if (recoveryId) restored.recoveryId = recoveryId;
-      this.queues[state.sessionId] = state.queued.map((entry) => (entry === recovery ? restored : entry));
+      const queued = state.queued.map((entry) => (entry === recovery ? restored : entry));
+      if (!queuedSubmissionBookFits(this.queues, state.sessionId, queued)) {
+        void vscode.window.showInformationMessage(
+          'Arc: the waiting queue cannot retain this prompt. Drop a waiting prompt or shorten this one.',
+        );
+        void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+        return;
+      }
+      this.queues[state.sessionId] = queued;
       this.holdDraft(state.sessionId, '');
       this.releaseSubmittedCommentClaims(state);
       if (heldAssets.length) {
@@ -5822,6 +5831,16 @@ export class PanelProvider implements vscode.Disposable {
     }
     const swap = queueEdit(state.queued, id, replacement ?? null);
     if (!swap) {
+      this.flushQueue(queueSession);
+      return;
+    }
+    if (!queuedSubmissionBookFits(this.queues, state.sessionId, swap.queued)) {
+      void this.sendToHost(host, {
+        type: 'restoreDraft',
+        session: offered.browserSession,
+        text: state.draft,
+        revision: currentRevision,
+      });
       this.flushQueue(queueSession);
       return;
     }

@@ -924,6 +924,7 @@ import {
   DRAFT_TEXT_LIMIT,
   hasUnsentPrompt,
   normalizeQueuedSubmissions,
+  queuedSubmissionBookFits,
   normalizeDrafts,
   pickShowing,
   emptyTimeline,
@@ -10239,8 +10240,9 @@ test('rejected sends and queued edits reply to the retained browser identity', a
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
+    'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission);
+  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
   const dequeue = new Function(
     'queuedSubmission',
     'queueWithout',
@@ -10320,7 +10322,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
   requestQueuedEdit.call(adoptedRejected, 'adopted-too-long', 'provisional', 19, adoptedHost, 'provisional');
   rememberSessionAlias(adoptedRejected.sessionAliases, 'provisional', 'durable');
   adoptedRejected.queues.durable = adoptedRejected.queues.provisional;
-  adoptedRejected.drafts.durable = 'x'.repeat(20_001);
+  adoptedRejected.drafts.durable = 'x'.repeat(DRAFT_TEXT_LIMIT + 1);
   delete adoptedRejected.queues.provisional;
   delete adoptedRejected.drafts.provisional;
   acceptQueuedEdit.call(adoptedRejected, 'adopted-too-long', 'durable', 19, 20, true, adoptedHost);
@@ -10329,7 +10331,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
     {
       type: 'restoreDraft',
       session: 'provisional',
-      text: 'x'.repeat(20_001),
+      text: 'x'.repeat(DRAFT_TEXT_LIMIT + 1),
       revision: 20,
     },
     'a rejected queued edit after adoption did not restore the retained provisional composer',
@@ -10338,7 +10340,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
   const oversized = {
     ...edited,
     queues: { durable: [{ id: 'too-long', text: 'waiting', assets: [], commentIds: [] }] },
-    drafts: { durable: 'x'.repeat(20_001) },
+    drafts: { durable: 'x'.repeat(DRAFT_TEXT_LIMIT + 1) },
     queuedEditOffers: new Map(),
     queuedEditReservations: new Set(),
     sessionAliases: new Map(),
@@ -10381,8 +10383,9 @@ test('a queued edit keeps a newer draft written from another panel', () => {
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
+    'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission);
+  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
   const setDraft = new Function(
     'hasUnsentPrompt',
     `return function (text, keep, session) {\n${methodBody('private setDraft(')}\n};`,
@@ -10459,7 +10462,7 @@ test('a queued edit keeps a newer draft written from another panel', () => {
   provider.boxText.s1 = 'small draft';
   provider.posted = [];
   requestQueuedEdit.call(provider, 'q2', 's1', 20, panelA);
-  const oversized = 'x'.repeat(20_001);
+  const oversized = 'x'.repeat(DRAFT_TEXT_LIMIT + 1);
   setDraft.call(provider, oversized, oversized, 's1');
   acceptQueuedEdit.call(provider, 'q2', 's1', 20, 21, true, panelA);
   assert.equal(provider.drafts.s1, oversized);
@@ -10498,8 +10501,9 @@ test('a queued edit retains an attachment that finishes after the offer', () => 
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
+    'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission);
+  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
   const lateAsset = {
     id: '00000000-0000-4000-8000-000000000001',
     name: 'late.txt',
@@ -10582,8 +10586,9 @@ test('releasing a rejected or abandoned queued edit resumes eligible delivery', 
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
+    'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission);
+  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
   const flushQueue = extractedFlushQueue();
   const delivered: string[] = [];
   const provider = {
@@ -16723,6 +16728,128 @@ function queueRecoveryProvider(comments: ReturnType<typeof applyComment> = []) {
   });
   return { provider, writes };
 }
+
+test.each(['queued edit', 'reset recovery'])(
+  'PanelProvider refuses an overflowing %s without losing persisted prompts or active draft ownership',
+  async (route) => {
+    const editorWindow = vscode.window as unknown as Record<string, unknown>;
+    const originalNotice = editorWindow.showInformationMessage;
+    editorWindow.showInformationMessage = () => Promise.resolve();
+    try {
+      const source = 'source';
+      const comment = {
+        id: 'active-comment',
+        sessionId: source,
+        turnKey: 'source:1',
+        part: 'summary' as const,
+        quote: '',
+        note: 'active draft comment',
+        headline: 'Source turn',
+        sessionTitle: 'Source',
+        turnAt: 1,
+        at: 2,
+      };
+      const asset = {
+        id: '12345678-1234-4123-8123-123456789abc',
+        name: 'diagram.png',
+        mime: 'image/png',
+        size: 4,
+        digest: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+      };
+      const { provider, writes } = queueRecoveryProvider([comment]);
+      const sent = vi.fn<() => Promise<{ delivered: boolean; reason: string; session: string }>>(async () => ({
+        delivered: true,
+        reason: '',
+        session: source,
+      }));
+      provider.onSendPrompt = sent;
+      provider.running.add('codex:' + source);
+      provider.assets[source] = [asset];
+      provider.draftCommentIds[source] = [comment.id];
+      const activeText = 'a'.repeat(route === 'queued edit' ? DRAFT_TEXT_LIMIT : 100_000);
+      provider.drafts[source] = activeText;
+      provider.boxText[source] = activeText;
+      provider.queues[source] = queueSubmissionAfter(
+        queueSubmissionAfter(
+          queueSubmissionAfter([], 'short', 's'.repeat(10), [], [], 1, false, { agent: 'codex', owner: source }),
+          'long',
+          'l'.repeat(DRAFT_TEXT_LIMIT),
+          ['queued-comment'],
+          [asset],
+          2,
+          false,
+          { agent: 'codex', owner: source },
+        ),
+        'tail',
+        't'.repeat(200_000),
+        [],
+        [],
+        3,
+        false,
+        { agent: 'codex', owner: source },
+      ).map((entry) => ({ ...entry, recoveryId: `submission-${entry.id}` }));
+      if (route === 'reset recovery') {
+        provider.queues[source][0] = {
+          ...provider.queues[source][0],
+          text: '',
+          delivery: { phase: 'draft-recovery', owner: source, source, resetId: 'short' },
+        };
+        for (const entry of provider.queues[source].slice(1)) entry.delivery.barrier = 'short';
+      }
+      await provider.writeDrafts();
+      const originalQueue = structuredClone(provider.queues[source]);
+      const originalSaved = structuredClone(provider.saved);
+      const posted: unknown[] = [];
+      provider.post = (message: unknown) => {
+        posted.push(message);
+        return Promise.resolve();
+      };
+      provider.sendToHost = (_host: unknown, message: unknown) => {
+        posted.push(message);
+        return Promise.resolve(true);
+      };
+      if (route === 'queued edit') {
+        const host = {};
+        provider.requestQueuedEdit('short', source, 4, host, 'browser-source');
+        assert.equal(provider.queuedEditReservations.has('short'), true);
+        provider.acceptQueuedEdit('short', source, 4, 5, true, host);
+      } else {
+        provider.sendPrompt(
+          activeText,
+          source,
+          5,
+          'browser-source',
+          undefined,
+          undefined,
+          undefined,
+          'edited-submission',
+        );
+      }
+      // Persist while delivery is blocked, then read the saved state as a reload does.
+      await provider.writeDrafts();
+      const reloaded = normalizePanelState(writes.at(-1));
+      assert.deepEqual(reloaded.queues?.[source], originalSaved.queues[source], 'reload lost an admitted submission');
+      assert.deepEqual(provider.queues[source], originalQueue, 'the refused replacement changed an admitted prompt');
+      assert.equal(provider.drafts[source], activeText);
+      assert.equal(provider.boxText[source], activeText);
+      assert.equal(reloaded.drafts?.[source], activeText);
+      assert.deepEqual(provider.assets[source], [asset]);
+      assert.deepEqual(reloaded.assets?.[source], [asset]);
+      assert.deepEqual(provider.draftCommentIds[source], [comment.id]);
+      assert.deepEqual(reloaded.draftCommentIds?.[source], [comment.id]);
+      assert.deepEqual(reloaded.comments, originalSaved.comments);
+      assert.deepEqual(posted.at(-1), {
+        type: 'restoreDraft',
+        session: 'browser-source',
+        text: activeText,
+        revision: 5,
+      });
+      assert.equal(sent.mock.calls.length, 0, 'a refused replacement reached the agent');
+    } finally {
+      editorWindow.showInformationMessage = originalNotice;
+    }
+  },
+);
 
 test('PanelProvider uses production successor movement and retries a refused successor payload once', async () => {
   const source = 'source';
@@ -24000,6 +24127,29 @@ async function claudeBehindPanel() {
   const sentTexts = () => written.filter((line) => line.type === 'user').map((line) => line.message.content[0].text);
   return { provider, say, type, sentTexts };
 }
+
+test('a long prompt reaches the Claude child through host submission and retains exact recovery text', async () => {
+  const { provider, type, sentTexts } = await claudeBehindPanel();
+  const text = '  first prompt\n' + 'long line\n'.repeat(10_000) + '  ';
+  await type(text);
+  await vi.waitFor(() => assert.deepEqual(sentTexts(), [text.trim()]));
+  assert.equal(provider.saved.submittedPrompts[0].text, text);
+  await vi.waitFor(() => assert.equal(provider.saved.submittedPrompts[0].accepted, true));
+});
+
+test('typing into an existing session protects its draft at the total storage limit', async () => {
+  const { provider } = queueRecoveryProvider();
+  provider.drafts = {
+    source: 'old draft',
+    ...Object.fromEntries(Array.from({ length: 10 }, (_, index) => [`large-${index}`, 'x'.repeat(1024 * 1024)])),
+  };
+  const prefix = '  newly edited prompt\n';
+  const text = prefix + 'x'.repeat(DRAFT_TEXT_LIMIT - prefix.length);
+  provider.holdDraft('source', text, true);
+  await provider.writeDrafts();
+  assert.equal(provider.saved.drafts.source, text);
+  assert.equal(provider.saved.drafts['large-0'], undefined);
+});
 
 test.each(['after', 'before'])(
   'a /compact typed %s joined Claude work completes reaches the child once',

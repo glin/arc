@@ -58,6 +58,7 @@ import {
   formatWhen,
   headLabel,
   DRAFT_TEXT_LIMIT,
+  QUEUED_TEXT_CHARS,
   NEEDS_INPUT,
   NextTurnBasis,
   noteName,
@@ -2858,7 +2859,11 @@ export function queueSubmissionAfter(
   heldForClear = false,
   ownership?: { agent: string; owner: string },
 ): QueuedSubmission[] {
-  if (queued.length >= QUEUED_SUBMISSION_LIMIT || text.trim().length > DRAFT_TEXT_LIMIT) {
+  if (
+    queued.length >= QUEUED_SUBMISSION_LIMIT ||
+    text.trim().length > DRAFT_TEXT_LIMIT ||
+    queued.reduce((sum, entry) => sum + entry.text.length, 0) + text.trim().length > QUEUED_TEXT_CHARS
+  ) {
     return [...queued];
   }
   const claimed = new Set(queued.flatMap((entry) => entry.commentIds));

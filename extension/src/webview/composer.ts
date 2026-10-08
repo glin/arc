@@ -89,6 +89,7 @@ interface ComposerOptions {
     ): void;
   };
   sendToHost(message: PanelToHost): void;
+  submissionNotice(session: string, words: string | null): void;
   isFileStaging(session: string | null): boolean;
   platform: string;
   hasLocalComments(session: string | null): boolean;
@@ -1590,10 +1591,13 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       try {
         attempt = options.recovery.submit(aim, next, prompt.value, view.recoverySetup);
       } catch (error) {
-        walkAnnouncer.textContent =
-          error instanceof Error ? error.message : 'This prompt could not be saved. Copy it before trying again.';
+        options.submissionNotice(
+          aim,
+          error instanceof Error ? error.message : 'This prompt could not be saved. Copy it before trying again.',
+        );
         return false;
       }
+      options.submissionNotice(aim, null);
       options.sendToHost({ type: 'sendPrompt', text: prompt.value, session: aim, revision: next, attempt });
       drafts.set(aim, '');
       setPromptValue('');

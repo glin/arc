@@ -717,6 +717,9 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     sendToHost(message) {
       vscode.postMessage(message);
     },
+    submissionNotice(session, words) {
+      attachmentRenderer.submissionNotice(session, words);
+    },
     isFileStaging(session) {
       return attachmentRenderer && attachmentRenderer.isStaging(session);
     },

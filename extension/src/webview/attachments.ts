@@ -17,6 +17,7 @@ interface AttachmentOptions {
 
 export interface AttachmentRenderer {
   update(view: ComposerView | null): void;
+  submissionNotice(session: string, words: string | null): void;
   isStaging(session: string | null): boolean;
   pendingLabel(session: string): string;
   staging(session: string, pending: boolean, token: string): void;
@@ -95,6 +96,7 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
   let serial = 0;
   let dropDepth = 0;
   let current: ComposerView | null = null;
+  let submissionNotice: { session: string; words: string } | null = null;
   let pendingRemoval: { session: string; id: string; index: number; control: HTMLButtonElement } | null = null;
 
   const isStaging = (session: string | null): boolean => !!session && (sessions.get(session)?.size ?? 0) > 0;
@@ -159,7 +161,15 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
       }
       pendingRemoval = null;
     }
-    render(h(Notice, { words: current?.notice ?? null }), options.noticeMount);
+    render(
+      h(Notice, {
+        words:
+          submissionNotice && submissionNotice.session === current?.sessionId
+            ? submissionNotice.words
+            : (current?.notice ?? null),
+      }),
+      options.noticeMount,
+    );
   };
   const fileDrag = (event: DragEvent): boolean => Array.from(event.dataTransfer?.types ?? []).includes('Files');
   const clearDrop = () => {
@@ -250,6 +260,12 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
       event.preventDefault();
     }
   });
+  options.prompt.addEventListener('input', () => {
+    if (submissionNotice) {
+      submissionNotice = null;
+      redraw();
+    }
+  });
   options.composer.addEventListener('dragenter', (event) => {
     if (!fileDrag(event)) {
       return;
@@ -283,7 +299,12 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
 
   return {
     update(view) {
+      if (view?.sessionId !== current?.sessionId) submissionNotice = null;
       current = view;
+      redraw();
+    },
+    submissionNotice(session, words) {
+      submissionNotice = words ? { session, words } : null;
       redraw();
     },
     isStaging,

@@ -1,5 +1,6 @@
 import type { BrowserStatePort, PanelHost } from './host.ts';
 import type { SessionProfile } from '../view/launcher.ts';
+import { PROMPT_TEXT_CHARS } from '../domain/prompt-text.ts';
 
 export interface SubmittedPrompt {
   id: string;
@@ -14,7 +15,7 @@ export interface SubmittedPrompt {
 }
 
 export const SUBMITTED_PROMPT_LIMIT = 5;
-export const SUBMITTED_PROMPT_CHARS = 20_000;
+export const SUBMITTED_PROMPT_CHARS = PROMPT_TEXT_CHARS;
 
 export function mergeSubmittedPrompts(...snapshots: unknown[]): SubmittedPrompt[] {
   const entries = new Map<string, SubmittedPrompt>();
@@ -213,7 +214,7 @@ export function createSavedState(
     recovery: () => recovery.slice(),
     submit(source, revision, text, setup) {
       if (text.length > SUBMITTED_PROMPT_CHARS)
-        throw new Error('This prompt exceeds the 20,000-character recovery limit. Shorten it before sending.');
+        throw new Error('This prompt exceeds 1,048,576 characters. Shorten it before sending.');
       const order = (recovery.at(-1)?.order ?? 0) + 1;
       if (!Number.isSafeInteger(order)) throw new Error('This prompt could not be saved. Copy it before trying again.');
       const attempt = {

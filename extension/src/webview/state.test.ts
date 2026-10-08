@@ -4,6 +4,7 @@ import type { BrowserStatePort, PanelHost } from './host.ts';
 import { createReadState } from './read-state.ts';
 import {
   createSavedState,
+  SUBMITTED_PROMPT_CHARS,
   mergeSubmittedPrompts,
   type SubmittedPrompt,
   type SavedPanelState,
@@ -257,7 +258,7 @@ test('submitted recovery retains repeated exact multiline text through fresh pag
     },
   };
   const owner = createSavedState(undefined, port, { send() {} });
-  for (const size of [4001, 20000]) {
+  for (const size of [4001, 97_199, SUBMITTED_PROMPT_CHARS]) {
     const text = '  \n' + 'x'.repeat(size - 5) + '\n ';
     const first = owner.submit('draft:claude', 1, text);
     const second = owner.submit('draft:codex', 2, text);
@@ -272,8 +273,8 @@ test('submitted recovery retains repeated exact multiline text through fresh pag
       [text, text],
     );
   }
-  assert.throws(() => owner.submit('draft:claude', 3, 'x'.repeat(20001)), /20,000/);
-  assert.equal(owner.recovery().length, 4);
+  assert.throws(() => owner.submit('draft:claude', 3, 'x'.repeat(SUBMITTED_PROMPT_CHARS + 1)), /1,048,576/);
+  assert.equal(owner.recovery().length, 5);
   const exhausted = createSavedState({ submittedPrompts: [submission('last', Number.MAX_SAFE_INTEGER)] }, port, {
     send() {},
   });
