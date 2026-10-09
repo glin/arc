@@ -1421,6 +1421,7 @@ test('a same-prefix rollout rewrite drops its stale dispatch cursor', () => {
     commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'launch', { stdout: DISPATCH_RECEIPT }),
   ];
   const file = writeRollout(records);
+  fs.utimesSync(file, 1_700_000_000, 1_700_000_000);
   const first = scanCodexDispatchReferences(file, 'parent');
   assert.equal(first.references.length, 1);
   const replacement =
@@ -1430,6 +1431,7 @@ test('a same-prefix rollout rewrite drops its stale dispatch cursor', () => {
       .replace(CLAUDE_SESSION, '00000000-0000-0000-0000-000000000000') + '\n';
   assert.equal(Buffer.byteLength(replacement), fs.statSync(file).size);
   fs.writeFileSync(file, replacement);
+  fs.utimesSync(file, 1_700_000_001, 1_700_000_001);
   const invalidated = scanCodexDispatchReferences(file, 'parent', first.cursor);
   assert.equal(invalidated.reset, true);
   const rewritten = scanCodexDispatchReferences(file, 'parent', invalidated.cursor);

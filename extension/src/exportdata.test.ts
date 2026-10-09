@@ -955,3 +955,46 @@ test('strong graph recheck rejects an interior rewrite with restored size and mt
     await assert.rejects(capture.recheck(), /changed during export/);
   });
 });
+
+test('capturing a Codex parent includes its recorded background review on the owning turn without unrelated review text', async () => {
+  for (const threadSource of ['guardian_review', 'subagent']) {
+    const f = fixture();
+    const root = f.codexSession(CODEX_ID, undefined, codexTurn('parent'));
+    const child = f.codexSession(NATIVE_CODEX_ID, CODEX_ID, codexTurn('review', 1));
+    const records = fs
+      .readFileSync(child, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    records[0].timestamp = at(1);
+    records[0].payload = {
+      ...records[0].payload,
+      parent_thread_id: CODEX_ID,
+      source: { subagent: { other: 'guardian' } },
+      thread_source: threadSource,
+    };
+    f.write(child, records);
+    f.codexSession('unrelated', 'different-parent', codexTurn('PRIVATE UNRELATED REVIEW'));
+    const result = await withExportTransaction(f.output, (writer) =>
+      completeSessionExport(
+        writer,
+        { ...f.options, root: { ...f.options.root, agent: 'codex', file: root, sessionId: CODEX_ID } },
+        (capture, transaction) => projectSessionSite(capture.model, transaction, { script: '', stylesheet: '' }),
+      ),
+    );
+    const data = exportedSiteData(result.directory);
+    assert.equal(data.manifest.sessions.length, 2);
+    const edge = data.manifest.relationships.find((edge) => edge.kind === 'subagent')!;
+    assert.ok(edge.to);
+    assert.ok(edge.turn);
+    const card = [...data.data.values()]
+      .map((value) => value as { card?: import('./webview/payload-contracts').CardView })
+      .find((value) => value.card?.key === edge.turn)!.card!;
+    assert.equal(card.agents?.length, 1);
+    assert.equal(card.agents?.[0].description, 'Background review');
+    assert.equal(card.agents?.[0].sessionId, edge.to);
+    const artifact = await artifactText(result.directory);
+    assert.ok(artifact.text.includes('answer review'));
+    assert.ok(artifact.text.every((text) => !text.includes('PRIVATE UNRELATED REVIEW')));
+  }
+});

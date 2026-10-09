@@ -1,4 +1,4 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -156,4 +156,135 @@ test('cancellation between HTML chunks stops writing and removes owned staging',
     ExportCancelled,
   );
   assert.deepEqual(fs.readdirSync(parent), []);
+});
+
+test('a temporary spool lock recovers before atomic publication without staging private pages beside the destination', async () => {
+  const parent = tempDir('export-writer-lock-');
+  const original = fs.promises.unlink;
+  let attempts = 0;
+  let spoolDirectory = '';
+  const unlink = vi.spyOn(fs.promises, 'unlink').mockImplementation(async (file) => {
+    if (path.basename(String(file)).startsWith('s-')) {
+      spoolDirectory = path.dirname(String(file));
+      if (++attempts <= 2) throw Object.assign(new Error('locked spool'), { code: 'EBUSY' });
+    }
+    return original(file);
+  });
+  vi.useFakeTimers();
+  try {
+    const operation = withExportTransaction(parent, async (writer) => {
+      await writer.spool({ private: 'recorded body' });
+      assert.deepEqual(fs.readdirSync(writer.staging), []);
+      await writer.writeIndexChunks(
+        (async function* () {
+          yield 'complete';
+        })(),
+      );
+      return writer.publish(async () => {});
+    });
+    let completed = false;
+    void operation.then(
+      () => {
+        completed = true;
+      },
+      () => {
+        completed = true;
+      },
+    );
+    await vi.waitFor(() => assert.ok(completed));
+    const result = await operation;
+    assert.equal(attempts, 3);
+    assert.equal(fs.readFileSync(result.index, 'utf8'), 'complete');
+    assert.deepEqual(fs.readdirSync(result.directory), ['index.html']);
+    assert.notEqual(path.dirname(spoolDirectory), parent);
+    assert.equal(fs.existsSync(spoolDirectory), false);
+  } finally {
+    vi.useRealTimers();
+    unlink.mockRestore();
+  }
+});
+
+for (const failure of ['persistent', 'cancel', 'replaced'] as const) {
+  test(`a ${failure} spool lock prevents publication and preserves the original outcome`, async () => {
+    const parent = tempDir('export-writer-lock-');
+    const original = fs.promises.unlink;
+    const controller = new AbortController();
+    let attempts = 0;
+    let writer: ExportTransaction | undefined;
+    let replacedFile = '';
+    const unlink = vi.spyOn(fs.promises, 'unlink').mockImplementation(async (file) => {
+      if (path.basename(String(file)).startsWith('s-')) {
+        attempts++;
+        if (failure === 'cancel') controller.abort();
+        if (failure === 'replaced') {
+          replacedFile = String(file);
+          fs.writeFileSync(replacedFile, 'external replacement');
+        }
+        throw Object.assign(new Error('locked spool'), { code: 'EBUSY' });
+      }
+      return original(file);
+    });
+    vi.useFakeTimers();
+    try {
+      writer = await ExportTransaction.create(parent, controller.signal);
+      await writer.spool({ private: 'body' });
+      await writer.writeIndexChunks(
+        (async function* () {
+          yield 'complete';
+        })(),
+      );
+      let observed: unknown;
+      let completed = false;
+      const publishing = writer
+        .publish(async () => {})
+        .then(
+          () => {
+            completed = true;
+          },
+          (error) => {
+            observed = error;
+            completed = true;
+          },
+        );
+      await vi.waitFor(() => assert.ok(completed));
+      await publishing;
+      assert.ok(observed instanceof Error);
+      if (failure === 'cancel') assert.ok(observed instanceof ExportCancelled);
+      else assert.match(observed.message, failure === 'replaced' ? /export file changed/ : /locked spool/);
+      assert.equal(attempts, failure === 'persistent' ? 4 : 1);
+      assert.ok(fs.readdirSync(parent).every((name) => name.startsWith('.arc-export-')));
+    } finally {
+      vi.useRealTimers();
+      unlink.mockRestore();
+      if (failure !== 'replaced') await writer?.dispose();
+      else if (writer && replacedFile) {
+        fs.unlinkSync(replacedFile);
+        fs.rmdirSync(path.dirname(replacedFile));
+        fs.unlinkSync(path.join(writer.staging, 'index.html'));
+        fs.rmdirSync(writer.staging);
+      }
+    }
+  });
+}
+
+test('cleanup locks never replace a source failure with a cleanup failure', async () => {
+  const parent = tempDir('export-writer-lock-');
+  let writer: ExportTransaction | undefined;
+  const sourceError = new Error('source unavailable');
+  const unlink = vi
+    .spyOn(fs.promises, 'unlink')
+    .mockRejectedValue(Object.assign(new Error('cleanup locked'), { code: 'EIO' }));
+  try {
+    await assert.rejects(
+      withExportTransaction(parent, async (transaction) => {
+        writer = transaction;
+        await writer.spool({ body: 'private' });
+        throw sourceError;
+      }),
+      (error) => error === sourceError,
+    );
+  } finally {
+    unlink.mockRestore();
+    await writer?.dispose();
+  }
 });

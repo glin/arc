@@ -1,4 +1,5 @@
-import * as fs from 'node:fs/promises';
+import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits';
@@ -38,6 +39,7 @@ export class ExportTransaction {
   private files = new Map<string, OwnedFile>();
   private sequence = 0;
   private published = false;
+  private spools: { directory: string; identity: Identity } | undefined;
   private constructor(
     readonly staging: string,
     private readonly identity: Identity,
@@ -58,7 +60,11 @@ export class ExportTransaction {
 
   private async check(): Promise<void> {
     checkExportCancellation(this.signal);
-    if (this.published || !(await ownedDirectory(this.staging, this.identity))) {
+    if (
+      this.published ||
+      !(await ownedDirectory(this.staging, this.identity)) ||
+      (this.spools && !(await ownedDirectory(this.spools.directory, this.spools.identity)))
+    ) {
       throw new Error('The export folder changed.');
     }
   }
@@ -105,6 +111,10 @@ export class ExportTransaction {
     await this.check();
     // Spools contain one admitted semantic page and never enter the published directory.
     const text = JSON.stringify(page);
+    if (!this.spools) {
+      const directory = await fs.mkdtemp(path.join(tmpdir(), 'arc-export-pages-'));
+      this.spools = { directory, identity: fileIdentity(await fs.lstat(directory)) };
+    }
     return this.write(`s-${(++this.sequence).toString(36)}.json`, text, EXPORT_LIMITS.pageBytes * 8);
   }
 
@@ -128,7 +138,7 @@ export class ExportTransaction {
     await this.check();
     const size = typeof bytes === 'string' ? Buffer.byteLength(bytes) : bytes.byteLength;
     if (size > limit) throw new ExportLimitError('asset', limit);
-    const file = path.join(this.staging, key);
+    const file = path.join(key.startsWith('s-') ? this.spools!.directory : this.staging, key);
     const handle = await fs.open(file, 'wx');
     this.files.set(key, { file, ...fileIdentity(await handle.stat()) });
     try {
@@ -154,31 +164,63 @@ export class ExportTransaction {
     return key;
   }
 
-  private async removeFile(key: string): Promise<void> {
-    const owned = this.files.get(key)!;
-    if (!(await ownedDirectory(this.staging, this.identity))) throw new Error('The export folder changed.');
-    const stat = await fs.lstat(owned.file);
-    if (
-      stat.isSymbolicLink() ||
-      !sameIdentity(stat, owned) ||
-      stat.size !== owned.size ||
-      stat.mtimeMs !== owned.mtimeMs
-    ) {
-      throw new Error('The export file changed.');
+  private async retryRemoval(operation: () => Promise<void>, signal?: AbortSignal): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      checkExportCancellation(signal);
+      try {
+        await operation();
+        return;
+      } catch (error) {
+        if (
+          attempt === 3 ||
+          !['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')
+        )
+          throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+      }
     }
-    await fs.unlink(owned.file);
+  }
+
+  private async removeFile(key: string, signal?: AbortSignal): Promise<void> {
+    const owned = this.files.get(key)!;
+    const directory = key.startsWith('s-') ? this.spools!.directory : this.staging;
+    const identity = key.startsWith('s-') ? this.spools!.identity : this.identity;
+    await this.retryRemoval(async () => {
+      if (!(await ownedDirectory(directory, identity))) throw new Error('The export folder changed.');
+      const stat = await fs.lstat(owned.file);
+      if (
+        stat.isSymbolicLink() ||
+        !sameIdentity(stat, owned) ||
+        stat.size !== owned.size ||
+        stat.mtimeMs !== owned.mtimeMs
+      )
+        throw new Error('The export file changed.');
+      await fs.unlink(owned.file);
+    }, signal);
     this.files.delete(key);
+  }
+
+  private async removeSpools(signal?: AbortSignal): Promise<void> {
+    for (const key of [...this.files.keys()]) if (key.startsWith('s-')) await this.removeFile(key, signal);
+    if (!this.spools) return;
+    const { directory, identity } = this.spools;
+    await this.retryRemoval(async () => {
+      if (!(await ownedDirectory(directory, identity))) throw new Error('The export folder changed.');
+      await fs.rmdir(directory);
+    }, signal);
+    this.spools = undefined;
   }
 
   async reset(): Promise<void> {
     await this.check();
-    for (const key of [...this.files.keys()]) await this.removeFile(key);
+    for (const key of [...this.files.keys()]) await this.removeFile(key, this.signal);
+    await this.removeSpools(this.signal);
   }
 
   async publish(recheck: () => Promise<void>): Promise<{ directory: string; index: string }> {
     await this.check();
     if (!this.files.has('index.html')) throw new Error('The export page is unavailable.');
-    for (const key of [...this.files.keys()]) if (key.startsWith('s-')) await this.removeFile(key);
+    await this.removeSpools(this.signal);
     await recheck();
     await this.check();
     // An exclusive reservation owns the publication parent on platforms whose rename replaces empty directories.
@@ -210,9 +252,13 @@ export class ExportTransaction {
   }
 
   async dispose(): Promise<void> {
+    await this.removeSpools();
     if (this.published || !(await ownedDirectory(this.staging, this.identity))) return;
     for (const key of [...this.files.keys()]) await this.removeFile(key);
-    await fs.rmdir(this.staging);
+    await this.retryRemoval(async () => {
+      if (!(await ownedDirectory(this.staging, this.identity))) throw new Error('The export folder changed.');
+      await fs.rmdir(this.staging);
+    });
   }
 }
 
@@ -223,9 +269,14 @@ export async function withExportTransaction<T>(
   assetBytes?: number,
 ): Promise<T> {
   const writer = await ExportTransaction.create(parent, signal, assetBytes);
+  let failed = false;
   try {
     return await operation(writer);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    await writer.dispose();
+    if (failed) await writer.dispose().catch(() => {});
+    else await writer.dispose();
   }
 }

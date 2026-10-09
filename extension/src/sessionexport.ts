@@ -1,4 +1,5 @@
 import type { SessionFile } from './transcript';
+import { shortenTo } from './domain/text';
 import type { ExportCaptureOptions } from './exportdata';
 import { completeSessionExport } from './exportdata';
 import { packagedExportAssets } from './exportassets';
@@ -39,16 +40,17 @@ export async function exportSavedSession(
   options: Omit<ExportCaptureOptions, 'root' | 'signal' | 'progress'>,
   ports: SessionExportPorts,
 ): Promise<void> {
+  const displayTitle = shortenTo(title.replace(/\s+/g, ' ').trim(), 80, '...');
   if (!source) {
-    ports.failed(`Arc: ${title} is unavailable or ambiguous.`);
+    ports.failed(`Arc: ${displayTitle} is unavailable or ambiguous.`);
     return;
   }
   const root = { ...source };
   try {
-    if (!(await ports.confirm(`Export ${title} as HTML?`, EXPORT_CONFIRMATION))) return;
+    if (!(await ports.confirm(`Export ${displayTitle} as HTML?`, EXPORT_CONFIRMATION))) return;
     const destination = await ports.chooseFolder();
     if (!destination) return;
-    const result = await ports.progress(`Exporting ${title}`, (signal, report) =>
+    const result = await ports.progress(`Exporting ${displayTitle}`, (signal, report) =>
       ports.write(destination, {
         ...options,
         root,
@@ -59,13 +61,15 @@ export async function exportSavedSession(
       }),
     );
     try {
-      await ports.completed(title, result.index);
+      await ports.completed(displayTitle, result.index);
     } catch {
-      ports.failed(`Arc: ${title} was exported but did not open.`);
+      ports.failed(`Arc: ${displayTitle} was exported but did not open.`);
     }
   } catch (error) {
     if (!(error instanceof ExportCancelled))
-      ports.failed(`Arc: ${title} was not exported. ${error instanceof Error ? error.message : 'The export failed.'}`);
+      ports.failed(
+        `Arc: ${displayTitle} was not exported. ${error instanceof Error ? error.message : 'The export failed.'}`,
+      );
   }
 }
 

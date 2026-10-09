@@ -208,6 +208,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   reg('arc.unpinSession', (arg) => setSessionPinned(panel, arg, false));
   reg('arc.copySessionId', (arg) => copySessionId(panel, arg));
   reg('arc.showSessionDetails', (arg) => showSessionDetails(panel, arg));
+  reg('arc.exportSession', (arg) => {
+    const session = sessionIdFrom(arg);
+    if (session) void panel.exportSession(session);
+  });
   reg('arc.hideComposer', () => panel.setComposerHidden(true));
   reg('arc.showComposer', () => panel.setComposerHidden(false));
   // Copy the turn's rendered Markdown through the panel, without reading screen text.

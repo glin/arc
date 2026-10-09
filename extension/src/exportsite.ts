@@ -390,7 +390,7 @@ export async function projectSessionSite(
   const encode = (id: string, json: string) =>
     `<script type="application/octet-stream" id="arc-data-${id}">${Buffer.from(json).toString('base64')}</script>\n`;
   async function* documentChunks(): AsyncGenerator<string> {
-    yield `<!DOCTYPE html><html lang="en" data-theme="onedark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-${scriptHash}'; style-src 'self' 'unsafe-inline'; img-src 'none'; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'"><title>Arc session</title><link rel="stylesheet" href="./${stylesheet}"></head>${staticPageBody('Arc session', 'Review captured sessions in this read-only export.', 'Loading sessions...')}`;
+    yield `<!DOCTYPE html><html lang="en" data-theme="onedark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-${scriptHash}'; style-src 'self' 'unsafe-inline'; img-src 'none'; font-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'"><title>Arc session</title><link rel="stylesheet" href="./${stylesheet}"></head>${staticPageBody('Arc session', '', 'Loading sessions...')}`;
     for (const session of model.sessions) {
       const title = normalizeSessionTitle(session.title) ?? session.title;
       const pages: SitePage[] = [];

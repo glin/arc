@@ -111,3 +111,15 @@ test('a failed local Open preserves the completed export outcome', async () => {
   await exportSavedSession(source, 'Session name', {}, f.ports);
   assert.equal(f.calls.at(-1), 'Arc: Session name was exported but did not open.');
 });
+
+test('native export choices bound long multiline names while retaining the exact saved identity', async () => {
+  const f = fixture();
+  const title = 'Long saved title with an emoji ?? and newline\n'.repeat(100);
+  await exportSavedSession(source, title, {}, f.ports);
+  assert.ok(f.calls[0].length <= 101);
+  assert.match(f.calls[0], /\.\.\. as HTML\?$/);
+  assert.ok(!f.calls[0].includes('\n'));
+  assert.equal(f.written()?.root.sessionId, source.sessionId);
+  assert.equal(f.written()?.root.file, source.file);
+  assert.ok(f.calls.some((call) => call.startsWith('open Long saved title')));
+});

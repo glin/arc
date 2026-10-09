@@ -505,7 +505,6 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   // Retain the Timeline layout from the latest host render.
   let layout: TimelineLayout = DEFAULT_TIMELINE_LAYOUT;
   const layoutDialog = createLayoutDialog({
-    readOnly: kernel.readOnly,
     document,
     events: { document: onDocument, window: onWindow },
     layout: () => layout,
@@ -958,8 +957,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     toggleLabelEditor(id, button) {
       railRenderer.toggleLabelEditor(id, button);
     },
-    toggleLayoutDialog(gear, session) {
-      layoutDialog.toggle(gear, session);
+    toggleLayoutDialog(gear) {
+      layoutDialog.toggle(gear);
     },
     syncDetails(rows) {
       sessionDetails.sync(rows);

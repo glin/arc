@@ -267,6 +267,11 @@
         "title": "Go forward",
         "category": "Arc",
         "icon": "$(arrow-right)"
+      },
+      {
+        "command": "arc.exportSession",
+        "title": "Export session as HTML...",
+        "category": "Arc Session"
       }
     ],
     "menus": {
@@ -507,6 +512,11 @@
           "command": "arc.showComposer",
           "when": "webviewSection == 'arcComposerHidden'",
           "group": "1_composer@1"
+        },
+        {
+          "command": "arc.exportSession",
+          "when": "sessionPersisted && (webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived')",
+          "group": "zz_export@1"
         }
       ],
       "commandPalette": [
@@ -652,6 +662,10 @@
         },
         {
           "command": "arc.goForward",
+          "when": "false"
+        },
+        {
+          "command": "arc.exportSession",
           "when": "false"
         }
       ]

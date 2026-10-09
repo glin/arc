@@ -22,8 +22,8 @@ export const DEFAULT_TIMELINE_LAYOUT: TimelineLayout = { cardLayout: 'two-column
 // The words the dialog draws, and the words the Settings editor shows for each value. Reader-facing
 // copy never says chip: Compact names the setting, and the explanation names what the figures hold.
 export const TIMELINE_LAYOUT_WORDS = {
-  title: 'Timeline options',
-  hintDetail: 'Card layout, prompt position and saved-session HTML export',
+  title: 'Timeline layout',
+  hintDetail: 'How an open turn shows its subagents, commits, files and prompt',
   // The dialog's section headings.
   sections: {
     cardLayout: 'Card layout',

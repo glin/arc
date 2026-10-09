@@ -87,7 +87,7 @@ interface TimelineRendererOptions {
   filterable(): boolean;
   filterByLabel(name: string): void;
   toggleLabelEditor(sessionId: string, button: HTMLButtonElement): void;
-  toggleLayoutDialog(gear: HTMLElement, session?: string): void;
+  toggleLayoutDialog(gear: HTMLElement): void;
   syncDetails(rows: readonly SessionDetailsRow[]): void;
   footersDrawn?(nodes: readonly Node[]): void;
   setRoving(node: HTMLElement | null, controls?: HTMLElement[]): void;
@@ -663,7 +663,7 @@ function SessionHeading({
           },
           nativeMenuIcon(),
         ),
-        // Every session heading opens the shared Timeline options dialog. The dialog marks its opener expanded.
+        // Every session heading opens the shared Timeline layout dialog. The dialog marks its opener expanded.
         h(
           'button',
           {
@@ -677,10 +677,7 @@ function SessionHeading({
             'data-hint': TIMELINE_LAYOUT_WORDS.title,
             'data-hint-detail': TIMELINE_LAYOUT_WORDS.hintDetail,
             onClick(event: MouseEvent) {
-              options.toggleLayoutDialog(
-                event.currentTarget as HTMLElement,
-                session.row?.persisted === true ? session.id : undefined,
-              );
+              options.toggleLayoutDialog(event.currentTarget as HTMLElement);
             },
           },
           layoutIcon(),

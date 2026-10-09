@@ -1,4 +1,4 @@
-// One Timeline options dialog serves every session-heading gear in the panel.
+// One Timeline layout dialog serves every session-heading gear in the panel.
 // Radio rows post setLayout and reflect the latest host settings. Their labels expose native tooltips from the Settings editor.
 
 import { Fragment, h, render } from 'preact';
@@ -15,7 +15,6 @@ import type { PanelToHost } from './protocol.ts';
 export const LAYOUT_DIALOG_ID = 'layoutpop';
 
 export interface LayoutDialogOptions {
-  readOnly?: boolean;
   document: Document;
   events: {
     document(type: string, listener: EventListener, options?: boolean | AddEventListenerOptions): void;
@@ -27,7 +26,7 @@ export interface LayoutDialogOptions {
 
 export interface LayoutDialog {
   // Opens the dialog under a gear, or closes it when that gear already holds it open.
-  toggle(gear: HTMLElement, session?: string): void;
+  toggle(gear: HTMLElement): void;
   // Redraws the checked rows and the gears' expanded state after a render.
   sync(): void;
   close(returnFocus: boolean): void;
@@ -89,7 +88,6 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
   pop.setAttribute('aria-label', TIMELINE_LAYOUT_WORDS.title);
   document.body.appendChild(pop);
   let anchor: HTMLElement | null = null;
-  let exportSession: string | undefined;
 
   const draw = () => {
     render(
@@ -103,26 +101,6 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
               post: options.post,
               key: 'promptPosition',
             }),
-            exportSession && !options.readOnly
-              ? h(
-                  'div',
-                  { class: 'railfiltersection', key: 'export' },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      class: 'launchrow',
-                      'data-control': 'exportSession',
-                      onClick() {
-                        const session = exportSession!;
-                        close(true);
-                        options.post({ type: 'exportSession', session });
-                      },
-                    },
-                    'Export session as HTML...',
-                  ),
-                )
-              : null,
           ])
         : null,
       pop,
@@ -149,7 +127,6 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
     const gear = anchor;
     anchor = null;
-    exportSession = undefined;
     pop.hidden = true;
     draw();
     markGears();
@@ -158,9 +135,8 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
   };
 
-  const open = (gear: HTMLElement, session?: string) => {
+  const open = (gear: HTMLElement) => {
     anchor = gear;
-    exportSession = session;
     pop.hidden = false;
     draw();
     markGears();
@@ -223,7 +199,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
   });
 
   return {
-    toggle(gear, session) {
+    toggle(gear) {
       if (anchor === gear) {
         close(true);
         return;
@@ -231,7 +207,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
       if (anchor) {
         close(false);
       }
-      open(gear, session);
+      open(gear);
     },
     sync() {
       if (anchor && !anchor.isConnected) {

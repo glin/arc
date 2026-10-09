@@ -980,7 +980,6 @@ export async function captureSessionExport(
         if (
           candidate.agent !== 'codex' ||
           !candidate.opening?.hasSubagentSource ||
-          isHiddenThread(candidate.opening) ||
           candidate.opening.parentThreadId !== entry.sessionId
         )
           continue;
@@ -1136,6 +1135,21 @@ export async function captureSessionExport(
           : await readCodexHistoryPageAsync(entry.file, entry.sessionId, cursor as CodexHistoryCursor | null, history, {
               capturedOpening: entry.opening,
               sessionTitle: title,
+              structuralChildren: relationships
+                .filter((edge) => edge.from === key && edge.kind === 'subagent' && edge.to)
+                .map((edge) => {
+                  const child = entries.get(edge.to!)!;
+                  return {
+                    file: child.file,
+                    threadId: child.sessionId,
+                    parentThreadId: child.opening!.parentThreadId,
+                    agentPath: child.opening!.agentPath,
+                    openedAt: child.opening!.openedAt,
+                    startedAt: child.opening!.startedAt,
+                    threadSource: child.opening!.threadSource,
+                    backgroundReview: isHiddenThread(child.opening!),
+                  };
+                }),
             });
       if (result.kind !== 'page') throw new SourceChanged();
       const page: SemanticHistoryPage = result.page;
@@ -1162,7 +1176,12 @@ export async function captureSessionExport(
           if (edge.from !== key) continue;
           const child = edge.to ? entries.get(edge.to) : undefined;
           const agent = turn.agents.find((agent) => child && agent.id === child.sessionId);
-          if (agent && !projected.relationships.includes(edge.key)) projected.relationships.push(edge.key);
+          if (agent) {
+            if (!projected.relationships.includes(edge.key)) projected.relationships.push(edge.key);
+            const capturedAgent = projected.agents[turn.agents.indexOf(agent)];
+            const agentLinks = (capturedAgent.relationships ??= []);
+            if (!agentLinks.includes(edge.key)) agentLinks.push(edge.key);
+          }
           if (projected.relationships.includes(edge.key)) {
             edge.turn = projected.key;
             if (!edge.to) {

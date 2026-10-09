@@ -28530,3 +28530,44 @@ test('read-only titled usage lines expose a named semantic group without a keybo
   assert.ok(title.includes('line.text') && title.includes('line.title'));
   assert.doesNotMatch(title, /tabIndex|tabindex/);
 });
+
+test('saved session headings offer Export last and route their saved identity through the native command', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const entries = manifestMenu(manifest);
+  for (const webviewSection of Object.values(SESSION_MENU_SECTIONS)) {
+    const context = { webviewSection, session: 'saved-session', sessionPersisted: true };
+    const visible = menuGroups(entries, context).flat();
+    assert.equal(visible.at(-1)?.command, 'arc.exportSession');
+    assert.equal(visible.filter((entry) => entry.command === 'arc.exportSession').length, 1);
+    assert.ok(
+      !menuGroups(entries, { ...context, sessionPersisted: false })
+        .flat()
+        .some((entry) => entry.command === 'arc.exportSession'),
+    );
+  }
+  for (const webviewSection of [...Object.values(RAIL_MENU_SECTIONS), 'arcTurnHead', 'arcFile'])
+    assert.ok(
+      !menuGroups(entries, { webviewSection, session: 'saved-session', sessionPersisted: true })
+        .flat()
+        .some((entry) => entry.command === 'arc.exportSession'),
+    );
+  assert.ok(
+    manifest.contributes.menus.commandPalette.some(
+      (entry: { command: string; when: string }) => entry.command === 'arc.exportSession' && entry.when === 'false',
+    ),
+  );
+  const dialogSource = fs.readFileSync(path.join(__dirname, 'webview', 'layout-dialog.ts'), 'utf8');
+  assert.ok(!dialogSource.includes("type: 'exportSession'"), 'the gear still starts export');
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  sourceMatch(
+    extensionSource,
+    /reg\('arc\.exportSession', \(arg\) => \{\s*const session = sessionIdFrom\(arg\);\s*if \(session\) void panel\.exportSession\(session\);/,
+    'the export command lost its initiating native-menu session',
+  );
+  const hostSource = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
+  sourceMatch(
+    hostSource,
+    /public exportSession\(session: string\): Promise<void> \{\s*session = this\.panelSession\(session\);\s*const sources = this\.catalog\?\.sessions \?\? \[\];\s*const source = savedExportSource\(session, sources\);/,
+    'the export command no longer resolves its exact saved source',
+  );
+});
