@@ -96,6 +96,8 @@ For the Claude status command, a warm cache prices `context_window.total_input_t
 
 Claude Code supplies `prompt_cache.warm`, `expires_at`, `hit_ratio`, and `recache_tokens_if_cold` directly to the status command. Arc uses those native fields there, so the timer and warm or cold estimate do not depend on transcript inference. The panel does not receive the status-command payload. It derives cache state from transcript request timing and token categories, then changes to the cold face 90 seconds before the inferred expiry. Near that switch, the warm face says `under 2m`. The detail shows the other price when it differs.
 
+Changing the model prices the next turn uncached. Changing Claude effort does the same when the recorded request effort differs and the detectable route rebuilds the cache. The effort estimate retains the recorded write lifetime. Google Cloud, the Claude apps gateway, HIPAA, and disabled experimental betas have no separate route signal. Their cache behavior remains undetected.
+
 In simplified form:
 
 ```text

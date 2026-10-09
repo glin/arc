@@ -42,6 +42,8 @@ interface BedrockSupport {
 }
 
 export interface ModelDefinition {
+  // Claude Code keeps cache after effort changes only on these exact model identities.
+  effortChangeKeepsCache?: true | RegExp;
   pattern: RegExp;
   rate: Rate;
   window: number;
@@ -127,6 +129,7 @@ export type UsagePriceContext = Pick<UsageQuoteInput, 'inferenceClass' | 'servic
 // Readers retain each request's pricing band before aggregation. Aggregate totals cannot recover those bands.
 export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   {
+    effortChangeKeepsCache: /^claude-fable-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/,
     pattern: /^claude-(fable|mythos)-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/,
     rate: { input: 10, cacheRead: 0.25, output: 50 },
     cachePolicy: CLAUDE_CACHE_POLICY,
@@ -141,6 +144,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   // https://platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing
   // Fast rates require an omitted provider. A recorded regional Bedrock inference class adds the regional multiplier.
   {
+    effortChangeKeepsCache: true,
     pattern: /^claude-opus-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
     rate: { input: 4, cacheRead: 0.2, output: 20 },
     fast: { input: 8, cacheRead: 0.4, output: 40 },
@@ -169,6 +173,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   },
   // Sonnet definitions list supported generations explicitly. Unlisted Sonnet generations remain unpriced.
   {
+    effortChangeKeepsCache: true,
     pattern: /^claude-sonnet-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
     // The public rate has no history. For a Sonnet 5.5 request before effectiveDate, an estimate from this row prices cache reads at half the former $0.20 list rate.
     rate: { input: 2, cacheRead: 0.1, output: 10 },
@@ -199,6 +204,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
   // A prompt over 100,000 tokens pays five times every rate. The threshold counts total request
   // input, cache reads and writes included, as the shared request band does for every banded model.
   {
+    effortChangeKeepsCache: true,
     pattern: /^claude-haiku-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
     rate: { input: 0.1, output: 0.5 },
     longContext: { threshold: 100_000, inputMultiplier: 5, outputMultiplier: 5 },
@@ -427,6 +433,21 @@ export interface ModelPricingResolution {
 }
 
 const BEDROCK_MODEL = /^(?:([^.]+)\.)?openai\.(.+)$/;
+
+// https://code.claude.com/docs/en/prompt-caching#changing-effort-level
+// Google Cloud, the apps gateway, HIPAA, and disabled experimental betas have no separate recorded signal.
+// Those undetectable routes retain the direct-model policy here.
+export function effortChangeKeepsCache(
+  model: string | null,
+  provider: string | null,
+  inferenceClass: UsageInferenceClass = null,
+  bedrock = false,
+): boolean {
+  if (!model || provider !== null || bedrock || inferenceClass === 'bedrock-regional') return false;
+  const identity = modelForRate(model);
+  const policy = MODEL_DEFINITIONS.find((row) => row.pattern.test(identity))?.effortChangeKeepsCache;
+  return policy === true || (policy instanceof RegExp && policy.test(identity));
+}
 
 // Explicit provider and recorded inference evidence select a route.
 export function resolveModelPricing(

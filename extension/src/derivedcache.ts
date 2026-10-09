@@ -560,6 +560,8 @@ function contextRequest(value: unknown): boolean {
     value === null ||
     (record(value) &&
       finite(value.at) &&
+      (value.effort === undefined || value.effort === null || nonEmptyText(value.effort)) &&
+      (value.bedrock === undefined || typeof value.bedrock === 'boolean') &&
       (value.lifetime === null || isCacheLifetime(value.lifetime)) &&
       (value.inferenceClass === null ||
         value.inferenceClass === 'in-region' ||

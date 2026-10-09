@@ -79,6 +79,7 @@ import {
   contextWindowFor,
   formatConservativeCost,
   nextTurnFloor,
+  effortChangeKeepsCache,
 } from './pricing';
 import { CACHE_SPAN_MINIMUM_SECONDS } from './view/time';
 import { looksLikeComments } from './turncomments';
@@ -2004,41 +2005,38 @@ function nextTurnFaces(
 
 interface ProspectiveNextTurn {
   basis: NextTurnBasis;
-  coldOnly: 'model-change' | null;
+  coldOnly: 'model-change' | 'effort-change' | null;
 }
 
-// Keep the recorded request basis when the selected model matches. A different model replaces pricing identity and window and clears cache state.
+// A changed model replaces pricing identity and clears cache state. Effort changes retain the recorded model and write tier.
 export function prospectiveNextTurn(state: ComposerState): ProspectiveNextTurn | null {
   const basis = state.nextTurn;
-  if (!basis) {
-    return null;
-  }
+  if (!basis) return null;
   const selected = chosenModel(state.models, state.settings.selectedModel);
-  if (!selected) {
-    return { basis, coldOnly: null };
+  const unchanged =
+    !selected ||
+    (selected.resolvedModel
+      ? sameModelIdentity(selected.resolvedModel, basis.model)
+      : modelRan(state.models, basis.model)?.value === selected.value);
+  if (selected && !unchanged) {
+    const model = selected.resolvedModel ?? selected.value;
+    return {
+      basis: { ...basis, model, window: contextWindowFor(model, basis.provider), tier: null, readBack: false },
+      coldOnly: 'model-change',
+    };
   }
-  if (selected.resolvedModel) {
-    // Compare model identities apart from window and Bedrock prefix. Two dated snapshots must name the same date.
-    if (sameModelIdentity(selected.resolvedModel, basis.model)) {
-      return { basis, coldOnly: null };
-    }
-  } else {
-    const recorded = modelRan(state.models, basis.model);
-    if (recorded?.value === selected.value) {
-      return { basis, coldOnly: null };
+  if (state.agent === 'claude' && basis.effort) {
+    const pending = state.settings.pendingEffort;
+    const effort = pending ?? (state.settings.selectedEffort || state.settings.confirmedEffort);
+    if (
+      effort &&
+      effort !== basis.effort &&
+      !effortChangeKeepsCache(basis.model, basis.provider, basis.inferenceClass, basis.bedrock)
+    ) {
+      return { basis: { ...basis, readBack: false }, coldOnly: 'effort-change' };
     }
   }
-  const model = selected.resolvedModel ?? selected.value;
-  return {
-    basis: {
-      ...basis,
-      model,
-      window: contextWindowFor(model, basis.provider),
-      tier: null,
-      readBack: false,
-    },
-    coldOnly: 'model-change',
-  };
+  return { basis, coldOnly: null };
 }
 
 // Omit the next-turn figure without a request basis or a usable formatted price.
@@ -2055,7 +2053,7 @@ function nextTurnFigure(prospective: ProspectiveNextTurn | null): ComposerNextTu
     model: basis.model,
     provider: basis.provider,
     contextWindow: basis.window,
-    tier: basis.afterCompaction || coldOnly !== null ? null : basis.tier,
+    tier: basis.afterCompaction || coldOnly === 'model-change' ? null : basis.tier,
     inferenceClass: basis.inferenceClass,
     serviceTier: basis.serviceTier,
   });

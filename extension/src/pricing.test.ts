@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   rateFor,
+  effortChangeKeepsCache,
   estimateCost,
   estimateCacheReadCost,
   estimateCompactionCost,
@@ -106,6 +107,11 @@ const claudeSupport = (
     rate,
     window,
     cachePolicy: RECORDED_POLICY,
+    ...(models.includes('claude-fable-5-1')
+      ? { effortChangeKeepsCache: /^claude-fable-5-1(?:-\d{8})?(?:\[[^\]]+\])?$/ }
+      : models.some((model) => ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'].includes(model))
+        ? { effortChangeKeepsCache: true as const }
+        : {}),
     ...(fast ? { fast } : {}),
     ...(effectiveDate ? { effectiveDate } : {}),
   },
@@ -206,6 +212,7 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
   {
     models: ['claude-haiku-5-5'],
     definition: {
+      effortChangeKeepsCache: true,
       ...claudeSupport(
         /^claude-haiku-5-5(?:-\d{8})?(?:\[[^\]]+\])?$/,
         [],
@@ -1881,4 +1888,20 @@ test('Bedrock Astra prices exact routes and request thresholds without inventing
     assert.equal(resolveModelPricing(model, 'amazon-bedrock'), null, model);
   for (const provider of [null, 'openai', 'router', 'unknown'])
     assert.equal(resolveModelPricing('openai.gpt-6-astra', provider), null);
+});
+
+test('effort cache policy distinguishes exact Claude models and detectable Bedrock routes', () => {
+  for (const model of ['opus-5-5', 'sonnet-5-5', 'haiku-5-5', 'fable-5-1', 'mythos-5-1', 'opus-5']) {
+    const keeps = ['opus-5-5', 'sonnet-5-5', 'haiku-5-5', 'fable-5-1'].includes(model);
+    for (const suffix of ['', '-20261001', '[1m]', '-20261001[1m]']) {
+      const identity = 'claude-' + model + suffix;
+      assert.equal(effortChangeKeepsCache(identity, null), keeps, identity);
+      assert.equal(effortChangeKeepsCache(identity, null, 'bedrock-regional'), false);
+      assert.equal(effortChangeKeepsCache(identity, null, null, true), false);
+      if (model === 'fable-5-1' || model === 'mythos-5-1')
+        assert.deepEqual(rateFor(identity), { input: 10, cacheRead: 0.25, output: 50 });
+    }
+  }
+  assert.equal(effortChangeKeepsCache('gpt-5.6', null), false);
+  assert.equal(effortChangeKeepsCache('claude-opus-5-5', 'amazon-bedrock'), false);
 });

@@ -155,7 +155,7 @@ import { Ask, readModels } from './claudewire.ts';
 import { formatCacheSpan } from './view/time.ts';
 import { McpServer, ModelChoice, PromptEntry, QuestionAsk } from './agentwire.ts';
 import { createClaudeSessionReducer } from './transcript.ts';
-import { composerRuntimeBySession } from './turncard.ts';
+import { composerRuntimeBySession, nextTurnBasisOf } from './turncard.ts';
 import {
   CONTEXT_BANDS,
   DRAFT_TEXT_LIMIT,
@@ -7955,5 +7955,140 @@ test('the Prompt box remains warm four minutes after a supported Bedrock request
     assert.equal(nextTurnStateAt(figure, AT + 4 * 60_000), 'warm', model);
     assert.equal(figure.coldAt, AT + 28.5 * 60_000);
     assert.equal(nextTurnStateAt(figure, AT + 28.5 * 60_000), 'cold', model);
+  }
+});
+
+test('Claude effort picks immediately price the next turn uncached at its recorded write tier', () => {
+  for (const model of ['', 'opus']) {
+    for (const [tier, price] of [
+      ['5m', '$3.88'],
+      ['1h', '$6.20'],
+    ] as const) {
+      const state = composerState({
+        models: PRICE_MODELS,
+        model,
+        effort: 'low',
+        nextTurn: { ...FLOOR_BASIS, effort: 'high', tier },
+      });
+      for (const settings of [
+        state.settings,
+        { ...state.settings, pendingEffort: 'low' },
+        { ...state.settings, selectedEffort: '', confirmedEffort: 'low' },
+      ]) {
+        const figure = composerView({ ...state, settings })?.nextTurn;
+        assert.equal(figure?.warm, null);
+        assert.equal(figure?.coldAt, null);
+        assert.equal(figure?.cold?.trail, ', uncached');
+        assert.equal(figure?.cold?.price, price);
+        assert.equal(prospectiveNextTurn({ ...state, settings })?.basis.tier, tier);
+      }
+      const reverted = composerView({
+        ...state,
+        settings: { ...state.settings, selectedEffort: 'high', pendingEffort: 'high' },
+      })?.nextTurn;
+      assert.ok(reverted?.warm);
+    }
+  }
+});
+
+test('effort pricing requires a known changed Claude request effort', () => {
+  const state = composerState({
+    models: PRICE_MODELS,
+    model: '',
+    effort: 'low',
+    nextTurn: { ...FLOOR_BASIS, effort: 'high' },
+  });
+  for (const over of [
+    { nextTurn: FLOOR_BASIS },
+    { effort: 'high' },
+    { agent: 'codex' as const },
+    { effort: '', ran: null },
+    { nextTurn: { ...FLOOR_BASIS, model: 'claude-opus-5-5', effort: 'high' } },
+  ])
+    assert.ok(
+      composerView(composerState({ ...state, settings: undefined, model: '', effort: 'low', ...over }))?.nextTurn?.warm,
+    );
+});
+
+test('a named default effort pick keeps equal request effort warm and prices different request effort cold', () => {
+  const state = composerState({
+    models: [{ ...PRICE_MODELS[0], efforts: MODELS[0].efforts }],
+    model: 'opus',
+    effort: 'high',
+    nextTurn: { ...FLOOR_BASIS, effort: 'high' },
+    defaults: { base: { status: 'ready', model: 'claude-opus-5', effort: 'high', reason: '' } },
+  });
+  state.settings.pendingEffort = 'high';
+  assert.ok(composerView(state)?.nextTurn?.warm);
+  assert.equal(composerView({ ...state, nextTurn: { ...state.nextTurn!, effort: 'low' } })?.nextTurn?.warm, null);
+});
+
+test('parsed Claude effort commands preserve the priced request and both Bedrock routes price the effort pick cold', () => {
+  for (const profile of [null, 'us.anthropic.claude-opus-5-5', 'global.anthropic.claude-opus-5-5']) {
+    const model = profile ? 'claude-opus-5-5' : 'claude-opus-5';
+    const reducer = createClaudeSessionReducer('effort-price');
+    if (profile)
+      reducer.pushLine(
+        JSON.stringify({ type: 'attachment', attachment: { type: 'model', identity: { modelId: profile } } }),
+      );
+    reducer.pushLine(
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date(AT).toISOString(),
+        message: { role: 'user', content: 'Continue' },
+      }),
+    );
+    const response = {
+      type: 'assistant',
+      timestamp: new Date(AT + 1000).toISOString(),
+      effort: 'high',
+      message: {
+        id: profile ? 'msg_bdrk_effort_price' : 'msg_effort_price',
+        role: 'assistant',
+        model,
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Finished' }],
+        usage: {
+          input_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 620000,
+          cache_creation: { ephemeral_1h_input_tokens: 620000 },
+          output_tokens: 0,
+        },
+      },
+    };
+    reducer.pushLine(JSON.stringify(response));
+    const restored = createClaudeSessionReducer('effort-price', {}, structuredClone(reducer.snapshot()));
+    restored.pushLine(
+      JSON.stringify({
+        ...response,
+        effort: 'low',
+        message: {
+          ...response.message,
+          id: 'effort_command_reply',
+          usage: undefined,
+          content: [{ type: 'text', text: 'Set effort level to low.' }],
+        },
+      }),
+    );
+    const turn = restored.read().turns[0];
+    assert.equal(turn.effort, 'low');
+    assert.equal(turn.contextRequest?.effort, 'high');
+    assert.equal(turn.contextRequest?.bedrock, profile !== null);
+    const basis = nextTurnBasisOf(turn, null)!;
+    const state = composerState({ model: '', effort: '', ran: { model, effort: 'low' }, nextTurn: basis });
+    const figure = composerView(state)?.nextTurn;
+    assert.equal(figure?.warm, null, String(profile));
+    assert.equal(figure?.coldAt, null);
+    assert.equal(figure?.cold?.price, profile?.startsWith('global.') ? '$4.96' : profile ? '$5.46' : '$6.20');
+    const newer = {
+      ...response,
+      effort: undefined,
+      message: { ...response.message, id: profile ? 'msg_bdrk_newer' : 'msg_newer' },
+    };
+    restored.pushLine(JSON.stringify(newer));
+    const newerBasis = nextTurnBasisOf(restored.read().turns[0], null)!;
+    assert.equal(newerBasis.effort, null);
+    assert.ok(composerView({ ...state, nextTurn: newerBasis })?.nextTurn?.warm);
   }
 });

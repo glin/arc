@@ -4277,6 +4277,8 @@ export function currentContextOf(
 }
 
 export interface NextTurnBasis {
+  effort?: string | null;
+  bedrock?: boolean;
   tokens: number;
   outputTokens: number;
   window: number | null;
@@ -4325,6 +4327,8 @@ export function nextTurnBasisOf(
   return {
     tokens,
     outputTokens: compacted ? 0 : (request?.outputTokens ?? 0),
+    effort: request?.effort ?? null,
+    bedrock: request?.bedrock ?? false,
     window,
     model,
     provider: newest.provider ?? null,

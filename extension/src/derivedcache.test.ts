@@ -921,7 +921,12 @@ test('derived cache round trips a regional Bedrock request', () => {
         {
           ...turn,
           model: 'claude-opus-5-5',
-          contextRequest: { ...turn.contextRequest!, inferenceClass: 'bedrock-regional' },
+          contextRequest: {
+            ...turn.contextRequest!,
+            inferenceClass: 'bedrock-regional',
+            bedrock: true,
+            effort: 'high',
+          },
           usageParts: [
             {
               model: 'claude-opus-5-5',
@@ -2630,4 +2635,22 @@ test('Bedrock Astra discards literal derived generation 44 and rebuilds unchange
   assert.equal(persisted?.mtimeMs, before.mtimeMs);
   assert.equal(fs.statSync(source).size, before.size);
   assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
+});
+
+test('derived cache retains global Bedrock request effort without changing pricing class', () => {
+  const file = path.join(folder(), 'cache.json');
+  const saved = {
+    ...title,
+    stats: {
+      ...stats,
+      turns: [
+        {
+          ...stats.turns[0],
+          contextRequest: { ...stats.turns[0].contextRequest!, effort: 'high', bedrock: true, inferenceClass: null },
+        },
+      ],
+    },
+  };
+  saveDerivedCache(file, [['/session.jsonl', saved]]);
+  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), saved);
 });

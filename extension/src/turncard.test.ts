@@ -10248,3 +10248,14 @@ test('background usage preserves recorded cache-write warnings in main and deleg
     }
   }
 });
+
+test('the next-turn basis reads request effort independently of later turn effort', () => {
+  const held = turn({
+    contextTokens: 620000,
+    effort: 'low',
+    contextRequest: { ...CONTEXT_REQUEST, effort: 'high', bedrock: true },
+  });
+  assert.equal(nextTurnBasisOf(held, null)?.effort, 'high');
+  assert.equal(nextTurnBasisOf(held, null)?.bedrock, true);
+  assert.equal(nextTurnBasisOf({ ...held, contextRequest: CONTEXT_REQUEST }, null)?.effort, null);
+});

@@ -370,6 +370,10 @@ export function isCacheLifetime(value: unknown): value is CacheLifetime {
 
 // The one request that established a turn's current context level.
 export interface ContextRequest {
+  // Effort belongs to the priced request. Older saved contexts leave it unknown.
+  effort?: string | null;
+  // Bedrock message identity is independent of its regional pricing multiplier.
+  bedrock?: boolean;
   // When that request was recorded. The turn's own end moves with a tool result, an
   // interruption and a background notification, so it dates the turn and not this request.
   at: number;
@@ -10030,6 +10034,8 @@ function reduceClaudeSessionLine(
       state.lastLifetime = wrote;
     }
     cur.contextRequest = {
+      effort: usageEvent.effort,
+      bedrock: typeof message.id === 'string' && message.id.startsWith(BEDROCK_MESSAGE_PREFIX),
       at: stamp(o.timestamp),
       lifetime: wrote ?? state.lastLifetime,
       inferenceClass: usageEvent.inferenceClass,
