@@ -91,6 +91,7 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Offline review evidence | `evals/agent-review/cases/` and a separate bare evidence cache | Source commits, partial review keys, and exported review conditions for the development tool only |
 | Saved session capture | Configured Claude project directories, Codex rollout directories, and caller-supplied reader-started links and saved reader-parent identities | Verified identities across working directories and the outgoing relationships of the selected saved session. Unreachable text bodies stay outside the capture |
 | Portable review fixtures | `evals/agent-review/portable/cases/`, `evals/agent-review/fixtures/`, `evals/agent-review/cohorts/`, and captured checkout instructions | Candidate source, qualification checks, frozen keys, coverage targets, and instruction hashes for local exploratory comparisons |
+| Codex account capability | Non-refreshing `account/read` on the selected app-server process | `account.type: amazonBedrock` excludes subscription usage. Missing accounts, unknown types, and discovery failures establish no exclusion |
 | Claude context summary | `get_context_usage` with `detail: summary` on the selected connected child | Estimated content categories, occupied tokens, accounting window, free space, and compaction reserve from one response |
 | Codex retained context | The selected rollout's newest complete replacement history or opening, plus subsequent response items and request usage | Locally estimated text categories, retained checkpoint tool text, and an explicit unattributed remainder, without attaching to a saved session |
 | Claude status-line JSON | CLI stdin | Current model, effort, context size and use, prompt-cache state and expiry, and session cost metadata |
@@ -375,7 +376,7 @@ The first column is checked against the shipped extension directory by `architec
 | `view/time.ts` | Browser-safe relative-time ladder with compact and verbose recency formatters, including `formatRelativeShort` for a compact session list row, the cache-span figure, and the duration formatter | no |
 | `view/tokens.ts` | Browser-safe compact token-count formatter shared by host and panel renderers | no |
 | `view/usage.ts` | Browser-safe display contracts for collapsed and expanded usage figures | no |
-| `usageview.ts` | Normalizes reported account limits and prepares usage-bar rows | no |
+| `usageview.ts` | Normalizes reported account limits, owns current-process admission and retained account exclusion, and prepares usage-bar rows | no |
 | `usagerecord.ts` | Bounds normalized account-reading admission and asynchronously publishes committed gzip prefixes under exclusive daily-slot ownership | no |
 | `mcpview.ts` | Normalizes reported MCP server state and available actions | no |
 

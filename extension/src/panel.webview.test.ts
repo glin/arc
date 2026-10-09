@@ -367,10 +367,11 @@ import {
   retireDraftProfile,
   freshHostKey,
   AgentSession,
+  codexIdlePlan,
   claudePlan,
   renameAgentSession,
 } from './agenthost.ts';
-import { USAGE_AGENT_ORDER } from './usageview.ts';
+import { USAGE_AGENT_ORDER, UsageBook, usageBar } from './usageview.ts';
 import { missingSetupValues } from './domain/session-setups.ts';
 import { ProjectSetupStore, SetupProjects, normalizeProjectPath, projectSetupKey } from './projectsetups.ts';
 import { STORED_STATE_KEYS } from './identity.ts';
@@ -9061,7 +9062,7 @@ test('a host takes its own listeners away with it, and the editor ones are wired
 test('default metadata watches external ancestors and ignores unrelated editor settings', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const begin = source.indexOf('let defaultsRevision = 0;');
-  const end = source.indexOf("// One session's own agent,", begin);
+  const end = source.indexOf('const readFrom = async', begin);
   assert.ok(begin >= 0 && end > begin);
   const compiled = esbuild.transformSync(`export function wire(context, panel) { ${source.slice(begin, end)} }`, {
     loader: 'ts',
@@ -9704,7 +9705,7 @@ test('an invalid live Codex permission pick changes no setting or session', asyn
   assert.deepEqual(sessionUpdates, [], 'an invalid value changed a live Codex session');
 });
 
-function catalogRefreshFixture() {
+function catalogRefreshFixture(book?: UsageBook) {
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const statements = ['const publishPicks =', 'const readFrom =', 'const askAgent ='].map((needle) =>
     statementFrom(source, source.indexOf(needle)),
@@ -9721,6 +9722,11 @@ function catalogRefreshFixture() {
     busySibling: false,
     idleSibling: false,
     ownerBusy: false,
+    supported: true,
+    discoveryFailure: false,
+    discoveryCount: 0,
+    holdDiscovery: null as Promise<boolean> | null,
+    states: null as Array<{ agent: string; key: string; sessionId: string; exited: boolean; busy: boolean }> | null,
     holdModels: null as Promise<unknown> | null,
     answer: null as object | null,
     cwd: 'C:/workspace' as string | null,
@@ -9731,7 +9737,47 @@ function catalogRefreshFixture() {
   ]);
   const usageResults: Array<{ agent: string; phase: string }> = [];
   const refreshStates: import('./view/usage').UsageRefresh[] = [];
-  const usageReads = new UsageReadQueue((state) => refreshStates.push(state));
+  const projections: ReturnType<typeof usageBar>[] = [];
+  const modelCalls: string[] = [];
+  const sources = new Map(
+    ['busy', 'live', 'idle-sibling', 'fresh'].map((key) => {
+      const session = new AgentSession(
+        key,
+        codexIdlePlan(
+          { command: 'codex', leadingArgs: [], env: {} },
+          { cwd: 'C:/workspace', clientInfo: { name: 'arc-test', title: 'Arc test', version: '1' } },
+        ),
+        () => ({
+          stdin: { write() {}, end() {} },
+          stdout: { setEncoding() {}, on() {} },
+          stderr: { setEncoding() {}, on() {} },
+          kill() {},
+          on() {},
+        }),
+        () => {},
+        () => {},
+      );
+      return [key, session.usageSource] as const;
+    }),
+  );
+  const sourceOf = (key: string) => sources.get(key)!;
+  const publishUsage = () => {
+    if (book) projections.push(usageBar(book.usages(), Date.now(), refreshStates.at(-1)));
+  };
+  const queueCode = esbuild.transformSync(
+    `${statementFrom(source, source.indexOf('const usageReads ='))}\nreturn usageReads;`,
+    { loader: 'ts' },
+  ).code;
+  const usageReads = new Function('UsageReadQueue', 'usage', 'panel', queueCode)(
+    UsageReadQueue,
+    book ?? { excluded: () => false },
+    {
+      setUsageRefresh: (state: import('./view/usage').UsageRefresh) => {
+        refreshStates.push(state);
+        publishUsage();
+      },
+    },
+  ) as UsageReadQueue;
   const originalResult = usageReads.result?.bind(usageReads) ?? (() => {});
   usageReads.result = (agent, id, phase, detail, operation) => {
     usageResults.push({ agent, phase });
@@ -9752,11 +9798,15 @@ function catalogRefreshFixture() {
     settingBook: () => ({}),
     stored: () => ({}),
     ASK_MODE_KEY: 'askModes',
-    publishUsage() {},
+    publishUsage,
     publishCommands() {},
     commandLists: { revision: () => 0 },
     commandsAsked: new Set<string>(),
-    usage: {
+    usage: book ?? {
+      beginDiscovery: () => 1,
+      canDiscover: () => true,
+      resolveDiscovery: () => true,
+      accepts: () => true,
       toAsk: (agents: string[]) => agents.filter((agent) => !settledUsage.has(agent)),
       note: (agent: string) => {
         settledUsage.add(agent);
@@ -9766,8 +9816,10 @@ function catalogRefreshFixture() {
     },
     usageReads,
     host: {
+      get: (key: string) => ({ usageSource: sourceOf(key) }),
       states: () =>
-        control.live
+        control.states ??
+        (control.live
           ? [
               ...(control.busySibling
                 ? [{ agent: control.agent, key: 'busy', sessionId: 'other', exited: false, busy: true }]
@@ -9777,10 +9829,18 @@ function catalogRefreshFixture() {
                 : []),
               { agent: control.agent, key: 'live', sessionId: 'selected', exited: false, busy: control.ownerBusy },
             ]
-          : [],
+          : []),
       withActivity: (key: string, work: (session: unknown) => Promise<void>) =>
         work({
           agent: control.agent,
+          cwd: 'C:/workspace',
+          usageSource: sourceOf(key),
+          usageSupported: async () => {
+            control.discoveryCount++;
+            if (control.holdDiscovery) return await control.holdDiscovery;
+            if (control.discoveryFailure) throw new Error('Account discovery refused');
+            return control.supported;
+          },
           state: () => ({ busy: false }),
           rateLimits: async () => {
             calls.push(`usage ${key}`);
@@ -9788,6 +9848,7 @@ function catalogRefreshFixture() {
             return control.answer;
           },
           models: async () => {
+            modelCalls.push(key);
             if (control.holdModels) await control.holdModels;
             if (control.failure === 'throw') throw new Error('read failed');
             return null;
@@ -9804,10 +9865,14 @@ function catalogRefreshFixture() {
       _spawner: unknown,
       _deadline: unknown,
       publish?: (reading: object | null, failure: string) => void,
+      admit: () => boolean = () => true,
+      onDiscovery: (supported: boolean | null, source: number) => boolean = () => true,
     ) => {
       calls.push('catalog');
+      if (!admit()) return { usage: null, models: null, commands: [] };
+      const eligible = onDiscovery(null, sourceOf('fresh')) && onDiscovery(control.supported, sourceOf('fresh'));
       if (control.failure === 'throw') throw new Error('read failed');
-      publish?.({}, '');
+      if (eligible) publish?.(control.answer ?? {}, '');
       return {
         usage: {},
         models: control.failure === 'empty' ? null : { readAt: Date.now(), models: [] },
@@ -9820,16 +9885,300 @@ function catalogRefreshFixture() {
     },
     readMcpFrom: async () => {},
   };
-  const code = esbuild.transformSync(`${statements.join('\n')}\nreturn askAgent;`, { loader: 'ts' }).code;
-  const ask = new Function(...Object.keys(scope), code)(...Object.values(scope)) as (
+  const code = esbuild.transformSync(`${statements.join('\n')}\nreturn { askAgent, readFrom };`, { loader: 'ts' }).code;
+  const compiled = new Function(...Object.keys(scope), code)(...Object.values(scope));
+  const ask = compiled.askAgent as (
     agent: string,
     force: boolean,
     owner?: string,
     cwd?: string,
     attempt?: number,
   ) => Promise<void>;
-  return { ask, models, mcp, calls, publications, control, usageReads, usageResults, readingTimes, refreshStates };
+  return {
+    ask,
+    models,
+    mcp,
+    calls,
+    publications,
+    control,
+    usageReads,
+    usageResults,
+    readingTimes,
+    refreshStates,
+    projections,
+    modelCalls,
+    sourceOf,
+    readLive: compiled.readFrom as (key: string, force: boolean, attempt?: number, operation?: number) => Promise<void>,
+  };
 }
+
+test('supported source selection survives newer-child retirement and a busy current source', async () => {
+  const book = new UsageBook();
+  const fixture = catalogRefreshFixture(book);
+  const old = { agent: 'codex', key: 'live', sessionId: 'old', exited: false, busy: false };
+  const newer = { ...old, key: 'idle-sibling', sessionId: 'new' };
+  Object.assign(fixture.control, {
+    states: [old, newer],
+    answer: { readAt: Date.now(), limits: [], complete: true, plan: '', spend: null },
+  });
+  const revision = book.beginDiscovery('codex', fixture.sourceOf('idle-sibling'));
+  book.resolveDiscovery('codex', fixture.sourceOf('idle-sibling'), revision, true);
+  const id = fixture.usageReads.begin(['codex'])!;
+  await fixture.ask('codex', true, undefined, undefined, id);
+  assert.deepEqual(fixture.calls, ['usage idle-sibling']);
+  assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'success');
+  fixture.control.states = [old];
+  await fixture.usageReads.run('codex', false, (_force, operation) =>
+    fixture.readLive('live', false, undefined, operation),
+  );
+  assert.deepEqual(fixture.calls, ['usage idle-sibling', 'usage live']);
+  assert.equal(book.accepts('codex', fixture.sourceOf('live')), true);
+  assert.equal(book.accepts('codex', fixture.sourceOf('idle-sibling')), false);
+  assert.equal(book.resolveDiscovery('codex', fixture.sourceOf('idle-sibling'), revision, false), false);
+  const retry = fixture.usageReads.begin(['codex'])!;
+  await fixture.ask('codex', true, undefined, undefined, retry);
+  assert.deepEqual(fixture.calls, ['usage idle-sibling', 'usage live', 'usage live']);
+  newer.busy = true;
+  fixture.control.states = [old, newer];
+  const current = book.beginDiscovery('codex', fixture.sourceOf('idle-sibling'));
+  book.resolveDiscovery('codex', fixture.sourceOf('idle-sibling'), current, true);
+  const busyRetry = fixture.usageReads.begin(['codex'])!;
+  await fixture.ask('codex', true, undefined, undefined, busyRetry);
+  assert.deepEqual(fixture.calls, [
+    'usage idle-sibling',
+    'usage live',
+    'usage live',
+    'catalog',
+    'MCP C:/workspace old',
+  ]);
+  assert.equal(book.accepts('codex', fixture.sourceOf('fresh')), true);
+  fixture.usageReads.dispose();
+});
+
+test('deferred supported refresh selects a fresh source when an obsolete sibling becomes idle first', async () => {
+  vi.useFakeTimers();
+  try {
+    const book = new UsageBook();
+    const fixture = catalogRefreshFixture(book);
+    const older = { agent: 'codex', key: 'live', sessionId: 'old', exited: false, busy: true };
+    const newer = { ...older, key: 'idle-sibling', sessionId: 'new' };
+    Object.assign(fixture.control, {
+      states: [older, newer],
+      answer: { readAt: Date.now(), limits: [], complete: true, plan: '', spend: null },
+    });
+    const current = fixture.sourceOf('idle-sibling');
+    const revision = book.beginDiscovery('codex', current);
+    book.resolveDiscovery('codex', current, revision, true);
+    const id = fixture.usageReads.begin(['codex'])!;
+    const first = fixture.ask('codex', true, undefined, undefined, id);
+    await vi.advanceTimersByTimeAsync(90_000);
+    older.busy = false;
+    const resumed = fixture.usageReads.resumeDeferred('codex', (attempt, operation) =>
+      fixture.readLive('live', true, attempt, operation),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(fixture.calls, ['catalog', 'MCP C:/workspace old']);
+    await Promise.all([first, resumed]);
+    assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'success');
+    assert.equal(book.accepts('codex', fixture.sourceOf('fresh')), true);
+    assert.equal(book.accepts('codex', current), false);
+    fixture.usageReads.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('obsolete account source admission leaves the live model catalog independent', async () => {
+  const book = new UsageBook();
+  const fixture = catalogRefreshFixture(book);
+  Object.assign(fixture.control, { live: true, idleSibling: true });
+  const newer = fixture.sourceOf('idle-sibling');
+  const revision = book.beginDiscovery('codex', newer);
+  book.resolveDiscovery('codex', newer, revision, true);
+  await fixture.readLive('live', false);
+  assert.deepEqual(fixture.calls, []);
+  assert.deepEqual(fixture.modelCalls, ['live'], 'obsolete usage admission skipped the independent catalog');
+  assert.equal(book.accepts('codex', newer), true);
+  fixture.usageReads.dispose();
+});
+
+test('supported discovery after busy-wait expiry releases retry before held catalogs', async () => {
+  vi.useFakeTimers();
+  try {
+    const fixture = catalogRefreshFixture(new UsageBook());
+    let discover = (_supported: boolean) => {};
+    let finish = () => {};
+    Object.assign(fixture.control, {
+      live: true,
+      ownerBusy: true,
+      holdDiscovery: new Promise<boolean>((resolve) => {
+        discover = resolve;
+      }),
+      holdModels: new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+    });
+    const expired = fixture.usageReads.begin(['claude', 'codex'])!;
+    fixture.usageReads.result('claude', expired, 'success');
+    const first = fixture.ask('codex', true, undefined, undefined, expired);
+    await vi.advanceTimersByTimeAsync(90_000);
+    fixture.control.ownerBusy = false;
+    const resumed = fixture.usageReads.resumeDeferred('codex', (id, operation) =>
+      fixture.readLive('live', true, id, operation),
+    );
+    await vi.advanceTimersByTimeAsync(31_000);
+    assert.equal(fixture.control.discoveryCount, 1);
+    assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'failed');
+    fixture.control.holdDiscovery = null;
+    discover(true);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(fixture.modelCalls, ['live']);
+    assert.deepEqual(fixture.calls, []);
+    const retry = fixture.usageReads.begin(['codex'])!;
+    const next = fixture.ask('codex', true, undefined, undefined, retry);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(fixture.calls, ['usage live'], 'completed account discovery kept retry behind the catalog');
+    assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'empty');
+    finish();
+    await Promise.all([first, resumed, next]);
+    fixture.usageReads.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('classified Bedrock busy timeout stays excluded and later explicit retry rediscovers support', async () => {
+  vi.useFakeTimers();
+  try {
+    const book = new UsageBook();
+    book.note('claude', {
+      readAt: Date.now(),
+      limits: [
+        { window: 'five_hour', group: 'session', scope: '', utilization: 0.2, resetsAtSeconds: null, status: '' },
+      ],
+      complete: true,
+      plan: '',
+      spend: null,
+    });
+    const fixture = catalogRefreshFixture(book);
+    const revision = book.beginDiscovery('codex', fixture.sourceOf('live'));
+    book.resolveDiscovery('codex', fixture.sourceOf('live'), revision, false);
+    Object.assign(fixture.control, { live: true, ownerBusy: true });
+    const id = fixture.usageReads.begin(['claude', 'codex'])!;
+    fixture.usageReads.result('claude', id, 'success');
+    const work = fixture.ask('codex', true, undefined, undefined, id);
+    const settled = Promise.allSettled([work]);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await settled;
+    assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'excluded');
+    const bar = fixture.projections.at(-1)!;
+    assert.deepEqual(
+      bar.groups.map((group) => group.agent),
+      ['claude'],
+    );
+    assert.doesNotMatch(bar.refresh!.announcement + bar.refresh!.name, /Codex/);
+    fixture.control.ownerBusy = false;
+    const retry = fixture.usageReads.begin(['codex'])!;
+    await fixture.ask('codex', true, undefined, undefined, retry);
+    assert.equal(fixture.control.discoveryCount, 1);
+    assert.deepEqual(fixture.calls, ['usage live']);
+    assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'empty');
+    fixture.usageReads.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Read again excludes Bedrock live usage, persists removal, and rediscovers a supported account', async () => {
+  const book = new UsageBook();
+  const reading = {
+    plan: 'max',
+    complete: true,
+    spend: null,
+    creditResetsAtSeconds: null,
+    readAt: Date.now(),
+    limits: [{ window: 'five_hour', group: 'session', scope: '', utilization: 0.2, resetsAtSeconds: null, status: '' }],
+  };
+  book.note('claude', reading);
+  book.note('codex', { ...reading, plan: 'plus' });
+  const fixture = catalogRefreshFixture(book);
+  let release = () => {};
+  Object.assign(fixture.control, {
+    live: true,
+    supported: false,
+    holdModels: new Promise<void>((resolve) => {
+      release = resolve;
+    }),
+  });
+  const held: Promise<void>[] = [];
+  for (let pass = 0; pass < 2; pass++) {
+    const id = fixture.usageReads.begin(['claude', 'codex'])!;
+    assert.ok(id);
+    fixture.usageReads.result('claude', id, 'success');
+    held.push(fixture.ask('codex', true, undefined, undefined, id));
+    await vi.waitFor(() => assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'excluded'));
+    assert.deepEqual(
+      book.usages().map((u) => u.agent),
+      ['claude'],
+    );
+    assert.deepEqual(fixture.calls, []);
+    assert.equal(fixture.control.discoveryCount, pass + 1);
+    const bar = fixture.projections.at(-1)!;
+    assert.deepEqual(
+      bar.groups.map((g) => g.agent),
+      ['claude'],
+    );
+    assert.equal(bar.refresh!.busy, false);
+    assert.doesNotMatch(bar.name + bar.refresh!.name + bar.refresh!.announcement, /Codex/);
+  }
+  release();
+  await Promise.all(held);
+  for (const bar of fixture.projections) assert.doesNotMatch(bar?.refresh?.name ?? '', /Codex/);
+  for (const failure of ['none', 'refused', 'discovery']) {
+    Object.assign(fixture.control, {
+      supported: true,
+      discoveryFailure: failure === 'discovery',
+      failure,
+      answer: { ...reading, plan: 'plus' },
+    });
+    const id = fixture.usageReads.begin(['codex'])!;
+    await fixture.ask('codex', true, undefined, undefined, id);
+    const bar = fixture.projections.at(-1)!;
+    assert.ok(bar.groups.some((g) => g.agent === 'codex'));
+    assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, failure === 'none' ? 'success' : 'failed');
+    assert.equal(bar.refresh!.busy, false);
+  }
+  fixture.usageReads.dispose();
+});
+
+test('Bedrock removal publishes and persists only the retained Claude reading', async () => {
+  const book = new UsageBook();
+  const reading = { plan: 'max', complete: true, spend: null, readAt: 1, limits: [] };
+  book.note('claude', reading);
+  book.note('codex', { ...reading, plan: 'plus' });
+  const revision = book.beginDiscovery('codex', 1);
+  book.resolveDiscovery('codex', 1, revision, false);
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const statement = statementFrom(source, source.indexOf('const publishUsage ='));
+  const saved: unknown[] = [];
+  const posted: unknown[] = [];
+  const code = esbuild.transformSync(statement + '\nreturn publishUsage;', { loader: 'ts' }).code;
+  const publish = new Function('usage', 'panel', 'scheduleUsageReset', 'usageWrites', 'context', 'USAGE_KEY', code)(
+    book,
+    { setUsage: (value: unknown) => posted.push(value) },
+    () => {},
+    { write: (write: () => unknown) => Promise.resolve(write()) },
+    { workspaceState: { update: (_key: string, value: unknown) => saved.push(value) } },
+    'usage',
+  );
+  publish();
+  assert.deepEqual(posted, [book.usages()]);
+  assert.deepEqual(saved, [book.usages()]);
+  assert.deepEqual(
+    book.usages().map((u) => u.agent),
+    ['claude'],
+  );
+});
 
 test('manual account refresh uses an idle sibling for both agents and publishes before a held live catalog', async () => {
   for (const agent of ['claude', 'codex']) {
@@ -10062,7 +10411,7 @@ test('draft acceptance survives profile-save and adoption failures until removal
 test('an idle live child answers a missing initial MCP read', async () => {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const askAt = extensionSource.indexOf('const askAgent =');
-  const liveAt = extensionSource.indexOf('if (live[0]) {', askAt);
+  const liveAt = extensionSource.indexOf('if (idleLive) {', askAt);
   assert.ok(askAt >= 0 && liveAt >= 0, 'the idle live-child refresh branch is not available to exercise');
   const liveBranch = statementFrom(extensionSource, liveAt);
   const liveBody = liveBranch.slice(liveBranch.indexOf('{') + 1, liveBranch.lastIndexOf('}'));
@@ -10140,7 +10489,7 @@ test('owner-scoped discovery binds its MCP profile generation before account adm
   );
   sourceMatch(
     ask,
-    /\}, requestOwner, attempt\);/,
+    /\}, requestOwner, attempt, ownedOperation\);/,
     'same-agent catalog reads can share a request across different MCP owners',
   );
 });

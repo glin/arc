@@ -27,6 +27,8 @@ Claude records without a provider use recognized Claude list prices. A missing p
 
 Support requires enough recorded usage to identify the applicable request band and service tier. Unknown combinations remain unpriced. Claude Haiku 5.5 prices a whole request at five times every rate when its total input, cache reads and writes included, passes 100,000 tokens. A recorded cost or a configured Project cost rate supplies a separate pricing source when available.
 
+Subscription limits and recorded request costs use separate sources. [Usage status bar](composer.md#usage-status-bar) describes account eligibility and refresh behavior.
+
 ## Read the estimate
 
 | Display | Meaning |

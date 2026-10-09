@@ -34,7 +34,15 @@ export interface UsageGroup {
   status: string;
 }
 
-export type UsageRefreshPhase = 'queued' | 'waiting' | 'reading' | 'success' | 'empty' | 'failed';
+export type UsageRefreshPhase =
+  | 'discovering'
+  | 'excluded'
+  | 'queued'
+  | 'waiting'
+  | 'reading'
+  | 'success'
+  | 'empty'
+  | 'failed';
 
 export interface UsageRefreshState {
   phase: UsageRefreshPhase;

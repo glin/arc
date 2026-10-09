@@ -413,9 +413,11 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
   let readAt = Number.POSITIVE_INFINITY;
   const statuses = Object.fromEntries(
     Object.entries(refresh?.agents ?? {})
-      .filter(([, state]) => !state.superseded)
+      .filter(([, state]) => !state.superseded && !['discovering', 'excluded'].includes(state.phase))
       .map(([agent, state]) => {
         const text = {
+          discovering: '',
+          excluded: '',
           queued: 'Queued',
           waiting: 'Waiting for current work',
           reading: 'Reading usage',
@@ -527,7 +529,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
   const spokenAge = stale ? `${age}, ${formatClock(readAt)}` : '';
   const said = [briefs.map((b) => b.name).join('. '), spokenAge, ...Object.values(statuses)].filter(Boolean).join(', ');
   const busy = Object.values(refresh?.agents ?? {}).some((state) =>
-    ['queued', 'waiting', 'reading'].includes(state.phase),
+    ['discovering', 'queued', 'waiting', 'reading'].includes(state.phase),
   );
   const summary = Object.values(statuses).join('. ');
   return {
@@ -584,6 +586,50 @@ export class UsageBook {
   private readonly record: ((agent: string, reading: UsageReading) => void) | undefined;
   // Agents with failed usage reads. Suppress repeated automatic requests until a forced read.
   private readonly silent = new Set<string>();
+  private readonly sources = new Map<
+    string,
+    { source: number; revision: number; supported: boolean; pending: boolean }
+  >();
+
+  canDiscover(agent: string, source: number, liveSources?: readonly number[]): boolean {
+    if (agent !== 'codex') return true;
+    const previous = this.sources.get(agent);
+    return (
+      !previous || source >= previous.source || (liveSources !== undefined && !liveSources.includes(previous.source))
+    );
+  }
+
+  beginDiscovery(agent: string, source: number, liveSources?: readonly number[]): number {
+    if (agent !== 'codex') return 1;
+    const previous = this.sources.get(agent);
+    if (!this.canDiscover(agent, source, liveSources)) return 0;
+    const revision = (previous?.revision ?? 0) + 1;
+    this.sources.set(agent, { source, revision, supported: previous?.supported ?? true, pending: true });
+    return revision;
+  }
+
+  resolveDiscovery(agent: string, source: number, revision: number, supported: boolean): boolean {
+    if (agent !== 'codex') return true;
+    const current = this.sources.get(agent);
+    if (!current || current.source !== source || current.revision !== revision) return false;
+    current.supported = supported;
+    current.pending = false;
+    if (!supported) {
+      this.byAgent.delete(agent);
+      this.silent.delete(agent);
+    }
+    return true;
+  }
+
+  accepts(agent: string, source?: number): boolean {
+    if (agent !== 'codex') return true;
+    const current = this.sources.get(agent);
+    return !current || (current.supported && !current.pending && (source === undefined || source === current.source));
+  }
+
+  excluded(agent: string): boolean {
+    return this.sources.get(agent)?.supported === false;
+  }
 
   constructor(seed: readonly AgentUsage[] = [], record?: (agent: string, reading: UsageReading) => void) {
     this.record = record;
@@ -592,7 +638,8 @@ export class UsageBook {
     }
   }
 
-  note(agent: string, reading: UsageReading): void {
+  note(agent: string, reading: UsageReading, source?: number): void {
+    if (!this.accepts(agent, source)) return;
     try {
       this.record?.(agent, reading);
     } catch {
@@ -602,8 +649,14 @@ export class UsageBook {
     this.silent.delete(agent);
   }
 
-  noteLimit(agent: string, limit: RateLimit | null, readAt: number, creditResetsAtSeconds: number | null = null): void {
-    this.note(agent, limitReading(limit, readAt, creditResetsAtSeconds));
+  noteLimit(
+    agent: string,
+    limit: RateLimit | null,
+    readAt: number,
+    creditResetsAtSeconds: number | null = null,
+    source?: number,
+  ): void {
+    this.note(agent, limitReading(limit, readAt, creditResetsAtSeconds), source);
   }
 
   // Marks an agent as unavailable without discarding its last reading.
@@ -619,6 +672,7 @@ export class UsageBook {
       return [...agents];
     }
     return agents.filter((agent) => {
+      if (this.sources.get(agent)?.supported === false) return false;
       if (this.silent.has(agent)) {
         return false;
       }
@@ -637,6 +691,7 @@ export class UsageBook {
   clear(): void {
     this.byAgent.clear();
     this.silent.clear();
+    this.sources.clear();
   }
 
   // A window the bar does not draw sets no timer. The computed credit reset does, because

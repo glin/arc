@@ -1,5 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert';
+import { UsageReadQueue } from './agenthost';
 import {
   AgentUsage,
   SpendReading,
@@ -146,6 +147,85 @@ test('usage progress survives absent or expired figures and retains retry after 
     assert.equal(terminal.groups[1].status, '');
     assert.match(terminal.refresh!.announcement, /Claude.*failed.*Codex.*read/);
     refresh.agents.claude = { phase: 'waiting', detail: '' };
+  }
+});
+
+test('Bedrock discovery removes saved Codex limits and rejects obsolete process readings', () => {
+  const recorded: string[] = [];
+  const book = new UsageBook([CLAUDE, CODEX], (agent) => recorded.push(agent));
+  const old = book.beginDiscovery('codex', 1);
+  const current = book.beginDiscovery('codex', 2);
+  assert.equal(book.resolveDiscovery('codex', 2, current, false), true);
+  assert.equal(book.resolveDiscovery('codex', 1, old, true), false);
+  book.noteLimit('codex', limit(), NOW, null, 1);
+  book.noteLimit('codex', limit(), NOW, null, 2);
+  assert.deepEqual(
+    book.usages().map((u) => u.agent),
+    ['claude'],
+  );
+  assert.deepEqual(recorded, []);
+  assert.deepEqual(book.toAsk(['claude', 'codex'], NOW, false), []);
+  assert.deepEqual(book.toAsk(['codex'], NOW, true), ['codex']);
+  assert.equal(book.beginDiscovery('codex', 1), 0);
+  const supported = book.beginDiscovery('codex', 3);
+  assert.equal(book.resolveDiscovery('codex', 3, supported, true), true);
+  book.noteLimit('codex', limit(), NOW, null, 2);
+  assert.deepEqual(recorded, []);
+  book.noteLimit('codex', limit(), NOW, null, 3);
+  assert.deepEqual(
+    book.usages().map((u) => u.agent),
+    ['claude', 'codex'],
+  );
+  assert.deepEqual(recorded, ['codex']);
+});
+
+test('mixed Claude usage excludes Codex discovery and unsupported outcomes from every bar surface', () => {
+  for (const phase of ['discovering', 'excluded'] as const) {
+    const bar = usageBar([CLAUDE], NOW, {
+      id: 1,
+      agents: {
+        claude: { phase: 'success', detail: '' },
+        codex: { phase, detail: '' },
+      },
+    })!;
+    assert.deepEqual(
+      bar.groups.map((g) => g.agent),
+      ['claude'],
+    );
+    assert.deepEqual(
+      bar.briefs.map((g) => g.agent),
+      ['claude'],
+    );
+    assert.doesNotMatch(bar.name + bar.refresh!.name + bar.refresh!.announcement, /Codex/);
+    assert.equal(bar.refresh!.busy, phase === 'discovering');
+  }
+});
+
+test('mixed supported discovery announces only after every account settles and retry becomes available', () => {
+  for (const phase of ['success', 'failed'] as const) {
+    const announcements: string[] = [];
+    let announcedAttempt = 0;
+    let bar: ReturnType<typeof usageBar> = null;
+    const queue = new UsageReadQueue((state) => {
+      bar = usageBar([CLAUDE], NOW, state);
+      if (bar?.refresh?.announcement && bar.refresh.id > announcedAttempt) {
+        announcedAttempt = bar.refresh.id;
+        announcements.push(bar.refresh.announcement);
+      }
+    });
+    const id = queue.begin(['claude', 'codex'])!;
+    queue.result('claude', id, 'success');
+    assert.equal(bar!.refresh!.busy, true);
+    assert.equal(queue.begin(['claude', 'codex']), null);
+    assert.deepEqual(announcements, []);
+    assert.doesNotMatch(bar!.refresh!.name, /Codex/);
+    queue.reading('codex', id);
+    queue.result('codex', id, phase, phase === 'failed' ? 'Account reading refused' : '');
+    assert.equal(bar!.refresh!.busy, false);
+    assert.equal(announcements.length, 1);
+    assert.match(announcements[0], phase === 'failed' ? /Codex: Usage reading failed/ : /Codex: Usage read/);
+    assert.ok(queue.begin(['claude', 'codex']));
+    queue.dispose();
   }
 });
 

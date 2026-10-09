@@ -672,9 +672,25 @@ export class CodexWire {
     await this.request('turn/interrupt', { threadId: pending.threadId, turnId });
   }
 
+  private usageEligibility: Promise<boolean> | null = null;
+
+  async usageSupported(rediscover = false): Promise<boolean> {
+    if (rediscover || !this.usageEligibility) {
+      const discovery = this.request('account/read', { refreshToken: false }).then(
+        (answer) => obj(answer.account)?.type !== 'amazonBedrock',
+      );
+      this.usageEligibility = discovery;
+      void discovery.catch(() => {
+        if (this.usageEligibility === discovery) this.usageEligibility = null;
+      });
+    }
+    return this.usageEligibility;
+  }
+
   // What the reader's account has left. The server answers this on a bare handshake, with
   // no thread started and no prompt sent, so asking it costs no model tokens.
   async rateLimits(refreshAuthentication = false): Promise<Json> {
+    if (!(await this.usageSupported())) return {};
     if (refreshAuthentication) {
       await this.request('account/read', { refreshToken: true });
     }

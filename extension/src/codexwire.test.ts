@@ -1119,7 +1119,9 @@ test('a skill-list failure leaves native autocomplete available without closing 
   assert.equal(h.events[0].kind, 'ready');
 
   const limits = h.wire.rateLimits();
-  assert.equal(h.parsed()[1].method, 'account/rateLimits/read');
+  assert.equal(h.parsed()[1].method, 'account/read');
+  reply(h, { account: { type: 'chatgpt' } });
+  await vi.waitFor(() => assert.equal(h.parsed()[2].method, 'account/rateLimits/read'));
   reply(h, { rateLimits: null });
   assert.deepEqual(await limits, { rateLimits: null });
 });
@@ -1403,31 +1405,83 @@ test('a server that reports no window at all is reported as nothing', () => {
   assert.equal(readRateLimits(null, 1), null);
 });
 
-test('the rate-limit request goes out on a bare server, before any thread', async () => {
-  // Read rate limits without creating a thread or rollout.
-
+test('the rate-limit request discovers the account before any thread', async () => {
   const h = harness();
-  void h.wire.rateLimits();
-  assert.equal(h.parsed()[0].method, 'account/rateLimits/read');
+  const pending = h.wire.rateLimits();
+  assert.equal(h.parsed()[0].method, 'account/read');
+  reply(h, { account: { type: 'chatgpt' } });
+  await vi.waitFor(() => assert.equal(h.parsed()[1].method, 'account/rateLimits/read'));
+  reply(h, { rateLimits: null });
+  await pending;
 });
 
-test('an explicit rate-limit refresh renews managed authentication before reading limits', async () => {
+test('an explicit rate-limit refresh renews managed authentication after eligibility discovery', async () => {
   const h = harness();
   const reading = h.wire.rateLimits(true);
-  assert.deepEqual(h.parsed()[0], {
-    id: 1,
-    method: 'account/read',
-    params: { refreshToken: true },
-  });
+  assert.deepEqual(h.parsed()[0], { id: 1, method: 'account/read', params: { refreshToken: false } });
   reply(h, { account: { type: 'chatgpt' } });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(h.parsed()[1], {
-    id: 2,
-    method: 'account/rateLimits/read',
-    params: {},
-  });
+  await vi.waitFor(() => assert.equal(h.parsed().length, 2));
+  assert.deepEqual(h.parsed()[1], { id: 2, method: 'account/read', params: { refreshToken: true } });
+  reply(h, { account: { type: 'chatgpt' } });
+  await vi.waitFor(() => assert.equal(h.parsed().length, 3));
+  assert.equal(h.parsed()[2].method, 'account/rateLimits/read');
   reply(h, { rateLimits: null });
   assert.deepEqual(await reading, { rateLimits: null });
+});
+
+test('Bedrock account discovery excludes limits and explicit rediscovery restores supported usage', async () => {
+  const h = harness();
+  const first = h.wire.rateLimits(true);
+  assert.deepEqual(h.parsed()[0].params, { refreshToken: false });
+  reply(h, { account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false });
+  assert.deepEqual(await first, {});
+  assert.deepEqual(
+    h.parsed().map((m) => m.method),
+    ['account/read'],
+  );
+  assert.equal(await h.wire.usageSupported(), false);
+  const rediscovery = h.wire.usageSupported(true);
+  reply(h, { account: { type: 'chatgpt' } });
+  assert.equal(await rediscovery, true);
+  const next = h.wire.rateLimits(true);
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).params.refreshToken, true));
+  reply(h, { account: { type: 'chatgpt' } });
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'account/rateLimits/read'));
+  reply(h, { rateLimits: null });
+  assert.deepEqual(await next, { rateLimits: null });
+  h.wire.close('finished');
+});
+
+test('unknown and signed-out Codex accounts retain retryable subscription errors', async () => {
+  for (const account of [null, { type: 'apiKey' }, { type: 'unknown' }, { type: 'chatgpt' }]) {
+    const h = harness();
+    const first = h.wire.rateLimits();
+    reply(h, { account, requiresOpenaiAuth: false });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'account/rateLimits/read'));
+    h.wire.receive(
+      JSON.stringify({ id: h.parsed().at(-1).id, error: { code: -32600, message: 'Account reading refused' } }),
+    );
+    await assert.rejects(first, /Account reading refused/);
+    const retry = h.wire.rateLimits();
+    await vi.waitFor(() => assert.equal(h.parsed().length, 3));
+    reply(h, { rateLimits: null });
+    await retry;
+    h.wire.close('finished');
+  }
+});
+
+test('failed Codex discovery remains retryable and never establishes Bedrock', async () => {
+  const h = harness();
+  const first = h.wire.rateLimits();
+  h.wire.receive(JSON.stringify({ id: h.parsed().at(-1).id, error: { code: -32600, message: 'Discovery refused' } }));
+  await assert.rejects(first, /Discovery refused/);
+  const retry = h.wire.rateLimits();
+  assert.equal(h.parsed().length, 2);
+  reply(h, { account: null });
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'account/rateLimits/read'));
+  reply(h, { rateLimits: null });
+  await retry;
+  h.wire.close('finished');
 });
 
 test('how much Codex asks rides the next prompt, because that is the only place it can', async () => {

@@ -238,7 +238,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const usage = new UsageBook(context.workspaceState.get<AgentUsage[]>(USAGE_KEY) ?? [], (agent, reading) =>
     recorder.record(agent, reading),
   );
-  const usageReads = new UsageReadQueue((state) => panel.setUsageRefresh(state));
+  const usageReads = new UsageReadQueue(
+    (state) => panel.setUsageRefresh(state),
+    (agent) => usage.excluded(agent),
+  );
   context.subscriptions.push(usageReads);
   // Retain each agent's reported model catalog. Its freshness window controls when another catalog is requested.
   const models = new ModelBook();
@@ -360,7 +363,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void readMcpFrom(key);
       }
       if (agent && event.kind === 'rateLimit') {
-        usage.noteLimit(agent, event.limit, Date.now(), event.creditResetsAtSeconds);
+        const source = host.get(key)?.usageSource;
+        if (!usage.accepts(agent, source)) return;
+        usage.noteLimit(agent, event.limit, Date.now(), event.creditResetsAtSeconds, source);
         if (event.limit && !event.limit.scope) usageReads.admitted(agent);
         publishUsage();
       }
@@ -906,38 +911,88 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   }
 
-  // One session's own agent, asked while its child is alive. Costs no model tokens, so
-  // it runs at the end of every turn.
+  // Read account usage and the model catalog after a live child ends a turn. These controls consume no model tokens.
   //
-  // A failure is kept rather than shown. The bar already says how old its figure is, and an
-  // error box over a percentage the reader did not ask for would interrupt them at the one
-  // moment they are reading what the turn did.
+  // Automatic failures retain readings without adding explicit refresh feedback.
   const readFrom = async (key: string, force: boolean, attempt?: number, operation?: number): Promise<void> => {
     await host.withActivity(key, async (session) => {
       if (force && session.state().busy) {
         await usageReads.waitUntilIdle(session.agent, true, attempt, operation);
         return;
       }
-      if (!usageReads.reading(session.agent, attempt, operation)) return;
+      if (!usageReads.current(session.agent, attempt)) return;
+      const source = session.usageSource;
+      const liveSources = host
+        .states()
+        .filter((state) => state.agent === session.agent && !state.exited)
+        .map((state) => host.get(state.key)!.usageSource);
+      const revision = usage.beginDiscovery(session.agent, source, liveSources);
       let usageFailure = '';
-      try {
-        const reading = await session.rateLimits(force);
-        if (reading) {
-          usage.note(session.agent, reading);
-          usageReads.admitted(session.agent);
-          publishUsage();
+      if (!revision && force && operation !== undefined) {
+        await askAgent(session.agent, true, undefined, session.cwd, attempt, operation);
+        return;
+      }
+      if (!revision)
+        usageReads.result(session.agent, attempt, usage.excluded(session.agent) ? 'excluded' : 'empty', '', operation);
+      else {
+        let discovered = false;
+        try {
+          const supported = await session.usageSupported(force);
+          discovered = true;
+          if (!usage.resolveDiscovery(session.agent, source, revision, supported)) {
+            usageReads.result(
+              session.agent,
+              attempt,
+              usage.excluded(session.agent) ? 'excluded' : 'empty',
+              '',
+              operation,
+            );
+          } else if (!supported) {
+            publishUsage();
+            usageReads.result(session.agent, attempt, 'excluded', '', operation);
+          } else if (usageReads.reading(session.agent, attempt, operation)) {
+            const reading = await session.rateLimits(force);
+            if (!usage.accepts(session.agent, source)) {
+              usageReads.result(
+                session.agent,
+                attempt,
+                usage.excluded(session.agent) ? 'excluded' : 'empty',
+                '',
+                operation,
+              );
+            } else {
+              if (reading) {
+                usage.note(session.agent, reading, source);
+                usageReads.admitted(session.agent);
+                publishUsage();
+              }
+              usageReads.result(
+                session.agent,
+                attempt,
+                reading ? 'success' : 'empty',
+                reading ? '' : 'No usable usage reading was returned.',
+                operation,
+              );
+            }
+          } else {
+            usageReads.result(session.agent, attempt, 'empty', 'No usable usage reading was returned.', operation);
+          }
+        } catch (error) {
+          if (!discovered) usage.resolveDiscovery(session.agent, source, revision, true);
+          if (!usage.accepts(session.agent, source)) {
+            usageReads.result(
+              session.agent,
+              attempt,
+              usage.excluded(session.agent) ? 'excluded' : 'empty',
+              '',
+              operation,
+            );
+          } else {
+            usage.noteSilent(session.agent);
+            usageFailure = (error as Error).message;
+            usageReads.result(session.agent, attempt, 'failed', usageFailure, operation);
+          }
         }
-        usageReads.result(
-          session.agent,
-          attempt,
-          reading ? 'success' : 'empty',
-          reading ? '' : 'No usable usage reading was returned.',
-          operation,
-        );
-      } catch (error) {
-        usage.noteSilent(session.agent);
-        usageFailure = (error as Error).message;
-        usageReads.result(session.agent, attempt, 'failed', usageFailure, operation);
       }
       // Pass the explicit refresh flag to the model catalog. It clears a previous silent failure so the reader can retry.
       if (models.toAsk([session.agent], Date.now(), force).length > 0) {
@@ -1016,6 +1071,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     mcpOwner?: string,
     mcpCwd?: string,
     attempt?: number,
+    ownedOperation?: number,
   ): Promise<void> => {
     const requestedMcpRevision = mcpOwner ? mcp.revision(mcpOwner) : 0;
     const requestedMcpGeneration = mcpSurfaceGeneration;
@@ -1044,13 +1100,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!wantUsage && !wantModels && !wantCommands && !wantMcp) {
           return;
         }
+        const liveSources = live.map((state) => host.get(state.key)!.usageSource);
+        const eligibleIdle = live
+          .filter((state) => !state.busy && usage.canDiscover(agent, host.get(state.key)!.usageSource, liveSources))
+          .sort((left, right) =>
+            agent === 'codex' ? host.get(right.key)!.usageSource - host.get(left.key)!.usageSource : 0,
+          );
         const idleLive = mcpOwner
           ? mcpLive?.busy
             ? undefined
-            : (mcpLive ?? live.find((state) => !state.busy))
-          : live.find((state) => !state.busy);
+            : mcpLive && eligibleIdle.includes(mcpLive)
+              ? mcpLive
+              : eligibleIdle[0]
+          : eligibleIdle[0];
         // Account reads use an idle child. All-busy requests wait without changing active authentication.
-        if (live.length && !idleLive) {
+        if (live.length && !idleLive && (live.every((state) => state.busy) || (mcpOwner && mcpLive?.busy))) {
           const waiting = usageReads.waitUntilIdle(agent, force, attempt, operation);
           if (waiting) {
             await waiting;
@@ -1060,7 +1124,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         let refreshFailure: Error | null = null;
         let initialMcpRevision: number | null = null;
         try {
-          if (live[0]) {
+          if (idleLive) {
             // Reuse a live child's command catalog. MCP status still requires a request, and a missing answer keeps the initial-read gate open.
             publishCommands();
             commandsAsked.add(agent);
@@ -1115,13 +1179,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             wantMcp && resolvedMcpOwner ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision) : null;
           const commandRevision = commandLists.revision(agent);
           if (!usageReads.current(agent, attempt)) return;
+          let source = 0;
+          let revision = 0;
           const answers = await askIdle(
             plan,
             spawner,
             undefined,
             (reading, failure) => {
+              if (!usage.accepts(agent, source)) {
+                usageReads.result(agent, attempt, 'excluded', '', operation);
+                return;
+              }
               if (reading) {
-                usage.note(agent, reading);
+                usage.note(agent, reading, source);
                 usageReads.admitted(agent);
                 publishUsage();
               } else usage.noteSilent(agent);
@@ -1133,7 +1203,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 operation,
               );
             },
-            () => usageReads.reading(agent, attempt, operation),
+            () => usageReads.current(agent, attempt),
+            (supported, discoveredSource) => {
+              source = discoveredSource;
+              if (supported === null) {
+                revision = usage.beginDiscovery(agent, source);
+                if (!revision) usageReads.result(agent, attempt, 'excluded', '', operation);
+                return revision !== 0;
+              }
+              if (!usage.resolveDiscovery(agent, source, revision, supported)) {
+                usageReads.result(agent, attempt, 'excluded', '', operation);
+                return false;
+              }
+              if (!supported) {
+                publishUsage();
+                usageReads.result(agent, attempt, 'excluded', '', operation);
+                return false;
+              }
+              const reading = usageReads.reading(agent, attempt, operation);
+              if (!reading)
+                usageReads.result(agent, attempt, 'empty', 'No usable usage reading was returned.', operation);
+              return reading;
+            },
+            force,
           );
           // Publish the idle child's commands when its remaining controls settle.
           commandsAsked.add(agent);
@@ -1175,6 +1267,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       requestOwner,
       attempt,
+      ownedOperation,
     );
   };
 

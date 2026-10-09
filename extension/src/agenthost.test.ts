@@ -4383,6 +4383,119 @@ test('an agent that publishes no commands answers with none rather than failing 
   assert.deepEqual(answers.commands, [], 'an agent with no commands is not an agent that failed');
 });
 
+test('mixed Claude and Bedrock idle reads exclude Codex before limits and release refresh before catalogs', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const book = new UsageBook();
+  const reading: UsageReading = {
+    plan: 'max',
+    complete: true,
+    spend: null,
+    creditResetsAtSeconds: null,
+    readAt: Date.now(),
+    limits: [{ window: 'five_hour', group: 'session', scope: '', utilization: 0.2, resetsAtSeconds: null, status: '' }],
+  };
+  book.note('claude', reading);
+  book.note('codex', { ...reading, plan: 'plus' });
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const bars: ReturnType<typeof usageBar>[] = [];
+  const publish = () => bars.push(usageBar(book.usages(), Date.now(), states.at(-1)));
+  const queue = new UsageReadQueue((state) => {
+    states.push(state);
+    publish();
+  });
+  const children: FakeChild[] = [];
+  const held: Promise<void>[] = [];
+  for (let pass = 0; pass < 2; pass++) {
+    const id = queue.begin(['claude', 'codex'])!;
+    assert.ok(id);
+    queue.result('claude', id, 'success');
+    const run = queue.run(
+      'codex',
+      true,
+      async (_force, operation) => {
+        let revision = 0;
+        await askIdle(
+          codexIdlePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }),
+          () => {
+            const child = new FakeChild();
+            children.push(child);
+            return child;
+          },
+          undefined,
+          () => assert.fail('Bedrock published a subscription result'),
+          () => queue.current('codex', id),
+          (supported, source) => {
+            if (supported === null) {
+              revision = book.beginDiscovery('codex', source);
+              return true;
+            }
+            assert.equal(book.resolveDiscovery('codex', source, revision, supported), true);
+            if (!supported) {
+              publish();
+              queue.result('codex', id, 'excluded', '', operation);
+              return false;
+            }
+            return queue.reading('codex', id, operation);
+          },
+          true,
+        );
+      },
+      '',
+      id,
+    );
+    held.push(run);
+    await vi.advanceTimersByTimeAsync(0);
+    const child = children[pass];
+    child.reply({ userAgent: 'codex' });
+    await vi.advanceTimersByTimeAsync(0);
+    child.reply({ data: [{ cwd: WS, skills: [] }] });
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(
+      child
+        .sent()
+        .filter((m) => m.method === 'account/read')
+        .map((m) => m.params),
+      [{ refreshToken: false }],
+    );
+    child.replyTo('account/read', { account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false });
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(states.at(-1)?.agents.codex.phase, 'excluded');
+    assert.equal(vi.getTimerCount(), pass + 1, 'only the outstanding catalog wire deadlines remain');
+    assert.deepEqual(
+      book.usages().map((u) => u.agent),
+      ['claude'],
+    );
+    const bar = bars.at(-1)!;
+    assert.deepEqual(
+      bar.groups.map((g) => g.agent),
+      ['claude'],
+    );
+    assert.doesNotMatch(bar.name + bar.refresh!.name + bar.refresh!.announcement, /Codex/);
+    assert.equal(bar.refresh!.busy, false);
+    assert.equal(
+      child.sent().some((m) => m.method === 'account/rateLimits/read'),
+      false,
+    );
+    assert.equal(
+      child.sent().some((m) => typeof m.method === 'string' && /thread|turn|mcp/.test(m.method)),
+      false,
+    );
+    assert.equal(child.ended, false, 'catalog is still held');
+  }
+  for (const bar of bars) {
+    assert.doesNotMatch(bar?.refresh?.name ?? '', /Codex/);
+    assert.doesNotMatch(bar?.refresh?.announcement ?? '', /Codex/);
+    assert.equal(bar?.groups.find((g) => g.agent === 'codex')?.status ?? '', '');
+  }
+  for (const child of children) child.replyTo('model/list', { data: [] });
+  await vi.advanceTimersByTimeAsync(0);
+  await Promise.all(held);
+  for (const child of children) child.exit(0, null);
+  await vi.advanceTimersByTimeAsync(0);
+  queue.dispose();
+  assert.equal(vi.getTimerCount(), 0);
+});
+
 test('a Codex idle child answers both questions and still starts no thread', { timeout: 5000 }, async () => {
   const probe = idleProbe(codexIdlePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
   await tick();
@@ -4391,7 +4504,9 @@ test('a Codex idle child answers both questions and still starts no thread', { t
   // The skills list, but no thread: autocomplete needs the first and the second would leave
   // a session on disk the reader never asked for.
   const methods = child.sent().map((m) => m.method);
-  assert.deepEqual(methods, ['initialize', 'initialized', 'skills/list', 'account/rateLimits/read', 'model/list']);
+  assert.deepEqual(methods, ['initialize', 'initialized', 'skills/list', 'account/read', 'model/list']);
+  child.replyTo('account/read', { account: { type: 'chatgpt' } });
+  await vi.waitFor(() => assert.ok(child.sent().some((m) => m.method === 'account/rateLimits/read')));
   child.replyTo('account/rateLimits/read', {
     rateLimits: {
       planType: 'plus',
@@ -4439,8 +4554,10 @@ test('a rejected Codex skill list leaves the idle usage and models available', {
   await tick();
   assert.deepEqual(
     child.sent().map((message) => message.method),
-    ['initialize', 'initialized', 'skills/list', 'account/rateLimits/read', 'model/list'],
+    ['initialize', 'initialized', 'skills/list', 'account/read', 'model/list'],
   );
+  child.replyTo('account/read', { account: { type: 'chatgpt' } });
+  await vi.waitFor(() => assert.ok(child.sent().some((m) => m.method === 'account/rateLimits/read')));
   child.replyTo('account/rateLimits/read', {
     rateLimits: {
       planType: 'plus',
@@ -4676,6 +4793,71 @@ test('a manual usage deadline cancels queued work and a retry reads once after t
   queue.dispose();
 });
 
+test('unsupported completion releases joined attempts and deferred waits while catalogs remain held', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  let finishCatalog = () => {};
+  let operation = 0;
+  const automatic = queue.run('codex', true, async (_force, current) => {
+    operation = current;
+    queue.reading('codex', undefined, current);
+    await new Promise<void>((resolve) => {
+      finishCatalog = resolve;
+    });
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  const id = queue.begin(['codex'])!;
+  const joined = queue.run('codex', true, async () => assert.fail('joined read dispatched'), '', id);
+  const deferred = queue.waitUntilIdle('codex', true, id, operation)!;
+  queue.result('codex', undefined, 'excluded', '', operation);
+  await Promise.all([joined, deferred]);
+  assert.equal(states.at(-1)?.agents.codex.phase, 'excluded');
+  assert.equal(vi.getTimerCount(), 0);
+  const retryId = queue.begin(['codex'])!;
+  await queue.run(
+    'codex',
+    true,
+    async (_force, next) => {
+      queue.result('codex', retryId, 'excluded', '', next);
+    },
+    '',
+    retryId,
+  );
+  finishCatalog();
+  await automatic;
+  assert.equal(states.at(-1)?.id, retryId);
+  assert.equal(states.at(-1)?.agents.codex.phase, 'excluded');
+  queue.dispose();
+});
+
+test('late Bedrock classification removes expired failure feedback and leaves the next retry available', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  let answer = () => {};
+  const id = queue.begin(['codex'])!;
+  const read = queue.run(
+    'codex',
+    true,
+    async (_force, operation) => {
+      await new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+      queue.result('codex', id, 'excluded', '', operation);
+    },
+    '',
+    id,
+  );
+  await vi.advanceTimersByTimeAsync(USAGE_REFRESH_DEADLINE_MS);
+  assert.equal(states.at(-1)?.agents.codex.phase, 'failed');
+  answer();
+  await read;
+  assert.equal(states.at(-1)?.agents.codex.phase, 'excluded');
+  assert.ok(queue.begin(['codex']));
+  queue.dispose();
+});
+
 test('both busy agents finish visibly at the accepted-press deadline and can retry', async () => {
   vi.useFakeTimers();
   const states: import('./view/usage').UsageRefresh[] = [];
@@ -4695,7 +4877,7 @@ test('both busy agents finish visibly at the accepted-press deadline and can ret
   const settled = Promise.allSettled(work);
   await vi.advanceTimersByTimeAsync(USAGE_REFRESH_DEADLINE_MS - 1);
   assert.equal(states.at(-1)?.agents.claude.phase, 'waiting');
-  assert.equal(states.at(-1)?.agents.codex.phase, 'waiting');
+  assert.equal(states.at(-1)?.agents.codex.phase, 'discovering');
   await vi.advanceTimersByTimeAsync(1);
   await settled;
   assert.equal(states.at(-1)?.agents.claude.phase, 'failed');
@@ -4814,7 +4996,7 @@ test('usage failures, exit, stale completions, and disposal clear attempt clocks
   const queue = new UsageReadQueue((state) => states.push(state));
   const first = queue.begin(['claude', 'codex'])!;
   queue.result('claude', first, 'success');
-  assert.equal(states.at(-1)?.agents.codex.phase, 'queued');
+  assert.equal(states.at(-1)?.agents.codex.phase, 'discovering');
   const failed = queue.run(
     'codex',
     true,
@@ -4906,7 +5088,9 @@ test('an old automatic catalog completion cannot release a newer automatic accou
   const account = new Promise<void>((resolve) => {
     answer = resolve;
   });
+  let oldOperation = 0;
   const old = queue.run('codex', false, async (_force, operation) => {
+    oldOperation = operation;
     queue.result('codex', undefined, 'success', '', operation);
     await catalog;
   });
@@ -4931,10 +5115,17 @@ test('an old automatic catalog completion cannot release a newer automatic accou
   );
   finishCatalog();
   await old;
+  let staleSettled = false;
+  const stale = queue
+    .run('codex', false, async () => assert.fail('obsolete account operation dispatched'), '', undefined, oldOperation)
+    .then(() => {
+      staleSettled = true;
+    });
   await vi.advanceTimersByTimeAsync(0);
+  assert.equal(staleSettled, true, 'obsolete account operation joined the newer account read');
   assert.equal(manualReading, false, 'old catalog completion released the newer automatic read');
   answer();
-  await Promise.all([newer, manual]);
+  await Promise.all([newer, manual, stale]);
   assert.equal(manualReading, true);
   queue.dispose();
 });

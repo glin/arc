@@ -243,6 +243,7 @@ export interface Driver {
   usage?(): Promise<{ usage: unknown; context: unknown }>;
   // Normalized account usage. Both providers answer without a session or model request.
   rateLimits?(refreshAuthentication?: boolean): Promise<UsageReading | null>;
+  usageSupported?(rediscover?: boolean): Promise<boolean>;
   // The provider's model catalog. The control read uses no model tokens.
   models?(): Promise<ModelList | null>;
   appliedDefaults?(): Promise<AppliedDefaults>;
@@ -441,6 +442,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
         close: (reason) => wire.close(reason),
         hasOpenTurns: () => wire.hasOpenTurns(),
         outlivesTurn: (id) => wire.outlivesTurn(id),
+        usageSupported: (rediscover) => wire.usageSupported(rediscover),
         async rateLimits(refreshAuthentication) {
           return readRateLimits(await wire.rateLimits(refreshAuthentication), Date.now());
         },
@@ -501,6 +503,7 @@ export function codexIdlePlan(
         interrupt: () => Promise.resolve(),
         sessionId: () => null,
         close: (reason) => wire.close(reason),
+        usageSupported: (rediscover) => wire.usageSupported(rediscover),
         async rateLimits(refreshAuthentication) {
           return readRateLimits(await wire.rateLimits(refreshAuthentication), Date.now());
         },
@@ -728,9 +731,11 @@ export function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
 
 // Unique submission sequence within this extension-host process. Cleanup state uses the same process lifetime.
 let sessionTurnSequence = 0;
+let nextUsageSource = 0;
 
 // One session and the child running it.
 export class AgentSession {
+  readonly usageSource = ++nextUsageSource;
   readonly key: string;
   readonly agent: AgentName;
   readonly cwd: string;
@@ -1146,6 +1151,10 @@ export class AgentSession {
   // Reads account usage without model tokens.
   async rateLimits(refreshAuthentication = false): Promise<UsageReading | null> {
     return this.driver.rateLimits ? await this.driver.rateLimits(refreshAuthentication) : null;
+  }
+
+  async usageSupported(rediscover = false): Promise<boolean> {
+    return this.driver.usageSupported ? this.driver.usageSupported(rediscover) : true;
   }
 
   // Reads applied CLI settings or returns an unavailable result when the driver exposes no settings read.
@@ -1618,6 +1627,8 @@ export async function askIdle(
   openingDeadlineMs: number = OPENING_DEADLINE_MS,
   onUsage?: (reading: UsageReading | null, failure: string) => void,
   admit: () => boolean = () => true,
+  onDiscovery: (supported: boolean | null, source: number) => boolean = () => true,
+  force = false,
 ): Promise<IdleAnswers> {
   const session = new AgentSession(
     'idle',
@@ -1639,15 +1650,37 @@ export async function askIdle(
     // Exclude MCP status here because that read waits for server connections.
     // Account usage and model requests run independently through the same child.
     let usageFailure = '';
+    let publishUsage = true;
+    const readUsage = () => {
+      if (!onDiscovery(null, session.usageSource)) {
+        publishUsage = false;
+        return Promise.resolve(null);
+      }
+      if (session.agent !== 'codex') {
+        publishUsage = onDiscovery(true, session.usageSource);
+        return publishUsage ? session.rateLimits(force) : Promise.resolve(null);
+      }
+      return (async () => {
+        let supported: boolean;
+        try {
+          supported = await session.usageSupported(force);
+        } catch (error) {
+          publishUsage = onDiscovery(true, session.usageSource);
+          throw error;
+        }
+        publishUsage = onDiscovery(supported, session.usageSource) && supported;
+        if (!publishUsage) return null;
+        return await session.rateLimits(force);
+      })();
+    };
     const [usage, models] = await Promise.all([
-      session
-        .rateLimits()
+      readUsage()
         .catch((error: Error) => {
           usageFailure = error.message;
           return null;
         })
         .then((reading) => {
-          onUsage?.(reading, usageFailure);
+          if (publishUsage) onUsage?.(reading, usageFailure);
           return reading;
         }),
       session.models().catch(() => null),
@@ -1669,7 +1702,10 @@ export class UsageReadQueue {
   private attempt: import('./view/usage.ts').UsageRefresh | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
-  constructor(private readonly publish: (state: import('./view/usage.ts').UsageRefresh) => void = () => {}) {}
+  constructor(
+    private readonly publish: (state: import('./view/usage.ts').UsageRefresh) => void = () => {},
+    private readonly excluded: (agent: string) => boolean = () => false,
+  ) {}
 
   begin(agents: readonly string[]): number | null {
     if (
@@ -1679,7 +1715,12 @@ export class UsageReadQueue {
       return null;
     const id = ++this.nextAttempt;
     this.expiresAt = Date.now() + USAGE_REFRESH_DEADLINE_MS;
-    this.attempt = { id, agents: Object.fromEntries(agents.map((agent) => [agent, { phase: 'queued', detail: '' }])) };
+    this.attempt = {
+      id,
+      agents: Object.fromEntries(
+        agents.map((agent) => [agent, { phase: agent === 'codex' ? 'discovering' : 'queued', detail: '' }]),
+      ),
+    };
     this.timer = setTimeout(() => {
       this.timer = null;
       for (const [agent, state] of Object.entries(this.attempt?.agents ?? {})) {
@@ -1694,7 +1735,7 @@ export class UsageReadQueue {
   }
 
   private pending(phase: string): boolean {
-    return ['queued', 'waiting', 'reading'].includes(phase);
+    return ['discovering', 'queued', 'waiting', 'reading'].includes(phase);
   }
   current(agent: string, id?: number): boolean {
     return (
@@ -1712,11 +1753,21 @@ export class UsageReadQueue {
     this.publish({ id: this.attempt.id, agents: structuredClone(this.attempt.agents) });
   }
   private update(agent: string, id: number, phase: import('./view/usage.ts').UsageRefreshPhase, detail = ''): void {
+    if (phase === 'excluded' && !this.disposed && this.attempt?.id === id && this.attempt.agents[agent]) {
+      this.attempt.agents[agent] = { phase, detail: '' };
+      this.emit();
+      return;
+    }
     if (this.disposed || this.attempt?.id !== id || !this.pending(this.attempt.agents[agent]?.phase)) return;
     if (Date.now() >= this.expiresAt) {
       phase = 'failed';
       detail = 'Usage reading timed out. Read again to retry.';
     }
+    if (phase === 'failed' && this.excluded(agent)) {
+      phase = 'excluded';
+      detail = '';
+    }
+    if (phase === 'waiting' && this.attempt.agents[agent].phase === 'discovering') phase = 'discovering';
     this.attempt.agents[agent] = { phase, detail };
     this.emit();
   }
@@ -1737,7 +1788,7 @@ export class UsageReadQueue {
   result(
     agent: string,
     id: number | undefined,
-    phase: 'success' | 'empty' | 'failed',
+    phase: 'success' | 'empty' | 'failed' | 'excluded',
     detail = '',
     operation?: number,
   ): void {
@@ -1749,6 +1800,17 @@ export class UsageReadQueue {
       active.release();
     }
     if (id !== undefined) this.update(agent, id, phase, detail);
+    else if (phase === 'excluded' && this.attempt?.agents[agent] && !this.pending(this.attempt.agents[agent].phase)) {
+      this.attempt.agents[agent] = { phase, detail: '' };
+      this.emit();
+    }
+    if (phase === 'excluded') {
+      const waiting = this.deferred.get(agent);
+      if (waiting) {
+        this.deferred.delete(agent);
+        waiting.resolve();
+      }
+    }
   }
   dispose(): void {
     if (this.timer !== null) clearTimeout(this.timer);
@@ -1789,9 +1851,15 @@ export class UsageReadQueue {
     read: (force: boolean, operation: number) => Promise<void>,
     requestOwner = '',
     attempt?: number,
+    ownedOperation?: number,
   ): Promise<void> {
     if (!this.current(agent, attempt)) return Promise.resolve();
     const active = this.active.get(agent);
+    if (ownedOperation !== undefined) {
+      return active?.operation === ownedOperation
+        ? Promise.resolve().then(() => (this.current(agent, attempt) ? read(force, ownedOperation) : undefined))
+        : Promise.resolve();
+    }
     if (active) {
       if (attempt !== undefined && active.force && active.sent && active.requestOwner === requestOwner) {
         active.joined.add(attempt);
