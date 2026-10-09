@@ -3641,6 +3641,9 @@ function readCodexOwnSpend(file: string): {
   const requests: UsageEvent[] = [];
   const personScan: CodexPersonScan = {
     bytes: 0,
+    headless: meta?.launchSource === 'exec',
+    interactive: false,
+    openedAt: meta?.openedAt ?? null,
     person: false,
     prompts: [],
     fragment: Buffer.alloc(0),
@@ -4077,9 +4080,12 @@ export function readCodexAgentSpend(file: string, children: readonly CodexSubage
 
 export interface CodexPersonScan {
   bytes: number;
+  headless: boolean;
+  interactive: boolean;
+  openedAt: number | null;
   fragment: Buffer;
   person: boolean;
-  prompts: Array<{ turn: string | null; count: number }>;
+  prompts: Array<{ turn: string | null; count: number; interactive?: true }>;
   prompt: { text: string; at: number; kind: string; turn: string | null } | null;
   usage: CodexUsageReducerState;
   dispatchCompletion?: {
@@ -4098,6 +4104,27 @@ export interface CodexPersonScan {
 function codexPersonRecord(scan: CodexPersonScan, record: Entry): void {
   const foreign = scan.usage.foreignSessionMeta;
   reduceCodexUsageEvents(scan.usage, { kind: record.kind, timestamp: record.at, payload: record.payload });
+  // Interactive metadata shares prompt-turn provenance so delayed copied dates retract both.
+  if (
+    scan.headless &&
+    record.kind === 'session_meta' &&
+    (record.payload.source === 'cli' || record.payload.source === 'vscode') &&
+    scan.usage.openingSessionId !== null &&
+    (str(record.payload.id) ?? str(record.payload.session_id)) === scan.usage.openingSessionId &&
+    scan.openedAt !== null &&
+    record.at > scan.openedAt &&
+    !foreign &&
+    !scan.usage.foreignSessionMeta &&
+    !scan.usage.currentTurnCopied
+  ) {
+    const turn = scan.usage.currentTurnId;
+    if (turn === null) scan.interactive = true;
+    else {
+      let evidence = scan.prompts.find((entry) => entry.turn === turn);
+      if (!evidence) scan.prompts.push((evidence = { turn, count: 0 }));
+      evidence.interactive = true;
+    }
+  }
   const completion = scan.dispatchCompletion;
   if (completion) {
     const id = str(record.payload.turn_id);
@@ -4169,7 +4196,8 @@ function codexPersonRecord(scan: CodexPersonScan, record: Entry): void {
     }
   }
   scan.prompts = scan.prompts.filter((entry) => !entry.turn || !scan.usage.datedCopiedTurnIds[entry.turn]);
-  scan.person = scan.prompts.reduce((sum, entry) => sum + entry.count, 0) > 1;
+  const interactive = !scan.headless || scan.interactive || scan.prompts.some((entry) => entry.interactive);
+  scan.person = interactive && scan.prompts.reduce((sum, entry) => sum + entry.count, 0) > 1;
   if (scan.usage.currentTurnCopied || subagentNotification(record)) return;
   const text = codexPrompt(userMessage(record) ?? '');
   if (!text) return;
@@ -4185,7 +4213,7 @@ function codexPersonRecord(scan: CodexPersonScan, record: Entry): void {
   let evidence = scan.prompts.find((entry) => entry.turn === turn);
   if (!evidence) scan.prompts.push((evidence = { turn, count: 0 }));
   evidence.count = Math.min(2, evidence.count + 1);
-  scan.person = scan.prompts.reduce((sum, entry) => sum + entry.count, 0) > 1;
+  scan.person = interactive && scan.prompts.reduce((sum, entry) => sum + entry.count, 0) > 1;
   scan.prompt = { text, at: record.at, kind: record.kind, turn };
 }
 
@@ -4201,6 +4229,9 @@ export function scanForCodexPerson(
       ? previous
       : {
           bytes: 0,
+          headless: meta?.launchSource === 'exec',
+          interactive: false,
+          openedAt: meta?.openedAt ?? null,
           person: false,
           prompts: [],
           fragment: Buffer.alloc(0),

@@ -105,7 +105,7 @@ import {
   toCard,
 } from './turncard.ts';
 import { formatWhen } from './turnformat.ts';
-import { railCacheMarkOf } from './turnrail.ts';
+import { agentRunAnswer, railCacheMarkOf } from './turnrail.ts';
 import { resumeCommand } from './domain/resume.ts';
 import {
   PROJECT_SPEND_PARSER_GENERATION,
@@ -9406,6 +9406,296 @@ test.each([false, true])(
     assert.equal(readCodexDispatchedSpend([file], [], Date.now() + 6000).person, false);
     fs.appendFileSync(file, JSON.stringify(event('user_message', 8, { message: 'please continue' })) + '\n');
     assert.equal(scanForCodexPerson(file, fs.statSync(file).size, scan).person, true);
+    assert.equal(readCodexDispatchedSpend([file], [], Date.now() + 6000).person, true);
+  },
+);
+
+test.each(['event', 'response'])(
+  'headless dispatch continuations retain final agent classification through active and quiet reads (%s)',
+  (shape) => {
+    const id = UUID_B;
+    const parent = writeRollout([
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      turnContext(1, TURN, 'gpt-6.1-sol', 'high'),
+      commandCompleted(2, 'python dispatch.py --runner codex --arc-dispatch', 0, 'completed', 'dispatch', {
+        stdout: `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}"}`,
+      }),
+    ]);
+    const [edge] = scanCodexDispatchReferences(parent, 'parent').references;
+    assert.equal(edge.sessionId, id);
+    assert.equal(edge.owned, false);
+    const root = sessionsRoot([
+      { day: '2026/08/25', name: ROLLOUT(id), records: [meta({ id, source: 'exec', originator: 'codex_exec' })] },
+    ]);
+    const [session] = codexSessionFiles(root, ['c:\\repo']).sessions;
+    let scan = scanForCodexPerson(session.file, fs.statSync(session.file).size, undefined, id);
+    for (let index = 0; index < 3; index++) {
+      const second = index * 5 + 1;
+      const prompt = `task ${index}`;
+      const records = [
+        event('task_started', second, { turn_id: String(index) }),
+        shape === 'event'
+          ? event('user_message', second + 1, { message: prompt })
+          : message('user', second + 1, prompt),
+        turnContext(second + 2, String(index), 'gpt-6.1-sol', 'high'),
+        tokens(second + 3, { input_tokens: 10 }),
+        event('task_complete', second + 4, { turn_id: String(index) }),
+      ];
+      fs.appendFileSync(session.file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+      scan = scanForCodexPerson(session.file, fs.statSync(session.file).size, scan, id);
+      if (index < 2) continue;
+      for (const now of [Date.now(), Date.now() + 6000]) {
+        const spend = readCodexDispatchedSpend([session.file], [], now);
+        assert.equal(
+          agentRunAnswer(session.agentRun === true, id, new Set(), false, true, edge.owned || spend.person),
+          true,
+        );
+        assert.equal(spend.person, false);
+        assert.equal(scan.person, spend.person);
+        assert.equal(
+          agentRunAnswer(session.agentRun === true, id, new Set(), false, true, edge.owned || scan.person),
+          true,
+        );
+        assert.equal(agentRunAnswer(true, id, new Set([id]), false, true, scan.person), false);
+        assert.equal(agentRunAnswer(true, id, new Set(), false, true, true), false);
+        assert.equal(agentRunAnswer(true, id, new Set([id]), true, true, true), true);
+      }
+      assert.equal(scan.dispatchCompletion?.terminal?.id, String(index));
+      assert.equal(scanForCodexPerson(session.file, fs.statSync(session.file).size, scan, id).person, false);
+    }
+    assert.equal(
+      scan.prompts.reduce((sum, entry) => sum + entry.count, 0),
+      3,
+    );
+  },
+);
+
+test.each(['cli', 'vscode'])(
+  'interactive Codex resume metadata retains reader ownership across bounded appends (%s)',
+  (source) => {
+    const file = writeRollout([
+      meta({ source: 'exec' }),
+      event('task_started', 1, { turn_id: 'launch' }),
+      event('user_message', 2, { message: 'work' }),
+      message('user', 2, 'work'),
+      event('task_complete', 3, { turn_id: 'launch' }),
+    ]);
+    let scan = scanForCodexPerson(file, fs.statSync(file).size);
+    assert.equal(scan.person, false);
+    fs.appendFileSync(file, JSON.stringify(recordedAt(meta({ source }), at(6))) + '\n');
+    scan = scanForCodexPerson(file, fs.statSync(file).size, scan);
+    assert.equal(scan.person, false, 'resume metadata alone adds no prompt');
+    fs.appendFileSync(
+      file,
+      [
+        event('task_started', 7, { turn_id: 'resumed' }),
+        message('user', 8, 'continue'),
+        event('task_complete', 9, { turn_id: 'resumed' }),
+        recordedAt(meta({ source: 'exec' }), at(10)),
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    scan = scanForCodexPerson(file, fs.statSync(file).size, scan);
+    assert.equal(scan.person, true);
+    assert.equal(scanForCodexPerson(file, fs.statSync(file).size, scan).person, true);
+    assert.equal(readCodexDispatchedSpend([file], [], Date.now() + 6000).person, true);
+    assert.equal(agentRunAnswer(true, UUID_A, new Set(), false, true, scan.person), false);
+  },
+);
+
+test.each([
+  'foreign',
+  'foreign history',
+  'missing identity',
+  'replayed opening',
+  'older clock',
+  'copied turn',
+  'unknown source',
+])('unqualified Codex resume metadata preserves headless ownership (%s)', (shape) => {
+  const records: object[] = [
+    meta({ source: 'exec' }),
+    event('task_started', 1, { turn_id: 'launch' }),
+    event('user_message', 2, { message: 'work' }),
+    event('task_complete', 3, { turn_id: 'launch' }),
+  ];
+  if (shape === 'copied turn') records.push(event('task_started', 4, { turn_id: 'copy', started_at: ms(-60) / 1000 }));
+  if (shape === 'foreign history') records.push(recordedAt(meta({ id: UUID_B, source: 'cli' }), at(5)));
+  records.push(
+    recordedAt(
+      meta({
+        source: shape === 'unknown source' ? 'unknown' : 'cli',
+        ...(shape === 'foreign' ? { id: UUID_B } : {}),
+        ...(shape === 'missing identity' ? { id: null, session_id: null } : {}),
+      }),
+      at(shape === 'replayed opening' ? 0 : shape === 'older clock' ? -10 : 6),
+    ),
+  );
+  records.push(
+    recordedAt(meta({ source: 'exec' }), at(7)),
+    event('task_started', 8, { turn_id: 'continuation' }),
+    message('user', 9, 'continue'),
+    event('task_complete', 10, { turn_id: 'continuation' }),
+  );
+  const file = writeRollout(records);
+  const scan = scanForCodexPerson(file, fs.statSync(file).size);
+  assert.equal(scan.person, false);
+  assert.equal(readCodexDispatchedSpend([file], [], Date.now() + 6000).person, false);
+  assert.equal(agentRunAnswer(true, UUID_A, new Set(), false, true, scan.person), true);
+});
+
+test.each(
+  ['cli', 'vscode'].flatMap((source) =>
+    ['same turn', 'next turn'].flatMap((context) => ['whole', 'appends'].map((read) => ({ source, context, read }))),
+  ),
+)(
+  'delayed copied Codex resume metadata preserves final agent filing ($source, $context, $read)',
+  ({ source, context, read }) => {
+    const opening = [
+      meta({ source: 'exec' }),
+      event('task_started', 1, { turn_id: 'launch' }),
+      event('user_message', 2, { message: 'work' }),
+      event('task_complete', 3, { turn_id: 'launch' }),
+    ];
+    const copied = [
+      event('task_started', 4, { turn_id: 'copy' }),
+      recordedAt(meta({ source }), at(6)),
+      event('user_message', 6, { message: 'copied work' }),
+    ];
+    const date = {
+      ...turnContext(10, 'copy', 'gpt-6.1-sol', 'high'),
+      payload: { turn_id: 'copy', current_date: '2026-08-24' },
+    };
+    const continuation = [
+      recordedAt(meta({ source: 'exec' }), at(8)),
+      event('task_started', 9, { turn_id: 'continuation' }),
+    ];
+    const end = [message('user', 11, 'continue'), event('task_complete', 12, { turn_id: 'continuation' })];
+    const batches = [
+      opening,
+      copied,
+      ...(context === 'same turn' ? [[date], continuation] : [continuation, [date]]),
+      end,
+    ];
+    const file = writeRollout(read === 'whole' ? batches.flat() : opening);
+    let scan = scanForCodexPerson(file, fs.statSync(file).size);
+    if (read === 'appends') {
+      for (const batch of batches.slice(1)) {
+        fs.appendFileSync(file, batch.map((record) => JSON.stringify(record)).join('\n') + '\n');
+        scan = scanForCodexPerson(file, fs.statSync(file).size, scan);
+      }
+    }
+    assert.equal(agentRunAnswer(true, UUID_A, new Set(), false, true, scan.person), true);
+    const spend = readCodexDispatchedSpend([file], [], Date.now() + 6000);
+    assert.equal(agentRunAnswer(true, UUID_A, new Set(), false, true, spend.person), true);
+    assert.equal(scan.person, spend.person);
+    assert.equal(
+      scan.prompts.reduce((sum, entry) => sum + entry.count, 0),
+      2,
+    );
+  },
+);
+
+test.each(['outside turn', 'genuine turn'])(
+  'delayed copied Codex resume retains independent interactive evidence (%s)',
+  (provenance) => {
+    const file = writeRollout([
+      meta({ source: 'exec' }),
+      ...(provenance === 'outside turn' ? [recordedAt(meta({ source: 'vscode' }), at(1))] : []),
+      event('task_started', 2, { turn_id: 'launch' }),
+      ...(provenance === 'genuine turn' ? [recordedAt(meta({ source: 'vscode' }), at(3))] : []),
+      event('user_message', 4, { message: 'work' }),
+      event('task_complete', 5, { turn_id: 'launch' }),
+      event('task_started', 6, { turn_id: 'copy' }),
+      recordedAt(meta({ source: 'cli' }), at(7)),
+      event('task_started', 8, { turn_id: 'continuation' }),
+    ]);
+    let scan = scanForCodexPerson(file, fs.statSync(file).size);
+    fs.appendFileSync(
+      file,
+      [
+        { ...turnContext(9, 'copy', 'gpt-6.1-sol', 'high'), payload: { turn_id: 'copy', current_date: '2026-08-24' } },
+        message('user', 10, 'continue'),
+        event('task_complete', 11, { turn_id: 'continuation' }),
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    scan = scanForCodexPerson(file, fs.statSync(file).size, scan);
+    assert.equal(agentRunAnswer(true, UUID_A, new Set(), false, true, scan.person), false);
+    assert.equal(
+      agentRunAnswer(
+        true,
+        UUID_A,
+        new Set(),
+        false,
+        true,
+        readCodexDispatchedSpend([file], [], Date.now() + 6000).person,
+      ),
+      false,
+    );
+  },
+);
+
+test('delayed copied Codex resume retracts metadata-only turns beyond the usage association limit', () => {
+  const copiedIds = Array.from({ length: CODEX_USAGE_ASSOCIATION_LIMIT + 1 }, (_, index) => `copy-${index}`);
+  const file = writeRollout([
+    meta({ source: 'exec' }),
+    event('task_started', 1, { turn_id: 'launch' }),
+    event('user_message', 2, { message: 'work' }),
+    event('task_complete', 3, { turn_id: 'launch' }),
+    ...copiedIds.flatMap((turn_id, index) => [
+      event('task_started', 4 + index * 2, { turn_id }),
+      recordedAt(meta({ source: 'cli' }), at(5 + index * 2)),
+    ]),
+    event('task_started', 150, { turn_id: 'continuation' }),
+  ]);
+  let scan = scanForCodexPerson(file, fs.statSync(file).size);
+  assert.equal(
+    scan.prompts.reduce((sum, entry) => sum + entry.count, 0),
+    1,
+    'metadata adds no prompts',
+  );
+  fs.appendFileSync(
+    file,
+    [
+      ...copiedIds.map((turn_id) => ({
+        ...turnContext(151, turn_id, 'gpt-6.1-sol', 'high'),
+        payload: { turn_id, current_date: '2026-08-24' },
+      })),
+      message('user', 152, 'continue'),
+      event('task_complete', 153, { turn_id: 'continuation' }),
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  scan = scanForCodexPerson(file, fs.statSync(file).size, scan);
+  assert.equal(agentRunAnswer(true, UUID_A, new Set(), false, true, scan.person), true);
+  assert.equal(
+    agentRunAnswer(
+      true,
+      UUID_A,
+      new Set(),
+      false,
+      true,
+      readCodexDispatchedSpend([file], [], Date.now() + 6000).person,
+    ),
+    true,
+  );
+  assert.equal(scan.prompts.length, 2, 'copied metadata-only evidence is removed');
+});
+
+test.each(['cli', 'vscode', undefined])(
+  'interactive and unknown Codex launches retain prompt ownership (%s)',
+  (source) => {
+    const file = writeRollout([
+      meta({ source }),
+      event('user_message', 1, { message: 'first' }),
+      message('user', 1, 'first'),
+      event('user_message', 2, { message: 'second' }),
+    ]);
+    assert.equal(scanForCodexPerson(file, fs.statSync(file).size).person, true);
     assert.equal(readCodexDispatchedSpend([file], [], Date.now() + 6000).person, true);
   },
 );

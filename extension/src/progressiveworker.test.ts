@@ -7963,7 +7963,7 @@ test('Codex dispatched facts survive old parent caches, late catalog arrival and
       new AbortController().signal,
     );
     assert.ok(person?.value.kind === 'claude-children');
-    assert.equal(person.value.dispatchFacts[0].person, true);
+    assert.equal(person.value.dispatchFacts[0].person, false, 'a headless continuation retains agent ownership');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -8257,7 +8257,7 @@ test('rejected dispatch terminals keep whole spend unread until quiet and source
 });
 
 test.each(['large-opening', 'copied-before', 'copied-after'])(
-  'an opening-only dispatched Codex child excludes launch duplicates and copied turns before reader intervention (%s)',
+  'an opening-only dispatched Codex child retains launch ownership across delayed prompts and copied turns (%s)',
   async (shape) => {
     const directory = tempDir('codex-delayed-launch-person-');
     const id = 'aaaaaaaa-1111-1111-1111-111111111111';
@@ -8278,7 +8278,7 @@ test.each(['large-opening', 'copied-before', 'copied-after'])(
     );
     fs.writeFileSync(
       childFile,
-      record('session_meta', 0, { id, cwd: directory, source: 'exec' }) +
+      record('session_meta', 0, { id, cwd: directory, source: shape === 'large-opening' ? 'exec' : 'cli' }) +
         (shape === 'large-opening' ? record('turn_context', 0, { instructions: 'x'.repeat(300 * 1024) }) : '') +
         (shape === 'copied-before'
           ? record('event_msg', 0, { type: 'task_started', turn_id: 'dated-copy' }) +
@@ -8354,7 +8354,7 @@ test.each(['large-opening', 'copied-before', 'copied-after'])(
           record('event_msg', 602, { type: 'user_message', message: 'please continue' }),
       );
       fs.writeFileSync(clock, String(Date.parse(timestamp(603))));
-      assert.equal(await person(), true);
+      assert.equal(await person(), shape !== 'large-opening');
     } finally {
       worker.stop();
     }
