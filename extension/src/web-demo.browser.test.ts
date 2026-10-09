@@ -62,6 +62,132 @@ describe('read-only web demo', () => {
     await page.keyboard.press('Escape');
   };
 
+  it('moves back and forward through selected sessions and parent links without changing saved labels or read marks', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    for (const width of [1280, 390]) {
+      const page = await browser!.newPage();
+      page.setDefaultTimeout(5_000);
+      await page.setViewportSize({ width, height: 850 });
+      await page.goto(`${base}/`);
+      const picker = page.locator('[data-control="picker"]');
+      await page.locator('[data-control="session:arc-read-state"]').waitFor();
+      const unchanged = async (messages: unknown[]) => {
+        expect(
+          await page.evaluate((messages) => {
+            const api = (
+              window as unknown as { acquireVsCodeApi(): { postMessage(message: unknown): void } }
+            ).acquireVsCodeApi();
+            let replies = 0;
+            const count = () => replies++;
+            window.addEventListener('message', count);
+            for (const message of messages) api.postMessage(message);
+            window.removeEventListener('message', count);
+            return replies;
+          }, messages),
+        ).toBe(0);
+      };
+      const choose = async (session: string) => {
+        if (width === 1280) await page.locator(`[data-control="rail:${session}"]`).first().click();
+        else await picker.selectOption(session);
+        await page.locator(`[data-control="session:${session}"]`).waitFor();
+      };
+      const move = async (button: number, session: string) => {
+        await page.dispatchEvent('#list', 'mousedown', { button });
+        await page.dispatchEvent('#list', 'mouseup', { button });
+        await page.locator(`[data-control="session:${session}"]`).waitFor();
+        expect(await picker.inputValue()).toBe(session);
+      };
+      await unchanged([
+        { type: 'goBack' },
+        { type: 'goForward' },
+        { type: 'showSession', session: 'arc-read-state' },
+        { type: 'showSession', session: 'unknown-session' },
+      ]);
+      await choose('arc-demo-continuation');
+      await page.locator('[data-control="sessionlabels:arc-demo-continuation"]').click();
+      await page.locator('#labelpop [data-control="label-find"]').fill('navigation');
+      await page.locator('#labelpop input[data-control="label:navigation"]').check();
+      await page
+        .locator('.sessionlabels .sessionlabel')
+        .filter({ hasText: /^navigation$/ })
+        .waitFor();
+      await page.keyboard.press('Escape');
+      const readKeys = await page.evaluate(() => {
+        const state = (window as unknown as { acquireVsCodeApi(): { getState(): { read: string[] } } })
+          .acquireVsCodeApi()
+          .getState();
+        return state.read.filter((key) => key.startsWith('arc-demo-continuation:'));
+      });
+      expect(readKeys.length).toBeGreaterThan(0);
+      await page.locator('[data-control="sessionparent:arc-demo-dispatch"]').click();
+      await page.locator('[data-control="session:arc-demo-dispatch"]').waitFor();
+      await move(3, 'arc-demo-continuation');
+      await page
+        .locator('.sessionlabels .sessionlabel')
+        .filter({ hasText: /^navigation$/ })
+        .waitFor();
+      await move(4, 'arc-demo-dispatch');
+      await move(3, 'arc-demo-continuation');
+      await unchanged([
+        { type: 'showSession', session: 'arc-demo-continuation' },
+        { type: 'showReaderParent', session: 'unknown-parent' },
+      ]);
+      await move(4, 'arc-demo-dispatch');
+      await move(3, 'arc-demo-continuation');
+      await choose('delegated-cost');
+      await unchanged([{ type: 'goForward' }]);
+      await move(3, 'arc-demo-continuation');
+      await page
+        .locator('.sessionlabels .sessionlabel')
+        .filter({ hasText: /^navigation$/ })
+        .waitFor();
+      expect(
+        await page.evaluate(
+          () =>
+            (window as unknown as { acquireVsCodeApi(): { getState(): { read: string[] } } })
+              .acquireVsCodeApi()
+              .getState().read,
+        ),
+      ).toEqual(expect.arrayContaining(readKeys));
+      await move(3, 'arc-read-state');
+      await unchanged([{ type: 'goBack' }]);
+      await page.close();
+    }
+  });
+
+  it('follows platform Back and Forward shortcuts and preserves editable keyboard actions', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    for (const [platform, back, forward] of [
+      ['Win32', 'Alt+ArrowLeft', 'Alt+ArrowRight'],
+      ['MacIntel', 'Control+-', 'Control+Shift+-'],
+      ['Linux x86_64', 'Control+Alt+-', 'Control+Shift+-'],
+    ]) {
+      const page = await browser!.newPage();
+      page.setDefaultTimeout(5_000);
+      await page.addInitScript(
+        (platform) => Object.defineProperty(navigator, 'platform', { value: platform }),
+        platform,
+      );
+      await page.setViewportSize({ width: 390, height: 850 });
+      await page.goto(`${base}/`);
+      const picker = page.locator('[data-control="picker"]');
+      await picker.selectOption('delegated-cost');
+      await page.locator('[data-control="session:delegated-cost"]').waitFor();
+      await page.locator('#prompt').fill('Keep this draft');
+      await page.locator('#prompt').press(back);
+      expect(await picker.inputValue()).toBe('delegated-cost');
+      expect(await page.locator('#prompt').inputValue()).toBe('Keep this draft');
+      await page.locator('#list .session').first().focus();
+      await page.keyboard.press(back);
+      await page.locator('[data-control="session:arc-read-state"]').waitFor();
+      await page.locator('#list .session').first().focus();
+      await page.keyboard.press(forward);
+      await page.locator('[data-control="session:delegated-cost"]').waitFor();
+      expect(await picker.inputValue()).toBe('delegated-cost');
+      await page.close();
+    }
+  });
+
   it('keeps decorative chrome outside keyboard navigation and panel overlays reachable', async (t) => {
     if (!browser) t.skip('Edge or Chrome is required');
     for (const width of [1280, 390]) {
@@ -423,7 +549,16 @@ describe('read-only web demo', () => {
         };
         await navigate('delegated-cost');
         expect(await page.locator(`[data-control="linemark:${comment.id}"]`).count()).toBe(0);
-        await navigate('arc-read-state');
+        await page.dispatchEvent('#list', 'mousedown', { button: 3 });
+        await page.dispatchEvent('#list', 'mouseup', { button: 3 });
+        await mark.waitFor();
+        await page.dispatchEvent('#list', 'mousedown', { button: 4 });
+        await page.dispatchEvent('#list', 'mouseup', { button: 4 });
+        await page.locator('[data-control="session:delegated-cost"]').waitFor();
+        expect(await page.locator(`[data-control="linemark:${comment.id}"]`).count()).toBe(0);
+        await page.dispatchEvent('#list', 'mousedown', { button: 3 });
+        await page.dispatchEvent('#list', 'mouseup', { button: 3 });
+        await mark.waitFor();
         await mark.focus();
         await mark.press('Enter');
         await page.locator(`[data-control="noteedit:${comment.id}"]`).press('Enter');

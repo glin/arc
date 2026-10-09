@@ -74,7 +74,13 @@ async function prepare(page: Page, scene: (typeof README_SCENES)[number], demoDi
     await page.route('http://arc-demo.local/**', async (route) => {
       const name = path.basename(new URL(route.request().url()).pathname) || 'index.html';
       let body = fs.readFileSync(path.join(demoDirectory, name), 'utf8');
-      if (name === 'samples.js') body += '\nwindow.__ARC_DEMO_SAMPLES__.railWidth = 270;';
+      if (name === 'samples.js')
+        body += `
+window.__ARC_DEMO_SAMPLES__.railWidth = 270;
+for (const payload of Object.values(window.__ARC_DEMO_SAMPLES__.payloads)) {
+  payload.comments = [];
+  payload.usage.composer.annotations = null;
+}`;
       if (name === 'index.html') body = body.replace('<html lang="en"', '<html class="demo-capture" lang="en"');
       await route.fulfill({
         contentType: name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html',
@@ -88,6 +94,8 @@ async function prepare(page: Page, scene: (typeof README_SCENES)[number], demoDi
     await page.waitForFunction(() => document.body.style.getPropertyValue('--demo-header-height') === '0px');
     await page.evaluate(() => document.fonts.ready);
     await page.evaluate(SETTLED);
+    if (await page.locator('.linemark, #composer .cchip').count())
+      throw new Error('The main capture contains comments.');
     return;
   }
   const payload = readmePayload(scene);
@@ -203,6 +211,7 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
   if (
     scene === 'review' ||
     scene === 'comment' ||
+    scene === 'comment-editor' ||
     scene.endsWith('menu') ||
     scene === 'cost' ||
     scene === 'next-turn'
@@ -217,6 +226,23 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
   if (scene === 'comment') {
     await page.locator('#list .turn .summary .linemark').first().click();
     await page.locator('.markfloat').waitFor({ state: 'visible' });
+  }
+  if (scene === 'comment-editor') {
+    await page
+      .locator('#list .turn .summary p')
+      .first()
+      .evaluate((node) => {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const selection = window.getSelection()!;
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.dispatchEvent(new Event('selectionchange'));
+      });
+    await page.locator('.quotefloat .quoteact').click();
+    await page
+      .locator('.quotefloat .notearea')
+      .fill('Check that files and the full diff open after restoring a session tab.');
   }
   if (scene === 'cost' || scene === 'cache') {
     await page.locator('#list .turn [data-metric="cost"]').first().click();
@@ -321,7 +347,7 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
         height: Math.round(box.height),
       },
     });
-  } else if (scene === 'comment') {
+  } else if (scene === 'comment' || scene === 'comment-editor') {
     const rail = await page.locator('#rail').boundingBox();
     if (!rail) throw new Error('Session list is not visible.');
     await writeLosslessWebp(page, file, {
