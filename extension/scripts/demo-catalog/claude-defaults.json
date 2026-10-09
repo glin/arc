@@ -1,6 +1,6 @@
 {
   "applied": {
-    "model": "claude-opus-5-5[1m]",
+    "model": "claude-sonnet-5-5",
     "effort": "medium"
   }
 }

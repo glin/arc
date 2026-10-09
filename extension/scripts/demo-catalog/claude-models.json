@@ -43,6 +43,16 @@
     },
     {
       "value": "haiku",
+      "resolvedModel": "claude-haiku-5-5",
+      "displayName": "Haiku 5.5",
+      "description": "Fastest for quick answers",
+      "supportsEffort": true,
+      "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+      "supportsAdaptiveThinking": true,
+      "supportsAutoMode": true
+    },
+    {
+      "value": "claude-haiku-4-5-20251001",
       "resolvedModel": "claude-haiku-4-5-20251001",
       "displayName": "Haiku 4.5",
       "description": "Fastest for quick answers"
