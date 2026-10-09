@@ -4,8 +4,8 @@ Arc is a VS Code extension for working with Claude Code and Codex. **Experimenta
 
 [Web demo](https://glin.github.io/arc/)
 
-- Run Claude Code and Codex sessions side by side. Keep track of all the agents with vertical tabs, labels, saved views, filters, and linked sessions.
-- Read results, not chat. Each turn shows the final response with file edits, commits, subagents, and cost.
+- Keep track of all the agents! Vertical tabs, labels, saved views, filters, subagent links.
+- Read results, not chat! Each turn shows the final response with file edits, commits, subagents, and cost.
 - See what a session costs with turn-level breakdowns. Save costs with the prompt cache expiry and next-turn starting price hints.
 - Or use Arc as a session viewer. It reads sessions started from the Claude Code and Codex CLIs, VS Code extensions, and desktop apps.
 
