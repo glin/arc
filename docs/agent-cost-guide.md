@@ -158,6 +158,7 @@ Prompt caching matches an unchanged prefix at the start of a later prompt. The p
 - Expect compaction to change the prefix and reduce immediate cache reuse.
 - Compare the smaller post-compaction context with the temporary cache loss.
 - Do not send filler messages only to refresh a cache.
+- Expect a Claude Code effort change on a live session to rewrite the cache unless the model and provider keep it. [Claude Code's prompt caching page](https://code.claude.com/docs/en/prompt-caching#changing-effort-level) lists the models and providers that keep it.
 
 A relevant request before expiry can refresh an eligible cache entry. That request still incurs a cache-read charge and can generate billed output.
 
