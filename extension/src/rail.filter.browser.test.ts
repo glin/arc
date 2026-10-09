@@ -190,7 +190,7 @@ test('empty status filters stay selectable before matching sessions exist', { ti
       assert.equal(await button.locator('.railcountfig').count(), 0);
       await button.press('Enter');
       assert.equal(await button.getAttribute('aria-checked'), 'true');
-      assert.equal(await page.locator('.railcount').count(), 0, `${lens} forced a zero-match rail shortcut`);
+      assert.equal(await page.locator(`[data-control="railcount:${lens}"]`).count(), lens === 'unread' ? 0 : 1);
     }
     await page.locator('[data-control="raillens:running"]').click();
     await page.locator('[data-control="railfilterlabel:composer"]').click();
@@ -205,7 +205,7 @@ test('empty status filters stay selectable before matching sessions exist', { ti
     const reloaded = await browser.newPage();
     initial.railFilters = filters;
     await openPage(reloaded, initial, undefined, { railFilterId: saved.id, railFilter: saved.query });
-    assert.equal(await reloaded.locator('[data-control="railcount:running"]').count(), 0);
+    assert.equal(await reloaded.locator('[data-control="railcount:running"] .railcountfig').textContent(), '0');
     const matching = { ...payload().rail[0], status: 'running', labels: ['composer'] };
     await postToPage(reloaded, railMessage(initial, [matching]));
     assert.equal(await reloaded.locator('.railcard').count(), 1);
@@ -1032,9 +1032,9 @@ test(
   },
 );
 
-// The Running lens includes running, subagent, and background sessions. Ending the last matching session removes its zero-count shortcut.
+// The Running lens includes running, subagent, and background sessions. Its selected shortcut stays available after work ends.
 
-test('the Running count keeps working sessions and leaves the rail at zero', { timeout: 60_000 }, async (t) => {
+test('the Running count stays selected at zero and clears to restore sessions', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no installed Edge or Chrome, so the Running press was not measured');
@@ -1085,75 +1085,98 @@ test('the Running count keeps working sessions and leaves the rail at zero', { t
 
     await postToPage(page, payload());
     assert.deepEqual(await cardsShown(), [], 'the lens kept a session that stopped running');
-    assert.equal(await running.count(), 0, 'the selected zero-match shortcut stayed on the rail');
+    assert.equal(await running.count(), 1, 'the selected Running filter disappeared when work ended');
+    assert.equal(await running.locator('.railcountfig').textContent(), '0');
+    assert.equal(await running.getAttribute('aria-label'), 'Running, 0 sessions');
+    assert.equal(await running.getAttribute('aria-pressed'), 'true');
+    assert.equal(await running.isEnabled(), true);
+    assert.equal(await running.evaluate((node) => node === document.activeElement), true);
+    const restored = await browser.newPage();
+    const saved = await page.evaluate<Record<string, unknown>>(
+      `window.__posted.filter(message => message.type === 'saveState').at(-1).state`,
+    );
+    await openPage(restored, payload(), FIXTURE_CLOCK, saved);
+    assert.equal(await restored.locator('[data-control="railcount:running"] .railcountfig').textContent(), '0');
+    assert.equal(await restored.locator('[data-control="railcount:running"]').getAttribute('aria-pressed'), 'true');
+    await restored.close();
     await page.locator('[data-control="railfilters"]').click();
     assert.equal(await page.locator('[data-control="raillens:running"]').getAttribute('aria-checked'), 'true');
+    await page.locator('[data-control="railfilters"]').press('Escape');
+    await running.press('Enter');
+    assert.ok((await cardsShown()).length > 3, 'clearing Running did not restore the other sessions');
+    assert.equal(await running.count(), 0, 'an unselected zero-count Running button stayed visible');
+    await postToPage(page, payload([], [], [], [], [], [], working));
+    assert.equal(await running.locator('.railcountfig').textContent(), '3');
     assert.deepEqual(failures, []);
   } finally {
     await browser.close();
   }
 });
 
-test('View clears a selected zero-match filter after its rail shortcut disappears', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no installed Edge or Chrome, so the clearing press was not measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    const initial = payload([], [], [], [], [], [], new Map());
-    // s1 and s2 are Active at the fixture clock. Archiving both empties the lens.
+test(
+  'View clears a selected zero-match filter while its rail shortcut stays visible',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed Edge or Chrome, so the clearing press was not measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (error) => failures.push(String(error)));
+      const initial = payload([], [], [], [], [], [], new Map());
+      // s1 and s2 are Active at the fixture clock. Archiving both empties the lens.
 
-    const archived = payload([], [], [], [], [], [], new Map());
-    archived.rail = archived.rail.map((card) =>
-      card.id === 's1' || card.id === 's2' ? { ...card, archived: true } : card,
-    );
-    await openPage(page, initial, FIXTURE_CLOCK, { railFilter: '' });
-    const cardsShown = async () =>
-      (await page.evaluate(
-        `[...document.querySelectorAll('.railcard')].map((node) => node.dataset.session)`,
-      )) as string[];
-    const focus = async () =>
-      await page.evaluate(`(() => ({
+      const archived = payload([], [], [], [], [], [], new Map());
+      archived.rail = archived.rail.map((card) =>
+        card.id === 's1' || card.id === 's2' ? { ...card, archived: true } : card,
+      );
+      await openPage(page, initial, FIXTURE_CLOCK, { railFilter: '' });
+      const cardsShown = async () =>
+        (await page.evaluate(
+          `[...document.querySelectorAll('.railcard')].map((node) => node.dataset.session)`,
+        )) as string[];
+      const focus = async () =>
+        await page.evaluate(`(() => ({
         control: document.activeElement ? document.activeElement.dataset.control ?? null : null,
         body: document.activeElement === document.body,
       }))()`);
-    const before = (await cardsShown()).sort();
+      const before = (await cardsShown()).sort();
 
-    const active = page.locator('[data-control="railcount:active"]');
-    await active.click();
-    await page.evaluate(SETTLED);
-    assert.deepEqual([...new Set(await cardsShown())].sort(), ['s1', 's2'], 'Active kept a session outside the lens');
+      const active = page.locator('[data-control="railcount:active"]');
+      await active.click();
+      await page.evaluate(SETTLED);
+      assert.deepEqual([...new Set(await cardsShown())].sort(), ['s1', 's2'], 'Active kept a session outside the lens');
 
-    // Both Active sessions are archived, so the lens the rail still holds now matches nothing.
-    await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, archived.rail))}, '*')`);
-    await page.evaluate(SETTLED);
-    assert.deepEqual(await cardsShown(), [], 'an archived session stayed on the rail under the Active lens');
-    assert.equal(await active.count(), 0);
-    assert.deepEqual(await focus(), { control: 'railfilters', body: false });
-    await page.locator('[data-control="railfilters"]').click();
-    assert.equal(await page.locator('[data-control="raillens:active"]').isEnabled(), true);
-    assert.equal(await page.locator('[data-control="raillens:active"]').getAttribute('aria-checked'), 'true');
-    await page.locator('[data-control="raillens:all"]').click();
-    await page.evaluate(SETTLED);
-    const after = new Set(await cardsShown());
-    // Show archived defaults to true, so s1 and s2 must return along with every other session
-    // the rail held before the lens narrowed it.
-    assert.deepEqual(after, new Set(before), 'the clearing press did not restore every session');
-    assert.deepEqual(
-      await focus(),
-      { control: 'raillens:all', body: false },
-      'the clearing press dropped focus off the rail head row, onto the page body',
-    );
+      // Both Active sessions are archived, so the lens the rail still holds now matches nothing.
+      await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, archived.rail))}, '*')`);
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await cardsShown(), [], 'an archived session stayed on the rail under the Active lens');
+      assert.equal(await active.locator('.railcountfig').textContent(), '0');
+      assert.deepEqual(await focus(), { control: 'railcount:active', body: false });
+      await page.locator('[data-control="railfilters"]').click();
+      assert.equal(await page.locator('[data-control="raillens:active"]').isEnabled(), true);
+      assert.equal(await page.locator('[data-control="raillens:active"]').getAttribute('aria-checked'), 'true');
+      await page.locator('[data-control="raillens:all"]').click();
+      await page.evaluate(SETTLED);
+      const after = new Set(await cardsShown());
+      // Show archived defaults to true, so s1 and s2 must return along with every other session
+      // the rail held before the lens narrowed it.
+      assert.deepEqual(after, new Set(before), 'the clearing press did not restore every session');
+      assert.deepEqual(
+        await focus(),
+        { control: 'raillens:all', body: false },
+        'the clearing press dropped focus off the rail head row, onto the page body',
+      );
 
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
+      assert.deepEqual(failures, []);
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test('the funnel fill and name follow the lens a count press writes', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
@@ -1369,13 +1392,26 @@ test(
         'the page did not open with the box open, every heading shut, and both saved views holding the lens',
       );
 
+      const active = page.locator('[data-control="railcount:active"]');
+      await active.focus();
       await page.clock.setFixedTime(FIXTURE_CLOCK + 61 * 60_000);
       await page.waitForFunction(
         `!document.querySelector('[data-bucket="${COMPOSER_VIEW}"]') && !document.querySelector('[data-bucket="${RELEASE_VIEW}"]')`,
         undefined,
         { timeout: 10_000 },
       );
-      assert.deepEqual(await state(), { box: 1, counts: 0, cards: 0, views: [] });
+      assert.deepEqual(await state(), { box: 1, counts: 1, cards: 0, views: [] });
+      assert.equal(await active.locator('.railcountfig').textContent(), '0');
+      assert.equal(await active.getAttribute('aria-label'), `Active, 0 sessions. ${CARD_ACTIONS.railCountCacheNone}`);
+      assert.equal(await active.getAttribute('aria-pressed'), 'true');
+      assert.equal(await active.isEnabled(), true);
+      assert.equal(await active.evaluate((node) => node === document.activeElement), true);
+      const renewed = payload()
+        .rail.filter((card) => card.id === 's1' || card.id === 's2')
+        .map((card) => ({ ...card, at: FIXTURE_CLOCK + 61 * 60_000 }));
+      await postToPage(page, railMessage(payload(), renewed));
+      assert.equal(await active.locator('.railcountfig').textContent(), '2');
+      assert.equal(await active.evaluate((node) => node === document.activeElement), true);
       assert.deepEqual(failures, []);
     } finally {
       await browser.close();
@@ -1665,6 +1701,14 @@ test(
         assert.deepEqual(await shown(), again, `${kind} set again kept a session read before`);
         await post(['s1', 's2']);
         assert.deepEqual(await shown(), again, `${kind} dropped a session read under it`);
+        const selected = page.locator(`[data-control="railcount:${kind}"]`);
+        assert.equal(await selected.locator('.railcountfig').textContent(), '0');
+        assert.equal(
+          await selected.getAttribute('aria-label'),
+          `${kind === 'unread' ? 'Unread' : 'Needs input'}, 0 sessions`,
+        );
+        assert.equal(await selected.getAttribute('aria-pressed'), 'true');
+        assert.equal(await selected.isEnabled(), true);
         // A query changed and put back within one frame still changed.
         await page.evaluate(`(() => {
         const input = document.querySelector('.railfilter');

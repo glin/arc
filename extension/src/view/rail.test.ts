@@ -781,15 +781,30 @@ test('a lens count is pressed while the query holds its words, whatever wrote th
   assert.equal(railCountPressed('active', { ...ALL_LENS, query: 'is:needsyou -is:archived -is:agentrun' }), false);
 });
 
-test('a selected zero-match lens draws no rail shortcut, configured or unchecked', () => {
+test('a selected configured zero-match lens keeps its live count and clearing action', () => {
   const zero = { running: 0, warm: 0, expiring: 0, active: 0, unread: 0, input: 0 };
+  assert.deepEqual(railCountButtons(zero, ALL_LENS, HEAD_WORDS, RAIL_LENSES), []);
   for (const lens of RAIL_LENSES) {
-    for (const configured of [[], RAIL_LENSES]) {
+    for (const filterId of [ALL_RAIL_FILTER_ID, 'saved']) {
+      const query = `label:ui ${RAIL_LENS_WORDS[lens]}`;
+      const selected = { filterId, query };
+      assert.deepEqual(railCountButtons(zero, selected, HEAD_WORDS, []), [], lens);
+      const buttons = railCountButtons(zero, selected, HEAD_WORDS, RAIL_LENSES);
+      assert.equal(buttons.length, 1, lens);
+      const [button] = buttons;
       assert.deepEqual(
-        railCountButtons(zero, { ...ALL_LENS, query: RAIL_LENS_WORDS[lens] }, HEAD_WORDS, configured),
-        [],
-        lens,
+        [button.kind, button.figure, button.pressed, button.hint, button.name],
+        [
+          lens,
+          '0',
+          true,
+          HEAD_WORDS.pressedHint,
+          `${HEAD_WORDS[lens]}, 0 ${HEAD_WORDS.sessions}${lens === 'active' ? `. ${HEAD_WORDS.cacheNone}` : ''}`,
+        ],
       );
+      const cleared = { ...selected, query: pressRailLens(query, lens) };
+      assert.equal(cleared.query, 'label:ui');
+      assert.deepEqual(railCountButtons(zero, cleared, HEAD_WORDS, RAIL_LENSES), []);
     }
   }
 });
