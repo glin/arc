@@ -285,7 +285,8 @@ test('startup progress ignores stale epochs and never replaces usable selected c
     assert.equal(await background.getAttribute('role'), 'status');
     assert.equal(await background.getAttribute('aria-live'), 'polite');
     assert.equal(await background.getAttribute('tabindex'), null);
-    assert.equal(await running.count(), 0, 'an authoritative zero count retained the Running filter');
+    assert.equal(await running.count(), 1, 'an authoritative zero count removed the selected Running filter');
+    assert.equal(await running.locator('.railcountfig').textContent(), '0');
     const before = await page.locator('#list').textContent();
     await page.evaluate((value) => window.postMessage(value, '*'), { ...progress, sequence: 4, completed: 2 });
     await page.waitForFunction(() =>

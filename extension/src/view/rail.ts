@@ -812,7 +812,7 @@ export function railCountPressed(kind: RailCountKind, lens: RailHeadLens): boole
   return railQueryHeldLens(lens.query) === kind;
 }
 
-// Configured shortcuts draw only while their scoped session count is positive.
+// Configured shortcuts draw while selected or while their scoped session count is positive.
 // Naming holds their counts and disables presses. Active adds its scoped cache information.
 export function railCountButtons(
   counts: RailCounts | null,
@@ -826,37 +826,37 @@ export function railCountButtons(
     unread: words.unreadHint,
     input: words.inputHint,
   };
-  return RAIL_LENSES.filter((kind) => headLenses.includes(kind) && (counts === null || counts[kind] > 0)).map(
-    (kind) => {
-      const count = counts?.[kind];
-      const figure = count === undefined ? '' : count.toLocaleString('en-US');
-      const pressed = railCountPressed(kind, lens);
-      const cacheState: RailCacheState | null =
-        kind !== 'active' || !counts ? null : counts.expiring > 0 ? 'nearly-gone' : counts.warm > 0 ? 'warm' : null;
-      const cacheDetail =
-        kind !== 'active' || !counts
-          ? null
-          : cacheState === 'nearly-gone'
-            ? words.cacheExpiring
-            : cacheState === 'warm'
-              ? words.cacheWarm
-              : words.cacheNone;
-      return {
-        kind,
-        control: `railcount:${kind}`,
-        label: words[kind],
-        figure,
-        cacheState,
-        cacheDetail,
-        pressed,
-        name:
-          count === undefined
-            ? words[kind]
-            : `${words[kind]}, ${figure} ${count === 1 ? words.session : words.sessions}${cacheDetail ? `. ${cacheDetail}` : ''}`,
-        hint: pressed ? words.pressedHint : hints[kind],
-      };
-    },
-  );
+  return RAIL_LENSES.filter(
+    (kind) => headLenses.includes(kind) && (counts === null || counts[kind] > 0 || railCountPressed(kind, lens)),
+  ).map((kind) => {
+    const count = counts?.[kind];
+    const figure = count === undefined ? '' : count.toLocaleString('en-US');
+    const pressed = railCountPressed(kind, lens);
+    const cacheState: RailCacheState | null =
+      kind !== 'active' || !counts ? null : counts.expiring > 0 ? 'nearly-gone' : counts.warm > 0 ? 'warm' : null;
+    const cacheDetail =
+      kind !== 'active' || !counts
+        ? null
+        : cacheState === 'nearly-gone'
+          ? words.cacheExpiring
+          : cacheState === 'warm'
+            ? words.cacheWarm
+            : words.cacheNone;
+    return {
+      kind,
+      control: `railcount:${kind}`,
+      label: words[kind],
+      figure,
+      cacheState,
+      cacheDetail,
+      pressed,
+      name:
+        count === undefined
+          ? words[kind]
+          : `${words[kind]}, ${figure} ${count === 1 ? words.session : words.sessions}${cacheDetail ? `. ${cacheDetail}` : ''}`,
+      hint: pressed ? words.pressedHint : hints[kind],
+    };
+  });
 }
 
 // One Quick filters checkbox selecting whether its lens count appears on the session list header.

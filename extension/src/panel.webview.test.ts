@@ -21717,7 +21717,10 @@ test('startup selection preserves configured filters until the workspace catalog
     timelineLayout: {},
     iconFonts: [],
   });
-  assert.deepEqual(buttons, [], 'an authoritative empty catalog retains zero-match filters');
+  assert.deepEqual(
+    buttons.map((button) => [button.kind, button.figure, button.pressed]),
+    [['running', '0', true]],
+  );
   const running = { id: 'running', status: 'running', at: 1_000, cache: null };
   handlers.render({
     ...configuration,
@@ -21739,7 +21742,10 @@ test('startup selection preserves configured filters until the workspace catalog
     ],
   );
   handlers.rail(configuration);
-  assert.deepEqual(buttons, [], 'a later workspace update loses authoritative zero counts');
+  assert.deepEqual(
+    buttons.map((button) => [button.kind, button.figure, button.pressed]),
+    [['running', '0', true]],
+  );
 });
 
 test('selection and accepted worker results avoid unnecessary catalog walks', () => {

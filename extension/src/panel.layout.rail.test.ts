@@ -2758,29 +2758,33 @@ async function pressActiveOverLeavingSession(
   return read;
 }
 
-test('the selected Active shortcut disappears when a tick drops its last session', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (e) => failures.push(String(e)));
-    const read = await pressActiveOverLeavingSession(page);
-    // Pause before advancing so due timers run over an exact interval.
+test(
+  'the selected Active shortcut stays pressed when a tick drops its last session',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (e) => failures.push(String(e)));
+      const read = await pressActiveOverLeavingSession(page);
+      // Pause before advancing so due timers run over an exact interval.
 
-    await pauseClock(page);
-    await page.clock.runFor(25_000);
-    const after = await read();
-    assert.equal(after.drawn, 0, 'the session did not leave the list on the tick that crossed the window');
-    assert.equal(after.pressed, null, 'the selected zero-match shortcut stayed visible');
-    assert.deepEqual(failures, [], 'the panel threw while the Active session left the list');
-  } finally {
-    await browser.close();
-  }
-});
+      await pauseClock(page);
+      await page.clock.runFor(25_000);
+      const after = await read();
+      assert.equal(after.drawn, 0, 'the session did not leave the list on the tick that crossed the window');
+      assert.equal(after.pressed, 'true', 'the selected zero-match shortcut disappeared');
+      assert.deepEqual(failures, [], 'the panel threw while the Active session left the list');
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test('ending naming refreshes held cache information at the current time', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
@@ -2861,38 +2865,42 @@ test('a tick that empties Active removes its shortcut and focuses the funnel', {
   }
 });
 
-test('releasing a held text selection removes the zero-match Active shortcut', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (e) => failures.push(String(e)));
-    const read = await pressActiveOverLeavingSession(page);
-    // A held session-list text selection defers both header and list repaint.
+test(
+  'releasing a held text selection retains the selected zero-match Active shortcut',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (e) => failures.push(String(e)));
+      const read = await pressActiveOverLeavingSession(page);
+      // A held session-list text selection defers both header and list repaint.
 
-    await page.evaluate(`(() => {
+      await page.evaluate(`(() => {
         const range = document.createRange();
         range.selectNodeContents(document.querySelector('.railcard[data-session="s1"]'));
         getSelection().removeAllRanges();
         getSelection().addRange(range);
       })()`);
-    await pauseClock(page);
-    await page.clock.runFor(25_000);
-    // Wait for selectionchange to release the deferred update. The paused clock cannot advance an animation-frame wait.
+      await pauseClock(page);
+      await page.clock.runFor(25_000);
+      // Wait for selectionchange to release the deferred update. The paused clock cannot advance an animation-frame wait.
 
-    await page.evaluate('getSelection().removeAllRanges()');
-    await page.waitForFunction(`document.querySelector('.railcard[data-session="s1"]') === null`);
-    const after = await read();
-    assert.equal(after.pressed, null, 'the selected zero-match shortcut survived selection release');
-    assert.deepEqual(failures, [], 'the panel threw while releasing the held selection');
-  } finally {
-    await browser.close();
-  }
-});
+      await page.evaluate('getSelection().removeAllRanges()');
+      await page.waitForFunction(`document.querySelector('.railcard[data-session="s1"]') === null`);
+      const after = await read();
+      assert.equal(after.pressed, 'true', 'the selected zero-match shortcut disappeared after selection release');
+      assert.deepEqual(failures, [], 'the panel threw while releasing the held selection');
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test(
   'the rail head row funnel and magnifier take the session action hover chip and scale with the text',
