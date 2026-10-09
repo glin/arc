@@ -3,6 +3,8 @@
   const sample = window.__ARC_DEMO_SAMPLES__;
   const ids = Object.keys(sample.payloads);
   let selected = ids[0];
+  const placeRules = sample.placeRules;
+  let trail = placeRules.visitPlace(placeRules.emptyTrail(), selected);
   let layout = { cardLayout: 'two-columns', promptPosition: 'above' };
   let views = sample.payloads[selected].views;
   let railFilters = sample.payloads[selected].railFilters;
@@ -133,6 +135,19 @@
   function labelEditorReply(session) {
     return labelRules.labelEditorReply(labels, sample.payloads[selected].sessions, session, sample.labelWords.heading);
   }
+  function visit(session) {
+    if (!Object.hasOwn(sample.payloads, session) || session === selected) return;
+    trail = placeRules.visitPlace(trail, session);
+    selected = session;
+    render();
+  }
+  function navigate(direction) {
+    const next = direction === 'goBack' ? placeRules.stepBack(trail) : placeRules.stepForward(trail);
+    if (!next) return;
+    trail = next;
+    selected = placeRules.trailPlace(trail);
+    render();
+  }
   function membership(action, session) {
     if (!ids.includes(session)) return;
     if (action === 'pin') {
@@ -223,10 +238,11 @@
           break;
         case 'showSession':
         case 'showReaderParent':
-          if (Object.hasOwn(sample.payloads, message.session)) {
-            selected = message.session;
-            render();
-          }
+          visit(message.session);
+          break;
+        case 'goBack':
+        case 'goForward':
+          navigate(message.type);
           break;
         case 'refreshUsage':
         case 'newSession':
@@ -340,6 +356,24 @@
       const editable = target instanceof Element && target.closest('input,textarea,[contenteditable]');
       const chord = sample.isSendChord(event, navigator.platform);
       const composing = event.isComposing || event.keyCode === 229;
+      if (!editable && !event.defaultPrevented && !composing && !event.metaKey) {
+        let direction;
+        if (/^Win/.test(navigator.platform)) {
+          if (event.altKey && !event.ctrlKey && !event.shiftKey) {
+            if (event.key === 'ArrowLeft') direction = 'goBack';
+            else if (event.key === 'ArrowRight') direction = 'goForward';
+          }
+        } else if ((event.key === '-' || event.code === 'Minus') && event.ctrlKey) {
+          if (event.shiftKey && !event.altKey) direction = 'goForward';
+          else if (!event.shiftKey && event.altKey === !/^Mac/.test(navigator.platform)) direction = 'goBack';
+        }
+        if (direction) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          navigate(direction);
+          return;
+        }
+      }
       const enter =
         prompt &&
         event.key === 'Enter' &&
