@@ -372,7 +372,7 @@ test('acknowledged Claude discovery resumes after worker restart while metadata 
   );
   const stat = revisionOf(fs.statSync(file, { bigint: true }));
   const session = { file, sessionId: 'parent', agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
-  let worker = new ProgressiveWorker(source);
+  let worker = new ProgressiveWorker('performance.now = () => 0;' + source);
   let entries: Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]> = [];
   let checkpoint: import('./progressiveworker').DiscoveryCheckpoint | undefined;
   let previous = 0;
@@ -411,7 +411,7 @@ test('acknowledged Claude discovery resumes after worker restart while metadata 
       entries = [...restored.claudeChildReferences];
       checkpoint = restored.discovery;
       worker.stop();
-      worker = new ProgressiveWorker(source);
+      worker = new ProgressiveWorker('performance.now = () => 0;' + source);
     }
     assert.fail('acknowledged discovery never reached its fixed target');
   } finally {
@@ -428,7 +428,7 @@ test('bounded Claude discovery visits all roots and serves selected history duri
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId: String(index), agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
   });
-  const worker = new ProgressiveWorker(source);
+  const worker = new ProgressiveWorker('performance.now = () => 0;' + source);
   try {
     let previous = new Map<string, number>();
     let total = 0;
@@ -516,7 +516,7 @@ test.each(['deleted', 'unreachable'] as const)(
       const stat = revisionOf(fs.statSync(file, { bigint: true }));
       return { file, sessionId: path.basename(file), agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
     });
-    let worker = new ProgressiveWorker(source);
+    let worker = new ProgressiveWorker('performance.now = () => 0;' + source);
     const request = { kind: 'claude-children' as const, parents, repositoryRoots: [directory], quantumBytes: 65536 };
     try {
       let checkpoint: import('./progressiveworker').DiscoveryCheckpoint | undefined;
@@ -541,7 +541,7 @@ test.each(['deleted', 'unreachable'] as const)(
         checkpoint.parents = [waiting];
         checkpoint.catalog = [waiting];
         worker.stop();
-        worker = new ProgressiveWorker(source);
+        worker = new ProgressiveWorker('performance.now = () => 0;' + source);
       }
       const result = await completeDiscovery(
         worker,
@@ -575,7 +575,7 @@ test('a completed Claude quantum survives cancellation before a later colliding 
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, sessionId: path.basename(file), agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
   });
-  let worker = new ProgressiveWorker(source);
+  let worker = new ProgressiveWorker('performance.now = () => 0;' + source);
   let acknowledged:
     | Extract<import('./progressiveworker').ProgressiveValue, { kind: 'claude-children-delta' }>
     | undefined;
@@ -608,7 +608,7 @@ test('a completed Claude quantum survives cancellation before a later colliding 
     const previous = entry.claudeCursor!.offset;
     assert.ok(previous > 0);
     worker.stop();
-    worker = new ProgressiveWorker(source);
+    worker = new ProgressiveWorker('performance.now = () => 0;' + source);
     let advanced = false;
     for (let pass = 0; pass < 10; pass++) {
       const resumed = await worker.run(

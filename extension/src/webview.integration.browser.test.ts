@@ -470,10 +470,15 @@ test('responsive heading Labels leave the timeline and card fingerprints untouch
           } else {
             await page.setViewportSize({ width, height: 850 });
           }
+          const labelTag = width < RAIL_MIN_WIDTH ? 'SPAN' : 'BUTTON';
+          await page.waitForFunction(
+            (tag) => document.querySelector('.sessionrow[data-session="bulk0"] .sessionlabel')?.tagName === tag,
+            labelTag,
+          );
           await page.evaluate(SETTLED);
           assert.deepEqual(await drawCounts(page), counts, `resize at ${width} drew the timeline at ${n} sessions`);
           assert.equal(await page.evaluate('window.__arcCardPrints'), prints, 'resize traversed card fingerprints');
-          assert.equal(await label.evaluate((node) => node.tagName), width < RAIL_MIN_WIDTH ? 'SPAN' : 'BUTTON');
+          assert.equal(await label.evaluate((node) => node.tagName), labelTag);
           if (width < RAIL_MIN_WIDTH) {
             assert.equal(await page.evaluate(`document.activeElement?.dataset.control`), 'sessionlabels:bulk0');
           }

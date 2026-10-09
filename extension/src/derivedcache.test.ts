@@ -17,14 +17,14 @@ test.each(['claude', 'codex'] as const)(
       '{"type":"event_msg","timestamp":"2026-10-08T12:00:00Z","payload":{"type":"task_complete"}}',
     );
     const parent = { file, sessionId: 'parent' };
+    let clock = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
     const first =
       agent === 'claude'
         ? await scanClaudeRelationshipQuantum(parent, undefined)
         : await scanCodexDispatchReferencesAsync(file, 'parent');
     assert.equal(first.cursor.terminalApplied, true);
     fs.appendFileSync(file, '\n');
-    let clock = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => clock);
     const read = RelationshipReader.prototype.read;
     const observed = vi.spyOn(RelationshipReader.prototype, 'read').mockImplementation(function (
       this: RelationshipReader,

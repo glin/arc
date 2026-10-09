@@ -3652,7 +3652,7 @@ test('a Codex launch reaches the host card and the dispatched child heading afte
     return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
   };
   const sessions = [session(parentFile, 'parent', 'codex'), session(childFile, childId, 'claude')];
-  const worker = new ProgressiveWorker(progressiveWorkerSource);
+  const worker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
   const fixture = liveProviderFixture({ ...livePress(), sessionId: 'parent', agent: 'codex' });
   const provider = fixture.provider as unknown as Record<string, any>;
   Object.assign(provider, {
@@ -3695,7 +3695,7 @@ test('a Codex launch reaches the host card and the dispatched child heading afte
     saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
     provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
     worker.stop();
-    provider.progressiveWorker = new ProgressiveWorker(progressiveWorkerSource);
+    provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
     assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
     const parentRead = readCodexSession(parentFile, 'parent');
     const recorded = parentRead.turns[0];
@@ -3846,7 +3846,7 @@ test('a Codex launch reaches the host card and the dispatched child heading afte
     saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
     provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
     provider.progressiveWorker.stop();
-    provider.progressiveWorker = new ProgressiveWorker(progressiveWorkerSource);
+    provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
     assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
     assert.equal(provider.claudeChildReferences.length, 1);
   } finally {
@@ -3933,7 +3933,7 @@ test.each([
       return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
     };
     const sessions = [session(parentFile, 'parent', parentAgent), session(childFile, childId, childAgent)];
-    const worker = new ProgressiveWorker(progressiveWorkerSource);
+    const worker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
     const fixture = liveProviderFixture({ ...livePress(), sessionId: 'parent', agent: parentAgent });
     const provider = fixture.provider as unknown as Record<string, any>;
     Object.assign(provider, {
@@ -4081,7 +4081,7 @@ test.each([
       saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
       provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
       worker.stop();
-      provider.progressiveWorker = new ProgressiveWorker(progressiveWorkerSource);
+      provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
       assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
       assert.equal(provider.claudeChildReferences.length, 1);
     } finally {

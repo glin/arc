@@ -449,25 +449,26 @@ test('local installation rejects unrelated directories and hosted marketplace ow
   }
 });
 
-test('invalid plugin state reports partial installation and preserves legacy hooks', () => {
+test.each([
+  { name: 'malformed JSON', state: 'invalid json' },
+  { name: 'an object instead of a list', state: '{}' },
+  { name: 'an empty list', state: '[]' },
+  { name: 'project scope only', state: '[{"id":"arc-hooks@arc","scope":"project","enabled":true}]' },
+  { name: 'a string enabled flag', state: '[{"id":"arc-hooks@arc","scope":"user","enabled":"true"}]' },
+  {
+    name: 'a hook loading error',
+    state: '[{"id":"arc-hooks@arc","scope":"user","enabled":true,"errors":["Failed to load hooks/hooks.json"]}]',
+  },
+])('invalid plugin state $name reports partial installation and preserves legacy hooks', ({ state }) => {
   const f = installerFixture();
   try {
-    for (const state of [
-      'invalid json',
-      '{}',
-      '[]',
-      '[{"id":"arc-hooks@arc","scope":"project","enabled":true}]',
-      '[{"id":"arc-hooks@arc","scope":"user","enabled":"true"}]',
-      '[{"id":"arc-hooks@arc","scope":"user","enabled":true,"errors":["Failed to load hooks/hooks.json"]}]',
-    ]) {
-      const r = f.run(['code'], { ARC_TEST_PLUGIN_LIST: state });
-      assert.equal(r.status, 1, r.stderr);
-      assert.match(r.stderr, /extension is installed, but Claude snapshot plugin setup failed/);
-      assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
-      assert.equal(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'), 'utf8'), f.legacy);
-      assert.doesNotMatch(r.stdout, /==> Installed Arc\./);
-      assert.doesNotMatch(r.commands, /plugin enable/);
-    }
+    const r = f.run(['code'], { ARC_TEST_PLUGIN_LIST: state });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /extension is installed, but Claude snapshot plugin setup failed/);
+    assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+    assert.equal(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'), 'utf8'), f.legacy);
+    assert.doesNotMatch(r.stdout, /==> Installed Arc\./);
+    assert.doesNotMatch(r.commands, /plugin enable/);
   } finally {
     f.cleanup();
   }
