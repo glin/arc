@@ -368,6 +368,9 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
   );
   assert.match(chip.detail, /Longest qualifying gap: 1d 2h/);
   assert.ok(chip.detail.includes('The record does not identify every cache-key change.'));
+  // The Codex caveat explains the count, so it folds into the notes.
+  assert.deepEqual(chip.detailList?.notes, ['The record does not identify every cache-key change.']);
+  assert.deepEqual(chip.detailList?.footer, []);
   const lower = sessionCacheExpiryStats({
     ...exact,
     returns: [
@@ -469,26 +472,22 @@ test('indexed compaction detail falls back to turns and preserves lifetime turn 
   );
   assert.deepEqual(
     merged.detailList?.entries.map((entry) => entry.label),
-    [
-      '22 turns in the main session',
-      '1m between the first and last turns',
-      'Context compacted 3 times',
-      'Latest compaction',
-      'About these figures',
-    ],
+    ['Turns in the main session', 'First to last turn', 'Compactions', 'Latest compaction'],
   );
-  assert.equal(merged.detailList?.entries.at(-2)?.value, 'Automatic');
+  assert.equal(merged.detailList?.entries.at(-1)?.value, 'Automatic');
+  assert.deepEqual(merged.detailList?.notes, [
+    'The turn count excludes delegated work.',
+    'Elapsed time includes gaps between turns.',
+  ]);
   assert.equal(
     merged.detail,
     [
-      '22 turns in the main session',
-      '1m between the first and last turns',
-      'Context compacted 3 times',
+      'Turns in the main session: 22',
+      'First to last turn: 1m',
+      'Compactions: 3',
       'Latest compaction: Automatic',
-      '',
-      'About these figures',
-      '  The turn count excludes delegated work.',
-      '  Elapsed time includes gaps between turns.',
+      'The turn count excludes delegated work.',
+      'Elapsed time includes gaps between turns.',
     ].join('\n'),
   );
   assert.match(merged.detail, /The turn count excludes delegated work\./);
@@ -1973,7 +1972,7 @@ test('an Edit and then a whole-file Write keeps the lines and says the file was 
   assert.deepEqual(files.detailList?.footer, ['1 file was written whole, so its line counts are partial.']);
   const heading = sessionStats([written], []).find((c) => c.metric === 'files')!;
   assert.equal(heading.name, files.name, 'the session heading names the file apart from the turn figure');
-  assert.equal(heading.detail.split('\n').at(-1), '  1 file was written whole, so its line counts are partial.');
+  assert.deepEqual(heading.detailList?.footer, ['1 file was written whole, so its line counts are partial.']);
 });
 
 test('the files figure names a Write and a shell edit apart, and folds a subagent write in too', () => {
@@ -2936,6 +2935,57 @@ test('a genuine tool count survives a later artifacts read that recomputes the s
 });
 
 // A priced child keeps request and token totals in cost detail. Duration remains a separate figure.
+
+test('a subagent cost record folds its compaction note, and the turn cost keeps it visible', () => {
+  const usage = {
+    requests: 2,
+    input: 1_000,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheRead: 100_000,
+    output: 2_000,
+    thinking: 0,
+  };
+  const recorded = {
+    model: 'claude-sonnet-5',
+    provider: null,
+    contextWindow: null,
+    contextBand: null,
+    inferenceClass: null,
+    serviceTier: null,
+    usage,
+  };
+  const estimate = { ...recorded, compactionEstimate: true as const, usage: { ...usage, requests: 1 } };
+  const card = toCard(
+    turn({
+      agents: [
+        agent({
+          spendFound: true,
+          spend: [{ model: 'claude-sonnet-5', usage, usageParts: [recorded, estimate] }],
+        }),
+      ],
+    }),
+    false,
+    NOW,
+  );
+  const record = card.agents[0].figures.find((figure) => figure.metric === 'cost')?.record;
+  const note = /Includes an estimated \$[\d.]+ for 1 compaction\./;
+  assert.ok(
+    record?.notes?.some((line) => note.test(line)),
+    `the subagent record notes are ${JSON.stringify(record?.notes)}`,
+  );
+  assert.ok(
+    !record?.entries.some((entry) =>
+      (entry.lines ?? []).some((line) => note.test(typeof line === 'string' ? line : JSON.stringify(line))),
+    ),
+    'the subagent record still draws the compaction note as a visible line',
+  );
+  const turnCost = card.chips.find((chip) => chip.metric === 'cost')?.detailList;
+  assert.ok(
+    turnCost?.footer?.some((line) => note.test(line)),
+    `the turn cost footer is ${JSON.stringify(turnCost?.footer)}`,
+  );
+});
 
 test('a priced child keeps its requests and its token totals in the cost record', () => {
   const card = toCard(
@@ -4784,7 +4834,7 @@ test('the cost chip includes child transcripts and its hover breaks the total do
         lines: costLines('Cached input reads: $0 (0% cached)', 'Uncached input: $1.00'),
       },
     ],
-    footer: ['Estimated from published model rates. Your actual charge may differ.'],
+    notes: ['Estimated from published model rates. Your actual charge may differ.'],
   });
   assert.equal(cost?.headDetail, true);
   assert.match(cost!.name!, /Audit the parser .* haiku-4-5: \$1\.00/);
@@ -4840,6 +4890,21 @@ test('turn and compaction chips keep semantic identities while optional roles ch
   assert.deepEqual(
     toCompactionCard(compaction(), NOW).chips.map((chip) => chip.metric),
     ['cost', 'dropped-context'],
+  );
+});
+
+test('a compaction cost figure keeps its usage visible and folds its pricing basis into the notes', () => {
+  const cost = toCompactionCard(compaction(), NOW).chips.find((chip) => chip.metric === 'cost')!;
+  assert.match(cost.detailList?.entries[0]?.label ?? '', /of context sent, .* summary written\.$/);
+  // The reader sees that a Claude compaction cost is modelled without opening the notes.
+  assert.deepEqual(cost.detailList?.footer, [
+    'Claude Code records no usage for a compaction, so this cost is an estimate.',
+  ]);
+  assert.equal(cost.detailList?.notes?.at(-1), 'Estimated from published model rates. Your actual charge may differ.');
+  assert.match(cost.detailList?.notes?.[0] ?? '', /^Estimated as /, 'the estimate basis joins the notes');
+  assert.equal(
+    cost.detail,
+    [cost.detailList!.entries[0].label, ...cost.detailList!.footer!, ...cost.detailList!.notes!].join('\n'),
   );
 });
 
@@ -7453,7 +7518,8 @@ test('indexed lifetime cost rolls every priced bucket into one ordered usage bre
   assert.deepEqual(chip.detailList, {
     heading: { label: 'Estimated total', value: '$6.13' },
     entries: [{ label: 'Cost by usage · gpt-5.5, opus-5, gpt-5.6', lines: costLines(...lineTexts) }],
-    footer: [
+    footer: [],
+    notes: [
       CACHED_INPUT_READ_EXPLANATION,
       'Includes the main session and delegated work.',
       'Estimated from published model rates. Your actual charge may differ.',
@@ -7478,7 +7544,7 @@ test('indexed lifetime cost rolls every priced bucket into one ordered usage bre
     'the flat rail hover includes the explanation once',
   );
   assert.equal(
-    chip.detailList?.footer?.filter((line) => line === CACHED_INPUT_READ_EXPLANATION).length,
+    chip.detailList?.notes?.filter((line) => line === CACHED_INPUT_READ_EXPLANATION).length,
     1,
     'the structured selected-heading detail includes the explanation once',
   );
@@ -7549,8 +7615,8 @@ test('indexed lifetime cost separates the main agent from rolled-up delegated wo
         lines: costLines('Output: <$0.01', 'Cached input reads: $0 (0% cached)', 'Uncached input: <$0.01'),
       },
     ],
-    footer: [
-      'Some usage could not be priced, so the estimated total may be low.',
+    footer: ['Some usage could not be priced, so the estimated total may be low.'],
+    notes: [
       'Codex Auto Review uses the OpenAI Codex rate card.',
       'Includes the main session and delegated work.',
       'Estimated from published model rates. Your actual charge may differ.',
@@ -8266,37 +8332,33 @@ test('a ledger with no span and no compaction count leaves both lines out of the
 
   assert.equal(
     sessionTurnStats(turnStats(12))[0].detail,
-    '12 turns in the main session\n\nAbout these figures\n  The turn count excludes delegated work.',
+    'Turns in the main session: 12\nThe turn count excludes delegated work.',
   );
 });
 
-test('the turn chip hover carries the elapsed span and compaction count', () => {
+test('the turn figure lists its counts as label and value rows and folds its notes', () => {
   const first = Date.UTC(2026, 0, 1, 9, 0, 0);
-  const last = first + (2 * 60 + 8) * 60_000; // 2h 8m later
-  const detail = sessionTurnStats(
-    turnStats(12, {
-      compactionCount: 3,
-      firstTurnAt: first,
-      lastTurnAt: last,
-    }),
-  )[0].detail;
+  const last = first + (9 * 24 + 3) * 60 * 60_000; // 9d 3h later
+  const [chip] = sessionTurnStats(turnStats(22, { compactionCount: 3, firstTurnAt: first, lastTurnAt: last }));
+  assert.deepEqual(chip.detailList, {
+    layout: 'economics',
+    entries: [
+      { label: 'Turns in the main session', value: '22' },
+      { label: 'First to last turn', value: '9d 3h' },
+      { label: 'Compactions', value: '3' },
+    ],
+    notes: ['The turn count excludes delegated work.', 'Elapsed time includes gaps between turns.'],
+  });
   assert.equal(
-    detail,
-    '12 turns in the main session\n' +
-      '2h 8m between the first and last turns\nContext compacted 3 times\n\nAbout these figures\n' +
-      '  The turn count excludes delegated work.\n  Elapsed time includes gaps between turns.',
+    chip.detail,
+    'Turns in the main session: 22\nFirst to last turn: 9d 3h\nCompactions: 3\n' +
+      'The turn count excludes delegated work.\nElapsed time includes gaps between turns.',
   );
 });
 
-test('a session with no compactions says so in words rather than a bare zero', () => {
-  const detail = sessionTurnStats(turnStats(12, { compactionCount: 0 }))[0].detail;
-  assert.match(detail, /\nNo compactions recorded\n/);
-  assert.doesNotMatch(detail, /\bIt held 0\b/);
-});
-
-test('a single compaction is worded in the singular', () => {
-  const detail = sessionTurnStats(turnStats(12, { compactionCount: 1 }))[0].detail;
-  assert.match(detail, /\nContext compacted once\n/);
+test('a session with no compactions shows a zero count row', () => {
+  const chip = sessionTurnStats(turnStats(12, { compactionCount: 0 }))[0];
+  assert.deepEqual(chip.detailList?.entries.at(-1), { label: 'Compactions', value: '0' });
 });
 
 test('a total that could not price every turn is marked as a floor and says how many', () => {
@@ -8462,6 +8524,14 @@ test('context is the newest turn level, never a sum of the turns', () => {
   const ctx = chips.find((c) => c.label.includes('ctx'));
   assert.equal(ctx?.label, '20% of 1M ctx (200k)');
   assert.match(ctx!.detail, /Context measures the current level, not cumulative token usage\./);
+  // The standing explanation sits under the notes disclosure, not in the visible breakdown.
+  assert.ok(ctx!.detailList?.notes?.includes('Context measures the current level, not cumulative token usage.'));
+  assert.ok(
+    !ctx!.detailList?.entries.some((entry) =>
+      (entry.lines ?? []).some((line) => typeof line === 'string' && line.startsWith('Context measures')),
+    ),
+    'the context explanation is still a visible line',
+  );
   // Session context must not sum the turns' token levels.
   assert.ok(!chips.some((c) => c.label.includes('700k')));
 });
@@ -8669,12 +8739,10 @@ test('a path the shell names without hunks in one turn and a later turn edits ke
     'Distinct files changed: 1',
     'Lines changed: +5',
     '  Across the 2 loaded turns',
-    '',
-    'About these figures',
-    '  Each file counts once, even when several turns change it.',
-    '  Line totals add recorded edits across those turns, rather than a final net diff.',
     // The sentence names its file, so it never reads as a sentence about the turns above it.
-    '  1 file was named by the shell without its lines, so its line counts are partial.',
+    '1 file was named by the shell without its lines, so its line counts are partial.',
+    'Each file counts once, even when several turns change it.',
+    'Line totals add recorded edits across those turns, rather than a final net diff.',
   ]);
 });
 
@@ -10199,12 +10267,15 @@ test('a dispatched share marks the turn cost as a lower bound when it is short o
   assert.equal(turnCardCost(turn(), [dispatchedCost()]).partial, false);
 });
 
-test('a dispatched share adds the session total footer notes for its compactions and auto reviews', () => {
-  const notes = (part: DispatchedCostUsage) =>
-    costFigure(
-      toCard(turn(), false, NOW, [], null, false, new Set(), [dispatchedCost({ parts: [part] })]),
-    ).detailList!.footer!.join(' ');
-  assert.match(notes(dispatchedPart(1_000_000, { compactionEstimate: true })), /estimated \$1\.00 for /);
+test('a dispatched share adds the session total notes for its compactions and auto reviews', () => {
+  const list = (part: DispatchedCostUsage) =>
+    costFigure(toCard(turn(), false, NOW, [], null, false, new Set(), [dispatchedCost({ parts: [part] })])).detailList!;
+  const notes = (part: DispatchedCostUsage) => list(part).notes!.join(' ');
+  // The compaction estimate stays in the visible footer.
+  assert.match(
+    (list(dispatchedPart(1_000_000, { compactionEstimate: true })).footer ?? []).join(' '),
+    /estimated \$1\.00 for /,
+  );
   assert.match(
     notes({ ...dispatchedPart(1_000_000), model: 'codex-auto-review', provider: 'openai', inferenceClass: 'global' }),
     /Codex Auto Review uses the OpenAI Codex rate card/,

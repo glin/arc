@@ -7140,7 +7140,7 @@ test('the next-turn popover keeps the current status and alternate cache estimat
       assert.doesNotMatch(words, /estimated cost to compact|assumes a summary/i);
     }
   }
-  assert.deepEqual(figure?.warm?.footer, ['Conservative API list-price estimates. Actual charges can differ.']);
+  assert.deepEqual(figure?.warm?.notes, ['Conservative API list-price estimates. Actual charges can differ.']);
 });
 
 test('the next-turn price includes an answer that crosses the request band', () => {
@@ -7182,7 +7182,7 @@ test('the working never says floor to the reader', () => {
       entry.value ? lineWords(entry.value) : '',
       ...(entry.lines ?? []).map(lineWords),
     ]),
-    ...face.footer,
+    ...face.notes,
   ]);
   for (const words of said) {
     assert.doesNotMatch(words, /floor/i, `the reader is shown "${words}"`);

@@ -226,7 +226,7 @@ export function createComposerPresentation(options: ComposerPresentationOptions)
         valueTitle: typeof words === 'string' ? face.statusTitle : null,
       },
       entries: face.entries,
-      footer: face.footer,
+      notes: face.notes,
     };
   };
   const wordsNode = (text: string, title: string | null = null): HTMLElement => {

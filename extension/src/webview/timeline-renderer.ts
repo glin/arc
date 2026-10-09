@@ -125,12 +125,16 @@ function withDrawnCount(chip: SessionStat, shown: number): SessionStat {
   }
   const [firstLine, ...remainingLines] = (chip.detail || '').split('\n');
   const [firstEntry, ...remainingEntries] = chip.detailList.entries;
+  // A label and value list takes the drawn count as one more row.
+  const shownEntry: { label: string; value?: string } =
+    chip.detailList.layout === 'economics' ? { label: 'Turns shown', value: String(shown) } : { label: shownDetail };
+  const shownLine = shownEntry.value === undefined ? shownDetail : `${shownEntry.label}: ${shownEntry.value}`;
   return {
     ...chip,
-    detail: [firstLine, shownDetail, ...remainingLines].join('\n'),
+    detail: [firstLine, shownLine, ...remainingLines].join('\n'),
     detailList: {
       ...chip.detailList,
-      entries: [...(firstEntry ? [firstEntry] : []), { label: shownDetail }, ...remainingEntries],
+      entries: [...(firstEntry ? [firstEntry] : []), shownEntry, ...remainingEntries],
     },
   };
 }

@@ -8,7 +8,15 @@ import { CARD_ACTIONS } from './turnview.ts';
 import { formatCacheSpan } from './view/time.ts';
 import { composerView, pickMenu } from './composerview.ts';
 import { CONSERVATIVE_CACHE_BOUNDARY_MS } from './pricing.ts';
-import { DRAFT_COMPOSER, FIXTURE_CLOCK, nextTurnPayload, pageHtml, renderPayload, themed } from './panelfixture.ts';
+import {
+  DRAFT_COMPOSER,
+  FIXTURE_CLOCK,
+  nextTurnPayload,
+  pageHtml,
+  renderPayload,
+  statPopoverPayload,
+  themed,
+} from './panelfixture.ts';
 import {
   layoutAt,
   axName,
@@ -898,7 +906,9 @@ test('pressing the next-turn price opens its working inside the panel', { timeou
           hidden: node.hidden,
           pinned: node.classList.contains('pinned'),
           pressed: control.getAttribute('aria-pressed'),
-          describes: control.getAttribute('aria-describedby'),
+          // Ids inside the popover count as the popover, since a figure with notes names its breakdown parts.
+          describes: [...new Set((control.getAttribute('aria-describedby') || '').split(' ').filter(Boolean)
+            .map((id) => document.getElementById(id)?.closest('#chippop') && !document.getElementById(id)?.closest('.chippopnotes') ? 'chippop' : id))].join(' ') || null,
           text: node.textContent,
           heading: node.querySelector('.chippophead') ? node.querySelector('.chippophead').textContent : null,
           statusTitle: node.querySelector('.chippopmuted [title]')?.getAttribute('title')
@@ -906,7 +916,7 @@ test('pressing the next-turn price opens its working inside the panel', { timeou
             ?? null,
           labels: [...node.querySelectorAll('.chippoplabel')].map((one) => one.textContent),
           lines: [...node.querySelectorAll('.chippopsubitem')].map((one) => one.textContent),
-          footer: [...node.querySelectorAll('.chippopfoot')].map((one) => one.textContent),
+          notes: [...node.querySelectorAll('.chippopnotes li')].map((one) => one.textContent),
           stacked: node.classList.contains('chippop-stacked'),
           itemHeadJustify: firstHead ? getComputedStyle(firstHead).justifyContent : null,
           scrollable: node.scrollHeight > node.clientHeight,
@@ -923,7 +933,7 @@ test('pressing the next-turn price opens its working inside the panel', { timeou
         statusTitle: string | null;
         labels: string[];
         lines: string[];
-        footer: string[];
+        notes: string[];
         stacked: boolean;
         itemHeadJustify: string | null;
         scrollable: boolean;
@@ -953,9 +963,9 @@ test('pressing the next-turn price opens its working inside the panel', { timeou
       assert.equal(pop.itemHeadJustify, 'flex-start', `the next-turn labels and values are pushed apart at ${width}px`);
       assert.deepEqual(pop.lines, detailLines ?? [], `the next-turn working retains a removed detail at ${width}px`);
       assert.deepEqual(
-        pop.footer,
+        pop.notes,
         ['Conservative API list-price estimates. Actual charges can differ.'],
-        `the working drops its estimate footer at ${width}px`,
+        `the working drops its estimate note at ${width}px`,
       );
       assert.doesNotMatch(
         pop.text,
@@ -1331,6 +1341,19 @@ test('the session heading hint falls back to the name the rail draws', { timeout
       (await heading.getAttribute('aria-label')) ?? '',
       new RegExp(stored),
       'the session heading accessible name reads the card title instead of the name the rail draws',
+    );
+    // A dialog with no heading takes the Files figure's spoken name, not its drawn text.
+    await page.evaluate(`window.postMessage(${JSON.stringify(statPopoverPayload())}, '*')`);
+    await page.evaluate(SETTLED);
+    const files = page.locator('#list .sessionstats .statchip[data-metric="files"]');
+    await files.click();
+    await page.locator('#chippop[role="dialog"]').waitFor();
+    const spoken = ((await files.locator('.saidonly').textContent()) ?? '').trim();
+    assert.ok(spoken, 'the Files figure has no spoken name, so this measures nothing');
+    assert.equal(
+      await page.getByRole('dialog', { name: spoken, exact: true }).count(),
+      1,
+      `the Files dialog is not named "${spoken}"`,
     );
   } finally {
     await browser.close();

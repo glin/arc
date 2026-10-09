@@ -1689,8 +1689,8 @@ test('the session heading puts cost before turns and names how many turns are dr
     };
     await post(page, payload);
     await turnsChip.focus();
-    assert.match(await page.locator('#chippop').innerText(), /3 turns shown\./);
-    assert.match(await page.locator('#chippop').innerText(), /Context compacted 2 times/);
+    assert.match(await page.locator('#chippop').innerText(), /Turns shown\W*3/);
+    assert.match(await page.locator('#chippop').innerText(), /Compactions\W*2/);
     await turnsChip.press('Enter');
     assert.equal(await turnsChip.getAttribute('aria-pressed'), 'true');
     await page.keyboard.press('Escape');
@@ -1762,9 +1762,9 @@ test('latest compaction stays with context and uses turns only as its fallback',
       const turnsChip = page.locator('section.sessionsection .sessionstats [data-metric="turns"]');
       await turnsChip.click();
       const turnsText = await contextPop.innerText();
-      assert.match(turnsText, /22 turns in the main session/);
-      assert.match(turnsText, /10m between the first and last turns/);
-      assert.match(turnsText, /Context compacted 3 times/);
+      assert.match(turnsText, /Turns in the main session\s+22/);
+      assert.match(turnsText, /First to last turn\s+10m/);
+      assert.match(turnsText, /Compactions\s+3/);
       assert.match(turnsText, /About these figures/);
       assert.match(turnsText, /Latest compaction\s+Automatic/);
       assert.doesNotMatch(turnsText, removed);
@@ -1985,8 +1985,8 @@ test('a comment editor holds a replacement view that a session change draws at o
     const retainedChip = page.locator('section.sessionsection[data-session="s1"] .sessionstats [data-metric="turns"]');
     await retainedChip.evaluate((node: HTMLElement) => node.click());
     assert.ok((await page.locator('#chippop .chippopitem').count()) > 0);
-    assert.match(await page.locator('#chippop').innerText(), /32 turns in the main session/);
-    assert.doesNotMatch(await page.locator('#chippop').innerText(), /64 turns|compacted 4 times/);
+    assert.match(await page.locator('#chippop').innerText(), /Turns in the main session\s+32/);
+    assert.doesNotMatch(await page.locator('#chippop').innerText(), /\b64\b|Compactions\s+4/);
 
     await page.locator('.quoteslot .notearea').press('Escape');
     await page.evaluate(SETTLED);
@@ -3593,6 +3593,116 @@ test('cost chip selection keeps the pinned detail through running activity', asy
     }))()`),
       { oldDetail: false, newDetail: true, sameButton: true, sameAnchor: true },
     );
+  } finally {
+    await browser.close();
+  }
+});
+
+// The notes fold under one closed disclosure. A pinned popover reaches it by keyboard and keeps its focus and open state through a redraw.
+test('figure notes disclosure is reachable when pinned and keeps focus and open state through a redraw', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    const payload = renderPayload() as Payload;
+    const card = payload.cards[0];
+    const costOf = (held: Record<string, unknown>) =>
+      (held.chips as Array<Record<string, unknown>>).find((chip) => String(chip.label).startsWith('$'))!;
+    const cost = costOf(card);
+    cost.label = '$0.10';
+    cost.detail = 'Original cost detail.';
+    cost.detailList = {
+      entries: [{ label: 'Estimated total', value: '$0.10' }],
+      footer: ['Some usage could not be priced.'],
+      notes: ['Standing note.'],
+    };
+    payload.cards = [card];
+    await post(page, payload);
+    const selector = `[data-key=${JSON.stringify(card.key)}] button.statchip.has-detail[data-metric="cost"]`;
+    const state = () =>
+      page.evaluate(`(() => {
+        const pop = document.querySelector('#chippop');
+        const figure = document.querySelector(${JSON.stringify(selector)});
+        const described = (figure.getAttribute('aria-describedby') || '')
+          .split(' ')
+          .map((id) => document.getElementById(id)?.textContent ?? '')
+          .join(' ');
+        return {
+          role: pop.getAttribute('role'),
+          pinned: pop.classList.contains('pinned'),
+          described,
+          open: pop.querySelector('.chippopnotes')?.open ?? null,
+          onSummary: document.activeElement === pop.querySelector('.chippopnotes summary'),
+          onFigure: document.activeElement === figure,
+        };
+      })()`) as Promise<Record<string, unknown>>;
+    await page.locator(selector).focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !!document.querySelector('#chippop:not([hidden]) .chippopnotes'));
+    const pinned = await state();
+    assert.equal(pinned.role, 'dialog');
+    assert.equal(await page.getByRole('dialog', { name: /\$0\.10/ }).count(), 1, 'the dialog takes its figure name');
+    assert.equal(pinned.open, false, 'the notes start closed');
+    assert.match(String(pinned.described), /\$0\.10[\s\S]*Some usage could not be priced\./);
+    assert.doesNotMatch(String(pinned.described), /Standing note|About these figures/);
+
+    // A control right after the figure takes a native Tab unless the popover claims it.
+    await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).after(document.createElement('button'))`);
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.activeElement?.matches('#chippop .chippopnotes summary') === true);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(
+      () => document.querySelector<HTMLDetailsElement>('#chippop .chippopnotes')?.open === true,
+    );
+
+    const changed = structuredClone(card) as Record<string, unknown>;
+    changed.activity = [
+      ...(card.activity as unknown[]),
+      {
+        sourceId: 'notes-disclosure:redraw',
+        kind: 'step',
+        status: 'running',
+        code: '',
+        figure: '',
+        since: null,
+        line: 'Notes disclosure activity.',
+        title: 'Notes disclosure activity.',
+      },
+    ];
+    const changedCost = costOf(changed);
+    changedCost.label = '$0.20';
+    changedCost.detailList = {
+      ...(cost.detailList as object),
+      entries: [{ label: 'Estimated total', value: '$0.20' }],
+    };
+    await post(page, { type: 'activity', session: card.sessionId, card: changed });
+    await page.waitForFunction(() => document.querySelector('#chippop')?.textContent?.includes('$0.20') === true);
+    const redrawn = await state();
+    assert.equal(redrawn.onSummary, true, 'focus stays on the summary through the redraw');
+    assert.equal(redrawn.open, true, 'the notes stay open through the redraw');
+
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => document.querySelector('#chippop')?.hasAttribute('hidden') === true);
+    assert.equal((await state()).onFigure, true, 'Escape returns focus to the figure');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !!document.querySelector('#chippop:not([hidden]) .chippopnotes'));
+    assert.equal((await state()).open, true, 'the panel keeps one open state for the notes');
+
+    // A hover shows the closed summary. Pinning that hover drawing restores the open state.
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => document.querySelector('#chippop')?.hasAttribute('hidden') === true);
+    await page.locator(selector).hover();
+    await page.waitForFunction(() => !!document.querySelector('#chippop:not([hidden]) .chippopnotes'));
+    const hovered = await state();
+    assert.equal(hovered.pinned, false, 'the hover pinned the popover, so this measures nothing');
+    assert.equal(hovered.open, false, 'a hover opens the notes');
+    await page.locator(selector).click();
+    await page.waitForFunction(() => document.querySelector('#chippop')?.classList.contains('pinned') === true);
+    assert.equal((await state()).open, true, 'pinning a hover drawing leaves the notes closed');
   } finally {
     await browser.close();
   }

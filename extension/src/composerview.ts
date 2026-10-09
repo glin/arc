@@ -1899,7 +1899,8 @@ export interface NextTurnFace {
   // Display estimate details in one column.
   layout: 'stacked';
   entries: NextTurnEntry[];
-  footer: string[];
+  // Standing explanations under the popover's notes disclosure.
+  notes: string[];
 }
 
 export interface ComposerNextTurn {
@@ -1929,7 +1930,7 @@ const NEXT_TURN_DISCLOSURE = 'Details';
 // Shared text before the price on every estimate face.
 const NEXT_TURN_LEAD = 'Next turn starts at ';
 
-const NEXT_TURN_FOOTER = ['Conservative API list-price estimates. Actual charges can differ.'];
+const NEXT_TURN_NOTES = ['Conservative API list-price estimates. Actual charges can differ.'];
 
 function nextTurnFaces(
   basis: NextTurnBasis,
@@ -1953,7 +1954,7 @@ function nextTurnFaces(
       statusTitle,
       layout: 'stacked',
       entries: [...(warmMoney === coldMoney ? [] : [{ label: 'Cost if cache were warm', value: warmMoney }])],
-      footer: NEXT_TURN_FOOTER,
+      notes: NEXT_TURN_NOTES,
     };
     return { warm: null, cold: compacted };
   }
@@ -1968,7 +1969,7 @@ function nextTurnFaces(
         statusTitle,
         layout: 'stacked',
         entries: [...(warmMoney === coldMoney ? [] : [{ label: 'Cost if cache were warm', value: warmMoney }])],
-        footer: NEXT_TURN_FOOTER,
+        notes: NEXT_TURN_NOTES,
       },
     };
   }
@@ -1988,7 +1989,7 @@ function nextTurnFaces(
     },
     layout: 'stacked',
     entries: [...(warmMoney === coldMoney ? [] : [{ label: 'Cost if cache were cold', value: coldMoney }])],
-    footer: NEXT_TURN_FOOTER,
+    notes: NEXT_TURN_NOTES,
   };
   const cold: NextTurnFace = {
     state: 'cold',
@@ -1998,7 +1999,7 @@ function nextTurnFaces(
     statusTitle,
     layout: 'stacked',
     entries: [...(warmMoney === coldMoney ? [] : [{ label: 'Cost if cache were warm', value: warmMoney }])],
-    footer: NEXT_TURN_FOOTER,
+    notes: NEXT_TURN_NOTES,
   };
   return { warm, cold };
 }

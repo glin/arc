@@ -1064,7 +1064,7 @@ function ActivitySection({
         label: card.status === 'running' ? cardWords().activityBreakdownRunning : cardWords().activityBreakdownTable,
       },
       entries: tally.map((item) => ({ label: item.name, value: String(item.count) })),
-      footer: [
+      notes: [
         `${rawTotal} ${card.status === 'running' ? cardWords().activityRecordedSoFar : cardWords().activityRecorded}. ${cardWords().activityBreakdownDifference}`,
       ],
     };
@@ -1114,8 +1114,8 @@ function ActivitySection({
         ],
       };
     }),
-    // Describe best-effort evidence once in the footer when any skill carries that evidence.
-    footer: skills.some(bestEffort) ? [cardWords().activitySkillsBestEffort] : undefined,
+    // Describe best-effort evidence once in the notes when any skill carries that evidence.
+    notes: skills.some(bestEffort) ? [cardWords().activitySkillsBestEffort] : undefined,
   });
   const rowButtons = () =>
     Array.from(list.current?.querySelectorAll<HTMLButtonElement>('button[data-logrow]') ?? []).filter(

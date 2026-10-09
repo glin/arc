@@ -859,6 +859,7 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.notequote { color: var(--idle) }',
   '.notesave { color: var(--vscode-button-foreground, #fff) }',
   '.pop { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',
+  '.projectspendpricing { color: var(--idle) }',
   '.prompt { color: var(--idle) }',
   '.quoteact { color: var(--vscode-button-foreground, #fff) }',
   '.railfiltertools > button { color: var(--idle) }',

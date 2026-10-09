@@ -830,8 +830,8 @@ test('the latest indexed compaction trigger attaches to turns when current conte
       value: 'Manual',
     },
   );
-  assert.match(turns?.detail ?? '', /Context compacted once/);
-  assert.match(turns?.detail ?? '', /About these figures/);
+  assert.match(turns?.detail ?? '', /Compactions: 1/);
+  assert.match(turns?.detail ?? '', /The turn count excludes delegated work\./);
 });
 
 test('the open heading and rail use one lifetime cost and turn count', () => {

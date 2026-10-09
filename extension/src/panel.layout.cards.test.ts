@@ -1716,14 +1716,14 @@ test(
         'a skill with no recorded file drew its plain name as a button anyway',
       );
       assert.deepEqual(
-        await pop.locator('.chippopfoot').allTextContents(),
+        await pop.locator('.chippopnotes li').allTextContents(),
         [CARD_ACTIONS.activitySkillsBestEffort],
         'the reader is not told the list holds a best-effort Codex match',
       );
       assert.deepEqual(
         await popoverDescriptions(page),
-        [CARD_ACTIONS.activitySkillsBestEffort],
-        'the best-effort note is spoken as a description of the dialog',
+        [],
+        'the folded best-effort note is spoken as a description of the dialog',
       );
       const opens = pop.locator('.chippopsubitem.chippoppath .chippopnamelink');
       assert.equal(await opens.count(), 2);
@@ -1849,8 +1849,11 @@ test(
       await page.evaluate(SETTLED);
       await page.keyboard.press('Tab');
       await page.keyboard.press('Tab');
+      // The notes summary is the last stop inside the popover.
       await page.keyboard.press('Tab');
-      assert.equal(await pop.isHidden(), true, 'walking past the last button left the popover open');
+      assert.equal(await page.evaluate('document.activeElement?.matches("#chippop .chippopnotes summary")'), true);
+      await page.keyboard.press('Tab');
+      assert.equal(await pop.isHidden(), true, 'walking past the last stop left the popover open');
       assert.equal(
         await page.evaluate('document.activeElement?.className'),
         'actviewaction',
@@ -1876,14 +1879,26 @@ test(
       await page.evaluate(SETTLED);
       assert.equal(await pop.isHidden(), true, 'a second press on the count left the list open');
 
-      // Read-only tool anchors describe a tooltip rather than control a dialog.
+      // A tool anchor has no actions. Its notes make the popover a dialog that the anchor controls,
+      // and the anchor's description names the visible breakdown without the notes.
 
       const tool = page.locator('#list .turn .acttool');
       await tool.hover();
       await page.evaluate(SETTLED);
-      assert.equal(await pop.getAttribute('role'), 'tooltip');
-      assert.equal(await tool.getAttribute('aria-describedby'), 'chippop');
-      assert.equal(await tool.getAttribute('aria-controls'), null);
+      assert.equal(await pop.getAttribute('role'), 'dialog');
+      assert.equal(
+        await tool.evaluate((node) =>
+          (node.getAttribute('aria-describedby') ?? '')
+            .split(' ')
+            .every(
+              (id) =>
+                !!document.getElementById(id)?.closest('#chippop') &&
+                !document.getElementById(id)?.closest('.chippopnotes'),
+            ),
+        ),
+        true,
+      );
+      assert.equal(await tool.getAttribute('aria-controls'), 'chippop');
       assert.equal(await pop.locator('.chippopnamelink').count(), 0);
 
       // Skill loads do not create tool categories, and zero skills omit the skill count.

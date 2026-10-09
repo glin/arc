@@ -129,7 +129,10 @@ export interface StatDetailList {
   actions?: true;
   heading?: StatDetailEntry & { fact?: string };
   entries: StatDetailEntry[];
+  // Lines that change how a figure reads: unpriced or incomplete usage, lower bounds, and count caveats.
   footer?: string[];
+  // Standing explanations, drawn under a closed "About these figures" disclosure.
+  notes?: string[];
 }
 
 export interface StatChip {
@@ -927,13 +930,19 @@ function hintDetailLine(line: StatDetailLine): string {
 }
 
 // Cost breakdown for a child figure, excluding its displayed total.
-// Coverage-only blocks become standalone notes without headings.
-function agentCostEntries(agent: TurnAgent, partial: boolean, runner: AgentKind, noEnding: boolean): StatDetailEntry[] {
+// Coverage-only blocks become standalone lines without headings. Compaction notes go to `notes`.
+function agentCostEntries(
+  agent: TurnAgent,
+  partial: boolean,
+  runner: AgentKind,
+  noEnding: boolean,
+  notes: string[],
+): StatDetailEntry[] {
   if (!agent.spend.length) {
     return [];
   }
   const entries: StatDetailEntry[] = [];
-  for (const entry of childCostEntries(agent, true, 'Cost by usage', runner, noEnding)) {
+  for (const entry of childCostEntries(agent, true, 'Cost by usage', runner, noEnding, notes)) {
     const lines = entry.lines ?? [];
     if (!lines.length) {
       continue;
@@ -1041,6 +1050,18 @@ function figureRecord(
     record,
     detail: (flat ? [name, ...flat] : flatDetailList(record)).join('\n'),
   };
+}
+
+// A child cost record, with its compaction notes folded under the notes disclosure.
+function costRecordList(
+  agent: TurnAgent,
+  partial: boolean,
+  runner: AgentKind,
+  noEnding: boolean,
+): Omit<StatDetailList, 'heading'> {
+  const notes: string[] = [];
+  const entries = agentCostEntries(agent, partial, runner, noEnding, notes);
+  return notes.length ? { entries, notes } : { entries };
 }
 
 // Unpriced children display token usage as a separate figure.
@@ -1187,7 +1208,7 @@ function agentFigures(
       metric: 'cost',
       compactLabel: `${cost}${partial ? '+' : ''}`,
       name,
-      ...figureRecord(name, { entries: agentCostEntries(agent, partial, runner, noEnding) }, false),
+      ...figureRecord(name, costRecordList(agent, partial, runner, noEnding), false),
     });
   }
   if (running) {
@@ -2402,6 +2423,8 @@ function childCostEntries(
   name = agent.description,
   runner: AgentKind = 'claude',
   noEnding = false,
+  // Receives each block's compaction note, led by the block label. Without it the note stays a block line.
+  notes?: string[],
 ): StatDetailEntry[] {
   // A child that is still running, or whose own turn has not ended, reports a lower bound.
   const finished = turnFinished && !agentSpendIsOpen(agent.status);
@@ -2456,7 +2479,9 @@ function childCostEntries(
         const entry = exactCostEntry(name, parts, finished);
         // Each model's block names the compactions that model ran, in the session total's words.
         const compactionNote = compactionEstimateNote(parts.map(priceSessionCost));
-        if (compactionNote) {
+        if (compactionNote && notes) {
+          notes.push(`${entry.label}: ${compactionNote}`);
+        } else if (compactionNote) {
           (entry.lines ?? (entry.lines = [])).push(compactionNote);
         }
         return [entry];
@@ -2539,6 +2564,7 @@ function costDetailList(
 ): StatDetailList {
   const total = cardCostOf(turn, shares);
   const sharedCosts = shares.flatMap((share) => share.costs);
+  const childCompactionNotes: string[] = [];
   const totalLabel = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
   const mainParts = (turn.usageParts ?? []).map((part): SessionCostUsage => ({
     agent: turn.agent,
@@ -2567,7 +2593,14 @@ function costDetailList(
       ? [
           withCostWarnings(mainEntry(), mainWarnings),
           ...turn.agents.flatMap((agent, index) => {
-            const childEntries = childCostEntries(agent, finished, agent.description, turn.agent, noEnding(agent));
+            const childEntries = childCostEntries(
+              agent,
+              finished,
+              agent.description,
+              turn.agent,
+              noEnding(agent),
+              childCompactionNotes,
+            );
             if (childEntries[0]) {
               withCostWarnings(
                 childEntries[0],
@@ -2625,8 +2658,11 @@ function costDetailList(
       value: totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable',
     },
     entries,
-    footer: [
-      ...(compactionNote ? [compactionNote] : []),
+    // The compaction notes say part of the cost is a modelled estimate, so they stay visible.
+    ...(compactionNote || childCompactionNotes.length
+      ? { footer: [...(compactionNote ? [compactionNote] : []), ...childCompactionNotes] }
+      : {}),
+    notes: [
       ...(hasCacheRead ? [CACHED_INPUT_READ_EXPLANATION] : []),
       ...(hasPublicAutoReview ? [AUTO_REVIEW_RATE_NOTE] : []),
       COST_ESTIMATE_NOTE,
@@ -2722,6 +2758,7 @@ function flatDetailList(list: StatDetailList): string[] {
     ...(list.heading && list.entries.length ? [''] : []),
     ...list.entries.flatMap((entry) => [...(entry.separateBefore ? [''] : []), ...flatDetailEntry(entry)]),
     ...(list.footer ?? []),
+    ...(list.notes ?? []),
   ];
 }
 
@@ -2784,13 +2821,13 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
       ...(facts.excluded > 0 ? [{ label: 'Excluded ambiguous events', value: String(facts.excluded) }] : []),
     ],
     footer: [
-      ...(facts.returns.some((item) => item.request.agent === 'codex')
-        ? ['The record does not identify every cache-key change.']
-        : []),
       ...(facts.returns.some((item) => item.request.reportedCost !== null)
         ? ['One or more affected requests have only a provider-reported total. Their input cost is not available.']
         : []),
     ],
+    ...(facts.returns.some((item) => item.request.agent === 'codex')
+      ? { notes: ['The record does not identify every cache-key change.'] }
+      : {}),
   };
   return [
     {
@@ -2826,12 +2863,7 @@ export function withSessionContextDetail(
     if (chip.metric !== metric || !chip.detailList) {
       return chip;
     }
-    const entries = [...chip.detailList.entries];
-    if (metric === 'turns' && entries.at(-1)?.label === 'About these figures') {
-      entries.splice(entries.length - 1, 0, ...addition.entries);
-    } else {
-      entries.push(...addition.entries);
-    }
+    const entries = [...chip.detailList.entries, ...addition.entries];
     const detailList: StatDetailList = {
       ...chip.detailList,
       layout: 'economics',
@@ -2914,11 +2946,11 @@ function compactionEstimateLines(estimate: CompactionEstimate | null): string[] 
   if (!estimate || estimate.basis === 'read') {
     return ['Estimated as a cache read of the whole context, because the record carries no usage for this compaction.'];
   }
-  return [
-    claudeCompactionEstimateLine(estimate),
-    'Claude Code records no usage for a compaction, so this cost is an estimate.',
-  ];
+  return [claudeCompactionEstimateLine(estimate)];
 }
+
+// Says that a Claude compaction cost is a modelled estimate.
+const CLAUDE_COMPACTION_ESTIMATE = 'Claude Code records no usage for a compaction, so this cost is an estimate.';
 
 function claudeCompactionEstimateLine({ usage, basis }: CompactionEstimate): string {
   const parts = [
@@ -2968,24 +3000,35 @@ function compactionChips(c: Compaction): StatChip[] {
   const estimated = exactUsage ? null : compactionEstimate(estimateInput);
   const cost = formatCost(exactUsage ? exactCost : estimateCompactionCost(estimateInput));
   if (cost) {
+    // The usage stays visible. The pricing basis folds into the notes.
+    const detailList: StatDetailList = exactUsage
+      ? {
+          entries: [
+            {
+              label: `${formatTokens(exactUsage.input)} uncached, ${formatTokens(exactUsage.cacheRead)} cached, ${formatTokens(exactUsage.output)} output.`,
+            },
+            ...(exactUsage.cacheWrite30m
+              ? [{ label: `30-minute cache writes: ${detailedTokens(exactUsage.cacheWrite30m)} tokens.` }]
+              : []),
+          ],
+          notes: ['Exact request usage priced at the recorded model and provider context.', COST_ESTIMATE_NOTE],
+        }
+      : {
+          entries: [
+            {
+              label: `${formatTokens(estimated ? requestInputOf(estimated.usage) : c.contextBefore)} of context sent, ${formatTokens(estimated ? estimated.usage.output : c.contextAfter)} summary written.`,
+            },
+          ],
+          // The sentence that calls a Claude cost an estimate stays visible.
+          ...(estimated && estimated.basis !== 'read' ? { footer: [CLAUDE_COMPACTION_ESTIMATE] } : {}),
+          notes: [...compactionEstimateLines(estimated), COST_ESTIMATE_NOTE],
+        };
     chips.push({
       kind: 'plain',
       metric: 'cost',
       label: cost,
-      detail: exactUsage
-        ? [
-            'Exact request usage priced at the recorded model and provider context.',
-            `${formatTokens(exactUsage.input)} uncached, ${formatTokens(exactUsage.cacheRead)} cached, ${formatTokens(exactUsage.output)} output.`,
-            ...(exactUsage.cacheWrite30m
-              ? [`30-minute cache writes: ${detailedTokens(exactUsage.cacheWrite30m)} tokens.`]
-              : []),
-            COST_ESTIMATE_NOTE,
-          ].join('\n')
-        : [
-            `${formatTokens(estimated ? requestInputOf(estimated.usage) : c.contextBefore)} of context sent, ${formatTokens(estimated ? estimated.usage.output : c.contextAfter)} summary written.`,
-            ...compactionEstimateLines(estimated),
-            COST_ESTIMATE_NOTE,
-          ].join('\n'),
+      detail: flatDetailList(detailList).join('\n'),
+      detailList,
     });
   }
   if (c.droppedTokens) {
@@ -3125,13 +3168,9 @@ function contextChip(turn: ContextTurn, when = 'Context at the end of the turn')
       },
     ],
     ...(window && share !== null
-      ? {
-          footer: [
-            turn.contextWindow
-              ? 'Recorded context window size.'
-              : `Window size from the model fallback for ${shortModel(turn.model)}.`,
-          ],
-        }
+      ? turn.contextWindow
+        ? { notes: ['Recorded context window size.'] }
+        : { footer: [`Window size from the model fallback for ${shortModel(turn.model)}.`] }
       : {}),
   };
   return {
@@ -5213,10 +5252,13 @@ export function sessionCostProjection(
     },
     entries,
     footer: [
+      // The compaction note says part of the total is a modelled estimate, so it stays visible.
       ...(compactionNote ? [compactionNote] : []),
       ...(mainShort ? ['Main agent usage is incomplete.'] : []),
       ...(short ? ['Delegated work usage is incomplete.'] : []),
       ...(unavailable.size > 0 || incomplete ? [UNAVAILABLE_COST_NOTE] : []),
+    ],
+    notes: [
       ...(costs.some((cost) => cost.categories.some((category) => category.key === 'cacheRead' && category.dollars > 0))
         ? [CACHED_INPUT_READ_EXPLANATION]
         : []),
@@ -5248,27 +5290,20 @@ export function sessionTurnStats(stats: SessionTurnStats | null | undefined): Se
     return [];
   }
   const label = `${turns} turn${turns === 1 ? '' : 's'}`;
-  const entries: StatDetailEntry[] = [{ label: `${label} in the main session` }];
+  // Label and right-aligned value rows, as the cache-expiry figure draws them.
+  const entries: StatDetailEntry[] = [{ label: 'Turns in the main session', value: String(turns) }];
   const notes = ['The turn count excludes delegated work.'];
   const first = stats?.firstTurnAt;
   const last = stats?.lastTurnAt;
   if (typeof first === 'number' && typeof last === 'number') {
-    entries.push({ label: `${formatDuration(Math.max(0, last - first))} between the first and last turns` });
+    entries.push({ label: 'First to last turn', value: formatExpiryGap(Math.max(0, last - first)) });
     notes.push('Elapsed time includes gaps between turns.');
   }
   const compactions = stats?.compactionCount;
   if (typeof compactions === 'number') {
-    entries.push({
-      label:
-        compactions === 0
-          ? 'No compactions recorded'
-          : compactions === 1
-            ? 'Context compacted once'
-            : `Context compacted ${compactions} times`,
-    });
+    entries.push({ label: 'Compactions', value: String(compactions) });
   }
-  entries.push({ label: 'About these figures', separateBefore: true, lines: notes });
-  const detailList = { entries };
+  const detailList: StatDetailList = { layout: 'economics', entries, notes };
   return [
     {
       metric: 'turns',
@@ -5321,7 +5356,6 @@ function sessionFigureStats(
     const contextEntry = detailList.entries[detailList.entries.length - 1];
     contextEntry.lines = [
       ...(contextEntry.lines ?? []),
-      'Context measures the current level, not cumulative token usage.',
       ...(ctx.level && HANDOFF_LEVELS.includes(ctx.level) ? [HANDOFF_SENTENCE] : []),
     ];
     const facts = contextDetailFacts(newest, !current.afterCompaction);
@@ -5329,8 +5363,11 @@ function sessionFigureStats(
       facts.entries[0].separateBefore = true;
     }
     detailList.entries.push(...facts.entries);
-    const notes = [...(facts.footer ?? []), ...(detailList.footer ?? [])];
-    detailList.footer = notes.length ? [notes.join(' ')] : [];
+    detailList.notes = [
+      'Context measures the current level, not cumulative token usage.',
+      ...(facts.notes ?? []),
+      ...(detailList.notes ?? []),
+    ];
     chips.push({
       ...ctx,
       metric: 'context',
@@ -5404,15 +5441,11 @@ export function sessionStats(turns: Turn[], compactions: Compaction[]): SessionS
           value: diffValue(added, removed),
           lines: [`Across the ${turns.length} loaded turn${turns.length === 1 ? '' : 's'}`],
         },
-        {
-          label: 'About these figures',
-          separateBefore: true,
-          lines: [
-            'Each file counts once, even when several turns change it.',
-            'Line totals add recorded edits across those turns, rather than a final net diff.',
-            ...caveats,
-          ],
-        },
+      ],
+      ...(caveats.length ? { footer: caveats } : {}),
+      notes: [
+        'Each file counts once, even when several turns change it.',
+        'Line totals add recorded edits across those turns, rather than a final net diff.',
       ],
     };
     const files = {
@@ -5438,15 +5471,15 @@ export function sessionStats(turns: Turn[], compactions: Compaction[]): SessionS
 // Supporting context facts retain the scope of the loaded history and the latest priced turn.
 function contextDetailFacts(newest: SessionFigureTurn, includeReread = true): StatDetailList {
   const entries: StatDetailEntry[] = [];
-  const footer: string[] = [];
+  const notes: string[] = [];
   if (includeReread) {
     const reread = formatCost(cacheReadCostOf(newest));
     if (reread) {
       entries.push({ label: 'Latest turn cached input reads', value: reread });
-      footer.push(COST_ESTIMATE_NOTE);
+      notes.push(COST_ESTIMATE_NOTE);
     }
   }
-  return { entries, footer };
+  return { entries, notes };
 }
 
 // Prices cached input reads with retained request rates and tiers, falling back to aggregate usage when absent.

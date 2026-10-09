@@ -3263,6 +3263,8 @@ test('an unresolved child preserves the safe lifetime heading subtotal and compa
   assert.equal(projection.total.partial, true);
   assert.match(projection.stats[0].compactLabel, /\+$/);
   assert.match(projection.stats[0].detail, /Includes an estimated \$0\.10 for 1 compaction\./);
+  // The estimate stays in the visible footer, not under the notes disclosure.
+  assert.match(projection.stats[0].detailList?.footer?.[0] ?? '', /Includes an estimated \$0\.10 for 1 compaction\./);
   const entries = projection.stats[0].detailList!.entries;
   assert.doesNotMatch(String(entries[0].value), /\+$/);
   assert.match(String(entries[1].value), /\+$/);
@@ -4282,17 +4284,13 @@ test('a subagent compaction with no request before it costs nothing on its row o
   );
 });
 
-test('a subagent notes its compaction under the model that ran it', () => {
+test('a subagent compaction note names the model that ran it', () => {
   const child = claudeCompactionTranscript(COMPACTION_ROW, { sidechain: true });
   const last = Date.parse((child.at(-1) as { timestamp: string }).timestamp);
   const { detail } = subagentCompactionParity([...child, haikuAnswer('haiku-1', last + 1_000, true)]);
-  const noteAt = detail.findIndex((line) => /Includes an estimated \$[\d.]+ for 1 compaction\./.test(line));
-  assert.ok(noteAt >= 0, `the subagent figure says ${detail.join(' | ')}`);
-  const heading = detail
-    .slice(0, noteAt)
-    .filter((line) => /· .*(opus|haiku)/i.test(line))
-    .at(-1);
-  assert.match(heading ?? '', /opus/i, `the note sits under ${heading}`);
+  const note = detail.find((line) => /Includes an estimated \$[\d.]+ for 1 compaction\./.test(line));
+  assert.ok(note, `the subagent figure says ${detail.join(' | ')}`);
+  assert.match(note, /^[^:]*· [^:]*opus[^:]*: Includes/i, `the note names ${note}`);
   assert.ok(
     detail.some((line) => /· .*haiku/i.test(line)),
     `the Haiku request has its own block: ${detail.join(' | ')}`,

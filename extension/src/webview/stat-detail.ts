@@ -79,8 +79,21 @@ export interface StatDetailList {
   // Turn record arrays shared with the card body. Entries provide the chip's plain-text detail.
   rows?: DetailRows;
   bound?: DetailHead;
+  // Lines that change how a figure reads. They stay visible under the breakdown.
   footer?: string[];
+  // Standing explanations, folded under a closed "About these figures" disclosure.
+  // Notes select the dialog role, so a pinned popover can reach the disclosure.
+  notes?: string[];
 }
+
+// Label of the notes disclosure in every figure popover.
+const NOTES_SUMMARY = 'About these figures';
+
+// One open state for the notes disclosure across every figure popover in the panel, kept in memory.
+const notesOpen = new WeakMap<Document, boolean>();
+
+// A list with actions or notes draws as a dialog. Every other list draws as a tooltip.
+const isDialogList = (list: StatDetailList | null | undefined): boolean => !!list?.actions || !!list?.notes?.length;
 
 export type CurrentDetail<T> = T | (() => T);
 
@@ -228,6 +241,10 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   // Track whether the current draw includes actions. The content print does not include this flag.
   let drawnActions = false;
   let contextMeasurementOpen = false;
+  // Ids of the drawn parts before the notes disclosure, which describe a figure with notes.
+  let breakdownIds: string[] = [];
+  // Counts the ids given to figures that name a dialog.
+  let figureIds = 0;
   let drawDebt: { anchor: HTMLElement; value: ResolvedDetailValue } | null = null;
 
   const resolve = (
@@ -410,9 +427,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   };
   // Arrow-key targets include label actions, record-row buttons, and the Context action.
   const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button';
-  // The Tab walk holds presses, row figure stops, rows without links, and the Context
-  // measurement disclosure. The arrow keys walk presses alone.
-  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .context-measurement summary`;
+  // The Tab walk holds presses, row figure stops, rows without links, the Context
+  // measurement disclosure, and the notes disclosure. The arrow keys walk presses alone.
+  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .context-measurement summary, .chippopnotes summary`;
   // Every button the reader can reach inside the popover, in reading order.
   const actionButtons = () => Array.from(pop.querySelectorAll<HTMLButtonElement>(POP_PRESSES));
   // Every stop Tab takes inside the popover, in reading order.
@@ -426,6 +443,27 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       list.appendChild(subitem(line, withActions));
     }
     parent.appendChild(list);
+  };
+  // A dialog with no heading takes its name from its figure through the figure's id, so the
+  // browser reads the figure's spoken text and skips its drawn text.
+  const figureNameId = (node: HTMLElement): string => node.id || (node.id = `${pop.id}figure-${++figureIds}`);
+  // The notes close the popover under the breakdown, so everything drawn before them is the breakdown.
+  // Its parts get ids, and the figure's description names them.
+  const appendNotes = (notes: string[] | undefined) => {
+    if (!notes?.length) {
+      return;
+    }
+    breakdownIds = Array.from(pop.children).map((part, at) => part.id || (part.id = `${pop.id}part-${at}`));
+    const disclosure = el('details', 'projectspendpricing chippopnotes');
+    // A hover shows the closed summary. A pinned popover restores the panel's open state.
+    disclosure.open = pinned && (notesOpen.get(document) ?? false);
+    disclosure.appendChild(el('summary', '', NOTES_SUMMARY));
+    const list = el('ul', 'projectspendratelist');
+    for (const line of notes) {
+      list.appendChild(el('li', '', line));
+    }
+    disclosure.appendChild(list);
+    pop.appendChild(disclosure);
   };
   const drawInto = (value: ResolvedDetailValue, withActions: boolean) => {
     const { detail, detailList: listValue } = value;
@@ -457,9 +495,11 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     pop.classList.toggle('chippop-commits', listValue?.layout === 'commits');
     drawnPrint = value.print;
     drawnActions = withActions;
-    // Declared actions select the dialog role. Other lists use the tooltip role.
-    pop.setAttribute('role', withActions ? 'dialog' : 'tooltip');
-    if (withActions && listValue?.heading) {
+    breakdownIds = [];
+    // Declared actions or notes select the dialog role. Other lists use the tooltip role.
+    const dialog = withActions || isDialogList(listValue);
+    pop.setAttribute('role', dialog ? 'dialog' : 'tooltip');
+    if (dialog && listValue?.heading) {
       // Include the heading label and its string value in the dialog's accessible name.
       const figure = typeof listValue.heading.value === 'string' ? listValue.heading.value : null;
       pop.setAttribute(
@@ -473,12 +513,18 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           .filter(Boolean)
           .join(', '),
       );
+      pop.removeAttribute('aria-labelledby');
+    } else if (dialog && anchor) {
+      // A dialog without a heading takes its figure's name.
+      pop.removeAttribute('aria-label');
+      pop.setAttribute('aria-labelledby', figureNameId(anchor));
     } else {
       pop.removeAttribute('aria-label');
+      pop.removeAttribute('aria-labelledby');
     }
     // Footer lines describe the dialog through aria-describedby, separately from its accessible name.
     const footIds =
-      withActions && listValue?.footer?.length
+      dialog && listValue?.footer?.length
         ? // Prefix footer ids with the popover id to distinguish simultaneous instances.
           listValue.footer.map((_line, at) => `${pop.id}foot-${at}`)
         : [];
@@ -504,6 +550,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         options.renderRows(host, listValue.rows);
         rowsHost = host;
         (listValue.footer || []).forEach((line, at) => appendFoot(line, at, 'chippopfoot'));
+        appendNotes(listValue.notes);
         return;
       }
       // Omit empty lists so their margins leave no blank gap.
@@ -533,6 +580,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       (listValue.footer || []).forEach((line, at) =>
         appendFoot(line, at, flush ? 'chippopfoot chippopfoot-flush' : 'chippopfoot'),
       );
+      appendNotes(listValue.notes);
       return;
     }
     for (const line of (detail || '').split(/\r?\n/)) {
@@ -544,7 +592,10 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   const draw = (value: ResolvedDetailValue, withActions: boolean) => {
     const measurement = pop.querySelector<HTMLDetailsElement>('.context-measurement');
     if (measurement && drawnPrint !== null) contextMeasurementOpen = measurement.open;
-    const focused = ['.context-bound button', '.context-measurement summary'].find(
+    const notes = pop.querySelector<HTMLDetailsElement>('.chippopnotes');
+    // Only a pinned drawing holds the reader's choice. A hover drawing is always closed.
+    if (notes && drawnPrint !== null && pop.classList.contains('pinned')) notesOpen.set(document, notes.open);
+    const focused = ['.context-bound button', '.context-measurement summary', '.chippopnotes summary'].find(
       (selector) => pop.querySelector(selector) === document.activeElement,
     );
     redrawing = true;
@@ -582,17 +633,21 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       contextMeasurementOpen = false;
     }
     anchor = node;
-    // Interactive anchors expose a disclosure. Read-only anchors expose a description.
-    if (value.detailList?.actions) {
-      node.setAttribute('aria-controls', pop.id);
-      node.setAttribute('aria-expanded', 'true');
-    } else {
-      node.setAttribute('aria-describedby', pop.id);
-    }
     // Draw available actions on hover as well as when pinned.
     const withActions = !!value.detailList?.actions;
     if (value.print !== drawnPrint || withActions !== drawnActions) {
       draw(value, withActions);
+    }
+    // Dialog anchors expose a disclosure. Read-only anchors expose a description.
+    // A figure with notes does both, and its description names the visible breakdown alone.
+    if (isDialogList(value.detailList)) {
+      node.setAttribute('aria-controls', pop.id);
+      node.setAttribute('aria-expanded', 'true');
+    }
+    if (value.detailList?.notes?.length && breakdownIds.length) {
+      node.setAttribute('aria-describedby', breakdownIds.join(' '));
+    } else if (!value.detailList?.actions) {
+      node.setAttribute('aria-describedby', pop.id);
     }
     pop.hidden = false;
     if (!node.closest('.cnextturn')) {
@@ -656,6 +711,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     }, HOVER_GRACE_MS);
   };
   const markPinned = (node: HTMLElement) => {
+    // Pinning a hover drawing restores the notes open state without a redraw.
+    const notes = pop.querySelector<HTMLDetailsElement>('.chippopnotes');
+    if (notes) notes.open = notesOpen.get(document) ?? false;
     pop.classList.add('pinned');
     node.classList.add('detail-pinned');
     if (!options.actionAnchor) node.setAttribute('aria-pressed', 'true');
@@ -764,7 +822,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     details.set(node, { detail, detailList });
     // Publish disclosure attributes for supplied interactive lists.
     // Resolve lazy lists only when shown, avoiding detail construction on every card draw.
-    if (typeof detailList !== 'function' && detailList?.actions) {
+    if (typeof detailList !== 'function' && isDialogList(detailList)) {
       node.setAttribute('aria-controls', pop.id);
       if (options.actionAnchor) node.setAttribute('aria-haspopup', 'dialog');
       if (anchor !== node || pop.hidden) {
@@ -814,10 +872,12 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   pop.addEventListener(
     'toggle',
     (event) => {
-      const measurement = event.target;
-      if (!(measurement instanceof HTMLDetailsElement) || !measurement.matches('.context-measurement')) return;
+      const disclosure = event.target;
+      if (!(disclosure instanceof HTMLDetailsElement)) return;
       if (!anchor || pop.hidden) return;
-      contextMeasurementOpen = measurement.open;
+      if (disclosure.matches('.chippopnotes')) notesOpen.set(document, disclosure.open);
+      else if (disclosure.matches('.context-measurement')) contextMeasurementOpen = disclosure.open;
+      else return;
       if (anchor && !pop.hidden) options.placeFloat(pop, anchor, view.innerHeight - 6);
     },
     true,

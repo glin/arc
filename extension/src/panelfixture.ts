@@ -907,7 +907,7 @@ export const RAIL_STATS: Record<string, SessionStatChip[]> = {
           { label: 'Longest qualifying gap', value: '1d 2h' },
           { label: 'Excluded ambiguous events', value: '2' },
         ],
-        footer: ['The record does not identify every cache-key change.'],
+        notes: ['The record does not identify every cache-key change.'],
       },
     },
   ],

@@ -13517,7 +13517,7 @@ test('a recent Codex compaction explains every priced exact request category', (
   );
   const cost = toCompactionCard(compaction).chips.find((chip) => chip.label.startsWith('$'));
   assert.equal(cost?.label, '$2.63');
-  assert.match(cost?.detail ?? '', /^Exact request usage priced at the recorded model and provider context\./);
+  assert.match(cost?.detail ?? '', /Exact request usage priced at the recorded model and provider context\./);
   assert.match(cost?.detail ?? '', /8k output\./);
   assert.match(cost?.detail ?? '', /30-minute cache writes: 1,234 tokens\./);
 });
