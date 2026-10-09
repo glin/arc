@@ -133,6 +133,7 @@ test('usage progress survives absent or expired figures and retains retry after 
     assert.equal(bar.age, '');
     assert.equal(bar.groups[0].age, '');
     assert.equal(bar.groups[0].exact, '');
+    assert.equal(bar.groups[1].status, '');
     assert.equal(bar.refresh?.busy, true);
     assert.equal(bar.refresh?.announcement, '');
     assert.match(bar.refresh!.name, /Claude: Waiting.*Codex: Usage read/);
@@ -140,9 +141,40 @@ test('usage progress survives absent or expired figures and retains retry after 
     const terminal = usageBar(readings, NOW, refresh)!;
     assert.equal(terminal.refresh?.busy, false);
     assert.equal(terminal.read, 'Read again');
+    assert.ok(terminal.groups[0].status);
+    assert.equal(terminal.groups[1].status, '');
     assert.match(terminal.refresh!.announcement, /Claude.*failed.*Codex.*read/);
     refresh.agents.claude = { phase: 'waiting', detail: '' };
   }
+});
+
+test('a successful refresh updates figures and reading times without a separate outcome row', () => {
+  const refresh: import('./view/usage').UsageRefresh = {
+    id: 8,
+    agents: { claude: { phase: 'success', detail: '' }, codex: { phase: 'success', detail: '' } },
+  };
+  const old = usageBar([CLAUDE, CODEX], NOW + 12 * 3600_000)!;
+  const book = new UsageBook([CLAUDE, CODEX]);
+  for (const agent of ['claude', 'codex']) {
+    book.note(agent, {
+      plan: '',
+      limits: [limit({ utilization: 0.23, resetsAtSeconds: seconds(NOW + 16 * 3600_000) })],
+      complete: true,
+      spend: null,
+      readAt: NOW + 12 * 3600_000,
+    });
+  }
+  const current = usageBar(book.usages(), NOW + 12 * 3600_000, refresh)!;
+  for (const [index, group] of current.groups.entries()) {
+    assert.equal(group.status, '');
+    assert.equal(group.age, 'updated just now');
+    assert.notEqual(group.exact, old.groups[index].exact);
+    assert.equal(group.lines[0].percent, 23);
+    assert.equal(group.lines[0].resets, 'resets in 4h');
+  }
+  assert.match(current.read, /press to read again/);
+  assert.equal(current.refresh?.busy, false);
+  assert.ok(current.refresh?.announcement);
 });
 
 // These limits supply window names without explicit groups.

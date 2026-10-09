@@ -513,7 +513,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
         ? `updated ${now - agentReadAt > USAGE_FRESH_MS ? `${lengthWord(now - agentReadAt)} ago` : 'just now'}`
         : '',
       exact: Number.isFinite(agentReadAt) ? new Date(agentReadAt).toLocaleString() : '',
-      status: statuses[agent] ?? '',
+      status: refresh?.agents[agent]?.phase === 'success' ? '' : (statuses[agent] ?? ''),
     });
   }
   if (!groups.length) {
