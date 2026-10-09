@@ -346,14 +346,22 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
     const top = await commits.boundingBox();
     const bottom = await files.boundingBox();
     if (!top || !bottom) throw new Error('Files and Commits are not visible.');
-    await writeLosslessWebp(page, file, {
-      clip: {
-        x: Math.floor(top.x),
-        y: Math.floor(top.y),
-        width: Math.ceil(Math.max(top.x + top.width, bottom.x + bottom.width) - Math.floor(top.x)),
-        height: Math.ceil(bottom.y + bottom.height - Math.floor(top.y)),
-      },
-    });
+    const clip = {
+      x: Math.floor(top.x),
+      y: Math.floor(top.y),
+      width: Math.ceil(Math.max(top.x + top.width, bottom.x + bottom.width) - Math.floor(top.x)),
+      height: Math.ceil(bottom.y + bottom.height - Math.floor(top.y)),
+    };
+    const background = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    const crop = await page.screenshot({ clip });
+    // Pad the captured pixels without including adjacent response or prompt content.
+    await page.setContent(`<style>
+html, body { margin: 0; }
+figure { margin: 0; padding: 18px; width: fit-content; background: ${background}; }
+img { display: block; width: ${clip.width}px; height: ${clip.height}px; }
+</style><figure><img src="data:image/png;base64,${crop.toString('base64')}"></figure>`);
+    await page.locator('img').evaluate((image: HTMLImageElement) => image.decode());
+    await writeLosslessWebp(page.locator('figure'), file);
   } else if (scene === 'review') {
     const box = await page.locator('#list .turn').first().boundingBox();
     if (!box) throw new Error('Review turn is not visible.');

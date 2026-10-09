@@ -4,7 +4,7 @@ Arc is a VS Code extension for working with Claude Code and Codex. **Experimenta
 
 [Web demo](https://glin.github.io/arc/)
 
-- Keep track of all the agents! Vertical tabs, labels, saved views, filters, subagent links.
+- Keep track of all the agents! Vertical tabs, labels, saved views, filters, links to subagent sessions.
 - Read results, not chat! Each turn shows the final response with file edits, commits, subagents, and cost.
 - See what a session costs with turn-level breakdowns. Save costs with the prompt cache expiry and next-turn starting price hints.
 - Or use Arc as a session viewer. It reads sessions started from the Claude Code and Codex CLIs, VS Code extensions, and desktop apps.
@@ -82,6 +82,14 @@ Arc estimates costs for supported models using published prices. Subscription es
 
 <a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning and cache costs" width="480"></a>
 
+#### Project cost
+
+<a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a>
+
+#### Account usage
+
+<a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
+
 ### Saved-session HTML
 
 [Export a saved session as HTML](docs/session-html.md) to review its recorded text and linked work in a browser or publish the complete site directory.
@@ -91,11 +99,3 @@ Arc estimates costs for supported models using published prices. Subscription es
 Select response text and add a comment beside it. Saved comments stay attached to their text. Edit or delete them from their marks, then send them with your next prompt.
 
 <a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>
-
-### Project cost
-
-<a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a>
-
-### Account usage
-
-<a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
