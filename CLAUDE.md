@@ -20,6 +20,8 @@ Do not line wrap Markdown. One paragraph is one line, and one list item is one l
 - No emdash characters. No semicolons: write two sentences.
 - One fact has one home. State it in the section that owns it, and never restate it elsewhere.
 - When moving a topic between guides, update the reading guide and links to its old location.
+- Use literal verbs and existing names.
+- Preserve technical terms, conditions, and uncertainty when simplifying prose. Never strengthen a claim to satisfy a writing rule.
 
 `docs/criteria.md` is personal first-person prose and does not follow this section. Everything else does.
 
@@ -36,6 +38,8 @@ When a design goal blocks valuable work, state the conflict and its cost. The au
 ## Development workflow
 
 Use `/ship` for repository changes. Implement in a worktree. Run `/pre-commit-review` before landing.
+
+Before committing, check changed documentation, comments, and product messages against the writing rules. Check code claims against the relevant code. Reviewers must repeat these checks.
 
 Read `docs/development.md` before installing dependencies, repairing the panel-mockup link, linking worktree dependencies, or profiling.
 
