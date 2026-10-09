@@ -109,6 +109,7 @@ import {
   viewCanSave,
   viewFiles,
   viewName,
+  viewNameForQuery,
   viewNameTaken,
   viewQuery,
   viewQueryNotes,
@@ -2670,15 +2671,16 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       cancelAnimationFrame(filterFrame);
       drawFilterFrame();
     }
-    naming = { lens: { ...liveRailFilter(), query: filter }, name: '' };
+    naming = { lens: { ...liveRailFilter(), query: filter }, name: viewNameForQuery(filter, labels) };
     filterShutOn = null;
     filterAt = 0;
     if (filterInput) {
-      filterInput.value = '';
+      filterInput.value = naming.name;
     }
     drawTop();
     drawFilterPop();
     filterInput?.focus();
+    filterInput?.select();
   };
   // Restore the current query in the box when naming ends.
   const stopNaming = () => {

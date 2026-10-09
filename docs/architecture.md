@@ -327,7 +327,7 @@ The first column is checked against the shipped extension directory by `architec
 | `domain/session-query.ts` | Browser-safe session-query grammar, quoting, caret tokens, cost, cache-expiry, status and caller-answered cache terms, matching, and content-search eligibility | no |
 | `domain/session-setups.ts` | Browser-safe pinned setup records, value checks, and recent setup limits | no |
 | `domain/text.ts` | Browser-safe line shortening and the one cleaning every typed name goes through | no |
-| `domain/views.ts` | Browser-safe saved-view record, name rules, ceilings, cost- and cache-expiry-query acceptance, live status-view acceptance, and normalization | no |
+| `domain/views.ts` | Browser-safe saved-view record, name rules, label-derived name suggestions, ceilings, cost- and cache-expiry-query acceptance, live status-view acceptance, and normalization | no |
 | `view/card-menu.ts` | Browser-safe turn-menu sections and context projections | no |
 | `view/card-presentation.ts` | Browser-safe status glyphs, card identity, context-band class projection, the repository-work label the commits chip draws and the figures the Commits heading draws, the commit-sha comparison, and the grouping of commit rows by branch within a repository that the popover heading and the panel both read | no |
 | `view/card-words.ts` | Browser-safe card and control wording, including prompt box visibility and height names, shared by typed panel owners | no |

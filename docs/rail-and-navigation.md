@@ -120,6 +120,8 @@ A view writes its fold under its own id rather than its name, so renaming a view
 
 A saved view requires an effective query term. The save row draws only while the box holds one, so a query of `find:` or `in:` words alone offers no save. `domain/views.ts` owns the term gate.
 
+Save as view opens the name field with its text selected. A stored query with exactly one positive label suggests its catalog name, or its parsed spelling when absent from the catalog. Other terms keep their restrictions. Multiple positive labels and queries without a positive label leave the name empty. Enter saves the name, typing replaces the selection, and Escape cancels. An existing view with the suggested name requires another name.
+
 The extension owns saved views and excludes them from panel state saves. An older panel therefore cannot overwrite views created elsewhere. Save, rename, and delete each post the complete list in one message. The extension normalizes names and limits before publishing the list to every panel. Saved views participate in session list update comparison even when their changes move no card.
 
 A saved-view heading opens the native menu from right-click, the keyboard context-menu route, or its three-dot button. The menu offers Edit view… and Delete this view. Edit view opens the existing name and order editor. Save and Cancel return focus to the opening control, including after a heading redraw. A time bucket carries no view actions.

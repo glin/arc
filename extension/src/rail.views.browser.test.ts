@@ -670,6 +670,61 @@ async function startNaming(page: Page, query: string): Promise<void> {
   await page.evaluate(SETTLED);
 }
 
+test(
+  'a label view opens with its selected name for immediate saving or replacement',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed browser, so label view naming was not exercised');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const base = payload();
+      base.labels = [...base.labels, { name: 'Performance', count: 0, countName: 'carried by no sessions' }];
+      await openPage(page, base);
+      await page.locator('[data-control="railfilters"]').click();
+      await page.locator('[data-control="railfilter-order:cost-desc"]').click();
+      await page.locator('[data-control="railfilters"]').click();
+      const query = 'label:PERFORMANCE is:running -label:release';
+      await startNaming(page, query);
+      const box = page.locator('.railfilter');
+      assert.deepEqual(
+        await box.evaluate((node) => {
+          const input = node as HTMLInputElement;
+          return {
+            name: input.value,
+            start: input.selectionStart,
+            end: input.selectionEnd,
+            focused: document.activeElement === input,
+          };
+        }),
+        { name: 'Performance', start: 0, end: 11, focused: true },
+      );
+      await page.evaluate('window.__posted = []');
+      await box.press('Enter');
+      assert.deepEqual(await viewMessages(page), [
+        [...savedViews(), { id: 'v4', name: 'Performance', query, sort: 'cost-desc', archived: false }],
+      ]);
+
+      await startNaming(page, 'label:COMPOSER');
+      assert.equal(await box.inputValue(), 'composer');
+      assert.equal((await describedNote(page, '.railfilter')).said.includes(VIEW_NOTES.taken), true);
+      await page.evaluate('window.__posted = []');
+      await box.press('Enter');
+      assert.deepEqual(await viewMessages(page), []);
+      await box.pressSequentially('Custom name');
+      assert.equal(await box.inputValue(), 'Custom name');
+      await box.press('Escape');
+      assert.equal(await box.inputValue(), 'label:COMPOSER');
+      assert.deepEqual(await viewMessages(page), []);
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
 // Removing the selected saved filter resets the live query and sort. Naming holds its captured lens separately.
 // The payload leaves the name, caret and captured lens alone. Saving preserves the captured query and sort.
 // Filter buttons refuse presses throughout naming because a press edits the query.
@@ -687,7 +742,7 @@ test(
       const failures: string[] = [];
       page.on('pageerror', (error) => failures.push(String(error)));
       const lens = {
-        query: 'label:composer label:"release 0.4"',
+        query: 'label:composer -label:unavailable',
         sort: 'cost-desc',
       };
       const base = payload();
@@ -795,7 +850,7 @@ test('the filter box offers no completion while it is taking a view name', { tim
         cancel: document.querySelector('.filterclear').dataset.control };
     })()`),
       {
-        value: '',
+        value: 'composer',
         role: null,
         autocomplete: null,
         controls: null,
@@ -1152,8 +1207,8 @@ test('both name boxes point at the note that says what is wrong with the name', 
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
 
-    // The rail's naming box. It opens empty, which is the first thing wrong with the name.
-    await startNaming(page, 'label:composer');
+    // A status query opens the naming box without a suggested label name.
+    await startNaming(page, 'is:running');
     const naming = await describedNote(page, '.railfilter');
     assert.deepEqual(
       { ...naming, said: naming.said.slice(0, 1) },

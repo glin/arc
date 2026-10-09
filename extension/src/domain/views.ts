@@ -2,6 +2,7 @@
 // The extension normalizes saved views. The browser draws and edits them.
 
 import { parseSessionQuery } from './session-query.ts';
+import { labelKey } from './labels.ts';
 import { normalizeSavedViewSort, type SavedViewSort } from './rail-sort.ts';
 import { cleanName } from './text.ts';
 
@@ -55,6 +56,16 @@ export function viewKey(name: string): string {
 // this first: a long query whose only term sits past the cut reaches storage with no term.
 export function viewQuery(raw: unknown): string {
   return typeof raw === 'string' ? raw.trim().slice(0, VIEW_QUERY_LIMIT) : '';
+}
+
+// Suggest the sole positive label in the query the view will store.
+export function viewNameForQuery(query: string, labels: readonly { name: string }[]): string {
+  const positive = parseSessionQuery(viewQuery(query)).terms.filter((term) => term.field === 'labels' && !term.negated);
+  if (positive.length !== 1) {
+    return '';
+  }
+  const name = positive[0].needle;
+  return viewName(labels.find((label) => labelKey(label.name) === labelKey(name))?.name ?? name);
 }
 
 // Returns the first unused sequential view id.

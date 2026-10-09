@@ -10,6 +10,7 @@ import {
   viewFiles,
   viewKey,
   viewName,
+  viewNameForQuery,
   viewNameTaken,
   viewTypedNotes,
   type SavedView,
@@ -24,6 +25,28 @@ function view(over: Partial<SavedView> = {}): SavedView {
     ...over,
   };
 }
+
+test('a view name follows one positive label in its stored query', () => {
+  const labels = [{ name: 'Composer' }, { name: 'Release 0.4' }];
+  for (const [query, name] of [
+    ['label:COMPOSER', 'Composer'],
+    ['label:"release 0.4"', 'Release 0.4'],
+    ['label:Missing', 'Missing'],
+    ['label:composer is:running cost:>5 title:work find:needle', 'Composer'],
+    ['label:composer -label:release', 'Composer'],
+    ['label:"Say ""yes"""', 'Say "yes"'],
+    ['label:"  New   name  "', 'New name'],
+    [`label:${'a'.repeat(VIEW_NAME_LIMIT + 1)}`, 'a'.repeat(VIEW_NAME_LIMIT)],
+    ['label:composer label:release', ''],
+    ['label:composer label:COMPOSER', ''],
+    ['-label:composer', ''],
+    ['is:running', ''],
+    ['', ''],
+    [`is:running find:${'x'.repeat(VIEW_QUERY_LIMIT)} label:composer`, ''],
+  ]) {
+    assert.equal(viewNameForQuery(query, labels), name, query);
+  }
+});
 
 test('a name is cleaned and cut the way a label name is', () => {
   assert.equal(viewName('  Release   0.4 '), 'Release 0.4');
