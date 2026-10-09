@@ -18,12 +18,13 @@ A relevant request can refresh an eligible prompt cache, but it incurs its own t
 
 ## Choose a boundary
 
-| Situation                                        | Action                                             |
-| ------------------------------------------------ | -------------------------------------------------- |
-| The next step needs the current details          | Continue in this session.                          |
-| The same task continues from a short summary     | Compact at a completed step.                       |
-| A new task or phase needs little of this context | Write a handoff and start a fresh session.         |
-| Context is nearly full                           | Finish the current step, then compact or hand off. |
+| Situation | Action |
+| --- | --- |
+| The next step needs the current details | Continue in this session. |
+| The same task continues from a short summary | Compact at a completed step. |
+| The cache expired and a short summary is enough | Compact before the next prompt. A cold compaction costs less than the cold next turn, as [Compact after the cache expires](agent-cost-guide.md#compact-after-the-cache-expires) explains. |
+| A new task or phase needs little of this context | Write a handoff and start a fresh session. |
+| Context is nearly full | Finish the current step, then compact or hand off. |
 
 Before a handoff, commit or account for changed files. Record the goal, decisions, branch, test command, open risks, and exact next step. Link to project files instead of copying them.
 
