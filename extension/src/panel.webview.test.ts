@@ -17742,7 +17742,11 @@ test('initial session listing keeps every metadata read within 64 MiB before the
     'Claude metadata no longer starts from its bounded tail window',
   );
   assert.equal(
-    reader.replace('sessionTitleOf(file, read, childTranscript)', '').match(/\bfile\b/g)?.length ?? 0,
+    reader
+      .replace('sessionTitleOf(file, read, childTranscript)', '')
+      // The repeated-record map extends by at most the window's own bytes.
+      .replace('blankClaudeRepeated(file, read.lines, read.offset ?? 0, Number.MAX_SAFE_INTEGER, bytes)', '')
+      .match(/\bfile\b/g)?.length ?? 0,
     1,
     'Claude metadata passes the transcript file beyond its bounded tail read, which can scan history synchronously',
   );

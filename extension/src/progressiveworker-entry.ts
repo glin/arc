@@ -40,6 +40,12 @@ import {
   refreshCodexStructuralAgents,
   scanCodexDispatchReferencesAsync,
 } from './codex';
+import {
+  adoptClaudeRepeatedMap,
+  blankClaudeRepeated,
+  onClaudeRepeatedCoverage,
+  type ClaudeRepeatedHeldMap,
+} from './clauderepeated';
 import { historyPageBytes } from './historypages';
 import {
   agentSpendDependencyKey,
@@ -62,6 +68,7 @@ import {
   scanForAgentRun,
   scanForPerson,
   tailOf,
+  withClaudeRepeated,
   revisionOf as fileRevisionOf,
   type FileRevision,
   relationshipStamp,
@@ -277,10 +284,10 @@ async function execute(
           () =>
             session.agent === 'codex'
               ? createCodexSessionReducer(session.sessionId, { maxTurns: 40 }, request.opening ?? null)
-              : createClaudeSessionReducer(session.sessionId, {
-                  maxTurns: 40,
-                  childTranscript: session.childTranscript,
-                }),
+              : createClaudeSessionReducer(
+                  session.sessionId,
+                  withClaudeRepeated(session.file, { maxTurns: 40, childTranscript: session.childTranscript }),
+                ),
           work,
         ),
       };
@@ -1218,6 +1225,9 @@ async function execute(
   const initialRevision = result.checkpoint.revision;
   if (!result.read.turns.length && result.checkpoint.coveredFrom > 0) {
     const tail = tailOf(session.file, tailBytes, true);
+    if (session.agent === 'claude') {
+      tail.lines = blankClaudeRepeated(session.file, tail.lines, tail.offset ?? 0, Number.MAX_SAFE_INTEGER);
+    }
     if (tail.cursor) {
       if (session.agent === 'claude' && session.childTranscript) {
         result = await read(session.size, undefined);
@@ -1505,6 +1515,12 @@ function runDiscovery(message: WorkerMessage): void {
     });
   });
 }
+// Bounded reads skip the records that the repeated-record map does not reach yet, and request background
+// completion of the map. When a map reaches the end of its file, the host reads that file again and draws once.
+onClaudeRepeatedCoverage((file) => {
+  dispatchFacts.delete(file);
+  parentPort?.postMessage({ repeatedCoverage: file });
+});
 parentPort?.on(
   'message',
   (message: {
@@ -1513,7 +1529,9 @@ parentPort?.on(
     request: ProgressiveRequest;
     cancel?: number;
     metadataEligible?: string[];
+    repeated?: { file: string; map: ClaudeRepeatedHeldMap };
   }) => {
+    if (message.repeated) adoptClaudeRepeatedMap(message.repeated.file, message.repeated.map);
     if (message.metadataEligible) {
       if (metadataRecovery && !message.metadataEligible.includes(metadataRecovery.sessionId)) metadataRecovery = null;
       return;

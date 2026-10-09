@@ -1130,7 +1130,7 @@ export async function captureSessionExport(
               history,
               {
                 childTranscript: entry.childTranscript === true,
-                captureCopies: numericSource.claudeCopies ?? undefined,
+                captureRepeated: numericSource.claudeRepeated ?? undefined,
               },
             )
           : await readCodexHistoryPageAsync(entry.file, entry.sessionId, cursor as CodexHistoryCursor | null, history, {

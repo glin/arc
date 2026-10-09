@@ -13,12 +13,13 @@ import {
   withClaudeFirstRequest,
   claudeModelEvidence,
   readPreviousLines,
+  withClaudeRepeated,
   type BackwardLineCursor,
   type FileRevision,
 } from './transcript';
 import { BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS } from './parserstate';
 import { sameModelIdentity } from './domain/model-identity';
-import { insideClaudeCopy } from './claudecopies';
+import { insideClaudeRepeated } from './clauderepeated';
 import {
   ForwardParserCheckpoint,
   IncrementalSessionResult,
@@ -81,6 +82,8 @@ export function recoverClaudeAttachmentSlice(
   state: ClaudeAttachmentRecovery,
   childTranscript = false,
   budget: AttachmentRecoveryBudget = {},
+  // Returns true for a repeated record, which holds no evidence.
+  repeatedRecord?: (start: number, text: string) => boolean,
 ): { kind: 'pending' | 'complete' | 'stale' | 'cancelled'; readBytes: number } {
   if (budget.signal?.aborted) return { kind: 'cancelled', readBytes: 0 };
   try {
@@ -108,6 +111,7 @@ export function recoverClaudeAttachmentSlice(
     readBytes += before - batch.cursor.end;
     state.cursor = batch.cursor;
     for (const line of batch.lines) {
+      if (repeatedRecord?.(line.offset, line.text)) continue;
       inspectAttachmentEvidence(state, line.text, childTranscript);
       if ((state.status as string) === 'complete') break;
     }
@@ -206,7 +210,7 @@ function titleRank(source: RecordedTitleSource | undefined): number {
 
 function claudeParserKey(opts: ReadOptions): string {
   return JSON.stringify({
-    version: 13,
+    version: 14,
     recoveredModelAttachment: opts.recoveredModelAttachment ?? null,
     tailBytes: opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     maxTurns: opts.maxTurns ?? 40,
@@ -222,11 +226,12 @@ export function readClaudeSessionIncremental(
   checkpoint?: ClaudeForwardCheckpoint,
   opts: ReadOptions = {},
 ): IncrementalSessionResult<ClaudeSessionParserState> {
+  const repeated = withClaudeRepeated(file, opts);
   const result = readForwardSession(
     file,
     'claude',
     sessionId,
-    (restored) => createClaudeSessionReducer(sessionId, opts, restored),
+    (restored) => createClaudeSessionReducer(sessionId, repeated, restored),
     checkpoint,
     undefined,
     claudeParserKey(opts),
@@ -245,11 +250,12 @@ export async function readClaudeSessionIncrementalAsync(
   opts: ReadOptions = {},
   work: ForwardReadOptions & { attachmentBudget?: AttachmentRecoveryBudget } = {},
 ): Promise<IncrementalSessionResult<ClaudeSessionParserState> & { recoveryBytes?: number; recoveryPending?: boolean }> {
+  const repeated = withClaudeRepeated(file, opts);
   const result = await readForwardSessionAsync(
     file,
     'claude',
     sessionId,
-    (restored) => createClaudeSessionReducer(sessionId, opts, restored),
+    (restored) => createClaudeSessionReducer(sessionId, repeated, restored),
     checkpoint,
     undefined,
     claudeParserKey(opts),
@@ -279,10 +285,13 @@ export async function readClaudeSessionIncrementalAsync(
             cursor: { ...previous.cursor, revision: next.revision, fragment: Buffer.from(previous.cursor.fragment) },
           }
         : attachmentRecovery(next.reducedFrom ?? next.coveredFrom, next.revision, next.skippedFragment);
-  const slice = recoverClaudeAttachmentSlice(file, recovery, opts.childTranscript === true, {
-    ...work.attachmentBudget,
-    signal: work.signal,
-  });
+  const slice = recoverClaudeAttachmentSlice(
+    file,
+    recovery,
+    opts.childTranscript === true,
+    { ...work.attachmentBudget, signal: work.signal },
+    repeated.repeatedRecord,
+  );
   if (slice.kind === 'stale' || slice.kind === 'cancelled')
     return {
       kind: slice.kind,
@@ -295,7 +304,7 @@ export async function readClaudeSessionIncrementalAsync(
   if (slice.kind === 'complete') {
     recovery.cursor.fragment = Buffer.alloc(0);
     next.skippedFragment = Buffer.alloc(0);
-    const reducer = createClaudeSessionReducer(sessionId, opts, next.parserState);
+    const reducer = createClaudeSessionReducer(sessionId, repeated, next.parserState);
     reducer.recoverAttachment(recovery.identity);
     next.parserState = reducer.snapshot();
     if (next.lineFragment.length)
@@ -336,13 +345,17 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
     },
     accepts: (record) => claudeSessionLineMayAffectRead(record.text),
     parse: (input, backward) => {
-      const records = opts.captureCopies
-        ? input.filter((record) => !insideClaudeCopy(opts.captureCopies, record.start))
+      const captured = opts.captureRepeated
+        ? input.filter((record) => !insideClaudeRepeated(opts.captureRepeated, record.start))
         : input;
-      const boundary = records[0]?.start ?? 0;
+      const boundary = captured[0]?.start ?? 0;
+      // Every loop below reads only genuine records, so the reducer classifies nothing again.
+      const classify = opts.repeatedRecord;
+      const records = classify ? captured.filter((record) => !classify(record.start, record.text)) : captured;
       const evidence = backward.attachmentEvidence?.boundary === boundary ? backward.attachmentEvidence : undefined;
       const reducer = createClaudeSessionReducer(sessionId, {
         ...opts,
+        ...(classify ? { repeatedRecord: () => false } : {}),
         maxTurns: Number.MAX_SAFE_INTEGER,
         recoveredModelAttachment: evidence?.status === 'complete' ? evidence.identity : null,
       });
@@ -463,6 +476,8 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
           : attachmentRecovery(boundary, backward.revision);
       evidence.status = 'pending';
       for (const record of [...records].reverse()) {
+        if (insideClaudeRepeated(opts.captureRepeated, record.start)) continue;
+        if (opts.repeatedRecord?.(record.start, record.text)) continue;
         inspectAttachmentEvidence(evidence, record.text, opts.childTranscript === true);
         if ((evidence.status as string) === 'complete') break;
       }
@@ -529,7 +544,13 @@ export function readClaudeHistoryPage(
   const capture = options.exportLimits
     ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
     : readOptions;
-  const result = readSemanticHistoryPage(file, sessionId, claudeAdapter(sessionId, capture), cursor, options);
+  const result = readSemanticHistoryPage(
+    file,
+    sessionId,
+    claudeAdapter(sessionId, withClaudeRepeated(file, capture)),
+    cursor,
+    options,
+  );
   if (result.page && !options.exportLimits) {
     withClaudeFirstRequest(file, result.page.compactions, readOptions.childTranscript === true);
   }
@@ -546,12 +567,16 @@ export function readClaudeHistoryPageAsync(
   const capture = options.exportLimits
     ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
     : readOptions;
-  return readSemanticHistoryPageAsync(file, sessionId, claudeAdapter(sessionId, capture), cursor, options).then(
-    (result) => {
-      if (result.page && !options.exportLimits) {
-        withClaudeFirstRequest(file, result.page.compactions, readOptions.childTranscript === true);
-      }
-      return result;
-    },
-  );
+  return readSemanticHistoryPageAsync(
+    file,
+    sessionId,
+    claudeAdapter(sessionId, withClaudeRepeated(file, capture)),
+    cursor,
+    options,
+  ).then((result) => {
+    if (result.page && !options.exportLimits) {
+      withClaudeFirstRequest(file, result.page.compactions, readOptions.childTranscript === true);
+    }
+    return result;
+  });
 }

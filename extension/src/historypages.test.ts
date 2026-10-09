@@ -80,7 +80,7 @@ for (const agent of ['claude', 'codex'] as const) {
     const commentary =
       agent === 'claude'
         ? record('assistant', {
-            uuid: 'commentary',
+            uuid: `${identity}-commentary`,
             message: {
               id: 'commentary',
               role: 'assistant',
@@ -100,7 +100,7 @@ for (const agent of ['claude', 'codex'] as const) {
     const answer =
       agent === 'claude'
         ? record('assistant', {
-            uuid: 'answer',
+            uuid: `${identity}-answer`,
             message: {
               id: 'answer',
               role: 'assistant',

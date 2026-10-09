@@ -8,7 +8,7 @@ import {
   validCostStateMaterialization,
   type ClaudeCostSupplement,
 } from './claudecoststate';
-import { validClaudeCopyState } from './claudecopies';
+import { validClaudeRepeatedState } from './clauderepeated';
 import type {
   CacheExpiryCarry,
   CacheExpiryFacts,
@@ -986,10 +986,10 @@ function spendRecord(
     (value.trailingBytes !== undefined && !validBase64(value.trailingBytes)) ||
     (value.pendingBytes !== undefined && !validBase64(value.pendingBytes)) ||
     (value.parserKind !== undefined && value.parserKind !== 'claude' && value.parserKind !== 'codex') ||
-    (value.claudeCopies !== undefined &&
+    (value.claudeRepeated !== undefined &&
       (value.parserKind !== 'claude' ||
-        !validClaudeCopyState(value.claudeCopies) ||
-        value.claudeCopies.through > value.offset))
+        !validClaudeRepeatedState(value.claudeRepeated) ||
+        value.claudeRepeated.through > value.offset))
   ) {
     return null;
   }
@@ -1126,7 +1126,7 @@ function spendRecord(
     ...(currentParser && parserKind !== undefined && value.parserState !== undefined
       ? { parserState: value.parserState }
       : {}),
-    ...(currentParser && value.claudeCopies !== undefined ? { claudeCopies: value.claudeCopies } : {}),
+    ...(currentParser && value.claudeRepeated !== undefined ? { claudeRepeated: value.claudeRepeated } : {}),
     ...(value.complete === undefined ? {} : { complete: value.complete }),
     ...(value.scanOffset === undefined ? {} : { scanOffset: value.scanOffset }),
     ...(value.pendingBytes === undefined ? {} : { pendingBytes: value.pendingBytes }),

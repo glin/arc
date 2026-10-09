@@ -1,5 +1,5 @@
 import * as fs from 'node:fs';
-import { createClaudeCopyFilter } from './claudecopies';
+import { createClaudeRepeatedFilter } from './clauderepeated';
 import { createInterface } from 'node:readline';
 import {
   ClaudeChildSessionCache,
@@ -234,9 +234,9 @@ async function readTimelineFile(session: SessionFile, now: number): Promise<Time
   const raw = createTimelineEvidenceReader(now, session.mtimeMs);
   try {
     const lines = createInterface({ input: fs.createReadStream(session.file), crlfDelay: Infinity });
-    const copies = createClaudeCopyFilter();
+    const repeated = createClaudeRepeatedFilter();
     for await (const line of lines) {
-      if (!line.trim() || copies(line)) continue;
+      if (!line.trim() || repeated(line)) continue;
       let record: RawRecord;
       try {
         record = JSON.parse(line);

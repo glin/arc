@@ -93,6 +93,7 @@ import {
   sessionStatFactsOf,
   shortenTo,
 } from './transcript';
+import { onClaudeRepeatedCoverage } from './clauderepeated';
 import {
   CodexMetaCache,
   CodexStatCache,
@@ -1113,7 +1114,11 @@ export class PanelProvider implements vscode.Disposable {
   private readonly livePressHosts = new Map<string, PanelHost>();
   private readonly readyHosts = new Set<PanelHost>();
   private readonly panelVisibility = createPanelVisibility<PanelHost>();
-  private readonly progressiveWorker = new ProgressiveWorker(undefined, () => this.diagnostics.enabled());
+  private readonly progressiveWorker = new ProgressiveWorker(
+    undefined,
+    () => this.diagnostics.enabled(),
+    (file) => this.repeatedCoverage(file),
+  );
   private readonly commitRepositoryReservations = new CommitRepositoryReservations();
   private readonly commitRepositoryReplies = new Map<string, { key: string; reply: CommitRepositoryReply }>();
   private readonly lifetimeRail = new SessionFiguresCache<
@@ -2673,8 +2678,20 @@ export class PanelProvider implements vscode.Disposable {
     );
     // Refresh icon variants when the editor switches between light and dark themes.
     this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => void this.refresh(true)));
+    const stopCoverage = onClaudeRepeatedCoverage((file) => this.repeatedCoverage(file));
+    this.disposables.push({ dispose: stopCoverage });
     // Update permitted webview resource roots when workspace folders change.
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.workspaceFoldersChanged()));
+  }
+
+  // A bounded read skips records the repeated-record map does not reach yet. When the map of the extension
+  // host or of the progressive worker reaches the end of a file, drop the search entries and session-list
+  // facts read from that file, and draw once. The held facts stay on screen until the new read replaces them.
+  private repeatedCoverage(file: string): void {
+    this.corpus.delete(file);
+    const held = this.titles.get(file);
+    if (held) this.titles.set(file, { ...held, size: -1 });
+    this.refreshFrom('repeated-record-coverage', true, false, [file]);
   }
 
   // Builds the repository scope over a Git runner. A change of its roots runs repositoryScopeChanged, and each decision it makes about a
@@ -11045,6 +11062,7 @@ export class PanelProvider implements vscode.Disposable {
               tailBytes: SEARCH_TAIL_BYTES,
               childTranscript: session.childTranscript === true,
               turnsOnly: true,
+              boundedRepeated: true,
             });
       if (session.agent === 'claude') {
         this.observeParsedNames(read.turns, new Map([[session.sessionId, session]]));

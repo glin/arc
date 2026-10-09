@@ -25,7 +25,7 @@ import {
 import { createClaudeUsageLineReducer, readClaudeAgentSpend, type ClaudeUsageReducerState } from './transcript.ts';
 import { createCodexUsageLineReducer, type CodexUsageReducerState } from './codex.ts';
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
-import { createClaudeCopyFilter } from './claudecopies.ts';
+import { createClaudeRepeatedFilter } from './clauderepeated.ts';
 import { tempDir } from './temproot.ts';
 import { sessionCacheExpiryStats } from './turncard.ts';
 import { readSessionRequests } from './sessioncost.ts';
@@ -944,10 +944,10 @@ test('a replayed compaction counts once, and a replayed abandoned compaction nev
     ...claudeLinkedCompaction(10, 'A', 'a-m1'),
   ];
   assert.equal(indexed(kept, claudeReducer).compactionCount, 1);
-  // A reader skips each copy before the reducer reads it.
+  // A reader skips each repeated record before the reducer reads it.
   const reducer = createClaudeUsageLineReducer();
-  const copies = createClaudeCopyFilter();
-  const read = kept.filter((line) => !copies(line));
+  const repeated = createClaudeRepeatedFilter();
+  const read = kept.filter((line) => !repeated(line));
   assert.equal(read.flatMap((line) => reducer.pushLine(line)).filter((event) => event.compactionEstimate).length, 1);
 
   const abandoned = [
@@ -2007,10 +2007,10 @@ test('supported Codex visible-turn returns use nominal lifetime rather than the 
   }
 });
 
-// ## Copied records
+// ## Repeated records
 //
-// At a later compaction in one process, Claude Code can append a second copy of earlier records
-// with their original uuids and timestamps. The copy carries the writing process's version and
+// At a later compaction in one process, Claude Code can append earlier records again
+// with their original uuids and timestamps. The repeated record carries the writing process's version and
 // working folder, and it ends right before a fresh compaction boundary.
 
 const written = (line: string, version: string, cwd: string) => JSON.stringify({ ...JSON.parse(line), version, cwd });
@@ -2026,9 +2026,9 @@ const claudeAttachment = (minutes: number, id: string) =>
 const claudeStopHook = (minutes: number, id: string) =>
   JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', uuid: `s-${id}`, timestamp: at(minutes) });
 
-// The source with and without the copied run. The run starts at compaction A's boundary, whose
+// The source with and without the repeated run. The run starts at compaction A's boundary, whose
 // parent is null, and ends right before the fresh boundary of compaction C.
-function copiedRunSource(): { fresh: string[]; copied: string[] } {
+function repeatedRunSource(): { fresh: string[]; repeated: string[] } {
   const before = [
     claudePrompt(0, 'p1'),
     linked(claudeResponse(1, { id: 'm1', input: 100, read: 40_000, write1h: 4_000 }), 'u-p1'),
@@ -2054,9 +2054,12 @@ function copiedRunSource(): { fresh: string[]; copied: string[] } {
     linked(claudeResponse(91, { id: 'm4', input: 2, write1h: 2_500 }), 'u-p4'),
   ];
   const original = (line: string) => written(line, '2.1.200', 'C:/work');
-  const copy = (line: string) => written(line, '2.1.210', 'D:/elsewhere');
+  const repeat = (line: string) => written(line, '2.1.210', 'D:/elsewhere');
   const fresh = [...before, ...run, ...middle, ...after].map(original);
-  return { fresh, copied: [...[...before, ...run, ...middle].map(original), ...run.map(copy), ...after.map(original)] };
+  return {
+    fresh,
+    repeated: [...[...before, ...run, ...middle].map(original), ...run.map(repeat), ...after.map(original)],
+  };
 }
 
 // What the spend index publishes for a source, without the scan bookkeeping.
@@ -2089,28 +2092,32 @@ function slicedIndex(lines: readonly string[], maxBytes: number): SpendFileIndex
   return record;
 }
 
-test('a copied run adds no turn, compaction, cost or cache expiry to the spend index', () => {
-  const { fresh, copied } = copiedRunSource();
+test('a repeated run adds no turn, compaction, cost or cache expiry to the spend index', () => {
+  const { fresh, repeated } = repeatedRunSource();
   const expected = published(indexed(fresh, claudeReducer));
   assert.equal(expected.turnCount, 4);
   assert.equal(expected.compactionCount, 3);
 
-  assert.deepEqual(published(indexed(copied, claudeReducer)), expected, 'the copy changed the whole-file scan');
-  // A 200-byte slice ends inside the run, so a later slice classifies copies from saved state.
-  const sliced = slicedIndex(copied, 200);
-  assert.deepEqual(published(sliced), expected, 'the copy changed a sliced scan');
-  assert.equal(sliced.claudeCopies?.copies.length, 2, 'the copy map holds one run');
+  assert.deepEqual(
+    published(indexed(repeated, claudeReducer)),
+    expected,
+    'the repeated run changed the whole-file scan',
+  );
+  // A 200-byte slice ends inside the run, so a later slice classifies repeated records from saved state.
+  const sliced = slicedIndex(repeated, 200);
+  assert.deepEqual(published(sliced), expected, 'the repeated run changed a sliced scan');
+  assert.equal(sliced.claudeRepeated?.runs.length, 2, 'the repeated-record map holds one run');
   const storage = dir();
   saveSpendLedger(storage, 'w', [sliced]);
   assert.deepEqual(
-    loadSpendLedger(storage, 'w').files[0].claudeCopies,
-    sliced.claudeCopies,
-    'the saved copy map was dropped',
+    loadSpendLedger(storage, 'w').files[0].claudeRepeated,
+    sliced.claudeRepeated,
+    'the saved repeated-record map was dropped',
   );
 });
 
-// A run that copies the file start after more compactions than the reducer retains.
-function farCopySource(): { fresh: string[]; copied: string[] } {
+// A run that repeats the file start after more compactions than the reducer retains.
+function farRepeatSource(): { fresh: string[]; repeated: string[] } {
   const lines = [claudePrompt(0, 'p0'), linked(claudeResponse(1, { id: 'm0', input: 100, write1h: 4_000 }), 'u-p0')];
   let parent = 'a-m0';
   for (let n = 1; n <= RETAINED_COMPACTIONS + 2; n++) {
@@ -2126,11 +2133,11 @@ function farCopySource(): { fresh: string[]; copied: string[] } {
     linked(claudePrompt(1_001, 'pz'), 'c-Z'),
     linked(claudeResponse(1_002, { id: 'mz', input: 2, write1h: 2_000 }), 'u-pz'),
   ];
-  return { fresh: [...lines, ...tail], copied: [...lines, ...lines.slice(0, 5), ...tail] };
+  return { fresh: [...lines, ...tail], repeated: [...lines, ...lines.slice(0, 5), ...tail] };
 }
 
-test('a copied run adds no request to arc cost or to the own-spend read', () => {
-  for (const { fresh, copied } of [copiedRunSource(), farCopySource()]) {
+test('a repeated run adds no request to arc cost or to the own-spend read', () => {
+  for (const { fresh, repeated } of [repeatedRunSource(), farRepeatSource()]) {
     const requests = (lines: readonly string[]) =>
       readSessionRequests(writtenSource(lines)).map(({ requestKey, timestamp, model, usage, toolCalls }) => ({
         requestKey,
@@ -2139,18 +2146,26 @@ test('a copied run adds no request to arc cost or to the own-spend read', () => 
         usage,
         toolCalls,
       }));
-    assert.deepEqual(requests(copied), requests(fresh), 'arc cost counted a copied request');
+    assert.deepEqual(requests(repeated), requests(fresh), 'arc cost counted a repeated request');
 
     const spend = (lines: readonly string[]) => readClaudeAgentSpend(writtenSource(lines), [], false).models;
-    assert.deepEqual(spend(copied), spend(fresh), 'the own-spend read counted a copied request');
+    assert.deepEqual(spend(repeated), spend(fresh), 'the own-spend read counted a repeated request');
   }
 });
 
-test('a copy whose original sits more than 16 compactions back adds nothing', () => {
-  const { fresh, copied } = farCopySource();
+test('a repeated record whose original sits more than 16 compactions back adds nothing', () => {
+  const { fresh, repeated } = farRepeatSource();
   const expected = published(indexed(fresh, claudeReducer));
-  assert.deepEqual(published(indexed(copied, claudeReducer)), expected, 'the copy changed the whole-file scan');
-  assert.deepEqual(published(slicedIndex(copied, 300)), expected, 'a sliced scan missed a copy from the file start');
+  assert.deepEqual(
+    published(indexed(repeated, claudeReducer)),
+    expected,
+    'the repeated run changed the whole-file scan',
+  );
+  assert.deepEqual(
+    published(slicedIndex(repeated, 300)),
+    expected,
+    'a sliced scan missed a repeated record from the file start',
+  );
 });
 
 test('a child response rewritten after a compaction keeps that compaction in the cache-expiry facts', () => {

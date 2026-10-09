@@ -3,6 +3,7 @@ import { brotliDecompressSync } from 'node:zlib';
 import { CODEX_TITLE_BYTES, type CodexSessionMeta, type CodexSubagentFile } from './codex';
 import type { ClaudeChildReferenceCacheEntry, DerivedTitleEntry } from './derivedcache';
 import { HEAD_KEY_BYTES, SESSION_HEAD_BYTES } from './transcript';
+import { heldClaudeRepeatedMap } from './clauderepeated';
 import type { ClaudeForwardCheckpoint, ClaudeHistoryCursor } from './claudehistory';
 import type { CodexForwardCheckpoint, CodexHistoryCursor } from './codexhistory';
 import {
@@ -302,6 +303,8 @@ export class ProgressiveWorker {
   constructor(
     private readonly source?: string,
     private readonly measureJson: () => boolean = () => false,
+    // Hears each file whose repeated-record map in the worker reaches the end of the file.
+    private readonly onRepeatedCoverage?: (file: string) => void,
   ) {}
 
   private countTransport(value: unknown, reply: boolean): void {
@@ -368,7 +371,17 @@ export class ProgressiveWorker {
       this.worker = worker;
       worker.on(
         'message',
-        (message: { id: number; result?: ProgressiveResult; error?: string; progress?: boolean }) => {
+        (message: {
+          id: number;
+          result?: ProgressiveResult;
+          error?: string;
+          progress?: boolean;
+          repeatedCoverage?: string;
+        }) => {
+          if (message.repeatedCoverage !== undefined) {
+            if (this.worker === worker) this.onRepeatedCoverage?.(message.repeatedCoverage);
+            return;
+          }
           const held = this.pending.get(message.id);
           if (!held || this.worker !== worker) {
             return;
@@ -443,7 +456,12 @@ export class ProgressiveWorker {
         progress,
         dispose: () => signal.removeEventListener('abort', abort),
       });
-      const message = { id, generation, request };
+      // The worker starts from the repeated-record map this process holds for a Claude transcript, so its
+      // bounded reads skip repeated records without reading the file again.
+      const session = 'session' in request ? request.session : 'input' in request ? request.input.session : null;
+      const map = session?.agent === 'claude' ? heldClaudeRepeatedMap(session.file) : null;
+      const repeated = map && session ? { file: session.file, map } : undefined;
+      const message = { id, generation, request, repeated };
       this.countTransport(message, false);
       const started = performance.now();
       this.worker!.postMessage(message);

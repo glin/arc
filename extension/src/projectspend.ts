@@ -2,12 +2,15 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  ClaudeCopyDetector,
-  claudeCopyLookups,
-  emptyClaudeCopyState,
-  forgetClaudeCopyLookups,
-  type ClaudeCopyState,
-} from './claudecopies';
+  ClaudeRepeatedDetector,
+  claudeRepeatedLookups,
+  emptyClaudeRepeatedState,
+  forgetClaudeRepeatedLookups,
+  claudeFileRevision,
+  publishClaudeRepeatedLedger,
+  publishClaudeRepeatedMap,
+  type ClaudeRepeatedState,
+} from './clauderepeated';
 import {
   matchingCostSupplement,
   costStateDependency,
@@ -152,8 +155,8 @@ export interface SpendFileIndex {
   parserKind?: 'claude' | 'codex';
   indexedAt: number;
   parserState?: unknown;
-  // The Claude copy detector and the byte ranges of copied records it found. Readers skip those ranges.
-  claudeCopies?: ClaudeCopyState;
+  // The Claude repeated-record detector and the byte ranges of repeated records it found. Readers skip those ranges.
+  claudeRepeated?: ClaudeRepeatedState;
   // False means the scan stopped before the target size.
   // size and mtimeMs identify the target revision. scanOffset resumes within it.
   complete?: boolean;
@@ -431,7 +434,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 44;
+export const PROJECT_SPEND_PARSER_GENERATION = 46;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -506,7 +509,7 @@ export interface IndexSpendFileResult {
   // be queued again with the returned record, even when its totals did not change.
   complete: boolean;
   // True when the bytes behind the saved offset changed or went away during the slice. The
-  // returned record drops its copy detector, so the next slice rebuilds the file.
+  // returned record drops its repeated-record detector, so the next slice rebuilds the file.
   invalidated?: boolean;
 }
 
@@ -1443,10 +1446,10 @@ interface IncrementalRead {
   firstTurnAt: number | null;
   lastTurnAt: number | null;
   cacheExpiry: CacheExpiryLedger | null;
-  // The copy detector after this slice, for a Claude source.
-  claudeCopies: ClaudeCopyState | null;
-  // True when a copy lookup could not read the bytes before the restored offset.
-  copyRevisionLost: boolean;
+  // The repeated-record detector after this slice, for a Claude source.
+  claudeRepeated: ClaudeRepeatedState | null;
+  // True when a repeated-record lookup could not read the bytes before the restored offset.
+  repeatedRevisionLost: boolean;
 }
 
 function readIncremental(
@@ -1460,8 +1463,8 @@ function readIncremental(
   lifetimeBuckets: ProjectUsageBucket[],
   cacheExpiry: CacheExpiryLedger | null | undefined,
   budget: SpendIndexBudget,
-  // The saved copy detector for a Claude source, or null for a source without one.
-  restoredCopies: ClaudeCopyState | null = null,
+  // The saved repeated-record detector for a Claude source, or null for a source without one.
+  restoredRepeated: ClaudeRepeatedState | null = null,
 ): IncrementalRead {
   const fd = fs.openSync(file, 'r');
   try {
@@ -1471,17 +1474,17 @@ function readIncremental(
     const deadline = clock() + (budget.maxMilliseconds ?? DEFAULT_SCAN_MILLISECONDS);
     // A lookup reads through this descriptor, so it reads the revision this slice reads. Lookups of
     // earlier slices carry over while the file keeps its identity.
-    const opened = restoredCopies === null ? null : fs.fstatSync(fd);
-    const copies =
-      restoredCopies === null || opened === null
+    const opened = restoredRepeated === null ? null : fs.fstatSync(fd);
+    const repeated =
+      restoredRepeated === null || opened === null
         ? null
-        : new ClaudeCopyDetector(
-            restoredCopies,
+        : new ClaudeRepeatedDetector(
+            restoredRepeated,
             (buffer, at, length) => fs.readSync(fd, buffer, 0, length, at),
-            claudeCopyLookups(file, `${opened.dev}:${opened.ino}:${opened.birthtimeMs}`, restoredCopies.through),
+            claudeRepeatedLookups(file, claudeFileRevision(opened), restoredRepeated.through),
             () => clock() >= deadline,
           );
-    let copyRevisionLost = false;
+    let repeatedRevisionLost = false;
     // A lookup that runs out of budget stops the slice before its line.
     let stoppedBetweenLines = false;
     let classified = false;
@@ -1593,19 +1596,19 @@ function readIncremental(
         // The first line of a slice always gets a lookup budget, even past the deadline, so every
         // slice makes progress. A later line stops the slice when its lookup finds either budget spent.
         const allowance = classified ? maxBytes - readBytes : Math.max(1, maxBytes - readBytes);
-        const copy = copies ? copies.copyAt(text, completedOffset, end, allowance, !classified) : false;
-        if (copy === null) {
-          copyRevisionLost = true;
+        const repeat = repeated ? repeated.repeatedAt(text, completedOffset, end, allowance, !classified) : false;
+        if (repeat === null) {
+          repeatedRevisionLost = true;
           break;
         }
         // Lookups share the slice's byte and time budgets.
-        readBytes += copies?.takeConfirmingBytes() ?? 0;
-        if (copy === 'pending') {
+        readBytes += repeated?.takeConfirmingBytes() ?? 0;
+        if (repeat === 'pending') {
           stoppedBetweenLines = true;
           break;
         }
         classified = true;
-        if (!copy) {
+        if (!repeat) {
           for (const event of reducer.pushLine(text, end)) {
             add(event);
           }
@@ -1613,7 +1616,7 @@ function readIncremental(
         lineStart = cursor + 1;
         completedOffset = position - (bytes.length - lineStart);
       }
-      if (copyRevisionLost) {
+      if (repeatedRevisionLost) {
         break;
       }
       if (stoppedBetweenLines) {
@@ -1624,18 +1627,23 @@ function readIncremental(
       }
       held = Buffer.from(bytes.subarray(lineStart));
     }
-    const complete = !copyRevisionLost && position >= size;
+    const complete = !repeatedRevisionLost && position >= size;
     if (complete && budget.exportRecordBytes !== undefined && held.length) {
       const text = held.toString('utf8');
-      const copy = copies ? copies.copyAt(text, completedOffset, position, maxBytes, true) : false;
-      if (copy === null || copy === 'pending') throw new Error('The session changed during export.');
-      if (!copy) for (const event of reducer.pushLine(text, position)) add(event);
+      const repeat = repeated ? repeated.repeatedAt(text, completedOffset, position, maxBytes, true) : false;
+      if (repeat === null || repeat === 'pending') throw new Error('The session changed during export.');
+      if (!repeat) for (const event of reducer.pushLine(text, position)) add(event);
       completedOffset = position;
       held = Buffer.alloc(0);
     }
     if (complete && completedOffset > 0 && held.length > 0 && held.every((byte) => byte === 0)) {
       completedOffset = position;
       held = Buffer.alloc(0);
+    }
+    const repeatedState = repeated ? repeated.snapshot() : null;
+    // Windowed readers in this process extend the published map instead of reading the file again.
+    if (repeatedState && opened && !repeatedRevisionLost) {
+      publishClaudeRepeatedMap(file, fd, repeatedState);
     }
     return {
       offset: completedOffset,
@@ -1653,8 +1661,8 @@ function readIncremental(
       firstTurnAt: reducer.firstTurnAt?.() ?? null,
       lastTurnAt: reducer.lastTurnAt?.() ?? null,
       cacheExpiry: ordered ? ordered.ledger(reducer.recentCompactions!()) : null,
-      claudeCopies: copies ? copies.snapshot() : null,
-      copyRevisionLost,
+      claudeRepeated: repeatedState,
+      repeatedRevisionLost,
     };
   } finally {
     fs.closeSync(fd);
@@ -1746,12 +1754,12 @@ export function indexSpendFile<State>(
     previous.missingAt !== undefined ||
     stat.size < previous.size ||
     (!resuming && stat.size === previous.size);
-  // A Claude source resumes only with the copy detector that classified the bytes before its offset.
-  const copyStateLost =
+  // A Claude source resumes only with the repeated-record detector that classified the bytes before its offset.
+  const repeatedStateLost =
     parserKind === 'claude' &&
     !!previous &&
-    (!previous.claudeCopies || previous.claudeCopies.through > previous.offset);
-  const base = rebuilt || copyStateLost ? undefined : previous;
+    (!previous.claudeRepeated || previous.claudeRepeated.through > previous.offset);
+  const base = rebuilt || repeatedStateLost ? undefined : previous;
   const reducer = base ? makeReducer(base.parserState as State | undefined) : emptyReducer;
   const resume = base?.complete === false;
   const scanned = readIncremental(
@@ -1765,15 +1773,15 @@ export function indexSpendFile<State>(
     base?.lifetimeBuckets ?? [],
     base?.cacheExpiry,
     scanBudget,
-    parserKind === 'claude' ? (base?.claudeCopies ?? emptyClaudeCopyState()) : null,
+    parserKind === 'claude' ? (base?.claudeRepeated ?? emptyClaudeRepeatedState()) : null,
   );
-  if (scanned.copyRevisionLost) {
-    forgetClaudeCopyLookups(file);
+  if (scanned.repeatedRevisionLost) {
+    forgetClaudeRepeatedLookups(file);
   }
-  if (scanned.copyRevisionLost && previous) {
+  if (scanned.repeatedRevisionLost && previous) {
     // The bytes behind the saved offset changed or went away. The next slice rebuilds the file.
     const kept: SpendFileIndex = { ...previous, complete: false };
-    delete kept.claudeCopies;
+    delete kept.claudeRepeated;
     return {
       record: kept,
       totalsChanged: false,
@@ -1807,7 +1815,7 @@ export function indexSpendFile<State>(
     ...(parserKind === undefined ? {} : { parserKind }),
     indexedAt: now,
     parserState: reducer.snapshot(),
-    ...(scanned.claudeCopies ? { claudeCopies: scanned.claudeCopies } : {}),
+    ...(scanned.claudeRepeated ? { claudeRepeated: scanned.claudeRepeated } : {}),
     complete: scanned.complete,
     ...(scanned.complete ? {} : { scanOffset: scanned.scanOffset, pendingBytes: scanned.trailing.toString('base64') }),
   };
@@ -1838,7 +1846,7 @@ export function indexSpendFile<State>(
     totalsChanged,
     stateChanged,
     changed: stateChanged,
-    rebuilt: rebuilt || copyStateLost,
+    rebuilt: rebuilt || repeatedStateLost,
     found: true,
     complete: scanned.complete,
   };
@@ -1931,6 +1939,9 @@ export function loadSpendLedger(storageDirectory: string, workspace: string): Sp
     if (!ledger) {
       throw new Error('invalid ledger');
     }
+    // Readers in this process start from the saved maps, also of files the index does not read again.
+    publishClaudeRepeatedLedger(ledger.files);
+    publishClaudeRepeatedLedger(ledger.completeFiles);
     return {
       ...ledger,
       files: ledger.files.map(consumeSpendPadding),

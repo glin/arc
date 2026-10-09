@@ -288,6 +288,7 @@ export function boundedSessionRead(
           maxTurns: turns,
           childTranscript: source.childTranscript === true,
           turnsOnly: true,
+          boundedRepeated: true,
         });
   if (beforeScope !== scope() || before !== revision(source.file)) {
     result.state = 'stale';

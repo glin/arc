@@ -297,8 +297,8 @@ export function instrumentSelection(tree: string): void {
   );
   patch(
     'progressiveworker.ts',
-    'const message = { id, generation, request };',
-    `const message = { id, generation, request, __arcMeasure: requestClick };
+    'const message = { id, generation, request, repeated };',
+    `const message = { id, generation, request, repeated, __arcMeasure: requestClick };
       selectionTrace('worker-send', message);`,
   );
   patch(

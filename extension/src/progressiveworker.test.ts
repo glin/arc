@@ -4566,13 +4566,16 @@ test('an active dispatched transcript reads only its bounded metadata', async ()
   const observedSource =
     `const observedFs = require('node:fs'); const observedRead = observedFs.readSync;
     let simulatedNow = ${Date.parse(activeAt) + 1000}; Date.now = () => simulatedNow;
-    let activeBytes = 0; observedFs.readSync = function (fd, buffer, ...args) { const read = observedRead.call(this, fd, buffer, ...args);
-      try { if (observedFs.fstatSync(fd).size === ${childStat.size}) activeBytes += read; } catch {} return read; };
+    let activeBytes = 0; let completionBytes = 0; Error.stackTraceLimit = Math.max(Error.stackTraceLimit, 64);
+    observedFs.readSync = function (fd, buffer, ...args) { const read = observedRead.call(this, fd, buffer, ...args);
+      try { if (observedFs.fstatSync(fd).size === ${childStat.size}) {
+        if (String(new Error().stack).includes('coverageStep')) completionBytes += read; else activeBytes += read;
+      } } catch {} return read; };
     const observedPort = require('node:worker_threads').parentPort; const observedPost = observedPort.postMessage;
     observedPort.on('message', (message) => {
       if (message.generation > 1) simulatedNow = ${Date.parse(activeAt) + 2 * 60 * 60 * 1000};
     });
-    observedPort.postMessage = function (message) { if (message.result) message.result.activeBytes = activeBytes; return observedPost.call(this, message); };` +
+    observedPort.postMessage = function (message) { if (message.result) Object.assign(message.result, { activeBytes, completionBytes }); return observedPost.call(this, message); };` +
     source;
   const worker = new ProgressiveWorker(observedSource);
   try {
@@ -4615,6 +4618,13 @@ test('an active dispatched transcript reads only its bounded metadata', async ()
     assert.ok(
       settledBytes - (result as typeof result & { activeBytes: number }).activeBytes < childStat.size + 512 * 1024,
       'a quiet dispatched transcript was read whole more than once',
+    );
+    // Background completion of the repeated-record map, which the bounded metadata read requested,
+    // reads the file at most once more, outside every request.
+    const completionBytes = (stopped as typeof stopped & { completionBytes: number }).completionBytes;
+    assert.ok(
+      completionBytes <= childStat.size + 64 * 1024,
+      `background completion read ${completionBytes} bytes of a ${childStat.size}-byte transcript`,
     );
     const retained = await completeDiscovery(
       worker,

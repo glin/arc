@@ -9,7 +9,12 @@ import {
   noteClaudeCostEvent,
   type ClaudeCostCapture,
 } from './claudecoststate';
-import { claudeRecordIdentity, createClaudeCopyFilter } from './claudecopies';
+import {
+  blankClaudeRepeated,
+  claudeRecordIdentity,
+  claudeRepeatedClassifier,
+  createClaudeRepeatedFilter,
+} from './clauderepeated';
 import { createHash } from 'node:crypto';
 import {
   AgentSessionTargetLookup,
@@ -1196,6 +1201,8 @@ export function readTurnStartsFromTail(
   file: string,
   startsIn: (lines: string[]) => number[],
   bytes = TURN_START_BYTES,
+  // Set for a Claude transcript, whose repeated records the window skips.
+  claude = false,
 ): TurnStarts {
   let fd = -1;
   try {
@@ -1225,7 +1232,8 @@ export function readTurnStartsFromTail(
 
       // Include the first line so a record starting exactly at the window boundary remains eligible.
       // The scanners reject partial JSON records.
-      const lines = body.toString('utf8').split('\n');
+      const split = body.toString('utf8').split('\n');
+      const lines = claude ? blankClaudeRepeated(file, split, start, size, size - start) : split;
       const starts = startsIn(lines);
       if (starts.length) {
         return { starts, whole: start === 0 };
@@ -1254,7 +1262,7 @@ export function readTurnStartsFromTail(
 
 // Turn starts in oldest-first order. Read failures return an empty, incomplete result.
 export function readSessionTurnStarts(file: string, bytes = TURN_START_BYTES, childTranscript = false): TurnStarts {
-  return readTurnStartsFromTail(file, (lines) => sessionTurnStartsIn(lines, childTranscript), bytes);
+  return readTurnStartsFromTail(file, (lines) => sessionTurnStartsIn(lines, childTranscript), bytes, true);
 }
 
 // A command's identity and pairing state in file order.
@@ -1718,21 +1726,23 @@ function sessionTitleOf(
 // Records can arrive out of timestamp order, so the reader takes their maximum timestamp.
 // Unreadable timestamps are excluded rather than replaced with epoch zero.
 export function readSessionActivity(file: string, bytes = 256 * 1024): number | null {
-  return activityIn(tailLines(file, bytes));
+  return activityIn(claudeTailOf(file, bytes, false, true).lines);
 }
 
 // Only user and assistant timestamps establish resumed child work.
 // Disjoint backward reads recover complete records beyond bookkeeping and split records.
+// It reads at most `bytes` of map extension and lookups, so it never waits for the repeated-record map.
 export function readSessionWork(file: string, bytes = 256 * 1024, now = Infinity): number | null {
-  const tail = tailOf(file, bytes, true);
+  const tail = claudeTailOf(file, bytes, true, true);
   if (!tail.success) return null;
   let newest = activityIn(tail.lines, true, now);
   let cursor = tail.cursor;
+  const skip = cursor ? claudeRepeatedClassifier(file, cursor.revision.size, bytes) : null;
   while (cursor && cursor.end > 0) {
     const batch = readPreviousLines(file, cursor, bytes);
     if (!batch) return null;
     const at = activityIn(
-      batch.lines.map((line) => line.text),
+      batch.lines.filter((line) => !skip?.(line.offset, line.text)).map((line) => line.text),
       true,
       now,
     );
@@ -1959,6 +1969,7 @@ export function readSessionMeta(
   childTranscript = false,
 ): SessionMeta {
   const read = tailOf(file, bytes);
+  read.lines = blankClaudeRepeated(file, read.lines, read.offset ?? 0, Number.MAX_SAFE_INTEGER, bytes);
   const { title, headKey, withdrawnPrompt } = sessionTitleOf(file, read, childTranscript);
   const tail = outcomeIn(read.lines, childTranscript);
   return {
@@ -4434,6 +4445,27 @@ export function tailLines(file: string, bytes: number): string[] {
   return tailOf(file, bytes).lines;
 }
 
+// A tail read of a Claude transcript whose repeated records are blanked. The window cannot hold the
+// originals before it, so each line is classified through the map of the whole file. A rail read
+// sets `bounded`: it extends the map by at most its own window and never waits for the rest. It skips
+// each record the map does not reach yet, and the map completes in the background.
+export function claudeTailOf(file: string, bytes: number, keepCursor = false, bounded = false): TailRead {
+  const tail = tailOf(file, bytes, keepCursor);
+  if (!tail.lines.length) return tail;
+  const allowance = bounded ? bytes : Infinity;
+  return {
+    ...tail,
+    lines: blankClaudeRepeated(file, tail.lines, tail.offset ?? 0, Number.MAX_SAFE_INTEGER, allowance),
+  };
+}
+
+// Read options whose session reducer skips the repeated records of `file`.
+export function withClaudeRepeated(file: string, opts: ReadOptions): ReadOptions {
+  return opts.repeatedRecord
+    ? opts
+    : { ...opts, repeatedRecord: claudeRepeatedClassifier(file, Number.MAX_SAFE_INTEGER) };
+}
+
 // Opened source revision used to reject replaced or changed files during backward reads.
 export interface FileRevision {
   size: number;
@@ -6850,7 +6882,7 @@ const CLAUDE_HIDDEN_POLICY: HiddenStatePolicy = {
 export interface ReadOptions {
   // Explicit captures retain all recorded submissions. Ordinary panel reads stay bounded.
   captureSessionText?: boolean;
-  captureCopies?: Pick<import('./claudecopies').ClaudeCopyState, 'copies'>;
+  captureRepeated?: Pick<import('./clauderepeated').ClaudeRepeatedState, 'runs'>;
   exportTurnBytes?: number;
   recoveredModelAttachment?: string | null;
   tailBytes?: number;
@@ -6869,6 +6901,12 @@ export interface ReadOptions {
   // Set by a caller that keeps only the turns. Its compactions then carry no first request cache
   // read, because finding it can read the head of a large transcript.
   turnsOnly?: boolean;
+  // Classifies a line by its start byte for a reader that does not read from byte 0. True means
+  // the session reducer skips the line as a repeated record.
+  repeatedRecord?: (start: number, text: string) => boolean;
+  // Set by a read with a byte limit. It extends the repeated-record map by at most its own window
+  // and never waits for the rest of the file.
+  boundedRepeated?: boolean;
 }
 
 export type ClaudeUsage = {
@@ -6898,7 +6936,7 @@ export interface ClaudeUsageReducerState {
   openTurn: boolean;
   openTurnAnswered: boolean;
   // How many compactions this transcript has held. The usage line reducer revokes an abandoned one.
-  // A reader skips copied records before they reach the reducer, so a copied compaction never counts.
+  // A reader skips repeated records before they reach the reducer, so a repeated compaction never counts.
   compactionCount: number;
   // The newest of those summaries, oldest first. `RETAINED_COMPACTIONS` bounds it, so
   // compactionCount stays the exact total and this list only describes them.
@@ -8350,9 +8388,9 @@ function readClaudeOwnSpend(
     folders,
     maxTurns: Number.MAX_SAFE_INTEGER,
   });
-  const copies = createClaudeCopyFilter();
+  const repeated = createClaudeRepeatedFilter();
   const found = scanLines(file, (line) => {
-    if (copies(line)) {
+    if (repeated(line)) {
       return;
     }
     child.pushLine(line);
@@ -8644,7 +8682,7 @@ export function withClaudeFirstRequest(file: string, compactions: Compaction[], 
 // Turns and compactions in the tail of one session transcript, each oldest first.
 export function readSession(file: string, sessionId: string, opts: ReadOptions = {}): SessionRead {
   const tailBytes = opts.tailBytes ?? 4 * 1024 * 1024;
-  const tail = tailOf(file, tailBytes, opts.prepareNewestTurnDiscovery === true);
+  const tail = claudeTailOf(file, tailBytes, opts.prepareNewestTurnDiscovery === true, opts.boundedRepeated === true);
   const read = readSessionLines(tail.lines, sessionId, opts, tail.readBytes, tail.offset);
   if (!opts.turnsOnly) {
     withClaudeFirstRequest(file, read.compactions, opts.childTranscript === true);
@@ -8668,7 +8706,13 @@ export function discoverClaudeNewestTurn(
   for (let index = newer.length - 1; index >= 0; index -= 1) {
     claudeBackwardBoundary(segment, newer[index]);
   }
-  return discoverBackwardBoundary(file, cursor, (line) => claudeBackwardBoundary(segment, line.text), options);
+  const skip = claudeRepeatedClassifier(file, cursor.revision.size);
+  return discoverBackwardBoundary(
+    file,
+    cursor,
+    (line) => !skip(line.offset, line.text) && claudeBackwardBoundary(segment, line.text),
+    options,
+  );
 }
 
 // What a backward walk has seen since the newest typed prompt it passed, which is everything
@@ -10669,8 +10713,20 @@ export function createClaudeSessionReducer(
   state.curCarried ??= null;
   state.curInferredStop ??= null;
   state.curToolEnded ??= false;
+  // A reader that classifies its lines through the file's repeated-record map passes the
+  // classifier. Otherwise the reducer skips a line whose identity matches a line it already read,
+  // which is a repeated record wherever the window starts.
+  // A line without a byte offset falls back to the check against the lines this reducer read.
+  const classify = opts.repeatedRecord;
+  const local = createClaudeRepeatedFilter();
+  const skipRepeated = (line: string | ParserLine): boolean => {
+    const text = typeof line === 'string' ? line : line.text;
+    if (classify && typeof line !== 'string' && line.start !== undefined) return classify(line.start, text);
+    return local(text);
+  };
   return {
     pushLine: (line) => {
+      if (skipRepeated(line)) return;
       const order = opts.captureSessionText
         ? captureTurnTextOrder([state.cur, state.pending.held, state.turns.at(-1)])
         : null;
