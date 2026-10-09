@@ -1,4 +1,4 @@
-// One Timeline layout dialog serves every session-heading gear in the panel.
+// One Timeline options dialog serves every session-heading gear in the panel.
 // Radio rows post setLayout and reflect the latest host settings. Their labels expose native tooltips from the Settings editor.
 
 import { Fragment, h, render } from 'preact';
@@ -26,7 +26,7 @@ export interface LayoutDialogOptions {
 
 export interface LayoutDialog {
   // Opens the dialog under a gear, or closes it when that gear already holds it open.
-  toggle(gear: HTMLElement): void;
+  toggle(gear: HTMLElement, session?: string): void;
   // Redraws the checked rows and the gears' expanded state after a render.
   sync(): void;
   close(returnFocus: boolean): void;
@@ -88,6 +88,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
   pop.setAttribute('aria-label', TIMELINE_LAYOUT_WORDS.title);
   document.body.appendChild(pop);
   let anchor: HTMLElement | null = null;
+  let exportSession: string | undefined;
 
   const draw = () => {
     render(
@@ -101,6 +102,26 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
               post: options.post,
               key: 'promptPosition',
             }),
+            exportSession
+              ? h(
+                  'div',
+                  { class: 'railfiltersection', key: 'export' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'launchrow',
+                      'data-control': 'exportSessionHtml',
+                      onClick() {
+                        const session = exportSession!;
+                        close(true);
+                        options.post({ type: 'exportSessionHtml', session });
+                      },
+                    },
+                    'Export session as HTML...',
+                  ),
+                )
+              : null,
           ])
         : null,
       pop,
@@ -127,6 +148,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
     const gear = anchor;
     anchor = null;
+    exportSession = undefined;
     pop.hidden = true;
     draw();
     markGears();
@@ -135,8 +157,9 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
   };
 
-  const open = (gear: HTMLElement) => {
+  const open = (gear: HTMLElement, session?: string) => {
     anchor = gear;
+    exportSession = session;
     pop.hidden = false;
     draw();
     markGears();
@@ -153,7 +176,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
     }
     // Tab past either edge closes the dialog before focus leaves, including when no other panel control follows.
     if (event.key === 'Tab') {
-      const stops = Array.from(pop.querySelectorAll<HTMLElement>('[role="radio"][tabindex="0"]'));
+      const stops = Array.from(pop.querySelectorAll<HTMLElement>('button:not([tabindex="-1"])'));
       const edge = event.shiftKey ? stops[0] : stops[stops.length - 1];
       if (event.target === edge) {
         close(false);
@@ -199,7 +222,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
   });
 
   return {
-    toggle(gear) {
+    toggle(gear, session) {
       if (anchor === gear) {
         close(true);
         return;
@@ -207,7 +230,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
       if (anchor) {
         close(false);
       }
-      open(gear);
+      open(gear, session);
     },
     sync() {
       if (anchor && !anchor.isConnected) {

@@ -6,6 +6,39 @@ import * as path from 'node:path';
 import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader } from './transcript';
 import { scanCodexDispatchReferencesAsync } from './codex';
 
+test('Codex skipped relationship records retain incomplete coverage through cache reload', () => {
+  const directory = folder();
+  const file = path.join(directory, 'oversized.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: 'session_meta', payload: { id: 'parent' } }) +
+      '\n' +
+      JSON.stringify({ type: 'ignored', payload: 'x'.repeat(5 * 1024 * 1024) }) +
+      '\n',
+  );
+  const scan = scanCodexDispatchReferences(file, 'parent');
+  assert.equal(scan.traversed, true);
+  assert.equal(scan.complete, false);
+  const entry: ClaudeChildReferenceCacheEntry = {
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    source: 'codex',
+    sessionId: 'parent',
+    childTranscript: false,
+    ...scan.cursor.evidence!.provisional,
+    references: [],
+    complete: false,
+    relationshipComplete: false,
+    visitedEof: true,
+    cursor: scan.cursor,
+  };
+  saveDerivedCache(cache, [], [[file, entry]]);
+  const restored = loadDerivedCache(cache).claudeChildReferences.get(normalizeFsPath(file));
+  assert.ok(restored?.cursor);
+  assert.equal(restored.cursor.lostRecords, true);
+  assert.equal(scanCodexDispatchReferences(file, 'parent', restored.cursor).complete, false);
+});
+
 test.each(['claude', 'codex'] as const)(
   '%s terminal deadline checkpoints retain progress through reload',
   async (agent) => {
@@ -751,7 +784,7 @@ test('derived cache rejects child references from another parser generation', ()
 // Cache format compatibility alone does not establish parser compatibility.
 test('derived cache rescans an unchanged parent after the receipt parser upgrade', () => {
   const file = path.join(folder(), 'cache.json');
-  for (const parserVersion of [2, 7, 12, 13, 14, 17, 18]) {
+  for (const parserVersion of [2, 7, 12, 13, 14, 17, 18, 24]) {
     fs.writeFileSync(
       file,
       JSON.stringify({

@@ -18,6 +18,7 @@ import {
 } from './transcript';
 import { BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS } from './parserstate';
 import { sameModelIdentity } from './domain/model-identity';
+import { insideClaudeCopy } from './claudecopies';
 import {
   ForwardParserCheckpoint,
   IncrementalSessionResult,
@@ -314,7 +315,9 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
   return {
     source: 'claude',
     initialState: (file, revision) => {
-      const title = readSessionRecordedTitlePair(file, opts.tailBytes ?? DEFAULT_TAIL_BYTES);
+      const title = opts.captureSessionText
+        ? { short: null, full: null, source: null, at: null }
+        : readSessionRecordedTitlePair(file, opts.tailBytes ?? DEFAULT_TAIL_BYTES);
       return {
         revision,
         titleRecord:
@@ -332,7 +335,10 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
       };
     },
     accepts: (record) => claudeSessionLineMayAffectRead(record.text),
-    parse: (records, backward) => {
+    parse: (input, backward) => {
+      const records = opts.captureCopies
+        ? input.filter((record) => !insideClaudeCopy(opts.captureCopies, record.start))
+        : input;
       const boundary = records[0]?.start ?? 0;
       const evidence = backward.attachmentEvidence?.boundary === boundary ? backward.attachmentEvidence : undefined;
       const reducer = createClaudeSessionReducer(sessionId, {
@@ -426,10 +432,18 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
         snapshot.titleRecord = titleRecord;
       }
       const merged = createClaudeSessionReducer(sessionId, { ...opts, maxTurns: Number.MAX_SAFE_INTEGER }, snapshot);
+      const openRange = merged.openRange();
+      const unfinished = opts.captureSessionText && openRange ? (merged.read().turns.at(-1) ?? null) : null;
       return {
         turns: merged.completedTurns(),
         compactions: merged.completedCompactions(),
-        openRange: merged.openRange(),
+        openRange,
+        ...(opts.captureSessionText
+          ? { firstRequestCacheRead: snapshot.usageState.firstRequestCacheRead ?? null }
+          : {}),
+        ...(opts.captureSessionText
+          ? { unfinished: unfinished && openRange ? { turn: unfinished, ...openRange } : null }
+          : {}),
         adapterState: {
           revision: backward.revision,
           titleRecord,
@@ -512,8 +526,11 @@ export function readClaudeHistoryPage(
   options: SemanticHistoryOptions = {},
   readOptions: ReadOptions = {},
 ): ClaudeHistoryPageResult {
-  const result = readSemanticHistoryPage(file, sessionId, claudeAdapter(sessionId, readOptions), cursor, options);
-  if (result.page) {
+  const capture = options.exportLimits
+    ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
+    : readOptions;
+  const result = readSemanticHistoryPage(file, sessionId, claudeAdapter(sessionId, capture), cursor, options);
+  if (result.page && !options.exportLimits) {
     withClaudeFirstRequest(file, result.page.compactions, readOptions.childTranscript === true);
   }
   return result;
@@ -526,9 +543,12 @@ export function readClaudeHistoryPageAsync(
   options: SemanticHistoryOptions = {},
   readOptions: ReadOptions = {},
 ): Promise<ClaudeHistoryPageResult> {
-  return readSemanticHistoryPageAsync(file, sessionId, claudeAdapter(sessionId, readOptions), cursor, options).then(
+  const capture = options.exportLimits
+    ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
+    : readOptions;
+  return readSemanticHistoryPageAsync(file, sessionId, claudeAdapter(sessionId, capture), cursor, options).then(
     (result) => {
-      if (result.page) {
+      if (result.page && !options.exportLimits) {
         withClaudeFirstRequest(file, result.page.compactions, readOptions.childTranscript === true);
       }
       return result;

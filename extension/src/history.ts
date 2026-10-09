@@ -14,6 +14,7 @@ import {
 } from './transcript';
 import { cloneParserState, ParserLine, BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS } from './parserstate';
 import { OversizedRecordReducer } from './oversizedrecord';
+import { ExportLimitError, type ExportReadLimits } from './exportlimits';
 
 export interface FileIdentity {
   dev: number | string;
@@ -164,6 +165,7 @@ export interface BufferedHistoryRecord extends ParserLine {
 }
 
 export interface SourceHistoryCursor<State = unknown> {
+  exportLimits?: ExportReadLimits;
   source: AgentKind;
   sessionId: string;
   revision: FileRevision;
@@ -181,6 +183,9 @@ export interface SemanticHistoryPage<State = unknown> {
   ownedRange: { start: number; end: number };
   turns: Turn[];
   compactions: Compaction[];
+  // Recorded unfinished body, supplied only on the first explicit capture page.
+  unfinished?: { turn: Turn; start: number; end: number } | null;
+  firstRequestCacheRead?: number | null;
   recoveryBytes?: number;
   nextOlderCursor: SourceHistoryCursor<State> | null;
 }
@@ -193,6 +198,8 @@ export interface SemanticParse<State> {
   turns: Array<{ turn: Turn; start: number; end: number }>;
   compactions: Array<{ compaction: Compaction; start: number; end: number }>;
   openRange: { start: number; end: number } | null;
+  unfinished?: { turn: Turn; start: number; end: number } | null;
+  firstRequestCacheRead?: number | null;
   adapterState: State;
   olderEvidence?: SemanticEvidenceClaim[];
   deferOlderEvidence?: boolean;
@@ -223,6 +230,7 @@ export interface SemanticSourceAdapter<State> {
 }
 
 export interface SemanticHistoryOptions {
+  exportLimits?: ExportReadLimits;
   chunkBytes?: number;
   targetTurns?: number;
   readRange?: BackwardRangeReader;
@@ -649,9 +657,11 @@ function startHistoryCursor<State>(
   source: AgentKind,
   sessionId: string,
   adapterState: State,
+  exportLimits?: ExportReadLimits,
 ): SourceHistoryCursor<State> {
   return {
     source,
+    ...(exportLimits ? { exportLimits: { ...exportLimits } } : {}),
     sessionId,
     revision,
     end: revision.size,
@@ -666,6 +676,7 @@ function initialHistoryCursor<State>(
   file: string,
   sessionId: string,
   adapter: SemanticSourceAdapter<State>,
+  exportLimits?: ExportReadLimits,
 ): { kind: 'ready'; cursor: SourceHistoryCursor<State> } | { kind: 'missing' | 'stale' } {
   const revision = revisionFor(file);
   if (!revision) {
@@ -679,7 +690,7 @@ function initialHistoryCursor<State>(
   if (!sameRevision(revision, confirmed)) {
     return { kind: 'stale' };
   }
-  return { kind: 'ready', cursor: startHistoryCursor(revision, adapter.source, sessionId, state) };
+  return { kind: 'ready', cursor: startHistoryCursor(revision, adapter.source, sessionId, state, exportLimits) };
 }
 
 function* scanSemanticHistoryPage<State>(
@@ -689,13 +700,15 @@ function* scanSemanticHistoryPage<State>(
   initial: SourceHistoryCursor<State> | null,
   options: SemanticHistoryOptions = {},
 ): Generator<void, SemanticHistoryResult<State>, void> {
-  const started = initial ? null : initialHistoryCursor(file, sessionId, adapter);
+  if (options.signal?.aborted) return { kind: 'cancelled', page: null, openRange: null };
+  if (JSON.stringify(initial?.exportLimits) !== JSON.stringify(options.exportLimits)) initial = null;
+  const started = initial ? null : initialHistoryCursor(file, sessionId, adapter, options.exportLimits);
   if (started && started.kind !== 'ready') {
     return { kind: started.kind, page: null, openRange: null };
   }
   let cursor = initial ?? (started as { kind: 'ready'; cursor: SourceHistoryCursor<State> }).cursor;
   if (cursor.source !== adapter.source || cursor.sessionId !== sessionId) {
-    const reset = initialHistoryCursor(file, sessionId, adapter);
+    const reset = initialHistoryCursor(file, sessionId, adapter, options.exportLimits);
     if (reset.kind !== 'ready') {
       return { kind: reset.kind, page: null, openRange: null };
     }
@@ -709,10 +722,17 @@ function* scanSemanticHistoryPage<State>(
     return { kind: 'stale', page: null, openRange: null };
   }
 
-  const targetTurns = Math.max(1, options.targetTurns ?? 20);
-  const chunkBytes = Math.max(1, options.chunkBytes ?? 1024 * 1024);
+  const limits = options.exportLimits;
+  const targetTurns = limits ? 1 : Math.max(1, options.targetTurns ?? 20);
+  const chunkBytes = Math.max(1, Math.min(options.chunkBytes ?? 1024 * 1024, limits?.sliceBytes ?? Infinity));
+  const charge = (record: BufferedHistoryRecord) =>
+    Math.max(1, record.end - record.start + (record.end < cursor.revision.size ? 1 : 0));
+  let heldBytes = cursor.heldRecords.reduce((total, record) => total + charge(record), 0);
+  if (limits && heldBytes + cursor.fragment.length > limits.pageBytes)
+    throw new ExportLimitError('page', limits.pageBytes);
+  if (limits && cursor.heldRecords.some((record) => Buffer.byteLength(record.text) > limits.recordBytes))
+    throw new ExportLimitError('record', limits.recordBytes);
   let held = cloneParserState(cursor.heldRecords);
-  let heldBytes = held.reduce((total, record) => total + Math.max(1, record.end - record.start), 0);
   let parsedBytes = 0;
   let parseState = cloneParserState(cursor.adapterState);
   let byteCursor: BackwardLineCursor = {
@@ -728,9 +748,15 @@ function* scanSemanticHistoryPage<State>(
       return { kind: 'cancelled', page: null, openRange: null };
     }
     if (byteCursor.end > 0) {
-      const batch = readPreviousLines(file, byteCursor, chunkBytes, options.readRange);
+      const batch = readPreviousLines(file, byteCursor, chunkBytes, options.readRange, limits?.recordBytes);
       if (!batch) {
         return { kind: 'stale', page: null, openRange: null };
+      }
+      if (limits && (batch.lines.some((line) => line.oversized) || batch.cursor.discardedFragment)) {
+        throw new ExportLimitError('record', limits.recordBytes);
+      }
+      if (limits && cursor.pageEnd - batch.cursor.end > limits.pageBytes) {
+        throw new ExportLimitError('page', limits.pageBytes);
       }
       const older = [...batch.lines]
         .reverse()
@@ -739,10 +765,13 @@ function* scanSemanticHistoryPage<State>(
           start: line.offset,
           end: line.offset + Buffer.byteLength(line.text),
         }))
-        .filter((record) => adapter.accepts(record));
+        .filter((record) => limits || adapter.accepts(record));
       if (older.length) {
+        const olderBytes = older.reduce((total, record) => total + charge(record), 0);
+        if (limits && heldBytes + olderBytes + batch.cursor.fragment.length > limits.pageBytes)
+          throw new ExportLimitError('page', limits.pageBytes);
         held = [...older, ...held];
-        heldBytes += older.reduce((total, record) => total + Math.max(1, record.end - record.start), 0);
+        heldBytes += olderBytes;
         parsed = null;
       }
       byteCursor = batch.cursor;
@@ -786,9 +815,13 @@ function* scanSemanticHistoryPage<State>(
           evidenceCursor,
           Math.min(chunkBytes, BACKGROUND_SCAN_BYTES - evidenceSliceBytes),
           options.evidenceReadRange,
+          limits?.recordBytes,
         );
         if (!batch) {
           return { kind: 'stale', page: null, openRange: null };
+        }
+        if (limits && (batch.lines.some((line) => line.oversized) || batch.cursor.discardedFragment)) {
+          throw new ExportLimitError('record', limits.recordBytes);
         }
         const evidenceBytes = evidenceCursor.end - batch.cursor.end;
         recoveryBytes += evidenceBytes;
@@ -834,6 +867,15 @@ function* scanSemanticHistoryPage<State>(
     }
 
     const selected = complete.slice(-targetTurns);
+    if (limits) {
+      const ranges = [...parsed.turns, ...(parsed.unfinished ? [parsed.unfinished] : [])].sort(
+        (a, b) => a.start - b.start,
+      );
+      for (let index = 0; index < ranges.length; index++) {
+        const end = ranges[index + 1]?.start ?? cursor.pageEnd;
+        if (end - ranges[index].start > limits.turnBytes) throw new ExportLimitError('turn', limits.turnBytes);
+      }
+    }
     const pageStart = atBeginning && complete.length <= targetTurns ? 0 : (selected[0]?.start ?? semanticEnd);
     const selectedRanges = new Set(selected.map(({ start, end }) => `${start}:${end}`));
     const turns = selected.map(({ turn }) => turn);
@@ -853,6 +895,7 @@ function* scanSemanticHistoryPage<State>(
           pageEnd: pageStart,
           heldRecords: nextHeld,
           adapterState: cloneParserState(nextAdapterState),
+          ...(limits ? { exportLimits: { ...limits } } : {}),
         }
       : null;
     // Reject duplicate source ranges within the selected page.
@@ -868,6 +911,8 @@ function* scanSemanticHistoryPage<State>(
         ownedRange: { start: pageStart, end: semanticEnd },
         turns,
         compactions,
+        ...(limits ? { unfinished: cursor.pageEnd === cursor.revision.size ? (parsed.unfinished ?? null) : null } : {}),
+        ...(limits && atBeginning ? { firstRequestCacheRead: parsed.firstRequestCacheRead } : {}),
         recoveryBytes,
         nextOlderCursor,
       },

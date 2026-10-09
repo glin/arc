@@ -741,7 +741,12 @@ function codexAdapter(
   return {
     source: 'codex',
     initialState: (file) => ({
-      meta: initialMeta === undefined ? readCodexSessionMeta(file) : initialMeta,
+      meta:
+        opts.capturedOpening !== undefined
+          ? opts.capturedOpening
+          : initialMeta === undefined
+            ? readCodexSessionMeta(file)
+            : initialMeta,
       copiedTurnIds: [],
       copiedTurnRanges: [],
       resolvedLegacyRanges: [],
@@ -831,10 +836,16 @@ function codexAdapter(
               .filter((claim) => !resolved.has(claim.key))
           : [];
       const oldestPendingIndex = pendingIndexes.size ? Math.min(...pendingIndexes) : -1;
+      const openRange = reducer.openRange();
+      const candidate = opts.captureSessionText && openRange ? (reducer.read().turns.at(-1) ?? null) : null;
+      const unfinished = candidate?.promptId === snapshot.open?.promptId ? candidate : null;
       return {
         turns: visibleTurns,
         compactions: reducer.completedCompactions(),
-        openRange: reducer.openRange(),
+        openRange,
+        ...(opts.captureSessionText
+          ? { unfinished: unfinished && openRange ? { turn: unfinished, ...openRange } : null }
+          : {}),
         adapterState: {
           meta: backward.meta,
           copiedTurnIds: copied.map((entry) => entry.id),
@@ -953,8 +964,13 @@ function codexAdapter(
 function cursorMetaForSession(
   cursor: CodexHistoryCursor | null,
   sessionId: string,
+  exportLimits: SemanticHistoryOptions['exportLimits'],
 ): CodexSessionMeta | null | undefined {
-  return cursor?.source === 'codex' && cursor.sessionId === sessionId ? cursor.adapterState.meta : undefined;
+  return cursor?.source === 'codex' &&
+    cursor.sessionId === sessionId &&
+    JSON.stringify(cursor.exportLimits) === JSON.stringify(exportLimits)
+    ? cursor.adapterState.meta
+    : undefined;
 }
 
 export function readCodexHistoryPage(
@@ -969,9 +985,11 @@ export function readCodexHistoryPage(
     sessionId,
     codexAdapter(
       sessionId,
-      readOptions,
-      cursorMetaForSession(cursor, sessionId),
-      Math.max(1, options.targetTurns ?? 20),
+      options.exportLimits
+        ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
+        : readOptions,
+      cursorMetaForSession(cursor, sessionId, options.exportLimits),
+      options.exportLimits ? 1 : Math.max(1, options.targetTurns ?? 20),
     ),
     cursor,
     options,
@@ -990,9 +1008,11 @@ export function readCodexHistoryPageAsync(
     sessionId,
     codexAdapter(
       sessionId,
-      readOptions,
-      cursorMetaForSession(cursor, sessionId),
-      Math.max(1, options.targetTurns ?? 20),
+      options.exportLimits
+        ? { ...readOptions, captureSessionText: true, exportTurnBytes: options.exportLimits.turnBytes }
+        : readOptions,
+      cursorMetaForSession(cursor, sessionId, options.exportLimits),
+      options.exportLimits ? 1 : Math.max(1, options.targetTurns ?? 20),
     ),
     cursor,
     options,

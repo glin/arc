@@ -44,6 +44,7 @@ import { codexOpeningsAtStartup, CodexOpeningsWriter } from './codexopenings';
 import { baselineUri, turnFileUri, PATCH_SCHEME } from './uris';
 import { readSetting, writeSetting } from './config';
 import { saveTimelineLayout } from './view/timeline-layout';
+import { exportSavedSession, savedExportSource, writeSavedSession } from './sessionexport';
 import { RAIL_FOLDS } from './view/rail';
 import { settingName } from './settings';
 import { ARC_IDENTITY, MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity';
@@ -11511,12 +11512,67 @@ export class PanelProvider implements vscode.Disposable {
             void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
           });
         },
-        // The Timeline layout dialog writes the reader's setting. The configuration listener
+        // The Timeline options dialog writes the reader's setting. The configuration listener
         // sends its new value to every host. A refused write reaches the reader as an error message.
         setLayout: (msg) => {
           void saveTimelineLayout(msg.key, msg.value, writeSetting, (message) => {
             void vscode.window.showErrorMessage(message);
           });
+        },
+        exportSessionHtml: (msg) => {
+          const sources = this.catalog?.sessions ?? [];
+          const source = savedExportSource(msg.session, sources);
+          const title = source ? this.sessionLabel(source).fullLabel : msg.session;
+          return exportSavedSession(
+            source,
+            title,
+            {
+              roots: { claude: projectsRoot(), codex: codexSessionsRoot() },
+              readerParents: { ...this.saved.readerParents },
+              capturedAt: Date.now(),
+            },
+            {
+              confirm: async (title, detail) =>
+                (await vscode.window.showWarningMessage(title, { modal: true, detail }, 'Export')) === 'Export',
+              chooseFolder: async () =>
+                (
+                  await vscode.window.showOpenDialog({
+                    canSelectFiles: false,
+                    canSelectFolders: true,
+                    canSelectMany: false,
+                    openLabel: 'Export here',
+                    title: 'Choose an export folder',
+                  })
+                )?.[0]?.fsPath,
+              progress: (title, operation) =>
+                vscode.window.withProgress(
+                  { location: vscode.ProgressLocation.Notification, title, cancellable: true },
+                  async (progress, token) => {
+                    const controller = new AbortController();
+                    const subscription = token.onCancellationRequested(() => controller.abort());
+                    if (token.isCancellationRequested) controller.abort();
+                    try {
+                      return await operation(controller.signal, (message) => progress.report({ message }));
+                    } finally {
+                      subscription.dispose();
+                    }
+                  },
+                ),
+              write: (destination, options) => writeSavedSession(destination, this.extensionUri.fsPath, options),
+              completed: async (title, index) => {
+                if (
+                  (await vscode.window.showInformationMessage(
+                    `Arc: ${title} was exported. Inspect it before sharing.`,
+                    'Open',
+                  )) === 'Open'
+                )
+                  await vscode.env.openExternal(vscode.Uri.file(index));
+              },
+              failed: (message) => {
+                void vscode.window.showErrorMessage(message);
+              },
+            },
+          );
         },
         saveState: (msg) => {
           this.saveState(msg.state);

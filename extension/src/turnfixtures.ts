@@ -24,6 +24,164 @@ import type { searchTurns } from './turnsearch.ts';
 import type { LivePress } from './composerview.ts';
 import { toCard, type TurnCard } from './turncard.ts';
 import { ARC_IDENTITY } from './identity.ts';
+import type { SessionExport, ExportPage, ExportTurn, ExportNumbers } from './exportdata.ts';
+import type { ExportTransaction } from './exportwriter.ts';
+
+export async function sessionSiteFixture(writer: ExportTransaction): Promise<SessionExport> {
+  const capturedAt = Date.parse('2026-09-29T12:00:00Z');
+  const usage = {
+    requests: 2,
+    input: 10,
+    cacheRead: 20,
+    cacheWrite1h: 0,
+    cacheWrite5m: 4,
+    cacheWrite30m: 0,
+    output: 30,
+    thinking: 3,
+  };
+  const numbers: ExportNumbers = {
+    parts: [],
+    main: { dollars: 2, partial: false },
+    delegated: { dollars: 1, partial: false },
+    combined: { dollars: 3, partial: false },
+    coverage: { usage: 'complete', cost: 'complete' },
+  };
+  const sessions: SessionExport['sessions'] = [];
+  for (const key of ['root', 'child']) {
+    const pages: string[] = [];
+    const count = key === 'root' ? 22 : 1;
+    for (let index = count - 1; index >= 0; index--) {
+      const startedAt = capturedAt - 100000 + index * 1000;
+      const blocks: ExportTurn['blocks'] = [
+        {
+          key: `${key}-${index}-prompt`,
+          kind: 'prompt',
+          text: `Prompt ${index}`,
+          at: startedAt,
+          sourceOrder: 1,
+          notResponse: null,
+        },
+      ];
+      if (index === count - 1)
+        for (let prompt = 0; prompt < 13; prompt++)
+          blocks.push({
+            key: `${key}-${index}-later-${prompt}`,
+            kind: 'prompt',
+            text: `Later prompt ${prompt}`,
+            at: startedAt,
+            sourceOrder: prompt + 2,
+            notResponse: null,
+          });
+      blocks.push({
+        key: `${key}-${index}-answer`,
+        kind: 'answer',
+        text:
+          index === count - 1
+            ? 'Complete answer ' +
+              'x'.repeat(70000) +
+              ' final sentinel <script>window.attacked=true</script> [outside](https://example.invalid/attack) ![image](https://example.invalid/image)'
+            : `Answer ${index}`,
+        at: startedAt + 100,
+        sourceOrder: 20,
+        notResponse: null,
+      });
+      blocks.push({
+        key: `${key}-${index}-commentary`,
+        kind: 'commentary',
+        text: `Commentary ${index}`,
+        at: startedAt + 100,
+        sourceOrder: 21,
+        notResponse: null,
+      });
+      const turn: ExportTurn = {
+        key: `${key}-${index}`,
+        startedAt,
+        endedAt: startedAt + 100,
+        finished: index !== count - 1,
+        interrupted: false,
+        model: 'claude-sonnet-4-5',
+        provider: null,
+        effort: 'high',
+        blocks,
+        usage,
+        usageParts: [],
+        relationships: key === 'root' && index === count - 1 ? ['reader-link', 'missing-link'] : [],
+        context: { tokens: 34, window: 200000, request: null },
+        outputRate: { output: 30, milliseconds: 500 },
+        error: null,
+        activity: {
+          calls: 2,
+          failures: 1,
+          categories: ['read', 'edit'],
+          counts: { edits: 1, reads: 1, searches: 0, commands: 0, agents: 0, coordination: 0, web: 0, other: 0 },
+        },
+        agents: [],
+        files: [{ path: 'src/example.ts', added: 5, removed: 2, isNew: false, reason: null }],
+        commits: [],
+        changes: 'complete',
+      };
+      pages.push(
+        await writer.spool({
+          key: `${key}-page-${index}`,
+          session: key,
+          turns: [turn],
+          compactions: [],
+        } satisfies ExportPage),
+      );
+    }
+    sessions.push({
+      key,
+      agent: key === 'root' ? 'claude' : 'codex',
+      title: key === 'root' ? 'Review export' : 'Linked session',
+      pages,
+      turnCount: count,
+      compactionCount: 0,
+      firstRequestCacheRead: 20,
+      numbers,
+      parentOutsideExport: false,
+      provenance: { sourceBytes: 100, sha256: 'a'.repeat(64) },
+      coverage: {
+        text: 'complete',
+        relationships: key === 'root' ? 'partial' : 'complete',
+        context: 'recorded',
+        changes: 'recorded',
+      },
+    });
+  }
+  return {
+    version: 1,
+    root: 'root',
+    capturedAt,
+    sessions,
+    relationships: [
+      {
+        key: 'reader-link',
+        from: 'root',
+        to: 'child',
+        kind: 'reader-started',
+        ownership: 'navigation',
+        requestedByReader: true,
+        coverage: 'complete',
+        turn: 'root-21',
+      },
+      {
+        key: 'missing-link',
+        from: 'root',
+        to: null,
+        kind: 'dispatched',
+        ownership: 'delegated',
+        requestedByReader: false,
+        coverage: 'partial',
+        reason: 'missing',
+        label: 'Missing research',
+        turn: 'root-21',
+      },
+    ],
+    omissions: [{ session: 'root', relationship: null, reason: 'missing' }],
+    coverage: { text: 'complete', relationships: 'partial', inventory: 'complete' },
+    deliberatelyOmitted: ['raw tools', 'reasoning', 'attachments'],
+  };
+}
 
 // Synthetic clocks reproduce transcript closure, delayed writes, and resumed work.
 export function timelineCheckRecords(

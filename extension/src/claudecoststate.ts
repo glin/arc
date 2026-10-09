@@ -4,6 +4,7 @@ import { normalizeModelIdentity } from './domain/model-identity';
 import { BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS, retainedParserPayloadScan } from './parserstate';
 import { insideClaudeCopy } from './claudecopies';
 import { hasRequestContextPricing } from './pricing';
+import { ExportLimitError } from './exportlimits';
 import type {
   ProjectUsageBucket,
   SpendFileIndex,
@@ -570,7 +571,17 @@ export function reconcileClaudeCostState(
         if (!read && !progress.pending) break;
         remaining -= read;
         progress.offset += read;
-        const bytes = Buffer.concat([Buffer.from(progress.pending, 'base64'), chunk.subarray(0, read)]);
+        const pendingBytes = Buffer.from(progress.pending, 'base64');
+        if (budget.exportRecordBytes !== undefined) {
+          let length = pendingBytes.length;
+          for (let at = 0; at < read; at++) {
+            if (chunk[at] === 10) length = 0;
+            else if (++length > budget.exportRecordBytes)
+              throw new ExportLimitError('record', budget.exportRecordBytes);
+          }
+        }
+        const terminal = budget.exportRecordBytes !== undefined && progress.offset === file.size;
+        const bytes = Buffer.concat([pendingBytes, chunk.subarray(0, read), ...(terminal ? [Buffer.from([10])] : [])]);
         let start = 0;
         for (let end = 0; end < bytes.length; end++) {
           if (bytes[end] !== 10) continue;

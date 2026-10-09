@@ -15,6 +15,8 @@ const expectedFiles = [
   'extension/dist/extension.js',
   'extension/dist/build-identity.json',
   'extension/dist/cli.cjs',
+  'extension/dist/export-viewer.js',
+  'extension/dist/export-viewer.css',
   'extension/dist/windowpipe.exe',
   'extension/dist/bin/arc',
   'extension/dist/bin/arc.cmd',
@@ -71,7 +73,7 @@ assert.equal(
   sha256(await readFile(join(extensionRoot, 'dist', 'extension.js'))),
   'VSIX bundle differs from the current build',
 );
-for (const file of ['cli.cjs', 'bin/arc', 'bin/arc.cmd', 'windowpipe.exe']) {
+for (const file of ['cli.cjs', 'export-viewer.js', 'export-viewer.css', 'bin/arc', 'bin/arc.cmd', 'windowpipe.exe']) {
   assert.equal(
     sha256(entries.get(`extension/dist/${file}`)),
     sha256(await readFile(join(extensionRoot, 'dist', file))),

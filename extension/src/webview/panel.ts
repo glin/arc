@@ -939,8 +939,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     toggleLabelEditor(id, button) {
       railRenderer.toggleLabelEditor(id, button);
     },
-    toggleLayoutDialog(gear) {
-      layoutDialog.toggle(gear);
+    toggleLayoutDialog(gear, session) {
+      layoutDialog.toggle(gear, session);
     },
     syncDetails(rows) {
       sessionDetails.sync(rows);

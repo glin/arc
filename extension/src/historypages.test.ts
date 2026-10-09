@@ -46,8 +46,252 @@ import { readCodexSession } from './codex.ts';
 import { Compaction, Turn, readSession, revisionOf } from './transcript.ts';
 import { compaction, turn } from './turnfixtures.ts';
 import { turnKey } from './turnread.ts';
+import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
+import { readSemanticHistoryPageAsync, type SemanticSourceAdapter, type SemanticHistoryResult } from './history.ts';
 
 type HistoryCursor = ClaudeHistoryCursor | CodexHistoryCursor;
+
+// These captures catch lost recorded text and source admission before reducer accumulation.
+for (const agent of ['claude', 'codex'] as const) {
+  const captureRecords = (finished: boolean, asks = 13, identity = 'first'): string[] => {
+    let sequence = 0;
+    const at = () => new Date(Date.UTC(2026, 8, 29, 12, 0, sequence++)).toISOString();
+    const record = (type: string, data: object) => JSON.stringify({ type, timestamp: at(), ...data });
+    const opening = agent === 'codex' ? [record('session_meta', { payload: { id: 'capture', cwd: '/project' } })] : [];
+    const start =
+      agent === 'claude'
+        ? [record('user', { promptId: identity, message: { role: 'user', content: 'opening prompt' } })]
+        : [
+            record('event_msg', { payload: { type: 'task_started', turn_id: identity } }),
+            record('response_item', {
+              payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'opening prompt' }] },
+            }),
+          ];
+    const followups = Array.from({ length: asks }, (_item, index) =>
+      agent === 'claude'
+        ? record('attachment', {
+            attachment: { type: 'queued_command', commandMode: 'prompt', prompt: `submission ${index}` },
+          })
+        : record('response_item', {
+            payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `submission ${index}` }] },
+          }),
+    );
+    const body = 'commentary '.repeat(1000);
+    const commentary =
+      agent === 'claude'
+        ? record('assistant', {
+            uuid: 'commentary',
+            message: {
+              id: 'commentary',
+              role: 'assistant',
+              stop_reason: 'tool_use',
+              content: [{ type: 'text', text: body }],
+            },
+          })
+        : record('response_item', {
+            payload: {
+              type: 'message',
+              id: 'commentary',
+              role: 'assistant',
+              phase: 'commentary',
+              content: [{ type: 'output_text', text: body }],
+            },
+          });
+    const answer =
+      agent === 'claude'
+        ? record('assistant', {
+            uuid: 'answer',
+            message: {
+              id: 'answer',
+              role: 'assistant',
+              stop_reason: finished ? 'end_turn' : undefined,
+              content: [{ type: 'text', text: 'recorded answer' }],
+            },
+          })
+        : record('response_item', {
+            payload: {
+              type: 'message',
+              id: 'answer',
+              role: 'assistant',
+              phase: 'final_answer',
+              content: [{ type: 'output_text', text: 'recorded answer' }],
+            },
+          });
+    const end =
+      finished && agent === 'codex'
+        ? [record('event_msg', { payload: { type: 'task_complete', turn_id: identity } })]
+        : [];
+    return [...opening, ...start, ...followups, commentary, answer, ...end];
+  };
+
+  test(`${agent} capture retains thirteen submissions and full commentary on an unfinished first turn`, async () => {
+    const file = path.join(tempDir('capture-unfinished-'), 'capture.jsonl');
+    fs.writeFileSync(file, captureRecords(false).join('\n') + '\n');
+    const options = { targetTurns: 1, chunkBytes: 127, exportLimits: EXPORT_LIMITS };
+    const result: SemanticHistoryResult =
+      agent === 'claude'
+        ? await readClaudeHistoryPageAsync(file, 'capture', null, options)
+        : await readCodexHistoryPageAsync(file, 'capture', null, options);
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') return;
+    const unfinished = result.page.unfinished;
+    assert.ok(unfinished, 'the first unfinished turn has no recorded body');
+    assert.equal(unfinished.turn.finished, false);
+    assert.equal(unfinished.turn.prompt, 'opening prompt');
+    assert.deepEqual(
+      unfinished.turn.laterPrompts.map((ask) => ask.text),
+      Array.from({ length: 13 }, (_item, index) => `submission ${index}`),
+    );
+    assert.equal(
+      unfinished.turn.updates.find((update) => update.kind === 'commentary')?.text,
+      'commentary '.repeat(1000),
+    );
+    assert.ok(
+      [unfinished.turn.summary, ...unfinished.turn.answers.map((answer) => answer.text)].includes('recorded answer'),
+    );
+    assert.equal(result.page.turns.length, 0);
+    assert.equal(result.page.nextOlderCursor, null);
+  });
+
+  test(`${agent} capture admits bounded records and rejects oversized records and indivisible turns`, async () => {
+    const file = path.join(tempDir('capture-limits-'), 'capture.jsonl');
+    fs.writeFileSync(file, captureRecords(true, 0).join('\n') + '\n');
+    const read = (
+      limits: typeof EXPORT_LIMITS | { sliceBytes: number; recordBytes: number; turnBytes: number; pageBytes: number },
+    ) =>
+      agent === 'claude'
+        ? readClaudeHistoryPageAsync(file, 'capture', null, { targetTurns: 1, exportLimits: limits })
+        : readCodexHistoryPageAsync(file, 'capture', null, { targetTurns: 1, exportLimits: limits });
+    assert.equal((await read(EXPORT_LIMITS)).kind, 'page');
+    await assert.rejects(
+      read({ ...EXPORT_LIMITS, recordBytes: 1024 }),
+      (error) => error instanceof ExportLimitError && error.boundary === 'record',
+    );
+    await assert.rejects(
+      read({ ...EXPORT_LIMITS, turnBytes: 1024 }),
+      (error) => error instanceof ExportLimitError && error.boundary === 'turn',
+    );
+    await assert.rejects(
+      read({ ...EXPORT_LIMITS, pageBytes: 1024 }),
+      (error) => error instanceof ExportLimitError && error.boundary === 'page',
+    );
+  });
+
+  test(`${agent} capture pages every completed turn and returns its unfinished body once at equal timestamps`, async () => {
+    const file = path.join(tempDir('capture-pages-'), 'capture.jsonl');
+    const records = [
+      captureRecords(true, 13, 'first'),
+      captureRecords(true, 13, 'second'),
+      captureRecords(false, 13, 'third'),
+    ].flatMap((rows, index) => (agent === 'codex' && index > 0 ? rows.slice(1) : rows));
+    fs.writeFileSync(file, records.join('\n') + '\n');
+    let cursor: HistoryCursor | null = null;
+    const completed: string[] = [];
+    const unfinished: string[] = [];
+    do {
+      const options = { exportLimits: EXPORT_LIMITS, chunkBytes: 4096 };
+      const result:
+        | Awaited<ReturnType<typeof readClaudeHistoryPageAsync>>
+        | Awaited<ReturnType<typeof readCodexHistoryPageAsync>> =
+        agent === 'claude'
+          ? await readClaudeHistoryPageAsync(file, 'capture', cursor as ClaudeHistoryCursor | null, options)
+          : await readCodexHistoryPageAsync(file, 'capture', cursor as CodexHistoryCursor | null, options);
+      assert.equal(result.kind, 'page');
+      if (result.kind !== 'page') break;
+      assert.ok(result.page.turns.length <= 1);
+      completed.push(...result.page.turns.map((turn) => turn.promptId));
+      if (result.page.unfinished) unfinished.push(result.page.unfinished.turn.promptId);
+      for (const turn of [...result.page.turns, ...(result.page.unfinished ? [result.page.unfinished.turn] : [])]) {
+        assert.equal(turn.laterPrompts.length, 13);
+        assert.ok((turn.laterPrompts[0].sourceOrder ?? Infinity) < (turn.updates[0].sourceOrder ?? 0));
+      }
+      cursor = result.page.nextOlderCursor;
+    } while (cursor);
+    assert.deepEqual(completed, ['second', 'first']);
+    assert.deepEqual(unfinished, ['third']);
+  });
+
+  test(`${agent} capture accounts omitted records in the raw turn limit`, async () => {
+    const file = path.join(tempDir('capture-omitted-bytes-'), 'capture.jsonl');
+    fs.writeFileSync(
+      file,
+      captureRecords(true, 0).join('\n') +
+        '\n' +
+        JSON.stringify({ type: 'ignored', payload: 'x'.repeat(16000) }) +
+        '\n',
+    );
+    const options = { exportLimits: { ...EXPORT_LIMITS, turnBytes: 20000 } };
+    await assert.rejects(
+      agent === 'claude'
+        ? readClaudeHistoryPageAsync(file, 'capture', null, options)
+        : readCodexHistoryPageAsync(file, 'capture', null, options),
+      (error) => error instanceof ExportLimitError && error.boundary === 'turn',
+    );
+  });
+}
+
+test('capture rejects an oversized held page before calling the semantic parser', async () => {
+  const file = path.join(tempDir('capture-page-admission-'), 'capture.jsonl');
+  fs.writeFileSync(
+    file,
+    Array.from({ length: 8 }, () => JSON.stringify({ type: 'ignored', payload: 'x'.repeat(100) })).join('\n') + '\n',
+  );
+  let parsed = 0;
+  const adapter: SemanticSourceAdapter<null> = {
+    source: 'claude',
+    initialState: () => null,
+    accepts: () => true,
+    parse() {
+      parsed++;
+      return { turns: [], compactions: [], openRange: null, adapterState: null };
+    },
+  };
+  await assert.rejects(
+    readSemanticHistoryPageAsync(file, 'capture', adapter, null, {
+      exportLimits: { ...EXPORT_LIMITS, pageBytes: 128 },
+    }),
+    (error) => error instanceof ExportLimitError && error.boundary === 'page',
+  );
+  assert.equal(parsed, 0);
+});
+
+test('Claude capture retains every unfinished assistant text block before a closing answer', async () => {
+  const file = path.join(tempDir('capture-text-blocks-'), 'capture.jsonl');
+  const record = (type: string, message: object) =>
+    JSON.stringify({ type, timestamp: '2026-09-29T12:00:00Z', promptId: 'same-clock', message });
+  fs.writeFileSync(
+    file,
+    [
+      record('user', { role: 'user', content: 'question' }),
+      record('assistant', {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'first text' },
+          { type: 'text', text: 'second text' },
+        ],
+      }),
+      record('assistant', {
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [
+          { type: 'text', text: 'first answer' },
+          { type: 'text', text: 'second answer' },
+        ],
+      }),
+    ].join('\n') + '\n',
+  );
+  const result = await readClaudeHistoryPageAsync(file, 'capture', null, { exportLimits: EXPORT_LIMITS });
+  assert.equal(result.kind, 'page');
+  if (result.kind !== 'page') return;
+  assert.deepEqual(
+    result.page.turns[0].recordedAnswers?.map((answer) => answer.text),
+    ['first text', 'second text', 'first answer', 'second answer'],
+  );
+  assert.deepEqual(
+    result.page.turns[0].answers.map((answer) => answer.text),
+    ['first answer', 'second answer'],
+  );
+});
 
 test('commit ownership quanta count every range read and preserve split UTF-8 and ownership records', async () => {
   const directory = tempDir('commit-ownership-quanta-');

@@ -4611,7 +4611,7 @@ test('a turn arriving beside the card the reader is reading draws at once', asyn
   }
 });
 
-test('the layout gear opens the Timeline layout dialog, which posts the setting a row names', async (t) => {
+test('the gear opens Timeline options and retains the initiating saved session for keyboard export', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -4619,15 +4619,15 @@ test('the layout gear opens the Timeline layout dialog, which posts the setting 
   }
   const page = await browser.newPage();
   try {
-    await page.setContent(pageHtml());
     const payload = renderPayload() as Payload;
     Object.assign(payload, { timelineLayout: { cardLayout: 'two-columns', promptPosition: 'below' } });
+    await page.setContent(themed(pageHtml(), 'dark'));
     await post(page, payload);
     const gear = page.locator('#list .sessionheading .sessionlayout').first();
     assert.equal(await gear.getAttribute('aria-haspopup'), 'dialog');
     assert.equal(await gear.getAttribute('aria-controls'), 'layoutpop');
     assert.equal(await gear.getAttribute('aria-expanded'), 'false');
-    assert.equal(await gear.getAttribute('aria-label'), 'Timeline layout');
+    assert.equal(await gear.getAttribute('aria-label'), 'Timeline options');
 
     await gear.click();
     await page.evaluate(SETTLED);
@@ -4660,7 +4660,7 @@ test('the layout gear opens the Timeline layout dialog, which posts the setting 
     assert.deepEqual(opened, {
       hidden: false,
       role: 'dialog',
-      label: 'Timeline layout',
+      label: 'Timeline options',
       groups: ['Card layout', 'Prompt'],
       checked: ['layout:cardLayout:two-columns', 'layout:promptPosition:below'],
       // Each row names its value and explains it on hover, in the words the Settings editor shows.
@@ -4725,6 +4725,8 @@ test('the layout gear opens the Timeline layout dialog, which posts the setting 
       'layout:promptPosition:above',
       'Tab from the Card layout row did not reach the Prompt row',
     );
+    await page.keyboard.press('Tab');
+    assert.equal((await read()).focused, 'exportSessionHtml');
     await page.evaluate(
       `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))`,
     );
@@ -4747,6 +4749,32 @@ test('the layout gear opens the Timeline layout dialog, which posts the setting 
     const placed = (await page.evaluate(edges)) as { pop: number; gear: number; top: number; below: number };
     assert.equal(placed.pop, placed.gear, 'the dialog stayed where it was when the panel narrowed under it');
     assert.ok(placed.top >= placed.below, 'the dialog covers the gear that opened it');
+    await page.keyboard.press('Escape');
+
+    await gear.click();
+    await page.waitForFunction(() => !document.getElementById('layoutpop')!.hidden);
+    await page.evaluate(() => {
+      (window as unknown as { __posted: unknown[] }).__posted.length = 0;
+    });
+    await dialog.getByRole('button', { name: 'Export session as HTML...', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    assert.deepEqual(
+      await page.evaluate(() =>
+        (window as unknown as { __posted: { type: string }[] }).__posted.filter(
+          (message) => message.type === 'exportSessionHtml',
+        ),
+      ),
+      [{ type: 'exportSessionHtml', session: 's1' }],
+    );
+    assert.equal(await dialog.isHidden(), true);
+    assert.equal(await gear.evaluate((node) => node === document.activeElement), true);
+
+    const draftPayload = renderPayload() as Payload;
+    for (const session of draftPayload.sessions) session.persisted = false;
+    await post(page, draftPayload);
+    await gear.click();
+    await page.waitForFunction(() => !document.getElementById('layoutpop')!.hidden);
+    assert.equal(await dialog.getByRole('button', { name: 'Export session as HTML...', exact: true }).count(), 0);
     await page.keyboard.press('Escape');
   } finally {
     await browser.close();

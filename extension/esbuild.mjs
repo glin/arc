@@ -9,13 +9,17 @@ import { require as tsRequire } from 'tsx/cjs/api';
 import { copyWindowsPipe } from '../scripts/windowpipe-build.mjs';
 
 // The scoped TypeScript loader lets Node import panelbundle.ts from this build script.
-const { browserBundle, browserStylesheet } = tsRequire('./src/panelbundle.ts', import.meta.url);
+const { browserBundle, browserStylesheet, exportBrowserAssets } = tsRequire('./src/panelbundle.ts', import.meta.url);
 
 // panelbundle.ts supplies the browser program and stylesheet to production builds and test pages.
 // Development builds select Vite without parsing browser sources.
 const PANEL_CSS = 'src/webview/panel.css';
 
 function panelText(developmentServerUrl) {
+  const exported = exportBrowserAssets();
+  fs.mkdirSync('dist', { recursive: true });
+  fs.writeFileSync('dist/export-viewer.js', exported.script);
+  fs.writeFileSync('dist/export-viewer.css', exported.stylesheet);
   const worker = esbuild.buildSync({
     entryPoints: ['src/progressiveworker-entry.ts'],
     bundle: true,
@@ -35,7 +39,7 @@ function panelText(developmentServerUrl) {
         PANEL_DEV_SERVER_URL: JSON.stringify(developmentServerUrl),
         PROGRESSIVE_WORKER_BROTLI: JSON.stringify(workerSource),
       },
-      inputs: Object.keys(worker.metafile.inputs),
+      inputs: [...exported.inputs, ...Object.keys(worker.metafile.inputs)],
     };
   }
   const browser = browserBundle();
@@ -46,7 +50,7 @@ function panelText(developmentServerUrl) {
       PANEL_DEV_SERVER_URL: 'null',
       PROGRESSIVE_WORKER_BROTLI: JSON.stringify(workerSource),
     },
-    inputs: [...new Set([PANEL_CSS, ...browser.inputs, ...Object.keys(worker.metafile.inputs)])],
+    inputs: [...new Set([PANEL_CSS, ...exported.inputs, ...browser.inputs, ...Object.keys(worker.metafile.inputs)])],
   };
 }
 
@@ -157,6 +161,8 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
         version: manifestVersion(),
         ...sourceIdentity(),
         extensionSha256: hash('dist/extension.js'),
+        exportViewerScriptSha256: hash('dist/export-viewer.js'),
+        exportViewerStylesheetSha256: hash('dist/export-viewer.css'),
         inputsSha256: createHash('sha256')
           .update(
             inputs

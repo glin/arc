@@ -1,0 +1,113 @@
+import { test } from 'vitest';
+import assert from 'node:assert';
+import { exportSavedSession, savedExportSource, type SessionExportPorts } from './sessionexport';
+import type { ExportCaptureOptions } from './exportdata';
+import { ExportCancelled } from './exportwriter';
+
+const source = {
+  agent: 'claude' as const,
+  file: '/configured/projects/session.jsonl',
+  sessionId: 'saved',
+  size: 100,
+  mtimeMs: 1,
+};
+function fixture() {
+  const calls: string[] = [];
+  let written: ExportCaptureOptions | undefined;
+  const controller = new AbortController();
+  const ports: SessionExportPorts = {
+    confirm: async (title, detail) => {
+      calls.push(title);
+      assert.match(detail, /linked session work/);
+      return true;
+    },
+    chooseFolder: async () => {
+      calls.push('folder');
+      return '/destination';
+    },
+    progress: async (title, operation) => {
+      calls.push(title);
+      return operation(controller.signal, (message) => calls.push(message));
+    },
+    write: async (destination, options) => {
+      assert.equal(destination, '/destination');
+      written = options;
+      options.progress?.('text', 2);
+      return { index: '/destination/site/index.html' };
+    },
+    completed: async (title, index) => {
+      calls.push(`open ${title} ${index}`);
+    },
+    failed: (message) => {
+      calls.push(message);
+    },
+  };
+  return { calls, ports, controller, written: () => written };
+}
+
+test('export retains its initiating saved identity and configured roots through native choices', async () => {
+  const f = fixture();
+  const root = { ...source };
+  f.ports.confirm = async () => {
+    root.sessionId = 'later-selection';
+    return true;
+  };
+  await exportSavedSession(
+    root,
+    'Starting session',
+    {
+      roots: { claude: '/configured/projects', codex: '/configured/sessions' },
+      readerParents: { child: 'saved' },
+      capturedAt: 100,
+    },
+    f.ports,
+  );
+  assert.equal(f.written()?.root.sessionId, 'saved');
+  assert.equal(f.written()?.root.file, source.file);
+  assert.deepEqual(f.written()?.roots, { claude: '/configured/projects', codex: '/configured/sessions' });
+  assert.deepEqual(f.written()?.readerParents, { child: 'saved' });
+  assert.equal(f.written()?.signal, f.controller.signal);
+  assert.equal(f.written()?.capturedAt, 100);
+  assert.deepEqual(f.calls, [
+    'folder',
+    'Exporting Starting session',
+    'Reading recorded text (2 sessions)',
+    'open Starting session /destination/site/index.html',
+  ]);
+});
+
+test('native declines, cancellation and failures never offer a partial export', async () => {
+  for (const phase of ['confirmation', 'folder', 'cancel', 'failure'] as const) {
+    const f = fixture();
+    if (phase === 'confirmation') f.ports.confirm = async () => false;
+    if (phase === 'folder') f.ports.chooseFolder = async () => undefined;
+    if (phase === 'cancel' || phase === 'failure')
+      f.ports.write = async () => {
+        throw phase === 'cancel' ? new ExportCancelled() : new Error('Saved text unavailable.');
+      };
+    await exportSavedSession(source, 'Session name', {}, f.ports);
+    assert.ok(!f.calls.some((call) => call.startsWith('open ')));
+    assert.equal(f.calls.filter((call) => call.startsWith('Arc:')).length, phase === 'failure' ? 1 : 0);
+    if (phase === 'failure') assert.match(f.calls.at(-1)!, /Session name was not exported.*Saved text unavailable/);
+  }
+});
+
+test('only an unambiguous saved catalog source can start export', async () => {
+  assert.equal(savedExportSource('draft', [source]), null);
+  assert.equal(savedExportSource('saved', [source, { ...source, agent: 'codex' }]), null);
+  const selected = savedExportSource('saved', [source]);
+  assert.deepEqual(selected, source);
+  assert.notEqual(selected, source);
+  const f = fixture();
+  await exportSavedSession(null, 'Draft session', {}, f.ports);
+  assert.deepEqual(f.calls, ['Arc: Draft session is unavailable or ambiguous.']);
+});
+
+test('a failed local Open preserves the completed export outcome', async () => {
+  const f = fixture();
+  f.ports.completed = async () => {
+    throw new Error('No browser');
+  };
+  await exportSavedSession(source, 'Session name', {}, f.ports);
+  assert.equal(f.calls.at(-1), 'Arc: Session name was exported but did not open.');
+});

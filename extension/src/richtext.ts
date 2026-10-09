@@ -496,7 +496,7 @@ function imageFileName(target: string): string {
 
 // Renders response Markdown with validated disclosures and local visualization buttons. Other raw HTML stays escaped.
 // Links carry data-link for host routing. Without resolveImage, pictures render as text.
-export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): string {
+export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, inert = false): string {
   if (!text) {
     return '';
   }
@@ -507,6 +507,7 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): 
     // Loading remote images during card rendering would disclose panel access to that server.
     // Unresolved images retain their label text.
     renderer.image = (href: string | null, title: string | null, alt: string) => {
+      if (inert) return escapeHtml(alt || 'Image omitted');
       const target = href || '';
       // Marked supplies escaped `alt` and `title` values for direct attribute insertion.
       // Escaping them again would display `&quot;` literally.
@@ -531,6 +532,7 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): 
       );
     };
     renderer.link = (href: string, title: string | null | undefined, body: string) => {
+      if (inert) return body;
       const visualization = visualizationPath(href || '');
       if (visualization) {
         return (
@@ -546,7 +548,7 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver): 
       );
     };
     // renderMarkdownBlocks disables random email mangling so unchanged responses keep stable HTML.
-    return renderMarkdownBlocks(richMarkdown(text), renderer);
+    return renderMarkdownBlocks(inert ? text : richMarkdown(text), renderer);
   } catch {
     return `<pre>${escapeHtml(text)}</pre>`;
   }

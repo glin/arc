@@ -116,6 +116,8 @@ export interface CardRendererOptions {
   post(message: PanelToHost): void;
   read: ReadStateOwner;
   comments: CommentRenderer;
+  // Static pages supply a body that contains only local reading controls.
+  readonlyBody?(card: CardView): ComponentChildren;
   statDetails: StatDetailRenderer;
   // Subagent figure records open this popover above the parent popover. Without it, figures remain text.
   figureDetails?: StatDetailRenderer;
@@ -123,16 +125,24 @@ export interface CardRendererOptions {
   layout(): TimelineLayout;
 }
 
+type CardRenderOptions =
+  | CardRendererOptions
+  | (Omit<CardRendererOptions, 'read' | 'comments' | 'readonlyBody'> & {
+      readonlyBody(card: CardView): ComponentChildren;
+      read?: never;
+      comments?: never;
+    });
+
 function stop(event: Event): void {
   event.stopPropagation();
 }
 
-function Summary({ html, card, options }: { html: string; card: CardView; options: CardRendererOptions }) {
+function Summary({ html, card, options }: { html: string; card: CardView; options: CardRenderOptions }) {
   const root = useRef<HTMLDivElement>(null);
   const retained = useRef<DisclosureSnapshot>({ open: new Map(), focus: null });
   if (root.current) retained.current = captureDisclosures(root.current);
   useLayoutEffect(() => {
-    if (root.current) {
+    if (root.current && !options.readonlyBody) {
       const cleanup = enhanceSummary(root.current, {
         post: options.post,
         words: cardWords(),
@@ -410,7 +420,7 @@ function AskRows({
 // Draw the prompt above the response with later prompts behind one toggle.
 // Saved comments on later prompts reveal them until the reader changes the toggle.
 // Without an opening prompt, comments on `prompt` or the prompt heading anchor to the first later prompt.
-function PromptLead({ card, expanded, options }: { card: CardView; expanded: boolean; options: CardRendererOptions }) {
+function PromptLead({ card, expanded, options }: { card: CardView; expanded: boolean; options: CardRenderOptions }) {
   const [full, setFull] = useState(false);
   const [asksChoice, setAsksChoice] = useState<boolean | null>(null);
   const onOverflowChange = useCallback(() => {}, []);
@@ -421,7 +431,7 @@ function PromptLead({ card, expanded, options }: { card: CardView; expanded: boo
     part.startsWith('prompt:') ||
     (!opening && (part === 'prompt' || (part === 'summary' && quotesPromptHeading(quote || ''))));
   const asksShown =
-    asksChoice ?? options.comments.snapshot().some((comment) => comment.turnKey === card.key && onAsk(comment));
+    asksChoice ?? options.comments!.snapshot().some((comment) => comment.turnKey === card.key && onAsk(comment));
   const asksId = disclosureId(card, 'asks');
   return h('div', { class: 'promptlead' }, [
     h('h4', { class: 'sectionheading saidonly' }, card.promptHeading),
@@ -465,7 +475,7 @@ function PromptLead({ card, expanded, options }: { card: CardView; expanded: boo
 
 // The record sections the Card layout setting draws in the body: the same rows the chip popovers
 // draw, under a heading with the count.
-export function recordSections(card: CardView, options: CardRendererOptions): ComponentChildren[] {
+export function recordSections(card: CardView, options: CardRenderOptions): ComponentChildren[] {
   const sections: ComponentChildren[] = [];
   if (card.agents?.length) {
     sections.push(
@@ -683,7 +693,7 @@ function SaidBlock({
   full: boolean;
   onCut(id: string, clipped: boolean): void;
   onFull(id: string, value: boolean): void;
-  options: CardRendererOptions;
+  options: CardRenderOptions;
 }) {
   const block = useRef<HTMLDivElement>(null);
   const more = useRef<HTMLButtonElement>(null);
@@ -912,7 +922,7 @@ function ActivityToolCount({
   card: CardView;
   category: NonNullable<CardView['activityToolCategories']>[number];
   detail: StatDetailList;
-  options: CardRendererOptions;
+  options: CardRenderOptions;
 }) {
   const node = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => (node.current ? options.statDetails.mount(node.current, true) : undefined), []);
@@ -943,7 +953,7 @@ function ActivitySkillCount({
 }: {
   card: CardView;
   detail: StatDetailList;
-  options: CardRendererOptions;
+  options: CardRenderOptions;
 }) {
   const node = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => (node.current ? options.statDetails.mount(node.current, true) : undefined), []);
@@ -972,7 +982,7 @@ function ActivitySection({
 }: {
   card: CardView;
   expanded: boolean;
-  options: CardRendererOptions;
+  options: CardRenderOptions;
 }) {
   const [shownChoice, setShownChoice] = useState<boolean | null>(null);
   const [full, setFull] = useState<Record<string, boolean>>({});
@@ -1531,7 +1541,8 @@ function ActivitySection({
   ]);
 }
 
-function CardsBody({ card, expanded, options }: { card: CardView; expanded: boolean; options: CardRendererOptions }) {
+function CardsBody({ card, expanded, options }: { card: CardView; expanded: boolean; options: CardRenderOptions }) {
+  if (options.readonlyBody) return h(Fragment, {}, options.readonlyBody(card));
   const rows: ComponentChildren[] = [];
   if (card.kind === 'compaction') {
     if (card.summaryHtml) {
@@ -1578,7 +1589,19 @@ function CardsBody({ card, expanded, options }: { card: CardView; expanded: bool
     }
     return record;
   };
-  const columns = cardBodyColumns(layout, record.length > 0).map((names) => names.flatMap(part));
+  return h(CardBodyLayout, { layout, hasRecord: record.length > 0, part });
+}
+
+export function CardBodyLayout({
+  layout,
+  hasRecord,
+  part,
+}: {
+  layout: TimelineLayout;
+  hasRecord: boolean;
+  part(name: CardBodyPart): ComponentChildren[];
+}) {
+  const columns = cardBodyColumns(layout, hasRecord).map((names) => names.flatMap(part));
   // Two columns places the record beside the prose on wide cards.
   // Narrow cards stack the record below Activity, as One column does.
   if (columns.length === 2) {
@@ -1641,7 +1664,7 @@ function Card({
   card: CardView;
   host: CardHost;
   openState: CardOpenState;
-  options: CardRendererOptions;
+  options: CardRenderOptions;
   updates: WeakMap<CardHost, () => void>;
 }) {
   const [, setRevision] = useState(0);
@@ -1652,35 +1675,36 @@ function Card({
   const body = useRef<HTMLDivElement>(null);
   const expandable = cardHasBody(card);
   const expanded = expandable && openState.isExpanded();
-  const read = options.read.isRead(card);
+  const read = options.readonlyBody ? true : options.read!.isRead(card);
   const bodyId = disclosureId(card, 'body');
   const compaction = card.kind === 'compaction';
   const glyph = CARD_GLYPHS[compaction ? 'compaction' : (card.status as keyof typeof CARD_GLYPHS)] || '\u25CB';
 
-  useLayoutEffect(() => options.read.subscribe(repaint), []);
-  useEffect(() => options.comments.subscribe(repaint), []);
+  useLayoutEffect(() => options.read?.subscribe(repaint), []);
+  useEffect(() => options.comments?.subscribe(repaint), []);
   useLayoutEffect(() => {
     updates.set(host, repaint);
     return () => {
       updates.delete(host);
     };
   }, [host, repaint, updates]);
-  useLayoutEffect(() => options.comments.connectCard(host, card), [host, card]);
+  useLayoutEffect(() => options.comments?.connectCard(host, card), [host, card]);
 
   const writeContext = () => {
-    options.comments.writeContext(host, card, 'body');
+    if (options.readonlyBody) return;
+    options.comments!.writeContext(host, card, 'body');
     if (head.current) {
-      options.comments.writeContext(head.current, card, 'head');
+      options.comments!.writeContext(head.current, card, 'head');
     }
     if (body.current) {
-      options.comments.writeContext(body.current, card, 'body');
+      options.comments!.writeContext(body.current, card, 'body');
     }
   };
   const writeNotes = () => {
-    if (!body.current || compaction) {
+    if (options.readonlyBody || !body.current || compaction) {
       return;
     }
-    options.comments.renderAnnotations(body.current, card);
+    options.comments!.renderAnnotations(body.current, card);
     reclipMessages(body.current);
   };
 
@@ -1690,19 +1714,19 @@ function Card({
     host.classList.toggle('is-read', read);
     writeContext();
     writeNotes();
-    if (expanded && options.read.canMark(card)) {
-      options.read.mark(card.key);
+    if (!options.readonlyBody && expanded && options.read!.canMark(card)) {
+      options.read!.mark(card.key);
     }
   });
 
   const toggle = () => {
     const next = !expanded;
     openState.setExpanded(next);
-    if (next && options.read.canMark(card)) {
-      options.read.mark(card.key);
+    if (!options.readonlyBody && next && options.read!.canMark(card)) {
+      options.read!.mark(card.key);
     }
     repaint();
-    options.comments.refreshSelection();
+    options.comments?.refreshSelection();
   };
 
   const whenAt = compaction ? card.at : card.endedAt;
@@ -1733,7 +1757,7 @@ function Card({
   const headProps = {
     class: expandable ? 'head' : 'head statichead',
     ref: head,
-    title: options.comments.headTitle(card),
+    title: options.readonlyBody ? card.statusWord : options.comments!.headTitle(card),
     'aria-label': expandable ? card.label : undefined,
     'aria-controls': expandable ? bodyId : undefined,
     'aria-expanded': expandable ? String(expanded) : undefined,
@@ -1776,7 +1800,7 @@ function Card({
       inlineText(
         (card.chips ?? []).map((chip, index) =>
           h(StatChip, {
-            chip: withRecordRows(card, chip),
+            chip: options.readonlyBody ? chip : withRecordRows(card, chip),
             statDetails: options.statDetails,
             key: chip.metric ?? index,
           }),
@@ -1904,7 +1928,7 @@ export interface CardRenderer {
   remove(host: CardHost): void;
 }
 
-export function createCardRenderer(options: CardRendererOptions): CardRenderer {
+export function createCardRenderer(options: CardRenderOptions): CardRenderer {
   const updates = new WeakMap<CardHost, () => void>();
   return {
     draw(host, card, openState) {

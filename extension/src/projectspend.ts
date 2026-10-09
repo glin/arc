@@ -35,6 +35,7 @@ import {
 import { parseSpendLedger, projectUsageKey } from './projectspendstate';
 import type { CacheLifetime, ReducerCompaction, TurnOutcome, TurnUsage, UsageInferenceClass } from './transcript';
 import { normalizeFsPath } from './transcript';
+import { ExportLimitError } from './exportlimits';
 
 export interface UsageCounts {
   requests?: number;
@@ -1424,6 +1425,7 @@ export interface SpendIndexBudget {
   maxBytes?: number;
   maxMilliseconds?: number;
   now?: () => number;
+  exportRecordBytes?: number;
 }
 
 const DEFAULT_SCAN_BYTES = BACKGROUND_SCAN_BYTES;
@@ -1463,7 +1465,7 @@ function readIncremental(
 ): IncrementalRead {
   const fd = fs.openSync(file, 'r');
   try {
-    const chunk = Buffer.allocUnsafe(64 * 1024);
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, budget.maxBytes ?? 64 * 1024));
     const maxBytes = budget.maxBytes ?? DEFAULT_SCAN_BYTES;
     const clock = budget.now ?? Date.now;
     const deadline = clock() + (budget.maxMilliseconds ?? DEFAULT_SCAN_MILLISECONDS);
@@ -1560,6 +1562,15 @@ function readIncremental(
       }
       position += read;
       readBytes += read;
+      if (budget.exportRecordBytes !== undefined) {
+        let recordBytes = held.length;
+        for (let at = 0; at < read; at++) {
+          if (chunk[at] === 10) recordBytes = 0;
+          else if (++recordBytes > budget.exportRecordBytes) {
+            throw new ExportLimitError('record', budget.exportRecordBytes);
+          }
+        }
+      }
       const bytes = held.length ? Buffer.concat([held, chunk.subarray(0, read)]) : Buffer.from(chunk.subarray(0, read));
       let lineStart = 0;
       for (let cursor = 0; cursor < bytes.length; cursor++) {
@@ -1614,6 +1625,14 @@ function readIncremental(
       held = Buffer.from(bytes.subarray(lineStart));
     }
     const complete = !copyRevisionLost && position >= size;
+    if (complete && budget.exportRecordBytes !== undefined && held.length) {
+      const text = held.toString('utf8');
+      const copy = copies ? copies.copyAt(text, completedOffset, position, maxBytes, true) : false;
+      if (copy === null || copy === 'pending') throw new Error('The session changed during export.');
+      if (!copy) for (const event of reducer.pushLine(text, position)) add(event);
+      completedOffset = position;
+      held = Buffer.alloc(0);
+    }
     if (complete && completedOffset > 0 && held.length > 0 && held.every((byte) => byte === 0)) {
       completedOffset = position;
       held = Buffer.alloc(0);

@@ -8,11 +8,28 @@ import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildSync } from 'esbuild';
 import ts from 'typescript';
-import { browserBundle } from './panelbundle.ts';
+import { browserBundle, exportBrowserAssets } from './panelbundle.ts';
 import { childEnv } from './agenthost.ts';
 import { callSources, declarationSource, sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
 
 const extensionRoot = path.join(__dirname, '..');
+
+function overlayStaticSources(source: string): void {
+  for (const file of [
+    'panelbundle.ts',
+    'sessionexport.ts',
+    'webview/card.ts',
+    'webview/export-main.ts',
+    'webview/export.css',
+    'view/static-themes.ts',
+    'view/export-facts.ts',
+    'domain/places.ts',
+    'domain/export-limits.ts',
+  ]) {
+    fs.mkdirSync(path.dirname(path.join(source, 'src', file)), { recursive: true });
+    fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
+  }
+}
 
 beforeAll(() => {
   const build = spawnSync(process.execPath, ['esbuild.mjs'], {
@@ -72,6 +89,7 @@ test('build identity covers host, browser, worker, and version inputs', () => {
         ...sourceInputs('src/progressiveworker-entry.ts'),
         ...sourceInputs('../cli/src/main.ts'),
         ...browserBundle().inputs,
+        ...exportBrowserAssets().inputs,
         'src/webview/panel.css',
         'package.json',
         'esbuild.mjs',
@@ -96,6 +114,17 @@ test('build identity covers host, browser, worker, and version inputs', () => {
     .digest('hex');
   const identity = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'dist/build-identity.json'), 'utf8'));
   assert.equal(identity.inputsSha256, expected);
+  for (const [field, file] of [
+    ['exportViewerScriptSha256', 'export-viewer.js'],
+    ['exportViewerStylesheetSha256', 'export-viewer.css'],
+  ]) {
+    assert.equal(
+      identity[field],
+      createHash('sha256')
+        .update(fs.readFileSync(path.join(extensionRoot, 'dist', file)))
+        .digest('hex'),
+    );
+  }
   const embedded = embeddedHostIdentity(path.join(extensionRoot, 'dist/extension.js'));
   assert.equal(embedded.sourceCommit, identity.sourceCommit);
   assert.equal(embedded.dirty, identity.dirty);
@@ -162,6 +191,7 @@ test('extracted source builds without Git and never inherits an enclosing reposi
   assert.equal(extracted.status, 0, extracted.stderr);
   const source = path.join(sourceRoot, 'extension');
   fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
+  overlayStaticSources(source);
   fs.mkdirSync(path.join(sourceRoot, 'scripts'), { recursive: true });
   fs.copyFileSync(
     path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
@@ -253,6 +283,7 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   assert.equal(extracted.status, 0, extracted.stderr);
   const source = path.join(sourceRoot, 'extension');
   fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
+  overlayStaticSources(source);
   fs.mkdirSync(path.join(sourceRoot, 'scripts'), { recursive: true });
   fs.copyFileSync(
     path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
@@ -267,7 +298,7 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   );
   const script =
     "import { buildExtension } from './esbuild.mjs'; const close = await buildExtension({watch:true}); console.log('watch ready'); process.stdin.once('data', async () => { await close(); process.stdin.destroy(); });";
-  for (const file of ['panelhost.ts', 'diagnosticslog.ts', 'transcript.ts']) {
+  for (const file of ['panelhost.ts', 'diagnosticslog.ts', 'transcript.ts', 'exportlimits.ts']) {
     fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
   }
   const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {
@@ -364,6 +395,8 @@ test('the extension package contains exactly the intended files', () => {
       'dist/build-identity.json',
       'dist/extension.js',
       'dist/cli.cjs',
+      'dist/export-viewer.js',
+      'dist/export-viewer.css',
       'dist/windowpipe.exe',
       'dist/bin/arc',
       'dist/bin/arc.cmd',

@@ -6,6 +6,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import { RepositoryCommits, nodeGitRunner } from './gitcommits.ts';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tempDir } from './temproot.ts';
@@ -66,6 +68,9 @@ import {
   discoverCodexNewestTurn,
   claudeCommandResult,
   scanCodexDispatchReferences,
+  scanCodexDispatchReferencesAsync,
+  codexDispatchCursor,
+  codexDispatchRecord,
   refreshCodexStructuralAgents,
   structuralAgentStatus,
 } from './codex.ts';
@@ -796,6 +801,140 @@ const CLAUDE_SESSION = '5a7b07c1-bfcf-4d96-9eb2-8ef1fb609881';
 const DISPATCH_COMMAND =
   'python dispatch.py --runner claude --read-only --arc-dispatch --model claude-fable-5-1 --effort high --name arc-ui-proposal-fable';
 const DISPATCH_RECEIPT = `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${CLAUDE_SESSION}","name":"arc-ui-proposal-fable"}`;
+
+test('export dispatch scanning admits paired receipts beyond the panel record window', async () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'large-receipt', {
+      stdout: DISPATCH_RECEIPT + '\n' + 'x'.repeat(5 * 1024 * 1024),
+    }),
+    event('task_complete', 4, { turn_id: TURN }),
+  ]);
+  const panel = scanCodexDispatchReferences(file, 'parent');
+  assert.equal(panel.complete, false);
+  assert.equal(panel.cursor.lostRecords, true);
+  let capture = await scanCodexDispatchReferencesAsync(
+    file,
+    'parent',
+    panel.cursor,
+    256 * 1024,
+    () => false,
+    undefined,
+    EXPORT_LIMITS,
+  );
+  while (!capture.traversed) {
+    capture = await scanCodexDispatchReferencesAsync(
+      file,
+      'parent',
+      capture.cursor,
+      256 * 1024,
+      () => false,
+      undefined,
+      EXPORT_LIMITS,
+    );
+  }
+  assert.equal(capture.complete, true);
+  assert.equal(capture.cursor.seenBloom, null);
+  assert.deepEqual(
+    capture.references.map((reference) => reference.toolUseIds),
+    [['large-receipt']],
+  );
+});
+
+test('dispatch evidence loss remains partial after a newline, resumption, and EOF', () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+  ]);
+  fs.appendFileSync(file, '{"type":"ignored","payload":"' + 'x'.repeat(5 * 1024 * 1024));
+  let scan = scanCodexDispatchReferences(file, 'parent');
+  assert.equal(scan.cursor.skipLongLine, true);
+  assert.equal(scan.complete, false);
+  fs.appendFileSync(
+    file,
+    '"}\n' +
+      JSON.stringify(
+        commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'after-loss', { stdout: DISPATCH_RECEIPT }),
+      ) +
+      '\n',
+  );
+  scan = scanCodexDispatchReferences(file, 'parent', scan.cursor);
+  assert.equal(scan.cursor.skipLongLine, false);
+  assert.equal(scan.cursor.lostRecords, true);
+  assert.equal(scan.traversed, true);
+  assert.equal(scan.complete, false);
+  assert.deepEqual(
+    scan.references.map((reference) => reference.toolUseIds),
+    [['after-loss']],
+  );
+  assert.equal(scanCodexDispatchReferences(file, 'parent', scan.cursor).complete, false);
+});
+
+test('exact export dispatch identities retain a native child receipt that Bloom membership rejects', () => {
+  const ids = Array.from({ length: 19999 }, (_item, index) => `prior-${index}`);
+  const bloom = Buffer.alloc(64 * 1024);
+  const indexes = (id: string) => {
+    const hash = createHash('sha256').update(id).digest();
+    return [0, 4, 8, 12].map((at) => hash.readUInt32LE(at) % (bloom.length * 8));
+  };
+  for (const id of ids) for (const index of indexes(id)) bloom[index >> 3] |= 1 << (index & 7);
+  let id = '';
+  for (let index = 0; index < 100000; index++) {
+    const candidate = `not-seen-${index}`;
+    if (indexes(candidate).every((bit) => (bloom[bit >> 3] & (1 << (bit & 7))) !== 0)) {
+      id = candidate;
+      break;
+    }
+  }
+  assert.ok(id, 'the fixture has no deterministic false-positive identity');
+  assert.ok(!ids.includes(id));
+  const native = meta({
+    id: 'native-child',
+    thread_source: 'subagent',
+    parent_thread_id: 'parent',
+    timestamp: at(0),
+    source: { subagent: { thread_spawn: { parent_thread_id: 'parent', agent_path: '/root/helper' } } },
+  });
+  const records = [
+    native,
+    event('task_started', 1, { turn_id: id }),
+    turnContext(2, id, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'native-receipt', { stdout: DISPATCH_RECEIPT }),
+  ];
+  const make = (exact: boolean) => {
+    const cursor = codexDispatchCursor('', 0, 0, 'native-child');
+    cursor.seenTurnIds = exact ? ids : [];
+    cursor.seenBloom = exact ? null : bloom.toString('base64');
+    if (exact) cursor.exportPolicy = EXPORT_LIMITS;
+    for (const record of records) codexDispatchRecord(cursor, JSON.stringify(record), 'native-child', new Set());
+    return cursor;
+  };
+  assert.equal(make(false).candidates.length, 0);
+  const exact = make(true);
+  assert.equal(exact.candidates.length, 1);
+  assert.equal(exact.candidates[0].reference.sessionId, CLAUDE_SESSION);
+  assert.throws(
+    () =>
+      codexDispatchRecord(
+        exact,
+        JSON.stringify(event('task_started', 5, { turn_id: 'one-too-many' })),
+        'native-child',
+        new Set(),
+      ),
+    (error) => error instanceof ExportLimitError && error.boundary === 'dispatch identities',
+  );
+});
+
+test('export dispatch scanning rejects a record before decoding bytes above its admitted limit', async () => {
+  const file = writeRollout([meta(), { type: 'ignored', payload: 'x'.repeat(8 * 1024 * 1024) }]);
+  await assert.rejects(
+    scanCodexDispatchReferencesAsync(file, 'parent', null, Infinity, () => false, undefined, EXPORT_LIMITS),
+    (error) => error instanceof ExportLimitError && error.boundary === 'record',
+  );
+});
 
 test('synchronous dispatch growth retains every reference before the captured size', () => {
   const file = writeRollout([

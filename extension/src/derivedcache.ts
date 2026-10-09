@@ -318,7 +318,7 @@ export interface CarriedName {
   fullLabel: string;
 }
 
-export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 24;
+export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 25;
 export const MAX_CLAUDE_CHILD_REFERENCE_FILES = 10_000;
 export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };
@@ -843,6 +843,8 @@ function codexDispatchCursor(value: unknown, parentSessionId: string, size: numb
         Number.isInteger(value.fragmentStart) &&
         value.fragmentStart <= value.offset)) &&
     typeof value.skipLongLine === 'boolean' &&
+    (value.lostRecords === undefined || typeof value.lostRecords === 'boolean') &&
+    value.exportPolicy === undefined &&
     typeof value.head === 'string' &&
     /^[0-9a-f]{64}$/.test(value.head) &&
     typeof value.anchor === 'string' &&

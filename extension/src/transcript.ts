@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import { meterRead } from './readmeter';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -467,6 +468,7 @@ export interface ToolCounts {
 // or a cross-session message closes several of these. The newest one without `notResponse`
 // is the summary, and `responseAnswerIndex` finds it.
 export interface TurnAnswer {
+  sourceOrder?: number;
   text: string;
   stepsBefore: number;
   at: number; // epoch ms of the line that carried it
@@ -494,6 +496,7 @@ export function responseAnswerIndex(turn: Pick<Turn, 'answers' | 'summary'>): nu
 
 // Reader submission after the opening prompt, with its call position and timestamp.
 export interface TurnAsk {
+  sourceOrder?: number;
   text: string;
   stepsBefore: number;
   at: number; // epoch ms of the line that carried it
@@ -510,6 +513,7 @@ export interface TurnDelegation {
 // the response: it belongs in the ordered Activity record, but it must not increase a turn's
 // tool totals or replace the answer the turn closed with.
 export interface TurnUpdate {
+  sourceOrder?: number;
   sourceId: string;
   stepsBefore: number;
   kind: 'commentary' | 'reasoning';
@@ -647,6 +651,8 @@ export interface Turn {
   // While running, the summary can contain newer text without a completed answer.
   // Marks and waiting state read the summary alone, excluding resolved requests in earlier answers.
   answers: TurnAnswer[];
+  // Explicit captures retain assistant text before a stop reason closes an answer.
+  recordedAnswers?: TurnAnswer[];
   model: string | null; // the model that ran the turn, from its last real reply
   // The newest `model` attachment before that reply, kept only when it names the same model.
   // It names the window, as in `claude-opus-5-5[1m]`, which `model` never does.
@@ -702,6 +708,26 @@ export interface Turn {
   interrupted: boolean; // the user stopped the turn part-way
   finished: boolean; // the model closed the turn rather than being cut off mid-work
   error: string | null; // text of an API error that ended the turn, if any
+}
+
+type TurnText = Pick<Turn, 'promptParts' | 'laterPrompts' | 'answers' | 'updates'>;
+
+// Capture source ordering only for newly retained text, without revisiting an entire long turn.
+export function captureTurnTextOrder(turns: readonly (TurnText | null | undefined)[]) {
+  const lists = (turn: TurnText) => [turn.promptParts ?? [], turn.laterPrompts, turn.answers, turn.updates];
+  const lengths = new Map(
+    turns
+      .filter((turn): turn is TurnText => Boolean(turn))
+      .map((turn) => [turn, lists(turn).map((items) => items.length)]),
+  );
+  return (next: readonly (TurnText | null | undefined)[], start: number): void => {
+    for (const turn of next) {
+      if (!turn) continue;
+      for (const [index, items] of lists(turn).entries()) {
+        for (let at = lengths.get(turn)?.[index] ?? 0; at < items.length; at++) items[at].sourceOrder ??= start;
+      }
+    }
+  };
 }
 
 // Records a skill load by source ID and name. Repeated reads replace its earlier copy without increasing the total.
@@ -3243,6 +3269,7 @@ export interface ClaudeRelationshipState {
 export function createClaudeRelationshipReducer(
   parent: Pick<SessionFile, 'file' | 'sessionId' | 'childTranscript'>,
   state?: ClaudeRelationshipState,
+  exportPolicy?: ExportRelationshipLimits,
 ): { apply(line: string): void; state(): ClaudeRelationshipState; references(): ClaudeChildSessionReference[] } {
   const launches = new Set<string>(state?.launches);
   const children = new Map((state?.children ?? []).map(([id, ids]) => [id, new Set(ids)]));
@@ -3333,9 +3360,11 @@ export function createClaudeRelationshipReducer(
         const held = children.get(sessionId);
         if (held) {
           held.add(toolUseId);
-        } else if (linked < MAX_CLAUDE_CHILD_REFERENCES_PER_FILE) {
+        } else if (linked < (exportPolicy?.relationships ?? MAX_CLAUDE_CHILD_REFERENCES_PER_FILE)) {
           linked++;
           children.set(sessionId, new Set([toolUseId]));
+        } else if (exportPolicy) {
+          throw new ExportLimitError('relationships', exportPolicy.relationships);
         }
       }
       const shellLaunch = shellLaunches.get(resultToolUseId);
@@ -3351,7 +3380,9 @@ export function createClaudeRelationshipReducer(
             : null
           : shellResultText(record);
       const launched = output === null ? [] : shellDispatchFromOutput(output, shellLaunch);
-      const kept = launched.slice(0, MAX_CLAUDE_CHILD_REFERENCES_PER_FILE - linked);
+      if (exportPolicy && launched.length + linked > exportPolicy.relationships)
+        throw new ExportLimitError('relationships', exportPolicy.relationships);
+      const kept = launched.slice(0, (exportPolicy?.relationships ?? MAX_CLAUDE_CHILD_REFERENCES_PER_FILE) - linked);
       if (kept.length) {
         linked += kept.length;
         dispatches.set(
@@ -3597,6 +3628,7 @@ export class RelationshipReader {
 }
 
 export interface ClaudeRelationshipCursor {
+  exportPolicy?: ExportRelationshipLimits;
   evidence?: RelationshipEvidence;
   revision: FileRevision;
   target: number;
@@ -3622,6 +3654,7 @@ export async function scanClaudeRelationshipQuantum(
   budget = RELATIONSHIP_QUANTUM_BYTES,
   signal?: AbortSignal,
   meter?: { readBytes: number },
+  exportPolicy?: ExportRelationshipLimits,
 ): Promise<{
   cursor: ClaudeRelationshipCursor;
   references: ClaudeChildSessionReference[];
@@ -3632,7 +3665,10 @@ export async function scanClaudeRelationshipQuantum(
 }> {
   const fd = fs.openSync(parent.file, 'r');
   try {
-    let cursor = previous ? structuredClone(previous) : undefined;
+    let cursor =
+      previous && JSON.stringify(previous.exportPolicy) === JSON.stringify(exportPolicy)
+        ? structuredClone(previous)
+        : undefined;
     const reader = new RelationshipReader(fd, parent.file, budget, () => signal?.aborted === true, meter);
     const revision = reader.stamp;
     let qualification: 'match' | 'pending' | 'reset' = 'reset';
@@ -3672,12 +3708,13 @@ export async function scanClaudeRelationshipQuantum(
         terminalApplied: false,
         sessionId: parent.sessionId,
         childTranscript: parent.childTranscript === true,
+        ...(exportPolicy ? { exportPolicy: { ...exportPolicy } } : {}),
         sequence: previous?.sequence ?? 0,
         state,
       };
       qualification = 'match';
     }
-    const reducer = createClaudeRelationshipReducer(parent, cursor.state);
+    const reducer = createClaudeRelationshipReducer(parent, cursor.state, exportPolicy);
     if (qualification === 'match') {
       cursor.revision = revision;
       if (cursor.offset === cursor.target) cursor.target = revision.size;
@@ -3692,6 +3729,8 @@ export async function scanClaudeRelationshipQuantum(
         let start = 0;
         for (let index = 0; index < bytes.length; index++) {
           if (bytes[index] !== 10) continue;
+          if (exportPolicy && cursor.fragmentBytes + index - start > exportPolicy.recordBytes)
+            throw new ExportLimitError('record', exportPolicy.recordBytes);
           const record = Buffer.concat([
             ...cursor.fragments.map((fragment) => Buffer.from(fragment, 'base64')),
             bytes.subarray(start, index),
@@ -3705,6 +3744,8 @@ export async function scanClaudeRelationshipQuantum(
         }
         if (start < bytes.length) {
           const fragment = bytes.subarray(start);
+          if (exportPolicy && cursor.fragmentBytes + fragment.length > exportPolicy.recordBytes)
+            throw new ExportLimitError('record', exportPolicy.recordBytes);
           cursor.fragments.push(fragment.toString('base64'));
           cursor.fragmentBytes += fragment.length;
         }
@@ -4709,6 +4750,10 @@ const COMMAND_SCAFFOLD = /<(command-name|command-args)>[\s\S]*?<\/\1>/g;
 // Newlines inside arguments remain unchanged.
 const COMMAND_INVOCATION = /<command-name>\s*([^<]*?)\s*<\/command-name>\s*<command-args>([\s\S]*?)<\/command-args>/g;
 
+const COMMAND_NAME = /<command-name>\s*(\/[^\s<]*)\s*<\/command-name>/g;
+const COMMAND_ARGS = /<command-args>([\s\S]*?)<\/command-args>/g;
+const COMMAND_STDERR = /<local-command-stderr>[\s\S]*?<\/local-command-stderr>/g;
+
 function textOf(content: unknown): string {
   if (typeof content === 'string') {
     return content;
@@ -4722,13 +4767,39 @@ function textOf(content: unknown): string {
     .join('\n');
 }
 
+// Removes provider scaffolding. Literal capture retains the remaining user text and its whitespace.
+function extractPrompt(raw: string, literal = false): string {
+  const remove = (text: string, pattern: RegExp): string => {
+    if (!literal) {
+      return text.replace(pattern, ' ');
+    }
+    let body = '';
+    let start = 0;
+    for (const match of text.matchAll(pattern)) {
+      const at = match.index;
+      body += text.slice(start, at);
+      start = at + match[0].length;
+      // A standalone wrapper's next line starts the submitted body or another wrapper.
+      if (at === 0 || text[at - 1] === '\n') {
+        if (text.startsWith('\r\n', start)) start += 2;
+        else if (text[start] === '\n') start++;
+      }
+    }
+    return body + text.slice(start);
+  };
+  const named = COMMAND_NAMED.exec(raw);
+  const body = named && HARNESS_COMMANDS.has(named[1]) ? remove(raw, COMMAND_SCAFFOLD) : raw;
+  const extracted = remove(body, WRAPPED).replace(COMMAND_INVOCATION, (_all, name: string, args: string) =>
+    literal && !args ? name : `${name} ${args}`,
+  );
+  return literal
+    ? remove(extracted, COMMAND_STDERR).replace(COMMAND_NAME, '$1').replace(COMMAND_ARGS, '$1')
+    : extracted;
+}
+
 // Removes prompt wrappers and tag syntax while preserving line structure. Multiple blank lines collapse to one blank line.
 export function cleanPrompt(raw: string): string {
-  const named = COMMAND_NAMED.exec(raw);
-  const body = named && HARNESS_COMMANDS.has(named[1]) ? raw.replace(COMMAND_SCAFFOLD, ' ') : raw;
-  return body
-    .replace(WRAPPED, ' ')
-    .replace(COMMAND_INVOCATION, (_all, name: string, args: string) => `${name} ${args}`)
+  return extractPrompt(raw)
     .replace(/<\/?[a-z][a-z0-9-]{0,38}>/gi, ' ')
     .replace(/[^\S\n]+/g, ' ')
     .replace(/ *\n */g, '\n')
@@ -4758,7 +4829,10 @@ export function isReaderQueued(attachment: Record<string, unknown> | null | unde
 
 // The words and time of a prompt the reader queued, or null for any other record. The full
 // reader, the rail and the usage index all take a queued prompt by this one rule.
-function readerQueuedAsk(record: Record<string, unknown>): { text: string; at: number } | null {
+function readerQueuedAsk(
+  record: Record<string, unknown>,
+  captureSessionText = false,
+): { text: string; at: number } | null {
   if (record.type !== 'attachment') {
     return null;
   }
@@ -4766,8 +4840,14 @@ function readerQueuedAsk(record: Record<string, unknown>): { text: string; at: n
   if (!isReaderQueued(attachment)) {
     return null;
   }
-  const text = cleanPrompt(textOf(attachment?.prompt));
-  return text ? { text, at: stamp(attachment?.timestamp ?? record.timestamp) } : null;
+  const raw = textOf(attachment?.prompt);
+  const text = cleanPrompt(raw);
+  return text
+    ? {
+        text: captureSessionText ? extractPrompt(raw, true) : text,
+        at: stamp(attachment?.timestamp ?? record.timestamp),
+      }
+    : null;
 }
 
 // Raw task-notification text from a user record's content or a queued attachment's prompt.
@@ -6768,6 +6848,10 @@ const CLAUDE_HIDDEN_POLICY: HiddenStatePolicy = {
 };
 
 export interface ReadOptions {
+  // Explicit captures retain all recorded submissions. Ordinary panel reads stay bounded.
+  captureSessionText?: boolean;
+  captureCopies?: Pick<import('./claudecopies').ClaudeCopyState, 'copies'>;
+  exportTurnBytes?: number;
   recoveredModelAttachment?: string | null;
   tailBytes?: number;
   maxTurns?: number;
@@ -8052,6 +8136,23 @@ export interface ClaudeSubagentMeta {
 
 export type ClaudeSubagentMetaReader = (directory: string) => readonly ClaudeSubagentMeta[];
 
+export function claudeSubagentMetaOf(text: string, id: string, file: string): ClaudeSubagentMeta | null {
+  let record: unknown;
+  try {
+    record = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!record || typeof record !== 'object') return null;
+  const { toolUseId, parentAgentId } = record as { toolUseId?: unknown; parentAgentId?: unknown };
+  return {
+    id,
+    file,
+    toolUseId: typeof toolUseId === 'string' && toolUseId ? toolUseId : null,
+    parentAgentId: typeof parentAgentId === 'string' && parentAgentId ? parentAgentId : null,
+  };
+}
+
 // Parsed meta files by path. Claude Code writes a meta file once, when the subagent starts, so a
 // parsed file stays true while the folder lists it. A file that does not parse yet is read again.
 const subagentMetaFiles = new Map<string, ClaudeSubagentMeta>();
@@ -8073,24 +8174,16 @@ export function readClaudeSubagentMetas(directory: string): ClaudeSubagentMeta[]
     const metaFile = path.join(directory, name);
     let meta = subagentMetaFiles.get(metaFile);
     if (!meta) {
-      let record: unknown;
+      let text: string;
       try {
         const bytes = fs.readFileSync(metaFile);
         meterRead(metaFile, bytes.length);
-        record = JSON.parse(bytes.toString('utf8'));
+        text = bytes.toString('utf8');
       } catch {
         continue;
       }
-      if (!record || typeof record !== 'object') {
-        continue;
-      }
-      const { toolUseId, parentAgentId } = record as { toolUseId?: unknown; parentAgentId?: unknown };
-      meta = {
-        id: match[1],
-        file: path.join(directory, `agent-${match[1]}.jsonl`),
-        toolUseId: typeof toolUseId === 'string' && toolUseId ? toolUseId : null,
-        parentAgentId: typeof parentAgentId === 'string' && parentAgentId ? parentAgentId : null,
-      };
+      meta = claudeSubagentMetaOf(text, match[1], path.join(directory, `agent-${match[1]}.jsonl`)) ?? undefined;
+      if (!meta) continue;
       if (subagentMetaFiles.size >= SUBAGENT_META_LIMIT) {
         subagentMetaFiles.clear();
       }
@@ -9532,12 +9625,12 @@ function reduceClaudeSessionLine(
       const o = JSON.parse(line) as Record<string, unknown>;
       attachmentLine = o.type === 'attachment';
       const attachment = o.attachment as Record<string, unknown> | undefined;
-      const ask = attachmentLine && !o.isSidechain && state.cur ? readerQueuedAsk(o) : null;
+      const ask = attachmentLine && !o.isSidechain && state.cur ? readerQueuedAsk(o, opts.captureSessionText) : null;
       if (ask && state.cur) {
         state.curQueuedSinceOpening = true;
         setClaudeRepeatNotice(state, false);
         state.cur.laterPrompts.push({ text: ask.text, at: ask.at, stepsBefore: state.cur.stepCount });
-        if (state.cur.laterPrompts.length > TURN_ASK_LIMIT) {
+        if (!opts.captureSessionText && state.cur.laterPrompts.length > TURN_ASK_LIMIT) {
           state.cur.laterPrompts.shift();
         }
         extendSourceRange(state.cur, sourceStart, sourceEnd);
@@ -9727,7 +9820,10 @@ function reduceClaudeSessionLine(
       state.pending.held = null;
     }
     const rawText = textOf((o.message as { content?: unknown }).content);
-    const asked = [...state.queued, { text: cleanPrompt(rawText), at, stepsBefore: 0 }];
+    const asked = [
+      ...state.queued,
+      { text: opts.captureSessionText ? extractPrompt(rawText, true) : cleanPrompt(rawText), at, stepsBefore: 0 },
+    ];
     // `handbacks` stays for the whole session: a subagent's second completion notice can
     // arrive after the reader typed the next prompt, and it is still a repeat.
     setClaudeRepeatNotice(state, false);
@@ -9758,7 +9854,7 @@ function reduceClaudeSessionLine(
       toolUses: 0,
       toolCounts: emptyToolCounts(),
       toolTally: {},
-      laterPrompts: carriedAsks.slice(-TURN_ASK_LIMIT),
+      laterPrompts: opts.captureSessionText ? carriedAsks : carriedAsks.slice(-TURN_ASK_LIMIT),
       steps: [],
       updates: [],
       stepCount: 0,
@@ -10229,6 +10325,26 @@ function reduceClaudeSessionLine(
             cur.answers.push({ text: report, at: stamp(o.timestamp), stepsBefore: cur.stepCount });
             cur.summary = report;
           }
+          if (opts.captureSessionText && !(prior && reply && reply.length > said.length && reply.includes(said))) {
+            const recorded = (cur.recordedAnswers ??= []);
+            if (prior && reply && said.includes(reply)) {
+              let recordedIndex = recorded.length - 1;
+              while (
+                recordedIndex >= 0 &&
+                (recorded[recordedIndex].notResponse ||
+                  recorded[recordedIndex].text !== prior.text ||
+                  recorded[recordedIndex].at !== prior.at)
+              )
+                recordedIndex--;
+              if (recordedIndex >= 0) recorded.splice(recordedIndex, 1);
+            }
+            recorded.push({
+              text: report,
+              at: stamp(o.timestamp),
+              stepsBefore: cur.stepCount,
+              sourceOrder: sourceStart,
+            });
+          }
           state.handedBack = true;
           state.closingReply = null;
         }
@@ -10254,6 +10370,15 @@ function reduceClaudeSessionLine(
         }
         const closes = Boolean(message.stop_reason);
         const notResponse = closes ? claudeNotResponse(state, cur, text) : null;
+        if (opts.captureSessionText) {
+          (cur.recordedAnswers ??= []).push({
+            text,
+            at: stamp(o.timestamp),
+            stepsBefore: cur.stepCount,
+            sourceOrder: sourceStart,
+            ...(notResponse ? { notResponse } : {}),
+          });
+        }
         if (!notResponse) {
           cur.summary = text;
         }
@@ -10264,7 +10389,8 @@ function reduceClaudeSessionLine(
           if (notResponse) {
             answer.notResponse = notResponse;
           }
-          const keepsLast = notResponse && !cur.answers[cur.answers.length - 1]?.notResponse;
+          const keepsLast =
+            opts.captureSessionText || (notResponse && !cur.answers[cur.answers.length - 1]?.notResponse);
           if (answeredLine && !keepsLast) {
             cur.answers[cur.answers.length - 1] = answer;
           } else {
@@ -10301,6 +10427,15 @@ function reduceClaudeSessionLine(
       state.narrationOrdinals.set(base, ordinal + 1);
     } else {
       const notResponse = message.stop_reason ? claudeNotResponse(state, cur, content) : null;
+      if (opts.captureSessionText) {
+        (cur.recordedAnswers ??= []).push({
+          text: content,
+          at: stamp(o.timestamp),
+          stepsBefore: cur.stepCount,
+          sourceOrder: sourceStart,
+          ...(notResponse ? { notResponse } : {}),
+        });
+      }
       if (!notResponse) {
         cur.summary = content;
       }
@@ -10535,7 +10670,25 @@ export function createClaudeSessionReducer(
   state.curInferredStop ??= null;
   state.curToolEnded ??= false;
   return {
-    pushLine: (line) => reduceClaudeSessionLine(state, line, sessionId, opts),
+    pushLine: (line) => {
+      const order = opts.captureSessionText
+        ? captureTurnTextOrder([state.cur, state.pending.held, state.turns.at(-1)])
+        : null;
+      if (
+        opts.exportTurnBytes &&
+        typeof line !== 'string' &&
+        state.cur &&
+        !state.cur.finished &&
+        line.end !== undefined
+      ) {
+        const start = state.cur[SOURCE_START] ?? line.start ?? 0;
+        if (line.end - start > opts.exportTurnBytes) throw new ExportLimitError('turn', opts.exportTurnBytes);
+      }
+      reduceClaudeSessionLine(state, line, sessionId, opts);
+      if (opts.captureSessionText && typeof line !== 'string') {
+        order?.([state.cur, state.pending.held, state.turns.at(-1)], line.start ?? 0);
+      }
+    },
     retainedBytes: () => retainedParserPayload(state),
     retainedPayloadScan: () => retainedParserPayloadScan(state),
     trimBefore: (offset) => trimClaudeBefore(state, offset, opts.maxTurns ?? 40),

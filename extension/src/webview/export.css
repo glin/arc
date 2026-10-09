@@ -1,0 +1,111 @@
+body.export-page {
+  display: block;
+  overflow: auto;
+  padding: 1em;
+}
+.export-page #list {
+  margin: 1em auto;
+  max-width: 90em;
+}
+.export-tools,
+.export-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7em;
+}
+.export-tools h1 {
+  font-size: 1.1em;
+  margin: 0;
+}
+.export-tools details {
+  flex-basis: 100%;
+}
+#export-sessions nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7em;
+  margin-top: 1em;
+}
+#export-sessions a[aria-current] {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+.export-plain {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.export-facts {
+  display: grid;
+  grid-template-columns: minmax(7em, 1fr) minmax(0, 3fr);
+  gap: 0.4em 1em;
+  margin: 0.8em 0;
+}
+.export-facts dt {
+  color: var(--vscode-descriptionForeground);
+}
+.export-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.export-facts dd > .export-facts {
+  margin-top: 0;
+}
+.export-facts-list {
+  margin: 0;
+  padding-left: 1.5em;
+}
+@media (max-width: 50em) {
+  .export-facts {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.2em;
+  }
+  .export-facts dt {
+    font-weight: 600;
+  }
+  .export-facts dd {
+    padding: 0 0 0.6em 0.5em;
+  }
+}
+.export-block {
+  margin: 1em 0;
+}
+.export-page button,
+.export-page select {
+  font: inherit;
+  color: var(--vscode-foreground);
+  background: var(--vscode-button-secondaryBackground);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 3px;
+  padding: 0.35em 0.7em;
+}
+.export-page input {
+  font: inherit;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-widget-border);
+  padding: 0.35em 0.7em;
+  max-width: 100%;
+}
+.export-relationships {
+  margin: 0.8em 0;
+}
+.export-page button:focus-visible,
+.export-page select:focus-visible,
+.export-page summary:focus-visible,
+.export-page a:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.export-page input:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.export-page button:disabled {
+  opacity: 0.5;
+}
+
+.export-page a {
+  color: var(--vscode-textLink-foreground);
+}

@@ -1,9 +1,57 @@
 import { test, vi } from 'vitest';
+import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
   scanClaudeRelationshipQuantum,
   scanClaudeChildSessionReferences,
   type ClaudeRelationshipCursor,
 } from './transcript';
+
+test('Claude export relationship framing admits large records and rejects oversized fragments', async () => {
+  const file = writeTranscript([
+    { type: 'ignored', payload: 'x'.repeat(5 * 1024 * 1024) },
+    assistantTool('Agent', 1, 'capture-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'capture-launch' }] },
+      toolUseResult: { agentId: 'child-capture' },
+    },
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  let scan = await scanClaudeRelationshipQuantum(parent, undefined, 256 * 1024, undefined, undefined, EXPORT_LIMITS);
+  while (!scan.complete)
+    scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 256 * 1024, undefined, undefined, EXPORT_LIMITS);
+  assert.deepEqual(
+    scan.references.map((reference) => reference.sessionId),
+    ['child-capture'],
+  );
+  await assert.rejects(
+    scanClaudeRelationshipQuantum(parent, undefined, Infinity, undefined, undefined, {
+      ...EXPORT_LIMITS,
+      recordBytes: 1024,
+    }),
+    (error) => error instanceof ExportLimitError && error.boundary === 'record',
+  );
+});
+
+test('Claude export refuses relationship overflow instead of reporting a shortened graph', async () => {
+  const file = writeTranscript(
+    Array.from({ length: 3 }, (_item, index) => [
+      assistantTool('Agent', index + 1, `capture-${index}`, {}),
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: `capture-${index}` }] },
+        toolUseResult: { agentId: `child-${index}` },
+      },
+    ]).flat(),
+  );
+  await assert.rejects(
+    scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, undefined, Infinity, undefined, undefined, {
+      ...EXPORT_LIMITS,
+      relationships: 2,
+    }),
+    (error) => error instanceof ExportLimitError && error.boundary === 'relationships',
+  );
+});
 
 test.each([65536, 1024 * 1024])(
   'Claude interior rewrite plus growth resumes to the fresh relationships at %i bytes',
@@ -6230,6 +6278,45 @@ test('cleanPrompt strips IDE context and slash-command scaffolding', () => {
     '/write-ppm-docs review the plugin pages',
     'the command and everything typed after it are cut out of the card',
   );
+});
+
+test('literal Claude capture removes known scaffolding and preserves admitted user text', () => {
+  const literal = '  Keep <Widget> and <custom-tag> exactly.\n\n\n    indented  words\n';
+  const wrappers = [
+    'ide_opened_file',
+    'ide_selection',
+    'ide_diagnostics',
+    'system-reminder',
+    'local-command-stdout',
+    'local-command-stderr',
+    'local-command-caveat',
+    'command-message',
+    'command-contents',
+    'task-notification',
+  ];
+  const cases: [string, string][] = [
+    [literal, literal],
+    ...wrappers.map((tag): [string, string] => [`<${tag}>PRIVATE CONTEXT</${tag}>\n${literal}`, literal]),
+    [`<ide_selection>PRIVATE CONTEXT</ide_selection>\r\n${literal}`, literal],
+    [`before<ide_selection>PRIVATE CONTEXT</ide_selection>\nafter`, 'before\nafter'],
+    [`${literal}<system-reminder>PRIVATE CONTEXT</system-reminder>`, literal],
+    ['Keep <ide_selection> literally.', 'Keep <ide_selection> literally.'],
+    [
+      `<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>\n${literal}`,
+      literal,
+    ],
+    [
+      '<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>  <Widget>\n\n  exact  text\n</command-args>',
+      '/review   <Widget>\n\n  exact  text\n',
+    ],
+    ['<command-message>review</command-message>\n<command-name>/review</command-name>', '/review'],
+  ];
+  for (const [raw, expected] of cases) {
+    const reducer = createClaudeSessionReducer('sess', { captureSessionText: true });
+    reducer.pushLine(JSON.stringify(userPrompt(raw, 0)));
+    reducer.pushLine(JSON.stringify(assistantAnswer('Done.', 1)));
+    assert.equal(reducer.read().turns[0].prompt, expected, raw);
+  }
 });
 
 test('headlineOf skips section headings and returns the first line of substance', () => {

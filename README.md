@@ -82,6 +82,10 @@ Arc estimates costs for supported models using published prices. Subscription es
 
 <a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning and cache costs" width="480"></a>
 
+### Saved-session HTML
+
+[Export a saved session as HTML](docs/session-html.md) to review its recorded text and linked work in a browser or publish the complete site directory.
+
 ### Commenting
 
 Select response text and add a comment beside it. Saved comments stay attached to their text. Edit or delete them from their marks, then send them with your next prompt.

@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import { emptyCodexResponseClock, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
 import { meterRead } from './readmeter';
 import * as path from 'node:path';
@@ -6,6 +7,7 @@ import { createHash } from 'node:crypto';
 
 import {
   BackwardLineCursor,
+  captureTurnTextOrder,
   BoundaryDiscovery,
   BoundaryDiscoveryOptions,
   CacheLifetime,
@@ -945,9 +947,10 @@ export function codexTitleFor(
 // and a prompt from anywhere else carries no marker and is already clean.
 const IDE_REQUEST = '## My request for Codex:';
 
-export function codexPrompt(raw: string): string {
+export function codexPrompt(raw: string, captureSessionText = false): string {
   const at = raw.lastIndexOf(IDE_REQUEST);
-  return cleanPrompt(at < 0 ? raw : raw.slice(at + IDE_REQUEST.length));
+  const body = at < 0 ? raw : raw.slice(at + IDE_REQUEST.length).replace(/^\r?\n/, '');
+  return captureSessionText ? body : cleanPrompt(body);
 }
 
 // A hunk header, with either count able to be absent. A missing count means one line, which
@@ -2769,6 +2772,8 @@ interface CodexDispatchCandidate {
 }
 
 export interface CodexDispatchCursor {
+  exportPolicy?: ExportRelationshipLimits;
+  lostRecords?: boolean;
   evidence?: RelationshipEvidence;
   target?: number;
   replayFragment?: string;
@@ -2804,6 +2809,7 @@ export interface CodexDispatchCursor {
 
 const CODEX_DISPATCH_BLOOM_BYTES = 64 * 1024;
 const CODEX_DISPATCH_ID_WINDOW = 1024;
+const exactDispatchIds = new WeakMap<CodexDispatchCursor, Set<string>>();
 
 function bloomIndexes(id: string): number[] {
   const hash = createHash('sha256').update(id).digest();
@@ -2811,6 +2817,16 @@ function bloomIndexes(id: string): number[] {
 }
 
 function dispatchSeen(cursor: CodexDispatchCursor, id: string): boolean {
+  if (cursor.exportPolicy) {
+    let seen = exactDispatchIds.get(cursor);
+    if (!seen) exactDispatchIds.set(cursor, (seen = new Set(cursor.seenTurnIds)));
+    if (seen.has(id)) return true;
+    if (cursor.seenTurnIds.length >= cursor.exportPolicy.dispatchIdentities)
+      throw new ExportLimitError('dispatch identities', cursor.exportPolicy.dispatchIdentities);
+    cursor.seenTurnIds.push(id);
+    seen.add(id);
+    return false;
+  }
   if (cursor.seenBloom === null) {
     if (cursor.seenTurnIds.includes(id)) return true;
     cursor.seenTurnIds.push(id);
@@ -2920,7 +2936,10 @@ export function codexDispatchRecord(
       startedAt >= cursor.nativeSpawnedAt - CODEX_TURN_START_ROUNDING_MS
     ) {
       cursor.pendingOwnershipTurnIds.push(id);
-      if (cursor.pendingOwnershipTurnIds.length > CODEX_USAGE_ASSOCIATION_LIMIT) cursor.pendingOwnershipTurnIds.shift();
+      if (cursor.pendingOwnershipTurnIds.length > CODEX_USAGE_ASSOCIATION_LIMIT) {
+        if (cursor.exportPolicy) throw new ExportLimitError('dispatch ownership', CODEX_USAGE_ASSOCIATION_LIMIT);
+        cursor.pendingOwnershipTurnIds.shift();
+      }
     }
     cursor.lastTurnId = id;
     cursor.lastOccurrence = cursor.currentOccurrence;
@@ -2986,7 +3005,10 @@ export function codexDispatchRecord(
   if (!launch || launch.kind === 'native') return;
   const receipts = shellDispatchFromOutput(item.stdout, launch);
   for (const receipt of receipts) {
-    if (cursor.candidates.length >= 4096) break;
+    if (cursor.candidates.length >= (cursor.exportPolicy?.relationships ?? 4096)) {
+      if (cursor.exportPolicy) throw new ExportLimitError('relationships', cursor.exportPolicy.relationships);
+      break;
+    }
     cursor.candidates.push({
       turnId: cursor.currentTurnId,
       occurrence: cursor.currentOccurrence,
@@ -3013,6 +3035,8 @@ interface CodexDispatchScan {
   qualified: boolean;
   reset: boolean;
   readBytes: number;
+  traversed: boolean;
+  unresolvedTurnIds: string[];
 }
 
 // The synchronous caller drains the same steps that worker discovery yields between.
@@ -3037,8 +3061,9 @@ export async function scanCodexDispatchReferencesAsync(
   budget = RELATIONSHIP_QUANTUM_BYTES,
   cancelled: () => boolean = () => false,
   meter?: { readBytes: number },
+  exportPolicy?: ExportRelationshipLimits,
 ): Promise<CodexDispatchScan> {
-  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter);
+  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter, exportPolicy);
   let step = steps.next();
   while (!step.done) {
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -3054,10 +3079,14 @@ function* codexDispatchSteps(
   budget: number,
   cancelled: () => boolean,
   meter?: { readBytes: number },
+  exportPolicy?: ExportRelationshipLimits,
 ): Generator<void, CodexDispatchScan> {
   const fd = fs.openSync(file, 'r');
   try {
-    let cursor = previous ? structuredClone(previous) : null;
+    let cursor =
+      previous && JSON.stringify(previous.exportPolicy) === JSON.stringify(exportPolicy)
+        ? structuredClone(previous)
+        : null;
     const reader = new RelationshipReader(fd, file, budget, cancelled, meter, !Number.isFinite(budget));
     const stat = reader.stamp;
     let qualification: 'match' | 'pending' | 'reset' =
@@ -3082,6 +3111,7 @@ function* codexDispatchSteps(
         parentSessionId,
       );
       cursor.evidence = relationshipEvidence(stat);
+      if (exportPolicy) cursor.exportPolicy = { ...exportPolicy };
       cursor.target = stat.size;
       qualification = 'match';
     }
@@ -3115,18 +3145,30 @@ function* codexDispatchSteps(
         if (!bytes.length) break;
         extendRelationshipEvidence(cursor.evidence!, bytes);
         cursor.offset += bytes.length;
+        if (exportPolicy) {
+          const newline = bytes.indexOf(10);
+          const length = Buffer.byteLength(cursor.fragment, 'base64') + (newline < 0 ? bytes.length : newline);
+          if (length > exportPolicy.recordBytes) throw new ExportLimitError('record', exportPolicy.recordBytes);
+        }
         const joined = Buffer.concat([Buffer.from(cursor.fragment, 'base64'), bytes]);
+        const recordBytes = exportPolicy?.recordBytes ?? 4 * 1024 * 1024;
         let start = 0;
         for (let index = 0; index < joined.length; index++) {
           if (joined[index] !== 10) continue;
-          if (!cursor.skipLongLine && !cursor.terminalApplied && index - start <= 4 * 1024 * 1024)
+          if (index - start > recordBytes) {
+            if (exportPolicy) throw new ExportLimitError('record', recordBytes);
+            cursor.lostRecords = true;
+          }
+          if (!cursor.skipLongLine && !cursor.terminalApplied && index - start <= recordBytes)
             codexDispatchRecord(cursor, joined.toString('utf8', start, index), parentSessionId, retractedToolUseIds);
           cursor.terminalApplied = false;
           cursor.skipLongLine = false;
           start = index + 1;
         }
         const remaining = joined.subarray(start);
-        if (remaining.length > 4 * 1024 * 1024) {
+        if (remaining.length > recordBytes) {
+          if (exportPolicy) throw new ExportLimitError('record', recordBytes);
+          cursor.lostRecords = true;
           cursor.fragment = '';
           cursor.skipLongLine = true;
         } else cursor.fragment = remaining.toString('base64');
@@ -3155,7 +3197,7 @@ function* codexDispatchSteps(
     }
     const qualified = qualification === 'match' && reader.check();
     if (!qualified && qualification === 'match') cursor.evidence!.accepted = null;
-    const complete =
+    const traversed =
       !reset &&
       qualified &&
       cursor.offset === cursor.target &&
@@ -3163,12 +3205,26 @@ function* codexDispatchSteps(
       ((cursor.fragment === '' && cursor.fragmentStart === null) || cursor.terminalApplied) &&
       !cursor.skipLongLine &&
       !cancelled();
+    const unresolvedTurnIds = [
+      ...new Set(cursor.candidates.filter((candidate) => !candidate.classified).map((candidate) => candidate.turnId)),
+    ];
+    const complete = traversed && !cursor.lostRecords && (!exportPolicy || unresolvedTurnIds.length === 0);
     const references = cursor.candidates
       .filter((candidate) => candidate.classified)
       .map((candidate) => candidate.reference);
     if (!validRelationshipEvidence(cursor.evidence, cursor.offset))
       throw new Error('Relationship evidence exceeds its limits');
-    return { cursor, references, retractedToolUseIds, complete, qualified, reset, readBytes: reader.readBytes };
+    return {
+      cursor,
+      references,
+      retractedToolUseIds,
+      complete,
+      qualified,
+      reset,
+      readBytes: reader.readBytes,
+      traversed,
+      unresolvedTurnIds,
+    };
   } finally {
     fs.closeSync(fd);
   }
@@ -3553,6 +3609,7 @@ function blocksText(value: unknown): string {
 // `phase` distinguishes Activity commentary from final answers.
 function parsedMessageItem(
   payload: Record<string, unknown>,
+  captureSessionText = false,
 ): { sourceId: string | null; phase: string | null; text: string } | null {
   const nested = isRecord(payload.item) ? payload.item : null;
   const item = nested ?? payload;
@@ -3563,14 +3620,15 @@ function parsedMessageItem(
   if (type === 'message' && str(item.role) !== 'assistant') {
     return null;
   }
-  const text = (blocksText(item.content) || str(item.message) || '').trim();
-  return text ? { sourceId: str(item.id), phase: str(item.phase), text } : null;
+  const raw = blocksText(item.content) || str(item.message) || '';
+  const text = captureSessionText ? raw : raw.trim();
+  return text.trim() ? { sourceId: str(item.id), phase: str(item.phase), text } : null;
 }
 
 // Read asynchronous AgentMessage items as Activity, even when their phase says final_answer.
 // Question details use a title followed by one option per line. Other messages retain their own text.
 // `parsedFinalAnswer` excludes asynchronous delivery from turn-ending answers.
-function parsedAsyncMessage(payload: Record<string, unknown>): ParsedUpdate | null {
+function parsedAsyncMessage(payload: Record<string, unknown>, captureSessionText = false): ParsedUpdate | null {
   const item = isRecord(payload.item) ? payload.item : null;
   if (!item || str(item.type) !== 'AgentMessage' || str(item.delivery) !== 'async') {
     return null;
@@ -3588,14 +3646,15 @@ function parsedAsyncMessage(payload: Record<string, unknown>): ParsedUpdate | nu
     );
     return [[title, ...options.map((option) => `- ${option}`)].join('\n')];
   });
-  const text = questions.length ? questions.join('\n\n') : blocksText(item.content).trim();
+  const raw = blocksText(item.content);
+  const text = questions.length ? questions.join('\n\n') : captureSessionText ? raw : raw.trim();
   return text ? { sourceId: str(item.id), kind: 'commentary', text } : null;
 }
 
 // Visible assistant activity only. A final answer is handled by `parsedFinalAnswer` instead,
 // and opaque reasoning fields are never copied into the normalized turn.
-function parsedUpdate(payload: Record<string, unknown>): ParsedUpdate | null {
-  const message = parsedMessageItem(payload);
+function parsedUpdate(payload: Record<string, unknown>, captureSessionText = false): ParsedUpdate | null {
+  const message = parsedMessageItem(payload, captureSessionText);
   if (message) {
     return message.phase === 'commentary'
       ? { sourceId: message.sourceId, kind: 'commentary', text: message.text }
@@ -3613,12 +3672,15 @@ function parsedUpdate(payload: Record<string, unknown>): ParsedUpdate | null {
 
 // Read a final-answer message. Asynchronous delivery never supplies a turn-ending answer.
 // The turn completion later identifies which recorded answer supplies its response.
-function parsedFinalAnswer(payload: Record<string, unknown>): { sourceId: string | null; text: string } | null {
+function parsedFinalAnswer(
+  payload: Record<string, unknown>,
+  captureSessionText = false,
+): { sourceId: string | null; text: string } | null {
   const item = isRecord(payload.item) ? payload.item : payload;
   if (str(item.delivery) === 'async') {
     return null;
   }
-  const message = parsedMessageItem(payload);
+  const message = parsedMessageItem(payload, captureSessionText);
   return message && message.phase === 'final_answer' ? { sourceId: message.sourceId, text: message.text } : null;
 }
 
@@ -4654,6 +4716,8 @@ export function readCodexTurnStarts(file: string, bytes = TURN_START_BYTES): Tur
 }
 
 export interface CodexReadOptions extends ReadOptions {
+  // A capture supplies opening metadata admitted at its frozen source revision.
+  capturedOpening?: CodexSessionMeta | null;
   // Structural child headers cover background work that has no spawn record in the parent.
   // The reducer attaches one such child only when its opening time belongs to one parsed turn.
   structuralChildren?: readonly CodexSubagentFile[];
@@ -5744,8 +5808,8 @@ function reduceCodexSessionLine(
       // The first prompt opens the turn. Preserve later prompts with their timestamps as follow-up messages.
       const raw = userMessage(record);
       if (raw !== null) {
-        const asked = codexPrompt(raw);
-        if (!asked) {
+        const asked = codexPrompt(raw, opts.captureSessionText);
+        if (!codexPrompt(raw)) {
           break;
         }
         if (!turn.prompt) {
@@ -5753,17 +5817,17 @@ function reduceCodexSessionLine(
           break;
         }
         turn.laterPrompts.push({ text: asked, at, stepsBefore: turn.stepCount });
-        if (turn.laterPrompts.length > TURN_ASK_LIMIT) {
+        if (!opts.captureSessionText && turn.laterPrompts.length > TURN_ASK_LIMIT) {
           turn.laterPrompts.shift();
         }
         break;
       }
-      const update = parsedUpdate(payload);
+      const update = parsedUpdate(payload, opts.captureSessionText);
       if (update) {
         recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      const answer = parsedFinalAnswer(payload);
+      const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
         recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
@@ -6003,18 +6067,18 @@ function reduceCodexSessionLine(
         turn.endedAt = Math.max(turn.endedAt, at);
         break;
       }
-      const asked = parsedAsyncMessage(payload);
+      const asked = parsedAsyncMessage(payload, opts.captureSessionText);
       if (asked) {
         recordUpdate(turn, state.updateById, state.updateByText, asked, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
         break;
       }
-      const update = parsedUpdate(payload);
+      const update = parsedUpdate(payload, opts.captureSessionText);
       if (update) {
         recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      const answer = parsedFinalAnswer(payload);
+      const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
         recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
@@ -6097,12 +6161,12 @@ function reduceCodexSessionLine(
         turn.delegation ??= delegation;
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      const update = parsedUpdate(payload);
+      const update = parsedUpdate(payload, opts.captureSessionText);
       if (update) {
         recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      const answer = parsedFinalAnswer(payload);
+      const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
         recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
@@ -6122,12 +6186,12 @@ function reduceCodexSessionLine(
     case 'AgentMessage':
     case 'Reasoning':
     case 'reasoning': {
-      const update = parsedUpdate(payload);
+      const update = parsedUpdate(payload, opts.captureSessionText);
       if (update) {
         recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      const answer = parsedFinalAnswer(payload);
+      const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
         recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
@@ -6530,7 +6594,17 @@ export function createCodexSessionReducer(
   state.lastProviderSource ??= null;
   state.lastServiceTierSource ??= null;
   return {
-    pushLine: (line) => reduceCodexSessionLine(state, line, sessionId, opts),
+    pushLine: (line) => {
+      const order = opts.captureSessionText ? captureTurnTextOrder([state.open, state.turns.at(-1)]) : null;
+      if (opts.exportTurnBytes && typeof line !== 'string' && state.open && line.end !== undefined) {
+        const start = state.open[CODEX_SOURCE_START] ?? line.start ?? 0;
+        if (line.end - start > opts.exportTurnBytes) throw new ExportLimitError('turn', opts.exportTurnBytes);
+      }
+      reduceCodexSessionLine(state, line, sessionId, opts);
+      if (opts.captureSessionText && typeof line !== 'string') {
+        order?.([state.open, state.turns.at(-1)], line.start ?? 0);
+      }
+    },
     retainedBytes: () => retainedParserPayload(state),
     retainedPayloadScan: () => retainedParserPayloadScan(state),
     trimBefore: (offset) => trimCodexBefore(state, offset, opts.maxTurns ?? 40),
