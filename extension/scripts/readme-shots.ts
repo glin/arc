@@ -210,6 +210,7 @@ async function menuHolds(page: Page, titles: string[]): Promise<void> {
 async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: string): Promise<void> {
   if (
     scene === 'review' ||
+    scene === 'files' ||
     scene === 'comment' ||
     scene === 'comment-editor' ||
     scene.endsWith('menu') ||
@@ -336,7 +337,24 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
   await page.evaluate(SETTLED);
   const file = path.join(dir, `readme-${scene}.webp`);
   if (scene === 'session-menu' || scene === 'response-menu') await menuCrop(page, file);
-  else if (scene === 'review') {
+  else if (scene === 'files') {
+    const commits = page.locator('#list .turn .recordcommits').first();
+    const files = page.locator('#list .turn .recordfiles').first();
+    await commits.waitFor();
+    await files.waitFor();
+    await commits.scrollIntoViewIfNeeded();
+    const top = await commits.boundingBox();
+    const bottom = await files.boundingBox();
+    if (!top || !bottom) throw new Error('Files and Commits are not visible.');
+    await writeLosslessWebp(page, file, {
+      clip: {
+        x: Math.floor(top.x),
+        y: Math.floor(top.y),
+        width: Math.ceil(Math.max(top.x + top.width, bottom.x + bottom.width) - Math.floor(top.x)),
+        height: Math.ceil(bottom.y + bottom.height - Math.floor(top.y)),
+      },
+    });
+  } else if (scene === 'review') {
     const box = await page.locator('#list .turn').first().boundingBox();
     if (!box) throw new Error('Review turn is not visible.');
     await writeLosslessWebp(page, file, {
@@ -408,8 +426,15 @@ async function main(): Promise<void> {
     for (const scene of README_SCENES) {
       const context = await launched.browser.newContext({
         viewport: {
-          width: scene === 'main' ? 1186 : scene === 'review' ? 1100 : TIMELINE_CROPS.has(scene) ? 1430 : 1350,
-          height: scene === 'main' ? 826 : scene === 'review' ? 1000 : 700,
+          width:
+            scene === 'main'
+              ? 1186
+              : scene === 'review' || scene === 'files'
+                ? 1100
+                : TIMELINE_CROPS.has(scene)
+                  ? 1430
+                  : 1350,
+          height: scene === 'main' ? 826 : scene === 'review' || scene === 'files' ? 1000 : 700,
         },
         deviceScaleFactor: 2,
         locale: 'en-US',

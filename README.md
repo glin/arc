@@ -46,6 +46,16 @@ codex login
 
 ## Features
 
+### Files and commits
+
+Review file diffs even before the agent makes a commit. Open changed files and their diffs in VS Code from each turn's Files section.
+
+Arc detects sessions in the project's registered Git worktrees. Commits show their branch and worktree when available, plus attribution for subagent commits. Fast-forward merges appear separately from authored commits.
+
+Codex diffs use recorded patches. Claude's per-turn diffs use recorded edits, with changed regions shown when full file text is unavailable. Claude's full current-file diffs require Arc's optional hooks. These compare the file before the session's first edit with its current contents.
+
+<a href="docs/images/readme-files.webp"><img src="docs/images/readme-files.webp" alt="Files and Commits sections with changed files, authored commits, branch and worktree names, subagent attribution, and a merge into main" width="680"></a>
+
 ### Session costs
 
 Arc estimates costs for supported models using published prices. Subscription estimates do not measure your bill or plan limits.

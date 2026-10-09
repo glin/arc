@@ -27,6 +27,7 @@ import { DEMO_DEFAULT_EXPIRY, DEMO_TURNS, demoContextSample } from '../scripts/r
 import { validContextDetail } from './domain/context-detail.ts';
 import { parseHostToPanel, parsePanelToHost } from './webview/protocol.ts';
 import type { TurnComment } from './turncomments.ts';
+import { groupCommitRows } from './view/card-presentation.ts';
 
 vi.mock('node:fs', async (importOriginal) => ({ ...await importOriginal<typeof import('node:fs')>() }));
 
@@ -161,6 +162,38 @@ test('README scenes use one synthetic session and a matching selected card', () 
   assert.equal(payload.sessions.length, 6);
   assert.equal(payload.rail.length, payload.sessions.length);
   assert.equal(payload.cards[0].sessionId, payload.showing);
+});
+
+test('README Files scene keeps authored and merged work separate within one repository', () => {
+  const before = DEMO_SESSION_IDS.map((id) => demoPayload(id));
+  const { cards: [card] } = readmePayload('files') as { cards: TurnCard[] };
+  const authored = card.commits.filter((commit) => commit.kind === 'commit');
+  const landed = card.commits.filter((commit) => commit.kind === 'landing');
+  assert.equal(authored.length, 2);
+  assert.equal(landed.length, 2);
+  const matched = landed.find((landing) => authored.some((commit) => commit.sha === landing.sha))!;
+  const source = authored.find((commit) => commit.sha === matched.sha)!;
+  assert.ok(source, 'The merge has no authored source commit');
+  assert.equal(source.branch, matched.mergedBranch);
+  assert.equal(source.repository!.key, matched.repository!.key);
+  assert.notEqual(source.branch, matched.landingTarget);
+  assert.ok(source.where?.includes('worktree'));
+  assert.ok(source.madeBy);
+  assert.ok(source.at <= matched.at);
+  const imported = landed.find((landing) => !authored.some((commit) => commit.sha === landing.sha))!;
+  assert.ok(imported);
+  assert.equal(imported.branch, imported.landingTarget);
+  assert.ok(landed.every((landing) => landing.at <= card.endedAt && landing.added === null && landing.removed === null));
+  const groups = groupCommitRows(card.commits).groups;
+  const worktree = groups.find((group) => group.branch === source.branch)!;
+  assert.equal(worktree.arrival!.target, imported.landingTarget);
+  assert.deepEqual(worktree.rows.map((row) => row.kind), ['commit']);
+  assert.deepEqual(groups.find((group) => group.branch === imported.landingTarget)!.rows.map((row) => row.kind), ['landing']);
+  assert.equal(card.files.length, 4);
+  assert.ok(card.files.some((file) => file.path.endsWith('/navigation.ts')));
+  assert.equal(card.files.filter((file) => file.detail).length, 3);
+  assert.equal(card.files.find((file) => file.path.endsWith('/navigation.ts'))!.detail, undefined);
+  assert.deepEqual(DEMO_SESSION_IDS.map((id) => demoPayload(id)), before);
 });
 
 // These checks cover relationships and money without launching a browser.

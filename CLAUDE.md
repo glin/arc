@@ -35,6 +35,8 @@ When a design goal blocks valuable work, state the conflict and its cost. The au
 
 ## Development workflow
 
+Use `/ship` for repository changes. Implement in a worktree. Run `/pre-commit-review` before landing.
+
 Read `docs/development.md` before installing dependencies, repairing the panel-mockup link, linking worktree dependencies, or profiling.
 
 Use the diagnostic capture script in [Performance capture](docs/development.md#performance-capture) for performance investigations and diagnostic requests.

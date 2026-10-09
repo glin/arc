@@ -224,6 +224,43 @@ for (const agent of readStateTurn.agents) {
   for (const part of agent.spend) part.usage.byContextBand = { short: { ...part.usage } };
 }
 
+const README_REPOSITORY = { key: `${ROOT}/.git`, root: ROOT, own: true };
+const readmeFilesTurn: Turn = {
+  ...readStateTurn,
+  files: [file('extension/src/webview/navigation.ts', 12, 4)],
+  commits: readStateTurn.commits.map((commit) => ({ ...commit, repository: README_REPOSITORY })),
+  agents: readStateTurn.agents.map((agent) => ({
+    ...agent,
+    commits: agent.commits?.map((commit) => ({ ...commit, repository: README_REPOSITORY })),
+  })),
+  landings: [
+    {
+      id: 'readme-merge-read-state-tests',
+      sha: 'd29a6f4',
+      subject: 'test(rail): cover read state after switching views',
+      from: 'test/read-state',
+      mergedBranch: 'test/read-state',
+      head: { kind: 'branch', name: 'main' },
+      at: start + 13.5 * 60_000,
+      place: null,
+      dir: ROOT,
+      repository: README_REPOSITORY,
+    },
+    {
+      id: 'readme-merge-keyboard-focus',
+      sha: 'a87f3d2',
+      subject: 'fix(navigation): preserve focus after restoring tabs',
+      from: 'keyboard-focus',
+      mergedBranch: 'keyboard-focus',
+      head: { kind: 'branch', name: 'main' },
+      at: start + 14 * 60_000,
+      place: null,
+      dir: ROOT,
+      repository: README_REPOSITORY,
+    },
+  ],
+};
+
 const changesTurn: Turn = turn({
   sessionId: 'arc-open-changes',
   sessionTitle: 'Open changed files',
@@ -463,6 +500,7 @@ const cacheTurn: Turn = turn({
 export const README_SCENES = [
   'main',
   'review',
+  'files',
   'comment',
   'comment-editor',
   'session-menu',
@@ -1589,7 +1627,9 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
             ? cacheTurn
             : scene === 'review'
               ? { ...readStateTurn, agents: demoCodexReadStateTurn.agents }
-              : readStateTurn;
+              : scene === 'files'
+                ? readmeFilesTurn
+                : readStateTurn;
   const rows = [
     ['arc-read-state', 'Keep unread results visible', 'Codex', CAPTURE_TIME - 8 * 60_000],
     ['session-search', 'Search across sessions', 'Codex', CAPTURE_TIME - 2 * 60_000],
@@ -1630,7 +1670,7 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     'arc-cache-run': ['cost'],
   };
   const stats = {
-    'arc-read-state': sessionStats(scene === 'review' ? [selected] : [readStateTurn], []),
+    'arc-read-state': sessionStats(scene === 'review' || scene === 'files' ? [selected] : [readStateTurn], []),
     'arc-open-changes': [
       ...sessionStats(
         scene === 'cache-expiry' ? expiryHistory : scene === 'next-turn' ? [nextTurn] : [changesTurn],
@@ -1763,7 +1803,10 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     showing: selected.sessionId,
     sessionAdoptions: [],
     maxSessions: 10,
-    timelineLayout: { cardLayout: scene === 'review' ? 'one-column' : 'two-columns', promptPosition: 'above' },
+    timelineLayout: {
+      cardLayout: scene === 'review' || scene === 'files' ? 'one-column' : 'two-columns',
+      promptPosition: 'above',
+    },
     olderHistory: null,
     diagnosis: null,
     iconFonts: [],
