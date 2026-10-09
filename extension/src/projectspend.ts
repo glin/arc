@@ -421,7 +421,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 42;
+export const PROJECT_SPEND_PARSER_GENERATION = 43;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -970,6 +970,9 @@ export interface CacheExpiryLedger {
   // a revision arriving in a later slice reaches the row it replaces.
   newestReturnKey: string | null;
   newestCompactionKey: string | null;
+  // Facts for compactions a request reached, which trailing facts pushed out of `compactions`.
+  // A restored scan holds them again, because a later slice can revoke the trailing compaction.
+  displacedCompactions?: CompactionFact[];
 }
 
 export function emptyCacheExpiryFacts(): CacheExpiryFacts {
@@ -1119,6 +1122,32 @@ function primaryOrderedRequest(event: UsageEvent): boolean {
   );
 }
 
+function emptyCompactionFact(ordinal: number, contextBefore: number | null): CompactionFact {
+  return {
+    ordinal,
+    at: null,
+    trigger: null,
+    contextBefore,
+    contextAfter: null,
+    requestsAfter: 0,
+    firstRequestAfter: null,
+    requestUsage: null,
+    requestModel: null,
+    requestProvider: null,
+    requestServiceTier: null,
+    requestContextWindow: null,
+  };
+}
+
+// The newest facts for compactions that the carried request reached, oldest first.
+function reachedCompactions(facts: readonly CompactionFact[], carry: CacheExpiryCarry | null): CompactionFact[] {
+  const reached = carry?.compactionsBefore ?? 0;
+  return facts
+    .filter((item) => item.ordinal <= reached)
+    .sort((left, right) => left.ordinal - right.ordinal)
+    .slice(-RETAINED_COMPACTIONS);
+}
+
 // Folds the ordered request stream into the derived ledger. One instance covers one source
 // file, and it resumes from a saved ledger, so an incremental slice gives the same answer as
 // one whole scan of the same bytes.
@@ -1142,8 +1171,14 @@ export class CacheExpiryScan {
       excluded: restored.facts.excluded,
       unavailable: restored.facts.unavailable,
     };
-    this.compactions = restored.compactions.map((item) => ({ ...item }));
     this.carry = restored.carry ? { ...restored.carry } : null;
+    // The scan holds only facts for compactions a request reached. A saved ledger also lists
+    // trailing compactions, which `ledger()` rebuilds from the carry, because a later slice can
+    // revoke the compaction behind one.
+    this.compactions = reachedCompactions(
+      [...(restored.displacedCompactions ?? []), ...restored.compactions],
+      this.carry,
+    ).map((item) => ({ ...item }));
     this.newestReturnKey = restored.newestReturnKey;
     this.newestCompactionKey = restored.newestCompactionKey;
   }
@@ -1195,6 +1230,10 @@ export class CacheExpiryScan {
   private recordCompactions(next: CacheExpiryCarry, event: UsageEvent): void {
     const before = this.carry?.compactionsBefore ?? 0;
     const added = next.compactionsBefore - before;
+    if (added < 0) {
+      // A revoked compaction leaves no fact, as a restored scan holds none for it.
+      this.compactions.splice(0, this.compactions.length, ...reachedCompactions(this.compactions, next));
+    }
     if (added <= 0) {
       const open = this.compactions[this.compactions.length - 1];
       if (open && open.ordinal === next.compactionsBefore) {
@@ -1226,20 +1265,7 @@ export class CacheExpiryScan {
     if (held) {
       return held;
     }
-    const fact: CompactionFact = {
-      ordinal,
-      at: null,
-      trigger: null,
-      contextBefore,
-      contextAfter: null,
-      requestsAfter: 0,
-      firstRequestAfter: null,
-      requestUsage: null,
-      requestModel: null,
-      requestProvider: null,
-      requestServiceTier: null,
-      requestContextWindow: null,
-    };
+    const fact = emptyCompactionFact(ordinal, contextBefore);
     this.compactions.push(fact);
     this.compactions.sort((left, right) => left.ordinal - right.ordinal);
     return fact;
@@ -1281,24 +1307,29 @@ export class CacheExpiryScan {
 
   // Match recent compaction records to their derived facts by ordinal.
   // Missing clocks remain null and cannot shift another compaction's timestamp.
-  // Open facts for trailing compactions that no later request reached.
+  // List facts for trailing compactions that no later request reached, without holding them.
   // These facts retain their time and preceding context, with zero later requests.
+  // Reached facts that the trailing facts push out of the list are saved apart.
   ledger(recorded: readonly ReducerCompaction[]): CacheExpiryLedger {
     const reached = this.carry?.compactionsBefore ?? 0;
-    for (const item of recorded) {
-      if (item.ordinal <= reached) {
-        continue;
-      }
-      this.openCompaction(
-        item.ordinal,
-        item.ordinal === reached + 1 && !this.carry?.incomplete ? (this.carry?.inputTokens ?? null) : null,
+    const held = reachedCompactions(this.compactions, this.carry);
+    const trailing = recorded
+      .filter((item) => item.ordinal > reached)
+      .map((item) =>
+        emptyCompactionFact(
+          item.ordinal,
+          item.ordinal === reached + 1 && !this.carry?.incomplete ? (this.carry?.inputTokens ?? null) : null,
+        ),
       );
-    }
-    this.trimCompactions();
+    const listed = [...held, ...trailing]
+      .sort((left, right) => left.ordinal - right.ordinal)
+      .slice(-RETAINED_COMPACTIONS);
+    const displaced = held.slice(0, Math.max(0, held.length + trailing.length - RETAINED_COMPACTIONS));
     const byOrdinal = new Map(recorded.map((item) => [item.ordinal, item]));
     return {
+      ...(displaced.length > 0 ? { displacedCompactions: displaced.map((item) => ({ ...item })) } : {}),
       facts: this.facts,
-      compactions: this.compactions.map((item) => {
+      compactions: listed.map((item) => {
         const held = byOrdinal.get(item.ordinal);
         return {
           ...item,

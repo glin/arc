@@ -173,6 +173,13 @@ export function withRetainedRequestEvents<T>(state: T, limit: number = RETAINED_
 // Retain the newest compaction timestamps. compactionCount() keeps the exact total.
 export const RETAINED_COMPACTIONS = 16;
 
+// Retain the newest main-chain Claude record ids. A prompt that names one of the ids read before
+// a compaction proves the session abandoned that compaction.
+export const RETAINED_COMPACTION_PARENTS = 8;
+
+// Retain the newest Claude compaction boundary and summary ids, so a replayed compaction counts once.
+export const RETAINED_COMPACTION_RECORDS = 2 * RETAINED_COMPACTIONS;
+
 // Retain full detail for the newest cache-expiry return requests.
 // Counts remain exact beyond this limit. Retained dollar totals become lower bounds.
 export const RETAINED_CACHE_EXPIRY_RETURNS = 32;

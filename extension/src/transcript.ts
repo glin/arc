@@ -41,6 +41,8 @@ import {
   retainedParserPayloadScan,
   hiddenParserState,
   ParserLine,
+  RETAINED_COMPACTION_PARENTS,
+  RETAINED_COMPACTION_RECORDS,
   RETAINED_COMPACTIONS,
   RETAINED_REQUESTS,
   retainedRequestEvents,
@@ -6420,7 +6422,8 @@ export interface ClaudeUsageReducerState {
   closedTurns: number;
   openTurn: boolean;
   openTurnAnswered: boolean;
-  // How many compaction summaries this transcript has held.
+  // How many compactions this transcript has held. A replayed compaction does not count, and the
+  // usage line reducer revokes an abandoned one.
   compactionCount: number;
   // The newest of those summaries, oldest first. `RETAINED_COMPACTIONS` bounds it, so
   // compactionCount stays the exact total and this list only describes them.
@@ -6432,6 +6435,15 @@ export interface ClaudeUsageReducerState {
   // The newest compaction summary that no boundary has sized yet, with the main request before
   // it. Claude Code can write the summary before the boundary.
   unsizedCompaction?: ClaudeUnsizedCompaction | null;
+  // Ids of the newest main-chain answers and typed prompts, oldest first.
+  // `RETAINED_COMPACTION_PARENTS` bounds the list.
+  compactionParents?: string[];
+  // The newest compaction until a typed prompt or billed request shows whether the session
+  // continued from it.
+  pendingCompaction?: ClaudePendingCompaction | null;
+  // Ids of the newest compaction boundaries and summaries, oldest first, revoked ones included.
+  // `RETAINED_COMPACTION_RECORDS` bounds the list.
+  compactionRecords?: string[];
   // The newest main request, which sizes the next compaction's input.
   lastRequest?: ClaudeLastRequest | null;
   // The cache read of the first request this transcript billed, set once. A cold compaction
@@ -6560,6 +6572,20 @@ export interface ClaudeUnsizedCompaction {
   summaryChars?: number;
 }
 
+export interface ClaudePendingCompaction {
+  // `compactionParents` as the compaction's first boundary or summary record found it.
+  parents: string[];
+  // The compaction's ordinal once its summary counted it. Null while only its boundary is read.
+  ordinal: number | null;
+  boundary: boolean;
+  // The retained compaction that the summary pushed out of `recentCompactions`.
+  evicted: ReducerCompaction | null;
+}
+
+function copyPendingCompaction(value: ClaudePendingCompaction | null | undefined): ClaudePendingCompaction | null {
+  return value ? { ...value, parents: [...value.parents], evicted: value.evicted ? { ...value.evicted } : null } : null;
+}
+
 function copyUnsizedCompaction(value: ClaudeUnsizedCompaction | null | undefined): ClaudeUnsizedCompaction | null {
   return value ? { ...value, previous: value.previous ? { ...value.previous } : null } : null;
 }
@@ -6602,13 +6628,139 @@ export function emptyClaudeUsageReducerState(): ClaudeUsageReducerState {
   };
 }
 
+// Returns the oldest entry the push removed, or null.
 export function retainNewestCompaction(
   state: { recentCompactions: ReducerCompaction[] },
   compaction: ReducerCompaction,
-): void {
+): ReducerCompaction | null {
   state.recentCompactions.push(compaction);
+  let evicted: ReducerCompaction | null = null;
   while (state.recentCompactions.length > RETAINED_COMPACTIONS) {
-    state.recentCompactions.shift();
+    evicted = state.recentCompactions.shift() ?? null;
+  }
+  return evicted;
+}
+
+// Whether this compaction boundary or summary repeats one already read. Claude Code can replay a
+// stretch of the transcript with the same record ids.
+function repeatsClaudeCompaction(state: ClaudeUsageReducerState, record: Record<string, unknown>): boolean {
+  const uuid = typeof record.uuid === 'string' && record.uuid ? record.uuid : null;
+  if (!uuid) {
+    return false;
+  }
+  const held = (state.compactionRecords ??= []);
+  if (held.includes(uuid)) {
+    return true;
+  }
+  held.push(uuid);
+  while (held.length > RETAINED_COMPACTION_RECORDS) {
+    held.shift();
+  }
+  return false;
+}
+
+// The boundary pairs with a summary read before it, or opens the next pending compaction. A
+// summary that a record already decided still claims a boundary written inside its window.
+function noteClaudeCompactionBoundary(state: ClaudeUsageReducerState, at: number): void {
+  const pending = state.pendingCompaction;
+  if (pending && pending.ordinal !== null && !pending.boundary) {
+    pending.boundary = true;
+    return;
+  }
+  const unsized = state.unsizedCompaction;
+  if (!pending && unsized && withinCompactWindow(unsized.at, at)) {
+    return;
+  }
+  state.pendingCompaction = {
+    parents: [...(state.compactionParents ?? [])],
+    ordinal: null,
+    boundary: true,
+    evicted: null,
+  };
+}
+
+// The summary completes the pending compaction its boundary opened. Otherwise it replaces any
+// pending compaction with its own, and the replaced compaction stays counted.
+function noteClaudeCompactionSummary(
+  state: ClaudeUsageReducerState,
+  ordinal: number,
+  evicted: ReducerCompaction | null,
+): void {
+  const pending = state.pendingCompaction;
+  if (pending && pending.ordinal === null) {
+    pending.ordinal = ordinal;
+    pending.evicted = evicted;
+    return;
+  }
+  state.pendingCompaction = { parents: [...(state.compactionParents ?? [])], ordinal, boundary: false, evicted };
+}
+
+// The first main-chain typed prompt or new billed request after a compaction decides it. A
+// parent read before the compaction proves the session left it, so the compaction is revoked.
+// Any other parent, or none, keeps it. Each answer and typed prompt then joins
+// `compactionParents`. A record read before neither decides nor joins: its uuid is already held,
+// or it is a billed answer for an earlier request than the newest one. A later content block of
+// the newest request shares that request's key and joins, because the next record names it.
+function followClaudeCompactionLineage(
+  state: ClaudeUsageReducerState,
+  record: Record<string, unknown>,
+  childTranscript: boolean,
+): void {
+  if (record.isSidechain && !childTranscript) {
+    return;
+  }
+  const answer = record.type === 'assistant';
+  if (!answer && !(record.type === 'user' && isTypedPrompt(record, childTranscript))) {
+    return;
+  }
+  const pending = state.pendingCompaction;
+  const uuid = typeof record.uuid === 'string' && record.uuid ? record.uuid : null;
+  if (uuid && (state.compactionParents?.includes(uuid) || pending?.parents.includes(uuid))) {
+    return;
+  }
+  const message = record.message as ClaudeRequestMessage | undefined;
+  let decides = !answer;
+  if (answer && message?.usage && message.model !== '<synthetic>') {
+    const key = claudeRequestKey(record, message);
+    if (!seenRequestIndex(state).has(key)) {
+      decides = true;
+    } else if (state.seenRequestKeys[state.seenRequestKeys.length - 1] !== key) {
+      return;
+    }
+  }
+  if (pending && decides) {
+    state.pendingCompaction = null;
+    const parent = typeof record.parentUuid === 'string' && record.parentUuid ? record.parentUuid : null;
+    if (parent && pending.ordinal !== null && pending.parents.includes(parent)) {
+      revokeClaudeCompaction(state, pending.ordinal, pending.evicted);
+    }
+  }
+  if (uuid) {
+    const parents = (state.compactionParents ??= []);
+    parents.push(uuid);
+    while (parents.length > RETAINED_COMPACTION_PARENTS) {
+      parents.shift();
+    }
+  }
+}
+
+// Removes the newest compaction from the count and the retained list, and puts back the entry it
+// pushed out. Its summary request stays billed: an estimate already emitted stays, and a summary
+// still waiting for its boundary keeps `unsizedCompaction`, so the boundary emits the estimate.
+function revokeClaudeCompaction(
+  state: ClaudeUsageReducerState,
+  ordinal: number,
+  evicted: ReducerCompaction | null,
+): void {
+  if (ordinal !== state.compactionCount) {
+    return;
+  }
+  state.compactionCount--;
+  if (state.recentCompactions[state.recentCompactions.length - 1]?.ordinal === ordinal) {
+    state.recentCompactions.pop();
+  }
+  if (evicted) {
+    state.recentCompactions.unshift(evicted);
   }
 }
 
@@ -6714,10 +6866,14 @@ function reduceClaudeTurnRecord(
     withdrawClaudeUsageTurn(state, compactAnswer, true);
   }
   if (record.type === 'system' && record.subtype === 'compact_boundary') {
+    if (repeatsClaudeCompaction(state, record)) {
+      return;
+    }
+    const at = stamp(record.timestamp);
+    noteClaudeCompactionBoundary(state, at);
     const metadata = record.compactMetadata as Record<string, unknown> | undefined;
     state.pendingCompactionTrigger =
       typeof metadata?.trigger === 'string' && metadata.trigger ? metadata.trigger : null;
-    const at = stamp(record.timestamp);
     const after = positiveCount(metadata?.postTokens);
     // A boundary that names no summary size prices nothing, and a newer boundary replaces the
     // sizes of one no summary claimed.
@@ -6756,9 +6912,12 @@ function reduceClaudeTurnRecord(
     return;
   }
   if (record.type === 'user' && record.isCompactSummary) {
+    if (repeatsClaudeCompaction(state, record)) {
+      return;
+    }
     state.compactionCount++;
     const at = stamp(record.timestamp);
-    retainNewestCompaction(state, {
+    const evicted = retainNewestCompaction(state, {
       ordinal: state.compactionCount,
       at: Number.isFinite(at) && at > 0 ? at : null,
       trigger: state.pendingCompactionTrigger ?? null,
@@ -6770,6 +6929,7 @@ function reduceClaudeTurnRecord(
       requestServiceTier: null,
       requestContextWindow: null,
     });
+    noteClaudeCompactionSummary(state, state.compactionCount, evicted);
     state.pendingCompactionTrigger = null;
     const size = state.pendingCompactionSize ?? null;
     if (size && !withinCompactWindow(size.at, at)) {
@@ -7092,6 +7252,20 @@ export interface ClaudeUsageReadOptions {
   emitRepeats?: boolean;
 }
 
+interface ClaudeRequestMessage {
+  id?: unknown;
+  model?: unknown;
+  usage?: ClaudeUsage;
+}
+
+// The key of the request a billed answer belongs to. Every content block of one response shares it.
+function claudeRequestKey(record: Record<string, unknown>, message: ClaudeRequestMessage): string {
+  const messageId = typeof message.id === 'string' && message.id ? message.id : null;
+  const uuid = typeof record.uuid === 'string' && record.uuid ? record.uuid : null;
+  const timestamp = Date.parse(String(record.timestamp ?? ''));
+  return `claude:${messageId ?? uuid ?? `${Number.isNaN(timestamp) ? '' : timestamp}:${String(message.model ?? '')}`}`;
+}
+
 // Builds the membership set from saved request keys on first use and reuses it afterward.
 function seenRequestIndex(state: ClaudeUsageReducerState): Set<string> {
   if (state.seenRequests instanceof Set) {
@@ -7115,21 +7289,14 @@ export function reduceClaudeUsageRecord(
   if (record.isSidechain && opts.countSidechain !== true) {
     return null;
   }
-  const message = record.message as
-    | {
-        id?: unknown;
-        model?: unknown;
-        usage?: ClaudeUsage;
-      }
-    | undefined;
+  const message = record.message as ClaudeRequestMessage | undefined;
   const usage = message?.usage;
   if (!usage || message?.model === '<synthetic>') {
     return null;
   }
   const messageId = typeof message.id === 'string' && message.id ? message.id : null;
-  const uuid = typeof record.uuid === 'string' && record.uuid ? record.uuid : null;
   const timestamp = Date.parse(String(record.timestamp ?? ''));
-  const requestKey = `claude:${messageId ?? uuid ?? `${Number.isNaN(timestamp) ? '' : timestamp}:${String(message.model ?? '')}`}`;
+  const requestKey = claudeRequestKey(record, message);
   if (opts.emitRepeats !== true) {
     // Parent reads retain every billed request key because content-block repeats can follow many unrelated requests.
     const seen = seenRequestIndex(state);
@@ -7271,6 +7438,8 @@ export function reduceClaudeUsageLine(
   } catch {
     return null;
   }
+  // Own-spend reads skip this step. They count cost, and an abandoned compaction still billed.
+  followClaudeCompactionLineage(state, record, opts.countSidechain === true);
   reduceClaudeTurnRecord(state, record, opts.countSidechain === true);
   return record.type === 'assistant' ? reduceClaudeUsageRecord(state, record, opts) : null;
 }
@@ -7380,6 +7549,11 @@ export function createClaudeUsageLineReducer(
             pendingCompactionTrigger: restored.pendingCompactionTrigger ?? null,
             pendingCompactionSize: restored.pendingCompactionSize ? { ...restored.pendingCompactionSize } : null,
             unsizedCompaction: copyUnsizedCompaction(restored.unsizedCompaction),
+            ...(restored.compactionParents ? { compactionParents: [...restored.compactionParents] } : {}),
+            ...(restored.pendingCompaction
+              ? { pendingCompaction: copyPendingCompaction(restored.pendingCompaction) }
+              : {}),
+            ...(restored.compactionRecords ? { compactionRecords: [...restored.compactionRecords] } : {}),
             lastRequest: restored.lastRequest ? { ...restored.lastRequest } : null,
             firstRequestCacheRead: restored.firstRequestCacheRead ?? null,
             ...(restored.modelProfile ? { modelProfile: restored.modelProfile } : {}),
@@ -7459,6 +7633,9 @@ export function createClaudeUsageLineReducer(
             pendingCompactionTrigger: state.pendingCompactionTrigger ?? null,
             pendingCompactionSize: state.pendingCompactionSize ? { ...state.pendingCompactionSize } : null,
             unsizedCompaction: copyUnsizedCompaction(state.unsizedCompaction),
+            ...(state.compactionParents?.length ? { compactionParents: [...state.compactionParents] } : {}),
+            ...(state.pendingCompaction ? { pendingCompaction: copyPendingCompaction(state.pendingCompaction) } : {}),
+            ...(state.compactionRecords?.length ? { compactionRecords: [...state.compactionRecords] } : {}),
             lastRequest: state.lastRequest ? { ...state.lastRequest } : null,
             firstRequestCacheRead: state.firstRequestCacheRead ?? null,
             ...(state.modelProfile ? { modelProfile: state.modelProfile } : {}),

@@ -22,9 +22,11 @@ import {
   type UsageEvent,
   type UsageReducerFactory,
 } from './projectspend.ts';
-import { createClaudeUsageLineReducer, type ClaudeUsageReducerState } from './transcript.ts';
+import { createClaudeUsageLineReducer, readClaudeAgentSpend, type ClaudeUsageReducerState } from './transcript.ts';
 import { createCodexUsageLineReducer, type CodexUsageReducerState } from './codex.ts';
+import { RETAINED_COMPACTIONS } from './parserstate.ts';
 import { tempDir } from './temproot.ts';
+import { sessionCacheExpiryStats } from './turncard.ts';
 
 const dir = () => tempDir('cache-expiry-');
 
@@ -748,6 +750,348 @@ test('a request after a session-ending compaction completes that same fact, not 
     ],
     [44_100, 10_000, 1],
   );
+});
+
+// ## Abandoned and replayed compactions
+//
+// Claude Code can write a compaction that the session then leaves: the next prompt names a
+// record from before the compaction as its parent. It can also replay a stretch of the file with
+// the same record ids.
+
+const linked = (line: string, parentUuid: string | null) => JSON.stringify({ ...JSON.parse(line), parentUuid });
+
+const claudeCompactCommand = (minutes: number, id: string) =>
+  JSON.stringify({ ...JSON.parse(claudePrompt(minutes, id)), message: { role: 'user', content: '/compact' } });
+
+// A manual compaction as Claude Code writes it. The boundary links back only through
+// `logicalParentUuid`, and the summary names the boundary.
+const claudeLinkedCompaction = (minutes: number, id: string, logicalParentUuid: string) => [
+  JSON.stringify({
+    type: 'system',
+    subtype: 'compact_boundary',
+    uuid: `b-${id}`,
+    parentUuid: null,
+    logicalParentUuid,
+    timestamp: at(minutes),
+    compactMetadata: { trigger: 'manual', preTokens: 40_000, postTokens: 2_000, durationMs: 30_000 },
+  }),
+  linked(claudeCompaction(minutes, id), `b-${id}`),
+];
+
+const SIXTEEN_HOURS = 16 * 60;
+
+// Compaction A is kept. Compaction B is abandoned: the prompt 16 hours later names the last
+// answer before B's command. A stretch holding compaction A then replays with the same ids, and
+// compaction C is kept.
+function abandonedCompactionLines(): string[] {
+  return [
+    claudePrompt(0, 'p1'),
+    linked(claudeResponse(1, { id: 'm1', input: 100, read: 40_000, write1h: 4_000 }), 'u-p1'),
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+    linked(claudePrompt(11, 'p2'), 'c-A'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 20_000 }), 'u-p2'),
+    linked(claudePrompt(20, 'p3'), 'a-m2'),
+    linked(claudeResponse(20, { id: 'm3', input: 2, read: 20_000, write1h: 1_000 }), 'u-p3'),
+    linked(claudeCompactCommand(30, 'compact-b'), 'a-m3'),
+    ...claudeLinkedCompaction(31, 'B', 'u-compact-b'),
+    linked(claudePrompt(30 + SIXTEEN_HOURS, 'p4'), 'a-m3'),
+    linked(claudeResponse(30 + SIXTEEN_HOURS, { id: 'm4', input: 2, read: 1_000, write1h: 21_000 }), 'u-p4'),
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 20_000 }), 'u-p2'),
+    linked(claudePrompt(1_000, 'p5'), 'a-m4'),
+    linked(claudeResponse(1_000, { id: 'm5', input: 2, read: 22_000, write1h: 500 }), 'u-p5'),
+    ...claudeLinkedCompaction(1_080, 'C', 'a-m5'),
+    linked(claudePrompt(1_081, 'p6'), 'c-C'),
+    linked(claudeResponse(1_081, { id: 'm6', input: 2, write1h: 25_000 }), 'u-p6'),
+  ];
+}
+
+test('an abandoned compaction before a 16-hour gap leaves that gap counted as one cache expiry', () => {
+  const record = indexed(abandonedCompactionLines(), claudeReducer);
+
+  assert.equal(record.compactionCount, 2, 'compaction B was abandoned and compaction A was replayed');
+  assert.deepEqual(summary(record), {
+    counts: { '5m': 0, '30m': 0, '1h': 1 },
+    excluded: 1,
+    unavailable: 0,
+    longestGapMs: 970 * MINUTE,
+    truncated: false,
+  });
+  assert.deepEqual(
+    record.cacheExpiry!.facts.returns.map((item) => [item.lifetime, item.gapMs, item.request.usage.cacheWrite1h]),
+    [['1h', 970 * MINUTE, 21_000]],
+  );
+  assert.deepEqual(
+    record.cacheExpiry!.compactions.map((item) => [
+      item.ordinal,
+      item.at,
+      item.contextBefore,
+      item.contextAfter,
+      item.requestsAfter,
+    ]),
+    [
+      [1, Date.parse(at(10)), 44_100, 20_002, 4],
+      [2, Date.parse(at(1_080)), 22_502, 25_002, 1],
+    ],
+  );
+  assert.deepEqual(
+    sessionCacheExpiryStats(facts(record)).map((stat) => stat.label),
+    ['1 cache expiry'],
+  );
+});
+
+test('an abandoned compaction still bills the request that wrote its summary', () => {
+  const reducer = createClaudeUsageLineReducer();
+  const estimates = abandonedCompactionLines()
+    .flatMap((line) => reducer.pushLine(line))
+    .filter((event) => event.compactionEstimate);
+
+  const abandoned = estimates.filter((event) => event.timestamp === Date.parse(at(31)));
+  assert.equal(abandoned.length, 1, 'the summary request for compaction B left the totals');
+  assert.ok(abandoned[0].usage.output > 0);
+});
+
+test('a slice that ends between an abandoned summary and the prompt that leaves it gives the whole-scan answer', () => {
+  const lines = abandonedCompactionLines();
+  const whole = indexed(lines, claudeReducer);
+  const folder = dir();
+  const file = path.join(folder, 'source.jsonl');
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  const summaryLine = lines.indexOf(linked(claudeCompaction(31, 'B'), 'b-B'));
+  const firstBytes = Buffer.byteLength(`${lines.slice(0, summaryLine + 1).join('\n')}\n`);
+
+  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes: firstBytes }).record;
+  assert.equal(first.offset, firstBytes, 'the first slice ended after compaction B');
+  assert.equal(first.compactionCount, 2, 'compaction B counts until a later record leaves it');
+  const rest = indexSpendFile(first, file, 'w', claudeReducer, Date.now() + 1, { maxBytes: 1 << 20 }).record;
+
+  assert.equal(rest.complete, true);
+  assert.equal(rest.compactionCount, 2);
+  assert.deepEqual(summary(rest), summary(whole));
+  assert.deepEqual(rest.cacheExpiry!.compactions, whole.cacheExpiry!.compactions);
+});
+
+test('a kept compaction stays counted without parent links and across linked attachment lines', () => {
+  const unlinked = [
+    claudePrompt(0, 'p1'),
+    claudeResponse(1, { id: 'm1', input: 100, write1h: 4_000 }),
+    claudeCompaction(10, 'c1'),
+    claudePrompt(11, 'p2'),
+    claudeResponse(11, { id: 'm2', input: 2, write1h: 2_000 }),
+  ];
+  assert.equal(indexed(unlinked, claudeReducer).compactionCount, 1);
+
+  const attached = [
+    claudePrompt(0, 'p1'),
+    linked(claudeResponse(1, { id: 'm1', input: 100, write1h: 4_000 }), 'u-p1'),
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+    JSON.stringify({
+      type: 'attachment',
+      uuid: 'att-1',
+      parentUuid: 'c-A',
+      timestamp: at(10),
+      attachment: { type: 'deferred_tools_delta', addedNames: [], removedNames: [] },
+    }),
+    JSON.stringify({
+      type: 'system',
+      subtype: 'local_command',
+      uuid: 'sys-1',
+      parentUuid: 'att-1',
+      timestamp: at(10),
+      content: '<local-command-stdout>Compacted</local-command-stdout>',
+    }),
+    linked(claudePrompt(11, 'p2'), 'sys-1'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 2_000 }), 'u-p2'),
+  ];
+  assert.equal(indexed(attached, claudeReducer).compactionCount, 1);
+});
+
+test('revoking a compaction from a full retained list leaves a state that loads again', () => {
+  const lines = [claudePrompt(0, 'p0'), linked(claudeResponse(1, { id: 'm0', input: 100, write1h: 4_000 }), 'u-p0')];
+  let parent = 'a-m0';
+  for (let n = 1; n <= RETAINED_COMPACTIONS; n++) {
+    const minute = n * 10;
+    lines.push(
+      ...claudeLinkedCompaction(minute, `k${n}`, parent),
+      linked(claudePrompt(minute + 1, `p${n}`), `c-k${n}`),
+      linked(claudeResponse(minute + 1, { id: `m${n}`, input: 2, write1h: 2_000 }), `u-p${n}`),
+    );
+    parent = `a-m${n}`;
+  }
+  const last = (RETAINED_COMPACTIONS + 1) * 10;
+  lines.push(...claudeLinkedCompaction(last, 'gone', parent), linked(claudePrompt(last + 1, 'back'), parent));
+  const record = indexed(lines, claudeReducer);
+
+  assert.equal(record.compactionCount, RETAINED_COMPACTIONS);
+  assert.deepEqual(
+    (record.parserState as ClaudeUsageReducerState).recentCompactions.map((item) => item.ordinal),
+    Array.from({ length: RETAINED_COMPACTIONS }, (_, index) => index + 1),
+  );
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [record]);
+  assert.equal(loadSpendLedger(storage, 'w').files.length, 1, 'the saved state survived its own validation');
+});
+
+test('a replayed compaction counts once, and a replayed abandoned compaction never counts', () => {
+  const opening = [claudePrompt(0, 'p1'), linked(claudeResponse(1, { id: 'm1', input: 100, write1h: 4_000 }), 'u-p1')];
+  const kept = [
+    ...opening,
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+    linked(claudePrompt(11, 'p2'), 'c-A'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 2_000 }), 'u-p2'),
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+  ];
+  assert.equal(indexed(kept, claudeReducer).compactionCount, 1);
+  const reducer = createClaudeUsageLineReducer();
+  assert.equal(kept.flatMap((line) => reducer.pushLine(line)).filter((event) => event.compactionEstimate).length, 1);
+
+  const abandoned = [
+    ...opening,
+    ...claudeLinkedCompaction(10, 'B', 'a-m1'),
+    linked(claudePrompt(11, 'p2'), 'a-m1'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 2_000 }), 'u-p2'),
+    ...claudeLinkedCompaction(10, 'B', 'a-m1'),
+  ];
+  assert.equal(indexed(abandoned, claudeReducer).compactionCount, 0);
+});
+
+const opening = () => [
+  claudePrompt(0, 'p1'),
+  linked(claudeResponse(1, { id: 'm1', input: 100, read: 40_000, write1h: 4_000 }), 'u-p1'),
+];
+
+const nextResponse = (minutes: number, id: string, parent: string) =>
+  linked(claudeResponse(minutes, { id, input: 2, write1h: 2_000 }), parent);
+
+test('a replayed record between a summary and the prompt after it never decides the compaction', () => {
+  const [prompt, answer] = opening();
+  const compaction = claudeLinkedCompaction(10, 'A', 'a-m1');
+  const replayedAnswer = [
+    prompt,
+    answer,
+    ...compaction,
+    answer,
+    linked(claudePrompt(11, 'p2'), 'c-A'),
+    nextResponse(11, 'm2', 'u-p2'),
+  ];
+  assert.equal(indexed(replayedAnswer, claudeReducer).compactionCount, 1, 'a replayed answer revoked the compaction');
+
+  const replayedPrompt = [
+    prompt,
+    answer,
+    ...compaction,
+    prompt,
+    linked(claudePrompt(11, 'p2'), 'a-m1'),
+    nextResponse(11, 'm2', 'u-p2'),
+  ];
+  assert.equal(indexed(replayedPrompt, claudeReducer).compactionCount, 0, 'a replayed prompt kept the compaction');
+
+  // The replayed answer is older than the retained ids, so only its request key shows it was read.
+  const early = [prompt, answer];
+  let parent = 'a-m1';
+  for (let n = 2; n <= 6; n++) {
+    early.push(linked(claudePrompt(n * 2, `p${n}`), parent), nextResponse(n * 2 + 1, `m${n}`, `u-p${n}`));
+    parent = `a-m${n}`;
+  }
+  early.push(
+    ...claudeLinkedCompaction(30, 'B', parent),
+    answer,
+    linked(claudePrompt(31, 'q'), parent),
+    nextResponse(31, 'mq', 'u-q'),
+  );
+  assert.equal(indexed(early, claudeReducer).compactionCount, 0, 'a replayed early answer kept the compaction');
+});
+
+test('a billed answer decides a compaction, and a synthetic answer does not', () => {
+  const compaction = [...opening(), ...claudeLinkedCompaction(10, 'A', 'a-m1')];
+  assert.equal(indexed([...compaction, nextResponse(11, 'm2', 'a-m1')], claudeReducer).compactionCount, 0);
+  assert.equal(indexed([...compaction, nextResponse(11, 'm2', 'c-A')], claudeReducer).compactionCount, 1);
+
+  const synthetic = linked(claudeResponse(10, { id: 'syn', model: '<synthetic>', input: 1 }), 'a-m1');
+  const lines = [...compaction, synthetic, linked(claudePrompt(11, 'p2'), 'c-A'), nextResponse(11, 'm2', 'u-p2')];
+  assert.equal(indexed(lines, claudeReducer).compactionCount, 1, 'a synthetic answer revoked the compaction');
+});
+
+// The earlier compaction stays counted. The later one froze the same parents, because no answer
+// or prompt sits between them, so a prompt that names a record from before both revokes it.
+test('two compactions before one deciding prompt keep the earlier one counted', () => {
+  const both = [...opening(), ...claudeLinkedCompaction(10, 'A', 'a-m1'), ...claudeLinkedCompaction(12, 'B', 'c-A')];
+  const left = indexed(
+    [...both, linked(claudePrompt(13, 'p2'), 'a-m1'), nextResponse(13, 'm2', 'u-p2')],
+    claudeReducer,
+  );
+  assert.equal(left.compactionCount, 1);
+  assert.deepEqual(
+    (left.parserState as ClaudeUsageReducerState).recentCompactions.map((item) => item.at),
+    [Date.parse(at(10))],
+  );
+  const kept = indexed([...both, linked(claudePrompt(13, 'p2'), 'c-B'), nextResponse(13, 'm2', 'u-p2')], claudeReducer);
+  assert.equal(kept.compactionCount, 2);
+});
+
+test('a summary that a prompt leaves before its boundary arrives still bills its request', () => {
+  const [boundary, summaryLine] = claudeLinkedCompaction(10, 'A', 'a-m1');
+  const folder = dir();
+  for (const [parent, count] of [
+    ['a-m1', 0],
+    ['c-A', 1],
+  ] as const) {
+    const lines = [
+      ...opening(),
+      summaryLine,
+      linked(claudePrompt(10, 'p2'), parent),
+      boundary,
+      nextResponse(11, 'm2', 'u-p2'),
+    ];
+    const reducer = createClaudeUsageLineReducer();
+    const estimates = lines.flatMap((line) => reducer.pushLine(line)).filter((event) => event.compactionEstimate);
+    assert.equal(reducer.compactionCount(), count);
+    assert.equal(estimates.length, 1, `the summary request left the totals when the prompt named ${parent}`);
+    const file = path.join(folder, `${parent}.jsonl`);
+    fs.writeFileSync(file, `${lines.join('\n')}\n`);
+    const own = readClaudeAgentSpend(file, [], false)
+      .models.flatMap((model) => model.usageParts ?? [])
+      .filter((part) => part.compactionEstimate);
+    assert.deepEqual(
+      own.map((part) => part.usage),
+      estimates.map((event) => event.usage),
+      'the own-spend read and the usage reducer price the summary request differently',
+    );
+  }
+});
+
+test('a slice that ends after a summary at full retention keeps every reached compaction fact', () => {
+  const lines = [claudePrompt(0, 'p0'), linked(claudeResponse(1, { id: 'm0', input: 100, write1h: 4_000 }), 'u-p0')];
+  let parent = 'a-m0';
+  for (let n = 1; n <= RETAINED_COMPACTIONS; n++) {
+    const minute = n * 10;
+    lines.push(
+      ...claudeLinkedCompaction(minute, `k${n}`, parent),
+      linked(claudePrompt(minute + 1, `p${n}`), `c-k${n}`),
+      nextResponse(minute + 1, `m${n}`, `u-p${n}`),
+    );
+    parent = `a-m${n}`;
+  }
+  const last = (RETAINED_COMPACTIONS + 1) * 10;
+  lines.push(...claudeLinkedCompaction(last, 'gone', parent));
+  const firstBytes = Buffer.byteLength(`${lines.join('\n')}\n`);
+  lines.push(linked(claudePrompt(last + 1, 'back'), parent), nextResponse(last + 1, 'mb', 'u-back'));
+  const whole = indexed(lines, claudeReducer);
+  const folder = dir();
+  const file = path.join(folder, 'source.jsonl');
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+
+  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes: firstBytes }).record;
+  assert.equal(first.offset, firstBytes, 'the first slice ended after the last summary');
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [first]);
+  const [saved] = loadSpendLedger(storage, 'w').files;
+  assert.ok(saved, 'the saved slice survived its own validation');
+  const rest = indexSpendFile(saved, file, 'w', claudeReducer, Date.now() + 1, { maxBytes: 1 << 20 }).record;
+
+  assert.equal(rest.compactionCount, RETAINED_COMPACTIONS);
+  assert.equal(whole.cacheExpiry!.compactions.length, RETAINED_COMPACTIONS);
+  assert.deepEqual(rest.cacheExpiry, whole.cacheExpiry);
 });
 
 test('a compaction with no usable clock never shifts another compaction time onto itself', () => {

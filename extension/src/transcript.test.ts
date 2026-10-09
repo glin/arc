@@ -9670,11 +9670,13 @@ function manualCompactRecords(reverse = false): object[] {
     uuid: 'compact-summary',
   };
   const [caveat, wrapped] = localCommand('/compact', '', 2.003, 'compact-wrapped', { stdout: 'Compacted' });
+  // The caveat names the last record before the boundary, and the wrapped command names the
+  // caveat. A link from the wrapped command back past the boundary would revoke the compaction.
   return [
     userPrompt('/compact', 2, { uuid: 'compact-opening' }),
     ...(reverse ? [summary, boundary] : [boundary, summary]),
-    { ...caveat, parentUuid: 'compact-summary' },
-    wrapped,
+    { ...caveat, uuid: 'compact-caveat', parentUuid: 'compact-opening' },
+    { ...wrapped, parentUuid: 'compact-caveat' },
     userPrompt('<local-command-stdout>Compacted</local-command-stdout>', 14.099, { parentUuid: 'compact-wrapped' }),
   ];
 }

@@ -20,7 +20,13 @@ import type {
   UsageCounts,
 } from './projectspend';
 import type { ReducerCompaction } from './transcript';
-import { RETAINED_CACHE_EXPIRY_RETURNS, RETAINED_COMPACTIONS, RETAINED_REQUESTS } from './parserstate';
+import {
+  RETAINED_CACHE_EXPIRY_RETURNS,
+  RETAINED_COMPACTION_PARENTS,
+  RETAINED_COMPACTION_RECORDS,
+  RETAINED_COMPACTIONS,
+  RETAINED_REQUESTS,
+} from './parserstate';
 import type {
   ClaudePreviousTurn,
   ClaudeUsageReducerState,
@@ -42,6 +48,9 @@ const CLAUDE_STATE_KEYS = {
   pendingCompactionTrigger: true,
   pendingCompactionSize: true,
   unsizedCompaction: true,
+  compactionParents: true,
+  pendingCompaction: true,
+  compactionRecords: true,
   lastRequest: true,
   firstRequestCacheRead: true,
   toolListNames: true,
@@ -272,6 +281,26 @@ function unsizedCompaction(value: unknown): boolean {
   );
 }
 
+// Saved Claude record ids are at most `limit` nonempty strings.
+function claudeRecordIds(value: unknown, limit: number): boolean {
+  return value === undefined || (Array.isArray(value) && value.length <= limit && value.every(nonEmptyText));
+}
+
+// A pending compaction names the newest counted compaction, or none while only its boundary is read.
+function pendingCompaction(value: unknown, compactionCount: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (record(value) &&
+      Array.isArray(value.parents) &&
+      claudeRecordIds(value.parents, RETAINED_COMPACTION_PARENTS) &&
+      (value.ordinal === null ||
+        (nonNegativeInteger(value.ordinal) && value.ordinal >= 1 && value.ordinal === compactionCount)) &&
+      typeof value.boundary === 'boolean' &&
+      (value.evicted === null || reducerCompactions([value.evicted], undefined)))
+  );
+}
+
 function lastClaudeRequest(value: unknown): boolean {
   return (
     value === undefined ||
@@ -315,6 +344,9 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
     !(value.pendingCompactionTrigger === undefined || nullableText(value.pendingCompactionTrigger)) ||
     !compactionSize(value.pendingCompactionSize) ||
     !unsizedCompaction(value.unsizedCompaction) ||
+    !claudeRecordIds(value.compactionParents, RETAINED_COMPACTION_PARENTS) ||
+    !claudeRecordIds(value.compactionRecords, RETAINED_COMPACTION_RECORDS) ||
+    !pendingCompaction(value.pendingCompaction, value.compactionCount) ||
     !lastClaudeRequest(value.lastRequest) ||
     !(
       value.firstRequestCacheRead === undefined ||
@@ -888,7 +920,16 @@ function cacheExpiryLedger(value: unknown): CacheExpiryLedger | null {
   if (value.carry !== null && !carry) {
     return null;
   }
+  const displaced = value.displacedCompactions;
+  if (displaced !== undefined && (!Array.isArray(displaced) || displaced.length > RETAINED_COMPACTIONS)) {
+    return null;
+  }
+  const displacedCompactions = displaced?.map(compactionFact);
+  if (displacedCompactions && !displacedCompactions.every((item): item is CompactionFact => item !== null)) {
+    return null;
+  }
   return {
+    ...(displacedCompactions ? { displacedCompactions } : {}),
     facts,
     compactions,
     carry,
