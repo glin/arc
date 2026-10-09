@@ -2737,8 +2737,10 @@ test('updated summary content owns one safe action path and one comment paint', 
     return;
   }
   const page = await browser.newPage();
+  const failures: string[] = [];
+  page.on('pageerror', (e) => failures.push(String(e)));
   try {
-    await page.setContent(pageHtml());
+    await page.setContent(themed(pageHtml()));
     const payload = renderPayload() as Payload;
     const card = payload.cards[0];
     card.summaryHtml = '<p>review target <a data-link="first.txt">first</a></p>';
@@ -2784,6 +2786,9 @@ test('updated summary content owns one safe action path and one comment paint', 
       key: card.key,
       preventDefaultContextMenuItems: true,
     });
+    await page.locator(`[data-key=${JSON.stringify(card.key)}] a[data-link]`).click();
+    assert.deepEqual(await page.evaluate(`window.__posted`), [{ type: 'openLink', href: 'second.txt', beside: false }]);
+    await page.evaluate(`window.__posted.length = 0`);
     await page.locator(`[data-key=${JSON.stringify(card.key)}] a[data-link] span`).click({ modifiers: ['Control'] });
     await page.locator(`[data-key=${JSON.stringify(card.key)}] button[data-visualization] span`).click();
     await page.locator(`[data-key=${JSON.stringify(card.key)}] button[data-image] span`).click();
@@ -2795,6 +2800,7 @@ test('updated summary content owns one safe action path and one comment paint', 
       { type: 'openImage', path: 'shot.png', beside: false },
       { type: 'copy', text: 'const value = 2;' },
     ]);
+    assert.deepEqual(failures, [], 'the panel threw while replacing a summary link handler');
   } finally {
     await browser.close();
   }

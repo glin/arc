@@ -3076,49 +3076,6 @@ test('card disclosure controls own unique targets inside their card', { timeout:
   }
 });
 
-test('a summary update replaces its delegated link handler', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (e) => failures.push(String(e)));
-    await page.setContent(pageHtml());
-    const payload = renderPayload() as {
-      cards: Array<Record<string, unknown> & { key: string; sessionId: string }>;
-    };
-    const card = payload.cards[0];
-    card.summaryHtml = '<p><a data-link="first.txt">first</a></p>';
-    await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
-    await page.evaluate(SETTLED);
-    await page.click('#list .turn .head');
-    const updated = { ...card, summaryHtml: '<p><a data-link="second.txt">second</a></p>' };
-    await page.evaluate(
-      `window.postMessage(${JSON.stringify({
-        type: 'activity',
-        session: card.sessionId,
-        card: updated,
-      })}, '*')`,
-    );
-    await page.evaluate(SETTLED);
-    await page.click('#list .turn .summary a[data-link]');
-    const messages = (await page.evaluate(
-      `window.__posted.filter((message) => message.type === 'openLink')`,
-    )) as Array<{ href: string }>;
-    assert.deepEqual(
-      messages.map((message) => message.href),
-      ['second.txt'],
-      'one click after a summary update posted more than one openLink message',
-    );
-    assert.deepEqual(failures, [], 'the panel threw while replacing a summary link handler');
-  } finally {
-    await browser.close();
-  }
-});
-
 test('a card with no body is not exposed as an empty disclosure', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

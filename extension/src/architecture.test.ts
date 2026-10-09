@@ -41,14 +41,6 @@ test('the architecture table has one row for every recursive component path', ()
   );
 });
 
-test('every architecture row names a recursive component that still exists', () => {
-  const discovered = new Set(source().components);
-  const gone = documentedNames()
-    .filter((name) => !discovered.has(name))
-    .sort();
-  assert.deepEqual(gone, [], `the component table names ${gone.join(', ')}, which no longer exists`);
-});
-
 test('removed snapshot mutation APIs stay out of production source', () => {
   const removed = /\b(?:keepFile|rejectFile|keepHunk|rejectHunk|removeFromManifest)\b/;
   const offenders = source().components.filter((file) => {

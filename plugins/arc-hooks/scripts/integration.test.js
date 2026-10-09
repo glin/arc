@@ -17,29 +17,6 @@ function snapshotRoot(home) {
   return path.join(home, 'snapshots');
 }
 
-test('pretooluse-snapshot records a baseline from hook JSON', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-'));
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'wk-'));
-  const file = path.join(work, 'a.txt');
-  fs.writeFileSync(file, 'BEFORE');
-
-  runHook(
-    'pretooluse-snapshot',
-    {
-      session_id: 'abc',
-      cwd: work,
-      tool_name: 'Edit',
-      tool_input: { file_path: file },
-    },
-    root,
-  );
-
-  const snapshots = snapshotRoot(root);
-  const idx = JSON.parse(fs.readFileSync(path.join(snapshots, 'abc', 'index.json'), 'utf8'));
-  const key = Object.keys(idx.files)[0];
-  assert.equal(fs.readFileSync(path.join(snapshots, 'abc', 'baseline', key), 'utf8'), 'BEFORE');
-});
-
 test('pretooluse-snapshot never throws on malformed input', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-'));
   assert.doesNotThrow(() =>
@@ -86,6 +63,10 @@ test('stop-manifest writes a manifest after edits', () => {
     },
     root,
   );
+  const snapshots = snapshotRoot(root);
+  const idx = JSON.parse(fs.readFileSync(path.join(snapshots, 's9', 'index.json'), 'utf8'));
+  const key = Object.keys(idx.files)[0];
+  assert.equal(fs.readFileSync(path.join(snapshots, 's9', 'baseline', key), 'utf8'), 'BEFORE');
   fs.writeFileSync(file, 'AFTER'); // simulate the edit
 
   runHook('stop-manifest', { session_id: 's9', cwd: work }, root);
