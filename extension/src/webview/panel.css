@@ -4305,6 +4305,9 @@ button.cctx:hover {
 .sbbar.ctx-nearly-full i {
   background: var(--full);
 }
+.sbgroup > .sbreset {
+  font-size: var(--t-small);
+}
 .sbreset {
   margin-left: auto;
   white-space: nowrap;
