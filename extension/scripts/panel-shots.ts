@@ -912,9 +912,14 @@ async function chooseRailDensity(page: Page, density: RailDensity): Promise<void
   await page.evaluate(SETTLED);
 }
 
-export async function shoot(page: Page, shot: Shot, outDir: string): Promise<void> {
+export async function shoot(
+  page: Page,
+  shot: Shot,
+  outDir: string,
+  writer: typeof writeLosslessWebp = writeLosslessWebp,
+): Promise<void> {
   const file = path.join(outDir, `${shot.name}.webp`);
-  fs.rmSync(file, { force: true });
+  if (writer === writeLosslessWebp) fs.rmSync(file, { force: true });
   // Clear focus from the preceding capture before applying this state's actions.
   await page.evaluate(`document.activeElement instanceof HTMLElement && document.activeElement.blur()`);
   const escapes = shot.escape === true ? 1 : shot.escape || 0;
@@ -1319,7 +1324,7 @@ export async function shoot(page: Page, shot: Shot, outDir: string): Promise<voi
   }
   const viewport = page.viewportSize();
   const element = shot.clip ? await page.locator(shot.clip).first().boundingBox() : null;
-  await writeLosslessWebp(page, file, {
+  await writer(page, file, {
     clip: element
       ? {
           x: element.x,

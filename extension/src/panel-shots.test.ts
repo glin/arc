@@ -366,6 +366,33 @@ test('a screenshot stays clear of the browser scrollbar edge and lands as a loss
   fs.rmdirSync(directory);
 });
 
+test('an injected screenshot writer receives the target intact and bypasses the default writer', async () => {
+  const directory = tempDir('panel-shot-sink-');
+  const file = path.join(directory, 'plain.webp');
+  fs.writeFileSync(file, 'existing evidence');
+  const page = {
+    evaluate: async () => undefined,
+    waitForTimeout: async () => undefined,
+    mouse: { move: async () => undefined },
+    viewportSize: () => ({ width: 300, height: 900 }),
+    screenshot: async () => { throw new Error('default writer reached the screenshot'); },
+  } as unknown as Page;
+  const calls: unknown[] = [];
+  try {
+    await shoot(page, { name: 'plain' }, directory, async (target, destination, options) => {
+      assert.equal(fs.readFileSync(destination, 'utf8'), 'existing evidence');
+      calls.push({ target, destination, options });
+    });
+    assert.deepEqual(calls, [{ target: page, destination: file, options: { clip: { x: 0, y: 0, width: 287, height: 900 } } }]);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'existing evidence');
+    await assert.rejects(() => shoot(page, { name: 'plain' }, directory), /default writer reached the screenshot/);
+    assert.throws(() => assert.equal(fs.existsSync(file), true), assert.AssertionError);
+  } finally {
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+    fs.rmdirSync(directory);
+  }
+});
+
 // The draft first-project shot draws a session that has answered no prompt, so it drops that
 // session's entry from the keyed figures. One process draws the whole shot list twice, once
 // per theme kind, and every shot after this one reads the same fixture. A drop that reached
