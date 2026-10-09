@@ -23,6 +23,30 @@ The source installer builds and installs the editor extension from local or temp
 
 The panel shots and their test write WebP files with the ImageMagick 7 `magick` command. Put `magick` on the `PATH` before running the full test suite.
 
+## Panel screenshots
+
+The ordinary command captures the full state matrix in both default themes under `extension/shots`:
+
+```bash
+npm --prefix extension run shots
+```
+
+One positional destination retains the full matrix outside plan directories:
+
+```bash
+npm --prefix extension run shots -- /path/to/shots
+```
+
+Positional destinations reject adjacent `.claude/plans` components regardless of letter case on Windows, macOS, and Linux. Existing redirected or unreadable ancestors also refuse before browser launch or file writes. These checks cover the command's destination admission, without a filesystem sandbox or protection against concurrent path replacement.
+
+Explicit owner options select bounded capture through the checkout-local adapter:
+
+```bash
+npm --prefix extension run shots -- --owner PLAN --run RUN --reservation BYTES --shots wide,narrow
+```
+
+Owner, run, and reservation options are required together. Omit `--shots` for `wide,narrow`. Unknown, duplicate, missing, or mixed positional options fail. The adapter requires an existing In progress owner and a fresh run identifier. Select at most eight unique names from the existing shot list. Each selected state produces dark and light images. The byte reservation must exceed 8192 and stay within 10000000, including terminal receipt headroom. Whole-owner budgets and metadata reservations also apply. The command awaits terminal completion and preserves partial images on failure or cancellation. A checkout without the private adapter refuses owner captures without starting the legacy matrix. Default and safe positional captures need no private adapter.
+
 ## README screenshots
 
 From `extension/`, run the README capture command:

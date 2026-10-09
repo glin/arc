@@ -9,6 +9,7 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { estimateCodexContext } from '../src/codexcontext.ts';
 import { normalizeContext } from '../src/domain/context-detail.ts';
 import { codexContextRecords } from '../src/turnfixtures.ts';
@@ -1376,8 +1377,84 @@ function shotFor(shot: Shot, kind: 'dark' | 'light'): Shot {
   return kind === 'light' ? { ...shot, name: `${shot.name}-light` } : shot;
 }
 
-async function main(): Promise<void> {
-  const outDir = process.argv[2] ? path.resolve(process.argv[2]) : path.join(__dirname, '..', 'shots');
+// Inspect ancestors before launch without opening redirected directories.
+export function panelShotDestination(
+  destination: string,
+  cwd = process.cwd(),
+  platform: NodeJS.Platform = process.platform,
+  inspect: (file: string) => Pick<fs.Stats, 'isSymbolicLink' | 'isDirectory'> = fs.lstatSync,
+): string {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const resolved = paths.resolve(cwd, destination);
+  const root = paths.parse(resolved).root;
+  const segments = resolved.slice(root.length).split(paths.sep);
+  if (
+    segments.some(
+      (segment, index) => segment.toLowerCase() === '.claude' && segments[index + 1]?.toLowerCase() === 'plans',
+    )
+  ) {
+    throw new Error('Plan screenshots require --owner PLAN --run RUN --reservation BYTES [--shots NAMES]');
+  }
+  let ancestor = root;
+  for (const segment of ['', ...segments]) {
+    ancestor = paths.join(ancestor, segment);
+    try {
+      const stat = inspect(ancestor);
+      if (stat.isSymbolicLink()) throw new Error(`Screenshot destination contains a redirect: ${ancestor}`);
+      if (!stat.isDirectory()) throw new Error(`Screenshot destination is not a directory: ${ancestor}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw error;
+    }
+  }
+  return resolved;
+}
+
+type BoundedCapture = (argv: string[]) => Promise<void>;
+
+export async function loadBoundedPanelCapture(
+  file = path.join(__dirname, '../../.claude/plans/2026-10-07-plan-artifact-prevention/panel_capture.mjs'),
+): Promise<BoundedCapture> {
+  if (!fs.existsSync(file)) throw new Error(`Bounded panel capture adapter is unavailable: ${file}`);
+  const adapter = await import(pathToFileURL(file).href);
+  if (typeof adapter.capturePanel !== 'function')
+    throw new Error(`Bounded panel capture entry point is unavailable: ${file}`);
+  return adapter.capturePanel;
+}
+
+export async function runPanelShots(
+  argv: string[],
+  loadCapture: () => Promise<BoundedCapture> = loadBoundedPanelCapture,
+  captureLegacy: (outDir: string) => Promise<void> = capturePanelMatrix,
+): Promise<void> {
+  if (argv.some((value) => value.startsWith('-'))) {
+    const flags = new Set<string>();
+    for (let index = 0; index < argv.length; index += 2) {
+      const flag = argv[index];
+      const value = argv[index + 1];
+      if (
+        !['--owner', '--run', '--reservation', '--shots'].includes(flag) ||
+        flags.has(flag) ||
+        !value ||
+        value.startsWith('--')
+      ) {
+        throw new Error('Use --owner PLAN --run RUN --reservation BYTES [--shots NAMES]');
+      }
+      flags.add(flag);
+    }
+    if (!['--owner', '--run', '--reservation'].every((flag) => flags.has(flag))) {
+      throw new Error('Owner, run and byte reservation are required');
+    }
+    const capture = await loadCapture();
+    await capture(argv);
+    return;
+  }
+  if (argv.length > 1) throw new Error('Use one screenshot directory or complete plan capture options');
+  const outDir = panelShotDestination(argv[0] ?? path.join(__dirname, '..', 'shots'));
+  await captureLegacy(outDir);
+}
+
+async function capturePanelMatrix(outDir: string): Promise<void> {
   const browser = await browserOrNone();
   if (!browser) {
     console.log('No Edge, Chrome or bundled Chromium on this machine, so no pictures were written.');
@@ -1438,8 +1515,8 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
+  runPanelShots(process.argv.slice(2)).catch((error) => {
     console.error(error);
-    process.exitCode = 1;
+    if (process.exitCode !== 130) process.exitCode = 1;
   });
 }

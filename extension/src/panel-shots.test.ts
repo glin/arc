@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import type { Page } from 'playwright-core';
-import { firstProjectPayload, shoot } from '../scripts/panel-shots.ts';
+import { firstProjectPayload, shoot, runPanelShots, panelShotDestination, loadBoundedPanelCapture } from '../scripts/panel-shots.ts';
 import { RAIL_STATS, renderPayload } from './panelfixture.ts';
 import { missingUsageLimits, publish } from '../scripts/readme-shots.ts';
 import { DEMO_LABELS, DEMO_SESSION_IDS, README_SCENES, demoPayload, readmePayload } from '../scripts/readme-fixture.ts';
@@ -27,6 +27,91 @@ import { DEMO_DEFAULT_EXPIRY, DEMO_TURNS, demoContextSample } from '../scripts/r
 import { validContextDetail } from './domain/context-detail.ts';
 import { parseHostToPanel, parsePanelToHost } from './webview/protocol.ts';
 import type { TurnComment } from './turncomments.ts';
+
+test('ordinary shots command awaits the bounded owner capture and preserves its failure', async () => {
+  const argv = ['--owner', '2026-10-07-example', '--run', 'one', '--reservation', '1000000', '--shots', 'wide'];
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const capture = vi.fn<(argv: string[]) => Promise<void>>(async () => { await pending; });
+  const legacy = vi.fn<(directory: string) => Promise<void>>(async () => {});
+  let finished = false;
+  const running = runPanelShots(argv, async () => capture, legacy).then(() => { finished = true; });
+  try {
+    await vi.waitFor(() => assert.deepEqual(capture.mock.calls, [[argv]]));
+    assert.equal(finished, false);
+    assert.equal(legacy.mock.calls.length, 0);
+  } finally {
+    release();
+    await running;
+  }
+  const failure = new Error('bounded finish failed');
+  await assert.rejects(runPanelShots(argv, async () => async () => { throw failure; }, legacy), (error) => error === failure);
+  assert.equal(legacy.mock.calls.length, 0);
+});
+
+test('ordinary shots command rejects incomplete options and preserves safe legacy destinations', async () => {
+  const load = vi.fn<() => Promise<(argv: string[]) => Promise<void>>>(async () => async () => {});
+  const legacy = vi.fn<(directory: string) => Promise<void>>(async () => {});
+  for (const argv of [
+    ['--owner', 'example'], ['--owner', '--run', 'one', '--reservation', '1000000'],
+    ['--owner', 'example', '--run', 'one', '--reservation'],
+    ['--owner', 'example', '--run', 'one', '--reservation', '1000000', '--owner', 'other'],
+    ['--unknown', 'value'], ['safe', 'extra'], ['--shots', 'wide'],
+  ]) await assert.rejects(runPanelShots(argv, load, legacy));
+  assert.equal(load.mock.calls.length, 0);
+  assert.equal(legacy.mock.calls.length, 0);
+  const safe = path.join(tempDir('shots-command-'), 'safe');
+  await runPanelShots([safe], load, legacy);
+  await runPanelShots([], load, legacy);
+  assert.deepEqual(legacy.mock.calls, [[safe], [path.resolve(__dirname, '../shots')]]);
+  assert.equal(fs.existsSync(safe), false);
+  assert.equal(load.mock.calls.length, 0);
+});
+
+test('ordinary shots command refuses direct plans before capture on every platform', async () => {
+  const directory = () => ({ isDirectory: () => true, isSymbolicLink: () => false });
+  for (const platform of ['win32', 'darwin', 'linux'] as const) {
+    const cwd = platform === 'win32' ? 'C:\\Arc' : '/arc';
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const inspect = vi.fn<(file: string) => ReturnType<typeof directory>>(directory);
+    for (const destination of ['.claude/plans', '.CLAUDE/PlAnS/owner/run']) {
+      assert.throws(() => panelShotDestination(destination, cwd, platform, inspect), /Plan screenshots require/);
+    }
+    assert.equal(inspect.mock.calls.length, 0);
+    assert.equal(panelShotDestination('safe/shots', cwd, platform, inspect), paths.resolve(cwd, 'safe/shots'));
+    if (platform !== 'win32') {
+      assert.equal(panelShotDestination('.claude\\plans', cwd, platform, inspect), '/arc/.claude\\plans');
+    }
+  }
+  const legacy = vi.fn<(directory: string) => Promise<void>>(async () => {});
+  const load = vi.fn<() => Promise<(argv: string[]) => Promise<void>>>(async () => async () => {});
+  const destination = path.join(tempDir('shots-plan-'), '.claude', 'plans', 'owner', 'run');
+  await assert.rejects(runPanelShots([destination], load, legacy), /Plan screenshots require/);
+  assert.equal(legacy.mock.calls.length, 0);
+  assert.equal(load.mock.calls.length, 0);
+  assert.equal(fs.existsSync(destination), false);
+});
+
+test('ordinary shots command stops ancestor inspection at a redirect or unreadable path', () => {
+  for (const platform of ['win32', 'darwin', 'linux'] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const cwd = platform === 'win32' ? 'C:\\Arc' : '/arc';
+    const redirect = paths.join(cwd, 'linked');
+    const inspect = vi.fn<(file: string) => Pick<fs.Stats, 'isDirectory' | 'isSymbolicLink'>>((file: string) => ({ isDirectory: () => true, isSymbolicLink: () => file === redirect }));
+    assert.throws(() => panelShotDestination('linked/unopened/shots', cwd, platform, inspect), /contains a redirect/);
+    assert.equal(inspect.mock.calls.at(-1)![0], redirect);
+    assert.ok(inspect.mock.calls.every(([file]) => !file.includes('unopened')));
+    assert.throws(() => panelShotDestination('safe', cwd, platform, () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }), /denied/);
+  }
+});
+
+test('ordinary shots command fails closed without its adapter', async () => {
+  const argv = ['--owner', '2026-10-07-example', '--run', 'one', '--reservation', '1000000'];
+  const legacy = vi.fn<(directory: string) => Promise<void>>(async () => {});
+  const missing = path.join(tempDir('shots-adapter-'), 'missing.mjs');
+  await assert.rejects(runPanelShots(argv, () => loadBoundedPanelCapture(missing), legacy), /adapter is unavailable/);
+  assert.equal(legacy.mock.calls.length, 0);
+});
 
 test('README capture keeps the previous complete image set when a scene is missing', () => {
   const staged = tempDir('readme-staged-');
