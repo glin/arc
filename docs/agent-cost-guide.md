@@ -168,15 +168,15 @@ A relevant request before expiry can refresh an eligible cache entry. That reque
 
 A Claude Code compaction request reads the whole history once to write its summary. With a warm cache, it reads the history at the cache-read rate. With an expired cache, it sends the history as uncached input at the base input rate. It writes only the shared prefix of system instructions and tools back to the cache, because the summary replaces the history.
 
-The cold next-turn starting price writes the whole history to the cache at the cache-write rate. A cold compaction therefore costs less than the cold starting price that the prompt box shows before it.
+The cold next-turn starting price writes the whole history to the cache at the cache-write rate. When the history is much larger than the shared prefix and the summary, a cold compaction costs less than the cold starting price that the prompt box shows before it. For a small history, the summary output can cost more than the write it avoids.
 
 For example, take Opus 5.5 at 300,000 tokens with a one-hour cache. Input costs $4 per million tokens, a one-hour cache write costs $8 per million, and output costs $20 per million.
 
 - Continuing writes all 300,000 tokens to the cache for about $2.40.
 - Compacting sends about 281,000 tokens as uncached input for about $1.12. It writes a prefix of about 19,000 tokens for about $0.10 to $0.15, depending on the write lifetime. A 10,000-token summary adds about $0.20.
-- The first turn after the compaction writes about 30,000 tokens for about $0.24.
+- The first turn after the compaction starts from about 30,000 tokens. It reads the 19,000-token prefix that the compaction wrote and writes about 11,000 tokens, for about $0.09.
 
-Compacting and continuing costs about $1.70 against $2.40, and every later turn reads 30,000 tokens instead of 300,000. The compaction still pays for one cold pass over the history, and the summary keeps less detail than the history it replaces.
+Compacting and continuing costs about $1.55 against $2.40, and the next turns start from about 30,000 tokens instead of 300,000. That context grows again as the work continues. The compaction still pays for one cold pass over the history, and the summary keeps less detail than the history it replaces.
 
 ## Send messages while the agent works
 

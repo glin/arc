@@ -22,7 +22,7 @@ A relevant request can refresh an eligible prompt cache, but it incurs its own t
 | --- | --- |
 | The next step needs the current details | Continue in this session. |
 | The same task continues from a short summary | Compact at a completed step. |
-| The cache expired and a short summary is enough | Compact before the next prompt. A cold compaction costs less than the cold next turn, as [Compact after the cache expires](agent-cost-guide.md#compact-after-the-cache-expires) explains. |
+| The cache expired, the history is large, and a short summary is enough | Compact before the next prompt. [Compact after the cache expires](agent-cost-guide.md#compact-after-the-cache-expires) explains when that costs less than the cold next turn. |
 | A new task or phase needs little of this context | Write a handoff and start a fresh session. |
 | Context is nearly full | Finish the current step, then compact or hand off. |
 
