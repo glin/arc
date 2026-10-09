@@ -16,7 +16,8 @@ import {
   sweepOldSessions,
 } from './store';
 import { SCHEME } from './uris';
-import { relativePath, nativePath, linkTarget, resolveLink } from './transcript';
+import { relativePath, nativePath, linkTarget, resolveLink, projectsRoot, sessionFileFor } from './transcript';
+import { sessionRenameTitle } from './sessionrename';
 import { registerPanel, PanelProvider } from './panelhost';
 import { readSetting } from './config';
 import { STORED_STATE_KEYS } from './identity';
@@ -155,7 +156,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Register the panel that displays recorded turns.
   const panel = registerPanel(context, root, workspaceCache, activationAt);
-  channel?.setRequestHandler((request) => panel.readSessionRequest(request));
+  channel?.setRequestHandler((request) => panel.handleSessionRequest(request));
   panel.setWindowStateHandler((state) => {
     void channel?.update(state).catch(() => {
       void channel?.dispose();
@@ -557,8 +558,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     panel.setPicks(settingBook());
   };
-  panel.onSessionSettingsAdopted = (session, settings) => {
-    void persistSessionSettings(session, settings);
+  panel.onSessionSettingsAdopted = async (session, settings) => {
+    await persistSessionSettings(session, settings);
     publishPicks();
   };
   const setupProjects = new SetupProjects(nodeGitRunner());
@@ -1295,13 +1296,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const acceptedDrafts = new Set<string>();
   panel.onSendDraftPrompt = async (draft, prompt, onSubmitted) => {
     const acceptedProject = setupProjects.resolve(draft.cwd);
+    let accepted: { session: string; turnId: number } | null = null;
     try {
       const liveSession = await startFreshSession(draft);
       validateResolvedPromptAssets(prompt.assets);
       const turnId = await withStartedSessionActivity(
         liveSession,
         async (live) => {
-          const turnId = await live.prompt(prompt, (turnId) => onSubmitted?.(live.state().sessionId ?? '', turnId));
+          const turnId = await live.prompt(prompt, (turnId) => {
+            const session = live.state().sessionId;
+            onSubmitted?.(session ?? '', turnId);
+          });
+          const session = live.state().sessionId;
+          if (session) accepted = { session, turnId };
           acceptedDrafts.add(live.key);
           return turnId;
         },
@@ -1314,12 +1321,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!sessionId) {
         return failedPromptDelivery(draft.profile.agent, new Error('the agent did not name its new session'));
       }
+      accepted = { session: sessionId, turnId };
       const project = await acceptedProject;
       const entry = await setupStore.accept(project, draft.profile);
       if (project === panel.setupProject) panel.setRecentProfiles(entry.recents);
       void panel.refresh();
       return { delivered: true, reason: '', session: sessionId, turnId };
     } catch (error) {
+      if (accepted)
+        return {
+          delivered: true,
+          reason: `The session accepted its prompt, but its setup was not saved. ${(error as Error).message}`,
+          ...accepted,
+        };
       void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
       return failedPromptDelivery(draft.profile.agent, error);
     }
@@ -1524,6 +1538,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         });
       },
     });
+  panel.onRenameStartedSession = async (agent, sessionId, cwd, rawTitle) => {
+    const title = sessionRenameTitle(rawTitle);
+    if (!title) throw new Error('Enter a session name.');
+    await renameAgentSession(host, {
+      agent,
+      sessionId,
+      title,
+      file: '',
+      initial: true,
+      sourceFile: () => sessionFileFor(projectsRoot(), [cwd], sessionId) ?? '',
+      idlePlan: () => {
+        throw new Error('The new session is no longer connected.');
+      },
+    });
+  };
   const withStartedSessionActivity = async <T>(
     session: AgentSession,
     work: (session: AgentSession) => Promise<T>,

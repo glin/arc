@@ -2924,6 +2924,49 @@ export function resolveLink(target: string, folders: string[], exists: (p: strin
   return joined.find(exists) ?? joined[0] ?? null;
 }
 
+// Resolve one accepted Claude session without reading other transcripts.
+export function sessionFileFor(root: string, folders: string[], sessionId: string): string | null {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(sessionId) || !folders.length) return null;
+  let dirs: string[];
+  try {
+    dirs = fs.readdirSync(root);
+  } catch {
+    return null;
+  }
+  const slugs = folders.map((folder) => projectSlug(folder).toLowerCase());
+  let found: string | null = null;
+  for (const dir of dirs) {
+    const name = dir.toLowerCase();
+    if (!slugs.some((slug) => projectDirectoryMatches(name, slug))) continue;
+    const file = path.join(root, dir, `${sessionId}.jsonl`);
+    try {
+      if (!fs.statSync(file).isFile()) continue;
+    } catch {
+      continue;
+    }
+    const cwd = readSessionCwd(file);
+    if (cwd ? !isInside(cwd, folders) : !slugs.includes(name)) continue;
+    if (found) return null;
+    found = file;
+  }
+  return found;
+}
+
+// Initial Claude names also persist as a complete custom-title in the accepted transcript.
+export function readInitialCustomTitle(sessionFile: string, sessionId: string): string | null {
+  for (const line of tailLines(sessionFile, 16 * 1024).reverse()) {
+    if (!line.includes('"custom-title"')) continue;
+    try {
+      const record = JSON.parse(line) as { type?: unknown; sessionId?: unknown; customTitle?: unknown };
+      if (record.type === 'custom-title' && record.sessionId === sessionId)
+        return typeof record.customTitle === 'string' ? record.customTitle : null;
+    } catch {
+      /* skip incomplete lines */
+    }
+  }
+  return null;
+}
+
 export function sessionFilesFor(
   root: string,
   folders: string[],

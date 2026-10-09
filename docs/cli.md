@@ -2,7 +2,7 @@
 
 The Arc CLI is experimental. npm publication is deferred.
 
-The Arc CLI reports session cost from disk, renders Claude Code status-line input, and reads running Arc windows and scoped sessions through local channels.
+The Arc CLI reports session cost from disk, renders Claude Code status-line input, and manages scoped sessions through running Arc windows.
 
 `cost` reads a Claude transcript or Codex rollout and its discovered children. `statusline` reads one Claude Code JSON object from stdin.
 
@@ -54,6 +54,32 @@ Both commands print JSON. `--window` selects the window explicitly and takes pre
 `sessions` returns `version`, requester attribution, session rows, `complete`, and explanatory `notes`. Rows contain `id`, `provider`, `name`, `setup`, reader labels with their source, `pinned`, `archived`, `runStatus`, `attention`, `lastActivity`, `parent`, `agentRun`, and `facts`. Setup reports recorded model and effort where accepted facts supply them. Missing values remain `null`. `facts` distinguishes current, stale, and unparsed metadata. Parent relations identify reader-started, dispatched, or subagent relationships. Attention uses `input`, `unread`, `running`, `idle`, and `unknown`. Hidden panels report unknown live attention. Requester attribution names this request and establishes no saved session owner.
 
 Listings stop at 128 rows or 48 KiB of output. An incomplete result names discovery or response limits. `session` defaults to five newest turns and accepts one through twenty. Its independent read allows at most 512 KiB, including source-directory checks and Codex opening reads. Open Arc to establish an unavailable session catalog before retrying. Output stops below 48 KiB and names excluded turns. Large turns that exceed the output allowance are excluded. A response exceeding the channel's full reply allowance fails explicitly. `partial` identifies bounded history, and `state` identifies current, stale, or unparsed reads. Stale reads return no turns. An unparsed read does not establish an empty session. Turn fields include prompt, response summary, recorded model and effort, timestamps, and completion state. These reads never mark turns read.
+
+## Session management
+
+```text
+arc setups [--window ID] [--json]
+arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]
+arc label add|remove ID --label NAME [--dry-run] [--window ID] [--request-id ID]
+arc pin|unpin|archive|unarchive ID [--dry-run] [--window ID] [--request-id ID]
+arc archive ID --force [--window ID] [--request-id ID]
+```
+
+`setups` returns the runtime catalog, permissions, and current, pinned, and recent setup keys. Use a returned key or explicit values. Omitted model, effort, and permissions retain provider defaults. Starts require a ready panel, project setup storage, and a loaded catalog for the chosen provider. Unsupported setup values refuse launch.
+
+`start` reads one regular prompt file up to 48 KiB. Empty prompts and slash commands refuse launch. Repeat `--label` to apply initial labels. `--pinned` pins the new session. `--agent-run` files it under Run by agents. `--untagged` retains reader-started ownership and prompt-box continuation. Exactly one classification flag is required. Only `--arc-dispatch` prints the dispatch receipt. Untagged receipts include `owned: true`.
+
+Write results print JSON with `requestId` and a status. Starts report `accepted`, `accepted-with-errors`, or `refused`. Accepted results include `sessionId`, provider, requested setup, classification, attribution, and save errors. Requested settings do not establish observed provider execution. Curation reports `applied`, `dry-run`, or `refused`. A rejected save produces an error. Dry runs perform no writes. Archive refuses running and needs-input sessions. Completed unread sessions require `--force`. Unavailable or hidden attention refuses archive. Unarchive preserves reader state and leaves the session unpinned.
+
+A disconnected or timed-out write returns `unknown` with its request ID when delivery is uncertain. Use the returned ID for an identical-payload retry in the selected window. Fresh IDs are also accepted when prefixed with that window's `hostId` and a colon. The `windows` descriptor supplies `hostId`, which identifies one window activation. Arc retains one result per ID and refuses a conflicting payload. A window reload creates a new activation and makes an old ID's outcome unknown. Never change the ID to retry an uncertain launch. Requester text supplies attribution and grants no authority.
+
+```sh
+arc setups --window WINDOW_ID
+arc start --window WINDOW_ID --provider codex --prompt-file './review prompt.txt' --untagged --name 'Review branch' --label Review --pinned
+arc label add SESSION_ID --label Followup --window WINDOW_ID
+arc archive SESSION_ID --force --window WINDOW_ID
+arc unarchive SESSION_ID --window WINDOW_ID
+```
 
 ## Cost arguments
 

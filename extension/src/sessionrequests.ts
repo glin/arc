@@ -8,6 +8,7 @@ import { writeFileAtomically } from './atomicfile.ts';
 import { ARC_IDENTITY } from './identity.ts';
 import { arcHome } from './store.ts';
 import { WindowsPipeServer } from './windowpipe.ts';
+import { SessionWriteRequests, validSessionWrite, type SessionWriteParams } from './sessionwrites.ts';
 
 export const SESSION_REQUEST_VERSION = 1;
 export const SESSION_REQUEST_LIMITS = {
@@ -49,9 +50,9 @@ export interface SessionRequest {
   id: string;
   version: typeof SESSION_REQUEST_VERSION;
   token: string;
-  method: 'ping' | 'sessions' | 'session';
+  method: 'ping' | 'sessions' | 'session' | 'setups' | 'start' | 'curate';
   requester: string | null;
-  params: { sessionId?: string; turns?: number };
+  params: SessionWriteParams;
 }
 
 export type SessionReply = { id: string | null; result: unknown } | { id: string | null; error: string };
@@ -86,7 +87,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     value.version !== SESSION_REQUEST_VERSION ||
     typeof value.token !== 'string' ||
     !TOKEN.test(value.token) ||
-    !['ping', 'sessions', 'session'].includes(value.method as string) ||
+    !['ping', 'sessions', 'session', 'setups', 'start', 'curate'].includes(value.method as string) ||
     !(
       value.requester === null ||
       (typeof value.requester === 'string' && value.requester.length > 0 && value.requester.length <= 256)
@@ -105,6 +106,8 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       (value.params.turns as number) > 20
     )
       return null;
+  } else if (['setups', 'start', 'curate'].includes(value.method as string)) {
+    if (!validSessionWrite(value.method as string, value.params)) return null;
   } else if (Object.keys(value.params).length !== 0) return null;
   return value as unknown as SessionRequest;
 }
@@ -168,18 +171,22 @@ function receiveLines(
   socket: Duplex,
   limits: typeof SESSION_REQUEST_LIMITS | RequestLimits,
   line: (text: string) => void,
+  idleDeadlineMs = limits.lineDeadlineMs,
 ): void {
   let pending = Buffer.alloc(0);
+  let idle = false;
   let deadline = setTimeout(() => socket.destroy(), limits.lineDeadlineMs);
-  const restart = () => {
+  const restart = (ms = idleDeadlineMs, betweenLines = true) => {
+    idle = betweenLines;
     clearTimeout(deadline);
-    deadline = setTimeout(() => socket.destroy(), limits.lineDeadlineMs);
+    deadline = setTimeout(() => socket.destroy(), ms);
   };
   socket.on('close', () => clearTimeout(deadline));
   socket.on('error', () => socket.destroy());
   socket.on('data', (chunk: Buffer) => {
     let start = 0;
     while (start < chunk.length && !socket.destroyed) {
+      if (idle) restart(limits.lineDeadlineMs, false);
       const newline = chunk.indexOf(10, start);
       const end = newline < 0 ? chunk.length : newline;
       if (pending.length + end - start > limits.lineBytes) {
@@ -206,6 +213,7 @@ export interface RequestLimits {
 
 export class WindowChannel {
   readonly hostId = crypto.randomBytes(12).toString('hex');
+  private readonly writes = new SessionWriteRequests(this.hostId);
   private readonly token = crypto.randomBytes(32).toString('hex');
   private readonly address: string;
   private readonly registryFile: string;
@@ -329,64 +337,79 @@ export class WindowChannel {
     }
     this.sockets.add(socket);
     socket.on('close', () => this.sockets.delete(socket));
-    receiveLines(socket, this.limits, (text) => {
-      let value: unknown;
-      try {
-        value = JSON.parse(text);
-      } catch {
-        this.answer(socket, { id: null, error: 'Invalid request.' });
-        return;
-      }
-      if (
-        record(value) &&
-        Object.keys(value).join(',') === 'challenge' &&
-        typeof value.challenge === 'string' &&
-        TOKEN.test(value.challenge)
-      ) {
-        const proof = crypto.createHmac('sha256', Buffer.from(this.token, 'hex')).update(value.challenge).digest('hex');
-        const bytes = JSON.stringify({ proof }) + '\n';
-        if (socket.writableLength + Buffer.byteLength(bytes) > this.limits.lineBytes) socket.destroy();
-        else socket.write(bytes);
-        return;
-      }
-      const request = parseSessionRequest(value);
-      if (!request) {
-        this.answer(socket, { id: null, error: 'Invalid request.' });
-        return;
-      }
-      if (!crypto.timingSafeEqual(Buffer.from(request.token, 'hex'), Buffer.from(this.token, 'hex'))) {
-        this.answer(socket, { id: request.id, error: 'Access denied.' });
-        return;
-      }
-      if (this.inFlight >= this.limits.inFlight) {
-        socket.destroy();
-        return;
-      }
-      this.inFlight++;
-      void Promise.resolve()
-        .then<unknown>(() => {
-          if (this.closed) throw new Error('Window unavailable.');
-          if (request.method === 'ping') return this.ping(this.info());
-          if (!this.requestHandler) throw new Error('Session reads are unavailable in this window.');
-          return Promise.resolve(this.requestHandler(request)).then((data) => {
-            const result = { window: this.info(), data };
-            if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
-              throw new Error("The session response exceeds this window's channel limit.");
-            return result;
+    receiveLines(
+      socket,
+      this.limits,
+      (text) => {
+        let value: unknown;
+        try {
+          value = JSON.parse(text);
+        } catch {
+          this.answer(socket, { id: null, error: 'Invalid request.' });
+          return;
+        }
+        if (
+          record(value) &&
+          Object.keys(value).join(',') === 'challenge' &&
+          typeof value.challenge === 'string' &&
+          TOKEN.test(value.challenge)
+        ) {
+          const proof = crypto
+            .createHmac('sha256', Buffer.from(this.token, 'hex'))
+            .update(value.challenge)
+            .digest('hex');
+          const bytes = JSON.stringify({ proof }) + '\n';
+          if (socket.writableLength + Buffer.byteLength(bytes) > this.limits.lineBytes) socket.destroy();
+          else socket.write(bytes);
+          return;
+        }
+        const request = parseSessionRequest(value);
+        if (!request) {
+          this.answer(socket, { id: null, error: 'Invalid request.' });
+          return;
+        }
+        if (!crypto.timingSafeEqual(Buffer.from(request.token, 'hex'), Buffer.from(this.token, 'hex'))) {
+          this.answer(socket, { id: request.id, error: 'Access denied.' });
+          return;
+        }
+        if (this.inFlight >= this.limits.inFlight) {
+          socket.destroy();
+          return;
+        }
+        this.inFlight++;
+        void Promise.resolve()
+          .then<unknown>(() => {
+            if (this.closed) throw new Error('Window unavailable.');
+            if (request.method === 'ping') return this.ping(this.info());
+            if (!this.requestHandler) throw new Error('Session reads are unavailable in this window.');
+            const apply = () => this.requestHandler!(request);
+            const data =
+              request.method === 'start' || request.method === 'curate'
+                ? this.writes.run(request.id, { method: request.method, params: request.params }, apply)
+                : Promise.resolve().then(apply);
+            return Promise.resolve(data).then((data) => {
+              if (request.method === 'start' || request.method === 'curate')
+                data = { ...(data as object), requestId: request.id };
+              const result = { window: this.info(), data };
+              if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
+                throw new Error("The session response exceeds this window's channel limit.");
+              return result;
+            });
+          })
+          .then(
+            (result) => this.answer(socket, { id: request.id, result }),
+            (error: unknown) =>
+              this.answer(socket, {
+                id: request.id,
+                error: error instanceof Error ? error.message : 'Window unavailable.',
+              }),
+          )
+          .finally(() => {
+            this.inFlight--;
           });
-        })
-        .then(
-          (result) => this.answer(socket, { id: request.id, result }),
-          (error: unknown) =>
-            this.answer(socket, {
-              id: request.id,
-              error: error instanceof Error ? error.message : 'Window unavailable.',
-            }),
-        )
-        .finally(() => {
-          this.inFlight--;
-        });
-    });
+      },
+      120_000,
+    );
   }
 
   private answer(socket: Duplex, reply: SessionReply): void {
@@ -472,6 +495,7 @@ async function exchangeWindow(
   registrationFile = '',
   method: SessionRequest['method'] = 'ping',
   params: SessionRequest['params'] = {},
+  requestId?: string,
 ): Promise<unknown | null> {
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
@@ -480,7 +504,7 @@ async function exchangeWindow(
       ? await WindowsPipeServer.connect(entry.address, entry.pid, entry.transportPid!, registrationFile, deadlineMs)
       : net.createConnection(entry.address);
   return new Promise((resolve, reject) => {
-    const id = crypto.randomBytes(12).toString('hex');
+    const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
     const challenge = crypto.randomBytes(32).toString('hex');
     let authenticated = false;
     let settled = false;
@@ -571,10 +595,11 @@ export async function pingWindow(
 }
 
 export async function requestWindow(
-  method: 'sessions' | 'session',
+  method: Exclude<SessionRequest['method'], 'ping'>,
   params: SessionRequest['params'],
   selector = process.env[`${ARC_IDENTITY.environmentPrefix}WINDOW`],
   home = arcHome(),
+  requestId?: string,
 ): Promise<unknown> {
   let selected = selector;
   if (!selected) {
@@ -602,8 +627,22 @@ export async function requestWindow(
   } catch {
     throw new Error('The selected Arc window is unavailable.');
   }
-  const result = await exchangeWindow(entry, 1_000, file, method, params);
-  if (result === null) throw new Error('The selected Arc window is unavailable.');
+  const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
+  if (requestId && !requestId.startsWith(entry.hostId + ':'))
+    throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
+  const write = method === 'start' || method === 'curate';
+  const result = await exchangeWindow(entry, write ? 120_000 : 1_000, file, method, params, id);
+  if (result === null) {
+    if (write)
+      return {
+        version: 1,
+        status: 'unknown',
+        requestId: id,
+        window: entry.hostId,
+        reason: 'Delivery is unknown. Retry only this request ID in this window.',
+      };
+    throw new Error('The selected Arc window is unavailable.');
+  }
   return result;
 }
 

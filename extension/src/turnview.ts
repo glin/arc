@@ -212,6 +212,7 @@ export interface PanelState {
   // Sessions the reader started from this panel, oldest first.
   // Retain launch ownership across reloads because transcript classification alone cannot establish it.
   started: string[];
+  agentRuns?: string[];
   // Normalized descriptors for extension-staged files held with each draft. The bytes stay
   // in global storage and never enter this state.
   assets: Record<string, StoredPromptAsset[]>;
@@ -342,6 +343,7 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     draftCommentIds: normalizeDraftCommentIds(src.draftCommentIds),
     // One entry per session, so this takes the session-shaped ceiling beside them.
     started: ids(src.started, SESSION_LIMIT),
+    ...(ids(src.agentRuns, SESSION_LIMIT).length ? { agentRuns: ids(src.agentRuns, SESSION_LIMIT) } : {}),
     assets: normalizePromptAssetBook(src.assets),
     queues: normalizeQueuedSubmissions(src.queues),
   };

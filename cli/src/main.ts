@@ -2,6 +2,7 @@ import { renderNextTurn, renderStatus, snapshotFromClaude } from './status.ts';
 import { runCost } from './cost.ts';
 import { runWindows } from './windows.ts';
 import { runSessions } from './sessions.ts';
+import { runManagement } from './manage.ts';
 
 declare const ARC_VERSION: string;
 
@@ -14,6 +15,11 @@ function help(): string {
     '       arc windows [--json]',
     '       arc sessions [--window ID] [--json]',
     '       arc session ID [--turns 1-20] [--window ID] [--json]',
+    '       arc setups [--window ID] [--json]',
+    '       arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]',
+    '       arc label add|remove ID --label NAME [--dry-run] [--window ID] [--request-id ID]',
+    '       arc pin|unpin|archive|unarchive ID [--dry-run] [--window ID] [--request-id ID]',
+    '       arc archive ID --force [--window ID] [--request-id ID]',
     '       arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
     '',
     'Reads Claude Code status-line JSON from stdin.',
@@ -24,6 +30,8 @@ function help(): string {
     'Windows lists running Arc windows and their panel and repository readiness.',
     "Sessions lists the selected window's repository sessions as JSON. Session reads bounded turns without marking them read.",
     '--window selects an Arc window. Otherwise ARC_WINDOW or one unambiguous live window selects it.',
+    '--request-id accepts a fresh ID prefixed with the selected window hostId and a colon.',
+    'Use the returned requestId for identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',
   ].join('\n');
 }
 
@@ -63,6 +71,14 @@ async function run(): Promise<void> {
   }
   if (args[0] === 'sessions' || args[0] === 'session') {
     process.stdout.write(`${await runSessions(args[0], args.slice(1))}\n`);
+    return;
+  }
+  if (['setups', 'start', 'pin', 'unpin', 'archive', 'unarchive'].includes(args[0])) {
+    process.stdout.write(`${await runManagement(args[0], args.slice(1))}\n`);
+    return;
+  }
+  if (args[0] === 'label' && ['add', 'remove'].includes(args[1])) {
+    process.stdout.write(`${await runManagement(`label-${args[1]}`, args.slice(2))}\n`);
     return;
   }
   if (args[0] !== 'statusline') {

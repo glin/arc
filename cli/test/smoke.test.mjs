@@ -76,6 +76,70 @@ test('the bundled CLI reports the package version', () => {
   assert.equal(output.trim(), packageJson.version);
 });
 
+// This packaged check catches argument routing and unwanted dispatch receipts with one local channel.
+test('bundled management commands carry explicit classification, prompt files and curation without implicit receipts', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc management smoke '));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const requests = [];
+  channel.setRequestHandler((request) => {
+    requests.push(request);
+    return request.method === 'start'
+      ? { status: 'accepted', provider: request.params.setup.agent, sessionId: 'accepted' }
+      : { status: 'applied' };
+  });
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const env = { ...process.env, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+    const prompt = join(home, 'initial prompt.txt');
+    writeFileSync(prompt, 'Review this project.');
+    for (const provider of ['claude', 'codex'])
+      for (const classification of ['--agent-run', '--untagged']) {
+        const args = [
+          cli,
+          'start',
+          '--provider',
+          provider,
+          '--model',
+          'runtime-model',
+          '--effort',
+          'runtime-effort',
+          '--prompt-file',
+          prompt,
+          classification,
+          '--name',
+          'Review',
+          '--label',
+          'Initial',
+          '--pinned',
+        ];
+        const output = await run(process.execPath, args, { env, encoding: 'utf8' });
+        assert.equal(output.stdout.includes('ARC_DISPATCH_SESSION='), false);
+        assert.equal(requests.at(-1).params.agentRun, classification === '--agent-run');
+        assert.equal(requests.at(-1).params.prompt, 'Review this project.');
+        const tagged = await run(process.execPath, [...args, '--arc-dispatch'], { env, encoding: 'utf8' });
+        const receipt = JSON.parse(tagged.stdout.trim().split('\n')[1].slice('ARC_DISPATCH_SESSION='.length));
+        assert.equal(receipt.agent, provider);
+        assert.equal(receipt.owned === true, classification === '--untagged');
+      }
+    await run(process.execPath, [cli, 'label', 'remove', 'accepted', '--label', 'Initial', '--dry-run'], { env });
+    assert.equal(requests.at(-1).params.action, 'label-remove');
+    assert.equal(requests.at(-1).params.dryRun, true);
+    await run(process.execPath, [cli, 'archive', 'accepted', '--force'], { env });
+    assert.equal(requests.at(-1).params.force, true);
+    const before = requests.length;
+    writeFileSync(prompt, '/clear');
+    await assert.rejects(
+      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--untagged'], { env }),
+      /prompt-box command/,
+    );
+    assert.equal(requests.length, before);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bundled session commands select one window, reject unknown IDs, and bound turns before sending', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc-session-smoke-'));
   const channel = new WindowChannel(home);

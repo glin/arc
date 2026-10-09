@@ -46,8 +46,8 @@ import {
   compactCommand,
   effortChoices,
 } from './composerview';
-import { confirmClaudeRename } from './sessionrename';
-import { readCustomTitleSidecar } from './transcript';
+import { confirmClaudeRename, renameInitialCodexSession } from './sessionrename';
+import { readCustomTitleSidecar, readInitialCustomTitle } from './transcript';
 import { ARC_IDENTITY } from './identity';
 
 // The child-process methods used by the host. Tests supply these methods without starting a CLI.
@@ -565,6 +565,8 @@ export interface SessionRenameRequest {
   title: string;
   // The transcript, whose saved title file confirms a Claude rename.
   file: string;
+  sourceFile?: () => string;
+  initial?: boolean;
   // The rename-only child, asked for only when no child runs the session.
   idlePlan: () => AgentPlan;
 }
@@ -574,9 +576,20 @@ export async function renameAgentSession(
   request: SessionRenameRequest,
   confirm: { attempts?: number; pause?: () => Promise<void> } = {},
 ): Promise<void> {
-  await host.renameSession(request.agent, request.sessionId, request.title, request.idlePlan);
+  const rename = () => host.renameSession(request.agent, request.sessionId, request.title, request.idlePlan);
+  if (request.agent === 'codex' && request.initial) await renameInitialCodexSession(request.sessionId, rename, confirm);
+  else await rename();
   if (request.agent === 'claude') {
-    await confirmClaudeRename(request.title, () => readCustomTitleSidecar(request.file), confirm);
+    await confirmClaudeRename(
+      request.title,
+      () => {
+        const file = request.sourceFile?.() ?? request.file;
+        return (
+          (request.initial ? readInitialCustomTitle(file, request.sessionId) : null) ?? readCustomTitleSidecar(file)
+        );
+      },
+      confirm,
+    );
   }
 }
 

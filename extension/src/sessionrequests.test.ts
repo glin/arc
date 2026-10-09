@@ -23,6 +23,7 @@ import {
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
 import { requestWindow } from './sessionrequests.ts';
+import { SessionWriteRequests, archiveRefusal } from './sessionwrites.ts';
 import { arcCliSpawner, childEnv } from './agenthost.ts';
 import {
   discoverWindows,
@@ -41,6 +42,84 @@ import {
 // These Node guards catch access, resource exhaustion, wrong-window discovery, and lifecycle leaks without browser startup.
 const state: WindowState = { folders: [], scopeReady: true, panelReady: false, panelVisible: false };
 const channels: WindowChannel[] = [];
+// These cases catch duplicate acceptance and unsafe archive admission with no provider or browser startup.
+test('session writes retain one acceptance across equal concurrent retries and refuse conflicts, capacity and old activations', async () => {
+  const book = new SessionWriteRequests('window', 1);
+  let finish!: (value: unknown) => void;
+  let calls = 0;
+  const apply = () => {
+    calls++;
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  };
+  const first = book.run('window:1', { prompt: 'work', setup: { model: 'a', effort: 'high' } }, apply);
+  const second = book.run('window:1', { setup: { effort: 'high', model: 'a' }, prompt: 'work' }, apply);
+  await vi.waitFor(() => assert.equal(calls, 1));
+  await assert.rejects(book.run('window:1', { prompt: 'different' }, apply), /different request/);
+  await assert.rejects(book.run('window:2', {}, apply), /limit/);
+  await assert.rejects(new SessionWriteRequests('reloaded').run('window:1', {}, apply), /unknown/);
+  finish({ sessionId: 'accepted' });
+  assert.deepEqual(await first, await second);
+  assert.deepEqual(await book.run('window:1', { prompt: 'work', setup: { model: 'a', effort: 'high' } }, apply), {
+    sessionId: 'accepted',
+  });
+  assert.equal(calls, 1);
+});
+
+test('archive refuses current live work and stale attention even with force, while completed unread requires force', () => {
+  const row = { facts: 'current', runStatus: 'done', attention: 'idle' } as SessionListingRow;
+  assert.equal(archiveRefusal(row, false), null);
+  assert.match(archiveRefusal({ ...row, attention: 'unread' }, false)!, /--force/);
+  assert.equal(archiveRefusal({ ...row, attention: 'unread' }, true), null);
+  for (const runStatus of ['running', 'waiting', 'subagents', 'background'] as const)
+    assert.match(archiveRefusal({ ...row, runStatus }, true)!, /running or needs input/);
+  for (const facts of ['stale', 'unparsed'] as const)
+    assert.match(archiveRefusal({ ...row, facts }, true)!, /unavailable/);
+  assert.match(archiveRefusal({ ...row, attention: 'unknown' }, true)!, /unavailable/);
+});
+
+test('the authenticated window channel retains write acceptance across a disconnected caller and rejects conflicting retries', async () => {
+  const { channel, home, entry } = await fixture();
+  let calls = 0;
+  let release!: () => void;
+  channel.setRequestHandler(async () => {
+    calls++;
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { status: 'accepted', sessionId: 'only-launch' };
+  });
+  const params = {
+    prompt: 'work',
+    agentRun: false,
+    setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
+  };
+  const id = channel.hostId + ':one';
+  const socket =
+    process.platform === 'win32'
+      ? await WindowsPipeServer.connect(
+          entry.address,
+          entry.pid,
+          entry.transportPid!,
+          path.join(home, 'hosts', `${channel.hostId}.json`),
+        )
+      : net.createConnection(entry.address);
+  sockets.push(socket);
+  socket.on('error', () => {});
+  await new Promise<void>((resolve) => socket.once('connect', resolve));
+  socket.write(JSON.stringify(request(entry, { id, method: 'start', params })) + '\n');
+  await vi.waitFor(() => assert.equal(calls, 1));
+  socket.destroy();
+  const retried = requestWindow('start', params, channel.hostId, home, id);
+  release();
+  assert.equal(((await retried) as { sessionId: string }).sessionId, 'only-launch');
+  assert.equal(calls, 1);
+  await assert.rejects(
+    requestWindow('start', { ...params, prompt: 'other' }, channel.hostId, home, id),
+    /different request/,
+  );
+});
 const sockets: Duplex[] = [];
 afterEach(async () => {
   vi.useRealTimers();

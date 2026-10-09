@@ -2,6 +2,7 @@ import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
 import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
+import { archiveRefusal } from './sessionwrites';
 import {
   boundedSessionListing,
   boundedSessionRead,
@@ -178,7 +179,15 @@ import {
   remapReaderParents,
   abandonReaderParents,
 } from './turnview';
-import { DRAFT_SESSION_PREFIX, adoptLabelSession, labelEditorReply, labelsOf, setSessionLabels } from './turnlabels';
+import {
+  DRAFT_SESSION_PREFIX,
+  adoptLabelSession,
+  labelEditorReply,
+  labelsOf,
+  setSessionLabels,
+  labelKey,
+  labelName,
+} from './turnlabels';
 import { normalizeSavedViews } from './domain/views.ts';
 import { normalizeSavedRailFilters } from './domain/rail-filters.ts';
 import { readMovedOnlyFor, type ReadState } from './domain/read.ts';
@@ -1469,6 +1478,9 @@ export class PanelProvider implements vscode.Disposable {
   public onRenameSession:
     | ((agent: AgentKind, session: string, cwd: string | null, title: string, file: string) => Promise<void>)
     | null = null;
+  public onRenameStartedSession:
+    | ((agent: AgentKind, session: string, cwd: string, title: string) => Promise<void>)
+    | null = null;
   public onClear:
     | ((agent: string, session: string, cwd: string | null, name: string) => Promise<PromptDelivery>)
     | null = null;
@@ -1485,7 +1497,9 @@ export class PanelProvider implements vscode.Disposable {
   public readPinnedSetups: ((project?: string | null) => unknown | Promise<unknown>) | null = null;
   public persistPinnedSetups: ((setups: readonly PinnedSetup[], project?: string | null) => Promise<void>) | null =
     null;
-  public onSessionSettingsAdopted: ((session: string, settings: SessionSettingSelection) => void) | null = null;
+  public onSessionSettingsAdopted:
+    | ((session: string, settings: SessionSettingSelection) => void | Promise<void>)
+    | null = null;
   public onStopTurn: ((agent: string, session: string) => void) | null = null;
   public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean) | null = null;
   public onArchivedSessionsChange: ((sessions: ReadonlySet<string>) => void) | null = null;
@@ -1743,6 +1757,157 @@ export class PanelProvider implements vscode.Disposable {
   // Live panel state shared by attached hosts and persisted through the memento.
   private saved: PanelState = normalizePanelState(null);
   private windowStateHandler: ((state: WindowState) => void) | null = null;
+  private sessionWriteQueue: Promise<unknown> = Promise.resolve();
+  private membershipWrites?: Map<string, { persisted: Promise<void> }>;
+
+  public async handleSessionRequest(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
+    if (!['start', 'setups', 'curate'].includes(request.method)) return this.readSessionRequest(request);
+    if (request.method === 'curate') {
+      const run = () => this.curateSessionRequest(request);
+      const pending = (this.sessionWriteQueue ?? Promise.resolve()).then(run, run);
+      this.sessionWriteQueue = pending;
+      return pending;
+    }
+    const folders = this.folders();
+    const scope = this.repositoryScope.snapshot(folders);
+    if (this.disposed || !scope.ready || !folders[0] || !this.readyHosts.size || !this.setupProject) {
+      throw new Error('This Arc window is not ready to start sessions. Open Arc in a project and retry.');
+    }
+    const { view } = this.launcherFor();
+    if (request.method === 'setups') return { version: 1, project: this.setupProject, ...view };
+    const params = request.params;
+    const text = params.prompt!;
+    if (!text.trim() || text.trimStart().startsWith('/'))
+      throw new Error('Supply a nonempty prompt without a prompt-box command.');
+    const profile = launcherProfile(view, params.setup!);
+    if (!profile || this.pendingModels.includes(profile.agent))
+      throw new Error('The requested setup is unavailable or its model catalog is still loading.');
+    if (!this.onSendDraftPrompt || !this.memento) throw new Error('Session delivery or saving is unavailable.');
+    const draft = newSessionDraft(
+      `${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`,
+      folders[0],
+      null,
+      Date.now(),
+      profile,
+    );
+    const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] });
+    if (!delivery.delivered || !delivery.session)
+      return { version: 1, status: 'refused', reason: delivery.reason, requester: request.requester };
+    const session = delivery.session;
+    const errors: string[] = delivery.reason ? [delivery.reason] : [];
+    try {
+      this.adoptDraft(draft.draftId, session, draft, undefined, true);
+      this.picks = withSessionSettings(
+        this.picks,
+        session,
+        sessionSettingsForProfile(profile, this.models[profile.agent]),
+      );
+      if (params.agentRun) {
+        this.startedHere.delete(session);
+        this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
+        this.saved.agentRuns = [...(this.saved.agentRuns ?? []), session].slice(-SESSION_LIMIT);
+      }
+      await this.onSessionSettingsAdopted?.(session, { ...this.picks[session] });
+      this.saved.labels = setSessionLabels(this.saved.labels, session, params.labels ?? []);
+      const initialPinWrite = params.pinned ? { persisted: Promise.resolve() } : undefined;
+      if (params.pinned) {
+        (this.membershipWrites ??= new Map()).set(session, initialPinWrite!);
+        this.pinnedTop.add(session);
+      }
+      this.saved.pinnedTop = [...this.pinnedTop];
+      const persisted = Promise.resolve().then(() => this.writeDrafts());
+      if (initialPinWrite) {
+        initialPinWrite.persisted = persisted.finally(() => {
+          if (this.membershipWrites?.get(session) === initialPinWrite) this.membershipWrites.delete(session);
+        });
+        await initialPinWrite.persisted;
+      } else {
+        await persisted;
+      }
+      if (params.name) {
+        if (!this.onRenameStartedSession) throw new Error('The new session cannot be named.');
+        await this.onRenameStartedSession(profile.agent, session, draft.cwd, params.name);
+      }
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+    void this.post({ type: 'labelsChanged', session });
+    this.postRail(true);
+    void this.refresh(true);
+    return {
+      version: 1,
+      status: errors.length ? 'accepted-with-errors' : 'accepted',
+      sessionId: session,
+      provider: profile.agent,
+      requestedSetup: profile,
+      agentRun: params.agentRun,
+      requester: request.requester,
+      errors,
+    };
+  }
+
+  private async curateSessionRequest(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
+    const { sessionId: session, action, labels, dryRun, force } = request.params;
+    const scope = this.repositoryScope.snapshot(this.folders());
+    if (this.disposed || !scope.ready || !this.readyHosts.size || !this.memento)
+      throw new Error('This Arc window is not ready to change sessions.');
+    const sources = this.authoritativeCatalogScope === JSON.stringify(scope.roots) ? this.authoritativeCatalog : null;
+    const matches =
+      sources?.filter((source) => source.sessionId === session && (!source.cwd || isInside(source.cwd, scope.roots))) ??
+      [];
+    if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
+    let reason: string | null = null;
+    if (action === 'archive') {
+      const listing = this.readSessionRequest({ ...request, method: 'sessions', params: { sessionId: session } }) as {
+        sessions: SessionListingRow[];
+      };
+      const row = listing.sessions.find((row) => row.id === session);
+      reason = row ? archiveRefusal(row, force!) : 'The session state is unavailable.';
+    }
+    if (action === 'pin' && this.hidden.has(session!)) reason = 'Unarchive the session before pinning it.';
+    const result = { version: 1, sessionId: session, action, requester: request.requester };
+    if (reason) return { ...result, status: 'refused', reason };
+    if (dryRun) return { ...result, status: 'dry-run' };
+    if (action === 'label-add' || action === 'label-remove') {
+      const held = labelsOf(this.saved.labels, session!);
+      const keys = new Set((labels ?? []).map((name) => labelKey(labelName(name))));
+      await this.changeSessionLabels(
+        session!,
+        action === 'label-add' ? [...held, ...labels!] : held.filter((name) => !keys.has(labelKey(name))),
+      );
+    } else {
+      await this.updateSessionMembership(action!, session);
+    }
+    return {
+      ...result,
+      status: 'applied',
+      labels: labelsOf(this.saved.labels, session!),
+      pinned: this.pinnedTop.has(session!),
+      archived: this.hidden.has(session!),
+    };
+  }
+
+  private async changeSessionLabels(
+    session: string,
+    names: readonly string[],
+    browserSession = session,
+  ): Promise<void> {
+    const previous = this.saved.labels;
+    const next = setSessionLabels(previous, session, names);
+    this.saved.labels = next;
+    try {
+      await this.memento?.update(STATE_KEY, this.saved);
+    } catch (error) {
+      if (this.saved.labels === next) this.saved.labels = previous;
+      this.postRail(true);
+      await this.post(this.labelEditorReply(session, browserSession));
+      await this.post({ type: 'labelsChanged', session: browserSession });
+      throw error;
+    }
+    this.postRail(true);
+    await this.post(this.labelEditorReply(session, browserSession));
+    await this.post({ type: 'labelsChanged', session: browserSession });
+  }
 
   public readSessionRequest(request: import('./sessionrequests').SessionRequest): unknown {
     const scopeKey = (): string | null => {
@@ -1755,7 +1920,11 @@ export class PanelProvider implements vscode.Disposable {
     if (before === null) throw new Error('The repository scope is still loading. Retry the command.');
     const scope = this.repositoryScope.snapshot(this.folders());
     const accepted = this.authoritativeCatalogScope === JSON.stringify(scope.roots) ? this.authoritativeCatalog : null;
-    const sessions = (accepted ?? []).filter((source) => !source.cwd || isInside(source.cwd, scope.roots));
+    const sessions = (accepted ?? []).filter(
+      (source) =>
+        (!source.cwd || isInside(source.cwd, scope.roots)) &&
+        (request.method !== 'sessions' || !request.params.sessionId || source.sessionId === request.params.sessionId),
+    );
     if (before !== scopeKey()) throw new Error('The repository scope changed. Retry the command.');
     if (request.method === 'session') {
       if (!accepted)
@@ -3514,6 +3683,7 @@ export class PanelProvider implements vscode.Disposable {
     actual: string,
     submitted?: NewSessionDraft,
     submittedSettings?: ComposerState['settings'],
+    deferredPersistence = false,
   ): void {
     const draft = submitted ?? this.newDrafts[provisional];
     if (!draft) {
@@ -3602,8 +3772,18 @@ export class PanelProvider implements vscode.Disposable {
       cwd: draft.cwd,
     };
     // Persist reader-started ownership after the temporary awaiting-record row disappears.
-    this.rememberStarted(actual);
+    if (!deferredPersistence) this.rememberStarted(actual);
+    else {
+      this.startedHere.add(actual);
+      this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
+    }
     rememberSessionAlias(this.sessionAliases, provisional, actual);
+    const membershipWrites = this.membershipWrites;
+    const membershipWrite = membershipWrites?.get(provisional);
+    if (membershipWrites && membershipWrite) {
+      membershipWrites.delete(provisional);
+      if (!membershipWrites.has(actual)) membershipWrites.set(actual, membershipWrite);
+    }
     const notice = this.attachmentNotices[provisional];
     if (notice !== undefined) {
       delete this.attachmentNotices[provisional];
@@ -3631,10 +3811,10 @@ export class PanelProvider implements vscode.Disposable {
       this.saved.labels = adoptLabelSession(this.saved.labels, provisional, actual);
       void this.post({ type: 'labelsChanged', session: actual });
     }
-    void this.writeDrafts();
+    if (!deferredPersistence) void this.writeDrafts();
     const settings = this.picks[actual];
-    if (settings) {
-      this.onSessionSettingsAdopted?.(actual, { ...settings });
+    if (settings && !deferredPersistence) {
+      void this.onSessionSettingsAdopted?.(actual, { ...settings });
     }
   }
 
@@ -4003,7 +4183,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const settings = this.picks[successor];
     if (settings) {
-      this.onSessionSettingsAdopted?.(successor, { ...settings });
+      void this.onSessionSettingsAdopted?.(successor, { ...settings });
     }
     if (clearing?.delivery?.delivered) {
       this.finishClearSettlement(clearing);
@@ -6100,19 +6280,23 @@ export class PanelProvider implements vscode.Disposable {
 
   // Update durable archive membership through the provider, including actions targeting a provisional session ID.
   public setSessionArchived(session: string, archived: boolean): void {
-    this.updateSessionMembership(archived ? 'archive' : 'unarchive', session);
+    void Promise.resolve(this.updateSessionMembership(archived ? 'archive' : 'unarchive', session)).catch((error) => {
+      void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+    });
   }
 
   // Update durable pin membership through the provider.
   public setSessionPinned(session: string, pinned: boolean): void {
-    this.updateSessionMembership(pinned ? 'pin' : 'unpin', session);
+    void Promise.resolve(this.updateSessionMembership(pinned ? 'pin' : 'unpin', session)).catch((error) => {
+      void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+    });
   }
 
   private updateSessionMembership(
     action: 'archive' | 'unarchive' | 'pin' | 'unpin' | 'unarchiveAll',
     session?: string,
     openPinned = false,
-  ): void {
+  ): Promise<void> | void {
     const hidden = new Set(this.hidden);
     const pinnedTop = new Set(this.pinnedTop);
     const target = session === undefined ? '' : this.panelSession(session);
@@ -6133,9 +6317,15 @@ export class PanelProvider implements vscode.Disposable {
     const hiddenChanged = !same(this.hidden, hidden);
     const pinnedChanged = !same(this.pinnedTop, pinnedTop);
     const pinnedFoldChanged = openPinned && !this.saved.railFolds[RAIL_FOLDS.top];
-    if (!hiddenChanged && !pinnedChanged && !pinnedFoldChanged) {
-      return;
+    const targets = action === 'unarchiveAll' ? [...this.hidden] : [target];
+    const writes = (this.membershipWrites ??= new Map());
+    if (!hiddenChanged && !pinnedChanged && !pinnedFoldChanged && writes.has(target)) {
+      return writes.get(target)?.persisted;
     }
+    const previousHidden = this.hidden;
+    const previousPinned = this.pinnedTop;
+    const write = { persisted: Promise.resolve() };
+    for (const session of targets) writes.set(session, write);
     this.hidden = hidden;
     this.pinnedTop = pinnedTop;
     this.saved.hidden = [...hidden];
@@ -6143,13 +6333,41 @@ export class PanelProvider implements vscode.Disposable {
     if (pinnedFoldChanged) {
       this.saved.railFolds = { ...this.saved.railFolds, [RAIL_FOLDS.top]: true };
     }
-    void this.memento?.update(STATE_KEY, this.saved);
+    const persisted = Promise.resolve(this.memento?.update(STATE_KEY, this.saved));
     if (hiddenChanged) {
       this.onArchivedSessionsChange?.(this.hidden);
     }
     if (hiddenChanged || pinnedChanged) {
       this.postRail(true);
     }
+    return (write.persisted = persisted
+      .catch((error) => {
+        let restored = false;
+        for (const session of targets) {
+          const current = this.panelSession(session);
+          if (writes.get(current) !== write) continue;
+          if (previousHidden.has(session)) this.hidden.add(current);
+          else this.hidden.delete(current);
+          if (action !== 'unarchiveAll') {
+            if (previousPinned.has(session)) this.pinnedTop.add(current);
+            else this.pinnedTop.delete(current);
+          }
+          restored = true;
+        }
+        if (restored) {
+          this.saved.hidden = [...this.hidden];
+          this.saved.pinnedTop = [...this.pinnedTop];
+          if (hiddenChanged) this.onArchivedSessionsChange?.(this.hidden);
+          this.postRail(true);
+        }
+        throw error;
+      })
+      .finally(() => {
+        for (const session of targets) {
+          const current = this.panelSession(session);
+          if (writes.get(current) === write) writes.delete(current);
+        }
+      }));
   }
 
   public setComposerHidden(hidden: boolean): void {
@@ -6218,6 +6436,7 @@ export class PanelProvider implements vscode.Disposable {
     const acceptedComments = this.saved.comments.filter((comment) => acceptedCommentIds.has(comment.id));
     const readerParents = this.saved.readerParents;
     const submittedPrompts = this.saved.submittedPrompts;
+    const agentRuns = this.saved.agentRuns;
     this.saved = normalizePanelState(null);
     this.saved.readerParents = readerParents;
     this.saved.submittedPrompts = submittedPrompts;
@@ -6229,6 +6448,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.sentPrompts = normalizeSentPrompts(this.sentPrompts);
     // Preserve reader-started session ownership across preference resets.
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
+    this.saved.agentRuns = agentRuns;
     this.saved.assets = normalizePromptAssetBook(this.assets);
     // Waiting submissions are user-authored content, like the draft and its files above.
     // Forgetting panel preferences must not cancel work the reader already submitted.
@@ -9077,6 +9297,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Apply reader-started and parent ownership to cached agent-run classification without changing the shared metadata fact.
   private agentRunFor(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>): boolean {
+    if (this.saved.agentRuns?.includes(session.sessionId)) return true;
     const edge = edges.get(session.sessionId);
     const dispatched = edge?.relation === 'dispatched';
     return agentRunAnswer(
@@ -11020,12 +11241,9 @@ export class PanelProvider implements vscode.Disposable {
       },
       // Normalize and replace one session's labels, then publish the stored result.
       setLabels: (msg) => {
-        this.saved.labels = setSessionLabels(this.saved.labels, msg.session, msg.names);
-        void this.memento?.update(STATE_KEY, this.saved);
-        this.postRail(true);
-        void this.post(this.labelEditorReply(msg.session, browserSession ?? msg.session));
-        // Notify peer editors so their label counts and available names refresh.
-        void this.post({ type: 'labelsChanged', session: browserSession ?? msg.session });
+        return this.changeSessionLabels(msg.session, msg.names, browserSession ?? msg.session).catch((error) => {
+          void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+        });
       },
       // Normalize and persist the complete saved-view list. The session-list update publishes it to every host.
       setViews: (msg) => {
@@ -11041,11 +11259,15 @@ export class PanelProvider implements vscode.Disposable {
       // Apply one operation to the provider-owned sets. A panel can act before it receives a
       // peer's update without replacing that peer's membership state with an older snapshot.
       sessionMembership: (msg) => {
-        this.updateSessionMembership(
-          msg.action,
-          'session' in msg ? msg.session : undefined,
-          'openPinned' in msg && msg.openPinned === true,
-        );
+        return Promise.resolve(
+          this.updateSessionMembership(
+            msg.action,
+            'session' in msg ? msg.session : undefined,
+            'openPinned' in msg && msg.openPinned === true,
+          ),
+        ).catch((error) => {
+          void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+        });
       },
       // The Timeline layout dialog writes the reader's setting. The configuration listener
       // sends its new value to every host. A refused write reaches the reader as an error message.
@@ -11227,6 +11449,7 @@ export class PanelProvider implements vscode.Disposable {
     const since = this.saved.since;
     // Preserve reader-started ownership, which browsers do not supply in preference saves.
     const started = this.saved.started;
+    const agentRuns = this.saved.agentRuns;
     // Preserve labels updated through their dedicated messages, independent of browser preference saves.
     const labels = this.saved.labels;
     const readerParents = this.saved.readerParents;
@@ -11244,6 +11467,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.submittedPrompts = submittedPrompts;
     this.saved.draftCommentIds = draftCommentIds;
     this.saved.started = started;
+    this.saved.agentRuns = agentRuns;
     this.saved.labels = labels;
     this.saved.readerParents = readerParents;
     this.saved.views = views;

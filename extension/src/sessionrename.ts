@@ -97,3 +97,33 @@ export async function confirmClaudeRename(
   }
   throw new Error('Claude Code did not save the new session name.');
 }
+
+// Retry only metadata that the accepted Codex rollout has not written yet.
+export async function renameInitialCodexSession(
+  sessionId: string,
+  rename: () => Promise<void>,
+  options: { attempts?: number; pause?: () => Promise<void> } = {},
+): Promise<void> {
+  const attempts = options.attempts ?? 40;
+  const deadline = performance.now() + 2000;
+  const pause = options.pause ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 50)));
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await rename();
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      if (
+        attempt + 1 === attempts ||
+        performance.now() >= deadline ||
+        !message.startsWith('failed to set thread name:') ||
+        !message.includes(`failed to update thread metadata ${sessionId}:`) ||
+        !message.includes(': rollout at ') ||
+        !message.endsWith(`-${sessionId}.jsonl is empty`)
+      )
+        throw error;
+      await pause();
+      if (performance.now() >= deadline) throw error;
+    }
+  }
+}

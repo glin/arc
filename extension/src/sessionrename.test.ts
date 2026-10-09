@@ -1,4 +1,4 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -6,6 +6,7 @@ import {
   SESSION_NAME_LIMIT,
   answerSessionRename,
   confirmClaudeRename,
+  renameInitialCodexSession,
   requestSessionRename,
   sessionRenameOpening,
   sessionRenameTitle,
@@ -123,5 +124,33 @@ test('session rename adds no Claude Agent SDK dependency', () => {
       /claude-agent-sdk/,
       `${file} renames a session through the Claude Agent SDK`,
     );
+  }
+});
+
+test('initial Codex naming preserves unrelated refusals and bounds empty-rollout retries to the accepted identity', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
+    const empty = (id: string) =>
+      new Error(
+        `failed to set thread name: Fatal error: failed to update thread metadata ${id}: thread-store internal error: failed to read session metadata C:/sessions/rollout-${id}.jsonl: rollout at C:/sessions/rollout-${id}.jsonl is empty`,
+      );
+    for (const error of [new Error('name refused'), empty('foreign-session'), new Error('rollout is empty')]) {
+      const rename = vi.fn<() => Promise<void>>(async () => {
+        throw error;
+      });
+      await assert.rejects(renameInitialCodexSession(session, rename), (caught) => caught === error);
+      assert.equal(rename.mock.calls.length, 1);
+    }
+    const error = empty(session);
+    const rename = vi.fn<() => Promise<void>>(async () => {
+      throw error;
+    });
+    const pending = assert.rejects(renameInitialCodexSession(session, rename), (caught) => caught === error);
+    await vi.runAllTimersAsync();
+    await pending;
+    assert.equal(rename.mock.calls.length, 40);
+  } finally {
+    vi.useRealTimers();
   }
 });

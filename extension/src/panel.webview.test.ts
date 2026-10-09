@@ -284,6 +284,7 @@ import {
   freshHostKey,
   AgentSession,
   claudePlan,
+  renameAgentSession,
 } from './agenthost.ts';
 import { USAGE_AGENT_ORDER } from './usageview.ts';
 import { missingSetupValues } from './domain/session-setups.ts';
@@ -918,6 +919,8 @@ import {
 } from './codex.ts';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert';
+import { parseSessionRequest } from './sessionrequests.ts';
+import { SessionWriteRequests } from './sessionwrites.ts';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import { manifestMenu, menuGroups, whenHolds } from '../scripts/web-demo-menu.ts';
@@ -1116,7 +1119,8 @@ import * as vscode from 'vscode';
 import { performance } from 'node:perf_hooks';
 import { PanelPerformanceCounters, type PerformanceEventSink } from './performancediagnostics.ts';
 import { StartupThresholdWatch, createDiagnosticsLog } from './diagnosticslog.ts';
-import { answerSessionRename } from './sessionrename.ts';
+import { answerSessionRename, sessionRenameTitle } from './sessionrename.ts';
+import * as renameTranscripts from './transcript.ts';
 import { claudeSkillPath } from './claudeskillpath.ts';
 import type { PromptEntry } from './agentwire.ts';
 import { drawnSessionCards } from './sessiondetails.ts';
@@ -1244,6 +1248,315 @@ test('window session reads leave reader state and live capabilities unchanged an
       value instanceof Map || value instanceof Set ? [...value] : value,
     ),
     snapshot,
+  );
+});
+
+// These host cases catch reader-state loss and premature durable replies. They reuse the live-provider fixture without browser startup.
+test('window starts adopt both providers and classifications without changing the reader draft, selection, watermarks or tabs', async () => {
+  for (const agent of ['claude', 'codex'] as const)
+    for (const agentRun of [false, true]) {
+      const fixture = liveProviderFixture(livePress({ sessionId: 'reader', agent }));
+      const provider: any = fixture.provider;
+      const messages: any[] = [];
+      const catalog = {
+        [agent]: [
+          {
+            value: 'runtime-model',
+            label: 'Runtime model',
+            description: '',
+            efforts: [{ value: 'runtime-effort', label: 'Runtime effort', description: '' }],
+          },
+        ],
+      };
+      const profile = {
+        agent,
+        model: 'runtime-model',
+        effort: 'runtime-effort',
+        permissionMode: '',
+        source: 'custom' as const,
+      };
+      let save!: () => void;
+      let calls = 0;
+      Object.assign(provider, {
+        saved: normalizePanelState({
+          showing: 'reader',
+          read: ['read-key'],
+          readTo: { reader: 9 },
+          labels: { reader: ['Existing'] },
+        }),
+        drafts: { reader: 'unsent reader prompt' },
+        draftProfiles: {},
+        staging: new Set(),
+        railOrder: ['reader'],
+        startedHere: new Set(['reader']),
+        pinnedTop: new Set(['reader']),
+        hidden: new Set(),
+        trail: emptyTrail(),
+        models: catalog,
+        pendingModels: [],
+        setupProject: 'project',
+        folders: () => ['C:/workspace'],
+        repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'], revision: 1 }) },
+        launcherFor: () => ({ view: sessionLauncherView(null, [], catalog) }),
+        post: async (message: unknown) => {
+          messages.push(message);
+        },
+        memento: {
+          update: () =>
+            new Promise<void>((resolve) => {
+              save = resolve;
+            }),
+        },
+        onSessionSettingsAdopted: async () => {},
+        onRenameStartedSession: async (provider: string, session: string, cwd: string, name: string) => {
+          assert.equal(provider, agent);
+          assert.equal(session, 'accepted');
+          assert.equal(cwd, 'C:/workspace');
+          assert.equal(name, 'Initial name');
+          messages.push({ type: 'initialName' });
+        },
+        onSendDraftPrompt: async (draft: NewSessionDraft, prompt: { text: string }) => {
+          calls++;
+          assert.deepEqual(draft.profile, profile);
+          assert.equal(prompt.text, 'work');
+          return { delivered: true, session: 'accepted', turnId: 7, reason: '' };
+        },
+      });
+      const before = JSON.stringify([
+        provider.showing,
+        provider.drafts,
+        [...provider.hostSessions],
+        [...provider.hostPreviousSessions],
+        provider.saved.read,
+        provider.saved.readTo,
+      ]);
+      const request: any = {
+        method: 'start',
+        requester: 'attribution',
+        params: {
+          prompt: 'work',
+          name: 'Initial name',
+          setup: { kind: 'custom', ...profile },
+          agentRun,
+          labels: [' Review ', 'review'],
+          pinned: true,
+        },
+      };
+      let settled = false;
+      const pending = provider.handleSessionRequest(request).then((value: unknown) => {
+        settled = true;
+        return value;
+      });
+      await vi.waitFor(() => assert.equal(typeof save, 'function'));
+      assert.equal(settled, false);
+      save();
+      const result: any = await pending;
+      assert.equal(result.status, 'accepted');
+      assert.equal(result.sessionId, 'accepted');
+      assert.deepEqual(provider.saved.labels.accepted, ['Review']);
+      assert.equal(provider.pinnedTop.has('accepted'), true);
+      assert.equal(provider.startedHere.has('accepted'), !agentRun);
+      assert.equal(provider.saved.agentRuns?.includes('accepted') ?? false, agentRun);
+      assert.equal(
+        JSON.stringify([
+          provider.showing,
+          provider.drafts,
+          [...provider.hostSessions],
+          [...provider.hostPreviousSessions],
+          provider.saved.read,
+          provider.saved.readTo,
+        ]),
+        before,
+      );
+      assert.equal(calls, 1);
+      for (const prompt of ['', '  ', '/clear', '  /model'])
+        await assert.rejects(
+          provider.handleSessionRequest({ ...request, params: { ...request.params, prompt } }),
+          /nonempty prompt/,
+        );
+      await assert.rejects(
+        provider.handleSessionRequest({
+          ...request,
+          params: { ...request.params, setup: { kind: 'custom', ...profile, model: 'unknown' } },
+        }),
+        /unavailable/,
+      );
+      assert.equal(calls, 1);
+      assert.equal(
+        messages.some((message) => message.type === 'labelsChanged'),
+        true,
+      );
+      assert.equal(
+        messages.some((message) => message.type === 'initialName'),
+        true,
+      );
+    }
+});
+
+test('an initial metadata save failure reports the already accepted identity', async () => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+  Object.assign(provider, {
+    setupProject: 'project',
+    pendingModels: [],
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+    memento: {
+      update: async () => {
+        throw new Error('save refused');
+      },
+    },
+    onSendDraftPrompt: async () => ({ delivered: true, session: 'accepted', reason: 'recent setup save refused' }),
+    adoptDraft: () => {},
+    onSessionSettingsAdopted: async () => {},
+    pinnedTop: new Set(),
+    saved: normalizePanelState(null),
+  });
+  const result = await provider.handleSessionRequest({
+    method: 'start',
+    requester: null,
+    params: {
+      prompt: 'work',
+      agentRun: false,
+      setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+    },
+  });
+  assert.equal(result.status, 'accepted-with-errors');
+  assert.equal(result.sessionId, 'accepted');
+  assert.deepEqual(result.errors, ['recent setup save refused', 'save refused']);
+});
+
+test('scoped curation awaits saves, rechecks archive at apply, rolls back refusal and preserves reader state', async () => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+  let save!: () => void;
+  let writes = 0;
+  const messages: any[] = [];
+  let row = { id: 'known', facts: 'current', runStatus: 'done', attention: 'idle' };
+  Object.assign(provider, {
+    saved: normalizePanelState({
+      showing: 'reader',
+      read: ['read-key'],
+      readTo: { reader: 5 },
+      labels: { known: ['Existing'] },
+    }),
+    drafts: { reader: 'unsent' },
+    pinnedTop: new Set(),
+    hidden: new Set(),
+    sessionWriteQueue: Promise.resolve(),
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
+    authoritativeCatalog: [
+      { sessionId: 'known', cwd: 'C:/workspace', agent: 'codex' },
+      { sessionId: 'outside', cwd: 'C:/foreign', agent: 'codex' },
+    ],
+    readSessionRequest: () => ({ sessions: [row] }),
+    memento: {
+      update: () => {
+        writes++;
+        return new Promise<void>((resolve) => {
+          save = resolve;
+        });
+      },
+    },
+    post: async (message: unknown) => {
+      messages.push(message);
+    },
+  });
+  const request: any = {
+    method: 'curate',
+    requester: 'someone else',
+    params: { sessionId: 'known', action: 'label-add', labels: [' Review '], force: false, dryRun: false },
+  };
+  const before = JSON.stringify([
+    provider.showing,
+    provider.drafts,
+    [...provider.hostSessions],
+    provider.saved.read,
+    provider.saved.readTo,
+  ]);
+  let settled = false;
+  const adding = provider.handleSessionRequest(request).then((result: unknown) => {
+    settled = true;
+    return result;
+  });
+  await vi.waitFor(() => assert.equal(writes, 1));
+  const archive = provider.handleSessionRequest({
+    ...request,
+    params: { ...request.params, action: 'archive', force: true },
+  });
+  row = { ...row, runStatus: 'waiting', attention: 'input' };
+  assert.equal(settled, false);
+  save();
+  assert.equal((await adding).status, 'applied');
+  assert.equal((await archive).status, 'refused');
+  assert.equal(writes, 1);
+  assert.deepEqual(provider.saved.labels.known, ['Existing', 'Review']);
+  assert.equal(
+    messages.some((message) => message.type === 'labelEditor'),
+    true,
+  );
+  assert.equal(
+    messages.some((message) => message.type === 'labelsChanged'),
+    true,
+  );
+  for (const sessionId of ['unknown', 'outside'])
+    await assert.rejects(
+      provider.handleSessionRequest({ ...request, params: { ...request.params, sessionId } }),
+      /unknown or ambiguous/,
+    );
+  row = { ...row, runStatus: 'done', attention: 'unread' };
+  assert.equal(
+    (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'archive' } })).status,
+    'refused',
+  );
+  assert.equal(
+    (
+      await provider.handleSessionRequest({
+        ...request,
+        params: { ...request.params, action: 'archive', force: true, dryRun: true },
+      })
+    ).status,
+    'dry-run',
+  );
+  assert.equal(writes, 1);
+  provider.memento.update = async () => {
+    writes++;
+    throw new Error('save refused');
+  };
+  await assert.rejects(
+    provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'pin' } }),
+    /save refused/,
+  );
+  assert.equal(provider.pinnedTop.has('known'), false);
+  await assert.rejects(
+    provider.handleSessionRequest({ ...request, params: { ...request.params, labels: ['Different'] } }),
+    /save refused/,
+  );
+  assert.deepEqual(provider.saved.labels.known, ['Existing', 'Review']);
+  provider.memento.update = async () => {
+    writes++;
+  };
+  assert.equal(
+    (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'archive', force: true } }))
+      .status,
+    'applied',
+  );
+  assert.equal(provider.hidden.has('known'), true);
+  assert.equal(
+    (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } })).status,
+    'applied',
+  );
+  assert.equal(provider.hidden.has('known'), false);
+  assert.equal(
+    JSON.stringify([
+      provider.showing,
+      provider.drafts,
+      [...provider.hostSessions],
+      provider.saved.read,
+      provider.saved.readTo,
+    ]),
+    before,
   );
 });
 
@@ -9231,7 +9544,10 @@ test('draft acceptance survives profile-save and adoption failures until removal
       permissionMode: '',
       source: 'recent',
     });
-    assert.equal((await panel.onSendDraftPrompt(draft, { assets: [] })).delivered, !failSave);
+    const delivery = await panel.onSendDraftPrompt(draft, { assets: [] });
+    assert.equal(delivery.delivered, true);
+    assert.equal(delivery.session, 'actual');
+    if (failSave) assert.match(delivery.reason, /save failed/);
     assert.equal(accepted.has(live.key), true);
     panel.onDraftProfileChanged(draft);
     assert.deepEqual(retired, []);
@@ -9385,7 +9701,7 @@ test('an accepted draft adopts before its settings are published under the real 
   );
   sourceMatch(
     extensionSource,
-    /panel\.onSessionSettingsAdopted = \(session, settings\) => \{[\s\S]{0,120}persistSessionSettings\(session, settings\)/,
+    /panel\.onSessionSettingsAdopted = async \(session, settings\) => \{[\s\S]{0,120}persistSessionSettings\(session, settings\)/,
     'successful panel adoption does not publish the accepted setup to the reopening book',
   );
   const adoptAt = panelHostSource.indexOf('private adoptDraft(');
@@ -11118,7 +11434,7 @@ test('label requests keep the browser identity while reading durable label stora
   );
   sourceMatch(
     message,
-    /labelsChanged', session: browserSession \?\? msg\.session/,
+    /changeSessionLabels\(msg\.session, msg\.names, browserSession \?\? msg\.session\)/,
     'a label write reports a different session from the open provisional editor',
   );
 
@@ -11806,7 +12122,9 @@ test('archive and unarchive are bounded membership updates', () => {
       .replace(/\): boolean =>/, ') =>')}\n};`,
   )('arc.panelState');
   const setSessionArchived = new Function(
-    `return function (session, archived) {\n${methodBody('public setSessionArchived(')}\n};`,
+    esbuild.transformSync(`return function (session, archived) {\n${methodBody('public setSessionArchived(')}\n};`, {
+      loader: 'ts',
+    }).code,
   )();
   const archiveChanges: string[][] = [];
   const persisted: unknown[] = [];
@@ -12432,7 +12750,7 @@ test("/clear does not evict the source session's own labels at a full label reco
   );
 });
 
-test('provider acceptance adopts overlapping drafts without losing either setup', () => {
+test('provider acceptance adopts overlapping drafts without losing either setup', async () => {
   const adoptBody = methodBody('private adoptDraft(').replace('.next().value as string | undefined', '.next().value');
   const adopt = new Function(
     'adoptSessionIdentity',
@@ -12443,7 +12761,7 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
     'rememberSessionAlias',
     'remapReaderParents',
     'AGENT_NAMES',
-    `return function (provisional, actual, submitted, submittedSettings) {\n${adoptBody}\n};`,
+    `return function (provisional, actual, submitted, submittedSettings, deferredPersistence = false) {\n${adoptBody}\n};`,
   )(
     adoptSessionIdentity,
     (_trail: unknown, _provisional: string, actual: string) => actual,
@@ -12593,6 +12911,7 @@ test('provider acceptance adopts overlapping drafts without losing either setup'
     'publishing the first accepted setup erased the other provisional draft setup',
   );
   adopt.call(host, 'second', 'actual-second');
+  await Promise.resolve();
   assert.deepEqual(host.saved.readerParents, { 'actual-first': 'ancestor', 'actual-second': 'actual-first' });
   assert.deepEqual(
     [...host.hostSessions.values()],
@@ -15647,7 +15966,7 @@ test('the rail card and the session heading both offer archiving, and none of it
   );
   sourceMatch(
     panelHostSource,
-    /public setSessionArchived[\s\S]*this\.updateSessionMembership\(archived \? 'archive' : 'unarchive', session\);/,
+    /public setSessionArchived[\s\S]*this\.updateSessionMembership\(archived \? 'archive' : 'unarchive', session\)/,
     'the archive commands do not update and publish the provider-owned durable set',
   );
   sourceMatch(
@@ -20574,7 +20893,7 @@ test('an accepted Codex fork cannot restore a disposed panel selection', async (
   }
 });
 
-test('resetting workspace state invalidates every panel selection', async () => {
+test('resetting workspace state invalidates every panel selection and preserves launch classification', async () => {
   const fixture = liveProviderFixture({ ...livePress(), sessionId: 'source', agent: 'codex' });
   const provider = fixture.provider as unknown as Record<string, any>;
   const peer = { webview: {}, visible: () => true };
@@ -20594,18 +20913,70 @@ test('resetting workspace state invalidates every panel selection', async () => 
     pinnedTop: new Set<string>(),
     trail: emptyTrail(),
     onArchivedSessionsChange: null,
+    setupProject: 'project',
+    pendingModels: [],
+    models: {},
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+    draftProfiles: {},
+    railOrder: ['source'],
+    staging: new Set(),
+    stagingTokens: new Map(),
+    stagingOperations: new Map(),
+    onSendDraftPrompt: async (draft: NewSessionDraft, prompt: { text: string }) => ({
+      delivered: true,
+      session: prompt.text,
+      reason: '',
+    }),
+    onSessionSettingsAdopted: async () => {},
+    metaFor: () => ({ agentRun: false }),
     memento: {
-      update() {
+      update(_key: string, state: unknown) {
+        stored = structuredClone(state);
         return Promise.resolve();
       },
     },
   });
+  let stored: any;
   const originalWarning = (vscode.window as any).showWarningMessage;
   (vscode.window as any).showWarningMessage = async () => 'Reset';
   try {
+    for (const agentRun of [true, false]) {
+      const session = agentRun ? 'tagged' : 'untagged';
+      const result = await provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: {
+          prompt: session,
+          agentRun,
+          setup: { kind: 'custom', agent: 'claude', model: '', effort: '', permissionMode: '' },
+        },
+      });
+      assert.equal(result.status, 'accepted');
+      assert.equal(provider.agentRunFor({ sessionId: session }, new Map()), agentRun);
+      assert.equal(provider.startedHere.has(session), !agentRun);
+    }
     provider.saved.readerParents = { child: 'parent' };
     await provider.forgetState();
     assert.deepEqual(provider.saved.readerParents, { child: 'parent' });
+    assert.deepEqual(provider.saved.agentRuns, ['tagged']);
+    assert.deepEqual(provider.saved.started, ['untagged']);
+    const restored: any = Object.assign(Object.create(PanelProvider.prototype), {
+      saved: normalizePanelState(stored),
+      startedHere: new Set(stored.started),
+      metaFor: () => ({ agentRun: false }),
+    });
+    for (const reader of [provider, restored]) {
+      assert.equal(
+        reader.agentRunFor({ sessionId: 'tagged' }, new Map()),
+        true,
+        'Run by agents lost the tagged launch',
+      );
+      assert.equal(reader.agentRunFor({ sessionId: 'untagged' }, new Map()), false);
+      assert.equal(reader.startedHere.has('tagged'), false);
+      assert.equal(reader.startedHere.has('untagged'), true);
+    }
   } finally {
     (vscode.window as any).showWarningMessage = originalWarning;
   }
@@ -25961,3 +26332,827 @@ test.each([false, true])(
     }
   },
 );
+
+function initialRenameCallback(
+  host: unknown,
+  root: string,
+): (agent: string, session: string, cwd: string, title: string) => Promise<void> {
+  const panel: any = {};
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const source = statementFrom(extensionSource, extensionSource.indexOf('panel.onRenameStartedSession ='));
+  const scope = {
+    panel,
+    host,
+    sessionRenameTitle,
+    renameAgentSession,
+    projectsRoot: () => root,
+    sessionFilesFor: renameTranscripts.sessionFilesFor,
+    sessionFileFor: (renameTranscripts as any).sessionFileFor,
+  };
+  const code = esbuild.transformSync(source, { loader: 'ts' }).code;
+  new Function(...Object.keys(scope), code)(...Object.values(scope));
+  return panel.onRenameStartedSession;
+}
+
+test('initial Claude naming reads only the accepted transcript and confirms its durable complete title without a sidecar', async () => {
+  const root = tempDir('arc-initial-title-');
+  const cwd = 'C:/workspace';
+  const dir = path.join(root, renameTranscripts.projectSlug(cwd));
+  fs.mkdirSync(dir);
+  const session = 'de9a5233-9eef-4fc9-9778-cbd97dedc126';
+  const file = path.join(dir, `${session}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd }) + '\n');
+  for (let i = 0; i < 3; i++) fs.writeFileSync(path.join(dir, `unrelated-${i}.jsonl`), JSON.stringify({ cwd }) + '\n');
+  const name = 'Complete initial name';
+  const rename = initialRenameCallback(
+    {
+      renameSession: async () => {
+        fs.appendFileSync(file, JSON.stringify({ type: 'custom-title', sessionId: session, customTitle: name }) + '\n');
+      },
+    },
+    root,
+  );
+  const read = openReadWindow();
+  try {
+    await rename('claude', session, cwd, name);
+    assert.deepEqual([...read.files], [file], 'initial rename read unrelated transcript contents');
+    assert.ok(read.bytes <= 64 * 1024 + 16 * 1024);
+    assert.equal(fs.existsSync(path.join(dir, session, 'custom-title.json')), false);
+  } finally {
+    closeReadWindow(read);
+  }
+});
+
+test.each([false, true])(
+  'initial Codex naming retries empty rollout after one accepted launch with agentRun=%s',
+  async (agentRun) => {
+    vi.useFakeTimers();
+    try {
+      const fixture = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' }));
+      const provider: any = fixture.provider;
+      const session = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
+      const calls: unknown[] = [];
+      let durable = '';
+      const rename = initialRenameCallback(
+        {
+          renameSession: async (agent: string, id: string, name: string) => {
+            calls.push([agent, id, name]);
+            if (calls.length === 1)
+              throw new Error(
+                `failed to set thread name: Fatal error: failed to update thread metadata ${id}: thread-store internal error: failed to read session metadata C:/sessions/rollout-${id}.jsonl: rollout at C:/sessions/rollout-${id}.jsonl is empty`,
+              );
+            durable = name;
+          },
+        },
+        'unused',
+      );
+      let launches = 0;
+      Object.assign(provider, {
+        setupProject: 'project',
+        pendingModels: [],
+        models: {},
+        folders: () => ['C:/workspace'],
+        repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+        launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+        memento: { update: async () => {} },
+        adoptDraft: () => {},
+        onSessionSettingsAdopted: async () => {},
+        onSendDraftPrompt: async () => {
+          launches++;
+          return { delivered: true, session, reason: '' };
+        },
+        onRenameStartedSession: rename,
+        saved: normalizePanelState({ showing: 'reader', readTo: { reader: 9 } }),
+        drafts: { reader: 'unsent' },
+        pinnedTop: new Set(),
+        startedHere: new Set(['reader']),
+      });
+      const before = JSON.stringify([
+        provider.showing,
+        provider.drafts,
+        [...provider.hostSessions],
+        provider.saved.readTo,
+      ]);
+      const pending = provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: {
+          prompt: 'work',
+          name: 'Initial Codex name',
+          agentRun,
+          setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        },
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      assert.equal(result.status, 'accepted', JSON.stringify(result.errors));
+      assert.equal(result.sessionId, session);
+      assert.equal(durable, 'Initial Codex name');
+      assert.deepEqual(calls, [
+        ['codex', session, durable],
+        ['codex', session, durable],
+      ]);
+      assert.equal(launches, 1);
+      assert.equal(provider.saved.agentRuns?.includes(session) ?? false, agentRun);
+      assert.equal(
+        JSON.stringify([provider.showing, provider.drafts, [...provider.hostSessions], provider.saved.readTo]),
+        before,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['settings-first', 'curation-first'])(
+  'a failed curation pin preserves an independently accepted initial pin through a later save at %s',
+  async (ordering) => {
+    const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+    const started = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
+    const curated = '01a11dea-12be-7912-8e6c-84b35818ccf4';
+    let resumeSettings!: () => void;
+    let rejectCuration!: (error: Error) => void;
+    let durable: any;
+    Object.assign(provider, {
+      setupProject: 'project',
+      pendingModels: [],
+      models: {},
+      folders: () => ['C:/workspace'],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
+      authoritativeCatalog: [{ sessionId: curated, cwd: 'C:/workspace', agent: 'codex' }],
+      launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+      saved: normalizePanelState(null),
+      hidden: new Set(),
+      pinnedTop: new Set(),
+      draftProfiles: {},
+      railOrder: ['reader'],
+      startedHere: new Set(),
+      staging: new Set(),
+      stagingTokens: new Map(),
+      stagingOperations: new Map(),
+      trail: emptyTrail(),
+      onSendDraftPrompt: async () => ({ delivered: true, session: started, reason: '' }),
+      onSessionSettingsAdopted: () =>
+        new Promise<void>((resolve) => {
+          resumeSettings = resolve;
+        }),
+      memento: {
+        update: (_key: string, state: unknown) => {
+          if (!rejectCuration)
+            return new Promise<void>((_resolve, reject) => {
+              rejectCuration = reject;
+            });
+          durable = structuredClone(state);
+          return Promise.resolve();
+        },
+      },
+    });
+    const start = () =>
+      provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: {
+          prompt: 'work',
+          pinned: true,
+          agentRun: false,
+          setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        },
+      });
+    const curate = () =>
+      provider.handleSessionRequest({
+        method: 'curate',
+        requester: null,
+        params: { sessionId: curated, action: 'pin' },
+      });
+    let launch: Promise<any>;
+    if (ordering === 'settings-first') {
+      launch = start();
+      await vi.waitFor(() => assert.equal(typeof resumeSettings, 'function'));
+    }
+    const curation = curate();
+    const rejected = assert.rejects(curation, /curation save refused/);
+    await vi.waitFor(() => assert.equal(typeof rejectCuration, 'function'));
+    if (ordering === 'curation-first') {
+      launch = start();
+      await vi.waitFor(() => assert.equal(typeof resumeSettings, 'function'));
+      assert.ok(provider.awaitingSessionRecords[started], 'provider delivery did not adopt the real draft');
+      assert.equal(provider.pinnedTop.has(curated), true, 'adoption removed the pending curation pin');
+    } else {
+      resumeSettings();
+      assert.equal((await launch!).status, 'accepted');
+    }
+    rejectCuration(new Error('curation save refused'));
+    await rejected;
+    assert.equal(provider.pinnedTop.has(curated), false, 'refused curation pin survived real draft adoption');
+    if (ordering === 'curation-first') {
+      resumeSettings();
+      assert.equal((await launch!).status, 'accepted');
+    }
+    assert.equal(provider.pinnedTop.has(started), true, 'curation rollback removed the accepted initial pin');
+    assert.equal(provider.pinnedTop.has(curated), false);
+    await provider.writeDrafts();
+    assert.deepEqual(durable.pinnedTop, [started]);
+  },
+);
+
+test.each(['resolve', 'reject'])(
+  'CLI pin waits for catalog-admitted initial pin persistence to %s',
+  async (settlement) => {
+    const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+    const session = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
+    const cwd = tempDir('arc-initial-pin-');
+    const file = path.join(cwd, `rollout-${session}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session, cwd } }) + '\n');
+    let resolveSave!: () => void;
+    let rejectSave!: (error: Error) => void;
+    let durable: any = normalizePanelState(null);
+    let saves = 0;
+    Object.assign(provider, {
+      setupProject: 'project',
+      pendingModels: [],
+      models: {},
+      folders: () => [cwd],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: [cwd] }) },
+      repositoryScopeRoots: [cwd],
+      authoritativeCatalogScope: JSON.stringify([cwd]),
+      authoritativeCatalog: [],
+      launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+      saved: normalizePanelState(null),
+      hidden: new Set(),
+      pinnedTop: new Set(),
+      draftProfiles: {},
+      railOrder: ['reader'],
+      startedHere: new Set(),
+      staging: new Set(),
+      stagingTokens: new Map(),
+      stagingOperations: new Map(),
+      trail: emptyTrail(),
+      onSendDraftPrompt: async () => ({ delivered: true, session, reason: '' }),
+      onSessionSettingsAdopted: async () => {},
+      memento: {
+        update: (_key: string, state: unknown) => {
+          const snapshot = structuredClone(state);
+          saves++;
+          return new Promise<void>((resolve, reject) => {
+            resolveSave = () => {
+              durable = snapshot;
+              resolve();
+            };
+            rejectSave = reject;
+          });
+        },
+      },
+    });
+    try {
+      const launch = provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: {
+          prompt: 'work',
+          pinned: true,
+          agentRun: false,
+          setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        },
+      });
+      await vi.waitFor(() => assert.equal(saves, 1));
+      assert.ok(provider.awaitingSessionRecords[session], 'the accepted start did not adopt its real session ID');
+      assert.equal(provider.pinnedTop.has(session), true);
+      assert.deepEqual(durable.pinnedTop, []);
+      const windowId = 'a'.repeat(24);
+      const requests = new SessionWriteRequests(windowId);
+      let requestSequence = 0;
+      const curate = () => {
+        const request = parseSessionRequest({
+          id: `${windowId}:pin-${++requestSequence}`,
+          version: 1,
+          token: 'b'.repeat(64),
+          method: 'curate',
+          requester: null,
+          params: { sessionId: session, action: 'pin', dryRun: false, force: false },
+        });
+        assert.ok(request, 'the fresh pin request is invalid');
+        return requests.run(request.id, request, () => provider.handleSessionRequest(request));
+      };
+      await assert.rejects(curate(), /unknown or ambiguous/, 'delivery alone admitted an uncatalogued session');
+      const publication = statementFrom(
+        panelHostSource,
+        panelHostSource.indexOf('if (!selectedOnly && !metadataAfterRender) {'),
+      );
+      new Function('all', 'selectedOnly', 'metadataAfterRender', publication).call(
+        provider,
+        [{ sessionId: session, cwd, file, agent: 'codex' }],
+        false,
+        false,
+      );
+      assert.equal(provider.authoritativeCatalog[0].sessionId, session);
+      const membership = vi.spyOn(provider, 'updateSessionMembership');
+      let settled = false;
+      const outcome: Promise<{ result?: any; persistedPins?: string[]; error?: Error }> = curate().then(
+        (result: any) => {
+          settled = true;
+          return { result, persistedPins: [...durable.pinnedTop] };
+        },
+        (error: Error) => {
+          settled = true;
+          return { error };
+        },
+      );
+      await vi.waitFor(() => assert.equal(membership.mock.calls.length, 1));
+      const acknowledgedBeforeSave = settled;
+      if (settlement === 'resolve') resolveSave();
+      else rejectSave(new Error('initial pin refused'));
+      const start = await launch;
+      const pin = await outcome;
+      assert.equal(acknowledgedBeforeSave, false, 'CLI acknowledged a pin before initial persistence settled');
+      assert.equal(start.sessionId, session);
+      if (settlement === 'resolve') {
+        assert.equal(start.status, 'accepted');
+        assert.equal(pin.result.status, 'applied');
+        assert.deepEqual(pin.persistedPins, [session], 'the initial pin was absent at acknowledgment');
+        assert.deepEqual(durable.pinnedTop, [session], 'the acknowledgment has no persisted initial pin');
+      } else {
+        assert.equal(start.status, 'accepted-with-errors');
+        assert.deepEqual(start.errors, ['initial pin refused']);
+        assert.equal(pin.result, undefined, 'the failed initial save produced an applied acknowledgment');
+        assert.ok(pin.error);
+        assert.match(pin.error.message, /initial pin refused/);
+        assert.deepEqual(durable.pinnedTop, []);
+        assert.equal(provider.pinnedTop.has(session), true, 'metadata failure changed the accepted launch outcome');
+        for (const retrySettlement of ['reject', 'resolve']) {
+          let retrySettled = false;
+          const retry: Promise<{ result?: any; persistedPins?: string[]; error?: Error }> = curate().then(
+            (result: any) => {
+              retrySettled = true;
+              return { result, persistedPins: [...durable.pinnedTop] };
+            },
+            (error: Error) => {
+              retrySettled = true;
+              return { error };
+            },
+          );
+          await vi.waitFor(() => assert.equal(membership.mock.calls.length, retrySettlement === 'reject' ? 2 : 3));
+          assert.equal(retrySettled, false, 'a fresh pin acknowledged live membership without persisting it');
+          assert.equal(saves, retrySettlement === 'reject' ? 2 : 3, 'a fresh pin did not retry failed persistence');
+          assert.deepEqual(durable.pinnedTop, [], 'another save persisted the pin before the fresh retry');
+          if (retrySettlement === 'reject') {
+            rejectSave(new Error('retry pin refused'));
+            const refused = await retry;
+            assert.equal(refused.result, undefined, 'the rejected retry produced an applied acknowledgment');
+            assert.ok(refused.error);
+            assert.match(refused.error.message, /retry pin refused/);
+            assert.deepEqual(durable.pinnedTop, []);
+            assert.equal(provider.pinnedTop.has(session), true, 'retry failure changed the accepted launch outcome');
+          } else {
+            resolveSave();
+            const applied = await retry;
+            assert.equal(applied.result.status, 'applied');
+            assert.deepEqual(applied.persistedPins, [session], 'the fresh pin was absent at acknowledgment');
+            assert.deepEqual(durable.pinnedTop, [session]);
+            const listener = vi
+              .spyOn(PanelProvider.prototype as unknown as { wireEditorListeners(): void }, 'wireEditorListeners')
+              .mockImplementation(() => {});
+            let restored: InstanceType<typeof PanelProvider> | undefined;
+            try {
+              restored = new PanelProvider(
+                '',
+                {} as vscode.Uri,
+                {
+                  get: () => durable,
+                } as unknown as vscode.Memento,
+              );
+              assert.equal(
+                (restored as unknown as Record<string, any>).pinnedTop.has(session),
+                true,
+                'restoration lost the acknowledged fresh pin',
+              );
+            } finally {
+              restored?.dispose();
+              listener.mockRestore();
+            }
+          }
+        }
+      }
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test('an older failed CLI pin cannot roll back a newer pending initial pin', async () => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+  const session = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
+  let resumeSettings!: () => void;
+  let rejectOlder!: (error: Error) => void;
+  let saveInitial!: () => void;
+  let durable: any = normalizePanelState(null);
+  let saves = 0;
+  Object.assign(provider, {
+    setupProject: 'project',
+    pendingModels: [],
+    models: {},
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
+    authoritativeCatalog: [{ sessionId: session, cwd: 'C:/workspace', agent: 'codex' }],
+    launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+    saved: normalizePanelState(null),
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    draftProfiles: {},
+    railOrder: ['reader'],
+    startedHere: new Set(),
+    staging: new Set(),
+    stagingTokens: new Map(),
+    stagingOperations: new Map(),
+    trail: emptyTrail(),
+    onSendDraftPrompt: async () => ({ delivered: true, session, reason: '' }),
+    onSessionSettingsAdopted: () =>
+      new Promise<void>((resolve) => {
+        resumeSettings = resolve;
+      }),
+    memento: {
+      update: (_key: string, state: unknown) => {
+        const snapshot = structuredClone(state);
+        if (++saves === 1)
+          return new Promise<void>((_resolve, reject) => {
+            rejectOlder = reject;
+          });
+        if (saves === 2)
+          return new Promise<void>((resolve) => {
+            saveInitial = () => {
+              durable = snapshot;
+              resolve();
+            };
+          });
+        durable = snapshot;
+        return Promise.resolve();
+      },
+    },
+  });
+  const launch = provider.handleSessionRequest({
+    method: 'start',
+    requester: null,
+    params: {
+      prompt: 'work',
+      pinned: true,
+      agentRun: false,
+      setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+    },
+  });
+  await vi.waitFor(() => assert.equal(typeof resumeSettings, 'function'));
+  const pin = () =>
+    provider.handleSessionRequest({ method: 'curate', requester: null, params: { sessionId: session, action: 'pin' } });
+  const older = assert.rejects(pin(), /older pin refused/);
+  await vi.waitFor(() => assert.equal(saves, 1));
+  resumeSettings();
+  await vi.waitFor(() => assert.equal(saves, 2));
+  rejectOlder(new Error('older pin refused'));
+  await older;
+  assert.equal(provider.pinnedTop.has(session), true, 'older rollback removed the newer initial pin');
+  const membership = vi.spyOn(provider, 'updateSessionMembership');
+  let settled = false;
+  const latest = pin().then((result: any) => {
+    settled = true;
+    return { result, persistedPins: [...durable.pinnedTop] };
+  });
+  await vi.waitFor(() => assert.equal(membership.mock.calls.length, 1));
+  const acknowledgedBeforeSave = settled;
+  saveInitial();
+  const acknowledgment = await latest;
+  assert.equal((await launch).status, 'accepted');
+  assert.equal(acknowledgedBeforeSave, false, 'older settlement removed the newer pending-save owner');
+  assert.equal(acknowledgment.result.status, 'applied');
+  assert.deepEqual(acknowledgment.persistedPins, [session], 'initial pin was absent at acknowledgment');
+  await provider.writeDrafts();
+  assert.deepEqual(durable.pinnedTop, [session]);
+});
+
+test.each(['resolve', 'reject'])('CLI pin waits for pending native pin persistence to %s', async (settlement) =>
+  withEditorErrors(async (errors) => {
+    const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+    let resolveSave!: () => void;
+    let rejectSave!: (error: Error) => void;
+    let durable: any = normalizePanelState(null);
+    let saves = 0;
+    Object.assign(provider, {
+      saved: normalizePanelState(null),
+      hidden: new Set(),
+      pinnedTop: new Set(),
+      folders: () => ['C:/workspace'],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
+      authoritativeCatalog: [{ sessionId: 'reader', cwd: 'C:/workspace', agent: 'codex' }],
+      memento: {
+        update: (_key: string, state: unknown) => {
+          const snapshot = structuredClone(state);
+          if (++saves === 1)
+            return new Promise<void>((resolve, reject) => {
+              resolveSave = () => {
+                durable = snapshot;
+                resolve();
+              };
+              rejectSave = reject;
+            });
+          durable = snapshot;
+          return Promise.resolve();
+        },
+      },
+    });
+    const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+    const registration = /^\s*reg\('arc\.pinSession'.*$/m.exec(source)?.[0];
+    assert.ok(registration, 'the native pin command is not registered');
+    const compiled = esbuild.transformSync(
+      `${source.slice(source.indexOf('function sessionIdFrom('), source.indexOf('function setSessionRead('))}
+       ${source.slice(source.indexOf('function setSessionPinned('), source.indexOf('function copySessionId('))}
+       ${registration}`,
+      { loader: 'ts', target: 'node18' },
+    ).code;
+    let nativePin!: (arg: unknown) => void;
+    new Function('reg', 'panel', compiled)((_id: string, command: typeof nativePin) => {
+      nativePin = command;
+    }, provider);
+    nativePin({ session: 'reader' });
+    assert.equal(provider.pinnedTop.has('reader'), true);
+    assert.deepEqual(durable.pinnedTop, []);
+    const membership = vi.spyOn(provider, 'updateSessionMembership');
+    let settled = false;
+    const curation = provider.handleSessionRequest({
+      method: 'curate',
+      requester: null,
+      params: { sessionId: 'reader', action: 'pin' },
+    });
+    const outcome = curation.then(
+      (result: any) => {
+        settled = true;
+        return { result };
+      },
+      (error: Error) => {
+        settled = true;
+        return { error };
+      },
+    );
+    await vi.waitFor(() => assert.equal(membership.mock.calls.length, 1));
+    const acknowledgedBeforeSave = settled;
+    if (settlement === 'resolve') {
+      assert.equal(acknowledgedBeforeSave, false, 'CLI acknowledged a pin before pending native persistence settled');
+      resolveSave();
+      assert.equal((await outcome).result.status, 'applied');
+      assert.deepEqual(durable.pinnedTop, ['reader'], 'acknowledgment has no persisted pin');
+      assert.equal(provider.pinnedTop.has('reader'), true);
+      assert.deepEqual(errors, []);
+    } else {
+      rejectSave(new Error('native pin refused'));
+      const result = await outcome;
+      await vi.waitFor(() => assert.equal(errors.length, 1));
+      assert.equal(provider.pinnedTop.has('reader'), false, 'the refused pin remains live');
+      assert.deepEqual(provider.saved.pinnedTop, []);
+      await provider.writeDrafts();
+      assert.deepEqual(durable.pinnedTop, [], 'an ordinary save retained the refused pin');
+      assert.equal(acknowledgedBeforeSave, false, 'CLI acknowledged a pin before pending native persistence settled');
+      assert.match(result.error.message, /native pin refused/);
+    }
+  }),
+);
+
+test('a failed pin preserves a newer successful pin after unpinning', async () => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+  let rejectFirst!: (error: Error) => void;
+  let durable: any;
+  Object.assign(provider, {
+    saved: normalizePanelState(null),
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    memento: {
+      update: (_key: string, state: unknown) => {
+        if (!rejectFirst)
+          return new Promise<void>((_resolve, reject) => {
+            rejectFirst = reject;
+          });
+        durable = structuredClone(state);
+        return Promise.resolve();
+      },
+    },
+  });
+  const first = provider.updateSessionMembership('pin', 'reader');
+  const rejected = assert.rejects(first, /first pin refused/);
+  await provider.updateSessionMembership('unpin', 'reader');
+  await provider.updateSessionMembership('pin', 'reader');
+  rejectFirst(new Error('first pin refused'));
+  await rejected;
+  assert.equal(provider.pinnedTop.has('reader'), true, 'an older failed pin removed the newer accepted pin');
+  await provider.writeDrafts();
+  assert.deepEqual(durable.pinnedTop, ['reader']);
+});
+
+test.each(['label', 'membership'])('rejected panel %s saves settle and restore authoritative state', async (action) =>
+  withEditorErrors(async (errors) => {
+    const fixture = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' }));
+    const provider: any = fixture.provider;
+    const messages: any[] = [];
+    Object.assign(provider, {
+      saved: normalizePanelState({ labels: { reader: ['Existing'] } }),
+      hidden: new Set(),
+      pinnedTop: new Set(),
+      memento: {
+        update: async () => {
+          throw new Error('save refused');
+        },
+      },
+      post: async (message: unknown) => {
+        messages.push(message);
+      },
+      labelEditorReply: (session: string, browserSession: string) => ({
+        type: 'labelEditor',
+        session: browserSession,
+        names: labelsOf(provider.saved.labels, session),
+      }),
+    });
+    if (action === 'label') {
+      await provider.onMessage({ type: 'setLabels', session: 'reader', names: ['Rejected'] }, fixture.host);
+      assert.deepEqual(
+        messages.at(-2),
+        { type: 'labelEditor', session: 'reader', names: ['Existing'] },
+        'the open label editor did not receive restored authoritative labels',
+      );
+      assert.deepEqual(provider.saved.labels.reader, ['Existing']);
+    } else {
+      await provider.onMessage({ type: 'sessionMembership', session: 'reader', action: 'pin' }, fixture.host);
+      assert.equal(provider.pinnedTop.has('reader'), false, 'panel membership failure did not settle rollback');
+    }
+    assert.equal(errors.length, 1, 'the panel discarded its save rejection');
+  }),
+);
+
+function draftDeliveryCallback(panel: any, rejected: boolean): void {
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const live = {
+    key: 'codex:fresh:accepted',
+    state: () => ({ sessionId: 'provider-session' }),
+    prompt: async (_prompt: unknown, submitted: (turn: number) => void) => {
+      submitted(17);
+      if (rejected) throw new Error('turn/start refused');
+      return 17;
+    },
+  };
+  const scope = {
+    panel,
+    startFreshSession: async () => live,
+    validateResolvedPromptAssets() {},
+    withStartedSessionActivity: (_session: unknown, work: (session: typeof live) => unknown) => work(live),
+    resumePlanForDraft() {},
+    host: { cancelSessionRetirement() {} },
+    draftMcpKeys: new Map(),
+    mcpRefreshes: new McpPendingRefreshes(),
+    setupProjects: { resolve: async () => 'project' },
+    setupStore: {
+      accept: async () => {
+        throw new Error('setup save refused');
+      },
+    },
+    failedPromptDelivery: (_agent: unknown, error: Error) => ({ delivered: false, reason: error.message }),
+    vscode: { window: { showErrorMessage() {} } },
+  };
+  const source = ['const acceptedDrafts =', 'panel.onSendDraftPrompt =']
+    .map((needle) => statementFrom(extensionSource, extensionSource.indexOf(needle)))
+    .join('\n');
+  new Function(...Object.keys(scope), esbuild.transformSync(source, { loader: 'ts' }).code)(...Object.values(scope));
+}
+
+test.each(['CLI', 'prompt box'])(
+  'provider rejection after onSubmitted preserves %s refusal and recovery while later setup rejection retains acceptance',
+  async (origin) => {
+    const fixture = liveProviderFixture(livePress({ sessionId: 'draft:rejected', agent: 'codex' }));
+    const provider: any = fixture.provider;
+    Object.assign(provider, {
+      saved: normalizePanelState(null),
+      hidden: new Set(),
+      pinnedTop: new Set(),
+      setupProject: 'project',
+      pendingModels: [],
+      models: {},
+      folders: () => ['C:/workspace'],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+      memento: { update: async () => {} },
+      railOrder: [],
+      staging: new Set(),
+      trail: emptyTrail(),
+      draftProfiles: {},
+      live: {},
+      startedHere: new Set(),
+      draftRevisions: new Map(),
+      submittingDrafts: new Map(),
+      writeDrafts: async () => {},
+      completeSelectedWindow: async () => {},
+      postActivity: () => true,
+    });
+    const draft = newSessionDraft('draft:rejected', 'C:/workspace', null, Date.now(), {
+      agent: 'codex',
+      model: '',
+      effort: '',
+      permissionMode: '',
+      source: 'custom',
+    });
+    provider.newDrafts[draft.draftId] = draft;
+    draftDeliveryCallback(provider, true);
+    const result =
+      origin === 'CLI'
+        ? await provider.handleSessionRequest({
+            method: 'start',
+            requester: null,
+            params: {
+              prompt: 'work',
+              agentRun: false,
+              setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+            },
+          })
+        : null;
+    if (origin === 'CLI') assert.equal(result.status, 'refused', 'an undelivered CLI prompt was accepted');
+    else {
+      const text = 'Recover this undelivered prompt';
+      fixture.call.send(provider.stateFor(draft.draftId), text);
+      await vi.waitFor(() => assert.equal(provider.live[draft.draftId]?.[0]?.failed, true));
+      assert.equal(provider.live[draft.draftId][0].text, text);
+      provider.restoreLive(draft.draftId, 'prompt');
+      assert.equal(provider.drafts[draft.draftId], text, 'prompt-box recovery lost the rejected prompt');
+      assert.equal(provider.newDrafts[draft.draftId], draft, 'provider rejection adopted an undelivered draft');
+    }
+    draftDeliveryCallback(provider, false);
+    const accepted = await provider.onSendDraftPrompt(draft, { text: 'accepted', assets: [] });
+    assert.equal(accepted.delivered, true);
+    assert.equal(accepted.session, 'provider-session');
+    assert.match(accepted.reason, /setup save refused/);
+  },
+);
+
+test('initial Claude source lookup never reads unrelated contents and rejects cwd collisions and ambiguous accepted IDs', async () => {
+  const root = tempDir('arc-initial-source-');
+  const cwd = 'C:/workspace';
+  const dir = path.join(root, renameTranscripts.projectSlug(cwd).toUpperCase());
+  fs.mkdirSync(dir);
+  const session = 'de9a5233-9eef-4fc9-9778-cbd97dedc126';
+  const file = path.join(dir, `${session}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ cwd }) + '\n');
+  fs.writeFileSync(path.join(dir, 'unrelated.jsonl'), JSON.stringify({ cwd }) + '\n');
+  fs.mkdirSync(path.join(dir, session));
+  const sidecar = path.join(dir, session, 'custom-title.json');
+  fs.writeFileSync(sidecar, JSON.stringify({ customTitle: 'Saved name' }));
+  const rename = initialRenameCallback({ renameSession: async () => {} }, root);
+  const read = openReadWindow();
+  try {
+    await rename('claude', session, cwd, 'Saved name');
+    assert.deepEqual(
+      [...read.files].sort(),
+      [file, sidecar].sort(),
+      'initial rename read unrelated transcript contents',
+    );
+  } finally {
+    closeReadWindow(read);
+  }
+  const colliding = path.join(root, renameTranscripts.projectSlug(cwd) + '-collision');
+  fs.mkdirSync(colliding);
+  const other = path.join(colliding, `${session}.jsonl`);
+  fs.writeFileSync(other, JSON.stringify({ cwd: 'C:/foreign' }) + '\n');
+  await rename('claude', session, cwd, 'Saved name');
+  fs.writeFileSync(other, JSON.stringify({ cwd }) + '\n');
+  await assert.rejects(rename('claude', session, cwd, 'Saved name'), /did not save/);
+});
+
+test('initial Claude confirmation refuses unsaved, foreign and incomplete names and prioritizes its durable transcript title', async () => {
+  vi.useFakeTimers();
+  try {
+    const root = tempDir('arc-initial-unsaved-');
+    const cwd = 'C:/workspace';
+    const dir = path.join(root, renameTranscripts.projectSlug(cwd));
+    fs.mkdirSync(dir);
+    const session = 'de9a5233-9eef-4fc9-9778-cbd97dedc126';
+    const file = path.join(dir, `${session}.jsonl`);
+    const rename = initialRenameCallback({ renameSession: async () => {} }, root);
+    for (const record of [
+      null,
+      { sessionId: 'foreign', customTitle: 'Complete title' },
+      { sessionId: session, customTitle: 'Complete title suffix' },
+    ]) {
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ cwd }) + '\n' + (record ? JSON.stringify({ type: 'custom-title', ...record }) + '\n' : ''),
+      );
+      const refused = assert.rejects(rename('claude', session, cwd, 'Complete title'), /did not save/);
+      await vi.runAllTimersAsync();
+      await refused;
+    }
+    fs.mkdirSync(path.join(dir, session));
+    fs.writeFileSync(path.join(dir, session, 'custom-title.json'), JSON.stringify({ customTitle: 'Stale title' }));
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ cwd }) +
+        '\n' +
+        JSON.stringify({ type: 'custom-title', sessionId: session, customTitle: 'Complete title' }) +
+        '\n',
+    );
+    await rename('claude', session, cwd, 'Complete title');
+  } finally {
+    vi.useRealTimers();
+  }
+});
