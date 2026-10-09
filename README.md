@@ -96,6 +96,4 @@ Arc estimates costs for supported models using published prices. Subscription es
 
 ### Commenting
 
-Select response text and add a comment beside it. Saved comments stay attached to their text. Edit or delete them from their marks, then send them with your next prompt.
-
 <a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>
