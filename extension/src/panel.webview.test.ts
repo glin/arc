@@ -4268,8 +4268,10 @@ test('completion slices post changed figures once on retained and newest launchi
   );
   const now = fs.statSync(childFile).mtimeMs + 300_000;
   fs.writeFileSync(clock, String(now));
+  // Byte limits determine completion slices independently of worker scheduling.
   const worker = new ProgressiveWorker(
-    progressiveWorkerSource +
+    'performance.now = () => 0;\n' +
+      progressiveWorkerSource +
       `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`,
   );
   const sessions = [
