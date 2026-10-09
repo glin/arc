@@ -9529,15 +9529,18 @@ test('a Claude process end stops an unfinished rail turn in full and indexed rea
 });
 
 // Local command records include a caveat, the command, and its answer linked by parentUuid.
+// `user` records the answer as a user record that holds only the output element, as the CLI
+// does for most built-in commands, such as `/mcp`.
 
 function localCommand(
   name: string,
   args: string,
   second: number,
   uuid: string,
-  answer: { stdout?: string; stderr?: string; parent?: string },
+  answer: { stdout?: string; stderr?: string; parent?: string; user?: boolean },
 ): object[] {
   const tag = answer.stdout !== undefined ? 'local-command-stdout' : 'local-command-stderr';
+  const output = `<${tag}>${answer.stdout ?? answer.stderr ?? ''}</${tag}>`;
   return [
     {
       type: 'user',
@@ -9557,16 +9560,24 @@ function localCommand(
         content: `<command-name>${name}</command-name>\n<command-message>${name.slice(1)}</command-message>\n<command-args>${args}</command-args>`,
       },
     },
-    {
-      type: 'system',
-      subtype: 'local_command',
-      parentUuid: answer.parent ?? uuid,
-      timestamp: at(second),
-      level: 'info',
-      isMeta: false,
-      content: `<${tag}>${answer.stdout ?? answer.stderr ?? ''}</${tag}>`,
-      commandRun: { command: name.slice(1), args },
-    },
+    answer.user
+      ? {
+          type: 'user',
+          uuid: `${uuid}-answer`,
+          parentUuid: answer.parent ?? uuid,
+          timestamp: at(second),
+          message: { role: 'user', content: output },
+        }
+      : {
+          type: 'system',
+          subtype: 'local_command',
+          parentUuid: answer.parent ?? uuid,
+          timestamp: at(second),
+          level: 'info',
+          isMeta: false,
+          content: output,
+          commandRun: { command: name.slice(1), args },
+        },
   ];
 }
 
@@ -10185,6 +10196,92 @@ test('a Claude local command after a real turn leaves the header turn count and 
   const alone = localCommand('/usage', '', 0, 'usage-1', { stdout: 'Current session' });
   const empty = localAnswerStatuses(alone);
   assert.deepEqual([empty.turns.length, empty.count, empty.rail, empty.index], [0, 0, null, null]);
+});
+
+test('a Claude built-in command the CLI answers in a user record draws no turn in any reader', () => {
+  const before = [userPrompt('first question', 0), assistantAnswer('first answer', 1)];
+  const railBefore = readSessionMeta(writeTranscript(before)).outcome;
+  for (const answer of [
+    { stdout: 'Failed to reconnect to shotcut.', user: true },
+    { stdout: '(no content)', user: true },
+    { stderr: 'Unknown command', user: true },
+    { stdout: 'MCP dialog dismissed' },
+  ]) {
+    const records = [...before, ...localCommand('/mcp', '', 2, 'mcp-1', answer)];
+    const label = JSON.stringify(answer);
+    const read = localAnswerStatuses(records, AFTER_COMMAND, true);
+    assert.deepEqual(
+      [read.turns.map((turn) => turn.prompt), read.count],
+      [['first question'], 1],
+      `the timeline or the header counts /mcp as a turn for ${label}`,
+    );
+    assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done'], label);
+    assert.deepEqual(readSessionMeta(writeTranscript(records)).outcome, railBefore, label);
+    assert.deepEqual(
+      readSessionTurnStarts(writeTranscript(records)).starts,
+      [ms(0)],
+      `the rail's unread count counts /mcp as a turn for ${label}`,
+    );
+  }
+});
+
+test('a prompt queued before the CLI answers a Claude built-in command is the newest turn in every reader', () => {
+  for (const shape of [{ user: true }, {}]) {
+    const [caveat, command, answer] = localCommand('/mcp', '', 2, 'mcp-1', {
+      stdout: 'MCP dialog dismissed',
+      ...shape,
+    });
+    const records = [
+      userPrompt('first question', 0),
+      assistantAnswer('first answer', 1),
+      caveat,
+      command,
+      typedMidTurn('a queued follow-up', 3),
+      { ...answer, timestamp: at(4) },
+    ];
+    const label = JSON.stringify(shape);
+    const read = localAnswerStatuses(records, AFTER_COMMAND, true);
+    assert.deepEqual(
+      read.turns.map((turn) => turn.prompt),
+      ['first question', 'a queued follow-up'],
+      label,
+    );
+    assert.equal(read.count, read.turns.length, `the header counts the turns differently for ${label}`);
+    assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], `the readers disagree on the newest turn for ${label}`);
+    assert.deepEqual([read.rail, read.index], [read.full, read.full], label);
+    assert.deepEqual(
+      readSessionTurnStarts(writeTranscript(records)).starts,
+      [ms(0), ms(3)],
+      `the rail's unread count disagrees with the timeline for ${label}`,
+    );
+  }
+});
+
+test('model work after a Claude built-in command answered in a user record makes the command a turn', () => {
+  const records = [
+    userPrompt('first question', 0),
+    assistantAnswer('first answer', 1),
+    ...localCommand('/mcp', '', 2, 'mcp-1', { stdout: 'Reconnected to shotcut.', user: true }),
+    assistantAnswer('The server is back.', 3),
+  ];
+  const read = localAnswerStatuses(records, AFTER_COMMAND, true);
+  assert.deepEqual([read.turns.length, read.count], [2, 2], 'the readers lost the command turn the model answered');
+  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)]);
+  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)).starts, [ms(0), ms(2)]);
+});
+
+test('a Claude prompt that quotes a local command output element stays a prompt', () => {
+  const [, command] = localCommand('/mcp', '', 2, 'mcp-1', { stdout: '', user: true });
+  const quote = userPrompt('why did <local-command-stdout>Failed</local-command-stdout> happen', 3, {
+    uuid: 'quote-1',
+    parentUuid: 'mcp-1',
+  });
+  const records = [userPrompt('first question', 0), assistantAnswer('first answer', 1), command, quote];
+  const read = localAnswerStatuses(records, AFTER_COMMAND, true);
+  assert.deepEqual([read.turns.length, read.count], [2, 2], 'a quoting prompt withdrew the command before it');
+  assert.match(read.turns[1].prompt, /why did/);
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)]);
+  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)).starts, [ms(0), ms(2), ms(3)]);
 });
 
 test('a Claude local command answer after a process end leaves every reader stopped', () => {

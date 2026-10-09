@@ -4885,6 +4885,11 @@ test('the prompt is what the user typed, with the editor state the extension wra
   assert.equal(codexPrompt(wrapped), 'merge the two armatures');
   // A prompt from the CLI carries no wrapper and is already what was typed.
   assert.equal(codexPrompt('just this'), 'just this');
+  // Diagnostic text in a Claude local-command element stays in a Codex prompt.
+  assert.equal(
+    codexPrompt('Explain <local-command-stderr>Connection refused</local-command-stderr>'),
+    'Explain Connection refused',
+  );
 });
 
 test('a rollout with no session_meta at its head says nothing about itself', () => {

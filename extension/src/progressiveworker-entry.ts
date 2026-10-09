@@ -1156,7 +1156,7 @@ async function execute(
       } else {
         const discovered =
           session.agent === 'claude'
-            ? await discoverClaudeNewestTurn(session.file, tail.cursor, { signal, chunkBytes: 256 * 1024 })
+            ? await discoverClaudeNewestTurn(session.file, tail.cursor, { signal, chunkBytes: 256 * 1024 }, tail.lines)
             : await discoverCodexNewestTurn(session.file, tail.cursor, undefined, { signal, chunkBytes: 256 * 1024 });
         if (discovered.kind === 'cancelled' || discovered.kind === 'stale') {
           return { kind: 'stale', recoveryBytes };

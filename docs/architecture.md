@@ -370,7 +370,7 @@ Claude supplemental accounting reads transcript `cost-state` counters and frozen
 
 ## Module boundaries
 
-Claude CLI manual compaction can record a plain command before its boundary, then a wrapped duplicate and user-form stdout. The stdout names the duplicate as its parent. The Claude session reducer tracks prompt arrivals separately because retained queued prompts have a size limit. [Claude turn boundaries](timeline.md#shared-turn-model) owns command withdrawal.
+Claude CLI manual compaction can record a plain command before its boundary, then a wrapped duplicate and user-form stdout. The stdout names the duplicate as its parent. Any command the CLI answers by itself can record its answer in this user form. That record has no `subtype` field, so a line filter for the `local_command` subtype misses it. Newest-turn discovery passes over such a command. It reads the tail too, because the answer can lie past the tail's start. The Claude session reducer tracks prompt arrivals separately because retained queued prompts have a size limit. [Claude turn boundaries](timeline.md#shared-turn-model) owns command withdrawal.
 
 Subagent row names contain absolutely positioned accessible text. The clipped name establishes its positioning box so hidden suffixes cannot widen the page.
 

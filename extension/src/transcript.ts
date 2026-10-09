@@ -1226,14 +1226,27 @@ export function readSessionTurnStarts(file: string, bytes = TURN_START_BYTES, ch
   return readTurnStartsFromTail(file, (lines) => sessionTurnStartsIn(lines, childTranscript), bytes);
 }
 
+// A typed prompt stays a pending command until model work or a process end. The CLI's own answer
+// to it, or a manual compaction boundary for `/compact`, withdraws its start until model work restores it.
+// A prompt the reader queues before or after that answer starts a turn of its own in the command's place.
 function sessionTurnStartsIn(lines: string[], childTranscript = false): number[] {
   const starts: number[] = [];
-  let compact: { id: string; at: number; index: number; withdrawn: boolean; queued: boolean } | null = null;
+  let command: {
+    id: string;
+    at: number;
+    index: number;
+    compact: boolean;
+    withdrawn: boolean;
+    queued: boolean;
+    // The first prompt queued while the command waited for its answer.
+    queuedAt: number | null;
+  } | null = null;
   for (const line of lines) {
     if (
       !line.includes('"type":"user"') &&
-      (!compact ||
+      (!command ||
         (!line.includes('"type":"assistant"') &&
+          !line.includes('"local_command"') &&
           !line.includes('"compact_boundary"') &&
           !line.includes('"queued_command"') &&
           !line.includes('"cost-state"')))
@@ -1243,26 +1256,45 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
       const o = JSON.parse(line) as Record<string, unknown>;
       if (!o || typeof o !== 'object' || (o.isSidechain && !childTranscript)) continue;
       if (o.type === 'user' && isTypedPrompt(o, childTranscript)) {
-        compact = null;
+        command = null;
         const at = Date.parse(String(o.timestamp));
         if (!Number.isFinite(at)) continue;
         const id = claudeRecordId(o);
-        if (id && claudeCompactPrompt(o)) compact = { id, at, index: starts.length, withdrawn: false, queued: false };
+        if (id)
+          command = {
+            id,
+            at,
+            index: starts.length,
+            compact: claudeCompactPrompt(o),
+            withdrawn: false,
+            queued: false,
+            queuedAt: null,
+          };
         starts.push(at);
-      } else if (compact && readerQueuedAsk(o)) {
-        if (!compact.withdrawn) compact = null;
-        else if (!compact.queued) {
+      } else if (command && readerQueuedAsk(o)) {
+        if (!command.withdrawn) {
+          // A queued prompt keeps `/compact` a turn, and waits for the command's own answer.
+          command.compact = false;
+          command.queuedAt ??= readerQueuedAsk(o)!.at;
+        } else if (!command.queued) {
           starts.push(readerQueuedAsk(o)!.at);
-          compact.queued = true;
+          command.queued = true;
         }
-      } else if (compact && !compact.withdrawn && claudeProcessEndedAt(o) !== null) {
-        compact = null;
-      } else if (compact && claudeCompactAnswer(o, compact.id, compact.at)) {
-        if (!compact.withdrawn) starts.splice(compact.index, 1);
-        compact.withdrawn = true;
-      } else if (compact && claudeModelWorks(o)) {
-        if (compact.withdrawn) starts.splice(compact.index, compact.queued ? 1 : 0, compact.at);
-        compact = null;
+      } else if (command && !command.withdrawn && claudeProcessEndedAt(o) !== null) {
+        command = null;
+      } else if (
+        command &&
+        ((command.compact && claudeCompactAnswer(o, command.id, command.at)) ||
+          claudeLocalAnswer(o)?.parent === command.id)
+      ) {
+        if (!command.withdrawn) {
+          starts.splice(command.index, 1, ...(command.queuedAt === null ? [] : [command.queuedAt]));
+          command.queued = command.queuedAt !== null;
+        }
+        command.withdrawn = true;
+      } else if (command && claudeModelWorks(o)) {
+        if (command.withdrawn) starts.splice(command.index, command.queued ? 1 : 0, command.at);
+        command = null;
       }
     } catch {
       /* a partial line has no turn start */
@@ -2436,25 +2468,42 @@ function claudeCompactAnswer(
 }
 
 const LOCAL_COMMAND_OUTPUT = /<local-command-(?:stdout|stderr)>/;
+const LOCAL_COMMAND_OUTPUT_OPEN = /^<(local-command-(?:stdout|stderr))>/;
+
+// Whether the text is one local stdout or stderr element and nothing else.
+function localCommandOutputOnly(text: string): boolean {
+  const open = LOCAL_COMMAND_OUTPUT_OPEN.exec(text);
+  if (!open) {
+    return false;
+  }
+  const close = `</${open[1]}>`;
+  return text.indexOf(close) === text.length - close.length;
+}
 
 // CLI command answer with a parent record ID and local stdout or stderr tag.
+// The CLI records it as a `local_command` system record, or as a user record whose whole
+// content is one stdout or stderr element.
 // A command turn is withdrawn only when that ID matches its unanswered opening prompt.
 export function claudeLocalAnswer(record: unknown): { at: number; parent: string } | null {
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
     return null;
   }
   const value = record as Record<string, unknown>;
-  if (value.type !== 'system' || value.subtype !== 'local_command' || value.isSidechain) {
+  if (value.isSidechain) {
     return null;
   }
   const parent = value.parentUuid;
   if (typeof parent !== 'string' || !parent) {
     return null;
   }
-  if (!LOCAL_COMMAND_OUTPUT.test(textOf(value.content))) {
-    return null;
+  if (value.type === 'system' && value.subtype === 'local_command') {
+    return LOCAL_COMMAND_OUTPUT.test(textOf(value.content)) ? { at: stamp(value.timestamp), parent } : null;
   }
-  return { at: stamp(value.timestamp), parent };
+  if (value.type === 'user') {
+    const content = (value.message as { content?: unknown } | undefined)?.content;
+    return localCommandOutputOnly(textOf(content).trim()) ? { at: stamp(value.timestamp), parent } : null;
+  }
+  return null;
 }
 
 // Assistant record with an API error, visible reply or tool call, or positive output usage.
@@ -2520,6 +2569,8 @@ function outcomeIn(
   let withdrawn: TurnOutcome | null = null;
   // Whether a prompt queued since that answer opened the outcome.
   let queuedSinceAnswer = false;
+  // Prompts queued while the command waited for its answer, as start and end times.
+  let queuedBeforeAnswer = null as { startedAt: number; endedAt: number } | null;
   // Whether a result that ends the turn finished the outcome. A wake or later model work resumes it.
   let toolEnded = false;
   let open: readonly string[] = [];
@@ -2560,6 +2611,7 @@ function outcomeIn(
       previous = { outcome, modelAnswered };
       withdrawn = null;
       queuedSinceAnswer = false;
+      queuedBeforeAnswer = null;
       outcome = { finished: false, error: false, interrupted: false, endedAt: startedAt, startedAt };
       toolEnded = false;
       command = claudeRecordId(o);
@@ -2567,7 +2619,16 @@ function outcomeIn(
       modelAnswered = false;
       continue;
     }
-    if (readerQueuedAsk(o) && !withdrawn) compact = false;
+    const queuedAsk = readerQueuedAsk(o);
+    if (queuedAsk && !withdrawn) {
+      compact = false;
+      if (command !== null) {
+        queuedBeforeAnswer = {
+          startedAt: queuedBeforeAnswer?.startedAt ?? queuedAsk.at,
+          endedAt: Math.max(queuedBeforeAnswer?.endedAt ?? 0, queuedAsk.at),
+        };
+      }
+    }
     const compactAnswer = compact ? claudeCompactAnswer(o, command, outcome?.startedAt ?? null) : null;
     const localAnswer = compactAnswer ?? claudeLocalAnswer(o);
     if (localAnswer !== null) {
@@ -2590,8 +2651,19 @@ function outcomeIn(
         if (outcome && !modelAnswered && !compactAnswer) {
           outcome = stoppedByLocalAnswer(outcome);
         }
+        if (queuedBeforeAnswer) {
+          // Prompts queued before the answer wait on a card of their own, as a prompt queued after it does.
+          outcome = { finished: false, error: false, interrupted: false, ...queuedBeforeAnswer };
+          modelAnswered = false;
+          queuedSinceAnswer = true;
+          queuedBeforeAnswer = null;
+        }
+        continue;
       }
-      continue;
+      // An unmatched user-form answer, such as the stdout of `/compact`, reads as an ordinary record.
+      if (type !== 'user') {
+        continue;
+      }
     }
     const queued = withdrawn ? readerQueuedAsk(o) : null;
     if (queued) {
@@ -4718,7 +4790,12 @@ function isTypedPrompt(o: Record<string, unknown>, childTranscript = false): boo
   if (Array.isArray(content) && content.some((b) => b && (b as { type?: string }).type === 'tool_result')) {
     return false;
   }
-  const text = cleanPrompt(textOf(content));
+  const raw = textOf(content);
+  // The CLI's own answer to a command, such as a stderr element alone, is no prompt.
+  if (localCommandOutputOnly(raw.trim())) {
+    return false;
+  }
+  const text = cleanPrompt(raw);
   return text.length > 0 && !INTERRUPTED.test(text);
 }
 
@@ -6387,6 +6464,9 @@ export interface ClaudeUsageReducerState {
   // queued after it, before model work or a typed prompt, joins that turn, as the full reader
   // puts them on one card. Absent or false otherwise.
   currentTurnQueued?: boolean;
+  // Prompts the reader queued while the current command waited for its answer, as start and end
+  // times. A local command answer opens their turn in the command's place. Absent or null otherwise.
+  currentTurnQueuedBefore?: { startedAt: number; endedAt: number } | null;
   // Whether a result that ends the turn finished currentTurnOutcome. A wake or later model work
   // in the same turn resumes it. Absent or false otherwise.
   currentTurnToolEnded?: boolean;
@@ -6454,6 +6534,7 @@ function restoreClaudeTurn(state: ClaudeUsageReducerState, turn: ClaudePreviousT
   state.currentTurnCommand = null;
   state.currentTurnPrevious = null;
   state.currentTurnQueued = false;
+  state.currentTurnQueuedBefore = null;
   state.currentTurnToolEnded = false;
 }
 
@@ -6531,11 +6612,40 @@ export function retainNewestCompaction(
   }
 }
 
+// Opens the unanswered turn of prompts queued around a withdrawn command, starting at `at`.
+function openClaudeQueuedTurn(state: ClaudeUsageReducerState, at: number): void {
+  if (state.openTurn) {
+    state.closedTurns++;
+  }
+  const openChildren = state.currentTurnOutcome?.openChildren;
+  const closedChildren = state.currentTurnOutcome?.closedChildren;
+  state.openTurn = true;
+  state.openTurnAnswered = false;
+  state.currentTurnStartedAt = at;
+  state.currentTurnEndedAt = at;
+  state.currentTurnCommand = null;
+  state.currentTurnPrevious = null;
+  state.currentTurnQueued = true;
+  state.currentTurnQueuedBefore = null;
+  state.currentTurnToolEnded = false;
+  state.currentTurnOutcome = {
+    finished: false,
+    error: false,
+    interrupted: false,
+    endedAt: at,
+    startedAt: at,
+    ...(openChildren && openChildren.length > 0 ? { openChildren } : {}),
+    ...(closedChildren && closedChildren.length > 0 ? { closedChildren } : {}),
+  };
+  state.firstTurnAt ??= at;
+}
+
+// Returns whether the answer withdrew the open command turn.
 function withdrawClaudeUsageTurn(
   state: ClaudeUsageReducerState,
   localAnswer: { at: number; parent: string },
   compact = false,
-): void {
+): boolean {
   if (
     !state.openTurnAnswered &&
     state.currentTurnOutcome &&
@@ -6544,6 +6654,7 @@ function withdrawClaudeUsageTurn(
   ) {
     // Withdraw the unanswered command turn. Preserve its visible-turn sequence number for request identity.
     const previous = state.currentTurnPrevious ?? null;
+    const queuedBefore = state.currentTurnQueuedBefore ?? null;
     const outcome: TurnOutcome = {
       ...state.currentTurnOutcome,
       finished: true,
@@ -6566,7 +6677,15 @@ function withdrawClaudeUsageTurn(
     // An unanswered prompt restored by the local answer keeps its own turn for the next prompt count.
     state.openTurnAnswered = state.openTurn;
     state.currentTurnWithdrawn = withdrawn;
+    if (queuedBefore) {
+      // Prompts queued before the answer wait on a card of their own, as a prompt queued after it does.
+      openClaudeQueuedTurn(state, queuedBefore.startedAt);
+      state.currentTurnEndedAt = queuedBefore.endedAt;
+      if (state.currentTurnOutcome) state.currentTurnOutcome.endedAt = queuedBefore.endedAt;
+    }
+    return true;
   }
+  return false;
 }
 
 function reduceClaudeTurnRecord(
@@ -6577,7 +6696,17 @@ function reduceClaudeTurnRecord(
   if (record.isSidechain && !childTranscript) {
     return;
   }
-  if (readerQueuedAsk(record) && !state.currentTurnWithdrawn) state.currentTurnCompact = false;
+  const queuedAsk = readerQueuedAsk(record);
+  if (queuedAsk && !state.currentTurnWithdrawn) {
+    state.currentTurnCompact = false;
+    if (state.openTurn && state.currentTurnCommand) {
+      const held = state.currentTurnQueuedBefore;
+      state.currentTurnQueuedBefore = {
+        startedAt: held?.startedAt ?? queuedAsk.at,
+        endedAt: Math.max(held?.endedAt ?? 0, queuedAsk.at),
+      };
+    }
+  }
   const compactAnswer = state.currentTurnCompact
     ? claudeCompactAnswer(record, state.currentTurnCommand ?? null, state.currentTurnStartedAt)
     : null;
@@ -6658,6 +6787,7 @@ function reduceClaudeTurnRecord(
     state.currentTurnPrevious = copyPreviousTurn(currentClaudeTurn(state));
     state.currentTurnWithdrawn = null;
     state.currentTurnQueued = false;
+    state.currentTurnQueuedBefore = null;
     state.currentTurnToolEnded = false;
     if (state.openTurn && state.openTurnAnswered) {
       state.closedTurns++;
@@ -6699,29 +6829,7 @@ function reduceClaudeTurnRecord(
       }
       return;
     }
-    if (state.openTurn) {
-      state.closedTurns++;
-    }
-    const openChildren = state.currentTurnOutcome?.openChildren;
-    const closedChildren = state.currentTurnOutcome?.closedChildren;
-    state.openTurn = true;
-    state.openTurnAnswered = false;
-    state.currentTurnStartedAt = queued.at;
-    state.currentTurnEndedAt = queued.at;
-    state.currentTurnCommand = null;
-    state.currentTurnPrevious = null;
-    state.currentTurnQueued = true;
-    state.currentTurnToolEnded = false;
-    state.currentTurnOutcome = {
-      finished: false,
-      error: false,
-      interrupted: false,
-      endedAt: queued.at,
-      startedAt: queued.at,
-      ...(openChildren && openChildren.length > 0 ? { openChildren } : {}),
-      ...(closedChildren && closedChildren.length > 0 ? { closedChildren } : {}),
-    };
-    state.firstTurnAt ??= queued.at;
+    openClaudeQueuedTurn(state, queued.at);
     return;
   }
   if (withdrawn && claudeModelWorks(record)) {
@@ -6741,8 +6849,8 @@ function reduceClaudeTurnRecord(
     return;
   }
   const localAnswer = claudeLocalAnswer(record);
-  if (localAnswer !== null) {
-    withdrawClaudeUsageTurn(state, localAnswer);
+  // An unmatched user-form answer, such as the stdout of `/compact`, reads as an ordinary record.
+  if (localAnswer !== null && (withdrawClaudeUsageTurn(state, localAnswer) || record.type !== 'user')) {
     return;
   }
   const notice = taskNotificationText(record);
@@ -7284,6 +7392,9 @@ export function createClaudeUsageLineReducer(
             currentTurnPrevious: copyPreviousTurn(restored.currentTurnPrevious),
             currentTurnWithdrawn: copyPreviousTurn(restored.currentTurnWithdrawn),
             ...(restored.currentTurnQueued ? { currentTurnQueued: true } : {}),
+            ...(restored.currentTurnQueuedBefore
+              ? { currentTurnQueuedBefore: { ...restored.currentTurnQueuedBefore } }
+              : {}),
             ...(restored.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
             currentTurnOutcome: copyTurnOutcome(restored.currentTurnOutcome),
             // Only child reads retain request events for replacement. Parent reads discard repeated request keys.
@@ -7360,6 +7471,7 @@ export function createClaudeUsageLineReducer(
             currentTurnPrevious: copyPreviousTurn(state.currentTurnPrevious),
             currentTurnWithdrawn: copyPreviousTurn(state.currentTurnWithdrawn),
             ...(state.currentTurnQueued ? { currentTurnQueued: true } : {}),
+            ...(state.currentTurnQueuedBefore ? { currentTurnQueuedBefore: { ...state.currentTurnQueuedBefore } } : {}),
             ...(state.currentTurnToolEnded ? { currentTurnToolEnded: true } : {}),
             currentTurnOutcome: copyTurnOutcome(state.currentTurnOutcome),
             ...(state.requestEvents ? { requestEvents: { ...state.requestEvents } } : {}),
@@ -7907,12 +8019,76 @@ export function readSession(file: string, sessionId: string, opts: ReadOptions =
   return read;
 }
 
+// Finds the newest typed prompt before the cursor that draws a card. A command the CLI answered
+// by itself draws none, so discovery passes over it. `newer` holds the lines after the cursor,
+// oldest first, and they can hold the answer to a command before the cursor.
 export function discoverClaudeNewestTurn(
   file: string,
   cursor: BackwardLineCursor,
   options: BoundaryDiscoveryOptions = {},
+  newer: readonly string[] = [],
 ): Promise<BoundaryDiscovery> {
-  return discoverBackwardBoundary(file, cursor, (line) => humanPromptIn(line.text, false) !== null, options);
+  const segment: ClaudeBackwardSegment = { answers: new Set(), answered: false, kept: false };
+  for (let index = newer.length - 1; index >= 0; index -= 1) {
+    claudeBackwardBoundary(segment, newer[index]);
+  }
+  return discoverBackwardBoundary(file, cursor, (line) => claudeBackwardBoundary(segment, line.text), options);
+}
+
+// What a backward walk has seen since the newest typed prompt it passed, which is everything
+// recorded after the next older prompt.
+interface ClaudeBackwardSegment {
+  // Parent record IDs of the CLI's own command answers.
+  answers: Set<string>;
+  answered: boolean;
+  // Whether model work, a queued prompt, or a process end before an answer keeps the prompt a turn.
+  kept: boolean;
+}
+
+// Whether a line, read newest first, is a typed prompt that draws a card. A prompt the CLI
+// answered by itself, with no model work, queued prompt, or earlier process end after it, draws none.
+function claudeBackwardBoundary(segment: ClaudeBackwardSegment, text: string): boolean {
+  const prompt = humanPromptIn(text, false);
+  if (prompt) {
+    const id = claudeRecordId(prompt);
+    const withdrawn = !segment.kept && id !== null && segment.answers.has(id);
+    segment.answers.clear();
+    segment.answered = false;
+    segment.kept = false;
+    return !withdrawn;
+  }
+  if (
+    segment.kept ||
+    (text.indexOf('"type":"assistant"') < 0 &&
+      text.indexOf('<local-command-std') < 0 &&
+      text.indexOf('[Request interrupted by user') < 0 &&
+      text.indexOf('"queued_command"') < 0 &&
+      text.indexOf('"cost-state"') < 0 &&
+      text.indexOf('"local_command"') < 0)
+  ) {
+    return false;
+  }
+  let o: Record<string, unknown>;
+  try {
+    o = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (!o || typeof o !== 'object' || o.isSidechain) {
+    return false;
+  }
+  const answer = claudeLocalAnswer(o);
+  if (answer) {
+    segment.answers.add(answer.parent);
+    segment.answered = true;
+  } else if (
+    claudeModelWorks(o) ||
+    (o.type === 'attachment' && readerQueuedAsk(o)) ||
+    (segment.answered && claudeProcessEndedAt(o) !== null)
+  ) {
+    segment.kept = true;
+  }
+  return false;
 }
 
 interface RecordedTitleState {
@@ -8615,6 +8791,7 @@ function settleClaudeSteps(state: ClaudeSessionParserState): void {
   state.awaited = [];
 }
 
+// Returns whether the answer withdrew the open command turn.
 function applyClaudeLocalAnswer(
   state: ClaudeSessionParserState,
   answer: { at: number; parent: string },
@@ -8622,7 +8799,7 @@ function applyClaudeLocalAnswer(
   sourceEnd: number,
   maxTurns: number,
   compact = false,
-): void {
+): boolean {
   const cur = state.cur;
   if (
     cur &&
@@ -8670,7 +8847,9 @@ function applyClaudeLocalAnswer(
     // The local answer clears pending typed-skill evidence.
     state.pendingTypedSkill = null;
     extendSourceRange(cur, sourceStart, sourceEnd);
+    return true;
   }
+  return false;
 }
 
 function reduceClaudeSessionLine(
@@ -8866,18 +9045,20 @@ function reduceClaudeSessionLine(
     }
     return;
   }
-  // Local command answers can withdraw unanswered command turns. Other records merely naming the subtype continue below.
-  if (line.indexOf('"local_command"') >= 0) {
-    let systemLine = false;
+  // Local command answers can withdraw unanswered command turns. The CLI records an answer as a
+  // `local_command` system record or as a user record that holds only the output element.
+  // Other records naming the subtype or the element, and an unmatched user-form answer, continue below.
+  if (line.indexOf('"local_command"') >= 0 || line.indexOf('<local-command-std') >= 0) {
+    let done = false;
     try {
       const o = JSON.parse(line) as Record<string, unknown>;
-      systemLine = o.type === 'system';
       const answer = claudeLocalAnswer(o);
-      if (answer) applyClaudeLocalAnswer(state, answer, sourceStart, sourceEnd, maxTurns);
+      const withdrew = answer !== null && applyClaudeLocalAnswer(state, answer, sourceStart, sourceEnd, maxTurns);
+      done = o.type === 'system' || withdrew;
     } catch {
       /* skip malformed line */
     }
-    if (systemLine) {
+    if (done) {
       return;
     }
   }

@@ -1671,6 +1671,83 @@ test('Claude worker requests leave the Codex catalog canonical paths untouched',
   }
 });
 
+test('a Claude worker window passes built-in commands the CLI answered beyond the tail to the earlier real turn', async () => {
+  const directory = tempDir('worker-claude-local-commands-');
+  const file = path.join(directory, 'parent.jsonl');
+  const records: object[] = [
+    { type: 'user', uuid: 'real', timestamp: timestamp(0), message: { role: 'user', content: 'real question' } },
+    {
+      type: 'assistant',
+      uuid: 'real-answer',
+      timestamp: timestamp(1),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-4-1',
+        content: [{ type: 'text', text: 'real answer' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    },
+  ];
+  const command = (uuid: string, second: number) => ({
+    type: 'user',
+    uuid,
+    timestamp: timestamp(second),
+    message: {
+      role: 'user',
+      content:
+        '<command-name>/mcp</command-name>\n<command-message>mcp</command-message>\n<command-args></command-args>',
+    },
+  });
+  const answer = (uuid: string, second: number, text: string) => ({
+    type: 'user',
+    uuid: `${uuid}-answer`,
+    parentUuid: uuid,
+    timestamp: timestamp(second),
+    message: { role: 'user', content: `<local-command-stdout>${text}</local-command-stdout>` },
+  });
+  for (let index = 0; index < 40; index++) {
+    records.push(command(`mcp-${index}`, 2 + index), answer(`mcp-${index}`, 2 + index, 'Reconnected. '.repeat(20)));
+  }
+  // The tail starts inside the newest command, so only the tail holds its answer.
+  const blank = JSON.stringify(answer('mcp-last', 50, '')).length;
+  records.push(command('mcp-last', 50), answer('mcp-last', 50, 'x'.repeat(3950 - blank)));
+  const lines = records.map((record) => JSON.stringify(record));
+  const [commandBytes, answerBytes] = lines.slice(-2).map((line) => Buffer.byteLength(line) + 1);
+  assert.ok(
+    answerBytes < 4096 && commandBytes + answerBytes > 4096,
+    'the tail no longer splits a command from its answer',
+  );
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  const worker = new ProgressiveWorker(source);
+  try {
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const result = await worker.run(
+      {
+        kind: 'window',
+        input: {
+          session: { agent: 'claude', file, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs },
+          folders: [],
+          maxTurns: 40,
+          tailBytes: 4096,
+          children: [],
+        },
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(result?.value.kind === 'window');
+    assert.deepEqual(
+      result.value.read.turns.map((turn) => turn.prompt),
+      ['real question'],
+      'the timeline opened without the real turn before the commands',
+    );
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 function dispatchWorkerSource(requestKiB: number, cursorKiB = 64 * 1024): string {
   return source
     .replace(
