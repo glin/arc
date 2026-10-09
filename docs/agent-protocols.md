@@ -161,7 +161,11 @@ Rate limits and model catalogs are read from each CLI. Claude answers control re
 
 Account reads serialize per agent. Two reads share one request only when they target the same session or draft for MCP discovery. A selected owner's read starts in that owner's recorded working directory.
 
-An explicit Codex usage refresh first asks the same app-server process to renew managed authentication. A long-lived process keeps the credentials it opened with, so reading limits without that renewal can leave a cached status bar in place after another client signs in again. The explicit read waits behind an automatic read or a running turn rather than losing that renewal.
+An explicit Codex usage refresh through a live idle child first renews managed authentication in that app-server process. A long-lived process keeps the credentials it opened with. An idle sibling supplies the account reading when another child remains busy. When every eligible child is busy, both agents wait without interrupting work or changing active authentication.
+
+Each explicit attempt has a 120-second deadline from its accepted press, including queue and busy waits. Expired requests cannot dispatch unsent reads. A sent read retains its ownership until it settles. Retry joins that read without a second authentication renewal. Late valid readings update figures without changing an expired attempt's outcome.
+
+Account completion releases automatic and explicit read ownership before model catalogs or MCP status finish. Each operation has its own identity, so an older catalog completion cannot release a newer account read. Failed and empty answers retain the previous readings. Explicit failures appear in usage detail, while automatic failures remain quiet. Queued, waiting, reading, and terminal status stay in memory and never enter account history or workspace state.
 
 ## Failure interpretation
 

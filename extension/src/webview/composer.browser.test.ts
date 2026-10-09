@@ -16,6 +16,152 @@ import { COMPOSER, LIVE_PRESS, pageHtml, renderPayload, statPopoverPayload, them
 import { composerView, pickMenu, newSessionDraft, type ComposerState } from '../composerview.ts';
 import type { SessionLauncherView } from '../view/launcher.ts';
 import { SUBMITTED_PROMPT_CHARS } from './state.ts';
+import { usageBar } from '../usageview.ts';
+
+test(
+  'usage progress preserves the focused retry control, blocks duplicate activation, and announces one shared outcome',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no browser installed');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await page.clock.install();
+      await page.setContent(themed(pageHtml()));
+      const payload = renderPayload();
+      await post(page, payload);
+      await page.locator('[data-control="usage"]').click();
+      const read = page.locator('[data-control="usage:read"]');
+      for (const group of (payload.usage as { bar: NonNullable<ReturnType<typeof usageBar>> }).bar.groups) {
+        assert.ok((await page.locator('#usagepop').ariaSnapshot()).includes(group.exact));
+      }
+      await read.focus();
+      await page.evaluate(() => {
+        const root = window as unknown as { retainedUsageRead: Element | null; usageAnnouncements: string[] };
+        root.retainedUsageRead = document.activeElement;
+        root.usageAnnouncements = [];
+        const announcer = document.querySelector('#ask-announcer');
+        if (!announcer) throw new Error('Missing shared announcer');
+        new MutationObserver(() => {
+          if (announcer.textContent) root.usageAnnouncements.push(announcer.textContent);
+        }).observe(announcer, { childList: true });
+      });
+      await page.keyboard.press('Enter');
+      assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "refreshUsage").length'), 1);
+      const refresh: import('../view/usage').UsageRefresh = {
+        id: 1,
+        agents: { claude: { phase: 'waiting', detail: '' }, codex: { phase: 'reading', detail: '' } },
+      };
+      const reading = Date.now();
+      const readings = [
+        {
+          agent: 'claude',
+          plan: 'max',
+          windows: [
+            {
+              window: 'five_hour',
+              group: 'session',
+              scope: '',
+              utilization: 0.1,
+              status: '',
+              resetsAtSeconds: null,
+              readAt: reading,
+            },
+          ],
+          spend: null,
+          checkedAt: reading,
+          creditResetsAtSeconds: null,
+        },
+      ];
+      const send = () =>
+        post(page, {
+          type: 'usage',
+          usage: { ...(payload.usage as object), bar: usageBar(readings, Date.now(), refresh) },
+        });
+      await send();
+      assert.ok((await read.getAttribute('aria-label'))!.includes((await read.textContent())!));
+      assert.match((await read.getAttribute('aria-label'))!, /Claude.*Codex/);
+      assert.equal(await read.getAttribute('aria-busy'), 'true');
+      assert.equal(await read.getAttribute('aria-disabled'), 'true');
+      assert.equal(await page.evaluate('document.activeElement === window.retainedUsageRead'), true);
+      await page.keyboard.press('Space');
+      await page.keyboard.press('Enter');
+      assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "refreshUsage").length'), 1);
+      refresh.agents.codex = { phase: 'success', detail: '' };
+      await send();
+      assert.equal(await read.getAttribute('aria-busy'), 'true');
+      assert.equal(await page.evaluate('window.usageAnnouncements.length'), 0);
+      refresh.agents.claude = { phase: 'failed', detail: 'Usage reading timed out. Read again to retry.' };
+      await send();
+      await page.clock.runFor(0);
+      await page.waitForFunction('window.usageAnnouncements.length === 1');
+      assert.ok((await read.getAttribute('aria-label'))!.includes((await read.textContent())!));
+      assert.equal(await page.evaluate('document.activeElement === window.retainedUsageRead'), true);
+      assert.equal(await read.getAttribute('aria-busy'), 'false');
+      await send();
+      assert.equal(await page.evaluate('window.usageAnnouncements.length'), 1);
+      await page.keyboard.press('Enter');
+      assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "refreshUsage").length'), 2);
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test(
+  'a recreated usage renderer suppresses historical completion and announces a newly observed attempt once',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no browser installed');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await page.clock.install();
+      await page.setContent(themed(pageHtml()));
+      const payload = renderPayload();
+      const refresh: import('../view/usage').UsageRefresh = {
+        id: 4,
+        agents: { claude: { phase: 'failed', detail: '' }, codex: { phase: 'success', detail: '' } },
+      };
+      await page.evaluate(() => {
+        const root = window as unknown as { usageAnnouncements: string[] };
+        root.usageAnnouncements = [];
+        const announcer = document.querySelector('#ask-announcer')!;
+        new MutationObserver(() => {
+          if (announcer.textContent) root.usageAnnouncements.push(announcer.textContent);
+        }).observe(announcer, { childList: true });
+      });
+      (payload.usage as { bar: ReturnType<typeof usageBar> }).bar = usageBar([], Date.now(), refresh);
+      await post(page, payload);
+      await page.clock.runFor(0);
+      assert.equal(await page.evaluate('window.usageAnnouncements.length'), 0);
+      refresh.id = 5;
+      refresh.agents.claude = { phase: 'reading', detail: '' };
+      await post(page, {
+        type: 'usage',
+        usage: { ...(payload.usage as object), bar: usageBar([], Date.now(), refresh) },
+      });
+      refresh.agents.claude = { phase: 'success', detail: '' };
+      const completed = {
+        type: 'usage',
+        usage: { ...(payload.usage as object), bar: usageBar([], Date.now(), refresh) },
+      };
+      await post(page, completed);
+      await page.clock.runFor(0);
+      await page.waitForFunction('window.usageAnnouncements.length === 1');
+      await post(page, completed);
+      assert.equal(await page.evaluate('window.usageAnnouncements.length'), 1);
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 async function post(page: Page, message: unknown): Promise<void> {
   await page.evaluate(`window.postMessage(${JSON.stringify(message)}, '*')`);

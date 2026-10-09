@@ -19,6 +19,7 @@ import {
   SessionEvent,
   SessionState,
   UsageReadQueue,
+  USAGE_REFRESH_DEADLINE_MS,
   askIdle,
   askIdleMcp,
   askIdleMcpChange,
@@ -74,7 +75,7 @@ import {
   newSessionDraft,
   withSessionSettings,
 } from './composerview.ts';
-import { USAGE_FRESH_MS } from './usageview.ts';
+import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
 import { tempDir } from './temproot.ts';
 import { statementFrom, sourceMatch } from '../test/source-contract.ts';
 
@@ -4600,6 +4601,377 @@ test('a busy agent that exits rejects its deferred explicit usage read', async (
   await tick();
   assert.equal(queue.failDeferred('codex', new Error('the agent stopped')), true);
   await assert.rejects(explicit, /the agent stopped/);
+});
+
+test('a manual usage deadline cancels queued work and a retry reads once after the automatic answer', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  let release = () => {};
+  const automatic = queue.run(
+    'codex',
+    false,
+    () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  const calls: number[] = [];
+  const expired = queue.begin(['codex'])!;
+  const old = queue.run(
+    'codex',
+    true,
+    async () => {
+      calls.push(expired);
+    },
+    '',
+    expired,
+  );
+  assert.equal(queue.begin(['codex']), null);
+  await vi.advanceTimersByTimeAsync(USAGE_REFRESH_DEADLINE_MS);
+  assert.equal(states.at(-1)?.agents.codex.phase, 'failed');
+  const retry = queue.begin(['codex'])!;
+  const next = queue.run(
+    'codex',
+    true,
+    async () => {
+      calls.push(retry);
+      queue.result('codex', retry, 'success');
+    },
+    '',
+    retry,
+  );
+  release();
+  await Promise.all([automatic, old, next]);
+  assert.deepEqual(calls, [retry]);
+  assert.equal(states.at(-1)?.agents.codex.phase, 'success');
+  assert.equal(vi.getTimerCount(), 0);
+  queue.dispose();
+});
+
+test('both busy agents finish visibly at the accepted-press deadline and can retry', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  const id = queue.begin(['claude', 'codex'])!;
+  const work = ['claude', 'codex'].map((agent) =>
+    queue.run(
+      agent,
+      true,
+      async () => {
+        await queue.waitUntilIdle(agent, true, id);
+      },
+      '',
+      id,
+    ),
+  );
+  const settled = Promise.allSettled(work);
+  await vi.advanceTimersByTimeAsync(USAGE_REFRESH_DEADLINE_MS - 1);
+  assert.equal(states.at(-1)?.agents.claude.phase, 'waiting');
+  assert.equal(states.at(-1)?.agents.codex.phase, 'waiting');
+  await vi.advanceTimersByTimeAsync(1);
+  await settled;
+  assert.equal(states.at(-1)?.agents.claude.phase, 'failed');
+  assert.equal(states.at(-1)?.agents.codex.phase, 'failed');
+  assert.equal(
+    queue.resumeDeferred('codex', async () => assert.fail('expired read dispatched')),
+    null,
+  );
+  assert.ok(queue.begin(['claude', 'codex']));
+  queue.dispose();
+  assert.equal(vi.getTimerCount(), 0);
+});
+
+test('an accepted manual read stops waiting after 120 seconds even when no turn ends', async () => {
+  vi.useFakeTimers();
+  const queue = new UsageReadQueue();
+  const id = queue.begin?.(['codex']) ?? undefined;
+  let settled = false;
+  const work = queue.run(
+    'codex',
+    true,
+    async (force) => {
+      await queue.waitUntilIdle('codex', force, id);
+    },
+    '',
+    id,
+  );
+  const completed = work.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await vi.advanceTimersByTimeAsync(120_000);
+  assert.equal(settled, true, 'the manual read remains pending after its 120-second limit without a turn ending');
+  await completed;
+  queue.dispose();
+});
+
+test('a delayed deadline callback cannot admit an expired usage read', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const queue = new UsageReadQueue();
+  const id = queue.begin(['codex'])!;
+  vi.setSystemTime(120_000);
+  let dispatched = false;
+  await queue.run(
+    'codex',
+    true,
+    async () => {
+      dispatched = true;
+    },
+    '',
+    id,
+  );
+  assert.equal(dispatched, false);
+  assert.equal(queue.reading('codex', id), false);
+  queue.dispose();
+  assert.equal(vi.getTimerCount(), 0);
+});
+
+test('a retry joins a resumed usage read after its deadline without a second authentication renewal', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  const id = queue.begin(['codex'])!;
+  const original = queue.run(
+    'codex',
+    true,
+    async () => {
+      await queue.waitUntilIdle('codex', true, id);
+    },
+    '',
+    id,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  let release = () => {};
+  let renewals = 0;
+  const resumed = queue.resumeDeferred('codex', async (attempt) => {
+    assert.equal(queue.reading('codex', attempt), true);
+    renewals++;
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    queue.result('codex', attempt, 'success');
+  });
+  await vi.advanceTimersByTimeAsync(USAGE_REFRESH_DEADLINE_MS);
+  const deadline = states.at(-1)!;
+  assert.equal(deadline.agents.codex.phase, 'failed');
+  const retry = queue.begin(['codex'])!;
+  const joined = queue.run(
+    'codex',
+    true,
+    async () => {
+      renewals++;
+    },
+    '',
+    retry,
+  );
+  assert.equal(states.at(-1)?.agents.codex.phase, 'reading');
+  release();
+  await Promise.all([original, resumed, joined]);
+  assert.equal(renewals, 1);
+  assert.equal(states.at(-1)?.id, retry);
+  assert.equal(states.at(-1)?.agents.codex.phase, 'success');
+  assert.equal(deadline.agents.codex.phase, 'failed');
+  assert.equal(vi.getTimerCount(), 0);
+  queue.dispose();
+});
+
+test('usage failures, exit, stale completions, and disposal clear attempt clocks without false success', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  const first = queue.begin(['claude', 'codex'])!;
+  queue.result('claude', first, 'success');
+  assert.equal(states.at(-1)?.agents.codex.phase, 'queued');
+  const failed = queue.run(
+    'codex',
+    true,
+    async () => {
+      await queue.waitUntilIdle('codex', true, first);
+    },
+    '',
+    first,
+  );
+  const rejected = assert.rejects(failed, /agent stopped/);
+  await vi.advanceTimersByTimeAsync(0);
+  queue.failDeferred('codex', new Error('agent stopped'));
+  await rejected;
+  assert.equal(states.at(-1)?.agents.codex.phase, 'failed');
+  assert.equal(vi.getTimerCount(), 0);
+  const retry = queue.begin(['claude', 'codex'])!;
+  queue.result('claude', first, 'success');
+  assert.equal(states.at(-1)?.agents.claude.phase, 'queued');
+  queue.result('claude', retry, 'empty');
+  queue.dispose();
+  assert.equal(states.at(-1)?.agents.codex.phase, 'failed');
+  assert.equal(vi.getTimerCount(), 0);
+});
+
+test('automatic account completion admits a queued manual press while its catalog remains held', async () => {
+  const queue = new UsageReadQueue();
+  let answerAutomatic = () => {};
+  let finishCatalog = () => {};
+  let answerManual = () => {};
+  const account = new Promise<void>((resolve) => {
+    answerAutomatic = resolve;
+  });
+  const catalog = new Promise<void>((resolve) => {
+    finishCatalog = resolve;
+  });
+  const manualAccount = new Promise<void>((resolve) => {
+    answerManual = resolve;
+  });
+  let reads = 0;
+  const automatic = queue.run('codex', false, async (_force, operation) => {
+    reads++;
+    queue.reading('codex', undefined, operation);
+    await account;
+    queue.result('codex', undefined, 'success', '', operation);
+    await catalog;
+  });
+  await vi.waitFor(() => assert.equal(reads, 1));
+  const id = queue.begin(['codex'])!;
+  const manual = queue.run(
+    'codex',
+    true,
+    async (_force, operation) => {
+      reads++;
+      queue.reading('codex', id, operation);
+      await manualAccount;
+      queue.result('codex', id, 'success', '', operation);
+    },
+    '',
+    id,
+  );
+  answerAutomatic();
+  await vi.waitFor(() => assert.equal(reads, 2));
+  finishCatalog();
+  await automatic;
+  const joined = queue.run(
+    'codex',
+    true,
+    async () => {
+      reads++;
+    },
+    '',
+    id,
+  );
+  await Promise.resolve();
+  assert.equal(reads, 2, 'old catalog completion released the newer account read');
+  answerManual();
+  await Promise.all([manual, joined]);
+  queue.dispose();
+});
+
+test('an old automatic catalog completion cannot release a newer automatic account read', async () => {
+  vi.useFakeTimers();
+  const queue = new UsageReadQueue();
+  let finishCatalog = () => {};
+  let answer = () => {};
+  const catalog = new Promise<void>((resolve) => {
+    finishCatalog = resolve;
+  });
+  const account = new Promise<void>((resolve) => {
+    answer = resolve;
+  });
+  const old = queue.run('codex', false, async (_force, operation) => {
+    queue.result('codex', undefined, 'success', '', operation);
+    await catalog;
+  });
+  await Promise.resolve();
+  let automaticReading = false;
+  const newer = queue.run('codex', false, async (_force, operation) => {
+    automaticReading = true;
+    await account;
+    queue.result('codex', undefined, 'success', '', operation);
+  });
+  await vi.waitFor(() => assert.equal(automaticReading, true));
+  const id = queue.begin(['codex'])!;
+  let manualReading = false;
+  const manual = queue.run(
+    'codex',
+    true,
+    async () => {
+      manualReading = true;
+    },
+    '',
+    id,
+  );
+  finishCatalog();
+  await old;
+  await vi.advanceTimersByTimeAsync(0);
+  assert.equal(manualReading, false, 'old catalog completion released the newer automatic read');
+  answer();
+  await Promise.all([newer, manual]);
+  assert.equal(manualReading, true);
+  queue.dispose();
+});
+
+test('an admitted late reading retires expired feedback without changing terminal identity or newer ownership', async () => {
+  vi.useFakeTimers();
+  const states: import('./view/usage').UsageRefresh[] = [];
+  const queue = new UsageReadQueue((state) => states.push(state));
+  const id = queue.begin(['claude', 'codex'])!;
+  queue.result('codex', id, 'failed', 'The agent could not start to read usage.');
+  await vi.advanceTimersByTimeAsync(USAGE_REFRESH_DEADLINE_MS);
+  const expired = states.at(-1)!;
+  const book = new UsageBook();
+  book.note('claude', {
+    plan: 'max',
+    limits: [{ window: 'five_hour', group: 'session', scope: '', utilization: 0.1, resetsAtSeconds: null, status: '' }],
+    complete: true,
+    spend: null,
+    creditResetsAtSeconds: null,
+    readAt: Date.now(),
+  });
+  queue.admitted('claude');
+  queue.result('claude', id, 'success');
+  const retained = states.at(-1)!;
+  assert.equal(retained.id, id);
+  assert.equal(retained.agents.claude.phase, 'failed');
+  assert.equal(expired.agents.claude.superseded, undefined);
+  const bar = usageBar(book.usages(), Date.now(), retained)!;
+  assert.doesNotMatch(bar.name, /Claude: Usage reading failed/);
+  assert.deepEqual(
+    bar.groups.map((group) => group.agent),
+    ['claude', 'codex'],
+  );
+  assert.equal(bar.groups[0].age, 'updated just now');
+  assert.equal(bar.groups[0].status, '');
+  assert.match(bar.groups[1].status, /could not start/);
+  const retry = queue.begin(['claude', 'codex'])!;
+  queue.reading('claude', retry);
+  queue.admitted('claude');
+  queue.result('claude', id, 'success');
+  assert.equal(states.at(-1)?.id, retry);
+  assert.equal(states.at(-1)?.agents.claude.phase, 'reading');
+  assert.equal(states.at(-1)?.agents.claude.superseded, undefined);
+  queue.dispose();
+});
+
+test('idle account usage publishes before a held model catalog settles', async () => {
+  let release = () => {};
+  const catalog = new Promise<ModelList>((resolve) => {
+    release = () => resolve(A_MODEL_LIST);
+  });
+  let published = false;
+  const answers = askIdle(
+    answeringPlan({ usage: async () => null, models: () => catalog }),
+    () => new FakeChild(),
+    undefined,
+    () => {
+      published = true;
+    },
+  );
+  await vi.waitFor(() => assert.equal(published, true));
+  release();
+  await answers;
 });
 
 test('an idle child that never comes up is reported, not left hanging', { timeout: 5000 }, async () => {

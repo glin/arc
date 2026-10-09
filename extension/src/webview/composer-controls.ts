@@ -70,6 +70,19 @@ function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost):
           h('span', {}, group.label),
           group.plan ? [' ', h('span', { class: 'sbplan' }, group.plan)] : null,
         ]),
+        group.age
+          ? h(
+              'div',
+              {
+                class: 'sbreset',
+                role: 'group',
+                title: group.exact,
+                'aria-label': `${group.label}, ${group.age}, ${group.exact}`,
+              },
+              group.age,
+            )
+          : null,
+        group.status ? h('div', { class: 'pickwhy', style: { overflowWrap: 'anywhere' } }, group.status) : null,
         ...group.lines.map((line) => {
           const band = line.level ? CONTEXT_CLASSES[line.level] : '';
           return h('div', { class: 'sbline', key: line.key, title: line.name }, [
@@ -91,10 +104,14 @@ function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost):
       'button',
       {
         class: 'sbread',
+        key: 'read',
         type: 'button',
-        'aria-label': props.bar.read,
+        'aria-label': [props.bar.read, props.bar.refresh?.name].filter(Boolean).join('. '),
+        'aria-disabled': String(props.bar.refresh?.busy ?? false),
+        'aria-busy': String(props.bar.refresh?.busy ?? false),
         'data-control': 'usage:read',
         onClick() {
+          if (props.bar.refresh?.busy) return;
           props.sendToHost({ type: 'refreshUsage', agent: null, force: true });
         },
       },
@@ -331,6 +348,9 @@ function ControlsView(props: {
             },
             [
               ...props.bar.briefs.map((brief) => h(UsageBriefView, { key: brief.agent, brief })),
+              !props.bar.briefs.length
+                ? h('span', { class: 'sbagent' }, props.bar.refresh?.busy ? 'Reading usage' : 'Account usage')
+                : null,
               props.bar.age ? h('span', { class: 'sbage' }, props.bar.age) : null,
               h('span', { class: 'sbtwist' }, shown ? TWIST.open : TWIST.shut),
             ],
@@ -485,6 +505,8 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
   pickPopover.hidden = true;
   pickPopover.tabIndex = -1;
   let bar: UsageBar | null = null;
+  let announcedAttempt = 0;
+  let receivedUsage = false;
   let view: ComposerView | null = null;
   let contextDetail: ContextDetail | null = null;
   let contextRequest = 0;
@@ -785,6 +807,12 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     },
     update(nextBar, nextView, nextMenus) {
       bar = nextBar;
+      if (!receivedUsage && bar?.refresh && !bar.refresh.busy) announcedAttempt = bar.refresh.id;
+      if (bar) receivedUsage = true;
+      if (bar?.refresh?.announcement && bar.refresh.id > announcedAttempt) {
+        announcedAttempt = bar.refresh.id;
+        options.announce(bar.refresh.announcement);
+      }
       if (view?.sessionId !== nextView?.sessionId) openPick = null;
       const replaced = view?.sessionId !== nextView?.sessionId;
       const refreshed =

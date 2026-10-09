@@ -99,6 +99,52 @@ const CODEX = usage({
   ],
 });
 
+test('fresh Codex and twelve-hour-old Claude expose distinct ages until Claude admits a reading', () => {
+  const claude = usage({ windows: [reading({ readAt: NOW - 12 * 3600_000 })] });
+  const codex = usage({ agent: 'codex' });
+  const bar = usageBar([claude, codex], NOW)!;
+  assert.equal(bar.age, 'updated 12h ago');
+  assert.equal(bar.groups[0].age, 'updated 12h ago');
+  assert.equal(bar.groups[1].age, 'updated just now');
+  assert.ok(bar.groups[0].exact);
+  assert.notEqual(bar.groups[0].exact, bar.groups[1].exact);
+  const book = new UsageBook([claude, codex]);
+  book.note('claude', {
+    plan: 'max',
+    limits: [limit()],
+    complete: true,
+    spend: null,
+    creditResetsAtSeconds: null,
+    readAt: NOW,
+  });
+  assert.equal(book.bar(NOW)?.age, '');
+  assert.equal(book.bar(NOW)?.groups[0].age, 'updated just now');
+});
+
+test('usage progress survives absent or expired figures and retains retry after mixed outcomes', () => {
+  const refresh: import('./view/usage').UsageRefresh = {
+    id: 7,
+    agents: { claude: { phase: 'waiting', detail: '' }, codex: { phase: 'success', detail: '' } },
+  };
+  for (const readings of [[], [usage({ windows: [reading({ resetsAtSeconds: seconds(NOW - 1) })] })]]) {
+    const bar = usageBar(readings, NOW, refresh)!;
+    assert.equal(bar.groups.length, 2);
+    assert.equal(bar.briefs.length, 0);
+    assert.equal(bar.age, '');
+    assert.equal(bar.groups[0].age, '');
+    assert.equal(bar.groups[0].exact, '');
+    assert.equal(bar.refresh?.busy, true);
+    assert.equal(bar.refresh?.announcement, '');
+    assert.match(bar.refresh!.name, /Claude: Waiting.*Codex: Usage read/);
+    refresh.agents.claude = { phase: 'failed', detail: 'Read again to retry.' };
+    const terminal = usageBar(readings, NOW, refresh)!;
+    assert.equal(terminal.refresh?.busy, false);
+    assert.equal(terminal.read, 'Read again');
+    assert.match(terminal.refresh!.announcement, /Claude.*failed.*Codex.*read/);
+    refresh.agents.claude = { phase: 'waiting', detail: '' };
+  }
+});
+
 // These limits supply window names without explicit groups.
 
 const UNGROUPED = usage({

@@ -237,7 +237,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const usage = new UsageBook(context.workspaceState.get<AgentUsage[]>(USAGE_KEY) ?? [], (agent, reading) =>
     recorder.record(agent, reading),
   );
-  const usageReads = new UsageReadQueue();
+  const usageReads = new UsageReadQueue((state) => panel.setUsageRefresh(state));
+  context.subscriptions.push(usageReads);
   // Retain each agent's reported model catalog. Its freshness window controls when another catalog is requested.
   const models = new ModelBook();
   // Retain the latest MCP server list for each draft or recorded session, without a freshness clock.
@@ -354,6 +355,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       if (agent && event.kind === 'rateLimit') {
         usage.noteLimit(agent, event.limit, Date.now(), event.creditResetsAtSeconds);
+        if (event.limit && !event.limit.scope) usageReads.admitted(agent);
         publishUsage();
       }
       // Invalidate context readings when a child ends a turn, acquires a session, or reports readiness.
@@ -366,7 +368,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (event.kind === 'turnEnd') {
         const housekeeping = host.beginHousekeeping(key);
         const usageRead = agent
-          ? (usageReads.resumeDeferred(agent, () => readFrom(key, true)) ?? readFrom(key, false))
+          ? (usageReads.resumeDeferred(agent, (attempt, operation) => readFrom(key, true, attempt, operation)) ??
+            usageReads.run(agent, false, (_force, operation) => readFrom(key, false, undefined, operation)))
           : Promise.resolve();
         void Promise.allSettled([usageRead, readMcpFrom(key)]).then(() => host.settled(housekeeping));
       }
@@ -431,6 +434,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       updateAgentAffordance();
+      if (!state.busy && !state.exited) {
+        void usageReads
+          .resumeDeferred(state.agent, (attempt, operation) => readFrom(state.key, true, attempt, operation))
+          ?.catch(() => {});
+      }
       publishHostedSessions();
       if (state.exited) {
         if (state.sessionId) panel.invalidateContext(state.sessionId);
@@ -898,18 +906,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // A failure is kept rather than shown. The bar already says how old its figure is, and an
   // error box over a percentage the reader did not ask for would interrupt them at the one
   // moment they are reading what the turn did.
-  const readFrom = async (key: string, force: boolean): Promise<void> => {
+  const readFrom = async (key: string, force: boolean, attempt?: number, operation?: number): Promise<void> => {
     await host.withActivity(key, async (session) => {
+      if (force && session.state().busy) {
+        await usageReads.waitUntilIdle(session.agent, true, attempt, operation);
+        return;
+      }
+      if (!usageReads.reading(session.agent, attempt, operation)) return;
       let usageFailure = '';
       try {
         const reading = await session.rateLimits(force);
         if (reading) {
           usage.note(session.agent, reading);
+          usageReads.admitted(session.agent);
           publishUsage();
         }
+        usageReads.result(
+          session.agent,
+          attempt,
+          reading ? 'success' : 'empty',
+          reading ? '' : 'No usable usage reading was returned.',
+          operation,
+        );
       } catch (error) {
         usage.noteSilent(session.agent);
         usageFailure = (error as Error).message;
+        usageReads.result(session.agent, attempt, 'failed', usageFailure, operation);
       }
       // Pass the explicit refresh flag to the model catalog. It clears a previous silent failure so the reader can retry.
       if (models.toAsk([session.agent], Date.now(), force).length > 0) {
@@ -927,7 +949,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           publishPicks();
         }
       }
-      if (force && usageFailure) {
+      if (force && usageFailure && attempt === undefined) {
         throw new Error(`${session.agent} usage refresh failed: ${usageFailure}`);
       }
     });
@@ -982,16 +1004,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   // Refresh usage and model catalogs through a live child or an idle child. Explicit requests override freshness and silent failures.
-  const askAgent = (agent: AgentName, force: boolean, mcpOwner?: string, mcpCwd?: string): Promise<void> => {
+  const askAgent = (
+    agent: AgentName,
+    force: boolean,
+    mcpOwner?: string,
+    mcpCwd?: string,
+    attempt?: number,
+  ): Promise<void> => {
     const requestedMcpRevision = mcpOwner ? mcp.revision(mcpOwner) : 0;
     const requestedMcpGeneration = mcpSurfaceGeneration;
     const requestOwner = mcpOwner ? `${mcpOwner}:${requestedMcpRevision}` : '';
     return usageReads.run(
       agent,
       force,
-      async (force) => {
+      async (force, operation) => {
         const cwd = mcpCwd ?? workspaceCwd();
         if (!cwd) {
+          usageReads.result(agent, attempt, 'failed', 'Open a workspace folder before reading usage.', operation);
           return;
         }
         const now = Date.now();
@@ -1009,9 +1038,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!wantUsage && !wantModels && !wantCommands && !wantMcp) {
           return;
         }
-        // Defer explicit reads while a child is busy. Automatic reads rely on its live events until the turn ends.
-        if (mcpOwner ? mcpLive?.busy : live.some((s) => s.busy)) {
-          const waiting = usageReads.waitUntilIdle(agent, force);
+        const idleLive = mcpOwner
+          ? mcpLive?.busy
+            ? undefined
+            : (mcpLive ?? live.find((state) => !state.busy))
+          : live.find((state) => !state.busy);
+        // Account reads use an idle child. All-busy requests wait without changing active authentication.
+        if (live.length && !idleLive) {
+          const waiting = usageReads.waitUntilIdle(agent, force, attempt, operation);
           if (waiting) {
             await waiting;
           }
@@ -1026,7 +1060,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             commandsAsked.add(agent);
             if (wantMcp && resolvedMcpOwner) {
               if (mcpLive) {
-                await readMcpFrom(mcpLive.key, resolvedMcpOwner);
+                void readMcpFrom(mcpLive.key, resolvedMcpOwner);
               } else {
                 const revision = mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision);
                 if (revision !== null) {
@@ -1036,9 +1070,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
               }
             }
-            const idleLive = mcpLive ?? live.find((state) => !state.busy);
             if (idleLive) {
-              await readFrom(idleLive.key, force);
+              await readFrom(idleLive.key, force, attempt, operation);
             }
             return;
           }
@@ -1053,6 +1086,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
           const plan = idlePlanFor(agent, cwd);
           if (!plan) {
+            usageReads.result(
+              agent,
+              attempt,
+              'failed',
+              'The agent could not start to read usage. Check its executable setting.',
+              operation,
+            );
             commandsAsked.add(agent);
             if (resolvedMcpOwner) {
               const revision = mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision);
@@ -1068,14 +1108,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           initialMcpRevision =
             wantMcp && resolvedMcpOwner ? mcp.beginInitialRead(resolvedMcpOwner, requestedMcpRevision) : null;
           const commandRevision = commandLists.revision(agent);
-          const answers = await askIdle(plan, spawner);
-          // Publish the idle child's commands before its usage and model catalog.
+          if (!usageReads.current(agent, attempt)) return;
+          const answers = await askIdle(
+            plan,
+            spawner,
+            undefined,
+            (reading, failure) => {
+              if (reading) {
+                usage.note(agent, reading);
+                usageReads.admitted(agent);
+                publishUsage();
+              } else usage.noteSilent(agent);
+              usageReads.result(
+                agent,
+                attempt,
+                failure ? 'failed' : reading ? 'success' : 'empty',
+                failure || (reading ? '' : 'No usable usage reading was returned.'),
+                operation,
+              );
+            },
+            () => usageReads.reading(agent, attempt, operation),
+          );
+          // Publish the idle child's commands when its remaining controls settle.
           commandsAsked.add(agent);
           publishCommands({ agent, commands: answers.commands, complete: false }, commandRevision);
-          if (answers.usage) {
-            usage.note(agent, answers.usage);
-            publishUsage();
-          } else usage.noteSilent(agent);
           if (answers.models) {
             models.note(agent, answers.models);
             publishPicks();
@@ -1083,7 +1139,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             models.noteSilent(agent);
             publishPicks();
           }
-          if (force && answers.usageFailure) {
+          if (force && answers.usageFailure && attempt === undefined) {
             refreshFailure = new Error(`${agent} usage refresh failed: ${answers.usageFailure}`);
           }
           // Start MCP status separately without delaying publication of the other control answers.
@@ -1094,6 +1150,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             );
           }
         } catch (error) {
+          usageReads.result(agent, attempt, 'failed', (error as Error).message, operation);
           // Mark failed control reads silent to avoid repeated automatic process starts. Explicit refresh requests clear usage and model silent marks.
           commandsAsked.add(agent);
           if (resolvedMcpOwner && initialMcpRevision !== null) {
@@ -1102,7 +1159,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           usage.noteSilent(agent);
           models.noteSilent(agent);
           publishPicks();
-          if (force) {
+          if (force && attempt === undefined) {
             refreshFailure = error as Error;
           }
         }
@@ -1111,6 +1168,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       },
       requestOwner,
+      attempt,
     );
   };
 
@@ -1121,12 +1179,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     mcpAgent?: string,
     mcpCwd?: string,
   ): void => {
-    for (const agent of only ? [only] : USAGE_AGENT_ORDER) {
+    const agents = only ? [only] : USAGE_AGENT_ORDER;
+    const attempt = force ? usageReads.begin(agents) : undefined;
+    if (attempt === null) return;
+    for (const agent of agents) {
       const ownsMcp = only === agent || (!only && mcpAgent === agent);
       const read = () =>
-        askAgent(agent as AgentName, force, ownsMcp ? mcpOwner : undefined, ownsMcp ? mcpCwd : undefined);
+        askAgent(agent as AgentName, force, ownsMcp ? mcpOwner : undefined, ownsMcp ? mcpCwd : undefined, attempt);
       if (force) {
-        reportFailures(read);
+        void read().catch((error: Error) => usageReads.result(agent, attempt, 'failed', error.message));
       } else {
         void read();
       }

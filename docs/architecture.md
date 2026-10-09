@@ -306,7 +306,7 @@ The first column is checked against the shipped extension directory by `architec
 | `claudewire.ts` | Claude stream-json and control-channel adapter | no |
 | `codexwire.ts` | Codex app-server JSON-RPC adapter | no |
 | `codexreply.ts` | Codex async-question ids and the reply envelope that answers them | no |
-| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment and Claude attribution selection, line framing, lifecycle, accepted-turn identity, control reads, and session state after model changes | no |
+| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment and Claude attribution selection, line framing, lifecycle, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, and session state after model changes | no |
 | `composerview.ts` | Prompt box, agent-request, and new-session view data, bounded question Markdown reuse, wording, settings, queue behavior, answers, prompt assembly, completion rows, and the walk back through earlier prompts | no |
 | `domain/ask-answer.ts` | Browser-safe completion and answer assembly rules for agent questions | no |
 | `domain/claude-skills.ts` | Browser-safe Claude skill-highlight decision, the per-working-directory skill-list cache reducer, and the safe-folder-name check the host skill-path lookup runs first | no |

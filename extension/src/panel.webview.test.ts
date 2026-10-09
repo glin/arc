@@ -276,6 +276,7 @@ test('visibility revisions belong to one panel lifetime', () => {
 import type { PromptDelivery } from './composerview.ts';
 import {
   ModelBook,
+  UsageReadQueue,
   McpBook,
   McpPendingRefreshes,
   liveMcpTarget,
@@ -8885,7 +8886,29 @@ function catalogRefreshFixture() {
   const settledUsage = new Set<string>();
   const publications: Array<{ catalogs: Record<string, unknown>; pending: string[] }> = [];
   const calls: string[] = [];
-  const control = { failure: 'none', live: false };
+  const control = {
+    failure: 'none',
+    live: false,
+    agent: 'codex',
+    busySibling: false,
+    idleSibling: false,
+    ownerBusy: false,
+    holdModels: null as Promise<unknown> | null,
+    answer: null as object | null,
+    cwd: 'C:/workspace' as string | null,
+  };
+  const readingTimes = new Map([
+    ['claude', 1],
+    ['codex', 2],
+  ]);
+  const usageResults: Array<{ agent: string; phase: string }> = [];
+  const refreshStates: import('./view/usage').UsageRefresh[] = [];
+  const usageReads = new UsageReadQueue((state) => refreshStates.push(state));
+  const originalResult = usageReads.result?.bind(usageReads) ?? (() => {});
+  usageReads.result = (agent, id, phase, detail, operation) => {
+    usageResults.push({ agent, phase });
+    originalResult(agent, id, phase, detail, operation);
+  };
   const scope = {
     models,
     USAGE_AGENT_ORDER,
@@ -8907,17 +8930,37 @@ function catalogRefreshFixture() {
     commandsAsked: new Set<string>(),
     usage: {
       toAsk: (agents: string[]) => agents.filter((agent) => !settledUsage.has(agent)),
-      note: (agent: string) => settledUsage.add(agent),
+      note: (agent: string) => {
+        settledUsage.add(agent);
+        readingTimes.set(agent, Date.now());
+      },
       noteSilent: (agent: string) => settledUsage.add(agent),
     },
-    usageReads: { run: (_agent: string, force: boolean, work: (force: boolean) => Promise<void>) => work(force) },
+    usageReads,
     host: {
-      states: () => (control.live ? [{ agent: 'codex', key: 'live', exited: false, busy: false }] : []),
-      withActivity: (_key: string, work: (session: unknown) => Promise<void>) =>
+      states: () =>
+        control.live
+          ? [
+              ...(control.busySibling
+                ? [{ agent: control.agent, key: 'busy', sessionId: 'other', exited: false, busy: true }]
+                : []),
+              ...(control.idleSibling
+                ? [{ agent: control.agent, key: 'idle-sibling', sessionId: 'other', exited: false, busy: false }]
+                : []),
+              { agent: control.agent, key: 'live', sessionId: 'selected', exited: false, busy: control.ownerBusy },
+            ]
+          : [],
+      withActivity: (key: string, work: (session: unknown) => Promise<void>) =>
         work({
-          agent: 'codex',
-          rateLimits: async () => null,
+          agent: control.agent,
+          state: () => ({ busy: false }),
+          rateLimits: async () => {
+            calls.push(`usage ${key}`);
+            if (control.failure === 'refused') throw new Error('Account reading refused');
+            return control.answer;
+          },
           models: async () => {
+            if (control.holdModels) await control.holdModels;
             if (control.failure === 'throw') throw new Error('read failed');
             return null;
           },
@@ -8925,12 +8968,18 @@ function catalogRefreshFixture() {
     },
     draftMcpKeys: new Map(),
     mcpSurfaceGeneration: 0,
-    workspaceCwd: () => 'C:/workspace',
+    workspaceCwd: () => control.cwd,
     idlePlanFor: () => (control.failure === 'plan' ? null : {}),
     spawner() {},
-    askIdle: async () => {
+    askIdle: async (
+      _plan: unknown,
+      _spawner: unknown,
+      _deadline: unknown,
+      publish?: (reading: object | null, failure: string) => void,
+    ) => {
       calls.push('catalog');
       if (control.failure === 'throw') throw new Error('read failed');
+      publish?.({}, '');
       return {
         usage: {},
         models: control.failure === 'empty' ? null : { readAt: Date.now(), models: [] },
@@ -8949,9 +8998,105 @@ function catalogRefreshFixture() {
     force: boolean,
     owner?: string,
     cwd?: string,
+    attempt?: number,
   ) => Promise<void>;
-  return { ask, models, mcp, calls, publications, control };
+  return { ask, models, mcp, calls, publications, control, usageReads, usageResults, readingTimes, refreshStates };
 }
+
+test('manual account refresh uses an idle sibling for both agents and publishes before a held live catalog', async () => {
+  for (const agent of ['claude', 'codex']) {
+    const fixture = catalogRefreshFixture();
+    let release = () => {};
+    Object.assign(fixture.control, {
+      live: true,
+      agent,
+      busySibling: true,
+      answer: { readAt: 42 },
+      holdModels: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    });
+    const id = fixture.usageReads.begin?.([agent]);
+    const read = fixture.ask(agent, true, undefined, undefined, id ?? undefined);
+    await vi.waitFor(() => assert.deepEqual(fixture.calls, ['usage live']));
+    assert.deepEqual(fixture.usageResults, [{ agent, phase: 'success' }]);
+    const retryId = fixture.usageReads.begin([agent])!;
+    const retry = fixture.ask(agent, true, undefined, undefined, retryId);
+    await vi.waitFor(() => assert.deepEqual(fixture.calls, ['usage live', 'usage live']));
+    release();
+    await Promise.all([read, retry]);
+    fixture.usageReads.dispose();
+  }
+});
+
+test('automatic live account completion leaves manual usage available before its held catalog finishes', async () => {
+  const fixture = catalogRefreshFixture();
+  let release = () => {};
+  Object.assign(fixture.control, {
+    live: true,
+    answer: { readAt: 42 },
+    holdModels: new Promise<void>((resolve) => {
+      release = resolve;
+    }),
+  });
+  const expired = fixture.usageReads.begin(['claude', 'codex'])!;
+  fixture.usageReads.result('claude', expired, 'failed', 'The agent could not start.');
+  fixture.usageReads.result('codex', expired, 'failed', 'Usage reading timed out.');
+  fixture.usageResults.length = 0;
+  const automatic = fixture.ask('codex', false);
+  await vi.waitFor(() => assert.deepEqual(fixture.usageResults, [{ agent: 'codex', phase: 'success' }]));
+  assert.equal(fixture.refreshStates.at(-1)?.id, expired);
+  assert.equal(fixture.refreshStates.at(-1)?.agents.codex.phase, 'failed');
+  assert.equal(fixture.refreshStates.at(-1)?.agents.codex.superseded, true);
+  assert.equal(fixture.refreshStates.at(-1)?.agents.claude.phase, 'failed');
+  assert.equal(fixture.refreshStates.at(-1)?.agents.claude.superseded, undefined);
+  const id = fixture.usageReads.begin(['codex'])!;
+  const manual = fixture.ask('codex', true, undefined, undefined, id);
+  await vi.waitFor(() => assert.deepEqual(fixture.calls, ['usage live', 'usage live']));
+  release();
+  await Promise.all([automatic, manual]);
+  fixture.usageReads.dispose();
+});
+
+test('manual usage terminal failures and empty answers retain previous reading times', async () => {
+  for (const failure of ['missing-workspace', 'plan', 'refused', 'empty']) {
+    const fixture = catalogRefreshFixture();
+    Object.assign(fixture.control, {
+      failure,
+      live: ['refused', 'empty'].includes(failure),
+      cwd: failure === 'missing-workspace' ? null : 'C:/workspace',
+    });
+    const id = fixture.usageReads.begin(['codex'])!;
+    await fixture.ask('codex', true, undefined, undefined, id);
+    assert.equal(fixture.readingTimes.get('codex'), 2);
+    assert.equal(fixture.usageResults[0].phase, failure === 'empty' ? 'empty' : 'failed');
+    fixture.usageReads.dispose();
+  }
+});
+
+test('transient usage progress posts to the panel without persisting readings or account history', () => {
+  const source = memberFrom(panelHostSource, panelHostSource.indexOf('public setUsageRefresh(')).replace(
+    'public setUsageRefresh(',
+    'function setUsageRefresh(',
+  );
+  const code = esbuild.transformSync(`${source}\nreturn setUsageRefresh;`, { loader: 'ts' }).code;
+  const set = new Function(code)();
+  const messages: unknown[] = [];
+  const readings: unknown[] = [];
+  const host = {
+    usage: readings,
+    usageRefresh: null,
+    post: (message: unknown) => messages.push(message),
+    usagePayload() {
+      return { retained: this.usage, refresh: this.usageRefresh };
+    },
+  };
+  const refresh = { id: 1, agents: { claude: { phase: 'waiting', detail: '' } } };
+  set.call(host, refresh);
+  assert.equal(host.usage, readings);
+  assert.equal(host.usageRefresh, refresh);
+  assert.deepEqual(messages, [{ type: 'usage', usage: { retained: readings, refresh } }]);
+});
 
 test('a failed agent catalog read settles its pending state after the other agent publishes', async () => {
   for (const failure of ['plan', 'empty', 'throw']) {
@@ -9099,7 +9244,7 @@ test('an idle live child answers a missing initial MCP read', async () => {
     'readIdleMcp',
     'readFrom',
     'cwd',
-    `return async function (live, agent, force, wantMcp, resolvedMcpOwner, mcpLive) {${liveBody}\n};`,
+    `return async function (live, agent, force, wantMcp, resolvedMcpOwner, mcpLive) {const idleLive = mcpLive; const attempt = undefined; const operation = undefined; ${liveBody}\n};`,
   )(
     () => calls.push('commands'),
     { add: () => calls.push('commands settled') },
@@ -9132,20 +9277,26 @@ test('an idle live child answers a missing initial MCP read', async () => {
   );
 });
 
-test('selected-owner MCP discovery ignores a busy sibling but waits for its own busy child', () => {
+test('selected-owner MCP discovery uses its idle owner and defers its busy owner despite an idle sibling', async () => {
+  for (const ownerBusy of [false, true]) {
+    const fixture = catalogRefreshFixture();
+    Object.assign(fixture.control, {
+      live: true,
+      agent: 'claude',
+      busySibling: !ownerBusy,
+      idleSibling: ownerBusy,
+      ownerBusy,
+    });
+    await fixture.ask('claude', false, 'selected', 'D:/selected-worktree');
+    assert.deepEqual(fixture.calls, ownerBusy ? [] : ['usage live']);
+    fixture.usageReads.dispose();
+  }
+});
+
+test('owner-scoped discovery binds its MCP profile generation before account admission', () => {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const askAt = extensionSource.indexOf('const askAgent =');
   const ask = extensionSource.slice(askAt, extensionSource.indexOf('const refreshUsage', askAt));
-  sourceMatch(
-    ask,
-    /if \(mcpOwner \? mcpLive\?\.busy : live\.some\(\(s\) => s\.busy\)\)/,
-    'a busy sibling suppresses the selected owner server read',
-  );
-  sourceMatch(
-    ask,
-    /const idleLive = mcpLive \?\? live\.find\(\(state\) => !state\.busy\);/,
-    'selected-owner discovery reads a busy sibling after starting the owner server read',
-  );
   const boundAt = ask.indexOf('const requestedMcpRevision =');
   assert.ok(
     boundAt >= 0 && boundAt < ask.indexOf('return usageReads.run('),
@@ -9156,7 +9307,11 @@ test('selected-owner MCP discovery ignores a busy sibling but waits for its own 
     /readIdleMcp\(agent, mcpCwd \?\? cwd, resolvedMcpOwner, revision, requestedMcpGeneration\)/,
     'selected-owner discovery starts its idle child in another folder',
   );
-  sourceMatch(ask, /\}, requestOwner\);/, 'same-agent catalog reads can share a request across different MCP owners');
+  sourceMatch(
+    ask,
+    /\}, requestOwner, attempt\);/,
+    'same-agent catalog reads can share a request across different MCP owners',
+  );
 });
 
 test('draft MCP wiring cancels stale work and leaves Codex Servers on its cached path', () => {

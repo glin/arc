@@ -1573,6 +1573,8 @@ export async function askIdle(
   plan: AgentPlan,
   spawner: Spawner,
   openingDeadlineMs: number = OPENING_DEADLINE_MS,
+  onUsage?: (reading: UsageReading | null, failure: string) => void,
+  admit: () => boolean = () => true,
 ): Promise<IdleAnswers> {
   const session = new AgentSession(
     'idle',
@@ -1588,16 +1590,23 @@ export async function askIdle(
     if (failed) {
       throw new Error(failed);
     }
+    if (!admit()) return { usage: null, usageFailure: '', models: null, commands: [] };
     // The completed handshake has already supplied commands.
     const commands = session.state().commands;
     // Exclude MCP status here because that read waits for server connections.
     // Account usage and model requests run independently through the same child.
     let usageFailure = '';
     const [usage, models] = await Promise.all([
-      session.rateLimits().catch((error: Error) => {
-        usageFailure = error.message;
-        return null;
-      }),
+      session
+        .rateLimits()
+        .catch((error: Error) => {
+          usageFailure = error.message;
+          return null;
+        })
+        .then((reading) => {
+          onUsage?.(reading, usageFailure);
+          return reading;
+        }),
       session.models().catch(() => null),
     ]);
     return { usage, usageFailure, models, commands };
@@ -1606,16 +1615,118 @@ export async function askIdle(
   }
 }
 
-// Serializes account-usage reads per agent without losing an explicit request behind a
-// background read. A forced request waits for an automatic one. Repeated requests share the
-// answer only when they also target the same owner-scoped MCP discovery.
+// Serializes account reads independently of the remaining catalog work.
+// Repeated requests share an answer only when they target the same owner-scoped MCP discovery.
+export const USAGE_REFRESH_DEADLINE_MS = 120_000;
+
 export class UsageReadQueue {
+  private nextAttempt = 0;
+  private nextOperation = 0;
+  private expiresAt = 0;
+  private attempt: import('./view/usage.ts').UsageRefresh | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
+  constructor(private readonly publish: (state: import('./view/usage.ts').UsageRefresh) => void = () => {}) {}
+
+  begin(agents: readonly string[]): number | null {
+    if (
+      this.disposed ||
+      (this.attempt && Object.values(this.attempt.agents).some((state) => this.pending(state.phase)))
+    )
+      return null;
+    const id = ++this.nextAttempt;
+    this.expiresAt = Date.now() + USAGE_REFRESH_DEADLINE_MS;
+    this.attempt = { id, agents: Object.fromEntries(agents.map((agent) => [agent, { phase: 'queued', detail: '' }])) };
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      for (const [agent, state] of Object.entries(this.attempt?.agents ?? {})) {
+        if (!this.pending(state.phase)) continue;
+        this.update(agent, id, 'failed', 'Usage reading timed out. Read again to retry.');
+        const waiting = this.deferred.get(agent);
+        if (waiting?.attempt === id) this.failDeferred(agent, new Error('Usage reading timed out.'));
+      }
+    }, USAGE_REFRESH_DEADLINE_MS);
+    this.emit();
+    return id;
+  }
+
+  private pending(phase: string): boolean {
+    return ['queued', 'waiting', 'reading'].includes(phase);
+  }
+  current(agent: string, id?: number): boolean {
+    return (
+      !this.disposed &&
+      (id === undefined ||
+        (this.attempt?.id === id && Date.now() < this.expiresAt && this.pending(this.attempt.agents[agent]?.phase)))
+    );
+  }
+  private emit(): void {
+    if (!this.attempt) return;
+    if (!Object.values(this.attempt.agents).some((state) => this.pending(state.phase)) && this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.publish({ id: this.attempt.id, agents: structuredClone(this.attempt.agents) });
+  }
+  private update(agent: string, id: number, phase: import('./view/usage.ts').UsageRefreshPhase, detail = ''): void {
+    if (this.disposed || this.attempt?.id !== id || !this.pending(this.attempt.agents[agent]?.phase)) return;
+    if (Date.now() >= this.expiresAt) {
+      phase = 'failed';
+      detail = 'Usage reading timed out. Read again to retry.';
+    }
+    this.attempt.agents[agent] = { phase, detail };
+    this.emit();
+  }
+  reading(agent: string, id?: number, operation?: number): boolean {
+    if (!this.current(agent, id)) return false;
+    const active = this.active.get(agent);
+    if (operation !== undefined && active?.operation !== operation) return false;
+    if (active) active.sent = true;
+    if (id !== undefined) this.update(agent, id, 'reading');
+    return true;
+  }
+  admitted(agent: string): void {
+    const state = this.attempt?.agents[agent];
+    if (!state || this.pending(state.phase) || state.superseded) return;
+    state.superseded = true;
+    this.emit();
+  }
+  result(
+    agent: string,
+    id: number | undefined,
+    phase: 'success' | 'empty' | 'failed',
+    detail = '',
+    operation?: number,
+  ): void {
+    const active = this.active.get(agent);
+    if (operation !== undefined && active?.operation !== operation) return;
+    if (active && active.attempt === id) {
+      for (const joined of active.joined) this.update(agent, joined, phase, detail);
+      this.active.delete(agent);
+      active.release();
+    }
+    if (id !== undefined) this.update(agent, id, phase, detail);
+  }
+  dispose(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    for (const agent of this.deferred.keys()) this.failDeferred(agent, new Error('Usage reading stopped.'));
+    if (this.attempt)
+      for (const agent of Object.keys(this.attempt.agents))
+        this.update(agent, this.attempt.id, 'failed', 'Usage reading stopped.');
+    this.disposed = true;
+  }
   private readonly active = new Map<
     string,
     {
       force: boolean;
       requestOwner: string;
       promise: Promise<void>;
+      operation: number;
+      release: () => void;
+      attempt?: number;
+      sent: boolean;
+      joined: Set<number>;
     }
   >();
   private readonly deferred = new Map<
@@ -1624,33 +1735,67 @@ export class UsageReadQueue {
       promise: Promise<void>;
       resolve: () => void;
       reject: (error: Error) => void;
+      attempt?: number;
+      operation?: number;
     }
   >();
 
-  run(agent: string, force: boolean, read: (force: boolean) => Promise<void>, requestOwner = ''): Promise<void> {
+  run(
+    agent: string,
+    force: boolean,
+    read: (force: boolean, operation: number) => Promise<void>,
+    requestOwner = '',
+    attempt?: number,
+  ): Promise<void> {
+    if (!this.current(agent, attempt)) return Promise.resolve();
     const active = this.active.get(agent);
     if (active) {
-      if (active.requestOwner === requestOwner && (!force || active.force)) {
+      if (attempt !== undefined && active.force && active.sent && active.requestOwner === requestOwner) {
+        active.joined.add(attempt);
+        this.update(agent, attempt, 'reading');
+        return active.promise;
+      }
+      if (
+        active.requestOwner === requestOwner &&
+        (!force || active.force) &&
+        (attempt === undefined || active.attempt === attempt)
+      ) {
         return active.promise;
       }
       return active.promise.then(
-        () => this.run(agent, force, read, requestOwner),
-        () => this.run(agent, force, read, requestOwner),
+        () => this.run(agent, force, read, requestOwner, attempt),
+        () => this.run(agent, force, read, requestOwner, attempt),
       );
     }
 
-    const promise = Promise.resolve().then(() => read(force));
-    this.active.set(agent, { force, requestOwner, promise });
+    const operation = ++this.nextOperation;
+    let release = () => {};
+    const account = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const promise = Promise.resolve().then(() => (this.current(agent, attempt) ? read(force, operation) : undefined));
+    this.active.set(agent, {
+      force,
+      requestOwner,
+      promise: account,
+      operation,
+      release,
+      attempt,
+      sent: false,
+      joined: new Set(),
+    });
     const clear = () => {
-      if (this.active.get(agent)?.promise === promise) {
-        this.active.delete(agent);
-      }
+      this.result(agent, attempt, 'empty', 'No usable usage reading was returned.', operation);
+      release();
     };
-    void promise.then(clear, clear);
+    void promise.then(clear, (error: Error) => {
+      this.result(agent, attempt, 'failed', error.message, operation);
+      clear();
+    });
     return promise;
   }
 
-  waitUntilIdle(agent: string, force: boolean): Promise<void> | null {
+  waitUntilIdle(agent: string, force: boolean, attempt?: number, operation?: number): Promise<void> | null {
     if (!force) {
       return null;
     }
@@ -1664,18 +1809,26 @@ export class UsageReadQueue {
       resolve = settle;
       reject = fail;
     });
-    this.deferred.set(agent, { promise, resolve, reject });
+    this.deferred.set(agent, {
+      promise,
+      resolve,
+      reject,
+      attempt,
+      operation: operation ?? this.active.get(agent)?.operation,
+    });
+    if (attempt !== undefined) this.update(agent, attempt, 'waiting');
     return promise;
   }
 
-  resumeDeferred(agent: string, read: () => Promise<void>): Promise<void> | null {
+  resumeDeferred(agent: string, read: (attempt?: number, operation?: number) => Promise<void>): Promise<void> | null {
     const waiting = this.deferred.get(agent);
     if (!waiting) {
       return null;
     }
     this.deferred.delete(agent);
     try {
-      void read().then(waiting.resolve, waiting.reject);
+      if (!this.current(agent, waiting.attempt)) waiting.resolve();
+      else void read(waiting.attempt, waiting.operation).then(waiting.resolve, waiting.reject);
     } catch (error) {
       waiting.reject(error as Error);
     }

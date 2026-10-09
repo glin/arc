@@ -244,6 +244,7 @@ import {
 } from './turncard';
 import { transcriptReadCacheKey } from './turnread';
 import { AgentUsage, usageBar, agentsWithNewTurns, TurnMark } from './usageview';
+import type { UsageRefresh } from './view/usage';
 import {
   ANSWERED_IN_PROMPT,
   asksAnsweredBySend,
@@ -1243,6 +1244,7 @@ export class PanelProvider implements vscode.Disposable {
   private trail: Trail = emptyTrail();
   // Account usage and permission readings supplied by `extension.ts`. Rendering computes each reading's age.
   private usage: AgentUsage[] = [];
+  private usageRefresh: UsageRefresh | null = null;
   private askLevels: Record<string, string> = {};
   private codexEffectiveModes: Record<string, CodexEffectiveMode> = {};
   private claudeEffectiveModes: Record<string, string> = {};
@@ -2788,7 +2790,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     return {
-      bar: usageBar(this.usage, Date.now()),
+      bar: usageBar(this.usage, Date.now(), this.usageRefresh),
       composer: composerView(state),
       menus,
       launcher: sessionLauncherView(
@@ -2987,6 +2989,11 @@ export class PanelProvider implements vscode.Disposable {
     this.usage = usage;
     void this.post({ type: 'usage', usage: this.usagePayload() });
     this.postProjectSpend();
+  }
+
+  public setUsageRefresh(refresh: UsageRefresh): void {
+    this.usageRefresh = refresh;
+    void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
   // Update permission levels through the account and composer payload.

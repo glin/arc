@@ -5,6 +5,7 @@
 import { RateLimit, SpendCap, UsageReading } from './agentwire';
 import { CONTEXT_BANDS, bandForPercent, formatClock, wholePercent } from './turnview';
 import type { UsageBar, UsageBrief, UsageFigure, UsageGroup, UsageLine } from './view/usage.ts';
+import type { UsageRefresh } from './view/usage.ts';
 export type { UsageBar, UsageBrief, UsageFigure, UsageGroup, UsageLine } from './view/usage.ts';
 
 // A table lookup that cannot find a function on the prototype. A window or a group named
@@ -403,20 +404,36 @@ function agentOrder(agents: Iterable<string>): string[] {
 
 // Prepares the usage bar for all supplied agents with a displayed window or spend cap.
 // Returns null when no groups remain. Session selection does not narrow account usage.
-export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
+export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefresh | null): UsageBar | null {
   const byAgent = new Map(usages.map((u) => [u.agent, u]));
   const briefs: UsageBrief[] = [];
   const groups: UsageGroup[] = [];
   // The oldest reading among the figures actually drawn. The bar says its age once, so it
   // must not let a fresh event make an older account cap sound fresh.
   let readAt = Number.POSITIVE_INFINITY;
-  for (const agent of agentOrder(byAgent.keys())) {
+  const statuses = Object.fromEntries(
+    Object.entries(refresh?.agents ?? {})
+      .filter(([, state]) => !state.superseded)
+      .map(([agent, state]) => {
+        const text = {
+          queued: 'Queued',
+          waiting: 'Waiting for current work',
+          reading: 'Reading usage',
+          success: 'Usage read',
+          empty: 'No usable usage reading',
+          failed: 'Usage reading failed',
+        }[state.phase];
+        return [agent, `${agentLabel(agent)}: ${text}${state.detail ? `. ${state.detail}` : ''}`];
+      }),
+  );
+  for (const agent of agentOrder([...byAgent.keys(), ...Object.keys(statuses)])) {
     const usage = byAgent.get(agent);
     const live = usage ? liveLimits(usage, now) : [];
     const spend = usage?.spend ?? null;
-    if (!usage || (!live.length && !spend)) {
+    if ((!usage || (!live.length && !spend)) && !statuses[agent]) {
       continue;
     }
+    let agentReadAt = Number.POSITIVE_INFINITY;
     const creditWindow = live.find(isCreditWindow) ?? null;
     const rateWindows = live.filter((limit) => !isCreditWindow(limit));
     const label = agentLabel(agent);
@@ -425,6 +442,7 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
     const lines: UsageLine[] = [];
     for (const limit of rateWindows) {
       readAt = Math.min(readAt, limit.readAt);
+      agentReadAt = Math.min(agentReadAt, limit.readAt);
       const percent = percentOf(limit.utilization);
       const band = bandForPercent(percent);
       const level = band ? band.level : null;
@@ -452,15 +470,17 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
     if (spend || creditWindow) {
       if (spend) {
         readAt = Math.min(readAt, spend.readAt);
+        agentReadAt = Math.min(agentReadAt, spend.readAt);
       }
       if (creditWindow) {
         readAt = Math.min(readAt, creditWindow.readAt);
+        agentReadAt = Math.min(agentReadAt, creditWindow.readAt);
       }
       const percent = percentOf(spend?.utilization ?? creditWindow!.utilization);
       const band = bandForPercent(percent);
       const level = band ? band.level : null;
       const reportedReset =
-        liveCreditReset(creditWindow?.resetsAtSeconds, now) ?? liveCreditReset(usage.creditResetsAtSeconds, now);
+        liveCreditReset(creditWindow?.resetsAtSeconds, now) ?? liveCreditReset(usage?.creditResetsAtSeconds, now);
       const { resets, resetsExact } = resetWord(reportedReset ?? nextMonthStartUtc(now), now, reportedReset === null);
       const detail = spend
         ? `${moneyWord(spend.usedMinor, spend.exponent, spend.currency)} of ` +
@@ -484,7 +504,17 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
     if (figures.length) {
       briefs.push({ agent, label, figures, name: [label, ...spoken].join(', ') });
     }
-    groups.push({ agent, label, plan: usagePlanLabel(usage), lines });
+    groups.push({
+      agent,
+      label,
+      plan: usage ? usagePlanLabel(usage) : '',
+      lines,
+      age: Number.isFinite(agentReadAt)
+        ? `updated ${now - agentReadAt > USAGE_FRESH_MS ? `${lengthWord(now - agentReadAt)} ago` : 'just now'}`
+        : '',
+      exact: Number.isFinite(agentReadAt) ? new Date(agentReadAt).toLocaleString() : '',
+      status: statuses[agent] ?? '',
+    });
   }
   if (!groups.length) {
     return null;
@@ -495,16 +525,30 @@ export function usageBar(usages: AgentUsage[], now: number): UsageBar | null {
   const age = stale ? `updated ${lengthWord(now - readAt)} ago` : '';
   // The control that reads again carries the same words, so two wordings of one reading,
   // drawn a few pixels apart, can never name different numbers.
-  const readWord = age || 'updated just now';
+  const readWord = Number.isFinite(readAt) ? age || 'updated just now' : '';
   // Adds the reading's clock time to stale accessible age wording.
   const spokenAge = stale ? `${age}, ${formatClock(readAt)}` : '';
-  const said = [briefs.map((b) => b.name).join('. '), spokenAge].filter(Boolean).join(', ');
+  const said = [briefs.map((b) => b.name).join('. '), spokenAge, ...Object.values(statuses)].filter(Boolean).join(', ');
+  const busy = Object.values(refresh?.agents ?? {}).some((state) =>
+    ['queued', 'waiting', 'reading'].includes(state.phase),
+  );
+  const summary = Object.values(statuses).join('. ');
   return {
     briefs,
     groups,
     age,
-    read: `${readWord} · press to read again`,
+    read: busy ? 'Reading usage' : readWord ? `${readWord} · press to read again` : 'Read again',
     name: said ? `${said}. Press to show every limit.` : 'Press to show every limit.',
+    ...(refresh
+      ? {
+          refresh: {
+            id: refresh.id,
+            busy,
+            name: `${summary}. ${busy ? 'Reading usage' : 'Read again'}`,
+            announcement: busy ? '' : summary,
+          },
+        }
+      : {}),
   };
 }
 

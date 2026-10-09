@@ -212,6 +212,10 @@ A draft rejects setup changes while a submission is pending or after one succeed
 
 The collapsed bar shows current figures. Hover or focus opens a temporary detail view. A press pins it until another press or Escape. The detail view is a popover so opening it does not move the timeline.
 
+The shared age describes the oldest displayed reading. Each agent's detail shows its own reading age, with full local time in its tooltip and accessible name. Unchanged utilization still receives a new age when the agent admits a new reading.
+
+Read again requests both agents. Each detail group reports queued, waiting for current work, reading, or a terminal outcome. Missing and expired figures retain these groups and the retry control without inventing percentages or reading times. A newer admitted reading removes that agent's terminal feedback without changing the expired attempt's outcome. The button keeps focus while either agent remains active. Its accessible name includes its visible label and both agents' states. One announcement summarizes newly observed terminal outcomes. Reopening the panel does not announce retained completed attempts.
+
 Fresh values can arrive from live wire events, a read after a child finishes, a transcript refresh that detects finished work, or an idle child started only to answer controls. Failed or fresh reads are not repeated until the reader explicitly refreshes or the freshness rule allows another read.
 
 An expired limit is omitted. Complete readings replace account state, while partial live events update only the limit they name. A complete answer with no rate windows retains live windows because a money-cap answer says nothing about their clocks.

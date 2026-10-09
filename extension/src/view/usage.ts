@@ -30,6 +30,22 @@ export interface UsageGroup {
   label: string;
   plan: string;
   lines: UsageLine[];
+  age: string;
+  exact: string;
+  status: string;
+}
+
+export type UsageRefreshPhase = 'queued' | 'waiting' | 'reading' | 'success' | 'empty' | 'failed';
+
+export interface UsageRefreshState {
+  phase: UsageRefreshPhase;
+  detail: string;
+  superseded?: boolean;
+}
+
+export interface UsageRefresh {
+  id: number;
+  agents: Record<string, UsageRefreshState>;
 }
 
 export interface UsageBar {
@@ -38,4 +54,5 @@ export interface UsageBar {
   age: string;
   read: string;
   name: string;
+  refresh?: { id: number; busy: boolean; name: string; announcement: string };
 }
