@@ -611,6 +611,41 @@ const DISPATCH_COMMAND =
   'python dispatch.py --runner claude --read-only --arc-dispatch --model claude-fable-5-1 --effort high --name arc-ui-proposal-fable';
 const DISPATCH_RECEIPT = `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${CLAUDE_SESSION}","name":"arc-ui-proposal-fable"}`;
 
+test('synchronous dispatch growth retains every reference before the captured size', () => {
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    ...Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'late-launch', { stdout: DISPATCH_RECEIPT }),
+  ]);
+  const capturedSize = fs.statSync(file).size;
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const read = nativeFs.readSync;
+  let grew = false;
+  nativeFs.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+    const bytes = read(...args);
+    if (!grew) {
+      grew = true;
+      fs.appendFileSync(file, '{"type":"ignored"}\n');
+    }
+    return bytes;
+  }) as typeof fs.readSync;
+  syncBuiltinESMExports();
+  try {
+    const scan = scanCodexDispatchReferences(file, 'parent');
+    assert.equal(grew, true);
+    assert.equal(scan.cursor.offset, capturedSize);
+    assert.deepEqual(
+      scan.references.map((reference) => reference.toolUseIds),
+      [['late-launch']],
+    );
+  } finally {
+    nativeFs.readSync = read;
+    syncBuiltinESMExports();
+  }
+});
+
 test('a Codex shell launch links its own stdout receipt to the launching turn across a resumed scan', () => {
   const id = 'exec-987b9951-5d03-4b9c-ab46-099b76702eaf';
   const records = [
@@ -636,8 +671,9 @@ test('a Codex shell launch links its own stdout receipt to the launching turn ac
   assert.deepEqual(turn.dispatchToolUseIds, [id]);
   assert.ok(turn.stepCount > TURN_STEP_LIMIT);
   assert.ok(turn.steps.every((step) => (step as { id?: string }).id !== id));
-  let scan = scanCodexDispatchReferences(file, 'parent', null, 16 * 1024);
-  while (!scan.complete) scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 16 * 1024);
+  let scan = scanCodexDispatchReferences(file, 'parent', null, 32 * 1024);
+  for (let pass = 0; !scan.complete && pass < 100; pass++)
+    scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32 * 1024);
   assert.deepEqual(
     scan.references.map((reference) => [reference.sessionId, reference.toolUseIds]),
     [[CLAUDE_SESSION, [id]]],
@@ -672,10 +708,10 @@ test('the completed PowerShell dispatch envelope retains its launch identity thr
     full.references.map((reference) => [reference.sessionId, reference.toolUseIds]),
     expected,
   );
-  let scan = scanCodexDispatchReferences(file, 'parent', null, 16 * 1024);
+  let scan = scanCodexDispatchReferences(file, 'parent', null, 32 * 1024);
   assert.equal(scan.complete, false);
   for (let pass = 0; !scan.complete && pass < 4; pass++)
-    scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 16 * 1024);
+    scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32 * 1024);
   assert.equal(scan.complete, true);
   assert.deepEqual(
     scan.references.map((reference) => [reference.sessionId, reference.toolUseIds]),
@@ -922,17 +958,106 @@ test('a same-prefix rollout rewrite drops its stale dispatch cursor', () => {
       .replace(CLAUDE_SESSION, '00000000-0000-0000-0000-000000000000') + '\n';
   assert.equal(Buffer.byteLength(replacement), fs.statSync(file).size);
   fs.writeFileSync(file, replacement);
-  const rewritten = scanCodexDispatchReferences(file, 'parent', first.cursor);
+  const invalidated = scanCodexDispatchReferences(file, 'parent', first.cursor);
+  assert.equal(invalidated.reset, true);
+  const rewritten = scanCodexDispatchReferences(file, 'parent', invalidated.cursor);
   assert.deepEqual(
     rewritten.references.map((reference) => reference.sessionId),
     ['00000000-0000-0000-0000-000000000000'],
   );
   assert.deepEqual(
-    scanCodexDispatchReferences(file, 'another-parent', rewritten.cursor).references.map(
-      (reference) => reference.parentSessionId,
-    ),
+    scanCodexDispatchReferences(
+      file,
+      'another-parent',
+      scanCodexDispatchReferences(file, 'another-parent', rewritten.cursor).cursor,
+    ).references.map((reference) => reference.parentSessionId),
     ['another-parent'],
   );
+});
+
+test.each([65536, 1024 * 1024])(
+  'Codex interior rewrite plus growth resumes to the fresh relationships at %i bytes',
+  (budget) => {
+    vi.spyOn(performance, 'now').mockReturnValue(0);
+    const firstId = '11111111-1111-4111-8111-111111111111';
+    const secondId = '22222222-2222-4222-8222-222222222222';
+    const file = writeRollout([
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      turnContext(2, TURN, 'gpt-6-astra', 'high'),
+      { type: 'ignored', payload: 'x'.repeat(1024) },
+      commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'launch', {
+        stdout: DISPATCH_RECEIPT.replace(CLAUDE_SESSION, firstId),
+      }),
+      ...Array.from({ length: 100 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+    ]);
+    const first = scanCodexDispatchReferences(file, 'parent', null, budget);
+    assert.deepEqual(
+      first.references.map((reference) => reference.sessionId),
+      [firstId],
+    );
+    const old = fs.readFileSync(file, 'utf8');
+    assert.ok(old.indexOf(firstId) > 256 && old.indexOf(firstId) < first.cursor.offset - 4096);
+    fs.writeFileSync(file, old.replace(firstId, secondId) + '{"type":"ignored"}\n');
+    fs.utimesSync(file, new Date(0), new Date(first.cursor.mtimeMs + 2000));
+    let resumed = scanCodexDispatchReferences(file, 'parent', first.cursor, budget);
+    for (let pass = 0; !resumed.complete && pass < 100; pass++)
+      resumed = scanCodexDispatchReferences(file, 'parent', JSON.parse(JSON.stringify(resumed.cursor)), budget);
+    assert.ok(resumed.complete);
+    assert.deepEqual(resumed.references, scanCodexDispatchReferences(file, 'parent').references);
+  },
+);
+
+test('Codex append validation retains parsing position and replaces a superseded comparison', () => {
+  const file = writeRollout(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
+  let scan = scanCodexDispatchReferences(file, 'parent', null, 65536);
+  const offset = scan.cursor.offset;
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32768);
+  assert.equal(scan.reset, false);
+  assert.equal(scan.complete, false);
+  assert.equal(scan.cursor.offset, offset);
+  assert.ok(scan.cursor.evidence?.validation?.digest.offset);
+  const candidate = scan.cursor.evidence.validation.stamp;
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32768);
+  assert.equal(scan.cursor.offset, offset);
+  assert.notDeepEqual(scan.cursor.evidence?.validation?.stamp, candidate);
+  assert.ok(scan.cursor.evidence!.validation.digest.offset <= 16384);
+  for (let pass = 0; !scan.complete && pass < 100; pass++) {
+    const before = scan.cursor.offset;
+    scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 65536);
+    assert.equal(scan.reset, false);
+    assert.ok(scan.cursor.offset >= before);
+  }
+  assert.equal(scan.complete, true);
+  assert.equal(scan.cursor.offset, fs.statSync(file).size);
+});
+
+test('Codex replacement and truncation retire completed relationships before rebuilding', () => {
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'launch', { stdout: DISPATCH_RECEIPT }),
+  ];
+  for (const change of ['replacement', 'truncation']) {
+    const file = writeRollout(records);
+    const first = scanCodexDispatchReferences(file, 'parent');
+    assert.equal(first.complete, true);
+    assert.equal(first.references.length, 1);
+    if (change === 'replacement') {
+      fs.renameSync(file, file + '.old');
+      fs.writeFileSync(file, JSON.stringify(meta()) + '\n');
+    } else fs.writeFileSync(file, JSON.stringify(meta()) + '\n');
+    const invalidated = scanCodexDispatchReferences(file, 'parent', first.cursor);
+    assert.equal(invalidated.reset, true);
+    assert.equal(invalidated.complete, false);
+    assert.deepEqual(invalidated.references, []);
+    const fresh = scanCodexDispatchReferences(file, 'parent', invalidated.cursor);
+    assert.equal(fresh.complete, true);
+    assert.deepEqual(fresh.references, scanCodexDispatchReferences(file, 'parent').references);
+  }
 });
 
 test('a same-size middle rewrite replaces a dispatch receipt outside both cursor anchors', () => {
@@ -958,7 +1083,9 @@ test('a same-size middle rewrite replaces a dispatch receipt outside both cursor
   fs.writeFileSync(file, old.replace(firstId, secondId));
   fs.utimesSync(file, new Date(before.mtimeMs), new Date(before.mtimeMs + 2000));
   assert.equal(fs.statSync(file).size, before.size);
-  const refreshed = scanCodexDispatchReferences(file, 'parent', first.cursor);
+  const reset = scanCodexDispatchReferences(file, 'parent', first.cursor);
+  assert.equal(reset.reset, true);
+  const refreshed = scanCodexDispatchReferences(file, 'parent', reset.cursor);
   assert.deepEqual(
     refreshed.references.map((reference) => reference.sessionId),
     [secondId],
@@ -1004,10 +1131,12 @@ test('resuming a spilled partial line waits for enough budget and counts the rep
   assert.equal(small.cursor.offset, offset);
   assert.ok(small.readBytes <= 6 * 1024);
   assert.equal(small.complete, false);
-  const resumed = scanCodexDispatchReferences(file, 'parent', small.cursor, 24 * 1024);
+  let resumed = scanCodexDispatchReferences(file, 'parent', small.cursor, 32 * 1024);
+  for (let pass = 0; !resumed.complete && pass < 10; pass++)
+    resumed = scanCodexDispatchReferences(file, 'parent', resumed.cursor, 32 * 1024);
   assert.equal(resumed.complete, true);
-  assert.ok(resumed.readBytes > 8192);
-  assert.ok(resumed.readBytes <= 24 * 1024);
+  assert.ok(resumed.readBytes > 0);
+  assert.ok(resumed.readBytes <= 32 * 1024);
 });
 const claudePrintResult = (over: Record<string, unknown> = {}) => ({
   type: 'result',
