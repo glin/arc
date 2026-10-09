@@ -149,6 +149,8 @@ export interface TurnAgent {
   effort: string | null;
   // Recorded child usage grouped by pricing identity. Empty when no request usage is available.
   spend: ModelSpend[];
+  outputRate?: import('./outputrate').OutputRate;
+  outputRateModel?: string;
   spendFound: boolean;
   // Missing, unfinished, or uncertain child data makes `spend` a lower bound.
   spendPartial: boolean;
@@ -678,6 +680,7 @@ export interface Turn {
   usageParts?: TurnUsagePart[];
   contextTokens: number; // input plus cache of the turn's last real assistant message
   outputRate?: import('./outputrate').OutputRate;
+  outputRateModel?: string;
   responseIds?: string[];
   // Request that established `contextTokens`, separate from aggregate usage and the turn end time.
   contextRequest?: ContextRequest;

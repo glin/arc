@@ -10886,6 +10886,7 @@ export class PanelProvider implements vscode.Disposable {
           facts?.toolUses ?? 0,
           folders,
           now,
+          reference.kind === 'dispatch' ? reference.agent : turn.agent,
         );
       },
     );

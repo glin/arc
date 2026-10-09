@@ -23,9 +23,11 @@ export interface ModelSpend {
 
 export interface AgentSpend {
   models: ModelSpend[];
+  outputRate?: import('./outputrate').OutputRate;
+  outputRateModel?: string;
   // The model the transcript's own requests used most, by token count. Nested subagents never
-  // count toward it, although `models` includes them. Only the Claude reader sets it, because a
-  // Codex spawn call already names the exact model its child runs.
+  // count toward it, although `models` includes them. Only the Claude reader sets it.
+  // Codex measured response identity stays separate from launch and display models.
   ownModel?: string | null;
   effort: string | null;
   startedAt?: number | null;
@@ -251,6 +253,8 @@ export function readChildSpend(
   }
   return {
     models: spend.models,
+    ...(spend.outputRate ? { outputRate: { ...spend.outputRate } } : {}),
+    ...(spend.outputRateModel ? { outputRateModel: spend.outputRateModel } : {}),
     ...(spend.ownModel ? { ownModel: spend.ownModel } : {}),
     found: spend.found,
     partial: spend.partial,

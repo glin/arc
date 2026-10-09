@@ -265,3 +265,26 @@ test('missing Codex aggregate roots still load surviving descendants while Claud
   }
   assert.equal(reads, 2);
 });
+
+test('open child usage preserves native measurement and clears it on a source refresh', () => {
+  const file = path.join(tempDir('rate-refresh-'), 'child.jsonl');
+  fs.writeFileSync(file, 'child');
+  const cache = new AgentSpendCache();
+  const rate = { output: 84, milliseconds: 10000 };
+  let measured = true;
+  const load = () => ({
+    models: [],
+    found: true,
+    partial: true,
+    effort: null,
+    ...(measured ? { outputRate: rate, outputRateModel: 'gpt-6.1-sol' } : {}),
+  });
+  const read = (version: string) => readChildSpend(cache, file, 'running', version, load, '', true, 100000);
+  const initial = read('source:one\n5:1000');
+  assert.deepEqual(initial.outputRate, rate);
+  assert.equal(structuredClone(initial).outputRateModel, 'gpt-6.1-sol');
+  measured = false;
+  const refreshed = read('source:two\n5:2000');
+  assert.equal(refreshed.outputRate, undefined);
+  assert.equal(refreshed.outputRateModel, undefined);
+});

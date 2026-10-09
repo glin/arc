@@ -1,5 +1,5 @@
 import { wholePercent } from './view/tokens.ts';
-import { outputRateText } from './outputrate';
+import { outputRateText, type OutputRate } from './outputrate';
 // Reduces turns to card headlines, status, figures, and control text.
 // `turnview.ts` re-exports these projections for compatibility.
 
@@ -115,7 +115,7 @@ export interface StatDetailEntry {
 export type StatDetailLine =
   | string
   | RelativeStatDetail
-  | { text: string; cost?: true; cacheHit?: CacheHitDetail; warning?: true; lines?: StatDetailLine[] };
+  | { text: string; title?: string; cost?: true; cacheHit?: CacheHitDetail; warning?: true; lines?: StatDetailLine[] };
 
 // Lead with figures and keep scope beside the figure it limits. Separate changes of subject.
 // Use label/value rows for figures and bullets for explanations. Put relevant caveats last.
@@ -950,7 +950,13 @@ function agentCostEntries(agent: TurnAgent, partial: boolean, runner: AgentKind,
   for (const spend of agent.spend) {
     addUsage(total, spend.usage);
   }
-  const usage = usageDetailEntries(total, partial ? [{ label: 'Every part above, priced or not' }] : []);
+  const usage = usageDetailEntries(
+    total,
+    partial ? [{ label: 'Every part above, priced or not' }] : [],
+    agent.outputRateModel ? agent.outputRate : undefined,
+    runner,
+    agent.outputRateModel,
+  );
   if (usage.length) {
     entries.push({ ...usage[0], separateBefore: true }, ...usage.slice(1));
   }
@@ -1060,7 +1066,13 @@ function agentTokensFigure(agent: TurnAgent, priced: boolean, running = false, n
       ...figureRecord(
         name,
         {
-          entries: usageDetailEntries(total),
+          entries: usageDetailEntries(
+            total,
+            [],
+            agent.outputRateModel ? agent.outputRate : undefined,
+            'codex',
+            agent.outputRateModel,
+          ),
           ...(running ? { footer: [noEnding ? AGENT_USAGE_NO_ENDING : AGENT_USAGE_SO_FAR] } : {}),
         },
         false,
@@ -1312,6 +1324,7 @@ export function dispatchedAgentCard(
   toolUses: number,
   folders: string[] = [],
   now: number = Date.now(),
+  runner: AgentKind = 'claude',
 ): AgentCard {
   const agent: TurnAgent = {
     id: sessionId,
@@ -1325,6 +1338,9 @@ export function dispatchedAgentCard(
     spendFound: spend.found,
     spendPartial: spend.partial,
     spendUnfinished: spend.unfinished,
+    ...(spend.outputRate && spend.outputRateModel
+      ? { outputRate: spend.outputRate, outputRateModel: spend.outputRateModel }
+      : {}),
     commits: spend.commits,
     artifacts: spend.artifacts,
     durationMs: state === 'running' || startedAt === null || endedAt === null ? null : Math.max(0, endedAt - startedAt),
@@ -1335,7 +1351,7 @@ export function dispatchedAgentCard(
   const live = { session: false, children: state === 'running' ? new Set([sessionId]) : new Set<string>() };
   const files = state === 'running' ? [] : fileCardsOf(spend.artifacts?.files ?? [], folders);
   const commits = state === 'running' ? [] : (spend.commits ?? []).map((commit) => commitCard(commit, now));
-  const card = agentCard(agent, false, live, new Map(), fileRowPathsByKey(files), now);
+  const card = agentCard(agent, false, live, new Map(), fileRowPathsByKey(files), now, runner);
   return { ...card, kind: 'dispatch', files, commits, since: state === 'running' ? startedAt : null };
 }
 
@@ -1662,23 +1678,40 @@ function compactUsageParts(usage: Turn['usage']): string[] {
 }
 
 // Shared usage breakdown for turn token figures and child cost records.
-function usageDetailEntries(u: Turn['usage'], lead: StatDetailEntry[] = []): StatDetailEntry[] {
+function usageDetailEntries(
+  u: Turn['usage'],
+  lead: StatDetailEntry[] = [],
+  measurement?: OutputRate,
+  provider: AgentKind = 'claude',
+  measuredModel?: string,
+): StatDetailEntry[] {
   const entries: StatDetailEntry[] = [...lead];
   const input = inputSideTokens(u);
   if (input) {
     entries.push({ label: 'Input', value: `${detailedTokens(input)} tokens` });
   }
   if (u.output) {
+    const rate = outputRateText(measurement);
+    const title =
+      provider === 'claude'
+        ? 'Output tokens per second. Actual output includes thinking. Observed response time excludes untimed responses.'
+        : 'Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded.';
+    const lines: StatDetailLine[] = rate
+      ? [
+          {
+            text: rate,
+            title: `${rate}. ${title}${measuredModel ? ` Measured model: ${measuredModel}. Only this subagent is timed. Usage totals include any delegated work.` : ''}`,
+          },
+        ]
+      : [];
+    if (u.thinking)
+      lines.push(
+        `Thinking: ${detailedTokens(u.thinking)} tokens (${Math.round((u.thinking / u.output) * 100)}% of output), included in output`,
+      );
     entries.push({
       label: 'Output',
       value: `${detailedTokens(u.output)} tokens`,
-      ...(u.thinking
-        ? {
-            lines: [
-              `Thinking: ${detailedTokens(u.thinking)} tokens (${Math.round((u.thinking / u.output) * 100)}% of output), included in output`,
-            ],
-          }
-        : {}),
+      ...(lines.length ? { lines } : {}),
     });
   }
   const requests = u.requests ?? 0;
@@ -1701,17 +1734,12 @@ function usageDetailEntries(u: Turn['usage'], lead: StatDetailEntry[] = []): Sta
 
 // Token detail includes main-agent usage alone when the turn has children.
 function tokenDetailList(turn: Turn): StatDetailList {
-  const entries = usageDetailEntries(turn.usage, turn.agents.length ? [{ label: 'Main agent only' }] : []);
-  const speed = turn.interrupted ? null : outputRateText(turn.outputRate);
-  if (speed)
-    entries.push({
-      label: 'Speed',
-      value: speed,
-      valueTitle:
-        turn.agent === 'claude'
-          ? 'Actual output tokens, including thinking, per observed response second. Untimed responses are excluded.'
-          : 'Actual output tokens, including reasoning, per request second. Includes request preparation and hooks. Local tool waits and untimed responses are excluded.',
-    });
+  const entries = usageDetailEntries(
+    turn.usage,
+    turn.agents.length ? [{ label: 'Main agent only' }] : [],
+    turn.interrupted ? undefined : turn.outputRate,
+    turn.agent,
+  );
   return { entries };
 }
 

@@ -3,6 +3,7 @@ import type { TurnOutcome } from './transcript';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
 import { openReadWindow, closeReadWindow } from './readmeter';
 import { responseRateForTurn, savedResponseRates } from './outputrate';
+import { emptyUsage } from './agentspend';
 
 test('the panel persists an owned response speed and omits unowned or foreign completions', () => {
   const saves: Array<{ key: string; rates: unknown }> = [];
@@ -4724,6 +4725,19 @@ test.each([
         parentAgent === 'codex' ? readCodexSession(parentFile, 'parent') : readSession(parentFile, 'parent')
       ).turns[0];
       assert.deepEqual(recorded.dispatchToolUseIds, ['exec-launch']);
+      if (childAgent === 'codex') {
+        provider.dispatchFacts.set(childId, {
+          ...provider.dispatchFacts.get(childId),
+          spend: {
+            found: true,
+            partial: false,
+            effort: 'high',
+            outputRate: { output: 84, milliseconds: 10000 },
+            outputRateModel: 'gpt-6-sol',
+            models: [{ model: 'gpt-6-sol', usage: { ...emptyUsage(), output: 84 } }],
+          },
+        });
+      }
       const card = provider.renderTurnCard(
         recorded,
         false,
@@ -4736,6 +4750,13 @@ test.each([
       );
       assert.equal(card.dispatched.length, 1);
       assert.equal(detailRowsFor(card, 'dispatched')?.kind, 'dispatched');
+      if (childAgent === 'codex') {
+        const figure = card.dispatched[0].figures.find((value: { metric: string }) => value.metric === 'cost');
+        const line = figure.record.entries.find((entry: { label: string }) => entry.label === 'Output').lines[0];
+        assert.ok(line.text.includes('tok/s'));
+        assert.ok(line.title.includes('Request time'));
+        assert.ok(line.title.includes('gpt-6-sol'));
+      }
       provider.sessionParentEdges(provider.catalog.sessions);
       provider.authoritativeCatalog = sessions;
       provider.trail = visitPlace(emptyTrail(), 'parent');
@@ -28496,4 +28517,16 @@ test('initial Claude confirmation refuses unsaved, foreign and incomplete names 
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('read-only titled usage lines expose a named semantic group without a keyboard stop', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'webview', 'stat-detail.ts'), 'utf8');
+  const start = source.indexOf('if (line.title) {', source.indexOf('const subitem ='));
+  const end = source.indexOf('if (line.cacheHit)', start);
+  const title = source.slice(start, end);
+  assert.match(title, /if \(!press\)/);
+  assert.match(title, /row\.setAttribute\('role', 'group'\)/);
+  assert.match(title, /row\.setAttribute\(\s*'aria-label',/);
+  assert.ok(title.includes('line.text') && title.includes('line.title'));
+  assert.doesNotMatch(title, /tabIndex|tabindex/);
 });

@@ -379,6 +379,13 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
       if (line.title) {
         row.title = line.title;
+        if (!press) {
+          row.setAttribute('role', 'group');
+          row.setAttribute(
+            'aria-label',
+            line.title.startsWith(`${line.text}.`) ? line.title : `${line.text}. ${line.title}`,
+          );
+        }
       }
       if (line.cacheHit) {
         const text = cacheHitText(line.cacheHit);

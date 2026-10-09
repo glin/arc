@@ -13,7 +13,7 @@ export interface ResponseRate extends OutputRate {
 
 export const RESPONSE_RATE_LIMIT = 512;
 
-function validRate(value: OutputRate): boolean {
+export function validRate(value: OutputRate): boolean {
   return (
     Number.isSafeInteger(value.output) &&
     value.output >= 0 &&
@@ -75,7 +75,9 @@ export function responseRateForTurn(
 }
 
 export function outputRateText(rate: OutputRate | undefined): string | null {
-  return rate && validRate(rate) ? `${((rate.output * 1000) / rate.milliseconds).toFixed(1)} tok/s` : null;
+  if (!rate || !validRate(rate) || rate.output === 0) return null;
+  const value = (rate.output * 1000) / rate.milliseconds;
+  return Number.isFinite(value) ? `${value.toFixed(1)} tok/s` : null;
 }
 
 // A single main response retains final cumulative usage until its terminal event.
@@ -169,7 +171,7 @@ export interface CodexResponseClock {
   calls: string[];
   blocking: string[];
   seen: string[];
-  rates: Array<OutputRate & { responseId: string }>;
+  rates: Array<OutputRate & { responseId: string; model?: string }>;
   contaminated: boolean;
 }
 
@@ -265,7 +267,7 @@ export function reduceCodexResponseClock(
   state.seen.push(id);
   if (state.seen.length > RESPONSE_RATE_LIMIT) state.seen.shift();
   if (rate && validRate(rate)) {
-    state.rates.push({ ...rate, responseId: id });
+    state.rates.push({ ...rate, responseId: id, ...(identity(owner.model) ? { model: owner.model } : {}) });
     if (state.rates.length > RESPONSE_RATE_LIMIT) state.rates.shift();
   }
   return rate && validRate(rate) ? rate : null;

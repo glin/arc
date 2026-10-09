@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
-import { emptyCodexResponseClock, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
+import { emptyCodexResponseClock, validRate, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
 import { meterRead } from './readmeter';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -3808,6 +3808,22 @@ function readCodexOwnSpend(file: string): {
   partial ||= Object.keys(usageState.pendingClaudeResults).length > 0;
   const usageIncomplete = incompleteRequests > 0;
   const turns = child.finish(0).turns;
+  const outputRate = { output: 0, milliseconds: 0 };
+  let measuredModel: string | undefined;
+  let qualifiedRate = false;
+  for (const turn of turns) {
+    if (turn.sessionId !== meta?.sessionId || turn.interrupted || !turn.outputRate) continue;
+    const model = turn.outputRateModel;
+    if (!model || model.length > 512 || !validRate(turn.outputRate) || (measuredModel && measuredModel !== model)) {
+      qualifiedRate = false;
+      break;
+    }
+    measuredModel = model;
+    qualifiedRate = true;
+    outputRate.output += turn.outputRate.output;
+    outputRate.milliseconds += turn.outputRate.milliseconds;
+  }
+  qualifiedRate &&= validRate(outputRate) && outputRate.output > 0;
   const artifacts = reduceChildArtifacts(
     { turns },
     {
@@ -3824,6 +3840,7 @@ function readCodexOwnSpend(file: string): {
   const spend: AgentSpend = found
     ? {
         models: [...byIdentity.values()],
+        ...(qualifiedRate ? { outputRate, outputRateModel: measuredModel } : {}),
         found: true,
         partial,
         effort,
@@ -5392,6 +5409,7 @@ function reduceCodexSessionLine(
     : null;
   if (rateTurn && state.responseClock.model && rateModel !== state.responseClock.model) {
     delete rateTurn.outputRate;
+    delete rateTurn.outputRateModel;
     state.responseClock.rates = [];
   }
   const responseRate = reduceCodexResponseClock(state.responseClock, record, {
@@ -5403,14 +5421,22 @@ function reduceCodexSessionLine(
       !state.usageState.currentTurnCopied &&
       !state.usageState.currentTurnRepeated,
   });
-  if (rateTurn && kind === 'turn_aborted') delete rateTurn.outputRate;
+  if (rateTurn && kind === 'turn_aborted') {
+    delete rateTurn.outputRate;
+    delete rateTurn.outputRateModel;
+  }
   if (rateTurn && (responseRate || kind === 'compacted')) {
+    delete rateTurn.outputRateModel;
     if (!state.responseClock.rates.length) delete rateTurn.outputRate;
-    else
+    else {
+      const model = state.responseClock.rates[0].model;
+      if (model && model.length <= 512 && state.responseClock.rates.every((rate) => rate.model === model))
+        rateTurn.outputRateModel = model;
       rateTurn.outputRate = state.responseClock.rates.reduce(
         (total, rate) => ({ output: total.output + rate.output, milliseconds: total.milliseconds + rate.milliseconds }),
         { output: 0, milliseconds: 0 },
       );
+    }
   }
   synchronizeIdentityQueue(
     state.usageState.pendingRequestKeys,
@@ -6664,6 +6690,12 @@ function attachCodexAgentSpend(turns: Turn[], lookup: AgentSpendLookup | undefin
         status: agent.status,
       });
       agent.spend = spend.models;
+      delete agent.outputRate;
+      delete agent.outputRateModel;
+      if (spend.outputRate && spend.outputRateModel) {
+        agent.outputRate = { ...spend.outputRate };
+        agent.outputRateModel = spend.outputRateModel;
+      }
       if (!agent.effort) {
         agent.effort = spend.effort;
       }

@@ -5,7 +5,7 @@ import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { readCodexAgentSpend, refreshCodexStructuralAgents } from './codex.ts';
-import { AgentSpendCache, readChildSpend, spendFileVersion } from './agentspend.ts';
+import { AgentSpendCache, emptyUsage, readChildSpend, spendFileVersion } from './agentspend.ts';
 import { tempDir } from './temproot.ts';
 import * as pricing from './pricing.ts';
 import {
@@ -116,25 +116,111 @@ import { normalizeFsPath, sameCommitSha } from './transcript.ts';
 // Shared panel fixture for screenshots and measurements.
 import { FIXTURE_CLOCK, FIXTURE_TURNS, LONG_TURN_INDEX } from './panelfixture.ts';
 
-test('turn token detail publishes one output-speed figure only for qualified measurements', () => {
-  for (const agent of ['claude', 'codex'] as const) {
-    const turn = { ...FIXTURE_TURNS[0], agent, outputRate: { output: 84, milliseconds: 10000 } };
-    assert.equal(tokenLines(turn).filter((line) => line.includes('Speed')).length, 1);
-    assert.ok(tokenLines(turn).some((line) => line.includes('8.4 tok/s')));
+test('turn token detail places qualified measurement under Output before Thinking', () => {
+  for (const provider of ['claude', 'codex'] as const) {
+    const subject = {
+      ...FIXTURE_TURNS[0],
+      agent: provider,
+      usage: { ...FIXTURE_TURNS[0].usage, output: 168, thinking: 40 },
+      outputRate: { output: 84, milliseconds: 10000 },
+    };
+    const entries = toCard(subject, false, NOW).chips.find((chip) => chip.metric === 'tokens')!.detailList!.entries;
+    const output = entries.find((entry) => entry.label === 'Output')!;
+    const line = output.lines![0];
+    assert.ok(typeof line === 'object' && 'text' in line);
+    assert.equal(line.text, '8.4 tok/s');
+    assert.ok(line.title?.includes(provider === 'claude' ? 'Observed response' : 'Request time'));
+    assert.ok(typeof output.lines![1] === 'string');
+    assert.ok(!entries.some((entry) => entry.label === 'Speed'));
+    const flat = tokenLines(subject);
     assert.ok(
-      toCard(turn, false, NOW).chips.some(
-        (chip) =>
-          chip.metric === 'tokens' &&
-          chip.detailList?.entries.some(
-            (entry) => entry.label === 'Speed' && entry.value === '8.4 tok/s' && entry.valueTitle,
-          ),
+      flat.findIndex((text) => text.includes('Output:')) < flat.findIndex((text) => text.includes('8.4 tok/s')),
+    );
+    assert.ok(
+      flat.findIndex((text) => text.includes('8.4 tok/s')) < flat.findIndex((text) => text.includes('Thinking:')),
+    );
+    for (const outputRate of [
+      undefined,
+      { output: 84, milliseconds: 0 },
+      { output: 0, milliseconds: 1000 },
+      { output: -1, milliseconds: 1000 },
+      { output: 1, milliseconds: Infinity },
+      { output: NaN, milliseconds: 1000 },
+      { output: Number.MAX_SAFE_INTEGER + 1, milliseconds: 1000 },
+      { output: 1, milliseconds: Number.MIN_VALUE },
+    ]) {
+      assert.ok(!tokenLines({ ...subject, outputRate }).some((text) => text.includes('tok/s')));
+    }
+    assert.ok(!tokenLines({ ...subject, interrupted: true }).some((text) => text.includes('tok/s')));
+    assert.ok(
+      !tokenLines({ ...subject, usage: { ...subject.usage, output: 0 } }).some((text) => text.includes('tok/s')),
+    );
+  }
+});
+
+test('child usage measurement keeps measured identity separate from its displayed model', () => {
+  for (const priced of [false, true]) {
+    const child = agent({
+      model: null,
+      spendFound: true,
+      outputRate: { output: 168, milliseconds: 20000 },
+      outputRateModel: 'gpt-6.1-sol',
+      spend: [
+        {
+          model: priced ? 'gpt-6.1-sol' : 'unknown-sol',
+          usage: { ...emptyUsage(), input: 1000, output: 168, thinking: 40 },
+        },
+        { model: priced ? 'gpt-6-astra' : 'unknown-astra', usage: { ...emptyUsage(), input: 100000, output: 1000 } },
+      ],
+    });
+    const row = toCard(turn({ agent: 'codex', agents: [child] }), false, NOW).agents[0];
+    if (priced) assert.equal(row.model?.toLowerCase(), 'gpt-6-astra');
+    const figure = row.figures.find((value) => value.metric === (priced ? 'cost' : 'tokens'))!;
+    const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
+    assert.ok(typeof line === 'object' && 'text' in line);
+    assert.equal(line.text, '8.4 tok/s');
+    assert.ok(line.title?.includes('gpt-6.1-sol'));
+    assert.ok(line.title?.includes('Only this subagent'));
+    assert.ok(figure.detail?.includes('8.4 tok/s'));
+    assert.ok(
+      !JSON.stringify(toCard(turn({ agents: [{ ...child, outputRateModel: undefined }] }), false, NOW)).includes(
+        'tok/s',
       ),
     );
-    assert.ok(!tokenLines({ ...turn, outputRate: undefined }).some((line) => line.includes('Speed')));
-    assert.ok(!tokenLines({ ...turn, interrupted: true }).some((line) => line.includes('Speed')));
-    assert.ok(
-      !tokenLines({ ...turn, outputRate: { output: 84, milliseconds: 0 } }).some((line) => line.includes('Speed')),
+  }
+});
+
+test('dispatched Codex usage retains qualified measurement in priced and unpriced detail', () => {
+  for (const priced of [false, true]) {
+    const spend = {
+      found: true,
+      partial: false,
+      effort: 'high',
+      outputRate: { output: 168, milliseconds: 20000 },
+      outputRateModel: 'gpt-6.1-sol',
+      models: [{ model: priced ? 'gpt-6.1-sol' : 'unknown-sol', usage: { ...emptyUsage(), output: 168 } }],
+    };
+    const row = dispatchedAgentCard('child', 'Review the card', spend, 'done', 1000, 65000, 2, [], NOW, 'codex');
+    const figure = row.figures.find((value) => value.metric === (priced ? 'cost' : 'tokens'))!;
+    const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
+    assert.ok(typeof line === 'object' && 'text' in line);
+    assert.equal(line.text, '8.4 tok/s');
+    assert.ok(line.title?.includes('Request time'));
+    assert.ok(line.title?.includes('gpt-6.1-sol'));
+    assert.ok(figure.detail?.includes('8.4 tok/s'));
+    const unqualified = dispatchedAgentCard(
+      'child',
+      'Review the card',
+      { ...spend, outputRateModel: undefined },
+      'done',
+      1000,
+      65000,
+      2,
+      [],
+      NOW,
+      'codex',
     );
+    assert.ok(!JSON.stringify(unqualified).includes('tok/s'));
   }
 });
 import type { CacheExpiryFacts, CompactionFact, ProjectUsageBucket, SessionTurnStats } from './projectspend.ts';

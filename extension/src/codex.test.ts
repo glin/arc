@@ -239,12 +239,150 @@ test('native Codex speed survives incremental append and rebuild with exact outp
   const full = readCodexSession(file, thread);
   assert.deepEqual(resumed.read?.turns, full.turns);
   assert.deepEqual(full.turns[0].outputRate, { output: 168, milliseconds: 10000 });
+  assert.equal(full.turns[0].outputRateModel, 'gpt-6.1-sol');
+  const legacy = throughStructuredClone(initial.checkpoint);
+  legacy.parserState.responseClock.rates = [{ output: 10, milliseconds: 1000, responseId: 'legacy' }];
+  const legacyRead = readCodexSessionIncremental(file, thread, legacy).read!;
+  assert.deepEqual(legacyRead.turns[0].outputRate, { output: 178, milliseconds: 11000 });
+  assert.equal(legacyRead.turns[0].outputRateModel, undefined);
   const truncated = writeRollout([
     meta(),
     native(35, 'second', 168),
     tokens(40, { input_tokens: 1000, output_tokens: 168 }),
   ]);
   assert.ok(readCodexSession(truncated, thread).turns.every((turn) => !turn.outputRate));
+});
+
+test('Codex child measurement sums native intervals and retains only direct measured identity', () => {
+  const records = (id: string, parent: string, model: string): object[] => {
+    const native = (second: number, turnId: string, response: string, output: number) => ({
+      type: 'token_usage_record',
+      timestamp: at(second),
+      payload: {
+        thread_id: id,
+        turn_id: turnId,
+        response_id: response,
+        usage: usage({
+          input_tokens: model === 'gpt-6-astra' ? 100000 : 1000,
+          output_tokens: output,
+          total_tokens: output,
+        }),
+      },
+    });
+    return [
+      meta({
+        id,
+        session_id: id,
+        model_provider: 'openai',
+        source: { subagent: { thread_spawn: { parent_thread_id: parent, depth: 1, agent_path: `/root/${id}` } } },
+      }),
+      event('task_started', 1, { turn_id: 'one' }),
+      turnContext(2, 'one', model, 'high'),
+      event('user_message', 3, { message: 'work' }),
+      native(5, 'one', 'first', 10),
+      native(15, 'one', 'second', 84),
+      tokens(15.5, { input_tokens: model === 'gpt-6-astra' ? 100000 : 1000, output_tokens: 94 }),
+      event('task_complete', 16, { turn_id: 'one', last_agent_message: 'done' }),
+      event('task_started', 20, { turn_id: 'two' }),
+      turnContext(21, 'two', model, 'high'),
+      event('user_message', 22, { message: 'resume' }),
+      native(25, 'two', 'first-resumed', 10),
+      native(45, 'two', 'second-resumed', 336),
+      tokens(45.5, { input_tokens: model === 'gpt-6-astra' ? 100000 : 1000, output_tokens: 346 }),
+      event('task_complete', 46, { turn_id: 'two', last_agent_message: 'done' }),
+    ];
+  };
+  const childFile = writeRollout(records('child', 'root', 'gpt-6.1-sol'));
+  const grandchildFile = writeRollout(records('grandchild', 'child', 'gpt-6-astra'));
+  const entry = (file: string, threadId: string, parentThreadId: string): CodexSubagentFile => ({
+    file,
+    threadId,
+    parentThreadId,
+    agentPath: `/root/${threadId}`,
+    openedAt: ms(4),
+    startedAt: ms(4),
+    threadSource: 'subagent',
+    backgroundReview: false,
+  });
+  const catalog = [entry(childFile, 'child', 'root'), entry(grandchildFile, 'grandchild', 'child')];
+  const own = readCodexAgentSpend(childFile);
+  assert.deepEqual(own.outputRate, { output: 420, milliseconds: 30000 });
+  assert.equal(own.outputRateModel, 'gpt-6.1-sol');
+  const aggregate = readCodexAgentSpend(childFile, catalog);
+  assert.deepEqual(aggregate.outputRate, own.outputRate);
+  assert.equal(aggregate.outputRateModel, own.outputRateModel);
+  assert.ok(aggregate.models.some((part) => part.model === 'gpt-6-astra'));
+  const parentRecords = [
+    meta({ id: 'root', session_id: 'root' }),
+    event('task_started', 1, { turn_id: 'root-turn' }),
+    turnContext(2, 'root-turn', 'gpt-6.1-sol', 'high'),
+    event('user_message', 3, { message: 'work' }),
+    event('task_complete', 50, { turn_id: 'root-turn', last_agent_message: 'done' }),
+  ];
+  const lookup = codexAgentSpendReader(codexSpendIndex(catalog));
+  const parent = readCodexSession(writeRollout(parentRecords), 'root', {
+    structuralChildren: catalog,
+    agentSpendOf: (ref) => lookup(ref.id === 'child' ? childFile : grandchildFile),
+  });
+  assert.deepEqual(parent.turns[0].agents[0].outputRate, own.outputRate);
+  assert.equal(structuredClone(parent.turns)[0].agents[0].outputRateModel, own.outputRateModel);
+  assert.equal(parent.turns[0].outputRate, undefined);
+  refreshCodexStructuralAgents(parent.turns, 'root', catalog, () => ({
+    models: [],
+    found: true,
+    partial: true,
+    effort: null,
+  }));
+  assert.equal(parent.turns[0].agents[0].outputRate, undefined);
+  assert.equal(parent.turns[0].agents[0].outputRateModel, undefined);
+  const mixed = records('child', 'root', 'gpt-6.1-sol');
+  mixed[9] = turnContext(21, 'two', 'gpt-6-astra', 'high');
+  assert.equal(readCodexAgentSpend(writeRollout(mixed)).outputRate, undefined);
+  const aborted = records('child', 'root', 'gpt-6.1-sol');
+  aborted[7] = event('turn_aborted', 16, { turn_id: 'one' });
+  assert.deepEqual(readCodexAgentSpend(writeRollout(aborted)).outputRate, { output: 336, milliseconds: 20000 });
+});
+
+test('native Codex model transition clears prior measurement and qualifies only later intervals', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const native = (second: number, id: string, output: number) => ({
+    type: 'token_usage_record',
+    timestamp: at(second),
+    payload: { thread_id: thread, turn_id: TURN, response_id: id, usage: usage({ output_tokens: output }) },
+  });
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6.1-sol', 'high'),
+    event('user_message', 3, { message: 'work' }),
+    native(5, 'sol-first', 10),
+    native(15, 'sol-second', 84),
+  ]);
+  const initial = readCodexSessionIncremental(file, thread);
+  assert.ok(initial.checkpoint);
+  assert.deepEqual(initial.read?.turns[0].outputRate, { output: 84, milliseconds: 10000 });
+  assert.equal(initial.read?.turns[0].outputRateModel, 'gpt-6.1-sol');
+  fs.appendFileSync(file, JSON.stringify(turnContext(20, TURN, 'gpt-6-astra', 'high')) + '\n');
+  const changed = readCodexSessionIncremental(file, thread, throughStructuredClone(initial.checkpoint));
+  assert.ok(changed.checkpoint);
+  assert.equal(changed.read?.turns[0].outputRate, undefined);
+  assert.equal(changed.read?.turns[0].outputRateModel, undefined);
+  const suffix = [
+    native(25, 'astra-first', 10),
+    native(45, 'astra-second', 336),
+    event('task_complete', 46, { turn_id: TURN, last_agent_message: 'done' }),
+  ];
+  fs.appendFileSync(file, suffix.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const full = readCodexSession(file, thread);
+  assert.deepEqual(full.turns[0].outputRate, { output: 336, milliseconds: 20000 });
+  assert.equal(full.turns[0].outputRateModel, 'gpt-6-astra');
+  assert.deepEqual(
+    readCodexSessionIncremental(file, thread, throughStructuredClone(changed.checkpoint)).read?.turns,
+    full.turns,
+  );
+  const child = readCodexAgentSpend(file);
+  assert.deepEqual(child.outputRate, full.turns[0].outputRate);
+  assert.equal(child.outputRateModel, full.turns[0].outputRateModel);
 });
 
 test('native Codex speed retracts later classified compaction across append and cloned snapshots', () => {
@@ -280,6 +418,7 @@ test('native Codex speed retracts later classified compaction across append and 
     const provisional = readCodexSessionIncremental(file, thread);
     assert.ok(provisional.checkpoint);
     assert.ok(provisional.read?.turns[0].outputRate);
+    assert.equal(provisional.read?.turns[0].outputRateModel, 'gpt-6.1-sol');
     const clone = throughStructuredClone(provisional.checkpoint);
     const suffix = [
       {
@@ -299,10 +438,18 @@ test('native Codex speed retracts later classified compaction across append and 
     const full = readCodexSession(file, thread);
     const expected = hasWorkRate ? { output: 168, milliseconds: 10000 } : undefined;
     assert.deepEqual(full.turns[0].outputRate, expected);
+    assert.equal(full.turns[0].outputRateModel, hasWorkRate ? 'gpt-6.1-sol' : undefined);
+    const child = readCodexAgentSpend(file);
+    assert.deepEqual(child.outputRate, expected);
+    assert.equal(child.outputRateModel, hasWorkRate ? 'gpt-6.1-sol' : undefined);
     assert.equal(
       toCard(full.turns[0], false, Date.parse(at(28)))
         .chips.find((chip) => chip.metric === 'tokens')
-        ?.detailList?.entries.some((row) => row.label === 'Speed'),
+        ?.detailList?.entries.some(
+          (row) =>
+            row.label === 'Output' &&
+            row.lines?.some((line) => typeof line === 'object' && 'text' in line && line.text.includes('tok/s')),
+        ),
       hasWorkRate,
     );
     for (const checkpoint of [provisional.checkpoint, clone]) {
