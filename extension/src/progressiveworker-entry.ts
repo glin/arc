@@ -478,6 +478,8 @@ async function execute(
         return value;
       }
       const entries = limitCodexDispatchCursors(claudeChildReferences);
+      claudeChildReferences.clear();
+      for (const [file, entry] of entries) claudeChildReferences.set(file, entry);
       for (const [file, entry] of entries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
       epoch.completed = [...completed];
       return {

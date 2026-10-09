@@ -965,6 +965,98 @@ const source = buildSync({
 }).outputFiles[0].text;
 const timestamp = (at: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, at)).toISOString();
 
+test('pending startup discovery releases evicted worker cursors and retains unfinished Claude ownership', async () => {
+  const directory = tempDir('pending-discovery-retention-');
+  const codexFile = path.join(directory, 'codex.jsonl');
+  const claudeFile = path.join(directory, 'claude.jsonl');
+  fs.writeFileSync(
+    codexFile,
+    JSON.stringify({ type: 'session_meta', payload: { id: 'codex', cwd: directory } }) + '\n',
+  );
+  fs.writeFileSync(
+    claudeFile,
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Agent', id: 'launch' }] } }) +
+      '\n' +
+      Array.from({ length: 2048 }, () => JSON.stringify({ type: 'progress', text: 'x'.repeat(128) })).join('\n') +
+      '\n',
+  );
+  const scan = scanCodexDispatchReferences(codexFile, 'codex');
+  const entry = {
+    ...scan.cursor.evidence!.provisional,
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    source: 'codex' as const,
+    sessionId: 'codex',
+    childTranscript: false,
+    complete: scan.complete,
+    visitedEof: true,
+    relationshipComplete: scan.complete,
+    references: scan.references,
+    cursor: scan.cursor,
+  };
+  // A small budget reaches the same pressure boundary without allocating a production-sized cache.
+  const budget = 'byteLimit = MAX_CODEX_DISPATCH_CURSOR_BYTES';
+  assert.ok(source.includes(budget));
+  const inspect = `require('node:worker_threads').parentPort.on('message', message => {
+    if (message.metadataEligible) require('node:worker_threads').parentPort.postMessage({
+      repeatedCoverage: JSON.stringify([...claudeChildReferences])
+    });
+  });`;
+  let retained: Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]> | undefined;
+  const worker = new ProgressiveWorker(source.replace(budget, 'byteLimit = 1') + inspect, undefined, (value) => {
+    retained = JSON.parse(value);
+  });
+  const parents = [
+    {
+      file: claudeFile,
+      sessionId: 'claude',
+      agent: 'claude' as const,
+      ...revisionOf(fs.statSync(claudeFile, { bigint: true })),
+    },
+    {
+      file: codexFile,
+      sessionId: 'codex',
+      agent: 'codex' as const,
+      ...revisionOf(fs.statSync(codexFile, { bigint: true })),
+    },
+  ];
+  try {
+    const result = await worker.run(
+      {
+        kind: 'claude-children',
+        parents,
+        repositoryRoots: [directory],
+        referenceEntries: [[codexFile, entry]],
+        discoveryBytes: 65536,
+        quantumBytes: 65536,
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.equal(result?.value.kind, 'claude-children-progress');
+    if (result?.value.kind !== 'claude-children-progress') return;
+    const replied = new Map(result.value.referenceEntries);
+    assert.equal(replied.get(normalizeFsPath(codexFile))?.cursor, undefined);
+    const pending = replied.get(normalizeFsPath(claudeFile))?.claudeCursor;
+    assert.ok(pending && pending.offset > 0 && pending.offset < pending.target);
+    assert.deepEqual(pending.state.launches, ['launch']);
+    worker.retainMetadataRecovery([]);
+    await vi.waitFor(() => assert.ok(retained));
+    const held = new Map(retained);
+    assert.equal(
+      held.get(normalizeFsPath(codexFile))?.cursor,
+      undefined,
+      'the partial reply left an evicted cursor in worker memory',
+    );
+    assert.deepEqual(
+      held.get(normalizeFsPath(claudeFile))?.claudeCursor,
+      pending,
+      'pressure lost unfinished launch ownership',
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
 test('saved Codex categories cross the worker boundary only for the captured file revision', async () => {
   const directory = tempDir('codex-context-worker-');
   const file = path.join(directory, 'session.jsonl');
