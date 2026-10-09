@@ -57,6 +57,8 @@ jobs:
           npm ci
           npm --prefix extension ci
           npm --prefix cli ci
+      - name: Install bundled Chromium and system dependencies
+        run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - name: Root tests
         run: npm run test:root
       - name: Panel-mockup tests
@@ -88,5 +90,7 @@ jobs:
         run: |
           npm ci
           npm --prefix extension ci
+      - name: Install bundled Chromium and system dependencies
+        run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - name: Extension browser lane, part ${{ matrix.shard }} of 3
         run: npm --prefix extension run test:browser -- --shard=${{ matrix.shard }}/3

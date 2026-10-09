@@ -45,6 +45,8 @@ jobs:
       - run: npm ci
       - run: npm --prefix extension ci
       - run: npm --prefix cli ci
+      - name: Install bundled Chromium and system dependencies
+        run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - run: npm test
       - run: npm --prefix extension run build
       - run: npm --prefix extension run package
