@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import type { Page } from 'playwright-core';
-import { firstProjectPayload, shoot, runPanelShots, panelShotDestination, loadBoundedPanelCapture } from '../scripts/panel-shots.ts';
+import { firstProjectPayload, shoot, writeLosslessWebp, runPanelShots, panelShotDestination, loadBoundedPanelCapture } from '../scripts/panel-shots.ts';
 import { RAIL_STATS, renderPayload } from './panelfixture.ts';
 import { missingUsageLimits, publish } from '../scripts/readme-shots.ts';
 import { DEMO_LABELS, DEMO_SESSION_IDS, README_SCENES, demoPayload, readmePayload } from '../scripts/readme-fixture.ts';
@@ -27,6 +27,8 @@ import { DEMO_DEFAULT_EXPIRY, DEMO_TURNS, demoContextSample } from '../scripts/r
 import { validContextDetail } from './domain/context-detail.ts';
 import { parseHostToPanel, parsePanelToHost } from './webview/protocol.ts';
 import type { TurnComment } from './turncomments.ts';
+
+vi.mock('node:fs', async (importOriginal) => ({ ...await importOriginal<typeof import('node:fs')>() }));
 
 test('ordinary shots command awaits the bounded owner capture and preserves its failure', async () => {
   const argv = ['--owner', '2026-10-07-example', '--run', 'one', '--reservation', '1000000', '--shots', 'wide'];
@@ -408,6 +410,65 @@ test('README usage scene holds a 5h and a 7d limit for Claude and Codex', () => 
   assert.deepEqual(missingUsageLimits(groups), []);
 });
 
+test('default shoot preserves plan evidence before any page work, including escaped shot names', async () => {
+  const root = tempDir('panel-shot-plan-');
+  const directory = path.join(root, '.ClAuDe', 'PlAnS', 'owner');
+  fs.mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, 'protected.webp');
+  const evaluate = vi.fn<() => Promise<void>>(async () => { throw new Error('page work started'); });
+  const page = { evaluate } as unknown as Page;
+  for (const [outDir, name] of [[directory, 'protected'], [root, '.ClAuDe/PlAnS/owner/protected'], [path.join(root, 'safe'), '../.ClAuDe/PlAnS/owner/protected']]) {
+    fs.writeFileSync(file, 'existing evidence');
+    await assert.rejects(shoot(page, { name }, outDir), /Plan screenshots require/);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'existing evidence');
+    assert.equal(evaluate.mock.calls.length, 0);
+  }
+});
+
+test('the direct lossless writer preserves plan evidence without creating a temporary PNG', async () => {
+  const directory = path.join(tempDir('panel-shot-writer-plan-'), '.claude', 'plans', 'owner');
+  fs.mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, 'protected.webp');
+  fs.writeFileSync(file, 'existing evidence');
+  const screenshot = vi.fn<Parameters<typeof writeLosslessWebp>[0]['screenshot']>(async (options) => {
+    fs.writeFileSync(options.path!, 'temporary PNG');
+    throw new Error('screenshot work started');
+  });
+  await assert.rejects(writeLosslessWebp({ screenshot }, file), /Plan screenshots require/);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'existing evidence');
+  assert.equal(screenshot.mock.calls.length, 0);
+  assert.deepEqual(fs.readdirSync(directory), ['protected.webp']);
+});
+
+test('exported default writers refuse redirected ancestors and file targets before capture or replacement', async () => {
+  const root = tempDir('panel-shot-redirect-');
+  const directory = path.join(root, 'redirected');
+  fs.mkdirSync(directory);
+  const file = path.join(directory, 'protected.webp');
+  fs.writeFileSync(file, 'existing evidence');
+  const inspect = fs.lstatSync;
+  const evaluate = vi.fn<() => Promise<void>>(async () => { throw new Error('page work started'); });
+  const screenshot = vi.fn<Parameters<typeof writeLosslessWebp>[0]['screenshot']>(async () => { throw new Error('screenshot work started'); });
+  const page = { evaluate, screenshot } as unknown as Page;
+  for (const redirected of [directory, file]) {
+    const mock = vi.spyOn(fs, 'lstatSync').mockImplementation((candidate: fs.PathLike) => {
+      const stat = inspect(candidate);
+      if (String(candidate) === redirected) stat.isSymbolicLink = () => true;
+      return stat;
+    });
+    try {
+      await assert.rejects(shoot(page, { name: 'protected' }, directory), /contains a redirect/);
+      await assert.rejects(writeLosslessWebp({ screenshot }, file), /contains a redirect/);
+      assert.equal(fs.readFileSync(file, 'utf8'), 'existing evidence');
+      assert.equal(evaluate.mock.calls.length, 0);
+      assert.equal(screenshot.mock.calls.length, 0);
+      assert.deepEqual(fs.readdirSync(directory), ['protected.webp']);
+    } finally {
+      mock.mockRestore();
+    }
+  }
+});
+
 test('a missing screenshot state cannot leave an older image at the target path', async () => {
   const directory = tempDir('panel-shot-');
   const file = path.join(directory, 'missing.webp');
@@ -470,6 +531,21 @@ test('an injected screenshot writer receives the target intact and bypasses the 
     });
     assert.deepEqual(calls, [{ target: page, destination: file, options: { clip: { x: 0, y: 0, width: 287, height: 900 } } }]);
     assert.equal(fs.readFileSync(file, 'utf8'), 'existing evidence');
+    const planDirectory = path.join(directory, '.claude', 'plans', 'owner');
+    fs.mkdirSync(planDirectory, { recursive: true });
+    const planFile = path.join(planDirectory, 'plain.webp');
+    fs.writeFileSync(planFile, 'bounded evidence');
+    const writer = vi.fn<typeof writeLosslessWebp>(async (_target, destination) => {
+      assert.equal(fs.readFileSync(destination, 'utf8'), 'bounded evidence');
+    });
+    await shoot(page, { name: 'plain' }, planDirectory, writer);
+    assert.equal(writer.mock.calls.length, 1);
+    assert.equal(writer.mock.calls[0][1], planFile);
+    assert.equal(fs.readFileSync(planFile, 'utf8'), 'bounded evidence');
+    fs.unlinkSync(planFile);
+    fs.rmdirSync(planDirectory);
+    fs.rmdirSync(path.dirname(planDirectory));
+    fs.rmdirSync(path.dirname(path.dirname(planDirectory)));
     await assert.rejects(() => shoot(page, { name: 'plain' }, directory), /default writer reached the screenshot/);
     assert.throws(() => assert.equal(fs.existsSync(file), true), assert.AssertionError);
   } finally {

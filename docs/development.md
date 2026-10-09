@@ -37,7 +37,7 @@ One positional destination retains the full matrix outside plan directories:
 npm --prefix extension run shots -- /path/to/shots
 ```
 
-Positional destinations reject adjacent `.claude/plans` components regardless of letter case on Windows, macOS, and Linux. Existing redirected or unreadable ancestors also refuse before browser launch or file writes. These checks cover the command's destination admission, without a filesystem sandbox or protection against concurrent path replacement.
+Positional destinations reject adjacent `.claude/plans` components regardless of letter case on Windows, macOS, and Linux. Existing redirected or unreadable ancestors also refuse before browser launch or file writes. Exported `shoot` with its default writer and direct `writeLosslessWebp` calls check the actual target's parent and refuse existing file links before capture. Shot names that reach plan directories also refuse before replacement or page setup. These checks provide no filesystem sandbox or protection against concurrent path replacement.
 
 Explicit owner options select bounded capture through the checkout-local adapter:
 

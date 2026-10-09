@@ -876,6 +876,7 @@ export async function writeLosslessWebp(
   file: string,
   options: Omit<ScreenshotOptions, 'path'> = {},
 ): Promise<void> {
+  admitPanelShotFile(file);
   const temporary = `${file}.${process.pid}.png`;
   try {
     await target.screenshot({ ...options, path: temporary });
@@ -920,7 +921,10 @@ export async function shoot(
   writer: typeof writeLosslessWebp = writeLosslessWebp,
 ): Promise<void> {
   const file = path.join(outDir, `${shot.name}.webp`);
-  if (writer === writeLosslessWebp) fs.rmSync(file, { force: true });
+  if (writer === writeLosslessWebp) {
+    admitPanelShotFile(file);
+    fs.rmSync(file, { force: true });
+  }
   // Clear focus from the preceding capture before applying this state's actions.
   await page.evaluate(`document.activeElement instanceof HTMLElement && document.activeElement.blur()`);
   const escapes = shot.escape === true ? 1 : shot.escape || 0;
@@ -1408,6 +1412,17 @@ export function panelShotDestination(
     }
   }
   return resolved;
+}
+
+function admitPanelShotFile(file: string): void {
+  panelShotDestination(path.dirname(file));
+  try {
+    if (fs.lstatSync(file).isSymbolicLink()) {
+      throw new Error(`Screenshot destination contains a redirect: ${file}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 }
 
 type BoundedCapture = (argv: string[]) => Promise<void>;
