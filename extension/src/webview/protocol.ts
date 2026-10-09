@@ -353,7 +353,7 @@ export type PanelToHost =
   | { type: 'armSessionDetails'; session: string }
   | { type: 'armComposer' }
   | { type: 'showReaderParent'; session: string }
-  | { type: 'showSession'; session: string }
+  | { type: 'showSession'; session: string; parent?: true }
   | { type: 'labelEditor'; session: string }
   | { type: 'setLabels'; session: string; names: string[] }
   | { type: 'setViews'; views: SavedView[] }
@@ -365,7 +365,7 @@ export type PanelToHost =
   | { type: 'sessionMembership'; action: 'pin'; session: string; openPinned?: boolean }
   | { type: 'setLayout'; key: 'cardLayout'; value: CardLayout }
   | { type: 'setLayout'; key: 'promptPosition'; value: PromptPosition }
-  | { type: 'exportSessionHtml'; session: string }
+  | { type: 'exportSession'; session: string }
   | { type: 'saveState'; state: unknown }
   | { type: 'search'; text: string }
   | { type: 'loadOlder'; session: string; token: string }
@@ -1078,7 +1078,9 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'showReaderParent':
       return isString(m.session) && m.session.length > 0 ? { type: 'showReaderParent', session: m.session } : null;
     case 'showSession':
-      return isString(m.session) ? { type: 'showSession', session: m.session } : null;
+      return isString(m.session)
+        ? { type: 'showSession', session: m.session, ...(m.parent === true ? { parent: true as const } : {}) }
+        : null;
     case 'labelEditor':
       return isString(m.session) ? { type: 'labelEditor', session: m.session } : null;
     case 'setLabels':
@@ -1124,8 +1126,8 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
         return { type: 'setLayout', key: 'promptPosition', value: m.value };
       }
       return null;
-    case 'exportSessionHtml':
-      return isString(m.session) && m.session.length > 0 ? { type: 'exportSessionHtml', session: m.session } : null;
+    case 'exportSession':
+      return isString(m.session) && m.session.length > 0 ? { type: 'exportSession', session: m.session } : null;
     case 'saveState':
       // normalizePanelState accepts unknown state values.
       return { type: 'saveState', state: m.state };
@@ -1373,8 +1375,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.sessionMembership(message);
     case 'setLayout':
       return handlers.setLayout(message);
-    case 'exportSessionHtml':
-      return handlers.exportSessionHtml(message);
+    case 'exportSession':
+      return handlers.exportSession(message);
     case 'saveState':
       return handlers.saveState(message);
     case 'search':

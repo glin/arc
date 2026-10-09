@@ -270,6 +270,7 @@ interface LauncherPorts {
 }
 
 interface RailOptions {
+  readOnly?: boolean;
   document: Document;
   clock: Pick<Clock, 'subscribe'>;
   before: HTMLElement;
@@ -709,61 +710,67 @@ function RailRow({
           h(RailLabels, { card }),
         ],
       ),
-      h(
-        'button',
-        {
-          class: 'railact raillabelact',
-          'data-control': `raillabels:${card.id}`,
-          'data-session': card.id,
-          'aria-controls': 'labelpop',
-          'aria-haspopup': 'dialog',
-          'aria-expanded': String(labelsHere),
-          ...actionProps(
-            options.words.labelOpen,
-            card,
-            'L',
-            labelShortcut,
-            options.words.labelOpen,
-            options.words.labelOpenDetail,
-          ),
-          onClick: (event: MouseEvent) => owner.toggleLabelEditor(card.id, event.currentTarget as HTMLElement),
-        },
-        labelIcon(),
-      ),
-      h(
-        'button',
-        {
-          class: card.archived ? 'railact railhide is-archived' : 'railact railhide',
-          'data-control': `railhide:${card.id}`,
-          ...actionProps(
-            card.archived ? options.words.unarchiveSession : options.words.hideSession,
-            card,
-            awayHotkey,
-            card.archived ? null : archiveKey,
-            card.archived ? options.words.unarchiveSessionHint : options.words.hideSessionHint,
-            card.archived ? options.words.unarchiveSessionDetail : options.words.hideSessionDetail,
-          ),
-          onClick: () => (card.archived ? options.unarchiveSession(card.id) : options.archiveSession(card.id)),
-        },
-        archiveIcon(),
-      ),
-      h(
-        'button',
-        {
-          class: card.pinnedTop ? 'railact railpin is-pinned' : 'railact railpin',
-          'data-control': `railpin:${card.id}`,
-          ...actionProps(
-            card.pinnedTop ? options.words.railUnpin : options.words.railPin,
-            card,
-            'P',
-            pinShortcut,
-            card.pinnedTop ? options.words.railUnpinHint : options.words.railPinHint,
-            card.pinnedTop ? options.words.railUnpinDetail : options.words.railPinDetail,
-          ),
-          onClick: () => (owner as RailRenderer & { togglePinned(card: RailCardView): void }).togglePinned(card),
-        },
-        pinIcon(),
-      ),
+      !options.readOnly &&
+        h(
+          'button',
+          {
+            class: 'railact raillabelact',
+            hidden: options.readOnly,
+            'data-control': `raillabels:${card.id}`,
+            'data-session': card.id,
+            'aria-controls': 'labelpop',
+            'aria-haspopup': 'dialog',
+            'aria-expanded': String(labelsHere),
+            ...actionProps(
+              options.words.labelOpen,
+              card,
+              'L',
+              labelShortcut,
+              options.words.labelOpen,
+              options.words.labelOpenDetail,
+            ),
+            onClick: (event: MouseEvent) => owner.toggleLabelEditor(card.id, event.currentTarget as HTMLElement),
+          },
+          labelIcon(),
+        ),
+      !options.readOnly &&
+        h(
+          'button',
+          {
+            class: card.archived ? 'railact railhide is-archived' : 'railact railhide',
+            hidden: options.readOnly,
+            'data-control': `railhide:${card.id}`,
+            ...actionProps(
+              card.archived ? options.words.unarchiveSession : options.words.hideSession,
+              card,
+              awayHotkey,
+              card.archived ? null : archiveKey,
+              card.archived ? options.words.unarchiveSessionHint : options.words.hideSessionHint,
+              card.archived ? options.words.unarchiveSessionDetail : options.words.hideSessionDetail,
+            ),
+            onClick: () => (card.archived ? options.unarchiveSession(card.id) : options.archiveSession(card.id)),
+          },
+          archiveIcon(),
+        ),
+      !options.readOnly &&
+        h(
+          'button',
+          {
+            class: card.pinnedTop ? 'railact railpin is-pinned' : 'railact railpin',
+            hidden: options.readOnly,
+            'data-control': `railpin:${card.id}`,
+            ...actionProps(
+              card.pinnedTop ? options.words.railUnpin : options.words.railPin,
+              card,
+              'P',
+              pinShortcut,
+              card.pinnedTop ? options.words.railUnpinHint : options.words.railPinHint,
+              card.pinnedTop ? options.words.railUnpinDetail : options.words.railPinDetail,
+            ),
+            onClick: () => (owner as RailRenderer & { togglePinned(card: RailCardView): void }).togglePinned(card),
+          },
+          pinIcon(),
+        ),
     ],
   );
 }
@@ -1345,82 +1352,83 @@ function RailFilterPicker({
           nameTaken ? h('div', { class: 'labelnote' }, options.words.railFilterNameTaken) : null,
         ])
       : null,
-    h(
-      'div',
-      { class: 'launchactions railfilteractions', key: 'actions' },
-      nameMode
-        ? [
-            h(
-              'button',
-              {
-                type: 'button',
-                class: 'launchback',
-                'data-control': 'railfilter-name-cancel',
-                onClick: () => (owner as RailRenderer & { cancelRailFilterName(): void }).cancelRailFilterName(),
-              },
-              options.words.railFilterCancel,
-            ),
-            h(
-              'button',
-              {
-                type: 'button',
-                class: 'launchcreate',
-                'data-control': 'railfilter-name-save',
-                disabled: !name || nameTaken,
-                onClick: () => (owner as RailRenderer & { saveNamedRailFilter(): void }).saveNamedRailFilter(),
-              },
-              options.words.railFilterSave,
-            ),
-          ]
-        : [
-            current && !exact
-              ? h(
-                  'button',
-                  {
-                    type: 'button',
-                    class: 'launchcreate',
-                    'data-control': 'railfilter-update',
-                    onClick: () => (owner as RailRenderer & { updateRailFilter(): void }).updateRailFilter(),
-                  },
-                  options.words.railFilterSaveChanges,
-                )
-              : null,
-            h(
-              'button',
-              {
-                type: 'button',
-                class: 'launchback',
-                'data-control': 'railfilter-save-as',
-                onClick: () => (owner as RailRenderer & { nameNewRailFilter(): void }).nameNewRailFilter(),
-              },
-              options.words.railFilterSaveAsNew,
-            ),
-            current
-              ? h(
-                  'button',
-                  {
-                    type: 'button',
-                    class: 'launchback',
-                    'data-control': 'railfilter-rename',
-                    onClick: () => (owner as RailRenderer & { renameRailFilter(): void }).renameRailFilter(),
-                  },
-                  options.words.railFilterRename,
-                )
-              : null,
-            current
-              ? h(
-                  'button',
-                  {
-                    type: 'button',
-                    class: 'launchback railviewdelete',
-                    'data-control': 'railfilter-delete',
-                    onClick: () => (owner as RailRenderer & { deleteRailFilter(): void }).deleteRailFilter(),
-                  },
-                  deleteArmed ? options.words.railFilterDeleteConfirm : options.words.railFilterDelete,
-                )
-              : null,
-          ],
-    ),
+    !options.readOnly &&
+      h(
+        'div',
+        { class: 'launchactions railfilteractions', key: 'actions' },
+        nameMode
+          ? [
+              h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'launchback',
+                  'data-control': 'railfilter-name-cancel',
+                  onClick: () => (owner as RailRenderer & { cancelRailFilterName(): void }).cancelRailFilterName(),
+                },
+                options.words.railFilterCancel,
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'launchcreate',
+                  'data-control': 'railfilter-name-save',
+                  disabled: !name || nameTaken,
+                  onClick: () => (owner as RailRenderer & { saveNamedRailFilter(): void }).saveNamedRailFilter(),
+                },
+                options.words.railFilterSave,
+              ),
+            ]
+          : [
+              current && !exact
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'launchcreate',
+                      'data-control': 'railfilter-update',
+                      onClick: () => (owner as RailRenderer & { updateRailFilter(): void }).updateRailFilter(),
+                    },
+                    options.words.railFilterSaveChanges,
+                  )
+                : null,
+              h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'launchback',
+                  'data-control': 'railfilter-save-as',
+                  onClick: () => (owner as RailRenderer & { nameNewRailFilter(): void }).nameNewRailFilter(),
+                },
+                options.words.railFilterSaveAsNew,
+              ),
+              current
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'launchback',
+                      'data-control': 'railfilter-rename',
+                      onClick: () => (owner as RailRenderer & { renameRailFilter(): void }).renameRailFilter(),
+                    },
+                    options.words.railFilterRename,
+                  )
+                : null,
+              current
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'launchback railviewdelete',
+                      'data-control': 'railfilter-delete',
+                      onClick: () => (owner as RailRenderer & { deleteRailFilter(): void }).deleteRailFilter(),
+                    },
+                    deleteArmed ? options.words.railFilterDeleteConfirm : options.words.railFilterDelete,
+                  )
+                : null,
+            ],
+      ),
   ]);
 }
 
@@ -2479,45 +2487,46 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
               filtersButton,
             ]),
             // New follows the filters in tab order. Its stable key preserves the button, ref, and focus across header redraws.
-            h('span', { class: 'railnewsplit', key: 'new-split' }, [
-              h(
-                'button',
-                {
-                  class: 'railnew',
-                  ref: (node: HTMLButtonElement | null) => {
-                    railNew = node;
+            !options.readOnly &&
+              h('span', { class: 'railnewsplit', key: 'new-split' }, [
+                h(
+                  'button',
+                  {
+                    class: 'railnew',
+                    ref: (node: HTMLButtonElement | null) => {
+                      railNew = node;
+                    },
+                    disabled: !view,
+                    'aria-label': primaryName || undefined,
+                    'aria-keyshortcuts': view ? newSessionKeyshortcut(options.platform) : undefined,
+                    'data-hint': primaryName || undefined,
+                    'data-hint-detail': view?.words.primaryDetail,
+                    onClick: () =>
+                      options.sendToHost({
+                        type: 'newSession',
+                        ...(view?.owner === undefined ? {} : { owner: view.owner }),
+                      }),
                   },
-                  disabled: !view,
-                  'aria-label': primaryName || undefined,
-                  'aria-keyshortcuts': view ? newSessionKeyshortcut(options.platform) : undefined,
-                  'data-hint': primaryName || undefined,
-                  'data-hint-detail': view?.words.primaryDetail,
-                  onClick: () =>
-                    options.sendToHost({
-                      type: 'newSession',
-                      ...(view?.owner === undefined ? {} : { owner: view.owner }),
-                    }),
-                },
-                view?.words.primaryLabel ?? UNREADY_LAUNCHER_WORDS.primaryLabel,
-              ),
-              h(
-                'button',
-                {
-                  class: 'railnewmenu',
-                  ref: (node: HTMLButtonElement | null) => {
-                    railNewMenu = node;
+                  view?.words.primaryLabel ?? UNREADY_LAUNCHER_WORDS.primaryLabel,
+                ),
+                h(
+                  'button',
+                  {
+                    class: 'railnewmenu',
+                    ref: (node: HTMLButtonElement | null) => {
+                      railNewMenu = node;
+                    },
+                    disabled: !view,
+                    'aria-haspopup': 'dialog',
+                    'aria-controls': 'launcher',
+                    'aria-expanded': String(options.launcher.open() && options.launcher.anchor() === railNewMenu),
+                    'aria-label': view?.words.menuName ?? UNREADY_LAUNCHER_WORDS.menuName,
+                    'data-hint': view?.words.menuName,
+                    onClick: (event: MouseEvent) => options.launcher.toggle(event.currentTarget as HTMLElement),
                   },
-                  disabled: !view,
-                  'aria-haspopup': 'dialog',
-                  'aria-controls': 'launcher',
-                  'aria-expanded': String(options.launcher.open() && options.launcher.anchor() === railNewMenu),
-                  'aria-label': view?.words.menuName ?? UNREADY_LAUNCHER_WORDS.menuName,
-                  'data-hint': view?.words.menuName,
-                  onClick: (event: MouseEvent) => options.launcher.toggle(event.currentTarget as HTMLElement),
-                },
-                options.twist.shut,
-              ),
-            ]),
+                  options.twist.shut,
+                ),
+              ]),
           ]),
           // Cost and cache-expiry each report their own invalid value.
           [
@@ -2547,7 +2556,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
               : null,
           ],
           // Offer to save a valid filtering query only while the box is open and not already naming a view.
-          open && !naming && viewFiles(filter) && !invalidCost && !invalidCacheExpiry
+          !options.readOnly && open && !naming && viewFiles(filter) && !invalidCost && !invalidCacheExpiry
             ? h(
                 'button',
                 {
@@ -2669,6 +2678,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     next.focus();
   };
   const startNaming = () => {
+    if (options.readOnly) return;
     if (!viewCanSave(filter)) {
       return;
     }
@@ -3060,6 +3070,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
   };
   const openLabelEditor = (session: string, anchor?: HTMLElement | null) => {
+    if (options.readOnly) return;
     // Close other popovers before opening the label editor.
     if (viewOpen) {
       closeViewEditor(false);
@@ -3624,6 +3635,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawRailFilterPop('railfilter-more-labels');
     },
     updateRailFilter() {
+      if (options.readOnly) return;
       const current = findRailFilter(railFilters, railFilterId);
       if (!current) {
         return;
@@ -3635,11 +3647,13 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawRailFilterPop('railfilter-update');
     },
     nameNewRailFilter() {
+      if (options.readOnly) return;
       railFilterDeleteArmed = false;
       railFilterNameMode = { kind: 'save', name: '' };
       drawRailFilterPop('railfilter-name');
     },
     renameRailFilter() {
+      if (options.readOnly) return;
       const current = findRailFilter(railFilters, railFilterId);
       if (!current) {
         return;
@@ -3650,6 +3664,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       railFilterNameInput?.select();
     },
     deleteRailFilter() {
+      if (options.readOnly) return;
       const current = findRailFilter(railFilters, railFilterId);
       if (!current) {
         return;
@@ -3672,6 +3687,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawRailFilterPop('railfilter-name');
     },
     saveNamedRailFilter() {
+      if (options.readOnly) return;
       if (!railFilterNameMode) {
         return;
       }
@@ -3701,6 +3717,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawRailFilterPop('railfilter-save-as');
     },
     toggleLabelEditor(session, anchor) {
+      if (options.readOnly) return;
       // The same session occurrence toggles its editor closed. Another occurrence moves the editor to that row.
       const here = labelsOpen?.session === current(session) && labelsOpen.section === sectionOf(anchor);
       if (here) {
@@ -3766,6 +3783,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       }
     },
     openArmedLabelEditor(session) {
+      if (options.readOnly) return;
       const arm = labelArm;
       if (!arm || arm.session !== session) {
         return;
@@ -3816,6 +3834,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     },
     // Open the saved-view editor only for this panel's recent context-menu target. Close other popovers first.
     openViewEditor(view, mode) {
+      if (options.readOnly) return;
       const arm = viewArm;
       viewArm = null;
       if (!arm || arm.view !== view || Date.now() - arm.at > MENU_ARM_MS) {
@@ -3846,6 +3865,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     },
     // Open Rename only in the panel holding the matching recent context-menu target.
     openSessionRename(session, title) {
+      if (options.readOnly) return;
       const arm = renameArm;
       renameArm = null;
       if (!arm || arm.session !== session || Date.now() - arm.at > MENU_ARM_MS) {
@@ -4003,6 +4023,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       postLabels();
     },
     togglePinned(card) {
+      if (options.readOnly) return;
       let openPinned = false;
       if (!card.pinnedTop) {
         (effectiveFilter() ? filteredFolds : folds).set(RAIL_FOLDS.top, true);

@@ -20,7 +20,11 @@ describe('portable saved-session site', () => {
     browser = await browserOrNone();
     if (!browser) return;
     const writer = await ExportTransaction.create(tempDir('arc-site-browser-'));
-    await projectSessionSite(await sessionSiteFixture(writer), writer, exportBrowserAssets());
+    const model = await sessionSiteFixture(writer);
+    const page = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
+    page.turns[0].finished = true;
+    model.sessions[0].pages[0] = await writer.spool(page);
+    await projectSessionSite(model, writer, exportBrowserAssets());
     directory = (await writer.publish(async () => {})).directory;
     server = createServer((request, response) => {
       const name = path.basename(new URL(request.url ?? '/', 'http://localhost').pathname);
@@ -29,10 +33,7 @@ describe('portable saved-session site', () => {
         response.writeHead(404).end();
         return;
       }
-      response.setHeader(
-        'Content-Type',
-        name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html',
-      );
+      response.setHeader('Content-Type', name.endsWith('.css') ? 'text/css' : 'text/html');
       response.end(fs.readFileSync(file));
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -45,7 +46,7 @@ describe('portable saved-session site', () => {
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  it('opens file and root or nested HTTP sites with local navigation and complete lazy text', async (t) => {
+  it('opens file and root or nested HTTP sites with complete inert text and retained older turns', async (t) => {
     if (!browser) t.skip('Edge or Chrome is required');
     for (const address of [
       pathToFileURL(path.join(directory, 'index.html')).href,
@@ -60,58 +61,50 @@ describe('portable saved-session site', () => {
       });
       page.on('pageerror', (error) => errors.push(error.message));
       await page.goto(address);
-      await page.locator('article[data-key="root-21"] .head').waitFor();
-      if (process.env.ARC_SITE_SHOTS && address.startsWith('file:')) {
-        fs.mkdirSync(process.env.ARC_SITE_SHOTS, { recursive: true });
-        for (const theme of ['dark', 'light'])
-          for (const width of [1350, 390]) {
-            await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(theme);
-            await page.setViewportSize({ width, height: 850 });
-            await page.screenshot({ path: path.join(process.env.ARC_SITE_SHOTS, `${theme}-${width}.png`) });
-          }
-        await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption('dark');
-        await page.setViewportSize({ width: 1350, height: 850 });
-      }
-      expect(await page.locator('article').count()).toBe(20);
-      const initial = await page.evaluate(
-        () =>
-          (window as unknown as { __arcExportMetrics: { cards: number; previewBytes: number; retainedBytes: number } })
-            .__arcExportMetrics,
-      );
-      expect(initial.cards).toBeLessThanOrEqual(EXPORT_LIMITS.initialCards);
-      expect(initial.previewBytes).toBeLessThanOrEqual(EXPORT_LIMITS.initialTextBytes);
       const first = page.locator('article[data-key="root-21"]');
-      await first.locator('.head').focus();
-      await page.keyboard.press('Enter');
-      await first.getByRole('button', { name: 'Read recorded text', exact: true }).click();
-      await first.locator('[data-block="root-21-later-12"]').waitFor();
-      const answer = first.locator('[data-block="root-21-answer"]');
-      await answer.getByRole('button', { name: 'Read full text', exact: true }).click();
-      await answer.locator('[data-full-text]').waitFor();
-      await answer.getByRole('button', { name: 'Next text', exact: true }).click();
+      await first.locator('.head').waitFor();
+      expect(await page.locator('article').count()).toBe(20);
+      await first.locator('.head').click();
       await page.waitForFunction(() =>
-        document.querySelector('[data-full-text="root-21-answer"]')?.textContent?.includes('final sentinel'),
+        document.querySelector('article[data-key="root-21"] .summary')?.textContent?.includes('final sentinel'),
       );
-      expect(await answer.locator('a, img, iframe, script, [data-link], [data-image]').count()).toBe(0);
+      const messageOnly = page.locator('article[data-key="root-20"]');
+      await messageOnly.locator('.head').click();
+      await messageOnly.locator('.actviewstate').waitFor();
+      expect(await messageOnly.locator('.actviewaction').count()).toBe(0);
+      expect(await first.locator('.actlist .ask').count()).toBe(0);
+      expect(await first.locator('.actviewaction').count()).toBe(1);
+      await first.locator('.actviewaction').click();
+      await page.waitForFunction(() =>
+        Array.from(document.querySelectorAll('article[data-key="root-21"] .actlist .ask'))
+          .at(-1)
+          ?.textContent?.includes('Later prompt 12'),
+      );
+      expect(await first.locator('.actlist .ask').count()).toBe(13);
+      expect(await first.locator('.actlist .run, .actlist .step, .actlist .reasoning').count()).toBe(0);
+      await first.locator('.actviewaction').click();
+      await page.waitForFunction(
+        () => document.querySelectorAll('article[data-key="root-21"] .actlist .ask').length === 0,
+      );
+      const asks = first.locator('[data-control="asks:root-21"]');
+      if (await asks.count()) await asks.click();
+      await page.waitForFunction(() =>
+        document.querySelector('article[data-key="root-21"]')?.textContent?.includes('Later prompt 12'),
+      );
+      expect(
+        await first.locator('.summary a, .summary img, .summary iframe, .summary script, .summary [data-link]').count(),
+      ).toBe(0);
       expect(await page.evaluate(() => (window as unknown as { attacked?: boolean }).attacked)).toBeUndefined();
       expect(
-        await page.evaluate(() => typeof (window as unknown as { acquireVsCodeApi?: unknown }).acquireVsCodeApi),
-      ).toBe('undefined');
-      expect(
         await page
-          .locator('input[type="file"], textarea, [contenteditable], [data-control^="composer"], #layoutpop')
+          .locator('#composer:visible, .sessionlabelact:visible, .railact:visible, .railnewsplit:visible')
           .count(),
       ).toBe(0);
       await page.getByRole('button', { name: 'Older turns', exact: true }).click();
       await page.locator('article[data-key="root-0"]').waitFor();
-      await page
-        .getByRole('navigation', { name: 'Sessions', exact: true })
-        .getByRole('link', { name: 'Linked session', exact: true })
-        .click();
-      await page.locator('article[data-key="child-0"]').waitFor();
-      await page.getByRole('button', { name: 'Back', exact: true }).click();
-      await page.locator('article[data-key="root-21"]').waitFor();
-      await page.getByRole('button', { name: 'Forward', exact: true }).click();
+      expect(await page.locator('article').count()).toBe(22);
+      expect(await first.count()).toBe(1);
+      await page.locator('#rail button.railcard').filter({ hasText: 'Linked session' }).click();
       await page.locator('article[data-key="child-0"]').waitFor();
       const retained = await page.evaluate(
         () => (window as unknown as { __arcExportMetrics: { retainedBytes: number } }).__arcExportMetrics.retainedBytes,
@@ -123,60 +116,158 @@ describe('portable saved-session site', () => {
     }
   });
 
-  it('filters saved names and changes local layout while following contextual linked work', async (t) => {
+  it('uses the production relationship navigation and local layout without mutation controls', async (t) => {
     if (!browser) t.skip('Edge or Chrome is required');
     const page = await browser!.newPage();
     await page.goto(pathToFileURL(path.join(directory, 'index.html')).href);
     const first = page.locator('article[data-key="root-21"]');
     await first.locator('.head').waitFor();
-    const filter = page.getByRole('searchbox', { name: 'Filter sessions', exact: true });
-    await filter.fill('agent:codex title:Linked');
-    await page.waitForFunction(() => document.querySelector('#export-sessions nav')?.children.length === 1);
-    expect(await page.locator('#export-sessions nav').textContent()).toBe('Linked session');
-    await filter.fill('');
     await first.locator('.head').click();
-    await first
-      .getByRole('navigation', { name: 'Linked work', exact: true })
-      .getByRole('link', { name: 'Linked session', exact: true })
-      .waitFor();
-    expect(await first.getByText('Work is not included: missing.', { exact: true }).count()).toBe(1);
-    if (process.env.ARC_SITE_SHOTS) {
-      for (const theme of ['dark', 'light'])
-        for (const width of [1350, 390]) {
-          await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(theme);
-          await page.setViewportSize({ width, height: 850 });
-          await page.screenshot({ path: path.join(process.env.ARC_SITE_SHOTS, `${theme}-${width}-linked.png`) });
-        }
+    await first.locator('[data-control^="session:"]').filter({ hasText: 'Linked session' }).click();
+    await page.locator('article[data-key="child-0"]').waitFor();
+    await page.locator('.sessionparent').click();
+    await first.waitFor();
+    await page.locator('.sessionlayout').click();
+    expect(await page.locator('[data-control="exportSession"]').count()).toBe(0);
+    const one = page.locator('[data-control="layout:cardLayout:one-column"]');
+    await one.click();
+    await page.waitForFunction(() =>
+      document.querySelector('[role="radio"][aria-checked="true"]')?.textContent?.includes('One column'),
+    );
+    await page.keyboard.press('Escape');
+    await page.locator('[data-control="railsearch"]').click();
+    const filter = page.locator('[data-control="railfilter"]');
+    await filter.fill('agent:codex title:Linked');
+    await page.waitForFunction(() => document.querySelectorAll('#rail button.railcard').length === 1);
+    await filter.fill('');
+    await page.evaluate(() => {
+      const text = document.querySelector('article .summary');
+      if (!text) throw new Error('The response is unavailable.');
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      const selection = getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+    });
+    expect(await page.locator('.quotefloat:visible, .noteedit:visible').count()).toBe(0);
+    expect(await page.locator('[data-control^="diff:"]').count()).toBe(0);
+    await page.close();
+  });
+
+  it('restores real browser visits and page ranges with platform shortcuts and editable exclusions', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    for (const platform of ['Win32', 'MacIntel', 'Linux x86_64']) {
+      const page = await browser!.newPage();
+      await page.addInitScript(
+        (platform) => Object.defineProperty(navigator, 'platform', { value: platform }),
+        platform,
+      );
+      await page.goto(pathToFileURL(path.join(directory, 'index.html')).href);
+      const newest = page.locator('article[data-key="root-21"]');
+      const oldest = page.locator('article[data-key="root-0"]');
+      const child = page.locator('article[data-key="child-0"]');
+      await newest.waitFor();
+      const initialLength = await page.evaluate(() => history.length);
+      await page.getByRole('button', { name: 'Older turns', exact: true }).click();
+      await oldest.waitFor();
+      await page.locator('#rail button.railcard').filter({ hasText: 'Linked session' }).click();
+      await child.waitFor();
+      await page.goBack();
+      await oldest.waitFor();
+      expect(await newest.count()).toBe(1);
+      await page.goBack();
+      await newest.waitFor();
+      expect(await oldest.count()).toBe(0);
+      await page.goForward();
+      await oldest.waitFor();
+      await page.goForward();
+      await child.waitFor();
+      expect(await page.evaluate(() => history.length)).toBe(initialLength + 2);
+      const back = platform === 'Win32' ? 'Alt+ArrowLeft' : platform === 'MacIntel' ? 'Control+-' : 'Control+Alt+-';
+      const forward = platform === 'Win32' ? 'Alt+ArrowRight' : 'Control+Shift+-';
+      await page.locator('[data-control="railsearch"]').click();
+      const input = page.locator('[data-control="railfilter"]');
+      await input.focus();
+      const before = await page.evaluate(() => JSON.stringify(history.state));
+      await page.keyboard.press(back);
+      await page.keyboard.press(forward);
+      expect(await page.evaluate(() => JSON.stringify(history.state))).toBe(before);
+      await child.locator('.head').focus();
+      await page.keyboard.press(back);
+      await oldest.waitFor();
+      await page.keyboard.press(forward);
+      await child.waitFor();
+      await page.goBack();
+      await oldest.waitFor();
+      await page.locator('#rail button.railcard').filter({ hasText: 'Review export' }).click();
+      await newest.waitFor();
+      expect(await oldest.count()).toBe(0);
+      expect(await page.evaluate(() => history.state.arcExport.session)).toBe('root');
+      expect(await page.evaluate(() => history.length)).toBe(initialLength + 2);
+      await page.close();
     }
-    await page.getByRole('combobox', { name: 'Card layout', exact: true }).selectOption('one-column');
-    await first.getByRole('navigation', { name: 'Linked work', exact: true }).waitFor();
-    await page.getByRole('combobox', { name: 'Prompt position', exact: true }).selectOption('above');
-    await first.locator('.export-prompt').waitFor();
+  });
+
+  it('returns native and dispatched child headings to their older launching turn', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    for (const kind of ['subagent', 'dispatched'] as const) {
+      const writer = await ExportTransaction.create(tempDir('arc-site-parent-'));
+      const model = await sessionSiteFixture(writer);
+      model.relationships[0] = { ...model.relationships[0], kind, turn: 'root-0' };
+      const spool = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages.at(-1)!);
+      spool.turns[0].relationships = ['reader-link'];
+      model.sessions[0].pages[model.sessions[0].pages.length - 1] = await writer.spool(spool);
+      await projectSessionSite(model, writer, exportBrowserAssets());
+      const captured = await writer.publish(async () => {});
+      const page = await browser!.newPage();
+      await page.goto(pathToFileURL(captured.index).href);
+      await page.locator('article[data-key="root-21"]').waitFor();
+      await page.getByRole('button', { name: 'Older turns', exact: true }).click();
+      const launch = page.locator('article[data-key="root-0"]');
+      await launch.locator('.head').click();
+      await launch.locator('[data-control^="session:"]').filter({ hasText: 'Linked session' }).click();
+      await page.locator('article[data-key="child-0"]').waitFor();
+      await page.locator('.sessionparent').click();
+      await launch.waitFor();
+      expect(await page.locator('article[data-key="root-21"]').count()).toBe(0);
+      await page.close();
+    }
+  });
+
+  it('rolls a bounded decoded page over and restores it through native history', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    const writer = await ExportTransaction.create(tempDir('arc-site-rollover-'));
+    const model = await sessionSiteFixture(writer);
+    model.sessions = [model.sessions[0]];
+    for (const index of [0, 1]) {
+      const spool = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[index]);
+      spool.turns[0].blocks.find((block) => block.kind === 'answer')!.text =
+        'x'.repeat(5 * 1024 * 1024) + ` complete ${index}`;
+      model.sessions[0].pages[index] = await writer.spool(spool);
+    }
+    model.sessions[0].pages = model.sessions[0].pages.slice(0, 2);
+    await projectSessionSite(model, writer, exportBrowserAssets());
+    const captured = await writer.publish(async () => {});
+    const page = await browser!.newPage();
+    await page.goto(pathToFileURL(captured.index).href);
+    const newer = page.locator('article[data-key="root-21"]');
+    const older = page.locator('article[data-key="root-20"]');
+    await newer.waitFor();
+    await page.getByRole('button', { name: 'Older turns', exact: true }).click();
+    await older.waitFor();
+    expect(await newer.count()).toBe(0);
     expect(
-      await first.evaluate(
-        (element) =>
-          element.querySelector('.export-prompt')!.compareDocumentPosition(element.querySelector('.summary')!) &
-          Node.DOCUMENT_POSITION_FOLLOWING,
+      await page.evaluate(
+        () => (window as unknown as { __arcExportMetrics: { retainedBytes: number } }).__arcExportMetrics.retainedBytes,
       ),
-    ).toBeTruthy();
-    await page.getByRole('combobox', { name: 'Card layout', exact: true }).selectOption('compact');
-    await first.getByText('Recorded figures and changes', { exact: true }).waitFor();
-    await first
-      .getByRole('navigation', { name: 'Linked work', exact: true })
-      .getByRole('link', { name: 'Linked session', exact: true })
-      .focus();
-    await page.keyboard.press('Enter');
-    await page.locator('h2').filter({ hasText: 'Linked session' }).waitFor();
-    const parent = page
-      .getByRole('navigation', { name: 'Parent session', exact: true })
-      .getByRole('link', { name: 'Parent: Review export', exact: true });
-    await parent.focus();
-    await page.keyboard.press('Enter');
-    await first.getByRole('navigation', { name: 'Linked work', exact: true }).waitFor();
-    expect(await page.evaluate(() => location.hash)).toBe('#root/root-21');
-    expect(
-      await page.locator('input[type="file"], textarea, [contenteditable], [data-control^="composer"]').count(),
-    ).toBe(0);
+    ).toBeLessThanOrEqual(EXPORT_LIMITS.retainedBytes);
+    await page.goBack();
+    await newer.waitFor();
+    expect(await older.count()).toBe(0);
+    await page.goForward();
+    await older.waitFor();
+    expect(await newer.count()).toBe(0);
     await page.close();
   });
 });

@@ -37,7 +37,7 @@ export const CAPTURE_TIME = Date.parse('2026-09-15T14:42:00-05:00');
 // Browser timezone for captures.
 export const CAPTURE_ZONE = 'America/Chicago';
 // Session list width for README captures and the web demo.
-export const CAPTURE_RAIL_WIDTH = 380;
+export { STATIC_PAGE_RAIL_WIDTH as CAPTURE_RAIL_WIDTH } from '../src/view/static-page.ts';
 export const DEMO_RAIL_FOLDS = { [RAIL_FOLDS.agent]: false, [RAIL_FOLDS.archived]: false };
 const ROOT = 'C:/sample/arc';
 const TEST_WORKTREE = `${ROOT}/.claude/worktrees/read-state-tests`;

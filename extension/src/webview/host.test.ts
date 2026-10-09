@@ -18,7 +18,7 @@ test('the VS Code API remains inside the host closure', () => {
   };
 
   const ports = createHost(api);
-  assert.deepEqual(Object.keys(ports).sort(), ['browserState', 'host']);
+  assert.deepEqual(Object.keys(ports).sort(), ['browserState', 'host', 'readOnly']);
   assert.equal(Object.values(ports).includes(api), false);
   assert.equal(Object.values(ports.host).includes(api), false);
   assert.equal(Object.values(ports.browserState).includes(api), false);

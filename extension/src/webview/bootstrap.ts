@@ -31,6 +31,7 @@ export function startBrowserPanel(options: BrowserPanelStartOptions = {}): Brows
 
   const panel = startPanel({
     dom: panelDom(document),
+    readOnly: ports.readOnly,
     events: globalEvents,
     savedState,
     sendToHost: ports.host.send,

@@ -73,6 +73,7 @@ export interface ExportNumbers {
   coverage: { usage: 'complete' | 'partial' | 'unavailable'; cost: 'complete' | 'partial' | 'unpriced' };
 }
 export interface ExportBlock {
+  opening?: boolean;
   key: string;
   kind: 'prompt' | 'assignment' | 'answer' | 'commentary';
   text: string;
@@ -125,6 +126,9 @@ export interface ExportTurn {
     };
   };
   agents: {
+    relationships?: string[];
+    spend?: ExportCostPart[];
+    spendFound?: boolean;
     key: string;
     description: string;
     agentType: string | null;

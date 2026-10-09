@@ -18,6 +18,7 @@ import {
   type TurnUsage,
   type ClaudeChildSessionReference,
   normalizeSessionTitle,
+  cleanPrompt,
 } from './transcript';
 import {
   codexSessionsRoot,
@@ -168,7 +169,7 @@ async function openingOf(
 ): Promise<{ text: string; digest: string }> {
   const handle = await fs.open(file, 'r');
   try {
-    const buffer = Buffer.allocUnsafe(limits.sliceBytes);
+    const buffer = Buffer.allocUnsafe(Math.min(limits.sliceBytes, 4096));
     const fragments: Buffer[] = [];
     let length = 0;
     for (let offset = 0; ;) {
@@ -217,6 +218,7 @@ async function sourceDigest(entry: Entry, limits: ExportLimits, signal?: AbortSi
 async function inventoryOf(options: ExportCaptureOptions, limits: ExportLimits): Promise<Inventory> {
   const inventory: Inventory = { entries: [], partial: false, signature: '', issues: [], paths: 0, bytes: 0 };
   const identities: string[] = [];
+  const candidates: { agent: AgentKind; file: string; name: string }[] = [];
   const issue = (reason: ExportOmissionReason) => {
     inventory.partial = true;
     if (!inventory.issues.includes(reason)) inventory.issues.push(reason);
@@ -253,52 +255,69 @@ async function inventoryOf(options: ExportCaptureOptions, limits: ExportLimits):
         continue;
       }
       if (!child.isFile() || !child.name.endsWith('.jsonl')) continue;
-      try {
-        let entry = await fileEntry(agent, file, child.name.slice(0, -6));
-        if (agent === 'codex') {
-          const opening = await openingOf(file, limits, options.signal);
-          const meta = openingRecordOf(opening.text);
-          if (!meta?.sessionId) {
-            issue('unresolved');
-            continue;
-          }
-          entry = {
-            ...entry,
-            sessionId: meta.sessionId,
-            ...(meta.cwd ? { cwd: meta.cwd } : {}),
-            opening: meta,
-            openingHash: opening.digest,
-          };
-        }
-        if (agent === 'claude') {
-          const readable = await fs.open(file, 'r');
-          await readable.close();
-          const cwd = readSessionCwd(file);
-          if (cwd) entry.cwd = cwd;
-        }
-        const metadata = JSON.stringify({
-          key: entryKey(entry),
-          file: normalizeFsPath(file),
-          identity: { dev: entry.stamp.dev, ino: entry.stamp.ino },
-          opening: entry.openingHash ?? null,
-        });
-        if (inventory.bytes + Buffer.byteLength(metadata) > limits.inventoryBytes) {
-          issue('inventory-incomplete');
-          break;
-        }
-        inventory.bytes += Buffer.byteLength(metadata);
-        identities.push(metadata);
-        inventory.entries.push(entry);
-      } catch (error) {
-        if (options.signal?.aborted || error instanceof ExportLimitError) throw error;
-        issue('unreadable');
-        // Claude filename evidence participates in prefix ambiguity even when unreadable.
-        identities.push(JSON.stringify({ agent, file: normalizeFsPath(file), unavailable: true }));
-      }
+      candidates.push({ agent, file, name: child.name });
     }
   };
   await walk(options.roots?.claude ?? projectsRoot(), 'claude', 1);
   await walk(options.roots?.codex ?? codexSessionsRoot(), 'codex', 3);
+  const results: Array<{ entry?: Entry; metadata: string; reason?: ExportOmissionReason }> = [];
+  let next = 0;
+  // Metadata reads share a bounded worker pool. Results retain inventory order for admission.
+  await Promise.all(
+    Array.from({ length: Math.min(16, candidates.length) }, async () => {
+      while (next < candidates.length) {
+        checkExportCancellation(options.signal);
+        const index = next++;
+        const { agent, file, name } = candidates[index];
+        try {
+          let entry = await fileEntry(agent, file, name.slice(0, -6));
+          if (agent === 'codex') {
+            const opening = await openingOf(file, limits, options.signal);
+            const meta = openingRecordOf(opening.text);
+            if (!meta?.sessionId) {
+              results[index] = { metadata: '', reason: 'unresolved' };
+              continue;
+            }
+            entry = {
+              ...entry,
+              sessionId: meta.sessionId,
+              ...(meta.cwd ? { cwd: meta.cwd } : {}),
+              opening: meta,
+              openingHash: opening.digest,
+            };
+          } else {
+            const readable = await fs.open(file, 'r');
+            await readable.close();
+          }
+          results[index] = {
+            entry,
+            metadata: JSON.stringify({
+              key: entryKey(entry),
+              file: normalizeFsPath(file),
+              identity: { dev: entry.stamp.dev, ino: entry.stamp.ino },
+              opening: entry.openingHash ?? null,
+            }),
+          };
+        } catch (error) {
+          if (options.signal?.aborted || error instanceof ExportLimitError) throw error;
+          results[index] = {
+            metadata: JSON.stringify({ agent, file: normalizeFsPath(file), unavailable: true }),
+            reason: 'unreadable',
+          };
+        }
+      }
+    }),
+  );
+  for (const result of results) {
+    if (result.reason) issue(result.reason);
+    if (inventory.bytes + Buffer.byteLength(result.metadata) > limits.inventoryBytes) {
+      issue('inventory-incomplete');
+      break;
+    }
+    inventory.bytes += Buffer.byteLength(result.metadata);
+    if (result.metadata) identities.push(result.metadata);
+    if (result.entry) inventory.entries.push(result.entry);
+  }
   inventory.signature = hash(
     JSON.stringify({
       identities: identities.sort(),
@@ -371,6 +390,7 @@ function blocksOf(turn: Turn, key: string): ExportBlock[] {
     at: number,
     order?: number,
     notResponse?: ExportBlock['notResponse'],
+    opening?: boolean,
   ) => {
     if (text)
       entries.push({
@@ -379,14 +399,15 @@ function blocksOf(turn: Turn, key: string): ExportBlock[] {
         at,
         sourceOrder: order ?? null,
         notResponse: notResponse ?? null,
+        ...(opening === undefined ? {} : { opening }),
         sequence: entries.length,
       });
   };
   if (turn.delegation) add('assignment', turn.delegation.text, turn.startedAt, -1);
   if (turn.promptParts?.length)
-    for (const part of turn.promptParts) add('prompt', part.text, part.at, part.sourceOrder);
-  else add('prompt', turn.prompt, turn.startedAt, -1);
-  for (const part of turn.laterPrompts) add('prompt', part.text, part.at, part.sourceOrder);
+    for (const part of turn.promptParts) add('prompt', part.text, part.at, part.sourceOrder, undefined, true);
+  else add('prompt', turn.prompt, turn.startedAt, -1, undefined, true);
+  for (const part of turn.laterPrompts) add('prompt', part.text, part.at, part.sourceOrder, undefined, false);
   const answers = turn.agent === 'claude' ? (turn.recordedAnswers ?? turn.answers) : turn.answers;
   for (const answer of answers) add('answer', answer.text, answer.at, answer.sourceOrder, answer.notResponse);
   if (turn.agent !== 'claude' && turn.summary && !answers.some((answer) => answer.text === turn.summary))
@@ -498,6 +519,16 @@ function projectTurn(
       },
     },
     agents: turn.agents.map((agent, index) => ({
+      relationships: agent.toolUseId ? (links.get(agent.toolUseId) ?? []) : [],
+      spend: agent.spend.map((part) =>
+        costPartOf({
+          ...part,
+          provider: part.provider ?? null,
+          contextWindow: part.contextWindow ?? null,
+          role: 'delegated',
+        }),
+      ),
+      spendFound: agent.spendFound,
       key: `${key}-a${index + 1}`,
       description: agent.description,
       agentType: agent.agentType,
@@ -869,6 +900,7 @@ export async function captureSessionExport(
   for (let position = 0; position < queue.length; position++) {
     checkExportCancellation(options.signal);
     const entry = queue[position];
+    if (entry.agent === 'claude' && !entry.cwd) entry.cwd = readSessionCwd(entry.file) ?? undefined;
     const key = keys.get(entryKey(entry))!;
     options.progress?.('relationships', position);
     frozen.set(entry.file, await sourceDigest(entry, limits, options.signal));
@@ -1123,7 +1155,8 @@ export async function captureSessionExport(
         if (title) session.title = title;
         else if (turn.sessionFullTitle || turn.sessionTitle)
           session.title = turn.sessionFullTitle ?? turn.sessionTitle!;
-        else if (!title) session.title = normalizeSessionTitle(turn.delegation?.text || turn.prompt) ?? session.title;
+        else if (!title)
+          session.title = normalizeSessionTitle(cleanPrompt(turn.delegation?.text || turn.prompt)) ?? session.title;
         const projected = projectTurn(turn, `${key}-t${session.turnCount}`, entry, omissions, key, links);
         for (const edge of relationships) {
           if (edge.from !== key) continue;
@@ -1358,7 +1391,6 @@ export async function captureSessionExport(
     }
     if ((await inventoryOf(options, limits)).signature !== inventorySignature) throw new SourceChanged();
   };
-  await recheck();
   return { model, recheck };
 }
 

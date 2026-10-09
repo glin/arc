@@ -38,6 +38,19 @@ const ELEMENT_NODE = 1;
 
 export type NavigationMessage = Extract<PanelToHost, { type: 'goBack' | 'goForward' }>;
 
+export function navigationShortcut(event: KeyboardEvent, platform: string): NavigationMessage['type'] | null {
+  if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.metaKey) return null;
+  if (/^Win/.test(platform)) {
+    if (!event.altKey || event.ctrlKey || event.shiftKey) return null;
+    return event.key === 'ArrowLeft' ? 'goBack' : event.key === 'ArrowRight' ? 'goForward' : null;
+  }
+  if ((event.key === '-' || event.code === 'Minus') && event.ctrlKey) {
+    if (event.shiftKey && !event.altKey) return 'goForward';
+    if (!event.shiftKey && event.altKey === !/^Mac/.test(platform)) return 'goBack';
+  }
+  return null;
+}
+
 export interface NavigationEvents {
   document(
     type: string,

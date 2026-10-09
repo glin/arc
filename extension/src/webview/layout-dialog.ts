@@ -15,6 +15,7 @@ import type { PanelToHost } from './protocol.ts';
 export const LAYOUT_DIALOG_ID = 'layoutpop';
 
 export interface LayoutDialogOptions {
+  readOnly?: boolean;
   document: Document;
   events: {
     document(type: string, listener: EventListener, options?: boolean | AddEventListenerOptions): void;
@@ -102,7 +103,7 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
               post: options.post,
               key: 'promptPosition',
             }),
-            exportSession
+            exportSession && !options.readOnly
               ? h(
                   'div',
                   { class: 'railfiltersection', key: 'export' },
@@ -111,11 +112,11 @@ export function createLayoutDialog(options: LayoutDialogOptions): LayoutDialog {
                     {
                       type: 'button',
                       class: 'launchrow',
-                      'data-control': 'exportSessionHtml',
+                      'data-control': 'exportSession',
                       onClick() {
                         const session = exportSession!;
                         close(true);
-                        options.post({ type: 'exportSessionHtml', session });
+                        options.post({ type: 'exportSession', session });
                       },
                     },
                     'Export session as HTML...',

@@ -33,6 +33,7 @@ export interface InitialRailState {
 }
 
 interface SessionStateOptions {
+  readOnly?: boolean;
   savedState: SavedStateService;
   sendToHost(message: PanelToHost): void;
   rail(): RailSnapshot | null;
@@ -173,6 +174,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
       });
     },
     hide(session) {
+      if (options.readOnly) return;
       const hiddenChanged = !hidden.has(session);
       const pinnedChanged = pinnedTop.delete(session);
       if (!hiddenChanged && !pinnedChanged) {
@@ -183,6 +185,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
       options.sendToHost({ type: 'sessionMembership', action: 'archive', session });
     },
     unarchive(session) {
+      if (options.readOnly) return;
       if (!hidden.delete(session)) {
         return;
       }
@@ -190,6 +193,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
       options.sendToHost({ type: 'sessionMembership', action: 'unarchive', session });
     },
     setPinned(session, pinned, openPinned = false) {
+      if (options.readOnly) return;
       const changed = pinned ? !pinnedTop.has(session) && !hidden.has(session) : pinnedTop.has(session);
       if (!changed) {
         return;
@@ -207,6 +211,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
       );
     },
     clearHidden() {
+      if (options.readOnly) return;
       if (!hidden.size) {
         return;
       }

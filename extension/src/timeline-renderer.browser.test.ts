@@ -4726,7 +4726,7 @@ test('the gear opens Timeline options and retains the initiating saved session f
       'Tab from the Card layout row did not reach the Prompt row',
     );
     await page.keyboard.press('Tab');
-    assert.equal((await read()).focused, 'exportSessionHtml');
+    assert.equal((await read()).focused, 'exportSession');
     await page.evaluate(
       `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))`,
     );
@@ -4761,10 +4761,10 @@ test('the gear opens Timeline options and retains the initiating saved session f
     assert.deepEqual(
       await page.evaluate(() =>
         (window as unknown as { __posted: { type: string }[] }).__posted.filter(
-          (message) => message.type === 'exportSessionHtml',
+          (message) => message.type === 'exportSession',
         ),
       ),
-      [{ type: 'exportSessionHtml', session: 's1' }],
+      [{ type: 'exportSession', session: 's1' }],
     );
     assert.equal(await dialog.isHidden(), true);
     assert.equal(await gear.evaluate((node) => node === document.activeElement), true);

@@ -216,7 +216,7 @@ function SessionPin({
     };
   }, [session, pins]);
   const pinned = options.pinned(session);
-  if (pinned === null) {
+  if (pinned === null || options.cardOptions.readOnly) {
     return null;
   }
   const words = cardWords();
@@ -287,6 +287,7 @@ function SessionParent({ parent, options }: { parent: SessionParentView; options
         options.cardOptions.post({
           type: parent.relation === 'reader' ? 'showReaderParent' : 'showSession',
           session: parent.id,
+          ...(parent.relation !== 'reader' && options.cardOptions.readOnly ? { parent: true as const } : {}),
         });
       },
     },
@@ -300,6 +301,7 @@ function SessionParent({ parent, options }: { parent: SessionParentView; options
 function SessionLabels({ session, options }: { session: SessionView; options: TimelineRendererOptions }) {
   const button = useRef<HTMLButtonElement>(null);
   const title = session.title;
+  if (options.cardOptions.readOnly && !session.labels.length) return null;
   const word = session.labels.length ? cardWords().labelOpen : cardWords().sessionLabelsAdd;
   const pressable = options.filterable();
   const labels = session.labels.map((label) =>
@@ -328,6 +330,7 @@ function SessionLabels({ session, options }: { session: SessionView; options: Ti
     'button',
     {
       class: 'sessionlabelact',
+      hidden: options.cardOptions.readOnly,
       key: 'edit',
       type: 'button',
       ref: button,
@@ -356,7 +359,7 @@ function SessionLabels({ session, options }: { session: SessionView; options: Ti
   );
 }
 
-function detailsRow(session: SessionView): SessionDetailsRow {
+function detailsRow(session: SessionView, readOnly = false): SessionDetailsRow {
   const row = session.row;
   return {
     id: session.id,
@@ -364,7 +367,7 @@ function detailsRow(session: SessionView): SessionDetailsRow {
     fullLabel: row?.fullLabel || row?.label || session.title,
     agent: row?.agent || session.cards[0]?.agent || '',
     // Build a resume command for each persisted row, so Session details works for any session list card.
-    resumeCommand: row?.persisted ? resumeCommand(row.agentKey || '', session.id) : null,
+    resumeCommand: row?.persisted && !readOnly ? resumeCommand(row.agentKey || '', session.id) : null,
   };
 }
 
@@ -1063,14 +1066,17 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
     options.onDraw?.();
     options.syncDetails(
       shown.sessions.map((row) =>
-        detailsRow({
-          id: row.id,
-          title: row.label || 'Session',
-          cards: shown.cards.filter((card) => card.sessionId === row.id),
-          row,
-          stats: sessionStats[row.id] || [],
-          labels: options.labels(row.id),
-        }),
+        detailsRow(
+          {
+            id: row.id,
+            title: row.label || 'Session',
+            cards: shown.cards.filter((card) => card.sessionId === row.id),
+            row,
+            stats: sessionStats[row.id] || [],
+            labels: options.labels(row.id),
+          },
+          options.cardOptions.readOnly,
+        ),
       ),
     );
     renderedCards.clear();

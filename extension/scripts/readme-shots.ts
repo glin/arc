@@ -130,7 +130,7 @@ window.__arcInstallMenu = installMenu;`,
     },
     ...BROWSER_BUILD,
   }).outputFiles[0].text;
-  await page.addStyleTag({ content: fs.readFileSync(path.join(__dirname, 'web-demo-menu.css'), 'utf8') });
+  await page.addStyleTag({ content: fs.readFileSync(path.join(__dirname, '../src/webview/static-menu.css'), 'utf8') });
   await page.addScriptTag({ content: script });
   const entries = manifestMenu(JSON.parse(fs.readFileSync(path.join(ROOT, 'extension/package.json'), 'utf8')));
   await page.evaluate((list) => {

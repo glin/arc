@@ -356,17 +356,8 @@
       const editable = target instanceof Element && target.closest('input,textarea,[contenteditable]');
       const chord = sample.isSendChord(event, navigator.platform);
       const composing = event.isComposing || event.keyCode === 229;
-      if (!editable && !event.defaultPrevented && !composing && !event.metaKey) {
-        let direction;
-        if (/^Win/.test(navigator.platform)) {
-          if (event.altKey && !event.ctrlKey && !event.shiftKey) {
-            if (event.key === 'ArrowLeft') direction = 'goBack';
-            else if (event.key === 'ArrowRight') direction = 'goForward';
-          }
-        } else if ((event.key === '-' || event.code === 'Minus') && event.ctrlKey) {
-          if (event.shiftKey && !event.altKey) direction = 'goForward';
-          else if (!event.shiftKey && event.altKey === !/^Mac/.test(navigator.platform)) direction = 'goBack';
-        }
+      if (!editable) {
+        const direction = sample.navigationShortcut(event, navigator.platform);
         if (direction) {
           event.preventDefault();
           event.stopImmediatePropagation();

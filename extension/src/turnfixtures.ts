@@ -1,3 +1,6 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import type { SiteManifest } from './webview/export-model';
 // Shared turn and session fixtures for tests. Production code must not import this module.
 // Keep a builder in its test file until another test file or shared builder needs it.
 import { Compaction, ToolCounts, Turn, TurnAgent, TurnCommit, TurnLanding, TurnSkillUse } from './transcript.ts';
@@ -1587,4 +1590,14 @@ export function bedrockAstraRecords(child = false): object[] {
     payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'completed' },
   });
   return records;
+}
+
+export function exportedSiteData(directory: string): { manifest: SiteManifest; data: Map<string, unknown> } {
+  const html = fs.readFileSync(path.join(directory, 'index.html'), 'utf8');
+  const data = new Map<string, unknown>();
+  for (const match of html.matchAll(
+    /<script type="application\/octet-stream" id="arc-data-([^"]+)">([^<]+)<\/script>/g,
+  ))
+    data.set(match[1], JSON.parse(Buffer.from(match[2], 'base64').toString('utf8')));
+  return { manifest: data.get('manifest') as SiteManifest, data };
 }

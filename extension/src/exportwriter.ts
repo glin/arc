@@ -67,8 +67,38 @@ export class ExportTransaction {
     return this.write(`a-${(++this.sequence).toString(36)}.${kind}`, bytes, this.assetBytes);
   }
 
-  async writeIndex(html: string): Promise<string> {
-    return this.write('index.html', html, this.assetBytes);
+  async writeIndexChunks(chunks: AsyncIterable<string>): Promise<string> {
+    await this.check();
+    const key = 'index.html';
+    const file = path.join(this.staging, key);
+    const handle = await fs.open(file, 'wx');
+    this.files.set(key, { file, ...fileIdentity(await handle.stat()) });
+    let position = 0;
+    try {
+      for await (const chunk of chunks) {
+        await this.check();
+        const buffer = Buffer.from(chunk);
+        for (let offset = 0; offset < buffer.length;) {
+          checkExportCancellation(this.signal);
+          const result = await handle.write(
+            buffer,
+            offset,
+            Math.min(EXPORT_LIMITS.sliceBytes, buffer.length - offset),
+            position,
+          );
+          if (!result.bytesWritten) throw new Error('The export file could not be saved.');
+          offset += result.bytesWritten;
+          position += result.bytesWritten;
+        }
+      }
+    } finally {
+      try {
+        this.files.set(key, { file, ...fileIdentity(await handle.stat()) });
+      } finally {
+        await handle.close();
+      }
+    }
+    return key;
   }
 
   async spool(page: unknown): Promise<string> {

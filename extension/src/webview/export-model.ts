@@ -1,47 +1,29 @@
-import type { CardView } from './payload-contracts.ts';
-import type {
-  SessionExport,
-  ExportSession,
-  ExportTurn,
-  ExportCompaction,
-  ExportBlock,
-} from '../domain/export-model.ts';
+import type { PanelSessionRow, PanelStat, PanelRailCard } from './protocol.ts';
+import type { SessionExport, ExportSession } from '../domain/export-model.ts';
 
 export interface SiteAsset {
   id: string;
-  file: string;
   bytes: number;
-}
-export interface SiteText {
-  raw: string;
-  html: string;
-}
-export interface SiteBlock extends Omit<ExportBlock, 'text'> {
-  preview: string;
-  chunks: SiteAsset[];
-}
-export interface SiteCard {
-  card: CardView;
-  bodies: SiteAsset[];
-  facts: SiteAsset;
-  relationships?: string[];
 }
 export interface SitePage extends SiteAsset {
   keys: string[];
+  cards?: SiteAsset[];
 }
 export interface SiteSession extends Omit<ExportSession, 'pages'> {
   pages: SitePage[];
 }
 export interface SiteManifest extends Omit<SessionExport, 'sessions'> {
   sessions: SiteSession[];
+  rows: PanelSessionRow[];
+  rail: PanelRailCard[];
+  stats: Record<string, PanelStat[]>;
 }
-export type SiteFacts = Omit<ExportTurn, 'blocks'> | Omit<ExportCompaction, 'summary'>;
 
 // The static entry never accepts panel host messages. Every new protocol request requires a decision.
 export const EXPORT_HOST_POLICY = {
   health: 'blocked',
   contextDetail: 'blocked',
-  ready: 'blocked',
+  ready: 'local',
   painted: 'blocked',
   initialize: 'blocked',
   developmentReload: 'blocked',
@@ -73,7 +55,7 @@ export const EXPORT_HOST_POLICY = {
   dequeue: 'blocked',
   editQueued: 'blocked',
   acceptQueuedEdit: 'blocked',
-  copy: 'blocked',
+  copy: 'local',
   note: 'blocked',
   armSelectedText: 'blocked',
   selectedTextHandoff: 'blocked',
@@ -87,9 +69,9 @@ export const EXPORT_HOST_POLICY = {
   renameSession: 'blocked',
   setRailFilters: 'blocked',
   sessionMembership: 'blocked',
-  setLayout: 'blocked',
-  exportSessionHtml: 'blocked',
-  saveState: 'blocked',
+  setLayout: 'local',
+  exportSession: 'blocked',
+  saveState: 'local',
   search: 'blocked',
   loadOlder: 'local',
   openLink: 'blocked',

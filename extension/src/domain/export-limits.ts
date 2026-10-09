@@ -13,9 +13,7 @@ export const EXPORT_LIMITS = {
   inventoryBytes: 32 * 1024 * 1024,
   dispatchIdentities: 20000,
   assetBytes: 2 * 1024 * 1024,
-  textBytes: 64 * 1024,
   initialCards: 20,
-  initialTextBytes: 2 * 1024 * 1024,
   retainedBytes: 32 * 1024 * 1024,
 } as const;
 

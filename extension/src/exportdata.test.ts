@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tempDir } from './temproot.ts';
-import { claudeDispatchTranscript } from './turnfixtures.ts';
+import { claudeDispatchTranscript, exportedSiteData } from './turnfixtures.ts';
 import {
   captureSessionExport,
   completeSessionExport,
@@ -14,8 +14,7 @@ import {
 import { ExportCancelled, ExportTransaction, withExportTransaction } from './exportwriter.ts';
 import { ExportLimitError } from './exportlimits.ts';
 import { projectSessionSite } from './exportsite.ts';
-import { runInNewContext } from 'node:vm';
-import type { SiteAsset, SiteManifest, SiteCard, SiteBlock, SiteText } from './webview/export-model.ts';
+import type { SiteManifest } from './webview/export-model.ts';
 const CODEX_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
@@ -145,34 +144,15 @@ async function readPages(
 }
 
 async function artifactText(directory: string): Promise<{ manifest: SiteManifest; text: string[] }> {
-  const manifestFile = fs
-    .readdirSync(directory)
-    .find(
-      (name) =>
-        name.endsWith('.js') &&
-        fs.readFileSync(path.join(directory, name), 'utf8').startsWith('window.__arcExportManifest='),
-    )!;
-  const window: { __arcExportManifest?: SiteManifest } = {};
-  runInNewContext(fs.readFileSync(path.join(directory, manifestFile), 'utf8'), { window });
-  const manifest = window.__arcExportManifest!;
-  const load = (asset: SiteAsset): unknown => {
-    let data: unknown;
-    runInNewContext(fs.readFileSync(path.join(directory, asset.file), 'utf8'), {
-      window: {
-        __arcExportReceive(_id: string, value: unknown) {
-          data = value;
-        },
-      },
-    });
-    return data;
-  };
-  const text: string[] = [];
-  for (const session of manifest.sessions)
-    for (const page of session.pages)
-      for (const card of load(page) as SiteCard[])
-        for (const body of card.bodies)
-          for (const block of load(body) as SiteBlock[])
-            text.push(block.chunks.map((chunk) => (load(chunk) as SiteText).raw).join(''));
+  const blocks = exportedSiteData(directory);
+  const manifest = blocks.manifest;
+  const text = manifest.sessions.flatMap((session) =>
+    session.pages.flatMap((page) =>
+      (page.cards ?? []).flatMap((asset) =>
+        (blocks.data.get(asset.id) as { blocks: { text: string }[] }).blocks.map((block) => block.text),
+      ),
+    ),
+  );
   return { manifest, text };
 }
 
@@ -401,7 +381,11 @@ test('unrelated body appends preserve export while changed opening evidence reje
         unrelated,
         JSON.stringify(record('event_msg', 10, { payload: { type: 'task_started', turn_id: 'later' } })) + '\n',
       );
-      await transaction.writeIndex('<!doctype html>');
+      await transaction.writeIndexChunks(
+        (async function* () {
+          yield '<!doctype html>';
+        })(),
+      );
     }),
   );
   assert.equal(projections, 1);
@@ -902,7 +886,11 @@ test('source changes after rendering cause one whole capture retry before public
     completeSessionExport(writer, f.options, async (capture, writer) => {
       projections++;
       if (projections === 1) f.write(f.root, claudeTurn('changed'));
-      await writer.writeIndex('<!doctype html><title>capture</title>');
+      await writer.writeIndexChunks(
+        (async function* () {
+          yield '<!doctype html><title>capture</title>';
+        })(),
+      );
       await writer.writeAsset('json', JSON.stringify(capture.model));
     }),
   );
@@ -918,7 +906,11 @@ test('a second source change fails without publishing either capture', async () 
     withExportTransaction(f.output, (writer) =>
       completeSessionExport(writer, f.options, async (_capture, writer) => {
         f.write(f.root, claudeTurn(`changed-${++projections}`));
-        await writer.writeIndex('<!doctype html><title>capture</title>');
+        await writer.writeIndexChunks(
+          (async function* () {
+            yield '<!doctype html><title>capture</title>';
+          })(),
+        );
       }),
     ),
     /changed during export/,

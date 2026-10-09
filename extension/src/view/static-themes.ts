@@ -45,3 +45,17 @@ export const LIGHT_MODERN_THEME = `:root{
 --vscode-editor-font-family:Consolas,"Courier New",monospace;
 }
 body{background:var(--vscode-editor-background);color:var(--vscode-foreground);}`;
+
+export const ONE_DARK_PRO_DARKER_THEME = `${DARK_MODERN_THEME}
+:root{
+--vscode-descriptionForeground:#abb2bf;--vscode-editor-background:#23272e;--vscode-sideBar-background:#1e2227;
+--vscode-editorWidget-background:#1e2227;--vscode-focusBorder:#3e4452;--vscode-textLink-foreground:#61afef;
+--vscode-list-hoverBackground:#2c313a;--vscode-list-activeSelectionBackground:#2c313a;--vscode-list-activeSelectionForeground:#d7dae0;
+--vscode-list-inactiveSelectionBackground:#323842;
+--vscode-button-background:#404754;--vscode-button-secondaryBackground:#30333d;--vscode-button-secondaryForeground:#c0bdbd;
+--vscode-input-background:#1d1f23;--vscode-input-foreground:#abb2bf;
+--vscode-dropdown-background:#1e2227;--vscode-dropdown-border:#1e2227;--vscode-textBlockQuote-border:#4b5362;
+--vscode-editorWarning-foreground:#d19a66;--vscode-settings-headerForeground:#fff;
+--vscode-editorHoverWidget-background:#1e2227;--vscode-editorHoverWidget-border:#181a1f;
+--vscode-editor-selectionBackground:#67769660;--vscode-editor-findMatchHighlightBackground:#ffffff22;
+}`;

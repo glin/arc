@@ -132,6 +132,7 @@ export interface ChromeRenderer {
 }
 
 interface ChromeOptions {
+  readOnly?: boolean;
   document: Document;
   events: {
     document(
@@ -233,6 +234,7 @@ function CompactPicker(props: {
 }
 
 function CompactControls(props: {
+  readOnly?: boolean;
   document: Document;
   view: SessionLauncherView | null;
   state: CompactState;
@@ -252,37 +254,39 @@ function CompactControls(props: {
     : UNREADY_LAUNCHER_WORDS.primaryName;
   const picker = props.state.sessions.length >= 2;
   return h(Fragment, null, [
-    h('span', { class: 'compactnewsplit', key: 'new' }, [
-      h(
-        'button',
-        {
-          class: 'compactnew',
-          disabled: !view,
-          'aria-label': primaryName || undefined,
-          'aria-keyshortcuts': view ? newSessionKeyshortcut(props.platform) : undefined,
-          'data-hint': primaryName || undefined,
-          'data-hint-detail': view?.words.primaryDetail,
-          onClick: () =>
-            props.sendToHost({ type: 'newSession', ...(view?.owner === undefined ? {} : { owner: view.owner }) }),
-        },
-        view?.words.primaryLabel ?? UNREADY_LAUNCHER_WORDS.primaryLabel,
-      ),
-      h(
-        'button',
-        {
-          class: 'compactnewmenu',
-          ref: props.setCompactMenu,
-          disabled: !view,
-          'aria-haspopup': 'dialog',
-          'aria-controls': 'launcher',
-          'aria-expanded': String(props.launcherExpanded),
-          'aria-label': view?.words.menuName ?? UNREADY_LAUNCHER_WORDS.menuName,
-          'data-hint': view?.words.menuName,
-          onClick: (event: MouseEvent) => props.openLauncher(event.currentTarget as HTMLElement),
-        },
-        props.twist,
-      ),
-    ]),
+    !props.readOnly
+      ? h('span', { class: 'compactnewsplit', key: 'new' }, [
+          h(
+            'button',
+            {
+              class: 'compactnew',
+              disabled: !view,
+              'aria-label': primaryName || undefined,
+              'aria-keyshortcuts': view ? newSessionKeyshortcut(props.platform) : undefined,
+              'data-hint': primaryName || undefined,
+              'data-hint-detail': view?.words.primaryDetail,
+              onClick: () =>
+                props.sendToHost({ type: 'newSession', ...(view?.owner === undefined ? {} : { owner: view.owner }) }),
+            },
+            view?.words.primaryLabel ?? UNREADY_LAUNCHER_WORDS.primaryLabel,
+          ),
+          h(
+            'button',
+            {
+              class: 'compactnewmenu',
+              ref: props.setCompactMenu,
+              disabled: !view,
+              'aria-haspopup': 'dialog',
+              'aria-controls': 'launcher',
+              'aria-expanded': String(props.launcherExpanded),
+              'aria-label': view?.words.menuName ?? UNREADY_LAUNCHER_WORDS.menuName,
+              'data-hint': view?.words.menuName,
+              onClick: (event: MouseEvent) => props.openLauncher(event.currentTarget as HTMLElement),
+            },
+            props.twist,
+          ),
+        ])
+      : null,
     picker
       ? h(CompactPicker, {
           key: 'picker',
@@ -351,6 +355,7 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
     render(
       h(CompactControls, {
         document: options.document,
+        readOnly: options.readOnly,
         view: launcherView,
         state: compactState,
         platform: options.platform,
@@ -988,6 +993,7 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
     launcherOpen: () => launcherSnapshot.open,
     launcherAnchor: () => launcherSnapshot.anchor,
     openLauncher(anchor = null, action = null, custom = false) {
+      if (options.readOnly) return;
       // Start fields from the quick New setup and reset the list's Tab stop.
       // Focus the inherited row, first setup or Agent field. Custom openings focus the Agent field.
       const choice = launcherView ? defaultLauncherChoice(launcherView) : null;
@@ -1012,6 +1018,7 @@ export function createChromeRenderer(options: ChromeOptions): ChromeRenderer {
       return back;
     },
     toggleLauncher(anchor) {
+      if (options.readOnly) return;
       if (launcherSnapshot.open) {
         controller.closeLauncher(true);
       } else {

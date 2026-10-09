@@ -11519,7 +11519,7 @@ export class PanelProvider implements vscode.Disposable {
             void vscode.window.showErrorMessage(message);
           });
         },
-        exportSessionHtml: (msg) => {
+        exportSession: (msg) => {
           const sources = this.catalog?.sessions ?? [];
           const source = savedExportSource(msg.session, sources);
           const title = source ? this.sessionLabel(source).fullLabel : msg.session;

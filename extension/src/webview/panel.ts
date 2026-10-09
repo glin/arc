@@ -65,6 +65,7 @@ export interface GlobalEventPort {
 }
 
 export interface PanelKernel {
+  readOnly?: boolean;
   dom: PanelDom;
   events: GlobalEventPort;
   savedState: SavedStateService;
@@ -168,8 +169,9 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   // The saved-state owner selects the shared host state, falling back to this webview's browser state.
   // Bootstrap supplies it before the first render.
   const saved = savedState.initial;
-  let composerHidden = saved.composerHidden === true;
+  let composerHidden = kernel.readOnly === true || saved.composerHidden === true;
   const sessionState = createPanelSessionState({
+    readOnly: kernel.readOnly,
     savedState,
     sendToHost: kernel.sendToHost,
     rail: () => railRenderer?.snapshot() ?? null,
@@ -408,6 +410,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   });
 
   commentsRenderer = createCommentRenderer({
+    readOnly: kernel.readOnly,
     document,
     list,
     read: readState,
@@ -462,6 +465,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           vscode.postMessage(message);
         },
         figureDetails,
+        kernel.readOnly,
       );
     },
   });
@@ -478,9 +482,15 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       return commentsRenderer.selectionWithin(node);
     },
     renderRows(host, rows) {
-      renderDetailRows(host, rows, (message) => {
-        vscode.postMessage(message);
-      });
+      renderDetailRows(
+        host,
+        rows,
+        (message) => {
+          vscode.postMessage(message);
+        },
+        undefined,
+        kernel.readOnly,
+      );
     },
     // Pin the containing popover with the nested record so its hover grace cannot close the child.
     // Figures in card bodies have no containing popover.
@@ -495,6 +505,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   // Retain the Timeline layout from the latest host render.
   let layout: TimelineLayout = DEFAULT_TIMELINE_LAYOUT;
   const layoutDialog = createLayoutDialog({
+    readOnly: kernel.readOnly,
     document,
     events: { document: onDocument, window: onWindow },
     layout: () => layout,
@@ -504,6 +515,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   });
 
   const cardOptions: CardRendererOptions = {
+    readOnly: kernel.readOnly,
     layout: () => layout,
     post(message) {
       vscode.postMessage(message);
@@ -513,10 +525,12 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     statDetails,
     figureDetails,
   };
+  cardOptions.post = Object.assign(cardOptions.post, { readOnly: kernel.readOnly });
   cardRenderer = createCardRenderer(cardOptions);
 
   let chrome: ReturnType<typeof createChromeRenderer>;
   railRenderer = createRailRenderer({
+    readOnly: kernel.readOnly,
     document,
     clock,
     onDraw: drawCounter('rail'),
@@ -710,6 +724,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   });
   // The prompt box owner mounts stable controls and routes their actions to the host.
   composerRenderer = createComposerRenderer({
+    readOnly: kernel.readOnly,
     words: ACTIONS,
     recovery: savedState,
     document,
@@ -739,6 +754,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const composerCollapse = composerBox.querySelector<HTMLButtonElement>('#composer-collapse')!;
   const composerRestore = composerBox.querySelector<HTMLButtonElement>('#composer-restore')!;
   function setComposerHidden(hidden: boolean, persist = true) {
+    if (kernel.readOnly) hidden = true;
     const active = document.activeElement;
     let returnFocus =
       hidden &&
@@ -750,7 +766,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     composerHidden = hidden;
     composerBox.classList.toggle('composer-hidden', hidden);
     composerCollapse.hidden = hidden;
-    composerRestore.hidden = !hidden;
+    composerRestore.hidden = kernel.readOnly === true || !hidden;
     composerRenderer.setHidden(hidden);
     composerControlsRenderer?.setHidden(hidden);
     if (hidden) {
@@ -774,10 +790,12 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     composerRestore.focus();
   });
   composerRestore.addEventListener('click', () => {
+    if (kernel.readOnly) return;
     setComposerHidden(false);
     promptBox.focus();
   });
   attachmentRenderer = createAttachmentRenderer({
+    readOnly: kernel.readOnly,
     document,
     composer: composerBox,
     prompt: promptBox,
@@ -884,6 +902,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     },
   });
   chrome = createChromeRenderer({
+    readOnly: kernel.readOnly,
     document: document,
     events: { document: onDocument },
     list: list,

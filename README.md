@@ -90,10 +90,6 @@ Arc estimates costs for supported models using published prices. Subscription es
 
 <a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
 
-### Saved-session HTML
-
-[Export a saved session as HTML](docs/session-html.md) to review its recorded text and linked work in a browser or publish the complete site directory.
-
 ### Commenting
 
 <a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>

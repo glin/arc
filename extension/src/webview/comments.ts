@@ -67,6 +67,7 @@ interface ListToReopen {
 }
 
 export interface CommentRendererOptions {
+  readOnly?: boolean;
   document: Document;
   list: HTMLElement;
   read: ReadStateOwner;
@@ -880,6 +881,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   };
 
   const refreshSelection = () => {
+    if (options.readOnly) return;
     if (editor) {
       placeQuoteHost(editor.rect);
       return;
@@ -929,6 +931,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   };
 
   const write = (card: CommentCard, quote: string, part: CommentPart, words: string, offset?: number) => {
+    if (options.readOnly) return;
     count += 1;
     const note: TurnComment = {
       id: `${Date.now()}:${count}:${Math.random().toString(36).slice(2, 10)}`,
@@ -950,6 +953,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   };
 
   const openEditor = (anchor: CommentAnchor) => {
+    if (options.readOnly) return;
     closeMarkFloat();
     if (editor) {
       return;
@@ -1338,7 +1342,8 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
   };
 
   const cardRewriteWaits = (node: HTMLElement): boolean =>
-    listHolds(node) || !!(editor?.painted && node.contains(editor.painted)) || selectionWithin(node);
+    !options.readOnly &&
+    (listHolds(node) || !!(editor?.painted && node.contains(editor.painted)) || selectionWithin(node));
 
   options.events.window('resize', () => {
     if (editor) {
@@ -1568,7 +1573,7 @@ export function createCommentRenderer(options: CommentRendererOptions): CommentR
     closeMarkFloat,
     noteBeingWritten,
     selectionWithin,
-    heldSelection: () => selectionWithin(options.list),
+    heldSelection: () => !options.readOnly && selectionWithin(options.list),
     cardRewriteWaits,
     openArmed(key) {
       if (!menuArm || menuArm.key !== key || Date.now() - menuArm.at > MENU_ARM_MS) {

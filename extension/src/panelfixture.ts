@@ -1,4 +1,4 @@
-import { DARK_MODERN_THEME, LIGHT_MODERN_THEME } from './view/static-themes.ts';
+import { DARK_MODERN_THEME, LIGHT_MODERN_THEME, ONE_DARK_PRO_DARKER_THEME } from './view/static-themes.ts';
 // Shared panel page and render payload for browser tests and screenshots.
 // Importing a test module registers its tests, so scripts use this separate fixture module.
 // Production modules do not import this file.
@@ -1553,20 +1553,7 @@ export { DARK_MODERN_THEME, LIGHT_MODERN_THEME } from './view/static-themes.ts';
 
 // Layer One Dark Pro Darker values over the Dark Modern table.
 // Variables omitted here retain the Dark Modern values.
-export const ONE_DARK_PRO_DARKER_THEME = `${DARK_MODERN_THEME}
-:root{
---vscode-descriptionForeground:#abb2bf;--vscode-editor-background:#23272e;--vscode-sideBar-background:#1e2227;
---vscode-editorWidget-background:#1e2227;--vscode-focusBorder:#3e4452;--vscode-textLink-foreground:#61afef;
---vscode-list-hoverBackground:#2c313a;--vscode-list-activeSelectionBackground:#2c313a;--vscode-list-activeSelectionForeground:#d7dae0;
---vscode-list-inactiveSelectionBackground:#323842;
---vscode-button-background:#404754;--vscode-button-secondaryBackground:#30333d;--vscode-button-secondaryForeground:#c0bdbd;
---vscode-input-background:#1d1f23;--vscode-input-foreground:#abb2bf;
---vscode-dropdown-background:#1e2227;--vscode-dropdown-border:#1e2227;--vscode-textBlockQuote-border:#4b5362;
---vscode-editorWarning-foreground:#d19a66;--vscode-settings-headerForeground:#fff;
---vscode-editorHoverWidget-background:#1e2227;--vscode-editorHoverWidget-border:#181a1f;
---vscode-editor-selectionBackground:#67769660;--vscode-editor-findMatchHighlightBackground:#ffffff22;
-}`;
-
+export { ONE_DARK_PRO_DARKER_THEME } from './view/static-themes.ts';
 // High-contrast dark values layered over the Dark Modern table.
 export const HIGH_CONTRAST_DARK_THEME = `${DARK_MODERN_THEME}
 :root{

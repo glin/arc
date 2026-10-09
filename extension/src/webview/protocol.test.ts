@@ -4,12 +4,12 @@ import assert from 'node:assert';
 
 test('HTML export requires its initiating saved session and dispatches that identity', () => {
   for (const session of [undefined, null, 7, ''])
-    assert.equal(parsePanelToHost({ type: 'exportSessionHtml', session }), null);
-  const request = parsePanelToHost({ type: 'exportSessionHtml', session: 'initiating-session' });
-  assert.deepEqual(request, { type: 'exportSessionHtml', session: 'initiating-session' });
+    assert.equal(parsePanelToHost({ type: 'exportSession', session }), null);
+  const request = parsePanelToHost({ type: 'exportSession', session: 'initiating-session' });
+  assert.deepEqual(request, { type: 'exportSession', session: 'initiating-session' });
   const seen: string[] = [];
   dispatchPanelToHost(request!, panelRecorder(seen));
-  assert.deepEqual(seen, ['exportSessionHtml']);
+  assert.deepEqual(seen, ['exportSession']);
 });
 
 test('visibility messages reject invalid state and revision values', () => {
@@ -330,7 +330,7 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
 ];
 
 const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
-  { raw: { type: 'exportSessionHtml', session: 's1' }, parsed: { type: 'exportSessionHtml', session: 's1' } },
+  { raw: { type: 'exportSession', session: 's1' }, parsed: { type: 'exportSession', session: 's1' } },
   { raw: { type: 'health', sequence: 1 }, parsed: { type: 'health', sequence: 1 } },
   {
     raw: { type: 'requestDefaults', agent: 'claude', model: '' },
@@ -668,7 +668,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     setRailFilters: take('setRailFilters'),
     sessionMembership: take('sessionMembership'),
     setLayout: take('setLayout'),
-    exportSessionHtml: take('exportSessionHtml'),
+    exportSession: take('exportSession'),
     saveState: take('saveState'),
     search: take('search'),
     loadOlder: take('loadOlder'),

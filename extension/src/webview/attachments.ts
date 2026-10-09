@@ -2,6 +2,7 @@ import { h, render, type ComponentChildren } from 'preact';
 import type { ComposerFile, ComposerView, PanelToHost } from './protocol.ts';
 
 interface AttachmentOptions {
+  readOnly?: boolean;
   document: Document;
   composer: HTMLElement;
   prompt: HTMLTextAreaElement;
@@ -183,6 +184,7 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
     options.updateFoot();
   };
   const readFiles = (files: FileList | File[], clipboard: boolean): boolean => {
+    if (options.readOnly) return false;
     const captured = Array.from(files ?? []);
     const session = options.session();
     const view = options.view();

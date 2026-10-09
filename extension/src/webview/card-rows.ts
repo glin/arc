@@ -39,7 +39,7 @@ export type DetailRows =
   | { kind: 'dispatched'; key: string; agents: AgentRowView[]; files: FileRowView[]; commits: CommitRowView[] }
   | { kind: 'commits'; key: string; commits: CommitRowView[] };
 
-export type RowPost = (message: PanelToHost) => void;
+export type RowPost = ((message: PanelToHost) => void) & { readOnly?: boolean };
 
 const noContextClass = () => '';
 
@@ -115,9 +115,9 @@ export function FileRow({
   sourceSessionId?: string;
 }) {
   return h(
-    'button',
+    post.readOnly ? 'span' : 'button',
     {
-      class: 'row click',
+      class: post.readOnly ? 'row' : 'row click',
       title: file.detail ?? file.shownPath,
       'aria-label': file.label,
       'data-control': `file:${cardKey}:${file.path}`,
@@ -128,6 +128,7 @@ export function FileRow({
       }),
       onClick(event: MouseEvent) {
         stop(event);
+        if (post.readOnly) return;
         post({
           type: 'openFile',
           key: cardKey,
@@ -164,6 +165,7 @@ export function FileRow({
 
 // A button styled as a link opens the whole turn's diff below the file rows.
 export function TurnDiffAction({ cardKey, post }: { cardKey: string; post: RowPost }) {
+  if (post.readOnly) return null;
   return h(
     'div',
     { class: 'actions' },
@@ -793,6 +795,8 @@ export function renderDetailRows(
   rows: DetailRows | null,
   post: RowPost,
   figureDetails?: StatDetailRenderer,
+  readOnly = false,
 ): void {
+  post = Object.assign(post, { readOnly });
   render(rows ? h(DetailRowList, { rows, post, figureDetails }) : null, host);
 }

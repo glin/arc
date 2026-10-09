@@ -113,6 +113,7 @@ export function cardWords(): CardWords {
 export type CardHost = HTMLElement;
 
 export interface CardRendererOptions {
+  readOnly?: boolean;
   post(message: PanelToHost): void;
   read: ReadStateOwner;
   comments: CommentRenderer;
@@ -1346,17 +1347,19 @@ function ActivitySection({
             ? cardWords().logRepliesView
             : cardWords().logMessagesView,
       ),
-      h(
-        'button',
-        {
-          class: 'actviewaction',
-          onClick(event: MouseEvent) {
-            stop(event);
-            chooseFilter(filter === 'everything' ? 'messages' : 'everything');
-          },
-        },
-        filter === 'everything' ? cardWords().logShowMessagesOnly : cardWords().logShowAllActivity,
-      ),
+      !options.readOnly || card.activity?.some((row) => row.kind !== 'message')
+        ? h(
+            'button',
+            {
+              class: 'actviewaction',
+              onClick(event: MouseEvent) {
+                stop(event);
+                chooseFilter(filter === 'everything' ? 'messages' : 'everything');
+              },
+            },
+            filter === 'everything' ? cardWords().logShowMessagesOnly : cardWords().logShowAllActivity,
+          )
+        : null,
     ]),
     h(
       'div',

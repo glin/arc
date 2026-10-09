@@ -70,6 +70,7 @@ export interface ComposerSlots {
 }
 
 interface ComposerOptions {
+  readOnly?: boolean;
   words: Pick<
     typeof import('../view/card-words.ts').CARD_ACTIONS,
     'composerCollapse' | 'composerCollapseDetail' | 'composerRestore' | 'composerRestoreDetail'
@@ -1408,6 +1409,11 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
     walkAnnouncer,
     slots,
     setHidden(value) {
+      if (options.readOnly) {
+        element.hidden = true;
+        element.style.display = 'none';
+        value = true;
+      }
       hidden = value;
       if (hidden) pendingFocus = null;
       drawSlash();
@@ -1557,6 +1563,7 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       boxChanged();
     },
     send(fromKey) {
+      if (options.readOnly) return false;
       const view = current;
       const box = view?.box;
       if (!view || !box) {

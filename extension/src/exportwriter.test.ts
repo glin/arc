@@ -14,7 +14,11 @@ test('concurrent exports publish independent directories and never replace an ex
   fs.writeFileSync(path.join(previous, 'index.html'), 'author');
   const publish = (text: string) =>
     withExportTransaction(parent, async (writer) => {
-      await writer.writeIndex(text);
+      await writer.writeIndexChunks(
+        (async function* () {
+          yield text;
+        })(),
+      );
       const key = await writer.writeAsset('js', 'window.example = true;');
       assert.match(key, /^a-[a-z0-9]+\.js$/);
       return writer.publish(async () => {});
@@ -30,7 +34,11 @@ test('a failed source recheck removes staging before publication', async () => {
   const parent = tempDir('export-writer-');
   await assert.rejects(
     withExportTransaction(parent, async (writer) => {
-      await writer.writeIndex('capture');
+      await writer.writeIndexChunks(
+        (async function* () {
+          yield 'capture';
+        })(),
+      );
       await writer.publish(async () => {
         throw new Error('source changed');
       });
@@ -57,7 +65,11 @@ test('cancellation after writes prevents publication and removes only owned file
     withExportTransaction(
       parent,
       async (writer) => {
-        await writer.writeIndex('capture');
+        await writer.writeIndexChunks(
+          (async function* () {
+            yield 'capture';
+          })(),
+        );
         await writer.spool({ text: 'body' });
         controller.abort();
         await writer.publish(async () => {});
@@ -91,7 +103,11 @@ test('cleanup stops after staging replacement and never follows the replacement 
 test('cleanup refuses externally replaced files without deleting their contents', async () => {
   const parent = tempDir('export-writer-');
   const writer = await ExportTransaction.create(parent);
-  await writer.writeIndex('capture');
+  await writer.writeIndexChunks(
+    (async function* () {
+      yield 'capture';
+    })(),
+  );
   const file = path.join(writer.staging, 'index.html');
   fs.unlinkSync(file);
   fs.writeFileSync(file, 'author replacement');
@@ -102,9 +118,42 @@ test('cleanup refuses externally replaced files without deleting their contents'
 test('the writer refuses duplicate index writes and source-controlled spool paths', async () => {
   const parent = tempDir('export-writer-');
   await withExportTransaction(parent, async (writer) => {
-    await writer.writeIndex('capture');
-    await assert.rejects(writer.writeIndex('replace'), { code: 'EEXIST' });
+    await writer.writeIndexChunks(
+      (async function* () {
+        yield 'capture';
+      })(),
+    );
+    await assert.rejects(
+      writer.writeIndexChunks(
+        (async function* () {
+          yield 'replace';
+        })(),
+      ),
+      { code: 'EEXIST' },
+    );
     await assert.rejects(writer.readSpool('../author.json'), /unavailable/);
   });
+  assert.deepEqual(fs.readdirSync(parent), []);
+});
+
+test('cancellation between HTML chunks stops writing and removes owned staging', async () => {
+  const parent = tempDir('export-writer-');
+  const controller = new AbortController();
+  await assert.rejects(
+    withExportTransaction(
+      parent,
+      async (writer) => {
+        await writer.writeIndexChunks(
+          (async function* () {
+            yield 'first';
+            controller.abort();
+            yield 'second';
+          })(),
+        );
+      },
+      controller.signal,
+    ),
+    ExportCancelled,
+  );
   assert.deepEqual(fs.readdirSync(parent), []);
 });
