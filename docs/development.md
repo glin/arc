@@ -160,21 +160,25 @@ Run the full check after the final rebase or merge. Record the tested full commi
 
 `extension/src/pricing.ts` owns exact model definitions and explicit provider support. Its shared formulas serve the panel, Project cost, and status CLI.
 
-1. Read primary pricing and cache-policy sources before adding a model or provider route.
+1. Read primary pricing and cache-policy sources before adding a model or provider route. Check effort-change retention for each exact model identity and provider route. For Claude Code, consult [Changing effort level](https://code.claude.com/docs/en/prompt-caching#changing-effort-level).
 2. Define the exact model identity, base rates, request threshold, fallback context window, and explicit sourced cache policy once.
-3. Add explicit provider support beside that definition for every confirmed provider.
-4. Specify each provider's accepted prefixes, regional multiplier, effective dates, fallback window, and explicit sourced cache policy.
-5. Reuse shared rates only when published provider rates establish equivalence. Set a provider rate override when they differ.
-6. Keep service tiers specific to their provider. Price recorded cache tokens without inferring caching support or a lifetime.
-7. Extend the independent exhaustive support matrix in `pricing.test.ts` before adding any model or provider route. Include rates, request bands, tiers, windows, accepted identities, and cache policies.
-8. Require documented duration, recorded duration, unsupported caching, or sourced unknown duration. Never infer duration from token-field names.
-9. Add symptom regressions to the existing pricing and consumer tests. Include saved usage and both request bands.
-10. Bump `PROJECT_SPEND_PARSER_GENERATION` in `projectspend.ts` when model support changes saved request bands or derived usage facts.
-11. Bump `VERSION` in `derivedcache.ts` when model support changes saved session cost or context facts.
-12. Remove the new provider support temporarily and run the symptom regressions. Also remove its policy, price, and independent route expectation separately. Require each guard to fail, then restore from plain backups.
-13. Update exact model coverage in [Supported pricing](agent-cost-guide.md#supported-pricing). Update README provider summaries when provider coverage changes.
-14. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
-15. Run the focused tests and the verification commands in [Fast iteration](#fast-iteration).
+3. Check `effortChangeKeepsCache` independently of `cachePolicy`. General prompt-cache support does not establish retention after an effort change. Set `true` only when primary retention evidence covers the whole pricing row. Use an exact-identity `RegExp` when primary evidence covers only part of the pricing row. Leave the field absent when primary evidence does not establish retention.
+4. Preserve detectable route exclusions. Undetectable routes retain the direct-model policy. Record conflicting primary evidence as a route-detection limitation. Missing route signals do not establish a direct route.
+5. An absent retention policy returns false. A false result does not establish provider rejection.
+6. Add explicit provider support beside that definition for every confirmed provider.
+7. Specify each provider's accepted prefixes, regional multiplier, effective dates, fallback window, and explicit sourced cache policy.
+8. Reuse shared rates only when published provider rates establish equivalence. Set a provider rate override when they differ.
+9. Keep service tiers specific to their provider. Price recorded cache tokens without inferring caching support or a lifetime.
+10. Extend the independent exhaustive support matrix in `pricing.test.ts` before adding any model or provider route. Include rates, request bands, tiers, windows, accepted identities, cache policies, and effort-change retention.
+11. Extend existing independent effort-change policy tests for exact identities, dated snapshots, context suffixes, broad-row exceptions, and detectable provider routes.
+12. Require documented duration, recorded duration, unsupported caching, or sourced unknown duration. Never infer duration from token-field names.
+13. Add symptom regressions to the existing pricing and consumer tests. Include saved usage and both request bands.
+14. Bump `PROJECT_SPEND_PARSER_GENERATION` in `projectspend.ts` when model support changes saved request bands or derived usage facts.
+15. Bump `VERSION` in `derivedcache.ts` when model support changes saved session cost or context facts.
+16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
+17. Update exact model coverage in [Supported pricing](agent-cost-guide.md#supported-pricing). Update README provider summaries when provider coverage changes.
+18. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
+19. Run the focused tests and the verification commands in [Fast iteration](#fast-iteration).
 
 ## Verification
 
