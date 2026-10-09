@@ -2367,16 +2367,28 @@ test('the wheel scrolls the textarea through a visible skill control', { timeout
         deltaY: event.deltaY,
       });
     })`);
-    await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 5));
+    const wheel = async (deltaY: number) => {
+      const count = await page.evaluate<number>('window.__composerWheels.length');
+      await page.mouse.wheel(0, deltaY);
+      await page.waitForFunction(`window.__composerWheels.length > ${count}`);
+    };
+    await prompt.evaluate((node: HTMLTextAreaElement) => {
+      node.setSelectionRange(0, 5);
+      node.scrollTop = 0;
+      node.dispatchEvent(new Event('scroll'));
+    });
+    await page.waitForFunction(`document.getElementById('prompt').scrollTop === 0
+      && document.querySelector('.cskilllayer').scrollTop === 0`);
     await moveTo(page, page.locator('.cskilltoken').first());
-    await page.mouse.wheel(0, 7);
-    await page.waitForFunction(`document.getElementById('prompt').scrollTop > 0`);
-    await page.evaluate(SETTLED);
+    const beforeSkillWheel = await prompt.evaluate((node: HTMLTextAreaElement) => node.scrollTop);
+    await wheel(7);
+    await page.waitForFunction(`document.getElementById('prompt').scrollTop > ${beforeSkillWheel}
+      && document.querySelector('.cskilllayer').scrollTop === document.getElementById('prompt').scrollTop`);
     const scroll = (await page.evaluate(`(() => ({
       prompt: document.getElementById('prompt').scrollTop,
       layer: document.querySelector('.cskilllayer').scrollTop,
     }))()`)) as { prompt: number; layer: number };
-    assert.ok(scroll.prompt > 0, 'wheel input over the skill did not scroll the textarea');
+    assert.ok(scroll.prompt > beforeSkillWheel, 'wheel input over the skill did not scroll the textarea');
     assert.equal(scroll.layer, scroll.prompt);
     assert.deepEqual(
       await prompt.evaluate((node: HTMLTextAreaElement) => [node.selectionStart, node.selectionEnd]),
@@ -2399,8 +2411,8 @@ test('the wheel scrolls the textarea through a visible skill control', { timeout
     });
     await moveTo(page, prompt, 0.9);
     const pageBefore = (await page.evaluate(`window.scrollY`)) as number;
-    await page.mouse.wheel(0, 120);
-    await page.mouse.wheel(0, 120);
+    await wheel(120);
+    await wheel(120);
     await page.waitForFunction((before) => window.scrollY > before, pageBefore);
     await page.evaluate(SETTLED);
     const pageAfter = (await page.evaluate(`window.scrollY`)) as number;
@@ -2421,8 +2433,7 @@ test('the wheel scrolls the textarea through a visible skill control', { timeout
       node.scrollTop = 0;
     });
     await moveTo(page, prompt);
-    await page.mouse.wheel(0, 7);
-    await page.evaluate(SETTLED);
+    await wheel(7);
     assert.equal(
       await page.evaluate(`window.__composerWheels.at(-1).prevented`),
       false,
@@ -2439,8 +2450,8 @@ test('the wheel scrolls the textarea through a visible skill control', { timeout
     });
     await page.evaluate(`window.scrollTo(0, 0)`);
     await moveTo(page, page.locator('.cinput'), 0.98);
-    await page.mouse.wheel(0, 40);
-    await page.mouse.wheel(0, 40);
+    await wheel(40);
+    await wheel(40);
     await page.waitForFunction(`window.scrollY > 0`);
     await page.evaluate(SETTLED);
     const scrolledY = (await page.evaluate(`window.scrollY`)) as number;
@@ -2455,7 +2466,7 @@ test('the wheel scrolls the textarea through a visible skill control', { timeout
     await moveTo(page, page.locator('.cskilltoken').first());
     const beforeModified = await prompt.evaluate((node: HTMLTextAreaElement) => node.scrollTop);
     await page.keyboard.down('Control');
-    await page.mouse.wheel(0, 120);
+    await wheel(120);
     await page.keyboard.up('Control');
     await page.evaluate(SETTLED);
     assert.deepEqual(

@@ -1,11 +1,21 @@
 import { bedrockAstraRecords } from '../../extension/src/turnfixtures.ts';
+import { tempDir } from '../../extension/src/temproot.ts';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { test, vi } from 'vitest';
+import { afterEach, beforeEach, test, vi } from 'vitest';
 import { runCost } from '../src/cost.ts';
+
+const defaultRoots = { codex: tempDir('cli-cost-codex-'), projects: tempDir('cli-cost-projects-') };
+
+beforeEach(() => {
+  vi.stubEnv('ARC_CODEX_ROOT', defaultRoots.codex);
+  vi.stubEnv('ARC_PROJECTS_ROOT', defaultRoots.projects);
+});
+
+afterEach(() => vi.unstubAllEnvs());
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-cost-cli-'));
@@ -114,11 +124,24 @@ test('cost preserves native usage, metadata-only sessions, and incomplete traili
       rollout,
       JSON.stringify({ type: 'session_meta', payload: { session_id: 'native-session', source: 'cli' } }),
     );
-    for (const flags of [[], ['--source-only']]) {
-      const report = JSON.parse(runCost([rollout, ...flags]));
-      assert.equal(report.source.kind, 'codex');
-      assert.equal(report.source.sessionId, 'native-session');
-      assert.equal(report.parent.requests, 0);
+    const nativeFs = createRequire(import.meta.url)('node:fs');
+    const reads = vi.spyOn(nativeFs, 'readdirSync');
+    syncBuiltinESMExports();
+    try {
+      for (const flags of [[], ['--source-only']]) {
+        reads.mockClear();
+        const report = JSON.parse(runCost([rollout, ...flags]));
+        assert.deepEqual(
+          reads.mock.calls.map(([directory]) => String(directory)),
+          flags.length ? [] : [defaultRoots.codex],
+        );
+        assert.equal(report.source.kind, 'codex');
+        assert.equal(report.source.sessionId, 'native-session');
+        assert.equal(report.parent.requests, 0);
+      }
+    } finally {
+      reads.mockRestore();
+      syncBuiltinESMExports();
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
