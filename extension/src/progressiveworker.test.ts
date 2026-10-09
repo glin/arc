@@ -1655,12 +1655,315 @@ test('pending Codex comparison retains dispatched sessions and spend through com
     assert.deepEqual(stable.value.references, first.value.references);
     assert.deepEqual(stable.value.dispatchFacts, first.value.dispatchFacts);
     assert.equal(stable.value.continuation, false);
+    const rewritten = fs.readFileSync(file);
+    const mismatchAt = rewritten.lastIndexOf('x');
+    assert.ok(mismatchAt > 8 * 1024 * 1024 && mismatchAt < finished.cursor!.offset);
+    rewritten[mismatchAt] = 'y'.charCodeAt(0);
+    fs.writeFileSync(file, rewritten);
+    fs.appendFileSync(file, line({ type: 'ignored' }));
+    fs.utimesSync(file, 104, 104);
+    const comparing = await worker.run(request(), 4, new AbortController().signal);
+    assert.ok(comparing?.value.kind === 'claude-children');
+    const comparingEntry = comparing.value.referenceEntries[0][1];
+    assert.ok(comparingEntry.cursor!.evidence!.validation);
+    assert.equal(comparingEntry.complete, false);
+    assert.equal(comparingEntry.relationshipComplete, false);
+    assert.equal(comparingEntry.sourceGeneration, old.sourceGeneration);
+    assert.deepEqual(comparing.value.references, first.value.references);
+    assert.deepEqual(comparing.value.dispatchFacts, first.value.dispatchFacts);
+    const mismatch = await worker.run(request(), 5, new AbortController().signal);
+    assert.ok(mismatch?.value.kind === 'claude-children');
+    assert.equal(mismatch.value.referenceEntries[0][1].sourceGeneration, old.sourceGeneration! + 1);
+    assert.deepEqual(mismatch.value.referenceEntries[0][1].references, []);
+    assert.deepEqual(mismatch.value.references, []);
+    assert.deepEqual(mismatch.value.dispatchFacts, []);
     fs.writeFileSync(file, line({ type: 'ignored' }));
-    const reset = await worker.run(request(), 4, new AbortController().signal);
+    const reset = await worker.run(request(), 6, new AbortController().signal);
+    assert.ok(reset?.value.kind === 'claude-children');
+    assert.equal(reset.value.referenceEntries[0][1].sourceGeneration, old.sourceGeneration! + 2);
+    assert.deepEqual(reset.value.references, []);
+    assert.deepEqual(reset.value.dispatchFacts, []);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('an unreached same-size Codex rewrite retains dispatch references until comparison retires them', async () => {
+  const directory = tempDir('relationship-codex-unreached-rewrite-');
+  const file = path.join(directory, 'parent.jsonl');
+  const childId = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const childFile = path.join(directory, childId + '.jsonl');
+  const line = (record: object) => JSON.stringify(record) + '\n';
+  fs.writeFileSync(childFile, line({ type: 'user', cwd: directory, message: { content: 'work' } }));
+  fs.utimesSync(childFile, 100, 100);
+  const padding = line({ type: 'ignored', text: 'x'.repeat(1024) }).repeat(8);
+  fs.writeFileSync(
+    file,
+    line({ type: 'session_meta', payload: { id: 'parent', cwd: directory } }) +
+      padding +
+      line({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'launch' } }) +
+      line({ type: 'turn_context', payload: { turn_id: 'launch' } }) +
+      line({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            id: 'launch',
+            parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch' }],
+            stdout: 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa-1111-1111-1111-111111111111"}',
+          },
+        },
+      }) +
+      padding,
+  );
+  fs.utimesSync(file, 100, 100);
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [
+      { file, sessionId: 'parent', agent: 'codex' as const, ...revisionOf(fs.statSync(file, { bigint: true })) },
+    ],
+    catalog: [
+      {
+        file: childFile,
+        sessionId: childId,
+        agent: 'claude' as const,
+        ...revisionOf(fs.statSync(childFile, { bigint: true })),
+      },
+    ],
+    repositoryRoots: [directory],
+  });
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const first = await completeDiscovery(worker, request(), 1, new AbortController().signal);
+    assert.ok(first?.value.kind === 'claude-children');
+    const old = first.value.referenceEntries[0][1];
+    assert.equal(first.value.references.length, 1);
+    const before = fs.readFileSync(file, 'utf8');
+    const at = before.indexOf('aaaaaaaa-1111');
+    assert.ok(at > 4096 && at < before.length - 4096);
+    fs.writeFileSync(file, before.replace('aaaaaaaa-1111', 'bbbbbbbb-1111'));
+    fs.utimesSync(file, 102, 102);
+    assert.equal(fs.statSync(file).size, old.size);
+    const unreached = await worker.run({ ...request(), discoveryBytes: 16 * 1024 }, 2, new AbortController().signal);
+    assert.ok(unreached?.value.kind === 'claude-children');
+    const entry = unreached.value.referenceEntries[0][1];
+    assert.equal(unreached.value.charges!.readBytes, 0);
+    assert.equal(entry.complete, false);
+    assert.equal(entry.relationshipComplete, false);
+    assert.equal(entry.sourceGeneration, old.sourceGeneration);
+    assert.deepEqual(entry.validatedRevision, old.validatedRevision);
+    assert.deepEqual(unreached.value.references, first.value.references);
+    const reached = await worker.run(request(), 3, new AbortController().signal);
+    assert.ok(reached?.value.kind === 'claude-children');
+    assert.equal(reached.value.referenceEntries[0][1].sourceGeneration, old.sourceGeneration! + 1);
+    assert.deepEqual(reached.value.references, []);
+    assert.deepEqual(reached.value.dispatchFacts, []);
+  } finally {
+    worker.stop();
+  }
+});
+
+test.each(['appended', 'unchanged'] as const)(
+  'a protected Claude child keeps priority with an %s parent',
+  async (change) => {
+    const directory = tempDir('relationship-protected-child-');
+    const parentFile = path.join(directory, 'parent.jsonl');
+    const childDirectory = path.join(directory, 'parent', 'subagents');
+    fs.mkdirSync(childDirectory, { recursive: true });
+    const childFile = path.join(childDirectory, 'agent-child.jsonl');
+    const line = (record: object) => JSON.stringify(record) + '\n';
+    fs.writeFileSync(
+      parentFile,
+      line({ type: 'user', cwd: directory, message: { content: 'work' } }) +
+        line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'launch', name: 'Agent' }] } }) +
+        line({
+          type: 'user',
+          message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+          toolUseResult: { agentId: 'child' },
+        }),
+    );
+    fs.writeFileSync(
+      childFile,
+      line({ type: 'user', cwd: directory, isSidechain: true, message: { content: 'work' } }) +
+        line({ type: 'ignored', text: 'x'.repeat(900000) }),
+    );
+    const session = (file: string, sessionId: string, childTranscript = false) => ({
+      file,
+      sessionId,
+      childTranscript,
+      agent: 'claude' as const,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    });
+    const request = () => ({
+      kind: 'claude-children' as const,
+      parents: [session(parentFile, 'parent')],
+      catalog: [session(parentFile, 'parent')],
+      repositoryRoots: [directory],
+      quantumBytes: 65536,
+      discoveryBytes: 65536,
+    });
+    const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+    try {
+      let saved:
+        | Extract<import('./progressiveworker').ProgressiveValue, { kind: 'claude-children-progress' }>
+        | undefined;
+      for (let pass = 0; pass < 12; pass++) {
+        const result = await worker.run(request(), 1, new AbortController().signal);
+        assert.ok(result?.value.kind === 'claude-children-progress');
+        saved = result.value;
+        if (saved.checkpoint.protectedFile) break;
+      }
+      const key = normalizeFsPath(childFile);
+      assert.equal(saved?.checkpoint.protectedFile, key);
+      const prior = new Map(saved.referenceEntries).get(key)!.claudeCursor!.offset;
+      if (change === 'appended') fs.appendFileSync(parentFile, line({ type: 'ignored' }));
+      const next = await worker.run(request(), 2, new AbortController().signal);
+      assert.ok(next?.value.kind === 'claude-children-progress');
+      assert.equal(next.value.checkpoint.protectedFile, key);
+      const entries = new Map(next.value.referenceEntries);
+      assert.ok(entries.get(key)!.claudeCursor!.offset > prior);
+      assert.equal(
+        entries.get(normalizeFsPath(parentFile))!.claudeCursor!.offset,
+        saved.referenceEntries.find(([file]) => file === normalizeFsPath(parentFile))![1].claudeCursor!.offset,
+      );
+      const finished = await completeDiscovery(worker, request(), 3, new AbortController().signal);
+      assert.ok(finished?.value.kind === 'claude-children');
+      assert.equal(finished.value.checkpoint?.protectedFile, undefined);
+      assert.equal(finished.value.children[0]?.sessionId, 'child');
+    } finally {
+      worker.stop();
+    }
+  },
+);
+
+test('expired Codex terminal checks preserve revision pairing and retained dispatch references', async () => {
+  const directory = tempDir('relationship-codex-terminal-expiry-');
+  const file = path.join(directory, 'parent.jsonl');
+  const childId = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const childFile = path.join(directory, childId + '.jsonl');
+  fs.writeFileSync(childFile, JSON.stringify({ type: 'user', cwd: directory, message: { content: 'work' } }) + '\n');
+  fs.utimesSync(childFile, 100, 100);
+  const records = [
+    { type: 'session_meta', payload: { id: 'parent', cwd: directory } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'launch' } },
+    { type: 'turn_context', payload: { turn_id: 'launch' } },
+    {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        item: {
+          type: 'CommandExecution',
+          id: 'launch',
+          parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch' }],
+          stdout: 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa-1111-1111-1111-111111111111"}',
+        },
+      },
+    },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n'));
+  fs.utimesSync(file, 100, 100);
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [
+      { file, sessionId: 'parent', agent: 'codex' as const, ...revisionOf(fs.statSync(file, { bigint: true })) },
+    ],
+    catalog: [
+      {
+        file: childFile,
+        sessionId: childId,
+        agent: 'claude' as const,
+        ...revisionOf(fs.statSync(childFile, { bigint: true })),
+      },
+    ],
+    repositoryRoots: [directory],
+  });
+  const firstWorker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  let worker: ProgressiveWorker | undefined;
+  try {
+    const first = await completeDiscovery(firstWorker, request(), 1, new AbortController().signal);
+    assert.ok(first?.value.kind === 'claude-children');
+    const old = first.value.referenceEntries[0][1];
+    assert.equal(old.cursor!.terminalApplied, true);
+    assert.equal(old.references.length, 1);
+    assert.equal(first.value.references.length, 1);
+    assert.ok(old.cursor!.offset < 4096);
+    fs.appendFileSync(file, 'x');
+    fs.utimesSync(file, 102, 102);
+    const timed = `let terminalClock=0;performance.now=()=>terminalClock;const tf=require('node:fs'),tr=tf.readSync;tf.readSync=function(...args){const count=tr.apply(this,args);terminalClock+=15;return count;};`;
+    worker = new ProgressiveWorker(timed + source);
+    const expired = await worker.run(
+      { ...request(), referenceEntries: first.value.referenceEntries },
+      2,
+      new AbortController().signal,
+    );
+    assert.ok(expired?.value.kind === 'claude-children');
+    const entry = expired.value.referenceEntries[0][1];
+    assert.equal(expired.value.charges!.readBytes, old.cursor!.offset);
+    assert.equal(entry.cursor!.evidence!.validation, undefined);
+    assert.deepEqual(entry.cursor!.evidence!.accepted, entry.cursor!.evidence!.provisional);
+    assert.equal(entry.cursor!.size, entry.cursor!.evidence!.provisional.size);
+    assert.equal(entry.cursor!.mtimeMs, entry.cursor!.evidence!.provisional.mtimeMs);
+    assert.equal(entry.cursor!.dev, entry.cursor!.evidence!.provisional.dev);
+    assert.equal(entry.cursor!.ino, entry.cursor!.evidence!.provisional.ino);
+    assert.equal(entry.complete, false);
+    assert.equal(entry.relationshipComplete, false);
+    assert.deepEqual(entry.validatedRevision, old.validatedRevision);
+    assert.deepEqual(expired.value.references, first.value.references);
+    worker.stop();
+    worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+    const reset = await worker.run(
+      { ...request(), referenceEntries: expired.value.referenceEntries },
+      3,
+      new AbortController().signal,
+    );
     assert.ok(reset?.value.kind === 'claude-children');
     assert.equal(reset.value.referenceEntries[0][1].sourceGeneration, old.sourceGeneration! + 1);
     assert.deepEqual(reset.value.references, []);
-    assert.deepEqual(reset.value.dispatchFacts, []);
+  } finally {
+    firstWorker.stop();
+    worker?.stop();
+  }
+});
+
+test('Claude relationship completeness waits for bytes appended beyond its frozen target', async () => {
+  const directory = tempDir('relationship-frozen-target-');
+  const file = path.join(directory, 'parent.jsonl');
+  fs.writeFileSync(file, (JSON.stringify({ type: 'ignored', text: 'x'.repeat(1024) }) + '\n').repeat(150));
+  fs.utimesSync(file, 100, 100);
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [
+      { file, sessionId: 'parent', agent: 'claude' as const, ...revisionOf(fs.statSync(file, { bigint: true })) },
+    ],
+    repositoryRoots: [directory],
+    quantumBytes: 65536,
+    discoveryBytes: 65536,
+  });
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const first = await worker.run(request(), 1, new AbortController().signal);
+    assert.ok(first?.value.kind === 'claude-children-progress');
+    const target = first.value.referenceEntries[0][1].claudeCursor!.target;
+    assert.ok(first.value.referenceEntries[0][1].claudeCursor!.offset < target);
+    fs.appendFileSync(file, (JSON.stringify({ type: 'ignored' }) + '\n').repeat(100));
+    fs.utimesSync(file, 102, 102);
+    let reached = false;
+    for (let pass = 0; pass < 20; pass++) {
+      const result = await worker.run(request(), 2, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children-progress');
+      const entry = result.value.referenceEntries[0][1];
+      if (entry.claudeCursor!.offset !== target) continue;
+      reached = true;
+      assert.ok(entry.claudeCursor!.offset < entry.size);
+      assert.equal(entry.relationshipComplete, false);
+      break;
+    }
+    assert.equal(reached, true);
+    const finished = await completeDiscovery(worker, request(), 3, new AbortController().signal);
+    assert.ok(finished?.value.kind === 'claude-children');
+    assert.equal(finished.value.referenceEntries[0][1].relationshipComplete, true);
+    assert.equal(finished.value.referenceEntries[0][1].claudeCursor!.offset, fs.statSync(file).size);
   } finally {
     worker.stop();
   }

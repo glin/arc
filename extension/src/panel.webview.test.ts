@@ -4655,6 +4655,7 @@ test('completion slices post changed figures once on retained and newest launchi
     assert.notEqual(deadline, null);
     assert.ok(deadline > Date.now());
     const beforeDeadline = fixture.collections();
+    assert.equal(beforeDeadline, 2);
     fs.writeFileSync(clock, String(deadline + 1));
     vi.setSystemTime(deadline + 1);
     await provider.refresh(false, true);

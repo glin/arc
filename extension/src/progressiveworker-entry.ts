@@ -482,6 +482,22 @@ async function execute(
       };
     };
     let found = walk();
+    if (epoch.protectedFile && !candidates.has(epoch.protectedFile)) {
+      const held = claudeChildReferences.get(epoch.protectedFile);
+      // Pending parent validation hides ownership edges while the child still needs parsing.
+      if (held?.source === 'claude' && held.childTranscript)
+        candidates.set(epoch.protectedFile, {
+          file: epoch.protectedFile,
+          sessionId: held.sessionId,
+          agent: held.source,
+          childTranscript: held.childTranscript,
+          mtimeMs: held.mtimeMs,
+          size: held.size,
+          dev: held.dev,
+          ino: held.ino,
+        });
+      else delete epoch.protectedFile;
+    }
     for (const [key, parent] of candidates) {
       const current = checkParent(parent.file);
       if (!current || !unchangedFinished(claudeChildReferences.get(key), parent, current)) {
@@ -491,7 +507,7 @@ async function execute(
           claudeChildReferences.set(key, { ...entry, complete: false, relationshipComplete: false, visitedEof: false });
       }
     }
-    if (epoch.protectedFile && !candidates.has(epoch.protectedFile)) delete epoch.protectedFile;
+    if (epoch.protectedFile && completed.has(epoch.protectedFile)) delete epoch.protectedFile;
     // Scanners capture their own revision. Admission shares one source observation before the publication walk.
     const seedMissing = new Set<string>();
     if (seeding) {
@@ -630,7 +646,9 @@ async function execute(
         };
         const evidence = claudeCursor?.evidence ?? cursor!.evidence;
         const reachedTarget = cursor ? cursor.offset === cursor.target : claudeCursor!.offset === claudeCursor!.target;
-        const accepted = qualified && (complete || (parent.agent === 'claude' && reachedTarget));
+        const accepted =
+          qualified &&
+          (complete || (parent.agent === 'claude' && reachedTarget && claudeCursor!.offset === scanRevision.size));
         const finished = qualified && reachedTarget && (claudeCursor?.offset ?? cursor!.offset) === scanRevision.size;
         claudeChildReferences.set(key, {
           sourceGeneration: (held?.sourceGeneration ?? 0) + Number(reset || !held),
