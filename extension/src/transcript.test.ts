@@ -234,6 +234,7 @@ import {
   linkTargetIsMarkdown,
   resolveLink,
   holdsHumanPrompt,
+  promptScanLists,
   scanForHumanPrompt,
   scanForAgentRun,
   scanForPerson,
@@ -9645,6 +9646,182 @@ function localCommand(
 }
 
 const RENAMED = 'Session renamed to: claude entrypoint auto handback';
+
+test('command-only CLI transcripts supply neither admission nor a fallback name', () => {
+  for (const answer of [
+    { stdout: 'Login interrupted', user: true },
+    { stdout: 'Login interrupted' },
+    { stderr: 'Login interrupted', user: true },
+  ]) {
+    const records = localCommand('/usage-credits', '', 2, 'command', answer);
+    records[0] = { ...records[0], uuid: 'caveat', timestamp: at(2.001) };
+    records[1] = { ...records[1], parentUuid: 'caveat' };
+    const file = writeTranscript(records);
+    assert.equal(holdsHumanPrompt(fs.readFileSync(file, 'utf8')), false);
+    const scan = scanForHumanPrompt(file, fs.statSync(file).size);
+    assert.equal(scan.found, false);
+    assert.equal(scan.command?.withdrawn, true);
+    assert.equal(readSessionMeta(file).title, null);
+    assert.equal(localAnswerStatuses(records, AFTER_COMMAND, true).count, 0);
+  }
+});
+
+test('command admission withdraws and restores across appends, chunk edges and incomplete lines', () => {
+  const [caveat, command, answer] = localCommand('/usage-credits', '', 2, 'command', {
+    stdout: 'Login interrupted',
+    user: true,
+  });
+  const file = writeTranscript([caveat, command]);
+  let scan = scanForHumanPrompt(file, fs.statSync(file).size);
+  assert.equal(scan.found, false);
+  assert.equal(scan.command?.withdrawn, false);
+  assert.equal(promptScanLists(scan), true);
+  fs.appendFileSync(file, JSON.stringify(answer));
+  const partial = scanForHumanPrompt(file, fs.statSync(file).size, scan);
+  assert.deepEqual(partial, scan);
+  fs.appendFileSync(file, '\n');
+  scan = scanForHumanPrompt(file, fs.statSync(file).size, partial);
+  assert.equal(scan.command?.withdrawn, true);
+  assert.equal(promptScanLists(scan), false);
+  fs.appendFileSync(file, JSON.stringify(assistantAnswer('model work', 3)) + '\n');
+  scan = scanForHumanPrompt(file, fs.statSync(file).size, scan);
+  assert.equal(scan.found, true);
+  assert.equal(scanForHumanPrompt(file, fs.statSync(file).size, scan), scan);
+  fs.writeFileSync(file, JSON.stringify({ ...userPrompt('fresh file', 0), uuid: 'fresh' }) + '\n');
+  const shrunk = scanForHumanPrompt(file, fs.statSync(file).size, scan);
+  assert.equal(shrunk.found, false);
+  assert.equal(shrunk.command?.id, 'fresh');
+
+  const long = writeTranscript([
+    command,
+    ...Array.from({ length: 8 }, () => ({ type: 'bookkeeping', padding: 'x'.repeat(150_000) })),
+  ]);
+  const size = fs.statSync(long).size;
+  const meter = openReadWindow();
+  const pending = scanForHumanPrompt(long, size);
+  assert.equal(closeReadWindow(meter).bytes, size);
+  const retryMeter = openReadWindow();
+  assert.deepEqual(scanForHumanPrompt(long, size, pending), pending);
+  assert.equal(closeReadWindow(retryMeter).bytes, 0);
+  fs.appendFileSync(long, JSON.stringify(answer) + '\n');
+  const appendMeter = openReadWindow();
+  assert.equal(scanForHumanPrompt(long, fs.statSync(long).size, pending).command?.withdrawn, true);
+  assert.equal(closeReadWindow(appendMeter).bytes, fs.statSync(long).size - size);
+
+  const prefix = JSON.stringify(command) + '\n';
+  const padding =
+    JSON.stringify({ type: 'bookkeeping', padding: 'x'.repeat(256 * 1024 - Buffer.byteLength(prefix) - 45) }) + '\n';
+  fs.writeFileSync(long, prefix + padding + JSON.stringify(answer) + '\n');
+  assert.equal(scanForHumanPrompt(long, fs.statSync(long).size).command?.withdrawn, true);
+  fs.writeFileSync(long, JSON.stringify(userPrompt('new file', 0)) + '\n');
+  assert.equal(scanForHumanPrompt(long, fs.statSync(long).size, pending).found, true);
+});
+
+test('command admission keeps mismatched answers and process-ended commands, and confirms queued asks', () => {
+  const [caveat, command, answer] = localCommand('/usage-credits', '', 2, 'command', {
+    stdout: 'Login interrupted',
+    user: true,
+  });
+  const ended = { type: 'cost-state', startTime: ms(2), totalDuration: 1 };
+  for (const records of [
+    [caveat, command, { ...answer, parentUuid: 'other' }],
+    [caveat, command, ended, answer],
+    [caveat, command, typedMidTurn('next ask', 3), answer],
+    [caveat, command, answer, typedMidTurn('next ask', 3)],
+    [caveat, { ...command, uuid: undefined }, answer],
+  ]) {
+    assert.equal(holdsHumanPrompt(records.map((record) => JSON.stringify(record)).join('\n')), true);
+    const file = writeTranscript(records);
+    assert.equal(promptScanLists(scanForHumanPrompt(file, fs.statSync(file).size)), true);
+  }
+});
+
+test('fallback names skip withdrawn commands, retain restored commands and use only the head window', () => {
+  const records = localCommand('/usage-credits', '', 2, 'command', { stdout: 'Login interrupted', user: true });
+  const real = readSessionMeta(
+    writeTranscript([...records, userPrompt('actual task', 3), assistantAnswer('answer', 4)]),
+  );
+  assert.equal(real.title, 'actual task');
+  assert.equal(real.withdrawnPrompt, true);
+  const restored = readSessionMeta(writeTranscript([...records, assistantAnswer('model work', 3)]));
+  assert.equal(restored.title, '/usage-credits');
+  assert.equal(restored.withdrawnPrompt, undefined);
+  for (const queued of [
+    [...records.slice(0, 2), typedMidTurn('queued task', 3), records[2]],
+    [...records, typedMidTurn('queued task', 3)],
+    [...records, { type: 'bookkeeping', padding: 'x'.repeat(150 * 1024) }, typedMidTurn('queued task', 3)],
+  ]) {
+    const meta = readSessionMeta(writeTranscript(queued));
+    assert.equal(meta.title, 'queued task');
+    assert.equal(meta.withdrawnPrompt, true);
+  }
+  const [, command, answer] = records;
+  const file = writeTranscript([command, { type: 'bookkeeping', padding: 'x'.repeat(300 * 1024) }, answer]);
+  assert.equal(readSessionMeta(file, 512).title, '/usage-credits');
+  assert.equal(readSessionMeta(file, 1024 * 1024).title, '/usage-credits');
+});
+
+for (const [name, prompt] of [
+  ['typed prompt', { ...userPrompt('human task', 2), uuid: 'human' }],
+  ['unanswered unknown command', localCommand('/unknown-command', '', 2, 'command', {})[1]],
+] as const) {
+  test(`a peer prompt and its model reply retain admission for a pending ${name}`, () => {
+    const file = writeTranscript([prompt]);
+    const before = scanForHumanPrompt(file, fs.statSync(file).size);
+    assert.equal(before.found, false);
+    assert.equal(promptScanLists(before), true);
+    assert.deepEqual(readSessionTurnStarts(file).starts, [ms(2)]);
+    const peer = { ...userPrompt('peer wake', 3), uuid: 'peer', origin: { kind: 'peer' } };
+    fs.appendFileSync(file, JSON.stringify(peer) + '\n');
+    const afterPeer = scanForHumanPrompt(file, fs.statSync(file).size, before);
+    assert.equal(promptScanLists(afterPeer), true);
+    fs.appendFileSync(file, JSON.stringify(assistantAnswer('peer reply', 4)) + '\n');
+    assert.equal(holdsHumanPrompt(fs.readFileSync(file, 'utf8')), true);
+    const afterReply = scanForHumanPrompt(file, fs.statSync(file).size, afterPeer);
+    assert.equal(afterReply.found, true);
+    assert.equal(promptScanLists(afterReply), true);
+    assert.equal(promptScanLists(scanForHumanPrompt(file, fs.statSync(file).size)), true);
+    assert.deepEqual(readSessionTurnStarts(file).starts, [ms(2), ms(3)]);
+  });
+}
+
+test('a peer prompt and its model reply do not restore withdrawn command admission', () => {
+  const records = localCommand('/usage-credits', '', 2, 'command', { stdout: 'Login interrupted', user: true });
+  const file = writeTranscript(records);
+  const before = scanForHumanPrompt(file, fs.statSync(file).size);
+  const peer = { ...userPrompt('peer wake', 3), uuid: 'peer', origin: { kind: 'peer' } };
+  const reply = assistantAnswer('peer reply', 4);
+  fs.appendFileSync(file, [peer, reply].map((record) => JSON.stringify(record)).join('\n') + '\n');
+  assert.equal(holdsHumanPrompt(fs.readFileSync(file, 'utf8')), false);
+  const after = scanForHumanPrompt(file, fs.statSync(file).size, before);
+  assert.equal(after.found, false);
+  assert.equal(promptScanLists(after), false);
+  assert.deepEqual(readSessionTurnStarts(file).starts, [ms(3)]);
+});
+
+test('whole-file fallback naming reaches a first prompt record beyond the command evidence window', () => {
+  const file = writeTranscript([
+    {
+      ...userPrompt('screenshot task', 2),
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'screenshot task' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x'.repeat(150 * 1024) } },
+        ],
+      },
+    },
+  ]);
+  assert.equal(readSessionMeta(file).title, 'screenshot task');
+  const records = localCommand('/usage-credits', '', 2, 'command', { stdout: 'Login interrupted', user: true });
+  const later = writeTranscript([
+    ...records,
+    { type: 'bookkeeping', padding: 'x'.repeat(150 * 1024) },
+    userPrompt('later task', 3),
+  ]);
+  assert.equal(readSessionMeta(later).title, 'later task');
+  assert.equal(readSessionMeta(later).withdrawnPrompt, true);
+});
 const renameRecords = (): object[] => [
   userPrompt('first question', 0),
   assistantAnswer('first answer', 1),

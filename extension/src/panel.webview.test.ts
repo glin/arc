@@ -907,6 +907,9 @@ import {
   sessionOutcomeOf,
   sessionStatFactsOf,
   scanForPerson,
+  readSessionTurnStarts,
+  revalidatedCatalog,
+  revalidatedCatalogPaths,
   shortenTo,
 } from './transcript.ts';
 import {
@@ -921,6 +924,8 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert';
 import { parseSessionRequest } from './sessionrequests.ts';
 import { SessionWriteRequests } from './sessionwrites.ts';
+import { orderSessionCatalog, AGENT_NAMES } from './turnview.ts';
+import { searchablePrompt, searchableSummary } from './turnsearch.ts';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import { manifestMenu, menuGroups, whenHolds } from '../scripts/web-demo-menu.ts';
@@ -1154,6 +1159,344 @@ vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
 let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
 beforeAll(async () => {
   ({ PanelProvider } = await import('./panelhost.ts'));
+});
+
+test('command-only admission removes pending rows through every catalog path and releases list and search names', () => {
+  const directory = tempDir('command-catalog-');
+  const file = path.join(directory, 'command.jsonl');
+  const peerFile = path.join(directory, 'peer.jsonl');
+  fs.writeFileSync(
+    peerFile,
+    JSON.stringify({
+      type: 'user',
+      timestamp: '2026-10-09T05:30:52.052Z',
+      message: { role: 'user', content: 'another task' },
+    }) + '\n',
+  );
+  const peer = {
+    agent: 'claude',
+    sessionId: 'peer',
+    cwd: directory,
+    file: peerFile,
+    ...revisionOf(fs.statSync(peerFile, { bigint: true })),
+  };
+  const command = {
+    type: 'user',
+    uuid: 'B',
+    timestamp: '2026-10-09T05:30:52.052Z',
+    message: {
+      role: 'user',
+      content:
+        '<command-name>/usage-credits</command-name>\n<command-message>usage-credits</command-message>\n<command-args></command-args>',
+    },
+  };
+  const caveat = {
+    ...command,
+    uuid: 'A',
+    isMeta: true,
+    timestamp: '2026-10-09T05:30:52.053Z',
+    message: { role: 'user', content: '<local-command-caveat>Run in the CLI</local-command-caveat>' },
+  };
+  const answer = {
+    ...command,
+    uuid: 'C',
+    parentUuid: 'B',
+    message: { role: 'user', content: '<local-command-stdout>Login interrupted</local-command-stdout>' },
+  };
+  let sources: any[] = [];
+  const dependencies = {
+    fs,
+    fileRevisionOf: revisionOf,
+    revalidatedCatalog,
+    revalidatedCatalogPaths,
+    orderSessionCatalog,
+    readSession,
+    readCodexSession,
+    turnKey,
+    AGENT_NAMES,
+    searchablePrompt,
+    searchableSummary,
+    SEARCH_TAIL_BYTES: 1024 * 1024,
+    codexSessionIndexPath: () => '',
+    readThreadNames: () => ({ stamp: '', names: new Map() }),
+    projectsRoot: () => directory,
+    codexSessionsRoot: () => directory,
+    sessionFilesFor: () => sources,
+    readSessionCwd: () => directory,
+    staleMetas: () => [],
+    discoverClaudeSessionSpendSources: () => [],
+    codexSessionFiles: () => ({ walked: [], sessions: [], sources: [], subagents: [] }),
+  };
+  const compile = (name: string, body: string, parameters: string) => {
+    const code = ts.transpileModule(`function ${name}(${parameters}) { ${body} }`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    return new Function(...Object.keys(dependencies), code + `\nreturn ${name};`)(...Object.values(dependencies));
+  };
+  const listing = compile('listing', methodBody('private allSessions('), 'reuseCatalog = false');
+  const search = compile('search', methodBody('private searchCorpus('), 'only = null');
+  const refreshBody = methodBody('async refresh(');
+  const selected = compile(
+    'selected',
+    refreshBody.slice(
+      refreshBody.indexOf('let all = selectedOnly'),
+      refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
+    ) + '\nreturn all;',
+    'selectedOnly = true, reuseCatalog = true',
+  );
+  const childrenBody = methodBody('private async prepareClaudeChildren(');
+  const discovery = compile(
+    'discovery',
+    childrenBody.slice(
+      childrenBody.indexOf('const held = this.catalog?.sessions'),
+      childrenBody.indexOf('this.discoveryComplete = {'),
+    ) + '\nreturn sessions;',
+    'progress, spendSources = null',
+  );
+  for (const route of ['walk', 'targeted', 'reuse', 'selected', 'worker']) {
+    fs.writeFileSync(file, [caveat, command].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const source = () => ({
+      agent: 'claude',
+      sessionId: 'command',
+      cwd: directory,
+      file,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    });
+    sources = [source(), peer];
+    const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+      folders: () => [directory],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+      publishWindowState() {},
+      activityFor: () => 1,
+      codexMetas: { revision: 0, keys: () => [] },
+      codexStats: { keys: () => [] },
+      subagentDirectories: { sweep() {} },
+      cwds: new Map(),
+      humanScans: new Map(),
+      claudeChildren: [],
+      titles: new Map(),
+      sessionNames: new SessionNames(),
+      carriedNames: new Map(),
+      hidden: new Set(['command']),
+      pinnedTop: new Set(),
+      saved: { labels: { command: ['Review'] }, read: ['turn'], readTo: { command: 1 } },
+      showing: 'peer',
+      newDrafts: {},
+      awaitingSessionRecords: {},
+      metaFor(session: any) {
+        return this.titles.get(session.file);
+      },
+      corpus: new Map(),
+      threadNames: { stamp: '', names: new Map() },
+      allSessions(reuse = false) {
+        return listing.call(this, reuse);
+      },
+    });
+    const observe = () => {
+      const meta = readSessionMeta(file);
+      const next = {
+        ...source(),
+        label: meta.title ?? '',
+        fullLabel: meta.fullTitle ?? '',
+        nameSource: meta.titleSource ?? undefined,
+        nameAt: meta.titleAt,
+        headKey: meta.headKey,
+        withdrawnPrompt: meta.withdrawnPrompt,
+        outcome: meta.outcome,
+        stats: null,
+        agentRun: false,
+        activityMs: meta.activityMs,
+      };
+      const carried = carryDerivedTitleFacts(provider.titles.get(file), next);
+      provider.titles.set(file, provider.observeStoredName(source(), carried));
+    };
+    const read = () => {
+      if (route === 'worker') return discovery.call(provider, { roots: sources });
+      if (route === 'selected') return selected.call(provider);
+      provider.targetedRefreshPaths = route === 'targeted' ? [peerFile] : null;
+      return listing.call(provider, route === 'reuse');
+    };
+    assert.equal(listing.call(provider).length, 2);
+    provider.authoritativeCatalog = sources;
+    if (route === 'selected') {
+      const accepted = provider.authoritativeCatalog;
+      const acceptedBytes = accepted[1].size;
+      fs.appendFileSync(peerFile, JSON.stringify({ type: 'mode', mode: 'normal' }) + '\n');
+      const refreshed = read();
+      assert.ok(refreshed[1].size > acceptedBytes);
+      assert.equal(
+        provider.authoritativeCatalog,
+        accepted,
+        'revalidation without removal preserves accepted revisions',
+      );
+    }
+    observe();
+    assert.equal(provider.sessionLabel(source()).label, '/usage-credits');
+    fs.appendFileSync(file, JSON.stringify(answer) + '\n');
+    sources = [source(), peer];
+    assert.deepEqual(
+      read().map((session: any) => session.sessionId),
+      ['peer'],
+      route,
+    );
+    if (route === 'selected') assert.equal(provider.authoritativeCatalog.length, 1);
+    observe();
+    assert.equal(provider.sessionNames.get('command'), null, route);
+    fs.appendFileSync(
+      file,
+      JSON.stringify({ ...command, uuid: 'D', message: { role: 'user', content: 'actual task' } }) + '\n',
+    );
+    sources = [source(), peer];
+    provider.targetedRefreshPaths = [file];
+    assert.equal(listing.call(provider).length, 2, route);
+    observe();
+    assert.equal(provider.sessionLabel(source()).fullLabel, 'actual task', route);
+    assert.equal(
+      search.call(provider).find((entry: any) => entry.sessionId === 'command')?.sessionTitle,
+      'actual task',
+      route,
+    );
+    assert.equal(provider.hidden.has('command'), true);
+    assert.deepEqual(provider.saved.labels.command, ['Review']);
+    assert.deepEqual(provider.saved.read, ['turn']);
+    assert.equal(provider.saved.readTo.command, 1);
+  }
+});
+
+test('human admission uses walked sizes and stats reused rows only until evidence is confirmed', async () => {
+  const { scanForHumanPrompt, promptScanLists } = await import('./transcript.ts');
+  const directory = tempDir('command-size-');
+  const file = path.join(directory, 'command.jsonl');
+  const command = { type: 'user', uuid: 'command', message: { role: 'user', content: '/usage-credits' } };
+  fs.writeFileSync(file, JSON.stringify(command) + '\n');
+  const source: any = { agent: 'claude', file, size: fs.statSync(file).size };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), { humanScans: new Map() });
+  const stat = vi.fn<typeof fs.statSync>(fs.statSync);
+  const compiled = ts.transpileModule(
+    `function admission(session, sizeCurrent = false) { ${methodBody('private hasHumanPrompt(')} }`,
+    {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    },
+  ).outputText;
+  provider.hasHumanPrompt = new Function(
+    'fs',
+    'scanForHumanPrompt',
+    'promptScanLists',
+    compiled + '\nreturn admission;',
+  )({ statSync: stat }, scanForHumanPrompt, promptScanLists);
+  assert.equal(provider.hasHumanPrompt(source, true), true);
+  assert.equal(stat.mock.calls.length, 0);
+  fs.appendFileSync(
+    file,
+    JSON.stringify({
+      type: 'user',
+      parentUuid: 'command',
+      message: { content: '<local-command-stdout>Done</local-command-stdout>' },
+    }) + '\n',
+  );
+  assert.equal(provider.hasHumanPrompt(source), false);
+  assert.equal(stat.mock.calls.length, 1);
+  fs.appendFileSync(
+    file,
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'model work' } }) + '\n',
+  );
+  assert.equal(provider.hasHumanPrompt(source), true);
+  assert.equal(stat.mock.calls.length, 2);
+  assert.equal(provider.hasHumanPrompt(source), true);
+  assert.equal(stat.mock.calls.length, 2, 'confirmed evidence does not stat a stale row');
+});
+
+test('current whole-file facts archive a listed session with no turn and refuse unavailable or active facts', async () => {
+  const directory = tempDir('empty-session-archive-');
+  const file = path.join(directory, 'empty.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ type: 'mode', mode: 'normal' }) + '\n');
+  const source = {
+    agent: 'claude',
+    sessionId: 'empty',
+    cwd: directory,
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const meta = readSessionMeta(file);
+  const entry: any = {
+    ...source,
+    outcome: meta.outcome,
+    activityMs: meta.activityMs,
+    metadataWindow: meta.coverage,
+    starts: readSessionTurnStarts(file),
+  };
+  let visible = true;
+  let unread: any = undefined;
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    folders: () => [directory],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+    authoritativeCatalog: [source],
+    authoritativeCatalogScope: JSON.stringify([directory]),
+    anyVisible: () => visible,
+    watching: true,
+    pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
+    unreadCounts: () => new Map(unread ? [['empty', unread]] : []),
+    titles: new Map([[file, entry]]),
+    cache: new Map(),
+    pinnedTop: new Set(),
+    hidden: new Set(),
+    saved: normalizePanelState(null),
+    sessionLabel: () => ({ fullLabel: 'Empty' }),
+    agentRunFor: () => false,
+    readyHosts: new Set([{}]),
+    memento: { update: async () => {} },
+    sessionWriteQueue: Promise.resolve(),
+    running: new Set(),
+    asks: [],
+    post: async () => {},
+    postRail() {},
+    sessionAliases: new Map(),
+  });
+  const request: any = {
+    method: 'curate',
+    requester: null,
+    params: { sessionId: 'empty', action: 'archive', force: false, dryRun: false },
+  };
+  const row = () => provider.readSessionRequest({ ...request, method: 'sessions', params: {} }).sessions[0];
+  assert.deepEqual([row().runStatus, row().attention], ['none', 'idle']);
+  source.agent = 'codex';
+  assert.equal(row().runStatus, 'unknown');
+  source.agent = 'claude';
+  assert.equal((await provider.handleSessionRequest(request)).status, 'applied');
+  assert.equal(provider.hidden.has('empty'), true);
+  const refuse = async (pattern: RegExp) =>
+    assert.match((await provider.handleSessionRequest(request)).reason, pattern);
+  entry.metadataWindow = { whole: false, windowBytes: 1 };
+  assert.equal(row().runStatus, 'unknown');
+  await refuse(/unavailable/);
+  entry.metadataWindow = meta.coverage;
+  entry.starts = { whole: false, starts: [] };
+  await refuse(/unavailable/);
+  entry.starts = undefined;
+  await refuse(/unavailable/);
+  entry.starts = readSessionTurnStarts(file);
+  provider.titles.clear();
+  await refuse(/unavailable/);
+  provider.titles.set(file, entry);
+  visible = false;
+  await refuse(/unavailable/);
+  visible = true;
+  provider.running.add('claude:empty');
+  await refuse(/running or needs input/);
+  provider.running.clear();
+  provider.asks = [{ session: 'empty' }];
+  await refuse(/running or needs input/);
+  provider.asks = [];
+  entry.backgroundCommands = [{ toolUseId: 'background', startedAt: Date.now() }];
+  await refuse(/unavailable/);
+  delete entry.backgroundCommands;
+  unread = { count: 1, atLeast: false };
+  await refuse(/--force/);
+  assert.equal(
+    (await provider.handleSessionRequest({ ...request, params: { ...request.params, force: true } })).status,
+    'applied',
+  );
 });
 
 test('window session reads leave reader state and live capabilities unchanged and reject unknown IDs', () => {
@@ -5680,7 +6023,7 @@ test('a session joins the list only once a human has prompted it, and the cut st
   // Filter Claude sessions by human-prompt presence before combining the session catalog.
   sourceMatch(
     panelHostSource,
-    /const listed = claude\.filter\(\(s\) => this\.hasHumanPrompt\(s\)\);/,
+    /const listed = claude\.filter\(\(s\) => this\.hasHumanPrompt\(s, true\)\);/,
     'the peer-wake sessions still join the list',
   );
   sourceMatch(
@@ -5696,12 +6039,12 @@ test('a session joins the list only once a human has prompted it, and the cut st
   // Retain successful prompt detection and pass the previous scan cursor.
   sourceMatch(
     panelHostSource,
-    /if \(prev\?\.found\) \{ return true; \}/,
+    /if \(prev\?\.found && \(!sizeCurrent \|\| prev\.bytes <= session\.size\)\) \{ return true; \}/,
     'the found answer is not sticky, so every poll rescans every session',
   );
   sourceMatch(
     panelHostSource,
-    /scanForHumanPrompt\(session\.file, session\.size, prev\)/,
+    /scanForHumanPrompt\(session\.file, size, prev\)/,
     'the scan is not handed its cursor, so every poll reads every wake file whole',
   );
   // Trim caches against walked files, including sessions excluded by the prompt filter.
@@ -15409,7 +15752,7 @@ test('activity changes leave the rail order alone while a host remains open', ()
   // Reused catalogs also order by the current activity reading.
   sourceMatch(
     panelHostSource,
-    /const sorted = orderSessionCatalog\(held, \(session\) => this\.activityFor\(session\)\);/,
+    /const sorted = orderSessionCatalog\(admitted, \(session\) => this\.activityFor\(session\)\);/,
     'a reused catalog keeps the order it was walked in, so a session that grew stays put',
   );
   const rowsAt = panelHostSource.indexOf(
@@ -24956,6 +25299,7 @@ test.each([false, true])('the first reader child selection includes its parent (
     ensureProjectSpendWorkspace() {},
     createDraft: PanelProvider.prototype.createDraft,
     refresh: PanelProvider.prototype.refresh,
+    hasHumanPrompt: () => true,
     sendToHost: (_owner: unknown, message: Record<string, any>) => {
       posted.push(message);
       return Promise.resolve(true);

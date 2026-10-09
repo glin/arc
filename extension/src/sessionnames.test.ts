@@ -41,6 +41,17 @@ test('a prompt name never changes', () => {
   assert.deepEqual(resolveSessionName(null, name('first ask', 'prompt')), name('first ask', 'prompt'));
 });
 
+test('withdrawing a command releases prompt names while retaining custom and generated names', () => {
+  for (const source of ['prompt', 'custom', 'generated'] as const) {
+    const names = new SessionNames();
+    names.observe('command', name('/usage-credits', source), { size: 100 });
+    names.observe('command', null, { size: 200 }, true);
+    assert.equal(names.get('command')?.label ?? null, source === 'prompt' ? null : '/usage-credits');
+    names.observe('command', name('actual task', 'prompt'), { size: 300 }, true);
+    assert.equal(names.get('command')?.label, source === 'prompt' ? 'actual task' : '/usage-credits');
+  }
+});
+
 test('within one rank the later record wins, whatever order the reads report in', () => {
   const older = { ...name('Old title', 'generated'), at: 100 };
   const newer = { ...name('New title', 'generated'), at: 900 };

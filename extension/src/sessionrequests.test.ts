@@ -70,6 +70,7 @@ test('session writes retain one acceptance across equal concurrent retries and r
 test('archive refuses current live work and stale attention even with force, while completed unread requires force', () => {
   const row = { facts: 'current', runStatus: 'done', attention: 'idle' } as SessionListingRow;
   assert.equal(archiveRefusal(row, false), null);
+  assert.equal(archiveRefusal({ ...row, runStatus: 'none' }, false), null);
   assert.match(archiveRefusal({ ...row, attention: 'unread' }, false)!, /--force/);
   assert.equal(archiveRefusal({ ...row, attention: 'unread' }, true), null);
   for (const runStatus of ['running', 'waiting', 'subagents', 'background'] as const)
@@ -77,6 +78,7 @@ test('archive refuses current live work and stale attention even with force, whi
   for (const facts of ['stale', 'unparsed'] as const)
     assert.match(archiveRefusal({ ...row, facts }, true)!, /unavailable/);
   assert.match(archiveRefusal({ ...row, attention: 'unknown' }, true)!, /unavailable/);
+  assert.match(archiveRefusal({ ...row, runStatus: 'unknown' }, true)!, /unavailable/);
 });
 
 test('the authenticated window channel retains write acceptance across a disconnected caller and rejects conflicting retries', async () => {

@@ -1112,15 +1112,12 @@ function scanSessionCwd(file: string, onUnreadable?: () => void): string | null 
   return null;
 }
 
-// True when complete lines contain a typed prompt without a known peer origin.
-// Meta user records do not count. Missing and unknown origin kinds remain eligible.
+// Typed prompts without a known peer origin admit a session while pending or confirmed.
+// A paired CLI answer withdraws that evidence until model work restores it.
 export function holdsHumanPrompt(text: string): boolean {
-  for (const line of text.split('\n')) {
-    if (humanPromptIn(line, true)) {
-      return true;
-    }
-  }
-  return false;
+  const scan: HumanPromptScan = { bytes: 0, found: false };
+  scanPromptLines(text, scan);
+  return promptScanLists(scan);
 }
 
 // Returns a typed prompt record so callers can read its timestamp.
@@ -1228,21 +1225,57 @@ export function readSessionTurnStarts(file: string, bytes = TURN_START_BYTES, ch
   return readTurnStartsFromTail(file, (lines) => sessionTurnStartsIn(lines, childTranscript), bytes);
 }
 
+// A command's identity and pairing state in file order.
+interface ClaudePromptPair {
+  id: string;
+  at: number;
+  compact: boolean;
+  withdrawn: boolean;
+  queuedAt: number | null;
+}
+
+function promptPair(o: Record<string, unknown>, at: number): ClaudePromptPair | null {
+  const id = claudeRecordId(o);
+  return id ? { id, at, compact: claudeCompactPrompt(o), withdrawn: false, queuedAt: null } : null;
+}
+
+// Pairing follows file order and record IDs. Each reader owns the evidence it withdraws or restores.
+function advancePromptPair(
+  command: ClaudePromptPair,
+  o: Record<string, unknown>,
+): 'queued' | 'withdraw' | 'restore' | 'confirm' | null {
+  const queued = readerQueuedAsk(o);
+  if (queued) {
+    if (!command.withdrawn) {
+      command.compact = false;
+      command.queuedAt ??= queued.at;
+    }
+    return 'queued';
+  }
+  if (!command.withdrawn && claudeProcessEndedAt(o) !== null) return 'confirm';
+  if (
+    (command.compact && claudeCompactAnswer(o, command.id, command.at)) ||
+    claudeLocalAnswer(o)?.parent === command.id
+  ) {
+    if (command.withdrawn) return null;
+    command.withdrawn = true;
+    return 'withdraw';
+  }
+  if (claudeModelWorks(o)) return command.withdrawn ? 'restore' : 'confirm';
+  return null;
+}
+
 // A typed prompt stays a pending command until model work or a process end. The CLI's own answer
 // to it, or a manual compaction boundary for `/compact`, withdraws its start until model work restores it.
 // A prompt the reader queues before or after that answer starts a turn of its own in the command's place.
 function sessionTurnStartsIn(lines: string[], childTranscript = false): number[] {
   const starts: number[] = [];
-  let command: {
-    id: string;
-    at: number;
-    index: number;
-    compact: boolean;
-    withdrawn: boolean;
-    queued: boolean;
-    // The first prompt queued while the command waited for its answer.
-    queuedAt: number | null;
-  } | null = null;
+  let command:
+    | (ClaudePromptPair & {
+        index: number;
+        queued: boolean;
+      })
+    | null = null;
   for (const line of lines) {
     if (
       !line.includes('"type":"user"') &&
@@ -1261,42 +1294,21 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
         command = null;
         const at = Date.parse(String(o.timestamp));
         if (!Number.isFinite(at)) continue;
-        const id = claudeRecordId(o);
-        if (id)
-          command = {
-            id,
-            at,
-            index: starts.length,
-            compact: claudeCompactPrompt(o),
-            withdrawn: false,
-            queued: false,
-            queuedAt: null,
-          };
+        const pair = promptPair(o, at);
+        if (pair) command = { ...pair, index: starts.length, queued: false };
         starts.push(at);
-      } else if (command && readerQueuedAsk(o)) {
-        if (!command.withdrawn) {
-          // A queued prompt keeps `/compact` a turn, and waits for the command's own answer.
-          command.compact = false;
-          command.queuedAt ??= readerQueuedAsk(o)!.at;
-        } else if (!command.queued) {
+      } else if (command) {
+        const step = advancePromptPair(command, o);
+        if (step === 'queued' && command.withdrawn && !command.queued) {
           starts.push(readerQueuedAsk(o)!.at);
           command.queued = true;
-        }
-      } else if (command && !command.withdrawn && claudeProcessEndedAt(o) !== null) {
-        command = null;
-      } else if (
-        command &&
-        ((command.compact && claudeCompactAnswer(o, command.id, command.at)) ||
-          claudeLocalAnswer(o)?.parent === command.id)
-      ) {
-        if (!command.withdrawn) {
+        } else if (step === 'withdraw') {
           starts.splice(command.index, 1, ...(command.queuedAt === null ? [] : [command.queuedAt]));
           command.queued = command.queuedAt !== null;
+        } else if (step === 'restore' || step === 'confirm') {
+          if (step === 'restore') starts.splice(command.index, command.queued ? 1 : 0, command.at);
+          command = null;
         }
-        command.withdrawn = true;
-      } else if (command && claudeModelWorks(o)) {
-        if (command.withdrawn) starts.splice(command.index, command.queued ? 1 : 0, command.at);
-        command = null;
       }
     } catch {
       /* a partial line has no turn start */
@@ -1305,23 +1317,103 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
   return starts;
 }
 
-// Complete-line byte cursor and whether a human prompt has been found.
-// A found prompt remains found. Unread bytes are scanned on subsequent appends.
+// Complete-line cursor and confirmed human evidence. Pending and withdrawn pairs resume on append.
 export interface HumanPromptScan {
   bytes: number;
   found: boolean;
+  command?: ClaudePromptPair;
+  prompt?: string;
+  queuedPrompt?: string;
+  // Earlier fallback prompts withdrawn before the currently retained prompt.
+  released?: boolean;
 }
 
-// Resumes from the complete-line cursor until the first human prompt.
+export function promptScanLists(scan: HumanPromptScan): boolean {
+  return scan.found || !!(scan.command && !scan.command.withdrawn);
+}
+
+function scanPromptLines(
+  text: string,
+  scan: HumanPromptScan,
+  {
+    refusePeer = true,
+    childTranscript = false,
+    confirmQueued = true,
+    capturePrompt = false,
+    pairBytes = Infinity,
+  }: {
+    refusePeer?: boolean;
+    childTranscript?: boolean;
+    confirmQueued?: boolean;
+    capturePrompt?: boolean;
+    pairBytes?: number;
+  } = {},
+): boolean {
+  let bytes = 0;
+  for (const line of text.split('\n')) {
+    if (pairBytes !== Infinity) bytes += Buffer.byteLength(line) + 1;
+    const withinPairWindow = bytes <= pairBytes;
+    if (!withinPairWindow && scan.command && !scan.command.withdrawn) {
+      scan.found = true;
+      return true;
+    }
+    if (!claudeSessionLineMayAffectRead(line)) continue;
+    let o: Record<string, unknown>;
+    try {
+      o = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!o || typeof o !== 'object' || (o.isSidechain && !childTranscript)) continue;
+    if (capturePrompt && scan.command) {
+      const queued = readerQueuedAsk(o);
+      if (queued) scan.queuedPrompt ??= queued.text;
+    }
+    if (o.type === 'user' && isTypedPrompt(o, childTranscript)) {
+      if (refusePeer && (o.origin as { kind?: string } | undefined)?.kind === 'peer') {
+        if (scan.command && !scan.command.withdrawn) {
+          scan.found = true;
+          return true;
+        }
+        scan.command = undefined;
+        continue;
+      }
+      if (scan.command && !scan.command.withdrawn) {
+        scan.found = true;
+      } else {
+        if (scan.command?.withdrawn) scan.released = true;
+        if (capturePrompt) {
+          scan.prompt =
+            scan.command?.withdrawn && scan.queuedPrompt
+              ? scan.queuedPrompt
+              : textOf((o.message as { content?: unknown } | undefined)?.content);
+        }
+        scan.command =
+          scan.command?.withdrawn && scan.queuedPrompt ? undefined : (promptPair(o, stamp(o.timestamp)) ?? undefined);
+        scan.queuedPrompt = undefined;
+        scan.found = !scan.command || !withinPairWindow;
+      }
+    } else if (scan.command && withinPairWindow) {
+      const step = advancePromptPair(scan.command, o);
+      if (step === 'restore' || step === 'confirm' || (step === 'queued' && confirmQueued)) scan.found = true;
+    }
+    if (scan.found) return true;
+  }
+  return false;
+}
+
+// Resumes from the complete-line cursor until human evidence is confirmed.
 // Preserve UTF-8 bytes across chunks and incomplete trailing lines. Shrinkage restarts scanning.
 export function scanForHumanPrompt(file: string, size: number, prev?: HumanPromptScan): HumanPromptScan {
-  if (prev?.found) {
+  if (prev?.found && prev.bytes <= size) {
     return prev;
   }
-  let found = false;
   const from = prev && prev.bytes <= size ? prev.bytes : 0;
-  const { bytes } = readCompleteLines(file, from, size, (text) => (found = holdsHumanPrompt(text)));
-  return { bytes, found };
+  const scan: HumanPromptScan =
+    from && prev ? { ...prev, ...(prev.command ? { command: { ...prev.command } } : {}) } : { bytes: 0, found: false };
+  const { bytes } = readCompleteLines(file, from, size, (text) => scanPromptLines(text, scan));
+  scan.bytes = bytes;
+  return scan;
 }
 
 // Visits complete lines between `from` and `size`, returning the exclusive complete-line byte cursor.
@@ -1505,27 +1597,26 @@ function headKeyOf(firstLine: string): string {
   return createHash('sha1').update(firstLine).digest('hex').slice(0, 16);
 }
 
-function firstPromptIn(lines: string[], childTranscript: boolean): { short: string | null; full: string | null } {
-  for (const line of lines) {
-    if (line.indexOf('"type":"user"') < 0) {
-      continue;
-    }
-    let o: Record<string, unknown>;
-    try {
-      o = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    if (!isTypedPrompt(o, childTranscript)) {
-      continue;
-    }
-    const source = cleanPrompt(textOf((o.message as { content?: unknown }).content));
-    const short = normalizeSessionTitle(source);
-    if (short) {
-      return { short, full: normalizeFullSessionTitle(source) };
-    }
-  }
-  return { short: null, full: null };
+function firstPromptIn(
+  lines: string[],
+  childTranscript: boolean,
+): { short: string | null; full: string | null; withdrawnPrompt?: boolean } {
+  const scan: HumanPromptScan = { bytes: 0, found: false };
+  // Whole reads retain naming reach. Command pairing uses evidence inside the head window alone.
+  scanPromptLines(lines.join('\n'), scan, {
+    refusePeer: false,
+    childTranscript,
+    confirmQueued: false,
+    capturePrompt: true,
+    pairBytes: SESSION_HEAD_BYTES,
+  });
+  const withdrawnPrompt = scan.released || (!scan.found && scan.command?.withdrawn);
+  const source = cleanPrompt(promptScanLists(scan) ? (scan.prompt ?? '') : (scan.queuedPrompt ?? ''));
+  return {
+    short: normalizeSessionTitle(source) || null,
+    full: normalizeFullSessionTitle(source) || null,
+    ...(withdrawnPrompt ? { withdrawnPrompt: true } : {}),
+  };
 }
 
 // Whole lines from the head of a file. The last one is dropped when it runs past the
@@ -1574,7 +1665,7 @@ function sessionTitleOf(
   file: string,
   read: TailRead,
   childTranscript: boolean,
-): { title: SessionTitle; headKey?: string } {
+): { title: SessionTitle; headKey?: string; withdrawnPrompt?: boolean } {
   const recorded = recordedTitlePairIn(read.lines, read.offset);
   const head = read.whole
     ? { lines: read.lines, ...(read.lines.length > 1 ? { key: headKeyOf(read.lines[0]) } : {}) }
@@ -1586,6 +1677,7 @@ function sessionTitleOf(
   return {
     title: prompt.short ? { ...prompt, source: 'prompt', at: 0 } : { short: null, full: null, source: null },
     headKey: head.key,
+    ...(prompt.withdrawnPrompt ? { withdrawnPrompt: true } : {}),
   };
 }
 
@@ -1808,6 +1900,7 @@ function withoutCommand(open: readonly BackgroundCommand[], id: string): readonl
 }
 
 export interface SessionMeta {
+  withdrawnPrompt?: boolean;
   coverage?: MetadataCoverage;
   title: string | null;
   fullTitle: string | null;
@@ -1834,13 +1927,14 @@ export function readSessionMeta(
   childTranscript = false,
 ): SessionMeta {
   const read = tailOf(file, bytes);
-  const { title, headKey } = sessionTitleOf(file, read, childTranscript);
+  const { title, headKey, withdrawnPrompt } = sessionTitleOf(file, read, childTranscript);
   const tail = outcomeIn(read.lines, childTranscript);
   return {
     ...(read.success ? { coverage: { whole: read.whole, windowBytes: bytes } } : {}),
     title: title.short,
     fullTitle: title.full,
     titleSource: title.source,
+    ...(withdrawnPrompt ? { withdrawnPrompt: true } : {}),
     ...(title.source && title.at !== undefined ? { titleAt: title.at } : {}),
     ...(headKey ? { headKey } : {}),
     activityMs: activityIn(read.lines),

@@ -29,7 +29,7 @@ export interface SessionListingRow {
   labels: { name: string; source: 'reader' }[];
   pinned: boolean;
   archived: boolean;
-  runStatus: RailStatus | 'unknown';
+  runStatus: RailStatus | 'none' | 'unknown';
   attention: SessionAttention;
   lastActivity: number | null;
   parent: { id: string; relation: SessionParentEdge['relation'] | 'reader' } | null;
@@ -177,12 +177,12 @@ export function sessionReadStatus(
 
 export function sessionAttention(
   visible: boolean,
-  status: RailStatus | undefined,
+  status: RailStatus | 'none' | undefined,
   unread: boolean | null,
 ): SessionAttention {
   if (!visible) return 'unknown';
   if (status === 'waiting') return 'input';
-  if (railStatusRuns(status)) return 'running';
+  if (status !== 'none' && railStatusRuns(status)) return 'running';
   if (unread === true) return 'unread';
   return status !== undefined && unread !== null ? 'idle' : 'unknown';
 }

@@ -1016,6 +1016,7 @@ async function execute(
         ...(claude?.title && claude.titleSource ? { nameSource: claude.titleSource } : {}),
         ...(claude?.title && claude.titleSource && claude.titleAt !== undefined ? { nameAt: claude.titleAt } : {}),
         ...(claude?.headKey ? { headKey: claude.headKey } : {}),
+        ...(claude?.withdrawnPrompt ? { withdrawnPrompt: true } : {}),
       },
     };
   }

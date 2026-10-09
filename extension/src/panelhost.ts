@@ -70,6 +70,7 @@ import {
   trustedListedRevisions,
   revalidatedCatalogPaths,
   scanForHumanPrompt,
+  promptScanLists,
   createClaudeUsageLineReducer,
   type ClaudeUsageReducerState,
   isInside,
@@ -1952,11 +1953,13 @@ export class PanelProvider implements vscode.Disposable {
       const held = this.cache.get(source.file);
       const key = runningKey(source.agent, source.sessionId);
       const witness = this.sessionRunWitnesses?.get(key);
-      const status = sessionReadStatus(
+      const running = sessionRunning([...(this.running ?? [])], source.agent, source.sessionId);
+      const waiting = this.asks?.some((ask) => ask.session === source.sessionId) ?? false;
+      let status: SessionListingRow['runStatus'] | undefined = sessionReadStatus(
         source.sessionId,
         outcome,
-        sessionRunning([...(this.running ?? [])], source.agent, source.sessionId),
-        this.asks?.some((ask) => ask.session === source.sessionId) ?? false,
+        running,
+        waiting,
         this.runningSinceKeys?.get(key) ?? witness?.startedAt,
         witness?.exit?.at,
         {
@@ -1975,6 +1978,19 @@ export class PanelProvider implements vscode.Disposable {
       const heldEdge = edges.get(source.sessionId);
       const edge = heldEdge && ids.has(heldEdge.parent) ? heldEdge : undefined;
       const count = counts?.get(source.sessionId);
+      if (
+        source.agent === 'claude' &&
+        status === undefined &&
+        current &&
+        meta.metadataWindow?.whole === true &&
+        meta.starts?.whole === true &&
+        meta.starts.starts.length === 0 &&
+        outcome === null &&
+        !running &&
+        !waiting &&
+        !meta.backgroundCommands?.length
+      )
+        status = 'none';
       return {
         id: source.sessionId,
         provider: source.agent,
@@ -1991,7 +2007,11 @@ export class PanelProvider implements vscode.Disposable {
         attention: sessionAttention(
           visible,
           status,
-          current && count && !(count.atLeast && count.count === 0) ? count.count > 0 : null,
+          current && count && !(count.atLeast && count.count === 0)
+            ? count.count > 0
+            : status === 'none'
+              ? false
+              : null,
         ),
         lastActivity: current ? meta.activityMs : null,
         parent: parent
@@ -6806,6 +6826,21 @@ export class PanelProvider implements vscode.Disposable {
             }
           }) ?? this.authoritativeCatalog;
       }
+      if (selectedOnly) {
+        const admission = new Map<string, boolean>();
+        const admits = (session: SessionFile): boolean => {
+          const held = admission.get(session.file);
+          if (held !== undefined) return held;
+          const listed = session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session);
+          admission.set(session.file, listed);
+          return listed;
+        };
+        all = all.filter(admits);
+        if (this.authoritativeCatalog) {
+          const admitted = this.authoritativeCatalog.filter(admits);
+          if (admitted.length !== this.authoritativeCatalog.length) this.authoritativeCatalog = admitted;
+        }
+      }
       this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);
       if (this.repositoryScopeReady) {
         this.startupHistory?.stage('openingsEnumerated');
@@ -8454,7 +8489,10 @@ export class PanelProvider implements vscode.Disposable {
         }
       });
       if (held) {
-        const sorted = orderSessionCatalog(held, (session) => this.activityFor(session));
+        const admitted = held.filter(
+          (session) => session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
+        );
+        const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         this.claudeParents = sorted.filter((session) => session.childTranscript !== true);
         this.catalog = { folders: folderPrint, sessions: sorted };
         this.catalogWalked = false;
@@ -8471,7 +8509,10 @@ export class PanelProvider implements vscode.Disposable {
       });
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
-        const sorted = orderSessionCatalog(held, (session) => this.activityFor(session));
+        const admitted = held.filter(
+          (session) => session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
+        );
+        const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         // Retain the updated rows so later selections reuse their current revisions.
         this.catalog = { folders: folderPrint, sessions: sorted };
         this.catalogWalked = false;
@@ -8525,8 +8566,8 @@ export class PanelProvider implements vscode.Disposable {
     const codex = listing.sessions;
     this.claudeParents = [...claude, ...codex];
     this.walkedClaude = claude.map((s) => s.file);
-    // Filter Claude peer-wake transcripts before catalog publication. Sessions enter this list after a human prompt is found.
-    const listed = claude.filter((s) => this.hasHumanPrompt(s));
+    // Exclude Claude peer wakes and commands answered by the CLI before catalog publication.
+    const listed = claude.filter((s) => this.hasHumanPrompt(s, true));
     this.subagentDirectories.sweep();
     // Order the catalog by recorded activity before initializing stable session-list placement.
     const walked = new Set([
@@ -8796,7 +8837,9 @@ export class PanelProvider implements vscode.Disposable {
     const held = this.catalog?.sessions ?? [];
     const discoveryRoots =
       progress.roots ?? held.filter((session) => session.agent !== 'claude' || session.childTranscript !== true);
-    const roots = discoveryRoots.filter((session) => session.agent !== 'claude' || this.hasHumanPrompt(session));
+    const roots = discoveryRoots.filter(
+      (session) => session.agent !== 'claude' || this.hasHumanPrompt(session, !!progress.roots),
+    );
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
       this.codexSpendSources = spendSources.codex;
@@ -8836,15 +8879,24 @@ export class PanelProvider implements vscode.Disposable {
     return dropped;
   }
 
-  // Reuse a successful human-prompt scan. Otherwise resume scanning from the retained cursor.
-  private hasHumanPrompt(session: SessionFile): boolean {
+  // Reuse confirmed admission. Pending and withdrawn commands resume from the retained cursor.
+  private hasHumanPrompt(session: SessionFile, sizeCurrent = false): boolean {
     const prev = this.humanScans.get(session.file);
-    if (prev?.found) {
+    if (prev?.found && (!sizeCurrent || prev.bytes <= session.size)) {
       return true;
     }
-    const next = scanForHumanPrompt(session.file, session.size, prev);
+    // Reused catalogs update selected or watcher-named rows alone. Pending evidence needs the current file end.
+    let size = session.size;
+    if (!sizeCurrent) {
+      try {
+        size = fs.statSync(session.file).size;
+      } catch {
+        return false;
+      }
+    }
+    const next = scanForHumanPrompt(session.file, size, prev);
     this.humanScans.set(session.file, next);
-    return next.found;
+    return promptScanLists(next);
   }
 
   // Selected sessions supply turn cards. Session-list facts come from metadata.
@@ -9338,6 +9390,7 @@ export class PanelProvider implements vscode.Disposable {
         { size: entry.size, ...(entry.sourceIdentity ?? { dev: session.dev, ino: session.ino }) },
         entry.headKey,
       ),
+      entry.withdrawnPrompt,
     );
     const held = this.sessionNames.get(session.sessionId);
     return held ? withSessionName(entry, held) : entry;

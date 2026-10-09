@@ -267,7 +267,7 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   );
   const script =
     "import { buildExtension } from './esbuild.mjs'; const close = await buildExtension({watch:true}); console.log('watch ready'); process.stdin.once('data', async () => { await close(); process.stdin.destroy(); });";
-  for (const file of ['panelhost.ts', 'diagnosticslog.ts']) {
+  for (const file of ['panelhost.ts', 'diagnosticslog.ts', 'transcript.ts']) {
     fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
   }
   const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {

@@ -33,6 +33,8 @@ import {
 } from './transcript';
 
 export interface DerivedTitleEntry {
+  // Head-window evidence releases a command's provisional fallback name.
+  withdrawnPrompt?: boolean;
   mtimeMs: number;
   size: number;
   label: string;
@@ -157,9 +159,10 @@ export function carryDerivedTitleFacts(
 }
 
 // Carries the Claude session name through `resolveSessionName`.
-// Shrinkage or a changed first record releases the held name.
+// Withdrawal releases prompt names. Shrinkage or a changed first record releases every name.
 function carrySessionName(previous: DerivedTitleEntry | undefined, next: DerivedTitleEntry): DerivedTitleEntry {
-  const held = storedSessionName(previous);
+  const stored = storedSessionName(previous);
+  const held = next.withdrawnPrompt && stored?.source === 'prompt' ? null : stored;
   if (!previous || !held || replacedTranscript(previous, next)) {
     return next;
   }
@@ -369,7 +372,7 @@ interface StoredCache {
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive this version change.
-export const VERSION = 49;
+export const VERSION = 50;
 
 export class DerivedCacheCheckpointState {
   private generation = 0;
@@ -748,7 +751,8 @@ function titleEntry(value: unknown): value is DerivedTitleEntry {
       value.nameSource === 'generated' ||
       value.nameSource === 'prompt') &&
     (value.nameAt === undefined || (typeof value.nameAt === 'number' && Number.isFinite(value.nameAt))) &&
-    (value.headKey === undefined || typeof value.headKey === 'string')
+    (value.headKey === undefined || typeof value.headKey === 'string') &&
+    (value.withdrawnPrompt === undefined || typeof value.withdrawnPrompt === 'boolean')
   );
 }
 

@@ -84,6 +84,7 @@ export class SessionWriteRequests {
   }
 }
 
+// Current no-turn rows use the same archive checks as completed turns.
 export function archiveRefusal(row: SessionListingRow, force: boolean): string | null {
   if (
     ['running', 'waiting', 'subagents', 'background'].includes(row.runStatus) ||

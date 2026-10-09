@@ -1001,6 +1001,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
     const RAIL_NAME_LIMIT = 200;
     export class Harness {
+      hasHumanPrompt() { return true; }
       failSessionLoading() {}
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine(() => {});
@@ -1241,6 +1242,7 @@ function completeDiscoveryHarness(
       set showing(value) { if (value !== this._showing) this.selections.push(value); this._showing = value; }
       abandonDraft() { return false; }
       anyVisible() { return true; } allSessions() { return this.partial; } folders() { return ['project']; }
+      hasHumanPrompt() { return true; }
       activityFor(session) { return session.activity; }
       // A discovery that runs while no further pass is pending stands for a complete reply under the current roots that answered the
       // held catalog.

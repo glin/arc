@@ -1,7 +1,8 @@
 // Claude session surfaces share one name: the session list card, heading, compaction cards, live card, and search.
 // `custom` comes from the newest `custom-title` record. Arc renames, `/rename`, and `claude --name` write that record.
 // `generated` comes from the newest CLI `ai-title` record. `prompt` comes from the first user prompt.
-// Different read windows find different sources. Held names never fall to a lower rank, and held `prompt` names never change.
+// Different read windows find different sources. Held names never fall to a lower rank.
+// A paired CLI answer releases a held prompt name. Other prompt names stay fixed.
 // A refresh with fewer sources preserves the held name.
 
 export type SessionNameSource = 'custom' | 'generated' | 'prompt';
@@ -150,9 +151,15 @@ export class SessionNames {
 
   // Applies one read result. A changed file identity clears the old name before ranking the update.
   // Returns whether the held name changed.
-  observe(sessionId: string, update: SessionName | null | undefined, file?: SessionFileIdentity): boolean {
+  observe(
+    sessionId: string,
+    update: SessionName | null | undefined,
+    file?: SessionFileIdentity,
+    withdrawnPrompt = false,
+  ): boolean {
     const before = this.held.get(sessionId) ?? null;
     let held = before;
+    if (withdrawnPrompt && held?.source === 'prompt') held = null;
     if (file) {
       const seen = this.files.get(sessionId);
       const replaced = !!seen && replacedTranscript(seen, file);
