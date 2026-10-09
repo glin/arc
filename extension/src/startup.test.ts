@@ -2426,7 +2426,8 @@ test('host delta checkpoints retain completion and source progress through cance
     checkpointDerivedCache() {},
   });
   const controller = new AbortController();
-  let worker = titleWorker();
+  const quantumClock = 'let tick = 0; performance.now = () => ++tick;';
+  let worker = titleWorker(quantumClock);
   let messages = 0;
   let header: unknown;
   try {
@@ -2437,18 +2438,23 @@ test('host delta checkpoints retain completion and source progress through cance
         signal: AbortSignal,
         accept: (result: ProgressiveResult) => boolean,
       ) =>
-        worker.run(request, generation, signal, (result) => {
-          assert.equal(result.value.kind, 'claude-children-delta');
-          if (result.value.kind !== 'claude-children-delta') return;
-          messages++;
-          assert.equal(accept(result), true);
-          if (messages === 1) header = provider.discoveryCheckpoint;
-          else {
-            assert.equal(result.value.checkpoint, undefined, 'a source quantum replayed the epoch header');
-            assert.equal(provider.discoveryCheckpoint, header);
-            controller.abort();
-          }
-        }),
+        worker.run(
+          request.kind === 'claude-children' ? { ...request, quantumBytes: 256 * 1024 } : request,
+          generation,
+          signal,
+          (result) => {
+            assert.equal(result.value.kind, 'claude-children-delta');
+            if (result.value.kind !== 'claude-children-delta') return;
+            messages++;
+            assert.equal(accept(result), true);
+            if (messages === 1) header = provider.discoveryCheckpoint;
+            else {
+              assert.equal(result.value.checkpoint, undefined, 'a source quantum replayed the epoch header');
+              assert.equal(provider.discoveryCheckpoint, header);
+              controller.abort();
+            }
+          },
+        ),
     };
     assert.equal(await provider.prepareClaudeChildren(4, controller.signal), false);
     assert.equal(messages, 2);
@@ -2469,7 +2475,7 @@ test('host delta checkpoints retain completion and source progress through cance
     provider.discoveryCompleted = undefined;
     provider.claudeChildReferenceEntries = restored.claudeChildReferences;
     worker.stop();
-    worker = titleWorker();
+    worker = titleWorker(quantumClock);
     const resumed = new AbortController();
     provider.progressiveWorker = {
       run: (
@@ -2478,13 +2484,18 @@ test('host delta checkpoints retain completion and source progress through cance
         signal: AbortSignal,
         accept: (result: ProgressiveResult) => boolean,
       ) =>
-        worker.run(request, generation, signal, (result) => {
-          assert.equal(result.value.kind, 'claude-children-delta');
-          if (result.value.kind !== 'claude-children-delta') return;
-          assert.equal(result.value.checkpoint, undefined, 'restart replayed the retained epoch header');
-          assert.equal(accept(result), true);
-          if (result.value.referenceEntries[0][0] === pendingFile) resumed.abort();
-        }),
+        worker.run(
+          request.kind === 'claude-children' ? { ...request, quantumBytes: 256 * 1024 } : request,
+          generation,
+          signal,
+          (result) => {
+            assert.equal(result.value.kind, 'claude-children-delta');
+            if (result.value.kind !== 'claude-children-delta') return;
+            assert.equal(result.value.checkpoint, undefined, 'restart replayed the retained epoch header');
+            assert.equal(accept(result), true);
+            if (result.value.referenceEntries[0][0] === pendingFile) resumed.abort();
+          },
+        ),
     };
     assert.equal(await provider.prepareClaudeChildren(4, resumed.signal), false);
     assert.ok(provider.claudeChildReferenceEntries.get(pendingFile).claudeCursor.offset > offset);

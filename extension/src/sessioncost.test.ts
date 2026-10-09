@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { test, vi } from 'vitest';
+import { afterEach, beforeEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
 import * as projectSpend from './projectspend';
 import * as codexReader from './codex';
@@ -19,6 +19,15 @@ import {
 function directory(): string {
   return tempDir('session-cost-');
 }
+
+const defaultRoots = { codexSessions: directory(), projects: directory() };
+
+beforeEach(() => {
+  vi.stubEnv('ARC_CODEX_ROOT', defaultRoots.codexSessions);
+  vi.stubEnv('ARC_PROJECTS_ROOT', defaultRoots.projects);
+});
+
+afterEach(() => vi.unstubAllEnvs());
 
 function write(file: string, records: object[]): string {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -1028,13 +1037,25 @@ test('Codex billing records count unique requests alongside matching token snaps
       payload: { response_id: 'unmatched', turn_id: 'turn-1', usage: usage(20, 3) },
     },
   ]);
-  const report = sessionCostReport(file);
-  assert.equal(report.parent.requests, 4);
-  assert.equal(report.parent.uncachedInputTokens, 168_605);
-  assert.deepEqual(report.parent.models, ['gpt-5.6-terra', 'gpt-6-sol']);
-  assert.equal(report.parent.coverage, 'billed-with-unknown-coverage');
-  assert.equal(report.parent.costUsd, null);
-  assert.equal(report.parent.snapshotEvidence?.count, 1);
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const reads = vi.spyOn(nativeFs, 'readdirSync');
+  syncBuiltinESMExports();
+  try {
+    const report = sessionCostReport(file);
+    assert.deepEqual(
+      reads.mock.calls.map(([root]) => String(root)),
+      [defaultRoots.codexSessions],
+    );
+    assert.equal(report.parent.requests, 4);
+    assert.equal(report.parent.uncachedInputTokens, 168_605);
+    assert.deepEqual(report.parent.models, ['gpt-5.6-terra', 'gpt-6-sol']);
+    assert.equal(report.parent.coverage, 'billed-with-unknown-coverage');
+    assert.equal(report.parent.costUsd, null);
+    assert.equal(report.parent.snapshotEvidence?.count, 1);
+  } finally {
+    reads.mockRestore();
+    syncBuiltinESMExports();
+  }
 });
 
 test('a delayed copied-turn date removes billing usage from the session report', () => {
