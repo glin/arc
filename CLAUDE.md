@@ -67,7 +67,7 @@ Control clocks and filesystem timestamps in expiry and cache-band tests. Set exp
 
 Add a test to the existing file for its subject and reuse that file's setup and helpers. Create a new browser test file only when no file covers the subject. Add a browser test only when no Node test or text scan can catch the defect. Never add a browser test to check a width, spacing, color, font or wording. A plan or brief does not override this rule. When one asks for such a test, skip it and name the conflict in your report.
 
-Before a test timing change lands, run the test several times on the old commit and on the new commit.
+Review each changed timing test's trigger, time-dependent fixture setup, and controlled clock or awaited state. Before a test timing change lands, run the test several times on the old commit and on the new commit.
 
 Dress a browser test with the `themed` helper from `extension/src/panelfixture.ts`. Never set a theme variable by hand.
 
