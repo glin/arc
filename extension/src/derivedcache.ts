@@ -16,6 +16,7 @@ import {
   normalizeFsPath,
   sameSessionRevision,
   fileIdentityValue,
+  validRelationshipEvidence,
   sessionOutcomeOf,
   sessionStatFactsOf,
   type AgentRunScan,
@@ -314,7 +315,7 @@ export interface CarriedName {
   fullLabel: string;
 }
 
-export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 23;
+export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 24;
 export const MAX_CLAUDE_CHILD_REFERENCE_FILES = 10_000;
 export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };
@@ -328,6 +329,7 @@ export interface ClaudeChildReferenceCacheEntry {
   visitedEof?: boolean;
   cursor?: import('./codex').CodexDispatchCursor;
   claudeCursor?: import('./transcript').ClaudeRelationshipCursor;
+  evidence?: import('./transcript').RelationshipEvidence;
   resetReason?: string;
   pendingReferences?: ClaudeChildSessionReference[];
   relationshipComplete?: boolean;
@@ -806,8 +808,29 @@ function codexDispatchCursor(value: unknown, parentSessionId: string, size: numb
     Number.isInteger(value.offset) &&
     value.offset <= size &&
     value.size === size &&
+    validRelationshipEvidence(value.evidence, value.offset) &&
+    value.evidence.provisional.size === value.size &&
+    value.evidence.provisional.mtimeMs === value.mtimeMs &&
+    value.evidence.provisional.dev === value.dev &&
+    value.evidence.provisional.ino === value.ino &&
+    Number.isSafeInteger(value.target) &&
+    (value.target as number) >= value.offset &&
+    (value.target as number) <= size &&
+    (value.replayThrough === undefined
+      ? value.replayFragment === undefined
+      : value.fragmentStart !== null &&
+        nonNegative(value.fragmentStart) &&
+        nonNegative(value.replayThrough) &&
+        Number.isSafeInteger(value.replayThrough) &&
+        value.replayThrough >= value.fragmentStart &&
+        value.replayThrough <= value.offset &&
+        typeof value.replayFragment === 'string' &&
+        Buffer.from(value.replayFragment, 'base64').toString('base64') === value.replayFragment &&
+        Buffer.byteLength(value.replayFragment, 'base64') <= 4 * 1024 * 1024 &&
+        Buffer.byteLength(value.replayFragment, 'base64') === value.replayThrough - value.fragmentStart) &&
     nonNegative(value.mtimeMs) &&
     typeof value.fragment === 'string' &&
+    Buffer.from(value.fragment, 'base64').toString('base64') === value.fragment &&
     value.fragment.length <= 6 * 1024 * 1024 &&
     (value.fragmentStart === null ||
       (nonNegative(value.fragmentStart) &&
@@ -879,6 +902,15 @@ function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCache
         value.pendingReferences.length <= MAX_CLAUDE_CHILD_REFERENCES_PER_FILE &&
         value.pendingReferences.every((reference) => childReference(reference, sessionId)))) &&
     (value.visitedEof === undefined || typeof value.visitedEof === 'boolean') &&
+    (value.evidence === undefined ||
+      (record(value.evidence) &&
+        validRelationshipEvidence(value.evidence, value.evidence.offset as number) &&
+        value.evidence.provisional.size === value.size &&
+        value.evidence.provisional.mtimeMs === value.mtimeMs &&
+        value.evidence.provisional.dev === value.dev &&
+        value.evidence.provisional.ino === value.ino &&
+        (!(value.complete || value.visitedEof) ||
+          (value.evidence.accepted !== null && !value.evidence.validation && value.evidence.offset === value.size)))) &&
     (value.claudeCursor === undefined || claudeRelationshipCursor(value.claudeCursor, sessionId)) &&
     (value.source !== 'codex' ||
       (typeof value.complete === 'boolean' &&
@@ -902,6 +934,11 @@ function claudeRelationshipCursor(value: unknown, sessionId: string): boolean {
     rows.every((row: unknown) => Array.isArray(row) && row.length === 2 && nonEmptyText(row[0]) && check(row[1]));
   return (
     value.sessionId === sessionId &&
+    validRelationshipEvidence(value.evidence, value.offset as number) &&
+    value.evidence.provisional.size === value.revision.size &&
+    value.evidence.provisional.mtimeMs === value.revision.mtimeMs &&
+    value.evidence.provisional.dev === value.revision.dev &&
+    value.evidence.provisional.ino === value.revision.ino &&
     typeof value.childTranscript === 'boolean' &&
     [
       value.offset,
@@ -917,7 +954,7 @@ function claudeRelationshipCursor(value: unknown, sessionId: string): boolean {
     fileIdentityValue(value.revision.ino) &&
     (value.applied as number) <= (value.offset as number) &&
     (value.offset as number) <= (value.target as number) &&
-    (value.target as number) <= (value.revision.size as number) &&
+    (value.target as number) <= value.revision.size &&
     (value.headBytes as number) <= 256 &&
     typeof value.head === 'string' &&
     /^[0-9a-f]{64}$/.test(value.head) &&
@@ -1105,17 +1142,40 @@ export function saveDerivedCache(
   writeFileAtomically(file, JSON.stringify(data), replace);
 }
 
-// Parent-file reads recreate discarded Codex cursors.
+// Changed parent files recreate discarded cursors. Unchanged finished sources retain their evidence.
 // Evicts Codex cursors at EOF before unfinished scans, then complete entries and larger cursors.
 export function limitCodexDispatchCursors(
   entries: Iterable<[string, ClaudeChildReferenceCacheEntry]>,
   byteLimit = MAX_CODEX_DISPATCH_CURSOR_BYTES,
 ): Array<[string, ClaudeChildReferenceCacheEntry]> {
   const rows = [...entries];
+  const retainEvidence = (entry: ClaudeChildReferenceCacheEntry) => {
+    const evidence = entry.claudeCursor?.evidence ?? entry.cursor?.evidence;
+    const finished =
+      !!evidence &&
+      validRelationshipEvidence(evidence, evidence.offset) &&
+      evidence.accepted !== null &&
+      !evidence.validation &&
+      evidence.offset === entry.size &&
+      evidence.provisional.size === entry.size &&
+      evidence.provisional.mtimeMs === entry.mtimeMs &&
+      evidence.provisional.dev === entry.dev &&
+      evidence.provisional.ino === entry.ino;
+    return {
+      ...entry,
+      evidence: finished ? evidence : undefined,
+      complete: finished && entry.complete === true,
+      relationshipComplete: finished && entry.relationshipComplete === true,
+      visitedEof: finished && entry.visitedEof === true,
+    };
+  };
   // Unfinished Claude cursors retain unmatched launches that cannot be recreated at their saved offset.
   // Keep them above the soft budget. The scheduler protects one large pending source.
   let claudeBytes = rows.reduce(
-    (sum, [, entry]) => sum + (entry.claudeCursor ? Buffer.byteLength(JSON.stringify(entry.claudeCursor)) : 0),
+    (sum, [, entry]) =>
+      sum +
+      (entry.claudeCursor ? Buffer.byteLength(JSON.stringify(entry.claudeCursor)) : 0) +
+      (entry.evidence ? Buffer.byteLength(JSON.stringify(entry.evidence)) : 0),
     0,
   );
   for (let index = 0; index < rows.length && claudeBytes > byteLimit; index++) {
@@ -1123,11 +1183,14 @@ export function limitCodexDispatchCursors(
     if (
       !entry.claudeCursor ||
       entry.claudeCursor.offset < entry.claudeCursor.target ||
-      (entry.claudeCursor.fragmentBytes && !entry.claudeCursor.terminalApplied)
+      (entry.claudeCursor.fragmentBytes && !entry.claudeCursor.terminalApplied) ||
+      entry.claudeCursor.evidence?.validation
     )
       continue;
     claudeBytes -= Buffer.byteLength(JSON.stringify(entry.claudeCursor));
-    rows[index] = [file, { ...entry, claudeCursor: undefined }];
+    const retained = { ...retainEvidence(entry), claudeCursor: undefined };
+    claudeBytes += retained.evidence ? Buffer.byteLength(JSON.stringify(retained.evidence)) : 0;
+    rows[index] = [file, retained];
   }
   const sized = rows.flatMap(([file, entry], index) =>
     entry.source === 'codex' && entry.cursor
@@ -1152,8 +1215,9 @@ export function limitCodexDispatchCursors(
   )) {
     if (total <= byteLimit) break;
     const [file, entry] = rows[row.index];
-    rows[row.index] = [file, { ...entry, cursor: undefined }];
-    total -= row.bytes;
+    const retained = { ...retainEvidence(entry), cursor: undefined };
+    rows[row.index] = [file, retained];
+    total -= row.bytes - (retained.evidence ? Buffer.byteLength(JSON.stringify(retained.evidence)) : 0);
   }
   return rows;
 }

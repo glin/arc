@@ -3208,7 +3208,203 @@ export function scanClaudeChildSessionReferences(
   return { complete, references: reducer.references() };
 }
 
+export const RELATIONSHIP_QUANTUM_BYTES = 1024 * 1024;
+export const RELATIONSHIP_READ_BYTES = 256 * 1024;
+export const RELATIONSHIP_RESERVE_BYTES = 16 * 1024;
+export const RELATIONSHIP_SLICE_MS = 15;
+export const RELATIONSHIP_EVIDENCE_BYTES = 16 * 1024;
+const RELATIONSHIP_BLOCK_BYTES = 4096;
+
+export interface RelationshipStamp extends FileRevision {
+  mtimeNs: string;
+  ctimeNs: string;
+}
+
+export interface RelationshipDigest {
+  offset: number;
+  chain: string;
+  tail: string;
+}
+
+export interface RelationshipEvidence extends RelationshipDigest {
+  version: 1;
+  accepted: RelationshipStamp | null;
+  provisional: RelationshipStamp;
+  validation?: { stamp: RelationshipStamp; required: number; digest: RelationshipDigest };
+}
+
+export function relationshipStamp(stat: fs.BigIntStats): RelationshipStamp {
+  return { ...revisionOf(stat), mtimeNs: stat.mtimeNs.toString(), ctimeNs: stat.ctimeNs.toString() };
+}
+
+export function sameRelationshipStamp(left: RelationshipStamp | null, right: RelationshipStamp): boolean {
+  return (
+    left !== null &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+export function validRelationshipEvidence(value: unknown, offset: number): value is RelationshipEvidence {
+  const object = (item: unknown): item is Record<string, unknown> => typeof item === 'object' && item !== null;
+  const stamp = (item: unknown): item is RelationshipStamp =>
+    object(item) &&
+    Number.isSafeInteger(item.size) &&
+    (item.size as number) >= 0 &&
+    typeof item.mtimeMs === 'number' &&
+    Number.isFinite(item.mtimeMs) &&
+    item.mtimeMs >= 0 &&
+    fileIdentityValue(item.dev) &&
+    fileIdentityValue(item.ino) &&
+    typeof item.mtimeNs === 'string' &&
+    /^\d+$/.test(item.mtimeNs) &&
+    typeof item.ctimeNs === 'string' &&
+    /^\d+$/.test(item.ctimeNs) &&
+    Number(BigInt(item.mtimeNs) / 1_000_000n) + Number(BigInt(item.mtimeNs) % 1_000_000n) / 1_000_000 === item.mtimeMs;
+  const digest = (item: unknown): item is RelationshipDigest =>
+    object(item) &&
+    Number.isSafeInteger(item.offset) &&
+    (item.offset as number) >= 0 &&
+    typeof item.chain === 'string' &&
+    /^[0-9a-f]{64}$/.test(item.chain) &&
+    typeof item.tail === 'string' &&
+    Buffer.from(item.tail, 'base64').toString('base64') === item.tail &&
+    Buffer.byteLength(item.tail, 'base64') === (item.offset as number) % RELATIONSHIP_BLOCK_BYTES;
+  if (
+    !object(value) ||
+    Buffer.byteLength(JSON.stringify(value)) > RELATIONSHIP_EVIDENCE_BYTES ||
+    value.version !== 1 ||
+    !digest(value) ||
+    value.offset !== offset ||
+    !stamp(value.provisional) ||
+    value.provisional.size < offset ||
+    !(value.accepted === null || (stamp(value.accepted) && sameRelationshipStamp(value.accepted, value.provisional)))
+  )
+    return false;
+  const validation = value.validation;
+  return (
+    validation === undefined ||
+    (object(validation) &&
+      stamp(validation.stamp) &&
+      validation.stamp.dev === value.provisional.dev &&
+      validation.stamp.ino === value.provisional.ino &&
+      validation.stamp.size >= value.provisional.size &&
+      validation.required === offset &&
+      digest(validation.digest) &&
+      validation.digest.offset <= offset)
+  );
+}
+
+function emptyRelationshipDigest(): RelationshipDigest {
+  return { offset: 0, chain: createHash('sha256').update('arc-relationship-prefix-v1').digest('hex'), tail: '' };
+}
+
+export function relationshipEvidence(stamp: RelationshipStamp): RelationshipEvidence {
+  return { version: 1, ...emptyRelationshipDigest(), accepted: stamp, provisional: stamp };
+}
+
+export function extendRelationshipEvidence(evidence: RelationshipDigest, bytes: Buffer): void {
+  const joined = Buffer.concat([Buffer.from(evidence.tail, 'base64'), bytes]);
+  let index = (evidence.offset - Buffer.byteLength(evidence.tail, 'base64')) / RELATIONSHIP_BLOCK_BYTES;
+  let at = 0;
+  for (; at + RELATIONSHIP_BLOCK_BYTES <= joined.length; at += RELATIONSHIP_BLOCK_BYTES) {
+    evidence.chain = createHash('sha256')
+      .update(`arc-relationship-block-v1:${index++}:`)
+      .update(evidence.chain)
+      .update(joined.subarray(at, at + RELATIONSHIP_BLOCK_BYTES))
+      .digest('hex');
+  }
+  evidence.tail = joined.subarray(at).toString('base64');
+  evidence.offset += bytes.length;
+}
+
+// Every returned filesystem byte enters the request meter before any later operation can fail.
+export class RelationshipReader {
+  readonly stamp: RelationshipStamp;
+  readonly deadline: number;
+  private readonly buffer = Buffer.allocUnsafe(RELATIONSHIP_READ_BYTES);
+  readBytes = 0;
+  stable = true;
+  constructor(
+    readonly fd: number,
+    readonly file: string,
+    readonly budget: number,
+    readonly cancelled: () => boolean,
+    readonly meter?: { readBytes: number },
+    readonly capturedSizeOnly = false,
+  ) {
+    this.stamp = relationshipStamp(fs.fstatSync(fd, { bigint: true }));
+    this.deadline = Number.isFinite(budget) ? performance.now() + RELATIONSHIP_SLICE_MS : Infinity;
+    this.check();
+  }
+  check(): boolean {
+    if (this.capturedSizeOnly) return true;
+    try {
+      this.stable &&=
+        sameRelationshipStamp(this.stamp, relationshipStamp(fs.fstatSync(this.fd, { bigint: true }))) &&
+        sameRelationshipStamp(this.stamp, relationshipStamp(fs.statSync(this.file, { bigint: true })));
+    } catch {
+      this.stable = false;
+    }
+    return this.stable;
+  }
+  available(reserve = RELATIONSHIP_RESERVE_BYTES): number {
+    return this.stable && !this.cancelled() && performance.now() < this.deadline
+      ? Math.max(0, this.budget - this.readBytes - reserve)
+      : 0;
+  }
+  read(at: number, length: number, reserve = RELATIONSHIP_RESERVE_BYTES): Buffer {
+    const size = Math.min(length, RELATIONSHIP_READ_BYTES, this.available(reserve));
+    if (size <= 0) return Buffer.alloc(0);
+    const count = fs.readSync(this.fd, this.buffer, 0, size, at);
+    this.readBytes += count;
+    if (this.meter) this.meter.readBytes += count;
+    this.check();
+    return this.buffer.subarray(0, count);
+  }
+  *qualifySteps(evidence: RelationshipEvidence): Generator<void, 'match' | 'pending' | 'reset'> {
+    if (sameRelationshipStamp(evidence.accepted, this.stamp) && this.check()) return 'match';
+    const prior = evidence.provisional;
+    if (
+      prior.dev !== this.stamp.dev ||
+      prior.ino !== this.stamp.ino ||
+      this.stamp.size < prior.size ||
+      this.stamp.size < evidence.offset
+    )
+      return 'reset';
+    if (!evidence.validation || !sameRelationshipStamp(evidence.validation.stamp, this.stamp))
+      evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
+    const comparison = evidence.validation;
+    while (comparison.digest.offset < comparison.required && this.available() > 0) {
+      const remaining = comparison.required - comparison.digest.offset;
+      const available = this.available();
+      const allowance =
+        remaining < RELATIONSHIP_BLOCK_BYTES && remaining <= available
+          ? remaining
+          : Math.floor(available / RELATIONSHIP_BLOCK_BYTES) * RELATIONSHIP_BLOCK_BYTES;
+      const bytes = this.read(comparison.digest.offset, Math.min(RELATIONSHIP_READ_BYTES, remaining, allowance));
+      if (!bytes.length) break;
+      for (let at = 0; at < bytes.length; at += RELATIONSHIP_BLOCK_BYTES) {
+        if (at > 0 && (this.cancelled() || performance.now() >= this.deadline)) break;
+        extendRelationshipEvidence(comparison.digest, bytes.subarray(at, at + RELATIONSHIP_BLOCK_BYTES));
+      }
+      yield;
+    }
+    if (comparison.digest.offset !== comparison.required || !this.check() || this.cancelled()) return 'pending';
+    if (comparison.digest.chain !== evidence.chain || comparison.digest.tail !== evidence.tail) return 'reset';
+    evidence.accepted = this.stamp;
+    evidence.provisional = this.stamp;
+    delete evidence.validation;
+    return 'match';
+  }
+}
+
 export interface ClaudeRelationshipCursor {
+  evidence?: RelationshipEvidence;
   revision: FileRevision;
   target: number;
   offset: number;
@@ -3230,101 +3426,107 @@ export interface ClaudeRelationshipCursor {
 export async function scanClaudeRelationshipQuantum(
   parent: Pick<SessionFile, 'file' | 'sessionId' | 'childTranscript'>,
   previous: ClaudeRelationshipCursor | undefined,
-  budget = 1024 * 1024,
+  budget = RELATIONSHIP_QUANTUM_BYTES,
   signal?: AbortSignal,
+  meter?: { readBytes: number },
 ): Promise<{
   cursor: ClaudeRelationshipCursor;
   references: ClaudeChildSessionReference[];
   complete: boolean;
+  qualified: boolean;
   readBytes: number;
   reset: boolean;
 }> {
   const fd = fs.openSync(parent.file, 'r');
-  let readBytes = 0;
   try {
-    const { size, mtimeMs, dev, ino } = revisionOf(fs.fstatSync(fd, { bigint: true }));
-    const revision = { size, mtimeMs, dev, ino };
-    const read = (at: number, length: number) => {
-      const bytes = Buffer.allocUnsafe(length);
-      const count = fs.readSync(fd, bytes, 0, length, at);
-      readBytes += count;
-      return bytes.subarray(0, count);
-    };
-    const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
-    const headBytes = previous ? Math.min(size, previous.headBytes) : Math.min(size, 256);
-    const head = digest(read(0, headBytes));
-    const boundary = previous ? Math.max(0, previous.offset - 4096) : 0;
-    const anchor = previous ? digest(read(boundary, previous.offset - boundary)) : digest(Buffer.alloc(0));
-    const continuation = previous?.terminalApplied && previous.offset < size ? read(previous.offset, 1)[0] : 10;
-    const compatible =
-      previous &&
-      previous.sessionId === parent.sessionId &&
-      previous.childTranscript === (parent.childTranscript === true) &&
-      previous.revision.dev === dev &&
-      previous.revision.ino === ino &&
-      size >= previous.revision.size &&
-      size >= previous.offset &&
-      (size > previous.revision.size || mtimeMs === previous.revision.mtimeMs) &&
-      previous.head === head &&
-      previous.anchor === anchor &&
-      (continuation === 10 || continuation === 13);
-    const reducer = createClaudeRelationshipReducer(parent, compatible ? previous.state : undefined);
-    const cursor: ClaudeRelationshipCursor = compatible
-      ? {
-          ...previous,
-          fragments: [...previous.fragments],
-          target: previous.offset < previous.target ? previous.target : size,
-          revision,
-        }
-      : {
-          revision,
-          target: size,
-          offset: 0,
-          applied: 0,
-          head,
-          headBytes,
-          anchor: digest(Buffer.alloc(0)),
-          fragments: [],
-          fragmentBytes: 0,
-          terminalApplied: false,
-          sessionId: parent.sessionId,
-          childTranscript: parent.childTranscript === true,
-          sequence: previous?.sequence ?? 0,
-          state: reducer.state(),
-        };
-    const deadline = performance.now() + 15;
-    while (cursor.offset < cursor.target) {
-      if (readBytes + 16384 >= budget || signal?.aborted) break;
-      const bytes = read(
-        cursor.offset,
-        Math.min(256 * 1024, cursor.target - cursor.offset, budget - readBytes - 16384),
-      );
-      if (!bytes.length) throw new Error('Relationship read ended before its captured target');
-      const base = cursor.offset;
-      cursor.offset += bytes.length;
-      let start = 0;
-      for (let index = 0; index < bytes.length; index++) {
-        if (bytes[index] !== 10) continue;
-        const record = Buffer.concat([
-          ...cursor.fragments.map((fragment) => Buffer.from(fragment, 'base64')),
-          bytes.subarray(start, index),
-        ]);
-        if (!cursor.terminalApplied) reducer.apply(record.toString('utf8'));
-        cursor.terminalApplied = false;
-        cursor.fragments = [];
-        cursor.fragmentBytes = 0;
-        cursor.applied = base + index + 1;
-        start = index + 1;
+    let cursor = previous ? structuredClone(previous) : undefined;
+    const reader = new RelationshipReader(fd, parent.file, budget, () => signal?.aborted === true, meter);
+    const revision = reader.stamp;
+    let qualification: 'match' | 'pending' | 'reset' = 'reset';
+    if (
+      cursor?.evidence &&
+      cursor.sessionId === parent.sessionId &&
+      cursor.childTranscript === (parent.childTranscript === true)
+    ) {
+      const steps = reader.qualifySteps(cursor.evidence);
+      let step = steps.next();
+      while (!step.done) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        step = steps.next();
       }
-      if (start < bytes.length) {
-        const fragment = bytes.subarray(start);
-        cursor.fragments.push(fragment.toString('base64'));
-        cursor.fragmentBytes += fragment.length;
-      }
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      if (performance.now() >= deadline) break;
+      qualification = step.value;
     }
-    if (cursor.offset === cursor.target && cursor.fragmentBytes && !cursor.terminalApplied) {
+    if (qualification === 'match') cursor!.revision = cursor!.evidence!.provisional;
+    if (qualification === 'match' && cursor!.terminalApplied && cursor!.offset < revision.size) {
+      const continuation = reader.read(cursor!.offset, 1, 0);
+      if (!continuation.length) qualification = 'pending';
+      else if (continuation[0] !== 10 && continuation[0] !== 13) qualification = 'reset';
+    }
+    const reset = !!previous && qualification === 'reset';
+    if (!cursor || qualification === 'reset') {
+      const state = createClaudeRelationshipReducer(parent).state();
+      cursor = {
+        revision,
+        evidence: relationshipEvidence(revision),
+        target: revision.size,
+        offset: 0,
+        applied: 0,
+        head: emptyRelationshipDigest().chain,
+        headBytes: 0,
+        anchor: emptyRelationshipDigest().chain,
+        fragments: [],
+        fragmentBytes: 0,
+        terminalApplied: false,
+        sessionId: parent.sessionId,
+        childTranscript: parent.childTranscript === true,
+        sequence: previous?.sequence ?? 0,
+        state,
+      };
+      qualification = 'match';
+    }
+    const reducer = createClaudeRelationshipReducer(parent, cursor.state);
+    if (qualification === 'match') {
+      cursor.revision = revision;
+      if (cursor.offset === cursor.target) cursor.target = revision.size;
+    }
+    if (!reset && qualification === 'match')
+      while (cursor.offset < cursor.target && reader.available() > 0) {
+        const bytes = reader.read(cursor.offset, cursor.target - cursor.offset);
+        if (!bytes.length) break;
+        extendRelationshipEvidence(cursor.evidence!, bytes);
+        const base = cursor.offset;
+        cursor.offset += bytes.length;
+        let start = 0;
+        for (let index = 0; index < bytes.length; index++) {
+          if (bytes[index] !== 10) continue;
+          const record = Buffer.concat([
+            ...cursor.fragments.map((fragment) => Buffer.from(fragment, 'base64')),
+            bytes.subarray(start, index),
+          ]);
+          if (!cursor.terminalApplied) reducer.apply(record.toString('utf8'));
+          cursor.terminalApplied = false;
+          cursor.fragments = [];
+          cursor.fragmentBytes = 0;
+          cursor.applied = base + index + 1;
+          start = index + 1;
+        }
+        if (start < bytes.length) {
+          const fragment = bytes.subarray(start);
+          cursor.fragments.push(fragment.toString('base64'));
+          cursor.fragmentBytes += fragment.length;
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        reader.check();
+      }
+    if (
+      !reset &&
+      qualification === 'match' &&
+      reader.stable &&
+      !signal?.aborted &&
+      cursor.offset === cursor.target &&
+      cursor.fragmentBytes &&
+      !cursor.terminalApplied
+    ) {
       const terminal = Buffer.concat(cursor.fragments.map((fragment) => Buffer.from(fragment, 'base64'))).toString(
         'utf8',
       );
@@ -3337,29 +3539,25 @@ export async function scanClaudeRelationshipQuantum(
         /* An incomplete terminal record waits for its remaining bytes. */
       }
     }
-    const at = Math.max(0, cursor.offset - 4096);
-    cursor.anchor = digest(read(at, cursor.offset - at));
-    // Recheck the opened prefix and path identity after yielding. Growth beyond the target
-    // leaves the completed cut usable. A detectable rewrite invalidates this quantum.
-    const after = revisionOf(fs.statSync(parent.file, { bigint: true }));
-    if (
-      after.dev !== dev ||
-      after.ino !== ino ||
-      after.size < cursor.target ||
-      (after.size === size && after.mtimeMs !== mtimeMs) ||
-      digest(read(0, cursor.headBytes)) !== cursor.head ||
-      digest(read(at, cursor.offset - at)) !== cursor.anchor
-    )
-      throw new Error('Relationship source changed');
+    const qualified = qualification === 'match' && reader.check();
+    if (!qualified && qualification === 'match') cursor.evidence!.accepted = null;
     cursor.state = reducer.state();
     cursor.sequence++;
+    if (!validRelationshipEvidence(cursor.evidence, cursor.offset))
+      throw new Error('Relationship evidence exceeds its limits');
     return {
       cursor,
       references: reducer.references(),
+      qualified,
       complete:
-        cursor.offset === cursor.target && (cursor.fragmentBytes === 0 || cursor.terminalApplied) && !signal?.aborted,
-      readBytes,
-      reset: !!previous && !compatible,
+        !reset &&
+        qualified &&
+        cursor.offset === cursor.target &&
+        cursor.target === revision.size &&
+        (cursor.fragmentBytes === 0 || cursor.terminalApplied) &&
+        !signal?.aborted,
+      readBytes: reader.readBytes,
+      reset,
     };
   } finally {
     fs.closeSync(fd);

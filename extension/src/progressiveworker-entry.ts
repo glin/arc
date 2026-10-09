@@ -38,7 +38,7 @@ import {
   readCodexSessionTitlePair,
   readCodexTurnStarts,
   refreshCodexStructuralAgents,
-  scanCodexDispatchReferences,
+  scanCodexDispatchReferencesAsync,
 } from './codex';
 import { historyPageBytes } from './historypages';
 import {
@@ -64,6 +64,11 @@ import {
   tailOf,
   revisionOf as fileRevisionOf,
   type FileRevision,
+  relationshipStamp,
+  sameRelationshipStamp,
+  RELATIONSHIP_QUANTUM_BYTES,
+  RELATIONSHIP_RESERVE_BYTES,
+  RELATIONSHIP_SLICE_MS,
   type PersonScan,
   type Turn,
 } from './transcript';
@@ -177,20 +182,37 @@ function sameRevision(left: FileRevision | null, right: FileRevision | null): bo
   );
 }
 
-// A source is finished and unchanged when its saved entry has the same identity and revision, and either completed or
-// reached the end of a Codex rollout. An entry short of its target is never finished.
-function unchangedFinished(
+// Accepted evidence at the current end permits reuse after heavy cursor state is evicted.
+function qualifiedRelationships(
   held: ClaudeChildReferenceCacheEntry | undefined,
   parent: { agent: string; sessionId: string; childTranscript?: boolean },
-  revision: FileRevision,
+  revision: import('./transcript').RelationshipStamp,
 ): boolean {
+  if (!revision) return false;
+  const evidence = held?.claudeCursor?.evidence ?? held?.cursor?.evidence ?? held?.evidence;
   return (
+    !!evidence &&
+    sameRelationshipStamp(evidence.accepted, revision) &&
+    !evidence.validation &&
     held?.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION &&
     held.source === parent.agent &&
     held.sessionId === parent.sessionId &&
     held.childTranscript === (parent.childTranscript === true) &&
-    sameRevision(held, revision) &&
-    (held.complete === true || (held.source === 'codex' && held.visitedEof === true))
+    sameRevision(held, revision)
+  );
+}
+
+function unchangedFinished(
+  held: ClaudeChildReferenceCacheEntry | undefined,
+  parent: { agent: string; sessionId: string; childTranscript?: boolean },
+  revision: import('./transcript').RelationshipStamp,
+): boolean {
+  const evidence = held?.claudeCursor?.evidence ?? held?.cursor?.evidence ?? held?.evidence;
+  return (
+    qualifiedRelationships(held, parent, revision) &&
+    !!held &&
+    (held.complete === true || (held.source === 'codex' && held.visitedEof === true)) &&
+    (held.claudeCursor?.offset ?? held.cursor?.offset ?? evidence!.offset) === revision.size
   );
 }
 
@@ -367,7 +389,20 @@ async function execute(
         charges.parentCheckMs += performance.now() - startedAt;
       }
     };
-    const checkParent = (file: string) => parentCheck(() => revisionOf(file));
+    const parentStamps = new Map<string, import('./transcript').RelationshipStamp | null>();
+    const checkParent = (file: string) => {
+      const key = normalizeFsPath(file);
+      if (parentStamps.has(key)) return parentStamps.get(key)!;
+      const stamp = parentCheck(() => {
+        try {
+          return relationshipStamp(fs.statSync(file, { bigint: true }));
+        } catch {
+          return null;
+        }
+      });
+      parentStamps.set(key, stamp);
+      return stamp;
+    };
     const checkMissing = (file: string) => parentCheck(() => missingFile(file));
     let continuation = false;
     let incomplete = false;
@@ -384,7 +419,20 @@ async function execute(
             const key = normalizeFsPath(parent.file);
             candidates.set(key, parent);
             const entry = claudeChildReferences.get(key);
-            return entry?.complete === true || entry?.source === 'codex' ? entry.references : [];
+            if (!entry) return [];
+            const current = checkParent(parent.file)!;
+            return (
+              parent.agent === 'codex'
+                ? entry.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION &&
+                  entry.source === 'codex' &&
+                  entry.sessionId === parent.sessionId &&
+                  entry.childTranscript === (parent.childTranscript === true) &&
+                  !!(entry.cursor?.evidence ?? entry.evidence) &&
+                  onlyGrew(entry, current)
+                : unchangedFinished(entry, parent, current)
+            )
+              ? entry.references
+              : [];
           },
           claudeChildSessions,
         );
@@ -422,20 +470,29 @@ async function execute(
         completionChanges.clear();
         return value;
       }
+      const entries = limitCodexDispatchCursors(claudeChildReferences);
+      for (const [file, entry] of entries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
       epoch.completed = [...completed];
       return {
         kind: 'claude-children-progress' as const,
-        referenceEntries: limitCodexDispatchCursors(claudeChildReferences),
+        referenceEntries: entries,
         checkpoint: epoch,
         continuation: true as const,
         charges,
       };
     };
     let found = walk();
+    for (const [key, parent] of candidates) {
+      const current = checkParent(parent.file);
+      if (!current || !unchangedFinished(claudeChildReferences.get(key), parent, current)) {
+        if (completed.delete(key)) completionChanges.set(key, false);
+        const entry = claudeChildReferences.get(key);
+        if (entry)
+          claudeChildReferences.set(key, { ...entry, complete: false, relationshipComplete: false, visitedEof: false });
+      }
+    }
     if (epoch.protectedFile && !candidates.has(epoch.protectedFile)) delete epoch.protectedFile;
-    // The seed shares the hit test with the parent loop below. The loop stats each present source again, because an active
-    // transcript can grow between the two, and a seed revision would pair the scan's size with a stale modification time. A
-    // source the seed found missing goes straight to the loop's missing check.
+    // Scanners capture their own revision. Admission shares one source observation before the publication walk.
     const seedMissing = new Set<string>();
     if (seeding) {
       let checked = 0;
@@ -461,7 +518,7 @@ async function execute(
     // The seeded count reaches the host at once, whatever agent the remaining sources belong to.
     if (completionChanges.size) acknowledge?.(pending(undefined, true));
     const requestBytes = Math.min(request.discoveryBytes ?? CODEX_DISPATCH_REQUEST_BYTES, CODEX_DISPATCH_REQUEST_BYTES);
-    const quantumBytes = Math.min(request.quantumBytes ?? 1024 * 1024, 1024 * 1024);
+    const quantumBytes = Math.min(request.quantumBytes ?? RELATIONSHIP_QUANTUM_BYTES, RELATIONSHIP_QUANTUM_BYTES);
     const pendingCharge = (entry: ClaudeChildReferenceCacheEntry | undefined) =>
       entry?.claudeCursor && entry.claudeCursor.offset < entry.claudeCursor.target
         ? Buffer.byteLength(JSON.stringify(entry.claudeCursor))
@@ -502,7 +559,7 @@ async function execute(
         parent.agent === 'codex' ? requestBytes : quantumBytes,
         requestBytes - charges.readBytes,
       );
-      if (allowance <= (parent.agent === 'codex' ? 8192 : 16384) || signal.aborted) {
+      if (allowance <= RELATIONSHIP_RESERVE_BYTES || charges.quanta >= 8 || signal.aborted) {
         if (parent.agent === 'codex' && !signal.aborted) {
           epoch.position = rows.findIndex(([file]) => file === key);
           continuation = true;
@@ -510,27 +567,32 @@ async function execute(
         }
         return pending();
       }
+      const readsBefore = charges.readBytes;
+      const startedAt = performance.now();
       try {
         let references: import('./transcript').ClaudeChildSessionReference[];
         let complete: boolean;
+        let qualified: boolean;
         let cursor: import('./codex').CodexDispatchCursor | undefined;
         let claudeCursor: import('./transcript').ClaudeRelationshipCursor | undefined;
-        let reset = !identity;
-        let readBytes: number;
+        let reset = !identity || (!!held && !(held.claudeCursor?.evidence ?? held.cursor?.evidence));
         if (parent.agent === 'codex') {
-          const scan = scanCodexDispatchReferences(
+          const scan = await scanCodexDispatchReferencesAsync(
             parent.file,
             parent.sessionId,
             identity ? (held?.cursor ?? null) : null,
             allowance,
             () => signal.aborted,
+            charges,
           );
           cursor = scan.cursor;
           complete = scan.complete;
-          references = scan.complete
+          qualified = scan.qualified && !scan.reset;
+          reset ||= scan.reset;
+          references = scan.qualified
             ? scan.references
             : [
-                ...(identity && held
+                ...(identity && held && !scan.reset
                   ? (held.pendingReferences ?? held.references).filter(
                       (reference) =>
                         !reference.toolUseIds.some((id) => scan.retractedToolUseIds.has(id)) &&
@@ -541,7 +603,6 @@ async function execute(
                   : []),
                 ...scan.references,
               ];
-          readBytes = scan.readBytes;
           reset ||=
             !!held?.cursor &&
             (cursor.dev !== held.cursor.dev || cursor.ino !== held.cursor.ino || cursor.offset < held.cursor.offset);
@@ -551,47 +612,48 @@ async function execute(
             identity ? held?.claudeCursor : undefined,
             allowance,
             signal,
+            charges,
           );
           claudeCursor = scan.cursor;
           complete = scan.complete;
+          qualified = scan.qualified && !scan.reset;
           references = scan.references;
-          readBytes = scan.readBytes;
           reset ||= scan.reset;
         }
-        charges.readBytes += readBytes;
-        charges.quanta++;
         charges.resets += Number(reset && !!held);
-        const compatible = identity && held && onlyGrew(held, revision) && !reset;
-        const reachedTarget = cursor ? cursor.offset === revision.size : claudeCursor!.offset === claudeCursor!.target;
-        const accepted = complete || reachedTarget || (compatible && held.complete === true);
+        const compatible = identity && held && !reset;
+        const scanRevision = claudeCursor?.revision ?? {
+          size: cursor!.size,
+          mtimeMs: cursor!.mtimeMs,
+          dev: cursor!.dev,
+          ino: cursor!.ino,
+        };
+        const evidence = claudeCursor?.evidence ?? cursor!.evidence;
+        const reachedTarget = cursor ? cursor.offset === cursor.target : claudeCursor!.offset === claudeCursor!.target;
+        const accepted = qualified && (complete || (parent.agent === 'claude' && reachedTarget));
+        const finished = qualified && reachedTarget && (claudeCursor?.offset ?? cursor!.offset) === scanRevision.size;
         claudeChildReferences.set(key, {
           sourceGeneration: (held?.sourceGeneration ?? 0) + Number(reset || !held),
           sequence: (held?.sequence ?? 0) + 1,
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
           source: parent.agent,
-          ...revision,
-          // A Codex scan that reaches the end of the file describes the current revision. The stored size then matches the next
-          // stat, so a parent that stops growing lets discovery settle.
-          size:
-            complete && claudeCursor
-              ? claudeCursor.target
-              : compatible && !(cursor && reachedTarget)
-                ? held.size
-                : revision.size,
-          mtimeMs:
-            complete || (cursor && reachedTarget) ? revision.mtimeMs : compatible ? held.mtimeMs : revision.mtimeMs,
+          ...scanRevision,
           sessionId: parent.sessionId,
           childTranscript: parent.childTranscript === true,
-          complete: parent.agent === 'codex' ? complete : accepted,
-          visitedEof: reachedTarget,
+          complete: accepted,
+          visitedEof: qualified && reachedTarget,
           cursor,
           claudeCursor,
           references:
-            parent.agent === 'codex' || complete || reachedTarget ? references : compatible ? held.references : [],
-          pendingReferences: complete ? undefined : references,
-          relationshipComplete: complete,
+            qualified && (complete || reachedTarget || parent.agent === 'codex')
+              ? references
+              : compatible
+                ? held.references
+                : [],
+          pendingReferences: accepted ? undefined : references,
+          relationshipComplete: accepted,
           appliedCut:
-            complete || reachedTarget
+            qualified && (complete || reachedTarget)
               ? (claudeCursor?.applied ??
                 (cursor!.terminalApplied
                   ? cursor!.offset
@@ -599,17 +661,22 @@ async function execute(
               : compatible
                 ? held.appliedCut
                 : undefined,
-          validatedRevision: revision,
+          validatedRevision:
+            qualified && (complete || reachedTarget)
+              ? evidence!.accepted!
+              : compatible
+                ? held.validatedRevision
+                : undefined,
           ...(reset && held ? { resetReason: 'source generation changed' } : {}),
         });
         if (reset) dispatchFacts.delete(parent.file);
         pendingBytes += pendingCharge(claudeChildReferences.get(key)) - pendingCharge(held);
         if (!reachedTarget && claudeCursor && pendingBytes > 64 * 1024 * 1024) epoch.protectedFile ??= key;
-        if (accepted || parent.agent === 'codex') {
+        if (finished || parent.agent === 'codex') {
           completed.add(key);
           completionChanges.set(key, true);
         }
-        if (reachedTarget && epoch.protectedFile === key) delete epoch.protectedFile;
+        if (qualified && reachedTarget && epoch.protectedFile === key) delete epoch.protectedFile;
         if (
           !reachedTarget &&
           claudeCursor &&
@@ -621,9 +688,17 @@ async function execute(
           completed.delete(key);
           completionChanges.set(key, false);
         }
-        continuation ||= !reachedTarget;
-        if (parent.agent === 'claude') acknowledge?.(pending(key));
+        continuation ||= !finished;
+        if (!finished && parent.agent === 'claude') {
+          completed.delete(key);
+          completionChanges.set(key, false);
+        }
+        if (charges.readBytes > readsBefore || performance.now() - startedAt >= RELATIONSHIP_SLICE_MS) {
+          charges.quanta++;
+          acknowledge?.(pending(key));
+        }
       } catch (error) {
+        if (charges.readBytes > readsBefore || performance.now() - startedAt >= RELATIONSHIP_SLICE_MS) charges.quanta++;
         incomplete = true;
         claudeChildReferences.set(key, {
           ...(held ?? { ...revision, references: [] }),
@@ -632,6 +707,7 @@ async function execute(
           sessionId: parent.sessionId,
           childTranscript: parent.childTranscript === true,
           complete: false,
+          relationshipComplete: false,
           resetReason: error instanceof Error ? error.message : 'Source unavailable',
         });
         completed.delete(key);
@@ -639,6 +715,7 @@ async function execute(
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    parentStamps.clear();
     found = walk();
     if (incomplete || [...candidates].some(([key, parent]) => parent.agent === 'claude' && !completed.has(key)))
       return pending();
@@ -649,53 +726,25 @@ async function execute(
         continue;
       }
       const current = checkParent(file);
-      if (!onlyGrew(entry, current) || (current!.size === entry.size && current!.mtimeMs !== entry.mtimeMs)) {
+      if (!current || !unchangedFinished(entry, candidates.get(file)!, current)) {
         completed.delete(file);
-        claudeChildReferences.set(file, {
-          ...entry,
-          complete: false,
-          references: [],
-          claudeCursor: undefined,
-          cursor: undefined,
-          sourceGeneration: (entry.sourceGeneration ?? 0) + 1,
-          sequence: (entry.sequence ?? 0) + 1,
-        });
-        dispatchFacts.delete(candidates.get(file)!.file);
-        return pending();
+        completionChanges.set(file, false);
+        claudeChildReferences.set(file, { ...entry, complete: false, relationshipComplete: false });
+        continuation = true;
+        if (candidates.get(file)!.agent === 'claude') return pending();
       }
-      if (entry.source === 'claude' && entry.claudeCursor && !sameRevision(entry.validatedRevision ?? entry, current)) {
-        if (requestBytes - charges.readBytes < 16384) return pending();
-        const parent = candidates.get(file)!;
-        try {
-          const validated = await scanClaudeRelationshipQuantum(parent, entry.claudeCursor, 16384, signal);
-          charges.readBytes += validated.readBytes;
-          if (validated.reset) {
-            charges.resets++;
-            completed.delete(file);
-            claudeChildReferences.set(file, {
-              ...entry,
-              complete: false,
-              references: [],
-              claudeCursor: validated.cursor,
-              sourceGeneration: (entry.sourceGeneration ?? 0) + 1,
-              sequence: (entry.sequence ?? 0) + 1,
-            });
-            dispatchFacts.delete(parent.file);
-            return pending();
-          }
-          claudeChildReferences.set(file, { ...entry, claudeCursor: validated.cursor, validatedRevision: current! });
-        } catch {
-          completed.delete(file);
-          return pending();
-        }
-      }
-      continuation ||= !sameRevision(entry, current);
     }
+
     for (const file of [...claudeChildReferences.keys()]) if (!candidates.has(file)) claudeChildReferences.delete(file);
     const boundedEntries = limitCodexDispatchCursors(claudeChildReferences);
+    for (const [file, entry] of boundedEntries) if (!entry.complete && !entry.visitedEof) completed.delete(file);
     claudeChildReferences.clear();
     for (const [file, entry] of boundedEntries) claudeChildReferences.set(file, entry);
-    continuation ||= JSON.stringify(epoch.parents) !== JSON.stringify(request.parents);
+    const parentKeys = (parents: typeof epoch.parents) =>
+      JSON.stringify(
+        parents.map(({ file, sessionId, agent, childTranscript }) => ({ file, sessionId, agent, childTranscript })),
+      );
+    continuation ||= parentKeys(epoch.parents) !== parentKeys(request.parents);
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
     const references = resolveClaudeDispatchReferences(found.references, epoch.catalog);
@@ -1413,6 +1462,30 @@ async function handleMessage(message: {
   }
 }
 
+type WorkerMessage = {
+  id: number;
+  generation: number;
+  request: ProgressiveRequest;
+  cancel?: number;
+  metadataEligible?: string[];
+};
+let activeDiscovery = false;
+let waitingDiscovery: WorkerMessage | undefined;
+function runDiscovery(message: WorkerMessage): void {
+  activeDiscovery = true;
+  void handleMessage(message).finally(() => {
+    if (!waitingDiscovery) {
+      activeDiscovery = false;
+      return;
+    }
+    setImmediate(() => {
+      const waiting = waitingDiscovery;
+      waitingDiscovery = undefined;
+      activeDiscovery = false;
+      if (waiting) runDiscovery(waiting);
+    });
+  });
+}
 parentPort?.on(
   'message',
   (message: {
@@ -1424,6 +1497,21 @@ parentPort?.on(
   }) => {
     if (message.metadataEligible) {
       if (metadataRecovery && !message.metadataEligible.includes(metadataRecovery.sessionId)) metadataRecovery = null;
+      return;
+    }
+    if (message.cancel !== undefined) {
+      if (waitingDiscovery?.id === message.cancel) {
+        parentPort?.postMessage({ id: waitingDiscovery.id });
+        waitingDiscovery = undefined;
+      }
+      void handleMessage({ ...message });
+      return;
+    }
+    if (message.request.kind === 'claude-children') {
+      if (activeDiscovery) {
+        if (waitingDiscovery) parentPort?.postMessage({ id: waitingDiscovery.id });
+        waitingDiscovery = message;
+      } else runDiscovery(message);
       return;
     }
     void handleMessage(message);

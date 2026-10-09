@@ -286,9 +286,12 @@ export class ProgressiveWorker {
   readonly transport = { requests: 0, replies: 0, postMs: 0, jsonMs: 0, requestJsonBytes: 0, replyJsonBytes: 0 };
   private worker: Worker | null = null;
   private nextId = 0;
+  private discoveryActive = false;
+  private discoveryWaiter?: { start(): void; cancel(): void };
   private pending = new Map<
     number,
     {
+      generation: number;
       resolve(value: ProgressiveResult | null): void;
       reject(error: Error): void;
       dispose(): void;
@@ -320,6 +323,41 @@ export class ProgressiveWorker {
     signal: AbortSignal,
     progress?: (value: ProgressiveResult) => void,
   ): Promise<ProgressiveResult | null> {
+    if (request.kind !== 'claude-children') return this.runAdmitted(request, generation, signal, progress);
+    if (signal.aborted) return Promise.resolve(null);
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        signal.removeEventListener('abort', cancel);
+        this.discoveryActive = true;
+        void this.runAdmitted(request, generation, signal, progress)
+          .then(resolve, reject)
+          .finally(() => {
+            this.discoveryActive = false;
+            const waiting = this.discoveryWaiter;
+            this.discoveryWaiter = undefined;
+            waiting?.start();
+          });
+      };
+      const cancel = () => {
+        signal.removeEventListener('abort', cancel);
+        if (this.discoveryWaiter === waiting) this.discoveryWaiter = undefined;
+        resolve(null);
+      };
+      const waiting = { start, cancel };
+      if (this.discoveryActive) {
+        this.discoveryWaiter?.cancel();
+        this.discoveryWaiter = waiting;
+        signal.addEventListener('abort', cancel, { once: true });
+      } else start();
+    });
+  }
+
+  private runAdmitted(
+    request: ProgressiveRequest,
+    generation: number,
+    signal: AbortSignal,
+    progress?: (value: ProgressiveResult) => void,
+  ): Promise<ProgressiveResult | null> {
     if (signal.aborted) {
       return Promise.resolve(null);
     }
@@ -332,7 +370,15 @@ export class ProgressiveWorker {
         'message',
         (message: { id: number; result?: ProgressiveResult; error?: string; progress?: boolean }) => {
           const held = this.pending.get(message.id);
-          if (!held) {
+          if (!held || this.worker !== worker) {
+            return;
+          }
+          if (message.result && message.result.generation !== held.generation) {
+            if (!message.progress) {
+              this.pending.delete(message.id);
+              held.dispose();
+              held.resolve(null);
+            }
             return;
           }
           this.countTransport(message, true);
@@ -385,12 +431,18 @@ export class ProgressiveWorker {
         held.dispose();
         held.resolve(null);
         this.worker?.postMessage({ cancel: id });
-        if (!this.pending.size) {
+        if (!this.pending.size && !this.discoveryWaiter) {
           this.stop();
         }
       };
       signal.addEventListener('abort', abort, { once: true });
-      this.pending.set(id, { resolve, reject, progress, dispose: () => signal.removeEventListener('abort', abort) });
+      this.pending.set(id, {
+        generation,
+        resolve,
+        reject,
+        progress,
+        dispose: () => signal.removeEventListener('abort', abort),
+      });
       const message = { id, generation, request };
       this.countTransport(message, false);
       const started = performance.now();
@@ -400,6 +452,8 @@ export class ProgressiveWorker {
   }
 
   stop(): void {
+    this.discoveryWaiter?.cancel();
+    this.discoveryWaiter = undefined;
     const worker = this.worker;
     this.worker = null;
     void worker?.terminate();

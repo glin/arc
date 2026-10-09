@@ -5,6 +5,65 @@ import {
   type ClaudeRelationshipCursor,
 } from './transcript';
 
+test.each([65536, 1024 * 1024])(
+  'Claude interior rewrite plus growth resumes to the fresh relationships at %i bytes',
+  async (budget) => {
+    vi.spyOn(performance, 'now').mockReturnValue(0);
+    const file = writeTranscript([
+      { type: 'ignored', payload: 'x'.repeat(1024) },
+      assistantTool('Agent', 1, 'interior-launch', {}),
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'interior-launch' }] },
+        toolUseResult: { agentId: 'child-a' },
+      },
+      ...Array.from({ length: 100 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+    ]);
+    const parent = { file, sessionId: 'parent' };
+    const first = await scanClaudeRelationshipQuantum(parent, undefined, budget);
+    assert.deepEqual(
+      first.references.map((reference) => reference.sessionId),
+      ['child-a'],
+    );
+    const old = fs.readFileSync(file, 'utf8');
+    assert.ok(old.indexOf('child-a') > 256 && old.indexOf('child-a') < first.cursor.offset - 4096);
+    fs.writeFileSync(file, old.replace('child-a', 'child-b') + '{"type":"ignored"}\n');
+    fs.utimesSync(file, new Date(0), new Date(first.cursor.revision.mtimeMs + 2000));
+    let resumed = await scanClaudeRelationshipQuantum(parent, first.cursor, budget);
+    for (let pass = 0; !resumed.complete && pass < 100; pass++)
+      resumed = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(resumed.cursor)), budget);
+    assert.ok(resumed.complete);
+    assert.deepEqual(resumed.references, scanClaudeChildSessionReferences(parent).references);
+  },
+);
+
+test('Claude append validation retains parsing position and replaces a superseded comparison', async () => {
+  const file = writeTranscript(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
+  const parent = { file, sessionId: 'parent' };
+  let scan = await scanClaudeRelationshipQuantum(parent, undefined, 65536);
+  const offset = scan.cursor.offset;
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 32768);
+  assert.equal(scan.reset, false);
+  assert.equal(scan.complete, false);
+  assert.equal(scan.cursor.offset, offset);
+  assert.ok(scan.cursor.evidence?.validation?.digest.offset);
+  const candidate = scan.cursor.evidence.validation.stamp;
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 32768);
+  assert.equal(scan.cursor.offset, offset);
+  assert.notDeepEqual(scan.cursor.evidence?.validation?.stamp, candidate);
+  assert.ok(scan.cursor.evidence!.validation.digest.offset <= 16384);
+  for (let pass = 0; !scan.complete && pass < 100; pass++) {
+    const before = scan.cursor.offset;
+    scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 65536);
+    assert.equal(scan.reset, false);
+    assert.ok(scan.cursor.offset >= before);
+  }
+  assert.equal(scan.complete, true);
+  assert.equal(scan.cursor.offset, fs.statSync(file).size);
+});
+
 // Relationship scans retain child ownership across record boundaries, restarts, and detectable source changes.
 test('Claude relationship quanta retain launches receipts and oversized records across restart', async () => {
   const records = [
@@ -96,19 +155,23 @@ test('Claude relationship cursors rebuild equal-size edits truncation replacemen
   fs.utimesSync(file, clock, clock);
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.reset, true);
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.references[0].sessionId, 'child-b');
   fs.writeFileSync(file, original.replace('child-a', 'child-c') + '{"type":"ignored"}\n');
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.reset, true);
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.references[0].sessionId, 'child-c');
   fs.renameSync(file, file + '.previous');
   fs.writeFileSync(file, original);
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.reset, true);
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.references[0].sessionId, 'child-a');
   fs.writeFileSync(file, '{}\n');
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.equal(scan.reset, true);
+  scan = await scanClaudeRelationshipQuantum(parent, scan.cursor);
   assert.deepEqual(scan.references, []);
 });
 import assert from 'node:assert';

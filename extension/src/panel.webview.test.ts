@@ -4327,15 +4327,27 @@ test('completion slices post changed figures once on retained and newest launchi
     fs.appendFileSync(childFile, record('event_msg', 6, { type: 'task_started', turn_id: 'resumed' }));
     Object.assign(sessions[1], { size: fs.statSync(childFile).size, mtimeMs: fs.statSync(childFile).mtimeMs });
     await provider.refresh(false, true);
+    assert.equal(provider.dispatchDiscoveryPending, false);
     assert.equal(provider.dispatchFacts.get(id).spend.found, false);
     const deadline = provider.dispatchFacts.get(id).refreshAt;
+    assert.notEqual(deadline, null);
+    assert.ok(deadline > Date.now());
+    const beforeDeadline = fixture.collections();
     fs.writeFileSync(clock, String(deadline + 1));
     vi.setSystemTime(deadline + 1);
     await provider.refresh(false, true);
     assert.equal(provider.dispatchFacts.get(id).spend.found, true);
-    assert.equal(fixture.collections(), 3);
+    assert.equal(fixture.collections(), beforeDeadline + 1);
+    const refreshedRender = fixture.posted.filter((message) => message.type === 'render').at(-1);
+    assert.ok(refreshedRender);
+    const refreshedCards = refreshedRender.cards as CardView[];
+    assert.equal(refreshedCards.length, 2);
+    for (const card of refreshedCards) {
+      assert.ok(card.dispatched);
+      assert.ok(card.dispatched[0].figures.some((figure) => figure.metric === 'cost'));
+    }
     await provider.refresh(false, true);
-    assert.equal(fixture.collections(), 3);
+    assert.equal(fixture.collections(), beforeDeadline + 1);
   } finally {
     vi.useRealTimers();
     worker.stop();

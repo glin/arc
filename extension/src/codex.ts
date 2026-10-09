@@ -42,6 +42,12 @@ import {
   normalizeFsPath,
   sameCommitSha,
   revisionOf,
+  RelationshipReader,
+  RELATIONSHIP_QUANTUM_BYTES,
+  relationshipEvidence,
+  extendRelationshipEvidence,
+  validRelationshipEvidence,
+  type RelationshipEvidence,
   normalizeSessionTitle,
   normalizeFullSessionTitle,
   readTurnStartsFromTail,
@@ -2762,6 +2768,10 @@ interface CodexDispatchCandidate {
 }
 
 export interface CodexDispatchCursor {
+  evidence?: RelationshipEvidence;
+  target?: number;
+  replayFragment?: string;
+  replayThrough?: number;
   offset: number;
   size: number;
   mtimeMs: number;
@@ -2994,117 +3004,170 @@ export function codexDispatchRecord(
   }
 }
 
-// A cursor stores only accepted launch evidence and replay identity. An append reads its
-// new bytes, while a replacement or truncated file starts again from the opening record.
+interface CodexDispatchScan {
+  cursor: CodexDispatchCursor;
+  references: ClaudeDispatchSessionReference[];
+  retractedToolUseIds: Set<string>;
+  complete: boolean;
+  qualified: boolean;
+  reset: boolean;
+  readBytes: number;
+}
+
+// The synchronous caller drains the same steps that worker discovery yields between.
 export function scanCodexDispatchReferences(
   file: string,
   parentSessionId: string,
   previous: CodexDispatchCursor | null = null,
   budget = Number.POSITIVE_INFINITY,
   cancelled: () => boolean = () => false,
-): {
-  cursor: CodexDispatchCursor;
-  references: ClaudeDispatchSessionReference[];
-  retractedToolUseIds: Set<string>;
-  complete: boolean;
-  readBytes: number;
-} {
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  meter?: { readBytes: number },
+): CodexDispatchScan {
+  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+export async function scanCodexDispatchReferencesAsync(
+  file: string,
+  parentSessionId: string,
+  previous: CodexDispatchCursor | null = null,
+  budget = RELATIONSHIP_QUANTUM_BYTES,
+  cancelled: () => boolean = () => false,
+  meter?: { readBytes: number },
+): Promise<CodexDispatchScan> {
+  const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter);
+  let step = steps.next();
+  while (!step.done) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    step = steps.next();
+  }
+  return step.value;
+}
+
+function* codexDispatchSteps(
+  file: string,
+  parentSessionId: string,
+  previous: CodexDispatchCursor | null,
+  budget: number,
+  cancelled: () => boolean,
+  meter?: { readBytes: number },
+): Generator<void, CodexDispatchScan> {
   const fd = fs.openSync(file, 'r');
   try {
-    const headBuffer = Buffer.alloc(Math.min(stat.size, 256));
-    const headBytes = fs.readSync(fd, headBuffer, 0, headBuffer.length, 0);
-    const head = createHash('sha256').update(headBuffer.subarray(0, headBytes)).digest('hex');
-    const anchorAt = previous ? Math.max(0, previous.offset - 4096) : 0;
-    const anchorBytes = previous ? Buffer.alloc(previous.offset - anchorAt) : Buffer.alloc(0);
-    if (previous) fs.readSync(fd, anchorBytes, 0, anchorBytes.length, anchorAt);
-    const anchor = createHash('sha256').update(anchorBytes).digest('hex');
-    const nextByte = Buffer.alloc(1);
-    let nextByteRead = 0;
-    if (previous && previous.terminalApplied && previous.offset < stat.size) {
-      nextByteRead = fs.readSync(fd, nextByte, 0, 1, previous.offset);
+    let cursor = previous ? structuredClone(previous) : null;
+    const reader = new RelationshipReader(fd, file, budget, cancelled, meter, !Number.isFinite(budget));
+    const stat = reader.stamp;
+    let qualification: 'match' | 'pending' | 'reset' =
+      cursor?.evidence && cursor.parentSessionId === parentSessionId
+        ? yield* reader.qualifySteps(cursor.evidence)
+        : 'reset';
+    if (qualification === 'match') {
+      cursor!.size = cursor!.evidence!.provisional.size;
+      cursor!.mtimeMs = cursor!.evidence!.provisional.mtimeMs;
     }
-    const cursor =
-      previous &&
-      previous.parentSessionId === parentSessionId &&
-      previous.dev === stat.dev &&
-      previous.ino === stat.ino &&
-      previous.offset <= stat.size &&
-      (stat.size > previous.size || (stat.size === previous.size && stat.mtimeMs === previous.mtimeMs)) &&
-      previous.head === head &&
-      previous.anchor === anchor &&
-      (!previous.terminalApplied || previous.offset === stat.size || nextByte[0] === 10 || nextByte[0] === 13)
-        ? previous
-        : codexDispatchCursor(head, stat.dev, stat.ino, parentSessionId);
-    const startOffset = cursor.offset;
-    let readBytes = headBytes + anchorBytes.length + nextByteRead;
+    if (qualification === 'match' && cursor!.terminalApplied && cursor!.offset < stat.size) {
+      const continuation = reader.read(cursor!.offset, 1, 0);
+      if (!continuation.length) qualification = 'pending';
+      else if (continuation[0] !== 10 && continuation[0] !== 13) qualification = 'reset';
+    }
+    const reset = !!previous && qualification === 'reset';
+    if (!cursor || qualification === 'reset') {
+      cursor = codexDispatchCursor(
+        createHash('sha256').update(Buffer.alloc(0)).digest('hex'),
+        stat.dev,
+        stat.ino,
+        parentSessionId,
+      );
+      cursor.evidence = relationshipEvidence(stat);
+      cursor.target = stat.size;
+      qualification = 'match';
+    }
+    if (qualification === 'match') {
+      cursor.size = stat.size;
+      cursor.mtimeMs = stat.mtimeMs;
+      if (cursor.offset === cursor.target) cursor.target = stat.size;
+    }
     const retractedToolUseIds = new Set<string>();
-    while (cursor.offset < stat.size && readBytes < budget && !cancelled()) {
-      const replayBytes = cursor.fragmentStart === null ? 0 : cursor.offset - cursor.fragmentStart;
-      const available = budget - readBytes - replayBytes - 4096;
-      const size = Math.min(256 * 1024, stat.size - cursor.offset, available);
-      if (size <= 0) break;
-      const bytes = Buffer.allocUnsafe(size);
-      const count = fs.readSync(fd, bytes, 0, size, cursor.offset);
-      if (count <= 0) break;
-      cursor.offset += count;
-      readBytes += count;
-      let fragment = Buffer.from(cursor.fragment, 'base64');
-      if (cursor.fragmentStart !== null) {
-        fragment = Buffer.alloc(cursor.offset - count - cursor.fragmentStart);
-        fs.readSync(fd, fragment, 0, fragment.length, cursor.fragmentStart);
-        readBytes += fragment.length;
-        cursor.fragmentStart = null;
-      }
-      const joined = Buffer.concat([fragment, bytes.subarray(0, count)]);
-      let start = 0;
-      for (let index = 0; index < joined.length; index++) {
-        if (joined[index] !== 10) continue;
-        if (!cursor.skipLongLine && !cursor.terminalApplied && index - start <= 4 * 1024 * 1024) {
-          codexDispatchRecord(cursor, joined.toString('utf8', start, index), parentSessionId, retractedToolUseIds);
+    if (!reset && qualification === 'match')
+      while (cursor.offset < cursor.target! && reader.available() > 0) {
+        if (cursor.fragmentStart !== null) {
+          cursor.replayThrough ??= cursor.fragmentStart;
+          cursor.replayFragment ??= '';
+          while (cursor.replayThrough < cursor.offset && reader.available() > 0) {
+            const bytes = reader.read(cursor.replayThrough, cursor.offset - cursor.replayThrough);
+            if (!bytes.length) break;
+            cursor.replayFragment = Buffer.concat([Buffer.from(cursor.replayFragment, 'base64'), bytes]).toString(
+              'base64',
+            );
+            cursor.replayThrough += bytes.length;
+            yield;
+          }
+          if (cursor.replayThrough !== cursor.offset || reader.available() <= 0) break;
+          cursor.fragment = cursor.replayFragment;
+          cursor.fragmentStart = null;
+          delete cursor.replayFragment;
+          delete cursor.replayThrough;
         }
-        cursor.terminalApplied = false;
-        cursor.skipLongLine = false;
-        start = index + 1;
+        const bytes = reader.read(cursor.offset, cursor.target! - cursor.offset);
+        if (!bytes.length) break;
+        extendRelationshipEvidence(cursor.evidence!, bytes);
+        cursor.offset += bytes.length;
+        const joined = Buffer.concat([Buffer.from(cursor.fragment, 'base64'), bytes]);
+        let start = 0;
+        for (let index = 0; index < joined.length; index++) {
+          if (joined[index] !== 10) continue;
+          if (!cursor.skipLongLine && !cursor.terminalApplied && index - start <= 4 * 1024 * 1024)
+            codexDispatchRecord(cursor, joined.toString('utf8', start, index), parentSessionId, retractedToolUseIds);
+          cursor.terminalApplied = false;
+          cursor.skipLongLine = false;
+          start = index + 1;
+        }
+        const remaining = joined.subarray(start);
+        if (remaining.length > 4 * 1024 * 1024) {
+          cursor.fragment = '';
+          cursor.skipLongLine = true;
+        } else cursor.fragment = remaining.toString('base64');
+        yield;
       }
-      const remaining = joined.subarray(start);
-      if (remaining.length > 4 * 1024 * 1024) {
-        cursor.fragment = '';
-        cursor.skipLongLine = true;
-      } else {
-        cursor.fragment = remaining.toString('base64');
-      }
-    }
-    if (cursor.offset === stat.size && cursor.fragment && !cursor.terminalApplied && !cursor.skipLongLine) {
+    if (
+      !reset &&
+      qualification === 'match' &&
+      reader.stable &&
+      !cancelled() &&
+      cursor.offset === cursor.target &&
+      cursor.fragment &&
+      !cursor.terminalApplied &&
+      !cursor.skipLongLine
+    ) {
       const terminal = Buffer.from(cursor.fragment, 'base64').toString('utf8');
       if (parseRecord(terminal)) {
         codexDispatchRecord(cursor, terminal, parentSessionId, retractedToolUseIds);
         cursor.terminalApplied = true;
       }
     }
-    if (cursor.fragment && Buffer.byteLength(cursor.fragment, 'base64') > 4096) {
+    if (cursor.fragment && Buffer.byteLength(cursor.fragment, 'base64') > 4096 && cursor.replayThrough === undefined) {
       const bytes = Buffer.from(cursor.fragment, 'base64');
       if (!cursor.terminalApplied) cursor.fragmentStart = cursor.offset - bytes.length;
       cursor.fragment = '';
     }
-    if (cursor.offset !== startOffset) {
-      const anchorStart = Math.max(0, cursor.offset - 4096);
-      const anchorBuffer = Buffer.alloc(cursor.offset - anchorStart);
-      fs.readSync(fd, anchorBuffer, 0, anchorBuffer.length, anchorStart);
-      readBytes += anchorBuffer.length;
-      cursor.anchor = createHash('sha256').update(anchorBuffer).digest('hex');
-    }
-    cursor.size = stat.size;
-    cursor.mtimeMs = stat.mtimeMs;
+    const qualified = qualification === 'match' && reader.check();
+    if (!qualified && qualification === 'match') cursor.evidence!.accepted = null;
     const complete =
-      cursor.offset === stat.size &&
+      !reset &&
+      qualified &&
+      cursor.offset === cursor.target &&
+      cursor.target === stat.size &&
       ((cursor.fragment === '' && cursor.fragmentStart === null) || cursor.terminalApplied) &&
       !cursor.skipLongLine &&
       !cancelled();
     const references = cursor.candidates
       .filter((candidate) => candidate.classified)
       .map((candidate) => candidate.reference);
-    return { cursor, references, retractedToolUseIds, complete, readBytes };
+    if (!validRelationshipEvidence(cursor.evidence, cursor.offset))
+      throw new Error('Relationship evidence exceeds its limits');
+    return { cursor, references, retractedToolUseIds, complete, qualified, reset, readBytes: reader.readBytes };
   } finally {
     fs.closeSync(fd);
   }

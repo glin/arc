@@ -117,6 +117,7 @@ import {
   refreshClaudeAgentFacts,
   sameSessionRevision,
   revisionOf,
+  relationshipStamp,
   HEAD_KEY_BYTES,
   SESSION_HEAD_BYTES,
   type SessionFile,
@@ -2617,6 +2618,28 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
     await provider.prepareClaudeChildren(4, resumed.signal);
     assert.deepEqual(counts, [finished.sort()], 'the reload count restarted below the unchanged finished sources');
 
+    const checkpoint = structuredClone(provider.discoveryCheckpoint);
+    watch = undefined;
+    const claudeFiles = [files.big, files.small].map(normalizeFsPath);
+    const completedClaude = () =>
+      claudeFiles.every((file) => {
+        const entry = provider.claudeChildReferenceEntries.get(file);
+        const cursor = entry?.claudeCursor;
+        const stamp = relationshipStamp(fs.statSync(file, { bigint: true }));
+        return (
+          entry?.complete === true &&
+          entry.relationshipComplete === true &&
+          cursor?.evidence !== undefined &&
+          cursor.evidence.validation === undefined &&
+          cursor.offset === stamp.size &&
+          isDeepStrictEqual(cursor.evidence.accepted, stamp)
+        );
+      });
+    for (let i = 0; i < 64 && !completedClaude(); i++) {
+      await provider.prepareClaudeChildren(4, new AbortController().signal);
+    }
+    assert.ok(completedClaude(), 'the Claude fixture sources did not finish at their current revisions');
+
     // A saved checkpoint that has not counted a finished rollout, and whose remainder holds only Codex sources, reports the
     // seeded count before it reads them.
     fs.appendFileSync(
@@ -2624,10 +2647,12 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
       newline + JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'later' } }).slice(0, 24),
     );
     listed(rows());
-    const claudeFiles = [files.big, files.small].map(normalizeFsPath);
     saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries, [], undefined, {
-      ...provider.discoveryCheckpoint,
+      ...checkpoint,
+      parents: provider.claudeParents,
+      catalog: provider.claudeParents,
       completed: claudeFiles,
+      protectedFile: undefined,
     });
     const remainder = loadDerivedCache(cacheFile);
     Object.assign(provider, {
@@ -2640,8 +2665,11 @@ test('a reload of a partial follow-up checkpoint starts its count at the unchang
     worker = titleWorker(quantumClock);
     const seeded: string[][] = [];
     const codexOnly = new AbortController();
-    watch = () => {
+    watch = (result) => {
       if (seeded.length) return;
+      assert.equal(result.value.kind, 'claude-children-delta');
+      if (result.value.kind !== 'claude-children-delta') return;
+      assert.deepEqual(result.value.referenceEntries, []);
       seeded.push([...provider.discoveryCheckpoint.completed].sort());
       codexOnly.abort();
     };

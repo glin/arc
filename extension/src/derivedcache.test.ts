@@ -3,7 +3,73 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
-import { normalizeFsPath, scanClaudeRelationshipQuantum } from './transcript';
+import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader } from './transcript';
+import { scanCodexDispatchReferencesAsync } from './codex';
+
+test.each(['claude', 'codex'] as const)(
+  '%s terminal deadline checkpoints retain progress through reload',
+  async (agent) => {
+    const directory = folder();
+    const file = path.join(directory, 'terminal.jsonl');
+    const cache = path.join(directory, 'cache.json');
+    fs.writeFileSync(
+      file,
+      '{"type":"event_msg","timestamp":"2026-10-08T12:00:00Z","payload":{"type":"task_complete"}}',
+    );
+    const parent = { file, sessionId: 'parent' };
+    const first =
+      agent === 'claude'
+        ? await scanClaudeRelationshipQuantum(parent, undefined)
+        : await scanCodexDispatchReferencesAsync(file, 'parent');
+    assert.equal(first.cursor.terminalApplied, true);
+    fs.appendFileSync(file, '\n');
+    let clock = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    const read = RelationshipReader.prototype.read;
+    const observed = vi.spyOn(RelationshipReader.prototype, 'read').mockImplementation(function (
+      this: RelationshipReader,
+      ...args
+    ) {
+      const bytes = read.apply(this, args);
+      clock = 15;
+      return bytes;
+    });
+    const pending =
+      agent === 'claude'
+        ? await scanClaudeRelationshipQuantum(parent, first.cursor as import('./transcript').ClaudeRelationshipCursor)
+        : await scanCodexDispatchReferencesAsync(file, 'parent', first.cursor as import('./codex').CodexDispatchCursor);
+    observed.mockRestore();
+    assert.equal(pending.qualified, false);
+    assert.equal(pending.reset, false);
+    assert.equal(pending.cursor.offset, first.cursor.offset);
+    assert.equal(pending.cursor.evidence?.validation, undefined);
+    const entry: ClaudeChildReferenceCacheEntry = {
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      source: agent,
+      ...pending.cursor.evidence!.provisional,
+      sessionId: 'parent',
+      childTranscript: false,
+      complete: false,
+      relationshipComplete: false,
+      references: [],
+      ...(agent === 'claude'
+        ? { claudeCursor: pending.cursor as import('./transcript').ClaudeRelationshipCursor }
+        : { cursor: pending.cursor as import('./codex').CodexDispatchCursor }),
+    };
+    saveDerivedCache(cache, [], [[file, entry]]);
+    const restored = loadDerivedCache(cache).claudeChildReferences.get(normalizeFsPath(file));
+    assert.ok(restored, 'reload discarded the terminal checkpoint');
+    clock = 0;
+    const resumed =
+      agent === 'claude'
+        ? await scanClaudeRelationshipQuantum(parent, restored.claudeCursor)
+        : await scanCodexDispatchReferencesAsync(file, 'parent', restored.cursor);
+    assert.equal(resumed.reset, false);
+    assert.equal(resumed.complete, true);
+    assert.equal(resumed.cursor.offset, first.cursor.offset + 1);
+    assert.equal(resumed.readBytes, 2, 'resume reread the already matched prefix');
+  },
+);
 
 // An evicted launch or fragment cannot be recovered from the retained byte offset.
 test('Claude pending cursors survive soft cache pressure and reject corrupt durable fragments', async () => {
@@ -81,6 +147,86 @@ import {
   type ClaudeChildReferenceCacheEntry,
   type DerivedTitleEntry,
 } from './derivedcache.ts';
+
+test('durable prefix validation rejects inconsistent stamps offsets framing and oversized evidence', async () => {
+  const directory = folder();
+  const file = path.join(directory, 'source.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  fs.writeFileSync(
+    file,
+    Array.from({ length: 100 }, () => '{"type":"ignored","text":"' + 'x'.repeat(1024) + '"}\n').join(''),
+  );
+  const parent = { file, sessionId: 'parent' };
+  const first = await scanClaudeRelationshipQuantum(parent, undefined);
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  const pending = await scanClaudeRelationshipQuantum(parent, first.cursor, 32768);
+  assert.ok(pending.cursor.evidence?.validation);
+  const entry: ClaudeChildReferenceCacheEntry = {
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    source: 'claude',
+    sourceGeneration: 1,
+    sequence: 2,
+    ...pending.cursor.revision,
+    sessionId: 'parent',
+    childTranscript: false,
+    references: [],
+    complete: false,
+    relationshipComplete: false,
+    claudeCursor: pending.cursor,
+  };
+  saveDerivedCache(cache, [], [[file, entry]]);
+  assert.deepEqual(
+    loadDerivedCache(cache).claudeChildReferences.get(normalizeFsPath(file))?.claudeCursor,
+    pending.cursor,
+  );
+  const saved = fs.readFileSync(cache, 'utf8');
+  const corruptions = [
+    (cursor: typeof pending.cursor) => {
+      cursor.evidence!.validation!.required++;
+    },
+    (cursor: typeof pending.cursor) => {
+      cursor.evidence!.provisional.size++;
+    },
+    (cursor: typeof pending.cursor) => {
+      cursor.evidence!.accepted!.ctimeNs = 'invalid';
+    },
+    (cursor: typeof pending.cursor) => {
+      cursor.evidence!.tail += 'AAAA';
+    },
+    (cursor: typeof pending.cursor) => {
+      cursor.evidence!.validation!.digest.offset = cursor.offset + 1;
+    },
+    (cursor: typeof pending.cursor) => {
+      (cursor.evidence as unknown as Record<string, unknown>).extra = 'x'.repeat(16384);
+    },
+  ];
+  for (const corrupt of corruptions) {
+    const data = JSON.parse(saved);
+    corrupt(data.claudeChildReferences[0].entry.claudeCursor);
+    fs.writeFileSync(cache, JSON.stringify(data));
+    assert.equal(loadDerivedCache(cache).claudeChildReferences.size, 0);
+  }
+  const limited = limitCodexDispatchCursors(
+    [
+      [
+        file,
+        {
+          ...entry,
+          claudeCursor: first.cursor,
+          complete: true,
+          relationshipComplete: true,
+          validatedRevision: first.cursor.revision,
+        },
+      ],
+    ],
+    0,
+  )[0][1];
+  assert.equal(limited.complete, true);
+  assert.equal(limited.relationshipComplete, true);
+  assert.equal(limited.claudeCursor, undefined);
+  assert.deepEqual(limited.evidence, first.cursor.evidence);
+  assert.deepEqual(limited.validatedRevision, first.cursor.revision);
+});
 
 test('partial empty and positive metadata remains eligible and exhaustion survives restart', () => {
   const file = path.join(folder(), 'cache.json');
