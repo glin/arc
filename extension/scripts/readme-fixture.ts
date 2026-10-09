@@ -464,6 +464,7 @@ export const README_SCENES = [
   'main',
   'review',
   'comment',
+  'comment-editor',
   'session-menu',
   'response-menu',
   'cost',
@@ -1609,7 +1610,7 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
       ? nextTurn
       : scene === 'cache-expiry'
         ? expiryTurn
-        : scene === 'comment' || scene === 'cost'
+        : scene === 'comment' || scene === 'comment-editor' || scene === 'cost'
           ? changesTurn
           : scene === 'cache'
             ? cacheTurn
@@ -1721,7 +1722,7 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     scene === 'review' ? new Set(['sol-implementation']) : new Set(),
   );
   const comments: TurnComment[] =
-    scene === 'comment'
+    scene === 'comment' || scene === 'comment-editor'
       ? [
           {
             id: 'comment-open-changes',
@@ -1740,8 +1741,10 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
   const composer = {
     agent: selected.agent,
     session: selected.sessionTitle ?? '',
-    draft: scene === 'comment' ? 'Please check the restored-tab case before merging.' : '',
-    onScreen: scene === 'comment' ? 'Please check the restored-tab case before merging.' : '',
+    draft:
+      scene === 'comment' || scene === 'comment-editor' ? 'Please check the restored-tab case before merging.' : '',
+    onScreen:
+      scene === 'comment' || scene === 'comment-editor' ? 'Please check the restored-tab case before merging.' : '',
     queued: [],
     history: [],
     running: false,

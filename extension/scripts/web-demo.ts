@@ -27,6 +27,7 @@ const labelRules = esbuild.buildSync({
     contents: `import { labelCounts, labelEditorReply, labelsOf, railLabelFields, setSessionLabels } from './src/turnlabels.ts';
 import { newBySession } from './src/domain/read.ts';
 import { applyComment, normalizeComments } from './src/turncomments.ts';
+import { emptyTrail, visitPlace, stepBack, stepForward, trailPlace } from './src/turnplaces.ts';
 import { isSendChord } from './src/domain/composer-editing.ts';
 import { installMenu } from './scripts/web-demo-menu.ts';
 import { demoHost } from './scripts/web-demo-host.ts';
@@ -34,6 +35,7 @@ window.__ARC_DEMO_SAMPLES__.host = demoHost;
 window.__ARC_DEMO_SAMPLES__.labelRules = { labelCounts, labelEditorReply, labelsOf, railLabelFields, setSessionLabels };
 window.__ARC_DEMO_SAMPLES__.readRules = { newBySession };
 window.__ARC_DEMO_SAMPLES__.commentRules = { applyComment, normalizeComments };
+window.__ARC_DEMO_SAMPLES__.placeRules = { emptyTrail, visitPlace, stepBack, stepForward, trailPlace };
 window.__ARC_DEMO_SAMPLES__.isSendChord = isSendChord;
 window.__ARC_DEMO_SAMPLES__.installMenu = installMenu;`,
     resolveDir: path.join(__dirname, '..'),

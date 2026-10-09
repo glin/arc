@@ -44,7 +44,9 @@ claude auth login
 codex login
 ```
 
-## Session costs
+## Features
+
+### Session costs
 
 Arc estimates costs for supported models using published prices. Subscription estimates do not measure your bill or plan limits.
 
@@ -54,26 +56,36 @@ Arc estimates costs for supported models using published prices. Subscription es
 | OpenAI         | GPT                         |
 | Amazon Bedrock | Anthropic and OpenAI models |
 
-### Cost by agent
+#### Cost by agent
 
 <a href="docs/images/readme-cost.webp"><img src="docs/images/readme-cost.webp" alt="Cost details for Claude Opus 5.5 and a Sonnet 5.5 subagent" width="480"></a>
 
-### Next-turn price
+#### Next-turn price
 
 <a href="docs/images/readme-next-turn.webp"><img src="docs/images/readme-next-turn.webp" alt="Cached and uncached next-turn prices with cache time above the prompt box" width="540"></a>
 
-### Cache expiries
+#### Cache expiries
 
 <a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Cache expiry with its estimated input cost" width="541"></a>
 
-### Cache use
+#### Cache use
 
 <a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning and cache costs" width="480"></a>
 
-## Project cost
+### Commenting
+
+Select response text and add a comment beside it.
+
+<a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>
+
+Saved comments stay attached to their text. Edit or delete them from their marks, then send them with your next prompt.
+
+<a href="docs/images/readme-comment.webp"><img src="docs/images/readme-comment.webp" alt="Saved comment beside highlighted response text, with comments ready to send in the prompt box" width="970"></a>
+
+### Project cost
 
 <a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a>
 
-## Account usage
+### Account usage
 
 <a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
