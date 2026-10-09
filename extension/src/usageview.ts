@@ -509,11 +509,8 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
       label,
       plan: usage ? usagePlanLabel(usage) : '',
       lines,
-      age: Number.isFinite(agentReadAt)
-        ? `updated ${now - agentReadAt > USAGE_FRESH_MS ? `${lengthWord(now - agentReadAt)} ago` : 'just now'}`
-        : '',
       exact: Number.isFinite(agentReadAt) ? new Date(agentReadAt).toLocaleString() : '',
-      status: refresh?.agents[agent]?.phase === 'success' ? '' : (statuses[agent] ?? ''),
+      status: ['success', 'waiting'].includes(refresh?.agents[agent]?.phase ?? '') ? '' : (statuses[agent] ?? ''),
     });
   }
   if (!groups.length) {

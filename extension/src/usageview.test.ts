@@ -99,13 +99,14 @@ const CODEX = usage({
   ],
 });
 
-test('fresh Codex and twelve-hour-old Claude expose distinct ages until Claude admits a reading', () => {
+test('mixed reading times appear in the shared age without per-agent age rows', () => {
   const claude = usage({ windows: [reading({ readAt: NOW - 12 * 3600_000 })] });
   const codex = usage({ agent: 'codex' });
   const bar = usageBar([claude, codex], NOW)!;
   assert.equal(bar.age, 'updated 12h ago');
-  assert.equal(bar.groups[0].age, 'updated 12h ago');
-  assert.equal(bar.groups[1].age, 'updated just now');
+  for (const group of bar.groups) {
+    assert.equal('age' in group, false);
+  }
   assert.ok(bar.groups[0].exact);
   assert.notEqual(bar.groups[0].exact, bar.groups[1].exact);
   const book = new UsageBook([claude, codex]);
@@ -118,7 +119,7 @@ test('fresh Codex and twelve-hour-old Claude expose distinct ages until Claude a
     readAt: NOW,
   });
   assert.equal(book.bar(NOW)?.age, '');
-  assert.equal(book.bar(NOW)?.groups[0].age, 'updated just now');
+  assert.equal(book.bar(NOW)?.read, 'updated just now · press to read again');
 });
 
 test('usage progress survives absent or expired figures and retains retry after mixed outcomes', () => {
@@ -131,7 +132,7 @@ test('usage progress survives absent or expired figures and retains retry after 
     assert.equal(bar.groups.length, 2);
     assert.equal(bar.briefs.length, 0);
     assert.equal(bar.age, '');
-    assert.equal(bar.groups[0].age, '');
+    assert.equal(bar.groups[0].status, '');
     assert.equal(bar.groups[0].exact, '');
     assert.equal(bar.groups[1].status, '');
     assert.equal(bar.refresh?.busy, true);
@@ -167,7 +168,7 @@ test('a successful refresh updates figures and reading times without a separate 
   const current = usageBar(book.usages(), NOW + 12 * 3600_000, refresh)!;
   for (const [index, group] of current.groups.entries()) {
     assert.equal(group.status, '');
-    assert.equal(group.age, 'updated just now');
+    assert.equal('age' in group, false);
     assert.notEqual(group.exact, old.groups[index].exact);
     assert.equal(group.lines[0].percent, 23);
     assert.equal(group.lines[0].resets, 'resets in 4h');

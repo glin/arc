@@ -65,40 +65,37 @@ function UsageBriefView(props: { brief: UsageBar['briefs'][number] }): Component
 function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost): void }): ComponentChildren {
   return h('div', { class: 'sbopen' }, [
     ...props.bar.groups.map((group) =>
-      h('div', { class: 'sbgroup', key: group.agent }, [
-        h('div', { class: 'sbhead' }, [
-          h('span', {}, group.label),
-          group.plan ? [' ', h('span', { class: 'sbplan' }, group.plan)] : null,
-        ]),
-        group.age
-          ? h(
-              'div',
-              {
-                class: 'sbreset',
-                role: 'group',
-                title: group.exact,
-                'aria-label': `${group.label}, ${group.age}, ${group.exact}`,
-              },
-              group.age,
-            )
-          : null,
-        group.status ? h('div', { class: 'pickwhy', style: { overflowWrap: 'anywhere' } }, group.status) : null,
-        ...group.lines.map((line) => {
-          const band = line.level ? CONTEXT_CLASSES[line.level] : '';
-          return h('div', { class: 'sbline', key: line.key, title: line.name }, [
-            h('span', { class: 'sblabel' }, line.label),
-            ' ',
-            h(
-              'span',
-              { class: `sbbar${band ? ` ${band}` : ''}`, 'aria-hidden': 'true' },
-              h('i', { style: { width: `${line.fill}%` } }),
-            ),
-            h('span', { class: `sbpct${band ? ` ${band}` : ''}` }, `${line.percent}%`),
-            line.resets ? [' ', h('span', { class: 'sbreset', title: line.resetsExact }, line.resets)] : null,
-            line.detail ? [' ', h('span', { class: 'sbdetail' }, line.detail)] : null,
-          ]);
-        }),
-      ]),
+      h(
+        'div',
+        {
+          class: 'sbgroup',
+          key: group.agent,
+          role: 'group',
+          'aria-label': [group.label, group.exact].filter(Boolean).join(', '),
+        },
+        [
+          h('div', { class: 'sbhead' }, [
+            h('span', {}, group.label),
+            group.plan ? [' ', h('span', { class: 'sbplan' }, group.plan)] : null,
+          ]),
+          group.status ? h('div', { class: 'pickwhy', style: { overflowWrap: 'anywhere' } }, group.status) : null,
+          ...group.lines.map((line) => {
+            const band = line.level ? CONTEXT_CLASSES[line.level] : '';
+            return h('div', { class: 'sbline', key: line.key, title: line.name }, [
+              h('span', { class: 'sblabel' }, line.label),
+              ' ',
+              h(
+                'span',
+                { class: `sbbar${band ? ` ${band}` : ''}`, 'aria-hidden': 'true' },
+                h('i', { style: { width: `${line.fill}%` } }),
+              ),
+              h('span', { class: `sbpct${band ? ` ${band}` : ''}` }, `${line.percent}%`),
+              line.resets ? [' ', h('span', { class: 'sbreset', title: line.resetsExact }, line.resets)] : null,
+              line.detail ? [' ', h('span', { class: 'sbdetail' }, line.detail)] : null,
+            ]);
+          }),
+        ],
+      ),
     ),
     h(
       'button',

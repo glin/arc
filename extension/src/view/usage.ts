@@ -30,7 +30,6 @@ export interface UsageGroup {
   label: string;
   plan: string;
   lines: UsageLine[];
-  age: string;
   exact: string;
   status: string;
 }

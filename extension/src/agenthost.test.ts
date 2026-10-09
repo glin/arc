@@ -4968,7 +4968,7 @@ test('an admitted late reading retires expired feedback without changing termina
     bar.groups.map((group) => group.agent),
     ['claude', 'codex'],
   );
-  assert.equal(bar.groups[0].age, 'updated just now');
+  assert.equal(bar.read, 'updated just now · press to read again');
   assert.equal(bar.groups[0].status, '');
   assert.match(bar.groups[1].status, /could not start/);
   const retry = queue.begin(['claude', 'codex'])!;
