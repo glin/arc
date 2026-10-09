@@ -174,6 +174,7 @@ const CONTEXT_DETAIL = unavailableContext({
 });
 // Valid host messages and their parsed results cover every variant through the typed handler count.
 const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
+  { raw: { type: 'health', sequence: 1 }, parsed: { type: 'health', sequence: 1 } },
   {
     raw: { type: 'visibility', visible: false, revision: 1 },
     parsed: { type: 'visibility', visible: false, revision: 1 },
@@ -319,6 +320,7 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
 ];
 
 const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
+  { raw: { type: 'health', sequence: 1 }, parsed: { type: 'health', sequence: 1 } },
   {
     raw: { type: 'requestDefaults', agent: 'claude', model: '' },
     parsed: { type: 'requestDefaults', agent: 'claude', model: '' },
@@ -557,6 +559,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
   };
   return {
     visibility: take('visibility'),
+    health: take('health'),
     contextDetail: take('contextDetail'),
     focusProjectSpend: take('focusProjectSpend'),
     openLauncher: take('openLauncher'),
@@ -606,6 +609,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
   };
   return {
     contextDetail: take('contextDetail'),
+    health: take('health'),
     ready: take('ready'),
     painted: take('painted'),
     initialize: take('initialize'),

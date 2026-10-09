@@ -534,6 +534,8 @@ import {
   DiagnosticsLog,
   StartupThresholdWatch,
   StartupHistory,
+  HostHealth,
+  type HostHealthOutcome,
   createDiagnosticsLog,
   readStartupArtifact,
   silentDiagnosticsLog,
@@ -2049,6 +2051,7 @@ export class PanelProvider implements vscode.Disposable {
     private readonly workspaceCache?: WorkspaceCachePartition,
     activationAt = performance.now(),
     startupDirectory?: string,
+    private readonly health?: HostHealth,
   ) {
     this.performanceOutput = performanceOutput ?? null;
     this.repositoryScope = this.createRepositoryScope(nodeGitRunner());
@@ -2136,6 +2139,7 @@ export class PanelProvider implements vscode.Disposable {
 
   dispose(): void {
     if (this.disposed) return;
+    const shutdown = this.health?.begin('shutdown');
     this.sessionRunWitnesses?.clear();
     const finish = () => {
       this.cacheShutdownFlushing = true;
@@ -2147,6 +2151,8 @@ export class PanelProvider implements vscode.Disposable {
     };
     if (this.workspaceCache) this.workspaceCache.close(finish);
     else finish();
+    if (shutdown) this.health?.settle(shutdown);
+    this.health?.dispose();
   }
 
   private cacheShutdownFlushing = false;
@@ -2410,7 +2416,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   async openDiagnosticsLog(): Promise<void> {
-    const file = this.diagnostics.file();
+    const healthFile = this.health?.file;
+    const file = this.diagnostics.file() ?? (healthFile && fs.existsSync(healthFile) ? healthFile : undefined);
     if (!file) {
       void vscode.window.showInformationMessage(
         `Arc has written no diagnostics log in this window. Turn on ${settingName('diagnostics.log')} and reload the window.`,
@@ -2470,7 +2477,7 @@ export class PanelProvider implements vscode.Disposable {
         visibleHostCountAvailable = false;
       }
     }
-    return projectPerformanceDiagnostics(
+    const snapshot = projectPerformanceDiagnostics(
       {
         panel: {
           hostCount: this.hosts.length,
@@ -2521,33 +2528,48 @@ export class PanelProvider implements vscode.Disposable {
       },
       capturedAt,
     );
+    const health = this.health?.status();
+    return {
+      ...(snapshot as object),
+      hostHealth: health ? { provider: health.provider, failed: health.failed } : null,
+    };
   }
 
   // Restore tabs whose saved options match PANEL_OPTIONS. Replace other tabs to apply the current options.
   // Retain submitted prompts in workspace storage before disposing the restored browser.
   async revivePanel(panel: vscode.WebviewPanel, state?: unknown): Promise<void> {
-    if (state && typeof state === 'object' && 'submittedPrompts' in state) {
-      try {
-        await this.importPromptRecovery(state.submittedPrompts);
-      } catch {
-        void vscode.window.showInformationMessage(
-          'Arc: the saved prompts could not be retained. Keep this tab open and copy them before closing it.',
-        );
+    const request = this.health?.begin('serializer');
+    let outcome: 'returned' | 'failed' = 'returned';
+    try {
+      if (state && typeof state === 'object' && 'submittedPrompts' in state) {
+        try {
+          await this.importPromptRecovery(state.submittedPrompts);
+        } catch {
+          outcome = 'failed';
+          void vscode.window.showInformationMessage(
+            'Arc: the saved prompts could not be retained. Keep this tab open and copy them before closing it.',
+          );
+          this.adoptPanel(panel, 'serializer');
+          return;
+        }
+      }
+      const matches = (Object.keys(PANEL_OPTIONS) as (keyof typeof PANEL_OPTIONS)[]).every(
+        (key) => panel.options[key] === PANEL_OPTIONS[key],
+      );
+      if (matches) {
         this.adoptPanel(panel, 'serializer');
         return;
       }
+      const column = panel.viewColumn ?? vscode.ViewColumn.Active;
+      panel.dispose();
+      // Identify the new tab as a serializer replacement in diagnostics.
+      this.openInEditor(column, 'serializer-replaced');
+    } catch (error) {
+      outcome = 'failed';
+      throw error;
+    } finally {
+      if (request) this.health?.settle(request, outcome);
     }
-    const matches = (Object.keys(PANEL_OPTIONS) as (keyof typeof PANEL_OPTIONS)[]).every(
-      (key) => panel.options[key] === PANEL_OPTIONS[key],
-    );
-    if (matches) {
-      this.adoptPanel(panel, 'serializer');
-      return;
-    }
-    const column = panel.viewColumn ?? vscode.ViewColumn.Active;
-    panel.dispose();
-    // Identify the new tab as a serializer replacement in diagnostics.
-    this.openInEditor(column, 'serializer-replaced');
   }
 
   // Adopt a created or restored editor tab and log its source for startup diagnostics.
@@ -2574,6 +2596,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     this.diagnostics.log('panelAdopted', { origin });
+    this.health?.event('adopted');
     if (this.editorPanel && this.editorPanel !== panel) {
       this.editorPanel.dispose();
     }
@@ -2701,10 +2724,66 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
+  private healthPanels?: WeakMap<PanelHost, { id: number; sent: number; ack: number; posting?: boolean }>;
+  private healthPanelId = 0;
+
+  private healthPanel(host: PanelHost): { id: number; sent: number; ack: number; posting?: boolean } {
+    this.healthPanels ??= new WeakMap();
+    let panel = this.healthPanels.get(host);
+    if (!panel) {
+      panel = { id: (this.healthPanelId = (this.healthPanelId ?? 0) + 1), sent: 0, ack: 0 };
+      this.healthPanels.set(host, panel);
+    }
+    return panel;
+  }
+
+  healthCounts(): {
+    attached: number;
+    ready: number;
+    retainedTabs: number | null;
+    panels: { id: number; ready: boolean; sent: number; ack: number }[];
+  } {
+    let retainedTabs: number | null = null;
+    try {
+      retainedTabs = vscode.window.tabGroups.all
+        .flatMap((group) => group.tabs)
+        .filter(
+          (tab) =>
+            tab.input instanceof vscode.TabInputWebview &&
+            (tab.input.viewType === PANEL_TYPE || tab.input.viewType === `mainThreadWebview-${PANEL_TYPE}`),
+        ).length;
+    } catch {
+      /* Tab ownership remains unavailable in hosts without this API. */
+    }
+    return {
+      attached: this.hosts.length,
+      ready: this.readyHosts.size,
+      retainedTabs,
+      panels: this.hosts.slice(0, 16).map((host) => ({ ...this.healthPanel(host), ready: this.readyHosts.has(host) })),
+    };
+  }
+
+  healthPulse(sequence: number): void {
+    for (const host of this.hosts.slice(0, 16)) {
+      const panel = this.healthPanel(host);
+      if (panel.posting) continue;
+      panel.posting = true;
+      panel.sent = sequence;
+      try {
+        // The browser reply releases admission. Transport callbacks retain no panel or provider.
+        void this.sendToHost(host, { type: 'health', sequence }).then(healthPostSettled, healthPostSettled);
+      } catch {
+        panel.posting = false;
+        this.health?.event('postFailed', panel.id, undefined, sequence);
+      }
+    }
+  }
+
   // Register a panel host, its listeners, and its initial document.
   private attach(host: PanelHost): void {
     this.notePanelStart();
     this.hosts.push(host);
+    this.health?.event('attached', this.healthPanel(host).id);
     if (this.showing) {
       this.hostSessions?.set(host, this.showing);
       this.hostPreviousSessions?.set(host, this.showing);
@@ -2735,6 +2814,8 @@ export class PanelProvider implements vscode.Disposable {
     ];
     mine.push(
       host.onDidDispose(() => {
+        this.health?.event('disposed', this.healthPanel(host).id);
+        this.healthPanels?.delete(host);
         this.readyHosts.delete(host);
         this.publishWindowState();
         this.panelVisibility?.release(host);
@@ -2787,9 +2868,13 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private browserReady(host: PanelHost): void {
-    if (!this.hosts.includes(host) || this.readyHosts.has(host)) {
+    if (!this.hosts.includes(host)) {
       return;
     }
+    const panel = this.healthPanel(host);
+    panel.posting = false;
+    this.health?.event('ready', panel.id);
+    if (this.readyHosts.has(host)) return;
     this.readyHosts.add(host);
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
     this.publishWindowState();
@@ -2900,7 +2985,7 @@ export class PanelProvider implements vscode.Disposable {
     measured?: (serializedBytes: number | null) => void,
   ): Thenable<boolean> {
     const type = (message as { type?: unknown })?.type;
-    if (!this.readyHosts.has(host) && type !== 'requestPromptRecovery') {
+    if (!this.readyHosts.has(host) && type !== 'requestPromptRecovery' && type !== 'health') {
       return Promise.resolve(false);
     }
     const kind = typeof type === 'string' ? type : 'unknown';
@@ -2908,7 +2993,9 @@ export class PanelProvider implements vscode.Disposable {
     // Count other message kinds without byte measurements.
     const posted = host.webview.postMessage(message);
     const budget = messageByteBudget(kind);
+    const measuring = budget === null ? 0 : this.health?.begin('serialize');
     const serializedBytes = budget === null ? null : serializedMessageBytes(message);
+    if (measuring) this.health?.settle(measuring);
     this.performanceCounters.recordMessage(kind, serializedBytes, host);
     measured?.(serializedBytes);
     if (serializedBytes !== null && budget !== null && serializedBytes > budget) {
@@ -3354,7 +3441,12 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // A chosen setup creates a local draft and focuses the prompt box. Without a usable setup, open the setup menu.
-  public newSession(request?: LauncherRequest, host?: PanelHost, ownership?: { owner?: string }): boolean {
+  public newSession(
+    request?: LauncherRequest,
+    host?: PanelHost,
+    ownership?: { owner?: string },
+    observation?: { request: number; pending: boolean },
+  ): boolean {
     if (ownership && ownership.owner !== this.setupOwner) return false;
     const { owner, state, view } = this.launcherFor(host);
     const primary = view.primary;
@@ -3365,7 +3457,17 @@ export class PanelProvider implements vscode.Disposable {
       !state.settings?.selectedModel &&
       this.attachmentRecoveryPending?.(state.sessionId)
     ) {
-      void this.finishHandoffRecovery(state.sessionId, null, '', false, owner, { request, owner: this.setupOwner });
+      if (observation) observation.pending = true;
+      void this.finishHandoffRecovery(
+        state.sessionId,
+        null,
+        '',
+        false,
+        owner,
+        { request, owner: this.setupOwner },
+        false,
+        observation?.request,
+      );
       return true;
     }
     const profile = request
@@ -3465,11 +3567,13 @@ export class PanelProvider implements vscode.Disposable {
     owner?: PanelHost,
     launch?: { request?: LauncherRequest; owner?: string },
     readerParent: boolean = false,
+    healthRequest = 0,
   ): Promise<void> {
     const generation = this.selectionGeneration;
     const initiatingSession = owner ? this.hostSessions.get(owner) : this.showing;
     const controller = new AbortController();
     this.attachmentHandoffs.add(controller);
+    let healthOutcome: HostHealthOutcome = 'rejected';
     const current = () =>
       !this.disposed &&
       !controller.signal.aborted &&
@@ -3524,7 +3628,7 @@ export class PanelProvider implements vscode.Disposable {
         if (runtime) this.composerRuntime.set(sessionId, runtime);
         if (session.agent === 'codex' || !value.recoveryPending) {
           if (launch) {
-            this.newSession(launch.request, owner, launch);
+            healthOutcome = this.newSession(launch.request, owner, launch) ? 'returned' : 'rejected';
             return;
           }
           const refusal = this.createHandoffDraft(sessionId, key, text, copyLabels, owner, readerParent);
@@ -3533,10 +3637,12 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
     } catch {
+      healthOutcome = 'failed';
       if (current()) void vscode.window.showInformationMessage(handoffRefusalMessage('source', key !== null));
     } finally {
       controller.abort();
       this.attachmentHandoffs.delete(controller);
+      if (healthRequest) this.health?.settle(healthRequest, healthOutcome);
     }
   }
 
@@ -5069,91 +5175,111 @@ export class PanelProvider implements vscode.Disposable {
     host: PanelHost,
     supplied?: SubmittedPrompt,
   ): Promise<void> {
-    const state = this.stateFor(session);
-    const draft = this.newDrafts[session];
-    const cwd = state ? this.cwdForSession(state.agent, session) : null;
-    const captured = state
-      ? {
-          ...state,
-          comments: state.comments.slice(),
-          submittedComments: commentsForActiveSubmission(state),
-          submittedDraftRevision: revision,
-          assets: state.assets?.slice(),
-          draftCommentIds: state.draftCommentIds?.slice(),
-          queued: state.queued.slice(),
-          settings: { ...state.settings },
-        }
-      : null;
-    const assets = (this.assets[session] ?? []).slice();
-    const attempt = supplied ?? {
-      id: crypto.randomUUID(),
-      source,
-      revision,
-      text,
-      order: (this.saved.submittedPrompts?.at(-1)?.order ?? 0) + 1,
-    };
-    const restore = () => {
-      void this.post({ type: 'restoreDraft', session: source, text, revision });
-    };
-    this.submissionsInFlight ??= new Set();
-    if (this.submissionsInFlight.has(session)) {
-      restore();
-      return;
-    }
-    this.submissionsInFlight.add(session);
-    this.submittingDrafts ??= new Map();
-    if (captured)
-      this.submittingDrafts.set(session, {
-        revision,
-        commentIds: captured.submittedComments.map((comment) => comment.id),
-        assets,
-      });
-    for (const asset of assets) this.assetIdsInHandoff.add(asset.id);
+    const sending = this.health?.begin('send', this.healthPanel(host).id);
+    let result: 'rejected' | 'failed' | 'pending' = 'rejected';
     try {
-      const validated = mergeSubmittedPrompts([attempt]);
-      if (validated.length !== 1 || attempt.text !== text || attempt.source !== source || attempt.revision !== revision)
-        throw new Error('The prompt could not be retained.');
-      await this.importPromptRecovery(validated);
-      if (
-        !captured ||
-        !this.hosts.includes(host) ||
-        this.panelSession(source, host) !== session ||
-        !this.stateFor(session) ||
-        this.cwdForSession(captured.agent, session) !== cwd
-      ) {
+      const state = this.stateFor(session);
+      const draft = this.newDrafts[session];
+      const cwd = state ? this.cwdForSession(state.agent, session) : null;
+      const captured = state
+        ? {
+            ...state,
+            comments: state.comments.slice(),
+            submittedComments: commentsForActiveSubmission(state),
+            submittedDraftRevision: revision,
+            assets: state.assets?.slice(),
+            draftCommentIds: state.draftCommentIds?.slice(),
+            queued: state.queued.slice(),
+            settings: { ...state.settings },
+          }
+        : null;
+      const assets = (this.assets[session] ?? []).slice();
+      const attempt = supplied ?? {
+        id: crypto.randomUUID(),
+        source,
+        revision,
+        text,
+        order: (this.saved.submittedPrompts?.at(-1)?.order ?? 0) + 1,
+      };
+      const restore = () => {
+        void this.post({ type: 'restoreDraft', session: source, text, revision });
+      };
+      this.submissionsInFlight ??= new Set();
+      if (this.submissionsInFlight.has(session)) {
         restore();
         return;
       }
-      const previous = this.promptOriginHost;
-      this.promptOriginHost = host;
-      this.clearingDraftRevision = { session, revision };
+      this.submissionsInFlight.add(session);
+      this.submittingDrafts ??= new Map();
+      if (captured)
+        this.submittingDrafts.set(session, {
+          revision,
+          commentIds: captured.submittedComments.map((comment) => comment.id),
+          assets,
+        });
+      for (const asset of assets) this.assetIdsInHandoff.add(asset.id);
       try {
-        const current = this.stateFor(session);
-        if (!current) {
+        const validated = mergeSubmittedPrompts([attempt]);
+        if (
+          validated.length !== 1 ||
+          attempt.text !== text ||
+          attempt.source !== source ||
+          attempt.revision !== revision
+        )
+          throw new Error('The prompt could not be retained.');
+        const retention = this.health?.begin('retention', this.healthPanel(host).id);
+        let retained = false;
+        try {
+          await this.importPromptRecovery(validated);
+          retained = true;
+        } finally {
+          if (retention) this.health?.settle(retention, retained ? 'returned' : 'failed');
+        }
+        if (
+          !captured ||
+          !this.hosts.includes(host) ||
+          this.panelSession(source, host) !== session ||
+          !this.stateFor(session) ||
+          this.cwdForSession(captured.agent, session) !== cwd
+        ) {
           restore();
           return;
         }
-        const ready = {
-          ...captured,
-          submittedRecoveryId: attempt.id,
-          running: current.running,
-          live: current.live,
-          clearing: current.clearing,
-          queued: current.queued,
-          queueHandoffs: current.queueHandoffs,
-          asks: current.asks,
-        };
-        this.sendPrompt(text, session, revision, source, ready, assets, draft, attempt.id);
+        const previous = this.promptOriginHost;
+        this.promptOriginHost = host;
+        this.clearingDraftRevision = { session, revision };
+        try {
+          const current = this.stateFor(session);
+          if (!current) {
+            restore();
+            return;
+          }
+          const ready = {
+            ...captured,
+            submittedRecoveryId: attempt.id,
+            running: current.running,
+            live: current.live,
+            clearing: current.clearing,
+            queued: current.queued,
+            queueHandoffs: current.queueHandoffs,
+            asks: current.asks,
+          };
+          this.sendPrompt(text, session, revision, source, ready, assets, draft, attempt.id);
+          result = 'pending';
+        } finally {
+          this.promptOriginHost = previous;
+          this.clearingDraftRevision = null;
+        }
+      } catch {
+        result = 'failed';
+        restore();
       } finally {
-        this.promptOriginHost = previous;
-        this.clearingDraftRevision = null;
+        this.submissionsInFlight.delete(session);
+        this.submittingDrafts.delete(session);
+        for (const asset of assets) if (!this.assetHandoffs.has(session)) this.assetIdsInHandoff.delete(asset.id);
       }
-    } catch {
-      restore();
     } finally {
-      this.submissionsInFlight.delete(session);
-      this.submittingDrafts.delete(session);
-      for (const asset of assets) if (!this.assetHandoffs.has(session)) this.assetIdsInHandoff.delete(asset.id);
+      if (sending) this.health?.settle(sending, result);
     }
   }
 
@@ -7953,8 +8079,16 @@ export class PanelProvider implements vscode.Disposable {
         try {
           const directory = this.projectSpendStorageDir;
           const workspace = this.projectSpendWorkspace;
-          const write = () =>
-            saveSpendLedger(directory, workspace, this.projectSpendFiles, this.projectSpendVisibleFiles);
+          const write = () => {
+            const saving = this.health?.begin('ledgerSave');
+            let saved = false;
+            try {
+              saveSpendLedger(directory, workspace, this.projectSpendFiles, this.projectSpendVisibleFiles);
+              saved = true;
+            } finally {
+              if (saving) this.health?.settle(saving, saved ? 'returned' : 'failed');
+            }
+          };
           if (this.workspaceCache) {
             if (!this.workspaceCache.write(write, this.cacheShutdownFlushing, directory)) return;
           } else write();
@@ -10944,11 +11078,22 @@ export class PanelProvider implements vscode.Disposable {
           }
         : parsed;
     if (!message) {
+      this.health?.event('parseRejected');
       const named = raw !== null && typeof raw === 'object' ? (raw as { type?: unknown }).type : raw;
       console.warn('Arc: a message from the panel was not understood, so nothing was done.', named);
       return;
     }
+    if (message.type === 'health') {
+      const panel = this.healthPanel(host);
+      if (message.sequence > panel.ack && message.sequence <= panel.sent) {
+        panel.ack = message.sequence;
+        if (panel.ack === panel.sent) panel.posting = false;
+        this.health?.event('ack', panel.id, undefined, message.sequence);
+      }
+      return;
+    }
     if (message.type !== 'ready' && message.type !== 'importPromptRecovery' && !this.readyHosts.has(host)) {
+      this.health?.event('unready', this.healthPanel(host).id);
       return;
     }
     // Resolve current cards by key. Missing cards cannot supply action targets.
@@ -10956,473 +11101,485 @@ export class PanelProvider implements vscode.Disposable {
       const card = this.cards.find((c) => c.key === key);
       return card ? { card, sessionId: card.key.slice(0, card.key.indexOf(':')) } : null;
     };
-    await dispatchPanelToHost<void | Promise<void>>(message, {
-      ready: () => {
-        this.browserReady(host);
-      },
-      painted: (msg) => {
-        this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);
-      },
-      initialize: () => {
-        this.onSetupRefresh?.();
-        void this.refresh(true);
-      },
-      developmentReload: () => {
-        if (PANEL_DEV_SERVER_URL) {
-          this.readyHosts.delete(host);
-          this.publishWindowState();
-          this.releaseQueuedEditOffer(host);
-          if (!this.anyVisible()) {
-            this.stopPolling();
+    const phase = message.type === 'showSession' ? 'select' : message.type === 'newSession' ? 'new' : null;
+    const action = phase ? this.health?.begin(phase, this.healthPanel(host).id) : 0;
+    const newObservation = { request: action ?? 0, pending: false };
+    let outcome: 'returned' | 'failed' | 'pending' | 'rejected' = phase === 'select' ? 'pending' : 'returned';
+    try {
+      await dispatchPanelToHost<void | Promise<void>>(message, {
+        health: () => {},
+        ready: () => {
+          this.browserReady(host);
+        },
+        painted: (msg) => {
+          this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);
+        },
+        initialize: () => {
+          this.onSetupRefresh?.();
+          void this.refresh(true);
+        },
+        developmentReload: () => {
+          if (PANEL_DEV_SERVER_URL) {
+            this.readyHosts.delete(host);
+            this.publishWindowState();
+            this.releaseQueuedEditOffer(host);
+            if (!this.anyVisible()) {
+              this.stopPolling();
+            }
+            host.webview.html = this.shell(host.webview);
           }
-          host.webview.html = this.shell(host.webview);
-        }
-      },
-      refresh: () => {
-        this.onSetupRefresh?.();
-        void this.refresh();
-      },
-      perf: (msg) => {
-        this.performanceCounters.recordPanelMessage(msg.kind, msg.ms, host);
-      },
-      // Honor the editor's mouse-navigation setting because workbench listeners do not receive webview button events.
-      goBack: () => {
-        if (mouseNavigates()) {
-          this.goBack(host);
-        }
-      },
-      goForward: () => {
-        if (mouseNavigates()) {
-          this.goForward(host);
-        }
-      },
-      newSession: (msg) => {
-        this.newSession(msg.request, host, msg);
-      },
-      pinSetup: (msg) => {
-        if (msg.owner !== this.setupOwner) return;
-        void this.pinSetup(msg.request, host);
-      },
-      unpinSetup: (msg) => {
-        if (msg.owner !== this.setupOwner) return;
-        void this.unpinSetup(msg.id);
-      },
-      // Forward account-refresh requests to the callback that owns agent processes.
-      refreshUsage: (msg) => {
-        this.refreshUsageHandler?.(msg.agent, msg.force);
-      },
-      requestDefaults: (msg) => {
-        this.defaultContext(msg.agent, this.folders()[0] ?? null, msg.model);
-      },
-      openControl: (msg) => {
-        const state = this.stateFor(msg.session);
-        if (!state) {
-          return;
-        }
-        this.onPanelCommand?.(
-          state.sessionId,
-          state.agent,
-          msg.control,
-          this.newDrafts[state.sessionId] ?? null,
-          this.cwdForSession(state.agent, state.sessionId),
-        );
-      },
-      // Apply the choice already made by the panel menu.
-      pick: (msg) => {
-        if (msg.control === 'model') this.invalidateContext(msg.session);
-        // Resolve the target through current session state. Reject missing rows and inherited object keys before applying settings.
-        const aimed = this.stateFor(msg.session);
-        if (!aimed) {
-          return;
-        }
-        // Apply draft setup choices locally. MCP choices reach the agent-process callback.
-        if (aimed.profile && msg.control !== 'mcp') {
-          this.pickOnDraft(msg.session, msg.control, msg.value);
-          return;
-        }
-        this.onPicked?.(
-          aimed.agent,
-          msg.session,
-          msg.control,
-          msg.value,
-          msg.model,
-          this.ownCwdForSession(aimed.agent, msg.session),
-        );
-      },
-      // Update draft text for the session named by the typing message.
-      draft: (msg) => {
-        this.draftRevisions ??= new Map();
-        if (msg.revision !== undefined) this.draftRevisions.set(msg.session, msg.revision);
-        this.setDraft(msg.text, msg.keep, msg.session);
-      },
-      contextDetail: (msg) => this.requestContext(host, msg.session, msg.request, msg.generation),
-      pathCompletion: async (msg) => {
-        const state = this.stateFor(msg.session);
-        const workingDirectory = state ? this.cwdForSession(state.agent, msg.session) : null;
-        if (!state || !workingDirectory) {
-          return;
-        }
-        const platform = process.platform === 'win32' ? 'win32' : 'posix';
-        const completed = await completePath({
-          token: msg.token,
-          workingDirectory,
-          homeDirectory: os.homedir(),
-          platform,
-          reader: {
-            readDirectory: async (directory) =>
-              (await vscode.workspace.fs.readDirectory(vscode.Uri.file(directory))).map(([name, type]) => ({
-                name,
-                directory: (type & vscode.FileType.Directory) !== 0,
-                symbolicLink: (type & vscode.FileType.SymbolicLink) !== 0,
-              })),
-            stat: async (file) => ({
-              directory:
-                ((await vscode.workspace.fs.stat(vscode.Uri.file(file))).type & vscode.FileType.Directory) !== 0,
-            }),
-          },
-        });
-        await this.sendToHost(host, {
-          type: 'pathCompletion',
-          session: browserSession ?? msg.session,
-          request: msg.request,
-          token: msg.token,
-          caret: msg.caret,
-          rows: pathEntries(completed.entries, completed.prefix, completed.separator),
-        });
-      },
-      answerAsk: (msg) => {
-        const answered = this.onAnswerAsk?.(msg.session, msg.id, msg.answer) ?? false;
-        if (!answered) {
-          void this.post({ type: 'askRejected', session: browserSession ?? msg.session, id: msg.id });
-        }
-      },
-      beginFileStaging: (msg) => {
-        try {
-          this.openStagingOperation(browserSession ?? msg.session, msg.token, host);
-        } catch (error) {
-          this.setAttachmentNotice(msg.session, attachmentFailureNotice(error));
-          this.settleBrowserStagingOperation(browserSession ?? msg.session, msg.token, host);
-          void this.sendToHost(host, {
-            type: 'fileStagingRejected',
-            session: browserSession ?? msg.session,
-            token: msg.token,
-          });
-        }
-      },
-      fileReadError: (msg) => {
-        this.setAttachmentNotice(msg.session, attachmentRefusal('read', msg.name));
-        this.settleBrowserStagingOperation(browserSession ?? msg.session, msg.token, host);
-      },
-      fileRejected: (msg) => {
-        this.setAttachmentNotice(msg.session, attachmentRefusal(msg.code, msg.name, msg.size, msg.rejected));
-      },
-      attachFiles: async (msg) => {
-        if (!Array.isArray(msg.files)) {
-          this.setAttachmentNotice(msg.session, attachmentRefusal('read'));
-          this.settleBrowserStagingOperation(browserSession ?? msg.session, msg.token, host);
-          return;
-        }
-        const inputs: PromptAssetInput[] = [];
-        for (const value of msg.files) {
-          if (!value || typeof value !== 'object' || Array.isArray(value)) {
-            continue;
+        },
+        refresh: () => {
+          this.onSetupRefresh?.();
+          void this.refresh();
+        },
+        perf: (msg) => {
+          this.performanceCounters.recordPanelMessage(msg.kind, msg.ms, host);
+        },
+        // Honor the editor's mouse-navigation setting because workbench listeners do not receive webview button events.
+        goBack: () => {
+          if (mouseNavigates()) {
+            this.goBack(host);
           }
-          const file = value as Record<string, unknown>;
-          const bytes = messageBytes(file.data);
-          if (typeof file.name !== 'string' || typeof file.mime !== 'string' || !bytes) {
-            continue;
+        },
+        goForward: () => {
+          if (mouseNavigates()) {
+            this.goForward(host);
           }
-          inputs.push({
-            name: msg.clipboard ? pastedAssetName(file.name) : file.name,
-            mime: browserAssetMime(file.name, file.mime),
-            bytes,
-          });
-        }
-        await this.stageFiles(browserSession ?? msg.session, inputs, msg.token, host);
-      },
-      removeFile: async (msg) => {
-        await this.removeFile(msg.session, msg.value);
-      },
-      importPromptRecovery: async (msg) => {
-        try {
-          await this.importPromptRecovery(msg.submittedPrompts);
-          if (msg.request) {
-            this.panelRecoveryWaiters.get(msg.request)?.resolve();
-            this.panelRecoveryWaiters.delete(msg.request);
+        },
+        newSession: (msg) => {
+          outcome = this.newSession(msg.request, host, msg, newObservation) ? 'returned' : 'rejected';
+        },
+        pinSetup: (msg) => {
+          if (msg.owner !== this.setupOwner) return;
+          void this.pinSetup(msg.request, host);
+        },
+        unpinSetup: (msg) => {
+          if (msg.owner !== this.setupOwner) return;
+          void this.unpinSetup(msg.id);
+        },
+        // Forward account-refresh requests to the callback that owns agent processes.
+        refreshUsage: (msg) => {
+          this.refreshUsageHandler?.(msg.agent, msg.force);
+        },
+        requestDefaults: (msg) => {
+          this.defaultContext(msg.agent, this.folders()[0] ?? null, msg.model);
+        },
+        openControl: (msg) => {
+          const state = this.stateFor(msg.session);
+          if (!state) {
+            return;
           }
-        } catch (error) {
-          if (msg.request) {
-            this.panelRecoveryWaiters.get(msg.request)?.reject(error);
-            this.panelRecoveryWaiters.delete(msg.request);
-          }
-        }
-      },
-      sendPrompt: (msg) =>
-        this.acceptSubmission(msg.text, msg.session, msg.revision, browserSession ?? msg.session, host, msg.attempt),
-      compact: (msg) => {
-        this.compact(msg.session);
-      },
-      dismissLive: (msg) => {
-        this.dismissLive(msg.session, msg.kind);
-      },
-      restoreLive: (msg) => {
-        this.restoreLive(msg.session, msg.kind);
-      },
-      stopTurn: (msg) => {
-        // Stop the session named by the message, independent of the current panel selection.
-        const aimed = this.stateFor(msg.session);
-        if (aimed) {
-          this.cancelClearSettlement(aimed.sessionId, 'The clear request stopped before a new session opened.');
-          this.onStopTurn?.(aimed.agent, aimed.sessionId);
-        }
-      },
-      dequeue: (msg) => {
-        this.dequeue(msg.value, msg.session);
-      },
-      editQueued: (msg) => {
-        this.requestQueuedEdit(msg.value, msg.session, msg.revision, host, browserSession ?? msg.session);
-      },
-      acceptQueuedEdit: (msg) => {
-        this.acceptQueuedEdit(msg.value, msg.session, msg.revision, msg.currentRevision, msg.accepted, host);
-      },
-      copy: async (msg) => {
-        await this.copyText(msg.text);
-      },
-      // Apply one comment change to provider state and broadcast the resulting list, preserving peer-host edits.
-      note: (msg) => {
-        this.saved.comments = applyComment(this.saved.comments, msg.note);
-        void this.memento?.update(STATE_KEY, this.saved);
-        void this.post({ type: 'notes', comments: this.saved.comments });
-        // The composer derives its annotation chip and empty-prompt send state from the same
-        // comments. They travel in the usage payload, so publish that view with the card marks.
-        void this.post({ type: 'usage', usage: this.usagePayload() });
-        this.postRail(true);
-      },
-      armSelectedText: (msg) => {
-        this.selectedTextMenuArm = {
-          host,
-          session: msg.session,
-          key: msg.key,
-          at: Date.now(),
-        };
-      },
-      selectedTextHandoff: (msg) => {
-        this.acceptSelectedTextHandoff(host, msg.text, msg.session, msg.key, msg.copyLabels);
-      },
-      armSessionDetails: (msg) => {
-        this.detailsMenuArm = {
-          host,
-          session: msg.session,
-          browserSession: browserSession ?? msg.session,
-          at: Date.now(),
-        };
-      },
-      armComposer: () => {
-        this.composerMenuArm = { host, at: Date.now() };
-      },
-      // Select the named session. Refresh reconciles unavailable IDs with the newest reachable session.
-      showReaderParent: (msg) => {
-        this.show(msg.session || null, host);
-      },
-      showSession: (msg) => {
-        this.show(msg.session || null, host);
-      },
-      // Build label-editor rows from current provider state on each opening.
-      labelEditor: (msg) => {
-        void this.post(this.labelEditorReply(msg.session, browserSession ?? msg.session));
-      },
-      // Return rename success or failure to the host that opened the editor.
-      renameSession: async (msg) => {
-        await answerSessionRename(
-          msg,
-          () => this.renameSession(msg.session, msg.title),
-          (answer) => this.sendToHost(host, answer),
-        );
-      },
-      // Normalize and replace one session's labels, then publish the stored result.
-      setLabels: (msg) => {
-        return this.changeSessionLabels(msg.session, msg.names, browserSession ?? msg.session).catch((error) => {
-          void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
-        });
-      },
-      // Normalize and persist the complete saved-view list. The session-list update publishes it to every host.
-      setViews: (msg) => {
-        this.saved.views = normalizeSavedViews(msg.views);
-        void this.memento?.update(STATE_KEY, this.saved);
-        this.postRail(true);
-      },
-      setRailFilters: (msg) => {
-        this.saved.railFilters = normalizeSavedRailFilters(msg.railFilters);
-        void this.memento?.update(STATE_KEY, this.saved);
-        this.postRail(true);
-      },
-      // Apply one operation to the provider-owned sets. A panel can act before it receives a
-      // peer's update without replacing that peer's membership state with an older snapshot.
-      sessionMembership: (msg) => {
-        return Promise.resolve(
-          this.updateSessionMembership(
-            msg.action,
-            'session' in msg ? msg.session : undefined,
-            'openPinned' in msg && msg.openPinned === true,
-          ),
-        ).catch((error) => {
-          void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
-        });
-      },
-      // The Timeline layout dialog writes the reader's setting. The configuration listener
-      // sends its new value to every host. A refused write reaches the reader as an error message.
-      setLayout: (msg) => {
-        void saveTimelineLayout(msg.key, msg.value, writeSetting, (message) => {
-          void vscode.window.showErrorMessage(message);
-        });
-      },
-      saveState: (msg) => {
-        this.saveState(msg.state);
-      },
-      // Classify typed queries through `isSearch` before reading session content.
-      search: (msg) => {
-        const query = msg.text;
-        this.waitingSearch = null;
-        if (!isSearch(query)) {
-          void this.post({ type: 'results', query, hits: null, scope: 'workspace' });
-          return;
-        }
-        // Wait for cold opening reads before building the corpus. Answer only the latest waiting query.
-        const priming = this.codexPriming;
-        if (priming) {
-          this.waitingSearch = query;
-          void priming
-            .catch(() => undefined)
-            .then(() => {
-              if (this.waitingSearch === query) {
-                this.waitingSearch = null;
-                this.answerSearch(query);
-              }
-            });
-          return;
-        }
-        this.answerSearch(query);
-      },
-      loadOlder: (msg) => {
-        // Reject older-history requests that no longer match this host's selected session.
-        const showing = this.hostSessions.get(host) ?? this.showing;
-        if (!showing || msg.session !== showing) {
-          return;
-        }
-        void this.loadOlderHistory(showing);
-      },
-      openLink: async (msg) => {
-        if (!msg.href) {
-          return;
-        }
-        // Ctrl, or Cmd on a Mac, asks for a group of its own, the same press a file row takes.
-        await openLink(msg.href, msg.beside ? vscode.ViewColumn.Beside : this.column());
-      },
-      openVisualization: async (msg) => {
-        if (!msg.path) {
-          return;
-        }
-        await openVisualization(msg.path);
-      },
-      openImage: async (msg) => {
-        if (!msg.path) {
-          return;
-        }
-        // Ctrl, or Cmd on a Mac, asks for a group of its own, the same press a file link takes.
-        await openImage(msg.path, msg.beside ? vscode.ViewColumn.Beside : this.column());
-      },
-      openTurnDiff: async (msg) => {
-        const found = cardFor(msg.key);
-        if (!found) {
-          return;
-        }
-        const turn = this.turnsByKey.get(found.card.key);
-        if (turn) {
-          await this.openTurnDiff(found.sessionId, turn, found.card.headline, msg.beside);
-        }
-      },
-      openCommit: async (msg) => {
-        if (!cardFor(msg.key) || !msg.sha) {
-          return;
-        }
-        if (this.canOpenCommit === null) {
-          try {
-            this.canOpenCommit = (await vscode.commands.getCommands(true)).includes('git.viewCommit');
-          } catch {
-            this.canOpenCommit = false;
-          }
-        }
-        if (!this.canOpenCommit) {
-          void vscode.window.showInformationMessage('Arc: This version of VS Code cannot open commits.');
-          return;
-        }
-        const folder = msg.dir;
-        if (!folder) {
-          void vscode.window.showInformationMessage('Arc: The repository for this commit could not be identified.');
-          return;
-        }
-        try {
-          // Register the resolved repository before `git.viewCommit`, which uses repositories known to the built-in Git extension.
-          await vscode.commands.executeCommand('git.openRepository', folder);
-          await vscode.commands.executeCommand('git.viewCommit', vscode.Uri.file(folder), msg.sha);
-        } catch {
-          void vscode.window.showInformationMessage('Arc: This commit is no longer in the repository.');
-        }
-      },
-      openFile: async (msg) => {
-        const found = cardFor(msg.key);
-        if (!found || !msg.path) {
-          return;
-        }
-        const sourceSessionId = msg.sourceSessionId;
-        if (
-          sourceSessionId &&
-          (found.card.kind !== 'turn' ||
-            !found.card.dispatched?.some(
-              (child) => child.sessionId === sourceSessionId && child.files?.some((file) => file.path === msg.path),
-            ))
-        ) {
-          return;
-        }
-        const pending = this.pendingEntry(sourceSessionId ?? found.sessionId, msg.path);
-        // Open in the chosen editor column. The beside modifier requests a separate group.
-        const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
-        if (pending) {
-          await vscode.commands.executeCommand(
-            'vscode.diff',
-            baselineUri(pending.snapshot, pending.path),
-            vscode.Uri.file(pending.path),
-            path.basename(pending.path),
-            { viewColumn: column, preserveFocus: false },
+          this.onPanelCommand?.(
+            state.sessionId,
+            state.agent,
+            msg.control,
+            this.newDrafts[state.sessionId] ?? null,
+            this.cwdForSession(state.agent, state.sessionId),
           );
-        } else {
+        },
+        // Apply the choice already made by the panel menu.
+        pick: (msg) => {
+          if (msg.control === 'model') this.invalidateContext(msg.session);
+          // Resolve the target through current session state. Reject missing rows and inherited object keys before applying settings.
+          const aimed = this.stateFor(msg.session);
+          if (!aimed) {
+            return;
+          }
+          // Apply draft setup choices locally. MCP choices reach the agent-process callback.
+          if (aimed.profile && msg.control !== 'mcp') {
+            this.pickOnDraft(msg.session, msg.control, msg.value);
+            return;
+          }
+          this.onPicked?.(
+            aimed.agent,
+            msg.session,
+            msg.control,
+            msg.value,
+            msg.model,
+            this.ownCwdForSession(aimed.agent, msg.session),
+          );
+        },
+        // Update draft text for the session named by the typing message.
+        draft: (msg) => {
+          this.draftRevisions ??= new Map();
+          if (msg.revision !== undefined) this.draftRevisions.set(msg.session, msg.revision);
+          this.setDraft(msg.text, msg.keep, msg.session);
+        },
+        contextDetail: (msg) => this.requestContext(host, msg.session, msg.request, msg.generation),
+        pathCompletion: async (msg) => {
+          const state = this.stateFor(msg.session);
+          const workingDirectory = state ? this.cwdForSession(state.agent, msg.session) : null;
+          if (!state || !workingDirectory) {
+            return;
+          }
+          const platform = process.platform === 'win32' ? 'win32' : 'posix';
+          const completed = await completePath({
+            token: msg.token,
+            workingDirectory,
+            homeDirectory: os.homedir(),
+            platform,
+            reader: {
+              readDirectory: async (directory) =>
+                (await vscode.workspace.fs.readDirectory(vscode.Uri.file(directory))).map(([name, type]) => ({
+                  name,
+                  directory: (type & vscode.FileType.Directory) !== 0,
+                  symbolicLink: (type & vscode.FileType.SymbolicLink) !== 0,
+                })),
+              stat: async (file) => ({
+                directory:
+                  ((await vscode.workspace.fs.stat(vscode.Uri.file(file))).type & vscode.FileType.Directory) !== 0,
+              }),
+            },
+          });
+          await this.sendToHost(host, {
+            type: 'pathCompletion',
+            session: browserSession ?? msg.session,
+            request: msg.request,
+            token: msg.token,
+            caret: msg.caret,
+            rows: pathEntries(completed.entries, completed.prefix, completed.separator),
+          });
+        },
+        answerAsk: (msg) => {
+          const answered = this.onAnswerAsk?.(msg.session, msg.id, msg.answer) ?? false;
+          if (!answered) {
+            void this.post({ type: 'askRejected', session: browserSession ?? msg.session, id: msg.id });
+          }
+        },
+        beginFileStaging: (msg) => {
+          try {
+            this.openStagingOperation(browserSession ?? msg.session, msg.token, host);
+          } catch (error) {
+            this.setAttachmentNotice(msg.session, attachmentFailureNotice(error));
+            this.settleBrowserStagingOperation(browserSession ?? msg.session, msg.token, host);
+            void this.sendToHost(host, {
+              type: 'fileStagingRejected',
+              session: browserSession ?? msg.session,
+              token: msg.token,
+            });
+          }
+        },
+        fileReadError: (msg) => {
+          this.setAttachmentNotice(msg.session, attachmentRefusal('read', msg.name));
+          this.settleBrowserStagingOperation(browserSession ?? msg.session, msg.token, host);
+        },
+        fileRejected: (msg) => {
+          this.setAttachmentNotice(msg.session, attachmentRefusal(msg.code, msg.name, msg.size, msg.rejected));
+        },
+        attachFiles: async (msg) => {
+          if (!Array.isArray(msg.files)) {
+            this.setAttachmentNotice(msg.session, attachmentRefusal('read'));
+            this.settleBrowserStagingOperation(browserSession ?? msg.session, msg.token, host);
+            return;
+          }
+          const inputs: PromptAssetInput[] = [];
+          for (const value of msg.files) {
+            if (!value || typeof value !== 'object' || Array.isArray(value)) {
+              continue;
+            }
+            const file = value as Record<string, unknown>;
+            const bytes = messageBytes(file.data);
+            if (typeof file.name !== 'string' || typeof file.mime !== 'string' || !bytes) {
+              continue;
+            }
+            inputs.push({
+              name: msg.clipboard ? pastedAssetName(file.name) : file.name,
+              mime: browserAssetMime(file.name, file.mime),
+              bytes,
+            });
+          }
+          await this.stageFiles(browserSession ?? msg.session, inputs, msg.token, host);
+        },
+        removeFile: async (msg) => {
+          await this.removeFile(msg.session, msg.value);
+        },
+        importPromptRecovery: async (msg) => {
+          try {
+            await this.importPromptRecovery(msg.submittedPrompts);
+            if (msg.request) {
+              this.panelRecoveryWaiters.get(msg.request)?.resolve();
+              this.panelRecoveryWaiters.delete(msg.request);
+            }
+          } catch (error) {
+            if (msg.request) {
+              this.panelRecoveryWaiters.get(msg.request)?.reject(error);
+              this.panelRecoveryWaiters.delete(msg.request);
+            }
+          }
+        },
+        sendPrompt: (msg) =>
+          this.acceptSubmission(msg.text, msg.session, msg.revision, browserSession ?? msg.session, host, msg.attempt),
+        compact: (msg) => {
+          this.compact(msg.session);
+        },
+        dismissLive: (msg) => {
+          this.dismissLive(msg.session, msg.kind);
+        },
+        restoreLive: (msg) => {
+          this.restoreLive(msg.session, msg.kind);
+        },
+        stopTurn: (msg) => {
+          // Stop the session named by the message, independent of the current panel selection.
+          const aimed = this.stateFor(msg.session);
+          if (aimed) {
+            this.cancelClearSettlement(aimed.sessionId, 'The clear request stopped before a new session opened.');
+            this.onStopTurn?.(aimed.agent, aimed.sessionId);
+          }
+        },
+        dequeue: (msg) => {
+          this.dequeue(msg.value, msg.session);
+        },
+        editQueued: (msg) => {
+          this.requestQueuedEdit(msg.value, msg.session, msg.revision, host, browserSession ?? msg.session);
+        },
+        acceptQueuedEdit: (msg) => {
+          this.acceptQueuedEdit(msg.value, msg.session, msg.revision, msg.currentRevision, msg.accepted, host);
+        },
+        copy: async (msg) => {
+          await this.copyText(msg.text);
+        },
+        // Apply one comment change to provider state and broadcast the resulting list, preserving peer-host edits.
+        note: (msg) => {
+          this.saved.comments = applyComment(this.saved.comments, msg.note);
+          void this.memento?.update(STATE_KEY, this.saved);
+          void this.post({ type: 'notes', comments: this.saved.comments });
+          // The composer derives its annotation chip and empty-prompt send state from the same
+          // comments. They travel in the usage payload, so publish that view with the card marks.
+          void this.post({ type: 'usage', usage: this.usagePayload() });
+          this.postRail(true);
+        },
+        armSelectedText: (msg) => {
+          this.selectedTextMenuArm = {
+            host,
+            session: msg.session,
+            key: msg.key,
+            at: Date.now(),
+          };
+        },
+        selectedTextHandoff: (msg) => {
+          this.acceptSelectedTextHandoff(host, msg.text, msg.session, msg.key, msg.copyLabels);
+        },
+        armSessionDetails: (msg) => {
+          this.detailsMenuArm = {
+            host,
+            session: msg.session,
+            browserSession: browserSession ?? msg.session,
+            at: Date.now(),
+          };
+        },
+        armComposer: () => {
+          this.composerMenuArm = { host, at: Date.now() };
+        },
+        // Select the named session. Refresh reconciles unavailable IDs with the newest reachable session.
+        showReaderParent: (msg) => {
+          this.show(msg.session || null, host);
+        },
+        showSession: (msg) => {
+          this.show(msg.session || null, host);
+        },
+        // Build label-editor rows from current provider state on each opening.
+        labelEditor: (msg) => {
+          void this.post(this.labelEditorReply(msg.session, browserSession ?? msg.session));
+        },
+        // Return rename success or failure to the host that opened the editor.
+        renameSession: async (msg) => {
+          await answerSessionRename(
+            msg,
+            () => this.renameSession(msg.session, msg.title),
+            (answer) => this.sendToHost(host, answer),
+          );
+        },
+        // Normalize and replace one session's labels, then publish the stored result.
+        setLabels: (msg) => {
+          return this.changeSessionLabels(msg.session, msg.names, browserSession ?? msg.session).catch((error) => {
+            void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+          });
+        },
+        // Normalize and persist the complete saved-view list. The session-list update publishes it to every host.
+        setViews: (msg) => {
+          this.saved.views = normalizeSavedViews(msg.views);
+          void this.memento?.update(STATE_KEY, this.saved);
+          this.postRail(true);
+        },
+        setRailFilters: (msg) => {
+          this.saved.railFilters = normalizeSavedRailFilters(msg.railFilters);
+          void this.memento?.update(STATE_KEY, this.saved);
+          this.postRail(true);
+        },
+        // Apply one operation to the provider-owned sets. A panel can act before it receives a
+        // peer's update without replacing that peer's membership state with an older snapshot.
+        sessionMembership: (msg) => {
+          return Promise.resolve(
+            this.updateSessionMembership(
+              msg.action,
+              'session' in msg ? msg.session : undefined,
+              'openPinned' in msg && msg.openPinned === true,
+            ),
+          ).catch((error) => {
+            void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
+          });
+        },
+        // The Timeline layout dialog writes the reader's setting. The configuration listener
+        // sends its new value to every host. A refused write reaches the reader as an error message.
+        setLayout: (msg) => {
+          void saveTimelineLayout(msg.key, msg.value, writeSetting, (message) => {
+            void vscode.window.showErrorMessage(message);
+          });
+        },
+        saveState: (msg) => {
+          this.saveState(msg.state);
+        },
+        // Classify typed queries through `isSearch` before reading session content.
+        search: (msg) => {
+          const query = msg.text;
+          this.waitingSearch = null;
+          if (!isSearch(query)) {
+            void this.post({ type: 'results', query, hits: null, scope: 'workspace' });
+            return;
+          }
+          // Wait for cold opening reads before building the corpus. Answer only the latest waiting query.
+          const priming = this.codexPriming;
+          if (priming) {
+            this.waitingSearch = query;
+            void priming
+              .catch(() => undefined)
+              .then(() => {
+                if (this.waitingSearch === query) {
+                  this.waitingSearch = null;
+                  this.answerSearch(query);
+                }
+              });
+            return;
+          }
+          this.answerSearch(query);
+        },
+        loadOlder: (msg) => {
+          // Reject older-history requests that no longer match this host's selected session.
+          const showing = this.hostSessions.get(host) ?? this.showing;
+          if (!showing || msg.session !== showing) {
+            return;
+          }
+          void this.loadOlderHistory(showing);
+        },
+        openLink: async (msg) => {
+          if (!msg.href) {
+            return;
+          }
+          // Ctrl, or Cmd on a Mac, asks for a group of its own, the same press a file row takes.
+          await openLink(msg.href, msg.beside ? vscode.ViewColumn.Beside : this.column());
+        },
+        openVisualization: async (msg) => {
+          if (!msg.path) {
+            return;
+          }
+          await openVisualization(msg.path);
+        },
+        openImage: async (msg) => {
+          if (!msg.path) {
+            return;
+          }
+          // Ctrl, or Cmd on a Mac, asks for a group of its own, the same press a file link takes.
+          await openImage(msg.path, msg.beside ? vscode.ViewColumn.Beside : this.column());
+        },
+        openTurnDiff: async (msg) => {
+          const found = cardFor(msg.key);
+          if (!found) {
+            return;
+          }
+          const turn = this.turnsByKey.get(found.card.key);
+          if (turn) {
+            await this.openTurnDiff(found.sessionId, turn, found.card.headline, msg.beside);
+          }
+        },
+        openCommit: async (msg) => {
+          if (!cardFor(msg.key) || !msg.sha) {
+            return;
+          }
+          if (this.canOpenCommit === null) {
+            try {
+              this.canOpenCommit = (await vscode.commands.getCommands(true)).includes('git.viewCommit');
+            } catch {
+              this.canOpenCommit = false;
+            }
+          }
+          if (!this.canOpenCommit) {
+            void vscode.window.showInformationMessage('Arc: This version of VS Code cannot open commits.');
+            return;
+          }
+          const folder = msg.dir;
+          if (!folder) {
+            void vscode.window.showInformationMessage('Arc: The repository for this commit could not be identified.');
+            return;
+          }
+          try {
+            // Register the resolved repository before `git.viewCommit`, which uses repositories known to the built-in Git extension.
+            await vscode.commands.executeCommand('git.openRepository', folder);
+            await vscode.commands.executeCommand('git.viewCommit', vscode.Uri.file(folder), msg.sha);
+          } catch {
+            void vscode.window.showInformationMessage('Arc: This commit is no longer in the repository.');
+          }
+        },
+        openFile: async (msg) => {
+          const found = cardFor(msg.key);
+          if (!found || !msg.path) {
+            return;
+          }
+          const sourceSessionId = msg.sourceSessionId;
+          if (
+            sourceSessionId &&
+            (found.card.kind !== 'turn' ||
+              !found.card.dispatched?.some(
+                (child) => child.sessionId === sourceSessionId && child.files?.some((file) => file.path === msg.path),
+              ))
+          ) {
+            return;
+          }
+          const pending = this.pendingEntry(sourceSessionId ?? found.sessionId, msg.path);
+          // Open in the chosen editor column. The beside modifier requests a separate group.
+          const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
+          if (pending) {
+            await vscode.commands.executeCommand(
+              'vscode.diff',
+              baselineUri(pending.snapshot, pending.path),
+              vscode.Uri.file(pending.path),
+              path.basename(pending.path),
+              { viewColumn: column, preserveFocus: false },
+            );
+          } else {
+            await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path), { viewColumn: column });
+          }
+        },
+        openSkill: async (msg) => {
+          const found = cardFor(msg.key);
+          if (!found || found.card.kind !== 'turn' || !msg.path) {
+            return;
+          }
+          // Accept only skill paths published by this card.
+          if (!found.card.activitySkills.some((skill) => skill.path === msg.path)) {
+            return;
+          }
+          // Silently ignore missing or non-file skill targets.
+          let stat: fs.Stats | undefined;
+          try {
+            stat = fs.statSync(msg.path, { throwIfNoEntry: false });
+          } catch {
+            return;
+          }
+          if (!stat?.isFile()) {
+            return;
+          }
+          // Use the same editor-column rule as file rows.
+          const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
           await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path), { viewColumn: column });
-        }
-      },
-      openSkill: async (msg) => {
-        const found = cardFor(msg.key);
-        if (!found || found.card.kind !== 'turn' || !msg.path) {
-          return;
-        }
-        // Accept only skill paths published by this card.
-        if (!found.card.activitySkills.some((skill) => skill.path === msg.path)) {
-          return;
-        }
-        // Silently ignore missing or non-file skill targets.
-        let stat: fs.Stats | undefined;
-        try {
-          stat = fs.statSync(msg.path, { throwIfNoEntry: false });
-        } catch {
-          return;
-        }
-        if (!stat?.isFile()) {
-          return;
-        }
-        // Use the same editor-column rule as file rows.
-        const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
-        await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path), { viewColumn: column });
-      },
-    });
+        },
+      });
+    } catch (error) {
+      outcome = 'failed';
+      throw error;
+    } finally {
+      if (action && !newObservation.pending) this.health?.settle(action, outcome);
+    }
   }
 
   // Persist normalized panel preferences beyond the lifetime of an individual webview.
@@ -11505,6 +11662,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 }
 
+function healthPostSettled(): void {}
+
 export function registerPanel(
   context: vscode.ExtensionContext,
   storeRootDir: string,
@@ -11525,7 +11684,19 @@ export function registerPanel(
     startedAt: Math.round(performance.timeOrigin),
     measurementRun: process.env[MEASUREMENT_ENVIRONMENT.run],
   });
-  const provider = new PanelProvider(
+  let provider: PanelProvider | undefined;
+  const health = new HostHealth({
+    directory: path.join(arcHome(), DIAGNOSTICS_LOG_DIRECTORY),
+    workspace: JSON.stringify((vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)),
+    build:
+      typeof HOST_BUILD_IDENTITY === 'undefined'
+        ? { sourceCommit: null, dirty: null, builtAt: 0, unavailable: 'missing' }
+        : JSON.parse(HOST_BUILD_IDENTITY),
+    bundle: path.join(context.extensionUri.fsPath, 'dist', 'extension.js'),
+    counts: () => provider?.healthCounts() ?? { attached: 0, ready: 0, retainedTabs: null, panels: [] },
+    pulse: (sequence) => provider?.healthPulse(sequence),
+  });
+  provider = new PanelProvider(
     storeRootDir,
     context.extensionUri,
     context.workspaceState,
@@ -11538,6 +11709,7 @@ export function registerPanel(
     workspaceCache,
     activationAt,
     path.join(arcHome(), 'startup'),
+    health,
   );
   context.subscriptions.push(
     provider,
@@ -11568,6 +11740,7 @@ export function registerPanel(
 declare const PANEL_CSS: string;
 declare const PANEL_JS: string;
 declare const PANEL_DEV_SERVER_URL: string | null;
+declare const HOST_BUILD_IDENTITY: string;
 
 // `paneltext.ts` expands named tokens using the shared value table for production and browser fixtures.
 const STYLE = fillPanelText(PANEL_CSS, panelValues());

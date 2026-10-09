@@ -19,6 +19,12 @@ test('startup acknowledgements follow DOM application and a rendering opportunit
       window.requestAnimationFrame=(callback)=>{window.__frames.push(callback);return window.__frames.length;};
       window.__stepFrame=()=>{const callbacks=window.__frames.splice(0);for(const callback of callbacks)callback(performance.now());};</script>`;
     await page.setContent(pageHtml().replace('<head>', '<head>' + frames));
+    await page.evaluate(() =>
+      window.dispatchEvent(new MessageEvent('message', { data: { type: 'health', sequence: 41 } })),
+    );
+    assert.deepEqual(await page.evaluate('window.__posted.filter(m => m.type === "health")'), [
+      { type: 'health', sequence: 41 },
+    ]);
     assert.equal(await page.locator('[data-startup-status]').isVisible(), true);
     assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "ready").length'), 0);
     await page.evaluate('window.__stepFrame()');

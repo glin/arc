@@ -303,6 +303,36 @@ The script builds Arc, creates unique user-data and extensions directories under
 
 ## Performance capture
 
+### Host health evidence
+
+Sparse health recording runs with `arc.diagnostics.log` disabled. Open the current file through `arc.openDiagnosticsLog` when no detailed log exists. `arc.savePerformanceDiagnostics` includes provider identity and the current I/O failure status without a local health file path. Preserve the files before restarting the editor.
+
+Find retained activations on Windows:
+
+```powershell
+Get-ChildItem "$env:USERPROFILE/.arc/logs/health-*" | Sort-Object LastWriteTime
+```
+
+On Linux and macOS:
+
+```bash
+ls -lt ~/.arc/logs/health-*
+```
+
+Use `$env:ARC_HOME/logs` or `$ARC_HOME/logs` when `ARC_HOME` is set. Each activation has a `health-<provider-id>.json` snapshot and up to two JSONL event segments. The previous segment ends in `.previous.jsonl`. An interrupted atomic replacement leaves a `.json.next` temporary file. The complete `.json` remains the accepted snapshot.
+
+Match PID to the Extension Host process and the window registry under `ARC_HOME/hosts`. The workspace field hashes the JSON array of workspace folder paths. Provider identity distinguishes separate Arc activations within one process. Production bundles embed source commit, dirty state and build time. Watch bundles mark build identity unavailable with reason `watch`. Uncompiled hosts report reason `missing`. `diskChanged` compares bundle size and modification time with activation. It does not certify loaded bytes or detect replacements that preserve both values.
+
+Snapshots record wall time, monotonic elapsed time, process RSS, JavaScript heap, external memory and event-loop delay. RSS covers the whole host, including other extensions and workers. Heap and external memory cover the sampling JavaScript thread. Delay measures heartbeat delivery after a five-second interval. Additional settlement samples carry unavailable delay and preserve the heartbeat clock. A large delay establishes host scheduling delay without attributing its cause. An abrupt exit prevents a final sample. Unknown termination also covers forced shutdown and failed diagnostic I/O. Only successful provider disposal records clean termination.
+
+Compare attached, ready and retained-tab counts. Retained-tab count is unavailable when the editor lacks the tab API. Retained tabs with zero attachments identify missing provider ownership. Attached tabs without readiness identify an incomplete browser startup. Each observed panel carries sent and acknowledged health sequences. A panel admits one health request until its browser replies or a new browser reports readiness. Closed panels release observation without retaining transport promises. Acknowledged sequences advance monotonically and accept delayed replies. A progressing host with acknowledgements that stop identifies missing browser replies. The acknowledgement confirms browser message handling, not paint or action completion. A disconnected retained tab supplies no browser evidence to the replacement provider.
+
+Read lifecycle and action events beside the snapshot. `serializer` spans restoration and prompt recovery before adoption. `attached`, `adopted`, `ready` and `disposed` locate provider ownership changes. `parseRejected` and `unready` identify discarded requests. `select`, `new` and `send` carry numeric request identities and settlement durations. Selection settles pending because its refresh continues independently. New remains active during attachment recovery. Its settlement records draft creation, refusal or recovery failure. A rejected New also records an unavailable setup or folder. Send records prompt retention separately and settles pending after entering delivery or queue handling. These stages do not certify agent acceptance. Failed retention restores the prompt through the existing behavior.
+
+Activation prunes older health files to retain twenty activations. Concurrent active hosts can recreate pruned files. Each has a snapshot and temporary snapshot capped at 16 KiB each, plus two 64 KiB event segments. Snapshots retain twelve samples, thirty-two active work entries, sixteen panel observations and sixteen recent settlements. Fixed phase and outcome counters retain totals after those settlements age out. The event budget permits eight lines per second. Suppressed events and refused in-flight entries appear as counters. Settlements survive event suppression in snapshots while they remain among the sixteen recent outcomes. The first suppressed settlement writes an additional snapshot at most once per second. A later snapshot records only settlements still in that bounded history. Quiet hosts write one snapshot every five seconds. No prompts, session identifiers, file contents or arbitrary error messages enter these files. Diagnostic I/O failure leaves product actions unchanged. Snapshots retry on each cadence and count I/O failures. Observation errors leave unavailable counts and increment a separate counter. Retention races do not stop recording. The live capture reports current failure even when the last durable snapshot still says logging was active. Missing files establish unavailable evidence, not absence of traffic. Small synchronous writes add storage-dependent overhead and do not guarantee power-loss durability.
+
+### System capture
+
 Start performance investigations with a bounded system diagnostics capture. Use the script for requests to capture performance diagnostics. Save the capture before reloading the editor or restarting Explorer. Record the scenario and active test runners beside the capture. Use the same collector and comparable workloads for later measurements.
 
 For a Windows capture, run:

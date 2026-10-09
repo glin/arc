@@ -1147,6 +1147,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       return;
     }
     dispatchHostToPanel(message, {
+      health: (msg) => vscode.postMessage({ type: 'health', sequence: msg.sequence }),
       visibility: (msg) => visibility.receive(msg),
       startupProgress: function (msg) {
         if (

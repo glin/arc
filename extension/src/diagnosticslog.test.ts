@@ -1,5 +1,7 @@
 // extension/src/diagnosticslog.test.ts
 import { test, vi } from 'vitest';
+
+vi.mock('node:fs', { spy: true });
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -15,7 +17,340 @@ import {
   StartupThresholdWatch,
   StartupHistory,
   STARTUP_THRESHOLDS_MS,
+  HostHealth,
+  HOST_HEALTH_EVENT_BYTES,
+  HOST_HEALTH_KEPT_RUNS,
+  HOST_HEALTH_IN_FLIGHT,
 } from './diagnosticslog.ts';
+
+test('health evidence precedes an abrupt stop and a replacement preserves unknown termination', () => {
+  const directory = tempDir('host-health-restart');
+  vi.useFakeTimers();
+  const options = { directory, workspace: 'private-path', build: { sourceCommit: null, dirty: true, builtAt: 1 } };
+  const first = new HostHealth(options);
+  const work = first.begin('retention');
+  first.sample();
+  const prior = fs.readFileSync(first.file, 'utf8');
+  assert.equal(JSON.parse(prior).termination, 'unknown');
+  assert.equal(JSON.parse(prior).active[0].request, work);
+  const second = new HostHealth(options);
+  try {
+    assert.notEqual(first.provider, second.provider);
+    second.dispose();
+    assert.equal(JSON.parse(fs.readFileSync(second.file, 'utf8')).termination, 'clean');
+    assert.equal(fs.readFileSync(first.file, 'utf8'), prior);
+    assert.ok(readLines(first.file.replace('.json', '.jsonl')).some((line) => line.phase === 'retention'));
+  } finally {
+    first.dispose();
+    second.dispose();
+    vi.useRealTimers();
+  }
+});
+
+test('health caps samples, work, event rate, segment bytes and retained activations', () => {
+  const directory = tempDir('host-health-bounds');
+  vi.useFakeTimers();
+  let clock = 0;
+  const options = {
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    now: () => clock,
+  };
+  const health = new HostHealth(options);
+  try {
+    for (let i = 0; i < HOST_HEALTH_IN_FLIGHT; i++) assert.ok(health.begin('send'));
+    assert.equal(health.begin('send'), 0);
+    for (let i = 0; i < 100; i++) health.event('parseRejected');
+    assert.ok(readLines(health.file.replace('.json', '.jsonl')).length <= 8);
+    for (let i = 0; i < 1200; i++) {
+      clock += 1000;
+      health.event('attached', 1);
+    }
+    for (let i = 0; i < 20; i++) {
+      clock += 10_000;
+      health.sample();
+    }
+    const record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.samples.length, 12);
+    assert.equal(record.samples.at(-1).lagMs, 5000);
+    assert.equal(record.active.length, HOST_HEALTH_IN_FLIGHT);
+    assert.ok(record.suppressed > 0);
+    assert.equal(record.dropped, 1);
+    const segments = fs.readdirSync(directory).filter((name) => name.endsWith('.jsonl'));
+    assert.equal(segments.length, 2);
+    for (const segment of segments)
+      assert.ok(fs.statSync(path.join(directory, segment)).size <= HOST_HEALTH_EVENT_BYTES);
+    health.dispose();
+    for (let i = 0; i < HOST_HEALTH_KEPT_RUNS + 2; i++) new HostHealth(options).dispose();
+    assert.equal(fs.readdirSync(directory).filter((name) => name.endsWith('.json')).length, HOST_HEALTH_KEPT_RUNS);
+    assert.ok(fs.readdirSync(directory).length <= HOST_HEALTH_KEPT_RUNS * 3);
+  } finally {
+    health.dispose();
+    vi.useRealTimers();
+  }
+});
+
+test('health recovers after transient writes and observation exceptions on later pulses', async () => {
+  vi.useFakeTimers();
+  const directory = tempDir('host-health-retry');
+  let clock = 0;
+  let observationFails = false;
+  let pulseFails = false;
+  const health = new HostHealth({
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    now: () => clock,
+    counts: () => {
+      if (observationFails) throw new Error('secret observation');
+      return { attached: 1, ready: 1, retainedTabs: 1, panels: [] };
+    },
+    pulse: () => {
+      if (pulseFails) throw new Error('secret pulse');
+    },
+  });
+  const original = (await vi.importActual<typeof import('node:fs')>('node:fs')).renameSync;
+  const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+    throw new Error('busy');
+  });
+  try {
+    clock = 5000;
+    vi.advanceTimersByTime(5000);
+    assert.equal(health.status().failed, true);
+    rename.mockImplementation(original);
+    observationFails = true;
+    pulseFails = true;
+    clock = 10000;
+    assert.doesNotThrow(() => vi.advanceTimersByTime(5000));
+    assert.equal(health.status().failed, false);
+    let record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.elapsedMs, 10000);
+    assert.equal(record.panels.attached, null);
+    assert.equal(record.ioFailures, 1);
+    observationFails = false;
+    pulseFails = false;
+    clock = 15000;
+    vi.advanceTimersByTime(5000);
+    record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.panels.attached, 1);
+    assert.equal(record.observationFailures, 2);
+    assert.equal(fs.readFileSync(health.file, 'utf8').includes('secret'), false);
+    health.dispose();
+    assert.equal(JSON.parse(fs.readFileSync(health.file, 'utf8')).termination, 'clean');
+  } finally {
+    rename.mockRestore();
+    health.dispose();
+    vi.useRealTimers();
+  }
+});
+
+test('health survives shared retention entries disappearing before stat or deletion', async () => {
+  for (const step of ['stat', 'remove']) {
+    const directory = tempDir('host-health-prune-race');
+    for (let i = 0; i < HOST_HEALTH_KEPT_RUNS + 1; i++) {
+      const id = i.toString(16).padStart(8, '0') + '-0000-0000-0000-000000000000';
+      fs.writeFileSync(path.join(directory, `health-${id}.json`), '{}');
+    }
+    const operation = step === 'stat' ? 'statSync' : 'rmSync';
+    const original = (await vi.importActual<typeof import('node:fs')>('node:fs'))[operation];
+    let disappeared = false;
+    const race = vi.spyOn(fs, operation).mockImplementation((...args: any[]) => {
+      if (!disappeared && String(args[0]).includes('health-')) {
+        disappeared = true;
+        fs.unlinkSync(String(args[0]));
+        if (step === 'stat') throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      }
+      return (original as any)(...args);
+    });
+    let health: HostHealth | undefined;
+    try {
+      health = new HostHealth({ directory, workspace: 'test', build: { sourceCommit: null, dirty: null, builtAt: 1 } });
+      assert.equal(disappeared, true);
+      assert.equal(health.status().failed, false);
+      assert.equal(JSON.parse(fs.readFileSync(health.file, 'utf8')).logging, 'active');
+      assert.equal(readLines(health.file.replace('.json', '.jsonl'))[0].event, 'activated');
+    } finally {
+      race.mockRestore();
+      health?.dispose();
+    }
+  }
+
+  const directory = tempDir('host-health-pruned-writer');
+  let clock = 0;
+  const health = new HostHealth({
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    now: () => clock,
+    wall: () => 1000,
+  });
+  const events = health.file.replace('.json', '.jsonl');
+  try {
+    let remaining = HOST_HEALTH_EVENT_BYTES;
+    for (let i = 0; i < 2000 && remaining >= 80; i++) {
+      clock += 1000;
+      health.event('attached');
+      remaining = HOST_HEALTH_EVENT_BYTES - fs.statSync(events).size;
+    }
+    assert.ok(remaining > 0 && remaining < 80);
+    fs.unlinkSync(events);
+    clock += 1000;
+    health.event('attached');
+    assert.equal(readLines(events).at(-1)?.event, 'attached');
+    assert.equal(health.status().failed, false);
+    health.sample();
+    assert.equal(health.status().failed, false);
+    clock += 1000;
+    health.event('ready');
+    assert.deepEqual(
+      readLines(events).map((line) => line.event),
+      ['attached', 'ready'],
+    );
+    assert.ok(fs.statSync(events).size <= HOST_HEALTH_EVENT_BYTES);
+    const original = (await vi.importActual<typeof import('node:fs')>('node:fs')).appendFileSync;
+    const append = vi.spyOn(fs, 'appendFileSync').mockImplementationOnce(() => {
+      throw new Error('busy');
+    });
+    try {
+      clock += 1000;
+      health.event('attached');
+      assert.equal(health.status().failed, true);
+      health.sample();
+      assert.equal(health.status().failed, true);
+      assert.equal(JSON.parse(fs.readFileSync(health.file, 'utf8')).logging, 'failed');
+      append.mockImplementation(original);
+      clock += 1000;
+      health.event('ready');
+      assert.equal(health.status().failed, false);
+      assert.equal(readLines(events).at(-1)?.event, 'ready');
+    } finally {
+      append.mockRestore();
+    }
+  } finally {
+    health.dispose();
+  }
+});
+
+test('health retains bounded settled outcomes when unrelated events exhaust admission', () => {
+  const directory = tempDir('host-health-outcomes');
+  let clock = 0;
+  const health = new HostHealth({
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    now: () => clock,
+  });
+  try {
+    for (let i = 0; i < 100; i++) health.event('parseRejected');
+    clock = 500;
+    const send = health.begin('send', 1);
+    health.settle(send, 'failed');
+    const first = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(first.outcomes.at(-1).request, send);
+    assert.equal(first.outcomes.at(-1).outcome, 'failed');
+    assert.equal(first.samples.at(-1).lagMs, null);
+    for (let i = 0; i < 100; i++) {
+      const request = health.begin('new', 1);
+      health.settle(request, 'rejected');
+    }
+    clock = 15000;
+    health.sample();
+    const record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.outcomes.length, 16);
+    assert.equal(record.samples.at(-1).lagMs, 10000);
+    assert.equal(record.outcomes.at(-1).outcome, 'rejected');
+    assert.equal(record.outcomeCounts.send.failed, 1);
+    assert.equal(record.outcomeCounts.new.rejected, 100);
+    assert.equal(record.active.length, 0);
+    assert.ok(fs.statSync(health.file).size <= 16 * 1024);
+    assert.ok(readLines(health.file.replace('.json', '.jsonl')).length <= 8);
+    clock = 5000;
+  } finally {
+    health.dispose();
+  }
+});
+
+test('health settlement events keep the panel that began the request', () => {
+  const directory = tempDir('host-health-panel-settlement');
+  const health = new HostHealth({
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+  });
+  try {
+    const request = health.begin('new', 7);
+    health.settle(request, 'returned');
+    const lines = readLines(health.file.replace('.json', '.jsonl'));
+    assert.equal(lines.find((line) => line.event === 'begin' && line.request === request)?.panel, 7);
+    assert.equal(lines.find((line) => line.event === 'settled' && line.request === request)?.panel, 7);
+  } finally {
+    health.dispose();
+  }
+});
+
+test('health preserves the loaded build identity when the disk bundle changes', () => {
+  const directory = tempDir('host-health-build');
+  const bundle = path.join(directory, 'extension.js');
+  fs.writeFileSync(bundle, 'loaded');
+  const build = { sourceCommit: 'a'.repeat(40), dirty: true, builtAt: 1234 };
+  const health = new HostHealth({ directory, workspace: 'test', build, bundle });
+  try {
+    assert.deepEqual(JSON.parse(fs.readFileSync(health.file, 'utf8')).build, { ...build, diskChanged: false });
+    fs.writeFileSync(bundle, 'replacement bundle');
+    health.sample();
+    assert.deepEqual(JSON.parse(fs.readFileSync(health.file, 'utf8')).build, { ...build, diskChanged: true });
+  } finally {
+    health.dispose();
+  }
+});
+
+test('health excludes arbitrary strings and retains failed work without changing the caller', () => {
+  const directory = tempDir('host-health-redaction');
+  const health = new HostHealth({
+    directory,
+    workspace: 'secret workspace',
+    build: { sourceCommit: 'secret token', dirty: null, builtAt: 1 },
+  });
+  try {
+    const work = health.begin('send');
+    health.event(
+      'attached',
+      'secret prompt' as unknown as number,
+      'secret session' as never,
+      'secret request' as unknown as number,
+      'secret error' as never,
+    );
+    health.event('secret event' as never);
+    health.settle(work, 'failed');
+    health.sample();
+    const text = fs
+      .readdirSync(directory)
+      .map((name) => fs.readFileSync(path.join(directory, name), 'utf8'))
+      .join('');
+    assert.equal(text.includes('secret'), false);
+    const failed = readLines(health.file.replace('.json', '.jsonl')).find((line) => line.outcome === 'failed');
+    assert.equal(failed?.request, work);
+    assert.equal(typeof failed?.durationMs, 'number');
+  } finally {
+    health.dispose();
+  }
+  const blocked = path.join(directory, 'blocked');
+  fs.writeFileSync(blocked, 'file');
+  const failed = new HostHealth({
+    directory: blocked,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+  });
+  const action = () => {
+    const request = failed.begin('send');
+    failed.settle(request);
+    return 'delivered';
+  };
+  assert.equal(action(), 'delivered');
+  assert.equal(failed.status().failed, true);
+  failed.dispose();
+});
 
 const STARTED_AT = Date.UTC(2026, 8, 19, 7, 4, 5);
 

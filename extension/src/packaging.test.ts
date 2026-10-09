@@ -7,6 +7,7 @@ import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildSync } from 'esbuild';
+import ts from 'typescript';
 import { browserBundle } from './panelbundle.ts';
 import { childEnv } from './agenthost.ts';
 import { callSources, declarationSource, sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
@@ -25,6 +26,24 @@ beforeAll(() => {
     'the extension bundle exceeds the packaging size budget',
   );
 });
+
+function embeddedHostIdentity(file: string): Record<string, unknown> {
+  const bundle = fs.readFileSync(file, 'utf8');
+  // Read the literal consumed by the shipping provider, independently of the sidecar.
+  for (const match of bundle.matchAll(/JSON\.parse\(((?:"(?:[^"\\]|\\.)*")|(?:'(?:[^'\\]|\\.)*'))\)/g)) {
+    const source = ts.createSourceFile('identity.js', `const identity = ${match[1]};`, ts.ScriptTarget.Latest);
+    const declaration = (source.statements[0] as ts.VariableStatement).declarationList.declarations[0];
+    if (!declaration.initializer || !ts.isStringLiteral(declaration.initializer)) continue;
+    const literal = declaration.initializer.text;
+    try {
+      const identity = JSON.parse(literal);
+      if ('sourceCommit' in identity && 'builtAt' in identity) return identity;
+    } catch {
+      /* Other bundle literals are unrelated to host identity. */
+    }
+  }
+  return assert.fail('shipping host has no embedded build identity');
+}
 
 test('build identity covers host, browser, worker, and version inputs', () => {
   const sourceInputs = (entry: string) =>
@@ -77,6 +96,11 @@ test('build identity covers host, browser, worker, and version inputs', () => {
     .digest('hex');
   const identity = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'dist/build-identity.json'), 'utf8'));
   assert.equal(identity.inputsSha256, expected);
+  const embedded = embeddedHostIdentity(path.join(extensionRoot, 'dist/extension.js'));
+  assert.equal(embedded.sourceCommit, identity.sourceCommit);
+  assert.equal(embedded.dirty, identity.dirty);
+  assert.ok(typeof embedded.builtAt === 'number' && embedded.builtAt > 0);
+  assert.equal(embedded.unavailable, undefined);
   assert.equal(identity.version, JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version);
   for (const [field, args] of [
     ['sourceCommit', ['rev-parse', 'HEAD']],
@@ -243,6 +267,9 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   );
   const script =
     "import { buildExtension } from './esbuild.mjs'; const close = await buildExtension({watch:true}); console.log('watch ready'); process.stdin.once('data', async () => { await close(); process.stdin.destroy(); });";
+  for (const file of ['panelhost.ts', 'diagnosticslog.ts']) {
+    fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
+  }
   const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {
     cwd: source,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -256,6 +283,18 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   });
   try {
     await vi.waitFor(() => assert.match(output, /watch ready/), { timeout: 15_000 });
+    const hostBundle = path.join(source, 'dist/extension.js');
+    await vi.waitFor(() => assert.equal(embeddedHostIdentity(hostBundle).unavailable, 'watch'), { timeout: 15_000 });
+    for (const marker of ['host health watch one', 'host health watch two']) {
+      fs.appendFileSync(path.join(source, 'src/diagnosticslog.ts'), `\nconsole.log('${marker}');\n`);
+      await vi.waitFor(() => assert.ok(fs.readFileSync(hostBundle, 'utf8').includes(marker)), { timeout: 15_000 });
+      assert.deepEqual(embeddedHostIdentity(hostBundle), {
+        sourceCommit: null,
+        dirty: null,
+        builtAt: 0,
+        unavailable: 'watch',
+      });
+    }
     fs.appendFileSync(path.join(source, 'src/webview/panel.css'), '\n/* watch fixture */\n');
     await vi.waitFor(() => assert.match(output, /rebuilt: the panel source changed/), { timeout: 15_000 });
     fs.appendFileSync(path.join(sourceRoot, 'cli/src/main.ts'), "\nconsole.log('cli watch fixture');\n");

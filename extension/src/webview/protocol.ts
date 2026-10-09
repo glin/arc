@@ -195,6 +195,7 @@ export interface PanelSessionAdoption {
 }
 
 export type HostToPanel =
+  | { type: 'health'; sequence: number }
   | { type: 'visibility'; visible: boolean; revision: number }
   | {
       type: 'startupProgress';
@@ -259,6 +260,7 @@ export type HostToPanel =
   | RenderMessage;
 
 const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+  health: true,
   visibility: true,
   startupProgress: true,
   contextDetail: true,
@@ -303,6 +305,7 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
 };
 
 export type PanelToHost =
+  | { type: 'health'; sequence: number }
   | { type: 'contextDetail'; session: string; request: number; generation: number }
   | { type: 'ready' }
   | { type: 'painted'; generation: number; stage: 'railReady' | 'firstCard' | 'completeRender'; usableRows?: true }
@@ -590,6 +593,10 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     return null;
   }
   switch (m.type) {
+    case 'health':
+      return Number.isSafeInteger(m.sequence) && (m.sequence as number) > 0
+        ? { type: 'health', sequence: m.sequence as number }
+        : null;
     case 'visibility':
       return typeof m.visible === 'boolean' && Number.isSafeInteger(m.revision) && (m.revision as number) >= 0
         ? { type: 'visibility', visible: m.visible, revision: m.revision as number }
@@ -846,6 +853,10 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     return null;
   }
   switch (m.type) {
+    case 'health':
+      return Number.isSafeInteger(m.sequence) && (m.sequence as number) > 0
+        ? { type: 'health', sequence: m.sequence as number }
+        : null;
     case 'ready':
       return { type: 'ready' };
     case 'painted':
@@ -1168,6 +1179,8 @@ export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
 // The default branch assigns to never, so unhandled variants fail the typecheck.
 export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
   switch (message.type) {
+    case 'health':
+      return handlers.health(message);
     case 'visibility':
       return handlers.visibility(message);
     case 'startupProgress':
@@ -1259,6 +1272,8 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
 
 export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHostHandlers<R>): R {
   switch (message.type) {
+    case 'health':
+      return handlers.health(message);
     case 'ready':
       return handlers.ready(message);
     case 'painted':

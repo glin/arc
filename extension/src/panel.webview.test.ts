@@ -1117,8 +1117,12 @@ import type { WindowState } from './sessionrequests.ts';
 import { CommitRepositoryReservations } from './progressiveworker';
 import * as vscode from 'vscode';
 import { performance } from 'node:perf_hooks';
-import { PanelPerformanceCounters, type PerformanceEventSink } from './performancediagnostics.ts';
-import { StartupThresholdWatch, createDiagnosticsLog } from './diagnosticslog.ts';
+import {
+  PanelPerformanceCounters,
+  savePerformanceDiagnosticsSnapshot,
+  type PerformanceEventSink,
+} from './performancediagnostics.ts';
+import { StartupThresholdWatch, createDiagnosticsLog, HostHealth } from './diagnosticslog.ts';
 import { answerSessionRename, sessionRenameTitle } from './sessionrename.ts';
 import * as renameTranscripts from './transcript.ts';
 import { claudeSkillPath } from './claudeskillpath.ts';
@@ -2933,7 +2937,7 @@ test('the host sends every launcher through one validated draft operation', () =
     'a setup posted by the browser is used without checking that the view offered it',
   );
   sourceMatch(body, /this\.createDraft\(id, cwd, source, Date\.now\(\), profile\)/);
-  sourceMatch(hostHandler('newSession'), /this\.newSession\(msg\.request, host, msg\)/);
+  sourceMatch(hostHandler('newSession'), /this\.newSession\(msg\.request, host, msg, newObservation\)/);
   sourceMatch(hostHandler('pinSetup'), /this\.pinSetup\(msg\.request, host\)/);
   sourceMatch(
     panelHostSource,
@@ -3340,7 +3344,10 @@ test('stale setup messages cannot resolve another project recent row, migrated p
     mutations++;
   };
   const deliver = (name: string, message: unknown) =>
-    new Function('msg', 'host', handlerBody(panelHostSource, name)).call(provider, message, f.owner);
+    new Function('msg', 'host', 'newObservation', handlerBody(panelHostSource, name)).call(provider, message, f.owner, {
+      request: 0,
+      pending: false,
+    });
   const custom = { kind: 'custom', agent: 'claude', model: 'sonnet', effort: '', permissionMode: '' };
   for (const request of [{ kind: 'row', key: 'recent:0' }, { kind: 'row', key: 'pin:legacy-id' }, custom]) {
     deliver('newSession', { owner: 'project:A', request });
@@ -22236,12 +22243,12 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     panelHostSource,
-    /private sendToHost[\s\S]*?if \(!this\.readyHosts\.has\(host\) && type !== 'requestPromptRecovery'\) \{ return Promise\.resolve\(false\); \}/,
+    /private sendToHost[\s\S]*?if \(!this\.readyHosts\.has\(host\) && type !== 'requestPromptRecovery' && type !== 'health'\) \{ return Promise\.resolve\(false\); \}/,
     'a host receives data before its browser reports readiness',
   );
   sourceMatch(
     panelHostSource,
-    /if \(message\.type !== 'ready' && message\.type !== 'importPromptRecovery' && !this\.readyHosts\.has\(host\)\) \{ return; \}/,
+    /if \(message\.type !== 'ready' && message\.type !== 'importPromptRecovery' && !this\.readyHosts\.has\(host\)\) \{ this\.health\?\.event\('unready', this\.healthPanel\(host\)\.id\); return; \}/,
     'an unready host can trigger a refresh or a panel action',
   );
 
@@ -22254,7 +22261,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     ready,
-    /if \(!this\.hosts\.includes\(host\) \|\| this\.readyHosts\.has\(host\)\) \{ return; \}/,
+    /if \(this\.readyHosts\.has\(host\)\) return;/,
     'a duplicate ready message starts a second initial load',
   );
   assert.equal(
@@ -25305,10 +25312,403 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
+test('health distinguishes unready actions, handler failure and acknowledgements without logging their content', async () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const directory = tempDir('provider-health');
+  let clock = 0;
+  const health = new HostHealth({
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    now: () => clock,
+  });
+  provider.health = health;
+  const lines = () =>
+    fs
+      .readFileSync(health.file.replace('.json', '.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+  try {
+    provider.readyHosts.clear();
+    await provider.onMessage({ type: 'showSession', session: 'secret-session' }, fixture.host);
+    assert.equal(lines().at(-1).event, 'unready');
+    assert.equal(
+      lines().some((line) => line.phase === 'select'),
+      false,
+    );
+    provider.readyHosts.add(fixture.host);
+    provider.show = () => {
+      throw new Error('secret-error');
+    };
+    await assert.rejects(
+      provider.onMessage({ type: 'showSession', session: 'secret-session' }, fixture.host),
+      /secret-error/,
+    );
+    assert.equal(lines().at(-1).outcome, 'failed');
+    clock += 1000;
+    provider.newSession = () => true;
+    await provider.onMessage({ type: 'newSession' }, fixture.host);
+    assert.equal(lines().at(-1).phase, 'new');
+    assert.equal(lines().at(-1).outcome, 'returned');
+    provider.healthPanel(fixture.host).sent = 77;
+    await provider.onMessage({ type: 'health', sequence: 76 }, fixture.host);
+    assert.equal(provider.healthPanel(fixture.host).ack, 76);
+    await provider.onMessage({ type: 'health', sequence: 77 }, fixture.host);
+    assert.equal(provider.healthPanel(fixture.host).ack, 77);
+    assert.equal(lines().at(-1).event, 'ack');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      clock += 1000;
+      await provider.onMessage({ type: 'sendPrompt', text: 'secret-prompt' }, fixture.host);
+    } finally {
+      warning.mockRestore();
+    }
+    assert.equal(lines().at(-1).event, 'parseRejected');
+    assert.equal(fs.readFileSync(health.file.replace('.json', '.jsonl'), 'utf8').includes('secret'), false);
+    const blocked = path.join(directory, 'blocked');
+    fs.writeFileSync(blocked, 'file');
+    const failed = new HostHealth({
+      directory: blocked,
+      workspace: 'test',
+      build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    });
+    provider.health = failed;
+    await provider.onMessage({ type: 'newSession' }, fixture.host);
+    assert.equal(failed.status().failed, true);
+    failed.dispose();
+  } finally {
+    health.dispose();
+  }
+});
+
+test('health replies advance across pulses and replacement panels survive unresolved transports', async () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const never = new Promise<boolean>(() => {});
+  const callbacks = new Set<unknown>();
+  let posts = 0;
+  const send = provider.sendToHost;
+  provider.sendToHost = (_host: unknown, message: any) => {
+    if (message.type !== 'health') return Promise.resolve(true);
+    posts++;
+    return {
+      then(fulfilled: unknown, rejected: unknown) {
+        callbacks.add(fulfilled);
+        callbacks.add(rejected);
+        return never;
+      },
+    };
+  };
+  const oldHosts = Array.from({ length: 20 }, () => ({}));
+  provider.hosts = oldHosts;
+  provider.healthPulse(1);
+  provider.healthPulse(2);
+  assert.equal(posts, 16);
+  await provider.onMessage({ type: 'health', sequence: 1 }, oldHosts[0]);
+  assert.equal(provider.healthPanel(oldHosts[0]).ack, 1);
+  provider.healthPulse(3);
+  assert.equal(posts, 17);
+  await provider.onMessage({ type: 'health', sequence: 1 }, oldHosts[0]);
+  assert.equal(provider.healthPanel(oldHosts[0]).ack, 1);
+  await provider.onMessage({ type: 'health', sequence: 4 }, oldHosts[0]);
+  assert.equal(provider.healthPanel(oldHosts[0]).ack, 1);
+  await provider.onMessage({ type: 'health', sequence: 3 }, oldHosts[0]);
+  assert.equal(provider.healthPanel(oldHosts[0]).ack, 3);
+  for (let i = 0; i < 40; i++) {
+    provider.hosts = [(fixture.host = {} as any)];
+    provider.healthPulse(4 + i);
+    assert.equal(provider.healthPanel(fixture.host).sent, 4 + i);
+  }
+  assert.equal(posts, 57);
+  assert.equal(callbacks.size, 1);
+  provider.readyHosts.add(fixture.host);
+  let selected = false;
+  provider.show = () => {
+    selected = true;
+  };
+  await provider.onMessage({ type: 'showSession', session: 'source' }, fixture.host);
+  assert.equal(selected, true);
+  provider.sendToHost = send;
+});
+
+test('a recovered browser resumes bounded health requests on its existing panel host', async () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const host = fixture.host;
+  const posts: number[] = [];
+  provider.readyHosts.add(host);
+  provider.sendToHost = (_host: unknown, message: { type: string; sequence: number }) => {
+    if (message.type === 'health') posts.push(message.sequence);
+    return new Promise<boolean>(() => {});
+  };
+  provider.healthPulse(1);
+  provider.healthPulse(2);
+  assert.deepEqual(posts, [1]);
+  provider.browserReady(host);
+  provider.healthPulse(3);
+  provider.healthPulse(4);
+  assert.deepEqual(posts, [1, 3]);
+  assert.equal(provider.healthPanel(host).sent, 3);
+  await provider.onMessage({ type: 'health', sequence: 1 }, host);
+  assert.equal(provider.healthPanel(host).posting, true);
+  await provider.onMessage({ type: 'health', sequence: 3 }, host);
+  assert.equal(provider.healthPanel(host).posting, false);
+});
+
+test('saved performance diagnostics omit the local health path', async () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const health = new HostHealth({
+    directory: tempDir('health-capture-redaction'),
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+  });
+  provider.health = health;
+  try {
+    const capturedAt = Date.now();
+    Object.assign(provider, {
+      pendingWatch: { snapshot: () => ({ eventCount: 0, changedPaths: [], broadRequired: false }) },
+      hosts: [],
+      editorPanel: null,
+      poll: null,
+      watching: false,
+      showing: null,
+      running: new Set(),
+      catalog: null,
+      parsedRefs: [],
+      sessionRows: [],
+      pinnedTop: new Set(),
+      hidden: new Set(),
+      lastRailMessageType: null,
+      lastRailMessageSerializedBytes: null,
+      cache: new Map(),
+      history: new Map(),
+      patchBytes: 0,
+      watchScheduler: { pending: false, pendingAge: () => null },
+      projectSpendRevision: 0,
+      projectSpendIndexing: false,
+      projectSpendFiles: [],
+      projectSpendVisibleFiles: [],
+      projectSpendQueue: [],
+      projectSpendSaveScheduler: { pending: false },
+      projectSpendSaveOwed: false,
+      projectSpendSaveOwedSince: null,
+      performanceCounters: new PanelPerformanceCounters(),
+    });
+    const snapshot = provider.performanceDiagnostics(capturedAt);
+    let saved = '';
+    await savePerformanceDiagnosticsSnapshot({
+      snapshot,
+      target: path.join(tempDir('health-capture-output'), 'capture.json'),
+      environment: {},
+      workspaceFolder: null,
+      capturedAt,
+      ask: async () => null,
+      write: async (_file, contents) => {
+        saved = contents;
+      },
+      report: () => {},
+      announce: () => {},
+    });
+    const record = JSON.parse(saved);
+    assert.equal(record.redaction.paths, 'omitted');
+    assert.equal(record.hostHealth.provider, health.status().provider);
+    assert.equal(record.hostHealth.failed, false);
+    assert.equal(saved.includes(health.file), false);
+    assert.deepEqual(Object.keys(record.hostHealth).sort(), ['failed', 'provider']);
+  } finally {
+    health.dispose();
+  }
+});
+
+test('host health distinguishes retained tabs from actual provider attachments and readiness', () => {
+  const source = memberFrom(panelHostSource, panelHostSource.indexOf('  healthCounts():')).replace(
+    'healthCounts():',
+    'function healthCounts():',
+  );
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  class WebviewTab {
+    constructor(readonly viewType: string) {}
+  }
+  const editor = {
+    TabInputWebview: WebviewTab,
+    window: {
+      tabGroups: {
+        all: [
+          {
+            tabs: [
+              { input: new WebviewTab('mainThreadWebview-arc.panel') },
+              { input: new WebviewTab('arc.panel') },
+              { input: new WebviewTab('other-prefix-arc.panel') },
+              { input: new WebviewTab('mainThreadWebview-other.arc.panel') },
+              { input: new WebviewTab('other') },
+              { input: {} },
+            ],
+          },
+        ],
+      },
+    },
+  };
+  const counts = new Function('vscode', 'PANEL_TYPE', compiled + '\nreturn healthCounts;')(editor, 'arc.panel');
+  const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+  provider.hosts = [];
+  provider.readyHosts = new Set();
+  assert.deepEqual(counts.call(provider), { attached: 0, ready: 0, retainedTabs: 2, panels: [] });
+  const host = {};
+  provider.hosts = [host];
+  assert.equal(counts.call(provider).attached, 1);
+  assert.equal(counts.call(provider).ready, 0);
+  provider.readyHosts.add(host);
+  assert.equal(counts.call(provider).ready, 1);
+  delete (editor.window as any).tabGroups;
+  assert.equal(counts.call(provider).retainedTabs, null);
+});
+
+test('provider registration routes retained-tab counts and build identity into durable health', () => {
+  const source = declarationSource(panelHostSource, 'registerPanel').replace('export function', 'function');
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const directory = tempDir('host-health-registration');
+  let health!: HostHealth;
+  let attached = 0;
+  class RegisteredProvider {
+    constructor(...args: any[]) {
+      health = args.at(-1);
+    }
+    healthCounts() {
+      return { attached, ready: attached, retainedTabs: 2, panels: [] };
+    }
+    healthPulse() {}
+  }
+  const scope = {
+    performance,
+    process,
+    path,
+    HostHealth,
+    PanelProvider: RegisteredProvider,
+    projectsRoot: () => directory,
+    codexSessionsRoot: () => directory,
+    arcHome: () => directory,
+    cacheRoot: () => directory,
+    projectSpendDirectory: () => directory,
+    createDiagnosticsLog: () => ({ file: () => null }),
+    readSetting: () => false,
+    DIAGNOSTICS_LOG_DIRECTORY: 'logs',
+    MEASUREMENT_ENVIRONMENT: { run: 'ARC_TEST_UNUSED' },
+    HOST_BUILD_IDENTITY: JSON.stringify({ sourceCommit: 'a'.repeat(40), dirty: false, builtAt: 17 }),
+    PATCH_SCHEME: 'patch',
+    PANEL_TYPE: 'arc.panel',
+    vscode: {
+      workspace: { workspaceFolders: [], registerTextDocumentContentProvider() {} },
+      window: { createOutputChannel: () => ({ appendLine() {} }), registerWebviewPanelSerializer() {} },
+      commands: { registerCommand() {} },
+      ViewColumn: { Beside: 2 },
+    },
+  };
+  const register = new Function(...Object.keys(scope), compiled + '\nreturn registerPanel;')(...Object.values(scope));
+  try {
+    register(
+      { extensionUri: { fsPath: directory }, globalStorageUri: { fsPath: directory }, subscriptions: [] },
+      directory,
+      { root: directory },
+    );
+    health.sample();
+    let record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.panels.retainedTabs, 2);
+    assert.equal(record.panels.attached, 0);
+    assert.equal(record.build.sourceCommit, 'a'.repeat(40));
+    attached = 1;
+    health.sample();
+    record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.panels.attached, 1);
+    assert.equal(record.panels.ready, 1);
+  } finally {
+    health?.dispose();
+  }
+});
+
+test('opening diagnostics preserves guidance when sparse health failed before creating a file', async () => {
+  const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+  const directory = tempDir('host-health-open-failure');
+  const blocked = path.join(directory, 'blocked');
+  fs.writeFileSync(blocked, 'file');
+  const health = new HostHealth({
+    directory: blocked,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+  });
+  provider.health = health;
+  provider.diagnostics = { file: () => null };
+  const window = vscode.window as any;
+  const original = window.showInformationMessage;
+  const notices: string[] = [];
+  window.showInformationMessage = (message: string) => {
+    notices.push(message);
+  };
+  try {
+    await provider.openDiagnosticsLog();
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /written no diagnostics log/);
+  } finally {
+    window.showInformationMessage = original;
+    health.dispose();
+  }
+});
+
+test('New health remains active during asynchronous recovery and records its actual settlement', async () => {
+  const window = vscode.window as any;
+  const original = window.showInformationMessage;
+  window.showInformationMessage = () => {};
+  try {
+    for (const accepted of [true, false]) {
+      const f = pendingModelLauncher();
+      const provider = f.provider as Record<string, any>;
+      const health = new HostHealth({
+        directory: tempDir('host-health-new-recovery'),
+        workspace: 'test',
+        build: { sourceCommit: null, dirty: null, builtAt: 1 },
+      });
+      provider.health = health;
+      provider.readyHosts = new Set([f.owner]);
+      provider.healthPanels = new WeakMap();
+      try {
+        await provider.onMessage({ type: 'newSession', request: { kind: 'row', key: 'current' } }, f.owner);
+        health.sample();
+        const pending = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+        assert.equal(pending.active.filter((work: any) => work.phase === 'new').length, 1);
+        assert.equal(
+          pending.outcomes.some((work: any) => work.phase === 'new'),
+          false,
+        );
+        assert.equal(f.created.length, 0);
+        f.release(accepted ? f.result : null);
+        await f.completed();
+        health.sample();
+        const settled = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+        assert.equal(settled.active.length, 0);
+        assert.equal(settled.outcomes.at(-1).outcome, accepted ? 'returned' : 'rejected');
+        assert.equal(settled.outcomes.at(-1).panel, pending.active[0].panel);
+        assert.equal(f.created.length, accepted ? 1 : 0);
+      } finally {
+        health.dispose();
+      }
+    }
+  } finally {
+    window.showInformationMessage = original;
+  }
+});
+
 test('submitted recovery refuses failed storage, changed scope and disposed origins without replacing newer drafts', async () => {
   for (const failure of ['storage', 'scope', 'disposed']) {
     const fixture = liveProviderFixture(livePress());
     const provider = fixture.provider as unknown as Record<string, any>;
+    const health = new HostHealth({
+      directory: tempDir('retention-health'),
+      workspace: 'test',
+      build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    });
+    provider.health = health;
     provider.saved = normalizePanelState({});
     provider.stateFor = () => ({ ...COMPOSER, sessionId: 'sess', assets: [], draftCommentIds: [], queued: [] });
     let cwd = '/project';
@@ -25328,11 +25728,32 @@ test('submitted recovery refuses failed storage, changed scope and disposed orig
     const text = 'unprotected first prompt';
     const attempt = { id: failure, order: 1, source: 'sess', revision: 1, text };
     const pending = provider.acceptSubmission(text, 'sess', 1, 'sess', fixture.host, attempt);
+    const originalPanel = provider.healthPanel(fixture.host).id;
+    health.sample();
+    assert.ok(
+      JSON.parse(fs.readFileSync(health.file, 'utf8')).active.some(
+        (work: { phase: string }) => work.phase === 'retention',
+      ),
+    );
     provider.drafts.sess = 'newer draft';
     if (failure === 'scope') cwd = '/other';
     if (failure === 'disposed') provider.hosts = [];
+    if (failure === 'disposed') provider.healthPanels.delete(fixture.host);
     release();
     await pending;
+    const evidence = fs
+      .readFileSync(health.file.replace('.json', '.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      evidence.find((line) => line.phase === 'retention' && line.event === 'settled')?.outcome,
+      failure === 'storage' ? 'failed' : 'returned',
+    );
+    assert.equal(evidence.find((line) => line.phase === 'send' && line.event === 'settled')?.panel, originalPanel);
+    assert.equal(evidence.find((line) => line.phase === 'retention' && line.event === 'settled')?.panel, originalPanel);
+    if (failure === 'disposed') assert.equal(provider.healthPanels.has(fixture.host), false);
+    health.dispose();
     assert.equal(delivered.length, 0);
     assert.equal(provider.drafts.sess, 'newer draft');
     assert.equal(provider.saved.submittedPrompts[0].text, text);
@@ -25511,6 +25932,11 @@ test('serializer recovery imports durably before stale-option disposal and remai
       const events: string[] = [];
       const attempt = { id: 'browser-only', order: 6, source: 'draft:missing', revision: 1, text: '  full\n  prompt' };
       const panel = fakeWebviewPanel({ retainContextWhenHidden: true });
+      const health = new HostHealth({
+        directory: tempDir('serializer-health'),
+        workspace: 'test',
+        build: { sourceCommit: null, dirty: null, builtAt: 1 },
+      });
       const dispose = panel.dispose.bind(panel);
       panel.dispose = () => {
         events.push('dispose');
@@ -25529,8 +25955,14 @@ test('serializer recovery imports durably before stale-option disposal and remai
         },
         adoptPanel: () => events.push('adopt'),
         openInEditor: () => events.push('replace'),
+        health,
       });
       await provider.revivePanel(panel, { submittedPrompts: [attempt] });
+      health.sample();
+      const snapshot = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+      assert.equal(snapshot.outcomes.at(-1).phase, 'serializer');
+      assert.equal(snapshot.outcomes.at(-1).outcome, failure ? 'failed' : 'returned');
+      health.dispose();
       assert.deepEqual(events, failure ? ['persist', 'adopt'] : ['persist', 'dispose', 'replace']);
       assert.deepEqual(provider.saved.submittedPrompts, [attempt]);
       assert.deepEqual(provider.newDrafts, {});

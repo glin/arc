@@ -1028,6 +1028,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
       notePanelStart() {}
       shell() { return 'shell'; }
       closeBrowserStagingForHost() {}
+      healthPanel() { return { id: 1, posting: false }; }
       onMessage(message, host) { if (message.type === 'ready') this.browserReady(host); }
       ${body}
     }`,

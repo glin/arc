@@ -71,7 +71,7 @@ function sourceIdentity() {
   }
 }
 
-async function createBuildContext(developmentServerUrl) {
+async function createBuildContext(developmentServerUrl, watch = false) {
   const panel = panelText(developmentServerUrl);
   const context = await esbuild.context({
     entryPoints: ['src/extension.ts'],
@@ -85,7 +85,17 @@ async function createBuildContext(developmentServerUrl) {
     minify: true,
     keepNames: true,
     metafile: true,
-    define: { ...panel.defines, EXTENSION_VERSION: JSON.stringify(manifestVersion()) },
+    define: {
+      ...panel.defines,
+      EXTENSION_VERSION: JSON.stringify(manifestVersion()),
+      HOST_BUILD_IDENTITY: JSON.stringify(
+        JSON.stringify(
+          watch
+            ? { sourceCommit: null, dirty: null, builtAt: 0, unavailable: 'watch' }
+            : { ...sourceIdentity(), builtAt: Date.now() },
+        ),
+      ),
+    },
   });
   return { context, inputs: panel.inputs };
 }
@@ -121,7 +131,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
   copyWindowsPipe('dist');
   if (watch) fs.rmSync('dist/build-identity.json', { force: true });
   const cli = await createCliContext();
-  let current = await createBuildContext(developmentServerUrl);
+  let current = await createBuildContext(developmentServerUrl, watch);
   if (!watch) {
     const cliResult = await cli.rebuild();
     const result = await current.context.rebuild();
@@ -170,7 +180,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
   const rebuildPanel = async () => {
     await current.context.dispose();
     try {
-      current = await createBuildContext(developmentServerUrl);
+      current = await createBuildContext(developmentServerUrl, watch);
       await current.context.watch();
       rewatch();
       console.log(`rebuilt: the ${developmentServerUrl === null ? 'panel' : 'worker'} source changed`);
