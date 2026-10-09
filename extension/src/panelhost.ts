@@ -4961,6 +4961,7 @@ export class PanelProvider implements vscode.Disposable {
           clearing: current.clearing,
           queued: current.queued,
           queueHandoffs: current.queueHandoffs,
+          asks: current.asks,
         };
         this.sendPrompt(text, session, revision, source, ready, assets, draft, attempt.id);
       } finally {

@@ -2599,7 +2599,7 @@ test('queued submissions keep later comments out of earlier text', () => {
   );
 });
 
-test('a native mid-turn prompt cannot take comments owned by a local queue record', () => {
+test('a prompt queued behind a local record cannot take the comments that record owns', () => {
   const reserved = comment({ id: 'reserved', note: 'keep this with compact' });
   const active = comment({ id: 'active', note: 'send this now' });
   const waiting = queued('/compact', { id: 'compact', commentIds: [reserved.id] });
@@ -2611,7 +2611,7 @@ test('a native mid-turn prompt cannot take comments owned by a local queue recor
     comments: [reserved, active],
     queued: [waiting],
   });
-  assert.equal(sendAction(state), 'send');
+  assert.equal(sendAction(state), 'queue');
   assert.deepEqual(
     commentsForActiveSubmission(state).map((one) => one.id),
     [active.id],
@@ -2769,8 +2769,33 @@ test('a prompt typed while a turn runs goes to whichever queue will actually hol
         queued: [queued('/compact')],
       }),
     ),
+    'queue',
+    'a Claude prompt overtook a compaction waiting to send',
+  );
+  assert.equal(
+    sendAction(
+      composerState({
+        agent: 'claude',
+        draft: 'read the config',
+        running: true,
+        queued: [queued('/clear')],
+      }),
+    ),
+    'queue',
+    'a Claude prompt overtook a clear waiting to send',
+  );
+  assert.equal(
+    sendAction(
+      composerState({
+        agent: 'claude',
+        draft: 'read the config',
+        running: true,
+        queued: [queued('/compact')],
+        asks: [QUESTION],
+      }),
+    ),
     'send',
-    'a local control request turns Claude native mid-turn delivery into a second local queue',
+    'a Claude answer to an open request waited behind a compaction instead of joining the running turn',
   );
   // Codex also accepts prompts during a running turn.
 

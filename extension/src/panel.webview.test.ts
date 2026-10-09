@@ -24968,6 +24968,54 @@ test('submitted recovery refuses failed storage, changed scope and disposed orig
   }
 });
 
+test.each(['opens', 'closes'] as const)(
+  'a Claude prompt sent behind a queued compaction agrees with whether a request is open when a request %s during the save',
+  async (change) => {
+    const session = 's1';
+    const { provider } = queueRecoveryProvider();
+    const host = { webview: {} };
+    const ask = { kind: 'question', id: 'ask-1', questions: [] };
+    provider.asks = change === 'closes' ? [{ session, ask }] : [];
+    provider.hosts = [host];
+    provider.queues[session] = queueSubmissionAfter([], 'compact', '/compact', [], [], 1, false, {
+      agent: 'claude',
+      owner: session,
+    });
+    provider.stateFor = () => ({
+      ...COMPOSER_STATE,
+      sessionId: session,
+      running: true,
+      queued: provider.queues[session] ?? [],
+      asks: provider.asks.filter((entry: any) => entry.session === session).map((entry: any) => entry.ask),
+    });
+    let release!: () => void;
+    const saving = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    provider.importPromptRecovery = () => saving;
+    const answered: string[] = [];
+    provider.onAnswerAsk = (_session: string, id: string) => answered.push(id);
+    const sent: string[] = [];
+    provider.send = (_state: unknown, text: string) => sent.push(text);
+    const text = 'read the config';
+    const attempt = { id: `asks-${change}`, order: 1, source: session, revision: 1, text };
+    const pending = provider.acceptSubmission(text, session, 1, session, host, attempt);
+    provider.asks = change === 'opens' ? [{ session, ask }] : [];
+    release();
+    await pending;
+    const queuedBehind = provider.queues[session].map((entry: any) => entry.text);
+    if (change === 'opens') {
+      assert.deepEqual(answered, ['ask-1'], 'the request opened during the save was not answered by the prompt');
+      assert.deepEqual(sent, [text], 'the answer waited behind the compaction after it closed the request');
+      assert.deepEqual(queuedBehind, ['/compact']);
+    } else {
+      assert.deepEqual(answered, []);
+      assert.deepEqual(sent, [], 'the prompt overtook the compaction after the request closed during the save');
+      assert.deepEqual(queuedBehind, ['/compact', text]);
+    }
+  },
+);
+
 function catalogSendProvider(agent: 'claude' | 'codex') {
   const root = tempDir('catalog-send-');
   const workspace = path.join(root, 'workspace');

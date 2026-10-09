@@ -2502,13 +2502,16 @@ export function sendAction(state: ComposerState): SendMeaning {
   const compacting =
     state.agent === 'codex' &&
     state.live.some((press) => (press.kind === 'compact' || press.kind === 'clear') && !press.failed);
+  // A running agent takes a prompt mid-turn only when the local queue is empty, so the queue stays first in, first out.
+  // A Claude answer to an open request joins the running turn, which comes before any queued record.
+  const answersOpenRequest = state.agent === 'claude' && (state.asks?.length ?? 0) > 0;
   const takesNow =
     !state.clearing &&
     ((!state.running && !state.queued.length) ||
       (state.running &&
         takesMidTurnPrompt(state.agent) &&
         !compacting &&
-        (state.agent !== 'codex' || !state.queued.length)));
+        (!state.queued.length || answersOpenRequest)));
   // Comments or files permit a submission without typed text. Queued comments retain their attachments until delivery.
   const files = state.assets?.length ?? 0;
   if (!typed) {
