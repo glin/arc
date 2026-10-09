@@ -120,6 +120,192 @@ import {
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
 import { estimateCodexContext, inspectCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
 import { bedrockAstraRecords, codexContextRecords } from './turnfixtures.ts';
+import { emptyCodexResponseClock, reduceCodexResponseClock } from './outputrate';
+
+test('native Codex speed excludes serial and parallel tool waits without subtracting overlapping generation', () => {
+  for (const toolWait of [1000, 1000000]) {
+    const state = emptyCodexResponseClock();
+    const owner = { sessionId: 'main', turnId: 'turn', model: 'gpt-6.1-sol', eligible: true };
+    const push = (kind: string, at: number, payload: Record<string, unknown> = {}) =>
+      reduceCodexResponseClock(state, { kind, at, payload }, owner);
+    const usageRecord = (id: string) => ({
+      thread_id: 'main',
+      turn_id: 'turn',
+      response_id: id,
+      usage: { output_tokens: 84, reasoning_output_tokens: 40 },
+    });
+    push('task_started', 1);
+    push('function_call', 500, { call_id: 'parallel-a' });
+    push('custom_tool_call', 600, { call_id: 'parallel-b' });
+    assert.equal(push('token_usage_record', 1000, usageRecord('first')), null);
+    push('function_call_output', 1000 + toolWait / 2, { call_id: 'parallel-a' });
+    push('custom_tool_call_output', 1000 + toolWait, { call_id: 'parallel-b' });
+    // This call overlaps the next generation. Its output precedes that response's native completion.
+    push('function_call', 2000 + toolWait, { call_id: 'overlap' });
+    push('function_call_output', 3000 + toolWait, { call_id: 'overlap' });
+    assert.deepEqual(push('token_usage_record', 11000 + toolWait, usageRecord('second')), {
+      output: 84,
+      milliseconds: 10000,
+    });
+    assert.equal(push('token_usage_record', 50000 + toolWait, usageRecord('second')), null);
+    assert.deepEqual(push('token_usage_record', 21000 + toolWait, usageRecord('third')), {
+      output: 84,
+      milliseconds: 10000,
+    });
+  }
+});
+
+test('native Codex speed rejects contaminated or unproved response boundaries', () => {
+  for (const reason of [
+    'steering',
+    'compaction',
+    'model',
+    'foreign',
+    'replay',
+    'missing',
+    'negative',
+    'unfinished',
+    'aborted',
+  ]) {
+    const state = emptyCodexResponseClock();
+    const owner = { sessionId: 'main', turnId: 'turn', model: 'gpt-6.1-sol', eligible: true };
+    const push = (kind: string, at: number, payload: Record<string, unknown> = {}) =>
+      reduceCodexResponseClock(state, { kind, at, payload }, owner);
+    const payload = {
+      thread_id: 'main',
+      turn_id: 'turn',
+      response_id: 'one',
+      usage: { output_tokens: 84, reasoning_output_tokens: 40 },
+    };
+    push('task_started', 1);
+    push('token_usage_record', 1000, payload);
+    if (reason === 'steering') push('user_message', 5000);
+    if (reason === 'compaction') push('compacted', 5000);
+    if (reason === 'aborted') push('turn_aborted', 5000);
+    if (reason === 'model') owner.model = 'gpt-6-astra';
+    if (reason === 'replay') owner.eligible = false;
+    if (reason === 'unfinished') {
+      state.blocking.push('still-running');
+    }
+    const current = {
+      ...payload,
+      response_id: 'two',
+      ...(reason === 'foreign' ? { thread_id: 'child' } : {}),
+      ...(reason === 'missing' ? { usage: {} } : {}),
+    };
+    assert.equal(push('token_usage_record', reason === 'negative' ? 900 : 11000, current), null, reason);
+  }
+});
+
+test('native Codex speed survives incremental append and rebuild with exact output usage', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const native = (second: number, id: string, output: number) => ({
+    type: 'token_usage_record',
+    timestamp: at(second),
+    payload: {
+      thread_id: thread,
+      session_id: thread,
+      turn_id: TURN,
+      response_id: id,
+      usage: usage({ output_tokens: output, reasoning_output_tokens: 40, total_tokens: output }),
+    },
+  });
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6.1-sol', 'high'),
+    event('user_message', 3, { message: 'work' }),
+    item('function_call', 4, { call_id: 'blocking', name: 'shell_command', arguments: '{}' }),
+    native(5, 'first', 84),
+  ];
+  const file = writeRollout(records);
+  const initial = readCodexSessionIncremental(file, thread);
+  assert.ok(initial.checkpoint);
+  assert.equal(initial.read?.turns[0].outputRate, undefined);
+  const append = [
+    item('function_call_output', 25, { call_id: 'blocking', output: 'finished' }),
+    native(35, 'second', 168),
+    native(36, 'second', 168),
+    tokens(40, { input_tokens: 1000, output_tokens: 168, reasoning_output_tokens: 40 }),
+    event('task_complete', 41, { turn_id: TURN, last_agent_message: 'done' }),
+  ];
+  fs.appendFileSync(file, append.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const resumed = readCodexSessionIncremental(file, thread, throughStructuredClone(initial.checkpoint));
+  const full = readCodexSession(file, thread);
+  assert.deepEqual(resumed.read?.turns, full.turns);
+  assert.deepEqual(full.turns[0].outputRate, { output: 168, milliseconds: 10000 });
+  const truncated = writeRollout([
+    meta(),
+    native(35, 'second', 168),
+    tokens(40, { input_tokens: 1000, output_tokens: 168 }),
+  ]);
+  assert.ok(readCodexSession(truncated, thread).turns.every((turn) => !turn.outputRate));
+});
+
+test('native Codex speed retracts later classified compaction across append and cloned snapshots', () => {
+  for (const hasWorkRate of [false, true]) {
+    const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+    const native = (second: number, id: string, output: number) => ({
+      type: 'token_usage_record',
+      timestamp: at(second),
+      payload: {
+        thread_id: thread,
+        turn_id: TURN,
+        response_id: id,
+        usage: usage({ output_tokens: output, reasoning_output_tokens: 40, total_tokens: output }),
+      },
+    });
+    const records = [
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      turnContext(2, TURN, 'gpt-6.1-sol', 'high'),
+      event('user_message', 3, { message: 'work' }),
+      native(5, 'first', 84),
+    ];
+    if (hasWorkRate) records.push(native(15, 'work', 168));
+    records.push(
+      tokens(hasWorkRate ? 16 : 6, {
+        input_tokens: 1000,
+        output_tokens: hasWorkRate ? 252 : 84,
+        reasoning_output_tokens: 40,
+      }),
+      native(25, 'compaction', 840),
+    );
+    const file = writeRollout(records);
+    const provisional = readCodexSessionIncremental(file, thread);
+    assert.ok(provisional.checkpoint);
+    assert.ok(provisional.read?.turns[0].outputRate);
+    const clone = throughStructuredClone(provisional.checkpoint);
+    const suffix = [
+      {
+        timestamp: at(26),
+        type: 'compacted',
+        payload: {
+          compaction_response_id: 'compaction',
+          latest_token_usage_record: {
+            usage: usage({ output_tokens: 840, reasoning_output_tokens: 40, total_tokens: 840 }),
+          },
+          replacement_history: [],
+        },
+      },
+      event('task_complete', 27, { turn_id: TURN }),
+    ];
+    fs.appendFileSync(file, suffix.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const full = readCodexSession(file, thread);
+    const expected = hasWorkRate ? { output: 168, milliseconds: 10000 } : undefined;
+    assert.deepEqual(full.turns[0].outputRate, expected);
+    assert.equal(
+      toCard(full.turns[0], false, Date.parse(at(28)))
+        .chips.find((chip) => chip.metric === 'tokens')
+        ?.detailList?.entries.some((row) => row.label === 'Speed'),
+      hasWorkRate,
+    );
+    for (const checkpoint of [provisional.checkpoint, clone]) {
+      const resumed = readCodexSessionIncremental(file, thread, checkpoint);
+      assert.deepEqual(resumed.read?.turns, full.turns);
+    }
+  }
+});
 
 test('Codex active context explains pending tools and unmeasured results until a new complete measurement', async () => {
   for (const compacted of [false, true]) {
@@ -11323,7 +11509,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 18);
+  assert.equal(reset.checkpoint?.parserState.version, 20);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],

@@ -1,4 +1,5 @@
-import { MEASUREMENT_ENVIRONMENT } from './identity';
+import { MEASUREMENT_ENVIRONMENT, STORED_STATE_KEYS } from './identity';
+import { savedResponseRates, retainResponseRate, responseRateForTurn } from './outputrate';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
 import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
@@ -1553,6 +1554,7 @@ export class PanelProvider implements vscode.Disposable {
   private typedRenames = new Map<string, number>();
   // Pending prompt and compaction activity by session, ordered oldest first. `pressesAfter` reconciles it with recorded turns.
   private live: Record<string, LivePress[]> = {};
+  private responseRates: import('./outputrate').ResponseRate[] = [];
   // A clear is complete only after the agent accepts it and names its successor. Claude
   // reports those in separate events. Codex names the successor before its request resolves.
   // Keeping this outside `live` prevents a command-only operation from drawing a turn card.
@@ -2074,6 +2076,7 @@ export class PanelProvider implements vscode.Disposable {
     private readonly health?: HostHealth,
   ) {
     this.performanceOutput = performanceOutput ?? null;
+    this.responseRates = savedResponseRates(this.memento?.get(STORED_STATE_KEYS.responseRates));
     this.repositoryScope = this.createRepositoryScope(nodeGitRunner());
     this.watchScheduler = new BoundedTrailingScheduler(TRANSCRIPT_WAKE_MS, TRANSCRIPT_WAKE_MAX_MS, (event) =>
       this.runPendingWatch(event),
@@ -4154,7 +4157,22 @@ export class PanelProvider implements vscode.Disposable {
           press,
           this.newestBySession.get(session) ?? null,
         );
-        return !livePressOver(press, seen, running, now, acceptedRecordedTurn);
+        const over = livePressOver(press, seen, running, now, acceptedRecordedTurn);
+        if (
+          over &&
+          acceptedRecordedTurn &&
+          press.kind === 'prompt' &&
+          press.ran &&
+          !press.failed &&
+          !press.completed &&
+          press.turnId !== undefined
+        ) {
+          this.reconciledResponseOwners ??= new Map();
+          this.reconciledResponseOwners.set(press.turnId, session);
+          if (this.reconciledResponseOwners.size > 512)
+            this.reconciledResponseOwners.delete(this.reconciledResponseOwners.keys().next().value!);
+        }
+        return !over;
       });
       if (left.length === held.length) {
         continue;
@@ -4383,6 +4401,7 @@ export class PanelProvider implements vscode.Disposable {
     { at: number; blocks: Map<string, string>; owners: Map<string, number> }
   >();
   private pendingResponsePosts = new Map<number, Array<() => void>>();
+  private reconciledResponseOwners = new Map<number, string>();
   private pendingResponseOwners = new Map<
     number,
     { session: string; source: string; at: number; timer: ReturnType<typeof setTimeout> }
@@ -4443,7 +4462,21 @@ export class PanelProvider implements vscode.Disposable {
       void this.completeSelectedWindow(session, this.selectionGeneration);
   }
 
+  public noteResponseRate(session: string, rate: import('./outputrate').ResponseRate, turnId?: number): void {
+    if (this.disposed || turnId === undefined || session !== rate.sessionId) return;
+    const reconciled = this.reconciledResponseOwners?.get(turnId) === session;
+    const press = reconciled
+      ? null
+      : this.responsePress(session, turnId, () => this.noteResponseRate(session, rate, turnId));
+    if (!reconciled && !press) return;
+    this.responseRates = retainResponseRate(this.responseRates, rate);
+    void this.memento?.update(STORED_STATE_KEYS.responseRates, this.responseRates);
+    if (this.showing === session) void this.completeSelectedWindow(session, this.selectionGeneration);
+  }
+
   public noteResponseEnded(session: string, outcome: import('./agentwire').TurnOutcome, turnId?: number): void {
+    if (turnId !== undefined && this.reconciledResponseOwners?.get(turnId) === session)
+      this.reconciledResponseOwners.delete(turnId);
     if (outcome.turns === 0) return;
     const held = this.live[session];
     const press = this.responsePress(session, turnId, () => this.noteResponseEnded(session, outcome, turnId));
@@ -10765,7 +10798,12 @@ export class PanelProvider implements vscode.Disposable {
     dispatchedCosts: () => Readonly<Record<string, Readonly<Record<string, DispatchedSessionCost>>>> = () =>
       this.dispatchedTurnCosts(),
   ): RenderCard {
-    const turn = latest ? this.withActivity(recordedTurn) : recordedTurn;
+    const activeTurn = latest ? this.withActivity(recordedTurn) : recordedTurn;
+    const rate =
+      activeTurn.agent === 'claude' && this.responseRates?.length
+        ? responseRateForTurn(activeTurn, this.responseRates)
+        : activeTurn.outputRate;
+    const turn = rate ? { ...activeTurn, outputRate: rate } : activeTurn;
     const callIds = new Set([
       ...(turn.dispatchToolUseIds ?? []),
       ...turn.steps.map((step) => step.sourceId).filter((id): id is string => !!id),

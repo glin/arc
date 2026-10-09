@@ -446,6 +446,14 @@ function writeTranscript(lines: object[]): string {
   return file;
 }
 
+test('Claude turns retain main response identities for exact observed-speed publication', () => {
+  const first = assistantText('first', 1, { output_tokens: 84 }, undefined, 'tool_use');
+  const second = assistantText('second', 2, { output_tokens: 168 }, undefined, 'end_turn');
+  const child = { ...assistantText('child', 2, { output_tokens: 999 }), isSidechain: true };
+  const read = readSession(writeTranscript([userPrompt('work'), first, first, child, second]), 'sess');
+  assert.deepEqual(read.turns[0].responseIds, [first.message.id, second.message.id]);
+});
+
 // Haiku 5.5 prices each request in its own prompt-length band, so a turn total must keep both bands.
 test('a Haiku 5.5 turn prices each request in its own band', () => {
   const request = (second: number, usage: Record<string, number>, stop?: string) => {

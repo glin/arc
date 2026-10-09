@@ -318,6 +318,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
     onEvent: ({ key, event, turnId }) => {
+      if (event.kind === 'responseRate') {
+        const where = host.get(key)?.state().sessionId;
+        if (where === event.rate.sessionId) panel.noteResponseRate(where, event.rate, turnId);
+        return;
+      }
       if (event.kind === 'activity') {
         const where = host.get(key)?.state().sessionId;
         if (where) {

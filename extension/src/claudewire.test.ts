@@ -1,6 +1,7 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { CONTEXT_FRAME_BYTES } from './contextframe';
+import { ClaudeResponseClock, responseRateForTurn, savedResponseRates, retainResponseRate } from './outputrate';
 import {
   ClaudeWire,
   claudePromptContent,
@@ -17,6 +18,126 @@ import {
 // Protocol fixtures retain the fields consumed by the wire adapter, including the unified context window.
 
 const SESSION = 'c0129cee-9323-4aea-a448-ec90642971ea';
+
+test('Claude response speed uses final actual output and commits only a stopped main response', () => {
+  const events: WireEvent[] = [];
+  let clock = 1000;
+  const wire = new ClaudeWire({ send() {}, emit: (event) => events.push(event), sessionId: SESSION, now: () => clock });
+  const send = (event: Record<string, unknown>, parent: string | null = null, session = SESSION) =>
+    wire.receive(JSON.stringify({ type: 'stream_event', session_id: session, parent_tool_use_id: parent, event }));
+  send({ type: 'message_start', message: { id: 'response', model: 'claude-opus-5' } });
+  clock = 2000;
+  send({
+    type: 'message_delta',
+    delta: { stop_reason: 'tool_use' },
+    usage: { output_tokens: 84, output_tokens_details: { thinking_tokens: 40 } },
+  });
+  assert.equal(events.filter((event) => event.kind === 'responseRate').length, 0);
+  clock = 9000;
+  send({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 90 } });
+  send({ type: 'message_start', message: { id: 'child', model: 'claude-opus-5' } }, 'child-tool');
+  send({ type: 'message_stop' }, 'child-tool');
+  send({ type: 'message_stop' });
+  const rate = events.find((event) => event.kind === 'responseRate');
+  assert.ok(rate?.kind === 'responseRate');
+  assert.deepEqual(rate.rate, {
+    sessionId: SESSION,
+    responseId: 'response',
+    model: 'claude-opus-5',
+    output: 90,
+    milliseconds: 1000,
+  });
+  send({ type: 'message_stop' });
+  send({ type: 'message_start', message: { id: 'response', model: 'claude-opus-5' } });
+  assert.equal(events.filter((event) => event.kind === 'responseRate').length, 1);
+});
+
+test('Claude response timing excludes invalid scopes, clocks, resets, and unfinished responses', async () => {
+  for (const mutation of ['scope', 'session', 'missing', 'negative', 'interrupt', 'prompt', 'close']) {
+    const events: WireEvent[] = [];
+    let clock = 1000;
+    const wire = new ClaudeWire({
+      send() {},
+      emit: (event) => events.push(event),
+      sessionId: SESSION,
+      now: () => clock,
+    });
+    const send = (event: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+      wire.receive(
+        JSON.stringify({ type: 'stream_event', session_id: SESSION, parent_tool_use_id: null, event, ...extra }),
+      );
+    send({ type: 'message_start', message: { id: mutation, model: 'claude-opus-5' } });
+    clock = mutation === 'negative' ? 900 : 2000;
+    if (mutation === 'scope') send({ type: 'content_block_delta' }, { parent_tool_use_id: undefined });
+    if (mutation === 'session') send({ type: 'content_block_delta' }, { session_id: 'successor' });
+    if (mutation === 'interrupt') void wire.interrupt().catch(() => {});
+    if (mutation === 'prompt') await wire.prompt('new prompt');
+    if (mutation === 'close') wire.close('closed');
+    if (mutation === 'interrupt' || mutation === 'close')
+      send({ type: 'message_start', message: { id: 'late-response', model: 'claude-opus-5' } });
+    send({
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: mutation === 'missing' ? {} : { output_tokens: 50 },
+    });
+    send({ type: 'message_stop' });
+    assert.equal(events.filter((event) => event.kind === 'responseRate').length, 0, mutation);
+    wire.close('finished');
+  }
+  const observer = new ClaudeResponseClock();
+  assert.deepEqual(
+    observer.observe({ session_id: SESSION, parent_tool_use_id: null, event: { type: 'message_stop' } }, 100),
+    {},
+  );
+});
+
+test('Claude response speed omits usage after an unreadable successor start', () => {
+  const events: WireEvent[] = [];
+  let clock = 1000;
+  const wire = new ClaudeWire({ send() {}, emit: (event) => events.push(event), sessionId: SESSION, now: () => clock });
+  const frame = (event: Record<string, unknown>) =>
+    JSON.stringify({ type: 'stream_event', session_id: SESSION, parent_tool_use_id: null, event });
+  wire.receive(frame({ type: 'message_start', message: { id: 'first', model: 'claude-opus-5' } }));
+  wire.receive(frame({ type: 'message_start', message: { id: 'successor', model: 'claude-opus-5' } }).slice(0, -1));
+  clock = 2000;
+  wire.receive(frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 84 } }));
+  wire.receive(frame({ type: 'message_stop' }));
+  assert.equal(events.filter((event) => event.kind === 'responseRate').length, 0);
+  wire.receive(frame({ type: 'message_start', message: { id: 'next', model: 'claude-opus-5' } }));
+  clock = 3000;
+  wire.receive(frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 42 } }));
+  wire.receive(frame({ type: 'message_stop' }));
+  const rates = events.filter((event) => event.kind === 'responseRate');
+  assert.equal(rates.length, 1);
+  assert.equal(rates[0].rate.responseId, 'next');
+});
+
+test('saved Claude response speed joins exact session and main request identities with weighted times', () => {
+  const first = { sessionId: SESSION, responseId: 'one', model: 'claude-opus-5', output: 84, milliseconds: 10000 };
+  let rates = retainResponseRate([], first);
+  rates = retainResponseRate(rates, first);
+  rates = retainResponseRate(rates, { ...first, responseId: 'two', output: 168, milliseconds: 10000 });
+  rates = retainResponseRate(rates, { ...first, sessionId: 'child', output: 999 });
+  const turn = { sessionId: SESSION, model: first.model, responseIds: ['one', 'two'], interrupted: false };
+  assert.deepEqual(responseRateForTurn(turn, savedResponseRates(JSON.parse(JSON.stringify(rates)))), {
+    output: 252,
+    milliseconds: 20000,
+  });
+  assert.equal(responseRateForTurn({ ...turn, responseIds: ['missing'] }, rates), undefined);
+  assert.equal(responseRateForTurn({ ...turn, interrupted: true }, rates), undefined);
+  assert.equal(responseRateForTurn({ ...turn, model: 'different' }, rates), undefined);
+  assert.equal(
+    savedResponseRates(Array.from({ length: 1000 }, (_, index) => ({ ...first, responseId: String(index) }))).length,
+    512,
+  );
+  assert.deepEqual(
+    savedResponseRates([
+      { ...first, milliseconds: 0 },
+      { ...first, output: -1 },
+    ]),
+    [],
+  );
+});
 
 const INIT_LINE = JSON.stringify({
   type: 'system',

@@ -758,6 +758,7 @@ export class AgentSession {
   private readonly nativeTurnOwners = new Map<string, number>();
   private readonly respondingTurns = new Set<number>();
   private readonly responseOwners = new Map<string, number>();
+  private readonly responseRateOwners = new Map<string, number>();
   private readonly pendingResponses: WireEvent[] = [];
   private acceptingPrompts = 0;
   // Claude reported `running` and has not reported `idle` since. It keeps the session busy
@@ -1349,6 +1350,34 @@ export class AgentSession {
   }
 
   private handle(event: WireEvent): void {
+    if (event.kind === 'responseStarted') {
+      if (
+        this.agent === 'claude' &&
+        !this.acceptingPrompts &&
+        this.openTurns.size === 1 &&
+        this.preparingTurns.size === 0
+      ) {
+        const owner = this.openTurns.values().next().value;
+        if (owner && !this.responseRateOwners.has(event.sourceId)) {
+          this.responseRateOwners.set(event.sourceId, owner.id);
+          if (this.responseRateOwners.size > 512)
+            this.responseRateOwners.delete(this.responseRateOwners.keys().next().value!);
+        }
+      }
+      return;
+    }
+    if (event.kind === 'responseRate') {
+      const owner = this.responseRateOwners.get(event.sourceId);
+      this.responseRateOwners.delete(event.sourceId);
+      if (
+        owner !== undefined &&
+        [...this.openTurns].some((turn) => turn.id === owner) &&
+        this.openTurns.size === 1 &&
+        this.preparingTurns.size === 0
+      )
+        this.report(event, owner);
+      return;
+    }
     if (event.kind === 'sessionState') {
       if (this.driver.hasOpenTurns) return;
       if (event.state === 'running') {
@@ -1462,6 +1491,7 @@ export class AgentSession {
     this.nativeTurnOwners.clear();
     this.respondingTurns.clear();
     this.responseOwners.clear();
+    this.responseRateOwners.clear();
     this.pendingResponses.length = 0;
     this.agentRunning = false;
     this.interruptedTurnEnds = 0;

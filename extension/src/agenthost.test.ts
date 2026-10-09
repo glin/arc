@@ -337,6 +337,32 @@ function settle(host: AgentHost, key: string): void {
   host.settled(host.beginHousekeeping(key));
 }
 
+test('Claude response speed requires a sole prompt owner established at response start', async () => {
+  const SESSION = 'speed-session';
+  const { host, children, events } = fakeHost();
+  const opening = host.session('speed', claudePlan(CLAUDE, { cwd: WS, sessionId: SESSION }));
+  children[0].answerHandshake([]);
+  const session = await opening;
+  const id = await session.prompt('first');
+  const handle = (event: WireEvent) => (session as unknown as { handle(event: WireEvent): void }).handle(event);
+  const rate: WireEvent = {
+    kind: 'responseRate',
+    sourceId: 'response',
+    rate: { sessionId: SESSION, responseId: 'response', model: 'claude-opus-5', output: 84, milliseconds: 1000 },
+  };
+  handle(rate);
+  assert.equal(events.filter((entry) => entry.event.kind === 'responseRate').length, 0);
+  handle({ kind: 'responseStarted', sourceId: 'response' });
+  handle(rate);
+  assert.equal(events.find((entry) => entry.event.kind === 'responseRate')?.turnId, id);
+  handle(rate);
+  assert.equal(events.filter((entry) => entry.event.kind === 'responseRate').length, 1);
+  handle({ kind: 'responseStarted', sourceId: 'steered' });
+  await session.prompt('second');
+  handle({ ...rate, sourceId: 'steered' });
+  assert.equal(events.filter((entry) => entry.event.kind === 'responseRate').length, 1);
+});
+
 test('LineReader keeps a line whole across the chunks it arrives in', () => {
   const lines: string[] = [];
   const reader = new LineReader((line) => lines.push(line));

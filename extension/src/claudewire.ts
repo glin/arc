@@ -53,6 +53,7 @@ import {
   normalizeAgentPrompt,
 } from './agentwire';
 import { agentTakesAsset, validatePromptAssetBytes } from './promptassets';
+import { ClaudeResponseClock } from './outputrate';
 
 type ClaudePromptBlock = Record<string, unknown>;
 
@@ -447,6 +448,7 @@ export const CONTROL_DEADLINE_MS = 60_000;
 const HUMAN_ORIGIN = { kind: 'human' } as const;
 
 export interface WireOptions {
+  now?(): number;
   // Receives each outbound JSON line with its terminating newline.
   send(line: string): void;
   // Every event the panel acts on.
@@ -485,6 +487,9 @@ function claudeToolActivity(block: Json): WireActivity | null {
 }
 
 export class ClaudeWire {
+  private readonly responseClock = new ClaudeResponseClock();
+  private responseTimingBlocked = false;
+  private readonly now: () => number;
   private readonly send: (line: string) => void;
   private readonly emit: (event: WireEvent) => void;
   private readonly nextId: () => string;
@@ -515,6 +520,7 @@ export class ClaudeWire {
   private session: string | null = null;
 
   constructor(options: WireOptions) {
+    this.now = options.now ?? (() => performance.now());
     this.send = options.send;
     this.emit = options.emit;
     this.nextId = options.nextId ?? (() => `arc_${++this.counter}`);
@@ -539,6 +545,7 @@ export class ClaudeWire {
   // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
   // Every prompt carries a human origin. The transcript's `agentRunIn` rule uses it to identify reader-owned sessions across windows.
   prompt(input: AgentPromptInput): Promise<void> {
+    this.responseClock.reset();
     if (this.closed) {
       throw new Error('the agent is no longer running');
     }
@@ -597,6 +604,8 @@ export class ClaudeWire {
 
   // Stops the active turn. `cancelQueued` also cancels queued prompts and prevents pending attachments from reaching the child.
   async interrupt(cancelQueued = false): Promise<void> {
+    this.responseClock.reset();
+    this.responseTimingBlocked = true;
     if (cancelQueued) {
       this.promptGeneration += 1;
     }
@@ -712,6 +721,7 @@ export class ClaudeWire {
     try {
       parsed = JSON.parse(text);
     } catch {
+      this.responseClock.reset();
       this.emit({ kind: 'error', message: `unreadable line from the agent: ${text.slice(0, 200)}` });
       return;
     }
@@ -722,6 +732,8 @@ export class ClaudeWire {
 
     const session = str(m.session_id);
     if (session && session !== this.session) {
+      this.responseClock.reset();
+      if (this.session !== null) this.responseTimingBlocked = true;
       // Preserve the previous session id for the session-change event.
       const previous = this.session;
       this.session = session;
@@ -739,9 +751,17 @@ export class ClaudeWire {
         this.assistant(obj(m.message));
         return;
       case 'stream_event':
+        {
+          const timing = this.closed || this.responseTimingBlocked ? {} : this.responseClock.observe(m, this.now());
+          if (timing.started) this.emit({ kind: 'responseStarted', sourceId: timing.started });
+          if (timing.completed)
+            this.emit({ kind: 'responseRate', sourceId: timing.completed.responseId, rate: timing.completed });
+        }
         this.partial(obj(m.event));
         return;
       case 'result':
+        this.responseClock.reset();
+        this.responseTimingBlocked = false;
         this.emit({ kind: 'turnEnd', outcome: readOutcome(m) });
         return;
       case 'rate_limit_event':
@@ -780,6 +800,7 @@ export class ClaudeWire {
 
   // Rejects pending control requests and clears asks when the child exits.
   close(reason: string): void {
+    this.responseClock.reset();
     this.contextRequests.clear();
     if (this.closed) {
       return;

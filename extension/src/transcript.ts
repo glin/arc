@@ -662,6 +662,8 @@ export interface Turn {
   usage: TurnUsage;
   usageParts?: TurnUsagePart[];
   contextTokens: number; // input plus cache of the turn's last real assistant message
+  outputRate?: import('./outputrate').OutputRate;
+  responseIds?: string[];
   // Request that established `contextTokens`, separate from aggregate usage and the turn end time.
   contextRequest?: ContextRequest;
   // Recorded runtime context window, or null when absent. It can differ from the published model window.
@@ -8637,7 +8639,7 @@ interface RecordedTitleState {
 }
 
 export interface ClaudeSessionParserState {
-  version: 7;
+  version: 8;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
   turnMembershipStarts: number[];
@@ -8772,7 +8774,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
   const suppliedTitle = normalizeSessionTitle(opts.sessionTitle);
   const suppliedFullTitle = normalizeFullSessionTitle(opts.sessionTitle);
   return {
-    version: 7,
+    version: 8,
     turns: [],
     turnRanges: [],
     turnMembershipStarts: [],
@@ -10016,6 +10018,11 @@ function reduceClaudeSessionLine(
     opts.childTranscript ? { countSidechain: true, emitRepeats: true } : {},
   );
   if (usageEvent) {
+    if (!opts.childTranscript && typeof message.id === 'string' && message.id && message.id.length <= 512) {
+      const ids = (cur.responseIds ??= []);
+      if (!ids.includes(message.id)) ids.push(message.id);
+      if (ids.length > 512) ids.shift();
+    }
     const usage = usageEvent.usage;
     cur.contextTokens = usage.input + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m;
     const wrote = message.usage ? claudeCacheLifetime(message.usage) : null;
@@ -10496,7 +10503,7 @@ export function createClaudeSessionReducer(
   restored?: ClaudeSessionParserState,
 ): ClaudeSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyClaudeSessionParserState(opts);
-  if (state.version !== 7) {
+  if (state.version !== 8) {
     throw new Error('Incompatible Claude parser state');
   }
   applyHiddenParserState(claudeHiddenSlots(state), state.hidden, CLAUDE_HIDDEN_POLICY);

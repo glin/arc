@@ -1681,6 +1681,7 @@ export function statPopoverPayload(): Record<string, unknown> {
   const turns = FIXTURE_TURNS.slice(0, 2).map((turn) => ({
     ...turn,
     finished: true,
+    outputRate: { output: 84, milliseconds: 10000 },
     usage: { ...turn.usage, requests: 22, thinking: 1200, cacheWrite1h: 12500, cacheWrite30m: 5400 },
   }));
   const session = sessionStats(turns, []);

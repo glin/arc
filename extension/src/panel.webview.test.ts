@@ -2,6 +2,90 @@ import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import type { TurnOutcome } from './transcript';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
 import { openReadWindow, closeReadWindow } from './readmeter';
+import { responseRateForTurn, savedResponseRates } from './outputrate';
+
+test('the panel persists an owned response speed and omits unowned or foreign completions', () => {
+  const saves: Array<{ key: string; rates: unknown }> = [];
+  const rate = {
+    sessionId: 'speed-session',
+    responseId: 'response',
+    model: 'claude-opus-5',
+    output: 84,
+    milliseconds: 10000,
+  };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    live: { 'speed-session': [{ kind: 'prompt', at: 1000, turnId: 1 }] },
+    responseRates: [],
+    pendingResponseOwners: new Map(),
+    showing: null,
+    memento: {
+      update: async (key: string, rates: unknown) => {
+        saves.push({ key, rates });
+      },
+    },
+  });
+  provider.noteResponseRate('speed-session', rate, 2);
+  provider.noteResponseRate('foreign', rate, 1);
+  assert.equal(saves.length, 0);
+  provider.noteResponseRate('speed-session', rate, 1);
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].key, 'arc.responseRates.v1');
+  assert.deepEqual(
+    responseRateForTurn(
+      { sessionId: 'speed-session', model: rate.model, responseIds: ['response'], interrupted: false },
+      savedResponseRates(JSON.parse(JSON.stringify(saves[0].rates))),
+    ),
+    { output: 84, milliseconds: 10000 },
+  );
+});
+
+test('Claude response speed persists after a running prompt reconciles to its recorded turn', () => {
+  const press = {
+    ...livePress({ sessionId: 'speed-session', agent: 'claude' }),
+    at: 1000,
+    ran: true,
+    started: true,
+    turnId: 1,
+  };
+  const recorded = turn({
+    sessionId: press.sessionId,
+    agent: 'claude',
+    startedAt: press.at,
+    model: 'claude-opus-5',
+    responseIds: ['first', 'second'],
+  });
+  const fixture = liveProviderFixture(press, recorded);
+  const provider = fixture.provider as any;
+  const saves: unknown[] = [];
+  provider.responseRates = [];
+  provider.memento = {
+    update: async (_key: string, rates: unknown) => {
+      saves.push(rates);
+    },
+  };
+  provider.completeSelectedWindow = () => Promise.resolve();
+  provider.running.add('claude:' + press.sessionId);
+  const rate = {
+    sessionId: press.sessionId,
+    responseId: 'first',
+    model: recorded.model!,
+    output: 84,
+    milliseconds: 10000,
+  };
+  assert.equal(fixture.call.dropSpentPresses(), true);
+  assert.equal(provider.live[press.sessionId], undefined);
+  provider.noteResponseRate(press.sessionId, rate, 99);
+  provider.noteResponseRate('foreign', { ...rate, sessionId: 'foreign' }, press.turnId);
+  assert.equal(saves.length, 0);
+  provider.noteResponseRate(press.sessionId, rate, press.turnId);
+  provider.noteResponseRate(press.sessionId, { ...rate, responseId: 'second', output: 168 }, press.turnId);
+  assert.equal(saves.length, 2);
+  const reloaded = savedResponseRates(JSON.parse(JSON.stringify(saves.at(-1))));
+  assert.deepEqual(responseRateForTurn(recorded, reloaded), { output: 252, milliseconds: 20000 });
+  provider.noteResponseEnded(press.sessionId, { status: 'ok' }, press.turnId);
+  provider.noteResponseRate(press.sessionId, { ...rate, responseId: 'late' }, press.turnId);
+  assert.equal(saves.length, 2);
+});
 
 test('the host reads closed child work once per file version and never reads open child work', () => {
   const start = panelHostSource.indexOf('private liveOpenChildren(');

@@ -27,6 +27,7 @@ export const MEASUREMENT_ENVIRONMENT = {
 
 // Workspace and global saved-state keys. Changing a key stops reading values stored under the old spelling.
 export const STORED_STATE_KEYS = {
+  responseRates: 'arc.responseRates.v1',
   usage: 'arc.usage',
   askModes: 'arc.askModes',
   models: 'arc.models',

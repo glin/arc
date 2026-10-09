@@ -115,6 +115,28 @@ import type { ChildArtifacts } from './childartifacts.ts';
 import { normalizeFsPath, sameCommitSha } from './transcript.ts';
 // Shared panel fixture for screenshots and measurements.
 import { FIXTURE_CLOCK, FIXTURE_TURNS, LONG_TURN_INDEX } from './panelfixture.ts';
+
+test('turn token detail publishes one output-speed figure only for qualified measurements', () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const turn = { ...FIXTURE_TURNS[0], agent, outputRate: { output: 84, milliseconds: 10000 } };
+    assert.equal(tokenLines(turn).filter((line) => line.includes('Speed')).length, 1);
+    assert.ok(tokenLines(turn).some((line) => line.includes('8.4 tok/s')));
+    assert.ok(
+      toCard(turn, false, NOW).chips.some(
+        (chip) =>
+          chip.metric === 'tokens' &&
+          chip.detailList?.entries.some(
+            (entry) => entry.label === 'Speed' && entry.value === '8.4 tok/s' && entry.valueTitle,
+          ),
+      ),
+    );
+    assert.ok(!tokenLines({ ...turn, outputRate: undefined }).some((line) => line.includes('Speed')));
+    assert.ok(!tokenLines({ ...turn, interrupted: true }).some((line) => line.includes('Speed')));
+    assert.ok(
+      !tokenLines({ ...turn, outputRate: { output: 84, milliseconds: 0 } }).some((line) => line.includes('Speed')),
+    );
+  }
+});
 import type { CacheExpiryFacts, CompactionFact, ProjectUsageBucket, SessionTurnStats } from './projectspend.ts';
 
 test('a dispatched child row carries its own figures and full session target', () => {

@@ -1,4 +1,5 @@
 import { wholePercent } from './view/tokens.ts';
+import { outputRateText } from './outputrate';
 // Reduces turns to card headlines, status, figures, and control text.
 // `turnview.ts` re-exports these projections for compatibility.
 
@@ -99,6 +100,7 @@ export interface RelativeStatDetail {
 }
 
 export interface StatDetailEntry {
+  valueTitle?: string;
   label: string;
   value?: string | RelativeStatDetail;
   // Draws the value in the tone the panel gives work still moving, rather than as plain text.
@@ -1699,7 +1701,18 @@ function usageDetailEntries(u: Turn['usage'], lead: StatDetailEntry[] = []): Sta
 
 // Token detail includes main-agent usage alone when the turn has children.
 function tokenDetailList(turn: Turn): StatDetailList {
-  return { entries: usageDetailEntries(turn.usage, turn.agents.length ? [{ label: 'Main agent only' }] : []) };
+  const entries = usageDetailEntries(turn.usage, turn.agents.length ? [{ label: 'Main agent only' }] : []);
+  const speed = turn.interrupted ? null : outputRateText(turn.outputRate);
+  if (speed)
+    entries.push({
+      label: 'Speed',
+      value: speed,
+      valueTitle:
+        turn.agent === 'claude'
+          ? 'Actual output tokens, including thinking, per observed response second. Untimed responses are excluded.'
+          : 'Actual output tokens, including reasoning, per request second. Includes request preparation and hooks. Local tool waits and untimed responses are excluded.',
+    });
+  return { entries };
 }
 
 export function tokenLines(turn: Turn): string[] {

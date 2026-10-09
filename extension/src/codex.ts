@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { emptyCodexResponseClock, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
 import { meterRead } from './readmeter';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -4696,7 +4697,8 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 18;
+  version: 20;
+  responseClock: CodexResponseClock;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
   turnMembershipStarts: number[];
@@ -4780,7 +4782,8 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 18,
+    version: 20,
+    responseClock: emptyCodexResponseClock(),
     turns: [],
     turnRanges: [],
     turnMembershipStarts: [],
@@ -5319,6 +5322,32 @@ function reduceCodexSessionLine(
       sourceEnd: hasSourceOffset ? sourceEnd : undefined,
     }),
   ];
+  const rateTurn = state.open;
+  const rateModel = state.usageState.currentTurnId
+    ? (state.usageState.turnModels[state.usageState.currentTurnId] ?? state.lastModel)
+    : null;
+  if (rateTurn && state.responseClock.model && rateModel !== state.responseClock.model) {
+    delete rateTurn.outputRate;
+    state.responseClock.rates = [];
+  }
+  const responseRate = reduceCodexResponseClock(state.responseClock, record, {
+    sessionId: state.usageState.openingSessionId,
+    turnId: state.usageState.currentTurnId,
+    model: rateModel,
+    eligible:
+      !state.usageState.foreignSessionMeta &&
+      !state.usageState.currentTurnCopied &&
+      !state.usageState.currentTurnRepeated,
+  });
+  if (rateTurn && kind === 'turn_aborted') delete rateTurn.outputRate;
+  if (rateTurn && (responseRate || kind === 'compacted')) {
+    if (!state.responseClock.rates.length) delete rateTurn.outputRate;
+    else
+      rateTurn.outputRate = state.responseClock.rates.reduce(
+        (total, rate) => ({ output: total.output + rate.output, milliseconds: total.milliseconds + rate.milliseconds }),
+        { output: 0, milliseconds: 0 },
+      );
+  }
   synchronizeIdentityQueue(
     state.usageState.pendingRequestKeys,
     Object.values(state.usageState.pendingRequests).flatMap((events) => events.map((event) => event.requestKey)),
@@ -6476,7 +6505,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 18) {
+  if (state.version !== 20) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);

@@ -195,6 +195,8 @@ export interface CodexEffectiveMode {
 }
 
 export type WireEvent =
+  | { kind: 'responseStarted'; sourceId: string }
+  | { kind: 'responseRate'; sourceId: string; rate: import('./outputrate').ResponseRate }
   | { kind: 'ready'; commands: PromptEntry[] }
   | { kind: 'commands'; commands: PromptEntry[] }
   // `previous` identifies the session the child left. It is null when the child first reports its identity.
