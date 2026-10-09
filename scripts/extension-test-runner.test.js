@@ -790,7 +790,7 @@ test('forwarding a signal kills the child, releases the lock only after it close
   assert.equal(processEmitter.listenerCount('SIGINT'), baseline);
 });
 
-test('the browser lane acquires the lock before detecting a browser, and releases it on the skip path', async () => {
+test('the browser lane fails without a browser and releases the lock after detection', async () => {
   const root = fixture();
   const order = [];
   try {
@@ -813,7 +813,7 @@ test('the browser lane acquires the lock before detecting a browser, and release
         throw new Error('must not spawn when no browser is found');
       },
     });
-    assert.equal(status, 0);
+    assert.equal(status, 1);
     assert.deepEqual(order, ['acquired', 'detected', 'released']);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -1234,11 +1234,11 @@ test('full mode fails with a clear error naming a file that matches no test in e
   }
 });
 
-test('the browser lane is skipped when no browser is available', async () => {
+test('full mode fails when no browser is available even when Node tests pass', async () => {
   const root = fixture();
   const logs = [];
-  const original = console.log;
-  console.log = (message) => logs.push(message);
+  const original = console.error;
+  console.error = (message) => logs.push(message);
   try {
     const status = await runner.runFull([], {
       testRoot: root,
@@ -1251,10 +1251,10 @@ test('the browser lane is skipped when no browser is available', async () => {
         return { status: 0 };
       },
     });
-    assert.equal(status, 0);
-    assert.ok(logs.includes('Browser lane skipped: no browser found.'));
+    assert.equal(status, 1);
+    assert.ok(logs.includes('Browser tests cannot run: no supported browser is available.'));
   } finally {
-    console.log = original;
+    console.error = original;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

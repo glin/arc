@@ -264,13 +264,13 @@ export async function runBrowserLane(
     return 1;
   }
   // Acquire the machine-wide browser-lane lock before detection so waiting sessions launch no detection browser.
-  // Release it on every exit, including the no-browser skip.
+  // Release it on every exit, including failed browser detection.
   const lock = await acquireLock({ cwd: testRoot });
   try {
     const browserName = await detect(testRoot);
     if (!browserName) {
-      console.log('Browser lane skipped: no browser found.');
-      return 0;
+      console.error('Browser tests cannot run: no supported browser is available.');
+      return 1;
     }
     console.log(`Browser executable: ${browserName}`);
     return await spawnBrowserLane(selected, passthrough, testRoot, spawnChild, lock);

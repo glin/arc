@@ -417,20 +417,51 @@ test('oversized complete and fragmented UTF-8 lines close before parsing', async
   assert.equal(handler.mock.calls.length, 0);
 });
 
-test('an unfinished line expires on its original deadline despite partial input', async () => {
-  const { entry } = await fixture({ ...SESSION_REQUEST_LIMITS, lineDeadlineMs: 100 });
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  const socket = await connect(entry.address);
-  const ended = closed(socket);
-  await vi.waitFor(() => assert.equal(vi.getTimerCount(), 1), { interval: 1 });
-  socket.write('{');
-  await vi.advanceTimersByTimeAsync(99);
-  assert.equal(socket.destroyed, false);
-  socket.write('"');
-  await vi.advanceTimersByTimeAsync(1);
-  vi.useRealTimers();
-  await ended;
-});
+test.each([0, 50])(
+  'an unfinished line keeps its original deadline after acceptance delayed by %i ms',
+  async (acceptDelay) => {
+    const prototype = process.platform === 'win32' ? WindowsPipeServer.prototype : net.Server.prototype;
+    const emit = prototype.emit;
+    let accepted!: (connection: { socket: Duplex; accept: () => void }) => void;
+    const connection = new Promise<{ socket: Duplex; accept: () => void }>((resolve) => {
+      accepted = resolve;
+    });
+    const emission = vi.spyOn(prototype, 'emit').mockImplementation(function (
+      this: net.Server | WindowsPipeServer,
+      event: string | symbol,
+      ...args: any[]
+    ) {
+      if (event !== 'connection') return emit.call(this, event, ...args);
+      accepted({ socket: args[0], accept: () => emit.call(this, event, ...args) });
+      return true;
+    });
+    try {
+      const { entry } = await fixture({ ...SESSION_REQUEST_LIMITS, lineDeadlineMs: 100 });
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const socket = await connect(entry.address);
+      const ended = closed(socket);
+      const server = await connection;
+      assert.equal(vi.getTimerCount(), 0);
+      await vi.advanceTimersByTimeAsync(acceptDelay);
+      server.accept();
+      assert.equal(vi.getTimerCount(), 1);
+      const first = new Promise<Buffer>((resolve) => server.socket.once('data', resolve));
+      socket.write('{');
+      assert.equal((await first).toString(), '{');
+      await vi.advanceTimersByTimeAsync(99);
+      assert.equal(server.socket.destroyed, false);
+      assert.equal(socket.destroyed, false);
+      const second = new Promise<Buffer>((resolve) => server.socket.once('data', resolve));
+      socket.write('"');
+      assert.equal((await second).toString(), '"');
+      await vi.advanceTimersByTimeAsync(1);
+      assert.equal(server.socket.destroyed, true);
+      await ended;
+    } finally {
+      emission.mockRestore();
+    }
+  },
+);
 
 test('open connection bounds refuse excess clients and release closed clients', async () => {
   const { entry } = await fixture({ ...SESSION_REQUEST_LIMITS, connections: 1 });
