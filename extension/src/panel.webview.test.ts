@@ -4045,7 +4045,7 @@ test('setup rows keep every visible fact in their accessible name', () => {
   );
   sourceMatch(
     panelHandler('openLauncher'),
-    /chrome\.openLauncher\(null, null, msg\.custom\)/,
+    /chrome\.openLauncher\([\s\S]*, null, msg\.custom\)/,
     'the primary New action does not open the setup fields on a fresh install',
   );
 });
@@ -25006,6 +25006,67 @@ test('a small Claude worker tail carries recovered model evidence through host s
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test.each(['wide', 'narrow', 'resized', 'replaced', 'missing-wide', 'missing-narrow'])(
+  'fresh-project New opens the New session menu at its current visible control: %s',
+  (scenario) => {
+    const catalog = {
+      claude: [
+        { value: 'opus', label: 'Opus', description: '', efforts: [{ value: 'high', label: 'High', description: '' }] },
+      ],
+    };
+    const view = sessionLauncherView(null, [], catalog);
+    assert.equal(view.primary, null);
+    const dispatch = new Function('msg', 'chrome', 'railRenderer', handlerBody(script, 'openLauncher'));
+    const owner = { webview: {} };
+    const sent: unknown[] = [];
+    const created: unknown[] = [];
+    const provider = Object.create(PanelProvider.prototype);
+    Object.assign(provider, {
+      hostSessions: new Map([[owner, null]]),
+      showing: null,
+      launcherFor: () => ({ owner, state: null, view }),
+      sendToHost: (host: unknown, message: unknown) => {
+        assert.equal(host, owner);
+        sent.push(message);
+        return Promise.resolve(true);
+      },
+      createDraft: (...args: unknown[]) => created.push(args),
+    });
+    let visible = scenario !== 'narrow' && scenario !== 'missing-narrow';
+    let railMenu: object | null = { control: 'session-list-New' };
+    let compactMenu: object | null = { control: 'compact-New' };
+    assert.equal(provider.newSession(undefined, owner), false, scenario);
+    assert.deepEqual(created, [], scenario);
+    assert.equal(provider.hostSessions.get(owner), null, scenario);
+    assert.deepEqual(sent, [{ type: 'openLauncher', custom: true }], scenario);
+    if (scenario === 'resized') visible = false;
+    if (scenario === 'replaced') railMenu = { control: 'replacement-New' };
+    if (scenario === 'missing-wide') railMenu = null;
+    if (scenario === 'missing-narrow') compactMenu = null;
+    const calls: unknown[][] = [];
+    const reads: string[] = [];
+    dispatch(
+      sent[0],
+      {
+        compactMenu: () => {
+          reads.push('compact');
+          return compactMenu;
+        },
+        openLauncher: (...args: unknown[]) => calls.push(args),
+      },
+      {
+        visible: () => visible,
+        newMenu: () => {
+          reads.push('session-list');
+          return railMenu;
+        },
+      },
+    );
+    assert.deepEqual(calls, [[visible ? railMenu : compactMenu, null, true]], scenario);
+    assert.deepEqual(reads, [visible ? 'session-list' : 'compact'], scenario);
+  },
+);
 
 test('Quick New opens New with when the current setup is unavailable and preserves its initiating host', () => {
   const owner = { webview: {} };

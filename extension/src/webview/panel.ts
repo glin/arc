@@ -1172,7 +1172,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         projectSpend.focus();
       },
       openLauncher: function (msg) {
-        chrome.openLauncher(null, null, msg.custom);
+        chrome.openLauncher(railRenderer.visible() ? railRenderer.newMenu() : chrome.compactMenu(), null, msg.custom);
       },
       labelEditor: function (msg) {
         railRenderer.receiveLabelEditor(msg.session, msg.heading, msg.rows);
