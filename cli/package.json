@@ -26,6 +26,7 @@
   "files": [
     "dist/arc-status.cjs",
     "dist/windowpipe.exe",
+    "skills/arc-sessions/SKILL.md",
     "README.md",
     "LICENSE"
   ],

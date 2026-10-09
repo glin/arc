@@ -14,6 +14,7 @@ Use this map to find the owner of a change. The topic guides hold behavior, and 
 | Prompts, queue, controls, and account usage | [`composer.md`](composer.md) |
 | Child processes, resume, and agent protocols | [`agent-protocols.md`](agent-protocols.md) |
 | CLI commands, arguments, and output | [`cli.md`](cli.md) |
+| Agent session-management guidance and skill installation | [`arc-sessions`](../cli/skills/arc-sessions/SKILL.md) and [`cli/README.md`](../cli/README.md#session-skill) |
 | Portable saved-session viewer and static assets | [`export-session.md`](export-session.md) |
 | Setup, tests, and performance capture | [`development.md`](development.md) |
 

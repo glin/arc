@@ -331,7 +331,8 @@ test('the packed package installs both commands globally, replaces the old packa
   assert.ok(npmCli, 'Run packaging smoke tests through npm.');
   mkdirSync(consumer);
   mkdirSync(join(packable, 'dist'), { recursive: true });
-  for (const file of ['package.json', 'README.md', 'LICENSE', 'dist/arc-status.cjs']) {
+  mkdirSync(join(packable, 'skills/arc-sessions'), { recursive: true });
+  for (const file of ['package.json', 'README.md', 'LICENSE', 'dist/arc-status.cjs', 'skills/arc-sessions/SKILL.md']) {
     copyFileSync(join(packageRoot, file), join(packable, file));
   }
   writeFileSync(join(packable, 'dist/obsolete.cjs'), 'obsolete bundle');
@@ -390,10 +391,15 @@ test('the packed package installs both commands globally, replaces the old packa
       'README.md',
       'dist/arc-status.cjs',
       'package.json',
+      'skills/arc-sessions/SKILL.md',
     ]);
     npm(['install', '--global', '--prefix', prefix, tarball]);
     const installedRoot = join(prefix, process.platform === 'win32' ? 'node_modules' : 'lib/node_modules', '@glin/arc');
     const manifest = JSON.parse(readFileSync(join(installedRoot, 'package.json'), 'utf8'));
+    assert.equal(
+      readFileSync(join(installedRoot, 'skills/arc-sessions/SKILL.md'), 'utf8'),
+      readFileSync(join(packageRoot, 'skills/arc-sessions/SKILL.md'), 'utf8'),
+    );
     assert.equal(manifest.name, '@glin/arc');
     assert.equal(manifest.license, 'MIT');
     assert.equal(manifest.private, undefined);

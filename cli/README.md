@@ -14,6 +14,32 @@ The package installs `arc` and the compatible `arc-status` alias. If you use the
 npm uninstall --global arc-agent-status
 ```
 
+## Session skill
+
+The package includes `skills/arc-sessions/SKILL.md`. Link its directory into your agent's skill directory after installation. Claude Code uses `~/.claude/skills`. Codex uses `~/.agents/skills`.
+
+For a global Windows installation, run in PowerShell:
+
+```powershell
+$arcSkill = Join-Path (npm prefix --global) 'node_modules/@glin/arc/skills/arc-sessions'
+New-Item -ItemType Directory -Path "$HOME/.claude/skills", "$HOME/.agents/skills" -Force
+New-Item -ItemType Junction -Path "$HOME/.claude/skills/arc-sessions" -Target $arcSkill
+New-Item -ItemType Junction -Path "$HOME/.agents/skills/arc-sessions" -Target $arcSkill
+```
+
+For a global macOS or Linux installation, run:
+
+```sh
+arc_skill="$(npm prefix --global)/lib/node_modules/@glin/arc/skills/arc-sessions"
+mkdir -p ~/.claude/skills ~/.agents/skills
+ln -s "$arc_skill" ~/.claude/skills/arc-sessions
+ln -s "$arc_skill" ~/.agents/skills/arc-sessions
+```
+
+A source checkout supplies the same skill under `cli/skills/arc-sessions`. A project-local package supplies it under `node_modules/@glin/arc/skills/arc-sessions`. Use that absolute directory as the link target. Existing links require a separate removal before replacement. Restart the agent session to load the skill.
+
+The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) owns session command arguments and outcomes.
+
 ## Status-line setup
 
 Add `statusLine` to your Claude Code settings in `~/.claude/settings.json`:
