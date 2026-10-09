@@ -69,7 +69,7 @@ Add a test to the existing file for its subject and reuse that file's setup and 
 
 Review each changed timing test's trigger, time-dependent fixture setup, and controlled clock or awaited state. Before a test timing change lands, run the test several times on the old commit and on the new commit.
 
-Dress a browser test with the `themed` helper from `extension/src/panelfixture.ts`. Never set a theme variable by hand.
+Use the `themed` helper from `extension/src/panelfixture.ts` for browser tests. Never set a theme variable by hand.
 
 ## Code boundaries
 
@@ -93,7 +93,7 @@ Use `extension/src/webview/inline-text.ts` for compound text split across elemen
 
 Apply relative text scaling to the text owner. Give repeated UI roles one production component or CSS rule. Review rendered peers at wide and narrow widths in each default theme.
 
-A webview helper that ends in a full Preact draw must never run inside a loop over sessions or cards. Walk the list, then draw once. `extension/src/webview.integration.browser.test.ts` guards this at 100 and 1000 sessions.
+A webview helper that performs a full Preact draw must never run inside a loop over sessions or cards. Process the list, then draw once. `extension/src/webview.integration.browser.test.ts` guards this at 100 and 1000 sessions.
 
 Size text-related elements in `em`. Use `px` for hairlines, radii, and decorative bars.
 

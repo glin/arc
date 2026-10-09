@@ -136,7 +136,7 @@ The walk ends wherever the prompt text field changes for another reason. Typing,
 
 The walk ends on the change itself rather than on a later comparison of the text. A reader who types a character into a recalled prompt and deletes it again is back at their own words. The text alone cannot tell that from the recall.
 
-A turn can record two prompts in one string. A prompt that got no response of its own is carried into the next turn and joined to its prompt. `promptParts` keeps them apart, or one press of Up puts both in the prompt text field and Enter sends both as one.
+A turn can record two prompts in one string. A prompt with no response joins the next turn's prompt. `promptParts` separates them for recall. Without that separation, Up recalls both prompts and Enter sends them together.
 
 Recall changes the displayed text without replacing the draft retained for that session. The panel publishes displayed text and retained draft separately. Displayed text determines the send action. The retained draft survives session changes and reloads.
 
@@ -196,9 +196,9 @@ The line directly above the prompt text field says what the next turn costs befo
 
 The next-turn estimate uses chip-height text in the muted foreground. Spacing separates it from the prompt text field.
 
-Only the price is pressable. The words around it are ordinary text, kept out of the accessibility tree because the price's own name carries the whole sentence: a listening reader hears it once instead of hearing it cut in half by the control inside it. Each face carries its own price, so a face change moves an open popover and the reader's focus to the price that arrived. The name the foot's focus restore looks a control up by sits on the visible face alone, because that restore takes the first control of its name and a hidden price cannot take focus. A press opens the same popover every figure chip opens. It repeats the visible price and cache status, then shows an alternate cache estimate when one exists. A compact disclaimer states that these are conservative API list-price estimates.
+Only the price is pressable. The words around it are ordinary text, kept out of the accessibility tree because the price's own name carries the whole sentence: a listening reader hears it once instead of hearing it cut in half by the control inside it. Each face carries its own price, so a face change moves an open popover and the reader's focus to the price that arrived. Only the visible face carries the name used for focus restoration in the Prompt box footer. Restoration selects the first control with that name, so it must exclude hidden prices. A press opens the same popover every figure chip opens. It repeats the visible price and cache status, then shows an alternate cache estimate when one exists. A compact disclaimer states that these are conservative API list-price estimates.
 
-What is left of a warm cache lifetime is its own node on the same ticker that rewords every age, so the figure moves without a repaint and without disturbing a selection. Only that duration carries the dotted lifetime affordance. The cache status retains its model lifetime as a native title without exposing a request timestamp. The figure is whole minutes and never seconds, and never smaller than two minutes, because the band either side of the boundary owns everything under that. `docs/timeline.md` holds the pricing and the reason.
+The remaining warm cache lifetime has its own node on the shared age ticker. Its updates require no repaint and preserve text selection. Only that duration carries the dotted lifetime affordance. The cache status retains its model lifetime as a native title without exposing a request timestamp. The figure uses whole minutes, with a minimum of two minutes. The bands on either side of the boundary cover shorter durations. `docs/timeline.md` holds the pricing and the reason.
 
 The panel measures the status bar and Prompt box heights whenever either changes size. A narrow status bar can wrap without a render.
 
