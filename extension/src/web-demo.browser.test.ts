@@ -465,6 +465,43 @@ describe('read-only web demo', () => {
         await page.setViewportSize({ width, height: 850 });
         await page.goto(`${base}/arc-vscode/`);
         await page.locator('#demo-theme').selectOption(theme);
+        const comments = () =>
+          page.evaluate(
+            () =>
+              (
+                window as unknown as {
+                  acquireVsCodeApi(): {
+                    getState(): {
+                      comments: { id: string; sessionId: string; turnKey: string; quote: string; note: string }[];
+                    };
+                  };
+                }
+              )
+                .acquireVsCodeApi()
+                .getState().comments,
+          );
+        const navigate = async (session: string) => {
+          if (width === 1280) await page.locator(`[data-control="rail:${session}"]`).first().click();
+          else await page.locator('[data-control="picker"]').selectOption(session);
+          await page.locator(`[data-control="session:${session}"]`).waitFor();
+        };
+        await page.locator('[data-control="session:arc-read-state"]').waitFor();
+        expect((await comments()).filter((entry) => entry.sessionId === 'arc-read-state')).toEqual([]);
+        expect(await page.locator('#list .linemark, #list .cmark').count()).toBe(0);
+        expect(await page.locator('[data-composer-slot="annotations"] .cchip').count()).toBe(0);
+        await navigate('delegated-cost');
+        expect(await page.locator('[data-control="railpin:delegated-cost"].is-pinned').count()).toBeGreaterThan(0);
+        const pinnedComment = (await comments()).find((entry) => entry.id === 'comment-open-changes')!;
+        expect(pinnedComment.sessionId).toBe('delegated-cost');
+        const pinnedResponse = page.locator('#list .turn .summary').first();
+        expect(await pinnedResponse.evaluate((response) => response.closest<HTMLElement>('.turn')!.dataset.key)).toBe(
+          pinnedComment.turnKey,
+        );
+        await pinnedResponse.locator('.cmark').waitFor();
+        expect(await pinnedResponse.locator('.cmark').textContent()).toBe(pinnedComment.quote);
+        await page.locator(`[data-control="linemark:${pinnedComment.id}"]`).first().waitFor();
+        expect(await page.locator('[data-composer-slot="annotations"] .cchip').count()).toBe(1);
+        await navigate('arc-read-state');
         const summary = page.locator('#list .turn .summary').first();
         await summary.waitFor({ state: 'visible' });
         await summary.scrollIntoViewIfNeeded();
@@ -514,21 +551,6 @@ describe('read-only web demo', () => {
           await page.screenshot({ path: path.join(process.env.ARC_DEMO_SHOTS, `editor-${theme}-${width}.png`) });
         if (width === 1280) await page.locator('.notesave').click();
         else await area.press('Enter');
-        const comments = () =>
-          page.evaluate(
-            () =>
-              (
-                window as unknown as {
-                  acquireVsCodeApi(): {
-                    getState(): {
-                      comments: { id: string; sessionId: string; turnKey: string; quote: string; note: string }[];
-                    };
-                  };
-                }
-              )
-                .acquireVsCodeApi()
-                .getState().comments,
-          );
         await expect.poll(comments).toContainEqual(
           expect.objectContaining({
             sessionId: 'arc-read-state',
@@ -542,11 +564,6 @@ describe('read-only web demo', () => {
         await mark.waitFor();
         if (process.env.ARC_DEMO_SHOTS)
           await page.screenshot({ path: path.join(process.env.ARC_DEMO_SHOTS, `saved-${theme}-${width}.png`) });
-        const navigate = async (session: string) => {
-          if (width === 1280) await page.locator(`[data-control="rail:${session}"]`).first().click();
-          else await page.locator('[data-control="picker"]').selectOption(session);
-          await page.locator(`[data-control="session:${session}"]`).waitFor();
-        };
         await navigate('delegated-cost');
         expect(await page.locator(`[data-control="linemark:${comment.id}"]`).count()).toBe(0);
         await page.dispatchEvent('#list', 'mousedown', { button: 3 });
@@ -584,7 +601,7 @@ describe('read-only web demo', () => {
         expect(await page.locator('.noteedit').count()).toBe(0);
         expect(
           (await comments()).filter((entry) => entry.sessionId === 'arc-read-state').map((entry) => entry.id),
-        ).toEqual(['demo-response-comment', 'demo-activity-comment']);
+        ).toEqual([]);
         await page.close();
       }
     }

@@ -1440,34 +1440,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
           sessionTitle: item.sessionTitle!,
           turnAt: item.startedAt,
         }))
-      : selected === 'arc-read-state'
-        ? [
-            {
-              id: 'demo-response-comment',
-              sessionId: selected,
-              turnKey: commentCard.key,
-              part: 'summary' as const,
-              quote: 'Opening one result clears only its own mark.',
-              note: 'Keep the other session unread when opening a result.',
-              headline: item.sessionTitle!,
-              sessionTitle: item.sessionTitle!,
-              turnAt: item.startedAt,
-              at: CAPTURE_TIME - 2 * 60_000,
-            },
-            {
-              id: 'demo-activity-comment',
-              sessionId: selected,
-              turnKey: commentCard.key,
-              part: 'said:demo-read-state-start' as const,
-              quote: 'shows an unread result losing its mark.',
-              note: 'Keep this check focused on switching views.',
-              headline: item.sessionTitle!,
-              sessionTitle: item.sessionTitle!,
-              turnAt: item.startedAt,
-              at: CAPTURE_TIME - 60_000,
-            },
-          ]
-        : [];
+      : [];
   const draft = selected === 'delegated-cost' ? commentScene.usage.composer.draft : '';
   const recordedModel = item.model ?? '';
   const defaults = DEMO_DEFAULTS[item.agent];
