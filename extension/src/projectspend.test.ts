@@ -5498,6 +5498,8 @@ describe('Claude background cost accounting', () => {
   test('replaced writes price residuals from surviving request evidence across saved cuts', () => {
     const write = (id: string, time: number, hour: boolean | null) => {
       const record = answer(id, time, 0, true);
+      // Claude Code gives each rewrite of a growing response its own uuid.
+      record.uuid = `${id}-${String(hour)}`;
       Object.assign(record.message.usage, {
         cache_creation_input_tokens: hour === null ? 0 : 10,
         cache_creation: {

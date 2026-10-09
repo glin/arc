@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { scanLines } from './agentspend';
+import { createClaudeCopyFilter } from './claudecopies';
 import {
   codexRequestUsage,
   codexSessionsRoot,
@@ -1498,8 +1499,10 @@ export function readSessionRequests(
     }
     return toolCalls;
   };
+  // A copied Claude record adds no request, tool or turn.
+  const copies = codex ? null : createClaudeCopyFilter();
   const complete = scanLines(file, (line) => {
-    if (!line.trim() || unsupported) return;
+    if (!line.trim() || unsupported || copies?.(line)) return;
     if (sourceOrder === 0 && line.trimStart().startsWith('[')) {
       unsupported = 'array';
       return;

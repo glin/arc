@@ -25,8 +25,10 @@ import {
 import { createClaudeUsageLineReducer, readClaudeAgentSpend, type ClaudeUsageReducerState } from './transcript.ts';
 import { createCodexUsageLineReducer, type CodexUsageReducerState } from './codex.ts';
 import { RETAINED_COMPACTIONS } from './parserstate.ts';
+import { createClaudeCopyFilter } from './claudecopies.ts';
 import { tempDir } from './temproot.ts';
 import { sessionCacheExpiryStats } from './turncard.ts';
+import { readSessionRequests } from './sessioncost.ts';
 
 const dir = () => tempDir('cache-expiry-');
 
@@ -942,8 +944,11 @@ test('a replayed compaction counts once, and a replayed abandoned compaction nev
     ...claudeLinkedCompaction(10, 'A', 'a-m1'),
   ];
   assert.equal(indexed(kept, claudeReducer).compactionCount, 1);
+  // A reader skips each copy before the reducer reads it.
   const reducer = createClaudeUsageLineReducer();
-  assert.equal(kept.flatMap((line) => reducer.pushLine(line)).filter((event) => event.compactionEstimate).length, 1);
+  const copies = createClaudeCopyFilter();
+  const read = kept.filter((line) => !copies(line));
+  assert.equal(read.flatMap((line) => reducer.pushLine(line)).filter((event) => event.compactionEstimate).length, 1);
 
   const abandoned = [
     ...opening,
@@ -2000,4 +2005,175 @@ test('supported Codex visible-turn returns use nominal lifetime rather than the 
       assert.equal(facts(record).excluded, 0, model);
     }
   }
+});
+
+// ## Copied records
+//
+// At a later compaction in one process, Claude Code can append a second copy of earlier records
+// with their original uuids and timestamps. The copy carries the writing process's version and
+// working folder, and it ends right before a fresh compaction boundary.
+
+const written = (line: string, version: string, cwd: string) => JSON.stringify({ ...JSON.parse(line), version, cwd });
+
+const claudeAttachment = (minutes: number, id: string) =>
+  JSON.stringify({
+    type: 'attachment',
+    uuid: `att-${id}`,
+    timestamp: at(minutes),
+    attachment: { type: 'todo_reminder' },
+  });
+
+const claudeStopHook = (minutes: number, id: string) =>
+  JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', uuid: `s-${id}`, timestamp: at(minutes) });
+
+// The source with and without the copied run. The run starts at compaction A's boundary, whose
+// parent is null, and ends right before the fresh boundary of compaction C.
+function copiedRunSource(): { fresh: string[]; copied: string[] } {
+  const before = [
+    claudePrompt(0, 'p1'),
+    linked(claudeResponse(1, { id: 'm1', input: 100, read: 40_000, write1h: 4_000 }), 'u-p1'),
+  ];
+  const run = [
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+    linked(claudePrompt(11, 'p2'), 'c-A'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 20_000 }), 'u-p2'),
+    linked(claudeToolResult(12, 't2'), 'a-m2'),
+    linked(claudeAttachment(12, 't2'), 'r-t2'),
+    linked(claudeResponse(13, { id: 'm2b', input: 2, read: 20_000, write1h: 500 }), 'att-t2'),
+    linked(claudeStopHook(14, 'm2b'), 'a-m2b'),
+  ];
+  const middle = [
+    linked(claudeCompactCommand(19, 'compact-b'), 's-m2b'),
+    ...claudeLinkedCompaction(20, 'B', 'u-compact-b'),
+    linked(claudePrompt(21, 'p3'), 'c-B'),
+    linked(claudeResponse(21, { id: 'm3', input: 2, write1h: 3_000 }), 'u-p3'),
+  ];
+  const after = [
+    ...claudeLinkedCompaction(90, 'C', 'a-m3'),
+    linked(claudePrompt(91, 'p4'), 'c-C'),
+    linked(claudeResponse(91, { id: 'm4', input: 2, write1h: 2_500 }), 'u-p4'),
+  ];
+  const original = (line: string) => written(line, '2.1.200', 'C:/work');
+  const copy = (line: string) => written(line, '2.1.210', 'D:/elsewhere');
+  const fresh = [...before, ...run, ...middle, ...after].map(original);
+  return { fresh, copied: [...[...before, ...run, ...middle].map(original), ...run.map(copy), ...after.map(original)] };
+}
+
+// What the spend index publishes for a source, without the scan bookkeeping.
+function published(record: SpendFileIndex): Record<string, unknown> {
+  return {
+    turnCount: record.turnCount,
+    compactionCount: record.compactionCount,
+    firstTurnAt: record.firstTurnAt,
+    lastTurnAt: record.lastTurnAt,
+    buckets: record.buckets,
+    lifetimeBuckets: record.lifetimeBuckets,
+    cacheExpiry: record.cacheExpiry,
+  };
+}
+
+function writtenSource(lines: readonly string[]): string {
+  const file = path.join(dir(), 'source.jsonl');
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  return file;
+}
+
+function slicedIndex(lines: readonly string[], maxBytes: number): SpendFileIndex {
+  const file = writtenSource(lines);
+  let record = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes }).record;
+  let guard = 0;
+  while (record.complete === false && guard++ < 1_000) {
+    record = indexSpendFile(record, file, 'w', claudeReducer, Date.now(), { maxBytes }).record;
+  }
+  assert.equal(record.complete, true, 'the sliced scan finished');
+  return record;
+}
+
+test('a copied run adds no turn, compaction, cost or cache expiry to the spend index', () => {
+  const { fresh, copied } = copiedRunSource();
+  const expected = published(indexed(fresh, claudeReducer));
+  assert.equal(expected.turnCount, 4);
+  assert.equal(expected.compactionCount, 3);
+
+  assert.deepEqual(published(indexed(copied, claudeReducer)), expected, 'the copy changed the whole-file scan');
+  // A 200-byte slice ends inside the run, so a later slice classifies copies from saved state.
+  const sliced = slicedIndex(copied, 200);
+  assert.deepEqual(published(sliced), expected, 'the copy changed a sliced scan');
+  assert.equal(sliced.claudeCopies?.copies.length, 2, 'the copy map holds one run');
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [sliced]);
+  assert.deepEqual(
+    loadSpendLedger(storage, 'w').files[0].claudeCopies,
+    sliced.claudeCopies,
+    'the saved copy map was dropped',
+  );
+});
+
+// A run that copies the file start after more compactions than the reducer retains.
+function farCopySource(): { fresh: string[]; copied: string[] } {
+  const lines = [claudePrompt(0, 'p0'), linked(claudeResponse(1, { id: 'm0', input: 100, write1h: 4_000 }), 'u-p0')];
+  let parent = 'a-m0';
+  for (let n = 1; n <= RETAINED_COMPACTIONS + 2; n++) {
+    lines.push(
+      ...claudeLinkedCompaction(n * 10, `K${n}`, parent),
+      linked(claudePrompt(n * 10 + 1, `p${n}`), `c-K${n}`),
+      linked(claudeResponse(n * 10 + 2, { id: `m${n}`, input: 2, write1h: 2_000 }), `u-p${n}`),
+    );
+    parent = `a-m${n}`;
+  }
+  const tail = [
+    ...claudeLinkedCompaction(1_000, 'Z', parent),
+    linked(claudePrompt(1_001, 'pz'), 'c-Z'),
+    linked(claudeResponse(1_002, { id: 'mz', input: 2, write1h: 2_000 }), 'u-pz'),
+  ];
+  return { fresh: [...lines, ...tail], copied: [...lines, ...lines.slice(0, 5), ...tail] };
+}
+
+test('a copied run adds no request to arc cost or to the own-spend read', () => {
+  for (const { fresh, copied } of [copiedRunSource(), farCopySource()]) {
+    const requests = (lines: readonly string[]) =>
+      readSessionRequests(writtenSource(lines)).map(({ requestKey, timestamp, model, usage, toolCalls }) => ({
+        requestKey,
+        timestamp,
+        model,
+        usage,
+        toolCalls,
+      }));
+    assert.deepEqual(requests(copied), requests(fresh), 'arc cost counted a copied request');
+
+    const spend = (lines: readonly string[]) => readClaudeAgentSpend(writtenSource(lines), [], false).models;
+    assert.deepEqual(spend(copied), spend(fresh), 'the own-spend read counted a copied request');
+  }
+});
+
+test('a copy whose original sits more than 16 compactions back adds nothing', () => {
+  const { fresh, copied } = farCopySource();
+  const expected = published(indexed(fresh, claudeReducer));
+  assert.deepEqual(published(indexed(copied, claudeReducer)), expected, 'the copy changed the whole-file scan');
+  assert.deepEqual(published(slicedIndex(copied, 300)), expected, 'a sliced scan missed a copy from the file start');
+});
+
+test('a child response rewritten after a compaction keeps that compaction in the cache-expiry facts', () => {
+  const childReducer: UsageReducerFactory<ClaudeUsageReducerState> = (state) =>
+    createClaudeUsageLineReducer(state, { childTranscript: true });
+  const first = claudeResponse(1, { id: 'm1', input: 100, write1h: 4_000 });
+  // The rewrite has a new uuid, the first response's message id and more output.
+  const grown = JSON.parse(first);
+  grown.uuid = 'a-m1-grown';
+  grown.timestamp = at(10.5);
+  grown.message.usage.output_tokens = 50;
+  const lines = [
+    claudePrompt(0, 'p1'),
+    first,
+    ...claudeLinkedCompaction(10, 'A', 'a-m1'),
+    JSON.stringify(grown),
+    linked(claudePrompt(11, 'p2'), 'c-A'),
+    linked(claudeResponse(11, { id: 'm2', input: 2, write1h: 2_000 }), 'u-p2'),
+  ];
+  const record = indexed(lines, childReducer);
+  assert.deepEqual(
+    record.cacheExpiry!.compactions.map((item) => [item.ordinal, item.contextBefore, item.contextAfter]),
+    [[1, 4_100, 2_002]],
+    'the rewrite moved the compaction behind the request it revised',
+  );
 });

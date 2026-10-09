@@ -10433,7 +10433,8 @@ test('background spend publishes Claude usage only after native children finish 
     type: 'assistant',
     isSidechain: true,
     timestamp: at,
-    uuid: 'child',
+    // Claude Code gives each rewrite of a growing response its own uuid.
+    uuid: `child-${input}`,
     message: { id: 'child', model: 'claude-haiku-4-5', usage: { input_tokens: input, output_tokens: 0 } },
   });
   fs.writeFileSync(child, JSON.stringify(answer(20)) + '\n');

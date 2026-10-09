@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { normalizeModelIdentity } from './domain/model-identity';
 import { BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS, retainedParserPayloadScan } from './parserstate';
+import { insideClaudeCopy } from './claudecopies';
 import { hasRequestContextPricing } from './pricing';
 import type {
   ProjectUsageBucket,
@@ -576,6 +577,11 @@ export function reconcileClaudeCostState(
           if (clock() >= deadline) break;
           // The parser's admission rule includes nested attachments and excludes ordinary tool results.
           // Charges cover retained objects, indexes, and checkpoint serialization copies.
+          // The spend index records the byte ranges of copied records, and a copy adds no cost.
+          if (insideClaudeCopy(file.claudeCopies, progress.offset - bytes.length + start)) {
+            start = end + 1;
+            continue;
+          }
           const line = bytes.subarray(start, end).toString('utf8');
           const retains = reducer.acceptsLine?.(line) ?? true;
           progress.resourceBytes =

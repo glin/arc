@@ -370,6 +370,22 @@ Codex can repeat a `token_count` snapshot without running another request. The u
 
 Main and delegated turns retain usage grouped by each request's pricing identity. Cost warnings stay hidden when legacy or incomplete data cannot supply those exact identities.
 
+### Claude repeated records
+
+At a later compaction in one process, Claude Code can append a second copy of records it already wrote to the same transcript. A repeated record is a record whose top-level `uuid` and `timestamp` both match an earlier record in the same file. The first record with that pair is genuine, and every later one is a repeated record. A record whose `uuid` repeats with a new `timestamp` is genuine. A `uuid` or `timestamp` key inside nested content, such as a tool input, is not the record's own.
+
+A repeated record keeps its `uuid`, `timestamp`, `type`, and `sessionId`. It carries the writing process's `version`, `cwd`, `gitBranch`, and `slug`. Some repeated records also differ in `promptId`, `toolUseResult`, `parentUuid`, or `message`. A run of repeated records usually starts with a record whose `parentUuid` is null, such as a repeated compaction boundary, and ends a few records before a fresh `compact_boundary`. A run can copy every record type, including prompts, answers, tool results, attachments, `stop_hook_summary` records, compaction boundaries, and compaction summaries. A run can copy records written many compactions earlier. Subagent transcripts are read the same way.
+
+A repeated record adds nothing. It adds no turn, prompt, request, compaction, summary, attachment, model change, tool list change, or cost. The project cost index, own-spend reads, `arc cost`, the timeline check, and the supplemental cost reader skip it before the usage reducer reads it. The person scan neither counts nor decides on it. Those readers take no field from it, including `version`. A resume and a rewind write new uuids. A fork copies the parent's records, uuids included, into a new file, so the rule compares records within one file only.
+
+A repeated record is always older than the newest record before it, but genuine records can be older too. A timestamp alone does not identify a repeated record. `claudecopies.ts` looks up the identity of each record at or behind the newest timestamp read so far. A reader that reads a file forward from byte 0 keeps every identity in memory. The project cost index saves a checkpoint about once per MiB. Each checkpoint holds a line start, the newest timestamp before that line, and the oldest timestamp of a genuine record in the interval it opens. The original of a repeated record lies at or after the last checkpoint older than the record, in an interval whose oldest genuine record is not newer than it. A run of repeated records copies an earlier run in the same order. The index saves the byte offset after the original of the last repeated record it found. A later slice first reads the next few records from that offset, so a slice inside a run reads each original once. Otherwise it reads only the candidate intervals, through the file it already holds open. Those reads count against the slice's byte and time budgets. When a lookup spends either budget, the slice stops before that record, and the next slice resumes the lookup where it stopped. The identities those intervals hold stay in memory for later slices of the same file revision, up to a fixed total across files. A rebuild of the file starts without them. When those bytes are gone, the slice reports the file revision as lost, and the next slice rebuilds the file. The index saves the byte ranges of repeated records with its other per-file state, and the supplemental cost reader skips those ranges.
+
+The fresh record right after a run can name the last repeated record as its `parentUuid`. That link is wrong. The real parent is the last genuine record before the run. No reader follows that link.
+
+### Claude preserved segments
+
+The first prompt after a kept compaction can descend from the boundary's `compactMetadata.preservedSegment.tailUuid`, a record written before the boundary, rather than from the summary. That is the kept shape on older Claude Code builds, not a rewind.
+
 ## Parsing and attribution constraints
 
 - `manifest.json` cannot attribute a file to a turn. It is overwritten cumulative state.

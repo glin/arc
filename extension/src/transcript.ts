@@ -8,6 +8,7 @@ import {
   noteClaudeCostEvent,
   type ClaudeCostCapture,
 } from './claudecoststate';
+import { claudeRecordIdentity, createClaudeCopyFilter } from './claudecopies';
 import { createHash } from 'node:crypto';
 import {
   AgentSessionTargetLookup,
@@ -42,7 +43,6 @@ import {
   hiddenParserState,
   ParserLine,
   RETAINED_COMPACTION_PARENTS,
-  RETAINED_COMPACTION_RECORDS,
   RETAINED_COMPACTIONS,
   RETAINED_REQUESTS,
   retainedRequestEvents,
@@ -2171,6 +2171,42 @@ export interface PersonScan {
   bg: boolean;
   start: number;
   userBefore: boolean;
+  // Identity keys of the records that counted as a prompt or decided the scan. A Claude repeated
+  // record has the identity of its original, so it neither counts nor decides.
+  counted?: string[];
+  // Whether `counted` also holds the records before `start`.
+  countedBefore?: boolean;
+}
+
+// The identity key of a counted record, or null for a record without an identity.
+function personRecordKey(line: string): string | null {
+  const identity = claudeRecordIdentity(line);
+  return identity ? `${identity.uuid}\n${identity.timestamp}` : null;
+}
+
+// Adds the records before `scan.start` that would count to `scan.counted`.
+function countPersonRecordsBefore(file: string, scan: PersonScan): void {
+  const counted = [...(scan.counted ?? [])];
+  const probe: PersonScan = { bytes: 0, person: false, prompts: 0, bg: false, start: 0, userBefore: true };
+  readCompleteLines(file, 0, scan.start, (text) => {
+    for (const line of text.split('\n')) {
+      if (!line.includes('"type":"user"') && !line.includes('"attachment"') && !line.includes('toolDenialKind')) {
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const prompts = probe.prompts;
+      const key = personSpokeIn(parsed, probe) || probe.prompts !== prompts ? personRecordKey(line) : null;
+      if (key) counted.push(key);
+    }
+    return false;
+  });
+  scan.counted = counted;
+  scan.countedBefore = true;
 }
 
 export function scanForPerson(file: string, size: number, prev?: PersonScan, start = 0): PersonScan {
@@ -2200,7 +2236,21 @@ export function scanForPerson(file: string, size: number, prev?: PersonScan, sta
       } catch {
         continue;
       }
-      if (personSpokeIn(parsed, scan)) {
+      const trial = { ...scan };
+      const spoke = personSpokeIn(parsed, trial);
+      const key = spoke || trial.prompts !== scan.prompts ? personRecordKey(line) : null;
+      if (key) {
+        // A record that would decide checks the bytes before a tail scan's start once.
+        if (spoke && scan.start > 0 && !scan.countedBefore) countPersonRecordsBefore(file, scan);
+        if (scan.counted?.includes(key)) {
+          scan.bg = trial.bg;
+          continue;
+        }
+        trial.counted = [...(scan.counted ?? []), key];
+        trial.countedBefore = scan.countedBefore;
+      }
+      Object.assign(scan, trial);
+      if (spoke) {
         scan.person = true;
         return true;
       }
@@ -6663,8 +6713,8 @@ export interface ClaudeUsageReducerState {
   closedTurns: number;
   openTurn: boolean;
   openTurnAnswered: boolean;
-  // How many compactions this transcript has held. A replayed compaction does not count, and the
-  // usage line reducer revokes an abandoned one.
+  // How many compactions this transcript has held. The usage line reducer revokes an abandoned one.
+  // A reader skips copied records before they reach the reducer, so a copied compaction never counts.
   compactionCount: number;
   // The newest of those summaries, oldest first. `RETAINED_COMPACTIONS` bounds it, so
   // compactionCount stays the exact total and this list only describes them.
@@ -6682,9 +6732,6 @@ export interface ClaudeUsageReducerState {
   // The newest compaction until a typed prompt or billed request shows whether the session
   // continued from it.
   pendingCompaction?: ClaudePendingCompaction | null;
-  // Ids of the newest compaction boundaries and summaries, oldest first, revoked ones included.
-  // `RETAINED_COMPACTION_RECORDS` bounds the list.
-  compactionRecords?: string[];
   // The newest main request, which sizes the next compaction's input.
   lastRequest?: ClaudeLastRequest | null;
   // The cache read of the first request this transcript billed, set once. A cold compaction
@@ -6880,24 +6927,6 @@ export function retainNewestCompaction(
     evicted = state.recentCompactions.shift() ?? null;
   }
   return evicted;
-}
-
-// Whether this compaction boundary or summary repeats one already read. Claude Code can replay a
-// stretch of the transcript with the same record ids.
-function repeatsClaudeCompaction(state: ClaudeUsageReducerState, record: Record<string, unknown>): boolean {
-  const uuid = typeof record.uuid === 'string' && record.uuid ? record.uuid : null;
-  if (!uuid) {
-    return false;
-  }
-  const held = (state.compactionRecords ??= []);
-  if (held.includes(uuid)) {
-    return true;
-  }
-  held.push(uuid);
-  while (held.length > RETAINED_COMPACTION_RECORDS) {
-    held.shift();
-  }
-  return false;
 }
 
 // The boundary pairs with a summary read before it, or opens the next pending compaction. A
@@ -7107,9 +7136,6 @@ function reduceClaudeTurnRecord(
     withdrawClaudeUsageTurn(state, compactAnswer, true);
   }
   if (record.type === 'system' && record.subtype === 'compact_boundary') {
-    if (repeatsClaudeCompaction(state, record)) {
-      return;
-    }
     const at = stamp(record.timestamp);
     noteClaudeCompactionBoundary(state, at);
     const metadata = record.compactMetadata as Record<string, unknown> | undefined;
@@ -7153,9 +7179,6 @@ function reduceClaudeTurnRecord(
     return;
   }
   if (record.type === 'user' && record.isCompactSummary) {
-    if (repeatsClaudeCompaction(state, record)) {
-      return;
-    }
     state.compactionCount++;
     const at = stamp(record.timestamp);
     const evicted = retainNewestCompaction(state, {
@@ -7794,7 +7817,6 @@ export function createClaudeUsageLineReducer(
             ...(restored.pendingCompaction
               ? { pendingCompaction: copyPendingCompaction(restored.pendingCompaction) }
               : {}),
-            ...(restored.compactionRecords ? { compactionRecords: [...restored.compactionRecords] } : {}),
             lastRequest: restored.lastRequest ? { ...restored.lastRequest } : null,
             firstRequestCacheRead: restored.firstRequestCacheRead ?? null,
             ...(restored.modelProfile ? { modelProfile: restored.modelProfile } : {}),
@@ -7876,7 +7898,6 @@ export function createClaudeUsageLineReducer(
             unsizedCompaction: copyUnsizedCompaction(state.unsizedCompaction),
             ...(state.compactionParents?.length ? { compactionParents: [...state.compactionParents] } : {}),
             ...(state.pendingCompaction ? { pendingCompaction: copyPendingCompaction(state.pendingCompaction) } : {}),
-            ...(state.compactionRecords?.length ? { compactionRecords: [...state.compactionRecords] } : {}),
             lastRequest: state.lastRequest ? { ...state.lastRequest } : null,
             firstRequestCacheRead: state.firstRequestCacheRead ?? null,
             ...(state.modelProfile ? { modelProfile: state.modelProfile } : {}),
@@ -8136,7 +8157,11 @@ function readClaudeOwnSpend(
     folders,
     maxTurns: Number.MAX_SAFE_INTEGER,
   });
+  const copies = createClaudeCopyFilter();
   const found = scanLines(file, (line) => {
+    if (copies(line)) {
+      return;
+    }
     child.pushLine(line);
     if (line.trim()) {
       lastLine = line;

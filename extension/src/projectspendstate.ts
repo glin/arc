@@ -8,6 +8,7 @@ import {
   validCostStateMaterialization,
   type ClaudeCostSupplement,
 } from './claudecoststate';
+import { validClaudeCopyState } from './claudecopies';
 import type {
   CacheExpiryCarry,
   CacheExpiryFacts,
@@ -23,7 +24,6 @@ import type { ReducerCompaction } from './transcript';
 import {
   RETAINED_CACHE_EXPIRY_RETURNS,
   RETAINED_COMPACTION_PARENTS,
-  RETAINED_COMPACTION_RECORDS,
   RETAINED_COMPACTIONS,
   RETAINED_REQUESTS,
 } from './parserstate';
@@ -50,7 +50,6 @@ const CLAUDE_STATE_KEYS = {
   unsizedCompaction: true,
   compactionParents: true,
   pendingCompaction: true,
-  compactionRecords: true,
   lastRequest: true,
   firstRequestCacheRead: true,
   toolListNames: true,
@@ -345,7 +344,6 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
     !compactionSize(value.pendingCompactionSize) ||
     !unsizedCompaction(value.unsizedCompaction) ||
     !claudeRecordIds(value.compactionParents, RETAINED_COMPACTION_PARENTS) ||
-    !claudeRecordIds(value.compactionRecords, RETAINED_COMPACTION_RECORDS) ||
     !pendingCompaction(value.pendingCompaction, value.compactionCount) ||
     !lastClaudeRequest(value.lastRequest) ||
     !(
@@ -987,7 +985,11 @@ function spendRecord(
     (value.missingAt !== undefined && !timestamp(value.missingAt)) ||
     (value.trailingBytes !== undefined && !validBase64(value.trailingBytes)) ||
     (value.pendingBytes !== undefined && !validBase64(value.pendingBytes)) ||
-    (value.parserKind !== undefined && value.parserKind !== 'claude' && value.parserKind !== 'codex')
+    (value.parserKind !== undefined && value.parserKind !== 'claude' && value.parserKind !== 'codex') ||
+    (value.claudeCopies !== undefined &&
+      (value.parserKind !== 'claude' ||
+        !validClaudeCopyState(value.claudeCopies) ||
+        value.claudeCopies.through > value.offset))
   ) {
     return null;
   }
@@ -1124,6 +1126,7 @@ function spendRecord(
     ...(currentParser && parserKind !== undefined && value.parserState !== undefined
       ? { parserState: value.parserState }
       : {}),
+    ...(currentParser && value.claudeCopies !== undefined ? { claudeCopies: value.claudeCopies } : {}),
     ...(value.complete === undefined ? {} : { complete: value.complete }),
     ...(value.scanOffset === undefined ? {} : { scanOffset: value.scanOffset }),
     ...(value.pendingBytes === undefined ? {} : { pendingBytes: value.pendingBytes }),

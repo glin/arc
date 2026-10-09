@@ -12241,6 +12241,16 @@ test('a dispatched session reads as a person only on a sign a person leaves', ()
     ],
     ['a background launch prompt that is a slash command', [slashLaunch, assistantAnswer('Reviewed.', 2)], false],
     [
+      'a repeated background launch command',
+      [{ ...slashLaunch, uuid: 'l' }, assistantAnswer('Reviewed.', 2), { ...slashLaunch, uuid: 'l' }],
+      false,
+    ],
+    [
+      'a repeated background launch prompt',
+      [{ ...launch, uuid: 'l' }, assistantAnswer('Reviewed.', 2), { ...launch, uuid: 'l' }],
+      false,
+    ],
+    [
       'a human-origin slash command after a slash-command launch',
       [slashLaunch, userPrompt('<command-name>/review</command-name>', 3, { ...bg, ...human })],
       true,
@@ -12277,6 +12287,25 @@ test('a dispatched session read from its end counts no prompt it could not see',
   );
   scan = scanForPerson(file, fs.statSync(file).size, scan);
   assert.equal(scan.person, true, 'a queued follow-up read from the end did not read as a person');
+});
+
+test('a dispatched session read from its end skips a repeated launch command', () => {
+  const launch = {
+    ...userPrompt('<command-name>/review-and-report</command-name>', 1, {
+      sessionKind: 'bg',
+      origin: { kind: 'human' },
+    }),
+    uuid: 'l',
+  };
+  const file = writeTranscript([launch, assistantAnswer('Reviewed.', 2)]);
+  const end = fs.statSync(file).size;
+  let scan = scanForPerson(file, end, undefined, end);
+  fs.appendFileSync(file, JSON.stringify(launch) + '\n');
+  scan = scanForPerson(file, fs.statSync(file).size, scan);
+  assert.equal(scan.person, false, 'a repeated launch command read as a person');
+  fs.appendFileSync(file, JSON.stringify({ ...launch, uuid: 'm', timestamp: at(3) }) + '\n');
+  scan = scanForPerson(file, fs.statSync(file).size, scan);
+  assert.equal(scan.person, true, 'a new human-origin command did not read as a person');
 });
 
 // An end-position scan distinguishes a later slash-command launch from a follow-up after an earlier launch.
