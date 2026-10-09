@@ -670,7 +670,13 @@ function RailRow({
             'div',
             { class: 'railmeta' },
             inlineText([
-              railAgentWordShown(bucket) ? h('span', { class: 'railagent' }, card.agentWord) : null,
+              railAgentWordShown(bucket)
+                ? h(
+                    'span',
+                    { class: 'railagent', title: card.agentWord !== card.agent ? card.agentWord : undefined },
+                    card.agent || card.agentWord,
+                  )
+                : null,
               h('span', { class: railStatusClass(card.status) }, [
                 slot.word || '',
                 card.status === 'running' && card.runningSince !== null && railRunningWord(card.runningSince, now)

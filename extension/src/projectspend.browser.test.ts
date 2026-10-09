@@ -2429,6 +2429,8 @@ test('Project cost leaves focus with the reader when its popover is dismissed', 
         'unknown cost steals focus after departure',
       );
 
+      // Keep hover hints out of the keyboard-only dismissal cases.
+      await page.mouse.move(0, 0);
       for (const spend of [
         { ...PROJECT_SPEND, calculating: true },
         { ...PROJECT_SPEND, calculating: false, windows: [], categories: [], rateSources: [] },

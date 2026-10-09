@@ -1650,7 +1650,7 @@ test(
         for (const wideWidth of [1350, RAIL_MIN_WIDTH]) {
           if (wideWidth !== 1350) {
             await page.setViewportSize({ width: wideWidth, height: 900 });
-            await page.evaluate(SETTLED);
+            await page.waitForFunction(() => !document.getElementById('rail')!.hidden);
           }
           const rail = (await page.evaluate(`(() => {
           const node = document.getElementById('rail');
@@ -1730,7 +1730,7 @@ test(
         }
 
         await page.setViewportSize({ width: RAIL_MIN_WIDTH - 1, height: 900 });
-        await page.evaluate(SETTLED);
+        await page.waitForFunction(() => document.getElementById('rail')!.hidden);
         assert.equal(
           await page.evaluate("document.getElementById('rail').hidden"),
           true,
@@ -1743,7 +1743,7 @@ test(
         );
 
         await page.setViewportSize({ width: 1350, height: 900 });
-        await page.evaluate(SETTLED);
+        await page.waitForFunction(() => !document.getElementById('rail')!.hidden);
         assert.equal(
           await page.evaluate("document.getElementById('rail').hidden"),
           false,

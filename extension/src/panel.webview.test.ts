@@ -5440,6 +5440,72 @@ const browserComposerPresentationSource = fs.readFileSync(
 );
 const queueLiveSource = fs.readFileSync(path.join(__dirname, 'webview', 'queue-live.ts'), 'utf8');
 const railSource = fs.readFileSync(path.join(__dirname, 'webview', 'rail.ts'), 'utf8');
+
+test('pinned agent-run session cards keep the provider visible and classification available', () => {
+  const [source] = sourceNodes(railSource, (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'RailRow');
+  assert.ok(source, 'the session list row renderer is missing');
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const agent of ['Codex', 'Claude', '']) {
+    const [card] = railSessions(
+      [{ id: 'run', label: 'Agent work', agent, when: '2:32 PM', at: 4200, relative: 'now', agentRun: true }],
+      new Map(),
+      new Map(),
+      new Map(),
+      new Set(),
+      null,
+      new Set(['run']),
+      new Map(),
+      {},
+      {},
+    );
+    const elements: Array<{ tag: string; props: Record<string, unknown>; text: unknown }> = [];
+    const h = (tag: string, props: Record<string, unknown>, text: unknown) => {
+      elements.push({ tag, props, text });
+      return { tag, props, text };
+    };
+    const dependencies = {
+      h,
+      railTimeSlot,
+      railCacheState: () => null,
+      railCardHint: () => ({}),
+      railRowId: () => 'row',
+      railRowKey: () => 'row',
+      railCardClass: () => 'railcard',
+      drawnRailCardName: () => card.nameBeforeAge,
+      inlineText: (parts: unknown) => parts,
+      railAgentWordShown: () => true,
+      railStatusClass: () => 'railstatus',
+      railAgeFormat: () => () => 'now',
+      RailStats: () => null,
+      RailLabels: () => null,
+      actionProps: () => ({}),
+      labelIcon: () => null,
+      archiveIcon: () => null,
+      pinIcon: () => null,
+    };
+    const draw = new Function(...Object.keys(dependencies), `${compiled}\nreturn RailRow;`)(
+      ...Object.values(dependencies),
+    );
+    draw({
+      card,
+      stats: [],
+      bucket: 'pinned',
+      owner: {},
+      options: { platform: 'Win32', words: {}, rowContext: () => '' },
+      now: 4200,
+      density: 'comfortable',
+      labelsOpen: null,
+    });
+    const provider = elements.find((element) => element.props?.class === 'railagent');
+    assert.ok(provider);
+    assert.equal(provider.text, agent || 'run by an agent');
+    assert.equal(provider.props.title, 'run by an agent');
+    assert.equal(card.runByAgent, true);
+    assert.equal(card.agentWord, 'run by an agent');
+    assert.match(card.nameBeforeAge, /run by an agent/);
+    if (agent) assert.ok(card.nameBeforeAge.includes(agent));
+  }
+});
 const sessionRenameSource = fs.readFileSync(path.join(__dirname, 'webview', 'session-rename.ts'), 'utf8');
 // view/rail.ts supplies the text for compact-row hover cards.
 const railHoverSource = fs.readFileSync(path.join(__dirname, 'view', 'rail.ts'), 'utf8');
