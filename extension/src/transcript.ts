@@ -695,6 +695,8 @@ export interface Turn {
   outputRate?: import('./outputrate').OutputRate;
   outputRateModel?: string;
   responseIds?: string[];
+  // The turn's first response id, which the cap on `responseIds` never drops.
+  openingResponseId?: string;
   // Request that established `contextTokens`, separate from aggregate usage and the turn end time.
   contextRequest?: ContextRequest;
   // Recorded runtime context window, or null when absent. It can differ from the published model window.
@@ -8953,6 +8955,8 @@ export interface ClaudeSessionParserState {
   curCommand: string | null;
   curLocalAnswer: boolean;
   curCompacted: boolean;
+  // A compaction after a response of the open turn, which that turn holds once it responds again.
+  curHeldCompaction?: { at: number; turnStart: number } | null;
   curPrevious: number | null;
   // Reader prompts arriving after this command opened prevent manual compaction withdrawal.
   curQueuedSinceOpening: boolean;
@@ -9054,6 +9058,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     curCommand: null,
     curLocalAnswer: false,
     curCompacted: false,
+    curHeldCompaction: null,
     curPrevious: null,
     curQueuedSinceOpening: false,
     curCarried: null,
@@ -9491,6 +9496,53 @@ function expireClaudeCompactMetadata(state: ClaudeSessionParserState, at: number
   state.compactMeta = state.compactMeta.filter((meta) => !meta.at || at - meta.at <= COMPACT_META_WINDOW_MS);
 }
 
+// A compaction between two responses under one prompt belongs to that turn. The turn's cost then
+// holds the compaction's estimated request, as the session total does. The estimate is a usage part
+// only, so the turn's token figures keep recorded usage. A compaction before the turn's first
+// response or after its last one stays outside every turn.
+function chargeHeldClaudeCompaction(state: ClaudeSessionParserState, turn: SourcedBuilding): void {
+  const held = state.curHeldCompaction;
+  state.curHeldCompaction = null;
+  const compaction =
+    held && held.turnStart === (turn[SOURCE_START] ?? 0)
+      ? state.compactions.find((item) => item.at === held.at)
+      : undefined;
+  if (!compaction?.model) {
+    return;
+  }
+  const previous = compaction.previousRequest ?? null;
+  const usage = compactionEstimate({
+    model: compaction.model,
+    at: compaction.at,
+    durationMs: compaction.durationMs,
+    contextBefore: compaction.contextBefore,
+    contextAfter: compaction.contextAfter,
+    previousRequest: previous,
+    firstRequestCacheRead: compaction.firstRequestCacheRead ?? state.usageState.firstRequestCacheRead ?? null,
+    summaryChars: compaction.summaryChars ?? null,
+  })?.usage;
+  if (!usage) {
+    return;
+  }
+  const event: UsageEvent = {
+    timestamp: compaction.at,
+    agent: 'claude',
+    provider: null,
+    model: compaction.model,
+    contextWindow: null,
+    contextBand: contextBandForRequest(compaction.model, null, requestInputTokens(usage)),
+    billingClass: 'unknown',
+    inferenceClass: previous?.inferenceClass ?? null,
+    serviceTier: previous?.serviceTier ?? null,
+    reportedCost: null,
+    visibleTurnId: null,
+    compactionEstimate: true,
+    usage,
+    requestKey: `claude-compaction:${compaction.at}`,
+  };
+  addTurnUsagePart(turn, event);
+}
+
 // Whether the model worked in a turn, or the reader interrupted it.
 function claudeModelWorked(turn: SourcedBuilding): boolean {
   return turn.toolUses > 0 || turn.usage.output > 0 || turn.summary !== '' || turn.error !== null || turn.interrupted;
@@ -9532,6 +9584,7 @@ function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): boo
   state.curCommand = null;
   state.curLocalAnswer = false;
   state.curCompacted = false;
+  state.curHeldCompaction = null;
   state.curPrevious = null;
   state.curQueuedSinceOpening = false;
   state.curCarried = null;
@@ -9619,6 +9672,7 @@ function resumeAfterClaudeLocalAnswer(state: ClaudeSessionParserState): void {
   state.curCommand = null;
   state.curLocalAnswer = false;
   state.curCompacted = false;
+  state.curHeldCompaction = null;
   state.curPrevious = null;
   state.curQueuedSinceOpening = false;
   state.curCarried = null;
@@ -10017,6 +10071,9 @@ function reduceClaudeSessionLine(
       }
       return false;
     });
+    if (state.cur && !state.curLocalAnswer && claudeModelWorked(state.cur)) {
+      state.curHeldCompaction = { at: compaction.at, turnStart: state.cur[SOURCE_START] ?? 0 };
+    }
     boundClaudeCompactions(state, maxTurns);
     return;
   }
@@ -10344,6 +10401,7 @@ function reduceClaudeSessionLine(
   if (usageEvent) {
     if (!opts.childTranscript && typeof message.id === 'string' && message.id && message.id.length <= 512) {
       const ids = (cur.responseIds ??= []);
+      cur.openingResponseId ??= message.id;
       if (!ids.includes(message.id)) ids.push(message.id);
       if (ids.length > 512) ids.shift();
     }
@@ -10379,6 +10437,9 @@ function reduceClaudeSessionLine(
             end: Math.max(sourceEnd, state.currentModelSource.end),
           }
         : null;
+    if (!opts.childTranscript) {
+      chargeHeldClaudeCompaction(state, cur);
+    }
     const events = opts.childTranscript ? replaceClaudeUsageEvent(state.usageState, usageEvent) : [usageEvent];
     for (const event of events) {
       addUsage(cur.usage, event.usage, event.contextBand);
@@ -10890,6 +10951,7 @@ export function createClaudeSessionReducer(
   state.curCommand ??= null;
   state.curLocalAnswer ??= false;
   state.curCompacted ??= false;
+  state.curHeldCompaction ??= null;
   state.curPrevious ??= null;
   state.curQueuedSinceOpening ??= false;
   state.curCarried ??= null;

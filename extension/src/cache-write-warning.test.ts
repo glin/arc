@@ -161,7 +161,7 @@ test('whole-session cost metadata nests warnings under their owning scopes even 
   ]);
   const chip = projection.stats[0];
   assert.deepEqual(
-    chip.warnings?.map((warning) => [warning.scope, warning.id]),
+    chip.warnings?.map((warning) => [warning.scope, 'id' in warning ? warning.id : undefined]),
     [
       ['main', undefined],
       ['delegated', 'child-a'],

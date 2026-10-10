@@ -391,7 +391,8 @@ import {
   sdkSlashCommandTranscript,
   throughStructuredClone,
 } from './turnfixtures.ts';
-import { nextTurnBasisOf, statusOf, toCard, TURN_QUIET_MS } from './turncard.ts';
+import { nextTurnBasisOf, sessionStats, statusOf, toCard, turnCacheExpiryReturn, TURN_QUIET_MS } from './turncard.ts';
+import type { CacheExpiryReturn } from './projectspend.ts';
 import { newCounts, newestTurnStarts } from './turnread.ts';
 import {
   childWriteKey,
@@ -534,6 +535,72 @@ function writeTranscript(lines: object[]): string {
   fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
   return file;
 }
+
+// A turn longer than the response-id cap still knows the response that opened it, so the
+// cache-expiry return that opened it still matches, also after a parser restore.
+test('a Claude turn keeps its opening response past the response-id cap', () => {
+  const steps = Array.from({ length: 600 }, (_, index) =>
+    assistantText(`step ${index}`, 1, { input_tokens: 10, output_tokens: 5 }, undefined, 'tool_use'),
+  );
+  const records = [userPrompt('long run', 0), ...steps];
+  const opening = steps[0].message.id;
+  const turn = readSession(writeTranscript(records), 'sess').turns[0];
+  assert.ok(!turn.responseIds?.includes(opening), 'the cap drops the opening id from the bounded list');
+  const opened = { requestKey: `claude:${opening}`, request: { agent: 'claude' } } as CacheExpiryReturn;
+  assert.equal(turnCacheExpiryReturn(turn, [opened]), opened);
+  const first = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 3)) first.pushLine(JSON.stringify(record));
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  for (const record of records.slice(3)) resumed.pushLine(JSON.stringify(record));
+  assert.equal(turnCacheExpiryReturn(resumed.read().turns[0], [opened]), opened);
+});
+
+// The turn that held a compaction between two of its responses names it under "Included above",
+// and its total holds the same estimate.
+test('a Claude turn that compacts between two responses names the compaction in its cost', () => {
+  const usage = { input_tokens: 10, cache_read_input_tokens: 150_000, output_tokens: 2_000 };
+  const before = [userPrompt('refactor', 0), assistantText('reading', 1, usage, undefined, 'tool_use')];
+  const compaction = [
+    {
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: at(2),
+      compactMetadata: { trigger: 'auto', preTokens: 152_010, postTokens: 9_000 },
+    },
+    { ...userPrompt('summary', 3), isCompactSummary: true, message: { role: 'user', content: 'summary' } },
+  ];
+  const after = [assistantText('done', 4, { ...usage, cache_read_input_tokens: 9_000 }, undefined, 'end_turn')];
+  const read = readSession(writeTranscript([...before, ...compaction, ...after]), 'sess');
+  assert.equal(read.turns.length, 1);
+  assert.equal(read.compactions.length, 1);
+  const cost = (turn: (typeof read.turns)[number]) =>
+    toCard(turn, false, Date.parse(at(60))).chips.find((chip) => chip.metric === 'cost')!.detailList!;
+  const list = cost(read.turns[0]);
+  const row = list.entries.find((entry) => entry.label === '1 compaction');
+  assert.match(String(row?.value), /^\$\d+\.\d\d$/);
+  const plainRead = readSession(writeTranscript([...before, ...after]), 'sess');
+  const plainTurn = plainRead.turns[0];
+  const plain = cost(plainTurn);
+  // The tokens figure, its request count, its cached-input share and the session's latest-turn
+  // cached reads hold recorded usage only.
+  const tokens = (turn: (typeof read.turns)[number]) =>
+    toCard(turn, false, Date.parse(at(60))).chips.find((chip) => chip.metric === 'tokens');
+  assert.deepEqual(tokens(read.turns[0]), tokens(plainTurn));
+  const reread = (session: typeof read) =>
+    sessionStats(session.turns, session.compactions)
+      .find((chip) => chip.metric === 'context')
+      ?.detail?.match(/Latest turn cached input reads: [^\n]*/)?.[0];
+  assert.ok(reread(plainRead));
+  assert.equal(reread(read), reread(plainRead));
+  const dollars = (value: unknown) => Number(String(value).replace(/[$+]/g, ''));
+  assert.ok(
+    Math.abs(dollars(list.heading!.value) - dollars(plain.heading!.value) - dollars(row?.value)) <= 0.011,
+    'the total holds the dollars the row names',
+  );
+  // A compaction after the turn's last response stays outside the turn.
+  const trailing = readSession(writeTranscript([...before, ...compaction]), 'sess').turns[0];
+  assert.ok(!cost(trailing).entries.some((entry) => entry.label === '1 compaction'));
+});
 
 test('Claude turns retain main response identities for exact observed-speed publication', () => {
   const first = assistantText('first', 1, { output_tokens: 84 }, undefined, 'tool_use');

@@ -839,6 +839,7 @@ function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
     !cacheTier(value.lifetime) ||
     !nonNegativeInteger(value.gapMs) ||
     !(value.visibleTurnId === undefined || value.visibleTurnId === null || nonEmptyText(value.visibleTurnId)) ||
+    !(value.requestKey === undefined || value.requestKey === null || nonEmptyText(value.requestKey)) ||
     !(
       value.previousInputSide === undefined ||
       value.previousInputSide === null ||
@@ -854,6 +855,7 @@ function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
         gapMs: value.gapMs,
         request,
         visibleTurnId: value.visibleTurnId ?? null,
+        requestKey: value.requestKey ?? null,
         previousInputSide: value.previousInputSide ?? null,
       }
     : null;

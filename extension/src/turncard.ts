@@ -9,7 +9,9 @@ import { FileIcon, iconFor } from './fileicons';
 import {
   cacheExpiryExtraCost,
   publicProjectSpendPrice,
+  type CacheExpiryCost,
   type CacheExpiryFacts,
+  type CacheExpiryReturn,
   type CompactionFact,
   type SessionSpendPart,
   type SessionSpendCoverage,
@@ -110,6 +112,8 @@ export interface StatDetailEntry {
   lines?: StatDetailLine[];
   separateBefore?: boolean;
   warning?: boolean;
+  // Draws the label as a muted group heading with no bullet, such as "Included above".
+  group?: true;
 }
 
 export type StatDetailLine =
@@ -159,7 +163,17 @@ export interface StatChip {
   // See `CONTEXT_BANDS` for thresholds.
   level?: ContextLevel;
   word?: string;
-  warnings?: CacheWriteWarning[];
+  // Each warning draws the warning sign on the figure. A turn's cache expiry joins only at
+  // `CACHE_EXPIRY_SIGN_DOLLARS` or more. Session figures carry cache-write warnings only.
+  warnings?: (CacheWriteWarning | CacheExpiryWarning)[];
+}
+
+// A turn whose first request returned to an expired cache.
+export interface CacheExpiryWarning {
+  scope: 'cache-expiry';
+  gapMs: number;
+  // The cost added by that return, or null where it cannot be priced.
+  dollars: number | null;
 }
 
 export type SessionMetric = 'cost' | 'turns' | 'context' | 'cache-expiry' | 'files' | 'commits';
@@ -2561,6 +2575,7 @@ function costDetailList(
   noEnding: (agent: TurnAgent) => boolean = (agent) =>
     agentState(agent, statusOf(turn, true, turn.endedAt) === 'running', NO_AGENT_LIFE) === 'open',
   shares: readonly DispatchedShare[] = [],
+  expiry: CacheExpiryWarning | null = null,
 ): StatDetailList {
   const total = cardCostOf(turn, shares);
   const sharedCosts = shares.flatMap((share) => share.costs);
@@ -2640,6 +2655,17 @@ function costDetailList(
     );
   // A dispatched session's notes follow the session total's rules.
   const compactionNote = compactionEstimateNote(sharedCosts);
+  // The main agent's estimated compactions, which the turn names under "Included above".
+  const mainCosts = mainParts.map(priceSessionCost);
+  const compactions = mainCosts
+    .filter((cost) => cost.part.compactionEstimate)
+    .reduce((sum, cost) => sum + (cost.part.usage.requests ?? 0), 0);
+  const included = includedAboveEntries(
+    compactions > 0 ? { count: compactions, cost: compactionOverheadCost(compactions, mainCosts) } : null,
+    null,
+  );
+  const mainEstimated =
+    compactions > 0 && mainCosts.some((cost) => cost.part.compactionEstimate && cost.dollars !== null);
   const hasPublicAutoReview =
     (turn.model === 'codex-auto-review' &&
       estimateCost(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow) !== null) ||
@@ -2657,10 +2683,16 @@ function costDetailList(
       label: 'Estimated total',
       value: totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable',
     },
-    entries,
+    entries: [...(expiry ? [{ label: cacheExpiryWarningText(expiry), warning: true }] : []), ...entries, ...included],
     // The compaction notes say part of the cost is a modelled estimate, so they stay visible.
-    ...(compactionNote || childCompactionNotes.length
-      ? { footer: [...(compactionNote ? [compactionNote] : []), ...childCompactionNotes] }
+    ...(mainEstimated || compactionNote || childCompactionNotes.length
+      ? {
+          footer: [
+            ...(mainEstimated ? [COMPACTION_ESTIMATE_FOOTER] : []),
+            ...(compactionNote ? [compactionNote] : []),
+            ...childCompactionNotes,
+          ],
+        }
       : {}),
     notes: [
       ...(hasCacheRead ? [CACHED_INPUT_READ_EXPLANATION] : []),
@@ -2789,6 +2821,60 @@ function formatExpiryGap(ms: number): string {
   return `${days}d${remainder ? ` ${remainder}h` : ''}`;
 }
 
+// The least cost added that draws the warning sign on a turn's cost figure.
+export const CACHE_EXPIRY_SIGN_DOLLARS = 1;
+
+// The return that opened `turn`, from the session's retained cache-expiry returns. A Claude
+// return names its request, which is the turn's opening response. A Codex return names the turn.
+export function turnCacheExpiryReturn(
+  turn: Pick<Turn, 'agent' | 'promptId' | 'responseIds' | 'openingResponseId'>,
+  returns: readonly CacheExpiryReturn[],
+): CacheExpiryReturn | null {
+  if (turn.agent === 'codex') {
+    const id = turn.promptId ? `codex-turn:${turn.promptId}` : null;
+    return (id && returns.find((item) => item.request.agent === 'codex' && item.visibleTurnId === id)) || null;
+  }
+  const responses = new Set([...(turn.openingResponseId ? [turn.openingResponseId] : []), ...(turn.responseIds ?? [])]);
+  return (
+    returns.find(
+      (item) =>
+        item.request.agent === 'claude' &&
+        item.requestKey?.startsWith('claude:') &&
+        responses.has(item.requestKey.slice('claude:'.length)),
+    ) ?? null
+  );
+}
+
+// The cache-expiry warning for `turn`, priced as cost added, or null when no retained return
+// opened it.
+export function turnCacheExpiryWarning(
+  turn: Pick<Turn, 'agent' | 'promptId' | 'responseIds' | 'openingResponseId'>,
+  facts: CacheExpiryFacts | null | undefined,
+): CacheExpiryWarning | null {
+  const found = facts ? turnCacheExpiryReturn(turn, facts.returns) : null;
+  if (!facts || !found) {
+    return null;
+  }
+  const priced = cacheExpiryExtraCost({ ...facts, returns: [found], truncated: false }, publicProjectSpendPrice);
+  return { scope: 'cache-expiry', gapMs: found.gapMs, dollars: priced.dollars };
+}
+
+// "a 1h 12m gap", "an 8h 0m gap", "an 11m gap": the article follows how the figure is spoken.
+function gapPhrase(ms: number): string {
+  const gap = formatExpiryGap(ms);
+  return `${/^(8|1[18](?!\d))/.test(gap) ? 'an' : 'a'} ${gap} gap`;
+}
+
+// What a drawn card's cache-expiry warning depends on, so a host redraws the card when it moves.
+export function cacheExpiryWarningPrint(warning: CacheExpiryWarning | null): string {
+  return warning ? JSON.stringify([warning.gapMs, warning.dollars]) : '';
+}
+
+export function cacheExpiryWarningText(warning: CacheExpiryWarning): string {
+  const added = warning.dollars === null ? null : (formatCost(warning.dollars) ?? ZERO_COST);
+  return `Cache expired after ${gapPhrase(warning.gapMs)}${added ? ` and added ${added}` : ''}`;
+}
+
 export interface CacheExpiryCountFact {
   count: number;
   // True when unclassified adjacent requests leave the expiry count as a lower bound.
@@ -2827,9 +2913,16 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
       ...(facts.returns.some((item) => item.request.reportedCost !== null)
         ? ['One or more affected requests have only a provider-reported total. Cost added is not available for them.']
         : []),
-      ...(facts.returns.some((item) => item.previousInputSide === null)
+      // The scan names the turn of every return it records, so a return without one was saved
+      // by an older ledger that recorded no reusable size.
+      ...(facts.returns.some((item) => item.previousInputSide === null && item.visibleTurnId !== null)
         ? [
             'One or more affected requests follow a compaction whose cached size is not recorded. Cost added is not available for them.',
+          ]
+        : []),
+      ...(facts.returns.some((item) => item.previousInputSide === null && item.visibleTurnId === null)
+        ? [
+            'One or more affected requests were recorded before Arc measured cost added. Cost added is not available for them.',
           ]
         : []),
     ],
@@ -2850,13 +2943,27 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
   ];
 }
 
+// Names what started a compaction. A recorded word Arc does not know shows as recorded, capitalized.
+export function compactionTriggerLabel(trigger: string | null | undefined): string {
+  const word = (trigger ?? '').trim();
+  if (word === 'manual') {
+    return 'Manual';
+  }
+  if (word === 'auto') {
+    return 'Automatic';
+  }
+  if (word === 'refusal') {
+    return 'After a refusal';
+  }
+  return word ? `${word[0].toUpperCase()}${word.slice(1)}` : 'Unknown';
+}
+
 export function sessionCompactionContextDetail(facts: readonly CompactionFact[]): SessionContextDetail | null {
   if (!facts.length) {
     return null;
   }
   const latest = facts.reduce((selected, fact) => (fact.ordinal > selected.ordinal ? fact : selected));
-  const value = latest.trigger === 'manual' ? 'Manual' : latest.trigger === 'auto' ? 'Automatic' : 'Unknown';
-  return { entries: [{ label: 'Latest compaction', value }] };
+  return { entries: [{ label: 'Latest compaction', value: compactionTriggerLabel(latest.trigger) }] };
 }
 
 export function withSessionContextDetail(
@@ -2975,25 +3082,41 @@ function claudeCompactionEstimateLine({ usage, basis }: CompactionEstimate): str
     : `Estimated as ${list}, because the request before it read no cached input.`;
 }
 
+// Prices a compaction request from its recorded usage, as one request.
+function exactCompactionCost(
+  usage: Turn['usage'],
+  model: string | null,
+  provider: string | null,
+  contextWindow: number | null,
+  inferenceClass: UsageInferenceClass,
+  serviceTier: string | null,
+): number | null {
+  return (
+    quoteUsage({
+      usage,
+      model,
+      provider,
+      contextWindow,
+      requestTokens: requestInputOf(usage),
+      inferenceClass,
+      serviceTier,
+    })?.cost ?? null
+  );
+}
+
 // A compaction draws the same row whether it is open or shut, as every card does.
 function compactionChips(c: Compaction): StatChip[] {
   const chips: StatChip[] = [];
   const exactUsage = c.usage;
   const exactCost = exactUsage
-    ? (quoteUsage({
-        usage: exactUsage,
-        model: c.model,
-        provider: c.provider ?? null,
-        contextWindow: c.contextWindow ?? null,
-        requestTokens:
-          exactUsage.input +
-          exactUsage.cacheRead +
-          exactUsage.cacheWrite1h +
-          exactUsage.cacheWrite5m +
-          (exactUsage.cacheWrite30m ?? 0),
-        inferenceClass: c.inferenceClass ?? null,
-        serviceTier: c.serviceTier ?? null,
-      })?.cost ?? null)
+    ? exactCompactionCost(
+        exactUsage,
+        c.model,
+        c.provider ?? null,
+        c.contextWindow ?? null,
+        c.inferenceClass ?? null,
+        c.serviceTier ?? null,
+      )
     : null;
   const estimateInput = {
     model: c.model,
@@ -3051,8 +3174,17 @@ function compactionChips(c: Compaction): StatChip[] {
 }
 
 export function toCompactionCard(c: Compaction, now: number = Date.now()): CompactionCard {
+  const trigger = compactionTriggerLabel(c.trigger);
   const why =
-    c.trigger === 'auto' ? 'Compacted automatically.' : c.trigger === 'manual' ? 'Compacted by hand.' : 'Compacted.';
+    c.trigger === 'auto'
+      ? 'Compacted automatically.'
+      : c.trigger === 'manual'
+        ? 'Compacted by hand.'
+        : c.trigger === 'refusal'
+          ? 'Compacted after a refusal.'
+          : trigger === 'Unknown'
+            ? 'Compacted.'
+            : `Compacted (${trigger}).`;
   const size =
     c.contextBefore && c.contextAfter
       ? `${formatTokens(c.contextBefore)} of session became a ${formatTokens(c.contextAfter)} summary.`
@@ -3333,6 +3465,7 @@ function chipsOf(
   carried = 0,
   // The dispatched sessions the card counts in its cost.
   dispatched: readonly DispatchedTurnCost[] = [],
+  expiry: CacheExpiryWarning | null = null,
 ): StatChip[] {
   const chips: StatChip[] = [];
   const shares = dispatched.map((cost) => dispatchedShare(turn, cost));
@@ -3340,13 +3473,18 @@ function chipsOf(
   // Keep a dispatched cost figure even when the parsed turn has no priced usage.
   const cost = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
   if (cost) {
-    const warnings = cacheWriteWarnings(turnCacheWriteScopes(turn, turn.finished));
+    const writeWarnings = cacheWriteWarnings(turnCacheWriteScopes(turn, turn.finished));
     const detailList = costDetailList(
       turn,
-      warnings,
+      writeWarnings,
       (agent) => agentState(agent, status === 'running', sessionLive) === 'open',
       shares,
+      expiry,
     );
+    const warnings: (CacheWriteWarning | CacheExpiryWarning)[] = [
+      ...(expiry && expiry.dollars !== null && expiry.dollars >= CACHE_EXPIRY_SIGN_DOLLARS ? [expiry] : []),
+      ...writeWarnings,
+    ];
     const detail = flatDetailList(detailList).join('\n');
     chips.push({
       kind: 'plain',
@@ -4116,6 +4254,8 @@ export function toCard(
   liveChildren: ReadonlySet<string> = new Set(),
   // The dispatched sessions the card counts in its cost, from `countedDispatchedCosts`.
   dispatched: readonly DispatchedTurnCost[] = [],
+  // The return to an expired cache that opened this turn, from `turnCacheExpiryWarning`.
+  expiry: CacheExpiryWarning | null = null,
 ): TurnCard {
   const live: AgentLive = { session: sessionLive, children: liveChildren };
   let added = 0;
@@ -4196,6 +4336,7 @@ export function toCard(
     subagentFileCount,
     carried,
     dispatched,
+    expiry,
   );
   const headDetails = chips.filter((chip) => chip.headDetail).map((chip) => chip.name || chip.detail);
   const label = headLabel(
@@ -5128,6 +5269,73 @@ function compactionEstimateNote(costs: readonly PricedSessionCost[]): string | n
   return `Includes an estimated ${label} for ${count} compaction${count === 1 ? '' : 's'}. Claude Code records no usage for a compaction.`;
 }
 
+// Says that compaction costs in an "Included above" row are modelled estimates.
+const COMPACTION_ESTIMATE_FOOTER = 'Compaction costs are estimates. Claude Code records no usage for a compaction.';
+
+// Defines the cache expiry row of an "Included above" group.
+const CACHE_EXPIRY_ROW_NOTE =
+  "A cache expiry's cost is what resending the context cost above a cache read of the same tokens.";
+
+// The cost of overheads a total already counts, as one value-column figure.
+function overheadCostValue(cost: CacheExpiryCost): string {
+  if (cost.dollars === null) {
+    return 'cost unavailable';
+  }
+  return `${formatCost(cost.dollars) ?? ZERO_COST}${cost.status === 'atLeast' ? '+' : ''}`;
+}
+
+// Prices `count` compactions from the Claude estimates among `costs`, which are in the total.
+// A Codex compaction's recorded usage is not in the total, so it stays unpriced. Fewer priced
+// compactions than counted make the cost a lower bound.
+function compactionOverheadCost(count: number, costs: readonly PricedSessionCost[]): CacheExpiryCost {
+  let dollars = 0;
+  let priced = 0;
+  for (const cost of costs) {
+    if (cost.part.compactionEstimate && cost.dollars !== null) {
+      dollars += cost.dollars;
+      priced += cost.part.usage.requests ?? 0;
+    }
+  }
+  if (priced === 0) {
+    return { dollars: null, status: 'unknown' };
+  }
+  return { dollars, status: priced < count ? 'atLeast' : 'exact' };
+}
+
+// The "Included above" group: overheads a total already counts, each with its count in the label.
+function includedAboveEntries(
+  compactions: { count: number; cost: CacheExpiryCost } | null,
+  expiries: { count: number; cost: CacheExpiryCost } | null,
+): StatDetailEntry[] {
+  const rows: StatDetailEntry[] = [
+    ...(compactions && compactions.count > 0
+      ? [
+          {
+            label: `${compactions.count} compaction${compactions.count === 1 ? '' : 's'}`,
+            value: overheadCostValue(compactions.cost),
+          },
+        ]
+      : []),
+    ...(expiries && expiries.count > 0
+      ? [
+          {
+            label: `${expiries.count} cache ${expiries.count === 1 ? 'expiry' : 'expiries'}`,
+            value: overheadCostValue(expiries.cost),
+            valueTitle: CACHE_EXPIRY_COST_ADDED_HINT,
+          },
+        ]
+      : []),
+  ];
+  return rows.length ? [{ label: 'Included above', group: true, separateBefore: true }, ...rows] : [];
+}
+
+// The overheads a session cost popover names under "Included above".
+export interface SessionOverheads {
+  // The exact lifetime count of completed primary-session compactions.
+  compactionCount?: number | null;
+  expiry?: CacheExpiryFacts | null;
+}
+
 // Groups delegated work without a named scope, marking missing usage as partial.
 function otherDelegatedEntry(costs: readonly PricedSessionCost[], short: boolean): StatDetailEntry {
   return { label: 'Other delegated work', value: sessionCostValue(costs, short), lines: delegatedCostLines(costs) };
@@ -5136,6 +5344,7 @@ function otherDelegatedEntry(costs: readonly PricedSessionCost[], short: boolean
 export function sessionCostProjection(
   parts: readonly SessionCostUsage[],
   coverage: boolean | SessionSpendCoverage = false,
+  overheads: SessionOverheads = {},
 ): SessionCostProjection {
   const mainShort = typeof coverage === 'boolean' ? false : coverage.main;
   const short = typeof coverage === 'boolean' ? coverage : coverage.delegated;
@@ -5256,16 +5465,34 @@ export function sessionCostProjection(
             lines: usageCategoryLines(main),
           },
         ];
-  const compactionNote = compactionEstimateNote(costs);
+  const compactionCount = overheads.compactionCount ?? 0;
+  const expiryCount = overheads.expiry ? cacheExpiryReturnCount(overheads.expiry).count : 0;
+  const included = includedAboveEntries(
+    compactionCount > 0 ? { count: compactionCount, cost: compactionOverheadCost(compactionCount, main) } : null,
+    overheads.expiry && expiryCount > 0
+      ? { count: expiryCount, cost: cacheExpiryExtraCost(overheads.expiry, publicProjectSpendPrice) }
+      : null,
+  );
+  // Beside a compactions row, the main session's note drops the count and dollars the row shows.
+  // The row prices main compactions only, so delegated estimates keep their counted note.
+  const compactionNotes =
+    compactionCount > 0
+      ? [
+          ...(main.some((cost) => cost.part.compactionEstimate && cost.dollars !== null)
+            ? [COMPACTION_ESTIMATE_FOOTER]
+            : []),
+          ...[compactionEstimateNote(delegated)].filter((note) => note !== null),
+        ]
+      : [compactionEstimateNote(costs)].filter((note) => note !== null);
   const detailList: StatDetailList = {
     heading: {
       label: 'Estimated total',
       value: chip.compactLabel,
     },
-    entries,
+    entries: [...entries, ...included],
     footer: [
       // The compaction note says part of the total is a modelled estimate, so it stays visible.
-      ...(compactionNote ? [compactionNote] : []),
+      ...compactionNotes,
       ...(mainShort ? ['Main agent usage is incomplete.'] : []),
       ...(short ? ['Delegated work usage is incomplete.'] : []),
       ...(unavailable.size > 0 || incomplete ? [UNAVAILABLE_COST_NOTE] : []),
@@ -5277,6 +5504,7 @@ export function sessionCostProjection(
       ...(costs.some((cost) => cost.part.model === 'codex-auto-review' && cost.publiclyPriced)
         ? [AUTO_REVIEW_RATE_NOTE]
         : []),
+      ...(expiryCount > 0 ? [CACHE_EXPIRY_ROW_NOTE] : []),
       scope,
       COST_ESTIMATE_NOTE,
     ],
@@ -5501,7 +5729,8 @@ function cacheReadCostOf(turn: SessionFigureTurn): number | null {
   }
   let dollars = 0;
   for (const part of turn.usageParts) {
-    if (part.usage.cacheRead <= 0) {
+    // A compaction estimate is modelled, not recorded, so it stays out of recorded cache reads.
+    if (part.compactionEstimate || part.usage.cacheRead <= 0) {
       continue;
     }
     const usage = part.contextBand ? usageInContextBand(part.usage, part.contextBand) : part.usage;

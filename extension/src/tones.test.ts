@@ -809,6 +809,7 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.agentrow .agenthead .namelink { color: inherit }',
   '.agentrow .namelink:focus-visible { color: var(--vscode-textLink-foreground) }',
   '.agentrow .namelink:hover { color: var(--vscode-textLink-foreground) }',
+  '.chippop .chippopitem.is-group .chippoplabel { color: var(--idle) }',
   '.chippop.chippop-skills .chippopsublist { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',
   '.chippopcachehit.is-warning { color: var(--warn) }',
   '.chippopfoot { color: var(--idle) }',

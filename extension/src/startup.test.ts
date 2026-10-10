@@ -7270,6 +7270,7 @@ test('a process exit refreshes a background subagent row without a transcript wr
     toCard,
     renderRichMarkdown: (text: string) => text,
   });
+  provider.cardCacheExpiryWarning = () => null;
   const launched = Date.now() - 120_000;
   const recorded = turn({
     sessionId: 'claude-a',

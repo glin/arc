@@ -5,8 +5,6 @@ import path from 'node:path';
 import {
   CacheExpiryScan,
   cacheExpiryExtraCost,
-  cacheExpiryInputCost,
-  cacheExpiryInputUsage,
   classifyCacheExpiry,
   PROJECT_SPEND_PARSER_GENERATION,
   emptyCacheExpiryLedger,
@@ -510,12 +508,6 @@ test('a partly warm return keeps its own categories and attributes only its cold
   const [returned] = result.returns;
   assert.equal(returned.request.usage.input, 2_000);
   assert.equal(returned.request.usage.cacheRead, 4_000, 'the observed warm half is retained');
-  assert.equal(
-    cacheExpiryInputUsage(returned.request).usage.cacheRead,
-    0,
-    'the warm half never reaches the attributed input figure',
-  );
-  assert.equal(cacheExpiryInputUsage(returned.request).usage.input, 2_000);
 });
 
 // ## Recording the same request twice
@@ -1798,49 +1790,6 @@ const priced = (over: Partial<ProjectUsageBucket> = {}): ProjectUsageBucket => (
 
 const pricer = (bucket: ProjectUsageBucket) => publicProjectSpendPrice(bucket);
 
-test('the attributed figure prices the cold input alone and calls a reported row unknown', () => {
-  const warm: CacheExpiryFacts = {
-    counts: { '5m': 0, '30m': 1, '1h': 0 },
-    returns: [{ lifetime: '30m', gapMs: 31 * MINUTE, request: priced(), visibleTurnId: 'b', previousInputSide: 0 }],
-    truncated: false,
-    longestGapMs: 31 * MINUTE,
-    excluded: 0,
-    unavailable: 0,
-  };
-  const exact = cacheExpiryInputCost(warm, pricer);
-  assert.equal(exact.status, 'exact');
-  // One million input tokens of gpt-5.6-sol at its $4 rate. The cache read and the answer
-  // beside them are observed and never attributed to the expiry.
-  assert.equal(exact.dollars, 4);
-
-  const reported: CacheExpiryFacts = {
-    ...warm,
-    returns: [
-      {
-        lifetime: '30m',
-        gapMs: 31 * MINUTE,
-        request: priced({ reportedCost: 9 }),
-        visibleTurnId: 'b',
-        previousInputSide: 0,
-      },
-    ],
-  };
-  assert.deepEqual(cacheExpiryInputCost(reported, pricer), { dollars: null, status: 'unknown' });
-
-  const truncated: CacheExpiryFacts = { ...warm, truncated: true, counts: { '5m': 0, '30m': 40, '1h': 0 } };
-  assert.deepEqual(cacheExpiryInputCost(truncated, pricer), { dollars: 4, status: 'atLeast' });
-
-  const none: CacheExpiryFacts = {
-    counts: { '5m': 0, '30m': 0, '1h': 0 },
-    returns: [],
-    truncated: false,
-    longestGapMs: null,
-    excluded: 0,
-    unavailable: 0,
-  };
-  assert.deepEqual(cacheExpiryInputCost(none, pricer), { dollars: 0, status: 'exact' });
-});
-
 // ## Bounded storage
 
 test('the retained return list stops growing while its counts stay exact', () => {
@@ -2268,7 +2217,7 @@ test('a child response rewritten after a compaction keeps that compaction in the
   );
 });
 
-// ## Added cost and the compaction a return is measured from
+// ## Cost added and the compaction a return is measured from
 
 const claudeBucket = (usage: Partial<ProjectUsageBucket['usage']>, over: Partial<ProjectUsageBucket> = {}) =>
   priced({
@@ -2292,6 +2241,7 @@ const expiryReturn = (request: ProjectUsageBucket, previousInputSide: number | n
   gapMs: 60 * MINUTE,
   request,
   visibleTurnId: 'claude-turn:2',
+  requestKey: 'claude:m2',
   previousInputSide,
 });
 
@@ -2308,7 +2258,7 @@ const expiryFactsOf = (
   ...over,
 });
 
-test('the added cost counts only the context a warm cache would have read', () => {
+test('Cost added counts only the context a warm cache would have read', () => {
   const close = (actual: number | null, expected: number) =>
     assert.ok(actual !== null && Math.abs(actual - expected) < 1e-9, `${actual} is ${expected}`);
   const write5m = perToken('cacheWrite5m');
@@ -2350,7 +2300,7 @@ test('the added cost counts only the context a warm cache would have read', () =
   close(cacheExpiryExtraCost(expiryFactsOf([expiryReturn(uncached, 30_000)]), pricer).dollars, 30_000 * (input - read));
 });
 
-test('the added cost says at least, or unavailable, on the same rules as the input cost', () => {
+test('Cost added says at least, or unavailable, when a return cannot be priced', () => {
   const resent = claudeBucket({ cacheWrite5m: 100_000 });
   const exact = cacheExpiryExtraCost(expiryFactsOf([expiryReturn(resent, 100_000)]), pricer);
   assert.equal(exact.status, 'exact');
@@ -2603,7 +2553,8 @@ test('a saved return without the cost-added fields keeps a deleted source and le
   );
   const [returned] = record.cacheExpiry!.facts.returns;
   assert.equal(returned.previousInputSide, 4_100);
-  const { visibleTurnId: _turn, previousInputSide: _side, ...older } = returned;
+  assert.equal(returned.requestKey, 'claude:m2', 'the return names its request, which a Claude card matches');
+  const { visibleTurnId: _turn, requestKey: _key, previousInputSide: _side, ...older } = returned;
   // A source deleted since an older parser generation saved it is never read again, so its
   // saved record is the only copy of its spend.
   const deleted: SpendFileIndex = {
@@ -2623,6 +2574,7 @@ test('a saved return without the cost-added fields keeps a deleted source and le
   assert.deepEqual(loaded.buckets, record.buckets);
   assert.deepEqual(facts(loaded).counts, facts(record).counts);
   assert.equal(facts(loaded).returns[0].visibleTurnId, null);
+  assert.equal(facts(loaded).returns[0].requestKey, null);
   assert.equal(facts(loaded).returns[0].previousInputSide, null);
   assert.deepEqual(cacheExpiryExtraCost(facts(loaded), pricer), { dollars: null, status: 'unknown' });
 });

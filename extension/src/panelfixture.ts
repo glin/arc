@@ -22,15 +22,17 @@ import type {
 import {
   CACHE_EXPIRY_COST_ADDED_HINT,
   nextTurnBasisOf,
+  sessionCacheExpiryStats,
   sessionCostProjection,
   sessionStats,
   sessionTurnStats,
   toCompactionCard,
+  turnCacheExpiryWarning,
   type ActivityRow,
   type SessionStatChip,
   type TurnStatus,
 } from './turncard.ts';
-import type { ProjectSpendView } from './projectspend.ts';
+import type { CacheExpiryFacts, ProjectSpendView } from './projectspend.ts';
 import type { CompleteSetupValues, PinnedSetup } from './domain/session-setups.ts';
 import type { Ask, PermissionAsk, QuestionAsk } from './agentwire.ts';
 import { usageBar } from './usageview.ts';
@@ -1352,6 +1354,120 @@ export function renderPayload(
         },
       ),
     },
+  };
+}
+
+// A Claude session with estimated compactions and cache expiries, and a turn that returned to an
+// expired cache. The session cost popover names both overheads, and the turn warns on its figure.
+// A Claude turn opened by a return to an expired cache, with the session facts that hold the return.
+export function cacheExpiryReturnTurn(): { turn: Turn; expiry: CacheExpiryFacts } {
+  const { turn, expiry } = costOverheadsParts();
+  return { turn, expiry };
+}
+
+function costOverheadsParts() {
+  const usage = (over: Partial<Turn['usage']>): Turn['usage'] => ({
+    requests: 1,
+    input: 0,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheWrite30m: 0,
+    cacheRead: 0,
+    output: 0,
+    thinking: 0,
+    ...over,
+  });
+  const part = {
+    model: 'claude-opus-5-5',
+    provider: null,
+    contextWindow: null,
+    contextBand: null,
+    inferenceClass: null,
+    serviceTier: null,
+  };
+  const returned = usage({ requests: 1, input: 6_000, cacheWrite1h: 182_000, output: 1_600 });
+  const expiry: CacheExpiryFacts = {
+    counts: { '5m': 0, '30m': 0, '1h': 4 },
+    longestGapMs: 5 * 60 * 60 * 1000,
+    returns: [
+      {
+        lifetime: '1h',
+        gapMs: 72 * 60 * 1000,
+        request: {
+          localDate: '2026-10-09',
+          agent: 'claude',
+          ...part,
+          billingClass: 'metered',
+          reportedCost: null,
+          usage: returned,
+          requests: 1,
+        },
+        visibleTurnId: 'claude-turn:9',
+        requestKey: 'claude:msg-return',
+        previousInputSide: 180_000,
+      },
+    ],
+    excluded: 0,
+    unavailable: 0,
+    truncated: true,
+  };
+  const turn: Turn = {
+    ...FIXTURE_TURNS[1],
+    agent: 'claude',
+    model: part.model,
+    provider: null,
+    sessionTitle: 'Cost overheads',
+    contextWindow: null,
+    usage: returned,
+    usageParts: [{ ...part, usage: returned }],
+    responseIds: ['msg-return'],
+    openingResponseId: 'msg-return',
+    agents: [],
+    files: [],
+  };
+  return { usage, part, turn, expiry };
+}
+
+export function costOverheadsPayload(): Record<string, unknown> {
+  const payload = renderPayload();
+  const { usage, part, turn, expiry } = costOverheadsParts();
+  const session = usage({
+    requests: 410,
+    input: 1_900_000,
+    cacheWrite1h: 1_800_000,
+    cacheRead: 24_000_000,
+    output: 620_000,
+  });
+  const compactions = usage({ requests: 3, input: 160_000, cacheRead: 300_000, output: 36_000 });
+  const stats = {
+    s1: [
+      ...sessionCostProjection(
+        [
+          { agent: 'claude', role: 'main', ...part, usage: session },
+          { agent: 'claude', role: 'main', ...part, compactionEstimate: true, usage: compactions },
+        ],
+        false,
+        { compactionCount: 3, expiry },
+      ).stats,
+      ...sessionTurnStats({ turnCount: 22, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 3 }),
+      ...sessionCacheExpiryStats(expiry),
+    ],
+  };
+  const sessions = (payload.sessions as Parameters<typeof railSessions>[0])
+    .filter((session) => session.id === 's1')
+    .map((session) => ({ ...session, label: turn.sessionTitle!, agent: 'Claude', agentKey: 'claude' }));
+  return {
+    ...payload,
+    sessions,
+    stats,
+    views: [],
+    cards: [
+      {
+        ...toCard(turn, false, NOW, [], null, false, new Set(), [], turnCacheExpiryWarning(turn, expiry)),
+        summaryHtml: '<p>Resumed after lunch.</p>',
+      },
+    ],
+    rail: railSessions(sessions, new Map(), new Map(), new Map(), new Set(), 's1', new Set(), new Map(), stats, {}),
   };
 }
 

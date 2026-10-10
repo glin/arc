@@ -38,6 +38,7 @@ import {
   launcherPinsPayload,
   compactionSummaryPayload,
   cacheWriteWarningPayload,
+  costOverheadsPayload,
   nextTurnPayload,
   pageHtml,
   renderPayload,
@@ -91,6 +92,7 @@ export interface Shot {
   activity?: 'messages' | 'empty' | 'all' | 'breakdown';
   compactionSummary?: 'collapsed' | 'expanded';
   cacheWriteWarning?: boolean;
+  costOverheads?: boolean;
   composerSkill?: boolean;
   raisedComposer?: boolean;
   launcherPins?: number | 'unavailable'; // Pinned setups for the New session menu fixture, beside ten recent setups.
@@ -627,6 +629,25 @@ export const SHOTS: Shot[] = [
     click: '.sessionstats [data-metric="cost"]',
   },
   { name: 'rail-cache-write-warning', width: 1350, railWidth: RAIL_WIDTH_MIN, escape: true, cacheWriteWarning: true },
+  ...[1350, 340].flatMap((width) => {
+    const size = width === 1350 ? 'wide' : 'narrow';
+    return [
+      {
+        name: `${size}-cost-overheads-session`,
+        width,
+        escape: true,
+        costOverheads: true,
+        click: '.sessionstats [data-metric="cost"]',
+      },
+      {
+        name: `${size}-cost-overheads-turn`,
+        width,
+        escape: true,
+        costOverheads: true,
+        click: '.chips [data-metric="cost"]',
+      },
+    ];
+  }),
 ];
 
 // Session list status fixtures include waiting, running, running subagents, and failed sessions.
@@ -1085,18 +1106,24 @@ export async function shoot(
       await page.evaluate(SETTLED);
     }
   }
-  if (shot.cacheWriteWarning) {
-    // Clear any visible session list query from the preceding capture.
-    if (await page.locator('.railfilter').count()) {
-      await page
-        .locator('.railfilter')
-        .first()
-        .evaluate((node) => {
-          (node as HTMLInputElement).value = '';
-          node.dispatchEvent(new Event('input', { bubbles: true }));
-        });
+  if (shot.cacheWriteWarning || shot.costOverheads) {
+    // Clear the session list query a preceding capture left, open or closed, so the list draws
+    // the fixture's session. The clear control also closes the box.
+    if (await page.locator('[data-control="railsearch"]').isVisible()) {
+      await page.locator('[data-control="railsearch"]').click();
+      await page.evaluate(SETTLED);
     }
+    if (await page.locator('[data-control="railclear"]').isVisible()) {
+      await page.locator('[data-control="railclear"]').click();
+      await page.evaluate(SETTLED);
+    }
+  }
+  if (shot.cacheWriteWarning) {
     await page.evaluate(`window.postMessage(${JSON.stringify(cacheWriteWarningPayload())}, '*')`);
+    await page.evaluate(SETTLED);
+  }
+  if (shot.costOverheads) {
+    await page.evaluate(`window.postMessage(${JSON.stringify(costOverheadsPayload())}, '*')`);
     await page.evaluate(SETTLED);
   }
   if (shot.composerSkill) {

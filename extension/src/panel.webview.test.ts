@@ -1142,6 +1142,7 @@ import {
   FIXTURE_TURNS,
   LIGHT_MODERN_THEME,
   NOW,
+  cacheExpiryReturnTurn,
 } from './panelfixture.ts';
 import { launcherCustomRequest, newSessionKeyshortcut, newSessionName } from './view/launcher.ts';
 import {
@@ -5384,6 +5385,7 @@ test('the host payload keeps dispatched artifacts on the child card', () => {
     turnsByKey: new Map(),
     dispatchedCostsForTurn: (PanelProvider.prototype as any).dispatchedCostsForTurn,
     dispatchedDiscoveryWaiting: (PanelProvider.prototype as any).dispatchedDiscoveryWaiting,
+    cardCacheExpiryWarning: () => null,
     projectSpendHydrated: true,
     dispatchedTurnCosts: () => ({}),
     repositoryCommits: { apply() {} },
@@ -24875,7 +24877,13 @@ test.each(['subagents', 'background', 'waiting'] as const)(
           },
         ],
         // Supply empty lifetime figures to isolate running-state projection.
-        lifetimeFiguresBySession: () => ({ stats: {}, contextDetails: {}, costs: {}, dispatched: {} }),
+        lifetimeFiguresBySession: () => ({
+          stats: {},
+          contextDetails: {},
+          costs: {},
+          cacheExpiryFacts: {},
+          dispatched: {},
+        }),
         railRows: () => [],
         windows: new Map(),
         parsedRailCaches: {},
@@ -28753,4 +28761,48 @@ test('saved session headings offer Export last and route their saved identity th
     /public exportSession\(session: string\): Promise<void> \{\s*session = this\.panelSession\(session\);\s*const sources = this\.catalog\?\.sessions \?\? \[\];\s*const source = savedExportSource\(session, sources\);/,
     'the export command no longer resolves its exact saved source',
   );
+});
+
+// A ledger change that gives a drawn Claude card its cache-expiry return redraws that card with
+// the warning, and the redraw still counts the turn's dispatched sessions.
+test('a drawn Claude card redraws with its cache-expiry warning when the session facts change', () => {
+  const { turn, expiry } = cacheExpiryReturnTurn();
+  let facts: Record<string, unknown> = {};
+  const dispatched = { [turn.sessionId]: {} };
+  const seen: unknown[] = [];
+  type Sent = {
+    cards: { chips: { metric?: string; detailList?: { entries: { label: string; warning?: boolean }[] } }[] }[];
+  };
+  const sent: Sent[] = [];
+  const host = Object.assign(Object.create(PanelProvider.prototype), {
+    live: {},
+    liveActivity: {},
+    turnsByKey: new Map([[turnKey(turn), turn]]),
+    newestBySession: new Map(),
+    sessionNames: new SessionNames(),
+    hosts: [{ webview: {} }],
+    projectSpendHydrated: true,
+    lifetimeFiguresBySession: () => ({ cacheExpiryFacts: facts }),
+    dispatchedTurnCosts: () => dispatched,
+    dispatchedCostsForTurn: (_turn: unknown, costs: () => unknown) => {
+      seen.push(costs());
+      return [];
+    },
+    folders: () => [],
+    runningSessions: () => new Set(),
+    liveOpenChildren: () => new Map(),
+    railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
+    themedFor: (cards: unknown[]) => cards,
+    sendToHost: (_host: unknown, message: Sent) => sent.push(message),
+  });
+  host.cards = [{ ...host.renderTurnCard(turn, false, 'Cost overheads', NOW), kind: 'turn', key: turnKey(turn) }];
+  host.postDispatchedCostsIfMoved();
+  assert.equal(sent.length, 0, 'a card whose warning did not move redrew');
+  facts = { [turn.sessionId]: expiry };
+  seen.length = 0;
+  host.postDispatchedCostsIfMoved();
+  const cost = sent[0]?.cards[0]?.chips.find((chip) => chip.metric === 'cost');
+  assert.match(cost?.detailList?.entries[0]?.label ?? '', /^Cache expired after a 1h 12m gap and added \$\d+\.\d\d$/);
+  assert.equal(cost?.detailList?.entries[0]?.warning, true);
+  assert.ok(seen.includes(dispatched), 'the redraw drew the card without its dispatched costs');
 });

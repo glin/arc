@@ -42,6 +42,8 @@ interface DetailHead {
   lines?: DetailLine[];
   separateBefore?: boolean;
   warning?: boolean;
+  // Draw the label as a muted group heading with no bullet.
+  group?: boolean;
   // Turn the label into a button when the list declares actions.
   nameAction?: DetailNameAction;
 }
@@ -561,6 +563,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           const item = el('li', 'chippopitem');
           if (entry.separateBefore) {
             item.classList.add('is-separated');
+          }
+          if (entry.group) {
+            item.classList.add('is-group');
           }
           const head = detailHead(entry, 'chippopitemhead', withActions);
           item.appendChild(head);

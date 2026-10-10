@@ -466,7 +466,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 49;
+export const PROJECT_SPEND_PARSER_GENERATION = 50;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -949,6 +949,9 @@ export interface CacheExpiryReturn {
   request: ProjectUsageBucket;
   // The visible turn the return request opened, or null where a saved return does not name it.
   visibleTurnId: string | null;
+  // The return request's key, which a Claude card matches against its turn's response ids, or
+  // null where a saved return does not name it.
+  requestKey: string | null;
   // The input-side tokens a warm cache could have held for the return: the previous request's
   // uncached input, cache reads, and cache writes. A return measured from a compaction holds the
   // cached prefix the compaction left instead. Null where no record establishes that size, or
@@ -1436,6 +1439,7 @@ export class CacheExpiryScan {
       gapMs: verdict.gapMs,
       request: requestBucket(event),
       visibleTurnId: next.visibleTurnId!,
+      requestKey: event.requestKey,
       previousInputSide: previous.compaction ? previous.compaction.prefixTokens : previous.inputTokens,
     });
     this.newestReturnKey = event.requestKey;
@@ -1489,53 +1493,9 @@ export class CacheExpiryScan {
   }
 }
 
-// Input cost after cache expiry includes uncached input and cache writes.
-// Exclude cache reads, output, and thinking.
-export function cacheExpiryInputUsage(request: ProjectUsageBucket): ProjectUsageBucket {
-  return {
-    ...request,
-    usage: {
-      requests: 1,
-      input: request.usage.input,
-      cacheWrite1h: request.usage.cacheWrite1h,
-      cacheWrite5m: request.usage.cacheWrite5m,
-      cacheWrite30m: request.usage.cacheWrite30m ?? 0,
-      cacheRead: 0,
-      output: 0,
-      thinking: 0,
-    },
-  };
-}
-
-export interface CacheExpiryInputCost {
+export interface CacheExpiryCost {
   dollars: number | null;
   status: 'exact' | 'atLeast' | 'unknown';
-}
-
-// Price the input usage of recorded cache-expiry returns.
-// Incomplete requests, reported whole-request costs, missing prices, and truncated facts make the result partial.
-// Return an unknown cost when no request can be priced, unless the complete return list is empty.
-export function cacheExpiryInputCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryInputCost {
-  let dollars = 0;
-  let priced = 0;
-  let partial = facts.truncated;
-  for (const item of facts.returns) {
-    if (item.request.incomplete || item.request.reportedCost !== null) {
-      partial = true;
-      continue;
-    }
-    const price = pricer(cacheExpiryInputUsage(item.request));
-    if (!price) {
-      partial = true;
-      continue;
-    }
-    dollars += price.dollars;
-    priced++;
-  }
-  if (priced === 0) {
-    return partial || facts.returns.length > 0 ? { dollars: null, status: 'unknown' } : { dollars: 0, status: 'exact' };
-  }
-  return { dollars, status: partial ? 'atLeast' : 'exact' };
 }
 
 // The tokens a return paid to resend context a warm cache could have held, at the rates they
@@ -1563,10 +1523,12 @@ export function cacheExpiryRebuiltUsage(
   };
 }
 
-// Price what recorded cache-expiry returns paid beyond a cache read of the same tokens. The
-// status rules match `cacheExpiryInputCost`. A return with no known reusable size is also
-// unpriced, which a return measured from a compaction with no recorded prefix leaves.
-export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryInputCost {
+// Price what recorded cache-expiry returns paid beyond a cache read of the same tokens.
+// Truncated facts, incomplete requests, reported whole-request costs, missing prices, and a return
+// with no known reusable size make the result a lower bound. A return measured from a compaction
+// with no recorded prefix has no reusable size. The result is unknown when no return is priced,
+// unless the complete return list is empty.
+export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryCost {
   let dollars = 0;
   let priced = 0;
   let partial = facts.truncated;

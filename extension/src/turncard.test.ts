@@ -66,6 +66,9 @@ import {
   sessionCompactionContextDetail,
   sessionCostProjection,
   sessionCostStats,
+  turnCacheExpiryReturn,
+  cacheExpiryWarningText,
+  CACHE_EXPIRY_SIGN_DOLLARS,
   sessionStats,
   sessionStatsFromFacts,
   saidMessagesOf,
@@ -93,7 +96,7 @@ import {
   withoutLeadingSymbol,
 } from './turncard.ts';
 import { turnMenuContext } from './view/card-menu.ts';
-import type { StatDetailLine, TurnCard } from './turncard.ts';
+import type { SessionCostUsage, SessionOverheads, StatDetailLine, TurnCard } from './turncard.ts';
 import type { TurnStep } from './transcript.ts';
 import { answerPart, commentAnchorText } from './turncomments.ts';
 import { formatWhen } from './turnformat.ts';
@@ -362,6 +365,7 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
         gapMs: 31 * 60 * 1000,
         request: economicRequest(),
         visibleTurnId: 'turn-b',
+        requestKey: null,
         previousInputSide: 100_000,
       },
     ],
@@ -390,6 +394,7 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
         gapMs: 61 * 60 * 1000,
         request: economicRequest({ reportedCost: 4.1 }),
         visibleTurnId: 'turn-c',
+        requestKey: null,
         previousInputSide: 100_000,
       },
     ],
@@ -407,7 +412,247 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
   assert.deepEqual(unknownPrefix.detailList?.footer, [
     'One or more affected requests follow a compaction whose cached size is not recorded. Cost added is not available for them.',
   ]);
+  // A return saved by an older ledger names neither its turn nor its reusable size, and no compaction.
+  const olderSaved = sessionCacheExpiryStats({
+    ...exact,
+    returns: [{ ...exact.returns[0], visibleTurnId: null, requestKey: null, previousInputSide: null }],
+  })[0];
+  assert.match(olderSaved.detail, /Cost added: Unavailable/);
+  assert.deepEqual(olderSaved.detailList?.footer, [
+    'One or more affected requests were recorded before Arc measured cost added. Cost added is not available for them.',
+  ]);
   assert.ok(!lower.detail.includes('recommend'));
+});
+
+const tokenUsage = (over: Partial<Turn['usage']> = {}): Turn['usage'] => ({
+  requests: 1,
+  input: 0,
+  cacheWrite1h: 0,
+  cacheWrite5m: 0,
+  cacheWrite30m: 0,
+  cacheRead: 0,
+  output: 0,
+  thinking: 0,
+  ...over,
+});
+
+const sonnetPart = {
+  agent: 'claude' as const,
+  role: 'main' as const,
+  model: 'claude-sonnet-5',
+  provider: null,
+  contextWindow: null,
+  contextBand: null,
+  inferenceClass: null,
+  serviceTier: null,
+};
+
+const oneExpiry = (over: Partial<CacheExpiryFacts> = {}): CacheExpiryFacts => ({
+  counts: { '5m': 0, '30m': 0, '1h': 1 },
+  longestGapMs: 72 * 60 * 1000,
+  returns: [
+    {
+      lifetime: '1h',
+      gapMs: 72 * 60 * 1000,
+      request: economicRequest(),
+      visibleTurnId: 'codex-turn:turn-b',
+      requestKey: 'codex:turn-b:1',
+      previousInputSide: 100_000,
+    },
+  ],
+  excluded: 0,
+  unavailable: 0,
+  truncated: false,
+  ...over,
+});
+
+test('the session cost popover names compactions and cache expiries under Included above', () => {
+  const parts = [
+    { ...sonnetPart, usage: tokenUsage({ requests: 20, input: 50_000, cacheRead: 2_000_000, output: 40_000 }) },
+    {
+      ...sonnetPart,
+      compactionEstimate: true as const,
+      usage: tokenUsage({ requests: 3, cacheRead: 600_000, output: 30_000 }),
+    },
+  ];
+  const expiry = oneExpiry();
+  const list = sessionCostProjection(parts, false, { compactionCount: 3, expiry }).stats[0].detailList!;
+  const group = list.entries.slice(-3);
+  assert.deepEqual(
+    group.map((entry) => entry.label),
+    ['Included above', '3 compactions', '1 cache expiry'],
+  );
+  assert.deepEqual(group[0], { label: 'Included above', group: true, separateBefore: true });
+  // The value column holds plain money, and every estimated compaction is priced.
+  assert.match(String(group[1].value), /^\$\d+\.\d\d$/);
+  // The row and the heading cache-expiry figure read one source.
+  const heading = sessionCacheExpiryStats(expiry)[0].detailList!.entries.find((entry) => entry.label === 'Cost added');
+  assert.equal(group[2].value, heading?.value);
+  assert.equal(group[2].valueTitle, CACHE_EXPIRY_COST_ADDED_HINT);
+  assert.equal(list.footer?.[0], 'Compaction costs are estimates. Claude Code records no usage for a compaction.');
+  assert.ok(
+    list.notes?.includes(
+      "A cache expiry's cost is what resending the context cost above a cache read of the same tokens.",
+    ),
+  );
+  // Without the counts there is no group, and the estimate note keeps its count and dollars.
+  const bare = sessionCostProjection(parts).stats[0].detailList!;
+  assert.ok(!bare.entries.some((entry) => entry.group));
+  assert.match(bare.footer?.[0] ?? '', /^Includes an estimated \$\d+\.\d\d for 3 compactions\./);
+});
+
+test('beside a compactions row the session popover keeps the delegated compaction estimate', () => {
+  const main = {
+    ...sonnetPart,
+    usage: tokenUsage({ requests: 20, input: 50_000, cacheRead: 2_000_000, output: 40_000 }),
+  };
+  const delegatedEstimate = {
+    ...sonnetPart,
+    role: 'delegated' as const,
+    scopeId: 'agent-1',
+    compactionEstimate: true as const,
+    usage: tokenUsage({ requests: 2, cacheRead: 400_000, output: 20_000 }),
+  };
+  const footer = (parts: SessionCostUsage[]) =>
+    sessionCostProjection(parts, false, { compactionCount: 1 }).stats[0].detailList!.footer ?? [];
+  // The main compaction has no estimate, so only the delegated amount and its count show.
+  const delegatedOnly = footer([main, delegatedEstimate]);
+  assert.ok(!delegatedOnly.includes('Compaction costs are estimates. Claude Code records no usage for a compaction.'));
+  assert.ok(delegatedOnly.some((line) => /^Includes an estimated \$\d+\.\d\d for 2 compactions\./.test(line)));
+  const both = footer([
+    main,
+    {
+      ...sonnetPart,
+      compactionEstimate: true as const,
+      usage: tokenUsage({ requests: 1, cacheRead: 300_000, output: 10_000 }),
+    },
+    delegatedEstimate,
+  ]);
+  assert.equal(both[0], 'Compaction costs are estimates. Claude Code records no usage for a compaction.');
+  assert.match(both[1] ?? '', /^Includes an estimated \$\d+\.\d\d for 2 compactions\./);
+});
+
+test('a session row prices only the compactions its total contains', () => {
+  const codex = {
+    agent: 'codex' as const,
+    role: 'main' as const,
+    model: 'gpt-5.6-sol',
+    provider: 'openai',
+    contextWindow: 272_000,
+    contextBand: 'short' as const,
+    inferenceClass: null,
+    serviceTier: null,
+  };
+  // Retained Codex facts carry recorded usage that the total does not hold.
+  const facts = Array.from({ length: 16 }, (_, index) =>
+    compactionFact({
+      ordinal: index + 5,
+      trigger: 'auto',
+      requestUsage: tokenUsage({ input: 100_000, output: 4_000 }),
+      requestModel: 'gpt-5.6-sol',
+      requestProvider: 'openai',
+      requestContextWindow: 272_000,
+    }),
+  );
+  const codexUsage = { ...codex, usage: tokenUsage({ requests: 40, input: 900_000, output: 50_000 }) };
+  const list = sessionCostProjection([codexUsage], false, {
+    compactionCount: 20,
+    compactions: facts,
+  } as SessionOverheads).stats[0].detailList!;
+  assert.equal(list.entries.find((entry) => entry.label === '20 compactions')?.value, 'cost unavailable');
+  assert.ok(!(list.footer ?? []).some((line) => line.includes('estimate')));
+  // Claude estimates are in the total, so they price the row, and the unpriced rest makes it a lower bound.
+  const mixed = sessionCostProjection(
+    [
+      codexUsage,
+      {
+        ...sonnetPart,
+        compactionEstimate: true as const,
+        usage: tokenUsage({ requests: 1, cacheRead: 300_000, output: 10_000 }),
+      },
+    ],
+    false,
+    { compactionCount: 3 },
+  ).stats[0].detailList!;
+  assert.match(String(mixed.entries.find((entry) => entry.label === '3 compactions')?.value), /^\$\d+\.\d\d\+$/);
+});
+
+test('a turn card finds the cache-expiry return that opened it', () => {
+  const claudeReturn = { ...oneExpiry().returns[0], request: economicRequest({ agent: 'claude' }) };
+  const claude = turn({ agent: 'claude', responseIds: ['m1', 'm2'] });
+  assert.equal(turnCacheExpiryReturn(claude, [{ ...claudeReturn, requestKey: 'claude:m1' }])?.requestKey, 'claude:m1');
+  assert.equal(turnCacheExpiryReturn(claude, [{ ...claudeReturn, requestKey: 'claude:m9' }]), null);
+  // A saved return without a request key never matches a Claude turn.
+  assert.equal(turnCacheExpiryReturn(claude, [{ ...claudeReturn, requestKey: null }]), null);
+  const codex = turn({ agent: 'codex', promptId: 'turn-b' });
+  assert.equal(turnCacheExpiryReturn(codex, oneExpiry().returns)?.visibleTurnId, 'codex-turn:turn-b');
+  assert.equal(turnCacheExpiryReturn(turn({ agent: 'codex', promptId: 'turn-c' }), oneExpiry().returns), null);
+});
+
+test('a turn that returned to an expired cache warns in its cost popover and signs its figure from $1', () => {
+  const usage = tokenUsage({ requests: 2, input: 40_000, cacheWrite1h: 300_000, output: 2_000 });
+  const ran = turn({
+    model: 'claude-sonnet-5',
+    usage,
+    usageParts: [{ ...sonnetPart, usage }],
+  });
+  const cost = (dollars: number | null) =>
+    toCard(ran, false, NOW, [], null, false, new Set(), [], {
+      scope: 'cache-expiry',
+      gapMs: 72 * 60 * 1000,
+      dollars,
+    }).chips.find((chip) => chip.metric === 'cost')!;
+  const signed = cost(2.34);
+  const sentence = 'Cache expired after a 1h 12m gap and added $2.34';
+  assert.deepEqual(signed.detailList?.entries[0], { label: sentence, warning: true });
+  assert.deepEqual(
+    signed.warnings?.map((warning) => warning.scope),
+    ['cache-expiry'],
+  );
+  assert.ok(signed.name?.includes(sentence), 'the accessible name carries the full sentence');
+  const atLimit = cost(CACHE_EXPIRY_SIGN_DOLLARS);
+  assert.equal(atLimit.warnings?.length, 1);
+  const small = cost(0.5);
+  assert.equal(small.detailList?.entries[0].label, 'Cache expired after a 1h 12m gap and added $0.50');
+  assert.equal(small.warnings, undefined, 'below $1 the figure carries no sign');
+  assert.equal(cost(null).detailList?.entries[0].label, 'Cache expired after a 1h 12m gap');
+  assert.ok(
+    !toCard(ran, false, NOW)
+      .chips.find((chip) => chip.metric === 'cost')
+      ?.detail.includes('Cache expired'),
+  );
+  const gap = (minutes: number) =>
+    cacheExpiryWarningText({ scope: 'cache-expiry', gapMs: minutes * 60 * 1000, dollars: null });
+  assert.equal(gap(8 * 60), 'Cache expired after an 8h 0m gap');
+  assert.equal(gap(11), 'Cache expired after an 11m gap');
+  assert.equal(gap(18 * 60), 'Cache expired after an 18h 0m gap');
+  assert.equal(gap(61), 'Cache expired after a 1h 1m gap');
+});
+
+test('a turn that holds a compaction names it under Included above', () => {
+  const plain = tokenUsage({ requests: 4, input: 20_000, cacheRead: 400_000, output: 3_000 });
+  const estimated = tokenUsage({ requests: 1, cacheRead: 300_000, output: 12_000 });
+  const ran = turn({
+    model: 'claude-sonnet-5',
+    usage: tokenUsage({ requests: 5, input: 20_000, cacheRead: 700_000, output: 15_000 }),
+    usageParts: [
+      { ...sonnetPart, usage: plain },
+      { ...sonnetPart, compactionEstimate: true, usage: estimated },
+    ],
+  });
+  const list = toCard(ran, false, NOW).chips.find((chip) => chip.metric === 'cost')!.detailList!;
+  assert.deepEqual(
+    list.entries.slice(-2).map((entry) => entry.label),
+    ['Included above', '1 compaction'],
+  );
+  assert.match(String(list.entries.at(-1)?.value), /^\$\d+\.\d\d$/);
+  assert.deepEqual(list.footer, ['Compaction costs are estimates. Claude Code records no usage for a compaction.']);
+  const none = toCard(
+    turn({ model: 'claude-sonnet-5', usage: plain, usageParts: [{ ...sonnetPart, usage: plain }] }),
+    false,
+    NOW,
+  );
+  assert.ok(!none.chips.find((chip) => chip.metric === 'cost')?.detailList?.entries.some((entry) => entry.group));
 });
 
 // Cache-expiry counts are lower bounds when any adjacent pair remains unavailable.
@@ -449,12 +694,13 @@ test('latest compaction selection keeps a null timestamp on the greatest ordinal
   assert.deepEqual(detail, { entries: [{ label: 'Latest compaction', value: 'Manual' }] });
 });
 
-test('latest compaction maps supported triggers and collapses every other value to unknown', () => {
+test('latest compaction shows a trigger Arc does not know as its recorded word', () => {
   const value = (trigger: string | null) =>
     sessionCompactionContextDetail([compactionFact({ trigger })])?.entries[0].value;
   assert.equal(value('manual'), 'Manual');
   assert.equal(value('auto'), 'Automatic');
-  assert.equal(value('scheduled'), 'Unknown');
+  assert.equal(value('refusal'), 'After a refusal');
+  assert.equal(value('scheduled'), 'Scheduled');
   assert.equal(value(''), 'Unknown');
   assert.equal(value(null), 'Unknown');
 });
@@ -990,7 +1236,9 @@ test('an inexact linked invocation does not suppress a complete direct child war
     NOW,
   );
   assert.deepEqual(
-    card.chips.find((chip) => chip.metric === 'cost')?.warnings?.map((warning) => warning.id),
+    card.chips
+      .find((chip) => chip.metric === 'cost')
+      ?.warnings?.map((warning) => ('id' in warning ? warning.id : undefined)),
     ['0:direct'],
   );
 });
@@ -6021,6 +6269,21 @@ test('a compaction says why it ran, what it cost and how long it took', () => {
   assert.deepEqual(
     foldedChips(card.chips).map((c) => c.label),
     ['$0.68', '615k dropped'],
+  );
+});
+
+test('a compaction card names a refusal trigger and any other recorded trigger', () => {
+  assert.equal(
+    toCompactionCard(compaction({ trigger: 'refusal' }), NOW).headline,
+    'Compacted after a refusal. 629k of session became a 14k summary.',
+  );
+  assert.equal(
+    toCompactionCard(compaction({ trigger: 'scheduled' }), NOW).headline,
+    'Compacted (Scheduled). 629k of session became a 14k summary.',
+  );
+  assert.equal(
+    toCompactionCard(compaction({ trigger: '' }), NOW).headline,
+    'Compacted. 629k of session became a 14k summary.',
   );
 });
 

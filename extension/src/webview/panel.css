@@ -4125,6 +4125,16 @@ button.cctx:hover {
   padding-top: 0.7em;
   border-top: 1px solid var(--edge);
 }
+/* A group heading inside the list, such as "Included above", names the rows under it. It reads
+   as a muted label rather than as another bulleted figure. */
+.chippop .chippopitem.is-group {
+  list-style: none;
+  padding-bottom: 0;
+}
+.chippop .chippopitem.is-group .chippoplabel {
+  font-weight: normal;
+  color: var(--idle);
+}
 .chippop.chippop-tools {
   width: max-content;
   max-width: min(320px, calc(100vw - 12px));

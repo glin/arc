@@ -3529,7 +3529,7 @@ test.each(['ordinary', 'warning', 'identity', 'review'] as const)(
         layout === 'warning' && !mainShort,
       );
       assert.equal(
-        (chip.warnings ?? []).some((warning) => warning.id?.endsWith('child')),
+        (chip.warnings ?? []).some((warning) => 'id' in warning && warning.id?.endsWith('child')),
         layout === 'warning' && !childShort,
       );
     }

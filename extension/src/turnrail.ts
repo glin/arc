@@ -173,6 +173,14 @@ export function hideSessions<T extends { sessionId: string }>(
   return sessions.filter((s) => !hidden.has(s.sessionId) || s.sessionId === pinned);
 }
 
+// A session figure carries cache-write warnings only. A cache-expiry warning belongs to a turn figure.
+function sessionWarningWords(warnings: SessionStatChip['warnings']): string {
+  const words = (warnings ?? []).flatMap((warning) =>
+    warning.scope === 'cache-expiry' ? [] : [cacheWriteWarningCondition(warning)],
+  );
+  return words.length ? `, ${words.join(', ')}` : '';
+}
+
 // Groups turns and compactions by session before preparing session statistics.
 // Callers must supply compactions so their counts cannot silently default to zero.
 export function statsBySession(turns: Turn[], compactions: Compaction[]): Record<string, SessionStatChip[]> {
@@ -1116,7 +1124,7 @@ export function railSessions(
     const cacheExpiryAtLeast = cacheExpiryCount !== null && cacheExpiryFact?.atLeast === true;
     const statNames = stats.map((stat) =>
       stat.metric === 'cost'
-        ? `whole session cost ${stat.compactLabel}${stat.partialDetail ? `, ${stat.partialDetail.replace(/\.$/, '')}` : ''}${stat.warnings?.length ? `, ${stat.warnings.map(cacheWriteWarningCondition).join(', ')}` : ''}`
+        ? `whole session cost ${stat.compactLabel}${stat.partialDetail ? `, ${stat.partialDetail.replace(/\.$/, '')}` : ''}${sessionWarningWords(stat.warnings)}`
         : stat.metric === 'turns'
           ? stat.compactLabel
           : `current context ${stat.compactLabel}`,
