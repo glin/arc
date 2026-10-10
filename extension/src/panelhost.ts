@@ -1898,7 +1898,7 @@ export class PanelProvider implements vscode.Disposable {
         action === 'label-add' ? [...held, ...labels!] : held.filter((name) => !keys.has(labelKey(name))),
       );
     } else {
-      await this.updateSessionMembership(action!, session);
+      await this.updateSessionMembership(action!, session!);
     }
     return {
       ...result,
@@ -6529,13 +6529,13 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private updateSessionMembership(
-    action: 'archive' | 'unarchive' | 'pin' | 'unpin' | 'unarchiveAll',
-    session?: string,
+    action: 'archive' | 'unarchive' | 'pin' | 'unpin',
+    session: string,
     openPinned = false,
   ): Promise<void> | void {
     const hidden = new Set(this.hidden);
     const pinnedTop = new Set(this.pinnedTop);
-    const target = session === undefined ? '' : this.panelSession(session);
+    const target = this.panelSession(session);
     if (action === 'archive') {
       hidden.add(target);
       pinnedTop.delete(target);
@@ -6545,15 +6545,12 @@ export class PanelProvider implements vscode.Disposable {
       pinnedTop.add(target);
     } else if (action === 'unpin') {
       pinnedTop.delete(target);
-    } else if (action === 'unarchiveAll') {
-      hidden.clear();
     }
     const same = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean =>
       left.size === right.size && [...left].every((session) => right.has(session));
     const hiddenChanged = !same(this.hidden, hidden);
     const pinnedChanged = !same(this.pinnedTop, pinnedTop);
     const pinnedFoldChanged = openPinned && !this.saved.railFolds[RAIL_FOLDS.top];
-    const targets = action === 'unarchiveAll' ? [...this.hidden] : [target];
     const writes = (this.membershipWrites ??= new Map());
     if (!hiddenChanged && !pinnedChanged && !pinnedFoldChanged && writes.has(target)) {
       return writes.get(target)?.persisted;
@@ -6561,7 +6558,7 @@ export class PanelProvider implements vscode.Disposable {
     const previousHidden = this.hidden;
     const previousPinned = this.pinnedTop;
     const write = { persisted: Promise.resolve() };
-    for (const session of targets) writes.set(session, write);
+    writes.set(target, write);
     this.hidden = hidden;
     this.pinnedTop = pinnedTop;
     this.saved.hidden = [...hidden];
@@ -6578,19 +6575,12 @@ export class PanelProvider implements vscode.Disposable {
     }
     return (write.persisted = persisted
       .catch((error) => {
-        let restored = false;
-        for (const session of targets) {
-          const current = this.panelSession(session);
-          if (writes.get(current) !== write) continue;
-          if (previousHidden.has(session)) this.hidden.add(current);
+        const current = this.panelSession(target);
+        if (writes.get(current) === write) {
+          if (previousHidden.has(target)) this.hidden.add(current);
           else this.hidden.delete(current);
-          if (action !== 'unarchiveAll') {
-            if (previousPinned.has(session)) this.pinnedTop.add(current);
-            else this.pinnedTop.delete(current);
-          }
-          restored = true;
-        }
-        if (restored) {
+          if (previousPinned.has(target)) this.pinnedTop.add(current);
+          else this.pinnedTop.delete(current);
           this.saved.hidden = [...this.hidden];
           this.saved.pinnedTop = [...this.pinnedTop];
           if (hiddenChanged) this.onArchivedSessionsChange?.(this.hidden);
@@ -6599,10 +6589,8 @@ export class PanelProvider implements vscode.Disposable {
         throw error;
       })
       .finally(() => {
-        for (const session of targets) {
-          const current = this.panelSession(session);
-          if (writes.get(current) === write) writes.delete(current);
-        }
+        const current = this.panelSession(target);
+        if (writes.get(current) === write) writes.delete(current);
       }));
   }
 
@@ -11627,11 +11615,7 @@ export class PanelProvider implements vscode.Disposable {
         // peer's update without replacing that peer's membership state with an older snapshot.
         sessionMembership: (msg) => {
           return Promise.resolve(
-            this.updateSessionMembership(
-              msg.action,
-              'session' in msg ? msg.session : undefined,
-              'openPinned' in msg && msg.openPinned === true,
-            ),
+            this.updateSessionMembership(msg.action, msg.session, 'openPinned' in msg && msg.openPinned === true),
           ).catch((error) => {
             void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
           });

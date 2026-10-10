@@ -38,7 +38,6 @@ import {
 } from './view/rail.ts';
 import { CACHE_LIFETIME_MS, CONSERVATIVE_CACHE_BOUNDARY_MS, cacheLifetimeFor, nextTurnFloor } from './pricing';
 export {
-  archivedNote,
   clampRailWidth,
   NEEDS_INPUT,
   railBuckets,

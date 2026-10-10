@@ -50,7 +50,6 @@ import {
 } from './protocol.ts';
 import { commentsFor } from '../view/comments.ts';
 import { CARD_GLYPHS, contextClass } from '../view/card-presentation.ts';
-import { archivedNote } from '../view/rail.ts';
 import { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES } from '../domain/prompt-assets.ts';
 import { CARD_ACTIONS } from '../view/card-words.ts';
 import type { SavedStateService } from './state.ts';
@@ -117,7 +116,6 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   let requestRenderer: ReturnType<typeof createRequestRenderer>;
   let composerPresentation: ReturnType<typeof createComposerPresentation>;
   let history: ReturnType<typeof createHistoryOwner>;
-  let railShown: boolean | undefined;
   let labelsFilterable: boolean | undefined;
   let latest: RenderMessage | null = null;
   const activityCardIndexes = new Map<string, number>();
@@ -182,10 +180,6 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     refreshContext: (session) => {
       timelineRenderer?.drawRowContext(session);
       railRenderer?.drawRowContext(session);
-    },
-    refreshContexts: (sessions) => {
-      timelineRenderer?.drawRowContexts(sessions);
-      railRenderer?.drawRowContexts(sessions);
     },
   });
   const open = sessionState.open;
@@ -595,19 +589,14 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       requestRenderer?.fitTabs();
     },
     onVisibilityChange(shown, filterable) {
-      const visibilityChanged = railShown !== shown;
       const labelsChanged = labelsFilterable !== filterable;
-      railShown = shown;
       labelsFilterable = filterable;
       if (chrome) {
         syncCompactControls(latest ? latest.sessions : [], latest ? latest.showing : null, shown);
       }
-      // Construction reports visibility before the heading and history owners exist.
-      if (timelineRenderer && history && (visibilityChanged || labelsChanged)) {
-        timelineRenderer.refreshHeadings(
-          undefined,
-          visibilityChanged ? history.footers(latest?.olderHistory ?? null) : undefined,
-        );
+      // Construction reports visibility before the heading owner exists.
+      if (timelineRenderer && labelsChanged) {
+        timelineRenderer.refreshHeadings();
       }
     },
     // Initial label-editor state arrives before the timeline owner exists.
@@ -978,10 +967,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     document,
     sendToHost: kernel.sendToHost,
     hidden: sessionState.hidden,
-    clearHidden: () => sessionState.clearHidden(),
-    railVisible: () => railRenderer.visible(),
     hiddenEmpty: ACTIONS.hiddenEmpty,
-    archivedNote,
     observe(_target, callback, init) {
       return typeof IntersectionObserver === 'function' ? new IntersectionObserver(callback, init) : null;
     },
@@ -1304,7 +1290,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           workspaceCatalogAvailable,
         );
         // Refresh timeline headings from the same labels and figures as the session list.
-        timelineRenderer.refreshHeadings(projected.stats, history.footers(latest?.olderHistory ?? null));
+        timelineRenderer.refreshHeadings(projected.stats);
         if (labeledBefore) {
           refreshLabeledCards(labeledBefore);
         }

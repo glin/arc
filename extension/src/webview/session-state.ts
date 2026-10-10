@@ -42,8 +42,6 @@ interface SessionStateOptions {
   promptFloor(): number | null;
   composerHidden(): boolean;
   refreshContext(session: string): void;
-  // Refresh contexts in a batch and draw each affected surface once.
-  refreshContexts(sessions: readonly string[]): void;
 }
 
 export interface PanelSessionState {
@@ -59,7 +57,6 @@ export interface PanelSessionState {
   hide(session: string): void;
   unarchive(session: string): void;
   setPinned(session: string, pinned: boolean, openPinned?: boolean): void;
-  clearHidden(): void;
   adopt(
     hidden: readonly string[],
     pinnedTop: readonly string[],
@@ -209,16 +206,6 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
           ? { type: 'sessionMembership', action: 'pin', session, ...(openPinned ? { openPinned: true } : {}) }
           : { type: 'sessionMembership', action: 'unpin', session },
       );
-    },
-    clearHidden() {
-      if (options.readOnly) return;
-      if (!hidden.size) {
-        return;
-      }
-      const shown = [...hidden];
-      hidden.clear();
-      options.refreshContexts(shown);
-      options.sendToHost({ type: 'sessionMembership', action: 'unarchiveAll' });
     },
     adopt(nextHidden, nextPinnedTop, nextShowing, adoptions = []) {
       const identities = new Map(adoptions.map(({ provisional, durable }) => [provisional, durable]));

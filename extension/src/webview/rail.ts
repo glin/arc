@@ -390,8 +390,6 @@ export interface RailRenderer {
   // Refresh one session's native menu context after a pin or archive change.
   // The timeline renderer exposes the same operation for session headings.
   drawRowContext(session: string): void;
-  // Refresh menu context for a session batch and redraw the list once.
-  drawRowContexts(sessions: readonly string[]): void;
 }
 
 interface FilterOffer {
@@ -3361,14 +3359,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       drawFilterPop();
     },
     drawRowContext(session) {
-      owner.drawRowContexts([session]);
-    },
-    drawRowContexts(sessions) {
-      const wanted = new Set(sessions);
-      // Refresh every occurrence of each requested session, including repeated saved-view rows.
+      // Refresh every occurrence of the session, including repeated saved-view rows.
       for (const row of nav.querySelectorAll<HTMLElement>('[data-vscode-context]')) {
-        const session = row.dataset.session;
-        if (session === undefined || !wanted.has(session)) {
+        if (row.dataset.session !== session) {
           continue;
         }
         const old = JSON.parse(row.dataset.vscodeContext ?? '{}') as {

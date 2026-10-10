@@ -805,8 +805,9 @@ describe('read-only web demo', () => {
       ),
     ).toBe(true);
     await page.setViewportSize({ width: 390, height: 800 });
-    await page.locator('[data-control="picker"]').selectOption('arc-demo-review');
-    await page.locator('.timeline-footer .hidden-note').getByRole('button', { name: 'Unarchive' }).click();
+    await page.locator('[data-control="picker"]').selectOption('arc-cache-run');
+    await page.locator('[data-control="sessionmenu:arc-cache-run"]').click();
+    await page.locator('.demo-menu').getByRole('menuitem', { name: 'Unarchive', exact: true }).click();
     await page.waitForFunction(
       () =>
         !(window as unknown as { acquireVsCodeApi(): { getState(): { hidden: string[] } } })

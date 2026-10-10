@@ -279,12 +279,6 @@
           railMessage();
           break;
         case 'sessionMembership':
-          if (message.action === 'unarchiveAll') {
-            hidden.clear();
-            browserState = { ...browserState, hidden: [], pinnedTop: [...pinnedTop] };
-            railMessage();
-            break;
-          }
           membership(message.action, message.session);
           break;
         case 'setLayout':

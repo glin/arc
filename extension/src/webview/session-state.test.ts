@@ -30,9 +30,6 @@ function owner(initial: Record<string, unknown> = {}, rail: () => RailSnapshot |
     refreshContext(session) {
       events.push(`context:${session}`);
     },
-    refreshContexts(sessions) {
-      events.push(`contexts:${sessions.join(',')}`);
-    },
   });
   return { state, events, saves };
 }
@@ -118,7 +115,6 @@ test('a membership action does not queue saveState through the real saved-state 
     promptFloor: () => null,
     composerHidden: () => false,
     refreshContext() {},
-    refreshContexts() {},
   });
 
   state.hide('s1');

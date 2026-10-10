@@ -847,9 +847,7 @@ export interface TimelineRenderer {
   settled(): boolean;
   refreshLayout(): void;
   drawRowContext(session: string): void;
-  refreshHeadings(stats?: Record<string, SessionStat[]>, footers?: Node[]): void;
-  // Reconcile the named mounted headings without replacing timeline content.
-  drawRowContexts(sessions: readonly string[]): void;
+  refreshHeadings(stats?: Record<string, SessionStat[]>): void;
   update(view: TimelineView, footers?: Node[]): void;
   updateCard(session: string, card: CardView): boolean;
   updateCards(cards: readonly CardView[]): boolean;
@@ -1357,92 +1355,47 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
     return true;
   };
 
-  const refresh = (stats?: Record<string, SessionStat[]>, footers?: Node[]) => {
+  const refresh = (stats?: Record<string, SessionStat[]>) => {
     if (stats) {
       sessionStats = stats;
     }
     // Adopt figures while a replacement view waits. Draw them when that view is released.
     if (pendingView) {
-      if (stats || footers || !pendingRefresh) {
-        pendingRefresh = () => refresh(undefined, footers);
+      if (stats || !pendingRefresh) {
+        pendingRefresh = () => refresh();
       }
       return;
     }
-    const nextFooters = footers ?? Array.from(footer.childNodes);
     if (latest) {
-      draw(latest, nextFooters);
-    } else if (footers) {
-      const active = options.document.activeElement as HTMLElement | null;
-      const heldControl = active && footer.contains(active) ? active.dataset.control : undefined;
-      const priorStop = options.rovingControls().find((node) => node.tabIndex === 0) || null;
-      footer.replaceChildren(...footers);
-      options.footersDrawn?.(footers);
-      const nextControl = heldControl
-        ? Array.from(footer.querySelectorAll<HTMLElement>('[data-control]')).find(
-            (node) => node.dataset.control === heldControl,
-          )
-        : null;
-      if (visibleControl(nextControl)) {
-        normalizeRoving(visibleControl(priorStop) ? priorStop : sharedFallback());
-        nextControl.focus({ preventScroll: true });
-      }
+      draw(latest, Array.from(footer.childNodes));
     }
   };
 
-  const refreshHeadings = (stats?: Record<string, SessionStat[]>, footers?: Node[]) => {
+  const refreshHeadings = (stats?: Record<string, SessionStat[]>) => {
     if (stats) sessionStats = stats;
     for (const [id, mounted] of headings) {
       for (const redraw of mounted) redraw(pendingView ? undefined : (stats?.[id] ?? (stats ? [] : undefined)));
     }
-    if (pendingView) {
-      if (stats || footers || !pendingRefresh) {
-        pendingRefresh = () => refreshHeadings(sessionStats, footers);
-      }
-      return;
+    if (pendingView && (stats || !pendingRefresh)) {
+      pendingRefresh = () => refreshHeadings(sessionStats);
     }
-    if (
-      !footers ||
-      (footers.length === footer.childNodes.length && footers.every((node, index) => node === footer.childNodes[index]))
-    )
-      return;
-    const active = options.document.activeElement as HTMLElement | null;
-    const held = active && footer.contains(active) ? active : null;
-    const priorStop = options.rovingControls().find((node) => node.tabIndex === 0) || null;
-    footer.replaceChildren(...footers);
-    options.footersDrawn?.(footers);
-    const replacement = held?.dataset.control
-      ? Array.from(footer.querySelectorAll<HTMLElement>('[data-control]')).find(
-          (node) => node.dataset.control === held.dataset.control,
-        )
-      : null;
-    const fallback = visibleControl(replacement)
-      ? replacement
-      : visibleControl(priorStop)
-        ? priorStop
-        : options.rovingControls()[0] || sharedFallback();
-    normalizeRoving(visibleControl(priorStop) ? priorStop : options.rovingControls()[0] || sharedFallback());
-    if (held && options.document.activeElement !== held) fallback?.focus({ preventScroll: true });
   };
 
-  // Membership updates the named mounted headings, including a held or retained view.
+  // Membership updates the session's mounted headings, including a held or retained view.
   // The heading captures its focus and keyboard stop before its pin can disappear.
-  const drawRowContexts = (sessions: readonly string[]) => {
-    const wanted = new Set(sessions);
+  const drawRowContext = (session: string) => {
     for (const row of root.querySelectorAll<HTMLElement>('.sessionrow')) {
-      const drawn = row.dataset.session;
-      if (drawn === undefined || !wanted.has(drawn)) {
+      if (row.dataset.session !== session) {
         continue;
       }
       // A pin or an archive changes the menu, never whether the session is saved.
       const persisted =
         (JSON.parse(row.dataset.vscodeContext ?? '{}') as { sessionPersisted?: unknown }).sessionPersisted === true;
-      row.dataset.vscodeContext = options.rowContext(drawn, persisted);
+      row.dataset.vscodeContext = options.rowContext(session, persisted);
     }
     // Update Preact props with the native context. Otherwise a reversal can preserve an outdated optimistic attribute.
-    for (const session of wanted) {
-      headings.get(session)?.forEach((redraw) => redraw());
-      pins.get(session)?.forEach((redraw) => redraw());
-    }
+    headings.get(session)?.forEach((redraw) => redraw());
+    pins.get(session)?.forEach((redraw) => redraw());
   };
 
   return {
@@ -1454,10 +1407,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
         options.list.style.removeProperty('--session-top');
       }
     },
-    drawRowContext(session) {
-      drawRowContexts([session]);
-    },
-    drawRowContexts,
+    drawRowContext,
     refreshHeadings,
     settled: () => !pendingView && !pendingCard && !pendingRefresh,
     update,

@@ -1103,15 +1103,7 @@ import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearc
 import { LABEL_NAME_LIMIT, labelTypedNotes } from './domain/labels.ts';
 import { canStartSearch, matchSessions, parseSessionQuery, queryToken, withWhere } from './domain/session-query.ts';
 import { labelSuggestions, whereNote } from './view/session-query.ts';
-import {
-  archivedNote,
-  RAIL_FOLDS,
-  railBuckets,
-  railCountButtons,
-  railCounts,
-  railTimeSlot,
-  sessionCount,
-} from './view/rail.ts';
+import { RAIL_FOLDS, railBuckets, railCountButtons, railCounts, railTimeSlot, sessionCount } from './view/rail.ts';
 import { formatRelative } from './view/time.ts';
 import { outsideCommentMarks } from './webview/comments.ts';
 import { detailRowsFor } from './webview/card-rows.ts';
@@ -6147,11 +6139,6 @@ test('the panel imports the shared session count wording', () => {
   assert.equal(sessionCount(1), '1 turn');
   assert.equal(sessionCount(3), '3 turns');
 });
-test('the panel imports the shared archived note wording', () => {
-  sourceDoesNotMatch(script, /function archivedNote\(/);
-  assert.deepEqual(archivedNote(1), { text: '1 session archived', action: 'Unarchive' });
-  assert.deepEqual(archivedNote(2), { text: '2 sessions archived', action: 'Unarchive all' });
-});
 test('the selected session is the progressive read target', () => {
   // Check the host's selected-session target and scheduling order.
   const marker = 'private shownSessions(';
@@ -9420,7 +9407,7 @@ test('archive and turn-end wiring reaches the process lifecycle owner', () => {
   assert.ok(hiddenAt >= 0 && hidden.length > 80, 'the membership handler is not available to inspect');
   sourceMatch(
     hidden,
-    /this\.updateSessionMembership\(\s*msg\.action, 'session' in msg \? msg\.session : undefined,[\s\S]*msg\.openPinned === true\)/,
+    /this\.updateSessionMembership\(\s*msg\.action, msg\.session,[\s\S]*msg\.openPinned === true\)/,
     'the membership operation does not reach the lifecycle owner',
   );
   sourceMatch(
@@ -12203,7 +12190,7 @@ test('awaiting session state and delayed panel actions use the adopted identity'
   );
   sourceMatch(
     message,
-    /sessionMembership:[\s\S]*updateSessionMembership\(\s*msg\.action, 'session' in msg \? msg\.session : undefined,[\s\S]*msg\.openPinned === true/,
+    /sessionMembership:[\s\S]*updateSessionMembership\(\s*msg\.action, msg\.session,[\s\S]*msg\.openPinned === true/,
     'the membership operation bypasses the shared adoption resolver',
   );
   const draftAt = panelHostSource.indexOf('private setDraft(');
@@ -16079,7 +16066,6 @@ const FIGURE_SIZES = [
   '.session .twist { font-size: var(--t-body) }',
   '.sessionmenu { font: inherit }',
   '.sessionmenu { font-size: var(--t-body) }',
-  '.hidden-note button { font: inherit }',
   '.controls select { font: inherit }',
   '.controls select { font-size: 0.92em }',
   '.compactnew, .compactnewmenu { font: inherit }',

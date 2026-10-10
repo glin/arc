@@ -7,10 +7,7 @@ interface HistoryOptions {
   document: Document;
   sendToHost(message: PanelToHost): void;
   hidden: ReadonlySet<string>;
-  clearHidden(): void;
-  railVisible(): boolean;
   hiddenEmpty: string;
-  archivedNote(count: number): { text: string; action: string };
   observe(
     target: Element,
     callback: IntersectionObserverCallback,
@@ -31,8 +28,6 @@ export function createHistoryOwner(options: HistoryOptions): HistoryOwner {
     element(options.document, tag, className, text);
   let footerPrint: string | null = null;
   let footerNodes: Node[] = [];
-  let olderPrint: string | null = null;
-  let olderFooter: Node | null = null;
   let olderSeen: string | null = null;
   let olderObserver: IntersectionObserver | null = null;
   let olderControl: HistoryControl | null = null;
@@ -94,36 +89,15 @@ export function createHistoryOwner(options: HistoryOptions): HistoryOwner {
     controls.set(button, control);
     return button;
   };
-  const hiddenNote = (): HTMLElement => {
-    const words = options.archivedNote(options.hidden.size);
-    const box = el('div', 'hidden-note');
-    box.append(options.document.createTextNode(words.text));
-    const button = el('button', '', words.action);
-    actionable(button, null, 'showHidden', options.clearHidden);
-    box.append(button);
-    return box;
-  };
-
   return {
     footers(control) {
-      const archivedCount = options.railVisible() ? 0 : options.hidden.size;
-      const controlPrint = JSON.stringify(
+      const print = JSON.stringify(
         control && [control.kind, control.label, control.name, control.auto, control.token, control.session],
       );
-      const print = JSON.stringify([archivedCount, controlPrint]);
       if (print === footerPrint) return footerNodes;
       footerPrint = print;
-      const nodes: Node[] = [];
-      if (archivedCount) {
-        nodes.push(hiddenNote());
-      }
-      if (controlPrint !== olderPrint) {
-        olderPrint = controlPrint;
-        olderFooter = control ? olderRow(control) : null;
-      }
-      if (olderFooter) nodes.push(olderFooter);
-      footerNodes = nodes;
-      return nodes;
+      footerNodes = control ? [olderRow(control)] : [];
+      return footerNodes;
     },
     drawn(nodes) {
       const node = nodes.find((candidate) => controls.has(candidate)) as HTMLElement | undefined;

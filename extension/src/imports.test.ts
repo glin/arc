@@ -91,7 +91,6 @@ test('rail prerequisite rules have one browser-safe owner', () => {
     );
   }
   for (const name of [
-    'archivedNote',
     'clampRailWidth',
     'formatRelative',
     'labelKey',
@@ -123,7 +122,7 @@ test('rail prerequisite rules have one browser-safe owner', () => {
   assert.match(turnrail, /from ['"]\.\/view\/rail\.ts['"]/);
   assert.doesNotMatch(
     turnrail,
-    /export function (archivedNote|clampRailWidth|railBuckets|railCardName|railTimeSlot|sessionCount)\s*\(/,
+    /export function (clampRailWidth|railBuckets|railCardName|railTimeSlot|sessionCount)\s*\(/,
   );
   assert.match(turnsearch, /from ['"]\.\/domain\/session-query\.ts['"]/);
   assert.match(turnsearch, /from ['"]\.\/view\/session-query\.ts['"]/);

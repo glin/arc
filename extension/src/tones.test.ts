@@ -841,7 +841,6 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.empty .dim { color: var(--idle) }',
   '.failed .glyph { color: var(--bad) }',
   '.headline strong { color: var(--vscode-foreground) }',
-  '.hidden-note button { color: var(--vscode-textLink-foreground) }',
   '.hintcard .railstats .ctx-filling { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',
   '.hintcard .railstats .ctx-getting-full { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',
   '.hintcard .railstats .ctx-nearly-full { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',

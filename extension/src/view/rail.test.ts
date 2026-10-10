@@ -24,7 +24,6 @@ test('session label lookup indexes authoritative rows once and follows replaceme
 });
 import assert from 'node:assert';
 import {
-  archivedNote,
   clampRailWidth,
   effectiveRailWidth,
   railWidthMaximum,
@@ -105,7 +104,6 @@ test('rail width and compact wording have one browser-safe owner', () => {
   assert.equal(clampRailWidth(9999), 9999);
   assert.equal(clampRailWidth(219.6), 220);
   assert.equal(sessionCount(1), '1 turn');
-  assert.deepEqual(archivedNote(2), { text: '2 sessions archived', action: 'Unarchive all' });
   assert.deepEqual(railTimeSlot('waiting', true), { word: 'needs input', time: false });
   assert.deepEqual(railTimeSlot('failed', false), { word: 'failed', time: true });
 });

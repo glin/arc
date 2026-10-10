@@ -399,13 +399,6 @@ export function railGroupHeadingId(section: string): string {
   return `railheading-${safeIdPart(section)}`;
 }
 
-export function archivedNote(n: number): { text: string; action: string } {
-  return {
-    text: `${n} session${n === 1 ? '' : 's'} archived`,
-    action: n === 1 ? 'Unarchive' : 'Unarchive all',
-  };
-}
-
 export function sessionCount(turns: number): string {
   return `${turns} turn${turns === 1 ? '' : 's'}`;
 }

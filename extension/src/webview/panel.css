@@ -849,23 +849,6 @@ body {
 .sessionmenu.sessionpin.is-pinned {
   color: var(--notice);
 }
-/* What is left of the hidden ones: a count, and the word that brings them all back. */
-.hidden-note {
-  padding: 10px 12px;
-  font-size: var(--t-body);
-  color: var(--idle);
-}
-.hidden-note button {
-  appearance: none;
-  border: 0;
-  background: none;
-  padding: 0;
-  margin-left: 4px;
-  font: inherit;
-  color: var(--vscode-textLink-foreground);
-  cursor: pointer;
-  text-decoration: underline;
-}
 /* The panel's one control bar holds the session picker. It stays visible because which
    session is on screen matters while the reader scrolls a long list. */
 .controls {

@@ -360,7 +360,6 @@ export type PanelToHost =
   // `request` names this rename, so the panel can tell its answer from an earlier one's.
   | { type: 'renameSession'; session: string; request: number; title: string }
   | { type: 'setRailFilters'; railFilters: SavedRailFilter[] }
-  | { type: 'sessionMembership'; action: 'unarchiveAll' }
   | { type: 'sessionMembership'; action: 'archive' | 'unarchive' | 'unpin'; session: string }
   | { type: 'sessionMembership'; action: 'pin'; session: string; openPinned?: boolean }
   | { type: 'setLayout'; key: 'cardLayout'; value: CardLayout }
@@ -1098,9 +1097,6 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'setRailFilters':
       return savedRailFilters(m.railFilters) ? { type: 'setRailFilters', railFilters: m.railFilters } : null;
     case 'sessionMembership':
-      if (m.action === 'unarchiveAll') {
-        return { type: 'sessionMembership', action: m.action };
-      }
       if (!isString(m.session)) {
         return null;
       }
