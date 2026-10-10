@@ -4931,6 +4931,31 @@ test('cold indexing continues within a byte budget without retaining earlier lin
   assert.equal((result.record.parserState as ClaudeUsageReducerState).closedTurns, lines.length);
 });
 
+test('a slice whose deadline passes before its first read still reads forward', () => {
+  const folder = dir();
+  const file = path.join(folder, 'late.jsonl');
+  const lines = Array.from(
+    { length: 40 },
+    (_, index) => JSON.stringify(event(stamp('2026-08-31T10:00:00') + index)) + '\n',
+  );
+  fs.writeFileSync(file, lines.join(''));
+  // The clock sets the deadline on its first call and reads past it on every later call.
+  const late = () => {
+    let calls = 0;
+    return { now: () => (calls++ === 0 ? 0 : 1_000), maxBytes: 512 };
+  };
+  let result = indexSpendFile(undefined, file, 'w', reducer, late());
+  let reached = 0;
+  for (let slice = 0; !result.complete && slice < lines.length * 4; slice++) {
+    const position = result.record.scanOffset ?? result.record.offset;
+    assert.ok(position > reached, `slice ${slice} stopped at byte ${position} without reading`);
+    reached = position;
+    result = indexSpendFile(result.record, file, 'w', reducer, late());
+  }
+  assert.equal(result.complete, true);
+  assert.equal(result.record.buckets[0].requests, lines.length);
+});
+
 test('pricing overrides use the newest valid historical date in a stable order', () => {
   const [bucket] = aggregateUsageEvents([
     event(stamp('2026-06-15T10:00:00'), {

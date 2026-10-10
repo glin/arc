@@ -1717,7 +1717,8 @@ function readIncremental(
     let held = pending;
     let completedOffset = offset;
     let readBytes = 0;
-    while (position < size && readBytes < maxBytes && clock() < deadline) {
+    // A slice reads its first chunk even past the deadline, so every slice makes progress.
+    while (position < size && readBytes < maxBytes && (readBytes === 0 || clock() < deadline)) {
       const allowed = Math.min(chunk.length, size - position, maxBytes - readBytes);
       const read = fs.readSync(fd, chunk, 0, allowed, position);
       if (read <= 0) {

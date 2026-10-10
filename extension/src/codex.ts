@@ -3115,7 +3115,7 @@ function* codexDispatchSteps(
       cursor!.mtimeMs = cursor!.evidence!.provisional.mtimeMs;
     }
     if (qualification === 'match' && cursor!.terminalApplied && cursor!.offset < stat.size) {
-      const continuation = reader.read(cursor!.offset, 1, 0);
+      const continuation = reader.read(cursor!.offset, 1, 0, false);
       if (!continuation.length) qualification = 'pending';
       else if (continuation[0] !== 10 && continuation[0] !== 13) qualification = 'reset';
     }

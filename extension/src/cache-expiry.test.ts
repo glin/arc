@@ -170,6 +170,10 @@ const codexSettings = (minutes: number, serviceTier: string) =>
 const claudeReducer: UsageReducerFactory<ClaudeUsageReducerState> = (state) => createClaudeUsageLineReducer(state);
 const codexReducer: UsageReducerFactory<CodexUsageReducerState> = (state) => createCodexUsageLineReducer(state);
 
+// A spend scan stops at a wall-clock deadline. This clock never advances, so a loaded machine cannot end a scan
+// early, and only a byte budget ends a slice.
+const stillClock = { now: () => 0 };
+
 function indexed<State>(
   lines: readonly string[],
   makeReducer: UsageReducerFactory<State>,
@@ -179,7 +183,7 @@ function indexed<State>(
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
-  return indexSpendFile(previous, file, 'w', makeReducer, Date.now(), budget).record;
+  return indexSpendFile(previous, file, 'w', makeReducer, Date.now(), { ...stillClock, ...budget }).record;
 }
 
 function facts(record: SpendFileIndex): CacheExpiryFacts {
@@ -581,7 +585,7 @@ test('an incremental rescan gives the same answer as one whole scan', () => {
   let previous: SpendFileIndex | undefined;
   for (let held = 1; held <= lines.length; held++) {
     fs.writeFileSync(file, `${lines.slice(0, held).join('\n')}\n`);
-    previous = indexSpendFile(previous, file, 'w', claudeReducer, Date.now() + held).record;
+    previous = indexSpendFile(previous, file, 'w', claudeReducer, Date.now() + held, stillClock).record;
   }
 
   assert.deepEqual(summary(previous!), summary(whole));
@@ -603,10 +607,10 @@ test('a byte-budgeted scan resumed across a line boundary gives the same answer'
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
-  let record = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes: 64 }).record;
+  let record = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { ...stillClock, maxBytes: 64 }).record;
   let guard = 0;
   while (record.complete === false && guard++ < 200) {
-    record = indexSpendFile(record, file, 'w', claudeReducer, Date.now(), { maxBytes: 64 }).record;
+    record = indexSpendFile(record, file, 'w', claudeReducer, Date.now(), { ...stillClock, maxBytes: 64 }).record;
   }
 
   assert.equal(record.complete, true);
@@ -735,14 +739,14 @@ test('a request after a session-ending compaction completes that same fact, not 
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
-  const trailing = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
+  const trailing = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), stillClock).record;
   assert.equal(trailing.cacheExpiry!.compactions.length, 1);
 
   fs.writeFileSync(
     file,
     `${[...lines, claudePrompt(11, 'p2'), claudeResponse(11, { id: 'm2', input: 9_000, write1h: 1_000 })].join('\n')}\n`,
   );
-  const grown = indexSpendFile(trailing, file, 'w', claudeReducer, Date.now() + 1).record;
+  const grown = indexSpendFile(trailing, file, 'w', claudeReducer, Date.now() + 1, stillClock).record;
 
   assert.equal(grown.cacheExpiry!.compactions.length, 1, 'the request completed the open fact');
   assert.deepEqual(
@@ -876,10 +880,16 @@ test('a slice that ends between an abandoned summary and the prompt that leaves 
   const summaryLine = lines.indexOf(linked(claudeCompaction(31, 'B'), 'b-B'));
   const firstBytes = Buffer.byteLength(`${lines.slice(0, summaryLine + 1).join('\n')}\n`);
 
-  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes: firstBytes }).record;
+  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), {
+    ...stillClock,
+    maxBytes: firstBytes,
+  }).record;
   assert.equal(first.offset, firstBytes, 'the first slice ended after compaction B');
   assert.equal(first.compactionCount, 2, 'compaction B counts until a later record leaves it');
-  const rest = indexSpendFile(first, file, 'w', claudeReducer, Date.now() + 1, { maxBytes: 1 << 20 }).record;
+  const rest = indexSpendFile(first, file, 'w', claudeReducer, Date.now() + 1, {
+    ...stillClock,
+    maxBytes: 1 << 20,
+  }).record;
 
   assert.equal(rest.complete, true);
   assert.equal(rest.compactionCount, 2);
@@ -1137,13 +1147,19 @@ test('a slice that ends after a summary at full retention keeps every reached co
   const file = path.join(folder, 'source.jsonl');
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
 
-  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes: firstBytes }).record;
+  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), {
+    ...stillClock,
+    maxBytes: firstBytes,
+  }).record;
   assert.equal(first.offset, firstBytes, 'the first slice ended after the last summary');
   const storage = dir();
   saveSpendLedger(storage, 'w', [first]);
   const [saved] = loadSpendLedger(storage, 'w').files;
   assert.ok(saved, 'the saved slice survived its own validation');
-  const rest = indexSpendFile(saved, file, 'w', claudeReducer, Date.now() + 1, { maxBytes: 1 << 20 }).record;
+  const rest = indexSpendFile(saved, file, 'w', claudeReducer, Date.now() + 1, {
+    ...stillClock,
+    maxBytes: 1 << 20,
+  }).record;
 
   assert.equal(rest.compactionCount, RETAINED_COMPACTIONS);
   assert.equal(whole.cacheExpiry!.compactions.length, RETAINED_COMPACTIONS);
@@ -1340,7 +1356,7 @@ test('a ledger written by an older parser generation rebuilds instead of loading
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
-  const current = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
+  const current = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), stillClock).record;
 
   // Use the preceding parser generation to check invalidation independently of its current value.
 
@@ -1349,7 +1365,7 @@ test('a ledger written by an older parser generation rebuilds instead of loading
     parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1,
     cacheExpiry: undefined,
   };
-  const rebuilt = indexSpendFile(stale, file, 'w', claudeReducer, Date.now() + 1);
+  const rebuilt = indexSpendFile(stale, file, 'w', claudeReducer, Date.now() + 1, stillClock);
 
   assert.equal(rebuilt.rebuilt, true);
   assert.deepEqual(summary(rebuilt.record), summary(current));
@@ -2142,10 +2158,10 @@ function writtenSource(lines: readonly string[]): string {
 
 function slicedIndex(lines: readonly string[], maxBytes: number): SpendFileIndex {
   const file = writtenSource(lines);
-  let record = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { maxBytes }).record;
+  let record = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), { ...stillClock, maxBytes }).record;
   let guard = 0;
   while (record.complete === false && guard++ < 1_000) {
-    record = indexSpendFile(record, file, 'w', claudeReducer, Date.now(), { maxBytes }).record;
+    record = indexSpendFile(record, file, 'w', claudeReducer, Date.now(), { ...stillClock, maxBytes }).record;
   }
   assert.equal(record.complete, true, 'the sliced scan finished');
   return record;
@@ -2492,11 +2508,11 @@ test('a compaction that reuses a revoked ordinal is measured from its own time',
   const storage = dir();
   const file = path.join(storage, 'source.jsonl');
   fs.writeFileSync(file, `${lines.slice(0, 5).join('\n')}\n`);
-  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
+  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), stillClock).record;
   saveSpendLedger(storage, 'w', [first]);
   const [restored] = loadSpendLedger(storage, 'w').files;
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
-  const resumed = indexSpendFile(restored, file, 'w', claudeReducer, Date.now() + 1).record;
+  const resumed = indexSpendFile(restored, file, 'w', claudeReducer, Date.now() + 1, stillClock).record;
   assert.deepEqual(summary(resumed), NOTHING);
   assert.deepEqual(resumed.cacheExpiry!.compactions, record.cacheExpiry!.compactions);
 });
@@ -2544,13 +2560,13 @@ test('a Claude compaction between two prompts counts one expiry from the compact
   const storage = dir();
   const file = path.join(storage, 'source.jsonl');
   fs.writeFileSync(file, `${lines.slice(0, 4).join('\n')}\n`);
-  const trailing = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
+  const trailing = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), stillClock).record;
   assert.deepEqual(trailing.cacheExpiry!.carry!.compaction, { ordinal: 1, at: Date.parse(at(2)), prefixTokens: null });
   saveSpendLedger(storage, 'w', [trailing]);
   const [restored] = loadSpendLedger(storage, 'w').files;
   assert.deepEqual(restored.cacheExpiry, trailing.cacheExpiry, 'the carry measured from a compaction loads again');
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
-  const resumed = indexSpendFile(restored, file, 'w', claudeReducer, Date.now() + 1).record;
+  const resumed = indexSpendFile(restored, file, 'w', claudeReducer, Date.now() + 1, stillClock).record;
   assert.deepEqual(summary(resumed), summary(record));
   assert.deepEqual(resumed.cacheExpiry!.compactions, record.cacheExpiry!.compactions);
 });

@@ -3611,6 +3611,7 @@ export class RelationshipReader {
   private readonly buffer = Buffer.allocUnsafe(RELATIONSHIP_READ_BYTES);
   readBytes = 0;
   stable = true;
+  private advanced = false;
   constructor(
     readonly fd: number,
     readonly file: string,
@@ -3634,16 +3635,19 @@ export class RelationshipReader {
     }
     return this.stable;
   }
+  // Reads ignore the deadline until a read that moves the scan returns bytes, so every slice makes progress.
   available(reserve = RELATIONSHIP_RESERVE_BYTES): number {
-    return this.stable && !this.cancelled() && performance.now() < this.deadline
+    return this.stable && !this.cancelled() && (!this.advanced || performance.now() < this.deadline)
       ? Math.max(0, this.budget - this.readBytes - reserve)
       : 0;
   }
-  read(at: number, length: number, reserve = RELATIONSHIP_RESERVE_BYTES): Buffer {
+  // The one-byte check after a terminal record passes advances false, so the parsing read that follows it still ignores the deadline.
+  read(at: number, length: number, reserve = RELATIONSHIP_RESERVE_BYTES, advances = true): Buffer {
     const size = Math.min(length, RELATIONSHIP_READ_BYTES, this.available(reserve));
     if (size <= 0) return Buffer.alloc(0);
     const count = fs.readSync(this.fd, this.buffer, 0, size, at);
     this.readBytes += count;
+    if (advances && count > 0) this.advanced = true;
     if (this.meter) this.meter.readBytes += count;
     this.check();
     return this.buffer.subarray(0, count);
@@ -3745,7 +3749,7 @@ export async function scanClaudeRelationshipQuantum(
     }
     if (qualification === 'match') cursor!.revision = cursor!.evidence!.provisional;
     if (qualification === 'match' && cursor!.terminalApplied && cursor!.offset < revision.size) {
-      const continuation = reader.read(cursor!.offset, 1, 0);
+      const continuation = reader.read(cursor!.offset, 1, 0, false);
       if (!continuation.length) qualification = 'pending';
       else if (continuation[0] !== 10 && continuation[0] !== 13) qualification = 'reset';
     }

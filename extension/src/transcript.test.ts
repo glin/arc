@@ -85,6 +85,47 @@ test.each([65536, 1024 * 1024])(
   },
 );
 
+test('Claude scans, rewrite comparisons and terminal continuations read forward when every slice starts past its deadline', async () => {
+  // Each reading of the clock lands a full slice after the previous one, so every deadline has passed.
+  let clock = 0;
+  vi.spyOn(performance, 'now').mockImplementation(() => (clock += 1_000));
+  const file = writeTranscript([
+    { type: 'ignored', payload: 'x'.repeat(1024) },
+    assistantTool('Agent', 1, 'interior-launch', {}),
+    {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'interior-launch' }] },
+      toolUseResult: { agentId: 'child-a' },
+    },
+    ...Array.from({ length: 20 }, () => ({ type: 'ignored', payload: 'y'.repeat(1024) })),
+  ]);
+  const parent = { file, sessionId: 'parent' };
+  const finish = async (cursor: Awaited<ReturnType<typeof scanClaudeRelationshipQuantum>>['cursor'] | undefined) => {
+    let scan = await scanClaudeRelationshipQuantum(parent, cursor, 65536);
+    for (let pass = 0; !scan.complete && pass < 100; pass++)
+      scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)), 65536);
+    return scan;
+  };
+  const first = await finish(undefined);
+  assert.ok(first.complete, 'the first scan finished');
+  assert.deepEqual(
+    first.references.map((reference) => reference.sessionId),
+    ['child-a'],
+  );
+  const old = fs.readFileSync(file, 'utf8');
+  // The rewrite ends without a newline, so the rescan applies its last record as a terminal record.
+  fs.writeFileSync(file, old.replace('child-a', 'child-b') + '{"type":"ignored"}');
+  fs.utimesSync(file, new Date(0), new Date(first.cursor.revision.mtimeMs + 2000));
+  const resumed = await finish(first.cursor);
+  assert.ok(resumed.complete, 'the rewritten parent finished its comparison and rescan');
+  assert.equal(resumed.cursor.terminalApplied, true);
+  assert.deepEqual(resumed.references, scanClaudeChildSessionReferences(parent).references);
+  fs.appendFileSync(file, '\n' + JSON.stringify(assistantTool('Agent', 2, 'late-launch', {})) + '\n');
+  const continued = await finish(resumed.cursor);
+  assert.ok(continued.complete, 'the scan read the records after the terminal record');
+  assert.deepEqual(continued.references, scanClaudeChildSessionReferences(parent).references);
+});
+
 test('Claude append validation retains parsing position and replaces a superseded comparison', async () => {
   const file = writeTranscript(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
   const parent = { file, sessionId: 'parent' };

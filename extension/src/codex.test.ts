@@ -1590,6 +1590,35 @@ test('a terminal dispatch record appears at stable EOF and survives a later newl
   );
 });
 
+test('a terminal dispatch record continues when every slice starts past its deadline', async () => {
+  // Each reading of the clock lands a full slice after the previous one, so every deadline has passed.
+  let clock = 0;
+  vi.spyOn(performance, 'now').mockImplementation(() => (clock += 1_000));
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-6-astra', 'high'),
+    commandCompleted(3, DISPATCH_COMMAND, 0, 'completed', 'launch', { stdout: DISPATCH_RECEIPT }),
+  ]);
+  fs.truncateSync(file, fs.statSync(file).size - 1);
+  const finish = async (cursor: Awaited<ReturnType<typeof scanCodexDispatchReferencesAsync>>['cursor'] | null) => {
+    let scan = await scanCodexDispatchReferencesAsync(file, 'parent', cursor, 64 * 1024, () => false);
+    for (let pass = 0; !scan.complete && pass < 100; pass++)
+      scan = await scanCodexDispatchReferencesAsync(file, 'parent', scan.cursor, 64 * 1024, () => false);
+    return scan;
+  };
+  const first = await finish(null);
+  assert.equal(first.complete, true);
+  assert.equal(first.cursor.terminalApplied, true);
+  fs.appendFileSync(file, '\n' + JSON.stringify(event('task_complete', 4, { turn_id: TURN })) + '\n');
+  const appended = await finish(first.cursor);
+  assert.equal(appended.complete, true, 'the scan read the records after the terminal record');
+  assert.deepEqual(
+    appended.references.map((reference) => reference.toolUseIds),
+    [['launch']],
+  );
+});
+
 test('resuming a spilled partial line waits for enough budget and counts the replay bytes', () => {
   const smallFile = writeRollout([meta()]);
   fs.appendFileSync(smallFile, '{"type":"ignored"');

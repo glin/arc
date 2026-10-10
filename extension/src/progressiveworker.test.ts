@@ -192,7 +192,9 @@ test('commit ownership workers resume a parent across children and reject change
     return { file, sessionId, revision: { size, mtimeMs, dev, ino } };
   };
   const ledger = new CommitRepositoryReservations();
-  const worker = new ProgressiveWorker(source);
+  // A commit ownership scan stops after 15 ms of the worker clock. This clock never advances, so a loaded machine
+  // cannot leave a scan pending, and only the byte allowance splits the parent across requests.
+  const worker = new ProgressiveWorker('Date.now=()=>0;' + source);
   fs.writeFileSync(
     childFile,
     fs
@@ -3353,10 +3355,18 @@ test('a rotated scan hides a changed parent until it reads the replacement recei
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { agent: 'codex' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
-  const worker = new ProgressiveWorker(source);
+  // A relationship scan stops after 15 ms of the worker clock. Until the comparison of the rewritten bytes finishes,
+  // the parent keeps its old references. This clock never advances, so bytes alone bound each request. The first
+  // request reads at most 1 MiB, so the second request can compare all of it within its default 8 MiB.
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
   try {
     const request = { kind: 'claude-children' as const, parents, catalog, repositoryRoots: [directory] };
-    const first = await discoveryState(worker, request, 1, new AbortController().signal);
+    const first = await discoveryState(
+      worker,
+      { ...request, discoveryBytes: 1024 * 1024 },
+      1,
+      new AbortController().signal,
+    );
     assert.equal(first?.value.kind, 'claude-children');
     if (!first || first.value.kind !== 'claude-children') return;
     assert.deepEqual(
