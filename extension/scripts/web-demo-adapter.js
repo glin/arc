@@ -29,6 +29,7 @@
       .flatMap((id) => sample.payloads[id].cards.filter((card) => card.kind === 'turn').map((card) => card.key)),
   };
   const approved = new WeakSet();
+  const exportDownloads = new WeakSet();
   const header = document.querySelector('.demo-header');
   const headerSize = () =>
     document.body.style.setProperty('--demo-header-height', `${header.getBoundingClientRect().height}px`);
@@ -75,6 +76,17 @@
     const event = new MessageEvent('message', { data: parsed });
     approved.add(event);
     window.dispatchEvent(event);
+  }
+  function exportSession(session) {
+    const filename = sample.exports[session];
+    if (!ids.includes(session) || !filename) return;
+    const download = document.createElement('a');
+    download.href = `./${filename}`;
+    download.download = filename;
+    exportDownloads.add(download);
+    document.body.append(download);
+    download.click();
+    download.remove();
   }
   function railRows() {
     const original = sample.payloads[selected];
@@ -196,6 +208,9 @@
       case 'arc.showSessionDetails':
         if (session) deliver({ type: 'showSessionDetails', session });
         break;
+      case 'arc.exportSession':
+        exportSession(session);
+        break;
       case 'arc.copySessionId':
         copy(session);
         break;
@@ -223,6 +238,9 @@
       const message = sample.host.parsePanelToHost(raw);
       if (!message || sample.host.policy[message.type] !== 'handled') return;
       switch (message.type) {
+        case 'exportSession':
+          exportSession(message.session);
+          break;
         case 'contextDetail':
           if (ids.includes(message.session))
             deliver(sample.host.contextReply(message, sample.contexts[message.session], sample.clock));
@@ -379,6 +397,7 @@
     'click',
     (event) => {
       if (!(event.target instanceof Element)) return;
+      if (exportDownloads.has(event.target.closest('a'))) return;
       if (event.target.closest('#composer .csend')) {
         event.preventDefault();
         event.stopImmediatePropagation();

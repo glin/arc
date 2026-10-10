@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { browserOrNone } from '../test/browser.ts';
 import { tempDir } from './temproot.ts';
@@ -61,6 +62,81 @@ describe('read-only web demo', () => {
     await page.locator('[data-control="railheadlens:unread"]').check();
     await page.keyboard.press('Escape');
   };
+
+  it('downloads the selected invented graph and opens it offline with export restrictions', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    const downloadPage = await browser!.newPage();
+    downloadPage.setDefaultTimeout(5_000);
+    await downloadPage.setViewportSize({ width: 390, height: 850 });
+    for (const session of ['arc-read-state', 'arc-demo-dispatch', 'delegated-cost']) {
+      await downloadPage.goto(`${base}/`);
+      await downloadPage.locator('[data-control="picker"]').selectOption(session);
+      await downloadPage.locator(`[data-control="sessionmenu:${session}"]`).click();
+      const pending = downloadPage.waitForEvent('download');
+      await downloadPage
+        .locator('.demo-menu')
+        .getByRole('menuitem', { name: 'Export session as HTML...', exact: true })
+        .click();
+      const download = await pending;
+      expect(download.suggestedFilename()).toBe(`export-${session}.html`);
+      const file = path.join(directory, `download-${session}.html`);
+      await download.saveAs(file);
+      const html = fs.readFileSync(file, 'utf8');
+      const manifest = JSON.parse(
+        Buffer.from(html.match(/id="arc-data-manifest">([^<]+)<\/script>/)![1], 'base64').toString('utf8'),
+      );
+      expect(manifest.root).toBe(session);
+      expect(
+        manifest.sessions
+          .find((item: { key: string }) => item.key === session)
+          .numbers.parts.every(
+            (part: { scope: string }) => part.scope !== 'arc-demo-continuation' || session === 'arc-demo-continuation',
+          ),
+      ).toBe(true);
+      const expectedSessions: Record<string, string[]> = {
+        'arc-read-state': ['arc-demo-sketch', 'arc-luna-read-state-tests', 'arc-read-state', 'arc-sol-read-state'],
+        'arc-demo-dispatch': ['arc-demo-continuation', 'arc-demo-dispatch', 'arc-demo-review'],
+        'delegated-cost': ['delegated-cost'],
+      };
+      expect(manifest.sessions.map((item: { key: string }) => item.key).sort()).toEqual(expectedSessions[session]);
+      expect(manifest.relationships.find((edge: { kind: string }) => edge.kind === 'reader-started')?.ownership).toBe(
+        session === 'arc-demo-dispatch' ? 'navigation' : undefined,
+      );
+      const offline = await browser!.newPage();
+      const requests: string[] = [];
+      offline.on('request', (request) => requests.push(request.url()));
+      await offline.goto(pathToFileURL(file).href);
+      await offline.locator(`article[data-key="${session}-t0"]`).waitFor();
+      expect(await offline.locator('#list .turn').count()).toBeGreaterThan(0);
+      expect(requests.every((url) => url === pathToFileURL(file).href)).toBe(true);
+      expect(
+        await offline
+          .locator(
+            '#prompt:visible,.quotefloat:visible,[data-control^="resume:"]:visible,[data-control^="diff:"]:visible',
+          )
+          .count(),
+      ).toBe(0);
+      await offline.locator(`[data-control="sessionmenu:${session}"]`).click();
+      expect(
+        await offline
+          .locator('.demo-menu')
+          .getByRole('menuitem', { name: 'Export session as HTML...', exact: true })
+          .count(),
+      ).toBe(0);
+      expect(manifest.deliberatelyOmitted).toEqual(
+        expect.arrayContaining(['raw-tools', 'reasoning', 'commands', 'patches', 'attachments', 'comments', 'drafts']),
+      );
+      if (process.env.ARC_DEMO_SHOTS) {
+        fs.copyFileSync(file, path.join(process.env.ARC_DEMO_SHOTS, download.suggestedFilename()));
+        await offline.screenshot({
+          path: path.join(process.env.ARC_DEMO_SHOTS, `offline-${session}.png`),
+          fullPage: true,
+        });
+      }
+      await offline.close();
+    }
+    await downloadPage.close();
+  }, 60_000);
 
   it('moves back and forward through selected sessions and parent links without changing saved labels or read marks', async (t) => {
     if (!browser) t.skip('Edge or Chrome is required');

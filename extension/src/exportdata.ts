@@ -362,7 +362,7 @@ function usageOf(usage: TurnUsage): ExportUsage {
     thinking: usage.thinking,
   };
 }
-function costPartOf(part: SessionCostUsage, scope: string | null = null): ExportCostPart {
+export function costPartOf(part: SessionCostUsage, scope: string | null = null): ExportCostPart {
   return {
     role: part.role ?? 'main',
     scope,
@@ -438,10 +438,10 @@ function relativeFile(file: string, cwd: string | undefined): string | null {
   return segments.filter((segment) => segment !== '.' && segment !== '').join('/') || null;
 }
 
-function projectTurn(
+export function projectTurn(
   turn: Turn,
   key: string,
-  entry: Entry,
+  entry: Pick<SessionFile, 'cwd'>,
   omissions: ExportOmission[],
   session: string,
   links: Map<string, string[]>,

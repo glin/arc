@@ -55,7 +55,7 @@ export const DEMO_HOST_POLICY = {
   setRailFilters: 'handled',
   sessionMembership: 'handled',
   setLayout: 'handled',
-  exportSession: 'noop',
+  exportSession: 'handled',
   saveState: 'handled',
   search: 'noop',
   loadOlder: 'noop',

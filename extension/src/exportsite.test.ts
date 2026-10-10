@@ -12,6 +12,52 @@ import type { CardView } from './webview/payload-contracts';
 import type { ExportBlock } from './exportdata';
 import { exportBrowserAssets } from './panelbundle';
 import { exportFactValue } from './view/export-facts';
+import { writeDemoExports } from '../scripts/web-demo-export';
+
+test('demo HTML downloads retain recorded files and incomplete delegated cost', async () => {
+  const directory = tempDir('arc-demo-export-content-');
+  await writeDemoExports(directory);
+  for (const root of ['arc-read-state', 'delegated-cost', 'arc-demo-dispatch']) {
+    const html = await fs.readFile(path.join(directory, `export-${root}.html`), 'utf8');
+    await fs.writeFile(path.join(directory, 'index.html'), html);
+    const { manifest, data } = exportedSiteData(directory);
+    assert.equal(JSON.stringify([...data.values()]).includes('C:/sample/arc'), false);
+    if (root === 'arc-demo-dispatch') {
+      const numbers = manifest.sessions.find((session) => session.key === root)!.numbers;
+      assert.ok(numbers.parts.every((part) => part.scope !== 'arc-demo-continuation'));
+      continue;
+    }
+    const expected =
+      root === 'arc-read-state'
+        ? ([
+            ['arc-sol-read-state', 'extension/src/webview/read-state.ts', 38, 12],
+            ['arc-sol-read-state', 'extension/src/webview/session-state.ts', 21, 7],
+            ['arc-luna-read-state-tests', 'extension/src/webview/read-state.test.ts', 44, 6],
+          ] as const)
+        : ([['delegated-cost', 'extension/src/turncard.ts', 28, 6]] as const);
+    for (const [session, file, added, removed] of expected) {
+      const page = manifest.sessions.find((item) => item.key === session)!.pages[0];
+      const { card } = data.get(page.cards![0].id) as { card: CardView };
+      const recorded = card.files!.find((item) => item.path === file);
+      assert.ok(recorded, `${session} has no recorded ${file}`);
+      assert.equal(recorded.added, added);
+      assert.equal(recorded.removed, removed);
+    }
+    assert.ok(manifest.omissions.every((omission) => omission.reason !== 'external-path'));
+    if (root === 'arc-read-state') {
+      const numbers = manifest.sessions.find((session) => session.key === root)!.numbers;
+      assert.ok(Math.abs(numbers.combined.dollars! - 6.6734) < 1e-10);
+      assert.equal(numbers.main.partial, false);
+      assert.equal(numbers.delegated.partial, true);
+      assert.equal(numbers.combined.partial, true);
+      assert.deepEqual(numbers.coverage, { usage: 'partial', cost: 'partial' });
+      assert.ok(numbers.parts.some((part) => part.scope === 'arc-sol-read-state' && part.incomplete));
+      const cost = manifest.stats[root].find((stat) => stat.metric === 'cost')!;
+      assert.equal(cost.label, '$6.67+');
+      assert.ok(manifest.rail.find((session) => session.id === root)!.costAtLeast);
+    }
+  }
+});
 
 test('portable projection retains every body beyond previews and removes post-builder action metadata', async () => {
   const directory = tempDir('arc-export-site-');

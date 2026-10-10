@@ -660,6 +660,13 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   assert.equal(new Set(main.cards.map((card) => card.key)).size, 3);
   assert.ok(main.cards.slice(1).every((card) => !card.agents.length && !card.commits.length && !card.files.length));
   assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cache-expiry'));
+  assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.detail.includes('Included above'));
+  const expired = demoPayload('delegated-cost') as typeof main;
+  const warning = expired.cards[0].chips.find((chip) => chip.metric === 'cost')!.warnings!.find((warning) => warning.scope === 'cache-expiry');
+  assert.ok(warning && warning.scope === 'cache-expiry' && warning.dollars! >= 1, 'invented cold turn must cross the production warning threshold');
+  assert.ok(expired.stats['delegated-cost'].find((chip) => chip.metric === 'cost')!.detail.includes('Included above'));
+  const readme = readmePayload('cost') as typeof main;
+  assert.ok(readme.cards[0].chips.find((chip) => chip.metric === 'cost')!.warnings!.some((warning) => warning.scope === 'cache-expiry'));
   assert.equal(DEMO_DEFAULT_EXPIRY.returns.length, 1);
   const history = DEMO_TURNS['arc-read-state'].filter((item) => item.usage.requests === 1);
   for (const item of history) {

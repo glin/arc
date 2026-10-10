@@ -29,6 +29,7 @@ export const DEMO_MENU_COMMANDS: ReadonlySet<string> = new Set([
   'arc.newSessionWithLabels',
   'arc.copySessionId',
   'arc.showSessionDetails',
+  'arc.exportSession',
   'arc.markTurnRead',
   'arc.markTurnUnread',
   'arc.copyTurnSummary',

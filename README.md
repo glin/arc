@@ -76,7 +76,7 @@ Arc estimates costs for supported models using published prices. Subscription es
 
 #### Cache expiries
 
-<a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Cache expiry with its estimated input cost" width="541"></a>
+<a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Cache expiries with cost added over cache-read price" width="541"></a>
 
 #### Cache use
 

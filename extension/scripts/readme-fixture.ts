@@ -8,6 +8,8 @@ import {
   priceDispatchedParts,
   sessionCacheExpiryStats,
   sessionCostStats,
+  sessionCostProjection,
+  turnCacheExpiryWarning,
   sessionStats,
 } from '../src/turncard.ts';
 import {
@@ -39,7 +41,7 @@ export const CAPTURE_ZONE = 'America/Chicago';
 // Session list width for README captures and the web demo.
 export { STATIC_PAGE_RAIL_WIDTH as CAPTURE_RAIL_WIDTH } from '../src/view/static-page.ts';
 export const DEMO_RAIL_FOLDS = { [RAIL_FOLDS.agent]: false, [RAIL_FOLDS.archived]: false };
-const ROOT = 'C:/sample/arc';
+export const ROOT = 'C:/sample/arc';
 const TEST_WORKTREE = `${ROOT}/.claude/worktrees/read-state-tests`;
 const start = CAPTURE_TIME - 22 * 60_000;
 const demoSolStartedAt = start + 6 * 60_000;
@@ -357,29 +359,29 @@ const beforeExpiry: Turn = turn({
   usage: {
     requests: 1,
     input: 2_000,
-    cacheWrite1h: 56_000,
+    cacheWrite1h: 126_000,
     cacheWrite5m: 0,
     cacheRead: 0,
     output: 1_000,
     thinking: 0,
   },
-  contextTokens: 58_000,
+  contextTokens: 128_000,
   contextWindow: 200_000,
 });
 
 const expiryUsage = {
   requests: 1,
   input: 2_000,
-  cacheWrite1h: 90_000,
+  cacheWrite1h: 160_000,
   cacheWrite5m: 0,
   cacheRead: 0,
   output: 2_300,
   thinking: 0,
 };
-const expiryTurn: Turn = { ...changesTurn, usage: expiryUsage, contextTokens: 92_000 };
+const expiryTurn: Turn = { ...changesTurn, usage: expiryUsage, contextTokens: 162_000 };
 const expiryHistory: Turn[] = [
   expiryTurn,
-  { ...beforeExpiry, usage: expiryUsage, contextTokens: 92_000 },
+  { ...beforeExpiry, usage: expiryUsage, contextTokens: 162_000 },
   {
     ...beforeExpiry,
     promptId: 'trace-restored-file-actions',
@@ -387,7 +389,7 @@ const expiryHistory: Turn[] = [
     endedAt: beforeExpiry.endedAt - 83 * 60_000,
     prompt: 'Trace file actions after restoring a session tab.',
     usage: expiryUsage,
-    contextTokens: 92_000,
+    contextTokens: 162_000,
   },
   {
     ...beforeExpiry,
@@ -398,6 +400,7 @@ const expiryHistory: Turn[] = [
   },
 ].map((item) => ({
   ...item,
+  openingResponseId: `demo-${item.promptId}`,
   contextRequest: {
     at: item.startedAt,
     lifetime: '1h' as const,
@@ -440,7 +443,7 @@ for (let index = expiryHistory.length - 2; index >= 0; index--) {
   const previous = expiryHistory[index + 1];
   const carry = (item: Turn): CacheExpiryCarry => ({
     ...previousRequest,
-    requestKey: item.promptId,
+    requestKey: `claude:${item.openingResponseId}`,
     visibleTurnId: item.promptId,
     timestamp: item.startedAt,
     inputTokens: item.usage.input + item.usage.cacheWrite1h,
@@ -1201,6 +1204,12 @@ for (const [id, turns] of Object.entries(DEMO_TURNS)) {
 export const DEMO_DEFAULT_EXPIRY = emptyCacheExpiryFacts();
 const demoCodexExpiry = emptyCacheExpiryFacts();
 const demoDelegatedExpiry = emptyCacheExpiryFacts();
+// Request identities let the production warning match the opening response.
+for (const turns of Object.values(DEMO_TURNS)) {
+  for (const item of turns) {
+    if (item.agent === 'claude') item.openingResponseId = `demo-${item.promptId}`;
+  }
+}
 // Single-request turns supply complete adjacent request evidence.
 for (const [sessionId, facts] of [
   ['arc-read-state', DEMO_DEFAULT_EXPIRY],
@@ -1210,8 +1219,8 @@ for (const [sessionId, facts] of [
   const defaultHistory = DEMO_TURNS[sessionId].filter((item) => item.usage.requests === 1).reverse();
   for (let index = 1; index < defaultHistory.length; index++) {
     const carry = (item: Turn): CacheExpiryCarry => ({
-      requestKey: item.promptId,
-      visibleTurnId: item.promptId,
+      requestKey: item.agent === 'claude' ? `claude:${item.openingResponseId}` : item.promptId,
+      visibleTurnId: item.agent === 'codex' ? `codex-turn:${item.promptId}` : item.promptId,
       timestamp: item.contextRequest!.at,
       lifetime: item.contextRequest!.lifetime,
       model: item.model,
@@ -1267,7 +1276,7 @@ export const DEMO_SESSION_IDS = Object.keys(DEMO_TURNS).filter((id) => id !== 'a
 DEMO_SESSION_IDS.splice(1, 0, 'arc-codex-read-state');
 
 // Map linked unread-results subagent session IDs to their parent edges.
-const demoParentEdges = new Map<string, SessionParentEdge>(
+export const demoParentEdges = new Map<string, SessionParentEdge>(
   demoReadStateTurn.agents.flatMap((agent) =>
     agent.childSessionId
       ? [[agent.childSessionId, { parent: readStateTurn.sessionId, relation: 'subagent' } as const]]
@@ -1277,7 +1286,7 @@ const demoParentEdges = new Map<string, SessionParentEdge>(
 demoParentEdges.set('arc-demo-sketch', { parent: 'arc-read-state', relation: 'dispatched' });
 demoParentEdges.set('arc-demo-review', { parent: 'arc-demo-dispatch', relation: 'dispatched' });
 
-const demoReaderParents: Readonly<Record<string, string>> = { 'arc-demo-continuation': 'arc-demo-dispatch' };
+export const demoReaderParents: Readonly<Record<string, string>> = { 'arc-demo-continuation': 'arc-demo-dispatch' };
 
 // Initial demo session labels. The adapter edits a page-local copy and rebuilds session list label fields from it.
 export const DEMO_LABELS: Readonly<Record<string, readonly string[]>> = {
@@ -1357,45 +1366,77 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
     : sessionParentOf(rows, demoParentEdges, selected);
   const mainTurns = DEMO_TURNS['arc-read-state'];
   const sketch = DEMO_TURNS['arc-demo-sketch'][0];
-  const mainCost = sessionCostStats([
-    ...mainTurns.flatMap((item) => [
-      {
-        agent: item.agent,
-        role: 'main' as const,
-        scopeId: item.sessionId ?? undefined,
-        model: item.model,
-        provider: item.provider ?? null,
-        contextWindow: item.contextWindow,
-        usage: item.usage,
-      },
-      ...item.agents.flatMap((agent) =>
-        agent.spend.map((part) => ({
-          ...part,
+  const mainCost = sessionCostProjection(
+    [
+      ...mainTurns.flatMap((item) => [
+        {
           agent: item.agent,
-          role: 'delegated' as const,
-          scopeId: agent.id ?? undefined,
-          provider: null,
+          role: 'main' as const,
+          scopeId: item.sessionId ?? undefined,
+          model: item.model,
+          provider: item.provider ?? null,
           contextWindow: item.contextWindow,
-          incomplete: agent.spendPartial || !agent.spendFound,
-        })),
-      ),
-    ]),
-    {
-      agent: sketch.agent,
-      role: 'delegated',
-      scopeId: sketch.sessionId ?? undefined,
-      model: sketch.model,
-      provider: null,
-      contextWindow: sketch.contextWindow,
-      usage: sketch.usage,
-    },
-  ]);
+          usage: item.usage,
+        },
+        ...item.agents.flatMap((agent) =>
+          agent.spend.map((part) => ({
+            ...part,
+            agent: item.agent,
+            role: 'delegated' as const,
+            scopeId: agent.id ?? undefined,
+            provider: null,
+            contextWindow: item.contextWindow,
+            incomplete: agent.spendPartial || !agent.spendFound,
+          })),
+        ),
+      ]),
+      {
+        agent: sketch.agent,
+        role: 'delegated',
+        scopeId: sketch.sessionId ?? undefined,
+        model: sketch.model,
+        provider: null,
+        contextWindow: sketch.contextWindow,
+        usage: sketch.usage,
+      },
+    ],
+    false,
+    { expiry: DEMO_DEFAULT_EXPIRY },
+  ).stats;
   stats['arc-read-state'] = [
     ...stats['arc-read-state'].filter((chip) => chip.metric !== 'cost'),
     ...mainCost,
     ...sessionCacheExpiryStats(DEMO_DEFAULT_EXPIRY),
   ];
-  stats['delegated-cost'].push(...sessionCacheExpiryStats(demoDelegatedExpiry));
+  stats['delegated-cost'] = [
+    ...stats['delegated-cost'].filter((chip) => chip.metric !== 'cost'),
+    ...sessionCostProjection(
+      DEMO_TURNS['delegated-cost'].flatMap((item) => [
+        {
+          agent: item.agent,
+          model: item.model,
+          provider: item.provider ?? null,
+          contextWindow: item.contextWindow,
+          usage: item.usage,
+          role: 'main' as const,
+        },
+        ...item.agents.flatMap((agent) =>
+          agent.spend.map((part) => ({
+            ...part,
+            agent: item.agent,
+            provider: part.provider ?? null,
+            contextWindow: part.contextWindow ?? item.contextWindow,
+            role: 'delegated' as const,
+            scopeId: agent.id ?? undefined,
+            incomplete: agent.spendPartial || !agent.spendFound,
+          })),
+        ),
+      ]),
+      false,
+      { expiry: demoDelegatedExpiry },
+    ).stats,
+    ...sessionCacheExpiryStats(demoDelegatedExpiry),
+  ];
   stats['arc-codex-read-state'].push(...sessionCacheExpiryStats(demoCodexExpiry));
   const statuses = new Map<string, RailStatus>([
     ['delegated-cost', 'waiting'],
@@ -1556,6 +1597,16 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
               },
             ]
           : [],
+        turnCacheExpiryWarning(
+          item,
+          selected === 'arc-read-state'
+            ? DEMO_DEFAULT_EXPIRY
+            : selected === 'delegated-cost'
+              ? demoDelegatedExpiry
+              : selected === 'arc-codex-read-state'
+                ? demoCodexExpiry
+                : null,
+        ),
       );
       if (selected === 'arc-demo-dispatch' || (selected === 'arc-read-state' && item === demoReadStateTurn)) {
         const review = DEMO_TURNS[selected === 'arc-read-state' ? 'arc-demo-sketch' : 'arc-demo-review'][0];
@@ -1625,9 +1676,9 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
   const selected =
     scene === 'next-turn'
       ? nextTurn
-      : scene === 'cache-expiry'
-        ? expiryTurn
-        : scene === 'comment' || scene === 'comment-editor' || scene === 'cost'
+      : scene === 'cache-expiry' || scene === 'cost'
+        ? expiryHistory[0]
+        : scene === 'comment' || scene === 'comment-editor'
           ? changesTurn
           : scene === 'cache'
             ? cacheTurn
@@ -1739,6 +1790,8 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
     null,
     false,
     scene === 'review' ? new Set(['sol-implementation']) : new Set(),
+    [],
+    turnCacheExpiryWarning(selected, scene === 'cache-expiry' || scene === 'cost' ? expiryFacts : null),
   );
   const comments: TurnComment[] =
     scene === 'comment' || scene === 'comment-editor'
