@@ -34,31 +34,78 @@ export function commitRepositorySourceKey(source: CommitRepositorySource): strin
   return JSON.stringify([source.file, source.sessionId, dev, ino, size, mtimeMs]);
 }
 
+// The lifetime allowance of a physical source revision counts the bytes of accepted replies and the full
+// admission of every other request. A worker that dies mid-read therefore still spends its admission.
 export class CommitRepositoryReservations {
   private readonly reserved = new Map<string, number>();
+  private readonly active = new Map<string, Promise<void>>();
 
-  reserve(
-    parent: CommitRepositorySource,
-    child: CommitRepositorySource,
-    parentComplete = false,
-  ): { parentBytes: number; childBytes: number } {
+  private static key(source: CommitRepositorySource): string {
+    const { dev, ino, size, mtimeMs } = source.revision;
+    return JSON.stringify([dev, ino, size, mtimeMs]);
+  }
+
+  reserve(parent: CommitRepositorySource, child: CommitRepositorySource): { parentBytes: number; childBytes: number } {
     const reserve = (source: CommitRepositorySource, bytes: number) => {
-      const { dev, ino, size, mtimeMs } = source.revision;
-      const key = JSON.stringify([dev, ino, size, mtimeMs]);
+      const key = CommitRepositoryReservations.key(source);
       const held = this.reserved.get(key) ?? 0;
       const admitted = Math.min(bytes, COMMIT_REPOSITORY_SOURCE_BYTES - held);
       this.reserved.set(key, held + admitted);
       return admitted;
     };
     return {
-      parentBytes: reserve(parent, parentComplete ? 0 : COMMIT_REPOSITORY_REQUEST_BYTES / 2),
+      parentBytes: reserve(parent, COMMIT_REPOSITORY_REQUEST_BYTES / 2),
       childBytes: reserve(child, COMMIT_REPOSITORY_REQUEST_BYTES / 2),
     };
   }
 
+  // Replace the admission of an accepted reply with the bytes its worker read.
+  settle(
+    parent: CommitRepositorySource,
+    child: CommitRepositorySource,
+    allowance: { parentBytes: number; childBytes: number },
+    readBytes: { parent: number; child: number },
+  ): void {
+    const settle = (source: CommitRepositorySource, admitted: number, read: number) => {
+      const key = CommitRepositoryReservations.key(source);
+      this.reserved.set(key, (this.reserved.get(key) ?? 0) - admitted + Math.min(read, admitted));
+    };
+    settle(parent, allowance.parentBytes, readBytes.parent);
+    settle(child, allowance.childBytes, readBytes.child);
+  }
+
+  // Wait until no request holds the parent or child revision, then hold both until `release`.
+  // Reservations count outstanding admissions as spent, so a concurrent request would receive a short admission.
+  // Returns null when the signal aborts before both revisions are free.
+  async hold(
+    parent: CommitRepositorySource,
+    child: CommitRepositorySource,
+    signal: AbortSignal,
+  ): Promise<(() => void) | null> {
+    const keys = [...new Set([parent, child].map(CommitRepositoryReservations.key))];
+    for (;;) {
+      if (signal.aborted) return null;
+      const busy = keys.flatMap((key) => this.active.get(key) ?? []);
+      if (!busy.length) break;
+      let stop = () => {};
+      const aborted = new Promise<void>((resolve) => {
+        stop = resolve;
+        signal.addEventListener('abort', stop, { once: true });
+      });
+      await Promise.race([Promise.all(busy), aborted]);
+      signal.removeEventListener('abort', stop);
+    }
+    let release = () => {};
+    const done = new Promise<void>((resolve) => (release = resolve));
+    for (const key of keys) this.active.set(key, done);
+    return () => {
+      for (const key of keys) if (this.active.get(key) === done) this.active.delete(key);
+      release();
+    };
+  }
+
   bytes(source: CommitRepositorySource): number {
-    const { dev, ino, size, mtimeMs } = source.revision;
-    return this.reserved.get(JSON.stringify([dev, ino, size, mtimeMs])) ?? 0;
+    return this.reserved.get(CommitRepositoryReservations.key(source)) ?? 0;
   }
 }
 

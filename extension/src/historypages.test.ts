@@ -375,6 +375,24 @@ test('a processing deadline at the final record preserves resumable ownership co
   assert.equal(cursor.through, size);
 });
 
+test('a resumed ownership cursor whose allowance cannot fund its head check ends exhausted', async () => {
+  const file = path.join(tempDir('commit-ownership-unfunded-'), 'parent.jsonl');
+  fs.writeFileSync(
+    file,
+    Array.from({ length: 8 }, () => JSON.stringify({ type: 'ignored', payload: 'x'.repeat(64) }) + '\n').join(''),
+  );
+  const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
+  const cursor = createCommitRepositoryCursor(
+    { file, sessionId: 'parent', revision: { size, mtimeMs, dev, ino } },
+    null,
+  );
+  const first = await scanCommitRepositorySource(cursor, 128, undefined, () => 0);
+  assert.equal(first.status, 'pending');
+  assert.ok(cursor.offset > 0 && cursor.head.length > 1);
+  const unfunded = await scanCommitRepositorySource(cursor, cursor.head.length - 1, undefined, () => 0);
+  assert.deepEqual(unfunded, { status: 'exhausted', readBytes: 0 });
+});
+
 test('commit ownership record exhaustion and cancellation provide no complete coverage', async () => {
   const file = path.join(tempDir('commit-ownership-limit-'), 'parent.jsonl');
   fs.writeFileSync(

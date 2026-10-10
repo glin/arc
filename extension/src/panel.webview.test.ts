@@ -3085,6 +3085,250 @@ test('commit repository replies expire on parent-only changes and reject stale o
   assert.equal(turns[0].commits[0].candidates?.complete, false);
 });
 
+function commitAllowanceHost(count: number) {
+  const directory = tempDir('host-commit-allowance-');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  fs.writeFileSync(parentFile, 'p'.repeat(1000));
+  const parent = { agent: 'codex', sessionId: 'parent', file: parentFile, size: 1000, mtimeMs: 1 };
+  const children = Array.from({ length: count }, (_, index) => {
+    const file = path.join(directory, `child-${index}.jsonl`);
+    fs.writeFileSync(file, 'c'.repeat(100 + index));
+    return {
+      threadId: `child-${index}`,
+      parentThreadId: 'parent',
+      file,
+      agentPath: '/root/worker',
+      backgroundReview: false,
+      openedAt: 1,
+      startedAt: 1,
+      threadSource: 'subagent',
+    };
+  });
+  const sessions = children.map((child, index) => ({
+    session: { ...parent, sessionId: child.threadId, file: child.file },
+    turns: [
+      turn({
+        commits: [
+          {
+            sha: 'a'.repeat(7),
+            printedSha: 'a'.repeat(40),
+            subject: 'Recorded',
+            at: 5,
+            files: 1,
+            added: 2,
+            removed: 0,
+            dir: null,
+            place: null,
+            repositoryEvidence: { dirs: [`C:/child-${index}/worktree`], at: 6, turnId: 'turn', complete: true },
+          },
+        ],
+      }),
+    ],
+  }));
+  const provider: any = Object.create(PanelProvider.prototype);
+  provider.codexSubagents = children;
+  provider.allSessions = () => [parent];
+  provider.commitRepositoryReplies = new Map();
+  provider.commitRepositoryReservations = new CommitRepositoryReservations();
+  const reply = (request: any, generation: number, status: string, readBytes: { parent: number; child: number }) => ({
+    generation,
+    revision: request.parent.revision,
+    value: {
+      kind: 'commit-repositories',
+      status,
+      token: status === 'pending' || status === 'complete' ? `token-${generation}` : null,
+      parent: request.parent,
+      child: request.child,
+      parserVersion: request.parserVersion,
+      readBytes,
+      covered: {
+        parent: [0, status === 'complete' ? request.parent.revision.size : 0],
+        child: [0, status === 'complete' ? request.child.revision.size : 0],
+      },
+      targets:
+        status === 'complete'
+          ? request.commits.map((commit: any) => ({
+              sha: commit.sha,
+              dirs: [commit.dirs[0].replace('/worktree', '')],
+              occurrence: JSON.stringify([commit.turnId, commit.at, commit.evidenceAt, commit.sha, commit.dirs]),
+            }))
+          : [],
+    },
+  });
+  // The fake worker follows the real allowance rule: an unread parent or a child without allowance ends the request.
+  const worker = (childStatus: (request: any) => { status: string; child: number }) => {
+    let parentRead = false;
+    return (request: any, generation: number) => {
+      if ((!parentRead && request.parentBytes === 0) || request.childBytes === 0)
+        return reply(request, generation, 'exhausted', { parent: 0, child: 0 });
+      const parentBytes = parentRead ? 0 : request.parent.revision.size;
+      parentRead = true;
+      const child = childStatus(request);
+      return reply(request, generation, child.status, { parent: parentBytes, child: child.child });
+    };
+  };
+  const resolve = (index: number) => {
+    const { session, turns } = sessions[index];
+    provider.applyCommitRepositoryEvidence(session, turns);
+    return turns[0].commits[0].candidates;
+  };
+  const bytes = (file: string, sessionId: string) =>
+    provider.commitRepositoryReservations.bytes({ file, sessionId, revision: provider.revisionOf({ file }) });
+  return { provider, parent, children, sessions, reply, worker, resolve, bytes };
+}
+
+test('repeated pending commit replies charge the bytes read and resolve the commit', async () => {
+  const { provider, sessions, worker, resolve } = commitAllowanceHost(1);
+  let requests = 0;
+  const model = worker(() =>
+    ++requests > 200 ? { status: 'complete', child: 100 } : { status: 'pending', child: 4096 },
+  );
+  provider.progressiveWorker = { run: async (request: any, generation: number) => model(request, generation) };
+  const { session, turns } = sessions[0];
+  for (let generation = 1; generation < 400; generation++)
+    if (!(await provider.hydrateCommitRepositories(session, turns, generation, new AbortController().signal))) break;
+  assert.deepEqual(resolve(0), { dirs: ['C:/child-0'], complete: true });
+  assert.equal(requests, 201);
+});
+
+test('children sharing one parent charge the parent only for bytes the worker read', async () => {
+  const { provider, parent, children, sessions, worker, resolve, bytes } = commitAllowanceHost(131);
+  const charges = new Map<string, number>();
+  const install = () => {
+    const model = worker((request) => ({ status: 'complete', child: request.child.revision.size }));
+    provider.progressiveWorker = {
+      async run(request: any, generation: number) {
+        const result = model(request, generation);
+        charges.set(request.child.file, result.value.readBytes.child);
+        return result;
+      },
+    };
+  };
+  install();
+  for (const [index, { session, turns }] of sessions.entries()) {
+    // A replacement worker keeps no parent cursor, so its first request reads the parent again.
+    if (index === 130) install();
+    await provider.hydrateCommitRepositories(session, turns, index + 1, new AbortController().signal);
+  }
+  for (const index of sessions.keys())
+    assert.deepEqual(resolve(index), { dirs: [`C:/child-${index}`], complete: true }, `child ${index}`);
+  assert.equal(bytes(parent.file, 'parent'), 2 * 1000);
+  for (const child of children) assert.equal(bytes(child.file, child.threadId), charges.get(child.file));
+});
+
+test('stale commit replies and complete replies without full coverage keep their whole charge', async () => {
+  const { provider, parent, children, sessions, reply, bytes } = commitAllowanceHost(2);
+  const replies = [
+    (request: any, generation: number) => reply(request, generation, 'stale', { parent: 10, child: 10 }),
+    (request: any, generation: number) => {
+      const partial = reply(request, generation, 'complete', { parent: 10, child: 10 });
+      partial.value.covered.child = [0, request.child.revision.size - 1];
+      return partial;
+    },
+  ];
+  let calls = 0;
+  provider.progressiveWorker = {
+    run: async (request: any, generation: number) => replies[calls++](request, generation),
+  };
+  for (const [index, { session, turns }] of sessions.entries())
+    await provider.hydrateCommitRepositories(session, turns, index + 1, new AbortController().signal);
+  assert.equal(calls, 2);
+  assert.equal(bytes(parent.file, 'parent'), 1024 * 1024);
+  for (const child of children) assert.equal(bytes(child.file, child.threadId), 512 * 1024);
+});
+
+test('concurrent commit requests on one parent wait so a nearly spent parent still funds both', async () => {
+  const { provider, parent, sessions, worker, resolve } = commitAllowanceHost(2);
+  const revision = provider.revisionOf(parent);
+  // Settled reads leave the parent 512 KiB and 1 byte of its lifetime allowance.
+  provider.commitRepositoryReservations.reserved.set(
+    JSON.stringify([revision.dev, revision.ino, revision.size, revision.mtimeMs]),
+    64 * 1024 * 1024 - 512 * 1024 - 1,
+  );
+  const model = worker((request) => ({ status: 'complete', child: request.child.revision.size }));
+  const requests: any[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  provider.progressiveWorker = {
+    async run(request: any, generation: number) {
+      requests.push(request);
+      if (requests.length === 1) await held;
+      return model(request, generation);
+    },
+  };
+  const hydrate = (index: number) =>
+    provider.hydrateCommitRepositories(
+      sessions[index].session,
+      sessions[index].turns,
+      index + 1,
+      new AbortController().signal,
+    );
+  const first = hydrate(0);
+  await vi.waitFor(() => assert.equal(requests.length, 1));
+  const second = hydrate(1);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(requests.length, 2);
+  assert.ok(requests[1].parentBytes > 1, `the second request carried ${requests[1].parentBytes} parent bytes`);
+  assert.deepEqual(resolve(0), { dirs: ['C:/child-0'], complete: true });
+  assert.deepEqual(resolve(1), { dirs: ['C:/child-1'], complete: true });
+  assert.deepEqual(
+    requests.map((request) => request.parent.revision),
+    [revision, revision],
+  );
+  assert.deepEqual(provider.revisionOf(parent), revision);
+});
+
+test('a lost commit reply frees its sources and a request aborted while it waits sends nothing', async () => {
+  const { provider, parent, sessions, worker, resolve, bytes } = commitAllowanceHost(1);
+  const model = worker((request) => ({ status: 'complete', child: request.child.revision.size }));
+  const { session, turns } = sessions[0];
+  let calls = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  provider.progressiveWorker = {
+    async run(request: any, generation: number) {
+      calls++;
+      if (calls === 1) return null;
+      if (calls === 2) await held;
+      return model(request, generation);
+    },
+  };
+  assert.equal(await provider.hydrateCommitRepositories(session, turns, 1, new AbortController().signal), true);
+  const second = provider.hydrateCommitRepositories(session, turns, 2, new AbortController().signal);
+  await vi.waitFor(() => assert.equal(calls, 2));
+  const controller = new AbortController();
+  const waiting = provider.hydrateCommitRepositories(session, turns, 3, controller.signal);
+  controller.abort();
+  assert.equal(await waiting, false);
+  release();
+  assert.equal(await second, false);
+  assert.equal(calls, 2);
+  assert.deepEqual(resolve(0), { dirs: ['C:/child-0'], complete: true });
+  assert.equal(bytes(parent.file, 'parent'), 512 * 1024 + 1000);
+});
+
+test('a commit request aborted after it takes its free sources charges nothing and frees them', async () => {
+  const { provider, parent, children, sessions, worker, bytes } = commitAllowanceHost(1);
+  const model = worker((request) => ({ status: 'complete', child: request.child.revision.size }));
+  let calls = 0;
+  provider.progressiveWorker = {
+    async run(request: any, generation: number, signal: AbortSignal) {
+      calls++;
+      return signal.aborted ? null : model(request, generation);
+    },
+  };
+  const { session, turns } = sessions[0];
+  const controller = new AbortController();
+  const hydration = provider.hydrateCommitRepositories(session, turns, 1, controller.signal);
+  controller.abort();
+  assert.equal(await hydration, false);
+  assert.equal(calls, 0);
+  assert.equal(bytes(parent.file, 'parent'), 0);
+  assert.equal(bytes(children[0].file, children[0].threadId), 0);
+  assert.equal(provider.commitRepositoryReservations.active.size, 0);
+});
+
 test.each(['current', 'retained'])(
   'commit replies keep repeated object owners and unresolved occurrences separate: %s',
   async (placement) => {

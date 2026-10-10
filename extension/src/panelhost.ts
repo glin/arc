@@ -9966,51 +9966,66 @@ export class PanelProvider implements vscode.Disposable {
     signal: AbortSignal,
   ): Promise<boolean> {
     for (const context of this.commitRepositoryContexts(session, turns)) {
-      const held = this.commitRepositoryReplies.get(context.child.file);
-      if (held?.key === context.key && held.reply.status !== 'pending') continue;
-      const allowance = this.commitRepositoryReservations.reserve(context.parent, context.child);
-      const request = {
-        kind: 'commit-repositories' as const,
-        parent: context.parent,
-        child: context.child,
-        commits: context.wanted,
-        ...allowance,
-        token: held?.key === context.key ? held.reply.token : null,
-        parserVersion: COMMIT_REPOSITORY_PARSER_VERSION,
-      };
-      const result = await this.progressiveWorker.run(request, generation, signal);
-      if (signal.aborted) return false;
-      if (!result) return allowance.parentBytes > 0 && allowance.childBytes > 0;
-      if (result.generation !== generation || result.value.kind !== 'commit-repositories') return false;
-      const reply = result.value;
-      const current = this.commitRepositoryContexts(session, turns).find(
-        (one) => one.child.file === context.child.file,
-      );
-      if (
-        current?.key !== context.key ||
-        commitRepositorySourceKey(reply.parent) !== commitRepositorySourceKey(context.parent) ||
-        commitRepositorySourceKey(reply.child) !== commitRepositorySourceKey(context.child) ||
-        reply.parserVersion !== COMMIT_REPOSITORY_PARSER_VERSION ||
-        reply.status === 'cancelled'
-      )
-        return false;
-      if (
-        reply.readBytes.parent < 0 ||
-        reply.readBytes.parent > allowance.parentBytes ||
-        reply.readBytes.child < 0 ||
-        reply.readBytes.child > allowance.childBytes
-      )
-        return false;
-      if (
-        reply.status === 'complete' &&
-        (reply.covered.parent[0] !== 0 ||
-          reply.covered.parent[1] !== context.parent.revision.size ||
-          reply.covered.child[0] !== 0 ||
-          reply.covered.child[1] !== context.child.revision.size)
-      )
-        return false;
-      this.commitRepositoryReplies.set(context.child.file, { key: context.key, reply });
-      if (reply.status === 'pending') return true;
+      const waiting = this.commitRepositoryReplies.get(context.child.file);
+      if (waiting?.key === context.key && waiting.reply.status !== 'pending') continue;
+      // Requests on a shared parent or child reserve one at a time, so no admission counts the outstanding admission of another request.
+      const release = await this.commitRepositoryReservations.hold(context.parent, context.child, signal);
+      if (!release) return false;
+      try {
+        // Read the reply again, because an earlier request on this child can finish while this one waits.
+        const held = this.commitRepositoryReplies.get(context.child.file);
+        if (held?.key === context.key && held.reply.status !== 'pending') continue;
+        // The signal can abort while hold resolves, and a reservation without a request would keep its full charge.
+        if (signal.aborted) return false;
+        const allowance = this.commitRepositoryReservations.reserve(context.parent, context.child);
+        const request = {
+          kind: 'commit-repositories' as const,
+          parent: context.parent,
+          child: context.child,
+          commits: context.wanted,
+          ...allowance,
+          token: held?.key === context.key ? held.reply.token : null,
+          parserVersion: COMMIT_REPOSITORY_PARSER_VERSION,
+        };
+        const result = await this.progressiveWorker.run(request, generation, signal);
+        if (signal.aborted) return false;
+        if (!result) return allowance.parentBytes > 0 && allowance.childBytes > 0;
+        if (result.generation !== generation || result.value.kind !== 'commit-repositories') return false;
+        const reply = result.value;
+        const current = this.commitRepositoryContexts(session, turns).find(
+          (one) => one.child.file === context.child.file,
+        );
+        if (
+          current?.key !== context.key ||
+          commitRepositorySourceKey(reply.parent) !== commitRepositorySourceKey(context.parent) ||
+          commitRepositorySourceKey(reply.child) !== commitRepositorySourceKey(context.child) ||
+          reply.parserVersion !== COMMIT_REPOSITORY_PARSER_VERSION ||
+          reply.status === 'cancelled'
+        )
+          return false;
+        if (
+          reply.readBytes.parent < 0 ||
+          reply.readBytes.parent > allowance.parentBytes ||
+          reply.readBytes.child < 0 ||
+          reply.readBytes.child > allowance.childBytes
+        )
+          return false;
+        if (
+          reply.status === 'complete' &&
+          (reply.covered.parent[0] !== 0 ||
+            reply.covered.parent[1] !== context.parent.revision.size ||
+            reply.covered.child[0] !== 0 ||
+            reply.covered.child[1] !== context.child.revision.size)
+        )
+          return false;
+        // Only an accepted reply returns its unread admission. Other outcomes keep the full charge.
+        if (reply.status === 'pending' || reply.status === 'complete' || reply.status === 'exhausted')
+          this.commitRepositoryReservations.settle(context.parent, context.child, allowance, reply.readBytes);
+        this.commitRepositoryReplies.set(context.child.file, { key: context.key, reply });
+        if (reply.status === 'pending') return true;
+      } finally {
+        release();
+      }
     }
     this.applyCommitRepositoryEvidence(session, turns);
     return false;

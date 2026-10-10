@@ -321,7 +321,9 @@ export async function scanCommitRepositorySource(
     if (cursor.offset > 0) {
       const head = read(0, cursor.head.length);
       const anchor = read(cursor.offset - cursor.anchor.length, cursor.anchor.length);
-      if (!head || !anchor) return { status: 'pending', readBytes: charged };
+      // The host admits less than these checks only after earlier requests spend the source's lifetime allowance.
+      // A pending reply would return the same admission, and the host would repeat the request without progress.
+      if (!head || !anchor) return { status: 'exhausted', readBytes: charged };
       if (!head.equals(cursor.head) || !anchor.equals(cursor.anchor)) return { status: 'stale', readBytes: charged };
     }
     while (!cursor.exhausted) {
