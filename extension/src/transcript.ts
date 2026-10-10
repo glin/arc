@@ -7086,7 +7086,8 @@ export interface ClaudeUnsizedCompaction {
 }
 
 export interface ClaudePendingCompaction {
-  // `compactionParents` as the compaction's first boundary or summary record found it.
+  // `compactionParents` as the compaction's first boundary or summary record found it, without the
+  // ids its boundary names as the head and tail of its preserved segment.
   parents: string[];
   // The compaction's ordinal once its summary counted it. Null while only its boundary is read.
   ordinal: number | null;
@@ -7155,11 +7156,14 @@ export function retainNewestCompaction(
 }
 
 // The boundary pairs with a summary read before it, or opens the next pending compaction. A
-// summary that a record already decided still claims a boundary written inside its window.
-function noteClaudeCompactionBoundary(state: ClaudeUsageReducerState, at: number): void {
+// summary that a record already decided still claims a boundary written inside its window. The
+// boundary's preserved segment ends and starts at records the next prompt descends from on older
+// builds, so those ids never prove that the session left the compaction.
+function noteClaudeCompactionBoundary(state: ClaudeUsageReducerState, at: number, preserved: string[]): void {
   const pending = state.pendingCompaction;
   if (pending && pending.ordinal !== null && !pending.boundary) {
     pending.boundary = true;
+    pending.parents = pending.parents.filter((id) => !preserved.includes(id));
     return;
   }
   const unsized = state.unsizedCompaction;
@@ -7167,11 +7171,17 @@ function noteClaudeCompactionBoundary(state: ClaudeUsageReducerState, at: number
     return;
   }
   state.pendingCompaction = {
-    parents: [...(state.compactionParents ?? [])],
+    parents: (state.compactionParents ?? []).filter((id) => !preserved.includes(id)),
     ordinal: null,
     boundary: true,
     evicted: null,
   };
+}
+
+// The ids of the records a compaction boundary keeps from before the summary: the first and the last.
+function preservedSegmentIds(metadata: Record<string, unknown> | undefined): string[] {
+  const segment = metadata?.preservedSegment as Record<string, unknown> | undefined;
+  return [segment?.headUuid, segment?.tailUuid].filter((id): id is string => typeof id === 'string' && id !== '');
 }
 
 // The summary completes the pending compaction its boundary opened. Otherwise it replaces any
@@ -7362,8 +7372,8 @@ function reduceClaudeTurnRecord(
   }
   if (record.type === 'system' && record.subtype === 'compact_boundary') {
     const at = stamp(record.timestamp);
-    noteClaudeCompactionBoundary(state, at);
     const metadata = record.compactMetadata as Record<string, unknown> | undefined;
+    noteClaudeCompactionBoundary(state, at, preservedSegmentIds(metadata));
     state.pendingCompactionTrigger =
       typeof metadata?.trigger === 'string' && metadata.trigger ? metadata.trigger : null;
     const after = positiveCount(metadata?.postTokens);

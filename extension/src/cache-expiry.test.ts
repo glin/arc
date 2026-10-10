@@ -767,7 +767,12 @@ const claudeCompactCommand = (minutes: number, id: string) =>
 
 // A manual compaction as Claude Code writes it. The boundary links back only through
 // `logicalParentUuid`, and the summary names the boundary.
-const claudeLinkedCompaction = (minutes: number, id: string, logicalParentUuid: string) => [
+const claudeLinkedCompaction = (
+  minutes: number,
+  id: string,
+  logicalParentUuid: string,
+  preservedSegment?: Record<string, string>,
+) => [
   JSON.stringify({
     type: 'system',
     subtype: 'compact_boundary',
@@ -775,7 +780,13 @@ const claudeLinkedCompaction = (minutes: number, id: string, logicalParentUuid: 
     parentUuid: null,
     logicalParentUuid,
     timestamp: at(minutes),
-    compactMetadata: { trigger: 'manual', preTokens: 40_000, postTokens: 2_000, durationMs: 30_000 },
+    compactMetadata: {
+      trigger: 'manual',
+      preTokens: 40_000,
+      postTokens: 2_000,
+      durationMs: 30_000,
+      ...(preservedSegment ? { preservedSegment } : {}),
+    },
   }),
   linked(claudeCompaction(minutes, id), `b-${id}`),
 ];
@@ -1005,6 +1016,40 @@ test('a replayed record between a summary and the prompt after it never decides 
     nextResponse(31, 'mq', 'u-q'),
   );
   assert.equal(indexed(early, claudeReducer).compactionCount, 0, 'a replayed early answer kept the compaction');
+});
+
+// Older Claude Code builds keep a stretch of records across a compaction. The next prompt then
+// descends from the stretch's last record, so naming a preserved record does not leave the compaction.
+test('a prompt that names a preserved record keeps its compaction counted and shows no cache expiry', () => {
+  const preserved = { headUuid: 'u-p1', anchorUuid: 'c-A', tailUuid: 'a-m1' };
+  const unrelated = { headUuid: 'u-other', anchorUuid: 'c-A', tailUuid: 'a-other' };
+  const [boundary, summaryLine] = claudeLinkedCompaction(10, 'A', 'a-m1', preserved);
+  const [plainBoundary] = claudeLinkedCompaction(10, 'A', 'a-m1', unrelated);
+  const after = (parent: string) => [
+    linked(claudePrompt(10 + SIXTEEN_HOURS, 'p2'), parent),
+    nextResponse(10 + SIXTEEN_HOURS, 'm2', 'u-p2'),
+  ];
+  const orders: Array<[string, string[]]> = [
+    ['boundary first', [boundary, summaryLine]],
+    ['summary first', [summaryLine, boundary]],
+  ];
+  for (const [order, compaction] of orders) {
+    for (const parent of ['a-m1', 'u-p1']) {
+      const record = indexed([...opening(), ...compaction, ...after(parent)], claudeReducer);
+      assert.equal(record.compactionCount, 1, `${order}: a prompt naming ${parent} revoked the compaction`);
+      assert.deepEqual(summary(record), {
+        counts: { '5m': 0, '30m': 0, '1h': 0 },
+        excluded: 1,
+        unavailable: 0,
+        longestGapMs: null,
+        truncated: false,
+      });
+    }
+  }
+  // Only the named records are exempt. A boundary that names other records still lets a prompt revoke.
+  const revoked = indexed([...opening(), plainBoundary, summaryLine, ...after('a-m1')], claudeReducer);
+  assert.equal(revoked.compactionCount, 0);
+  assert.equal(facts(revoked).counts['1h'], 1);
 });
 
 test('a billed answer decides a compaction, and a synthetic answer does not', () => {

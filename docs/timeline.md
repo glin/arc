@@ -390,7 +390,7 @@ The fresh record right after a run can name the last repeated record as its `par
 
 ### Claude preserved segments
 
-The first prompt after a kept compaction can descend from the boundary's `compactMetadata.preservedSegment.tailUuid`, a record written before the boundary, rather than from the summary. That is the kept shape on older Claude Code builds, not a rewind.
+The first prompt after a kept compaction can descend from the boundary's `compactMetadata.preservedSegment.tailUuid`, a record written before the boundary, rather than from the summary. That is the kept shape on older Claude Code builds, not a rewind. The abandoned-compaction check ignores the boundary's `preservedSegment.headUuid` and `preservedSegment.tailUuid` once the boundary is read. The first typed prompt or the first new billed request decides the check. A deciding record that names either id keeps its compaction counted. A deciding record read before the boundary still revokes the compaction when it names the tail.
 
 ## Parsing and attribution constraints
 
