@@ -4861,6 +4861,93 @@ test.each([
   },
 );
 
+test.each(['failure', 'complete'])(
+  'durable health retains acknowledged discovery charges before worker %s',
+  async (terminal) => {
+    const directory = tempDir('discovery-health-');
+    const file = path.join(directory, 'parent.jsonl');
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ type: 'user', cwd: directory, message: { role: 'user', content: 'hello' } }) + '\n',
+    );
+    const stat = fs.statSync(file);
+    const session = { file, sessionId: 'parent', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
+    let finalHeld = false;
+    const worker = new ProgressiveWorker(
+      `performance.now = () => 0;
+      const diagnosticPort = require('node:worker_threads').parentPort;
+      const diagnosticPost = diagnosticPort.postMessage.bind(diagnosticPort);
+      let diagnosticFinal;
+      diagnosticPort.postMessage = (message) => {
+        if (!message.progress && message.result?.value.kind === 'claude-children') {
+          diagnosticFinal = message;
+          diagnosticPost({ repeatedCoverage: 'diagnostic-ready' });
+        } else diagnosticPost(message);
+      };
+      diagnosticPort.on('message', (message) => {
+        if (!message.diagnosticTerminal) return;
+        if (message.diagnosticTerminal === 'failure') throw new TypeError('private failure detail');
+        diagnosticPost(diagnosticFinal);
+      });\n` + progressiveWorkerSource,
+      undefined,
+      () => {
+        finalHeld = true;
+      },
+    );
+    const { provider } = dispatchedRefreshFixture([session], worker, []);
+    provider.performanceCounters = new PanelPerformanceCounters();
+    let clock = 100;
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    const health = new HostHealth({
+      directory,
+      workspace: 'test',
+      build: { sourceCommit: null, dirty: false, builtAt: 1 },
+      now: () => clock,
+      work: () => provider.healthWork(),
+    });
+    try {
+      const pending = provider.prepareClaudeChildren(1, new AbortController().signal);
+      await vi.waitFor(() => assert.ok(finalHeld && provider.discoveryCheckpoint), { timeout: 5000, interval: 1 });
+      health.sample();
+      const before = JSON.parse(fs.readFileSync(health.file, 'utf8')).work;
+      assert.equal(before.discovery.readBytes, 0);
+      assert.ok(before.discoveryObservation.charges.readBytes > 0);
+      assert.ok(before.discoveryObservation.charges.quanta > 0);
+      assert.ok(before.discoveryObservation.charges.parentChecks > 0);
+      assert.equal(before.discoveryObservation.hostRequest, 1);
+      assert.equal(before.discoveryObservation.generation, 1);
+      assert.equal(before.discoveryObservation.sequence, before.checkpoint.sequence);
+      clock = 350;
+      (worker as unknown as { worker: { postMessage(message: unknown): void } }).worker.postMessage({
+        metadataEligible: [],
+        diagnosticTerminal: terminal,
+      });
+      assert.equal(await pending, terminal === 'complete');
+      health.sample();
+      const after = JSON.parse(fs.readFileSync(health.file, 'utf8')).work;
+      assert.equal(after.discoveryObservation.hostRequest, 1);
+      if (terminal === 'failure') {
+        assert.deepEqual(after.discoveryObservation.charges, before.discoveryObservation.charges);
+        assert.equal(after.discoveryObservation.ageSinceReceiptMs, 250);
+        assert.equal(after.discovery.readBytes, 0);
+        assert.equal(after.worker.lastFailure.name, 'TypeError');
+        assert.equal(after.loadingFailed, true);
+      } else {
+        assert.equal(after.discovery.readBytes, before.discoveryObservation.charges.readBytes);
+        assert.equal(after.discovery.quanta, before.discoveryObservation.charges.quanta);
+        for (const [field, charge] of Object.entries(after.discoveryObservation.charges)) {
+          assert.equal(after.discovery[field], charge, field);
+        }
+        assert.equal(after.discovery.publications, 1);
+      }
+    } finally {
+      health.dispose();
+      worker.stop();
+      now.mockRestore();
+    }
+  },
+);
+
 function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, turns: ReturnType<typeof turn>[]) {
   const fixture = liveProviderFixture(livePress({ sessionId: 'parent', agent: 'codex' }));
   const provider = fixture.provider as unknown as Record<string, any>;

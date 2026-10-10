@@ -336,6 +336,10 @@ export class PanelPerformanceCounters {
     };
   }
 
+  discoverySnapshot(): PerformanceCounterSnapshot['discovery'] {
+    return { ...this.discovery };
+  }
+
   private panelId(panel: object): string {
     const existing = this.panelIds.get(panel);
     if (existing) {

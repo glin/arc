@@ -9,6 +9,7 @@ import {
   type IncrementalSessionResult,
 } from './history';
 import { parentPort } from 'node:worker_threads';
+import { getHeapStatistics } from 'node:v8';
 import { closeReadWindow, openReadWindow } from './readmeter';
 import {
   readClaudeHistoryPageAsync,
@@ -105,6 +106,7 @@ import type {
   DiscoveryCharges,
 } from './progressiveworker';
 import type { DispatchSessionFacts } from './progressiveworker';
+import { workerErrorIdentity } from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
 
 const agentSpends = new AgentSpendCache();
@@ -1285,6 +1287,16 @@ async function execute(
 }
 
 const requests = new Map<number, AbortController>();
+
+function workerMemory(): import('./progressiveworker').WorkerMemory {
+  const heap = getHeapStatistics();
+  return {
+    heapUsed: heap.used_heap_size,
+    heapTotal: heap.total_heap_size,
+    heapLimit: heap.heap_size_limit,
+    external: heap.external_memory,
+  };
+}
 let commitParentCursor: import('./codexhistory').CommitRepositoryCursor | null = null;
 let commitChildCursor: import('./codexhistory').CommitRepositoryCursor | null = null;
 let commitCursorToken: string | null = null;
@@ -1406,11 +1418,14 @@ async function handleMessage(message: {
           parentPort?.postMessage({
             id: message.id,
             progress: true,
-            result: { generation: message.generation, revision: null, value },
+            result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
           });
       });
       if (!controller.signal.aborted) {
-        parentPort?.postMessage({ id: message.id, result: { generation: message.generation, revision: null, value } });
+        parentPort?.postMessage({
+          id: message.id,
+          result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
+        });
       }
       return;
     }
@@ -1487,7 +1502,7 @@ async function handleMessage(message: {
     ) {
       metadataRecovery = null;
     }
-    parentPort?.postMessage({ id: message.id, error: error instanceof Error ? error.message : String(error) });
+    if (!controller.signal.aborted) parentPort?.postMessage({ id: message.id, error: workerErrorIdentity(error) });
   } finally {
     requests.delete(message.id);
   }

@@ -1118,6 +1118,10 @@ export class PanelProvider implements vscode.Disposable {
     undefined,
     () => this.diagnostics.enabled(),
     (file) => this.repeatedCoverage(file),
+    (failure) => {
+      this.diagnostics.warn('workerFailure', { ...failure });
+      this.health?.sample('unknown', false);
+    },
   );
   private readonly commitRepositoryReservations = new CommitRepositoryReservations();
   private readonly commitRepositoryReplies = new Map<string, { key: string; reply: CommitRepositoryReply }>();
@@ -1213,6 +1217,13 @@ export class PanelProvider implements vscode.Disposable {
     revisions?: ReadonlyMap<string, SessionFile>;
   };
   private discoveryRequestSequence = 0;
+  private discoveryObservation?: {
+    hostRequest: number;
+    generation: number;
+    sequence: number;
+    receivedAt: number;
+    charges: import('./progressiveworker').DiscoveryCharges;
+  };
   private discoveryAcknowledgment?: {
     scope: string;
     epoch?: string;
@@ -2112,6 +2123,7 @@ export class PanelProvider implements vscode.Disposable {
           cache: this.startupCache,
           artifact: this.startupArtifact,
           counters: this.performanceCounters.snapshot(),
+          worker: this.progressiveWorker.snapshot(),
           workerTransport: {
             ...this.progressiveWorker.transport,
             byteScope: this.diagnostics.enabled() ? 'JSON content proxy, not native transport bytes' : 'not measured',
@@ -2818,6 +2830,33 @@ export class PanelProvider implements vscode.Disposable {
         this.health?.event('postFailed', panel.id, undefined, sequence);
       }
     }
+  }
+
+  healthWork(): NonNullable<ReturnType<NonNullable<import('./diagnosticslog').HostHealthOptions['work']>>> {
+    return {
+      worker: this.progressiveWorker.snapshot(),
+      discovery: this.performanceCounters.discoverySnapshot(),
+      discoveryObservation: this.discoveryObservation
+        ? {
+            hostRequest: this.discoveryObservation.hostRequest,
+            generation: this.discoveryObservation.generation,
+            sequence: this.discoveryObservation.sequence,
+            ageSinceReceiptMs: Math.max(0, performance.now() - this.discoveryObservation.receivedAt),
+            charges: { ...this.discoveryObservation.charges },
+          }
+        : null,
+      generation: this.refreshGeneration,
+      discoveryPending: this.dispatchDiscoveryPending,
+      loadingFailed: this.startupFailureGeneration === this.refreshGeneration,
+      checkpoint: this.discoveryCheckpoint
+        ? {
+            position: this.discoveryCheckpoint.position,
+            sequence: this.discoveryCheckpoint.sequence,
+            sources: this.discoveryCheckpoint.parents.length,
+            completed: this.discoveryCheckpoint.completed.length,
+          }
+        : null,
+    };
   }
 
   // Register a panel host, its listeners, and its initial document.
@@ -8800,6 +8839,15 @@ export class PanelProvider implements vscode.Disposable {
         sequence,
         generation: Math.max(result.generation, previous?.scope === scope ? previous.generation : 0),
       };
+      if (progress.charges) {
+        this.discoveryObservation = {
+          hostRequest: requestOrder,
+          generation: result.generation,
+          sequence,
+          receivedAt: performance.now(),
+          charges: { ...progress.charges },
+        };
+      }
       if (checkpoint && spendSources) checkpoint.spendSources = spendSources;
       if (delta && checkpoint) {
         const completed =
@@ -11866,6 +11914,7 @@ export function registerPanel(
     bundle: path.join(context.extensionUri.fsPath, 'dist', 'extension.js'),
     counts: () => provider?.healthCounts() ?? { attached: 0, ready: 0, retainedTabs: null, panels: [] },
     pulse: (sequence) => provider?.healthPulse(sequence),
+    work: () => provider?.healthWork(),
   });
   provider = new PanelProvider(
     storeRootDir,

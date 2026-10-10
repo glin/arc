@@ -410,6 +410,88 @@ test('startup history records a pending deadline without waiting for selected te
   }
 });
 
+test('unfinished startup keeps fresh durable work after the pending deadline with detailed logging disabled', async () => {
+  const directory = tempDir('startup-health-progress');
+  vi.useFakeTimers();
+  let clock = 0;
+  let readBytes = 0;
+  const log = createDiagnosticsLog({ enabled: false, directory, workspace: 'private', pid: 1, startedAt: 0 });
+  const discovery = {
+    readBytes: 0,
+    hits: 0,
+    resets: 0,
+    quanta: 0,
+    dispatchRetries: 0,
+    parentChecks: 0,
+    parentCheckMs: 0,
+    childHeadFiles: 0,
+    childHeadBytes: 0,
+    childHeadMs: 0,
+    dispatchSpendVisits: 0,
+    dispatchSpendRereads: 0,
+    dispatchSpendFiles: 0,
+    dispatchSpendBytes: 0,
+    dispatchSpendMs: 0,
+    continuations: 0,
+    publications: 0,
+  };
+  const health = new HostHealth({
+    directory,
+    workspace: 'private',
+    build: { sourceCommit: null, dirty: false, builtAt: 1 },
+    now: () => clock,
+    work: () => ({
+      worker: {
+        role: 'session-reader',
+        threadId: 2,
+        state: 'running',
+        pendingCount: 1,
+        waitingDiscovery: false,
+        active: [{ id: 7, kind: 'claude-children', generation: 2, ageMs: clock, status: 'pending' }],
+        lastFailure: null,
+        memory: {
+          scope: 'session-reader worker thread',
+          threadId: null,
+          requestId: null,
+          observed: null,
+          ageSinceReceiptMs: null,
+        },
+      },
+      discovery: { ...discovery, readBytes },
+      generation: 2,
+      discoveryPending: true,
+      loadingFailed: false,
+      checkpoint: { position: 1, sequence: 3, sources: 5, completed: 1 },
+    }),
+  });
+  const history = new StartupHistory(
+    path.join(directory, 'startup'),
+    () => ({}),
+    () => clock,
+    0,
+  );
+  try {
+    assert.equal(log.enabled(), false);
+    history.stage('panelOpened');
+    clock = 30_000;
+    await vi.advanceTimersByTimeAsync(30_000);
+    readBytes = 65_536;
+    clock = 180_000;
+    await vi.advanceTimersByTimeAsync(150_000);
+    const record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.equal(record.elapsedMs, 180_000);
+    assert.equal(record.work.discovery.readBytes, 65_536);
+    assert.equal(record.work.worker.active[0].ageMs, 180_000);
+    assert.equal(record.work.worker.active[0].kind, 'claude-children');
+    assert.equal(record.work.discoveryPending, true);
+    assert.ok(fs.statSync(health.file).size < 16 * 1024);
+  } finally {
+    history.dispose();
+    health.dispose();
+    vi.useRealTimers();
+  }
+});
+
 test('empty startup completion excludes a first card and samples from later activity', async () => {
   const directory = tempDir('startup-empty-history');
   vi.useFakeTimers();

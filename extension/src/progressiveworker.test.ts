@@ -5,6 +5,8 @@ import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { buildSync } from 'esbuild';
+import { once } from 'node:events';
+import { createDiagnosticsLog } from './diagnosticslog';
 import {
   ProgressiveWorker,
   CommitRepositoryReservations,
@@ -395,6 +397,12 @@ test('acknowledged Claude discovery resumes after worker restart while metadata 
       );
       entries = result.value.referenceEntries;
       const offset = entries[0][1].claudeCursor!.offset;
+      const memory = worker.snapshot().memory;
+      assert.equal(memory.scope, 'session-reader worker thread');
+      assert.equal(memory.threadId, worker.snapshot().threadId);
+      assert.ok(memory.requestId! > 0 && memory.ageSinceReceiptMs! >= 0);
+      assert.ok(memory.observed && memory.observed.heapUsed > 0 && memory.observed.heapLimit > 0);
+      assert.deepEqual(Object.keys(memory.observed).sort(), ['external', 'heapLimit', 'heapTotal', 'heapUsed']);
       assert.ok(offset > previous, 'a worker restart discarded acknowledged source bytes');
       previous = offset;
       if (result.value.kind === 'claude-children') {
@@ -412,6 +420,7 @@ test('acknowledged Claude discovery resumes after worker restart while metadata 
       checkpoint = restored.discovery;
       worker.stop();
       worker = new ProgressiveWorker('performance.now = () => 0;' + source);
+      assert.equal(worker.snapshot().memory.observed, null);
     }
     assert.fail('acknowledged discovery never reached its fixed target');
   } finally {
@@ -964,6 +973,134 @@ const source = buildSync({
   write: false,
 }).outputFiles[0].text;
 const timestamp = (at: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, at)).toISOString();
+
+for (const terminal of ['throw', 'exit'] as const) {
+  test(`worker ${terminal} preserves bounded cause and pending work when host rejection is swallowed`, async () => {
+    const directory = tempDir('worker-terminal-diagnostics');
+    const log = createDiagnosticsLog({ enabled: false, directory, workspace: 'private', pid: 1, startedAt: 0 });
+    const terminalSource = `const port = require('node:worker_threads').parentPort;
+      let seen = 0; port.on('message', () => { if (++seen === 12) {
+        ${terminal === 'throw' ? "throw Object.assign(new Error('PRIVATE_TRANSCRIPT_TEXT'), {name:'RangeError',code:'ERR_WORKER_OUT_OF_MEMORY'});" : 'process.exit(23);'}
+      } });`;
+    const worker = new ProgressiveWorker(
+      terminalSource,
+      () => false,
+      undefined,
+      (failure) => log.warn('workerFailure', { ...failure }),
+    );
+    const session = {
+      file: 'PRIVATE_FILE',
+      sessionId: 'PRIVATE_SESSION',
+      agent: 'codex' as const,
+      size: 0,
+      mtimeMs: 0,
+    };
+    try {
+      const pending = Array.from({ length: 12 }, (_, i) =>
+        worker.run({ kind: 'codex-context', session }, i + 1, new AbortController().signal).catch(() => null),
+      );
+      await Promise.all(pending);
+      await vi.waitFor(() => assert.equal(worker.snapshot().lastFailure?.exitCode, terminal === 'throw' ? 1 : 23));
+      const failure = worker.snapshot().lastFailure!;
+      assert.equal(failure.reason, terminal === 'throw' ? 'error' : 'exit');
+      assert.equal(failure.name, terminal === 'throw' ? 'RangeError' : 'WorkerExit');
+      assert.equal(failure.code, terminal === 'throw' ? 'ERR_WORKER_OUT_OF_MEMORY' : null);
+      assert.equal(failure.pendingCount, 12);
+      assert.equal(failure.active.length, 8);
+      assert.deepEqual(
+        failure.active.map((row) => row.generation),
+        [1, 2, 3, 4, 5, 6, 7, 8],
+      );
+      assert.ok(
+        failure.active.every((row) => row.kind === 'codex-context' && row.status === 'pending' && row.ageMs >= 0),
+      );
+      const text = fs.readFileSync(log.file()!, 'utf8');
+      assert.ok(text.includes('workerFailure'));
+      assert.ok(!text.includes('PRIVATE_'));
+      assert.ok(text.length < 4096);
+      assert.equal(worker.transport.requestJsonBytes, 0);
+    } finally {
+      worker.stop();
+    }
+  });
+}
+
+test('cancelled generation and disposal do not report a worker crash', async () => {
+  const failures: unknown[] = [];
+  const worker = new ProgressiveWorker(
+    "require('node:worker_threads').parentPort.on('message', () => {});",
+    () => false,
+    undefined,
+    (failure) => failures.push(failure),
+  );
+  const controller = new AbortController();
+  const pending = worker.run(
+    { kind: 'codex-context', session: { file: 'private', sessionId: 'private', agent: 'codex', size: 0, mtimeMs: 0 } },
+    4,
+    controller.signal,
+  );
+  const thread = (worker as unknown as { worker: import('node:worker_threads').Worker }).worker;
+  const exited = once(thread, 'exit');
+  controller.abort();
+  assert.equal(await pending, null);
+  await exited;
+  worker.stop();
+  assert.equal(worker.snapshot().state, 'cancelled');
+  assert.deepEqual(failures, []);
+});
+
+test('a caught worker request exception preserves safe cause without its message', async () => {
+  const directory = tempDir('worker-request-diagnostics');
+  const log = createDiagnosticsLog({ enabled: false, directory, workspace: 'private', pid: 1, startedAt: 0 });
+  const instrumented =
+    `const observedPort = require('node:worker_threads').parentPort;
+    const originalOn = observedPort.on;
+    observedPort.on = function(event, listener) {
+      return originalOn.call(this, event, event === 'message' ? message => {
+        if (message.request?.kind === 'codex-context') Object.defineProperty(message.request, 'session', {get() {
+          throw Object.assign(new RangeError('PRIVATE_TRANSCRIPT_TEXT'), {code:'ERR_OUT_OF_RANGE'});
+        }});
+        return listener(message);
+      } : listener);
+    };` + source;
+  const worker = new ProgressiveWorker(
+    instrumented,
+    () => false,
+    undefined,
+    (failure) => log.warn('workerFailure', { ...failure }),
+  );
+  try {
+    const session = { file: 'private', sessionId: 'private', agent: 'codex' as const, size: 0, mtimeMs: 0 };
+    const requests = [1, 2].map((generation) =>
+      worker.run({ kind: 'codex-context', session }, generation, new AbortController().signal),
+    );
+    const settled = await Promise.allSettled(requests);
+    assert.ok(
+      settled.every(
+        (result) =>
+          result.status === 'rejected' &&
+          result.reason.name === 'RangeError' &&
+          result.reason.code === 'ERR_OUT_OF_RANGE' &&
+          !result.reason.message.includes('PRIVATE_'),
+      ),
+    );
+    const records = fs
+      .readFileSync(log.file()!, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(records[0].reason, 'request');
+    assert.equal(records[0].name, 'RangeError');
+    assert.equal(records[0].code, 'ERR_OUT_OF_RANGE');
+    assert.equal(records[0].pendingCount, 2);
+    assert.equal(records[0].active.length, 2);
+    assert.equal(worker.snapshot().state, 'running');
+    assert.equal(worker.snapshot().pendingCount, 0);
+    assert.ok(!fs.readFileSync(log.file()!, 'utf8').includes('PRIVATE_'));
+  } finally {
+    worker.stop();
+  }
+});
 
 test('pending startup discovery releases evicted worker cursors and retains unfinished Claude ownership', async () => {
   const directory = tempDir('pending-discovery-retention-');

@@ -281,10 +281,27 @@ export interface HostHealthOptions {
     panels: { id: number; ready: boolean; sent: number; ack: number }[];
   };
   pulse?: (sequence: number) => void;
+  work?: () =>
+    | {
+        worker: ReturnType<import('./progressiveworker').ProgressiveWorker['snapshot']>;
+        discovery: import('./progressiveworker').DiscoveryCharges & { continuations: number; publications: number };
+        discoveryObservation?: {
+          hostRequest: number;
+          generation: number;
+          sequence: number;
+          ageSinceReceiptMs: number;
+          charges: import('./progressiveworker').DiscoveryCharges;
+        } | null;
+        generation: number;
+        discoveryPending: boolean;
+        loadingFailed: boolean;
+        checkpoint: { position: number; sequence: number; sources: number; completed: number } | null;
+      }
+    | undefined;
 }
 
 // Sparse evidence survives an extension-host exit independently of detailed logging.
-// Only fixed event names, numeric identities, and enumerated work labels reach disk.
+// Only bounded content-free lifecycle and work observations reach disk.
 export class HostHealth {
   readonly provider = randomUUID();
   readonly file: string;
@@ -490,8 +507,10 @@ export class HostHealth {
       if (this.samples.length > 12) this.samples.shift();
       if (heartbeat) this.lastSample = now;
       let counts: ReturnType<NonNullable<HostHealthOptions['counts']>> | undefined;
+      let work: ReturnType<NonNullable<HostHealthOptions['work']>> | undefined;
       try {
         counts = this.options.counts?.();
+        work = this.options.work?.();
       } catch {
         this.observationFailures++;
       }
@@ -531,6 +550,7 @@ export class HostHealth {
           })),
         },
         counters: this.counters,
+        work,
         outcomes: this.outcomes,
         outcomeCounts: this.outcomeCounts,
         suppressed: this.suppressed,
@@ -542,6 +562,11 @@ export class HostHealth {
           elapsedMs: now - work.started,
         })),
         samples: this.samples,
+        memoryScopes: {
+          rss: 'extension-host process including all extensions and worker threads',
+          heap: 'extension-host thread',
+          external: 'extension-host thread',
+        },
       };
       const text = JSON.stringify(record);
       if (Buffer.byteLength(text) > 16 * 1024) {
@@ -679,6 +704,7 @@ export class StartupHistory {
           stages: { ...this.stages },
           memory: {
             scope: 'extension-host process including all extensions and worker threads',
+            currentHeapScope: 'extension-host thread',
             samples: this.sampleCount,
             observedMaximumRssBytes: this.maximumRss,
             current: process.memoryUsage(),

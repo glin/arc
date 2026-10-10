@@ -249,6 +249,14 @@ export interface ProgressiveResult {
   generation: number;
   revision: FileRevision | null;
   value: ProgressiveValue;
+  workerMemory?: WorkerMemory;
+}
+
+export interface WorkerMemory {
+  heapUsed: number;
+  heapTotal: number;
+  heapLimit: number;
+  external: number;
 }
 
 export function sameProgressiveRevision(
@@ -282,6 +290,39 @@ export function preservesLoadedHistory(previousRevision: FileRevision, result: P
   );
 }
 
+export interface WorkerFailure {
+  role: 'session-reader';
+  threadId: number | null;
+  reason: 'request' | 'error' | 'exit';
+  name: string;
+  code: string | null;
+  exitCode: number | null;
+  pendingCount: number;
+  active: WorkerRequestObservation[];
+  memory: {
+    scope: 'session-reader worker thread';
+    threadId: number | null;
+    requestId: number | null;
+    observed: WorkerMemory | null;
+    ageSinceReceiptMs: number | null;
+  };
+}
+
+interface WorkerRequestObservation {
+  id: number;
+  generation: number;
+  kind: ProgressiveRequest['kind'];
+  ageMs: number;
+  status: 'pending';
+}
+
+export function workerErrorIdentity(error: unknown): { name: string; code: string | null } {
+  const value = error && typeof error === 'object' ? (error as { name?: unknown; code?: unknown }) : {};
+  const identifier = (part: unknown) =>
+    typeof part === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(part) ? part : null;
+  return { name: identifier(value.name) ?? 'Error', code: identifier(value.code) };
+}
+
 /** One execution boundary. The provider owns checkpoints and admitted pages. */
 export class ProgressiveWorker {
   readonly transport = { requests: 0, replies: 0, postMs: 0, jsonMs: 0, requestJsonBytes: 0, replyJsonBytes: 0 };
@@ -289,10 +330,19 @@ export class ProgressiveWorker {
   private nextId = 0;
   private discoveryActive = false;
   private discoveryWaiter?: { start(): void; cancel(): void };
+  private state: 'idle' | 'running' | 'cancelled' | 'failed' = 'idle';
+  private lastFailure: WorkerFailure | null = null;
+  private workerMemory: WorkerMemory | null = null;
+  private workerMemoryAt = 0;
+  private workerThreadId: number | null = null;
+  private workerMemoryThreadId: number | null = null;
+  private workerMemoryRequestId: number | null = null;
   private pending = new Map<
     number,
     {
       generation: number;
+      kind: ProgressiveRequest['kind'];
+      started: number;
       resolve(value: ProgressiveResult | null): void;
       reject(error: Error): void;
       dispose(): void;
@@ -305,7 +355,56 @@ export class ProgressiveWorker {
     private readonly measureJson: () => boolean = () => false,
     // Hears each file whose repeated-record map in the worker reaches the end of the file.
     private readonly onRepeatedCoverage?: (file: string) => void,
+    private readonly onFailure?: (failure: WorkerFailure) => void,
   ) {}
+
+  snapshot(): {
+    role: 'session-reader';
+    threadId: number | null;
+    state: 'idle' | 'running' | 'cancelled' | 'failed';
+    pendingCount: number;
+    waitingDiscovery: boolean;
+    active: WorkerRequestObservation[];
+    lastFailure: WorkerFailure | null;
+    memory: WorkerFailure['memory'];
+  } {
+    const active: WorkerRequestObservation[] = [];
+    const now = performance.now();
+    for (const [id, held] of this.pending) {
+      active.push({
+        id,
+        generation: held.generation,
+        kind: held.kind,
+        ageMs: Math.max(0, now - held.started),
+        status: 'pending',
+      });
+      if (active.length === 8) break;
+    }
+    return {
+      role: 'session-reader',
+      threadId: this.worker ? this.workerThreadId : null,
+      state: this.state,
+      pendingCount: this.pending.size,
+      waitingDiscovery: !!this.discoveryWaiter,
+      active,
+      lastFailure: this.lastFailure,
+      memory: {
+        scope: 'session-reader worker thread',
+        threadId: this.workerMemoryThreadId,
+        requestId: this.workerMemoryRequestId,
+        observed: this.workerMemory,
+        ageSinceReceiptMs: this.workerMemory ? Math.max(0, now - this.workerMemoryAt) : null,
+      },
+    };
+  }
+
+  private failure(reason: WorkerFailure['reason'], error: unknown, exitCode: number | null = null): WorkerFailure {
+    const { role, threadId, active, pendingCount, memory } = this.snapshot();
+    const failure = { role, threadId, reason, ...workerErrorIdentity(error), exitCode, active, pendingCount, memory };
+    this.lastFailure = failure;
+    this.onFailure?.(failure);
+    return failure;
+  }
 
   private countTransport(value: unknown, reply: boolean): void {
     this.transport[reply ? 'replies' : 'requests']++;
@@ -365,16 +464,29 @@ export class ProgressiveWorker {
       return Promise.resolve(null);
     }
     if (!this.worker) {
-      const source =
-        this.source ?? brotliDecompressSync(Buffer.from(PROGRESSIVE_WORKER_BROTLI, 'base64')).toString('utf8');
-      const worker = new Worker(source, { eval: true });
+      let worker: Worker;
+      try {
+        const source =
+          this.source ?? brotliDecompressSync(Buffer.from(PROGRESSIVE_WORKER_BROTLI, 'base64')).toString('utf8');
+        worker = new Worker(source, { eval: true, name: 'arc-session-reader' });
+      } catch (error) {
+        this.state = 'failed';
+        this.failure('error', error);
+        return Promise.reject(error);
+      }
       this.worker = worker;
+      this.workerThreadId = worker.threadId;
+      this.workerMemory = null;
+      this.workerMemoryThreadId = null;
+      this.workerMemoryRequestId = null;
+      this.state = 'running';
+      let terminalFailure: WorkerFailure | null = null;
       worker.on(
         'message',
         (message: {
           id: number;
           result?: ProgressiveResult;
-          error?: string;
+          error?: { name: string; code: string | null };
           progress?: boolean;
           repeatedCoverage?: string;
         }) => {
@@ -395,14 +507,27 @@ export class ProgressiveWorker {
             return;
           }
           this.countTransport(message, true);
+          const memory = message.result?.workerMemory;
+          if (memory) {
+            this.workerMemory = {
+              heapUsed: memory.heapUsed,
+              heapTotal: memory.heapTotal,
+              heapLimit: memory.heapLimit,
+              external: memory.external,
+            };
+            this.workerMemoryAt = performance.now();
+            this.workerMemoryThreadId = this.workerThreadId;
+            this.workerMemoryRequestId = message.id;
+          }
           if (message.progress) {
             if (message.result) held.progress?.(message.result);
             return;
           }
+          if (message.error) this.failure('request', message.error);
           this.pending.delete(message.id);
           held.dispose();
           if (message.error) {
-            held.reject(new Error(message.error));
+            held.reject(Object.assign(new Error('Session reading failed.'), workerErrorIdentity(message.error)));
           } else {
             held.resolve(message.result ?? null);
           }
@@ -412,6 +537,8 @@ export class ProgressiveWorker {
         if (this.worker !== worker) {
           return;
         }
+        this.state = 'failed';
+        terminalFailure = this.failure('error', error);
         for (const held of this.pending.values()) {
           held.dispose();
           held.reject(error);
@@ -421,10 +548,19 @@ export class ProgressiveWorker {
           this.worker = null;
         }
       });
-      worker.on('exit', () => {
+      worker.on('exit', (exitCode) => {
+        if (terminalFailure) {
+          terminalFailure.exitCode = exitCode;
+          this.onFailure?.(terminalFailure);
+          return;
+        }
         if (this.worker !== worker) {
           return;
         }
+        if (exitCode !== 0 || this.pending.size) {
+          this.state = 'failed';
+          this.failure('exit', { name: 'WorkerExit' }, exitCode);
+        } else this.state = 'idle';
         this.worker = null;
         for (const held of this.pending.values()) {
           held.dispose();
@@ -451,6 +587,8 @@ export class ProgressiveWorker {
       signal.addEventListener('abort', abort, { once: true });
       this.pending.set(id, {
         generation,
+        kind: request.kind,
+        started: performance.now(),
         resolve,
         reject,
         progress,
@@ -464,12 +602,20 @@ export class ProgressiveWorker {
       const message = { id, generation, request, repeated };
       this.countTransport(message, false);
       const started = performance.now();
-      this.worker!.postMessage(message);
+      try {
+        this.worker!.postMessage(message);
+      } catch (error) {
+        this.failure('request', error);
+        this.pending.delete(id);
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      }
       this.transport.postMs += performance.now() - started;
     });
   }
 
   stop(): void {
+    this.state = 'cancelled';
     this.discoveryWaiter?.cancel();
     this.discoveryWaiter = undefined;
     const worker = this.worker;
