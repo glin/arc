@@ -1,4 +1,5 @@
 import { h, render, type ComponentChildren } from 'preact';
+import { URI_DRAG_TYPES } from '../domain/prompt-assets.ts';
 import type { ComposerFile, ComposerView, PanelToHost } from './protocol.ts';
 
 interface AttachmentOptions {
@@ -21,7 +22,7 @@ export interface AttachmentRenderer {
   submissionNotice(session: string, words: string | null): void;
   isStaging(session: string | null): boolean;
   pendingLabel(session: string): string;
-  staging(session: string, pending: boolean, token: string): void;
+  staging(session: string, pending: boolean, token: string, count?: number): void;
   rejected(session: string, token: string): void;
 }
 
@@ -172,7 +173,9 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
       options.noticeMount,
     );
   };
-  const fileDrag = (event: DragEvent): boolean => Array.from(event.dataTransfer?.types ?? []).includes('Files');
+  const dragTypes = (event: DragEvent): string[] => Array.from(event.dataTransfer?.types ?? []);
+  const fileDrag = (event: DragEvent): boolean =>
+    dragTypes(event).some((type) => type === 'Files' || URI_DRAG_TYPES.includes(type.toLowerCase()));
   const clearDrop = () => {
     dropDepth = 0;
     options.setDropping(false);
@@ -256,6 +259,15 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
     return true;
   };
 
+  const dropUris = (types: string[], values: Array<{ type: string; data: string }>) => {
+    const session = options.session();
+    const view = options.view();
+    if (options.readOnly || !session || !view || view.sessionId !== session) {
+      return;
+    }
+    options.sendToHost({ type: 'dropUris', session, types, values });
+  };
+
   options.prompt.addEventListener('paste', (event) => {
     const files = event.clipboardData?.files;
     if (files?.length && readFiles(files, true)) {
@@ -294,8 +306,25 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
     if (!fileDrag(event)) {
       return;
     }
-    event.preventDefault();
     clearDrop();
+    const types = dragTypes(event);
+    const uriTypes = types.filter((type) => URI_DRAG_TYPES.includes(type.toLowerCase()));
+    // Every value is read here, inside the drop event, because the data is gone after the first await.
+    const values = uriTypes.map((type) => ({ type, data: event.dataTransfer?.getData(type) ?? '' }));
+    // A drag whose only URI type is text/uri-list also carries web links. With no file: line, the drop is not ours.
+    const linkOnly =
+      uriTypes.length === 1 &&
+      uriTypes[0].toLowerCase() === 'text/uri-list' &&
+      !values[0].data.split(/\r?\n/).some((line) => /^file:/i.test(line.trim()));
+    if (linkOnly && !types.includes('Files')) {
+      return;
+    }
+    event.preventDefault();
+    if (uriTypes.length && !linkOnly) {
+      // A URI drag follows the path route even when the drag also lists Files.
+      dropUris(types, values);
+      return;
+    }
     readFiles(event.dataTransfer?.files ?? [], false);
   });
 
@@ -311,9 +340,9 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
     },
     isStaging,
     pendingLabel,
-    staging(session, pending, token) {
+    staging(session, pending, token, count) {
       if (pending) {
-        add(session, token);
+        add(session, token, count);
       } else {
         release(session, token);
       }

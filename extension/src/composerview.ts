@@ -2837,6 +2837,9 @@ export function attachmentRefusal(code: string, name: string = '', size: number 
   if (code === 'busy') {
     return 'Wait for the attached files to finish staging.';
   }
+  if (code === 'uri') {
+    return `${rejected} dropped ${rejected === 1 ? 'item was' : 'items were'} not added. Arc adds only files and folders on this computer.`;
+  }
   return `${name || 'The file'} could not be read.`;
 }
 

@@ -125,7 +125,8 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Derived session cache | `~/.arc/cache/<workspace-key>/derived-session-cache.json` | Rebuildable session titles, activity, run classification, outcome, and bounded context facts for one normalized workspace identity |
 | Codex opening records | `~/.arc/cache/codex-openings.json` | The opening record of every Codex rollout on the machine, which places each rollout in a workspace. Every workspace and window reads and writes the one file |
 | Prompt asset staging | Extension global storage | Generated-id copies of files attached to unsent, locally queued, or in-flight prompts |
-| Local filesystem | The selected session's recorded working directory | Immediate path-completion candidates for the Prompt box |
+| Local filesystem | The selected session's recorded working directory | Immediate path-completion candidates for the Prompt box, and the file or folder kind of each dropped or added item |
+| Editor drag and Explorer menu | The `dataTransfer` of a drop on the Prompt box, and the resource arguments of `Add to Arc` | File URIs that become path text in the draft or image attachments staged from disk |
 
 Codex retained-context reads admit copied metadata only through the opening's declared fork ancestry. Tool pairs retain separate function, custom-tool, and client-search identities. Local-shell calls use function outputs. Server search outputs require no local call.
 
@@ -215,7 +216,7 @@ The first column is checked against the shipped extension directory by `architec
 | `webview/composer-controls.ts` | Preact owner for usage, Prompt box picker controls, permissions, MCP menus, context-detail demand, and their page-lifetime popover state | no |
 | `webview/composer-presentation.ts` | Typed owner for Prompt box body mounts, slots, next-turn presentation, shared-clock updates, footer measurement, box floor, session list-relative placement, and transient divider gesture hysteresis | no |
 | `webview/composer.ts` | Preact Prompt box owner for the stable shell, live prompt text field, native-menu selection highlight, inline skill and Claude-command detail controls, host-activation focus recovery, drafts, submitted-prompt recall, editing history, completion, the page-level send chord, and later-owner slots | no |
-| `webview/attachments.ts` | Preact owner for Prompt box attachment chips, browser file reads, staging tokens, paste and drop handling, attachment and submission-refusal notices, and both removable Prompt box chips and non-removable transient-card chips | no |
+| `webview/attachments.ts` | Preact owner for Prompt box attachment chips, browser file reads, staging tokens, paste and drop handling including editor URI drags posted to the host, attachment and submission-refusal notices, and both removable Prompt box chips and non-removable transient-card chips | no |
 | `webview/sessiondetails.ts` | Body-mounted non-modal session dialog opened by the native session context menu, including copy actions, focus return, and viewport placement | no |
 | `webview/dom.ts` | Authoritative browser DOM lookups, shared editable-target checks, float placement, accessibility wiring, and selected DOM conversion to Markdown | no |
 | `webview/hints.ts` | Page-lifetime delayed and keyboard hint service, body tooltip placement, the drawn body an anchor names with `data-hint-body` and its redraw port, and hint cleanup when anchors leave | no |
@@ -319,7 +320,8 @@ The first column is checked against the shipped extension directory by `architec
 | `activitydetail.ts` | Shared activity subject policies and safe tool-input presentation | no |
 | `agentwire.ts` | Shared asks, answers, events, settings, and turn outcomes | no |
 | `commandcatalog.ts` | Merges complete agent command catalogs, rejects superseded idle reads, and skips unchanged Prompt box payloads | no |
-| `promptassets.ts` | Prompt asset limits, descriptor normalization, staging paths, integrity validation, and staged-copy lifecycle | no |
+| `promptassets.ts` | Prompt asset limits, descriptor normalization, media-type decisions including the plain-text check for unlisted extensions, staging paths, integrity validation, and staged-copy lifecycle | no |
+| `droppeduris.ts` | Drag type reading, `file:` URI to path conversion, path text in the path-completion format, image routing, and the `Add to Arc` argument shape | no |
 | `domain/context-detail.ts` | Separate native Claude and local Codex context normalization, bounded partition checks, category shares, aggregate-compatible demand reuse, and stale-demand release | no |
 | `contextframe.ts` | Claude context envelope identification and transport budgets | no |
 | `webview/export-host.ts` | Local host for captured pages, bounded decoding, navigation and read-only capabilities | no |
@@ -345,7 +347,7 @@ The first column is checked against the shipped extension directory by `architec
 | `domain/labels.ts` | Browser-safe label identity, name ceiling, typed-name warning, and label-count wording rules | no |
 | `domain/model-identity.ts` | Model id comparison shared by transcript turns and the Prompt box: window suffix, snapshot date, Bedrock prefix, and deployment suffix | no |
 | `domain/link-path.ts` | Browser-safe local-path versus URI-scheme classification | no |
-| `domain/prompt-assets.ts` | Browser-safe prompt attachment count and byte limits | no |
+| `domain/prompt-assets.ts` | Browser-safe prompt attachment count and byte limits and the shared drag type list | no |
 | `domain/prompt-text.ts` | Browser-safe individual text limit shared by drafts, queued submissions, and submitted prompt recovery | no |
 | `domain/read.ts` | Browser-safe turn keys, read predicates, the count of new turns in each session, the retained read-key limit, and whether a saved read state moved one session alone | no |
 | `domain/rail-filters.ts` | Browser-safe saved session list filter records, normalization, live-filter identity, the lens words a lens press writes, the migration of older stored lenses into those words, naming, and query-term toggles | no |

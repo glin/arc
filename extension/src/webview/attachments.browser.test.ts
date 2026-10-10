@@ -296,3 +296,103 @@ test('attachment refusals post once and leave unrelated staging intact', async (
     await held.close();
   }
 });
+
+test('a drop that carries URI types and no Files goes to the host as paths, and the reply inserts text and no chip', async (t) => {
+  const held = await pageFor(t);
+  if (!held) return;
+  try {
+    await post(held.page, renderPayload());
+    const outcome = (await held.page.evaluate(`(() => {
+      const data = { resourceurls: JSON.stringify(['file:///w/src/a.ts']), 'text/plain': '/w/src/a.ts' };
+      const make = (name) => {
+        const event = new Event(name, { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'dataTransfer', { value: { files: [], types: ['resourceurls', 'text/plain'], getData: (type) => data[type] ?? '' } });
+        return event;
+      };
+      const composer = document.getElementById('composer');
+      composer.dispatchEvent(make('dragenter'));
+      const dropping = composer.classList.contains('dropping');
+      const drop = make('drop');
+      composer.dispatchEvent(drop);
+      return { dropping, prevented: drop.defaultPrevented, posted: window.__posted.at(-1) };
+    })()`)) as { dropping: boolean; prevented: boolean; posted: any };
+    assert.equal(outcome.dropping, true);
+    assert.equal(outcome.prevented, true);
+    assert.equal(outcome.posted.type, 'dropUris');
+    assert.deepEqual(outcome.posted.types, ['resourceurls', 'text/plain']);
+    assert.deepEqual(outcome.posted.values, [{ type: 'resourceurls', data: '["file:///w/src/a.ts"]' }]);
+    assert.equal(await held.page.locator('#composer').evaluate((node) => node.classList.contains('dropping')), false);
+    await post(held.page, { type: 'insertPrompt', session: 's1', text: 'src/a.ts' });
+    assert.equal(await held.page.locator('#prompt').inputValue(), 'src/a.ts ');
+    assert.equal(
+      await held.page.evaluate(`window.__posted.filter((message) => message.type === 'draft').at(-1).text`),
+      'src/a.ts ',
+    );
+    assert.equal(await held.page.locator('.cfile').count(), 0);
+    assert.equal(
+      await held.page.evaluate(
+        `window.__posted.some((message) => message.type === 'attachFiles' || message.type === 'beginFileStaging')`,
+      ),
+      false,
+    );
+  } finally {
+    await held.close();
+  }
+});
+
+test('Add to Arc text restores a collapsed Prompt box and lands in the draft', async (t) => {
+  const held = await pageFor(t);
+  if (!held) return;
+  try {
+    await post(held.page, renderPayload());
+    await held.page.locator('#composer-collapse').click();
+    await held.page.evaluate(SETTLED);
+    assert.equal(
+      await held.page.locator('#composer').evaluate((node) => node.classList.contains('composer-hidden')),
+      true,
+    );
+    await post(held.page, { type: 'insertPrompt', session: 's1', text: 'src/a.ts' });
+    assert.equal(
+      await held.page.locator('#composer').evaluate((node) => node.classList.contains('composer-hidden')),
+      false,
+    );
+    assert.equal(await held.page.locator('#composer-restore').isHidden(), true);
+    assert.equal(await held.page.locator('#prompt').inputValue(), 'src/a.ts ');
+  } finally {
+    await held.close();
+  }
+});
+
+test('a web link dropped with only text/uri-list keeps the default text drop, and a file: list goes to the host', async (t) => {
+  const held = await pageFor(t);
+  if (!held) return;
+  try {
+    await post(held.page, renderPayload());
+    const drop = async (data: string) =>
+      (await held.page.evaluate(`(() => {
+        const event = new Event('drop', { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'dataTransfer', { value: { files: [], types: ['text/uri-list', 'text/plain'], getData: (type) => type === 'text/uri-list' ? ${JSON.stringify(data)} : '' } });
+        const before = window.__posted.length;
+        document.getElementById('composer').dispatchEvent(event);
+        return { prevented: event.defaultPrevented, posted: window.__posted.slice(before).map((message) => message.type) };
+      })()`)) as { prevented: boolean; posted: string[] };
+    assert.deepEqual(await drop('# a link\r\nhttps://example.com/page\r\n'), { prevented: false, posted: [] });
+    assert.deepEqual(await drop('file:///w/src/a.ts\r\n'), { prevented: true, posted: ['dropUris'] });
+  } finally {
+    await held.close();
+  }
+});
+
+test('a host-staged batch counts every file in the Attaching notice', async (t) => {
+  const held = await pageFor(t);
+  if (!held) return;
+  try {
+    await post(held.page, renderPayload());
+    await post(held.page, { type: 'fileStaging', session: 's1', token: 'uri:1', pending: true, count: 3 });
+    assert.match((await held.page.locator('.cfilepending').textContent()) ?? '', /^Attaching 3 files/);
+    await post(held.page, { type: 'fileStaging', session: 's1', token: 'uri:1', pending: false });
+    assert.equal(await held.page.locator('.cfilepending').count(), 0);
+  } finally {
+    await held.close();
+  }
+});

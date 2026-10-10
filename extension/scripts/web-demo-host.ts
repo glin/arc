@@ -27,6 +27,7 @@ export const DEMO_HOST_POLICY = {
   answerAsk: 'noop',
   beginFileStaging: 'noop',
   attachFiles: 'noop',
+  dropUris: 'noop',
   fileReadError: 'noop',
   fileRejected: 'noop',
   removeFile: 'noop',

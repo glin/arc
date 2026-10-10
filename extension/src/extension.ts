@@ -24,6 +24,7 @@ import { STORED_STATE_KEYS } from './identity';
 import { nodeGitRunner } from './gitcommits';
 import { ProjectSetupStore, SetupProjects } from './projectsetups';
 import { settingName } from './settings';
+import { uriStringsFromCommand } from './droppeduris';
 import {
   AgentHost,
   AgentSession,
@@ -188,6 +189,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Path commands accept the context object attached to a file row or summary link.
   reg('arc.copyPath', (arg) => void copyPath(arg, false));
   reg('arc.copyLink', (arg) => void copyLink(arg));
+  // Explorer and editor tab menus pass the clicked resource, then the Explorer's multi-selection.
+  reg('arc.addToArc', (resource, selection) => panel.addToComposer(uriStringsFromCommand(resource, selection)));
   reg('arc.sendResponseLinkWithLabels', (arg) => sendResponseLink(panel, arg, true));
   reg('arc.sendResponseLink', (arg) => sendResponseLink(panel, arg, false));
   reg('arc.sendSelectedTextWithLabels', (arg) => sendSelectedText(panel, arg, true));

@@ -351,6 +351,7 @@ import {
   type SessionAlias,
 } from './composerview';
 import { completePath } from './pathcompletion';
+import { resolveDroppedUris, urisFromTransfer, type DroppedImage, type DropPlatform } from './droppeduris';
 import {
   normalizePinnedSetups,
   normalizeSetupValues,
@@ -373,16 +374,14 @@ import {
   WireActivity,
 } from './agentwire';
 import {
-  MAX_PROMPT_ASSETS,
-  MAX_PROMPT_ASSET_BYTES,
-  MAX_PROMPT_ASSET_TOTAL_BYTES,
   PromptAssetCompletionBook,
   StoredPromptAsset,
   PromptAssetInput,
   PromptAssetStagingOperation,
   adoptPromptAssetOperationTarget,
   agentTakesAsset,
-  browserAssetMime,
+  assetBatchRefusal,
+  stagedAssetMime,
   deleteStagedPromptAssets,
   mergePromptAssets,
   normalizePromptAssetBook,
@@ -1113,6 +1112,9 @@ export class PanelProvider implements vscode.Disposable {
   private promptOriginHost: PanelHost | null = null;
   private readonly livePressHosts = new Map<string, PanelHost>();
   private readonly readyHosts = new Set<PanelHost>();
+  private readonly pendingAdds: string[] = [];
+  private readonly noticeSurvivesDraft = new Set<string>();
+  private uriStagingSerial = 0;
   private readonly panelVisibility = createPanelVisibility<PanelHost>();
   private readonly progressiveWorker = new ProgressiveWorker(
     undefined,
@@ -2957,6 +2959,9 @@ export class PanelProvider implements vscode.Disposable {
     if (this.readyHosts.has(host)) return;
     this.readyHosts.add(host);
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
+    if (this.pendingAdds?.length && host.visible()) {
+      this.flushPendingAdds(host);
+    }
     this.publishWindowState();
     this.onSetupRefresh?.();
     if (!host.visible()) {
@@ -4980,6 +4985,7 @@ export class PanelProvider implements vscode.Disposable {
     browserSession: string,
     token: string,
     owner: PanelHost | null,
+    count?: number,
   ): PromptAssetStagingOperation {
     if (!token) {
       throw new Error('The attachment operation has no identity.');
@@ -5006,9 +5012,9 @@ export class PanelProvider implements vscode.Disposable {
     if (owner) {
       this.browserStagingOwners.set(token, owner);
     }
-    void this.post({ type: 'fileStaging', session: browserSession, pending: true, token });
+    void this.post({ type: 'fileStaging', session: browserSession, pending: true, token, count });
     if (target !== browserSession) {
-      void this.post({ type: 'fileStaging', session: target, pending: true, token });
+      void this.post({ type: 'fileStaging', session: target, pending: true, token, count });
     }
     return operation;
   }
@@ -5062,6 +5068,16 @@ export class PanelProvider implements vscode.Disposable {
     return operation;
   }
 
+  // Show the refusal notice and return true when a batch of this size does not fit beside the target's files.
+  private refuseAssetBatch(target: string, incoming: readonly { name: string; size: number }[]): boolean {
+    const refusal = assetBatchRefusal(this.assets[target] ?? [], incoming);
+    if (!refusal) {
+      return false;
+    }
+    this.setAttachmentNotice(target, attachmentRefusal(refusal.code, refusal.name, refusal.size, refusal.rejected));
+    return true;
+  }
+
   private async stageFiles(
     browserSession: string,
     inputs: readonly PromptAssetInput[],
@@ -5082,24 +5098,12 @@ export class PanelProvider implements vscode.Disposable {
       if (!state) {
         throw new Error('The prompt is no longer available for attachments.');
       }
-      const existing = this.assets[operation.target] ?? [];
-      if (existing.length + inputs.length > MAX_PROMPT_ASSETS) {
-        this.setAttachmentNotice(operation.target, attachmentRefusal('count', '', 0, inputs.length));
-        return;
-      }
-      const tooLarge = inputs.find((input) => input.bytes.byteLength > MAX_PROMPT_ASSET_BYTES);
-      if (tooLarge) {
-        this.setAttachmentNotice(
+      if (
+        this.refuseAssetBatch(
           operation.target,
-          attachmentRefusal('file-size', tooLarge.name, tooLarge.bytes.byteLength),
-        );
-        return;
-      }
-      const total =
-        existing.reduce((sum, asset) => sum + asset.size, 0) +
-        inputs.reduce((sum, input) => sum + input.bytes.byteLength, 0);
-      if (total > MAX_PROMPT_ASSET_TOTAL_BYTES) {
-        this.setAttachmentNotice(operation.target, attachmentRefusal('total-size', '', total));
+          inputs.map((input) => ({ name: input.name, size: input.bytes.byteLength })),
+        )
+      ) {
         return;
       }
       const unsupported = inputs.find((input) => !agentTakesAsset(state.agent, input.mime));
@@ -5169,6 +5173,114 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  // Turn dropped or chosen URIs into path text in the draft and image attachments. `types` is the drag's reported type list.
+  private async addUris(
+    host: PanelHost,
+    browserSession: string,
+    uris: string[],
+    types?: readonly string[],
+  ): Promise<void> {
+    const target = this.attachmentTarget(browserSession) ?? browserSession;
+    const state = this.stateFor(target);
+    const workingDirectory = state ? this.cwdForSession(state.agent, target) : null;
+    if (this.diagnostics.enabled()) {
+      this.diagnostics.log('uriDrop', { types: types ? [...types] : 'menu', entries: uris.length });
+    }
+    if (!state || !workingDirectory || !uris.length) {
+      return;
+    }
+    const platform: DropPlatform =
+      process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'darwin' : 'linux';
+    const result = await resolveDroppedUris(uris, {
+      workingDirectory,
+      platform,
+      isDirectory: async (file) =>
+        ((await vscode.workspace.fs.stat(vscode.Uri.file(file))).type & vscode.FileType.Directory) !== 0,
+    });
+    if (result.images.length) {
+      await this.stageImagePaths(host, browserSession, result.images);
+    }
+    if (result.text) {
+      if (result.skipped) {
+        this.noticeSurvivesDraft.add(target);
+      }
+      await this.sendToHost(host, { type: 'insertPrompt', session: browserSession, text: result.text });
+    }
+    if (result.skipped) {
+      this.setAttachmentNotice(target, attachmentRefusal('uri', '', 0, result.skipped));
+    }
+  }
+
+  // Read image files from disk and stage them as pasted images are, so each becomes an attachment.
+  private async stageImagePaths(
+    host: PanelHost,
+    browserSession: string,
+    images: readonly DroppedImage[],
+  ): Promise<void> {
+    const token = `uri:${Date.now()}:${++this.uriStagingSerial}`;
+    let operation: PromptAssetStagingOperation;
+    try {
+      operation = this.openStagingOperation(browserSession, token, host, images.length);
+    } catch (error) {
+      this.setAttachmentNotice(browserSession, attachmentFailureNotice(error));
+      return;
+    }
+    // Every size is read before any bytes, so a refused selection never loads into memory.
+    const sizes: { name: string; size: number }[] = [];
+    try {
+      for (const image of images) {
+        sizes.push({ name: image.name, size: (await vscode.workspace.fs.stat(vscode.Uri.file(image.path))).size });
+      }
+    } catch {
+      this.setAttachmentNotice(browserSession, attachmentRefusal('read', images[sizes.length]?.name));
+      this.settleBrowserStagingOperation(browserSession, token, host);
+      return;
+    }
+    if (this.refuseAssetBatch(operation.target, sizes)) {
+      this.settleBrowserStagingOperation(browserSession, token, host);
+      return;
+    }
+    const inputs: PromptAssetInput[] = [];
+    try {
+      for (const image of images) {
+        inputs.push({
+          name: image.name,
+          mime: image.mime,
+          bytes: await vscode.workspace.fs.readFile(vscode.Uri.file(image.path)),
+        });
+      }
+    } catch {
+      this.setAttachmentNotice(browserSession, attachmentRefusal('read', images[inputs.length]?.name));
+      this.settleBrowserStagingOperation(browserSession, token, host);
+      return;
+    }
+    await this.stageFiles(browserSession, inputs, token, host);
+  }
+
+  // Add to Arc: put the chosen files and folders into the draft of the session the panel shows.
+  public addToComposer(uris: readonly string[]): void {
+    if (this.disposed || !uris.length) {
+      return;
+    }
+    this.pendingAdds.push(...uris);
+    if (!this.anyVisible()) {
+      this.openInEditor();
+    }
+    const host = this.hosts.find((open) => this.readyHosts.has(open) && open.visible());
+    if (host) {
+      this.flushPendingAdds(host);
+    }
+  }
+
+  // Hand the held Add to Arc entries to a ready panel. A panel that is still opening takes them when it reports ready.
+  private flushPendingAdds(host: PanelHost): void {
+    const session = this.hostSessions.get(host) ?? this.showing;
+    const uris = this.pendingAdds.splice(0);
+    if (session && uris.length) {
+      void this.addUris(host, session, uris);
+    }
+  }
+
   // Use the session named by the typing message. `keep` is the saved draft, while `text` includes prompt-history navigation.
   private setDraft(text: string, keep: string, session: string): void {
     // Check row membership without assembling the complete composer state on each keystroke.
@@ -5180,7 +5292,9 @@ export class PanelProvider implements vscode.Disposable {
     // Set displayed text after `holdDraft`, which initially writes both text copies.
     const railMoved = this.holdDraft(session, keep);
     this.boxText[session] = text;
-    this.clearAttachmentNotice(session);
+    if (!this.noticeSurvivesDraft?.delete(this.attachmentTarget(session) ?? session)) {
+      this.clearAttachmentNotice(session);
+    }
     if (shown || railMoved) {
       void this.post({ type: 'usage', usage: this.usagePayload() });
     }
@@ -11451,6 +11565,9 @@ export class PanelProvider implements vscode.Disposable {
             void this.post({ type: 'askRejected', session: browserSession ?? msg.session, id: msg.id });
           }
         },
+        dropUris: async (msg) => {
+          await this.addUris(host, browserSession ?? msg.session, urisFromTransfer(msg.values), msg.types);
+        },
         beginFileStaging: (msg) => {
           try {
             this.openStagingOperation(browserSession ?? msg.session, msg.token, host);
@@ -11489,7 +11606,7 @@ export class PanelProvider implements vscode.Disposable {
             }
             inputs.push({
               name: msg.clipboard ? pastedAssetName(file.name) : file.name,
-              mime: browserAssetMime(file.name, file.mime),
+              mime: stagedAssetMime(file.name, file.mime, bytes),
               bytes,
             });
           }

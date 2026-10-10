@@ -6,7 +6,8 @@ import { AgentPrompt, PromptAsset } from './agentwire';
 import { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES } from './domain/prompt-assets';
 export { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES };
 
-const CLAUDE_ASSET_MIMES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf']);
+export const IMAGE_ASSET_MIMES: ReadonlySet<string> = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const CLAUDE_ASSET_MIMES = new Set([...IMAGE_ASSET_MIMES, 'application/pdf']);
 
 export function assetKindWord(mime: string): string {
   if (mime === 'application/pdf') {
@@ -131,6 +132,61 @@ export function assetMimeForName(name: string): string {
 export function browserAssetMime(name: string, reported: string): string {
   const named = assetMimeForName(name);
   return named !== 'application/octet-stream' ? named : (normalizeAssetMime(reported) ?? 'application/octet-stream');
+}
+
+export interface AssetBatchLimits {
+  count: number;
+  fileBytes: number;
+  totalBytes: number;
+}
+
+export interface AssetBatchRefusal {
+  code: 'count' | 'file-size' | 'total-size';
+  name: string;
+  // The offending file size for `file-size` and the combined size for `total-size`. Zero for `count`.
+  size: number;
+  // The number of incoming files for `count`. Zero otherwise.
+  rejected: number;
+}
+
+// Decide from sizes alone whether a batch fits beside the files already held. The first limit that fails wins, in the order count, file size, total size.
+export function assetBatchRefusal(
+  existing: readonly { size: number }[],
+  incoming: readonly { name: string; size: number }[],
+  limits: AssetBatchLimits = {
+    count: MAX_PROMPT_ASSETS,
+    fileBytes: MAX_PROMPT_ASSET_BYTES,
+    totalBytes: MAX_PROMPT_ASSET_TOTAL_BYTES,
+  },
+): AssetBatchRefusal | null {
+  if (existing.length + incoming.length > limits.count) {
+    return { code: 'count', name: '', size: 0, rejected: incoming.length };
+  }
+  const tooLarge = incoming.find((file) => file.size > limits.fileBytes);
+  if (tooLarge) {
+    return { code: 'file-size', name: tooLarge.name, size: tooLarge.size, rejected: 0 };
+  }
+  const total = [...existing, ...incoming].reduce((sum, file) => sum + file.size, 0);
+  return total > limits.totalBytes ? { code: 'total-size', name: '', size: total, rejected: 0 } : null;
+}
+
+// True when the bytes are valid UTF-8 with no NUL byte, which is how a source file with an unlisted extension reads.
+export function isPlainUtf8Text(bytes: Uint8Array): boolean {
+  if (bytes.includes(0)) {
+    return false;
+  }
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// A file whose name and reported type name no media type counts as text when its bytes read as plain UTF-8.
+export function stagedAssetMime(name: string, reported: string, bytes: Uint8Array): string {
+  const mime = browserAssetMime(name, reported);
+  return mime === 'application/octet-stream' && isPlainUtf8Text(bytes) ? 'text/plain' : mime;
 }
 
 export function normalizeStoredPromptAsset(raw: unknown): StoredPromptAsset | null {

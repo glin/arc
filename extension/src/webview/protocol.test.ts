@@ -230,6 +230,10 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
     parsed: { type: 'pathCompletion', session: 's1', request: 1, token: '~/Projects/wo', caret: 12, rows: [PATH_ROW] },
   },
   {
+    raw: { type: 'insertPrompt', session: 's1', text: 'src/a.ts' },
+    parsed: { type: 'insertPrompt', session: 's1', text: 'src/a.ts' },
+  },
+  {
     raw: { type: 'fileStaging', session: 's1', token: 't1', pending: true },
     parsed: { type: 'fileStaging', session: 's1', token: 't1', pending: true },
   },
@@ -424,6 +428,23 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
     parsed: { type: 'beginFileStaging', session: 's1', token: 't1' },
   },
   {
+    raw: {
+      type: 'dropUris',
+      session: 's1',
+      types: ['resourceurls', 7],
+      values: [
+        { type: 'resourceurls', data: '[]' },
+        { type: 'codeeditors', data: 5 },
+      ],
+    },
+    parsed: {
+      type: 'dropUris',
+      session: 's1',
+      types: ['resourceurls'],
+      values: [{ type: 'resourceurls', data: '[]' }],
+    },
+  },
+  {
     raw: { type: 'attachFiles', session: 's1', token: 't1', clipboard: true, files: [] },
     parsed: { type: 'attachFiles', session: 's1', token: 't1', clipboard: true, files: [] },
   },
@@ -583,6 +604,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
     sessionRenameResult: take('sessionRenameResult'),
     focusComposer: take('focusComposer'),
     pathCompletion: take('pathCompletion'),
+    insertPrompt: take('insertPrompt'),
     fileStaging: take('fileStaging'),
     fileStagingRejected: take('fileStagingRejected'),
     usage: take('usage'),
@@ -641,6 +663,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     answerAsk: take('answerAsk'),
     beginFileStaging: take('beginFileStaging'),
     attachFiles: take('attachFiles'),
+    dropUris: take('dropUris'),
     fileReadError: take('fileReadError'),
     fileRejected: take('fileRejected'),
     removeFile: take('removeFile'),
@@ -833,6 +856,14 @@ const MALFORMED_HOST_CONTAINERS: unknown[] = [
   { ...RENDER, sessionAdoptions: {} },
   { ...RENDER, sessionAdoptions: [{ provisional: 7, durable: 's1' }] },
 ];
+
+test('a staging notice keeps a positive whole file count and drops any other', () => {
+  const staging = { type: 'fileStaging', session: 's1', token: 't1', pending: true };
+  assert.deepEqual(parseHostToPanel({ ...staging, count: 3 }), { ...staging, count: 3 });
+  for (const count of [0, -1, 1.5, '3', null]) {
+    assert.deepEqual(parseHostToPanel({ ...staging, count }), staging);
+  }
+});
 
 test('a field the reader treated as missing arrives with the value it always had', () => {
   assert.deepEqual(parseHostToPanel({ type: 'fileStaging', session: 's1' }), {

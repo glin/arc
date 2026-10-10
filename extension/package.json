@@ -164,6 +164,10 @@
         "title": "Copy Relative Path"
       },
       {
+        "command": "arc.addToArc",
+        "title": "Add to Arc"
+      },
+      {
         "command": "arc.markTurnRead",
         "title": "Mark as read",
         "category": "Arc Turn"
@@ -290,6 +294,20 @@
           "command": "arc.openInEditor",
           "when": "activeWebviewPanelId != arc.panel",
           "group": "navigation@9"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "arc.addToArc",
+          "when": "resourceScheme == file",
+          "group": "6_arc@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "arc.addToArc",
+          "when": "resourceScheme == file",
+          "group": "6_arc@1"
         }
       ],
       "webview/context": [
@@ -520,6 +538,10 @@
         }
       ],
       "commandPalette": [
+        {
+          "command": "arc.addToArc",
+          "when": "false"
+        },
         {
           "command": "arc.copyLink",
           "when": "false"

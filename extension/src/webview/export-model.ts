@@ -40,6 +40,7 @@ export const EXPORT_HOST_POLICY = {
   pick: 'blocked',
   draft: 'blocked',
   pathCompletion: 'blocked',
+  dropUris: 'blocked',
   answerAsk: 'blocked',
   beginFileStaging: 'blocked',
   attachFiles: 'blocked',

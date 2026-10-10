@@ -21,11 +21,13 @@ import {
   promptAssetsSafeToDelete,
   adoptPromptAssetOperationTarget,
   agentTakesAsset,
+  assetBatchRefusal,
   assetKindWord,
   assetMimeForName,
   browserAssetMime,
   pastedAssetName,
   splitAssetName,
+  stagedAssetMime,
   storedAssetsForPrompt,
   unsupportedPromptAsset,
   validatePromptAssetBytes,
@@ -85,6 +87,24 @@ test('browser files use known extensions before browser media guesses', () => {
   assert.equal(browserAssetMime('photo.PNG', 'application/octet-stream'), 'image/png');
   assert.equal(browserAssetMime('archive.thing', 'APPLICATION/ZIP'), 'application/zip');
   assert.equal(browserAssetMime('archive.thing', 'not a mime'), 'application/octet-stream');
+});
+
+test('a staged file with an unlisted extension counts as text only when its bytes read as plain UTF-8', () => {
+  const text = new TextEncoder().encode(
+    'def main():' + String.fromCharCode(10) + '    print("héllo")' + String.fromCharCode(10),
+  );
+  const binary = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x01]);
+  const invalid = Uint8Array.from([0x68, 0x69, 0xff, 0xfe]);
+  assert.equal(stagedAssetMime('tool.py', '', text), 'text/plain');
+  assert.equal(stagedAssetMime('tool.py', 'application/octet-stream', text), 'text/plain');
+  assert.equal(stagedAssetMime('blob.py', '', binary), 'application/octet-stream');
+  assert.equal(stagedAssetMime('latin1.py', '', invalid), 'application/octet-stream');
+  assert.equal(stagedAssetMime('notes.json', '', binary), 'text/json');
+  assert.equal(stagedAssetMime('photo.png', '', text), 'image/png');
+  assert.equal(stagedAssetMime('doc.pdf', '', text), 'application/pdf');
+  assert.equal(stagedAssetMime('x.thing', 'application/zip', text), 'application/zip');
+  assert.equal(agentTakesAsset('claude', stagedAssetMime('tool.py', '', text)), true);
+  assert.equal(agentTakesAsset('claude', stagedAssetMime('blob.py', '', binary)), false);
 });
 
 test('delivery descriptors follow the prompt snapshot rather than later attachments', () => {
@@ -345,4 +365,35 @@ test('an open staging operation keeps its adopted target without the routing ali
   assert.deepEqual(operation, { browserSession: 'draft:one', target: 'thread-one' });
   assert.equal(adoptPromptAssetOperationTarget(operation, 'draft:one', 'other-thread'), false);
   assert.equal(operation.target, 'thread-one');
+});
+
+test('a batch is refused from sizes alone on count, then file size, then total size', () => {
+  const limits = { count: 3, fileBytes: 10, totalBytes: 20 };
+  const held = [{ size: 4 }];
+  assert.equal(assetBatchRefusal(held, [{ name: 'a', size: 5 }], limits), null);
+  assert.deepEqual(
+    assetBatchRefusal(
+      held,
+      ['a', 'b', 'c'].map((name) => ({ name, size: 99 })),
+      limits,
+    ),
+    { code: 'count', name: '', size: 0, rejected: 3 },
+  );
+  assert.deepEqual(assetBatchRefusal(held, [{ name: 'big.png', size: 11 }], limits), {
+    code: 'file-size',
+    name: 'big.png',
+    size: 11,
+    rejected: 0,
+  });
+  assert.deepEqual(
+    assetBatchRefusal(
+      held,
+      [
+        { name: 'a', size: 9 },
+        { name: 'b', size: 9 },
+      ],
+      limits,
+    ),
+    { code: 'total-size', name: '', size: 22, rejected: 0 },
+  );
 });

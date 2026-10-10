@@ -1218,8 +1218,13 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       pathCompletion: function (msg) {
         composerRenderer.takePathCompletion(msg.session, msg.request, msg.token, msg.caret, msg.rows);
       },
+      insertPrompt: function (msg) {
+        // A collapsed Prompt box would take the text where the reader cannot see it.
+        if (composerHidden && !kernel.readOnly) setComposerHidden(false);
+        composerRenderer.insertAtCaret(msg.session, msg.text);
+      },
       fileStaging: function (msg) {
-        attachmentRenderer.staging(msg.session, msg.pending, msg.token);
+        attachmentRenderer.staging(msg.session, msg.pending, msg.token, msg.count);
       },
       fileStagingRejected: function (msg) {
         attachmentRenderer.rejected(msg.session, msg.token);

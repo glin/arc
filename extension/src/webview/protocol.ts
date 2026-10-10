@@ -221,7 +221,8 @@ export type HostToPanel =
   | { type: 'sessionRenameResult'; session: string; request: number; title: string; error: string }
   | { type: 'focusComposer'; session: string }
   | { type: 'pathCompletion'; session: string; request: number; token: string; caret: number; rows: PathEntry[] }
-  | { type: 'fileStaging'; session: string; token: string; pending: boolean }
+  | { type: 'insertPrompt'; session: string; text: string }
+  | { type: 'fileStaging'; session: string; token: string; pending: boolean; count?: number }
   | { type: 'fileStagingRejected'; session: string; token: string }
   | { type: 'usage'; usage: PanelUsage | null }
   | { type: 'askRejected'; session: string; id: string }
@@ -275,6 +276,7 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
   sessionRenameResult: true,
   focusComposer: true,
   pathCompletion: true,
+  insertPrompt: true,
   fileStaging: true,
   fileStagingRejected: true,
   usage: true,
@@ -325,6 +327,7 @@ export type PanelToHost =
   | { type: 'draft'; text: string; keep: string; session: string; revision?: number }
   | { type: 'pathCompletion'; session: string; request: number; token: string; caret: number }
   | { type: 'answerAsk'; session: string; id: string; answer: AskAnswer }
+  | { type: 'dropUris'; session: string; types: string[]; values: Array<{ type: string; data: string }> }
   | { type: 'beginFileStaging'; session: string; token: string }
   | { type: 'attachFiles'; session: string; token: string; clipboard: boolean; files: unknown }
   | { type: 'fileReadError'; session: string; token: string; name: string }
@@ -526,6 +529,34 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+// A drop carries a few short type names and URI text. The host bounds both before it reads them.
+const DROP_TYPES_LIMIT = 24;
+const DROP_VALUES_LIMIT = 8;
+const DROP_DATA_LIMIT = 1_000_000;
+
+function dropPayload(m: Record<string, unknown>): {
+  types: string[];
+  values: Array<{ type: string; data: string }>;
+} {
+  const types = Array.isArray(m.types)
+    ? m.types
+        .filter(isString)
+        .slice(0, DROP_TYPES_LIMIT)
+        .map((type) => type.slice(0, 120))
+    : [];
+  const values = Array.isArray(m.values)
+    ? m.values
+        .flatMap((value) => {
+          const held = record(value);
+          return held && isString(held.type) && isString(held.data) && held.data.length <= DROP_DATA_LIMIT
+            ? [{ type: held.type.slice(0, 120), data: held.data }]
+            : [];
+        })
+        .slice(0, DROP_VALUES_LIMIT)
+    : [];
+  return { types, values };
+}
+
 // The launcher request names a row the host offered or a setup made of values the host
 // offered. The host checks the choice against its current view.
 function launcherRequest(raw: unknown): LauncherRequest | null {
@@ -691,6 +722,10 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
             rows: m.rows,
           }
         : null;
+    case 'insertPrompt':
+      return isString(m.session) && isString(m.text)
+        ? { type: 'insertPrompt', session: m.session, text: m.text }
+        : null;
     case 'fileStaging':
       return isString(m.session)
         ? {
@@ -698,6 +733,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
             session: m.session,
             token: textOr(m.token, ''),
             pending: m.pending === true,
+            ...(typeof m.count === 'number' && Number.isInteger(m.count) && m.count > 0 ? { count: m.count } : {}),
           }
         : null;
     case 'fileStagingRejected':
@@ -960,6 +996,8 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
       const answer = askAnswer(m.answer);
       return answer ? { type: 'answerAsk', session: m.session, id: m.id, answer } : null;
     }
+    case 'dropUris':
+      return isString(m.session) ? { type: 'dropUris', session: m.session, ...dropPayload(m) } : null;
     case 'beginFileStaging':
       return isString(m.session) ? { type: 'beginFileStaging', session: m.session, token: textOr(m.token, '') } : null;
     case 'attachFiles':
@@ -1210,6 +1248,8 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
       return handlers.contextDetail(message);
     case 'pathCompletion':
       return handlers.pathCompletion(message);
+    case 'insertPrompt':
+      return handlers.insertPrompt(message);
     case 'fileStaging':
       return handlers.fileStaging(message);
     case 'fileStagingRejected':
@@ -1313,6 +1353,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.pathCompletion(message);
     case 'answerAsk':
       return handlers.answerAsk(message);
+    case 'dropUris':
+      return handlers.dropUris(message);
     case 'beginFileStaging':
       return handlers.beginFileStaging(message);
     case 'attachFiles':

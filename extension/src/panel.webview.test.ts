@@ -18647,8 +18647,13 @@ test('a full composer reports every browser file rejected by an atomic batch', (
   const stageBody = panelHostSource.slice(stageAt, panelHostSource.indexOf('private async removeFile', stageAt));
   sourceMatch(
     stageBody,
-    /attachmentRefusal\('count', '', 0,\s*inputs\.length\)/,
-    'host browser staging reports only the overflow, despite rejecting the whole batch',
+    /refuseAssetBatch\(\s*operation\.target,\s*inputs\.map/,
+    'host browser staging checks fewer than every file of the batch, so the notice reports only the overflow',
+  );
+  sourceMatch(
+    panelHostSource,
+    /attachmentRefusal\(refusal\.code, refusal\.name, refusal\.size, refusal\.rejected\)/,
+    'the refusal notice drops the rejected count that assetBatchRefusal reports for the whole batch',
   );
 });
 
@@ -23567,7 +23572,7 @@ test('attachment compatibility and contents are checked at every handoff boundar
 
   sourceMatch(
     hostHandler('attachFiles'),
-    /mime: browserAssetMime\(file\.name, file\.mime\)/,
+    /mime: stagedAssetMime\(file\.name, file\.mime, bytes\)/,
     'paste and drop still let a browser MIME override a known textual filename extension',
   );
 

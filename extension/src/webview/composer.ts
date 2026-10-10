@@ -129,6 +129,8 @@ export interface ComposerRenderer {
   openSlash(): void;
   closeSlash(): void;
   takePathCompletion(session: string, request: number, token: string, caret: number, rows: PathEntry[]): void;
+  // Insert text at the caret of the named session's draft. A session that is not shown yet receives it when it is.
+  insertAtCaret(session: string, text: string): void;
   attachLineClipboard(area: HTMLTextAreaElement): void;
   // Runs after the renderer sets the draft itself, which sends no input event.
   onDraftSet(listener: () => void): void;
@@ -955,6 +957,25 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
     undoBreak(undoStack());
     boxChanged(undefined, { start: token.start, oldEnd: token.end, newEnd: end });
   };
+  let pendingInsert: { session: string; text: string } | null = null;
+  const insertIntoPrompt = (text: string) => {
+    const value = prompt.value;
+    const start = Math.min(prompt.selectionStart, prompt.selectionEnd);
+    const end = Math.max(prompt.selectionStart, prompt.selectionEnd);
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const inserted = `${before && !/\s$/.test(before) ? ' ' : ''}${text}${/^\s/.test(after) ? '' : ' '}`;
+    setPromptValue(before + inserted + after);
+    const caret = before.length + inserted.length;
+    prompt.focus();
+    prompt.setSelectionRange(caret, caret);
+    endWalk();
+    advanceRevision(aim);
+    undoBreak(undoStack());
+    recordUndo();
+    undoBreak(undoStack());
+    boxChanged(undefined, { start, oldEnd: end, newEnd: start + inserted.length });
+  };
   const takeCompletion = (entry: PromptEntryView | PathEntry | undefined) => {
     if (!entry) {
       return;
@@ -1438,6 +1459,11 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
       element.hidden = !view;
       grow();
       drawSlash(true);
+      if (pendingInsert && view && sessionIdentity(view.sessionId) === pendingInsert.session && !element.hidden) {
+        const waiting = pendingInsert;
+        pendingInsert = null;
+        insertIntoPrompt(waiting.text);
+      }
       if (pendingFocus && view?.sessionId === pendingFocus && !element.hidden && !hidden) {
         pendingFocus = null;
         prompt.focus();
@@ -1676,6 +1702,17 @@ export function createComposerRenderer(options: ComposerOptions): ComposerRender
     closeSlash() {
       slashShut = true;
       drawSlash();
+    },
+    insertAtCaret(session, text) {
+      const target = sessionIdentity(session);
+      if (!text || options.readOnly) {
+        return;
+      }
+      if (aim !== target || !current || element.hidden) {
+        pendingInsert = { session: target, text };
+        return;
+      }
+      insertIntoPrompt(text);
     },
     takePathCompletion(session, request, token, caret, rows) {
       const identity = pathIdentity();

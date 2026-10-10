@@ -41,7 +41,7 @@ function parentAndLeaf(token: string): { prefix: string; parent: string; leaf: s
     : { prefix: token.slice(0, at + 1), parent: token.slice(0, at + 1), leaf: token.slice(at + 1) };
 }
 
-function nativePath(value: string, platform: 'win32' | 'posix'): string {
+export function nativePath(value: string, platform: 'win32' | 'posix'): string {
   return platform === 'win32' ? value.replace(/\//g, '\\') : value.replace(/\\/g, '/');
 }
 
