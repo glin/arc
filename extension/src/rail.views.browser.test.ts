@@ -505,6 +505,19 @@ test('the saved rail filter picker searches and follows native keyboard focus', 
         inside: true,
       },
     );
+    // The cross stands in the walk between the box and the first row, and it empties the box.
+    await page.locator('[data-control="railfilter-find"]').focus();
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await active(), 'railfilter-find-clear');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await active(), 'raillens:all');
+    await page.keyboard.press('ArrowUp');
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await active(), 'railfilter-find');
+    await page.locator('[data-control="railfilter-find-clear"]').click();
+    assert.equal(await page.locator('[data-control="railfilter-find"]').inputValue(), '');
+    assert.equal(await active(), 'railfilter-find');
+    assert.equal(await page.locator('[data-control="railfilter-find-clear"]').count(), 0);
     await page.locator('[data-control="railfilter-find"]').fill('');
     await page.keyboard.press('Tab');
     assert.equal(await active(), 'raillens:all');
@@ -1060,7 +1073,7 @@ test(
 
       // Arrow navigation stops at either end of the view editor controls.
 
-      for (const control of ['view-order']) {
+      for (const control of ['view-name-clear', 'view-order']) {
         await page.keyboard.press('ArrowDown');
         assert.equal(await at(), control);
       }

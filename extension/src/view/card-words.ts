@@ -235,6 +235,11 @@ export const CARD_ACTIONS = {
   // The box at the top of the editor. It says both of the things the box does, because a
   // reader who types a name nothing matches is making one.
   labelFind: 'Find or create a label',
+  // The cross inside a find or name box. It empties the box and keeps focus there.
+  labelFindClear: 'Clear the find box',
+  railFilterFindClear: 'Clear the find box',
+  railFilterNameClear: 'Clear the name',
+  viewNameClear: 'Clear the name',
   // The row under the box that makes the typed name. A verb, since the row is a button and
   // the name joined to it is what the press produces.
   labelCreate: 'Create',
@@ -274,6 +279,7 @@ export const CARD_ACTIONS = {
   sessionRename: 'Rename session',
   sessionRenameField: 'Name',
   sessionRenameCancel: 'Cancel',
+  sessionRenameClear: 'Clear the name',
   sessionRenameSave: 'Save name',
   sessionRenameEmpty: 'Enter a name.',
   sessionRenamePending: 'Renaming session...',

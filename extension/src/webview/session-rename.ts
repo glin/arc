@@ -1,10 +1,12 @@
 import { Fragment, h, type ComponentChildren } from 'preact';
+import { textField } from './text-field.ts';
 
 // The words the session rename editor draws. `CARD_ACTIONS` holds them.
 export interface SessionRenameWords {
   sessionRename: string;
   sessionRenameField: string;
   sessionRenameCancel: string;
+  sessionRenameClear: string;
   sessionRenameSave: string;
   sessionRenameEmpty: string;
   sessionRenamePending: string;
@@ -53,6 +55,7 @@ export function answeredRename(open: OpenRename | null, answer: SessionRenameAns
 export function SessionRenameEditor({
   open,
   words,
+  cross,
   setInput,
   onTitle,
   onSubmit,
@@ -60,6 +63,7 @@ export function SessionRenameEditor({
 }: {
   open: OpenRename | null;
   words: SessionRenameWords;
+  cross: string;
   setInput(node: HTMLInputElement | null): void;
   onTitle(value: string): void;
   onSubmit(): void;
@@ -75,12 +79,17 @@ export function SessionRenameEditor({
     h('div', { class: 'launchhead', key: 'head' }, words.sessionRename),
     h('div', { class: 'launchfield', key: 'name' }, [
       h('label', { class: 'launchfieldname', for: 'sessionrenamename' }, words.sessionRenameField),
-      h('input', {
+      textField({
         type: 'text',
         id: 'sessionrenamename',
         class: 'labelfind',
         value: open.title,
         'data-control': 'session-rename-name',
+        text: open.title,
+        cross,
+        clearLabel: words.sessionRenameClear,
+        clearControl: 'session-rename-name-clear',
+        onClear: () => onTitle(''),
         readOnly: waiting,
         'aria-describedby': 'sessionrenamenote',
         'aria-invalid': open.error || empty ? 'true' : undefined,

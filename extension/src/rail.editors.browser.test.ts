@@ -690,7 +690,7 @@ test(
         messages: window.__posted.filter((message) => message.type === 'setLabels'),
         control: document.activeElement.dataset.control,
       }))()`),
-        { messages: [], control: 'label-create' },
+        { messages: [], control: 'label-find-clear' },
       );
       await answerLabelEditor(page, 's1');
       await input.fill('sweep');
@@ -705,6 +705,17 @@ test(
       assert.deepEqual(await page.evaluate(`window.__posted.filter((message) => message.type === 'setLabels')`), [
         { type: 'setLabels', session: 's1', names: ['performance', 'personal', 'sweep'] },
       ]);
+      // The find box clears from its cross. The cross is a stop between the box and the create row.
+      await input.fill('zzz-no-label');
+      await input.press('ArrowDown');
+      assert.equal(await page.evaluate(`document.activeElement.dataset.control`), 'label-find-clear');
+      await page.keyboard.press('ArrowDown');
+      assert.equal(await page.evaluate(`document.activeElement.dataset.control`), 'label-create');
+      await page.locator('[data-control="label-find-clear"]').click();
+      assert.equal(await input.inputValue(), '', 'the cross left text in the find box');
+      assert.equal(await page.evaluate(`document.activeElement.dataset.control`), 'label-find');
+      assert.equal(await page.locator('[data-control="label-create"]').count(), 0, 'the create row outlived the text');
+      assert.equal(await page.locator('[data-control="label-find-clear"]').count(), 0);
       await input.fill('');
       await input.press('Home');
       assert.equal(await page.evaluate(`document.activeElement.dataset.control`), 'label-find');
@@ -928,6 +939,11 @@ test(
         active: 'session-rename-name',
         activeSection: null,
       });
+      assert.equal(
+        await page.locator('[data-control="session-rename-name-clear"]').count(),
+        0,
+        'a rename waiting for its answer offered a cross',
+      );
       await page.locator('[data-control="session-rename-name"]').press('Enter');
       await page.evaluate(SETTLED);
       assert.equal((await renames()).length, 1, 'a rename still waiting for its answer sent a second one');

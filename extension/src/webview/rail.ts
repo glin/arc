@@ -143,6 +143,7 @@ import {
 import type { PanelStat, PanelToHost } from './protocol.ts';
 import { found, placeFloat } from './dom.ts';
 import { inlineText } from './inline-text.ts';
+import { textField } from './text-field.ts';
 import {
   SessionRenameEditor,
   answeredRename,
@@ -172,6 +173,10 @@ export interface LabelEditorRow extends LabelSuggestionCount {
 }
 
 interface RailWords extends SessionRenameWords, RailHoverWords {
+  labelFindClear: string;
+  railFilterFindClear: string;
+  railFilterNameClear: string;
+  viewNameClear: string;
   railLabel: string;
   railFilter: string;
   railFilterHint: string;
@@ -922,6 +927,7 @@ function LabelPopover({
   open,
   rows,
   create,
+  filter,
   notes,
   options,
   setInput,
@@ -930,6 +936,7 @@ function LabelPopover({
   open: OpenLabels | null;
   rows: LabelEditorRow[];
   create: string;
+  filter: string;
   notes: readonly (keyof typeof LABEL_NOTES)[];
   options: RailOptions;
   setInput(node: HTMLInputElement | null): void;
@@ -939,13 +946,18 @@ function LabelPopover({
     h(
       'div',
       { class: 'labelsearch', key: 'search' },
-      h('input', {
+      textField({
         type: 'text',
         class: 'labelfind',
         placeholder: options.words.labelFind,
         'aria-label': options.words.labelFind,
         'data-control': 'label-find',
         ref: setInput,
+        text: filter,
+        cross: options.cross,
+        clearLabel: options.words.labelFindClear,
+        clearControl: 'label-find-clear',
+        onClear: () => (owner as RailRenderer & { setLabelFilter(value: string): void }).setLabelFilter(''),
         onInput: (event: Event) => {
           const input = event.currentTarget as HTMLInputElement;
           (owner as RailRenderer & { setLabelFilter(value: string): void }).setLabelFilter(input.value);
@@ -1111,14 +1123,19 @@ function RailFilterPicker({
     h(
       'div',
       { class: 'labelsearch', key: 'search' },
-      h('input', {
-        type: 'search',
+      textField({
+        type: 'text',
         class: 'labelfind',
         placeholder: options.words.railFilterFind,
         'aria-label': options.words.railFilterFind,
         'data-control': 'railfilter-find',
         defaultValue: search,
         ref: setSearchInput,
+        text: search,
+        cross: options.cross,
+        clearLabel: options.words.railFilterFindClear,
+        clearControl: 'railfilter-find-clear',
+        onClear: () => menu.setRailFilterSearch(''),
         onInput: (event: Event) => menu.setRailFilterSearch((event.currentTarget as HTMLInputElement).value),
       }),
     ),
@@ -1327,12 +1344,17 @@ function RailFilterPicker({
     nameMode
       ? h('div', { class: 'launchfield railfilternamefield', key: 'name' }, [
           h('label', { class: 'launchfieldname', for: 'railfiltername' }, options.words.railFilterName),
-          h('input', {
+          textField({
             id: 'railfiltername',
             type: 'text',
             class: 'labelfind',
             value: nameMode.name,
             'data-control': 'railfilter-name',
+            text: nameMode.name,
+            cross: options.cross,
+            clearLabel: options.words.railFilterNameClear,
+            clearControl: 'railfilter-name-clear',
+            onClear: () => (owner as RailRenderer & { setRailFilterName(value: string): void }).setRailFilterName(''),
             'aria-invalid': String(!name || nameTaken),
             ref: setNameInput,
             onInput: (event: Event) =>
@@ -1457,12 +1479,17 @@ function ViewEditor({
     h('div', { class: 'launchhead', key: 'head' }, options.words.railViewEdit),
     h('div', { class: 'launchfield', key: 'name' }, [
       h('label', { class: 'launchfieldname', for: 'viewname' }, options.words.railViewNameField),
-      h('input', {
+      textField({
         type: 'text',
         id: 'viewname',
         class: 'labelfind',
         value: open.name,
         'data-control': 'view-name',
+        text: open.name,
+        cross: options.cross,
+        clearLabel: options.words.viewNameClear,
+        clearControl: 'view-name-clear',
+        onClear: () => (owner as RailRenderer & { setViewName(value: string): void }).setViewName(''),
         // Associate the name field with its validation notes.
         'aria-describedby': 'viewnotes',
         'aria-invalid': notes.some((note) => note === 'unnamed' || note === 'taken') ? 'true' : undefined,
@@ -2445,10 +2472,15 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
                     'button',
                     {
                       // Naming cancels the name. Filtering clears the query and closes the box. The accessible name describes the current action.
-                      class: 'filterclear',
+                      class: 'filterclear fieldclear',
                       type: 'button',
                       key: 'clear',
                       'aria-label': naming
+                        ? options.words.railViewNameCancel
+                        : filter
+                          ? options.words.railFilterClear
+                          : options.words.railFilterClose,
+                      'data-hint': naming
                         ? options.words.railViewNameCancel
                         : filter
                           ? options.words.railFilterClear
@@ -3034,6 +3066,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         open: labelsOpen,
         rows: labelShownRows(),
         create: labelCreateName(),
+        filter: labelFilter,
         notes: labelTypedNotes(labelFilter),
         options,
         setInput: (node) => {
@@ -3213,6 +3246,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       h(SessionRenameEditor, {
         open: renameOpen,
         words: options.words,
+        cross: options.cross,
         setInput: (node) => {
           renameInput = node;
         },
@@ -4045,7 +4079,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     if ((event.key === 'Home' || event.key === 'End') && document.activeElement === labelInput) {
       return;
     }
-    const stops = [...labelPop.querySelectorAll<HTMLElement>('.labelfind, .labelcreate, .labelbox')];
+    const stops = [...labelPop.querySelectorAll<HTMLElement>('.labelfind, .fieldclear, .labelcreate, .labelbox')];
     if (!stops.length) {
       return;
     }
@@ -4099,7 +4133,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       return;
     }
     // Skip disabled buttons, including Save for an empty or taken name.
-    const stops = [...viewPop.querySelectorAll<HTMLElement>('.labelfind, .launchactions button')].filter(
+    const stops = [...viewPop.querySelectorAll<HTMLElement>('.labelfind, .fieldclear, .launchactions button')].filter(
       (node) => !(node as HTMLButtonElement).disabled,
     );
     if (!stops.length) {
@@ -4119,7 +4153,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     event.preventDefault();
   });
 
-  // Escape alone. The box and the two buttons are what Tab already walks.
+  // Escape alone. The box, its cross, and the two buttons are what Tab already walks.
   renamePop.addEventListener('keydown', (event) => {
     if (!renameOpen || event.isComposing || event.keyCode === 229 || event.key !== 'Escape') {
       return;

@@ -1,6 +1,8 @@
 // Panel text token replacement.
 import { test } from 'vitest';
 import assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { fillPanelText, panelTokens } from './paneltext.ts';
 import { CARD_ACTIONS } from './view/card-words.ts';
 
@@ -72,4 +74,58 @@ test('the token pattern is reusable, so a second call sees what the first one sa
   assert.deepEqual(panelTokens(text), ['ONE']);
   assert.equal(fillPanelText(text, { ONE: '1' }), 'a 1 b');
   assert.equal(fillPanelText(text, { ONE: '1' }), 'a 1 b');
+});
+
+// Every `h('input', {...})` block in the panel's sources, read across lines.
+function inputBlocks(source: string): string[] {
+  const blocks: string[] = [];
+  for (const start of source.matchAll(/h\(\s*'input',\s*\{/g)) {
+    let depth = 1;
+    let at = start.index + start[0].length;
+    for (; at < source.length && depth > 0; at++) {
+      depth += source[at] === '{' ? 1 : source[at] === '}' ? -1 : 0;
+    }
+    blocks.push(source.slice(start.index, at));
+  }
+  return blocks;
+}
+
+// A block is allowed when it draws only checkboxes or radios, or is the rail filter box, which owns its own cross.
+function textInputBlocks(source: string): string[] {
+  return inputBlocks(source).filter((block) => {
+    if (/class:\s*'railfilter'/.test(block)) {
+      return false;
+    }
+    // Read every `type:` in the block, so a later one cannot hide behind an earlier checkbox.
+    const literals = [...block.matchAll(/\btype:\s*([^,}\n]+)/g)].flatMap((type) =>
+      [...type[1].matchAll(/'([^']*)'/g)].map((match) => match[1]),
+    );
+    return !literals.length || literals.some((literal) => literal !== 'checkbox' && literal !== 'radio');
+  });
+}
+
+test('a single-line text box is drawn by the shared text field, wherever its type sits in the block', () => {
+  const planted = [
+    "h('input', {",
+    "  id: 'x',",
+    '  class: "labelfind",',
+    "  'data-control': 'planted',",
+    "  type: 'text',",
+    '}),',
+  ].join('\n');
+  assert.equal(textInputBlocks(planted).length, 1);
+  const twoTypes = ["h('input', {", "  type: 'checkbox',", '  checked,', "  type: 'text',", '}),'].join('\n');
+  assert.equal(textInputBlocks(twoTypes).length, 1);
+  assert.equal(textInputBlocks("h('input', { type: question.multi ? 'checkbox' : 'radio', checked })").length, 0);
+  const dir = path.join(__dirname, 'webview');
+  const offenders: string[] = [];
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith('.ts') || file.endsWith('.test.ts') || file === 'text-field.ts') {
+      continue;
+    }
+    for (const block of textInputBlocks(fs.readFileSync(path.join(dir, file), 'utf8'))) {
+      offenders.push(`${file}: ${block.split('\n')[0]}`);
+    }
+  }
+  assert.deepEqual(offenders, [], 'draw a single-line text box with textField from webview/text-field.ts');
 });
