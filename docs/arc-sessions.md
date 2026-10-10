@@ -76,14 +76,14 @@ arc CLI <--- local channel ---> Selected ready Arc window
 2. Read `arc windows --json`. Select the intended repository's window and check `scopeReady` and `panelReady`.
 3. Read `arc setups` for that window. Choose offered settings for each provider using the [Manual check](#manual-check) commands.
 4. Start each session through `arc start`. Save accepted session IDs and preserve uncertain request IDs without launching replacements.
-5. Arc's adapters run the native CLIs. Arc reads Claude transcripts and Codex rollouts for saved results, alongside live process activity.
-6. Read each session through `arc session`. Report its result and recorded settings without changing reader attention.
+5. Arc's adapters run the native CLIs. Arc reads Claude transcripts and Codex rollouts for recorded turns. The panel shows live process activity, and session listings show live run status.
+6. Read recorded turns through `arc session`. Report each session's result and recorded settings without changing reader attention.
 7. Apply only authorized labels and pins, using `--dry-run` first. Archive only authorized completed sessions with known attention. Running and Needs input sessions refuse archive. Unread completion requires explicit `--force` authority.
 8. Leave the requested continuation session available. The reader opens it and sends the next prompt through its Prompt box.
 
-On an accepted start, `--arc-dispatch` emits the parent-link receipt itself. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Durable callback claim/ack separately tracks callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
+`arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
-For a small two-provider run, choose offered low-cost setups and launch one Claude session and one Codex session. Python and shell coordinators both invoke the same CLI. Use `--untagged` for reader-requested work and `--arc-dispatch` for its parent-session receipt. Use `--agent-run` for delegated work instead. [Session management](cli.md#session-management) owns command arguments, delivery outcomes, archive rules, and uncertain-launch handling.
+Python and shell coordinators both invoke the same CLI. Use `--untagged` for reader-requested work and `--agent-run` for delegated work. [Session management](cli.md#session-management) owns command arguments, delivery outcomes, archive rules, and uncertain-launch handling.
 
 Read each result before describing it. Recorded model and effort establish execution settings, while a requested setup only establishes what the caller selected. Keep a session available for reader continuation when that is part of the task.
 
