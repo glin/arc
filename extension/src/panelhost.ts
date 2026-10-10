@@ -10187,7 +10187,7 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWork = work;
     this.selectionWorks?.set(sessionId, work);
     let retryLatestRevision = false;
-    // Track worker requests so an unchanged cached result does not trigger another render.
+    // Track work that can change the drawn window, so an unchanged cached result does not trigger another render.
     let roundTrip = false;
     try {
       let session = this.currentSelectedSession(work);
@@ -10259,16 +10259,32 @@ export class PanelProvider implements vscode.Disposable {
       }
       const previous = this.cache.get(session.file);
       if (previous && this.progressiveCurrent(session)) {
-        roundTrip ||= this.commitRepositoryContexts(session, previous.read.turns).some((context) => {
-          const held = this.commitRepositoryReplies.get(context.child.file);
-          return held?.key !== context.key || held.reply.status === 'pending';
-        });
+        // Commit rows read only complete replies, so a pending reply that keeps its status and key changes nothing drawn.
+        const contexts = this.commitRepositoryContexts(session, previous.read.turns);
+        const stored = contexts.map((context) => this.commitRepositoryReplies.get(context.child.file));
         retryLatestRevision ||= await this.hydrateCommitRepositories(
           session,
           previous.read.turns,
           generation,
           controller.signal,
         );
+        // Sources can change while hydration waits, and a rejected reply stores nothing, so read the current keys again.
+        let currentKeys: Map<string, string> | undefined;
+        const currentKey = (file: string) =>
+          (currentKeys ??= new Map(
+            this.commitRepositoryContexts(session, previous.read.turns).map((one) => [one.child.file, one.key]),
+          )).get(file);
+        roundTrip ||= contexts.some((context, index) => {
+          const before = stored[index];
+          const after = this.commitRepositoryReplies.get(context.child.file);
+          return (
+            before?.key !== after?.key ||
+            before?.reply.status !== after?.reply.status ||
+            // A complete reply for an earlier key no longer proves its rows, so the drawn rows lose navigation.
+            (before?.reply.status === 'complete' &&
+              (before.key !== context.key || before.key !== currentKey(context.child.file)))
+          );
+        });
       }
       const requestedRevision = this.revisionOf(session);
       if (

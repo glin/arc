@@ -3086,6 +3086,126 @@ test('commit repository replies expire on parent-only changes and reject stale o
   assert.equal(turns[0].commits[0].candidates?.complete, false);
 });
 
+// Gives a commit allowance host the selection state that completeSelectedWindow reads, and counts its redraws.
+function selectCommitSession(provider: any, session: any, turns: any[]) {
+  const drawn = { refreshes: 0 };
+  Object.assign(provider, {
+    authoritativeCatalog: [session],
+    history: new Map(),
+    cache: new Map([
+      [session.file, { read: { turns }, agentKey: 'agents', revision: { size: session.size, mtimeMs: 1 } }],
+    ]),
+    selectionWork: null,
+    selectionFailure: null,
+    selectionGeneration: 1,
+    showing: session.sessionId,
+    hosts: [],
+    folders: () => [],
+    anyVisible: () => true,
+    progressiveCurrent: () => true,
+    agentSpendKey: () => 'agents',
+    acceptSelectedMetadataRead() {},
+    refresh() {
+      drawn.refreshes++;
+    },
+  });
+  return drawn;
+}
+
+test('an unchanged pending commit reply does not redraw the selected session', async () => {
+  const { provider, parent, sessions, reply, resolve } = commitAllowanceHost(1);
+  const drawn = selectCommitSession(provider, sessions[0].session, sessions[0].turns);
+  const statuses = ['pending', 'pending', 'pending', 'complete'];
+  const drawnAfter: number[] = [];
+  provider.progressiveWorker = {
+    async run(request: any, generation: number) {
+      drawnAfter.push(drawn.refreshes);
+      return reply(request, generation, statuses[drawnAfter.length - 1], { parent: 0, child: 0 });
+    },
+  };
+  await provider.completeSelectedWindow('child-0', 1);
+  await vi.waitFor(() => {
+    assert.equal(drawnAfter.length, statuses.length);
+    assert.equal(provider.selectionWork, null);
+  });
+  // The first pending reply is the first stored reply, so it draws once. Later pending replies keep its status and key.
+  assert.deepEqual(drawnAfter, [0, 1, 1, 1], 'an unchanged pending commit reply redrew the selected session');
+  assert.equal(drawn.refreshes, 2, 'the complete commit reply did not redraw the selected session exactly once');
+  assert.deepEqual(resolve(0), { dirs: ['C:/child-0'], complete: true });
+  // A parent-only change expires the complete reply. A cancelled request stores nothing, and the rows still lose navigation.
+  statuses.push('cancelled');
+  fs.appendFileSync(parent.file, ' changed');
+  await provider.completeSelectedWindow('child-0', 1);
+  assert.equal(drawnAfter.length, statuses.length);
+  assert.equal(drawn.refreshes, 3, 'an expired complete commit reply left its navigable rows drawn');
+  assert.equal(resolve(0)?.complete, false);
+});
+
+const commitProofExpiries: Record<string, (host: ReturnType<typeof commitAllowanceHost>) => void> = {
+  'its source changes': ({ children }) => fs.appendFileSync(children[1].file, ' changed'),
+  'its context disappears': (host) => {
+    host.provider.codexSubagents = [host.children[0]];
+  },
+};
+for (const [change, expire] of Object.entries(commitProofExpiries))
+  test(`a rejected commit reply redraws a complete commit row whose proof expired when ${change}`, async () => {
+    const host = commitAllowanceHost(2);
+    const { provider, parent, children, sessions, reply } = host;
+    // The selected parent session owns two child contexts: the first holds a pending reply and the second a complete one.
+    const agents = sessions.map(({ session, turns: [owned] }) => ({
+      id: session.sessionId,
+      description: 'worker',
+      agentType: null,
+      status: 'completed',
+      commits: owned.commits.map((commit: any) => ({ ...commit })),
+    }));
+    const turns = [turn({ commits: [], agents: agents as any })];
+    const statuses = ['complete', 'pending'];
+    provider.progressiveWorker = {
+      run: async (request: any, generation: number) =>
+        reply(request, generation, statuses.shift()!, { parent: 0, child: 0 }),
+    };
+    // A child's own context has the same key as its context in the parent, so these replies serve the parent's rows.
+    for (const index of [1, 0])
+      await provider.hydrateCommitRepositories(
+        sessions[index].session,
+        sessions[index].turns,
+        1,
+        new AbortController().signal,
+      );
+    const proven = () => {
+      provider.applyCommitRepositoryEvidence(parent, turns);
+      return turns[0].agents.map((agent: any) => agent.commits[0].candidates?.complete);
+    };
+    assert.deepEqual(proven(), [false, true]);
+    const drawn = selectCommitSession(provider, parent, turns);
+    const drawnAfter: number[] = [];
+    provider.progressiveWorker = {
+      async run(request: any, generation: number) {
+        drawnAfter.push(drawn.refreshes);
+        assert.equal(request.child.file, children[0].file);
+        // On the second request the first child grows, so its reply is rejected, and the complete proof expires.
+        if (drawnAfter.length === 2) {
+          fs.appendFileSync(children[0].file, ' changed');
+          expire(host);
+        }
+        return reply(request, generation, 'pending', { parent: 0, child: 0 });
+      },
+    };
+    await provider.completeSelectedWindow('parent', 1);
+    await vi.waitFor(() => {
+      assert.equal(drawnAfter.length, 2);
+      assert.equal(provider.selectionWork, null);
+    });
+    assert.deepEqual(
+      drawnAfter,
+      [0, 0],
+      'an unchanged pending reply beside a complete reply redrew the selected session',
+    );
+    assert.equal(drawn.refreshes, 1, 'a rejected commit reply left an expired complete row navigable');
+    assert.equal(proven()[1], false);
+  });
+
 function commitAllowanceHost(count: number) {
   const directory = tempDir('host-commit-allowance-');
   const parentFile = path.join(directory, 'parent.jsonl');
