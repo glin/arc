@@ -97,23 +97,31 @@ function UsageOpenView(props: { bar: UsageBar; sendToHost(message: PanelToHost):
         ],
       ),
     ),
-    h(
-      'button',
-      {
-        class: 'sbread',
-        key: 'read',
-        type: 'button',
-        'aria-label': [props.bar.read, props.bar.refresh?.name].filter(Boolean).join('. '),
-        'aria-disabled': String(props.bar.refresh?.busy ?? false),
-        'aria-busy': String(props.bar.refresh?.busy ?? false),
-        'data-control': 'usage:read',
-        onClick() {
-          if (props.bar.refresh?.busy) return;
-          props.sendToHost({ type: 'refreshUsage', agent: null, force: true });
-        },
-      },
-      props.bar.read,
-    ),
+    props.bar.refresh?.busy
+      ? h(
+          'span',
+          {
+            class: 'sbread',
+            key: 'reading',
+            role: 'status',
+            'aria-label': [props.bar.read, props.bar.refresh.name].filter(Boolean).join('. '),
+          },
+          props.bar.read,
+        )
+      : h(
+          'button',
+          {
+            class: 'sbread',
+            key: 'read',
+            type: 'button',
+            'aria-label': [props.bar.read, props.bar.refresh?.name].filter(Boolean).join('. '),
+            'data-control': 'usage:read',
+            onClick() {
+              props.sendToHost({ type: 'refreshUsage', agent: null, force: true });
+            },
+          },
+          props.bar.read,
+        ),
   ]);
 }
 
@@ -360,7 +368,7 @@ function ControlsView(props: {
     );
     props.usagePopover.hidden = !props.bar || !shown;
     if (props.bar) {
-      props.usagePopover.setAttribute('aria-label', props.bar.name);
+      props.usagePopover.setAttribute('aria-label', props.bar.name.replace(/\. Press to show every limit\.$/, ''));
     }
     render(
       menu
@@ -494,6 +502,7 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
   usagePopover.className = 'pop';
   usagePopover.hidden = true;
   usagePopover.setAttribute('role', 'group');
+  usagePopover.tabIndex = -1;
   const pickPopover = options.document.createElement('div');
   pickPopover.id = 'pickpop';
   pickPopover.className = 'pop';
@@ -652,6 +661,8 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
         .find(Boolean);
       if (again && !('disabled' in again && again.disabled)) {
         again.focus();
+      } else if (held === 'usage:read' && !usagePopover.hidden) {
+        usagePopover.focus();
       } else if (openPick === 'mcp' && !pickPopover.hidden) {
         (menuRows()[0] ?? pickPopover).focus();
       } else if (menuHadFocus && !hidden) {
@@ -712,10 +723,12 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     draw();
   });
   usagePopover.addEventListener('focusin', () => {
+    if (usageHovered) return;
     usageHovered = true;
     draw();
   });
   usagePopover.addEventListener('focusout', (event) => {
+    if (!event.relatedTarget) return;
     if (!usagePopover.contains(event.relatedTarget as Node | null)) {
       usageHovered = false;
       draw();
@@ -735,8 +748,9 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
       openPick = null;
       draw();
     }
-    if (usagePinned && target && !usagePopover.contains(target) && !statusBar.contains(target)) {
+    if ((usagePinned || usageHovered) && target && !usagePopover.contains(target) && !statusBar.contains(target)) {
       usagePinned = false;
+      usageHovered = false;
       draw();
     }
   });

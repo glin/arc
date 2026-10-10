@@ -5631,6 +5631,46 @@ const searchSource = fs.readFileSync(path.join(__dirname, 'webview', 'search.ts'
 const chromeSource = fs.readFileSync(path.join(__dirname, 'webview', 'chrome.ts'), 'utf8');
 const requestsSource = fs.readFileSync(path.join(__dirname, 'webview', 'requests.ts'), 'utf8');
 const composerControlsSource = fs.readFileSync(path.join(__dirname, 'webview', 'composer-controls.ts'), 'utf8');
+
+test('usage refresh renders busy phases without an action and retains the available refresh button', () => {
+  const source = composerControlsSource.slice(
+    composerControlsSource.indexOf('function UsageOpenView('),
+    composerControlsSource.indexOf('function PickRow('),
+  );
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const open = new Function('h', 'CONTEXT_CLASSES', `${compiled}\nreturn UsageOpenView;`)(
+    (tag: string, attributes: Record<string, any>, children: unknown) => ({ tag, attributes, children }),
+    {},
+  );
+  const sent: unknown[] = [];
+  const nameExpression = composerControlsSource.match(
+    /usagePopover\.setAttribute\(\s*'aria-label',\s*([\s\S]*?)\s*\);/,
+  )![1];
+  const popoverName = new Function('props', `return ${nameExpression.replace(/,\s*$/, '')};`);
+  for (const phase of ['reading', 'discovering', 'queued', 'waiting', 'success', 'empty', 'failed'] as const) {
+    const bar = usageBar([], NOW, {
+      id: 1,
+      agents: { claude: { phase, detail: '' }, codex: { phase: 'success', detail: '' } },
+    })!;
+    const name = popoverName({ bar });
+    assert.ok(name.length > 0, phase);
+    assert.doesNotMatch(name, /Press to show every limit/, phase);
+    assert.equal(bar.name, `${name}. Press to show every limit.`, phase);
+    const footer = open({ bar, sendToHost: (message: unknown) => sent.push(message) }).children.at(-1);
+    if (['discovering', 'queued', 'waiting', 'reading'].includes(phase)) {
+      assert.equal(footer.tag, 'span', phase);
+      assert.equal(footer.attributes.role, 'status', phase);
+      for (const attribute of ['onClick', 'data-control', 'tabIndex', 'type'])
+        assert.equal(footer.attributes[attribute], undefined, `${phase}: ${attribute}`);
+    } else {
+      assert.equal(footer.tag, 'button', phase);
+      assert.equal(footer.attributes.type, 'button', phase);
+      assert.equal(footer.attributes['data-control'], 'usage:read', phase);
+      footer.attributes.onClick();
+    }
+  }
+  assert.deepEqual(sent, Array(3).fill({ type: 'refreshUsage', agent: null, force: true }));
+});
 const composerPresentationSource = fs.readFileSync(path.join(__dirname, 'webview', 'composer-presentation.ts'), 'utf8');
 const sessionStateSource = fs.readFileSync(path.join(__dirname, 'webview', 'session-state.ts'), 'utf8');
 const historyControlSource = fs.readFileSync(path.join(__dirname, 'webview', 'history-control.ts'), 'utf8');

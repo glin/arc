@@ -4328,14 +4328,16 @@ button.cctx:hover {
   font: inherit;
   font-size: var(--t-small);
   color: var(--idle);
-  cursor: pointer;
   padding: 1px 5px;
   margin-left: -5px;
   border: 1px solid transparent;
   border-radius: 3px;
   background: none;
 }
-.sbread:hover {
+button.sbread {
+  cursor: pointer;
+}
+button.sbread:hover {
   color: var(--vscode-foreground);
   border-color: var(--edge);
 }

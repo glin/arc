@@ -19,7 +19,7 @@ import { SUBMITTED_PROMPT_CHARS } from './state.ts';
 import { usageBar } from '../usageview.ts';
 
 test(
-  'usage progress preserves the focused retry control, blocks duplicate activation, and announces one shared outcome',
+  'usage progress replaces the refresh action with status, retains focus nearby, and announces one shared outcome',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -33,15 +33,16 @@ test(
       await page.setContent(themed(pageHtml()));
       const payload = renderPayload();
       await post(page, payload);
-      await page.locator('[data-control="usage"]').click();
+      await page.locator('[data-control="usage"]').focus();
+      await page.keyboard.press('Enter');
       const read = page.locator('[data-control="usage:read"]');
       for (const group of (payload.usage as { bar: NonNullable<ReturnType<typeof usageBar>> }).bar.groups) {
         assert.ok((await page.locator('#usagepop').ariaSnapshot()).includes(group.exact));
       }
-      await read.focus();
+      await page.keyboard.press('Tab');
+      assert.equal(await read.evaluate((node) => node === document.activeElement), true);
       await page.evaluate(() => {
-        const root = window as unknown as { retainedUsageRead: Element | null; usageAnnouncements: string[] };
-        root.retainedUsageRead = document.activeElement;
+        const root = window as unknown as { usageAnnouncements: string[] };
         root.usageAnnouncements = [];
         const announcer = document.querySelector('#ask-announcer');
         if (!announcer) throw new Error('Missing shared announcer');
@@ -82,29 +83,45 @@ test(
           usage: { ...(payload.usage as object), bar: usageBar(readings, Date.now(), refresh) },
         });
       await send();
-      assert.ok((await read.getAttribute('aria-label'))!.includes((await read.textContent())!));
-      assert.match((await read.getAttribute('aria-label'))!, /Claude.*Codex/);
-      assert.equal(await read.getAttribute('aria-busy'), 'true');
-      assert.equal(await read.getAttribute('aria-disabled'), 'true');
-      assert.equal(await page.evaluate('document.activeElement === window.retainedUsageRead'), true);
+      const progress = page.locator('#usagepop [role="status"]');
+      assert.equal(await read.count(), 0);
+      assert.equal(await page.locator('#usagepop button').count(), 0);
+      assert.equal(await progress.evaluate((node: HTMLElement) => node.tabIndex), -1);
+      assert.equal(await progress.getAttribute('data-control'), null);
+      assert.ok((await progress.getAttribute('aria-label'))!.includes((await progress.textContent())!));
+      assert.match((await progress.getAttribute('aria-label'))!, /Claude.*Codex/);
+      assert.equal(await page.evaluate('document.activeElement.id'), 'usagepop');
+      await progress.click();
       await page.keyboard.press('Space');
       await page.keyboard.press('Enter');
       assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "refreshUsage").length'), 1);
       refresh.agents.codex = { phase: 'success', detail: '' };
       await send();
-      assert.equal(await read.getAttribute('aria-busy'), 'true');
+      assert.equal(await read.count(), 0);
+      assert.equal(await progress.count(), 1);
       assert.equal(await page.evaluate('window.usageAnnouncements.length'), 0);
       refresh.agents.claude = { phase: 'failed', detail: 'Usage reading timed out. Read again to retry.' };
       await send();
       await page.clock.runFor(0);
       await page.waitForFunction('window.usageAnnouncements.length === 1');
       assert.ok((await read.getAttribute('aria-label'))!.includes((await read.textContent())!));
-      assert.equal(await page.evaluate('document.activeElement === window.retainedUsageRead'), true);
-      assert.equal(await read.getAttribute('aria-busy'), 'false');
+      assert.equal(await progress.count(), 0);
+      assert.equal(await read.evaluate((node) => node.tagName), 'BUTTON');
+      assert.equal(await page.evaluate('document.activeElement.id'), 'usagepop');
       await send();
       assert.equal(await page.evaluate('window.usageAnnouncements.length'), 1);
+      await page.mouse.move(0, 0);
+      await page.keyboard.press('Tab');
+      assert.equal(await read.evaluate((node) => node === document.activeElement), true);
       await page.keyboard.press('Enter');
       assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "refreshUsage").length'), 2);
+      refresh.id = 2;
+      refresh.agents.claude = { phase: 'reading', detail: '' };
+      await send();
+      assert.equal(await page.evaluate('document.activeElement.id'), 'usagepop');
+      await page.locator('#list').click({ position: { x: 2, y: 150 } });
+      assert.equal(await page.evaluate('document.activeElement.tagName'), 'BODY');
+      await page.locator('#usagepop').waitFor({ state: 'hidden' });
     } finally {
       await browser.close();
     }
