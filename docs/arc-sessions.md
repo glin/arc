@@ -44,27 +44,44 @@ An ordinary CLI session can coordinate work when its shell finds `arc` and the i
 
 A coordinator is an ordinary agent session given an explicit session-management task. The skill supplies instructions rather than a scheduler or separate coordinator process.
 
-```mermaid
-flowchart TD
-  reader[Reader requests bounded work] --> coordinator[Ordinary Claude Code or Codex coordinator]
-  coordinator <--> cli[Arc CLI commands and results]
-  cli <--> channel[Selected local window channel]
-  subgraph arc[Arc extension host]
-    channel <--> host[Ready panel and repository scope]
-    host <--> adapters[Claude and Codex runtime adapters]
-    host <--> state[Saved labels, pins, and archive membership]
-    ingestion[Transcript and rollout readers] --> host
-  end
-  adapters <--> native[Native Claude and Codex CLIs]
-  native --> records[Claude transcripts and Codex rollouts]
-  records --> ingestion
-  host <--> panel[Live panel and Prompt box]
-  reader --> panel
-  coordinator --> report[Bounded result report and handoff]
-  native -->|Claude file edits| hooks[Optional Claude snapshot hooks]
-  hooks --> snapshots[First-touch file snapshots]
-  snapshots --> host
+```text
+Reader authorizes a bounded task
+             |
+             v
+Coordinator + installed native arc-sessions skill
+             |
+             v
+arc CLI <--- local channel ---> Selected ready Arc window
+                                         |
+                              Provider runtime adapters
+                                 /                \
+                                v                  v
+                         Native Claude CLI   Native Codex CLI
+                                |                  |
+                                v                  v
+                         Claude transcripts   Codex rollouts
+                                 \                /
+                                  v              v
+                                  Arc record readers
+                                         |
+                                         v
+                              Session results and panel
+                                 /                \
+                                v                  v
+                       Coordinator reads      Reader continues
+                       through arc session    through Prompt box
 ```
+
+1. Give the coordinator a bounded task authorizing one Claude session and one Codex session. Invoke its installed native `arc-sessions` skill.
+2. Read `arc windows --json`. Select the intended repository's window and check `scopeReady` and `panelReady`.
+3. Read `arc setups` for that window. Choose offered settings for each provider using the [Manual check](#manual-check) commands.
+4. Start each session through `arc start`. Save accepted session IDs and preserve uncertain request IDs without launching replacements.
+5. Arc's adapters run the native CLIs. Arc reads Claude transcripts and Codex rollouts for saved results, alongside live process activity.
+6. Read each session through `arc session`. Report its result and recorded settings without changing reader attention.
+7. Apply only authorized labels and pins, using `--dry-run` first. Archive only authorized completed sessions with known attention. Running and Needs input sessions refuse archive. Unread completion requires explicit `--force` authority.
+8. Leave the requested continuation session available. The reader opens it and sends the next prompt through its Prompt box.
+
+On an accepted start, `--arc-dispatch` emits the parent-link receipt itself. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Durable callback claim/ack separately tracks callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
 For a small two-provider run, choose offered low-cost setups and launch one Claude session and one Codex session. Python and shell coordinators both invoke the same CLI. Use `--untagged` for reader-requested work and `--arc-dispatch` for its parent-session receipt. Use `--agent-run` for delegated work instead. [Session management](cli.md#session-management) owns command arguments, delivery outcomes, archive rules, and uncertain-launch handling.
 
