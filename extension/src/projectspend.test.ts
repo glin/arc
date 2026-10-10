@@ -5433,6 +5433,89 @@ describe('Claude background cost accounting', () => {
   const tokens = (buckets: readonly ProjectUsageBucket[], field: keyof UsageCounts = 'input') =>
     buckets.reduce((sum, bucket) => sum + (bucket.usage[field] ?? 0), 0);
 
+  // The clock sets the deadline on its first call and reads past it on every later call.
+  const late = () => {
+    let calls = 0;
+    return {
+      maxMilliseconds: 15,
+      now: () => (calls++ === 0 ? 0 : 1_000),
+      maxBytes: 4096,
+      maxWorkingSetBytes: 1 << 20,
+    };
+  };
+
+  test('an expired cost-state slice advances without buffering the transcript', () => {
+    const filler = Array.from({ length: 5000 }, (_, index) => clock(at - 10_000 + index));
+    const fixture = indexCompactionSession([clock(), snapshot(120)], [...filler, answer('last', at - 1, 100, true)]);
+    assert.ok(fixture.records[1].size > 256 * 1024);
+    const capture = (fixture.records[0].parserState as ClaudeUsageReducerState).costState!;
+    const whole = reconcileClaudeCostState(
+      capture,
+      fixture.records,
+      (state) =>
+        createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
+          childTranscript: true,
+          retainAllRequests: true,
+        }),
+      undefined,
+      { maxMilliseconds: Number.POSITIVE_INFINITY },
+    );
+    assert.equal(tokens(whole.supplement!.lifetime), 20);
+    let result = replay(fixture, late());
+    let buffered = 0;
+    for (let slice = 0; !result.complete && slice < filler.length * 2; slice++) {
+      result = replay(fixture, late(), result.progress);
+      buffered = Math.max(buffered, Buffer.from(result.progress.pending, 'base64').length);
+    }
+    assert.equal(result.complete, true);
+    assert.equal(result.progress.reason, undefined);
+    assert.ok(buffered <= 2 * 4096, `the pending buffer reached ${buffered} bytes`);
+    assert.deepEqual(result.supplement, whole.supplement);
+  });
+
+  test('an expired cost-state slice completes at most one zero-byte native child', () => {
+    const fixture = indexCompactionSession([clock(), snapshot(120)], [answer('a', at, 100, true)]);
+    for (let index = 0; index < 20; index++) {
+      const file = path.join(path.dirname(fixture.file), `empty-${index}.jsonl`);
+      fs.writeFileSync(file, '');
+      fixture.records.push(
+        indexSpendFile(
+          undefined,
+          file,
+          'w',
+          (state) =>
+            createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, { childTranscript: true }),
+          1,
+          { maxMilliseconds: Infinity },
+        ).record,
+      );
+    }
+    const capture = (fixture.records[0].parserState as ClaudeUsageReducerState).costState!;
+    const whole = reconcileClaudeCostState(
+      capture,
+      fixture.records,
+      (state) =>
+        createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
+          childTranscript: true,
+          retainAllRequests: true,
+        }),
+      undefined,
+      { maxMilliseconds: Number.POSITIVE_INFINITY },
+    );
+    assert.equal(tokens(whole.supplement!.lifetime), 20);
+    let result = replay(fixture, late());
+    let slices = 1;
+    while (!result.complete && slices < fixture.records.length * 4) {
+      const child = result.progress.child;
+      result = replay(fixture, late(), result.progress);
+      slices++;
+      assert.ok(result.progress.child - child <= 1, `one slice completed ${result.progress.child - child} children`);
+    }
+    assert.equal(result.complete, true);
+    assert.equal(result.progress.reason, undefined);
+    assert.deepEqual(result.supplement, whole.supplement);
+  });
+
   test('repeated CLI counters correct intervening parent and child usage in session and Project totals', () => {
     for (const child of [false, true]) {
       const fixture = indexCompactionSession(
@@ -5988,11 +6071,16 @@ describe('Claude background cost accounting', () => {
       [answer('a', at, 100, true), clock(at + 1000), snapshot(120)],
     );
     const childCapture = (fixture.records[1].parserState as ClaudeUsageReducerState).costState!;
-    const childSupplement = reconcileClaudeCostState(childCapture, [fixture.records[1]], (state) =>
-      createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
-        childTranscript: true,
-        retainAllRequests: true,
-      }),
+    const childSupplement = reconcileClaudeCostState(
+      childCapture,
+      [fixture.records[1]],
+      (state) =>
+        createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
+          childTranscript: true,
+          retainAllRequests: true,
+        }),
+      undefined,
+      { maxMilliseconds: Number.POSITIVE_INFINITY },
     ).supplement!;
     fixture.records[1] = { ...fixture.records[1], costStateSupplement: childSupplement };
     const grandchildFile = path.join(path.dirname(fixture.file), 'grandchild.jsonl');
@@ -6024,19 +6112,17 @@ describe('Claude background cost accounting', () => {
     const cancelled = replay(fixture, { maxBytes: 0 });
     assert.equal(cancelled.complete, false);
     assert.equal(cancelled.progress.offset, 0);
+    const read = vi.spyOn(fs, 'readSync');
+    const bytesRead = () => read.mock.results.reduce((sum, result) => sum + Number(result.value), 0);
     let clockTick = 0;
     const exhausted = replay(fixture, { maxMilliseconds: 1, now: () => clockTick++ }, cancelled.progress);
     assert.equal(exhausted.complete, false);
-    assert.equal(exhausted.progress.offset, 0);
-    const read = vi.spyOn(fs, 'readSync');
-    const partial = replay(fixture, { maxBytes: 7 }, exhausted.progress);
-    assert.equal(partial.progress.offset, 7);
-    const completed = replay(fixture, {}, partial.progress);
+    assert.equal(exhausted.progress.offset, fixture.records[1].size);
+    assert.equal(exhausted.progress.offset, bytesRead());
+    assert.equal(Buffer.from(exhausted.progress.pending, 'base64').length, bytesRead());
+    const completed = replay(fixture, {}, exhausted.progress);
     assert.equal(tokens(completed.supplement!.lifetime), 20);
-    assert.equal(
-      read.mock.results.reduce((sum, result) => sum + Number(result.value), 0),
-      fixture.records[1].size,
-    );
+    assert.equal(bytesRead(), fixture.records[1].size);
     read.mockRestore();
     assert.equal(
       reconcileClaudeCostState(

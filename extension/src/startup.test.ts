@@ -10577,10 +10577,13 @@ test('background spend publishes Claude usage only after native children finish 
     indexSpendFile(undefined, child, 'workspace', factory, 1, { maxMilliseconds: Infinity }).record,
   );
   provider.projectSpendCostQueue = null;
+  // A frozen clock gives each cost-state slice its whole time budget, as on an idle machine.
+  let frozen = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
   await vi.waitFor(() => {
     provider.indexNextClaudeCostState();
     assert.ok(provider.projectSpendFiles[0].costStateSupplement);
   });
+  frozen.mockRestore();
   assert.equal(provider.projectSpendFiles[0].costStateSupplement.lifetime[0].usage.input, 80);
   const total = () =>
     sessionSpendPartsBySession(provider.projectSpendFiles, provider.claudeSpendSources).parent.reduce(
@@ -10594,10 +10597,12 @@ test('background spend publishes Claude usage only after native children finish 
   }).record;
   assert.equal(total(), 40);
   provider.projectSpendCostQueue = null;
+  frozen = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
   await vi.waitFor(() => {
     provider.indexNextClaudeCostState();
     assert.equal(provider.projectSpendFiles[0].costStateSupplement?.lifetime[0]?.usage.input, 60);
   });
+  frozen.mockRestore();
   assert.equal(total(), 100);
   assert.ok(provider.scheduleProjectSpendSave.mock.calls.length > 0);
 });
@@ -10690,7 +10695,10 @@ test('native non-primary accounting owners publish before ancestors across delay
     return provider;
   };
   let provider = make(records);
+  // A frozen clock gives the cost-state slice its whole time budget, as on an idle machine.
+  const frozen = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
   assert.equal(provider.indexNextClaudeCostState(), true);
+  frozen.mockRestore();
   const childRecord = provider.projectSpendFiles.find(
     (file: SpendFileIndex) => file.file === normalizeSpendFile(child),
   );

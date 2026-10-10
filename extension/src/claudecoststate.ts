@@ -517,13 +517,18 @@ export function reconcileClaudeCostState(
     delete progress.activeTierRequests;
     return { progress, complete: true };
   };
-  if (remaining <= 0 || clock() >= deadline) return { progress, complete: false };
+  // A slice that starts past its deadline still makes one admission step.
+  // When admission is complete, the slice also makes one read, one buffered line, or one child completion.
+  // Every later step checks the deadline first.
+  let advanced = false;
+  const expired = () => advanced && clock() >= deadline;
+  if (remaining <= 0) return { progress, complete: false };
   if (!admitted.has(progress)) {
     const scan = admissionScans.get(progress) ?? retainedParserPayloadScan([progress, capture], maxWorkingSet / 4);
     admissionScans.set(progress, scan);
     let steps = 0;
     for (;;) {
-      if (clock() >= deadline || steps++ >= 8) return { progress, complete: false };
+      if ((steps > 0 && clock() >= deadline) || steps++ >= 8) return { progress, complete: false };
       const next = scan.next();
       if (!next.done) continue;
       admissionScans.delete(progress);
@@ -539,7 +544,7 @@ export function reconcileClaudeCostState(
   const cuts = capture.snapshots
     .flatMap((snapshot, index) => (snapshot.at === null ? [] : [{ at: snapshot.at, index }]))
     .sort((a, b) => a.at - b.at || a.index - b.index);
-  while (progress.child < dependencies.length && remaining > 0 && clock() < deadline) {
+  while (progress.child < dependencies.length && remaining > 0 && !expired()) {
     const file = dependencies[progress.child];
     if (file.complete === false || file.missingAt || file.trailing || file.trailingBytes)
       return { progress, complete: false };
@@ -562,16 +567,20 @@ export function reconcileClaudeCostState(
     }
     const reducer = factory(progress.reducer);
     try {
-      while ((progress.offset < file.size || progress.pending) && remaining > 0 && clock() < deadline) {
-        const chunkBytes = Math.min(64 * 1024, file.size - progress.offset, remaining);
-        if ((progress.resourceBytes ?? 0) + progress.pending.length * 8 + chunkBytes * 8 > maxWorkingSet)
+      while ((progress.offset < file.size || progress.pending) && remaining > 0 && !expired()) {
+        const pendingBytes = Buffer.from(progress.pending, 'base64');
+        // The slice parses buffered complete lines before its next read.
+        // The buffer then holds at most one chunk and one partial record.
+        const buffered = pendingBytes.includes(10);
+        const chunkBytes = buffered ? 0 : Math.min(64 * 1024, file.size - progress.offset, remaining);
+        if (!buffered && (progress.resourceBytes ?? 0) + progress.pending.length * 8 + chunkBytes * 8 > maxWorkingSet)
           return withhold();
         const chunk = Buffer.allocUnsafe(chunkBytes);
-        const read = fs.readSync(fd, chunk, 0, chunk.length, progress.offset);
+        const read = buffered ? 0 : fs.readSync(fd, chunk, 0, chunk.length, progress.offset);
         if (!read && !progress.pending) break;
+        if (!buffered) advanced = true;
         remaining -= read;
         progress.offset += read;
-        const pendingBytes = Buffer.from(progress.pending, 'base64');
         if (budget.exportRecordBytes !== undefined) {
           let length = pendingBytes.length;
           for (let at = 0; at < read; at++) {
@@ -580,12 +589,13 @@ export function reconcileClaudeCostState(
               throw new ExportLimitError('record', budget.exportRecordBytes);
           }
         }
-        const terminal = budget.exportRecordBytes !== undefined && progress.offset === file.size;
+        const terminal = !buffered && budget.exportRecordBytes !== undefined && progress.offset === file.size;
         const bytes = Buffer.concat([pendingBytes, chunk.subarray(0, read), ...(terminal ? [Buffer.from([10])] : [])]);
         let start = 0;
         for (let end = 0; end < bytes.length; end++) {
           if (bytes[end] !== 10) continue;
-          if (clock() >= deadline) break;
+          if (expired()) break;
+          advanced = true;
           // The parser's admission rule includes nested attachments and excludes ordinary tool results.
           // Charges cover retained objects, indexes, and checkpoint serialization copies.
           // The spend index records the byte ranges of repeated records, and a repeated record adds no cost.
@@ -676,6 +686,7 @@ export function reconcileClaudeCostState(
       for (const [model, usage] of Object.entries(estimated)) add(progress.estimated[cut.index], model, usage);
     }
     progress.child++;
+    advanced = true;
     progress.offset = 0;
     progress.pending = '';
     delete progress.reducer;
