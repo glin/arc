@@ -2,7 +2,8 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import {
-  costPartOf,
+  costPartsOf,
+  projectCompaction,
   projectTurn,
   type SessionExport,
   type ExportRelationship,
@@ -11,7 +12,7 @@ import {
 import { projectSessionSite } from '../src/exportsite.ts';
 import { ExportTransaction } from '../src/exportwriter.ts';
 import { exportBrowserAssets } from '../src/panelbundle.ts';
-import { sessionCostProjection, type SessionCostUsage } from '../src/turncard.ts';
+import { sessionCostProjection } from '../src/turncard.ts';
 import {
   CAPTURE_TIME,
   ROOT,
@@ -19,6 +20,8 @@ import {
   DEMO_TURNS,
   demoParentEdges,
   demoReaderParents,
+  DEMO_COMPACTIONS,
+  demoSessionCostParts,
 } from './readme-fixture.ts';
 
 // Only invented fixture identities enter the downloadable graph.
@@ -47,35 +50,6 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
       coverage: 'complete' as const,
     })),
   ].filter((edge) => !!DEMO_TURNS[edge.from] && !!DEMO_TURNS[edge.to]);
-  const ownParts = (id: string): SessionCostUsage[] =>
-    DEMO_TURNS[id].flatMap((turn) => [
-      {
-        agent: turn.agent,
-        model: turn.model,
-        provider: turn.provider ?? null,
-        contextWindow: turn.contextWindow,
-        usage: turn.usage,
-        incomplete: !turn.finished,
-        role: 'main' as const,
-        scopeId: id,
-      },
-      ...turn.agents
-        .filter(
-          (agent) =>
-            !agent.childSessionId || !edges.some((edge) => edge.from === id && edge.to === agent.childSessionId),
-        )
-        .flatMap((agent) =>
-          agent.spend.map((part) => ({
-            ...part,
-            agent: turn.agent,
-            provider: part.provider ?? null,
-            contextWindow: part.contextWindow ?? turn.contextWindow,
-            role: 'delegated' as const,
-            scopeId: agent.id ?? undefined,
-            incomplete: agent.spendPartial || !agent.spendFound,
-          })),
-        ),
-    ]);
   for (const root of DEMO_SESSION_IDS) {
     const reachable = new Set([root]);
     for (let changed = true; changed;) {
@@ -116,7 +90,7 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
         const page: ExportPage = {
           key: id,
           session: id,
-          compactions: [],
+          compactions: (DEMO_COMPACTIONS[id] ?? []).map((item, index) => projectCompaction(item, `${id}-c${index}`)),
           turns: source.map((turn, index) => {
             const links = new Map<string, string[]>();
             const agents = turn.agents.map((agent, agentIndex) => ({
@@ -157,36 +131,7 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
             return projected;
           }),
         };
-        const delegated = new Set<string>();
-        const visit = (parent: string) => {
-          for (const edge of relationships)
-            if (edge.from === parent && edge.ownership === 'delegated' && edge.to && !delegated.has(edge.to)) {
-              delegated.add(edge.to);
-              visit(edge.to);
-            }
-        };
-        visit(id);
-        const parts = [
-          ...ownParts(id),
-          ...[...delegated].flatMap((child) =>
-            ownParts(child).map((part) => ({
-              ...part,
-              role: 'delegated' as const,
-              incomplete:
-                part.incomplete ||
-                relationships.some(
-                  (edge) =>
-                    edge.ownership === 'delegated' &&
-                    edge.to === child &&
-                    DEMO_TURNS[edge.from].some((turn) =>
-                      turn.agents.some(
-                        (agent) => agent.childSessionId === child && (agent.spendPartial || !agent.spendFound),
-                      ),
-                    ),
-                ),
-            })),
-          ),
-        ];
+        const parts = demoSessionCostParts(id);
         const price = (role: 'main' | 'delegated') =>
           sessionCostProjection(parts.filter((part) => part.role === role)).total;
         const combined = sessionCostProjection(parts).total;
@@ -196,10 +141,10 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
           title: source[0].sessionTitle!,
           pages: [await writer.spool(page)],
           turnCount: source.length,
-          compactionCount: 0,
+          compactionCount: DEMO_COMPACTIONS[id]?.length ?? 0,
           firstRequestCacheRead: null,
           numbers: {
-            parts: parts.map((part) => costPartOf(part, part.scopeId)),
+            parts: parts.flatMap((part) => costPartsOf(part, part.scopeId)),
             main: price('main'),
             delegated: price('delegated'),
             combined,

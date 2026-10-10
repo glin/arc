@@ -1,9 +1,23 @@
 import { EXPORT_LIMITS } from './exportlimits';
 import { checkExportCancellation, type ExportTransaction } from './exportwriter';
-import type { SessionExport, ExportTurn, ExportCompaction, ExportUsage, ExportPage } from './exportdata';
+import type {
+  SessionExport,
+  ExportTurn,
+  ExportCompaction,
+  ExportUsage,
+  ExportPage,
+  ExportCostPart,
+} from './exportdata';
 import type { SiteAsset, SiteManifest, SitePage } from './webview/export-model';
-import { isCacheLifetime, normalizeSessionTitle, type Turn, type TurnUsage, type Compaction } from './transcript';
-import { toCard, toCompactionCard, sessionStats } from './turncard';
+import {
+  isCacheLifetime,
+  normalizeSessionTitle,
+  type Turn,
+  type TurnUsage,
+  type Compaction,
+  type TurnUsagePart,
+} from './transcript';
+import { toCard, toCompactionCard, sessionStats, sessionCostProjection, type SessionCostUsage } from './turncard';
 import type { CardView } from './webview/payload-contracts';
 import { renderRichMarkdown } from './richtext';
 import { createHash } from 'node:crypto';
@@ -183,6 +197,27 @@ export function exportCard(value: ReturnType<typeof toCard> | ReturnType<typeof 
   };
 }
 
+function sessionCostUsage(part: ExportCostPart): SessionCostUsage & TurnUsagePart {
+  return {
+    role: part.role,
+    scopeId: part.scope ?? undefined,
+    model: part.model,
+    provider: part.provider,
+    contextWindow: part.contextWindow,
+    contextBand: part.contextBand,
+    inferenceClass: part.inferenceClass ?? null,
+    serviceTier: part.serviceTier,
+    recordedCost: part.recordedCost ?? undefined,
+    costBasis: part.costBasis ?? undefined,
+    unclassifiedCacheWrite: part.unclassifiedCacheWrite,
+    incomplete: part.incomplete,
+    ...(part.requestCountExact ? {} : { requestCountExact: false as const }),
+    ...(part.estimated ? { compactionEstimate: true as const } : {}),
+    ...(part.origin === 'claude-cost-state' ? { usageOrigin: part.origin } : {}),
+    usage: usage(part.usage),
+  };
+}
+
 export function exportTurn(value: ExportTurn, agent: 'claude' | 'codex', session: string): Turn {
   const prompts = value.blocks.filter((block) => block.kind === 'prompt');
   const opening = prompts.filter(
@@ -252,18 +287,7 @@ export function exportTurn(value: ExportTurn, agent: 'claude' | 'codex', session
     })),
     commits: value.commits.map((commit) => ({ ...commit, place: null, dir: null })),
     usage: usage(value.usage),
-    usageParts: value.usageParts.map((part) => ({
-      model: part.model,
-      provider: part.provider,
-      contextWindow: part.contextWindow,
-      contextBand: part.contextBand,
-      inferenceClass: part.inferenceClass ?? null,
-      serviceTier: part.serviceTier,
-      unclassifiedCacheWrite: part.unclassifiedCacheWrite,
-      incomplete: part.incomplete,
-      ...(part.requestCountExact ? {} : { requestCountExact: false as const }),
-      usage: usage(part.usage),
-    })),
+    usageParts: value.usageParts.map(sessionCostUsage),
     contextTokens: value.context.tokens ?? 0,
     contextWindow: value.context.window,
     contextRequest: value.context.request
@@ -387,6 +411,7 @@ export async function projectSessionSite(
   const sessions: SiteManifest['sessions'] = [];
   const rows: PanelSessionRow[] = [];
   const stats: Record<string, PanelStat[]> = {};
+  const sources = new Map(model.sessions.map((session) => [session.key, session]));
   const encode = (id: string, json: string) =>
     `<script type="application/octet-stream" id="arc-data-${id}">${Buffer.from(json).toString('base64')}</script>\n`;
   async function* documentChunks(): AsyncGenerator<string> {
@@ -497,7 +522,43 @@ export async function projectSessionSite(
       stats[session.key] = sessionStats(figures, compactions).filter(
         (stat) => stat.metric !== 'cost',
       ) as unknown as PanelStat[];
-      if (total.dollars !== null && total.dollars > 0)
+      const usageMissing = session.numbers.coverage.usage !== 'complete';
+      const mainMissing = session.numbers.parts.some((part) => part.role === 'main' && part.incomplete);
+      const delegatedParts = session.numbers.parts.filter((part) => part.role === 'delegated');
+      const delegatedScopeIds = new Set<string>();
+      for (const part of delegatedParts) {
+        const source = part.scope ? sources.get(part.scope) : undefined;
+        if (part.scope && (part.incomplete || (source && source.numbers.coverage.usage !== 'complete')))
+          delegatedScopeIds.add(part.scope);
+      }
+      const missingLinks =
+        session.coverage.relationships === 'partial' ||
+        model.relationships.some(
+          (edge) => edge.from === session.key && edge.ownership === 'delegated' && edge.coverage === 'partial',
+        );
+      const delegatedMissing =
+        missingLinks || delegatedScopeIds.size > 0 || delegatedParts.some((part) => part.incomplete);
+      // Unattributed missing usage qualifies every retained scope that it can affect.
+      const unknownCoverage = usageMissing;
+      if (missingLinks || unknownCoverage)
+        for (const part of delegatedParts) if (part.scope) delegatedScopeIds.add(part.scope);
+      const projection = sessionCostProjection(
+        session.numbers.parts.map((part) => ({
+          ...sessionCostUsage(part),
+          agent: (part.scope ? sources.get(part.scope)?.agent : null) ?? session.agent,
+        })),
+        {
+          main: mainMissing || unknownCoverage,
+          delegated: delegatedMissing || (unknownCoverage && delegatedParts.length > 0),
+          delegatedScopeIds,
+        },
+        { compactionCount: session.compactionCount },
+        session.numbers,
+      );
+      const cost = projection.stats[0];
+      if (cost && total.dollars !== null) {
+        stats[session.key].unshift(cost as unknown as PanelStat);
+      } else if (total.dollars !== null && total.dollars > 0) {
         stats[session.key].unshift({
           kind: 'plain',
           metric: 'cost',
@@ -507,6 +568,7 @@ export async function projectSessionSite(
           partial: total.partial,
           detail: `Estimated total. Main agent: ${formatCost(session.numbers.main.dollars)}. Delegated work: ${formatCost(session.numbers.delegated.dollars)}.${total.partial ? ' Recorded usage is incomplete.' : ''}`,
         });
+      }
     }
     const rail = railSessions(
       rows,

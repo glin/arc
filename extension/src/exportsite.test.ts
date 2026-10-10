@@ -5,14 +5,154 @@ import * as path from 'node:path';
 import { EXPORT_LIMITS } from './exportlimits';
 import { ExportTransaction, ExportCancelled } from './exportwriter';
 import { exportCard, exportTurn, exportScriptJson, projectSessionSite } from './exportsite';
-import { toCard } from './turncard';
+import { type SessionStatChip, toCard } from './turncard';
 import { turn, sessionSiteFixture, exportedSiteData } from './turnfixtures';
 import { tempDir } from './temproot';
 import type { CardView } from './webview/payload-contracts';
 import type { ExportBlock } from './exportdata';
 import { exportBrowserAssets } from './panelbundle';
 import { exportFactValue } from './view/export-facts';
+import { demoPayload, demoSessionCostParts, DEMO_COMPACTIONS } from '../scripts/readme-fixture';
+import { sessionCostProjection } from './turncard';
+import { estimateCost, formatCost } from './pricing';
 import { writeDemoExports } from '../scripts/web-demo-export';
+import { costPartOf } from './exportdata';
+
+test('export cost details distinguish missing prices from missing usage', async () => {
+  for (const role of ['main', 'delegated'] as const) {
+    const directory = tempDir('arc-export-unpriced-usage-');
+    const writer = await ExportTransaction.create(directory);
+    try {
+      const model = await sessionSiteFixture(writer);
+      model.relationships = [];
+      model.sessions[0].coverage.relationships = 'complete';
+      const known = { ...demoSessionCostParts('arc-demo-review')[0], role, scopeId: 'child' };
+      const unknown = { ...known, model: 'unlisted-model' };
+      const total = sessionCostProjection([known, unknown]).total;
+      model.sessions[0].numbers = {
+        parts: [costPartOf(known, 'child'), costPartOf(unknown, 'child')],
+        main: role === 'main' ? total : { dollars: 0, partial: false },
+        delegated: role === 'delegated' ? total : { dollars: 0, partial: false },
+        combined: total,
+        coverage: { usage: 'complete', cost: 'partial' },
+      };
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const result = await writer.publish(async () => {});
+      const { manifest } = exportedSiteData(result.directory);
+      const cost = manifest.stats.root.find((stat) => stat.metric === 'cost')! as unknown as SessionStatChip;
+      assert.equal(cost.dollars, total.dollars);
+      assert.equal(cost.partial, true);
+      assert.match(cost.detail, /Some usage could not be priced/);
+      assert.doesNotMatch(cost.detail, /(?:Main agent|Delegated work) usage is incomplete/);
+      assert.match(cost.detail, /requests/);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
+test('export cost details qualify safe child usage when other child usage is missing', async () => {
+  for (const identified of [true, false]) {
+    const directory = tempDir('arc-export-missing-child-usage-');
+    const writer = await ExportTransaction.create(directory);
+    try {
+      const model = await sessionSiteFixture(writer);
+      model.relationships = [];
+      model.sessions[0].coverage.relationships = 'complete';
+      const safe = {
+        ...demoSessionCostParts('arc-demo-review')[0],
+        role: 'delegated' as const,
+        scopeId: 'child',
+        model: 'claude-opus-5-5',
+        usage: {
+          requests: 6,
+          input: 0,
+          cacheRead: 0,
+          cacheWrite1h: 2_000_000,
+          cacheWrite5m: 0,
+          cacheWrite30m: 0,
+          output: 300,
+          thinking: 0,
+        },
+      };
+      const total = sessionCostProjection([safe]).total;
+      assert.ok(total.dollars! > 5);
+      assert.ok(sessionCostProjection([safe]).stats[0].warnings?.length);
+      model.sessions[0].numbers = {
+        parts: [costPartOf(safe, 'child')],
+        main: { dollars: 0, partial: false },
+        delegated: { ...total, partial: true },
+        combined: { ...total, partial: true },
+        coverage: { usage: 'partial', cost: 'partial' },
+      };
+      model.sessions[1].numbers.coverage.usage = identified ? 'partial' : 'complete';
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const result = await writer.publish(async () => {});
+      const { manifest } = exportedSiteData(result.directory);
+      const cost = manifest.stats.root.find((stat) => stat.metric === 'cost')! as unknown as SessionStatChip;
+      assert.equal(cost.dollars, total.dollars);
+      assert.equal(cost.partial, true);
+      assert.ok(cost.label.endsWith('+'));
+      assert.equal(cost.warnings?.length ?? 0, 0);
+      assert.doesNotMatch(cost.detail, /6 requests|avg input|Low cache reuse/);
+      assert.match(cost.detail, /Delegated work usage is incomplete/);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
+test('export cost details retain missing main and unresolved child coverage beside an incomplete child', async () => {
+  const directory = tempDir('arc-export-mixed-missing-usage-');
+  const writer = await ExportTransaction.create(directory);
+  try {
+    const model = await sessionSiteFixture(writer);
+    model.relationships = [];
+    model.sessions[0].coverage.relationships = 'complete';
+    const main = {
+      ...demoSessionCostParts('arc-demo-review')[0],
+      role: 'main' as const,
+      model: 'claude-opus-5-5',
+      usage: {
+        requests: 6,
+        input: 0,
+        cacheRead: 0,
+        cacheWrite1h: 2_000_000,
+        cacheWrite5m: 0,
+        cacheWrite30m: 0,
+        output: 300,
+        thinking: 0,
+      },
+    };
+    const child = { ...main, role: 'delegated' as const, scopeId: 'child' };
+    const unresolved = { ...child, scopeId: 'unresolved-child' };
+    const parts = [main, child, unresolved];
+    const total = sessionCostProjection(parts).total;
+    assert.equal(sessionCostProjection(parts).stats[0].warnings?.length, 3);
+    // Incomplete main buckets are omitted from captured parts.
+    model.sessions[0].numbers = {
+      parts: [costPartOf(main), costPartOf(child, 'child'), costPartOf(unresolved, 'unresolved-child')],
+      main: { ...sessionCostProjection([main]).total, partial: true },
+      delegated: { ...sessionCostProjection([child, unresolved]).total, partial: true },
+      combined: { ...total, partial: true },
+      coverage: { usage: 'partial', cost: 'partial' },
+    };
+    model.sessions[1].numbers.coverage.usage = 'partial';
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const result = await writer.publish(async () => {});
+    const { manifest } = exportedSiteData(result.directory);
+    const cost = manifest.stats.root.find((stat) => stat.metric === 'cost')! as unknown as SessionStatChip;
+    assert.equal(cost.dollars, total.dollars);
+    assert.equal(cost.partial, true);
+    assert.ok(cost.label.endsWith('+'));
+    assert.equal(cost.warnings?.length ?? 0, 0);
+    assert.doesNotMatch(cost.detail, /6 requests|avg input|Low cache reuse/);
+    assert.match(cost.detail, /Main agent usage is incomplete/);
+    assert.match(cost.detail, /Delegated work usage is incomplete/);
+  } finally {
+    await writer.dispose();
+  }
+});
 
 test('demo HTML downloads retain recorded files and incomplete delegated cost', async () => {
   const directory = tempDir('arc-demo-export-content-');
@@ -46,16 +186,109 @@ test('demo HTML downloads retain recorded files and incomplete delegated cost', 
     assert.ok(manifest.omissions.every((omission) => omission.reason !== 'external-path'));
     if (root === 'arc-read-state') {
       const numbers = manifest.sessions.find((session) => session.key === root)!.numbers;
-      assert.ok(Math.abs(numbers.combined.dollars! - 6.6734) < 1e-10);
+      assert.ok(
+        Math.abs(numbers.combined.dollars! - sessionCostProjection(demoSessionCostParts(root)).total.dollars!) < 1e-10,
+      );
       assert.equal(numbers.main.partial, false);
       assert.equal(numbers.delegated.partial, true);
       assert.equal(numbers.combined.partial, true);
       assert.deepEqual(numbers.coverage, { usage: 'partial', cost: 'partial' });
       assert.ok(numbers.parts.some((part) => part.scope === 'arc-sol-read-state' && part.incomplete));
-      const cost = manifest.stats[root].find((stat) => stat.metric === 'cost')!;
-      assert.equal(cost.label, '$6.67+');
+      const cost = manifest.stats[root].find((stat) => stat.metric === 'cost')! as unknown as SessionStatChip;
+      assert.equal(
+        cost.label,
+        (demoPayload(root) as { stats: Record<string, { label: string; metric?: string }[]> }).stats[root].find(
+          (stat) => stat.metric === 'cost',
+        )!.label,
+      );
       assert.ok(manifest.rail.find((session) => session.id === root)!.costAtLeast);
     }
+  }
+});
+
+test('demo downloads retain production cost categories and compaction overhead', async () => {
+  const directory = tempDir('arc-demo-export-cost-');
+  await writeDemoExports(directory);
+  for (const root of [
+    'arc-read-state',
+    'delegated-cost',
+    'arc-demo-review',
+    'arc-demo-continuation',
+    'arc-sol-read-state',
+  ]) {
+    await fs.copyFile(path.join(directory, `export-${root}.html`), path.join(directory, 'index.html'));
+    const { manifest, data } = exportedSiteData(directory);
+    const session = manifest.sessions.find((session) => session.key === root)!;
+    const cost = manifest.stats[root].find((stat) => stat.metric === 'cost')! as unknown as SessionStatChip;
+    assert.ok(
+      cost.detailList?.entries.some((entry) => entry.lines?.length),
+      root,
+    );
+    const live = (demoPayload(root) as { stats: Record<string, SessionStatChip[]> }).stats[root].find(
+      (stat) => stat.metric === 'cost',
+    )!;
+    assert.equal(cost.label, live.label);
+    assert.equal(session.numbers.combined.dollars, live.dollars);
+    assert.equal(cost.detailList!.heading!.value, live.label);
+    assert.ok(cost.detail.startsWith(`Estimated total: ${live.label}`), cost.detail);
+    for (const role of ['main', 'delegated'] as const) {
+      const captured = session.numbers[role];
+      const entry = cost.detailList!.entries.find((entry) =>
+        entry.label.startsWith(role === 'main' ? 'Main agent' : 'Delegated work'),
+      );
+      if (entry) assert.equal(entry.value, `${formatCost(captured.dollars)}${captured.partial ? '+' : ''}`, root);
+    }
+    for (const child of manifest.sessions.filter((child) => child.key !== root)) {
+      const expected = sessionCostProjection(demoSessionCostParts(child.key)).total;
+      assert.equal(child.numbers.combined.dollars, expected.dollars, child.key);
+      const retained = session.numbers.parts.filter((part) => part.scope === child.key);
+      if (!retained.length) continue;
+      const priced = sessionCostProjection(
+        retained.map((part) => ({
+          ...part,
+          scopeId: part.scope ?? undefined,
+          recordedCost: part.recordedCost ?? undefined,
+          costBasis: part.costBasis ?? undefined,
+          requestCountExact: part.requestCountExact ? undefined : (false as const),
+          usage: {
+            ...part.usage,
+            requests: part.usage.requests ?? undefined,
+            input: part.usage.input ?? 0,
+            cacheRead: part.usage.cacheRead ?? 0,
+            cacheWrite1h: part.usage.cacheWrite1h ?? 0,
+            cacheWrite5m: part.usage.cacheWrite5m ?? 0,
+            cacheWrite30m: part.usage.cacheWrite30m ?? 0,
+            output: part.usage.output ?? 0,
+            thinking: part.usage.thinking ?? 0,
+          },
+        })),
+      ).total;
+      assert.equal(priced.dollars, expected.dollars, child.key);
+    }
+    if (root === 'delegated-cost') {
+      assert.deepEqual(session.numbers.coverage, { usage: 'complete', cost: 'complete' });
+      assert.doesNotMatch(cost.detail, /usage is incomplete|cost unavailable/);
+      assert.deepEqual(cost.detailList!.entries, live.detailList!.entries);
+    }
+    if (root === 'arc-sol-read-state') assert.ok(cost.partial);
+    if (root !== 'arc-demo-continuation') continue;
+    assert.equal(session.compactionCount, 1);
+    const estimates = session.numbers.parts.filter((part) => part.estimated);
+    assert.equal(estimates.length, 1);
+    const estimate = demoSessionCostParts(root).find((part) => part.compactionEstimate)!;
+    const amount = estimateCost(estimate.usage, estimate.model)!;
+    assert.ok(amount > 0);
+    assert.equal(
+      cost.detailList!.entries.find((entry) => entry.label === '1 compaction')!.value,
+      live.detailList!.entries.find((entry) => entry.label === '1 compaction')!.value,
+    );
+    assert.ok(cost.detailList!.footer?.length);
+    assert.equal(DEMO_COMPACTIONS[root].length, 1);
+    assert.ok(
+      session.pages.some((page) =>
+        page.cards?.some((ref) => (data.get(ref.id) as { card: CardView }).card.kind === 'compaction'),
+      ),
+    );
   }
 });
 

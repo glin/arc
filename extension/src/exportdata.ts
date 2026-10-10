@@ -50,6 +50,7 @@ import {
   type UsageLineReducer,
 } from './projectspend';
 import { reconcileClaudeCostState, type ClaudeCostProgress } from './claudecoststate';
+import { recordedCostBasis } from './pricing';
 
 export type ExportLimits = { [K in keyof typeof EXPORT_LIMITS]: number };
 export type {
@@ -382,6 +383,26 @@ export function costPartOf(part: SessionCostUsage, scope: string | null = null):
     usage: usageOf(part.usage),
   };
 }
+export function costPartsOf(part: SessionCostUsage, scope: string | null = null): ExportCostPart[] {
+  const bands = part.usage.byContextBand;
+  if (!bands || part.contextBand || (recordedCostBasis(part.costBasis) && part.recordedCost !== undefined))
+    return [costPartOf(part, scope)];
+  const counts = [
+    'requests',
+    'input',
+    'cacheRead',
+    'cacheWrite1h',
+    'cacheWrite5m',
+    'cacheWrite30m',
+    'output',
+    'thinking',
+  ] as const;
+  if (!counts.every((key) => (part.usage[key] ?? 0) === (bands.short?.[key] ?? 0) + (bands.long?.[key] ?? 0)))
+    return [costPartOf(part, scope)];
+  return (['short', 'long'] as const).flatMap((contextBand) =>
+    bands[contextBand] ? [costPartOf({ ...part, contextBand, usage: bands[contextBand] }, scope)] : [],
+  );
+}
 function blocksOf(turn: Turn, key: string): ExportBlock[] {
   const entries: Array<Omit<ExportBlock, 'key'> & { sequence: number }> = [];
   const add = (
@@ -484,7 +505,7 @@ export function projectTurn(
         ),
       ),
     ],
-    usageParts: (turn.usageParts ?? []).map((part) => costPartOf(part)),
+    usageParts: (turn.usageParts ?? []).flatMap((part) => costPartsOf(part)),
     context: {
       tokens: turn.contextTokens > 0 ? turn.contextTokens : null,
       window: turn.contextWindow,
@@ -520,8 +541,8 @@ export function projectTurn(
     },
     agents: turn.agents.map((agent, index) => ({
       relationships: agent.toolUseId ? (links.get(agent.toolUseId) ?? []) : [],
-      spend: agent.spend.map((part) =>
-        costPartOf({
+      spend: agent.spend.flatMap((part) =>
+        costPartsOf({
           ...part,
           provider: part.provider ?? null,
           contextWindow: part.contextWindow ?? null,
@@ -553,7 +574,7 @@ export function projectTurn(
     changes,
   };
 }
-function projectCompaction(compaction: Compaction, key: string): ExportCompaction {
+export function projectCompaction(compaction: Compaction, key: string): ExportCompaction {
   const previous = compaction.previousRequest;
   return {
     key,
@@ -1314,8 +1335,8 @@ export async function captureSessionExport(
     );
     completeness.delegated ||= linkedMissing || session.coverage.relationships === 'partial';
     session.numbers = {
-      parts: all.map((part) =>
-        costPartOf(
+      parts: all.flatMap((part) =>
+        costPartsOf(
           part,
           part.scopeId?.startsWith('source:')
             ? (sourceKeys.get(normalizeFsPath(part.scopeId.slice(7))) ?? null)

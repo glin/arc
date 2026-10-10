@@ -10,7 +10,7 @@ import { missingUsageLimits, publish } from '../scripts/readme-shots.ts';
 import { DEMO_LABELS, DEMO_SESSION_IDS, README_SCENES, demoPayload, readmePayload } from '../scripts/readme-fixture.ts';
 import { turnCost } from './turncard.ts';
 import { claudeLaunchKind } from './transcript.ts';
-import type { SessionStatChip, TurnCard } from './turncard.ts';
+import type { SessionStatChip, TurnCard, CompactionCard } from './turncard.ts';
 import type { RailCard, SessionParent } from './turnrail.ts';
 import { estimateCost, formatCost } from './pricing.ts';
 import { manifestMenu, whenHolds } from '../scripts/web-demo-menu.ts';
@@ -23,7 +23,7 @@ import { readDefaultConfiguration, readModels } from './codexwire.ts';
 import { modelPicks, effortPicks } from './view/model-picks.ts';
 import { railSections, RAIL_FOLDS } from './view/rail.ts';
 import { DEMO_HOST_POLICY, demoContextReply } from '../scripts/web-demo-host.ts';
-import { DEMO_DEFAULT_EXPIRY, DEMO_TURNS, demoContextSample } from '../scripts/readme-fixture.ts';
+import { DEMO_DEFAULT_EXPIRY, DEMO_TURNS, demoContextSample, demoSessionCostParts } from '../scripts/readme-fixture.ts';
 import { validContextDetail } from './domain/context-detail.ts';
 import { parseHostToPanel, parsePanelToHost } from './webview/protocol.ts';
 import type { TurnComment } from './turncomments.ts';
@@ -256,7 +256,7 @@ test('demo samples keep dispatched costs and reader-started usage separate from 
   assert.ok(Math.abs(dollars(parent) - own - dollars(review)) < 1e-9);
   assert.equal(card.chips.find((chip) => chip.metric === 'cost')?.label, formatCost(own));
   const readerOwn = estimateCost({ requests: 2, input: 4_000, cacheWrite5m: 0, cacheWrite1h: 9_000, cacheRead: 9_000, output: 1_500, thinking: 0 }, 'claude-opus-5-5', null, 200_000)!;
-  assert.equal(dollars(continuation), readerOwn);
+  assert.equal(dollars(continuation), readerOwn + demoSessionCostParts('arc-demo-continuation').filter((part) => part.compactionEstimate).reduce((sum, part) => sum + estimateCost(part.usage, part.model)!, 0));
   assert.deepEqual(DEMO_LABELS['arc-demo-continuation'], DEMO_LABELS['arc-demo-dispatch']);
   assert.notEqual(DEMO_LABELS['arc-demo-continuation'], DEMO_LABELS['arc-demo-dispatch']);
   assert.deepEqual(README_SCENES.map((scene) => readmePayload(scene)), before);
@@ -282,11 +282,10 @@ test('demo selections keep available setups, cache facts, and their own prompt t
     assert.ok(model);
     assert.ok(model.efforts.some((effort) => effort.value === setup.effort));
     const warm = payload.rail.find((row) => row.id === 'delegated-cost')!.cache!;
-    const expiring = payload.rail.find((row) => row.id === 'arc-demo-continuation')!.cache!;
+    const compacted = payload.rail.find((row) => row.id === 'arc-demo-continuation')!;
     assert.ok(warm.expiresAt > CAPTURE_TIME);
     assert.ok(warm.nearlyGoneAt! > CAPTURE_TIME);
-    assert.ok(expiring.expiresAt > CAPTURE_TIME);
-    assert.ok(expiring.nearlyGoneAt! < CAPTURE_TIME);
+    assert.equal(compacted.cache, null);
   }
   const main = demoPayload('arc-read-state') as Payload;
   assert.equal(main.usage.launcher.primary!.profile.model, 'opus');
@@ -326,9 +325,9 @@ test('demo makers open distinct children with matching parent and turn chronolog
   }
   const parent = demoPayload('arc-demo-dispatch') as { cards: TurnCard[] };
   const review = demoPayload('arc-demo-review') as { cards: TurnCard[] };
-  const continuation = demoPayload('arc-demo-continuation') as { cards: TurnCard[] };
+  const continuation = demoPayload('arc-demo-continuation') as { cards: (TurnCard | CompactionCard)[] };
   assert.ok(review.cards[0].startedAt >= parent.cards[0].startedAt);
-  assert.ok(continuation.cards[0].startedAt >= parent.cards[0].endedAt);
+  assert.ok(continuation.cards.find((card) => card.kind === 'turn')!.startedAt >= parent.cards[0].endedAt);
 });
 
 test('demo catalogs, permissions, groups and running children match production inputs', () => {
@@ -662,9 +661,9 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cache-expiry'));
   assert.ok(main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.detail.includes('Included above'));
   const expired = demoPayload('delegated-cost') as typeof main;
-  const warning = expired.cards[0].chips.find((chip) => chip.metric === 'cost')!.warnings!.find((warning) => warning.scope === 'cache-expiry');
-  assert.ok(warning && warning.scope === 'cache-expiry' && warning.dollars! >= 1, 'invented cold turn must cross the production warning threshold');
-  assert.ok(expired.stats['delegated-cost'].find((chip) => chip.metric === 'cost')!.detail.includes('Included above'));
+  const warning = main.cards[1].chips.find((chip) => chip.metric === 'cost')!.warnings!.find((warning) => warning.scope === 'cache-expiry');
+  assert.ok(warning && warning.scope === 'cache-expiry' && warning.dollars! > 1, 'invented cold turn must cross the production warning threshold');
+  assert.ok(expired.cards.every((card) => !card.chips.some((chip) => chip.warnings?.some((warning) => warning.scope === 'cache-expiry'))));
   const readme = readmePayload('cost') as typeof main;
   assert.ok(readme.cards[0].chips.find((chip) => chip.metric === 'cost')!.warnings!.some((warning) => warning.scope === 'cache-expiry'));
   assert.equal(DEMO_DEFAULT_EXPIRY.returns.length, 1);
@@ -695,4 +694,31 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   assert.ok(dispatched, 'turn cost detail omits the dispatched child');
   assert.equal(dispatched.value, formatCost(childDollars), 'dispatched detail has the wrong cost');
   assert.ok(Math.abs(dollars - own - childDollars) < 1e-9, 'dispatched usage was omitted or counted twice');
+});
+
+test('demo session costs retain usage details and count compaction estimates once', () => {
+  for (const id of DEMO_SESSION_IDS) {
+    const payload = demoPayload(id) as { stats: Record<string, SessionStatChip[]> };
+    const cost = payload.stats[id].find((chip) => chip.metric === 'cost');
+    if (cost) assert.ok(cost.detailList?.entries.some((entry) => entry.lines?.length), id);
+  }
+  const id = 'arc-demo-continuation';
+  const payload = demoPayload(id) as { stats: Record<string, SessionStatChip[]> };
+  const cost = payload.stats[id].find((chip) => chip.metric === 'cost')!;
+  const parts = demoSessionCostParts(id);
+  const overhead = parts.filter((part) => part.compactionEstimate);
+  assert.equal(overhead.length, 1);
+  const amount = estimateCost(overhead[0].usage, overhead[0].model)!;
+  assert.ok(amount > 0);
+  assert.ok(Math.abs(cost.dollars! - turnCost(DEMO_TURNS[id][0]).dollars! - amount) < 1e-9);
+  assert.equal(cost.detailList!.entries.find((entry) => entry.label === '1 compaction')!.value, formatCost(amount));
+  assert.ok(cost.detailList!.entries.some((entry) => entry.group));
+  assert.ok(cost.detailList!.footer?.length);
+  const compacted = demoPayload(id) as { usage: { composer: ComposerView }; rail: RailCard[] };
+  const basis = compacted.usage.composer.nextTurn!;
+  assert.equal(demoContextSample(id).contextTokens, 3_000);
+  assert.equal(basis.afterCompaction, true);
+  assert.equal(basis.coldAt, null);
+  assert.equal(basis.cold!.price, '$0.03');
+  assert.equal(compacted.rail.find((session) => session.id === id)!.cache, null);
 });

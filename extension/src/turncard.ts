@@ -4976,7 +4976,7 @@ function unavailableUsage(costs: readonly PricedSessionCost[]): Map<string, Unav
 
 // `short` marks missing usage outside these cost parts.
 // Without a formatted price, partial totals read unavailable and complete totals read no billed usage.
-function sessionCostValue(costs: readonly PricedSessionCost[], short = false): string {
+function sessionCostValue(costs: readonly SessionCostTotal[], short = false): string {
   let dollars = 0;
   let priced = false;
   for (const cost of costs) {
@@ -5345,6 +5345,7 @@ export function sessionCostProjection(
   parts: readonly SessionCostUsage[],
   coverage: boolean | SessionSpendCoverage = false,
   overheads: SessionOverheads = {},
+  captured?: { main: SessionCostTotal; delegated: SessionCostTotal; combined: SessionCostTotal },
 ): SessionCostProjection {
   const mainShort = typeof coverage === 'boolean' ? false : coverage.main;
   const short = typeof coverage === 'boolean' ? coverage : coverage.delegated;
@@ -5354,10 +5355,12 @@ export function sessionCostProjection(
   const incomplete = mainShort || short;
   const costs = parts.map(priceSessionCost);
   const totals: readonly SessionCostTotal[] = incomplete ? [...costs, { dollars: null, partial: true }] : costs;
-  const total = sessionCostTotalOf(totals);
+  const total = captured?.combined ?? sessionCostTotalOf(totals);
   const unavailable = unavailableUsage(costs);
   const scope = 'Includes the main session and delegated work.';
-  const chip = costStat(totals, scope, () => [...unavailableUsageLines(unavailable), UNAVAILABLE_COST_NOTE].join('\n'));
+  const chip = costStat(captured ? [total] : totals, scope, () =>
+    [...unavailableUsageLines(unavailable), UNAVAILABLE_COST_NOTE].join('\n'),
+  );
   if (!chip) {
     return { stats: [], total };
   }
@@ -5397,7 +5400,7 @@ export function sessionCostProjection(
                     'Main agent',
                     main.map((cost) => cost.part.model),
                   ),
-                  value: sessionCostValue(main, mainShort),
+                  value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
                   lines: usageCategoryLines(main, true, mainShort),
                 },
                 warnings.filter((warning) => warning.scope === 'main'),
@@ -5441,7 +5444,7 @@ export function sessionCostProjection(
                       'Main agent',
                       main.map((cost) => cost.part.model),
                     ),
-                    value: sessionCostValue(main, mainShort),
+                    value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
                     lines: usageCategoryLines(main, true, mainShort),
                   },
                 ]
@@ -5450,7 +5453,7 @@ export function sessionCostProjection(
               ? [
                   {
                     label: 'Delegated work',
-                    value: sessionCostValue(delegated, short),
+                    value: sessionCostValue(captured ? [captured.delegated] : delegated, captured ? false : short),
                     lines: delegatedCostLines(delegated, delegatedShort),
                   },
                 ]

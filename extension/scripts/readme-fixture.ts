@@ -7,8 +7,9 @@ import {
   nextTurnBasisOf,
   priceDispatchedParts,
   sessionCacheExpiryStats,
-  sessionCostStats,
   sessionCostProjection,
+  toCompactionCard,
+  type SessionCostUsage,
   turnCacheExpiryWarning,
   sessionStats,
 } from '../src/turncard.ts';
@@ -19,13 +20,13 @@ import {
   prepareProjectSpendView,
   publicProjectSpendPrice,
 } from '../src/projectspend.ts';
-import { cacheLifetimeFor, contextBandForRequest } from '../src/pricing.ts';
+import { cacheLifetimeFor, contextBandForRequest, compactionEstimate } from '../src/pricing.ts';
 import type { CacheExpiryCarry, ProjectUsageBucket, SpendFileIndex } from '../src/projectspend.ts';
 import { usageBar } from '../src/usageview.ts';
 import type { AgentUsage } from '../src/usageview.ts';
 import { renderRichMarkdown } from '../src/richtext.ts';
 import { skillUse, subagent, turn } from '../src/turnfixtures.ts';
-import { SKILL_STEP_KIND, type Turn } from '../src/transcript.ts';
+import { SKILL_STEP_KIND, type Turn, type Compaction } from '../src/transcript.ts';
 import type { TurnComment } from '../src/turncomments.ts';
 import { railCacheMarkOf, sessionParentOf } from '../src/turnrail.ts';
 import { DEMO_DEFAULTS, DEMO_MODELS } from './demo-catalog.ts';
@@ -1138,7 +1139,8 @@ DEMO_TURNS['arc-read-state'] = DEMO_TURNS['arc-read-state'].map((item, index) =>
           at: item.contextRequest!.at - (index === 2 ? 60 * 60_000 : 0),
           lifetime: '1h' as const,
         },
-        usage: { ...item.usage, input: 0, cacheWrite1h: item.usage.input },
+        contextTokens: index === 2 ? 160_000 : 180_000,
+        usage: { ...item.usage, input: 0, cacheWrite1h: index === 2 ? 160_000 : 180_000 },
       },
 );
 
@@ -1201,6 +1203,34 @@ for (const [id, turns] of Object.entries(DEMO_TURNS)) {
   }));
 }
 
+export const DEMO_COMPACTIONS: Record<string, Compaction[]> = {};
+const compactedTurn = DEMO_TURNS['arc-demo-continuation'][0];
+const compactionSummary =
+  'Keep response read marks and session unread state together. Check opening a response, marking it unread, and switching sessions.';
+DEMO_COMPACTIONS['arc-demo-continuation'] = [
+  {
+    sessionId: compactedTurn.sessionId,
+    at: compactedTurn.endedAt + 15_000,
+    durationMs: 15_000,
+    trigger: 'manual',
+    model: compactedTurn.model,
+    contextWindow: compactedTurn.contextWindow,
+    contextBefore: compactedTurn.contextTokens,
+    contextAfter: 3_000,
+    retainedContext: { tokens: 3_000, window: compactedTurn.contextWindow },
+    droppedTokens: compactedTurn.contextTokens - 3_000,
+    summary: compactionSummary,
+    summaryChars: compactionSummary.length,
+    previousRequest: {
+      tokens: compactedTurn.contextTokens,
+      cacheRead: 9_000,
+      cacheWrite: 6_000,
+      at: compactedTurn.contextRequest!.at,
+      lifetime: '1h',
+    },
+  },
+];
+
 export const DEMO_DEFAULT_EXPIRY = emptyCacheExpiryFacts();
 const demoCodexExpiry = emptyCacheExpiryFacts();
 const demoDelegatedExpiry = emptyCacheExpiryFacts();
@@ -1214,7 +1244,6 @@ for (const turns of Object.values(DEMO_TURNS)) {
 for (const [sessionId, facts] of [
   ['arc-read-state', DEMO_DEFAULT_EXPIRY],
   ['arc-codex-read-state', demoCodexExpiry],
-  ['delegated-cost', demoDelegatedExpiry],
 ] as const) {
   const defaultHistory = DEMO_TURNS[sessionId].filter((item) => item.usage.requests === 1).reverse();
   for (let index = 1; index < defaultHistory.length; index++) {
@@ -1267,9 +1296,89 @@ const DEMO_PINNED_SETUPS: PinnedSetup[] = [
   { id: 'codex-sol-high', agent: 'codex', model: 'gpt-6.1-sol', effort: 'high', permissionMode: 'never' },
 ];
 
+// Complete invented sources and unfinished sources share the production cost projection.
+export function demoSessionCostParts(root: string): SessionCostUsage[] {
+  const parts: SessionCostUsage[] = [];
+  const visited = new Set<string>();
+  const visit = (id: string, delegated: boolean, incomplete = false) => {
+    if (visited.has(id)) return;
+    visited.add(id);
+    for (const item of DEMO_TURNS[id]) {
+      const main = item.usageParts?.length
+        ? item.usageParts
+        : [
+            {
+              model: item.model,
+              provider: item.provider ?? null,
+              contextWindow: item.contextWindow,
+              usage: item.usage,
+            },
+          ];
+      parts.push(
+        ...main.map((part) => ({
+          ...part,
+          agent: item.agent,
+          role: delegated ? ('delegated' as const) : ('main' as const),
+          scopeId: id,
+          incomplete: incomplete || !item.finished || ('incomplete' in part && part.incomplete),
+        })),
+      );
+      for (const agent of item.agents) {
+        if (agent.childSessionId && demoParentEdges.get(agent.childSessionId)?.parent === id) continue;
+        parts.push(
+          ...agent.spend.map((part) => ({
+            ...part,
+            agent: item.agent,
+            role: 'delegated' as const,
+            scopeId: agent.id ?? undefined,
+            provider: part.provider ?? null,
+            contextWindow: part.contextWindow ?? item.contextWindow,
+            incomplete: incomplete || agent.spendPartial || !agent.spendFound,
+          })),
+        );
+      }
+    }
+    parts.push(
+      ...(DEMO_COMPACTIONS[id] ?? []).map((item) => ({
+        agent: DEMO_TURNS[id][0].agent,
+        role: delegated ? ('delegated' as const) : ('main' as const),
+        scopeId: id,
+        model: item.model,
+        provider: item.provider ?? null,
+        contextWindow: item.contextWindow ?? null,
+        compactionEstimate: true as const,
+        incomplete,
+        usage: compactionEstimate(item)!.usage,
+      })),
+    );
+    for (const [child, edge] of demoParentEdges) {
+      if (edge.parent !== id) continue;
+      const partial = DEMO_TURNS[id].some((item) =>
+        item.agents.some((agent) => agent.childSessionId === child && (agent.spendPartial || !agent.spendFound)),
+      );
+      visit(child, true, incomplete || partial);
+    }
+  };
+  visit(root, false);
+  return parts;
+}
+
+export function demoSessionOverheads(id: string) {
+  return {
+    compactionCount: DEMO_COMPACTIONS[id]?.length ?? 0,
+    expiry: id === 'arc-read-state' ? DEMO_DEFAULT_EXPIRY : id === 'arc-codex-read-state' ? demoCodexExpiry : null,
+  };
+}
+
 export function demoContextSample(sessionId: string) {
   const item = DEMO_TURNS[sessionId][0];
-  return { agent: item.agent, model: item.model, contextTokens: item.contextTokens, contextWindow: item.contextWindow };
+  const newest = DEMO_COMPACTIONS[sessionId]?.find((compaction) => compaction.at > item.endedAt);
+  return {
+    agent: item.agent,
+    model: item.model,
+    contextTokens: newest?.contextAfter ?? item.contextTokens,
+    contextWindow: item.contextWindow,
+  };
 }
 
 export const DEMO_SESSION_IDS = Object.keys(DEMO_TURNS).filter((id) => id !== 'arc-codex-read-state');
@@ -1340,23 +1449,32 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
       persisted: true,
     };
   });
-  const stats = Object.fromEntries(rows.map((row) => [row.id, sessionStats(DEMO_TURNS[row.id], [])]));
-  const costParts = ['arc-demo-dispatch', 'arc-demo-review'].map((id) => {
-    const item = DEMO_TURNS[id][0];
-    return {
-      agent: item.agent,
-      role: id === 'arc-demo-review' ? ('delegated' as const) : ('main' as const),
-      scopeId: id,
-      model: item.model,
-      provider: null,
-      contextWindow: item.contextWindow,
-      usage: item.usage,
-    };
-  });
-  stats['arc-demo-dispatch'] = [
-    ...stats['arc-demo-dispatch'].filter((chip) => chip.metric !== 'cost'),
-    ...sessionCostStats(costParts),
-  ];
+  const stats = Object.fromEntries(
+    rows.map((row) => {
+      const parts = demoSessionCostParts(row.id);
+      const overheads = demoSessionOverheads(row.id);
+      return [
+        row.id,
+        [
+          ...sessionStats(DEMO_TURNS[row.id], DEMO_COMPACTIONS[row.id] ?? []).filter((chip) => chip.metric !== 'cost'),
+          ...sessionCostProjection(
+            parts,
+            {
+              main: parts.some((part) => part.role === 'main' && part.incomplete),
+              delegated: parts.some((part) => part.role === 'delegated' && part.incomplete),
+              delegatedScopeIds: new Set(
+                parts
+                  .filter((part) => part.role === 'delegated' && part.incomplete && part.scopeId !== undefined)
+                  .map((part) => part.scopeId!),
+              ),
+            },
+            overheads,
+          ).stats,
+          ...(overheads.expiry ? sessionCacheExpiryStats(overheads.expiry) : []),
+        ],
+      ];
+    }),
+  );
   const readerParentId = demoReaderParents[selected];
   const readerParent = readerParentId ? rows.find((row) => row.id === readerParentId) : undefined;
   const parent = readerParentId
@@ -1364,80 +1482,7 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
       ? { id: readerParent.id, label: readerParent.label, relation: 'reader' as const }
       : undefined
     : sessionParentOf(rows, demoParentEdges, selected);
-  const mainTurns = DEMO_TURNS['arc-read-state'];
   const sketch = DEMO_TURNS['arc-demo-sketch'][0];
-  const mainCost = sessionCostProjection(
-    [
-      ...mainTurns.flatMap((item) => [
-        {
-          agent: item.agent,
-          role: 'main' as const,
-          scopeId: item.sessionId ?? undefined,
-          model: item.model,
-          provider: item.provider ?? null,
-          contextWindow: item.contextWindow,
-          usage: item.usage,
-        },
-        ...item.agents.flatMap((agent) =>
-          agent.spend.map((part) => ({
-            ...part,
-            agent: item.agent,
-            role: 'delegated' as const,
-            scopeId: agent.id ?? undefined,
-            provider: null,
-            contextWindow: item.contextWindow,
-            incomplete: agent.spendPartial || !agent.spendFound,
-          })),
-        ),
-      ]),
-      {
-        agent: sketch.agent,
-        role: 'delegated',
-        scopeId: sketch.sessionId ?? undefined,
-        model: sketch.model,
-        provider: null,
-        contextWindow: sketch.contextWindow,
-        usage: sketch.usage,
-      },
-    ],
-    false,
-    { expiry: DEMO_DEFAULT_EXPIRY },
-  ).stats;
-  stats['arc-read-state'] = [
-    ...stats['arc-read-state'].filter((chip) => chip.metric !== 'cost'),
-    ...mainCost,
-    ...sessionCacheExpiryStats(DEMO_DEFAULT_EXPIRY),
-  ];
-  stats['delegated-cost'] = [
-    ...stats['delegated-cost'].filter((chip) => chip.metric !== 'cost'),
-    ...sessionCostProjection(
-      DEMO_TURNS['delegated-cost'].flatMap((item) => [
-        {
-          agent: item.agent,
-          model: item.model,
-          provider: item.provider ?? null,
-          contextWindow: item.contextWindow,
-          usage: item.usage,
-          role: 'main' as const,
-        },
-        ...item.agents.flatMap((agent) =>
-          agent.spend.map((part) => ({
-            ...part,
-            agent: item.agent,
-            provider: part.provider ?? null,
-            contextWindow: part.contextWindow ?? item.contextWindow,
-            role: 'delegated' as const,
-            scopeId: agent.id ?? undefined,
-            incomplete: agent.spendPartial || !agent.spendFound,
-          })),
-        ),
-      ]),
-      false,
-      { expiry: demoDelegatedExpiry },
-    ).stats,
-    ...sessionCacheExpiryStats(demoDelegatedExpiry),
-  ];
-  stats['arc-codex-read-state'].push(...sessionCacheExpiryStats(demoCodexExpiry));
   const statuses = new Map<string, RailStatus>([
     ['delegated-cost', 'waiting'],
     ['arc-read-state', 'subagents'],
@@ -1446,7 +1491,10 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
   ]);
   const newest = new Map(rows.map((row) => [row.id, DEMO_TURNS[row.id][0].startedAt]));
   const cacheById = Object.fromEntries(
-    Object.entries(DEMO_TURNS).map(([id, turns]) => [id, railCacheMarkOf({ turns, compactions: [] }, CAPTURE_TIME)]),
+    Object.entries(DEMO_TURNS).map(([id, turns]) => [
+      id,
+      railCacheMarkOf({ turns, compactions: DEMO_COMPACTIONS[id] ?? [] }, CAPTURE_TIME),
+    ]),
   );
   const runningSince = new Map([
     ['arc-cache-run', DEMO_TURNS['arc-cache-run'][0].startedAt],
@@ -1558,92 +1606,105 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
         ? { approvalPolicy: 'never', approvalsReviewer: 'user', sandbox: 'danger-full-access' }
         : null,
     effectivePermissionMode: item.agent === 'claude' ? 'auto' : null,
-    context: { used: item.contextTokens, max: item.contextWindow ?? 200_000 },
-    nextTurn: nextTurnBasisOf(item, null),
+    context: { used: demoContextSample(selected).contextTokens, max: item.contextWindow ?? 200_000 },
+    nextTurn: nextTurnBasisOf(
+      item,
+      (DEMO_COMPACTIONS[selected] ?? []).reduce<Compaction | null>(
+        (latest, compaction) => (!latest || compaction.at > latest.at ? compaction : latest),
+        null,
+      ),
+    ),
     mcpServers: [],
     live: [],
     claudeSkills: null,
   };
   return {
     ...base,
-    cards: DEMO_TURNS[selected].map((item) => {
-      const card = toCard(
-        item,
-        item === DEMO_TURNS[selected][0],
-        CAPTURE_TIME,
-        [],
-        null,
-        !item.finished,
-        selected === 'arc-read-state' ? new Set(['sol-implementation']) : new Set(),
-        selected === 'arc-read-state' && item === demoReadStateTurn
-          ? [
-              {
-                sessionId: sketch.sessionId,
-                name: sketch.sessionTitle!,
-                costs: priceDispatchedParts([
-                  {
-                    agent: sketch.agent,
-                    role: 'delegated',
-                    scopeId: sketch.sessionId,
-                    model: sketch.model,
-                    provider: sketch.provider ?? null,
-                    contextWindow: sketch.contextWindow,
-                    usage: sketch.usage,
-                    own: true,
-                  },
-                ]),
-                short: false,
-                ownSettledAt: sketch.startedAt,
-              },
-            ]
-          : [],
-        turnCacheExpiryWarning(
+    cards: [
+      ...DEMO_TURNS[selected].map((item) => {
+        const card = toCard(
           item,
-          selected === 'arc-read-state'
-            ? DEMO_DEFAULT_EXPIRY
-            : selected === 'delegated-cost'
-              ? demoDelegatedExpiry
-              : selected === 'arc-codex-read-state'
-                ? demoCodexExpiry
-                : null,
-        ),
-      );
-      if (selected === 'arc-demo-dispatch' || (selected === 'arc-read-state' && item === demoReadStateTurn)) {
-        const review = DEMO_TURNS[selected === 'arc-read-state' ? 'arc-demo-sketch' : 'arc-demo-review'][0];
-        card.dispatched = [
-          dispatchedAgentCard(
-            review.sessionId,
-            review.sessionTitle!,
-            {
-              models: [{ model: review.model!, usage: review.usage }],
-              effort: review.effort,
-              found: true,
-              partial: false,
-              commits: [],
-              artifacts: { files: [], commits: [], complete: true, revision: review.promptId },
-            },
-            'done',
-            review.startedAt,
-            review.endedAt,
-            review.toolUses,
-            [],
-            CAPTURE_TIME,
+          item === DEMO_TURNS[selected][0],
+          CAPTURE_TIME,
+          [],
+          null,
+          !item.finished,
+          selected === 'arc-read-state' ? new Set(['sol-implementation']) : new Set(),
+          selected === 'arc-read-state' && item === demoReadStateTurn
+            ? [
+                {
+                  sessionId: sketch.sessionId,
+                  name: sketch.sessionTitle!,
+                  costs: priceDispatchedParts([
+                    {
+                      agent: sketch.agent,
+                      role: 'delegated',
+                      scopeId: sketch.sessionId,
+                      model: sketch.model,
+                      provider: sketch.provider ?? null,
+                      contextWindow: sketch.contextWindow,
+                      usage: sketch.usage,
+                      own: true,
+                    },
+                  ]),
+                  short: false,
+                  ownSettledAt: sketch.startedAt,
+                },
+              ]
+            : [],
+          turnCacheExpiryWarning(
+            item,
+            selected === 'arc-read-state'
+              ? DEMO_DEFAULT_EXPIRY
+              : selected === 'delegated-cost'
+                ? demoDelegatedExpiry
+                : selected === 'arc-codex-read-state'
+                  ? demoCodexExpiry
+                  : null,
           ),
-        ];
-        card.chips.push(dispatchedChip(card.dispatched));
-      }
-      return {
-        ...card,
+        );
+        if (selected === 'arc-demo-dispatch' || (selected === 'arc-read-state' && item === demoReadStateTurn)) {
+          const review = DEMO_TURNS[selected === 'arc-read-state' ? 'arc-demo-sketch' : 'arc-demo-review'][0];
+          card.dispatched = [
+            dispatchedAgentCard(
+              review.sessionId,
+              review.sessionTitle!,
+              {
+                models: [{ model: review.model!, usage: review.usage }],
+                effort: review.effort,
+                found: true,
+                partial: false,
+                commits: [],
+                artifacts: { files: [], commits: [], complete: true, revision: review.promptId },
+              },
+              'done',
+              review.startedAt,
+              review.endedAt,
+              review.toolUses,
+              [],
+              CAPTURE_TIME,
+            ),
+          ];
+          card.chips.push(dispatchedChip(card.dispatched));
+        }
+        return {
+          ...card,
+          summaryHtml: renderRichMarkdown(item.summary),
+          saidMessages: card.saidMessages.map((message) => ({
+            ...message,
+            summaryHtml: renderRichMarkdown(message.text),
+          })),
+          activity: card.activity.map((row) =>
+            row.kind === 'message' ? { ...row, summaryHtml: renderRichMarkdown(row.text!) } : row,
+          ),
+        };
+      }),
+      ...(DEMO_COMPACTIONS[selected] ?? []).map((item) => ({
+        ...toCompactionCard(item, CAPTURE_TIME),
+        sessionTitle: DEMO_TURNS[selected][0].sessionTitle,
         summaryHtml: renderRichMarkdown(item.summary),
-        saidMessages: card.saidMessages.map((message) => ({
-          ...message,
-          summaryHtml: renderRichMarkdown(message.text),
-        })),
-        activity: card.activity.map((row) =>
-          row.kind === 'message' ? { ...row, summaryHtml: renderRichMarkdown(row.text!) } : row,
-        ),
-      };
-    }),
+      })),
+    ].sort((a, b) => ('startedAt' in b ? b.startedAt : b.at) - ('startedAt' in a ? a.startedAt : a.at)),
     sessions: rows.map((row) => ({
       ...row,
       ...(row.id === selected && parent ? { parent } : {}),

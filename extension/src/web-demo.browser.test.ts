@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -6,6 +7,8 @@ import { pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { browserOrNone } from '../test/browser.ts';
 import { tempDir } from './temproot.ts';
+import { demoPayload } from '../scripts/readme-fixture.ts';
+import type { SessionStatChip } from './turncard';
 
 describe('read-only web demo', () => {
   let browser: Awaited<ReturnType<typeof browserOrNone>>;
@@ -68,7 +71,7 @@ describe('read-only web demo', () => {
     const downloadPage = await browser!.newPage();
     downloadPage.setDefaultTimeout(5_000);
     await downloadPage.setViewportSize({ width: 390, height: 850 });
-    for (const session of ['arc-read-state', 'arc-demo-dispatch', 'delegated-cost']) {
+    for (const session of ['arc-read-state', 'arc-demo-dispatch', 'delegated-cost', 'arc-demo-continuation']) {
       await downloadPage.goto(`${base}/`);
       await downloadPage.locator('[data-control="picker"]').selectOption(session);
       await downloadPage.locator(`[data-control="sessionmenu:${session}"]`).click();
@@ -86,6 +89,21 @@ describe('read-only web demo', () => {
         Buffer.from(html.match(/id="arc-data-manifest">([^<]+)<\/script>/)![1], 'base64').toString('utf8'),
       );
       expect(manifest.root).toBe(session);
+      for (const captured of manifest.sessions) {
+        const cost = manifest.stats[captured.key].find((stat: SessionStatChip) => stat.metric === 'cost');
+        const live = (demoPayload(captured.key) as { stats: Record<string, SessionStatChip[]> }).stats[
+          captured.key
+        ].find((stat) => stat.metric === 'cost')!;
+        expect(cost.dollars).toBe(live.dollars);
+        expect(cost.partial).toBe(live.partial);
+        expect(cost.detailList.heading.value).toBe(live.label);
+        expect(cost.detail.startsWith(`Estimated total: ${live.label}`)).toBe(true);
+        if (captured.key === 'delegated-cost') {
+          assert.deepEqual(captured.numbers.coverage, { usage: 'complete', cost: 'complete' });
+          assert.doesNotMatch(cost.detail, /usage is incomplete|cost unavailable/);
+          assert.deepEqual(cost.detailList.entries, live.detailList!.entries);
+        }
+      }
       expect(
         manifest.sessions
           .find((item: { key: string }) => item.key === session)
@@ -97,6 +115,7 @@ describe('read-only web demo', () => {
         'arc-read-state': ['arc-demo-sketch', 'arc-luna-read-state-tests', 'arc-read-state', 'arc-sol-read-state'],
         'arc-demo-dispatch': ['arc-demo-continuation', 'arc-demo-dispatch', 'arc-demo-review'],
         'delegated-cost': ['delegated-cost'],
+        'arc-demo-continuation': ['arc-demo-continuation'],
       };
       expect(manifest.sessions.map((item: { key: string }) => item.key).sort()).toEqual(expectedSessions[session]);
       expect(manifest.relationships.find((edge: { kind: string }) => edge.kind === 'reader-started')?.ownership).toBe(
@@ -116,6 +135,19 @@ describe('read-only web demo', () => {
           )
           .count(),
       ).toBe(0);
+      await offline.locator('.sessionstats [data-metric="cost"]').click();
+      const expectedDetail =
+        session === 'arc-demo-continuation'
+          ? ['Included above', '1 compaction', 'Claude Code records no usage for a compaction.']
+          : ['Estimated total'];
+      for (const text of expectedDetail)
+        await expect.poll(() => offline.locator('#chippop').textContent()).toContain(text);
+      if (session === 'arc-demo-continuation' && process.env.ARC_DEMO_SHOTS)
+        await offline.screenshot({
+          path: path.join(process.env.ARC_DEMO_SHOTS, 'offline-compaction-cost.png'),
+          fullPage: true,
+        });
+      await offline.keyboard.press('Escape');
       await offline.locator(`[data-control="sessionmenu:${session}"]`).click();
       expect(
         await offline
