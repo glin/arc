@@ -174,6 +174,7 @@ export interface SourceHistoryCursor<State = unknown> {
   pageEnd: number;
   heldRecords: BufferedHistoryRecord[];
   adapterState: State;
+  exportRanges?: Array<{ start: number; bytes: Buffer }>;
 }
 
 export interface SemanticHistoryPage<State = unknown> {
@@ -278,7 +279,7 @@ function readStableRange(file: string, start: number, length: number, revision: 
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const count = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read));
+      const count = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read), start + read);
       if (count <= 0) {
         return null;
       }
@@ -743,12 +744,48 @@ function* scanSemanticHistoryPage<State>(
   let parsed: SemanticParse<State> | null = null;
   let olderEvidenceExhausted = false;
   let recoveryBytes = 0;
+  const ranges = limits ? [...(cursor.exportRanges ?? [])] : [];
+  let rangeBytes = ranges.reduce((total, range) => total + range.bytes.length, 0);
+  const trimRanges = (budget: number) => {
+    while (ranges.length && rangeBytes > budget) rangeBytes -= ranges.shift()!.bytes.length;
+  };
+  if (limits) trimRanges(Math.max(0, limits.pageBytes - heldBytes - byteCursor.fragment.length));
+  const captureRange: BackwardRangeReader = (source, start, length, revision) => {
+    const current = revisionFor(source);
+    if (!current || !sameRevision(current, revision)) return null;
+    const pieces: Buffer[] = [];
+    const end = start + length;
+    for (let at = start; at < end;) {
+      const cached = ranges.find((range) => range.start <= at && range.start + range.bytes.length > at);
+      if (cached) {
+        const stop = Math.min(end, cached.start + cached.bytes.length);
+        pieces.push(cached.bytes.subarray(at - cached.start, stop - cached.start));
+        at = stop;
+        continue;
+      }
+      const stop = ranges.reduce((next, range) => (range.start > at ? Math.min(next, range.start) : next), end);
+      const bytes = (options.readRange ?? readStableRange)(source, at, stop - at, revision);
+      if (!bytes || bytes.length !== stop - at) return null;
+      pieces.push(bytes);
+      if (limits) {
+        const budget = Math.max(0, limits.pageBytes - heldBytes - byteCursor.fragment.length);
+        if (bytes.length <= budget) {
+          trimRanges(budget - bytes.length);
+          ranges.push({ start: at, bytes });
+          rangeBytes += bytes.length;
+        }
+      }
+      at = stop;
+    }
+    return pieces.length === 1 ? pieces[0] : Buffer.concat(pieces, length);
+  };
+  const readRange = limits && !options.evidenceReadRange ? captureRange : options.readRange;
   while (true) {
     if (options.signal?.aborted) {
       return { kind: 'cancelled', page: null, openRange: null };
     }
     if (byteCursor.end > 0) {
-      const batch = readPreviousLines(file, byteCursor, chunkBytes, options.readRange, limits?.recordBytes);
+      const batch = readPreviousLines(file, byteCursor, chunkBytes, readRange, limits?.recordBytes);
       if (!batch) {
         return { kind: 'stale', page: null, openRange: null };
       }
@@ -774,6 +811,7 @@ function* scanSemanticHistoryPage<State>(
         heldBytes += olderBytes;
         parsed = null;
       }
+      if (limits) trimRanges(Math.max(0, limits.pageBytes - heldBytes - batch.cursor.fragment.length));
       byteCursor = batch.cursor;
       yield;
     }
@@ -814,7 +852,7 @@ function* scanSemanticHistoryPage<State>(
           file,
           evidenceCursor,
           Math.min(chunkBytes, BACKGROUND_SCAN_BYTES - evidenceSliceBytes),
-          options.evidenceReadRange,
+          options.evidenceReadRange ?? (limits ? readRange : undefined),
           limits?.recordBytes,
         );
         if (!batch) {
@@ -895,7 +933,9 @@ function* scanSemanticHistoryPage<State>(
           pageEnd: pageStart,
           heldRecords: nextHeld,
           adapterState: cloneParserState(nextAdapterState),
-          ...(limits ? { exportLimits: { ...limits } } : {}),
+          ...(limits
+            ? { exportLimits: { ...limits }, exportRanges: ranges.filter((range) => range.start < pageStart) }
+            : {}),
         }
       : null;
     // Reject duplicate source ranges within the selected page.

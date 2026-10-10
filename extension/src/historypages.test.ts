@@ -1641,3 +1641,98 @@ test('a paged turn reads a background agent that reported back as an attachment'
   assert.equal(launch.agents[0].toolUses, 31);
   assert.equal(launch.agents[0].durationMs, 512000);
 });
+
+test('Codex capture reuses older evidence bytes across semantic pages within the raw page allowance', async () => {
+  const file = path.join(tempDir('capture-evidence-reads-'), 'capture.jsonl');
+  const record = (type: string, payload: object) =>
+    JSON.stringify({ type, timestamp: '2026-09-29T12:00:00Z', payload });
+  const rows = [record('session_meta', { id: 'capture', cwd: '/project' })];
+  const ids = Array.from({ length: 96 }, (_value, index) => `turn-${index}`);
+  for (const id of ids)
+    rows.push(
+      record('event_msg', { type: 'task_started', turn_id: id }),
+      record('event_msg', { type: 'user_message', message: id }),
+      record('event_msg', { type: 'task_complete', turn_id: id, last_agent_message: 'answer '.repeat(100) }),
+    );
+  fs.writeFileSync(file, rows.join('\n') + '\n');
+  const size = fs.statSync(file).size;
+  const readRange = (source: string, start: number, length: number) => {
+    const fd = fs.openSync(source, 'r');
+    try {
+      const bytes = Buffer.alloc(length);
+      assert.equal(fs.readSync(fd, bytes, 0, length, start), length);
+      physicalBytes += length;
+      return bytes;
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  let physicalBytes = 0;
+  let cursor: CodexHistoryCursor | null = null;
+  const found: string[] = [];
+  do {
+    const result = await readCodexHistoryPageAsync(file, 'capture', cursor, {
+      exportLimits: EXPORT_LIMITS,
+      chunkBytes: Math.ceil(size * 0.72),
+      readRange,
+    });
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') break;
+    found.push(...result.page.turns.map((turn) => turn.promptId));
+    cursor = result.page.nextOlderCursor;
+    if (cursor) {
+      const retained = (cursor.exportRanges ?? []).reduce((bytes, range) => bytes + range.bytes.length, 0);
+      const held = cursor.heldRecords.reduce((bytes, record) => bytes + record.end - record.start + 1, 0);
+      assert.ok(retained + held + cursor.fragment.length <= EXPORT_LIMITS.pageBytes);
+    }
+  } while (cursor);
+  assert.deepEqual(found, ids.slice().reverse());
+  assert.equal(physicalBytes, size);
+});
+
+test('Codex capture shares the raw page allowance with growing unfinished fragments', async () => {
+  const file = path.join(tempDir('capture-fragment-budget-'), 'capture.jsonl');
+  const record = (type: string, payload: object) =>
+    JSON.stringify({ type, timestamp: '2026-09-29T12:00:00Z', payload });
+  const rows = [record('session_meta', { id: 'capture', cwd: '/project' })];
+  for (let index = 0; index < 7; index++) rows.push(record('ignored', { padding: 'x'.repeat(7 * 1024 * 1024) }));
+  const ids = Array.from({ length: 96 }, (_value, index) => `turn-${index}`);
+  for (const id of ids)
+    rows.push(
+      record('event_msg', { type: 'task_started', turn_id: id }),
+      record('event_msg', { type: 'user_message', message: id }),
+      record('event_msg', { type: 'task_complete', turn_id: id, last_agent_message: 'answer '.repeat(100) }),
+    );
+  fs.writeFileSync(file, rows.join('\n') + '\n');
+  let cursor: CodexHistoryCursor | null = null;
+  const found: string[] = [];
+  let fragments = 0;
+  let reachedPageLimit = false;
+  do {
+    let result: Awaited<ReturnType<typeof readCodexHistoryPageAsync>>;
+    try {
+      result = await readCodexHistoryPageAsync(file, 'capture', cursor, { exportLimits: EXPORT_LIMITS });
+    } catch (error) {
+      assert.ok(error instanceof ExportLimitError && error.boundary === 'page');
+      reachedPageLimit = true;
+      break;
+    }
+    assert.equal(result.kind, 'page');
+    if (result.kind !== 'page') break;
+    found.push(...result.page.turns.map((turn) => turn.promptId));
+    cursor = result.page.nextOlderCursor;
+    if (cursor) {
+      if (cursor.fragment.length) fragments++;
+      const retained = (cursor.exportRanges ?? []).reduce((bytes, range) => bytes + range.bytes.length, 0);
+      const held = cursor.heldRecords.reduce((bytes, record) => bytes + record.end - record.start + 1, 0);
+      assert.ok(
+        retained + held + cursor.fragment.length <= EXPORT_LIMITS.pageBytes,
+        `cursor retains ${retained + held + cursor.fragment.length} bytes against ${EXPORT_LIMITS.pageBytes}`,
+      );
+    }
+  } while (cursor);
+  assert.ok(found.length > 0);
+  assert.deepEqual(found, ids.slice(-found.length).reverse());
+  assert.ok(fragments > 0);
+  assert.equal(reachedPageLimit, true);
+});

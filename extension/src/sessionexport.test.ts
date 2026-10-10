@@ -123,3 +123,19 @@ test('native export choices bound long multiline names while retaining the exact
   assert.equal(f.written()?.root.file, source.file);
   assert.ok(f.calls.some((call) => call.startsWith('open Long saved title')));
 });
+
+test('native export progress distinguishes found sessions, scanned sessions and current byte work', async () => {
+  const f = fixture();
+  f.ports.write = async (_destination, options) => {
+    options.progress?.('relationships', 0, { discovered: 1, completed: 0, bytes: 49152 });
+    options.progress?.('relationships', 1, { discovered: 3, completed: 1, bytes: 98304 });
+    return { index: '/destination/site/index.html' };
+  };
+  await exportSavedSession(source, 'Session name', {}, f.ports);
+  assert.ok(
+    f.calls.includes(`Finding linked work (1 session found, 0 scanned, ${(49152).toLocaleString()} bytes read)`),
+  );
+  assert.ok(
+    f.calls.includes(`Finding linked work (3 sessions found, 1 scanned, ${(98304).toLocaleString()} bytes read)`),
+  );
+});

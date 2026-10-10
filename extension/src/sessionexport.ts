@@ -1,3 +1,4 @@
+import { withReadMetrics } from './readmeter';
 import type { SessionFile } from './transcript';
 import { shortenTo } from './domain/text';
 import type { ExportCaptureOptions } from './exportdata';
@@ -55,8 +56,12 @@ export async function exportSavedSession(
         ...options,
         root,
         signal,
-        progress(phase, sessions) {
-          report(`${PHASES[phase]} (${sessions} sessions)`);
+        progress(phase, sessions, work) {
+          report(
+            work
+              ? `${PHASES[phase]} (${work.discovered} ${work.discovered === 1 ? 'session' : 'sessions'} found, ${work.completed} scanned, ${work.bytes.toLocaleString()} bytes read)`
+              : `${PHASES[phase]} (${sessions} sessions)`,
+          );
         },
       }),
     );
@@ -79,12 +84,14 @@ export async function writeSavedSession(
   options: ExportCaptureOptions,
 ): Promise<{ index: string }> {
   const assets = await packagedExportAssets(extensionDirectory);
-  return withExportTransaction(
-    destination,
-    (writer) =>
-      completeSessionExport(writer, options, (capture, transaction) =>
-        projectSessionSite(capture.model, transaction, assets),
-      ),
-    options.signal,
-  );
+  const write = () =>
+    withExportTransaction(
+      destination,
+      (writer) =>
+        completeSessionExport(writer, options, (capture, transaction) =>
+          projectSessionSite(capture.model, transaction, assets),
+        ),
+      options.signal,
+    );
+  return options.diagnostics ? withReadMetrics(write, options.diagnostics) : write();
 }

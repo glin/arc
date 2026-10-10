@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
-import { meterRead } from './readmeter';
+import { meterRead, meterReadWork } from './readmeter';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import {
@@ -1708,7 +1708,7 @@ function headOf(file: string, bytes: number): { lines: string[]; key?: string } 
   try {
     fd = fs.openSync(file, 'r');
     const buf = Buffer.allocUnsafe(bytes);
-    const read = meterRead(file, fs.readSync(fd, buf, 0, bytes, 0));
+    const read = meterRead(file, fs.readSync(fd, buf, 0, bytes, 0), 0);
     const text = buf.subarray(0, read).toString('utf8');
     const lines = text.split('\n');
     if (read === bytes) {
@@ -3619,6 +3619,12 @@ export function extendRelationshipEvidence(evidence: RelationshipDigest, bytes: 
 }
 
 // Every returned filesystem byte enters the request meter before any later operation can fail.
+export interface RelationshipReadMeter {
+  readBytes: number;
+  size?: number;
+  onRead?: (bytes: Buffer, offset: number) => void;
+}
+
 export class RelationshipReader {
   readonly stamp: RelationshipStamp;
   readonly deadline: number;
@@ -3631,7 +3637,7 @@ export class RelationshipReader {
     readonly file: string,
     readonly budget: number,
     readonly cancelled: () => boolean,
-    readonly meter?: { readBytes: number },
+    readonly meter?: RelationshipReadMeter,
     readonly capturedSizeOnly = false,
   ) {
     this.stamp = relationshipStamp(fs.fstatSync(fd, { bigint: true }));
@@ -3657,12 +3663,18 @@ export class RelationshipReader {
   }
   // The one-byte check after a terminal record passes advances false, so the parsing read that follows it still ignores the deadline.
   read(at: number, length: number, reserve = RELATIONSHIP_RESERVE_BYTES, advances = true): Buffer {
-    const size = Math.min(length, RELATIONSHIP_READ_BYTES, this.available(reserve));
+    const size = Math.min(
+      length,
+      RELATIONSHIP_READ_BYTES,
+      this.available(reserve),
+      (this.meter?.size ?? Infinity) - at,
+    );
     if (size <= 0) return Buffer.alloc(0);
-    const count = fs.readSync(this.fd, this.buffer, 0, size, at);
+    const count = meterRead(this.file, fs.readSync(this.fd, this.buffer, 0, size, at), at);
     this.readBytes += count;
     if (advances && count > 0) this.advanced = true;
     if (this.meter) this.meter.readBytes += count;
+    this.meter?.onRead?.(this.buffer.subarray(0, count), at);
     this.check();
     return this.buffer.subarray(0, count);
   }
@@ -3729,7 +3741,7 @@ export async function scanClaudeRelationshipQuantum(
   previous: ClaudeRelationshipCursor | undefined,
   budget = RELATIONSHIP_QUANTUM_BYTES,
   signal?: AbortSignal,
-  meter?: { readBytes: number },
+  meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
 ): Promise<{
   cursor: ClaudeRelationshipCursor;
@@ -3743,7 +3755,9 @@ export async function scanClaudeRelationshipQuantum(
   try {
     let cursor =
       previous && JSON.stringify(previous.exportPolicy) === JSON.stringify(exportPolicy)
-        ? structuredClone(previous)
+        ? exportPolicy
+          ? previous
+          : (meterReadWork('cursorCopies'), structuredClone(previous))
         : undefined;
     const reader = new RelationshipReader(fd, parent.file, budget, () => signal?.aborted === true, meter);
     const revision = reader.stamp;
@@ -4645,7 +4659,7 @@ export function tailOf(file: string, bytes: number, keepCursor = false): TailRea
     const start = Math.max(0, size - bytes);
     const len = size - start;
     const buf = Buffer.allocUnsafe(len);
-    const read = meterRead(file, fs.readSync(fd, buf, 0, len, start));
+    const read = meterRead(file, fs.readSync(fd, buf, 0, len, start), start);
     const body = buf.subarray(0, read);
     const lines = body.toString('utf8').split('\n');
     if (start > 0) {
@@ -4692,7 +4706,7 @@ function readBackwardRange(file: string, start: number, length: number, revision
     const buffer = Buffer.allocUnsafe(length);
     let read = 0;
     while (read < length) {
-      const next = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read));
+      const next = meterRead(file, fs.readSync(fd, buffer, read, length - read, start + read), start + read);
       if (next <= 0) {
         return null;
       }

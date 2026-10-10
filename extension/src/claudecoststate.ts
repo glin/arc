@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { meterRead } from './readmeter';
 import { createHash } from 'node:crypto';
 import { normalizeModelIdentity } from './domain/model-identity';
 import { BACKGROUND_SCAN_BYTES, BACKGROUND_SCAN_MILLISECONDS, retainedParserPayloadScan } from './parserstate';
@@ -576,7 +577,9 @@ export function reconcileClaudeCostState(
         if (!buffered && (progress.resourceBytes ?? 0) + progress.pending.length * 8 + chunkBytes * 8 > maxWorkingSet)
           return withhold();
         const chunk = Buffer.allocUnsafe(chunkBytes);
-        const read = buffered ? 0 : fs.readSync(fd, chunk, 0, chunk.length, progress.offset);
+        const read = buffered
+          ? 0
+          : meterRead(file.file, fs.readSync(fd, chunk, 0, chunk.length, progress.offset), progress.offset);
         if (!read && !progress.pending) break;
         if (!buffered) advanced = true;
         remaining -= read;

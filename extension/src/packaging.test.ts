@@ -18,6 +18,7 @@ function overlayStaticSources(source: string): void {
   for (const file of [
     'panelbundle.ts',
     'sessionexport.ts',
+    'readmeter.ts',
     'webview/card.ts',
     'webview/export-host.ts',
     'webview/export-model.ts',

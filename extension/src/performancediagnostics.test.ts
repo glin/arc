@@ -1,3 +1,4 @@
+import { meterRead, readPhase, meterReadWork, withReadMetrics, type ReadMetrics } from './readmeter';
 import { test } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs/promises';
@@ -645,4 +646,41 @@ test('discovery counters sum relationship read charges across worker replies', (
     continuations: 1,
     publications: 1,
   });
+});
+
+test('read measurements isolate concurrent exports and report content-free phase totals', async () => {
+  const reports: ReadMetrics[] = [];
+  let release!: () => void;
+  const resumed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const first = withReadMetrics(
+    async () => {
+      readPhase('relationships');
+      meterRead('/private/first', 10, 0);
+      await resumed;
+      meterRead('/private/first', 10, 5);
+      meterRead('/private/first', 4);
+      meterReadWork('cursorCopies');
+    },
+    (metrics) => reports.push(metrics),
+  );
+  await withReadMetrics(
+    async () => {
+      readPhase('numbers');
+      meterRead('/private/second', 30, 0);
+      meterReadWork('sourceChangeRetries');
+    },
+    (metrics) => reports.push(metrics),
+  );
+  release();
+  await first;
+  assert.equal(reports[0].numbers.bytes, 30);
+  assert.equal(reports[0].numbers.sourceChangeRetries, 1);
+  assert.equal(reports[0].relationships, undefined);
+  assert.equal(reports[1].relationships.bytes, 24);
+  assert.equal(reports[1].relationships.repeatedBytes, 5);
+  assert.equal(reports[1].relationships.cursorCopies, 1);
+  assert.equal(reports[1].numbers, undefined);
+  assert.ok(!JSON.stringify(reports).includes('/private/'));
 });

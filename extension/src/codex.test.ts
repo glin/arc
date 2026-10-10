@@ -972,7 +972,9 @@ test('export dispatch scanning admits paired receipts beyond the panel record wi
     undefined,
     EXPORT_LIMITS,
   );
+  let physicalBytes = capture.readBytes;
   while (!capture.traversed) {
+    const previous = capture.cursor;
     capture = await scanCodexDispatchReferencesAsync(
       file,
       'parent',
@@ -982,7 +984,10 @@ test('export dispatch scanning admits paired receipts beyond the panel record wi
       undefined,
       EXPORT_LIMITS,
     );
+    assert.ok(capture.cursor === previous, 'export must retain its owned cursor');
+    physicalBytes += capture.readBytes;
   }
+  assert.equal(physicalBytes, fs.statSync(file).size);
   assert.equal(capture.complete, true);
   assert.equal(capture.cursor.seenBloom, null);
   assert.deepEqual(

@@ -1,3 +1,4 @@
+import { readPhase } from './readmeter';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -212,6 +213,7 @@ export class ExportTransaction {
   }
 
   async reset(): Promise<void> {
+    readPhase('cleanup');
     await this.check();
     for (const key of [...this.files.keys()]) await this.removeFile(key, this.signal);
     await this.removeSpools(this.signal);
@@ -220,8 +222,10 @@ export class ExportTransaction {
   async publish(recheck: () => Promise<void>): Promise<{ directory: string; index: string }> {
     await this.check();
     if (!this.files.has('index.html')) throw new Error('The export page is unavailable.');
+    readPhase('cleanup');
     await this.removeSpools(this.signal);
     await recheck();
+    readPhase('publication');
     await this.check();
     // An exclusive reservation owns the publication parent on platforms whose rename replaces empty directories.
     let reservation: string;
@@ -252,6 +256,7 @@ export class ExportTransaction {
   }
 
   async dispose(): Promise<void> {
+    readPhase('cleanup');
     await this.removeSpools();
     if (this.published || !(await ownedDirectory(this.staging, this.identity))) return;
     for (const key of [...this.files.keys()]) await this.removeFile(key);

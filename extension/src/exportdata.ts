@@ -1,3 +1,4 @@
+import { meterRead, meterReadWork, readPhase } from './readmeter';
 import * as fs from 'node:fs/promises';
 import type { Dir } from 'node:fs';
 import * as path from 'node:path';
@@ -23,6 +24,7 @@ import {
 import {
   codexSessionsRoot,
   openingRecordOf,
+  structuralAgentStatus,
   isHiddenThread,
   scanCodexDispatchReferencesAsync,
   createCodexUsageLineReducer,
@@ -93,7 +95,17 @@ export interface ExportCaptureOptions {
   capturedAt?: number;
   signal?: AbortSignal;
   limits?: Partial<ExportLimits>;
-  progress?: (phase: 'inventory' | 'relationships' | 'text' | 'numbers' | 'checking', sessions: number) => void;
+  progress?: (
+    phase: 'inventory' | 'relationships' | 'text' | 'numbers' | 'checking',
+    sessions: number,
+    work?: ExportProgress,
+  ) => void;
+  diagnostics?: (metrics: import('./readmeter').ReadMetrics) => void;
+}
+export interface ExportProgress {
+  discovered: number;
+  completed: number;
+  bytes: number;
 }
 export interface ExportCapture {
   model: SessionExport;
@@ -176,6 +188,7 @@ async function openingOf(
     for (let offset = 0; ;) {
       checkExportCancellation(signal);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      meterRead(file, bytesRead, offset);
       const newline = buffer.subarray(0, bytesRead).indexOf(10);
       const used = newline < 0 ? bytesRead : newline;
       if (length + used > limits.recordBytes) throw new ExportLimitError('record', limits.recordBytes);
@@ -203,6 +216,7 @@ async function sourceDigest(entry: Entry, limits: ExportLimits, signal?: AbortSi
     for (let at = 0; at < before.size;) {
       checkExportCancellation(signal);
       const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, before.size - at), at);
+      meterRead(entry.file, bytesRead, at);
       if (!bytesRead) throw new SourceChanged();
       digest.update(buffer.subarray(0, bytesRead));
       at += bytesRead;
@@ -621,8 +635,30 @@ async function referencesOf(
   entry: Entry,
   options: ExportCaptureOptions,
   limits: ExportLimits,
-  sessions: number,
-): Promise<{ references: ClaudeChildSessionReference[]; complete: boolean }> {
+  progress: (bytes: number) => void,
+): Promise<{ references: ClaudeChildSessionReference[]; complete: boolean; source: FrozenSource }> {
+  const before = await fs.lstat(entry.file);
+  if (!before.isFile() || before.isSymbolicLink() || !sameStamp(before, entry.stamp)) throw new SourceChanged();
+  const digest = createHash('sha256');
+  let through = 0;
+  const meter = {
+    readBytes: 0,
+    size: entry.stamp.size,
+    onRead(bytes: Buffer, offset: number) {
+      if (offset !== through) throw new SourceChanged();
+      digest.update(bytes);
+      through += bytes.length;
+    },
+  };
+  const check = async () => {
+    checkExportCancellation(options.signal);
+    if (!sameStamp(await fs.lstat(entry.file), before)) throw new SourceChanged();
+    progress(through);
+  };
+  const source = (): FrozenSource => {
+    if (through !== entry.stamp.size) throw new SourceChanged();
+    return { file: entry.file, stamp: entry.stamp, digest: digest.digest('hex') };
+  };
   const policy = {
     recordBytes: limits.recordBytes,
     dispatchIdentities: limits.dispatchIdentities,
@@ -632,21 +668,25 @@ async function referencesOf(
     let cursor: ClaudeRelationshipCursor | undefined;
     for (;;) {
       checkExportCancellation(options.signal);
+      const offset = cursor?.offset;
+      const applied = cursor?.applied;
+      const validation = cursor?.evidence?.validation?.digest.offset;
       const result = await scanClaudeRelationshipQuantum(
         entry,
         cursor,
         limits.sliceBytes,
         options.signal,
-        undefined,
+        meter,
         policy,
       );
+      await check();
       if (result.reset && cursor) throw new SourceChanged();
-      if (result.complete) return { references: result.references, complete: result.qualified };
+      if (result.complete) return { references: result.references, complete: result.qualified, source: source() };
       if (
         cursor &&
-        result.cursor.offset === cursor.offset &&
-        result.cursor.applied === cursor.applied &&
-        result.cursor.evidence?.validation?.digest.offset === cursor.evidence?.validation?.digest.offset
+        result.cursor.offset === offset &&
+        result.cursor.applied === applied &&
+        result.cursor.evidence?.validation?.digest.offset === validation
       )
         throw new SourceChanged();
       cursor = result.cursor;
@@ -661,13 +701,13 @@ async function referencesOf(
       cursor,
       limits.sliceBytes,
       () => options.signal?.aborted === true,
-      undefined,
+      meter,
       policy,
     );
+    await check();
     if (result.reset && cursor) throw new SourceChanged();
-    if (result.traversed) return { references: result.references, complete: result.complete && result.qualified };
-    if (cursor && result.readBytes === 0 && result.cursor.offset === cursor.offset)
-      options.progress?.('relationships', sessions);
+    if (result.traversed)
+      return { references: result.references, complete: result.complete && result.qualified, source: source() };
     await pause();
     checkExportCancellation(options.signal);
     if (cursor && result.readBytes === 0 && result.cursor.offset === cursor.offset)
@@ -829,6 +869,7 @@ export async function captureSessionExport(
   const limits: ExportLimits = { ...EXPORT_LIMITS, ...options.limits };
   for (const limit of Object.values(limits))
     if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('The export limit is invalid.');
+  readPhase('inventory');
   options.progress?.('inventory', 0);
   const inventory = await inventoryOf(options, limits);
   const inventorySignature = inventory.signature;
@@ -931,11 +972,19 @@ export async function captureSessionExport(
     const entry = queue[position];
     if (entry.agent === 'claude' && !entry.cwd) entry.cwd = readSessionCwd(entry.file) ?? undefined;
     const key = keys.get(entryKey(entry))!;
-    options.progress?.('relationships', position);
-    frozen.set(entry.file, await sourceDigest(entry, limits, options.signal));
+    readPhase('relationships');
+    const completedBytes = [...frozen.values()].reduce((total, source) => total + source.stamp.size, 0);
+    const progress = (bytes: number) =>
+      options.progress?.('relationships', position, {
+        discovered: queue.length,
+        completed: position,
+        bytes: completedBytes + bytes,
+      });
+    progress(0);
     let references: ClaudeChildSessionReference[];
     try {
-      const scan = await referencesOf(entry, options, limits, position);
+      const scan = await referencesOf(entry, options, limits, progress);
+      frozen.set(entry.file, scan.source);
       references = scan.references;
       if (!scan.complete) {
         discoveryPartial.add(key);
@@ -949,6 +998,7 @@ export async function captureSessionExport(
         entry === root
       )
         throw error;
+      frozen.set(entry.file, await sourceDigest(entry, limits, options.signal));
       discoveryPartial.add(key);
       references = [];
       omissions.push({ session: key, relationship: null, reason: 'unreadable' });
@@ -1063,6 +1113,11 @@ export async function captureSessionExport(
       link(key, 'reader-started', target, reason, 'navigation', '', child);
     }
   }
+  options.progress?.('relationships', queue.length, {
+    discovered: queue.length,
+    completed: queue.length,
+    bytes: [...frozen.values()].reduce((total, source) => total + source.stamp.size, 0),
+  });
   const claims = relationships.filter((edge) => edge.to !== null && edge.kind !== 'reader-started');
   const parentIndex = sessionParentIndex(
     claims
@@ -1097,8 +1152,18 @@ export async function captureSessionExport(
   const numeric = new Map<string, SpendFileIndex>();
   let turnCount = 0;
   let pageCount = 0;
+  const childStatuses = new Map<string, ReturnType<typeof structuralAgentStatus>>();
+  const structuralStatusOf: typeof structuralAgentStatus = (child) => {
+    let status = childStatuses.get(child.file);
+    if (!status) {
+      status = structuralAgentStatus(child);
+      childStatuses.set(child.file, status);
+    }
+    return status;
+  };
   for (const [key, entry] of entries) {
     if (!reachable.has(key)) continue;
+    readPhase('text');
     options.progress?.('text', sessions.length);
     if (entry.agent === 'codex' && !threadNames) {
       try {
@@ -1137,9 +1202,11 @@ export async function captureSessionExport(
     };
     const seen = new Map<string, string>();
     const compactions = new Set<string>();
+    readPhase('numbers');
     options.progress?.('numbers', sessions.length);
     const numericSource = await numericRecord(entry, options, limits);
     numeric.set(key, numericSource);
+    readPhase('text');
     let cursor: SemanticHistoryPage['nextOlderCursor'] = null;
     const links = new Map<string, string[]>();
     for (const edge of relationships.filter((edge) => edge.from === key)) {
@@ -1163,6 +1230,7 @@ export async function captureSessionExport(
             )
           : await readCodexHistoryPageAsync(entry.file, entry.sessionId, cursor as CodexHistoryCursor | null, history, {
               capturedOpening: entry.opening,
+              structuralStatusOf,
               sessionTitle: title,
               structuralChildren: relationships
                 .filter((edge) => edge.from === key && edge.kind === 'subagent' && edge.to)
@@ -1264,6 +1332,7 @@ export async function captureSessionExport(
       .filter(([child, edge]) => reachable.has(child) && edge.relation === 'dispatched')
       .map(([child, edge]) => [child, edge.parent]),
   );
+  readPhase('figures');
   let sources: SessionSpendSource[] = sessions.map((session) => ({
     sessionId: session.key,
     file: entries.get(session.key)!.file,
@@ -1401,6 +1470,7 @@ export async function captureSessionExport(
     ],
   };
   const recheck = async () => {
+    readPhase('validation');
     options.progress?.('checking', sessions.length);
     checkExportCancellation(options.signal);
     if (nameFileMissing) {
@@ -1437,6 +1507,7 @@ export async function captureSessionExport(
       }
       if (hash(JSON.stringify(names.sort())) !== expected) throw new SourceChanged();
     }
+    readPhase('validation-inventory');
     if ((await inventoryOf(options, limits)).signature !== inventorySignature) throw new SourceChanged();
   };
   return { model, recheck };
@@ -1451,11 +1522,14 @@ export async function completeSessionExport(
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const capture = await captureSessionExport(options, writer);
+      readPhase('projection');
       await project(capture, writer);
       const result = await writer.publish(capture.recheck);
       return { ...result, model: capture.model };
     } catch (error) {
       if (!(error instanceof SourceChanged) || attempt === 1) throw error;
+      meterReadWork('sourceChangeRetries');
+      readPhase('cleanup');
       await writer.reset();
     }
   }

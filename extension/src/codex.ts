@@ -1,12 +1,13 @@
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import { emptyCodexResponseClock, validRate, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
-import { meterRead } from './readmeter';
+import { meterRead, meterReadWork } from './readmeter';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import {
   BackwardLineCursor,
+  type RelationshipReadMeter,
   captureTurnTextOrder,
   BoundaryDiscovery,
   BoundaryDiscoveryOptions,
@@ -364,7 +365,7 @@ function firstLineOf(file: string): string | null {
     let window = FIRST_LINE_WINDOW;
     for (;;) {
       const want = window - have;
-      const read = meterRead(file, fs.readSync(fd, buf, have, want, have));
+      const read = meterRead(file, fs.readSync(fd, buf, have, want, have), have);
       const line = firstLineStep(buf, have, read, want);
       if (line !== undefined) {
         return line;
@@ -927,7 +928,7 @@ export function readThreadNames(file: string, held: ThreadNames | null): ThreadN
   }
   try {
     const bytes = fs.readFileSync(file);
-    meterRead(file, bytes.length);
+    meterRead(file, bytes.length, 0);
     return { stamp, ...parseThreadNamePairs(bytes.toString('utf8')) };
   } catch {
     return { stamp: '', names: new Map(), fullNames: new Map() };
@@ -3353,7 +3354,7 @@ export function scanCodexDispatchReferences(
   previous: CodexDispatchCursor | null = null,
   budget = Number.POSITIVE_INFINITY,
   cancelled: () => boolean = () => false,
-  meter?: { readBytes: number },
+  meter?: RelationshipReadMeter,
 ): CodexDispatchScan {
   const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter);
   let step = steps.next();
@@ -3367,7 +3368,7 @@ export async function scanCodexDispatchReferencesAsync(
   previous: CodexDispatchCursor | null = null,
   budget = RELATIONSHIP_QUANTUM_BYTES,
   cancelled: () => boolean = () => false,
-  meter?: { readBytes: number },
+  meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
 ): Promise<CodexDispatchScan> {
   const steps = codexDispatchSteps(file, parentSessionId, previous, budget, cancelled, meter, exportPolicy);
@@ -3385,14 +3386,16 @@ function* codexDispatchSteps(
   previous: CodexDispatchCursor | null,
   budget: number,
   cancelled: () => boolean,
-  meter?: { readBytes: number },
+  meter?: RelationshipReadMeter,
   exportPolicy?: ExportRelationshipLimits,
 ): Generator<void, CodexDispatchScan> {
   const fd = fs.openSync(file, 'r');
   try {
     let cursor =
       previous && JSON.stringify(previous.exportPolicy) === JSON.stringify(exportPolicy)
-        ? structuredClone(previous)
+        ? exportPolicy
+          ? previous
+          : (meterReadWork('cursorCopies'), structuredClone(previous))
         : null;
     const reader = new RelationshipReader(fd, file, budget, cancelled, meter, !Number.isFinite(budget));
     const stat = reader.stamp;
@@ -3497,7 +3500,12 @@ function* codexDispatchSteps(
         cursor.terminalApplied = true;
       }
     }
-    if (cursor.fragment && Buffer.byteLength(cursor.fragment, 'base64') > 4096 && cursor.replayThrough === undefined) {
+    if (
+      !exportPolicy &&
+      cursor.fragment &&
+      Buffer.byteLength(cursor.fragment, 'base64') > 4096 &&
+      cursor.replayThrough === undefined
+    ) {
       const bytes = Buffer.from(cursor.fragment, 'base64');
       if (!cursor.terminalApplied) cursor.fragmentStart = cursor.offset - bytes.length;
       cursor.fragment = '';
@@ -5045,6 +5053,8 @@ export interface CodexReadOptions extends ReadOptions {
   // Structural child headers cover background work that has no spawn record in the parent.
   // The reducer attaches one such child only when its opening time belongs to one parsed turn.
   structuralChildren?: readonly CodexSubagentFile[];
+  // Explicit capture reuses child lifecycle readings within its frozen graph.
+  structuralStatusOf?: typeof structuralAgentStatus;
 }
 
 export type CodexSessionRead = SessionRead;
@@ -6585,6 +6595,8 @@ function finishCodexSession(
     state.turns[0]?.sessionId ?? state.opening.sessionId,
     opts.structuralChildren ?? [],
     opts.agentSpendOf,
+    undefined,
+    opts.structuralStatusOf,
   );
   const title = normalizeSessionTitle(opts.sessionTitle);
   for (const turn of state.turns) {
@@ -6642,6 +6654,7 @@ export function structuralAgentStatus(
   child: CodexSubagentFile,
   previousLines: typeof readPreviousLines = readPreviousLines,
 ): { status: string; durationMs: number | null } {
+  meterReadWork('childLifecycleReads');
   const chunkBytes = 256 * 1024;
   const cutRecordLimit = 1024 * 1024;
   const tail = tailOf(child.file, chunkBytes, true);
@@ -6763,6 +6776,7 @@ function attachCodexStructuralAgents(
   turns: Turn[],
   parentThreadId: string | null,
   children: readonly CodexSubagentFile[] | undefined,
+  statusOf: typeof structuralAgentStatus = structuralAgentStatus,
 ): void {
   if (!parentThreadId || !children?.length || !turns.length) {
     return;
@@ -6809,7 +6823,7 @@ function attachCodexStructuralAgents(
       } else {
         delete existing.childSessionId;
       }
-      const lifecycle = structuralAgentStatus(child);
+      const lifecycle = statusOf(child);
       if ((existing as StructuralTurnAgent)[CODEX_STRUCTURAL_AGENT]) {
         existing.status = lifecycle.status;
         existing.durationMs = lifecycle.durationMs;
@@ -6844,7 +6858,7 @@ function attachCodexStructuralAgents(
     if (containing.length !== 1) {
       continue;
     }
-    const lifecycle = structuralAgentStatus(child);
+    const lifecycle = statusOf(child);
     const row: StructuralTurnAgent = {
       id: child.threadId,
       description: child.backgroundReview ? 'Background review' : 'agent',
@@ -6876,6 +6890,7 @@ export function refreshCodexStructuralAgents(
   children: readonly CodexSubagentFile[],
   lookup?: AgentSpendLookup,
   structuralIds?: readonly string[],
+  statusOf: typeof structuralAgentStatus = structuralAgentStatus,
 ): void {
   const marked = structuralIds?.length ? new Set(structuralIds) : null;
   const direct = new Set(
@@ -6897,7 +6912,7 @@ export function refreshCodexStructuralAgents(
       (agent) => !(agent as StructuralTurnAgent)[CODEX_STRUCTURAL_AGENT] || (agent.id !== null && direct.has(agent.id)),
     );
   }
-  attachCodexStructuralAgents(turns, parentThreadId, children);
+  attachCodexStructuralAgents(turns, parentThreadId, children, statusOf);
   attachCodexAgentSpend(turns, lookup);
 }
 
@@ -6975,7 +6990,14 @@ export function createCodexSessionReducer(
       if (last && completed.open && completed.open.startedAt > last.startedAt) {
         Object.defineProperty(last, CODEX_STRUCTURAL_END, { value: completed.open.startedAt });
       }
-      refreshCodexStructuralAgents(completed.turns, sessionId, opts.structuralChildren ?? [], opts.agentSpendOf);
+      refreshCodexStructuralAgents(
+        completed.turns,
+        sessionId,
+        opts.structuralChildren ?? [],
+        opts.agentSpendOf,
+        undefined,
+        opts.structuralStatusOf,
+      );
       const title = normalizeSessionTitle(opts.sessionTitle);
       for (const turn of completed.turns) {
         turn.sessionTitle = title;

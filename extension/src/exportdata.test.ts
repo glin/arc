@@ -1,9 +1,11 @@
+import { createHash } from 'node:crypto';
+import { withReadMetrics, type ReadMetrics } from './readmeter';
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tempDir } from './temproot.ts';
-import { claudeDispatchTranscript, exportedSiteData } from './turnfixtures.ts';
+import { claudeCostState, claudeDispatchTranscript, exportedSiteData } from './turnfixtures.ts';
 import {
   captureSessionExport,
   completeSessionExport,
@@ -137,6 +139,173 @@ function fixture() {
   };
   return { directory, claude, codex, output, root, options, write, claudeSession, codexSession, child };
 }
+function largeCodexFixture() {
+  const f = fixture();
+  const body = 'large admitted commentary '.repeat(40000);
+  const child = f.claudeSession(NATIVE_CODEX_ID);
+  const rows = codexTurn('large');
+  rows.splice(
+    3,
+    0,
+    record('response_item', 1, {
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: body }],
+      },
+    }),
+    record('event_msg', 1, {
+      payload: {
+        type: 'item_completed',
+        item: {
+          type: 'CommandExecution',
+          id: 'late-dispatch',
+          command: ['powershell.exe', '-Command', 'python dispatch.py --arc-dispatch --runner claude'],
+          parsed_cmd: [{ type: 'unknown', cmd: 'python dispatch.py --arc-dispatch --runner claude' }],
+          cwd: 'file:///C:/repo',
+          status: 'completed',
+          exit_code: 0,
+          stdout: `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${NATIVE_CODEX_ID}"}`,
+        },
+      },
+    }),
+  );
+  const root = f.codexSession(CODEX_ID, undefined, rows);
+  fs.utimesSync(root, 1700000000, 1700000000);
+  const options: ExportCaptureOptions = {
+    ...f.options,
+    root: { ...f.options.root, file: root, agent: 'codex', sessionId: CODEX_ID },
+    limits: { sliceBytes: 64 * 1024 },
+  };
+  return { ...f, root, child, body, options };
+}
+
+test('large Codex export retains following dispatch and hashes one sequential relationship pass', async () => {
+  const f = largeCodexFixture();
+  let metrics: ReadMetrics = {};
+  await withReadMetrics(
+    () =>
+      withExportTransaction(f.output, async (writer) => {
+        const capture = await captureSessionExport(f.options, writer);
+        assert.equal(capture.model.sessions.length, 2);
+        assert.equal(capture.model.relationships[0].kind, 'dispatched');
+        assert.equal(capture.model.relationships[0].coverage, 'complete');
+        const root = capture.model.sessions[0];
+        assert.equal(root.provenance.sha256, createHash('sha256').update(fs.readFileSync(f.root)).digest('hex'));
+        assert.ok(
+          (await readPages(capture.model, writer))
+            .flatMap((page) => page.turns.flatMap((turn) => turn.blocks))
+            .some((block) => block.text === f.body),
+        );
+        await capture.recheck();
+      }),
+    (result) => {
+      metrics = result;
+    },
+  );
+  const sourceBytes = fs.statSync(f.root).size + fs.statSync(f.child).size;
+  assert.ok(metrics.relationships.bytes <= sourceBytes + 16 * 1024);
+  assert.equal(metrics.relationships.repeatedBytes, 0);
+  assert.equal(metrics.relationships.cursorCopies, 0);
+  assert.equal(metrics.digest?.bytes ?? 0, 0);
+});
+
+test('Codex capture reads structural child lifecycle once across semantic reductions', async () => {
+  const f = largeCodexFixture();
+  fs.appendFileSync(
+    f.root,
+    codexTurn('unfinished', 3, false)
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  const child = f.codexSession(NATIVE_CODEX_ID, CODEX_ID, [
+    record('ignored', 0, { payload: 'x'.repeat(300 * 1024) }),
+    ...codexTurn('native'),
+  ]);
+  let metrics: ReadMetrics = {};
+  await withReadMetrics(
+    () =>
+      withExportTransaction(f.output, async (writer) => {
+        const capture = await captureSessionExport(f.options, writer);
+        assert.equal(capture.model.sessions.length, 3);
+        const pages = await readPages(capture.model, writer);
+        const edge = capture.model.relationships.find((edge) => edge.kind === 'subagent')!;
+        const agent = pages
+          .flatMap((page) => page.turns.flatMap((turn) => turn.agents))
+          .find((agent) => agent.relationships?.includes(edge.key));
+        assert.ok(agent);
+        assert.equal(agent.status, 'completed');
+      }),
+    (value) => {
+      metrics = value;
+    },
+  );
+  assert.equal(metrics.text.childLifecycleReads, 1);
+  const bytes = [f.root, f.child, child].reduce((sum, file) => sum + fs.statSync(file).size, 0);
+  assert.ok(
+    metrics.text.bytes <= 2 * bytes + fs.statSync(child).size + 128 * 1024,
+    `semantic reads returned ${metrics.text.bytes} bytes`,
+  );
+});
+
+test('large Codex assembly advances first-source progress and accepts queued cancellation', async () => {
+  const f = largeCodexFixture();
+  const controller = new AbortController();
+  const samples: number[] = [];
+  await assert.rejects(
+    withExportTransaction(
+      f.output,
+      (writer) =>
+        completeSessionExport(
+          writer,
+          {
+            ...f.options,
+            signal: controller.signal,
+            progress(phase, sessions, work) {
+              if (phase !== 'relationships' || !work || !work.bytes || work.completed !== 0) return;
+              assert.equal(sessions, 0);
+              assert.equal(work.discovered, 1);
+              assert.ok(work.bytes < fs.statSync(f.root).size);
+              samples.push(work.bytes);
+              if (samples.length === 3) setImmediate(() => controller.abort());
+            },
+          },
+          async () => assert.fail('cancelled assembly reached projection'),
+        ),
+      controller.signal,
+    ),
+    ExportCancelled,
+  );
+  assert.equal(samples.length, 3);
+  assert.ok(samples[0] < samples[1] && samples[1] < samples[2]);
+  assert.equal(fs.readdirSync(f.output).length, 0);
+});
+
+test('large Codex assembly rejects changed source before accepting linkage or provenance', async () => {
+  const f = largeCodexFixture();
+  let changed = false;
+  await assert.rejects(
+    withExportTransaction(f.output, (writer) =>
+      captureSessionExport(
+        {
+          ...f.options,
+          progress(phase, _sessions, work) {
+            if (phase !== 'relationships' || !work?.bytes || changed) return;
+            changed = true;
+            fs.appendFileSync(f.root, JSON.stringify({ type: 'ignored' }) + '\n');
+            fs.utimesSync(f.root, 1700000001, 1700000001);
+          },
+        },
+        writer,
+      ),
+    ),
+    /changed during export/,
+  );
+  assert.equal(changed, true);
+  assert.equal(fs.readdirSync(f.output).length, 0);
+});
+
 async function readPages(
   model: SessionExport,
   writer: Parameters<typeof captureSessionExport>[1],
@@ -578,8 +747,7 @@ test('repeated Claude assistant records retain their original body exactly once 
 
 test('graph capture closes nested native children, external dispatch, and reader links without counting reader work', async () => {
   const f = fixture();
-  f.child('child');
-  f.child('grandchild', 'child');
+  const nativeChildren = [f.child('child'), f.child('grandchild', 'child')];
   const external = f.codexSession(CODEX_ID);
   f.codexSession(NATIVE_CODEX_ID, CODEX_ID);
   f.claudeSession('reader');
@@ -589,6 +757,14 @@ test('graph capture closes nested native children, external dispatch, and reader
     ...claudeDispatchTranscript(
       'python dispatch.py --arc-dispatch',
       `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${CODEX_ID}"}`,
+    ),
+    record('progress', 10, {}),
+    claudeCostState(
+      {
+        'claude-sonnet-4-5': { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 90 },
+      },
+      1,
+      'root',
     ),
   ]);
   const readerLinks = [
@@ -601,28 +777,39 @@ test('graph capture closes nested native children, external dispatch, and reader
       child: { agent: 'claude' as const, sessionId: 'root' },
     },
   ];
-  await withExportTransaction(f.output, async (writer) => {
-    const capture = await captureSessionExport({ ...f.options, readerLinks }, writer);
-    assert.equal(capture.model.sessions.length, 6, JSON.stringify(capture.model.relationships));
-    assert.equal(capture.model.relationships.length, 6);
-    assert.equal(capture.model.relationships.filter((edge) => edge.kind === 'subagent').length, 3);
-    assert.equal(capture.model.coverage.relationships, 'complete');
-    const own = capture.model.sessions[0].numbers;
-    assert.ok(own.combined.dollars! > own.main.dollars!);
-    assert.ok(own.delegated.dollars! > 0);
-    assert.ok(!JSON.stringify(capture.model).includes(external));
-    const reader = capture.model.relationships.find(
-      (edge) => edge.kind === 'reader-started' && edge.from === capture.model.root,
-    )!.to!;
-    assert.ok(!own.parts.some((part) => part.scope === reader));
-    assert.equal(capture.model.sessions.find((session) => session.key === reader)!.numbers.delegated.dollars, null);
-    const text = (await readPages(capture.model, writer)).flatMap((page) =>
-      page.turns.flatMap((turn) => turn.blocks.map((block) => block.text)),
-    );
-    assert.ok(text.includes('answer grandchild'));
-    assert.ok(text.includes(`answer ${NATIVE_CODEX_ID}`));
-    assert.ok(!text.includes('answer unrelated'));
-  });
+  let metrics: ReadMetrics = {};
+  await withReadMetrics(
+    () =>
+      withExportTransaction(f.output, async (writer) => {
+        const capture = await captureSessionExport({ ...f.options, readerLinks }, writer);
+        assert.equal(capture.model.sessions.length, 6, JSON.stringify(capture.model.relationships));
+        assert.equal(capture.model.relationships.length, 6);
+        assert.equal(capture.model.relationships.filter((edge) => edge.kind === 'subagent').length, 3);
+        assert.equal(capture.model.coverage.relationships, 'complete');
+        const own = capture.model.sessions[0].numbers;
+        assert.ok(own.combined.dollars! > own.main.dollars!);
+        assert.ok(own.delegated.dollars! > 0);
+        assert.ok(!JSON.stringify(capture.model).includes(external));
+        const reader = capture.model.relationships.find(
+          (edge) => edge.kind === 'reader-started' && edge.from === capture.model.root,
+        )!.to!;
+        assert.ok(!own.parts.some((part) => part.scope === reader));
+        assert.equal(capture.model.sessions.find((session) => session.key === reader)!.numbers.delegated.dollars, null);
+        const text = (await readPages(capture.model, writer)).flatMap((page) =>
+          page.turns.flatMap((turn) => turn.blocks.map((block) => block.text)),
+        );
+        assert.ok(text.includes('answer grandchild'));
+        assert.ok(text.includes(`answer ${NATIVE_CODEX_ID}`));
+        assert.ok(!text.includes('answer unrelated'));
+      }),
+    (value) => {
+      metrics = value;
+    },
+  );
+  assert.equal(
+    metrics.figures.bytes,
+    nativeChildren.reduce((sum, file) => sum + fs.statSync(file).size, 0),
+  );
 });
 
 test('short Claude dispatch IDs require global configured uniqueness', async () => {
@@ -1045,17 +1232,28 @@ test('bounded incomplete inventory refuses a shortened identity and keeps honest
 test('source changes after rendering cause one whole capture retry before publication', async () => {
   const f = fixture();
   let projections = 0;
-  const result = await withExportTransaction(f.output, (writer) =>
-    completeSessionExport(writer, f.options, async (capture, writer) => {
-      projections++;
-      if (projections === 1) f.write(f.root, claudeTurn('changed'));
-      await writer.writeIndexChunks(
-        (async function* () {
-          yield '<!doctype html><title>capture</title>';
-        })(),
-      );
-      await writer.writeAsset('json', JSON.stringify(capture.model));
-    }),
+  let metrics: ReadMetrics = {};
+  const result = await withReadMetrics(
+    () =>
+      withExportTransaction(f.output, (writer) =>
+        completeSessionExport(writer, f.options, async (capture, writer) => {
+          projections++;
+          if (projections === 1) f.write(f.root, claudeTurn('changed'));
+          await writer.writeIndexChunks(
+            (async function* () {
+              yield '<!doctype html><title>capture</title>';
+            })(),
+          );
+          await writer.writeAsset('json', JSON.stringify(capture.model));
+        }),
+      ),
+    (value) => {
+      metrics = value;
+    },
+  );
+  assert.equal(
+    Object.values(metrics).reduce((sum, phase) => sum + phase.sourceChangeRetries, 0),
+    1,
   );
   assert.equal(projections, 2);
   assert.ok(fs.existsSync(result.index));

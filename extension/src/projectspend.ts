@@ -1,3 +1,4 @@
+import { meterRead } from './readmeter';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -1626,7 +1627,7 @@ function readIncremental(
         ? null
         : new ClaudeRepeatedDetector(
             restoredRepeated,
-            (buffer, at, length) => fs.readSync(fd, buffer, 0, length, at),
+            (buffer, at, length) => meterRead(file, fs.readSync(fd, buffer, 0, length, at), at),
             claudeRepeatedLookups(file, claudeFileRevision(opened), restoredRepeated.through),
             () => clock() >= deadline,
           );
@@ -1725,7 +1726,7 @@ function readIncremental(
     // A slice reads its first chunk even past the deadline, so every slice makes progress.
     while (position < size && readBytes < maxBytes && (readBytes === 0 || clock() < deadline)) {
       const allowed = Math.min(chunk.length, size - position, maxBytes - readBytes);
-      const read = fs.readSync(fd, chunk, 0, allowed, position);
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, allowed, position), position);
       if (read <= 0) {
         break;
       }

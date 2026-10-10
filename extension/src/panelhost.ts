@@ -6817,6 +6817,12 @@ export class PanelProvider implements vscode.Disposable {
         roots: { claude: projectsRoot(), codex: codexSessionsRoot() },
         readerParents: { ...this.saved.readerParents },
         capturedAt: Date.now(),
+        ...(this.diagnostics.enabled()
+          ? {
+              diagnostics: (metrics: import('./readmeter').ReadMetrics) =>
+                this.diagnostics.log('exportReadMetrics', metrics),
+            }
+          : {}),
       },
       {
         confirm: async (title, detail) =>
