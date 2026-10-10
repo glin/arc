@@ -4,6 +4,7 @@ import { completedQuestionAnswer, questionAnswered } from '../domain/ask-answer.
 import type { ComposerView, PanelToHost } from './protocol.ts';
 import { enhanceSummary } from './summary.ts';
 import { CARD_ACTIONS } from '../view/card-words.ts';
+import { textField } from './text-field.ts';
 
 type AskCard = ComposerView['asks'][number];
 type AskQuestion = AskCard['questions'][number];
@@ -32,6 +33,7 @@ interface RequestOptions {
       options?: boolean | AddEventListenerOptions,
     ): void;
   };
+  cross: string;
   sendToHost(message: PanelToHost): void;
   afterDraw(): void;
 }
@@ -95,6 +97,7 @@ function AskCardView(props: {
   card: AskCard;
   state: RequestState;
   twist: { open: string; shut: string };
+  cross: string;
   sendToHost(message: PanelToHost): void;
   focusAfter(control: string): void;
   announceMove(words: string): void;
@@ -314,54 +317,69 @@ function AskCardView(props: {
               const rememberCaret = (input: HTMLInputElement | HTMLTextAreaElement) => {
                 props.state.carets[question.id] = [input.selectionStart ?? 0, input.selectionEnd ?? 0];
               };
+              const typed = written[question.id] ?? '';
+              const box = {
+                class: 'caskwritten',
+                key: `written:${question.id}`,
+                value: typed,
+                placeholder: question.writtenPlaceholder,
+                disabled: submitting,
+                'aria-label': question.writtenName,
+                'data-control': `askwritten:${card.id}:${question.id}`,
+                ref(node: HTMLInputElement | HTMLTextAreaElement | null) {
+                  const held = props.state.carets[question.id];
+                  if (node && held) {
+                    node.setSelectionRange(held[0], held[1]);
+                  }
+                },
+                onInput(event: Event) {
+                  const input = event.currentTarget as HTMLInputElement | HTMLTextAreaElement;
+                  props.state.written = { ...written, [question.id]: input.value };
+                  rememberCaret(input);
+                  redraw();
+                },
+                onKeyDown(event: KeyboardEvent) {
+                  if (
+                    event.key !== 'Enter' ||
+                    event.shiftKey ||
+                    event.ctrlKey ||
+                    event.metaKey ||
+                    event.altKey ||
+                    event.isComposing ||
+                    event.keyCode === 229
+                  ) {
+                    return;
+                  }
+                  event.preventDefault();
+                  takePrimaryAction();
+                },
+                onKeyUp(event: KeyboardEvent) {
+                  rememberCaret(event.currentTarget as HTMLInputElement | HTMLTextAreaElement);
+                },
+                onClick(event: MouseEvent) {
+                  rememberCaret(event.currentTarget as HTMLInputElement | HTMLTextAreaElement);
+                },
+                onSelect(event: Event) {
+                  rememberCaret(event.currentTarget as HTMLInputElement | HTMLTextAreaElement);
+                },
+              };
               row.push(
-                h(question.secret ? 'input' : 'textarea', {
-                  class: 'caskwritten',
-                  key: `written:${question.id}`,
-                  type: question.secret ? 'password' : undefined,
-                  rows: question.secret ? undefined : 2,
-                  value: written[question.id] ?? '',
-                  placeholder: question.writtenPlaceholder,
-                  disabled: submitting,
-                  'aria-label': question.writtenName,
-                  'data-control': `askwritten:${card.id}:${question.id}`,
-                  ref(node: HTMLInputElement | HTMLTextAreaElement | null) {
-                    const held = props.state.carets[question.id];
-                    if (node && held) {
-                      node.setSelectionRange(held[0], held[1]);
-                    }
-                  },
-                  onInput(event: Event) {
-                    const input = event.currentTarget as HTMLInputElement | HTMLTextAreaElement;
-                    props.state.written = { ...written, [question.id]: input.value };
-                    rememberCaret(input);
-                    redraw();
-                  },
-                  onKeyDown(event: KeyboardEvent) {
-                    if (
-                      event.key !== 'Enter' ||
-                      event.shiftKey ||
-                      event.ctrlKey ||
-                      event.metaKey ||
-                      event.altKey ||
-                      event.isComposing ||
-                      event.keyCode === 229
-                    ) {
-                      return;
-                    }
-                    event.preventDefault();
-                    takePrimaryAction();
-                  },
-                  onKeyUp(event: KeyboardEvent) {
-                    rememberCaret(event.currentTarget as HTMLInputElement | HTMLTextAreaElement);
-                  },
-                  onClick(event: MouseEvent) {
-                    rememberCaret(event.currentTarget as HTMLInputElement | HTMLTextAreaElement);
-                  },
-                  onSelect(event: Event) {
-                    rememberCaret(event.currentTarget as HTMLInputElement | HTMLTextAreaElement);
-                  },
-                }),
+                question.secret
+                  ? textField({
+                      ...box,
+                      type: 'password',
+                      text: typed,
+                      cross: props.cross,
+                      clearLabel: CARD_ACTIONS.askSecretClear,
+                      clearControl: `askwrittenclear:${card.id}:${question.id}`,
+                      wrapperClass: 'caskwrittenfield',
+                      onClear() {
+                        props.state.written = { ...written, [question.id]: '' };
+                        props.state.carets[question.id] = [0, 0];
+                        redraw();
+                      },
+                    })
+                  : h('textarea', { ...box, rows: 2 }),
               );
             }
             return row;
@@ -486,6 +504,7 @@ function RequestList(props: {
         card,
         state,
         twist: props.twist,
+        cross: props.options.cross,
         sendToHost: props.options.sendToHost,
         focusAfter: props.focusAfter,
         announceMove: props.announceMove,

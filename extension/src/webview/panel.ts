@@ -838,6 +838,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     prompt: promptBox,
     moveAnnouncer: composerRenderer.walkAnnouncer,
     events: { window: onWindow },
+    cross: CROSS,
     sendToHost(message) {
       vscode.postMessage(message);
     },

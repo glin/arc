@@ -43,6 +43,8 @@ export const CARD_ACTIONS = {
   askedMidTurn: 'Asked while this was running',
   // A sent prompt absent from the transcript has no confirmed pickup time. Label it separately from prompts received during the turn.
   askedJustSent: 'Just sent',
+  // The cross inside the secret answer box of a request. It empties the box and keeps focus there.
+  askSecretClear: 'Clear the secret answer',
   // Keep the duration label outside the clock-updated figure. Finished turns use past tense. Running turns use present tense.
   ranFor: 'ran in',
   runningFor: 'running for',

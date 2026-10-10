@@ -3094,6 +3094,16 @@ button.sha:focus-visible {
   border: 1px solid var(--vscode-focusBorder);
   border-radius: 2px;
 }
+/* The secret answer box sits in a text field wrapper, so the wrapper takes the indent and the
+   box fills it. The box reserves the cross width on its right. */
+.caskwrittenfield {
+  margin: 0.3em 0 0 1.9em;
+}
+.caskwrittenfield > .caskwritten {
+  width: 100%;
+  margin: 0;
+  padding-right: 2.1em;
+}
 textarea.caskwritten {
   display: block;
   line-height: 1.35;

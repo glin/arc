@@ -16,12 +16,14 @@ export type TextFieldProps = InputProps & {
   clearLabel: string;
   // The cross's data-control value.
   clearControl: string;
+  // An extra class on the wrapper, for a box that sits in a layout of its own.
+  wrapperClass?: string;
   // Runs after the box is emptied and focused. Pass the handler the box's own input event calls, with an empty string.
   onClear(): void;
 };
 
-// A single-line text box with a cross that empties it. A read-only box and an empty box draw no cross.
-export function textField({ text, cross, clearLabel, clearControl, onClear, ...input }: TextFieldProps) {
+// A single-line text box with a cross that empties it. A read-only box, a disabled box, and an empty box draw no cross.
+export function textField({ text, cross, clearLabel, clearControl, wrapperClass, onClear, ...input }: TextFieldProps) {
   const clear = (event: Event) => {
     const field = (event.currentTarget as HTMLElement).closest('.textfield')?.querySelector('input');
     if (field) {
@@ -31,9 +33,9 @@ export function textField({ text, cross, clearLabel, clearControl, onClear, ...i
     }
     onClear();
   };
-  return h('span', { class: 'textfield' }, [
+  return h('span', { class: wrapperClass ? `textfield ${wrapperClass}` : 'textfield' }, [
     h('input', input as JSX.InputHTMLAttributes),
-    text && !input.readOnly
+    text && !input.readOnly && !input.disabled
       ? h(
           'button',
           {

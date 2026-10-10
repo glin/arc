@@ -3644,6 +3644,18 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
       'password',
       'a secret answer is typed in the open',
     );
+    // The cross empties the secret box and leaves the caret in it.
+    const secretBox = `[data-control="askwritten:layout-six:${secret.id}"]`;
+    await page.locator(`[data-control="askwrittenclear:layout-six:${secret.id}"]`).click();
+    await page.waitForFunction(
+      `(() => { const box = document.querySelector('${secretBox}'); return box && box.value === '' && document.activeElement === box; })()`,
+    );
+    assert.equal(
+      await page.locator(`[data-control="askwrittenclear:layout-six:${secret.id}"]`).count(),
+      0,
+      'an empty secret box draws no cross',
+    );
+    await page.locator(secretBox).fill('the-secret-answer');
     const rows = (await page.evaluate(`(() => {
       const strip = document.querySelector('.cask .casktabs');
       const count = () => new Set([...strip.querySelectorAll('.casktab')].map((tab) => tab.offsetTop)).size;
@@ -3759,6 +3771,13 @@ test('the strip stops at two rows and a folded request is one', { timeout: 60_00
     })()`),
       { count: 1, written: 'the-secret-answer' },
       'Enter did not send the complete secret answer once',
+    );
+    // A box that is disabled while the answer is sent draws no cross, even though it holds text.
+    await page.waitForFunction(`document.querySelector('${secretBox}')?.disabled === true`);
+    assert.equal(
+      await page.locator(`[data-control="askwrittenclear:layout-six:${secret.id}"]`).count(),
+      0,
+      'the cross stays drawn over a secret box that is disabled while its answer is sent',
     );
     assert.deepEqual(failures, [], 'the panel threw while the reader folded the request away');
     await page.close();

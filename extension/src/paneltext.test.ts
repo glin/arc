@@ -76,10 +76,10 @@ test('the token pattern is reusable, so a second call sees what the first one sa
   assert.equal(fillPanelText(text, { ONE: '1' }), 'a 1 b');
 });
 
-// Every `h('input', {...})` block in the panel's sources, read across lines.
+// Every `h('input', {...})` block in the panel's sources, read across lines. The tag may be a condition that can pick 'input'.
 function inputBlocks(source: string): string[] {
   const blocks: string[] = [];
-  for (const start of source.matchAll(/h\(\s*'input',\s*\{/g)) {
+  for (const start of source.matchAll(/h\(\s*[^,()]*'input'[^,()]*,\s*\{/g)) {
     let depth = 1;
     let at = start.index + start[0].length;
     for (; at < source.length && depth > 0; at++) {
@@ -116,6 +116,12 @@ test('a single-line text box is drawn by the shared text field, wherever its typ
   assert.equal(textInputBlocks(planted).length, 1);
   const twoTypes = ["h('input', {", "  type: 'checkbox',", '  checked,', "  type: 'text',", '}),'].join('\n');
   assert.equal(textInputBlocks(twoTypes).length, 1);
+  const conditional = [
+    "h(question.secret ? 'input' : 'textarea', {",
+    "  type: question.secret ? 'password' : undefined,",
+    '}),',
+  ].join('\n');
+  assert.equal(textInputBlocks(conditional).length, 1);
   assert.equal(textInputBlocks("h('input', { type: question.multi ? 'checkbox' : 'radio', checked })").length, 0);
   const dir = path.join(__dirname, 'webview');
   const offenders: string[] = [];

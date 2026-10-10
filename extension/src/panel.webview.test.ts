@@ -5738,6 +5738,7 @@ const namesRead = [
   ...script.matchAll(/\bACTIONS\.(\w+)/g),
   ...browserComposerSource.matchAll(/\bprops\.words\.(\w+)/g),
   ...cardSource.matchAll(/\bcardWords\(\)\.(\w+)/g),
+  ...requestsSource.matchAll(/\bCARD_ACTIONS\.(\w+)/g),
   ...cardRowsSource.matchAll(/\bCARD_ACTIONS\.(\w+)/g),
   ...summarySource.matchAll(/\boptions\.words\.(\w+)/g),
   ...outerPanelHostSource.matchAll(/\bcardWords\(\)\.(\w+)/g),
