@@ -4,7 +4,7 @@ Arc is a VS Code extension for working with Claude Code and Codex. **Experimenta
 
 [Web demo](https://glin.github.io/arc/)
 
-- Keep track of all the agents! Vertical tabs, labels, saved views, filters, links to subagent sessions.
+- Keep track of all the agents! See which are running. Vertical tabs, labels, saved views, filters, links to subagent sessions.
 - Read results, not chat! Each turn shows the final response with file edits, commits, subagents, and cost.
 - See what a session costs with turn-level breakdowns. Save costs with the prompt cache expiry and next-turn starting price hints.
 - Or use Arc as a session viewer. It reads sessions started from the Claude Code and Codex CLIs, VS Code extensions, and desktop apps.
@@ -48,11 +48,12 @@ codex login
 
 ### Files and commits
 
-Review file diffs even before the agent makes a commit. Open changed files and their diffs in VS Code from each turn's Files section.
+- Review file diffs before the agent commits. Open changed files and their diffs in VS Code.
+- Find sessions in the open project and its registered Git worktrees.
+- See commit branches and worktrees when available, including who made each subagent commit.
+- See fast-forward merges separately from authored commits.
 
-Arc detects sessions in the project's registered Git worktrees. Commits show their branch and worktree when available, plus attribution for subagent commits. Fast-forward merges appear separately from authored commits.
-
-Codex diffs use recorded patches. Claude's per-turn diffs use recorded edits, with changed regions shown when full file text is unavailable. Claude's full current-file diffs require Arc's optional hooks. These compare the file before the session's first edit with its current contents.
+Claude's full current-file diffs require the optional [hooks](#try-it). See [diff limits](docs/timeline.md#diff-selection).
 
 <a href="docs/images/readme-files.webp"><img src="docs/images/readme-files.webp" alt="Files and Commits sections with changed files, authored commits, branch and worktree names, subagent attribution, and a merge into main" width="680"></a>
 
