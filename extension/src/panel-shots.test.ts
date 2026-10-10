@@ -252,10 +252,10 @@ test('demo samples keep dispatched costs and reader-started usage separate from 
   assert.deepEqual(review.cards[0].files, []);
   assert.deepEqual(review.cards[0].commits, []);
   const dollars = (payload: DemoPayload) => payload.stats[payload.showing].find((chip) => chip.metric === 'cost')!.dollars!;
-  const own = estimateCost({ requests: 4, input: 8_000, cacheWrite5m: 20_000, cacheWrite1h: 0, cacheRead: 64_000, output: 2_500, thinking: 0 }, 'claude-opus-5-5', null, 200_000)!;
+  const own = estimateCost({ requests: 4, input: 8_000, cacheWrite5m: 20_000, cacheWrite1h: 0, cacheRead: 64_000, output: 2_500, thinking: 0 }, 'claude-opus-5-5', null, 1_000_000)!;
   assert.ok(Math.abs(dollars(parent) - own - dollars(review)) < 1e-9);
   assert.equal(card.chips.find((chip) => chip.metric === 'cost')?.label, formatCost(own));
-  const readerOwn = estimateCost({ requests: 2, input: 4_000, cacheWrite5m: 0, cacheWrite1h: 9_000, cacheRead: 9_000, output: 1_500, thinking: 0 }, 'claude-opus-5-5', null, 200_000)!;
+  const readerOwn = estimateCost({ requests: 2, input: 4_000, cacheWrite5m: 0, cacheWrite1h: 9_000, cacheRead: 9_000, output: 1_500, thinking: 0 }, 'claude-opus-5-5', null, 1_000_000)!;
   assert.equal(dollars(continuation), readerOwn + demoSessionCostParts('arc-demo-continuation').filter((part) => part.compactionEstimate).reduce((sum, part) => sum + estimateCost(part.usage, part.model)!, 0));
   assert.deepEqual(DEMO_LABELS['arc-demo-continuation'], DEMO_LABELS['arc-demo-dispatch']);
   assert.notEqual(DEMO_LABELS['arc-demo-continuation'], DEMO_LABELS['arc-demo-dispatch']);
@@ -621,6 +621,16 @@ test('README menu reads every manifest when clause and refuses one it cannot rea
 
 
 test('demo context replies cover both providers and preserve request identities and totals', () => {
+  for (const scene of ['cost', 'cache-expiry', 'comment', 'comment-editor'] as const) {
+    const payload = readmePayload(scene) as { usage: { composer: ComposerView } };
+    assert.equal(payload.usage.composer.context!.capacity, 1_000_000);
+  }
+  for (const turns of Object.values(DEMO_TURNS)) {
+    for (const turn of turns) {
+      if (turn.model === 'claude-opus-5-5') assert.equal(turn.contextWindow, 1_000_000);
+      if (turn.agent === 'codex') assert.equal(turn.contextWindow, 258_400);
+    }
+  }
   for (const session of DEMO_SESSION_IDS) {
     const request = { type: 'contextDetail' as const, session, request: 7, generation: 3 };
     assert.deepEqual(parsePanelToHost(request), request);

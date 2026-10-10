@@ -326,7 +326,7 @@ const changesTurn: Turn = turn({
     thinking: 0,
   },
   contextTokens: 52_000,
-  contextWindow: 200_000,
+  contextWindow: 1_000_000,
   toolUses: 22,
   toolCounts: { edits: 3, reads: 8, searches: 3, commands: 6, agents: 1, coordination: 1, web: 0, other: 0 },
 });
@@ -367,7 +367,7 @@ const beforeExpiry: Turn = turn({
     thinking: 0,
   },
   contextTokens: 128_000,
-  contextWindow: 200_000,
+  contextWindow: 1_000_000,
 });
 
 const expiryUsage = {
@@ -416,7 +416,7 @@ const expiryRequest: ProjectUsageBucket = {
   agent: 'claude',
   provider: null,
   model: changesTurn.model,
-  contextWindow: 200_000,
+  contextWindow: 1_000_000,
   contextBand: 'short',
   billingClass: 'metered',
   inferenceClass: null,
@@ -767,7 +767,7 @@ const demoReadStateTurn: Turn = {
   ...demoCodexReadStateTurn,
   agent: 'claude',
   model: 'claude-opus-5-5',
-  contextWindow: 200_000,
+  contextWindow: 1_000_000,
   agents: demoCodexReadStateTurn.agents.map((agent) => {
     const model = agent.id === 'background-review' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-5-5';
     return {
@@ -949,7 +949,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       model: 'claude-opus-5-5',
       effort: 'high',
       contextTokens: expiryTurn.contextTokens,
-      contextWindow: 200_000,
+      contextWindow: 1_000_000,
       contextRequest: {
         at: CAPTURE_TIME - 4 * 60_000,
         lifetime: '1h',
@@ -1008,7 +1008,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       effort: 'high',
       usage: { ...emptyUsage(), requests: 4, input: 8_000, cacheWrite5m: 20_000, cacheRead: 64_000, output: 2_500 },
       contextTokens: 36_000,
-      contextWindow: 200_000,
+      contextWindow: 1_000_000,
       toolUses: 3,
       toolCounts: { ...turn().toolCounts, reads: 2, commands: 1 },
       steps: [
@@ -1087,7 +1087,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       effort: 'high',
       usage: { ...emptyUsage(), requests: 2, input: 4_000, cacheWrite1h: 9_000, cacheRead: 9_000, output: 1_500 },
       contextTokens: 15_000,
-      contextWindow: 200_000,
+      contextWindow: 1_000_000,
       toolUses: 1,
       toolCounts: { ...turn().toolCounts, reads: 1 },
       steps: [
@@ -1131,7 +1131,7 @@ DEMO_TURNS['arc-read-state'] = DEMO_TURNS['arc-read-state'].map((item, index) =>
         ...item,
         agent: 'claude',
         model: 'claude-opus-5-5',
-        contextWindow: 200_000,
+        contextWindow: 1_000_000,
         startedAt: item.startedAt - (index === 2 ? 60 * 60_000 : 0),
         endedAt: item.endedAt - (index === 2 ? 60 * 60_000 : 0),
         contextRequest: {
