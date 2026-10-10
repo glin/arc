@@ -9761,7 +9761,7 @@ test('command-only CLI transcripts supply neither admission nor a fallback name'
   }
 });
 
-test('command admission withdraws and restores across appends, chunk edges and incomplete lines', () => {
+test('command admission withdraws and stays withdrawn after model work across appends, chunk edges and incomplete lines', () => {
   const [caveat, command, answer] = localCommand('/usage-credits', '', 2, 'command', {
     stdout: 'Login interrupted',
     user: true,
@@ -9780,8 +9780,10 @@ test('command admission withdraws and restores across appends, chunk edges and i
   assert.equal(promptScanLists(scan), false);
   fs.appendFileSync(file, JSON.stringify(assistantAnswer('model work', 3)) + '\n');
   scan = scanForHumanPrompt(file, fs.statSync(file).size, scan);
-  assert.equal(scan.found, true);
-  assert.equal(scanForHumanPrompt(file, fs.statSync(file).size, scan), scan);
+  assert.equal(scan.found, false);
+  assert.equal(scan.command?.withdrawn, true);
+  assert.equal(promptScanLists(scan), false);
+  assert.deepEqual(scanForHumanPrompt(file, fs.statSync(file).size, scan), scan);
   fs.writeFileSync(file, JSON.stringify({ ...userPrompt('fresh file', 0), uuid: 'fresh' }) + '\n');
   const shrunk = scanForHumanPrompt(file, fs.statSync(file).size, scan);
   assert.equal(shrunk.found, false);
@@ -9831,16 +9833,16 @@ test('command admission keeps mismatched answers and process-ended commands, and
   }
 });
 
-test('fallback names skip withdrawn commands, retain restored commands and use only the head window', () => {
+test('fallback names skip withdrawn commands, including ones model work follows, and use only the head window', () => {
   const records = localCommand('/usage-credits', '', 2, 'command', { stdout: 'Login interrupted', user: true });
   const real = readSessionMeta(
     writeTranscript([...records, userPrompt('actual task', 3), assistantAnswer('answer', 4)]),
   );
   assert.equal(real.title, 'actual task');
   assert.equal(real.withdrawnPrompt, true);
-  const restored = readSessionMeta(writeTranscript([...records, assistantAnswer('model work', 3)]));
-  assert.equal(restored.title, '/usage-credits');
-  assert.equal(restored.withdrawnPrompt, undefined);
+  const followed = readSessionMeta(writeTranscript([...records, assistantAnswer('model work', 3)]));
+  assert.equal(followed.title, null);
+  assert.equal(followed.withdrawnPrompt, true);
   for (const queued of [
     [...records.slice(0, 2), typedMidTurn('queued task', 3), records[2]],
     [...records, typedMidTurn('queued task', 3)],
@@ -10483,7 +10485,7 @@ test("a Claude local command answer hours after an unanswered prompt keeps the p
   );
 });
 
-test('model work after a Claude local command answer makes the command the running turn', () => {
+test('model work after a Claude local command answer resumes the prompt that waited across it', () => {
   const records = [
     userPrompt('first question', 0),
     assistantAnswer('first answer', 1),
@@ -10493,13 +10495,12 @@ test('model work after a Claude local command answer makes the command the runni
   ];
   const read = localAnswerStatuses(records);
   assert.deepEqual([read.full, read.rail, read.index], ['running', 'running', 'running']);
-  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'a reader does not take the command as the newest turn');
-  // The earlier prompt loses processEndedAt and remains stopped because a newer turn follows it.
-  const prompt = read.turns.find((turn) => turn.prompt === 'an unanswered prompt');
-  assert.ok(prompt, 'the unanswered prompt lost its card');
-  assert.notEqual(prompt, read.turns[read.turns.length - 1], 'the unanswered prompt is still the newest turn');
+  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)], 'a reader takes the command as the newest turn');
+  assert.deepEqual([read.turns.length, read.count], [2, 2], 'a reader counts the command as a turn');
+  // The model works on the waiting prompt, so the answer does not stop it.
+  const prompt = read.turns[read.turns.length - 1];
+  assert.equal(prompt.prompt, 'an unanswered prompt');
   assert.equal(prompt.processEndedAt, undefined, 'the answer still stops the prompt the model went on from');
-  assert.equal(statusOf(prompt, false, AFTER_COMMAND), 'stopped');
   // A read restored between the answer and the model work removes the stop too.
   const session = createClaudeSessionReducer('sess');
   for (const record of records.slice(0, -1)) {
@@ -10594,7 +10595,7 @@ test('a prompt queued before the CLI answers a Claude built-in command is the ne
   }
 });
 
-test('model work after a Claude built-in command answered in a user record makes the command a turn', () => {
+test('model work after a Claude built-in command answered in a user record joins the turn before it', () => {
   const records = [
     userPrompt('first question', 0),
     assistantAnswer('first answer', 1),
@@ -10602,9 +10603,9 @@ test('model work after a Claude built-in command answered in a user record makes
     assistantAnswer('The server is back.', 3),
   ];
   const read = localAnswerStatuses(records, AFTER_COMMAND, true);
-  assert.deepEqual([read.turns.length, read.count], [2, 2], 'the readers lost the command turn the model answered');
-  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)]);
-  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)).starts, [ms(0), ms(2)]);
+  assert.deepEqual([read.turns.length, read.count], [1, 1], 'the readers made the command a turn');
+  assert.deepEqual(read.starts, [ms(0), ms(0), ms(0)]);
+  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)).starts, [ms(0)]);
 });
 
 test('a Claude prompt that quotes a local command output element stays a prompt', () => {
@@ -10670,7 +10671,7 @@ test('a Claude local command answer after a model reply leaves the reply in char
   );
 });
 
-test('a hand-back reply after a Claude local command answer makes the command a turn in every reader', () => {
+test('a hand-back reply after a Claude local command answer joins the turn before it in every reader', () => {
   const usage = localCommand('/usage', '', 3, 'usage-1', { stdout: 'Current session: 4% used' });
   const handback = localAnswerStatuses([
     userPrompt('first question', 0),
@@ -10681,14 +10682,15 @@ test('a hand-back reply after a Claude local command answer makes the command a 
   ]);
   assert.deepEqual(
     [handback.turns.length, handback.count],
-    [2, 2],
-    'the timeline and the header count the hand-back reply differently',
+    [1, 1],
+    'the timeline or the header counts the command as a turn',
   );
-  assert.deepEqual(handback.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+  assert.deepEqual(handback.starts, [ms(0), ms(0), ms(0)], 'the readers disagree on the newest turn');
   assert.deepEqual([handback.full, handback.rail, handback.index], ['done', 'done', 'done']);
+  assert.equal(handback.turns[0].summary, 'The subagent finished its review.');
 });
 
-test('a reply to a prompt that waited across a Claude local command makes the command a turn in every reader', () => {
+test('a reply to a prompt that waited across a Claude local command answers that prompt in every reader', () => {
   const usage = localCommand('/usage', '', 3, 'usage-1', { stdout: 'Current session: 4% used' });
   const waiting = localAnswerStatuses([
     userPrompt('first question', 0),
@@ -10699,11 +10701,109 @@ test('a reply to a prompt that waited across a Claude local command makes the co
   ]);
   assert.deepEqual(
     [waiting.turns.length, waiting.count],
-    [3, 3],
-    'the timeline and the header count the reply to the waiting prompt differently',
+    [2, 2],
+    'the timeline or the header counts the command as a turn',
   );
-  assert.deepEqual(waiting.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+  assert.equal(waiting.turns[1].prompt, 'a waiting prompt');
+  assert.equal(waiting.turns[1].summary, 'The waiting prompt is answered.');
+  assert.deepEqual(waiting.starts, [ms(2), ms(2), ms(2)], 'the readers disagree on the newest turn');
   assert.deepEqual([waiting.full, waiting.rail, waiting.index], ['done', 'done', 'done']);
+});
+
+test('model work after two Claude local commands in a row joins the turn before them in every reader', () => {
+  const answered = [
+    userPrompt('first question', 0),
+    assistantText('first answer', 1, { input_tokens: 10, output_tokens: 5 }, undefined, 'end_turn'),
+  ];
+  const commands = [
+    ...localCommand('/usage', '', 3, 'usage-1', { stdout: 'Current session: 4% used' }),
+    ...localCommand('/cost', '', 4, 'cost-1', { stdout: 'Total cost: $0.10' }),
+  ];
+  const renamed = [
+    ...localCommand('/rename', 'claude entrypoint auto handback', 3, 'rename-1', { stdout: RENAMED }),
+    ...localCommand('/cost', '', 4, 'cost-1', { stdout: 'Total cost: $0.10' }),
+  ];
+  const waiting = [userPrompt('waiting', 2, { uuid: 'prompt-2' })];
+  for (const [stop, status] of [
+    ['end_turn', 'done'],
+    ['tool_use', 'running'],
+  ]) {
+    const reply = assistantText('the reply', 5, { input_tokens: 10, output_tokens: 7 }, undefined, stop);
+    const now = ms(5) + 60_000;
+    for (const [label, middle, cards] of [
+      // Each card as its prompt and its output tokens. The reply carries 7 of them.
+      ['an answered turn', commands, [['first question', 12]]],
+      ['an answered turn and /rename', renamed, [['first question', 12]]],
+      [
+        'a waiting prompt',
+        [...waiting, ...commands],
+        [
+          ['first question', 5],
+          ['waiting', 7],
+        ],
+      ],
+    ] as const) {
+      const read = localAnswerStatuses([...answered, ...middle, reply], now, true);
+      const where = `after ${label} with a ${stop} reply`;
+      assert.deepEqual(
+        read.turns.map((turn) => [turn.prompt, turn.usage.output]),
+        cards,
+        `the reply lands on the wrong card ${where}`,
+      );
+      assert.equal(read.count, cards.length, `the header count is wrong ${where}`);
+      const start = cards.length === 1 ? ms(0) : ms(2);
+      assert.deepEqual(read.starts, [start, start, start], `the readers disagree on the newest turn ${where}`);
+      assert.deepEqual([read.full, read.rail, read.index], [status, status, status], `a reader keeps a stop ${where}`);
+      assert.equal(read.turns.at(-1)?.processEndedAt, undefined, `the full read keeps the inferred stop ${where}`);
+      const file = writeTranscript([...answered, ...middle, reply]);
+      assert.deepEqual(
+        readSessionTurnStarts(file).starts,
+        cards.length === 1 ? [ms(0)] : [ms(0), ms(2)],
+        `turn starts keep a command ${where}`,
+      );
+    }
+  }
+});
+
+test('a hand-back reply after a Claude /rename never makes the command a prompt', () => {
+  const answered = [
+    userPrompt('first question', 0),
+    assistantText('first answer', 1, { input_tokens: 10, output_tokens: 5 }, undefined, 'end_turn'),
+    { type: 'system', subtype: 'stop_hook_summary', timestamp: at(1.5) },
+  ];
+  const rename = localCommand('/rename', 'broken caching', 3, 'rename-1', {
+    stdout: 'Session renamed to: broken caching',
+  });
+  const wake = [peerHandback('a1b2c3d4e5f6a7b8c', 5), assistantAnswer('The subagent finished its review.', 6)];
+  const records = [...answered, ...rename, ...wake];
+  const read = localAnswerStatuses(records, ms(6) + 60_000, true);
+  assert.deepEqual([read.turns.map((turn) => turn.prompt), read.count], [['first question'], 1]);
+  assert.equal(read.turns[0].summary, 'The subagent finished its review.');
+  assert.deepEqual(read.starts, [ms(0), ms(0), ms(0)]);
+  assert.deepEqual([read.full, read.rail, read.index], ['done', 'done', 'done']);
+  const file = writeTranscript(records);
+  assert.deepEqual(readSessionTurnStarts(file).starts, [ms(0)]);
+  assert.equal(promptScanLists(scanForHumanPrompt(file, fs.statSync(file).size)), true);
+  assert.equal(readSessionMeta(file).title, 'first question');
+  // With no turn before the command, the reply belongs to no turn and the session has no fallback name.
+  const alone = writeTranscript([...rename, ...wake]);
+  const empty = localAnswerStatuses([...rename, ...wake], ms(6) + 60_000, true);
+  assert.deepEqual([empty.turns.length, empty.count], [0, 0]);
+  assert.deepEqual(readSessionTurnStarts(alone).starts, []);
+  assert.equal(promptScanLists(scanForHumanPrompt(alone, fs.statSync(alone).size)), false);
+  assert.equal(readSessionMeta(alone).title, null);
+});
+
+test('a hand-back reply after a manual compaction still makes /compact a turn', () => {
+  const records = [
+    ...manualCompactRecords(),
+    peerHandback('a1b2c3d4e5f6a7b8c', 15),
+    assistantAnswer('The subagent finished its review.', 16),
+  ];
+  const read = localAnswerStatuses(records, AFTER_COMMAND, true);
+  assert.deepEqual([read.turns.map((turn) => turn.prompt), read.count], [['/compact'], 1]);
+  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)]);
+  assert.deepEqual(readSessionTurnStarts(writeTranscript(records)).starts, [ms(2)]);
 });
 
 test('a process end after a Claude local command answer stops the turn before it in every reader', () => {
@@ -10868,17 +10968,22 @@ test('a second prompt queued behind a Claude local command joins the first acros
   assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
 });
 
-test('model work after a stopped prompt queued behind a Claude local command makes the command the turn', () => {
+test('model work after a stopped prompt queued behind a Claude local command answers the queued turn', () => {
   const read = localAnswerStatuses([
     ...renameRecords(),
     typedMidTurn('a queued follow-up', 3),
     costState(ms(0), 4_000),
     assistantText('working on it', 5, { input_tokens: 10, output_tokens: 5 }, undefined, 'tool_use'),
   ]);
-  assert.equal(read.turns.length, 2, 'the queued prompt kept a card of its own');
+  assert.deepEqual(
+    read.turns.map((turn) => turn.prompt),
+    ['first question', 'a queued follow-up'],
+    'the command became a turn',
+  );
   assert.equal(read.count, read.turns.length, 'the header counts the turns differently');
-  assert.deepEqual(read.starts, [ms(2), ms(2), ms(2)], 'the readers disagree on the newest turn');
-  // The process end stopped the queued prompt, which is on the command's card now.
+  assert.deepEqual(read.starts, [ms(3), ms(3), ms(3)], 'the readers disagree on the newest turn');
+  assert.equal(read.turns[1].usage.output, 5, 'the model work is missing from the queued card');
+  // The process end stopped the queued prompt, and the model work joins its card.
   assert.deepEqual([read.full, read.rail, read.index], ['stopped', 'stopped', 'stopped']);
 });
 

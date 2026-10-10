@@ -343,7 +343,6 @@ import {
   LauncherRequest,
   attachmentRefusal,
   attachmentFailureNotice,
-  localAnswerNotice,
   rememberSessionAlias,
   resolveSessionAlias,
   sessionAdoptions,
@@ -4250,21 +4249,16 @@ export class PanelProvider implements vscode.Disposable {
     return swept;
   }
 
-  // Remove locally answered commands through `pressesAfterLocalAnswer`. Their reply appears as a temporary composer notice without a transcript card.
-  public noteLocalAnswer(session: string, clearFailure: string | null = null, reply = ''): void {
+  // Remove the locally answered command of turn `turnId` through `pressesAfterLocalAnswer`. Its reply shows no Composer message, because the title, the pickers and the usage figures already show what it reports.
+  public noteLocalAnswer(session: string, clearFailure: string | null = null, turnId?: number): void {
     if (clearFailure) {
       this.cancelClearSettlement(session, clearFailure);
-    } else {
-      const notice = localAnswerNotice(reply);
-      if (notice) {
-        this.setAttachmentNotice(session, notice);
-      }
     }
     const held = this.live[session];
     if (!held?.length) {
       return;
     }
-    const left = pressesAfterLocalAnswer(held);
+    const left = pressesAfterLocalAnswer(held, turnId);
     if (left.length === held.length) {
       return;
     }

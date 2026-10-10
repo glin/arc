@@ -1606,6 +1606,42 @@ test('persistence accepts one complete Codex usage snapshot and rejects malforme
   }
 });
 
+test('persistence keeps a withdrawn Claude command turn and rejects a damaged one', () => {
+  const turn = { open: true, answered: false, startedAt: 2000, endedAt: 3000, firstTurnAt: 1000, outcome: null };
+  const savedRecord = spendRecord('withdrawn.jsonl', {
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
+    parserKind: 'claude',
+    parserState: {
+      ...emptyClaudeUsageReducerState(),
+      currentTurnPrevious: { ...turn, localStopAt: 2500 },
+      currentTurnWithdrawn: { ...turn, compact: false, localStopAt: 2500 },
+    },
+  });
+  const folder = dir();
+  saveSpendLedger(folder, 'one', [savedRecord]);
+  const state = loadSpendLedger(folder, 'one').files[0]?.parserState as ClaudeUsageReducerState | undefined;
+  assert.deepEqual(
+    [state?.currentTurnPrevious, state?.currentTurnWithdrawn],
+    [
+      { ...turn, localStopAt: 2500 },
+      { ...turn, compact: false, localStopAt: 2500 },
+    ],
+  );
+
+  const target = path.join(folder, ledgerName(folder));
+  const saved = JSON.parse(ledgerText(folder)) as { files: Array<{ parserState: Record<string, any> }> };
+  for (const [field, key, bad] of [
+    ['currentTurnWithdrawn', 'compact', 'yes'],
+    ['currentTurnWithdrawn', 'localStopAt', 'soon'],
+    ['currentTurnPrevious', 'localStopAt', 'soon'],
+  ] as const) {
+    const malformed = structuredClone(saved);
+    malformed.files[0].parserState[field][key] = bad;
+    fs.writeFileSync(target, JSON.stringify(malformed));
+    assert.deepEqual(loadSpendLedger(folder, 'one').files, [], `a damaged ${field}.${key} loaded`);
+  }
+});
+
 function malformedSpendFixture() {
   const folder = dir();
   const buckets = aggregateUsageEvents([event(stamp('2026-08-31T10:00:00'))]);
@@ -2019,7 +2055,7 @@ test('a saved Claude index withdraws a local command whose answer arrives after 
   );
 
   // The withdrawn command is saved with the index, so model work read after a second load
-  // still makes it a turn again.
+  // answers the prompt before it and clears the stop the answer gave that prompt.
   saveSpendLedger(folder, 'one', [
     spendRecord('local-command.jsonl', {
       parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
@@ -2043,8 +2079,9 @@ test('a saved Claude index withdraws a local command whose answer arrives after 
       },
     }),
   );
-  assert.equal(again.turnCount(), 2, 'the reloaded index lost the withdrawn command');
-  assert.equal(again.newestTurnOutcome()?.startedAt, Date.parse(at(1)), 'the reply did not land on the command');
+  assert.equal(again.turnCount(), 1, 'the reloaded index counts the command as a turn');
+  assert.equal(again.newestTurnOutcome()?.startedAt, Date.parse(at(0)), 'the reply did not land on the waiting prompt');
+  assert.equal(again.newestTurnOutcome()?.processEndedAt, undefined, 'the reloaded index kept the inferred stop');
 });
 
 test('a record both ledgers share is written once, and a differing one is written twice', () => {

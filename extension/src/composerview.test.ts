@@ -5511,6 +5511,18 @@ test('a command the agent answers itself takes its own card away', () => {
     [working],
     'the card for a running turn was taken before its turn card arrived',
   );
+  // A started command still ends when the answer names its turn, because the CLI's own answer
+  // never becomes a recorded turn. A started prompt of another turn keeps its card.
+  const renaming = press({ text: '/rename broken caching', ran: true, started: true, turnId: 3 });
+  assert.deepEqual(pressesAfterLocalAnswer([renaming], 3), [], 'the card for a started /rename is still on screen');
+  const reviewing = press({ text: '/review check this patch', ran: true, started: true, turnId: 2 });
+  assert.deepEqual(
+    pressesAfterLocalAnswer([reviewing], 1),
+    [reviewing],
+    'an answer for an earlier turn took the started slash prompt away',
+  );
+  const queued = press({ at: PRESS_AT + 1000, ran: true, turnId: 4 });
+  assert.deepEqual(pressesAfterLocalAnswer([queued], 1), [queued], 'an answer for an earlier turn took a later prompt');
   const compacting = press({ kind: 'compact', text: '', ran: true, started: true });
   const local = press({ at: PRESS_AT + 1000, text: '/model' });
   assert.deepEqual(

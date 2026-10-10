@@ -1087,7 +1087,6 @@ import {
   sendAction,
   sentPromptsToSave,
   pressesAfterLocalAnswer,
-  localAnswerNotice,
 } from './composerview.ts';
 import { unsupportedPromptAsset, normalizePromptAssetBook } from './promptassets.ts';
 import type { StoredPromptAsset } from './promptassets.ts';
@@ -1474,9 +1473,16 @@ test('human admission uses walked sizes and stats reused rows only until evidenc
   );
   assert.equal(provider.hasHumanPrompt(source), false);
   assert.equal(stat.mock.calls.length, 1);
+  // Model work after the answer leaves the command withdrawn. A later typed prompt and its reply confirm.
   fs.appendFileSync(
     file,
-    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'model work' } }) + '\n',
+    [
+      { type: 'assistant', message: { role: 'assistant', content: 'model work' } },
+      { type: 'user', uuid: 'task', timestamp: '2026-01-01T00:00:05.000Z', message: { role: 'user', content: 'task' } },
+      { type: 'assistant', message: { role: 'assistant', content: 'task work' } },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
   );
   assert.equal(provider.hasHumanPrompt(source), true);
   assert.equal(stat.mock.calls.length, 2);
@@ -19839,7 +19845,7 @@ function clearSettlementMethods() {
     `
 export function finishClearSettlement(settlement: any) {\n${methodBody('private finishClearSettlement(')}\n}
 export function cancelClearSettlement(session: string, reason: string) {\n${methodBody('private cancelClearSettlement(')}\n}
-export function noteLocalAnswer(session: string, clearFailure: string | null = null, reply = '') {\n${methodBody('public noteLocalAnswer(')}\n}
+export function noteLocalAnswer(session: string, clearFailure: string | null = null, turnId?: number) {\n${methodBody('public noteLocalAnswer(')}\n}
 export function startClear(state: any, queued: any = null, text: string = '/clear') {\n${methodBody('private startClear(')}\n}`,
     {
       loader: 'ts',
@@ -19855,7 +19861,7 @@ export function startClear(state: any, queued: any = null, text: string = '/clea
         this: Record<string, any>,
         session: string,
         clearFailure?: string | null,
-        reply?: string,
+        turnId?: number,
       ) => void;
       startClear: (this: Record<string, any>, state: Record<string, any>, queued?: Record<string, any>) => void;
     },
@@ -19867,9 +19873,8 @@ export function startClear(state: any, queued: any = null, text: string = '/clea
     'pressesAfterLocalAnswer',
     'clearRequest',
     'queueResetFailed',
-    'localAnswerNotice',
     compiled,
-  )(module, module.exports, queueWithout, pressesAfterLocalAnswer, clearRequest, queueResetFailed, localAnswerNotice);
+  )(module, module.exports, queueWithout, pressesAfterLocalAnswer, clearRequest, queueResetFailed);
   return module.exports;
 }
 
@@ -19920,8 +19925,8 @@ function clearSettlementHost(methods: ReturnType<typeof clearSettlementMethods>)
     cancelClearSettlement(session: string, reason: string) {
       methods.cancelClearSettlement.call(this, session, reason);
     },
-    noteLocalAnswer(session: string, clearFailure: string | null = null, reply = '') {
-      methods.noteLocalAnswer.call(this, session, clearFailure, reply);
+    noteLocalAnswer(session: string, clearFailure: string | null = null) {
+      methods.noteLocalAnswer.call(this, session, clearFailure);
     },
     notices: [] as Array<[string, string]>,
     setAttachmentNotice(session: string, notice: string) {
@@ -20180,33 +20185,20 @@ test('a failed Claude clear result cancels settlement while a successful local a
   const localAnswer = statementFrom(extensionSource, localAnswerAt);
   sourceMatch(
     localAnswer,
-    /event\.outcome\.status === 'ok'[\s\S]*failedClearDelivery\([\s\S]*panel\.noteLocalAnswer\(ended, clearFailure, event\.outcome\.text\)/,
-    'the unsuccessful terminal outcome never reaches clear settlement cancellation, or the reply never reaches the Composer',
+    /event\.outcome\.status === 'ok'[\s\S]*failedClearDelivery\([\s\S]*panel\.noteLocalAnswer\(ended, clearFailure, turnId\)/,
+    'the unsuccessful terminal outcome never reaches clear settlement cancellation',
   );
 });
 
-test('a command the CLI answers by itself shows its reply once as the Composer message', () => {
+test('a command the CLI answers by itself shows no Composer message', () => {
   const { host } = clearSettlementHost(clearSettlementMethods());
-  const renamed = 'Session renamed to: local command turn fix rename';
-  host.noteLocalAnswer('source', null, renamed);
-  assert.deepEqual(host.notices, [['source', renamed]], 'the reply never reached the Composer');
-  host.noteLocalAnswer('source', null, '  ');
-  host.noteLocalAnswer('source', 'Claude stopped clearing this session. Try again.', 'Cleared');
-  assert.equal(host.notices.length, 1, 'an empty reply or a failed clear showed a message');
-  host.noteLocalAnswer('source', null, `${String.fromCharCode(27)}[1mSet model to Opus${String.fromCharCode(27)}[22m`);
-  assert.deepEqual(host.notices[1], ['source', 'Set model to Opus'], 'the message kept terminal color codes');
-  const context = [
-    '',
-    ` ${String.fromCharCode(27)}[1mContext Usage${String.fromCharCode(27)}[22m`,
-    '     claude-opus-4 · 41k/200k tokens (21%)',
-    '     System prompt: 3.1k tokens (1.6%)',
-    '',
-  ].join('\r\n');
-  host.noteLocalAnswer('source', null, context);
-  assert.deepEqual(host.notices[2], ['source', 'Context Usage'], 'a many-line reply showed more than its first line');
-  host.noteLocalAnswer('source', null, `Total cost: ${'$0.01 '.repeat(60)}\nTotal duration: 3s`);
-  const cost = host.notices[3][1];
-  assert.ok(cost.length <= 160 && cost.startsWith('Total cost: $0.01'), `a long first line showed in full: ${cost}`);
+  // A reply never becomes a message.
+  host.noteLocalAnswer('source', null);
+  host.noteLocalAnswer('source', 'Claude stopped clearing this session. Try again.');
+  assert.deepEqual(host.notices, [], 'a successful command reply or a failed clear showed a message');
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const localAnswer = statementFrom(extensionSource, extensionSource.indexOf('if (event.outcome.turns === 0)'));
+  assert.doesNotMatch(localAnswer, /noteLocalAnswer\([^)]*text/, 'a command reply reaches the Composer');
 });
 
 test('a cancelled accepted clear releases its source and later prompts', async () => {
@@ -21627,6 +21619,29 @@ test('zero-turn local answers retire their unfinished prompt beside retained res
   assert.equal(provider.live[retained.sessionId][1].completed, undefined);
   provider.noteLocalAnswer(retained.sessionId);
   assert.deepEqual(provider.live[retained.sessionId], [retained]);
+});
+
+test('a local answer for an earlier turn keeps the started slash prompt that followed it', () => {
+  // An effort change runs as turn 1. A custom /review prompt submitted before its result starts as turn 2.
+  for (const [text, answered, kept] of [
+    ['/review check this patch', 1, true],
+    ['/rename broken caching', 2, false],
+  ] as const) {
+    const retained = { ...livePress(), completed: true, outcome: 'ok' as const, ran: true, started: true, turnId: 0 };
+    const fixture = liveProviderFixture(retained);
+    const provider = fixture.provider as any;
+    const session = retained.sessionId;
+    provider.running.add(retained.agent + ':' + session);
+    const at = provider.noteLive(provider.stateFor(session), 'prompt', text);
+    provider.livePressAnswered(session, at, { delivered: true, reason: '', turnId: 2 });
+    assert.equal(provider.live[session][1].started, true, `${text} never started`);
+    provider.noteLocalAnswer(session, null, answered);
+    assert.deepEqual(
+      provider.live[session].map((press: LivePress) => press.text),
+      kept ? [retained.text, text] : [retained.text],
+      kept ? 'the result of an earlier turn took the started prompt away' : 'the started command kept its card',
+    );
+  }
 });
 
 test('retained terminal responses allow compaction to start and retire and keep local-answer ownership', () => {

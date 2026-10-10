@@ -3485,6 +3485,8 @@ button.cctx:hover {
 }
 .cnotice {
   margin: 0 0 5px;
+  /* The same inset as the next-turn line below it, so both lines start at one edge. */
+  padding: 0 10px;
   font-size: var(--t-small);
   color: var(--warn);
 }

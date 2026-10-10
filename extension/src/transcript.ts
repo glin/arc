@@ -1287,6 +1287,8 @@ interface ClaudePromptPair {
   at: number;
   compact: boolean;
   withdrawn: boolean;
+  // Whether a manual compaction boundary, rather than the CLI's own answer, withdrew the command.
+  compacted?: boolean;
   queuedAt: number | null;
 }
 
@@ -1296,10 +1298,12 @@ function promptPair(o: Record<string, unknown>, at: number): ClaudePromptPair | 
 }
 
 // Pairing follows file order and record IDs. Each reader owns the evidence it withdraws or restores.
+// Model work after a compaction restores the command. Model work after the CLI's own answer
+// resumes the turn before the command, so the command stays withdrawn.
 function advancePromptPair(
   command: ClaudePromptPair,
   o: Record<string, unknown>,
-): 'queued' | 'withdraw' | 'restore' | 'confirm' | null {
+): 'queued' | 'withdraw' | 'restore' | 'resume' | 'confirm' | null {
   const queued = readerQueuedAsk(o);
   if (queued) {
     if (!command.withdrawn) {
@@ -1309,21 +1313,24 @@ function advancePromptPair(
     return 'queued';
   }
   if (!command.withdrawn && claudeProcessEndedAt(o) !== null) return 'confirm';
-  if (
-    (command.compact && claudeCompactAnswer(o, command.id, command.at)) ||
-    claudeLocalAnswer(o)?.parent === command.id
-  ) {
+  const compacted = command.compact && claudeCompactAnswer(o, command.id, command.at) !== null;
+  if (compacted || claudeLocalAnswer(o)?.parent === command.id) {
     if (command.withdrawn) return null;
     command.withdrawn = true;
+    command.compacted = compacted;
     return 'withdraw';
   }
-  if (claudeModelWorks(o)) return command.withdrawn ? 'restore' : 'confirm';
+  if (claudeModelWorks(o)) {
+    if (!command.withdrawn) return 'confirm';
+    return command.compacted ? 'restore' : 'resume';
+  }
   return null;
 }
 
 // A typed prompt stays a pending command until model work or a process end. The CLI's own answer
-// to it, or a manual compaction boundary for `/compact`, withdraws its start until model work restores it.
-// A prompt the reader queues before or after that answer starts a turn of its own in the command's place.
+// to it, or a manual compaction boundary for `/compact`, withdraws its start. Model work restores
+// the start only after a compaction. A prompt the reader queues before or after that answer starts
+// a turn of its own in the command's place.
 function sessionTurnStartsIn(lines: string[], childTranscript = false): number[] {
   const starts: number[] = [];
   let command:
@@ -1361,7 +1368,7 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
         } else if (step === 'withdraw') {
           starts.splice(command.index, 1, ...(command.queuedAt === null ? [] : [command.queuedAt]));
           command.queued = command.queuedAt !== null;
-        } else if (step === 'restore' || step === 'confirm') {
+        } else if (step === 'restore' || step === 'resume' || step === 'confirm') {
           if (step === 'restore') starts.splice(command.index, command.queued ? 1 : 0, command.at);
           command = null;
         }
@@ -2727,8 +2734,9 @@ function claudeModelAnswered(record: Record<string, unknown>): boolean {
 }
 
 // Whether a record is the model working, or the reader interrupting it. After a local command
-// answer withdrew the command, such a record makes the command a turn again in every reader.
-// A process end, a notice or a `<synthetic>` reply does not.
+// answer withdrew the command, such a record resumes the turn before the command and removes the
+// stop the answer inferred for it. It makes the command a turn again only after a manual
+// compaction. A process end, a notice or a `<synthetic>` reply does not.
 function claudeModelWorks(record: Record<string, unknown>): boolean {
   if (record.type === 'user') {
     return interruptedATurn(record);
@@ -2743,7 +2751,8 @@ function claudeModelWorks(record: Record<string, unknown>): boolean {
 }
 
 // Marks an unanswered prompt stopped at its own last-record time after a local command answer.
-// Terminal outcomes retain their recorded state. Later model work restores the command turn.
+// Terminal outcomes retain their recorded state. Later model work resumes the turn and removes the
+// stop. It restores the command turn only after a manual compaction.
 function stoppedByLocalAnswer(outcome: TurnOutcome): TurnOutcome {
   if (outcome.finished || outcome.error || outcome.interrupted || outcome.processEndedAt !== undefined) {
     return outcome;
@@ -2772,6 +2781,13 @@ function outcomeIn(
   let previous = null as { outcome: TurnOutcome | null; modelAnswered: boolean } | null;
   // The command's outcome that a local command answer withdrew, until the model works after it.
   let withdrawn: TurnOutcome | null = null;
+  // Whether a manual compaction withdrew it. Only then does later model work restore it.
+  let withdrawnCompact = false;
+  // The stop time the answer gave the outcome before the command. Later model work removes it.
+  let localStopAt: number | undefined;
+  // The stop time an earlier answer gave the outcome the newest typed prompt replaced, when
+  // that prompt follows a command the CLI answered by itself.
+  let previousLocalStopAt: number | undefined;
   // Whether a prompt queued since that answer opened the outcome.
   let queuedSinceAnswer = false;
   // Prompts queued while the command waited for its answer, as start and end times.
@@ -2814,6 +2830,7 @@ function outcomeIn(
     if (type === 'user' && isTypedPrompt(o, childTranscript)) {
       const startedAt = stamp(o.timestamp);
       previous = { outcome, modelAnswered };
+      previousLocalStopAt = withdrawn && !queuedSinceAnswer ? localStopAt : undefined;
       withdrawn = null;
       queuedSinceAnswer = false;
       queuedBeforeAnswer = null;
@@ -2847,6 +2864,8 @@ function outcomeIn(
         // The CLI answered the command itself, so the command is no turn. The turn before it
         // is the newest again, or there is none when the tail holds no earlier prompt.
         withdrawn = { ...outcome, finished: true, endedAt: Math.max(outcome.endedAt, localAnswer.at) };
+        withdrawnCompact = compactAnswer !== null;
+        localStopAt = previousLocalStopAt;
         outcome = previous?.outcome ?? null;
         modelAnswered = previous?.modelAnswered ?? false;
         command = null;
@@ -2854,7 +2873,9 @@ function outcomeIn(
         queuedSinceAnswer = false;
         toolEnded = false;
         if (outcome && !modelAnswered && !compactAnswer) {
-          outcome = stoppedByLocalAnswer(outcome);
+          const stopped = stoppedByLocalAnswer(outcome);
+          if (stopped !== outcome) localStopAt = stopped.processEndedAt;
+          outcome = stopped;
         }
         if (queuedBeforeAnswer) {
           // Prompts queued before the answer wait on a card of their own, as a prompt queued after it does.
@@ -2884,8 +2905,18 @@ function outcomeIn(
       }
       continue;
     }
+    if (withdrawn && !withdrawnCompact && claudeModelWorks(o)) {
+      // Model work after the CLI's own answer stays out of the command. It answers the prompts
+      // queued around the command, or else resumes the turn before it, which the answer did not stop.
+      if (!queuedSinceAnswer && outcome && localStopAt !== undefined && outcome.processEndedAt === localStopAt) {
+        delete outcome.processEndedAt;
+      }
+      withdrawn = null;
+      localStopAt = undefined;
+      queuedSinceAnswer = false;
+    }
     if (withdrawn && claudeModelWorks(o)) {
-      // Model work after the answer makes the command a turn again. A process end that stopped
+      // Model work after a compaction makes the command a turn again. A process end that stopped
       // a queued prompt stops the command, because the prompt joins the command's card.
       const queuedEnd = queuedSinceAnswer ? outcome?.processEndedAt : undefined;
       outcome = withdrawn;
@@ -6994,9 +7025,9 @@ export interface ClaudeUsageReducerState {
   // command answer withdraws the command's turn and puts this one back as the newest turn.
   // Null once anything answers the current turn, because no answer can withdraw it then.
   currentTurnPrevious?: ClaudePreviousTurn | null;
-  // The command turn a local command answer withdrew, held until the next typed prompt. Model
-  // work after the answer puts it back as the newest turn, as the full reader keeps the
-  // command open for that work.
+  // The command turn a local command answer withdrew, held until the next typed prompt or model
+  // work. Model work after a compaction puts it back as the newest turn, as the full reader keeps
+  // the command open for that work. Model work after the CLI's own answer stays in the current turn.
   currentTurnWithdrawn?: ClaudePreviousTurn | null;
   // Whether a prompt queued behind the withdrawn command opened the current turn. Every prompt
   // queued after it, before model work or a typed prompt, joins that turn, as the full reader
@@ -7030,6 +7061,11 @@ export interface ClaudePreviousTurn {
   endedAt: number | null;
   firstTurnAt: number | null;
   outcome: TurnOutcome | null;
+  // Set on a withdrawn command turn only. Whether a manual compaction withdrew it.
+  compact?: boolean;
+  // On a withdrawn command turn, the stop time the CLI's own answer gave the turn before it. On a
+  // previous turn, the stop time an earlier such answer gave that turn.
+  localStopAt?: number;
 }
 
 function copyPreviousTurn(value: ClaudePreviousTurn | null | undefined): ClaudePreviousTurn | null {
@@ -7336,13 +7372,19 @@ function withdrawClaudeUsageTurn(
       ...currentClaudeTurn(state),
       endedAt: Math.max(state.currentTurnEndedAt ?? 0, localAnswer.at),
       outcome,
+      ...(compact ? { compact: true } : {}),
+      ...(previous?.localStopAt !== undefined ? { localStopAt: previous.localStopAt } : {}),
     };
     if (previous?.open && previous.answered) {
       state.closedTurns--;
     }
     restoreClaudeTurn(state, previous);
     if (!compact && previous?.open && !previous.answered && state.currentTurnOutcome) {
-      state.currentTurnOutcome = stoppedByLocalAnswer(state.currentTurnOutcome);
+      const stopped = stoppedByLocalAnswer(state.currentTurnOutcome);
+      if (stopped !== state.currentTurnOutcome && stopped.processEndedAt !== undefined) {
+        withdrawn.localStopAt = stopped.processEndedAt;
+      }
+      state.currentTurnOutcome = stopped;
     }
     // An unanswered prompt restored by the local answer keeps its own turn for the next prompt count.
     state.openTurnAnswered = state.openTurn;
@@ -7456,7 +7498,12 @@ function reduceClaudeTurnRecord(
     return;
   }
   if (record.type === 'user' && isTypedPrompt(record, childTranscript)) {
+    const handedStop = state.currentTurnQueued ? undefined : state.currentTurnWithdrawn?.localStopAt;
     state.currentTurnPrevious = copyPreviousTurn(currentClaudeTurn(state));
+    if (state.currentTurnPrevious && handedStop !== undefined) {
+      // The prompt follows a command the CLI answered by itself, and that answer stopped this turn.
+      state.currentTurnPrevious.localStopAt = handedStop;
+    }
     state.currentTurnWithdrawn = null;
     state.currentTurnQueued = false;
     state.currentTurnQueuedBefore = null;
@@ -7492,7 +7539,7 @@ function reduceClaudeTurnRecord(
   const withdrawn = state.currentTurnWithdrawn;
   const queued = withdrawn ? readerQueuedAsk(record) : null;
   if (queued) {
-    // Queued prompts after a withdrawn command share an unanswered turn until model work restores the command turn.
+    // Queued prompts after a withdrawn command share an unanswered turn until model work answers them.
     // Later queued prompts join the same turn, including after a process end.
     if (state.openTurn && state.currentTurnQueued) {
       state.currentTurnEndedAt = Math.max(state.currentTurnEndedAt ?? 0, queued.at);
@@ -7504,8 +7551,21 @@ function reduceClaudeTurnRecord(
     openClaudeQueuedTurn(state, queued.at);
     return;
   }
-  if (withdrawn && claudeModelWorks(record)) {
-    // Model work restores the withdrawn command turn and carries any queued turn's process end.
+  if (withdrawn && !withdrawn.compact && claudeModelWorks(record)) {
+    // Model work after the CLI's own answer stays out of the command. It answers the prompts
+    // queued around the command, or else resumes the turn before it, which the answer did not stop.
+    state.currentTurnWithdrawn = null;
+    const outcome = state.currentTurnOutcome;
+    if (
+      !state.currentTurnQueued &&
+      outcome &&
+      withdrawn.localStopAt !== undefined &&
+      outcome.processEndedAt === withdrawn.localStopAt
+    ) {
+      delete outcome.processEndedAt;
+    }
+  } else if (withdrawn && claudeModelWorks(record)) {
+    // Model work after a compaction restores the command turn and carries any queued turn's process end.
     state.currentTurnWithdrawn = null;
     if (state.openTurn && state.openTurnAnswered && !state.currentTurnQueued) {
       state.closedTurns++;
@@ -8748,12 +8808,13 @@ interface ClaudeBackwardSegment {
   // Parent record IDs of the CLI's own command answers.
   answers: Set<string>;
   answered: boolean;
-  // Whether model work, a queued prompt, or a process end before an answer keeps the prompt a turn.
+  // Whether model work or a process end before an answer, or a queued prompt, keeps the prompt a turn.
   kept: boolean;
 }
 
 // Whether a line, read newest first, is a typed prompt that draws a card. A prompt the CLI
-// answered by itself, with no model work, queued prompt, or earlier process end after it, draws none.
+// answered by itself draws none, unless model work or a process end came before the answer or a
+// prompt was queued after it.
 function claudeBackwardBoundary(segment: ClaudeBackwardSegment, text: string): boolean {
   const prompt = humanPromptIn(text, false);
   if (prompt) {
@@ -8789,9 +8850,8 @@ function claudeBackwardBoundary(segment: ClaudeBackwardSegment, text: string): b
     segment.answers.add(answer.parent);
     segment.answered = true;
   } else if (
-    claudeModelWorks(o) ||
     (o.type === 'attachment' && readerQueuedAsk(o)) ||
-    (segment.answered && claudeProcessEndedAt(o) !== null)
+    (segment.answered && (claudeModelWorks(o) || claudeProcessEndedAt(o) !== null))
   ) {
     segment.kept = true;
   }
@@ -8807,7 +8867,7 @@ interface RecordedTitleState {
 }
 
 export interface ClaudeSessionParserState {
-  version: 8;
+  version: 9;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
   turnMembershipStarts: number[];
@@ -8881,10 +8941,15 @@ export interface ClaudeSessionParserState {
   usageState: ClaudeUsageReducerState;
   cur: SourcedBuilding | null;
   // The id of the typed record that opened `cur`, and whether a local command answer that
-  // names it has finished `cur`. Such a turn is no turn. It closes with no card unless the
-  // model works in it later, and a process end goes to the newest card instead.
+  // names it has finished `cur`. Such a turn is no turn. It closes with no card, and a process
+  // end goes to the newest card instead. Later model work makes it a turn only when
+  // `curCompacted` says a manual compaction withdrew it. Otherwise that work answers the prompts
+  // queued around the command, or reopens the newest card when its source start equals
+  // `curPrevious`, the start of the turn before the command.
   curCommand: string | null;
   curLocalAnswer: boolean;
+  curCompacted: boolean;
+  curPrevious: number | null;
   // Reader prompts arriving after this command opened prevent manual compaction withdrawal.
   curQueuedSinceOpening: boolean;
   // The unanswered turn that `cur` took in when its prompt was typed, with that turn's source
@@ -8942,7 +9007,7 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
   const suppliedTitle = normalizeSessionTitle(opts.sessionTitle);
   const suppliedFullTitle = normalizeFullSessionTitle(opts.sessionTitle);
   return {
-    version: 8,
+    version: 9,
     turns: [],
     turnRanges: [],
     turnMembershipStarts: [],
@@ -8984,6 +9049,8 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     cur: null,
     curCommand: null,
     curLocalAnswer: false,
+    curCompacted: false,
+    curPrevious: null,
     curQueuedSinceOpening: false,
     curCarried: null,
     curInferredStop: null,
@@ -9159,6 +9226,8 @@ function trimClaudeBefore(state: ClaudeSessionParserState, offset: number, maxTu
     state.cur = null;
     state.curCommand = null;
     state.curLocalAnswer = false;
+    state.curCompacted = false;
+    state.curPrevious = null;
     state.curQueuedSinceOpening = false;
     state.curCarried = null;
     state.curInferredStop = null;
@@ -9447,15 +9516,19 @@ function claudeQueuedCard(command: SourcedBuilding, asks: TurnAsk[]): SourcedBui
   return card;
 }
 
-function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): void {
+// Returns whether the closed turn became the newest card.
+function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): boolean {
   const turn = state.cur;
   if (!turn) {
-    return;
+    return false;
   }
   const localOnly = state.curLocalAnswer && !claudeModelWorked(turn);
   const answered = claudeTurnAnswered(turn);
+  let emitted = false;
   state.curCommand = null;
   state.curLocalAnswer = false;
+  state.curCompacted = false;
+  state.curPrevious = null;
   state.curQueuedSinceOpening = false;
   state.curCarried = null;
   state.curInferredStop = null;
@@ -9473,12 +9546,14 @@ function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): voi
     if (card && claudeTurnAnswered(card)) {
       emitClaudeTurn(state, card, maxTurns);
       state.pending.held = null;
+      emitted = true;
     } else {
       state.pending.held = card;
     }
   } else if (answered) {
     emitClaudeTurn(state, turn, maxTurns);
     state.pending.held = null;
+    emitted = true;
   } else {
     state.pending.held = turn;
   }
@@ -9487,6 +9562,65 @@ function closeClaudeTurn(state: ClaudeSessionParserState, maxTurns: number): voi
   state.awaited = [];
   pruneClaudeAgentAssociations(state);
   pruneClaudeTurnAssociations(state);
+  return emitted;
+}
+
+// Takes the newest card back as `cur`, so later records extend it as if it never closed.
+function reopenClaudeTurn(state: ClaudeSessionParserState): void {
+  const emitted = state.turns.pop();
+  const range = state.turnRanges.pop();
+  const membership = state.turnMembershipStarts.pop();
+  if (!emitted || !range) {
+    state.cur = null;
+    return;
+  }
+  const turn: SourcedBuilding = {
+    ...emitted,
+    files: new Map(emitted.files.map((file) => [normalizeFsPath(file.path), file])),
+  };
+  setSourceRange(turn, range.start, range.end);
+  setMembershipStart(turn, membership ?? range.start);
+  for (const [id, owner] of state.toolOwnerById) {
+    if (owner === emitted) {
+      state.toolOwnerById.set(id, turn);
+    }
+  }
+  for (const held of state.skillUseById.values()) {
+    if (held.owner === emitted) {
+      held.owner = turn;
+    }
+  }
+  state.cur = turn;
+}
+
+// Model work after the CLI answered the command by itself. The command draws no card. The work
+// answers the prompts queued around the command on a card of their own, or else resumes the turn
+// before the command, or belongs to no turn when this read holds none.
+function resumeAfterClaudeLocalAnswer(state: ClaudeSessionParserState): void {
+  const command = state.cur;
+  if (!command) {
+    return;
+  }
+  const asks = [
+    ...(command.promptParts ?? []).slice(0, -1),
+    ...command.laterPrompts.map((ask) => ({ ...ask, stepsBefore: 0 })),
+  ];
+  if (asks.length > 0) {
+    state.cur = claudeQueuedCard(command, asks);
+  } else if (state.curPrevious !== null && state.turnRanges.at(-1)?.start === state.curPrevious) {
+    reopenClaudeTurn(state);
+  } else {
+    state.cur = null;
+  }
+  state.curCommand = null;
+  state.curLocalAnswer = false;
+  state.curCompacted = false;
+  state.curPrevious = null;
+  state.curQueuedSinceOpening = false;
+  state.curCarried = null;
+  state.curInferredStop = null;
+  state.curToolEnded = false;
+  state.pendingTypedSkill = null;
 }
 
 function settleClaudeSteps(state: ClaudeSessionParserState): void {
@@ -9536,6 +9670,7 @@ function applyClaudeLocalAnswer(
         state.curInferredStop = held.processEndedAt;
       }
       emitClaudeTurn(state, held, maxTurns);
+      state.curPrevious = state.turnRanges.at(-1)?.start ?? null;
       const heldParts = held.promptParts ?? [];
       const own = (ask: TurnAsk) => !heldParts.some((part) => part.text === ask.text && part.at === ask.at);
       const parts = (cur.promptParts ?? []).filter(own);
@@ -9551,6 +9686,7 @@ function applyClaudeLocalAnswer(
     cur.finished = true;
     cur.endedAt = Math.max(cur.endedAt, answer.at);
     state.curLocalAnswer = true;
+    state.curCompacted = compact;
     // The local answer clears pending typed-skill evidence.
     state.pendingTypedSkill = null;
     extendSourceRange(cur, sourceStart, sourceEnd);
@@ -9791,17 +9927,21 @@ function reduceClaudeSessionLine(
   if (o.isSidechain && !opts.childTranscript) {
     return;
   }
-  if (state.curLocalAnswer && state.cur && !claudeModelWorked(state.cur) && claudeModelWorks(o)) {
-    state.cur.finished = false;
-  }
   if (state.curInferredStop != null && state.curLocalAnswer && claudeModelWorks(o)) {
-    // Model work after the answer makes the command a turn again, so the card it handed back
-    // was not stopped by the answer.
+    // Model work after the answer shows that the CLI was not idle, so the card the answer handed
+    // back was not stopped by it.
     const newest = state.turns[state.turns.length - 1];
     if (newest?.processEndedAt === state.curInferredStop) {
       delete newest.processEndedAt;
     }
     state.curInferredStop = null;
+  }
+  if (state.curLocalAnswer && state.cur && !claudeModelWorked(state.cur) && claudeModelWorks(o)) {
+    if (state.curCompacted) {
+      state.cur.finished = false;
+    } else {
+      resumeAfterClaudeLocalAnswer(state);
+    }
   }
   // Resolve pending typed-skill evidence on the next admitted meta user record with a base-directory line, or clear it.
   if (state.pendingTypedSkill) {
@@ -9878,7 +10018,14 @@ function reduceClaudeSessionLine(
   }
 
   if (isUser && isTypedPrompt(o, opts.childTranscript)) {
-    closeClaudeTurn(state, maxTurns);
+    // A command the CLI answered by itself leaves no card. The next prompt takes over the turn
+    // before that command, and the stop the answer inferred for it.
+    const handing = state.curLocalAnswer && state.cur !== null && !claudeModelWorked(state.cur);
+    const handedPrevious = handing ? state.curPrevious : null;
+    const handedStop = handing ? state.curInferredStop : null;
+    const emitted = closeClaudeTurn(state, maxTurns);
+    const handed = !emitted && state.pending.held === null;
+    const previous = emitted ? (state.turnRanges.at(-1)?.start ?? null) : handed ? handedPrevious : null;
     const at = stamp(o.timestamp);
     // A held prompt got no reply of its own, so it belongs to this turn.
     const carried = state.pending.held;
@@ -9943,8 +10090,10 @@ function reduceClaudeSessionLine(
     state.cur = next;
     state.curCommand = o.isSidechain && rawText.trim() === '/compact' ? null : claudeRecordId(o);
     state.curLocalAnswer = false;
+    state.curCompacted = false;
+    state.curPrevious = previous;
     state.curQueuedSinceOpening = false;
-    state.curInferredStop = null;
+    state.curInferredStop = handed ? handedStop : null;
     state.curToolEnded = false;
     state.curCarried = carried
       ? {
@@ -10715,7 +10864,7 @@ export function createClaudeSessionReducer(
   restored?: ClaudeSessionParserState,
 ): ClaudeSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyClaudeSessionParserState(opts);
-  if (state.version !== 8) {
+  if (state.version !== 9) {
     throw new Error('Incompatible Claude parser state');
   }
   applyHiddenParserState(claudeHiddenSlots(state), state.hidden, CLAUDE_HIDDEN_POLICY);
@@ -10736,6 +10885,8 @@ export function createClaudeSessionReducer(
   state.workedSinceReply ??= false;
   state.curCommand ??= null;
   state.curLocalAnswer ??= false;
+  state.curCompacted ??= false;
+  state.curPrevious ??= null;
   state.curQueuedSinceOpening ??= false;
   state.curCarried ??= null;
   state.curInferredStop ??= null;

@@ -422,13 +422,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (event.kind === 'turnEnd') {
         const ended = host.get(key)?.state().sessionId;
         if (ended) {
-          // A zero-turn outcome is a locally answered command. Remove its pending card and display its reply.
+          // A zero-turn outcome is a locally answered command. Remove its pending card.
           if (event.outcome.turns === 0) {
             const clearFailure =
               event.outcome.status === 'ok'
                 ? null
                 : failedClearDelivery(agent ?? '', new Error(event.outcome.text)).reason;
-            panel.noteLocalAnswer(ended, clearFailure, event.outcome.text);
+            panel.noteLocalAnswer(ended, clearFailure, turnId);
           }
           panel.releaseDeliveredPromptAssets(ended, turnEndCompletesEveryPrompt(agent ?? ''), turnId);
           panel.flushQueue(ended);

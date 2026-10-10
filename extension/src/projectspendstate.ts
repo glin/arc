@@ -329,7 +329,9 @@ function previousTurn(value: unknown): value is ClaudePreviousTurn {
     (value.startedAt === null || timestamp(value.startedAt)) &&
     (value.endedAt === null || timestamp(value.endedAt)) &&
     (value.firstTurnAt === null || timestamp(value.firstTurnAt)) &&
-    (value.outcome === null || turnOutcome(value.outcome))
+    (value.outcome === null || turnOutcome(value.outcome)) &&
+    (value.compact === undefined || typeof value.compact === 'boolean') &&
+    (value.localStopAt === undefined || timestamp(value.localStopAt))
   );
 }
 

@@ -3396,22 +3396,18 @@ export function pressesAfterRunning(held: readonly LivePress[], running: boolean
   return held.map((press) => (press === begun ? { ...press, started: true } : press));
 }
 
-// Remove the oldest unfinished submission that has not started when the CLI answers locally. Started submissions retain their recorded-turn replacement requirement.
-export function pressesAfterLocalAnswer(held: readonly LivePress[]): LivePress[] {
-  const ended = held.find((press) => !press.failed && !press.started && !press.completed);
+// Remove the unfinished submission the CLI answered locally. The answer's turn names it, even after it started, because a command the CLI answers by itself never becomes a recorded turn. Without a match, remove the oldest submission that has not started and belongs to no other turn. Other started submissions retain their recorded-turn replacement requirement.
+export function pressesAfterLocalAnswer(held: readonly LivePress[], turnId?: number): LivePress[] {
+  const unfinished = held.filter((press) => !press.failed && !press.completed);
+  const ended =
+    (turnId === undefined ? undefined : unfinished.find((press) => press.turnId === turnId)) ??
+    unfinished.find(
+      (press) => !press.started && (turnId === undefined || press.turnId === undefined || press.turnId === turnId),
+    );
   if (!ended) {
     return [...held];
   }
   return held.filter((press) => !(press === ended && livePressOver(press, null, false, 0, false, true)));
-}
-
-// Terminal escape sequences removed from local CLI replies.
-const TERMINAL_CONTROL = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, 'g');
-
-// The first line of a local CLI reply, without terminal escape sequences. Empty replies return null.
-export function localAnswerNotice(reply: string): string | null {
-  const text = reply.replace(TERMINAL_CONTROL, '').replace(/\r\n?/g, '\n').trim();
-  return text ? firstLine(text) : null;
 }
 
 // Apply the delivery receipt to the submission with the matching timestamp. Busy state does not confirm acceptance.
