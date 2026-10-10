@@ -522,6 +522,7 @@ import {
   BoundedTrailingScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
   mergeRefreshRequests,
+  listedFilesFor,
   PendingWatcherWake,
   RefreshRequest,
   ScheduledRun,
@@ -1704,6 +1705,8 @@ export class PanelProvider implements vscode.Disposable {
   private poll: ReturnType<typeof setInterval> | null = null;
   private lastSignature = '';
   private lastSpendSourceSignature = '';
+  // The rows lastSpendSourceSignature signed, so a targeted offer can name every row that moved since.
+  private spendSourceRows: readonly SessionFile[] = [];
   // Catalog and folder identity retained for selection refreshes. Filesystem refreshes replace this snapshot.
   private catalog: { folders: string; sessions: SessionFile[] } | null = null;
   // The existing-session list from the last payload that completed discovery and required
@@ -2362,8 +2365,15 @@ export class PanelProvider implements vscode.Disposable {
     this.watchScheduler.offer();
   }
 
-  private wakeFromActivityFallback(): void {
-    this.pendingWatch.requireBroad('activity-fallback');
+  // Live activity for sessions with no drawn card revalidates their listed transcripts by name.
+  // A shown session draws even when no file moved, because that draw carries its first live card.
+  private wakeFromActivityFallback(sessions: readonly string[]): void {
+    const shown = new Set([this.showing, ...(this.hostSessions?.values() ?? [])]);
+    this.pendingWatch.noteActivityFallback(
+      listedFilesFor(sessions, this.catalog?.sessions ?? []),
+      sessions.some((session) => shown.has(session)),
+      normalizeFsPath,
+    );
     this.watchScheduler.offer();
   }
 
@@ -2373,12 +2383,7 @@ export class PanelProvider implements vscode.Disposable {
     const decision = watcherRefreshDecision(batch, (file) => known.has(normalizeFsPath(file)));
     const reason = batch.reasons.length ? batch.reasons.join('+') : 'watcher';
     const started = performance.now();
-    this.refreshFrom(
-      reason,
-      batch.reasons.includes('activity-fallback'),
-      false,
-      decision.kind === 'targeted' ? decision.changedPaths : null,
-    );
+    this.refreshFrom(reason, batch.drawRequired, false, decision.kind === 'targeted' ? decision.changedPaths : null);
     this.performanceCounters.recordWatcherOperation({
       reason,
       eventCount: batch.eventCount,
@@ -4590,8 +4595,9 @@ export class PanelProvider implements vscode.Disposable {
       this.activityPost = null;
       const sessions = [...this.activitySessions];
       this.activitySessions.clear();
-      if (!sessions.every((heldSession) => this.postActivity(heldSession))) {
-        this.wakeFromActivityFallback();
+      const missing = sessions.filter((heldSession) => !this.postActivity(heldSession));
+      if (missing.length) {
+        this.wakeFromActivityFallback(missing);
       }
     }, LIVE_ACTIVITY_POST_MS);
   }
@@ -4641,7 +4647,7 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // Update an existing card with live activity. A missing recorded card requires a full refresh.
+  // Update an existing card with live activity. A missing recorded card wakes the watcher refresh.
   private postActivity(session: string): boolean {
     const recorded = this.newestBySession.get(session);
     const index = recorded
@@ -7263,9 +7269,22 @@ export class PanelProvider implements vscode.Disposable {
       const signature = listingSignature(listed);
       const sourcesMoved = sourceSignature !== this.lastSpendSourceSignature;
       this.lastSpendSourceSignature = sourceSignature;
+      const signedRows = this.spendSourceRows;
+      this.spendSourceRows = all;
       if (projectSpendSourceOfferDue(sourcesMoved, now, this.projectSpendLastOfferAt)) {
         this.projectSpendLastOfferAt = now;
         const targeted = targetedRefreshPaths ? new Set(targetedRefreshPaths.map(normalizeFsPath)) : null;
+        if (targeted && sourcesMoved) {
+          // Child discovery can advance rows the refresh did not name. The signature now includes
+          // them, so no later offer sees them move. This offer names every row that moved.
+          const signed = new Map(signedRows.map((session) => [session.file, session]));
+          for (const session of all) {
+            const held = signed.get(session.file);
+            if (!held || !sameSessionRevision(held, session)) {
+              targeted.add(normalizeFsPath(session.file));
+            }
+          }
+        }
         const listedRevisions = targeted
           ? new Map(
               all

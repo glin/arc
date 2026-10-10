@@ -313,7 +313,7 @@ The first column is checked against the shipped extension directory by `architec
 | `sessionnames.ts` | Holds the one name each Claude session draws on every surface, ranks its sources, and releases withdrawn command names | no |
 | `sessionrename.ts` | Cleans a session name before either agent renames it, confirms a Claude rename from its saved title file, and builds the rename editor's opening message and the answer every rename request gets | no |
 | `atomicfile.ts` | Replaces a stored file through a named temporary, and sweeps the temporaries an abandoned writer left | no |
-| `scheduler.ts` | Bounded trailing scheduling and pending watcher-event aggregation | no |
+| `scheduler.ts` | Bounded trailing scheduling, aggregation of pending watcher events and of the transcripts a live-activity fallback names, and the targeted or broad wake decision | no |
 | `performancediagnostics.ts` | Redacted performance-snapshot projection, the file a capture is written to, message budgets, and monotonic host and panel counters | no |
 | `diagnosticslog.ts` | Per-host JSON-line diagnostics, startup thresholds, asynchronous startup history, and bounded durable host health, lifecycle and action evidence independent of detailed logging | no |
 | `sessionloadingline.ts` | Decides what the session-list loading line publishes, holds it hidden for the scope roots that completed the list, and writes each change of the line to the diagnostics log under fixed line budgets | no |

@@ -105,13 +105,33 @@ export interface WatcherWakeBatch {
   eventCount: number;
   changedPaths: string[];
   broadRequired: boolean;
+  // A shown session gained live activity that no drawn card carries, so the wake draws even
+  // when no file moved.
+  drawRequired: boolean;
   reasons: WatcherWakeReason[];
+}
+
+// The listed transcripts of the named sessions, or null when a session has no listed transcript.
+export function listedFilesFor(
+  sessions: readonly string[],
+  catalog: readonly { sessionId: string; file: string }[],
+): string[] | null {
+  const files: string[] = [];
+  for (const session of new Set(sessions)) {
+    const listed = catalog.filter((row) => row.sessionId === session);
+    if (!listed.length) {
+      return null;
+    }
+    files.push(...listed.map((row) => row.file));
+  }
+  return files;
 }
 
 export class PendingWatcherWake {
   private eventCount = 0;
   private readonly changedPaths = new Set<string>();
   private broadRequired = false;
+  private drawRequired = false;
   private readonly reasons = new Set<WatcherWakeReason>();
 
   noteFileEvent(
@@ -141,11 +161,33 @@ export class PendingWatcherWake {
     this.reasons.add(reason);
   }
 
+  // Live activity for sessions with no drawn card names their listed transcripts. Null files
+  // mean a session has no listed transcript, which only the broad walk can find. Named files
+  // have no count limit: each costs one stat, and the walk stats every listed file.
+  noteActivityFallback(
+    files: readonly string[] | null,
+    draw: boolean,
+    normalize: (file: string) => string = (file) => file,
+  ): void {
+    this.reasons.add('activity-fallback');
+    if (draw) {
+      this.drawRequired = true;
+    }
+    if (files === null) {
+      this.broadRequired = true;
+      return;
+    }
+    for (const file of files) {
+      this.changedPaths.add(normalize(file));
+    }
+  }
+
   snapshot(): WatcherWakeBatch {
     return {
       eventCount: this.eventCount,
       changedPaths: [...this.changedPaths].sort(),
       broadRequired: this.broadRequired,
+      drawRequired: this.drawRequired,
       reasons: [...this.reasons].sort(),
     };
   }
@@ -155,6 +197,7 @@ export class PendingWatcherWake {
     this.eventCount = 0;
     this.changedPaths.clear();
     this.broadRequired = false;
+    this.drawRequired = false;
     this.reasons.clear();
     return batch;
   }

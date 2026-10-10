@@ -1011,6 +1011,7 @@ import assert from 'node:assert';
 import { parseSessionRequest } from './sessionrequests.ts';
 import { SessionWriteRequests } from './sessionwrites.ts';
 import { orderSessionCatalog, AGENT_NAMES } from './turnview.ts';
+import { BoundedTrailingScheduler, PendingWatcherWake } from './scheduler.ts';
 import { searchablePrompt, searchableSummary } from './turnsearch.ts';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
@@ -21623,6 +21624,7 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
     projectSpendFiles: [],
     projectSpendVisibleFiles: [],
     projectSpendOffers: new Set(),
+    spendSourceRows: [],
     sessionNames: new SessionNames(),
     hosts: [host],
     readyHosts: new Set([host]),
@@ -22500,6 +22502,232 @@ test('the recorded turn replaces the live card while direct agent activity stays
   }
 });
 
+// Live activity for a session with no drawn card wakes the watcher refresh. Only the named
+// transcripts revalidate, and a draw follows only when content moved or a shown session needs one.
+function activityFallbackFixture(directory: string, children: { sessionId: string; file: string }[] = []) {
+  const shownFile = path.join(directory, 'parent.jsonl');
+  const listedFile = path.join(directory, 'listed.jsonl');
+  fs.writeFileSync(shownFile, '{}\n');
+  fs.writeFileSync(listedFile, '{}\n');
+  for (const child of children) fs.writeFileSync(child.file, '{}\n');
+  const row = (sessionId: string, file: string) => ({
+    sessionId,
+    file,
+    agent: 'claude',
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  // Discovery answers each child transcript at its revision on disk when the request arrives.
+  const childRows = () =>
+    children.map((child) => ({
+      ...row(child.sessionId, child.file),
+      childTranscript: true,
+      parentSessionId: 'parent',
+    }));
+  const listedChildren = childRows();
+  const sessions = [row('parent', shownFile), row('listed', listedFile), ...listedChildren];
+  const worker = {
+    run: async (_request: unknown, generation: number) => ({
+      generation,
+      value: {
+        kind: 'claude-children',
+        complete: true,
+        references: [],
+        children: childRows(),
+        referenceEntries: [],
+        continuation: false,
+        dispatchFacts: [],
+      },
+    }),
+  } as unknown as ProgressiveWorker;
+  const fixture = dispatchedRefreshFixture(sessions, worker, []);
+  const provider = fixture.provider;
+  const listing = (PanelProvider.prototype as unknown as { allSessions(reuse: boolean): unknown }).allSessions;
+  let walks = 0;
+  Object.assign(provider, {
+    folders: () => [directory],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+    publishWindowState() {},
+    watchDirectories() {},
+    hasHumanPrompt: () => true,
+    catalog: { folders: [directory, 1].join('\0'), sessions },
+    cwds: new Map(),
+    codexMetas: { revision: 0, get: () => undefined, keys: () => [], delete() {} },
+    codexStats: { get: () => undefined, keys: () => [], delete() {}, markChanged() {} },
+    subagentDirectories: { sweep() {} },
+    claudeChildren: listedChildren,
+    pendingWatch: new PendingWatcherWake(),
+    allSessions(this: Record<string, any>, reuse: boolean) {
+      const listed = listing.call(this, reuse);
+      if (this.catalogWalked) walks++;
+      return listed;
+    },
+  });
+  provider.watchScheduler = new BoundedTrailingScheduler(200, 1_000, (event) => provider.runPendingWatch(event));
+  provider.performanceCounters.recordWatcherOperation = () => {};
+  const activity = (session: string, sourceId: string, kind = 'tool', detail = 'npm test') =>
+    provider.noteActivity(session, {
+      sourceId,
+      kind,
+      name: 'Bash',
+      headline: '',
+      detail,
+      status: 'running',
+    });
+  const wake = async () => {
+    fixture.posted.length = 0;
+    fixture.refreshes.length = 0;
+    walks = 0;
+    await vi.advanceTimersByTimeAsync(150 + 1_000);
+    await Promise.all(fixture.refreshes);
+    return {
+      refreshes: fixture.refreshes.length,
+      walks,
+      renders: fixture.posted.filter((message) => message.type === 'render').length,
+    };
+  };
+  return { fixture, provider, activity, wake, shownFile, listedFile };
+}
+
+test('live activity for a session with no card revalidates its transcript without a catalog walk', async () => {
+  const directory = tempDir('activity-fallback-');
+  const empty = tempDir('activity-fallback-roots-');
+  vi.stubEnv('ARC_PROJECTS_ROOT', empty);
+  vi.stubEnv('ARC_CODEX_ROOT', empty);
+  vi.useFakeTimers();
+  try {
+    const { fixture, provider, activity, wake, listedFile } = activityFallbackFixture(directory);
+    await provider.refresh(true, true);
+    await Promise.all(fixture.refreshes);
+    const order = provider.sessionRows.map((one: { id: string }) => one.id);
+
+    activity('listed', 'listed-unmoved');
+    assert.deepEqual(
+      await wake(),
+      { refreshes: 1, walks: 0, renders: 0 },
+      'activity for a listed session with no card walked the catalog or redrew unchanged content',
+    );
+    assert.deepEqual(
+      provider.sessionRows.map((one: { id: string }) => one.id),
+      order,
+    );
+
+    fs.appendFileSync(listedFile, '{"moved":true}\n');
+    activity('listed', 'listed-moved');
+    assert.deepEqual(
+      await wake(),
+      { refreshes: 1, walks: 0, renders: 1 },
+      'activity for a listed session whose transcript moved did not draw it once',
+    );
+    assert.equal(provider.catalog.sessions.find((one: { sessionId: string }) => one.sessionId === 'listed').size, 18);
+
+    // Commentary moves out of the streamed reply of the live card, so the draw must carry the shorter reply.
+    provider.live = {
+      parent: [livePress({ sessionId: 'parent', agent: 'codex', reply: 'Reading the record.\n\nChecking the tests.' })],
+    };
+    activity('parent', 'shown-first-card', 'commentary', 'Checking the tests.');
+    assert.deepEqual(
+      await wake(),
+      { refreshes: 1, walks: 0, renders: 1 },
+      'a shown session with no recorded turn did not draw its first live card',
+    );
+    const drawn = fixture.posted.find((message) => message.type === 'render')!;
+    assert.deepEqual(
+      (fixture.usage(drawn) as Array<{ reply: string }>).map((card) => card.reply),
+      ['Reading the record.\n\n'],
+      'the live card drawn for a shown session kept commentary in its reply',
+    );
+
+    const recorded = turn({ sessionId: 'parent', startedAt: 1_000, endedAt: 1_500, finished: true });
+    provider.newestBySession = new Map([['parent', recorded]]);
+    provider.cards = [fixture.call.renderTurnCard(recorded, true, 'Parent', Date.now())];
+    activity('listed', 'listed-beside-card');
+    activity('parent', 'shown-beside-listed');
+    assert.deepEqual(await wake(), { refreshes: 1, walks: 0, renders: 0 });
+    assert.ok(
+      fixture.posted.some((message) => message.type === 'activity' && message.session === 'parent'),
+      'a session with no card dropped the live activity of the next session in its batch',
+    );
+
+    const other = { webview: {}, visible: () => true };
+    provider.hosts.push(other);
+    provider.readyHosts.add(other);
+    provider.hostSessions.set(other, 'listed');
+    activity('listed', 'other-panel-first-card');
+    assert.deepEqual(
+      await wake(),
+      { refreshes: 1, walks: 0, renders: 2 },
+      'a session that only another panel shows did not draw its first live card',
+    );
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test('a parent activity refresh that finds grown child usage still offers the child to Project cost', async () => {
+  const directory = tempDir('activity-fallback-spend-');
+  const empty = tempDir('activity-fallback-spend-roots-');
+  vi.stubEnv('ARC_PROJECTS_ROOT', empty);
+  vi.stubEnv('ARC_CODEX_ROOT', empty);
+  vi.useFakeTimers();
+  try {
+    const childFile = path.join(directory, 'child.jsonl');
+    const { fixture, provider, activity, wake, shownFile } = activityFallbackFixture(directory, [
+      { sessionId: 'child', file: childFile },
+    ]);
+    const indexed: string[] = [];
+    Object.assign(provider, {
+      watching: true,
+      projectSpendHydrated: true,
+      projectSpendWorkspace: 'workspace',
+      projectSpendStorageDir: directory,
+      projectSpendQueue: [],
+      projectSpendQueued: new Set(),
+      projectSpendTick: null,
+      claudeSpendSources: [
+        { file: shownFile, primary: true },
+        { file: childFile, primary: false },
+      ],
+      codexSpendSources: [],
+      postProjectSpend() {},
+      postDispatchedCostsIfMoved() {},
+      postRailIfSpendPendingMoved() {},
+      // Each source that reaches indexing is recorded in place of being read.
+      indexNextProjectSpendFile(this: Record<string, any>) {
+        indexed.push(...this.projectSpendQueue.map((source: { file: string }) => source.file));
+        this.projectSpendQueue = [];
+        this.projectSpendQueued.clear();
+        this.projectSpendTick = null;
+        this.projectSpendIndexing = false;
+      },
+    });
+    await provider.refresh(true, true);
+    await Promise.all(fixture.refreshes);
+    await vi.advanceTimersByTimeAsync(10);
+    assert.ok(indexed.includes(childFile), 'the first offer skipped the child transcript');
+    indexed.length = 0;
+
+    // The child appends usage. Parent activity refreshes first, and its discovery reads the
+    // grown child before the child's own change event arrives.
+    fs.appendFileSync(childFile, '{"usage":true}\n');
+    activity('parent', 'parent-tool');
+    await wake();
+    provider.wakeFromWatch(directory, 'child.jsonl', 'change');
+    await wake();
+    assert.ok(
+      indexed.includes(childFile),
+      'child usage that a parent refresh discovered never reached Project cost indexing',
+    );
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
+});
+
 test('a press is confirmed by its own handoff answer, not by the host becoming busy', () => {
   const at = panelHostSource.indexOf('public setRunning(');
   const body = memberFrom(panelHostSource, at);
@@ -22666,8 +22894,8 @@ test('the panel watches transcript paths and hands each burst to the bounded sch
   );
   sourceMatch(
     runBody,
-    /batch\.reasons\.includes\('activity-fallback'\)/,
-    'a no-card activity wake can be skipped when the transcript signature has not moved',
+    /this\.refreshFrom\(reason, batch\.drawRequired,/,
+    'a shown session with no card can miss its first live card when the transcript signature has not moved',
   );
 
   // Stopping polling closes transcript-directory watchers.

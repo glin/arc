@@ -2,6 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert';
 import {
   BoundedTrailingScheduler,
+  listedFilesFor,
   mergeRefreshRequests,
   PendingWatcherWake,
   RefreshRequest,
@@ -144,6 +145,50 @@ test('unknown filenames and rename events retain the broad watcher path', () => 
   const unknown = new PendingWatcherWake();
   unknown.noteFileEvent('records', 'unknown.jsonl', 'change');
   assert.equal(watcherRefreshDecision(unknown.take(), () => false).kind, 'broad');
+});
+
+test('live activity with no card names listed transcripts and draws only for a shown session', () => {
+  const catalog = [
+    { sessionId: 'shown', file: 'shown.jsonl' },
+    { sessionId: 'listed', file: 'listed.jsonl' },
+    { sessionId: 'listed', file: 'listed-continued.jsonl' },
+  ];
+  const listed = new PendingWatcherWake();
+  listed.noteActivityFallback(listedFilesFor(['listed'], catalog), false);
+  const quiet = listed.take();
+  assert.deepEqual(
+    watcherRefreshDecision(quiet, () => true),
+    { kind: 'targeted', changedPaths: ['listed-continued.jsonl', 'listed.jsonl'] },
+    'a session with two listed transcripts did not name both',
+  );
+  assert.equal(quiet.drawRequired, false);
+  assert.deepEqual(quiet.reasons, ['activity-fallback']);
+
+  const shown = new PendingWatcherWake();
+  shown.noteActivityFallback(listedFilesFor(['shown'], catalog), true);
+  const drawn = shown.take();
+  assert.equal(watcherRefreshDecision(drawn, () => true).kind, 'targeted');
+  assert.equal(drawn.drawRequired, true);
+  assert.equal(shown.take().drawRequired, false, 'a taken draw stays pending for the next wake');
+
+  const unlisted = new PendingWatcherWake();
+  unlisted.noteActivityFallback(listedFilesFor(['listed', 'new'], catalog), false);
+  assert.equal(watcherRefreshDecision(unlisted.take(), () => true).kind, 'broad');
+});
+
+test('a large burst of known transcript changes revalidates every file by name', () => {
+  const pending = new PendingWatcherWake();
+  for (let index = 0; index < 200; index++) {
+    pending.noteFileEvent('records', `${index}.jsonl`, 'change');
+  }
+  pending.noteActivityFallback(['listed.jsonl'], false);
+  const burst = pending.take();
+  assert.equal(burst.changedPaths.length, 201);
+  assert.equal(
+    watcherRefreshDecision(burst, () => true).kind,
+    'targeted',
+    'a burst of known transcript changes walked the whole catalog',
+  );
 });
 
 test('the ledger maximum bounds continuous changes and finish flushes the pending save once', () => {
