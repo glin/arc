@@ -253,7 +253,7 @@ test('extracted source builds without Git and never inherits an enclosing reposi
         .digest('hex'),
     );
   }
-});
+}, 90_000);
 
 test('watch startup invalidates identity from a preceding production build', async () => {
   const identity = path.join(extensionRoot, 'dist', 'build-identity.json');

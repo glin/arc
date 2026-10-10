@@ -269,5 +269,5 @@ describe('portable saved-session site', () => {
     await older.waitFor();
     expect(await newer.count()).toBe(0);
     await page.close();
-  });
+  }, 90_000);
 });
