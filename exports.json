@@ -1,0 +1,12 @@
+{
+  "arc-read-state": "export-arc-read-state.html",
+  "arc-codex-read-state": "export-arc-codex-read-state.html",
+  "arc-cache-run": "export-arc-cache-run.html",
+  "arc-luna-read-state-tests": "export-arc-luna-read-state-tests.html",
+  "arc-sol-read-state": "export-arc-sol-read-state.html",
+  "delegated-cost": "export-delegated-cost.html",
+  "arc-demo-sketch": "export-arc-demo-sketch.html",
+  "arc-demo-dispatch": "export-arc-demo-dispatch.html",
+  "arc-demo-review": "export-arc-demo-review.html",
+  "arc-demo-continuation": "export-arc-demo-continuation.html"
+}
