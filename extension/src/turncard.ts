@@ -3391,9 +3391,13 @@ function chipsOf(
       metric: 'files',
       detailList,
     });
-  } else if (status !== 'running') {
-    // A nonrunning turn with no recorded file changes names the recording limits.
+  } else if (
+    status !== 'running' &&
+    (turn.toolUses > 0 || turn.agents.length > 0 || turn.commits.length > 0 || turn.usage.output > 0)
+  ) {
+    // A nonrunning turn that did something but recorded no file changes names the recording limits.
     // This does not establish that the turn changed no files.
+    // A turn where nothing happened shows no files figure, because it had no work that could change a file.
     const detailList: StatDetailList = {
       heading: { label: 'No file changes recorded for this turn' },
       entries: [

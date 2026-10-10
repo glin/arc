@@ -105,6 +105,7 @@ import {
   recordCommit,
   recordLanding,
   skillUse,
+  subagent,
   subagentCommitTurn,
   turn,
 } from './turnfixtures.ts';
@@ -1039,7 +1040,7 @@ const changed = (path: string, added: number, removed: number) => ({ path, added
 // Read figures and marks from a summary containing both closing rows.
 
 const closingCard = (rows: string[]) => {
-  const card = toCard(turn({ summary: ['- The work landed.', '', ...rows].join('\n') }), false, NOW);
+  const card = toCard(turn({ summary: ['- The work landed.', '', ...rows].join('\n'), toolUses: 1 }), false, NOW);
   return {
     labels: card.chips.map((c) => c.label),
     kinds: card.chips.map((c) => c.kind),
@@ -1911,16 +1912,20 @@ test('a card carries the figures the panel shows, and omits the ones with nothin
 
   assert.equal(card.chips[4].detail, ['1 commit: +12', '', '00facf2a: Add the timeline'].join('\n'));
 
-  // A turn with no file changes carries only the no-change figure.
+  // A turn that answered in text with no file changes carries the no-change figure, its cost, and its output.
 
-  const empty = toCard(turn({ summary: 'Answered your question.' }), false, NOW);
+  const empty = toCard(
+    turn({ summary: 'Answered your question.', usage: { ...turn().usage, output: 50 } }),
+    false,
+    NOW,
+  );
   assert.deepEqual(
     empty.chips.map((c) => c.label),
-    ['no file changes'],
+    ['<$0.01', 'no file changes', '50 out'],
   );
   assert.deepEqual(
     foldedChips(empty.chips).map((c) => c.label),
-    ['no file changes'],
+    ['<$0.01', 'no file changes', '50 out'],
   );
 });
 
@@ -6639,15 +6644,15 @@ test('a card leads with latest activity and carries its start on the duration ho
   assert.equal(cc.absolute, '3:05 PM');
 });
 
-test('a turn with no file changes says so, in every status but a running one', () => {
+test('a turn that did work and changed no files says so, in every status but a running one', () => {
   const chipLabels = (card: TurnCard) => card.chips.map((c) => c.label);
   // Finished, failed, interrupted, and stopped turns all expose the no-file-change figure when their file list is empty.
 
   for (const [status, card] of [
-    ['done', toCard(turn({ summary: 'Read the parser.' }), false, NOW)],
-    ['failed', toCard(turn({ error: 'Overloaded.' }), false, NOW)],
-    ['interrupted', toCard(turn({ finished: false, interrupted: true }), false, NOW)],
-    ['stopped', toCard(turn({ finished: false }), false, NOW)],
+    ['done', toCard(turn({ summary: 'Read the parser.', toolUses: 1 }), false, NOW)],
+    ['failed', toCard(turn({ error: 'Overloaded.', toolUses: 1 }), false, NOW)],
+    ['interrupted', toCard(turn({ finished: false, interrupted: true, toolUses: 1 }), false, NOW)],
+    ['stopped', toCard(turn({ finished: false, toolUses: 1 }), false, NOW)],
   ] as [string, TurnCard][]) {
     assert.equal(card.status, status, `the ${status} fixture is not a ${status} turn`);
     assert.ok(chipLabels(card).includes('no file changes'), `a ${status} turn should say it changed nothing`);
@@ -6667,7 +6672,29 @@ test('a turn with no file changes says so, in every status but a running one', (
   );
   assert.ok(!chipLabels(edited).includes('no file changes'));
   assert.ok(chipLabels(edited).includes('1 file'));
-  const emptyDetail = toCard(turn({ summary: 'Read the parser.' }), false, NOW).chips.find(
+  // A turn where nothing happened has no files figure: no tool calls, subagents, commits, or output.
+  const failedEarly = toCard(turn({ error: 'Credit balance is too low' }), false, NOW);
+  assert.equal(failedEarly.status, 'failed', 'the fixture must be a failed turn');
+  assert.ok(!failedEarly.chips.some((chip) => chip.metric === 'files'));
+  // A turn whose only work is a subagent, or only a commit, keeps the figure.
+  const agentOnly = toCard(turn({ summary: 'Delegated.', agents: [subagent()] }), false, NOW);
+  assert.ok(
+    chipLabels(agentOnly).includes('no file changes'),
+    'a turn with only a subagent should say it changed nothing',
+  );
+  const commitOnly = toCard(
+    turn({ summary: 'Committed.', commits: [recordCommit('abc1234', 'Record the change', 0)] }),
+    false,
+    NOW,
+  );
+  assert.ok(
+    chipLabels(commitOnly).includes('no file changes'),
+    'a turn with only a commit should say it changed nothing',
+  );
+  // A turn that recorded output tokens keeps the figure.
+  const answered = toCard(turn({ summary: 'Answered.', usage: { ...turn().usage, output: 50 } }), false, NOW);
+  assert.ok(chipLabels(answered).includes('no file changes'));
+  const emptyDetail = toCard(turn({ summary: 'Read the parser.', toolUses: 1 }), false, NOW).chips.find(
     (chip) => chip.label === 'no file changes',
   )!.detail;
   assert.match(emptyDetail, /Changes outside edit tools/);
