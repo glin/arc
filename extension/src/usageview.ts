@@ -512,7 +512,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
       plan: usage ? usagePlanLabel(usage) : '',
       lines,
       exact: Number.isFinite(agentReadAt) ? new Date(agentReadAt).toLocaleString() : '',
-      status: ['success', 'waiting'].includes(refresh?.agents[agent]?.phase ?? '') ? '' : (statuses[agent] ?? ''),
+      status: ['failed', 'empty'].includes(refresh?.agents[agent]?.phase ?? '') ? (statuses[agent] ?? '') : '',
     });
   }
   if (!groups.length) {
@@ -527,7 +527,13 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
   const readWord = Number.isFinite(readAt) ? age || 'updated just now' : '';
   // Adds the reading's clock time to stale accessible age wording.
   const spokenAge = stale ? `${age}, ${formatClock(readAt)}` : '';
-  const said = [briefs.map((b) => b.name).join('. '), spokenAge, ...Object.values(statuses)].filter(Boolean).join(', ');
+  const said = [
+    briefs.length ? briefs.map((b) => b.name).join('. ') : 'Account usage',
+    spokenAge,
+    ...Object.values(statuses),
+  ]
+    .filter(Boolean)
+    .join(', ');
   const busy = Object.values(refresh?.agents ?? {}).some((state) =>
     ['discovering', 'queued', 'waiting', 'reading'].includes(state.phase),
   );

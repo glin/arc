@@ -132,6 +132,10 @@ test('usage progress survives absent or expired figures and retains retry after 
     const bar = usageBar(readings, NOW, refresh)!;
     assert.equal(bar.groups.length, 2);
     assert.equal(bar.briefs.length, 0);
+    assert.match(
+      bar.name,
+      /^Account usage, Claude: Waiting for current work, Codex: Usage read\. Press to show every limit\.$/,
+    );
     assert.equal(bar.age, '');
     assert.equal(bar.groups[0].status, '');
     assert.equal(bar.groups[0].exact, '');
@@ -143,10 +147,56 @@ test('usage progress survives absent or expired figures and retains retry after 
     const terminal = usageBar(readings, NOW, refresh)!;
     assert.equal(terminal.refresh?.busy, false);
     assert.equal(terminal.read, 'Read again');
+    assert.match(
+      terminal.name,
+      /^Account usage, Claude: Usage reading failed.*Codex: Usage read\. Press to show every limit\.$/,
+    );
     assert.ok(terminal.groups[0].status);
     assert.equal(terminal.groups[1].status, '');
     assert.match(terminal.refresh!.announcement, /Claude.*failed.*Codex.*read/);
     refresh.agents.claude = { phase: 'waiting', detail: '' };
+  }
+});
+
+test('only the bottom usage status reports queued and reading progress for either provider', () => {
+  for (const agents of [['claude'], ['codex'], ['claude', 'codex']]) {
+    for (const phase of ['queued', 'waiting', 'reading', 'success'] as const) {
+      for (const readings of [
+        [],
+        [CLAUDE, CODEX],
+        [usage({ windows: [reading({ resetsAtSeconds: seconds(NOW - 1) })] })],
+      ]) {
+        const bar = usageBar(readings, NOW, {
+          id: 9,
+          agents: Object.fromEntries(agents.map((agent) => [agent, { phase, detail: '' }])),
+        })!;
+        assert.ok(bar);
+        assert.ok(
+          bar.groups.every((group) => group.status === ''),
+          `${agents.join(', ')} ${phase} adds a progress row`,
+        );
+        assert.equal(bar.refresh?.busy, phase !== 'success');
+        if (!bar.briefs.length) {
+          assert.match(bar.name, /^Account usage, /);
+          assert.match(bar.name, /\. Press to show every limit\.$/);
+        }
+        if (phase !== 'success') {
+          assert.equal(bar.read, 'Reading usage');
+          assert.equal(bar.refresh?.announcement, '');
+        }
+      }
+    }
+  }
+});
+
+test('the collapsed usage name includes its visible label during mixed queued and reading progress', () => {
+  for (const readings of [[], [usage({ windows: [reading({ resetsAtSeconds: seconds(NOW - 1) })] })]]) {
+    const bar = usageBar(readings, NOW, {
+      id: 10,
+      agents: { claude: { phase: 'queued', detail: '' }, codex: { phase: 'reading', detail: '' } },
+    })!;
+    assert.equal(bar.briefs.length, 0);
+    assert.equal(bar.name, 'Account usage, Claude: Queued, Codex: Reading usage. Press to show every limit.');
   }
 });
 
@@ -748,7 +798,7 @@ test('an agent whose only live limit is scoped keeps its group and leaves the li
     ['Fable'],
   );
   assert.deepEqual(bar?.briefs, [], 'an agent with nothing to say collapsed put its name there anyway');
-  assert.equal(bar?.name, 'Press to show every limit.');
+  assert.equal(bar?.name, 'Account usage. Press to show every limit.');
 });
 
 test('one model with a limit on both clocks keeps a line and a key for each', () => {

@@ -345,9 +345,7 @@ function ControlsView(props: {
             },
             [
               ...props.bar.briefs.map((brief) => h(UsageBriefView, { key: brief.agent, brief })),
-              !props.bar.briefs.length
-                ? h('span', { class: 'sbagent' }, props.bar.refresh?.busy ? 'Reading usage' : 'Account usage')
-                : null,
+              !props.bar.briefs.length ? h('span', { class: 'sbagent' }, 'Account usage') : null,
               props.bar.age ? h('span', { class: 'sbage' }, props.bar.age) : null,
               h('span', { class: 'sbtwist' }, shown ? TWIST.open : TWIST.shut),
             ],
