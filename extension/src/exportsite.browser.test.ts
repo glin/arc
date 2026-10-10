@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { browserOrNone } from '../test/browser.ts';
 import { tempDir } from './temproot';
 import { ExportTransaction } from './exportwriter';
-import { sessionSiteFixture } from './turnfixtures';
+import { exportedSiteData, sessionSiteFixture } from './turnfixtures';
 import { projectSessionSite } from './exportsite';
 import { exportBrowserAssets } from './panelbundle';
 import { EXPORT_LIMITS } from './exportlimits';
@@ -240,15 +240,20 @@ describe('portable saved-session site', () => {
     const writer = await ExportTransaction.create(tempDir('arc-site-rollover-'));
     const model = await sessionSiteFixture(writer);
     model.sessions = [model.sessions[0]];
+    // The viewer drops the newer page only when both pages together exceed the retained byte limit.
+    // A card holds its answer text about five times, so each page lands just above half of the limit.
     for (const index of [0, 1]) {
       const spool = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[index]);
       spool.turns[0].blocks.find((block) => block.kind === 'answer')!.text =
-        'x'.repeat(5 * 1024 * 1024) + ` complete ${index}`;
+        'x'.repeat(3.5 * 1024 * 1024) + ` complete ${index}`;
       model.sessions[0].pages[index] = await writer.spool(spool);
     }
     model.sessions[0].pages = model.sessions[0].pages.slice(0, 2);
     await projectSessionSite(model, writer, exportBrowserAssets());
     const captured = await writer.publish(async () => {});
+    const pageBytes = exportedSiteData(captured.directory).manifest.sessions[0].pages.map((value) => value.bytes);
+    expect(pageBytes).toHaveLength(2);
+    expect(pageBytes[0] + pageBytes[1]).toBeGreaterThan(EXPORT_LIMITS.retainedBytes);
     const page = await browser!.newPage();
     await page.goto(pathToFileURL(captured.index).href);
     const newer = page.locator('article[data-key="root-21"]');
