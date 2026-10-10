@@ -13,6 +13,7 @@ import type {
   CacheExpiryCarry,
   CacheExpiryFacts,
   CacheExpiryLedger,
+  CacheExpiryCarryCompaction,
   CacheExpiryReturn,
   CompactionFact,
   ProjectUsageBucket,
@@ -793,7 +794,13 @@ function cacheExpiryCarry(value: unknown): CacheExpiryCarry | null {
   ) {
     return null;
   }
+  const compaction =
+    value.compaction === undefined ? undefined : cacheExpiryCarryCompaction(value.compaction, value.compactionsBefore);
+  if (compaction === null) {
+    return null;
+  }
   return {
+    ...(compaction ? { compaction } : {}),
     requestKey: value.requestKey,
     timestamp: value.timestamp,
     visibleTurnId: value.visibleTurnId,
@@ -810,12 +817,44 @@ function cacheExpiryCarry(value: unknown): CacheExpiryCarry | null {
   };
 }
 
+// A compaction the carry measures from comes after the request it keeps.
+function cacheExpiryCarryCompaction(value: unknown, requestCompactions: number): CacheExpiryCarryCompaction | null {
+  if (
+    !record(value) ||
+    !nonNegativeInteger(value.ordinal) ||
+    value.ordinal <= requestCompactions ||
+    !(value.at === null || timestamp(value.at)) ||
+    !(value.prefixTokens === null || nonNegativeInteger(value.prefixTokens))
+  ) {
+    return null;
+  }
+  return { ordinal: value.ordinal, at: value.at, prefixTokens: value.prefixTokens };
+}
+
 function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
-  if (!record(value) || !cacheTier(value.lifetime) || !nonNegativeInteger(value.gapMs)) {
+  if (
+    !record(value) ||
+    !cacheTier(value.lifetime) ||
+    !nonNegativeInteger(value.gapMs) ||
+    !(value.visibleTurnId === undefined || value.visibleTurnId === null || nonEmptyText(value.visibleTurnId)) ||
+    !(
+      value.previousInputSide === undefined ||
+      value.previousInputSide === null ||
+      nonNegativeInteger(value.previousInputSide)
+    )
+  ) {
     return null;
   }
   const request = bucket(value.request);
-  return request ? { lifetime: value.lifetime, gapMs: value.gapMs, request } : null;
+  return request
+    ? {
+        lifetime: value.lifetime,
+        gapMs: value.gapMs,
+        request,
+        visibleTurnId: value.visibleTurnId ?? null,
+        previousInputSide: value.previousInputSide ?? null,
+      }
+    : null;
 }
 
 function compactionFact(value: unknown): CompactionFact | null {

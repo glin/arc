@@ -13,7 +13,7 @@ import {
   scanCodexDispatchReferences,
 } from './codex';
 import { CACHE_LIFETIME_MS, PROMOTIONS, cacheLifetimeFor, quoteUsage, type CacheTier } from './pricing';
-import { discoverClaudeSessionSpendSources, spendFileIsClaudeChild } from './projectspend';
+import { cacheExpiryRebuiltUsage, discoverClaudeSessionSpendSources, spendFileIsClaudeChild } from './projectspend';
 import {
   createClaudeUsageLineReducer,
   listSessionFiles,
@@ -73,6 +73,8 @@ interface CacheExpiryReport {
   coverage: 'complete' | 'unknown-request-coverage';
   returns: number;
   inputCostAfterExpiryUsd: number | null;
+  // What the returns paid to resend the previous request's context, beyond a cache read of it.
+  extraCostAfterExpiryUsd: number | null;
   byLifetime: Record<CacheTier, number>;
   byBoundary: { afterAUserTurn: number; insideOneTurn: number; turnUnknown: number };
   longestGapSeconds: number | null;
@@ -246,6 +248,7 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
     coverage: 'complete',
     returns: 0,
     inputCostAfterExpiryUsd: 0,
+    extraCostAfterExpiryUsd: 0,
     byLifetime: { '5m': 0, '30m': 0, '1h': 0 },
     byBoundary: { afterAUserTurn: 0, insideOneTurn: 0, turnUnknown: 0 },
     longestGapSeconds: null,
@@ -301,22 +304,29 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
         : beforeTurn === afterTurn
           ? 'insideOneTurn'
           : 'afterAUserTurn';
-    const usage = { ...after.usage, requests: 1, cacheRead: 0, output: 0, thinking: 0 };
+    const quoteOf = (usage: SessionRequest['usage']) =>
+      quoteUsage({
+        usage,
+        model: after.model,
+        provider: after.provider,
+        contextWindow: after.contextWindow,
+        requestTokens: inputTokens(after),
+        inferenceClass: after.inferenceClass,
+        serviceTier: after.serviceTier,
+        reportedCost: null,
+      });
     const quote =
       after.reportedCost !== null || after.incomplete || (after.unclassifiedCacheWrite ?? 0) > 0
         ? null
-        : quoteUsage({
-            usage,
-            model: after.model,
-            provider: after.provider,
-            contextWindow: after.contextWindow,
-            requestTokens: inputTokens(after),
-            inferenceClass: after.inferenceClass,
-            serviceTier: after.serviceTier,
-            reportedCost: null,
-          });
+        : quoteOf({ ...after.usage, requests: 1, cacheRead: 0, output: 0, thinking: 0 });
     if (!quote) report.inputCostAfterExpiryUsd = null;
     else if (report.inputCostAfterExpiryUsd !== null) report.inputCostAfterExpiryUsd += quote.cost;
+    const rebuilt = quote ? cacheExpiryRebuiltUsage(inputTokens(before), after.usage) : null;
+    const paid = rebuilt ? quoteOf(rebuilt.paid) : null;
+    const asRead = rebuilt ? quoteOf(rebuilt.asRead) : null;
+    if (!paid || !asRead) report.extraCostAfterExpiryUsd = null;
+    else if (report.extraCostAfterExpiryUsd !== null)
+      report.extraCostAfterExpiryUsd += Math.max(0, paid.cost - asRead.cost);
     report.returns++;
     report.byLifetime[lifetime]++;
     report.byBoundary[boundary]++;
@@ -333,6 +343,8 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
   }
   if (report.inputCostAfterExpiryUsd !== null)
     report.inputCostAfterExpiryUsd = round(report.inputCostAfterExpiryUsd, 4);
+  if (report.extraCostAfterExpiryUsd !== null)
+    report.extraCostAfterExpiryUsd = round(report.extraCostAfterExpiryUsd, 4);
   report.largest.sort((a, b) => (b.inputCostUsd ?? -1) - (a.inputCostUsd ?? -1));
   report.largest = report.largest.slice(0, 5);
   return report;
@@ -462,6 +474,7 @@ export function summarizeRequests(
     if (evidence.length) {
       diagnostics.cacheExpiry.coverage = 'unknown-request-coverage';
       diagnostics.cacheExpiry.inputCostAfterExpiryUsd = null;
+      diagnostics.cacheExpiry.extraCostAfterExpiryUsd = null;
     }
     Object.assign(summary, diagnostics);
     if (coverage) summary.coverage = coverage;
@@ -481,6 +494,7 @@ export function summarizeRequests(
   ) {
     diagnostics.cacheExpiry.coverage = 'unknown-request-coverage';
     diagnostics.cacheExpiry.inputCostAfterExpiryUsd = null;
+    diagnostics.cacheExpiry.extraCostAfterExpiryUsd = null;
   }
   const requestCountExact =
     !uncertainCoverage && pricedRequests.every((request) => request.requestCountExact !== false);
@@ -691,6 +705,12 @@ export function sessionCostReport(
     inputCostAfterExpiryUsd: expiries.every((item) => item.inputCostAfterExpiryUsd !== null)
       ? round(
           expiries.reduce((sum, item) => sum + item.inputCostAfterExpiryUsd!, 0),
+          4,
+        )
+      : null,
+    extraCostAfterExpiryUsd: expiries.every((item) => item.extraCostAfterExpiryUsd !== null)
+      ? round(
+          expiries.reduce((sum, item) => sum + item.extraCostAfterExpiryUsd!, 0),
           4,
         )
       : null,

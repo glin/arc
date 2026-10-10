@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
+import { quoteUsage } from './pricing';
 import * as projectSpend from './projectspend';
 import * as codexReader from './codex';
 import {
@@ -3404,4 +3405,63 @@ test('Bedrock Astra parent and native Plato each price their own requests exactl
       quantities,
     );
   }
+});
+
+test('cache-expiry evidence reports the cost a warm cache would have saved beside the input cost', () => {
+  const file = path.join(directory(), 'expired.jsonl');
+  const usage = (input: number, write5m: number, read = 0) => ({
+    input_tokens: input,
+    output_tokens: 1,
+    cache_read_input_tokens: read,
+    cache_creation: { ephemeral_5m_input_tokens: write5m, ephemeral_1h_input_tokens: 0 },
+  });
+  const records = [
+    { type: 'user', timestamp: '2026-09-26T00:00:00Z', message: { content: 'first' } },
+    {
+      type: 'assistant',
+      timestamp: '2026-09-26T00:00:01Z',
+      message: { id: 'one', model: 'claude-opus-5', usage: usage(100, 299_900), content: [] },
+    },
+    { type: 'user', timestamp: '2026-09-26T01:00:00Z', message: { content: 'second' } },
+    {
+      type: 'assistant',
+      timestamp: '2026-09-26T01:00:01Z',
+      message: { id: 'two', model: 'claude-opus-5', usage: usage(10_000, 300_000), content: [] },
+    },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const rate = (category: 'input' | 'cacheWrite5m' | 'cacheRead') =>
+    quoteUsage({
+      usage: {
+        requests: 1,
+        input: 0,
+        cacheWrite1h: 0,
+        cacheWrite5m: 0,
+        cacheWrite30m: 0,
+        cacheRead: 0,
+        output: 0,
+        thinking: 0,
+        [category]: 1_000_000,
+      },
+      model: 'claude-opus-5',
+      provider: null,
+      contextWindow: null,
+      requestTokens: 1,
+      inferenceClass: null,
+      serviceTier: null,
+      reportedCost: null,
+    })!.cost / 1_000_000;
+
+  const expiry = sessionCostReport(file, { sourceOnly: true }).parent.cacheExpiry!;
+
+  assert.equal(expiry.returns, 1);
+  // The return resent the previous request's 300k context and sent 10k of new text.
+  assert.equal(
+    expiry.inputCostAfterExpiryUsd,
+    Number((10_000 * rate('input') + 300_000 * rate('cacheWrite5m')).toFixed(4)),
+  );
+  assert.equal(
+    expiry.extraCostAfterExpiryUsd,
+    Number((300_000 * (rate('cacheWrite5m') - rate('cacheRead'))).toFixed(4)),
+  );
 });

@@ -12,6 +12,7 @@ import {
   BoundaryDiscoveryOptions,
   CacheLifetime,
   Compaction,
+  CompactionSignal,
   PatchHunk,
   ReadOptions,
   ReducerCompaction,
@@ -2110,6 +2111,9 @@ export interface CodexUsageLineReducer {
   turnCount(): number;
   compactionCount(): number;
   recentCompactions(): readonly ReducerCompaction[];
+  // Compactions recorded since the last call, oldest first. A compacted record emits no usage
+  // event, so the cache-expiry scan reads its compactions here.
+  takeCompactionSignals(): CompactionSignal[];
   firstTurnAt(): number | null;
   lastTurnAt(): number | null;
   newestTurnStartedAt(): number | null;
@@ -2183,10 +2187,22 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
     : emptyCodexUsageReducerState();
   state.currentTurnOutcome ??= null;
   state.lastTurnOutcome ??= null;
+  const signals: CompactionSignal[] = [];
   return {
     parserKind: 'codex',
     pushLine: (line) => {
+      const compactionsBefore = state.compactionCount;
       const events = reduceCodexUsageLineEvents(state, line);
+      // Compaction facts are the reducer's own, so a signal reads the retained entry it added.
+      // The prefix a Codex compaction leaves is not recorded.
+      if (state.compactionCount > compactionsBefore) {
+        for (const item of state.recentCompactions) {
+          if (item.ordinal > compactionsBefore) {
+            signals.push({ ordinal: item.ordinal, at: item.at, prefixTokens: null });
+          }
+        }
+        signals.splice(0, Math.max(0, signals.length - RETAINED_COMPACTIONS));
+      }
       for (const event of events) delete state.pendingRequestSources[event.requestKey];
       synchronizeCodexSpendAssociations(state);
       return [...events, ...compactCodexSpendAssociations(state)];
@@ -2198,6 +2214,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
     turnCount: () => state.closedTurns + (currentCodexTurnCounts(state) ? 1 : 0),
     compactionCount: () => state.compactionCount,
     recentCompactions: () => state.recentCompactions.map((item) => ({ ...item })),
+    takeCompactionSignals: () => signals.splice(0),
     firstTurnAt: () =>
       state.firstTurnAt !== null
         ? state.firstTurnAt

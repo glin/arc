@@ -7,7 +7,7 @@ import { mayHaveUnrecordedEdits, TOOL_KIND as CODEX_TOOL_KIND } from './codex';
 import { TOOL_KIND as CLAUDE_TOOL_KIND } from './transcript';
 import { FileIcon, iconFor } from './fileicons';
 import {
-  cacheExpiryInputCost,
+  cacheExpiryExtraCost,
   publicProjectSpendPrice,
   type CacheExpiryFacts,
   type CompactionFact,
@@ -2767,8 +2767,11 @@ export interface SessionContextDetail {
   footer?: string[];
 }
 
-function inputCostLabel(facts: CacheExpiryFacts): string {
-  const priced = cacheExpiryInputCost(facts, publicProjectSpendPrice);
+export const CACHE_EXPIRY_COST_ADDED_HINT =
+  'Paid to resend context after the cache expired, beyond the cache-read price for the same tokens. New prompt text is not counted.';
+
+function costAddedLabel(facts: CacheExpiryFacts): string {
+  const priced = cacheExpiryExtraCost(facts, publicProjectSpendPrice);
   if (priced.dollars === null) {
     return 'Unavailable';
   }
@@ -2814,7 +2817,7 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
     heading: { label: 'Cache expiry', value: `${count} affected ${count === 1 ? 'turn' : 'turns'}` },
     entries: [
       { label: 'Cache lifetimes', value: lifetimeParts.join(' · ') },
-      { label: 'Input cost on affected requests', value: inputCostLabel(facts) },
+      { label: 'Cost added', value: costAddedLabel(facts), valueTitle: CACHE_EXPIRY_COST_ADDED_HINT },
       ...(facts.longestGapMs === null
         ? []
         : [{ label: 'Longest qualifying gap', value: formatExpiryGap(facts.longestGapMs) }]),
@@ -2822,7 +2825,12 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
     ],
     footer: [
       ...(facts.returns.some((item) => item.request.reportedCost !== null)
-        ? ['One or more affected requests have only a provider-reported total. Their input cost is not available.']
+        ? ['One or more affected requests have only a provider-reported total. Cost added is not available for them.']
+        : []),
+      ...(facts.returns.some((item) => item.previousInputSide === null)
+        ? [
+            'One or more affected requests follow a compaction whose cached size is not recorded. Cost added is not available for them.',
+          ]
         : []),
     ],
     ...(facts.returns.some((item) => item.request.agent === 'codex')

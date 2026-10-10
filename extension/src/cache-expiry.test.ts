@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   CacheExpiryScan,
+  cacheExpiryExtraCost,
   cacheExpiryInputCost,
   cacheExpiryInputUsage,
   classifyCacheExpiry,
@@ -823,9 +824,11 @@ test('an abandoned compaction before a 16-hour gap leaves that gap counted as on
   const record = indexed(abandonedCompactionLines(), claudeReducer);
 
   assert.equal(record.compactionCount, 2, 'compaction B was abandoned and compaction A was replayed');
+  // The 81 minutes from m5 to m6 hold compaction C. Measured from C, m6 came a minute later, so
+  // the cold pass is the compaction's own cost and no pair is excluded.
   assert.deepEqual(summary(record), {
     counts: { '5m': 0, '30m': 0, '1h': 1 },
-    excluded: 1,
+    excluded: 0,
     unavailable: 0,
     longestGapMs: 970 * MINUTE,
     truncated: false,
@@ -1020,7 +1023,8 @@ test('a replayed record between a summary and the prompt after it never decides 
 
 // Older Claude Code builds keep a stretch of records across a compaction. The next prompt then
 // descends from the stretch's last record, so naming a preserved record does not leave the compaction.
-test('a prompt that names a preserved record keeps its compaction counted and shows no cache expiry', () => {
+// The return is then measured from the compaction, not from the request before it.
+test('a prompt that names a preserved record keeps its compaction counted and measures from it', () => {
   const preserved = { headUuid: 'u-p1', anchorUuid: 'c-A', tailUuid: 'a-m1' };
   const unrelated = { headUuid: 'u-other', anchorUuid: 'c-A', tailUuid: 'a-other' };
   const [boundary, summaryLine] = claudeLinkedCompaction(10, 'A', 'a-m1', preserved);
@@ -1038,18 +1042,20 @@ test('a prompt that names a preserved record keeps its compaction counted and sh
       const record = indexed([...opening(), ...compaction, ...after(parent)], claudeReducer);
       assert.equal(record.compactionCount, 1, `${order}: a prompt naming ${parent} revoked the compaction`);
       assert.deepEqual(summary(record), {
-        counts: { '5m': 0, '30m': 0, '1h': 0 },
-        excluded: 1,
+        counts: { '5m': 0, '30m': 0, '1h': 1 },
+        excluded: 0,
         unavailable: 0,
-        longestGapMs: null,
+        longestGapMs: SIXTEEN_HOURS * MINUTE,
         truncated: false,
       });
     }
   }
-  // Only the named records are exempt. A boundary that names other records still lets a prompt revoke.
+  // Only the named records are exempt. A boundary that names other records still lets a prompt
+  // revoke, and the return is measured from the request before the compaction again.
   const revoked = indexed([...opening(), plainBoundary, summaryLine, ...after('a-m1')], claudeReducer);
   assert.equal(revoked.compactionCount, 0);
   assert.equal(facts(revoked).counts['1h'], 1);
+  assert.equal(facts(revoked).longestGapMs, (SIXTEEN_HOURS + 9) * MINUTE);
 });
 
 test('a billed answer decides a compaction, and a synthetic answer does not', () => {
@@ -1779,7 +1785,7 @@ const pricer = (bucket: ProjectUsageBucket) => publicProjectSpendPrice(bucket);
 test('the attributed figure prices the cold input alone and calls a reported row unknown', () => {
   const warm: CacheExpiryFacts = {
     counts: { '5m': 0, '30m': 1, '1h': 0 },
-    returns: [{ lifetime: '30m', gapMs: 31 * MINUTE, request: priced() }],
+    returns: [{ lifetime: '30m', gapMs: 31 * MINUTE, request: priced(), visibleTurnId: 'b', previousInputSide: 0 }],
     truncated: false,
     longestGapMs: 31 * MINUTE,
     excluded: 0,
@@ -1793,7 +1799,15 @@ test('the attributed figure prices the cold input alone and calls a reported row
 
   const reported: CacheExpiryFacts = {
     ...warm,
-    returns: [{ lifetime: '30m', gapMs: 31 * MINUTE, request: priced({ reportedCost: 9 }) }],
+    returns: [
+      {
+        lifetime: '30m',
+        gapMs: 31 * MINUTE,
+        request: priced({ reportedCost: 9 }),
+        visibleTurnId: 'b',
+        previousInputSide: 0,
+      },
+    ],
   };
   assert.deepEqual(cacheExpiryInputCost(reported, pricer), { dollars: null, status: 'unknown' });
 
@@ -2236,4 +2250,363 @@ test('a child response rewritten after a compaction keeps that compaction in the
     [[1, 4_100, 2_002]],
     'the rewrite moved the compaction behind the request it revised',
   );
+});
+
+// ## Added cost and the compaction a return is measured from
+
+const claudeBucket = (usage: Partial<ProjectUsageBucket['usage']>, over: Partial<ProjectUsageBucket> = {}) =>
+  priced({
+    agent: 'claude',
+    provider: null,
+    model: 'claude-sonnet-5',
+    contextWindow: null,
+    contextBand: null,
+    billingClass: 'unknown',
+    usage: { ...cold, input: 0, ...usage },
+    ...over,
+  });
+
+// The price of one token in each category, read from the public price list so the expected
+// figures below come from token counts alone.
+const perToken = (category: 'input' | 'cacheWrite1h' | 'cacheWrite5m' | 'cacheRead') =>
+  pricer(claudeBucket({ [category]: 1_000_000 }))!.dollars / 1_000_000;
+
+const expiryReturn = (request: ProjectUsageBucket, previousInputSide: number | null) => ({
+  lifetime: '5m' as const,
+  gapMs: 60 * MINUTE,
+  request,
+  visibleTurnId: 'claude-turn:2',
+  previousInputSide,
+});
+
+const expiryFactsOf = (
+  returns: CacheExpiryFacts['returns'],
+  over: Partial<CacheExpiryFacts> = {},
+): CacheExpiryFacts => ({
+  counts: { '5m': returns.length, '30m': 0, '1h': 0 },
+  returns,
+  truncated: false,
+  longestGapMs: 60 * MINUTE,
+  excluded: 0,
+  unavailable: 0,
+  ...over,
+});
+
+test('the added cost counts only the context a warm cache would have read', () => {
+  const close = (actual: number | null, expected: number) =>
+    assert.ok(actual !== null && Math.abs(actual - expected) < 1e-9, `${actual} is ${expected}`);
+  const write5m = perToken('cacheWrite5m');
+  const write1h = perToken('cacheWrite1h');
+  const read = perToken('cacheRead');
+  const input = perToken('input');
+  assert.ok(write1h > write5m && write5m > read && input > read, 'the price list separates the categories');
+
+  // A 300k previous request and a fully cold 310k return: 300k was resent, 10k is new text.
+  const fullyCold = claudeBucket({ input: 10_000, cacheWrite5m: 300_000 });
+  close(
+    cacheExpiryExtraCost(expiryFactsOf([expiryReturn(fullyCold, 300_000)]), pricer).dollars,
+    300_000 * (write5m - read),
+  );
+
+  // A return that still read 290k and wrote 20k resent only the 10k the cache lost.
+  const partlyWarm = claudeBucket({ cacheRead: 290_000, cacheWrite5m: 20_000 });
+  close(
+    cacheExpiryExtraCost(expiryFactsOf([expiryReturn(partlyWarm, 300_000)]), pricer).dollars,
+    10_000 * (write5m - read),
+  );
+
+  // A return that read the whole previous context added nothing, whatever new text it sent.
+  const warm = claudeBucket({ cacheRead: 300_000, input: 4_000, cacheWrite5m: 6_000 });
+  assert.deepEqual(cacheExpiryExtraCost(expiryFactsOf([expiryReturn(warm, 300_000)]), pricer), {
+    dollars: 0,
+    status: 'exact',
+  });
+
+  // Mixed lifetimes: the 1-hour write is taken first, then the 5-minute write, each at its own rate.
+  const mixed = claudeBucket({ cacheWrite1h: 100_000, cacheWrite5m: 250_000, input: 50_000 });
+  close(
+    cacheExpiryExtraCost(expiryFactsOf([expiryReturn(mixed, 300_000)]), pricer).dollars,
+    100_000 * (write1h - read) + 200_000 * (write5m - read),
+  );
+
+  // Uncached input is resent context too when the return wrote nothing.
+  const uncached = claudeBucket({ input: 50_000 });
+  close(cacheExpiryExtraCost(expiryFactsOf([expiryReturn(uncached, 30_000)]), pricer).dollars, 30_000 * (input - read));
+});
+
+test('the added cost says at least, or unavailable, on the same rules as the input cost', () => {
+  const resent = claudeBucket({ cacheWrite5m: 100_000 });
+  const exact = cacheExpiryExtraCost(expiryFactsOf([expiryReturn(resent, 100_000)]), pricer);
+  assert.equal(exact.status, 'exact');
+  const dollars = exact.dollars!;
+  const atLeast = { dollars, status: 'atLeast' };
+
+  const dropped = expiryFactsOf([expiryReturn(resent, 100_000)], {
+    truncated: true,
+    counts: { '5m': 40, '30m': 0, '1h': 0 },
+  });
+  assert.deepEqual(cacheExpiryExtraCost(dropped, pricer), atLeast, 'returns dropped past the retained list');
+  for (const [reason, other] of [
+    ['an incomplete return', expiryReturn(claudeBucket({ cacheWrite5m: 1_000 }, { incomplete: true }), 100_000)],
+    ['a provider-reported total', expiryReturn(claudeBucket({ cacheWrite5m: 1_000 }, { reportedCost: 3 }), 100_000)],
+    ['a missing price', expiryReturn(claudeBucket({ cacheWrite5m: 1_000 }, { model: 'claude-unlisted' }), 100_000)],
+    ['an unknown prefix after a compaction', expiryReturn(claudeBucket({ cacheWrite5m: 1_000 }), null)],
+  ] as const) {
+    assert.deepEqual(
+      cacheExpiryExtraCost(expiryFactsOf([expiryReturn(resent, 100_000), other]), pricer),
+      atLeast,
+      reason,
+    );
+    assert.deepEqual(
+      cacheExpiryExtraCost(expiryFactsOf([other]), pricer),
+      { dollars: null, status: 'unknown' },
+      `${reason} alone prices nothing`,
+    );
+  }
+  assert.deepEqual(cacheExpiryExtraCost(expiryFactsOf([]), pricer), { dollars: 0, status: 'exact' });
+});
+
+const orderedRequest = (
+  minutes: number,
+  turn: string,
+  usage: Partial<UsageEvent['usage']>,
+  compactionsBefore = 0,
+): UsageEvent => ({
+  timestamp: BASE + minutes * MINUTE,
+  agent: 'claude',
+  provider: null,
+  model: 'claude-sonnet-5',
+  contextWindow: null,
+  billingClass: 'unknown',
+  inferenceClass: null,
+  serviceTier: null,
+  reportedCost: null,
+  visibleTurnId: turn,
+  cacheLifetime: '5m',
+  compactionsBefore,
+  usage: { ...cold, input: 0, ...usage },
+  requestKey: `request-${minutes}`,
+});
+
+function orderedLedger(steps: ReadonlyArray<UsageEvent | Parameters<CacheExpiryScan['signal']>[0]>) {
+  const scan = new CacheExpiryScan();
+  for (const step of steps) {
+    if ('ordinal' in step) scan.signal(step);
+    else scan.push(step);
+  }
+  return scan.ledger([]);
+}
+
+const before = orderedRequest(0, 'turn-a', { input: 100, cacheWrite5m: 300_000 });
+const after = orderedRequest(60, 'turn-b', { input: 5_000, cacheWrite5m: 25_000 }, 1);
+
+test('a compaction between two requests measures the expiry from the compaction and prices its prefix', () => {
+  const ledger = orderedLedger([before, { ordinal: 1, at: BASE + 2 * MINUTE, prefixTokens: 19_000 }, after]);
+
+  assert.deepEqual(ledger.facts.counts, { '5m': 1, '30m': 0, '1h': 0 });
+  assert.equal(ledger.facts.excluded, 0);
+  const [returned] = ledger.facts.returns;
+  assert.equal(returned.gapMs, 58 * MINUTE, 'measured from the compaction, not from the request before it');
+  assert.equal(returned.previousInputSide, 19_000, 'the prefix the compaction left, not the old 300k context');
+  assert.equal(returned.visibleTurnId, 'turn-b');
+  const extra = cacheExpiryExtraCost(ledger.facts, pricer);
+  assert.ok(
+    Math.abs(extra.dollars! - 19_000 * (perToken('cacheWrite5m') - perToken('cacheRead'))) < 1e-9,
+    'only the prefix is priced',
+  );
+  assert.deepEqual(
+    ledger.compactions.map((item) => [item.ordinal, item.contextBefore, item.contextAfter, item.requestsAfter]),
+    [[1, 300_100, 30_000, 1]],
+  );
+});
+
+test('a compaction signal with no time leaves the next pair unavailable', () => {
+  const ledger = orderedLedger([before, { ordinal: 1, at: null, prefixTokens: null }, after]);
+  assert.deepEqual(ledger.facts.counts, { '5m': 0, '30m': 0, '1h': 0 });
+  assert.equal(ledger.facts.unavailable, 1);
+  assert.equal(ledger.facts.excluded, 0);
+});
+
+test('a cold compaction pass belongs to the compaction and never counts as an expiry too', () => {
+  const ledger = orderedLedger([
+    before,
+    { ordinal: 1, at: BASE + 120 * MINUTE, prefixTokens: 19_000 },
+    orderedRequest(121, 'turn-b', { input: 5_000, cacheRead: 19_000, cacheWrite5m: 6_000 }, 1),
+  ]);
+  assert.deepEqual(ledger.facts.counts, { '5m': 0, '30m': 0, '1h': 0 });
+  assert.equal(ledger.facts.excluded + ledger.facts.unavailable, 0);
+});
+
+test('a revoked compaction measures the next return from the request before it again', () => {
+  const ledger = orderedLedger([
+    before,
+    { ordinal: 1, at: BASE + 2 * MINUTE, prefixTokens: 19_000 },
+    orderedRequest(60, 'turn-b', { input: 5_000, cacheWrite5m: 25_000 }, 0),
+  ]);
+  assert.equal(ledger.facts.returns.length, 1);
+  assert.equal(ledger.facts.returns[0].gapMs, 60 * MINUTE);
+  assert.equal(ledger.facts.returns[0].previousInputSide, 300_100);
+  assert.deepEqual(ledger.compactions, []);
+});
+
+test('a compaction dated before the request it follows leaves the next pair unavailable', () => {
+  const ledger = orderedLedger([
+    orderedRequest(60, 'turn-a', { input: 100, cacheWrite5m: 300_000 }),
+    { ordinal: 1, at: BASE + 2 * MINUTE, prefixTokens: 19_000 },
+    orderedRequest(61, 'turn-b', { input: 5_000, cacheWrite5m: 25_000 }, 1),
+  ]);
+  assert.deepEqual(ledger.facts.counts, { '5m': 0, '30m': 0, '1h': 0 });
+  assert.equal(ledger.facts.unavailable, 1, 'the backwards compaction clock cannot be judged');
+  assert.deepEqual(
+    ledger.compactions.map((item) => [item.ordinal, item.requestsAfter]),
+    [[1, 1]],
+    'the compaction fact stays',
+  );
+});
+
+// Compaction A is revoked by the prompt at minute 58, and compaction B then reuses its ordinal.
+function reusedOrdinalLines(estimated: boolean): string[] {
+  return [
+    claudePrompt(0, 'p1'),
+    linked(claudeResponse(1, { id: 'm1', input: 100, write5m: 300_000 }), 'u-p1'),
+    ...claudeLinkedCompaction(2, 'A', 'a-m1'),
+    linked(claudePrompt(58, 'p2'), 'a-m1'),
+    ...(estimated ? claudeLinkedCompaction(59, 'B', 'u-p2') : [linked(claudeCompaction(59, 'B'), 'u-p2')]),
+    linked(claudePrompt(60, 'p3'), 'c-B'),
+    linked(claudeResponse(60, { id: 'm2', input: 5_000, write5m: 25_000 }), 'u-p3'),
+  ];
+}
+
+test('a compaction that reuses a revoked ordinal is measured from its own time', () => {
+  const lines = reusedOrdinalLines(true);
+  const record = indexed(lines, claudeReducer);
+
+  assert.equal(record.compactionCount, 1, 'compaction A was revoked');
+  assert.deepEqual(summary(record), NOTHING, 'the request came a minute after compaction B');
+  assert.deepEqual(
+    record.cacheExpiry!.compactions.map((item) => [item.ordinal, item.at]),
+    [[1, Date.parse(at(59))]],
+  );
+
+  // A slice that ends on the revoking prompt resumes from the saved ledger to the same answer.
+  const storage = dir();
+  const file = path.join(storage, 'source.jsonl');
+  fs.writeFileSync(file, `${lines.slice(0, 5).join('\n')}\n`);
+  const first = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
+  saveSpendLedger(storage, 'w', [first]);
+  const [restored] = loadSpendLedger(storage, 'w').files;
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  const resumed = indexSpendFile(restored, file, 'w', claudeReducer, Date.now() + 1).record;
+  assert.deepEqual(summary(resumed), NOTHING);
+  assert.deepEqual(resumed.cacheExpiry!.compactions, record.cacheExpiry!.compactions);
+});
+
+test('a compaction signal under the ordinal of the held compaction replaces it', () => {
+  const ledger = orderedLedger([
+    before,
+    { ordinal: 1, at: BASE + 2 * MINUTE, prefixTokens: 19_000 },
+    { ordinal: 1, at: BASE + 59 * MINUTE, prefixTokens: 19_000 },
+    after,
+  ]);
+  assert.deepEqual(ledger.facts.counts, { '5m': 0, '30m': 0, '1h': 0 }, 'measured from the newer compaction');
+  assert.equal(ledger.facts.excluded + ledger.facts.unavailable, 0);
+});
+
+test('an unestimated compaction after a revoked one leaves the pair excluded', () => {
+  const record = indexed(reusedOrdinalLines(false), claudeReducer);
+  assert.equal(record.compactionCount, 1);
+  assert.deepEqual(summary(record), { ...NOTHING, excluded: 1 });
+});
+
+test('a Claude compaction between two prompts counts one expiry from the compaction time', () => {
+  const lines = [
+    claudePrompt(0, 'p1'),
+    claudeResponse(1, { id: 'm1', input: 100, write5m: 300_000 }),
+    ...claudeLinkedCompaction(2, 'c1', 'a-m1'),
+    claudePrompt(60, 'p2'),
+    claudeResponse(60, { id: 'm2', input: 5_000, write5m: 25_000 }),
+  ];
+  const record = indexed(lines, claudeReducer);
+
+  assert.deepEqual(summary(record), { ...NOTHING, counts: { '5m': 1, '30m': 0, '1h': 0 }, longestGapMs: 58 * MINUTE });
+  const [returned] = facts(record).returns;
+  assert.equal(returned.visibleTurnId, 'claude-turn:2');
+  // No record names the prefix before the first request after the compaction, and that request
+  // is the cold return, so the count stands and the dollars are unavailable.
+  assert.equal(returned.previousInputSide, null);
+  assert.deepEqual(cacheExpiryExtraCost(facts(record), pricer), { dollars: null, status: 'unknown' });
+  assert.deepEqual(
+    record.cacheExpiry!.compactions.map((item) => [item.ordinal, item.at, item.contextBefore, item.contextAfter]),
+    [[1, Date.parse(at(2)), 300_100, 30_000]],
+  );
+
+  // A slice that ends on the trailing compaction resumes from the saved ledger to the same answer.
+  const storage = dir();
+  const file = path.join(storage, 'source.jsonl');
+  fs.writeFileSync(file, `${lines.slice(0, 4).join('\n')}\n`);
+  const trailing = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now()).record;
+  assert.deepEqual(trailing.cacheExpiry!.carry!.compaction, { ordinal: 1, at: Date.parse(at(2)), prefixTokens: null });
+  saveSpendLedger(storage, 'w', [trailing]);
+  const [restored] = loadSpendLedger(storage, 'w').files;
+  assert.deepEqual(restored.cacheExpiry, trailing.cacheExpiry, 'the carry measured from a compaction loads again');
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  const resumed = indexSpendFile(restored, file, 'w', claudeReducer, Date.now() + 1).record;
+  assert.deepEqual(summary(resumed), summary(record));
+  assert.deepEqual(resumed.cacheExpiry!.compactions, record.cacheExpiry!.compactions);
+});
+
+test('a Codex compaction between two turns counts one expiry from its own record', () => {
+  const record = indexed(
+    [
+      codexMeta(),
+      codexTaskStarted(1, 'turn-a'),
+      codexTurnContext(1, 'turn-a', 'gpt-5.6-sol'),
+      codexTokens(2, { input_tokens: 5_000, cache_write_input_tokens: 5_000, total_tokens: 5_000 }),
+      codexCompacted(6),
+      codexTaskStarted(40, 'turn-b'),
+      codexTurnContext(40, 'turn-b', 'gpt-5.6-sol'),
+      codexTokens(40, { input_tokens: 900, total_tokens: 5_900 }),
+    ],
+    codexReducer,
+  );
+
+  assert.deepEqual(summary(record), { ...NOTHING, counts: { '5m': 0, '30m': 1, '1h': 0 }, longestGapMs: 34 * MINUTE });
+  assert.equal(facts(record).returns[0].previousInputSide, null, 'a Codex record names no cached prefix');
+  assert.deepEqual(cacheExpiryExtraCost(facts(record), pricer), { dollars: null, status: 'unknown' });
+});
+
+test('a saved return without the cost-added fields keeps a deleted source and leaves its cost added unavailable', () => {
+  const record = indexed(
+    [
+      claudePrompt(0, 'p1'),
+      claudeResponse(1, { id: 'm1', input: 100, write1h: 4_000 }),
+      claudePrompt(80, 'p2'),
+      claudeResponse(80, { id: 'm2', input: 5_000, write1h: 1_000 }),
+    ],
+    claudeReducer,
+  );
+  const [returned] = record.cacheExpiry!.facts.returns;
+  assert.equal(returned.previousInputSide, 4_100);
+  const { visibleTurnId: _turn, previousInputSide: _side, ...older } = returned;
+  // A source deleted since an older parser generation saved it is never read again, so its
+  // saved record is the only copy of its spend.
+  const deleted: SpendFileIndex = {
+    ...record,
+    parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1,
+    missingAt: Date.now(),
+    cacheExpiry: {
+      ...record.cacheExpiry!,
+      facts: { ...record.cacheExpiry!.facts, returns: [older as typeof returned] },
+    },
+  };
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [deleted]);
+  const [loaded] = loadSpendLedger(storage, 'w').files;
+
+  assert.ok(loaded, 'the saved ledger survived its own validation');
+  assert.deepEqual(loaded.buckets, record.buckets);
+  assert.deepEqual(facts(loaded).counts, facts(record).counts);
+  assert.equal(facts(loaded).returns[0].visibleTurnId, null);
+  assert.equal(facts(loaded).returns[0].previousInputSide, null);
+  assert.deepEqual(cacheExpiryExtraCost(facts(loaded), pricer), { dollars: null, status: 'unknown' });
 });

@@ -437,6 +437,19 @@ export interface UsageEvent {
   // An estimated compaction request. Claude Code records no usage for one, so the reducer
   // estimates it and marks it here. It is never one of the ordered primary requests.
   compactionEstimate?: true;
+  // The compaction that the estimated request stands for, which the ordered pass measures the
+  // next cache-expiry return from.
+  compactionSignal?: CompactionSignal;
+}
+
+// One compaction in request order, for the cache-expiry scan.
+export interface CompactionSignal {
+  ordinal: number;
+  // When the record says the compaction happened, or null where it names no usable time.
+  at: number | null;
+  // The cached prefix the compaction left, in tokens. Null where no record establishes it
+  // before the first request after the compaction.
+  prefixTokens: number | null;
 }
 
 // Compaction fact in source order, with an explicit ordinal independent of its timestamp.
@@ -7892,6 +7905,7 @@ function claudeCompactionEstimateEvent(state: ClaudeUsageReducerState): UsageEve
     visibleTurnId: null,
     compactionsBefore: compaction.ordinal,
     compactionEstimate: true,
+    compactionSignal: { ordinal: compaction.ordinal, at: at > 0 ? at : null, prefixTokens: null },
     usage,
     requestKey: `claude-compaction:${compaction.ordinal}`,
   };

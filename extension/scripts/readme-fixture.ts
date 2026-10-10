@@ -453,6 +453,8 @@ for (let index = expiryHistory.length - 2; index >= 0; index--) {
     lifetime: verdict.lifetime,
     gapMs: verdict.gapMs,
     request: { ...expiryRequest, usage: current.usage },
+    visibleTurnId: current.promptId,
+    previousInputSide: carry(previous).inputTokens,
   });
 }
 
@@ -1229,6 +1231,8 @@ for (const [sessionId, facts] of [
     facts.returns.push({
       lifetime: verdict.lifetime,
       gapMs: verdict.gapMs,
+      visibleTurnId: carry(current).visibleTurnId!,
+      previousInputSide: carry(previous).inputTokens,
       request: {
         localDate: '2026-09-15',
         agent: current.agent,

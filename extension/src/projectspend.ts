@@ -36,7 +36,14 @@ import {
   BEDROCK_LIST_COST_BASIS,
 } from './pricing';
 import { parseSpendLedger, projectUsageKey } from './projectspendstate';
-import type { CacheLifetime, ReducerCompaction, TurnOutcome, TurnUsage, UsageInferenceClass } from './transcript';
+import type {
+  CacheLifetime,
+  CompactionSignal,
+  ReducerCompaction,
+  TurnOutcome,
+  TurnUsage,
+  UsageInferenceClass,
+} from './transcript';
 import { normalizeFsPath } from './transcript';
 import { ExportLimitError } from './exportlimits';
 
@@ -86,6 +93,9 @@ export interface UsageEvent {
   // An estimated compaction request rather than a recorded one. It reaches the lifetime buckets
   // only, and never the ordered request pass.
   compactionEstimate?: true;
+  // The compaction that an estimated request stands for, in request order. The ordered pass
+  // measures the next return from it.
+  compactionSignal?: CompactionSignal;
   usage: UsageCounts;
   requestKey: string | null;
 }
@@ -434,7 +444,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 47;
+export const PROJECT_SPEND_PARSER_GENERATION = 48;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -488,6 +498,9 @@ export interface UsageLineReducer<State = unknown> {
   turnCount?(): number | null;
   compactionCount?(): number | null;
   recentCompactions?(): readonly ReducerCompaction[];
+  // Compactions recorded by the lines pushed since the last call, oldest first. A reducer whose
+  // compactions arrive on its usage events instead leaves this out.
+  takeCompactionSignals?(): readonly CompactionSignal[];
   firstTurnAt?(): number | null;
   lastTurnAt?(): number | null;
   newestTurnStartedAt?(): number | null;
@@ -900,9 +913,9 @@ export function aggregateUsageEvents(
 //
 // Daily and lifetime buckets combine requests and discard their adjacency.
 // Derive these facts while the reducer still emits requests in source order.
-// The figures report input cost after a preceding request's cache expired.
-// Fresh prompt text and unrecorded cache-key changes also affect that cost.
-// The figures do not attribute the cost to waiting.
+// The figures report input cost after a preceding request's cache expired, and the part of it
+// that a warm cache would have read instead. Fresh prompt text and unrecorded cache-key changes
+// also affect the input cost. Cost added leaves out the new text.
 
 // One qualifying return, kept in the shape the cost resolver already quotes.
 export interface CacheExpiryReturn {
@@ -910,8 +923,15 @@ export interface CacheExpiryReturn {
   lifetime: CacheTier;
   // The request-to-request gap that crossed it, in milliseconds.
   gapMs: number;
-  // The return request itself, as one priceable row.
+  // The return request itself, as one priceable row. Its cache read is `request.usage.cacheRead`.
   request: ProjectUsageBucket;
+  // The visible turn the return request opened, or null where a saved return does not name it.
+  visibleTurnId: string | null;
+  // The input-side tokens a warm cache could have held for the return: the previous request's
+  // uncached input, cache reads, and cache writes. A return measured from a compaction holds the
+  // cached prefix the compaction left instead. Null where no record establishes that size, or
+  // where a saved return does not name it, which leaves its cost added unavailable.
+  previousInputSide: number | null;
 }
 
 export interface CacheExpiryFacts {
@@ -976,6 +996,19 @@ export interface CacheExpiryCarry {
   compactionsBefore: number;
   inputTokens: number;
   incomplete: boolean;
+  // The newest compaction after this request, when one came before the next request. The next
+  // comparison measures from it instead of from the request.
+  compaction?: CacheExpiryCarryCompaction;
+}
+
+export interface CacheExpiryCarryCompaction {
+  // The compaction's ordinal, which stands in for the request's compaction count.
+  ordinal: number;
+  // The compaction's own time, or null where its record names no usable time.
+  at: number | null;
+  // The cached prefix the compaction left, in tokens, which stands in for the request's input
+  // side as the reusable size. Null where no record establishes it.
+  prefixTokens: number | null;
 }
 
 export interface CacheExpiryLedger {
@@ -1045,25 +1078,33 @@ export function classifyCacheExpiry(
   if (previous.visibleTurnId === null || next.visibleTurnId === null) {
     return { kind: 'unavailable' };
   }
+  const from = previous.compaction;
+  const fromTime = from ? (from.at ?? 0) : previous.timestamp;
+  const fromCompactions = from ? from.ordinal : previous.compactionsBefore;
   // Requests under the same visible prompt do not qualify as a return after cache expiry.
   if (previous.visibleTurnId === next.visibleTurnId) {
     return { kind: 'none' };
   }
-  if (!positiveClock(previous.timestamp) || !positiveClock(next.timestamp) || next.timestamp < previous.timestamp) {
+  if (!positiveClock(fromTime) || !positiveClock(next.timestamp) || next.timestamp < fromTime) {
     return { kind: 'unavailable' };
   }
-  if (previous.incomplete || next.incomplete) {
+  // A compaction recorded after the request but dated before it is a backwards clock.
+  if (from && positiveClock(previous.timestamp) && fromTime < previous.timestamp) {
+    return { kind: 'unavailable' };
+  }
+  // The compaction replaced the request's context, so only its own record decides completeness.
+  if ((!from && previous.incomplete) || next.incomplete) {
     return { kind: 'unavailable' };
   }
   const lifetime = previous.lifetime;
   if (lifetime === null) {
     return { kind: 'unavailable' };
   }
-  if (!cacheLapsedBy(previous.timestamp, lifetime, next.timestamp)) {
+  if (!cacheLapsedBy(fromTime, lifetime, next.timestamp)) {
     return { kind: 'none' };
   }
   if (
-    previous.compactionsBefore !== next.compactionsBefore ||
+    fromCompactions !== next.compactionsBefore ||
     previous.model !== next.model ||
     previous.provider !== next.provider ||
     previous.serviceTier !== next.serviceTier ||
@@ -1084,7 +1125,7 @@ export function classifyCacheExpiry(
   if (!recordsColdInput(nextUsage)) {
     return { kind: 'none' };
   }
-  return { kind: 'return', lifetime, gapMs: next.timestamp - previous.timestamp };
+  return { kind: 'return', lifetime, gapMs: next.timestamp - fromTime };
 }
 
 function requestBucket(event: UsageEvent): ProjectUsageBucket {
@@ -1187,7 +1228,12 @@ export class CacheExpiryScan {
       excluded: restored.facts.excluded,
       unavailable: restored.facts.unavailable,
     };
-    this.carry = restored.carry ? { ...restored.carry } : null;
+    this.carry = restored.carry
+      ? {
+          ...restored.carry,
+          ...(restored.carry.compaction ? { compaction: { ...restored.carry.compaction } } : {}),
+        }
+      : null;
     // The scan holds only facts for compactions a request reached. A saved ledger also lists
     // trailing compactions, which `ledger()` rebuilds from the carry, because a later slice can
     // revoke the compaction behind one.
@@ -1200,6 +1246,9 @@ export class CacheExpiryScan {
   }
 
   push(event: UsageEvent): void {
+    if (event.compactionSignal) {
+      this.signal(event.compactionSignal);
+    }
     if (!primaryOrderedRequest(event)) {
       return;
     }
@@ -1222,11 +1271,52 @@ export class CacheExpiryScan {
       this.facts.unavailable++;
       return;
     }
+    this.revokeCompactions(next.compactionsBefore);
     this.recordCompactions(next, event);
     if (this.carry) {
       this.judge(this.carry, next, event);
     }
     this.carry = next;
+  }
+
+  // A compaction after the newest request moves the point the next comparison measures from.
+  // The carry keeps the request, and the compaction supplies the time, the compaction count, and
+  // the reusable size the comparison uses. A compaction with no usable time leaves the next pair
+  // unavailable. The compaction re-reads the old context itself, so a cold pass is the
+  // compaction's cost, and the request after it is measured from the compaction alone.
+  // A reducer signals each compaction once, so a signal is a new compaction even where its ordinal
+  // does not pass the carry's compaction. A revoked compaction gives its ordinal back, and the
+  // compaction after it reuses that ordinal and replaces it. Only a compaction the carried request
+  // already counts is behind the carry.
+  signal(signal: CompactionSignal): void {
+    const carry = this.carry;
+    if (!carry || signal.ordinal <= carry.compactionsBefore) {
+      return;
+    }
+    carry.compaction = { ordinal: signal.ordinal, at: signal.at, prefixTokens: signal.prefixTokens };
+  }
+
+  // The reducer's compaction count after a line. A record that revokes a compaction lowers the
+  // count before any request shows it, so the carry drops the compaction at once. A compaction
+  // the reducer cannot estimate, counted after the revocation, then leaves the next pair
+  // excluded instead of measured from the revoked compaction.
+  compactionCount(count: number): void {
+    this.revokeCompactions(count);
+  }
+
+  // A compaction count below the carry's compaction means a later record revoked it. Revoking
+  // every compaction since the newest request measures from that request again. A partial
+  // revocation leaves the compaction to measure from unknown, so the pair is unavailable.
+  private revokeCompactions(count: number): void {
+    const carry = this.carry;
+    if (!carry?.compaction || count >= carry.compaction.ordinal) {
+      return;
+    }
+    if (count <= carry.compactionsBefore) {
+      delete carry.compaction;
+      return;
+    }
+    carry.compaction = { ordinal: count, at: null, prefixTokens: null };
   }
 
   private revise(event: UsageEvent): void {
@@ -1236,6 +1326,10 @@ export class CacheExpiryScan {
     // revision keeps the count it had, and the next request opens the compaction fact.
     if (this.carry && revised.compactionsBefore > this.carry.compactionsBefore) {
       revised.compactionsBefore = this.carry.compactionsBefore;
+    }
+    // A revision of the request keeps measuring from a compaction that followed it.
+    if (this.carry?.compaction && this.carry.compaction.ordinal > revised.compactionsBefore) {
+      revised.compaction = { ...this.carry.compaction };
     }
     this.carry = revised;
     const newestReturn = this.facts.returns[this.facts.returns.length - 1];
@@ -1319,6 +1413,8 @@ export class CacheExpiryScan {
       lifetime: verdict.lifetime,
       gapMs: verdict.gapMs,
       request: requestBucket(event),
+      visibleTurnId: next.visibleTurnId!,
+      previousInputSide: previous.compaction ? previous.compaction.prefixTokens : previous.inputTokens,
     });
     this.newestReturnKey = event.requestKey;
     while (this.facts.returns.length > RETAINED_CACHE_EXPIRY_RETURNS) {
@@ -1412,6 +1508,59 @@ export function cacheExpiryInputCost(facts: CacheExpiryFacts, pricer: ProjectSpe
       continue;
     }
     dollars += price.dollars;
+    priced++;
+  }
+  if (priced === 0) {
+    return partial || facts.returns.length > 0 ? { dollars: null, status: 'unknown' } : { dollars: 0, status: 'exact' };
+  }
+  return { dollars, status: partial ? 'atLeast' : 'exact' };
+}
+
+// The tokens a return paid to resend context a warm cache could have held, at the rates they
+// paid, and the same tokens as a cache read. The reusable size is the previous input side less
+// what the return still read. The resent part comes from the 1-hour, 30-minute, and 5-minute
+// writes in that order, then uncached input. Tokens above the reusable size are new text.
+export function cacheExpiryRebuiltUsage(
+  previousInputSide: number,
+  usage: UsageCounts,
+): { paid: UsageCounts; asRead: UsageCounts } {
+  let remaining = Math.max(0, previousInputSide - usage.cacheRead);
+  const take = (tokens: number) => {
+    const taken = Math.min(tokens, remaining);
+    remaining -= taken;
+    return taken;
+  };
+  const cacheWrite1h = take(usage.cacheWrite1h);
+  const cacheWrite30m = take(usage.cacheWrite30m ?? 0);
+  const cacheWrite5m = take(usage.cacheWrite5m);
+  const input = take(usage.input);
+  const none = { requests: 1, input: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheWrite30m: 0, cacheRead: 0, output: 0 };
+  return {
+    paid: { ...none, input, cacheWrite1h, cacheWrite5m, cacheWrite30m, thinking: 0 },
+    asRead: { ...none, cacheRead: cacheWrite1h + cacheWrite30m + cacheWrite5m + input, thinking: 0 },
+  };
+}
+
+// Price what recorded cache-expiry returns paid beyond a cache read of the same tokens. The
+// status rules match `cacheExpiryInputCost`. A return with no known reusable size is also
+// unpriced, which a return measured from a compaction with no recorded prefix leaves.
+export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryInputCost {
+  let dollars = 0;
+  let priced = 0;
+  let partial = facts.truncated;
+  for (const item of facts.returns) {
+    if (item.request.incomplete || item.request.reportedCost !== null || item.previousInputSide === null) {
+      partial = true;
+      continue;
+    }
+    const { paid, asRead } = cacheExpiryRebuiltUsage(item.previousInputSide, item.request.usage);
+    const paidPrice = pricer({ ...item.request, usage: paid });
+    const readPrice = pricer({ ...item.request, usage: asRead });
+    if (!paidPrice || !readPrice) {
+      partial = true;
+      continue;
+    }
+    dollars += Math.max(0, paidPrice.dollars - readPrice.dollars);
     priced++;
   }
   if (priced === 0) {
@@ -1553,6 +1702,17 @@ function readIncremental(
       }
       addTo(lifetimeByKey, event);
     };
+    // A compaction that emits no usage event reaches the ordered pass after its line's events,
+    // and so does a revocation, which lowers the reducer's compaction count.
+    const signal = () => {
+      for (const item of reducer.takeCompactionSignals?.() ?? []) {
+        ordered?.signal(item);
+      }
+      const count = reducer.compactionCount?.();
+      if (typeof count === 'number') {
+        ordered?.compactionCount(count);
+      }
+    };
     let position = scanOffset;
     let held = pending;
     let completedOffset = offset;
@@ -1612,6 +1772,7 @@ function readIncremental(
           for (const event of reducer.pushLine(text, end)) {
             add(event);
           }
+          signal();
         }
         lineStart = cursor + 1;
         completedOffset = position - (bytes.length - lineStart);
@@ -1632,7 +1793,10 @@ function readIncremental(
       const text = held.toString('utf8');
       const repeat = repeated ? repeated.repeatedAt(text, completedOffset, position, maxBytes, true) : false;
       if (repeat === null || repeat === 'pending') throw new Error('The session changed during export.');
-      if (!repeat) for (const event of reducer.pushLine(text, position)) add(event);
+      if (!repeat) {
+        for (const event of reducer.pushLine(text, position)) add(event);
+        signal();
+      }
       completedOffset = position;
       held = Buffer.alloc(0);
     }

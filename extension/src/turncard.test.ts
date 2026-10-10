@@ -62,6 +62,7 @@ import {
   pendingAskOf,
   cacheExpiryReturnCount,
   sessionCacheExpiryStats,
+  CACHE_EXPIRY_COST_ADDED_HINT,
   sessionCompactionContextDetail,
   sessionCostProjection,
   sessionCostStats,
@@ -355,7 +356,15 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
   const exact: CacheExpiryFacts = {
     counts: { '5m': 0, '30m': 2, '1h': 1 },
     longestGapMs: 26 * 60 * 60 * 1000,
-    returns: [{ lifetime: '30m', gapMs: 31 * 60 * 1000, request: economicRequest() }],
+    returns: [
+      {
+        lifetime: '30m',
+        gapMs: 31 * 60 * 1000,
+        request: economicRequest(),
+        visibleTurnId: 'turn-b',
+        previousInputSide: 100_000,
+      },
+    ],
     excluded: 2,
     unavailable: 0,
     truncated: false,
@@ -365,7 +374,7 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
   assert.equal(chip.focusable, true);
   assert.deepEqual(
     chip.detailList?.entries.map((entry) => entry.label),
-    ['Cache lifetimes', 'Input cost on affected requests', 'Longest qualifying gap', 'Excluded ambiguous events'],
+    ['Cache lifetimes', 'Cost added', 'Longest qualifying gap', 'Excluded ambiguous events'],
   );
   assert.match(chip.detail, /Longest qualifying gap: 1d 2h/);
   assert.ok(chip.detail.includes('The record does not identify every cache-key change.'));
@@ -376,10 +385,28 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
     ...exact,
     returns: [
       ...exact.returns,
-      { lifetime: '1h', gapMs: 61 * 60 * 1000, request: economicRequest({ reportedCost: 4.1 }) },
+      {
+        lifetime: '1h',
+        gapMs: 61 * 60 * 1000,
+        request: economicRequest({ reportedCost: 4.1 }),
+        visibleTurnId: 'turn-c',
+        previousInputSide: 100_000,
+      },
     ],
   })[0];
-  assert.match(lower.detail, /Input cost on affected requests: At least \$/);
+  assert.match(lower.detail, /Cost added: At least \$/);
+  // The row prices the resent context only, and its hover says so.
+  const added = chip.detailList?.entries.find((entry) => entry.label === 'Cost added');
+  assert.equal(added?.valueTitle, CACHE_EXPIRY_COST_ADDED_HINT);
+  assert.ok(Number(String(added?.value).replace('$', '')) > 0);
+  const unknownPrefix = sessionCacheExpiryStats({
+    ...exact,
+    returns: [{ ...exact.returns[0], previousInputSide: null }],
+  })[0];
+  assert.match(unknownPrefix.detail, /Cost added: Unavailable/);
+  assert.deepEqual(unknownPrefix.detailList?.footer, [
+    'One or more affected requests follow a compaction whose cached size is not recorded. Cost added is not available for them.',
+  ]);
   assert.ok(!lower.detail.includes('recommend'));
 });
 
