@@ -226,6 +226,8 @@ Bedrock Codex accounts contribute no subscription figures, plan, detail group, r
 
 Fresh values can arrive from live wire events, a read after a child finishes, a transcript refresh that detects finished work, or an idle child started only to answer controls. Failed or fresh reads are not repeated until the reader explicitly refreshes or the freshness rule allows another read.
 
+Explicit unavailable Claude limits retain saved figures and their original reading age without a warning. Read again retries, and an admitted reading restores automatic refresh.
+
 An expired limit is omitted. Complete readings replace account state, while partial live events update only the limit they name. A complete answer with no rate windows retains live windows because a money-cap answer says nothing about their clocks.
 
 The account answer gives the credit cap no reset clock. Its row uses the next month boundary at midnight UTC and marks that moment as expected. A reported credit clock from a live rate-limit event replaces the expected moment.

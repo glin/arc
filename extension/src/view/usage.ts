@@ -37,6 +37,7 @@ export interface UsageGroup {
 export type UsageRefreshPhase =
   | 'discovering'
   | 'excluded'
+  | 'unavailable'
   | 'queued'
   | 'waiting'
   | 'reading'

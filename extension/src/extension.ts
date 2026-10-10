@@ -968,7 +968,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 operation,
               );
             } else {
-              if (reading) {
+              if (reading === 'unavailable') {
+                usage.noteSilent(session.agent);
+              } else if (reading) {
                 usage.note(session.agent, reading, source);
                 usageReads.admitted(session.agent);
                 publishUsage();
@@ -976,7 +978,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               usageReads.result(
                 session.agent,
                 attempt,
-                reading ? 'success' : 'empty',
+                reading === 'unavailable' ? 'unavailable' : reading ? 'success' : 'empty',
                 reading ? '' : 'No usable usage reading was returned.',
                 operation,
               );
@@ -1197,7 +1199,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 usageReads.result(agent, attempt, 'excluded', '', operation);
                 return;
               }
-              if (reading) {
+              if (reading === 'unavailable') {
+                usage.noteSilent(agent);
+              } else if (reading) {
                 usage.note(agent, reading, source);
                 usageReads.admitted(agent);
                 publishUsage();
@@ -1205,7 +1209,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               usageReads.result(
                 agent,
                 attempt,
-                failure ? 'failed' : reading ? 'success' : 'empty',
+                failure ? 'failed' : reading === 'unavailable' ? 'unavailable' : reading ? 'success' : 'empty',
                 failure || (reading ? '' : 'No usable usage reading was returned.'),
                 operation,
               );

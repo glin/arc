@@ -20,6 +20,7 @@ export {
   RateLimit,
   SpendCap,
   UsageReading,
+  UsageReadResult,
   EffortChoice,
   ModelChoice,
   ModelList,
@@ -38,6 +39,7 @@ import {
   RateLimit,
   SpendCap,
   UsageReading,
+  UsageReadResult,
   EffortChoice,
   ModelChoice,
   ModelList,
@@ -199,6 +201,10 @@ function readSkills(v: unknown): string[] | null {
 // A nonempty decoded `rate_limits.limits` list supplies window groups and model scopes.
 // Otherwise, only the named `five_hour` and `seven_day` windows supply limits.
 // Other window keys stay unread because they do not establish supported windows.
+export function readUsageResult(payload: unknown, readAt: number): UsageReadResult {
+  return obj(payload)?.rate_limits_available === false ? 'unavailable' : readUsage(payload, readAt);
+}
+
 export function readUsage(payload: unknown, readAt: number): UsageReading | null {
   const m = obj(payload);
   if (!m) {

@@ -9830,7 +9830,7 @@ function catalogRefreshFixture(book?: UsageBook) {
     holdDiscovery: null as Promise<boolean> | null,
     states: null as Array<{ agent: string; key: string; sessionId: string; exited: boolean; busy: boolean }> | null,
     holdModels: null as Promise<unknown> | null,
-    answer: null as object | null,
+    answer: null as object | 'unavailable' | null,
     cwd: 'C:/workspace' as string | null,
   };
   const readingTimes = new Map([
@@ -9947,7 +9947,7 @@ function catalogRefreshFixture(book?: UsageBook) {
           rateLimits: async () => {
             calls.push(`usage ${key}`);
             if (control.failure === 'refused') throw new Error('Account reading refused');
-            return control.answer;
+            return control.failure === 'empty' ? null : control.answer;
           },
           models: async () => {
             modelCalls.push(key);
@@ -9966,7 +9966,7 @@ function catalogRefreshFixture(book?: UsageBook) {
       _plan: unknown,
       _spawner: unknown,
       _deadline: unknown,
-      publish?: (reading: object | null, failure: string) => void,
+      publish?: (reading: object | 'unavailable' | null, failure: string) => void,
       admit: () => boolean = () => true,
       onDiscovery: (supported: boolean | null, source: number) => boolean = () => true,
     ) => {
@@ -9974,7 +9974,11 @@ function catalogRefreshFixture(book?: UsageBook) {
       if (!admit()) return { usage: null, models: null, commands: [] };
       const eligible = onDiscovery(null, sourceOf('fresh')) && onDiscovery(control.supported, sourceOf('fresh'));
       if (control.failure === 'throw') throw new Error('read failed');
-      if (eligible) publish?.(control.answer ?? {}, '');
+      if (eligible)
+        publish?.(
+          control.failure === 'empty' ? null : (control.answer ?? {}),
+          control.failure === 'refused' ? 'Account reading refused' : '',
+        );
       return {
         usage: {},
         models: control.failure === 'empty' ? null : { readAt: Date.now(), models: [] },
@@ -10012,6 +10016,91 @@ function catalogRefreshFixture(book?: UsageBook) {
     sourceOf,
     readLive: compiled.readFrom as (key: string, force: boolean, attempt?: number, operation?: number) => Promise<void>,
   };
+}
+
+for (const live of [false, true]) {
+  test(`Claude ${live ? 'hosted' : 'fresh'} unavailable usage keeps saved figures without a warning and recovers`, async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const now = Date.parse('2026-10-10T09:00:00Z');
+    vi.setSystemTime(now);
+    const book = new UsageBook();
+    const saved = {
+      plan: 'max',
+      complete: true,
+      spend: null,
+      readAt: now - 600_000,
+      limits: [
+        {
+          window: 'five_hour',
+          group: 'session',
+          scope: '',
+          utilization: 0.24,
+          resetsAtSeconds: (now + 5000) / 1000,
+          status: '',
+        },
+      ],
+    };
+    book.note('claude', saved);
+    const original = structuredClone(book.usages());
+    const fixture = catalogRefreshFixture(book);
+    Object.assign(fixture.control, { live, agent: 'claude', answer: 'unavailable' });
+    const read = async () => {
+      const id = fixture.usageReads.begin(['claude'])!;
+      assert.ok(id);
+      await fixture.ask('claude', true, undefined, undefined, id);
+      return fixture.projections.at(-1)!;
+    };
+    try {
+      const bar = await read();
+      assert.equal(fixture.refreshStates.at(-1)?.agents.claude.phase, 'unavailable');
+      assert.deepEqual(book.usages(), original);
+      assert.equal(bar.groups[0].lines[0].percent, 24);
+      assert.equal(bar.age, 'updated 10m ago');
+      assert.equal(bar.groups[0].status, '');
+      assert.equal(bar.refresh?.announcement, '');
+      assert.equal(bar.refresh?.name, 'Read again');
+      assert.equal(bar.refresh?.busy, false);
+      assert.deepEqual(book.toAsk(['claude'], now, false), []);
+      assert.deepEqual(book.toAsk(['claude'], now, true), ['claude']);
+      vi.setSystemTime(now + 5001);
+      const expired = await read();
+      assert.deepEqual(expired.briefs, []);
+      assert.deepEqual(expired.groups[0].lines, []);
+      assert.equal(expired.age, '');
+      assert.equal(expired.read, 'Read again');
+      assert.deepEqual(book.usages(), original);
+      fixture.control.failure = 'empty';
+      const empty = await read();
+      assert.match(empty.groups[0].status, /No usable usage reading/);
+      fixture.control.failure = 'refused';
+      const failed = await read();
+      assert.match(failed.groups[0].status, /Account reading refused/);
+      fixture.control.failure = 'none';
+      fixture.control.answer = {
+        ...saved,
+        readAt: Date.now(),
+        limits: [{ ...saved.limits[0], utilization: 0.37, resetsAtSeconds: (now + 60_000) / 1000 }],
+      };
+      const recovered = await read();
+      assert.equal(fixture.refreshStates.at(-1)?.agents.claude.phase, 'success');
+      assert.equal(recovered.groups[0].lines[0].percent, 37);
+      assert.equal(recovered.groups[0].status, '');
+      assert.equal(book.usages()[0].checkedAt, Date.now());
+      assert.deepEqual(book.toAsk(['claude'], Date.now() + 120_001, false), ['claude']);
+      book.clear();
+      fixture.control.answer = 'unavailable';
+      const missing = await read();
+      assert.deepEqual(book.usages(), []);
+      assert.deepEqual(missing.briefs, []);
+      assert.deepEqual(missing.groups[0].lines, []);
+      assert.equal(missing.groups[0].exact, '');
+      assert.equal(missing.read, 'Read again');
+      assert.equal(missing.refresh?.name, 'Read again');
+    } finally {
+      fixture.usageReads.dispose();
+      vi.useRealTimers();
+    }
+  });
 }
 
 test('supported source selection survives newer-child retirement and a busy current source', async () => {

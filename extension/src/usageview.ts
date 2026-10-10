@@ -418,6 +418,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
         const text = {
           discovering: '',
           excluded: '',
+          unavailable: '',
           queued: 'Queued',
           waiting: 'Waiting for current work',
           reading: 'Reading usage',
@@ -425,14 +426,14 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
           empty: 'No usable usage reading',
           failed: 'Usage reading failed',
         }[state.phase];
-        return [agent, `${agentLabel(agent)}: ${text}${state.detail ? `. ${state.detail}` : ''}`];
+        return [agent, text ? `${agentLabel(agent)}: ${text}${state.detail ? `. ${state.detail}` : ''}` : ''];
       }),
   );
   for (const agent of agentOrder([...byAgent.keys(), ...Object.keys(statuses)])) {
     const usage = byAgent.get(agent);
     const live = usage ? liveLimits(usage, now) : [];
     const spend = usage?.spend ?? null;
-    if ((!usage || (!live.length && !spend)) && !statuses[agent]) {
+    if ((!usage || (!live.length && !spend)) && !statuses[agent] && refresh?.agents[agent]?.phase !== 'unavailable') {
       continue;
     }
     let agentReadAt = Number.POSITIVE_INFINITY;
@@ -537,7 +538,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
   const busy = Object.values(refresh?.agents ?? {}).some((state) =>
     ['discovering', 'queued', 'waiting', 'reading'].includes(state.phase),
   );
-  const summary = Object.values(statuses).join('. ');
+  const summary = Object.values(statuses).filter(Boolean).join('. ');
   return {
     briefs,
     groups,
@@ -549,7 +550,7 @@ export function usageBar(usages: AgentUsage[], now: number, refresh?: UsageRefre
           refresh: {
             id: refresh.id,
             busy,
-            name: `${summary}. ${busy ? 'Reading usage' : 'Read again'}`,
+            name: [summary, busy ? 'Reading usage' : 'Read again'].filter(Boolean).join('. '),
             announcement: busy ? '' : summary,
           },
         }

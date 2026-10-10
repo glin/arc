@@ -156,6 +156,9 @@ export interface McpServer {
   mutable?: boolean;
 }
 
+// Explicit unavailable limits carry no reading. Null means no usable answer.
+export type UsageReadResult = UsageReading | 'unavailable' | null;
+
 // An agent's normalized account usage from one exchange.
 // `plan` retains the reported subscription name. Unrequested mid-turn events leave it empty.
 export interface UsageReading {

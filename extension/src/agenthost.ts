@@ -13,7 +13,7 @@ import {
   ClaudeWire,
   PermissionMode,
   SpawnOptions,
-  readUsage,
+  readUsageResult,
   readModels as readClaudeModels,
   spawnArgs,
 } from './claudewire';
@@ -35,7 +35,7 @@ import {
   ModelChoice,
   ModelList,
   PromptEntry,
-  UsageReading,
+  UsageReadResult,
   AgentPromptInput,
 } from './agentwire';
 import {
@@ -242,7 +242,7 @@ export interface Driver {
   // Requested spend and context reads. Claude exposes these controls. Codex reports these figures through notifications.
   usage?(): Promise<{ usage: unknown; context: unknown }>;
   // Normalized account usage. Both providers answer without a session or model request.
-  rateLimits?(refreshAuthentication?: boolean): Promise<UsageReading | null>;
+  rateLimits?(refreshAuthentication?: boolean): Promise<UsageReadResult>;
   usageSupported?(rediscover?: boolean): Promise<boolean>;
   // The provider's model catalog. The control read uses no model tokens.
   models?(): Promise<ModelList | null>;
@@ -345,7 +345,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
           return { usage, context };
         },
         async rateLimits() {
-          return readUsage(await wire.usage(), Date.now());
+          return readUsageResult(await wire.usage(), Date.now());
         },
         appliedDefaults: () => wire.appliedDefaults(),
         async models() {
@@ -1149,7 +1149,7 @@ export class AgentSession {
   }
 
   // Reads account usage without model tokens.
-  async rateLimits(refreshAuthentication = false): Promise<UsageReading | null> {
+  async rateLimits(refreshAuthentication = false): Promise<UsageReadResult> {
     return this.driver.rateLimits ? await this.driver.rateLimits(refreshAuthentication) : null;
   }
 
@@ -1611,7 +1611,7 @@ export async function askIdleMcpChange(
 
 // Everything one idle child was asked for in the exchange it was started for.
 export interface IdleAnswers {
-  usage: UsageReading | null;
+  usage: UsageReadResult;
   usageFailure: string;
   models: ModelList | null;
   // Commands returned by the opening handshake, available before the reader sends a prompt.
@@ -1625,7 +1625,7 @@ export async function askIdle(
   plan: AgentPlan,
   spawner: Spawner,
   openingDeadlineMs: number = OPENING_DEADLINE_MS,
-  onUsage?: (reading: UsageReading | null, failure: string) => void,
+  onUsage?: (reading: UsageReadResult, failure: string) => void,
   admit: () => boolean = () => true,
   onDiscovery: (supported: boolean | null, source: number) => boolean = () => true,
   force = false,
@@ -1788,7 +1788,7 @@ export class UsageReadQueue {
   result(
     agent: string,
     id: number | undefined,
-    phase: 'success' | 'empty' | 'failed' | 'excluded',
+    phase: 'success' | 'empty' | 'failed' | 'excluded' | 'unavailable',
     detail = '',
     operation?: number,
   ): void {

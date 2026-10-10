@@ -4335,6 +4335,7 @@ test('one idle child answers both the figures and the model list', { timeout: 50
     models: [{ value: 'opus', displayName: 'Opus', description: 'Thinks hardest' }],
   });
   const answers = await probe.answers;
+  assert.ok(answers.usage !== 'unavailable');
   assert.equal(answers.usage?.plan, 'max');
   assert.equal(answers.usage?.limits[0].utilization, 0.24);
   assert.deepEqual(
@@ -4343,6 +4344,60 @@ test('one idle child answers both the figures and the model list', { timeout: 50
   );
   assert.equal(child.ended, true, 'the read left its child running');
 });
+
+for (const hosted of [false, true]) {
+  test(`Claude ${hosted ? 'hosted' : 'fresh idle'} reads preserve explicit unavailable limits`, async () => {
+    const children: FakeChild[] = [];
+    const plan = claudeIdlePlan(CLAUDE, WS);
+    const spawner = () => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    };
+    const published: unknown[] = [];
+    const session = hosted
+      ? new AgentSession(
+          'one',
+          plan,
+          spawner,
+          () => {},
+          () => {},
+        )
+      : null;
+    const answer = session
+      ? session.start().then(() => session.rateLimits(true))
+      : askIdle(
+          plan,
+          spawner,
+          undefined,
+          (reading, failure) => published.push({ reading, failure }),
+          undefined,
+          undefined,
+          true,
+        );
+    await vi.waitFor(() => assert.equal(children.length, 1));
+    const child = children[0];
+    child.answerHandshake();
+    await vi.waitFor(() =>
+      assert.ok(child.sent().some((m) => (m.request as { subtype: string }).subtype === 'get_usage')),
+    );
+    child.answerControl('get_usage', { subscription_type: 'max', rate_limits_available: false, rate_limits: {} });
+    if (!hosted) child.answerControl('list_models', { models: [] });
+    try {
+      if (hosted) assert.equal(await answer, 'unavailable');
+      else {
+        const answers = (await answer) as IdleAnswers;
+        assert.equal(answers.usage, 'unavailable');
+        assert.equal(answers.usageFailure, '');
+        assert.deepEqual(published, [{ reading: 'unavailable', failure: '' }]);
+      }
+    } finally {
+      const disposing = session?.dispose();
+      child.exit(0);
+      await disposing;
+    }
+  });
+}
 
 test('the idle child brings back the command list, which is the only way a quiet panel gets one', async () => {
   // The idle handshake returns command completions before a session receives its first prompt. Retain that catalog in the idle answer.
@@ -4524,6 +4579,7 @@ test('a Codex idle child answers both questions and still starts no thread', { t
     ],
   });
   const answers = await probe.answers;
+  assert.ok(answers.usage !== 'unavailable');
   assert.deepEqual(
     answers.commands.map((command) => command.name),
     ['compact', 'clear', 'new', 'rename', 'polish'],
@@ -4569,6 +4625,7 @@ test('a rejected Codex skill list leaves the idle usage and models available', {
     data: [{ id: 'gpt-5', displayName: 'GPT-5', supportedReasoningEfforts: [] }],
   });
   const answers = await probe.answers;
+  assert.ok(answers.usage !== 'unavailable');
   assert.deepEqual(
     answers.commands.map((command) => command.name),
     ['compact', 'clear', 'new', 'rename'],

@@ -7,6 +7,7 @@ import {
   claudePromptContent,
   spawnArgs,
   readUsage,
+  readUsageResult,
   readModels,
   readAppliedDefaults,
   WireEvent,
@@ -1453,6 +1454,14 @@ test('the two sources of one figure agree once the wire has read them', () => {
   h.wire.receive(RATE_LINE);
   const volunteered = h.events.find((e) => e.kind === 'rateLimit') as { kind: 'rateLimit'; limit: RateLimit };
   assert.equal(asked?.limits[0].utilization, volunteered.limit.utilization);
+});
+
+test('an explicit unavailable Claude answer differs from malformed and missing usage', () => {
+  assert.equal(readUsageResult({ rate_limits_available: false }, 9), 'unavailable');
+  for (const payload of [null, 'not an object', {}, { rate_limits_available: 'false' }]) {
+    assert.equal(readUsageResult(payload, 9), null);
+  }
+  assert.deepEqual(readUsageResult(USAGE_ANSWER, 9), readUsage(USAGE_ANSWER, 9));
 });
 
 test('an account the CLI reports no limits for gets no row of noughts', () => {
