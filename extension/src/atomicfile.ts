@@ -1,4 +1,4 @@
-import * as fs from 'node:fs';
+import fs from 'node:fs';
 import * as path from 'node:path';
 
 // A save replaces its target through a uniquely named temporary file.
@@ -83,5 +83,71 @@ export function writeFileAtomically(
     } catch {
       // The temporary is absent or cannot be removed.
     }
+  }
+}
+
+// A streamed write holds at most this many UTF-16 code units before it writes them, so one write
+// holds at most 192 KiB of UTF-8.
+export const STREAMED_WRITE_UNITS = 64 * 1024;
+
+// Writes the text that `produce` passes to `write`, in order, with the replacement rules of
+// `writeFileAtomically`. The whole text never exists as one string: pieces collect into batches of
+// at most `STREAMED_WRITE_UNITS` code units, and a longer piece is written in slices of at most
+// that size.
+export function writeFileStreamAtomically(
+  target: string,
+  produce: (write: (text: string) => void) => void,
+  replace: (temporary: string, target: string) => void = fs.renameSync,
+  mode?: number,
+  cleanup = true,
+): void {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  if (cleanup) removeStaleTemporaries(target);
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    const descriptor = fs.openSync(temporary, 'w', mode);
+    try {
+      let batch: string[] = [];
+      let units = 0;
+      const flush = () => {
+        if (units === 0) return;
+        writeAll(descriptor, batch.length === 1 ? batch[0] : batch.join(''));
+        batch = [];
+        units = 0;
+      };
+      produce((text) => {
+        if (units + text.length > STREAMED_WRITE_UNITS) flush();
+        if (text.length <= STREAMED_WRITE_UNITS) {
+          batch.push(text);
+          units += text.length;
+          return;
+        }
+        for (let start = 0; start < text.length;) {
+          let end = Math.min(text.length, start + STREAMED_WRITE_UNITS);
+          // A slice never ends between the two halves of a surrogate pair.
+          const last = text.charCodeAt(end - 1);
+          if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
+          writeAll(descriptor, text.slice(start, end));
+          start = end;
+        }
+      });
+      flush();
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    replace(temporary, target);
+  } finally {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // The temporary is absent or cannot be removed.
+    }
+  }
+}
+
+function writeAll(descriptor: number, text: string): void {
+  const bytes = Buffer.from(text, 'utf8');
+  for (let at = 0; at < bytes.length;) {
+    at += fs.writeSync(descriptor, bytes, at, bytes.length - at);
   }
 }

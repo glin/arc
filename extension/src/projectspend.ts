@@ -18,7 +18,7 @@ import {
   type ClaudeCostProgress,
   type ClaudeCostSupplement,
 } from './claudecoststate';
-import { writeFileAtomically } from './atomicfile';
+import { writeFileStreamAtomically } from './atomicfile';
 import {
   BACKGROUND_SCAN_BYTES,
   BACKGROUND_SCAN_MILLISECONDS,
@@ -136,6 +136,7 @@ export interface SpendFileIndex {
   offset: number;
   // Readable trailing text supplies the fallback when trailingBytes is absent.
   // trailingBytes stores the exact bytes behind this decoded text.
+  // An incomplete record has empty trailing text and keeps its unfinished line in pendingBytes alone.
   trailing: string;
   trailingBytes?: string;
   buckets: ProjectUsageBucket[];
@@ -430,9 +431,30 @@ function sameSessionSources(held: readonly SessionSpendSource[], next: readonly 
 
 export const PROJECT_SPEND_INTEGRITY_MILLISECONDS = 30_000;
 // The ledger save waits for this much quiet after a change, and never longer than the maximum
-// after the first unsaved change.
-export const PROJECT_SPEND_SAVE_MS = 500;
-export const PROJECT_SPEND_SAVE_MAX_MS = 5_000;
+// after the first unsaved change. The quiet wait equals the maximum, so an ordinary save comes
+// `PROJECT_SPEND_SAVE_MAX_MS` after the first unsaved change and at most one save starts in that time.
+export const PROJECT_SPEND_SAVE_MAX_MS = 30_000;
+export const PROJECT_SPEND_SAVE_MS = PROJECT_SPEND_SAVE_MAX_MS;
+// An unfinished scan that holds more than this many bytes of one line continues before other
+// sources, and stops when that line ends.
+export const PROJECT_SPEND_HELD_LINE_BYTES = 64 * 1024;
+
+export function spendRecordHoldsLongLine(record: SpendFileIndex): boolean {
+  return (
+    record.complete === false &&
+    // The decoded length comes from the base64 length and its padding, without decoding.
+    Buffer.byteLength(record.pendingBytes ?? '', 'base64') > PROJECT_SPEND_HELD_LINE_BYTES
+  );
+}
+
+// An incomplete record without its held bytes reads its unfinished line again from its offset.
+export function releaseSpendHeldLine(record: SpendFileIndex): SpendFileIndex {
+  if (record.complete !== false) {
+    return record;
+  }
+  const { pendingBytes: _pendingBytes, trailingBytes: _trailingBytes, ...rest } = record;
+  return { ...rest, scanOffset: record.offset, trailing: '' };
+}
 // A failed ledger save tries again after this wait, and each later wait doubles. After
 // `PROJECT_SPEND_SAVE_RETRIES` tries the save stays owed until the next ledger change or flush.
 export const PROJECT_SPEND_SAVE_RETRY_MS = 2_000;
@@ -1634,7 +1656,8 @@ function readIncremental(
             () => clock() >= deadline,
           );
     let repeatedRevisionLost = false;
-    // A lookup that runs out of budget stops the slice before its line.
+    // A lookup that runs out of budget stops the slice before its line. The end of a long held line
+    // stops the slice after that line.
     let stoppedBetweenLines = false;
     let classified = false;
     const byKey = new Map(
@@ -1714,7 +1737,13 @@ function readIncremental(
       }
     };
     let position = scanOffset;
-    let held = pending;
+    // The bytes of an unfinished line, kept as separate pieces so that each byte is copied once
+    // when the line ends or the slice stops. None of these bytes is a newline.
+    let heldParts: Buffer[] = pending.length ? [pending] : [];
+    let heldLength = pending.length;
+    // A slice that resumes a long held line stops where that line ends, so the record holds no long
+    // tail and its file leaves the front of the index queue.
+    const stopAfterHeldLine = pending.length > PROJECT_SPEND_HELD_LINE_BYTES;
     let completedOffset = offset;
     let readBytes = 0;
     // A slice reads its first chunk even past the deadline, so every slice makes progress.
@@ -1727,7 +1756,7 @@ function readIncremental(
       position += read;
       readBytes += read;
       if (budget.exportRecordBytes !== undefined) {
-        let recordBytes = held.length;
+        let recordBytes = heldLength;
         for (let at = 0; at < read; at++) {
           if (chunk[at] === 10) recordBytes = 0;
           else if (++recordBytes > budget.exportRecordBytes) {
@@ -1735,13 +1764,18 @@ function readIncremental(
           }
         }
       }
-      const bytes = held.length ? Buffer.concat([held, chunk.subarray(0, read)]) : Buffer.from(chunk.subarray(0, read));
+      // A lost revision leaves the held bytes as they were before this chunk.
+      const partsBefore = heldParts;
+      const lengthBefore = heldLength;
       let lineStart = 0;
-      for (let cursor = 0; cursor < bytes.length; cursor++) {
-        if (bytes[cursor] !== 0x0a) {
+      for (let cursor = 0; cursor < read; cursor++) {
+        if (chunk[cursor] !== 0x0a) {
           continue;
         }
-        let line = bytes.subarray(lineStart, cursor);
+        // The line's text is decoded before the next read reuses the chunk.
+        let line = heldLength
+          ? Buffer.concat([...heldParts, chunk.subarray(0, cursor)], heldLength + cursor)
+          : chunk.subarray(lineStart, cursor);
         if (line.length && line[line.length - 1] === 0x0d) {
           line = line.subarray(0, line.length - 1);
         }
@@ -1753,7 +1787,7 @@ function readIncremental(
           line = line.subarray(firstContent);
         }
         const text = line.toString('utf8');
-        const end = position - (bytes.length - cursor - 1);
+        const end = position - (read - cursor - 1);
         // The first line of a slice always gets a lookup budget, even past the deadline, so every
         // slice makes progress. A later line stops the slice when its lookup finds either budget spent.
         const allowance = classified ? maxBytes - readBytes : Math.max(1, maxBytes - readBytes);
@@ -1775,20 +1809,33 @@ function readIncremental(
           }
           signal();
         }
+        heldParts = [];
+        heldLength = 0;
         lineStart = cursor + 1;
-        completedOffset = position - (bytes.length - lineStart);
+        completedOffset = position - (read - lineStart);
+        if (stopAfterHeldLine) {
+          stoppedBetweenLines = true;
+          break;
+        }
       }
       if (repeatedRevisionLost) {
+        heldParts = partsBefore;
+        heldLength = lengthBefore;
         break;
       }
       if (stoppedBetweenLines) {
         // The next slice reads again from the first unclassified line.
         position = completedOffset;
-        held = Buffer.alloc(0);
+        heldParts = [];
+        heldLength = 0;
         break;
       }
-      held = Buffer.from(bytes.subarray(lineStart));
+      if (lineStart < read) {
+        heldParts.push(Buffer.from(chunk.subarray(lineStart, read)));
+        heldLength += read - lineStart;
+      }
     }
+    let held = heldParts.length === 1 ? heldParts[0] : Buffer.concat(heldParts, heldLength);
     const complete = !repeatedRevisionLost && position >= size;
     if (complete && budget.exportRecordBytes !== undefined && held.length) {
       const text = held.toString('utf8');
@@ -1860,7 +1907,8 @@ export function indexSpendFile<State>(
     invalidateSpendFileNormalization(file);
     const record =
       previous && previous.file === normalizedFile
-        ? { ...previous, missingAt: previous.missingAt ?? now }
+        ? // A source that returns is read again from its start, so the record lets its held bytes go.
+          { ...releaseSpendHeldLine(previous), missingAt: previous.missingAt ?? now }
         : {
             file: normalizedFile,
             workspace: normalizedWorkspace,
@@ -1945,7 +1993,7 @@ export function indexSpendFile<State>(
   }
   if (scanned.repeatedRevisionLost && previous) {
     // The bytes behind the saved offset changed or went away. The next slice rebuilds the file.
-    const kept: SpendFileIndex = { ...previous, complete: false };
+    const kept = releaseSpendHeldLine({ ...previous, complete: false });
     delete kept.claudeRepeated;
     return {
       record: kept,
@@ -1965,8 +2013,10 @@ export function indexSpendFile<State>(
     size: stat.size,
     mtimeMs: stat.mtimeMs,
     offset: scanned.offset,
-    trailing: scanned.trailing.toString('utf8'),
-    trailingBytes: scanned.trailing.toString('base64'),
+    // An unfinished scan keeps its held bytes once, in pendingBytes. Every reader of trailing
+    // treats an incomplete record as unfinished first.
+    trailing: scanned.complete ? scanned.trailing.toString('utf8') : '',
+    ...(scanned.complete ? { trailingBytes: scanned.trailing.toString('base64') } : {}),
     buckets,
     lifetimeBuckets: scanned.lifetimeBuckets,
     turnCount: scanned.turnCount,
@@ -2135,17 +2185,11 @@ export function saveSpendLedger(
       state === record.parserState && normalizedFile === record.file
         ? record
         : { ...record, file: normalizedFile, parserState: state };
-    if (bounded.complete !== false) {
-      return bounded;
-    }
-    const { pendingBytes: _pendingBytes, trailingBytes: _trailingBytes, ...rest } = bounded;
-    return { ...rest, scanOffset: bounded.offset, trailing: '' };
+    return releaseSpendHeldLine(bounded);
   };
   // Array.from exposes sparse entries so filtering drops holes and unusable records before serialization.
   const present = Array.from(files).filter(usableSpendRecord);
   const shown = Array.from(completeFiles).filter(usableSpendRecord);
-  const saved = present.map(checkpoint);
-  const texts = saved.map((record) => JSON.stringify(record));
   const sameRecord = new Map<SpendFileIndex, number>();
   const samePath = new Map<string, number>();
   present.forEach((record, at) => {
@@ -2157,24 +2201,39 @@ export function saveSpendLedger(
       samePath.set(normalizedFile, at);
     }
   });
-  // Store display records as indexes when they match files by identity or by normalized path and serialized content.
-  // Write differing records in full.
-  const display = shown.map((record) => {
-    const shared = sameRecord.get(record);
-    if (shared !== undefined) {
-      return String(shared);
-    }
-    const found = samePath.get(normalizeSpendFile(record.file));
-    const text = JSON.stringify(checkpoint(record));
-    return found !== undefined && texts[found] === text ? String(found) : text;
+  // A checkpoint copies these fields unchanged, so records that differ in one of them serialize differently.
+  const sameScalars = (left: SpendFileIndex, right: SpendFileIndex) =>
+    (['size', 'mtimeMs', 'offset', 'complete', 'indexedAt'] as const).every(
+      (key) => left[key] === right[key] || Object.is(left[key], right[key]),
+    );
+  // The save streams one record text at a time, because the whole ledger can exceed 100 MB.
+  writeFileStreamAtomically(ledgerFile(storageDirectory, workspace), (write) => {
+    write(
+      `{"workspace":${JSON.stringify(normalizeWorkspace(workspace))}` +
+        `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATION}` +
+        `,"files":[`,
+    );
+    present.forEach((record, at) => write((at ? ',' : '') + JSON.stringify(checkpoint(record))));
+    write('],"displayFiles":[');
+    // Store display records as indexes when they match files by identity or by normalized path and serialized content.
+    // Write differing records in full.
+    shown.forEach((record, at) => {
+      const separator = at ? ',' : '';
+      const shared = sameRecord.get(record);
+      if (shared !== undefined) {
+        write(separator + String(shared));
+        return;
+      }
+      const found = samePath.get(normalizeSpendFile(record.file));
+      const text = JSON.stringify(checkpoint(record));
+      const same =
+        found !== undefined &&
+        sameScalars(present[found], record) &&
+        JSON.stringify(checkpoint(present[found])) === text;
+      write(separator + (same ? String(found) : text));
+    });
+    write(']}');
   });
-  writeFileAtomically(
-    ledgerFile(storageDirectory, workspace),
-    `{"workspace":${JSON.stringify(normalizeWorkspace(workspace))}` +
-      `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATION}` +
-      `,"files":[${texts.join(',')}]` +
-      `,"displayFiles":[${display.join(',')}]}`,
-  );
 }
 
 export function formatProjectCost(dollars: number | null): string {

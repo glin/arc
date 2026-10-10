@@ -60,6 +60,8 @@ import {
   SessionFiguresCache,
   sessionLifetimeDisplayFiles,
   spendRecordChangesRail,
+  spendRecordHoldsLongLine,
+  releaseSpendHeldLine,
   invalidateClaudeCostSupplements,
   claudeCostStateDependencies,
   discoverClaudeSessionSpendSources,
@@ -9773,6 +9775,7 @@ test('the lifetime figures hold through a spend pass that does not move them', (
         sessionCacheFactsBySession: () => ({}),
         normalizeSpendFile: (file: string) => file,
         spendRecordChangesRail: () => false,
+        spendRecordHoldsLongLine,
         createClaudeUsageLineReducer: () => null,
         createCodexUsageLineReducer: () => null,
         invalidateSpendFileNormalization: () => {},
@@ -9929,6 +9932,132 @@ test('a failed ledger save retries on a bounded backoff and writes the newest le
     vi.advanceTimersByTime(PROJECT_SPEND_SAVE_MS);
     assert.deepEqual(written.at(-1), [record(3)], 'the save after the failures missed the newest ledger');
     assert.equal(provider.projectSpendSaveOwedSince, null);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('continuous ledger changes start at most one save in 30 seconds, and a flush still writes at once', () => {
+  vi.useFakeTimers();
+  try {
+    const saves: number[] = [];
+    const provider = railPostHarness(LEDGER_SAVE_METHODS, {
+      ...LEDGER_SAVE_SCOPE,
+      saveSpendLedger: () => {
+        saves.push(Date.now());
+      },
+    });
+    provider.projectSpendWorkspace = 'project';
+    provider.projectSpendStorageDir = 'storage';
+    provider.projectSpendFiles = [];
+    provider.projectSpendVisibleFiles = [];
+    provider.projectSpendSaveOwed = false;
+    provider.performanceCounters.recordLedgerSave = () => {};
+    provider.projectSpendSaveScheduler = provider.newProjectSpendSaveScheduler();
+
+    // An indexing pass changes the ledger every second for 90 seconds.
+    const interval = 30_000;
+    const from = Date.now();
+    for (let second = 0; second < 90; second++) {
+      provider.scheduleProjectSpendSave();
+      vi.advanceTimersByTime(1_000);
+    }
+    const times = saves.map((at) => at - from);
+    assert.equal(
+      saves.length,
+      3,
+      `90 seconds of changes started ${saves.length} saves, the first at ${times.slice(0, 3).join(', ')} ms`,
+    );
+    times.forEach((at, index) => {
+      const gap = at - (index ? times[index - 1] : 0);
+      assert.ok(gap >= interval, `a save started ${gap} ms after the one before it`);
+      assert.ok(gap <= interval, `a change waited ${gap} ms for a save, so a crash loses more than 30 seconds`);
+    });
+
+    // Disposal and a workspace change write an owed save without the wait.
+    provider.scheduleProjectSpendSave();
+    provider.flushProjectSpendSave();
+    assert.equal(saves.length, 4, 'a flush waited for the save interval');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a source of long lines leaves the queue front after each line, and one record holds a long line', () => {
+  vi.useFakeTimers();
+  try {
+    const folder = tempDir('spend-long-lines');
+    // Each source holds three lines of 600 KiB, and each slice reads 256 KiB.
+    const sources = ['a', 'b'].map((name) => {
+      const file = path.join(folder, `${name}.jsonl`);
+      fs.writeFileSync(file, `{"pad":"${name.repeat(600 * 1024)}"}\n`.repeat(3));
+      return file;
+    });
+    const [first, second] = sources.map(normalizeSpendFile);
+    const provider = railPostHarness(['indexNextProjectSpendFile'], {
+      normalizeSpendFile,
+      spendRecordChangesRail: () => false,
+      spendRecordHoldsLongLine,
+      releaseSpendHeldLine,
+      invalidateSpendFileNormalization: () => {},
+      createClaudeUsageLineReducer: () => null,
+      // The reducer state counts the lines read, so a line read twice or skipped changes the count.
+      createCodexUsageLineReducer: (state: number | undefined) => {
+        let lines = state ?? 0;
+        return {
+          pushLine: () => {
+            lines++;
+            return [];
+          },
+          snapshot: () => lines,
+        };
+      },
+      indexSpendFile: (previous: never, file: string, workspace: string, makeReducer: never) =>
+        indexSpendFile(previous, file, workspace, makeReducer, { maxBytes: 256 * 1024, now: () => 0 }),
+      fs,
+    });
+    provider.projectSpendWorkspace = 'workspace';
+    provider.projectSpendStorageDir = 'storage';
+    provider.projectSpendFiles = [];
+    provider.projectSpendRevision = 0;
+    provider.projectSpendQueue = sources.map((file) => ({ file, agent: 'codex', primary: true }));
+    provider.projectSpendQueued = new Set([first, second]);
+    provider.projectSpendRailOwed = false;
+    provider.scheduleProjectSpendSave = () => {};
+    const record = (file: string) => provider.projectSpendFiles.find((entry: { file: string }) => entry.file === file);
+    let slices = 0;
+    let secondSliceAt: number | null = null;
+    let firstDoneAt: number | null = null;
+    let reordered = false;
+    while (provider.projectSpendQueue.length && slices < 100) {
+      const file = normalizeSpendFile(provider.projectSpendQueue[0].file);
+      provider.indexNextProjectSpendFile();
+      vi.clearAllTimers();
+      slices++;
+      if (file === second) secondSliceAt ??= slices;
+      if (file === first && record(first).complete !== false) firstDoneAt ??= slices;
+      const holding = provider.projectSpendFiles.filter(spendRecordHoldsLongLine).length;
+      assert.ok(holding <= 1, `slice ${slices} left ${holding} records that hold a long line`);
+      // A history change offers the sources again in source order, so a queued source can pass the one at the front.
+      if (
+        !reordered &&
+        file === second &&
+        spendRecordHoldsLongLine(record(second)) &&
+        provider.projectSpendQueue.length > 1
+      ) {
+        provider.projectSpendQueue.reverse();
+        reordered = true;
+      }
+    }
+    assert.ok(secondSliceAt !== null && firstDoneAt !== null, `the queue did not drain in ${slices} slices`);
+    assert.ok(
+      secondSliceAt < firstDoneAt,
+      `the second source waited for slice ${secondSliceAt}, after the first source ended at slice ${firstDoneAt}`,
+    );
+    for (const file of [first, second]) {
+      assert.equal(record(file).complete, true);
+      assert.equal(record(file).parserState, 3, `${file} read ${record(file).parserState} of its 3 lines`);
+    }
   } finally {
     vi.useRealTimers();
   }
@@ -10166,6 +10295,7 @@ test('running agents that only grow their transcripts start no refresh from a sp
         projectSpendOfferDecision,
         projectSpendHistoryCutoff,
         spendRecordChangesRail,
+        spendRecordHoldsLongLine,
         createClaudeUsageLineReducer: () => null,
         createCodexUsageLineReducer: () => null,
         fs: {
@@ -10282,7 +10412,8 @@ test('running agents that only grow their transcripts start no refresh from a sp
         setInterval(append, 300);
       }, at * 100);
     }
-    const seconds = 10;
+    // Three maximum waits, so the count check covers more than one save.
+    const seconds = (3 * PROJECT_SPEND_SAVE_MAX_MS) / 1_000;
     const [savesBefore, changesBefore] = [saves, changes.length];
     const [lifetimeBefore, railBefore] = [lifetimeRecalculated.length, railRecalculated.length];
     const appendsFrom = Date.now();

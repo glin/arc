@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
-import * as fs from 'node:fs';
+import fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
-import { test } from 'vitest';
-import { temporaryIsStale, writeFileAtomically } from './atomicfile.ts';
+import { test, vi } from 'vitest';
+import {
+  STREAMED_WRITE_UNITS,
+  temporaryIsStale,
+  writeFileAtomically,
+  writeFileStreamAtomically,
+} from './atomicfile.ts';
 
 const dir = () => tempDir('atomic-file-');
 
@@ -71,4 +76,79 @@ test('a write that cannot finish keeps the old target and leaves no temporary', 
   assert.equal(fs.readFileSync(target, 'utf8'), 'first');
   assert.equal(fs.existsSync(temporary), false);
   assert.deepEqual(fs.readdirSync(folder), ['store.json']);
+});
+
+// Runs a streamed write that must fail, checks the target, the folder, and the temporary's descriptor,
+// and returns the failure.
+function failedStreamedWrite(write: (target: string) => void): string {
+  const folder = dir();
+  const target = path.join(folder, 'store.json');
+  writeFileAtomically(target, 'first');
+  const opened = vi.spyOn(fs, 'openSync');
+  const closed = vi.spyOn(fs, 'closeSync');
+  let failure = '';
+  try {
+    try {
+      write(target);
+    } catch (error) {
+      failure = String(error);
+    }
+    assert.notEqual(failure, '', 'the streamed write did not fail');
+    const descriptor = opened.mock.results[0]?.value;
+    assert.equal(typeof descriptor, 'number', 'the write opened no temporary');
+    assert.ok(
+      closed.mock.calls.some(([closing]) => closing === descriptor),
+      'the failed write left the temporary open',
+    );
+  } finally {
+    opened.mockRestore();
+    closed.mockRestore();
+  }
+  assert.equal(fs.readFileSync(target, 'utf8'), 'first');
+  assert.deepEqual(fs.readdirSync(folder), ['store.json']);
+  return failure;
+}
+
+test('a streamed write that fails after writing part of the text keeps the old target', () => {
+  const real = fs.writeSync;
+  let writes = 0;
+  const spy = vi.spyOn(fs, 'writeSync').mockImplementation((...args: Parameters<typeof fs.writeSync>) => {
+    if (++writes > 1) throw new Error('disk full');
+    return (real as (...values: unknown[]) => number)(...args);
+  });
+  try {
+    const failure = failedStreamedWrite((target) =>
+      writeFileStreamAtomically(target, (write) => {
+        write('a'.repeat(STREAMED_WRITE_UNITS));
+        write('b'.repeat(STREAMED_WRITE_UNITS));
+      }),
+    );
+    assert.match(failure, /disk full/);
+    assert.equal(writes, 2, 'the first batch never reached the temporary');
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test('a streamed write whose producer throws keeps the old target', () => {
+  const failure = failedStreamedWrite((target) =>
+    writeFileStreamAtomically(target, (write) => {
+      write('a'.repeat(STREAMED_WRITE_UNITS + 1));
+      throw new Error('producer failed');
+    }),
+  );
+  assert.match(failure, /producer failed/);
+});
+
+test('a streamed write whose replacement fails keeps the old target', () => {
+  const failure = failedStreamedWrite((target) =>
+    writeFileStreamAtomically(
+      target,
+      (write) => write('second'),
+      () => {
+        throw new Error('replacement failed');
+      },
+    ),
+  );
+  assert.match(failure, /replacement failed/);
 });

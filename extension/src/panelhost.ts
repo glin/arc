@@ -446,6 +446,8 @@ import {
   sessionRailFactsBySession,
   projectSpendWorkspace,
   PROJECT_SPEND_SAVE_MAX_MS,
+  spendRecordHoldsLongLine,
+  releaseSpendHeldLine,
   PROJECT_SPEND_SAVE_MS,
   projectSpendSaveRetryDelay,
 } from './projectspend';
@@ -8599,6 +8601,15 @@ export class PanelProvider implements vscode.Disposable {
         invalidateSpendFileNormalization(next.file);
         // The integrity pass marks the disappeared source in the ledger.
       }
+    } else if (spendRecordHoldsLongLine(result.record)) {
+      // The file reads next, and the slice that ends the held line stops there. A re-offer can queue
+      // another source first, so any other record that holds a long line lets it go.
+      this.projectSpendQueue.unshift(next);
+      this.projectSpendFiles.forEach((record, index) => {
+        if (record !== result.record && spendRecordHoldsLongLine(record)) {
+          this.projectSpendFiles[index] = releaseSpendHeldLine(record);
+        }
+      });
     } else {
       this.projectSpendQueue.push(next);
     }

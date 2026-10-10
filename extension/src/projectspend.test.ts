@@ -14,7 +14,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   PROJECT_SPEND_INTEGRITY_MILLISECONDS,
+  PROJECT_SPEND_HELD_LINE_BYTES,
   PROJECT_SPEND_PARSER_GENERATION,
+  spendRecordHoldsLongLine,
   sessionCacheFactsBySession,
   SessionFiguresCache,
   aggregateUsageEvents,
@@ -1143,6 +1145,62 @@ test('metered Codex usage remains Codex spend', () => {
   assert.equal(view.categories[0].windows[0].display, '$1.00');
 });
 
+test('an unfinished long line stays in memory once, as pending bytes', () => {
+  const folder = dir();
+  const file = path.join(folder, 'source.jsonl');
+  const first = JSON.stringify(event(stamp('2026-08-31T10:00:00'))) + '\n';
+  const giant = JSON.stringify(event(stamp('2026-08-31T10:30:00'), { requestKey: 'x'.repeat(6 * 1024 * 1024) })) + '\n';
+  fs.writeFileSync(file, first + giant);
+  // A stopped clock leaves the byte budget as the only limit, so each slice reads 1 MiB.
+  const budget = { maxBytes: 1024 * 1024, now: () => 0 };
+  let record = indexSpendFile(undefined, file, 'w', reducer, budget).record;
+  let slices = 1;
+  while (record.complete === false) {
+    const held = (record.scanOffset ?? record.offset) - record.offset;
+    assert.equal(record.trailing, '', `slice ${slices} kept the held line as text`);
+    assert.equal(record.trailingBytes, undefined, `slice ${slices} kept a second copy of the held line`);
+    assert.ok(
+      (record.pendingBytes?.length ?? 0) <= 1.4 * held,
+      `slice ${slices} kept ${record.pendingBytes?.length} characters for ${held} held bytes`,
+    );
+    assert.equal(spendRecordHoldsLongLine(record), held > PROJECT_SPEND_HELD_LINE_BYTES);
+    record = indexSpendFile(record, file, 'w', reducer, budget).record;
+    slices++;
+  }
+  assert.equal(slices, 7);
+  assert.equal(
+    record.buckets.reduce((sum, bucket) => sum + bucket.requests, 0),
+    2,
+  );
+});
+
+test('a record holds a long line only when it holds more than PROJECT_SPEND_HELD_LINE_BYTES', () => {
+  const holding = (bytes: number) =>
+    ({ complete: false, pendingBytes: Buffer.alloc(bytes).toString('base64') }) as never;
+  assert.equal(spendRecordHoldsLongLine(holding(PROJECT_SPEND_HELD_LINE_BYTES)), false);
+  assert.equal(
+    spendRecordHoldsLongLine(holding(PROJECT_SPEND_HELD_LINE_BYTES + 1)),
+    true,
+    'a record that holds one byte past the limit does not count as holding a long line',
+  );
+});
+
+test('a source that disappears in the middle of a long line lets the held bytes go', () => {
+  const folder = dir();
+  const file = path.join(folder, 'source.jsonl');
+  fs.writeFileSync(
+    file,
+    JSON.stringify(event(stamp('2026-08-31T10:30:00'), { requestKey: 'x'.repeat(512 * 1024) })) + '\n',
+  );
+  const budget = { maxBytes: 256 * 1024, now: () => 0 };
+  const held = indexSpendFile(undefined, file, 'w', reducer, budget).record;
+  assert.equal(spendRecordHoldsLongLine(held), true);
+  fs.rmSync(file);
+  const missing = indexSpendFile(held, file, 'w', reducer, budget).record;
+  assert.notEqual(missing.missingAt, undefined);
+  assert.equal(missing.pendingBytes, undefined, 'a disappeared source kept its unfinished line');
+});
+
 test('incremental source reading preserves an incomplete UTF-8 CRLF line and does not rescan completed bytes', () => {
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
@@ -1405,6 +1463,40 @@ test('persistence keeps the last complete display ledger apart from resumable sc
   assert.equal(resumed.rebuilt, false);
   assert.equal(resumed.complete, true);
   assert.equal(resumed.record.buckets[0].requests, 2);
+});
+
+test('a ledger save writes the whole ledger in pieces under 1 MiB', () => {
+  const folder = dir();
+  // Multi-byte text and records longer than one write, with surrogate pairs at both parities.
+  const records = Array.from({ length: 2_000 }, (_, at) =>
+    spendRecord(`source-${at}.jsonl`, { indexedAt: at, trailing: `€${at}`.repeat(200) }),
+  );
+  records[7] = spendRecord('long-even.jsonl', { trailing: '😀'.repeat(300_000) });
+  records[8] = spendRecord('long-odd.jsonl', { trailing: `a${'😀'.repeat(300_000)}` });
+  const expected =
+    `{"workspace":${JSON.stringify(normalizeWorkspace('one'))}` +
+    `,"parserGeneration":${PROJECT_SPEND_PARSER_GENERATION}` +
+    `,"files":[${records.map((record) => JSON.stringify(record)).join(',')}]` +
+    `,"displayFiles":[${records.map((_, at) => at).join(',')}]}`;
+  const writes: number[] = [];
+  const write = fs.writeSync;
+  const spy = vi.spyOn(fs, 'writeSync').mockImplementation((...args: unknown[]) => {
+    const written = (write as (...values: unknown[]) => number)(...args);
+    writes.push(written);
+    return written;
+  });
+  try {
+    saveSpendLedger(folder, 'one', records);
+  } finally {
+    spy.mockRestore();
+  }
+  assert.equal(ledgerText(folder), expected);
+  assert.ok(writes.length > 10, `the save wrote ${writes.length} times`);
+  assert.equal(
+    writes.reduce((sum, bytes) => sum + bytes, 0),
+    Buffer.byteLength(expected),
+  );
+  assert.ok(Math.max(...writes) < 1024 * 1024, `one write held ${Math.max(...writes)} bytes`);
 });
 
 test('cache rewrites preserve historical lifetime usage and missing sources in the existing array format', () => {
