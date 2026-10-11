@@ -13,7 +13,7 @@ export function savedExportSource(session: string, sources: readonly SessionFile
 }
 
 export const EXPORT_CONFIRMATION =
-  'The export includes recorded prompts, responses, commentary and linked session work. Text can contain secrets, paths and addresses. Inspect the complete export before sharing it.';
+  'The export includes recorded prompts, responses, commentary, Activity commands and linked session work. Text can contain secrets, paths and addresses. Inspect the complete export before sharing it.';
 
 export interface SessionExportPorts {
   confirm(title: string, detail: string): PromiseLike<boolean>;

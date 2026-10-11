@@ -79,6 +79,7 @@ export interface ExportNumbers {
   coverage: { usage: 'complete' | 'partial' | 'unavailable'; cost: 'complete' | 'partial' | 'unpriced' };
 }
 export interface ExportBlock {
+  stepsBefore?: number;
   opening?: boolean;
   key: string;
   kind: 'prompt' | 'assignment' | 'answer' | 'commentary';
@@ -115,8 +116,21 @@ export interface ExportTurn {
     } | null;
   };
   outputRate: { output: number; milliseconds: number } | null;
+  outputRateModel?: string;
   error: string | null;
   activity: {
+    steps?: {
+      ordinal: number;
+      name: string;
+      detail: string;
+      fullDetail?: string;
+      headline?: string;
+      at: number;
+      status: 'running' | 'done' | 'failed' | 'interrupted';
+    }[];
+    failedOrdinals?: number[];
+    failedTools?: Record<string, number>;
+    tools?: Record<string, number>;
     calls: number;
     failures: number;
     categories: string[];
@@ -139,6 +153,9 @@ export interface ExportTurn {
     description: string;
     agentType: string | null;
     model: string | null;
+    ownModel?: string;
+    outputRate?: { output: number; milliseconds: number };
+    outputRateModel?: string;
     effort: string | null;
     status: string;
     startedAt: number | null;
@@ -146,8 +163,27 @@ export interface ExportTurn {
     tokens: number | null;
     toolUses: number | null;
     partial: boolean;
+    artifacts?: {
+      files: ExportTurn['files'];
+      commits: string[];
+      tools?: Record<string, number>;
+      failed?: { count: number; byTool: Record<string, number> };
+      startedAt?: number;
+      endedAt?: number;
+      turnCount?: number;
+      complete: boolean;
+    };
   }[];
-  files: { path: string; added: number | null; removed: number | null; isNew: boolean; reason: string | null }[];
+  files: {
+    path: string;
+    identity?: string;
+    added: number | null;
+    removed: number | null;
+    isNew: boolean;
+    reason: 'shell' | 'write' | 'replaceAll' | 'notebook' | 'zero' | null;
+    countsUnknown?: true;
+    countsPartial?: true;
+  }[];
   commits: {
     sha: string;
     subject: string;
@@ -157,6 +193,7 @@ export interface ExportTurn {
     removed: number | null;
   }[];
   changes: 'complete' | 'partial';
+  filesComplete?: boolean;
 }
 export interface ExportCompaction {
   key: string;

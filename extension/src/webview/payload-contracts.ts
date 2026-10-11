@@ -90,6 +90,7 @@ export interface CardView extends Record<string, unknown> {
     label: string;
     icon: CardIcon;
     path: string;
+    identity?: string;
     shownPath: string;
     // Additional hover detail, including the subagent that changed the file.
     detail?: string;

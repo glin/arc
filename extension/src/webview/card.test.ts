@@ -29,6 +29,7 @@ import {
 import type { CardView } from './payload-contracts.ts';
 import { DiffPair, labelledDiff, StaticStatChip } from './stat-chip.ts';
 import { walkOutOf } from './stat-detail.ts';
+import type { StatDetailList, StatDetailRenderer } from './stat-detail.ts';
 import { commitRecordCards, LONGEST_MAKER, type CommitRecordCase } from '../turnfixtures.ts';
 import { RepositoryCommits } from '../gitcommits.ts';
 import { recordCommits } from '../transcript.ts';
@@ -808,6 +809,103 @@ test('a figure that holds a record answers Enter and Space as a click', () => {
   assert.deepEqual(answer('ArrowRight'), [0, false], 'a key that presses no button pressed the figure');
   const plain = shown({ metric: 'tokens', compactLabel: '48k tokens', name: '48k tokens' });
   assert.equal(plain.onKeyDown, undefined, 'a figure with no record answers a press');
+});
+
+test('child figure callbacks preserve own collections, section fallback and captured membership', () => {
+  for (const layout of ['agents', 'dispatched'] as const)
+    for (const own of ['supplied', 'absent', 'empty'] as const)
+      for (const membership of ['opaque', 'legacy', 'absent', 'empty'] as const) {
+        const childFile = { path: 'src/shared.ts', identity: 'child', name: 'shared.ts', added: 7, removed: 3 };
+        const otherFile = { ...childFile, identity: 'other', added: 2, removed: 1 };
+        const parentFiles = [{ ...childFile, added: 13 }, otherFile] as FileRowView[];
+        const childFiles = [childFile, otherFile] as FileRowView[];
+        const childCommit = {
+          kind: 'commit',
+          sha: 'bbbbbbb1234567890',
+          key: 'child-commit',
+          subject: 'Child change',
+        } as CommitRowView;
+        const parentCommits = [
+          { ...childCommit, subject: 'Hydrated child change' },
+          { ...childCommit, sha: 'aaaaaaa1234567890', key: 'parent-commit' },
+        ];
+        const agent: AgentRowView = {
+          description: 'Child task',
+          sessionId: 'child',
+          kind: layout === 'dispatched' ? 'dispatch' : 'subagent',
+          state: 'done',
+          stateWord: '',
+          since: null,
+          hintDetail: '',
+          model: null,
+          effort: null,
+          ...(own === 'supplied' ? { files: childFiles, commits: [childCommit] } : {}),
+          ...(own === 'empty' ? { files: [], commits: [] } : {}),
+          figures: [
+            {
+              metric: 'files',
+              compactLabel: '1 file',
+              ...(membership === 'absent' ? {} : { paths: membership === 'empty' ? [] : ['src/shared.ts'] }),
+              ...(membership === 'opaque' ? { fileIdentities: ['child'] } : {}),
+              ...(membership === 'empty' ? { fileIdentities: [] } : {}),
+              record: { heading: { label: '1 file' }, layout: 'files', entries: [] },
+            },
+            {
+              metric: 'commits',
+              compactLabel: '1 commit',
+              shas: ['bbbbbbb'],
+              record: { heading: { label: '1 commit' }, layout: 'commits', entries: [] },
+            },
+          ],
+        };
+        const card = {
+          key: 'parent',
+          files: parentFiles,
+          commits: parentCommits,
+          agents: layout === 'agents' ? [agent] : [],
+          dispatched: layout === 'dispatched' ? [agent] : [],
+        } as CardView;
+        const records = new Map<string, StatDetailList>();
+        const figureDetails = {
+          connect(node, _detail, record) {
+            assert.equal(typeof record, 'function');
+            records.set(node.dataset.metric!, (record as () => StatDetailList)());
+          },
+        } as StatDetailRenderer;
+        const tree = h(DetailRowList, { rows: detailRowsFor(card, layout)!, post: () => {}, figureDetails });
+        for (const figure of findAll(tree, (node) => node.props?.role === 'button')) {
+          const ref = (figure as { ref: (node: HTMLElement) => void }).ref;
+          ref({ dataset: { metric: figure.props!['data-metric'] } } as unknown as HTMLElement);
+        }
+        const expectedFiles =
+          own === 'supplied' ? childFiles : own === 'empty' || layout === 'dispatched' ? [] : parentFiles;
+        const files = records.get('files')!.rows;
+        if (membership === 'absent') {
+          assert.equal(files, undefined);
+        } else {
+          assert.equal(files?.kind, 'files');
+          assert.deepEqual(
+            files?.kind === 'files' ? files.files : null,
+            membership === 'empty'
+              ? []
+              : membership === 'opaque'
+                ? expectedFiles.filter((file) => file.identity === 'child')
+                : expectedFiles,
+            `${layout}, ${own}, ${membership}`,
+          );
+        }
+        const commits = records.get('commits')!.rows;
+        assert.equal(commits?.kind, 'commits');
+        assert.deepEqual(
+          commits?.kind === 'commits' ? commits.commits.map((commit) => [commit.sha, commit.subject]) : null,
+          own === 'supplied'
+            ? [['bbbbbbb1234567890', 'Child change']]
+            : own === 'empty' || layout === 'dispatched'
+              ? []
+              : [['bbbbbbb1234567890', 'Hydrated child change']],
+          `${layout}, ${own}, ${membership}`,
+        );
+      }
 });
 
 test('a subagent figure record draws the card rows the child touched and no others', () => {

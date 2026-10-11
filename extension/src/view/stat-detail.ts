@@ -71,5 +71,7 @@ export interface AgentFigureFacts {
   // stands behind the card body and both popovers, so a press in any of them opens the same
   // editor tab.
   paths?: string[];
+  // Captured identities distinguish files whose display paths match. Rows without identity use paths.
+  fileIdentities?: string[];
   shas?: string[];
 }

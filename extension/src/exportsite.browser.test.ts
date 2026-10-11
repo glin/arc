@@ -6,8 +6,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { browserOrNone } from '../test/browser.ts';
 import { tempDir } from './temproot';
 import { ExportTransaction } from './exportwriter';
-import { exportedSiteData, sessionSiteFixture } from './turnfixtures';
-import { captureSessionExport, type ExportPage } from './exportdata';
+import { exportedSiteData, sessionSiteFixture, turn, subagent } from './turnfixtures';
+import { captureSessionExport, projectTurn, type ExportPage } from './exportdata';
 import { themed } from './panelfixture';
 import { projectSessionSite } from './exportsite';
 import { exportBrowserAssets } from './panelbundle';
@@ -26,6 +26,14 @@ describe('portable saved-session site', () => {
     const page = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
     page.turns[0].finished = true;
     model.sessions[0].pages[0] = await writer.spool(page);
+    const messages = await writer.readSpool<ExportPage>(model.sessions[0].pages[1]);
+    messages.turns[0].activity = {
+      calls: 0,
+      failures: 0,
+      categories: [],
+      counts: { edits: 0, reads: 0, searches: 0, commands: 0, agents: 0, coordination: 0, web: 0, other: 0 },
+    };
+    model.sessions[0].pages[1] = await writer.spool(messages);
     await projectSessionSite(model, writer, exportBrowserAssets());
     directory = (await writer.publish(async () => {})).directory;
     server = createServer((request, response) => {
@@ -46,6 +54,102 @@ describe('portable saved-session site', () => {
   afterAll(async () => {
     await browser?.close();
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('reveals captured commands and keyboard figure details without quick filters across render and page changes', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    const writer = await ExportTransaction.create(tempDir('arc-site-activity-figures-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const source = await writer.readSpool<ExportPage>(model.sessions[0].pages[0]);
+      const long = "printf '" + 'command '.repeat(70) + "'";
+      const original = turn({
+        finished: true,
+        steps: [
+          { ordinal: 1, name: 'Bash', detail: "printf 'first'", at: 2, status: 'done' },
+          { ordinal: 2, name: 'Bash', detail: long.slice(0, 80), fullDetail: long, at: 4, status: 'failed' },
+        ],
+        stepCount: 2,
+        stepKinds: ['commands', 'commands'],
+        toolUses: 2,
+        toolCounts: { edits: 0, reads: 0, searches: 0, commands: 2, agents: 0, coordination: 0, web: 0, other: 0 },
+        failedOrdinals: [2],
+        updates: [
+          { sourceId: 'middle', kind: 'commentary', text: 'Between commands', at: 3, stepsBefore: 1, status: 'done' },
+        ],
+        agents: [
+          subagent({
+            durationMs: 123_000,
+            spendFound: true,
+            spend: [
+              {
+                model: 'claude-sonnet-4-5',
+                usage: {
+                  requests: 1,
+                  input: 100_000,
+                  cacheRead: 0,
+                  cacheWrite1h: 0,
+                  cacheWrite5m: 0,
+                  output: 1000,
+                  thinking: 0,
+                },
+              },
+            ],
+          }),
+        ],
+      });
+      const captured = projectTurn(original, 'root-21', { cwd: '/project' }, [], 'root', new Map());
+      captured.relationships = source.turns[0].relationships;
+      source.turns[0] = captured;
+      model.sessions[0].pages[0] = await writer.spool(source);
+      await projectSessionSite(model, writer, exportBrowserAssets());
+      const output = (await writer.publish(async () => {})).directory;
+      const page = await browser!.newPage();
+      page.setDefaultTimeout(5000);
+      await page.goto(pathToFileURL(path.join(output, 'index.html')).href);
+      const card = page.locator('article[data-key="root-21"]');
+      await card.locator('.head').click();
+      expect(await page.locator('[data-control^="railcount:"]').count()).toBe(0);
+      expect(await card.locator('.actrow.step').count()).toBe(0);
+      await card.locator('.actviewaction').click();
+      await page.waitForFunction(
+        () => document.querySelectorAll('article[data-key="root-21"] .actrow.step').length === 2,
+      );
+      expect(await card.locator('.actrow.step.failed').count()).toBe(1);
+      const command = card.locator('[data-control^="activity-line:"]');
+      await command.focus();
+      await page.keyboard.press('Enter');
+      await card.locator('.actfull:visible').waitFor();
+      expect(await card.locator('.actfull:visible').textContent()).toBe(long);
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('article[data-key="root-21"] .actfull:not([hidden])'));
+      const cost = card.locator('.statchip[data-metric="cost"]');
+      await cost.focus();
+      await page.keyboard.press('Enter');
+      await page.locator('.chippop:not([hidden])').waitFor();
+      expect(await page.locator('.chippop [data-control^="file:"], .chippop [data-control^="diff:"]').count()).toBe(0);
+      await page.keyboard.press('Escape');
+      const childCost = card.locator('.agentrow [data-metric="cost"]');
+      await childCost.focus();
+      await page.keyboard.press('Enter');
+      await page.locator('.chippop:not([hidden])').waitFor();
+      await page.keyboard.press('Escape');
+      await page.locator('[data-control="railfilters"]').click();
+      expect(await page.locator('[data-control^="railheadlens:"]').count()).toBe(0);
+      await page.keyboard.press('Escape');
+      await page.getByRole('button', { name: 'Older turns', exact: true }).click();
+      await page.locator('article[data-key="root-0"]').waitFor();
+      expect(await page.locator('[data-control^="railcount:"]').count()).toBe(0);
+      await card.locator('[data-control^="session:"]').filter({ hasText: 'Linked session' }).focus();
+      await page.keyboard.press('Enter');
+      await page.locator('article[data-key="child-0"]').waitFor();
+      await page.locator('.sessionparent').click();
+      await card.waitFor();
+      expect(await page.locator('[data-control^="railcount:"]').count()).toBe(0);
+      await page.close();
+    } finally {
+      await writer.dispose();
+    }
   });
 
   it('opens file and root or nested HTTP sites with complete inert text and retained older turns', async (t) => {
@@ -83,7 +187,8 @@ describe('portable saved-session site', () => {
           ?.textContent?.includes('Later prompt 12'),
       );
       expect(await first.locator('.actlist .ask').count()).toBe(13);
-      expect(await first.locator('.actlist .run, .actlist .step, .actlist .reasoning').count()).toBe(0);
+      expect(await first.locator('.actlist .run').count()).toBe(1);
+      expect(await first.locator('.actlist .step, .actlist .reasoning').count()).toBe(0);
       await first.locator('.actviewaction').click();
       await page.waitForFunction(
         () => document.querySelectorAll('article[data-key="root-21"] .actlist .ask').length === 0,

@@ -22,6 +22,7 @@ export interface ChildEvidence {
 // These totals describe recorded edits, rather than the final net diff. Parent cards and child details share the file-row fields.
 export interface ChildFileChange {
   path: string;
+  identity?: string;
   added: number;
   removed: number;
   isNew: boolean;
@@ -134,10 +135,16 @@ export function reduceChildArtifacts(child: ChildEvidence, options: ChildArtifac
       }
     }
     for (const file of turn.files) {
-      const key = options.pathKey(file.path);
+      const key = file.identity ?? options.pathKey(file.path);
       let held = files.get(key);
       if (!held) {
-        held = { path: file.path, added: 0, removed: 0, isNew: false };
+        held = {
+          path: file.path,
+          ...(file.identity ? { identity: file.identity } : {}),
+          added: 0,
+          removed: 0,
+          isNew: false,
+        };
         files.set(key, held);
       }
       if (file.isNew) {

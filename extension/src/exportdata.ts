@@ -449,6 +449,7 @@ function blocksOf(turn: Turn, key: string): ExportBlock[] {
     order?: number,
     notResponse?: ExportBlock['notResponse'],
     opening?: boolean,
+    stepsBefore?: number,
   ) => {
     if (text)
       entries.push({
@@ -458,6 +459,7 @@ function blocksOf(turn: Turn, key: string): ExportBlock[] {
         sourceOrder: order ?? null,
         notResponse: notResponse ?? null,
         ...(opening === undefined ? {} : { opening }),
+        ...(stepsBefore === undefined ? {} : { stepsBefore }),
         sequence: entries.length,
       });
   };
@@ -465,13 +467,16 @@ function blocksOf(turn: Turn, key: string): ExportBlock[] {
   if (turn.promptParts?.length)
     for (const part of turn.promptParts) add('prompt', part.text, part.at, part.sourceOrder, undefined, true);
   else add('prompt', turn.prompt, turn.startedAt, -1, undefined, true);
-  for (const part of turn.laterPrompts) add('prompt', part.text, part.at, part.sourceOrder, undefined, false);
+  for (const part of turn.laterPrompts)
+    add('prompt', part.text, part.at, part.sourceOrder, undefined, false, part.stepsBefore);
   const answers = turn.agent === 'claude' ? (turn.recordedAnswers ?? turn.answers) : turn.answers;
-  for (const answer of answers) add('answer', answer.text, answer.at, answer.sourceOrder, answer.notResponse);
+  for (const answer of answers)
+    add('answer', answer.text, answer.at, answer.sourceOrder, answer.notResponse, undefined, answer.stepsBefore);
   if (turn.agent !== 'claude' && turn.summary && !answers.some((answer) => answer.text === turn.summary))
     add('answer', turn.summary, turn.endedAt);
   for (const update of turn.updates)
-    if (update.kind === 'commentary') add('commentary', update.text, update.at, update.sourceOrder);
+    if (update.kind === 'commentary')
+      add('commentary', update.text, update.at, update.sourceOrder, undefined, undefined, update.stepsBefore);
   entries.sort((a, b) => {
     if (a.sourceOrder !== null && b.sourceOrder !== null)
       return a.sourceOrder - b.sourceOrder || a.sequence - b.sequence;
@@ -496,6 +501,20 @@ function relativeFile(file: string, cwd: string | undefined): string | null {
   return segments.filter((segment) => segment !== '.' && segment !== '').join('/') || null;
 }
 
+// Display paths never establish identity across working directories.
+function exportFileIdentity(file: string, cwd: string | undefined, session: string): string {
+  const normalized = file.replace(/\\/g, '/');
+  const absolute = normalized.startsWith('/') || /^[a-z]:\//i.test(normalized);
+  const canonical = absolute
+    ? normalized
+    : cwd
+      ? `${cwd.replace(/\\/g, '/')}/${normalized}`
+      : `${session}\0${normalized}`;
+  return createHash('sha256')
+    .update(normalizeFsPath(path.posix.normalize(canonical)))
+    .digest('hex');
+}
+
 export function projectTurn(
   turn: Turn,
   key: string,
@@ -507,10 +526,12 @@ export function projectTurn(
   let changes: ExportTurn['changes'] =
     turn.commitIntents?.length || turn.landingIntents?.length ? 'partial' : 'complete';
   const files: ExportTurn['files'] = [];
+  let filesComplete = true;
   for (const file of turn.files) {
     const relative = relativeFile(file.path, entry.cwd);
     if (!relative) {
       changes = 'partial';
+      filesComplete = false;
       if (!omissions.some((omission) => omission.session === session && omission.reason === 'external-path'))
         omissions.push({ session, relationship: null, reason: 'external-path' });
       continue;
@@ -518,10 +539,12 @@ export function projectTurn(
     if (file.countsUnknown) changes = 'partial';
     files.push({
       path: relative,
-      added: file.countsUnknown ? null : file.added,
-      removed: file.countsUnknown ? null : file.removed,
+      identity: exportFileIdentity(file.path, entry.cwd, session),
+      added: file.added,
+      removed: file.removed,
       isNew: file.isNew,
       reason: file.unknownReason ?? null,
+      ...(file.countsUnknown ? { countsUnknown: true as const } : {}),
     });
   }
   return {
@@ -560,8 +583,26 @@ export function projectTurn(
         : null,
     },
     outputRate: turn.outputRate ? { output: turn.outputRate.output, milliseconds: turn.outputRate.milliseconds } : null,
+    ...(turn.outputRateModel ? { outputRateModel: turn.outputRateModel } : {}),
     error: turn.error,
     activity: {
+      steps: turn.steps.map((step) => ({
+        ordinal: step.ordinal,
+        name: step.name,
+        detail: turn.stepKinds[step.ordinal - 1] === 'commands' ? step.detail : '',
+        ...(turn.stepKinds[step.ordinal - 1] === 'commands' && step.fullDetail ? { fullDetail: step.fullDetail } : {}),
+        ...(turn.stepKinds[step.ordinal - 1] === 'commands' && step.headline ? { headline: step.headline } : {}),
+        at: step.at,
+        status: step.status,
+      })),
+      failedOrdinals: [...turn.failedOrdinals],
+      failedTools: Object.fromEntries(
+        [...new Set(turn.failures.map((failure) => failure.tool))].map((name) => [
+          name,
+          turn.failures.filter((failure) => failure.tool === name).length,
+        ]),
+      ),
+      tools: { ...turn.toolTally },
       calls: turn.toolUses,
       failures: turn.failedOrdinals.length,
       categories: turn.stepKinds.filter((kind) => kind !== 'reasoning'),
@@ -597,6 +638,9 @@ export function projectTurn(
       description: agent.description,
       agentType: agent.agentType,
       model: agent.model,
+      ...(agent.ownModel ? { ownModel: agent.ownModel } : {}),
+      ...(agent.outputRate ? { outputRate: agent.outputRate } : {}),
+      ...(agent.outputRateModel ? { outputRateModel: agent.outputRateModel } : {}),
       effort: agent.effort,
       status: agent.status,
       startedAt: agent.startedAt ?? null,
@@ -604,6 +648,38 @@ export function projectTurn(
       tokens: agent.tokens,
       toolUses: agent.toolUses,
       partial: agent.spendPartial || !agent.spendFound,
+      ...(agent.artifacts
+        ? {
+            artifacts: {
+              files: agent.artifacts.files.flatMap((file) => {
+                const relative = relativeFile(file.path, entry.cwd);
+                return relative
+                  ? [
+                      {
+                        path: relative,
+                        identity: exportFileIdentity(file.path, entry.cwd, session),
+                        added: file.added,
+                        removed: file.removed,
+                        isNew: file.isNew,
+                        reason: file.unknownReason ?? null,
+                        ...(file.countsUnknown ? { countsUnknown: true as const } : {}),
+                        ...(file.countsPartial ? { countsPartial: true as const } : {}),
+                      },
+                    ]
+                  : [];
+              }),
+              commits: [...agent.artifacts.commits],
+              tools: agent.artifacts.tools,
+              failed: agent.artifacts.failed,
+              startedAt: agent.artifacts.startedAt,
+              endedAt: agent.artifacts.endedAt,
+              turnCount: agent.artifacts.turnCount,
+              complete:
+                agent.artifacts.complete &&
+                agent.artifacts.files.every((file) => relativeFile(file.path, entry.cwd) !== null),
+            },
+          }
+        : {}),
     })),
     files,
     commits: turn.commits.map((commit) => ({
@@ -615,6 +691,7 @@ export function projectTurn(
       removed: commit.removed,
     })),
     changes,
+    filesComplete,
   };
 }
 export function projectCompaction(compaction: Compaction, key: string): ExportCompaction {
@@ -1510,7 +1587,6 @@ export async function captureSessionExport(
     deliberatelyOmitted: [
       'reasoning',
       'raw-tools',
-      'commands',
       'patches',
       'attachments',
       'comments',

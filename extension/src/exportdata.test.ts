@@ -60,6 +60,120 @@ test('per-pass pricing survives an export round trip with both bands and one exe
   assert.deepEqual(turnCost(restored), turnCost(original));
 });
 
+test('complete capture retains every command and its outcome beside interleaved messages for both providers', async () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const f = fixture();
+    const records =
+      agent === 'claude' ? claudeTurn('commands', 0, false).slice(0, 1) : codexTurn('commands', 0, false).slice(0, 3);
+    const commandCount = 260;
+    for (let index = 0; index < commandCount; index++) {
+      const command = `printf 'command ${index}'`;
+      const failed = index === 0;
+      if (agent === 'claude')
+        records.push(
+          record('assistant', 1, {
+            uuid: `call-${index}`,
+            message: {
+              id: `call-${index}`,
+              role: 'assistant',
+              model: 'claude-sonnet-4-5',
+              stop_reason: 'tool_use',
+              content: [
+                { type: 'text', text: `Before command ${index}` },
+                { type: 'tool_use', id: `command-${index}`, name: 'Bash', input: { command } },
+              ],
+            },
+          }),
+          record('user', 2, {
+            uuid: `result-${index}`,
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: `command-${index}`,
+                  is_error: failed,
+                  content: 'PRIVATE_RAW_RESULT',
+                },
+              ],
+            },
+          }),
+        );
+      else
+        records.push(
+          record('response_item', 1, {
+            payload: {
+              type: 'message',
+              role: 'assistant',
+              phase: 'commentary',
+              content: [{ type: 'output_text', text: `Before command ${index}` }],
+            },
+          }),
+          record('response_item', 1, {
+            payload: {
+              type: 'function_call',
+              name: 'exec_command',
+              call_id: `command-${index}`,
+              arguments: JSON.stringify({ cmd: command }),
+            },
+          }),
+          record('response_item', 2, {
+            payload: {
+              type: 'function_call_output',
+              call_id: `command-${index}`,
+              output: failed ? 'Script error:\nPRIVATE_RAW_RESULT' : 'Process exited with code 0\nPRIVATE_RAW_RESULT',
+            },
+          }),
+        );
+    }
+    const outcomes = records.filter(
+      (value) =>
+        ('uuid' in value && typeof value.uuid === 'string' && value.uuid.startsWith('result-')) ||
+        ('payload' in value && (value.payload as { type?: string }).type === 'function_call_output'),
+    );
+    const requests = records.filter((value) => !outcomes.includes(value));
+    records.splice(0, records.length, ...requests, ...outcomes);
+    if (agent === 'claude') records.push(claudeTurn('commands', 3).at(-1)!);
+    else records.push(...codexTurn('commands', 3).slice(3));
+    const file = agent === 'claude' ? f.write(f.root, records) : f.codexSession(CODEX_ID, undefined, records);
+    const writer = await ExportTransaction.create(f.output);
+    try {
+      const captured = await captureSessionExport(
+        { ...f.options, root: { ...f.options.root, file, agent, sessionId: agent === 'claude' ? 'root' : CODEX_ID } },
+        writer,
+      );
+      const page = await writer.readSpool<ExportPage>(captured.model.sessions[0].pages[0]);
+      const value = page.turns[0];
+      assert.equal(value.activity.steps?.length, commandCount, agent);
+      assert.deepEqual(
+        value.activity.steps?.map((step) => step.detail),
+        Array.from({ length: commandCount }, (_, index) => `printf 'command ${index}'`),
+      );
+      assert.equal(value.activity.steps?.[0].status, 'failed');
+      assert.equal(value.blocks.filter((block) => block.kind === 'commentary').length, commandCount);
+      assert.equal(value.blocks.find((block) => block.text === 'Before command 32')?.stepsBefore, 32);
+      assert.doesNotMatch(JSON.stringify(value), /PRIVATE_RAW_RESULT/);
+      assert.ok(!captured.model.deliberatelyOmitted.includes('commands'));
+      await projectSessionSite(captured.model, writer, { script: '', stylesheet: '' });
+      const published = exportedSiteData((await writer.publish(captured.recheck)).directory);
+      const card = (published.data.values().next().value as { card: import('./webview/payload-contracts').CardView })
+        .card;
+      const steps = (card.activity ?? []).flatMap((row) =>
+        row.kind === 'run' ? (row.steps ?? []) : row.kind === 'step' ? [row] : [],
+      );
+      assert.equal(steps.length, commandCount);
+      assert.equal(steps[0].status, 'failed');
+      assert.equal(steps.at(-1)?.code, `printf 'command ${commandCount - 1}'`);
+      assert.equal(
+        card.activity!.findIndex((row) => row.kind === 'step' && row.id === 'step:33'),
+        card.activity!.findIndex((row) => row.text === 'Before command 32') + 1,
+      );
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
 test('export capture retains child advisor usage origins beside executor spend', () => {
   const f = fixture();
   const child = readClaudeAgentSpend(f.write(f.child('advisor'), advisorResponseRecords({ sidechain: true })));

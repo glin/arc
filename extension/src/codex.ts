@@ -6254,6 +6254,7 @@ function reduceCodexSessionLine(
         const paths = codexChangePaths(payload.changes);
         const presented = presentedStepDetail('apply_patch', { paths });
         recordStep(turn, state.stepById, 'apply_patch', presented.detail, at, '', 'failed', {
+          capture: opts.captureSessionText,
           ...(presented.fullDetail !== undefined ? { fullDetail: presented.fullDetail } : {}),
         });
         break;
@@ -6262,6 +6263,7 @@ function reduceCodexSessionLine(
       const paths = codexChangePaths(payload.changes);
       const presented = presentedStepDetail('apply_patch', { paths });
       recordStep(turn, state.stepById, 'apply_patch', presented.detail, at, '', 'done', {
+        capture: opts.captureSessionText,
         ...(presented.fullDetail !== undefined ? { fullDetail: presented.fullDetail } : {}),
       });
       break;
@@ -6285,6 +6287,7 @@ function reduceCodexSessionLine(
         : callDetail(name, payload.arguments ?? payload.input);
       const step = name
         ? recordStep(turn, state.stepById, name, detail.detail, at, id ?? '', 'running', {
+            capture: opts.captureSessionText,
             ...(id ? { sourceId: id } : {}),
             ...(detail.fullDetail !== undefined ? { fullDetail: detail.fullDetail } : {}),
           })
@@ -6456,6 +6459,7 @@ function reduceCodexSessionLine(
           pending.expanded = true;
         } else {
           recordStep(turn, state.stepById, 'exec', command.detail, at, '', command.status, {
+            capture: opts.captureSessionText,
             ...(command.sourceId ? { sourceId: command.sourceId } : {}),
             fullDetail: command.fullDetail,
           });
@@ -6546,6 +6550,7 @@ function reduceCodexSessionLine(
         : [];
       const presented = presentedStepDetail('web_search', query ? { query } : { queries });
       recordStep(turn, state.stepById, 'web_search', presented.detail, at, '', 'done', {
+        capture: opts.captureSessionText,
         ...(presented.fullDetail !== undefined ? { fullDetail: presented.fullDetail } : {}),
       });
       turn.endedAt = Math.max(turn.endedAt, at);
@@ -7201,6 +7206,7 @@ function newTurn(
 
 // Optional source identity and unabridged detail for an Activity step.
 interface StepMetadata {
+  capture?: boolean;
   sourceId?: string;
   fullDetail?: string;
 }
@@ -7243,7 +7249,7 @@ function recordStep(
   turn.stepKinds.push(TOOL_KIND[name] ?? 'other');
   setTurnStepStatus(turn, step, status);
   turn.steps.push(step);
-  if (turn.steps.length > TURN_STEP_LIMIT) {
+  if (!metadata.capture && turn.steps.length > TURN_STEP_LIMIT) {
     turn.steps.shift();
   }
   if (id) {

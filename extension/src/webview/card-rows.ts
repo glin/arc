@@ -34,7 +34,7 @@ export type CommitRowView = NonNullable<CardView['commits']>[number];
 export type DetailRows =
   // An unset `turnDiff` offers the whole turn's diff. Subagent file lists set it to false.
   | { kind: 'files'; key: string; files: FileRowView[]; turnDiff?: boolean; sourceSessionId?: string }
-  // Ordinary subagents filter the parent card's rows. Dispatched rows carry their own.
+  // Explicit child collections take priority. Ordinary native rows fall back to the parent card.
   | { kind: 'agents'; key: string; agents: AgentRowView[]; files: FileRowView[]; commits: CommitRowView[] }
   | { kind: 'dispatched'; key: string; agents: AgentRowView[]; files: FileRowView[]; commits: CommitRowView[] }
   | { kind: 'commits'; key: string; commits: CommitRowView[] };
@@ -412,12 +412,13 @@ export function agentFigureRecord(
   }
   if (figure.metric === 'files' && figure.paths) {
     const paths = new Set(figure.paths);
+    const identities = figure.fileIdentities ? new Set(figure.fileIdentities) : null;
     return () => ({
       ...record,
       rows: {
         kind: 'files',
         key: cardKey,
-        files: files.filter((row) => paths.has(row.path)),
+        files: files.filter((row) => (identities && row.identity ? identities.has(row.identity) : paths.has(row.path))),
         turnDiff: false,
         ...(sourceSessionId ? { sourceSessionId } : {}),
       },
@@ -778,8 +779,8 @@ export function DetailRowList({
           cardKey: rows.key,
           agent,
           post,
-          files: rows.kind === 'dispatched' ? (agent.files ?? []) : rows.files,
-          commits: rows.kind === 'dispatched' ? (agent.commits ?? []) : rows.commits,
+          files: agent.files ?? (rows.kind === 'dispatched' ? [] : rows.files),
+          commits: agent.commits ?? (rows.kind === 'dispatched' ? [] : rows.commits),
           figureDetails,
           key: `${rows.key}:${agent.sessionId ?? agent.description}:${index}`,
         }),

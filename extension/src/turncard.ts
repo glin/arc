@@ -198,7 +198,7 @@ export function foldedChips(chips: StatChip[]): StatChip[] {
 
 // What a file row draws, in the body and in the Files chip popover alike.
 //
-// `path` is what the transcript recorded and what everything acting on the row uses.
+// `path` is the path row actions use. Captured rows carry a project-relative path.
 // `shownPath` is the same path in the spelling the panel reads out and hovers with.
 export interface FileCard {
   name: string;
@@ -206,6 +206,8 @@ export interface FileCard {
   label: string;
   icon: RowIcon;
   path: string;
+  // Opaque captured identity distinguishes files with the same display path.
+  identity?: string;
   shownPath: string;
   // Hover detail for a file changed by a subagent. Other rows use the path.
   detail?: string;
@@ -1198,10 +1200,10 @@ function agentDurationFigure(agent: TurnAgent, now: number): AgentFigure | null 
 }
 
 // Indexes recorded card paths by normalized filesystem identity for child-row filtering.
-export function fileRowPathsByKey(files: readonly { path: string }[]): Map<string, string> {
+export function fileRowPathsByKey(files: readonly { path: string; identity?: string }[]): Map<string, string> {
   const keyed = new Map<string, string>();
   for (const file of files) {
-    keyed.set(normalizeFsPath(file.path), file.path);
+    keyed.set(file.identity ?? normalizeFsPath(file.path), file.path);
   }
   return keyed;
 }
@@ -1265,6 +1267,7 @@ function agentFigures(
     const totals = childFileTotals(artifacts.files);
     const files = filesAndLines(artifacts.files.length, totals.added, totals.removed, '');
     const caveats = fileCountCaveats(artifacts.files);
+    const fileIdentities = artifacts.files.flatMap((file) => (file.identity ? [file.identity] : []));
     const fileLabel = partial ? files.label.replace(' ', '+ ') : files.label;
     const name = files.name ? (partial ? `At least ${files.name}` : files.name) : fileLabel;
     // Give the file-record action an accessible name even when its diff counts are absent.
@@ -1275,7 +1278,8 @@ function agentFigures(
       added: files.added,
       removed: files.removed,
       // Match card-row spelling for subagents and child-row spelling for dispatched sessions.
-      paths: artifacts.files.map((file) => rowPaths.get(normalizeFsPath(file.path)) ?? file.path),
+      paths: artifacts.files.map((file) => rowPaths.get(file.identity ?? normalizeFsPath(file.path)) ?? file.path),
+      ...(fileIdentities.length ? { fileIdentities } : {}),
       // File-count caveats appear in the record footer, separate from the figure name.
       ...figureRecord(
         name,
@@ -1387,12 +1391,12 @@ export function dispatchedAgentCard(
     durationMs: state === 'running' || startedAt === null || endedAt === null ? null : Math.max(0, endedAt - startedAt),
     tokens: null,
     toolUses,
-    status: state === 'done' ? 'completed' : state,
+    status: state === 'done' ? 'completed' : state === 'open' ? 'async_launched' : state,
   };
   const live = { session: false, children: state === 'running' ? new Set([sessionId]) : new Set<string>() };
   const files = state === 'running' ? [] : fileCardsOf(spend.artifacts?.files ?? [], folders);
   const commits = state === 'running' ? [] : (spend.commits ?? []).map((commit) => commitCard(commit, now));
-  const card = agentCard(agent, false, live, new Map(), fileRowPathsByKey(files), now, runner);
+  const card = agentCard(agent, false, live, new Map(), fileRowPathsByKey(spend.artifacts?.files ?? []), now, runner);
   return { ...card, kind: 'dispatch', files, commits, since: state === 'running' ? startedAt : null };
 }
 
@@ -1545,6 +1549,7 @@ function attributedFiles(turn: Turn): AttributedFile[] {
   const rows: AttributedFile[] = turn.files.map((file) => {
     const row: AttributedFile = {
       path: file.path,
+      ...(file.identity ? { identity: file.identity } : {}),
       added: file.added,
       removed: file.removed,
       isNew: file.isNew,
@@ -1557,11 +1562,11 @@ function attributedFiles(turn: Turn): AttributedFile[] {
   });
   const at = new Map<string, number>();
   rows.forEach((row, index) => {
-    at.set(normalizeFsPath(row.path), index);
+    at.set(row.identity ?? normalizeFsPath(row.path), index);
   });
   for (const agent of turn.agents) {
     for (const file of agent.artifacts?.files ?? []) {
-      const key = normalizeFsPath(file.path);
+      const key = file.identity ?? normalizeFsPath(file.path);
       const index = at.get(key);
       if (index === undefined) {
         at.set(key, rows.length);
@@ -1605,6 +1610,7 @@ function fileCardsOf(files: readonly AttributedFile[], folders: string[]): FileC
     label: `File ${names[index].spoken}${file.isNew ? ', new' : ''}${file.madeBy ? `, ${FILE_CHANGED_BY(file.madeBy)}` : ''}`,
     icon: iconFor(file.path),
     path: file.path,
+    ...(file.identity ? { identity: file.identity } : {}),
     shownPath: withForwardSlashes(file.path),
     ...(file.madeBy ? { detail: `${withForwardSlashes(file.path)}\n${FILE_CHANGED_BY(file.madeBy)}` } : {}),
     added: file.added,
@@ -3862,7 +3868,9 @@ export interface TimedWireActivity extends WireActivity {
 }
 
 function activityCountOf(turn: Pick<Turn, 'stepCount' | 'steps'>): number {
-  return Math.max(turn.stepCount, ...turn.steps.map((step) => step.ordinal));
+  let count = turn.stepCount;
+  for (const step of turn.steps) count = Math.max(count, step.ordinal);
+  return count;
 }
 
 export interface PendingAskPosition {
@@ -4150,12 +4158,28 @@ export function logOf(
   ].sort((one, other) => one.stepsBefore - other.stepsBefore || one.at - other.at);
   let before = 0;
   let previousAt = turn.startedAt;
+  let stepIndex = 0;
+  let failedIndex = 0;
+  const failedOrdinals = [
+    ...new Set([
+      ...turn.failedOrdinals,
+      ...turn.steps.filter((step) => step.status === 'failed').map((step) => step.ordinal),
+    ]),
+  ].sort((a, b) => a - b);
   const appendRun = (end: number) => {
     if (end <= before) {
       return;
     }
     const first = before + 1;
-    const kept = turn.steps.filter((step) => step.ordinal >= first && step.ordinal <= end);
+    const kept: TurnStep[] = [];
+    while (stepIndex < turn.steps.length && turn.steps[stepIndex].ordinal <= end) {
+      const step = turn.steps[stepIndex++];
+      if (step.ordinal >= first) kept.push(step);
+    }
+    let failedCount = 0;
+    while (failedIndex < failedOrdinals.length && failedOrdinals[failedIndex] <= end) {
+      if (failedOrdinals[failedIndex++] >= first) failedCount++;
+    }
     const count = end - before;
     before = end;
     if (count === 1 && kept.length === 1) {
@@ -4163,11 +4187,6 @@ export function logOf(
       return;
     }
     const earlier = count - kept.length;
-    const failed = new Set([
-      ...turn.failedOrdinals,
-      ...kept.filter((step) => step.status === 'failed').map((step) => step.ordinal),
-    ]);
-    const failedCount = [...failed].filter((ordinal) => ordinal >= first && ordinal <= end).length;
     const kinds = { edits: 0, reads: 0, searches: 0, commands: 0, agents: 0, coordination: 0, web: 0, other: 0 };
     for (let ordinal = first; ordinal <= end; ordinal++) {
       countStepKind(kinds, turn.stepKinds[ordinal - 1]);
@@ -4337,7 +4356,7 @@ export function toCard(
   const key = turnKey(turn);
   const fileCards = fileCardsOf(changed, folders);
   const launches = agentLaunches(turn);
-  const rowPaths = fileRowPathsByKey(fileCards);
+  const rowPaths = fileRowPathsByKey(changed);
   const agentCards = turn.agents.map((agent) =>
     agentCard(agent, status === 'running', live, launches, rowPaths, now, turn.agent),
   );
@@ -5682,7 +5701,7 @@ export function sessionStats(turns: Turn[], compactions: Compaction[]): SessionS
   const byPath = new Map<string, ChildFileChange>();
   for (const t of turns) {
     for (const f of t.files) {
-      const key = normalizeFsPath(f.path);
+      const key = f.identity ?? normalizeFsPath(f.path);
       let held = byPath.get(key);
       if (!held) {
         held = { path: f.path, added: 0, removed: 0, isNew: false };

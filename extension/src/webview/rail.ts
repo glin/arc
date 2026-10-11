@@ -1163,32 +1163,34 @@ function RailFilterPicker({
           ),
         ),
       ),
-      h('div', { class: 'railfiltersectionname railheadlensname', id: 'railheadlensname' }, [
-        options.words.railHeadLensesName,
-      ]),
-      h(
-        'div',
-        { class: 'railheadlensline', role: 'group', 'aria-labelledby': 'railheadlensname' },
-        railHeadLensBoxes(headLenses, options.words.railNarrowToValues).map((box) =>
-          h('label', { class: 'labelrow', key: box.lens }, [
-            h('input', {
-              type: 'checkbox',
-              class: 'labelbox',
-              checked: box.checked,
-              'data-control': box.control,
-              onChange: () => menu.toggleRailHeadLens(box.lens),
-              onKeyDown: (event: KeyboardEvent) => {
-                if (event.isComposing || event.keyCode === 229 || event.key !== 'Enter') {
-                  return;
-                }
-                event.preventDefault();
-                menu.toggleRailHeadLens(box.lens);
-              },
-            }),
-            h('span', { class: 'labelname' }, box.label),
-          ]),
+      !options.readOnly &&
+        h('div', { class: 'railfiltersectionname railheadlensname', id: 'railheadlensname' }, [
+          options.words.railHeadLensesName,
+        ]),
+      !options.readOnly &&
+        h(
+          'div',
+          { class: 'railheadlensline', role: 'group', 'aria-labelledby': 'railheadlensname' },
+          railHeadLensBoxes(headLenses, options.words.railNarrowToValues).map((box) =>
+            h('label', { class: 'labelrow', key: box.lens }, [
+              h('input', {
+                type: 'checkbox',
+                class: 'labelbox',
+                checked: box.checked,
+                'data-control': box.control,
+                onChange: () => menu.toggleRailHeadLens(box.lens),
+                onKeyDown: (event: KeyboardEvent) => {
+                  if (event.isComposing || event.keyCode === 229 || event.key !== 'Enter') {
+                    return;
+                  }
+                  event.preventDefault();
+                  menu.toggleRailHeadLens(box.lens);
+                },
+              }),
+              h('span', { class: 'labelname' }, box.label),
+            ]),
+          ),
         ),
-      ),
     ]),
     // Group by rearranges sessions without filtering them, so its values carry no counts.
     h('div', { class: 'railfiltersection', key: 'groupby' }, [
@@ -1768,7 +1770,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     options.initial.defaultSort === undefined ? railSort : normalizeRailSort(options.initial.defaultSort);
   let railShowArchived = normalizeRailShowArchived(options.initial.showArchived);
   let railShowRuns = normalizeRailShowRuns(options.initial.showRuns);
-  let railQuickFilters = normalizeRailQuickFilters(options.initial.headLenses);
+  let railQuickFilters = options.readOnly ? [] : normalizeRailQuickFilters(options.initial.headLenses);
   let railGroupBy = normalizeRailGroupBy(options.initial.groupBy);
   let railDensity = normalizeRailDensity(options.initial.density);
   nav.dataset.density = railDensity;
@@ -3482,7 +3484,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       // Restore default Show switches so reset reveals both archived sessions and agent runs.
       railShowArchived = RAIL_SHOWN_BUCKETS.showArchived;
       railShowRuns = RAIL_SHOWN_BUCKETS.showRuns;
-      railQuickFilters = [...DEFAULT_RAIL_QUICK_FILTERS];
+      railQuickFilters = options.readOnly ? [] : [...DEFAULT_RAIL_QUICK_FILTERS];
       railGroupBy = 'time';
       railDensity = 'comfortable';
       nav.dataset.density = railDensity;
@@ -3654,6 +3656,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     },
     // A checkbox changes configured button visibility and saves the choice. Focus stays on the checkbox.
     toggleRailHeadLens(value) {
+      if (options.readOnly) return;
       const lens = RAIL_LENSES.find((each) => each === value);
       if (!lens) {
         return;

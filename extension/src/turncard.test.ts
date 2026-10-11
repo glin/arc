@@ -9451,6 +9451,45 @@ test('what the reader typed mid-turn is drawn among the calls, where it happened
   );
 });
 
+test('Activity partitions complete interleaved commands with bounded ordinal reads', () => {
+  const count = 2000;
+  let ordinalReads = 0;
+  const steps = Array.from({ length: count }, (_, index) => ({
+    ...step({ name: 'Bash', detail: `command ${index + 1}`, at: 0, status: index % 2 ? 'failed' : 'done' }),
+    get ordinal() {
+      ordinalReads++;
+      return index + 1;
+    },
+  }));
+  const rows = logOf(
+    turn({
+      startedAt: 0,
+      steps,
+      stepCount: count,
+      stepKinds: Array(count).fill('commands'),
+      failedOrdinals: Array.from({ length: count / 2 }, (_, index) => index * 2 + 2),
+      updates: Array.from({ length: count }, (_, index) => ({
+        sourceId: `message-${index}`,
+        kind: 'commentary',
+        text: `After command ${index + 1}`,
+        at: 0,
+        stepsBefore: index + 1,
+        status: 'done',
+      })),
+    }),
+    null,
+    false,
+    10000,
+  ).rows;
+  assert.equal(rows.length, count * 2);
+  for (let index = 0; index < count; index++) {
+    assert.equal(rows[index * 2].code, `command ${index + 1}`);
+    assert.equal(rows[index * 2].status, index % 2 ? 'failed' : 'done');
+    assert.equal(rows[index * 2 + 1].text, `After command ${index + 1}`);
+  }
+  assert.ok(ordinalReads < count * 20, `${ordinalReads} ordinal reads exceed the complete Activity traversal bound`);
+});
+
 test('activity merges narration, reasoning, prompts and tools while tool totals stay tool-only', () => {
   const card = toCard(
     turn({

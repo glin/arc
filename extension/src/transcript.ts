@@ -111,6 +111,8 @@ export type FileCountReason = 'shell' | 'write' | 'replaceAll' | 'notebook' | 'z
 
 export interface TurnFileChange {
   path: string;
+  // Opaque identity retained when capture shortens paths from several working directories.
+  identity?: string;
   added: number;
   removed: number;
   isNew: boolean;
@@ -635,8 +637,8 @@ export const SKILL_STEP_KIND = 'skill';
 // `Turn.stepCount` retains the full total for truncated Activity runs.
 export const TURN_STEP_LIMIT = 60;
 
-// Pairing state is wider than the visible card so late results for long turns still update
-// hidden recent calls without allowing one unresolved turn to grow a checkpoint indefinitely.
+// Ordinary reads retain recent call associations beyond the visible card.
+// Capture retains the current turn's Activity associations.
 const CLAUDE_TOOL_ASSOCIATION_LIMIT_PER_TURN = TURN_STEP_LIMIT * 4;
 
 // Maximum characters in a one-line tool-detail preview. Full details remain available separately.
@@ -739,7 +741,7 @@ export interface Turn {
   // `TURN_ASK_LIMIT`. The agent answers these inside the turn, so the card that shows the
   // answer has to show the question.
   laterPrompts: TurnAsk[];
-  // What the turn did, in order, newest last, cut to `TURN_STEP_LIMIT`.
+  // What the turn did, in order, newest last. Export capture retains every step.
   steps: TurnStep[];
   // Launch ids stay after the bounded activity steps leave a long turn.
   dispatchToolUseIds?: string[];
@@ -7035,7 +7037,7 @@ const CLAUDE_HIDDEN_POLICY: HiddenStatePolicy = {
 };
 
 export interface ReadOptions {
-  // Explicit captures retain all recorded submissions. Ordinary panel reads stay bounded.
+  // Explicit captures retain recorded submissions and Activity steps. Ordinary panel reads stay bounded.
   captureSessionText?: boolean;
   captureRepeated?: Pick<import('./clauderepeated').ClaudeRepeatedState, 'runs'>;
   exportTurnBytes?: number;
@@ -9440,7 +9442,8 @@ function discardClaudeToolAssociation(state: ClaudeSessionParserState, id: strin
   state.editCalls.delete(id);
 }
 
-function boundClaudeToolAssociations(state: ClaudeSessionParserState): void {
+function boundClaudeToolAssociations(state: ClaudeSessionParserState, capture = false): void {
+  if (capture) return;
   if (state.awaited.length > CLAUDE_TOOL_ASSOCIATION_LIMIT_PER_TURN) {
     state.awaited.splice(0, state.awaited.length - CLAUDE_TOOL_ASSOCIATION_LIMIT_PER_TURN);
   }
@@ -9477,7 +9480,7 @@ function boundClaudeToolAssociations(state: ClaudeSessionParserState): void {
   }
 }
 
-function pruneClaudeTurnAssociations(state: ClaudeSessionParserState): void {
+function pruneClaudeTurnAssociations(state: ClaudeSessionParserState, capture = false): void {
   const retainedTurns = retainedClaudeTurns(state);
   const retainedOwners = new Set<Turn | SourcedBuilding>(retainedTurns);
   const retainedSteps = new Set<TurnStep>(state.awaited);
@@ -9530,7 +9533,7 @@ function pruneClaudeTurnAssociations(state: ClaudeSessionParserState): void {
       state.skillUseById.delete(id);
     }
   }
-  boundClaudeToolAssociations(state);
+  boundClaudeToolAssociations(state, capture);
 }
 
 function pruneClaudeAgentAssociations(state: ClaudeSessionParserState): void {
@@ -10871,7 +10874,7 @@ function reduceClaudeSessionLine(
           state.awaited.push(step);
           cur.stepKinds.push(block.name === 'Skill' ? SKILL_STEP_KIND : (TOOL_KIND[block.name] ?? 'other'));
           cur.steps.push(step);
-          if (cur.steps.length > TURN_STEP_LIMIT) {
+          if (!opts.captureSessionText && cur.steps.length > TURN_STEP_LIMIT) {
             cur.steps.shift();
           }
           // Record skill uses outside the step window. Call IDs pair rereads, paths, and failed results.
@@ -11094,7 +11097,7 @@ function reduceClaudeSessionLine(
     setClaudeRepeatNotice(state, false);
     state.workedSinceReply = true;
   }
-  boundClaudeToolAssociations(state);
+  boundClaudeToolAssociations(state, opts.captureSessionText);
   // A closed reply answers every handback before it, and the wake the flag describes is over
   // once its message is, so the next reply answers whatever wakes the agent next. A closing
   // line that holds no reply text, such as a thinking block, closes nothing.
@@ -11111,7 +11114,7 @@ function reduceClaudeSessionLine(
   }
   if (message.stop_reason && message.stop_reason !== 'tool_use') {
     settleClaudeSteps(state);
-    pruneClaudeTurnAssociations(state);
+    pruneClaudeTurnAssociations(state, opts.captureSessionText);
   }
 }
 

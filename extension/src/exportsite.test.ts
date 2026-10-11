@@ -1,4 +1,4 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -7,7 +7,7 @@ import { EXPORT_LIMITS } from './exportlimits';
 import { ExportTransaction, ExportCancelled } from './exportwriter';
 import { exportCard, exportTurn, exportScriptJson, projectSessionSite } from './exportsite';
 import { type SessionStatChip, toCard } from './turncard';
-import { turn, subagent, compaction, sessionSiteFixture, exportedSiteData } from './turnfixtures';
+import { turn, subagent, compaction, recordCommit, sessionSiteFixture, exportedSiteData } from './turnfixtures';
 import { tempDir } from './temproot';
 import type { CardView } from './webview/payload-contracts';
 import type { ExportBlock } from './exportdata';
@@ -19,6 +19,887 @@ import { estimateCost, formatCost } from './pricing';
 import { writeDemoExports } from '../scripts/web-demo-export';
 import { costPartOf, costPartsOf, projectTurn, projectCompaction } from './exportdata';
 import { railBuckets } from './view/rail';
+import { createClaudeSessionReducer } from './transcript';
+import { createCodexSessionReducer } from './codex';
+import { AgentRow, agentFigureRecord, DetailRowList, detailRowsFor } from './webview/card-rows';
+import { StaticStatChip } from './webview/stat-chip';
+import type { StatDetailList, StatDetailRenderer } from './webview/stat-detail';
+import type { VNode } from 'preact';
+
+test('linked child figures open their captured files and commits through the production row consumer', async () => {
+  for (const provider of ['claude', 'codex'] as const)
+    for (const kind of ['unmatched-native', 'reader-started', 'matched-native', 'dispatched'] as const)
+      for (const collidingPath of [false, true]) {
+        const writer = await ExportTransaction.create(tempDir('arc-site-child-records-'));
+        try {
+          const model = await sessionSiteFixture(writer);
+          model.sessions[0].agent = provider;
+          model.sessions[1].agent = provider;
+          const childPath = collidingPath ? 'src/shared.ts' : 'only-child.ts';
+          const parentPath = collidingPath ? 'src/shared.ts' : 'only-parent.ts';
+          const usage = {
+            requests: 1,
+            input: 100000,
+            cacheRead: 0,
+            cacheWrite1h: 0,
+            cacheWrite5m: 0,
+            output: 1000,
+            thinking: 0,
+          };
+          const childTurn = turn({
+            sessionId: 'child',
+            finished: true,
+            model: 'claude-sonnet-4-5',
+            usage,
+            files: [{ path: `/child/${childPath}`, added: 7, removed: 3, isNew: false, edits: [] }],
+            commits: [recordCommit('bbbbbbb1234567890', 'Child change', 1, { dir: '/child' })],
+          });
+          const child = projectTurn(childTurn, 'child-0', { cwd: '/child' }, [], 'child', new Map());
+          model.sessions[1].pages = [
+            await writer.spool({ key: 'child-page', session: 'child', turns: [child], compactions: [] }),
+          ];
+          model.sessions[1].numbers = {
+            ...model.sessions[1].numbers,
+            parts: [costPartOf({ model: childTurn.model!, provider: null, contextWindow: null, role: 'main', usage })],
+          };
+          const parentTurn = turn({
+            sessionId: 'root',
+            finished: true,
+            model: 'claude-sonnet-4-5',
+            usage,
+            files: [{ path: `/parent/${parentPath}`, added: 2, removed: 1, isNew: false, edits: [] }],
+            commits: [recordCommit('aaaaaaa1234567890', 'Parent change', 0, { dir: '/parent' })],
+            agents:
+              kind === 'matched-native'
+                ? [subagent({ id: 'native', toolUseId: 'launch', description: 'Child task', status: 'completed' })]
+                : [],
+          });
+          const parent = projectTurn(
+            parentTurn,
+            'root-21',
+            { cwd: '/parent' },
+            [],
+            'root',
+            new Map([['launch', ['reader-link']]]),
+          );
+          parent.relationships = ['reader-link'];
+          model.sessions[0].pages = [
+            await writer.spool({ key: 'root-page', session: 'root', turns: [parent], compactions: [] }),
+          ];
+          model.relationships = [
+            {
+              ...model.relationships[0],
+              kind: kind === 'dispatched' ? 'dispatched' : kind === 'reader-started' ? 'reader-started' : 'subagent',
+              ownership: kind === 'reader-started' ? 'navigation' : 'delegated',
+              requestedByReader: kind === 'reader-started',
+            },
+          ];
+          await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+          const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+          const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+          const records = new Map<string, StatDetailList>();
+          let metric = '';
+          const figureDetails = {
+            connect(_node, _detail, record) {
+              assert.equal(typeof record, 'function');
+              records.set(metric, (record as () => StatDetailList)());
+            },
+          } as StatDetailRenderer;
+          const rows = detailRowsFor(card, kind === 'dispatched' ? 'dispatched' : 'agents')!;
+          const children = DetailRowList({ rows, post: () => {}, figureDetails }).props.children as VNode<
+            Parameters<typeof AgentRow>[0]
+          >[];
+          assert.equal(children.length, 1);
+          const props = children[0].props;
+          assert.equal(children[0].type, AgentRow);
+          assert.equal(props.agent.sessionId, 'child');
+          assert.equal(props.agent.kind ?? 'subagent', kind === 'dispatched' ? 'dispatch' : 'subagent');
+          assert.equal(props.agent.figures.find((figure) => figure.metric === 'files')!.compactLabel, '1 file');
+          const rowChildren = AgentRow(props).props.children as VNode<{ class?: string }>[];
+          const facts = rowChildren.find((node) => node?.props?.class === 'agentfacts')!;
+          for (const node of facts.props.children as VNode<Parameters<typeof StaticStatChip>[0]>[]) {
+            if (node?.type !== StaticStatChip || !['files', 'commits'].includes(node.props.stat.metric)) continue;
+            metric = node.props.stat.metric;
+            const figure = StaticStatChip(node.props);
+            (figure.ref as (node: HTMLElement) => void)({} as HTMLElement);
+          }
+          const files = records.get('files')!.rows;
+          assert.equal(files?.kind, 'files');
+          if (files?.kind !== 'files') throw new Error('Missing child file detail');
+          assert.deepEqual(
+            files.files.map((file) => ({ path: file.path, added: file.added, removed: file.removed })),
+            [{ path: childPath, added: 7, removed: 3 }],
+            `${provider}, ${kind}, collision ${collidingPath}`,
+          );
+          assert.equal(files.files[0].identity, child.files[0].identity);
+          const commits = records.get('commits')!.rows;
+          assert.equal(commits?.kind, 'commits');
+          if (commits?.kind !== 'commits') throw new Error('Missing child commit detail');
+          assert.deepEqual(
+            commits.commits.map((commit) => commit.sha),
+            ['bbbbbbb1234567890'],
+          );
+          const native = kind === 'matched-native';
+          assert.equal(card.files!.length, native ? 2 : 1);
+          assert.equal(card.chips!.find((chip) => chip.metric === 'files')!.label, native ? '2 files' : '1 file');
+          assert.equal(card.files!.find((file) => file.identity === parent.files[0].identity)!.added, 2);
+          assert.equal(card.commits!.length, native ? 2 : 1);
+          if (kind === 'reader-started') {
+            assert.equal(props.agent.figures.find((figure) => figure.metric === 'cost')!.compactLabel, '$0.32');
+            assert.equal(
+              card.chips!.find((chip) => chip.metric === 'cost')!.label,
+              toCard(parentTurn, false, model.capturedAt).chips.find((chip) => chip.metric === 'cost')!.label,
+            );
+            assert.equal(manifest.stats.root.find((stat) => stat.metric === 'cost')!.dollars, 3);
+          }
+        } finally {
+          await writer.dispose();
+        }
+      }
+});
+
+test('an admitted 150000-command source retains every command through card projection', () => {
+  const reducer = createClaudeSessionReducer('root', {
+    captureSessionText: true,
+    exportTurnBytes: 16 * 1024 * 1024,
+    maxTurns: 2,
+  });
+  let bytes = 0;
+  const push = (value: object) => {
+    const text = JSON.stringify(value);
+    assert.ok(Buffer.byteLength(text) < 8 * 1024 * 1024);
+    const end = bytes + Buffer.byteLength(text) + 1;
+    reducer.pushLine({ text, start: bytes, end });
+    bytes = end;
+  };
+  push({
+    type: 'user',
+    uuid: 'p',
+    timestamp: '1970-01-01T00:00:00Z',
+    message: { role: 'user', content: 'Run commands' },
+  });
+  for (let page = 0; page < 2; page++) {
+    push({
+      type: 'assistant',
+      uuid: `a${page}`,
+      timestamp: '1970-01-01T00:00:00Z',
+      message: {
+        id: `m${page}`,
+        role: 'assistant',
+        model: 'claude-sonnet-4-5',
+        stop_reason: 'tool_use',
+        content: Array.from({ length: 75000 }, (_, index) => ({
+          type: 'tool_use',
+          id: `c${page * 75000 + index}`,
+          name: 'Bash',
+          input: { command: 'true' },
+        })),
+      },
+    });
+  }
+  assert.ok(bytes < 16 * 1024 * 1024);
+  const original = reducer.read().turns[0];
+  assert.equal(original.steps.length, 150000);
+  const captured = projectTurn(original, 'large', { cwd: '/project' }, [], 'root', new Map());
+  const card = exportCard(toCard(exportTurn(captured, 'claude', 'root'), false, 10000));
+  const commands = card.activity!.flatMap((row) =>
+    row.kind === 'run' ? row.steps! : row.kind === 'step' ? [row] : [],
+  );
+  assert.equal(commands.length, 150000);
+  assert.equal(commands[0].id, 'step:1');
+  assert.equal(commands.at(-1)!.id, 'step:150000');
+  assert.ok(commands.every((row) => row.code === 'true'));
+}, 60000);
+
+test('recorded aborted and failed unfinished children retain terminal figures', async () => {
+  for (const state of ['interrupted', 'failed'] as const) {
+    for (const native of [false, true]) {
+      const writer = await ExportTransaction.create(tempDir('arc-site-terminal-child-'));
+      try {
+        const model = await sessionSiteFixture(writer);
+        const child = model.sessions[1];
+        child.agent = state === 'interrupted' ? 'codex' : 'claude';
+        const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
+        if (state === 'interrupted') {
+          const reducer = createCodexSessionReducer('child');
+          for (const [at, payload] of [
+            [model.capturedAt - 124000, { type: 'task_started', turn_id: 'aborted' }],
+            [model.capturedAt - 124000, { type: 'user_message', message: 'Run the child task' }],
+            [model.capturedAt - 1000, { type: 'turn_aborted', turn_id: 'aborted', reason: 'interrupted' }],
+          ] as const)
+            reducer.pushLine(JSON.stringify({ type: 'event_msg', timestamp: new Date(at).toISOString(), payload }));
+          const aborted = reducer.read().turns[0];
+          assert.equal(aborted.finished, false);
+          assert.equal(aborted.interrupted, true);
+          childPage.turns[0] = projectTurn(
+            { ...aborted, files: [{ path: '/project/src/child.ts', added: 5, removed: 2, isNew: false, edits: [] }] },
+            'child-0',
+            { cwd: '/project' },
+            [],
+            'child',
+            new Map(),
+          );
+        }
+        Object.assign(childPage.turns[0], {
+          finished: false,
+          interrupted: state === 'interrupted',
+          error: state === 'failed' ? 'Command failed' : null,
+          startedAt: model.capturedAt - 124000,
+          endedAt: model.capturedAt - 1000,
+        });
+        child.pages = [await writer.spool(childPage)];
+        const root = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
+        model.relationships[0].kind = native ? 'subagent' : 'dispatched';
+        model.relationships[0].ownership = 'delegated';
+        if (native)
+          root.turns[0].agents = [
+            {
+              key: 'native',
+              relationships: ['reader-link'],
+              description: 'Native task',
+              agentType: null,
+              model: null,
+              effort: null,
+              status: 'launched',
+              startedAt: null,
+              durationMs: null,
+              tokens: null,
+              toolUses: null,
+              partial: false,
+            },
+          ];
+        model.sessions[0].pages[0] = await writer.spool(root);
+        await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+        const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+        const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+        const row = native ? card.agents![0] : card.dispatched![0];
+        assert.equal(row.state, state);
+        assert.equal(row.figures.find((figure) => figure.metric === 'duration')?.compactLabel, '2m');
+        assert.equal(row.figures.find((figure) => figure.metric === 'files')?.compactLabel, '1 file');
+      } finally {
+        await writer.dispose();
+      }
+    }
+  }
+});
+
+test('repeated dispatch receipts charge the first chronological turn across spooled pages', async () => {
+  for (const separatePages of [false, true]) {
+    const writer = await ExportTransaction.create(tempDir('arc-site-dispatch-owner-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const root = model.sessions[0];
+      const newest = await writer.readSpool<import('./exportdata').ExportPage>(root.pages[0]);
+      const oldest = await writer.readSpool<import('./exportdata').ExportPage>(root.pages.at(-1)!);
+      const cost = costPartOf({
+        model: 'claude-sonnet-4-5',
+        provider: null,
+        contextWindow: null,
+        role: 'main',
+        usage: {
+          requests: 1,
+          input: 100000,
+          cacheRead: 0,
+          cacheWrite1h: 0,
+          cacheWrite5m: 0,
+          output: 1000,
+          thinking: 0,
+        },
+      });
+      model.sessions[1].numbers.parts = [cost];
+      model.relationships[0].kind = 'dispatched';
+      model.relationships[0].ownership = 'delegated';
+      model.relationships.push({ ...model.relationships[0], key: 'first-dispatch', turn: oldest.turns[0].key });
+      oldest.turns[0].relationships = ['first-dispatch'];
+      root.pages = separatePages
+        ? [await writer.spool(newest), await writer.spool(oldest)]
+        : [await writer.spool({ ...newest, turns: [newest.turns[0], oldest.turns[0]] })];
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const cards = manifest.sessions[0].pages.flatMap((page) =>
+        page.cards!.map((asset) => (data.get(asset.id) as { card: CardView }).card),
+      );
+      const own = estimateCost(newest.turns[0].usage as import('./transcript').TurnUsage, newest.turns[0].model)!;
+      assert.equal(
+        cards.find((card) => card.key === 'root-21')!.chips!.find((chip) => chip.metric === 'cost')!.label,
+        formatCost(own),
+      );
+      assert.equal(
+        cards.find((card) => card.key === 'root-0')!.chips!.find((chip) => chip.metric === 'cost')!.label,
+        formatCost(0.315 + own),
+      );
+      assert.equal(manifest.stats.root.find((stat) => stat.metric === 'cost')!.dollars, 3);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
+test('child file records exclude colliding parent rows through capture and wire projection', () => {
+  const child = projectTurn(
+    turn({ files: [{ path: '/one/src/shared.ts', added: 3, removed: 0, isNew: false, edits: [] }] }),
+    'child',
+    { cwd: '/one' },
+    [],
+    'child',
+    new Map(),
+  );
+  const parent = projectTurn(
+    turn({
+      files: [{ path: '/root/src/shared.ts', added: 2, removed: 0, isNew: false, edits: [] }],
+      agents: [subagent({ id: 'child', description: 'Child task', status: 'completed' })],
+    }),
+    'parent',
+    { cwd: '/root' },
+    [],
+    'root',
+    new Map(),
+  );
+  parent.agents[0].artifacts = { files: child.files, commits: [], complete: true };
+  const projected = toCard(exportTurn(parent, 'claude', 'root'), false, 10000);
+  const card: CardView = JSON.parse(JSON.stringify(exportCard(projected)));
+  const figure = card.agents![0].figures.find((figure) => figure.metric === 'files')!;
+  assert.equal(figure.compactLabel, '1 file');
+  const record = agentFigureRecord(figure, card.key, card.files!, [])!();
+  assert.equal(record.rows?.kind, 'files');
+  if (record.rows?.kind !== 'files') throw new Error('Missing child files');
+  assert.deepEqual(
+    record.rows.files.map((file) => ({ path: file.path, added: file.added })),
+    [{ path: 'src/shared.ts', added: 3 }],
+  );
+  assert.doesNotMatch(JSON.stringify(card), /\/root\/|\/one\//);
+});
+
+test('delegated file identities distinguish relative-name collisions and deduplicate physical paths', async () => {
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    vi.stubGlobal('process', { ...process, platform });
+    try {
+      const files = ['C:/Repo/Src/Shared.ts', 'c:\\repo\\src\\shared.ts', '/one/Src/Shared.ts', 'src/shared.ts'].map(
+        (file, index) =>
+          projectTurn(
+            turn({ files: [{ path: file, added: 1, removed: 0, isNew: false, edits: [] }] }),
+            'case',
+            { cwd: index < 2 ? 'C:/Repo' : '/one' },
+            [],
+            'case',
+            new Map(),
+          ).files[0],
+      );
+      assert.equal(files[0].identity, files[1].identity, platform);
+      assert.equal(files[2].identity === files[3].identity, platform === 'win32', platform);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+  for (const kind of ['subagent', 'dispatched'] as const)
+    for (const sharedPath of [false, true]) {
+      const writer = await ExportTransaction.create(tempDir('arc-site-file-identities-'));
+      try {
+        const model = await sessionSiteFixture(writer);
+        const child = model.sessions[1];
+        const original = turn({
+          finished: true,
+          files: [{ path: '/one/src/shared.ts', added: 3, removed: 1, isNew: false, edits: [] }],
+        });
+        const captured = projectTurn(original, 'child-0', { cwd: '/one' }, [], 'child', new Map());
+        captured.relationships = ['nested-link'];
+        child.pages = [await writer.spool({ key: 'child-page', session: 'child', turns: [captured], compactions: [] })];
+        const nested = { ...child, key: 'nested', title: 'Nested task' };
+        const cwd = sharedPath ? '/one' : '/two';
+        const nestedTurn = projectTurn(
+          turn({
+            finished: true,
+            files: [{ path: `${cwd}/src/shared.ts`, added: 7, removed: 2, isNew: false, edits: [] }],
+          }),
+          'nested-0',
+          { cwd },
+          [],
+          'nested',
+          new Map(),
+        );
+        assert.equal(captured.files[0].identity === nestedTurn.files[0].identity, sharedPath);
+        assert.match(captured.files[0].identity!, /^[a-f0-9]{64}$/);
+        nested.pages = [
+          await writer.spool({ key: 'nested-page', session: 'nested', turns: [nestedTurn], compactions: [] }),
+        ];
+        model.sessions.push(nested);
+        model.relationships[0].kind = kind;
+        model.relationships[0].ownership = 'delegated';
+        model.relationships.push({
+          key: 'nested-link',
+          from: 'child',
+          to: 'nested',
+          kind: 'subagent',
+          ownership: 'delegated',
+          requestedByReader: false,
+          coverage: 'complete',
+        });
+        const root = model.sessions[0];
+        const rootPage = await writer.readSpool<import('./exportdata').ExportPage>(root.pages[0]);
+        rootPage.turns[0].files = projectTurn(
+          turn({ files: [{ path: '/root/src/shared.ts', added: 2, removed: 1, isNew: false, edits: [] }] }),
+          'root',
+          { cwd: '/root' },
+          [],
+          'root',
+          new Map(),
+        ).files;
+        rootPage.turns[0].agents =
+          kind === 'subagent'
+            ? [
+                {
+                  key: 'native',
+                  relationships: ['reader-link'],
+                  description: 'Native task',
+                  agentType: null,
+                  model: null,
+                  effort: null,
+                  status: 'completed',
+                  startedAt: null,
+                  durationMs: null,
+                  tokens: null,
+                  toolUses: null,
+                  partial: false,
+                },
+              ]
+            : [];
+        root.pages = [await writer.spool(rootPage)];
+        await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+        const published = await writer.publish(async () => {});
+        const { manifest, data } = exportedSiteData(published.directory);
+        const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+        const row = kind === 'subagent' ? card.agents![0] : card.dispatched!.find((row) => row.sessionId === 'child')!;
+        const files = row.figures.find((figure) => figure.metric === 'files')!;
+        assert.equal(files.compactLabel, sharedPath ? '1 file' : '2 files');
+        assert.equal(files.added, 10);
+        assert.equal(files.removed, 3);
+        assert.deepEqual(files.paths, Array(sharedPath ? 1 : 2).fill('src/shared.ts'));
+        const rows = detailRowsFor(card, kind === 'subagent' ? 'agents' : 'dispatched')!;
+        const props = (
+          DetailRowList({ rows, post: () => {} }).props.children as VNode<Parameters<typeof AgentRow>[0]>[]
+        ).find((node) => node.props.agent.sessionId === row.sessionId)!.props;
+        const record = agentFigureRecord(files, card.key, props.files!, props.commits!)!();
+        assert.equal(record.rows?.kind, 'files');
+        if (record.rows?.kind !== 'files') throw new Error('Missing delegated files');
+        assert.deepEqual(
+          record.rows.files.map((file) => file.added),
+          sharedPath ? [10] : [3, 7],
+        );
+        assert.equal(card.files!.length, kind === 'subagent' ? (sharedPath ? 2 : 3) : 1);
+        assert.equal(
+          card.chips!.find((chip) => chip.metric === 'files')!.label,
+          kind === 'subagent' ? (sharedPath ? '2 files' : '3 files') : '1 file',
+        );
+        const html = await fs.readFile(published.index, 'utf8');
+        const decoded = JSON.stringify([...data.values()]);
+        for (const directory of ['/one/', '/two/', '/root/'])
+          assert.ok(!html.includes(directory) && !decoded.includes(directory));
+      } finally {
+        await writer.dispose();
+      }
+    }
+});
+
+test('omitted child file identities and native hydration retain incomplete qualification separately from line counts', async () => {
+  for (const kind of ['dispatched', 'native', 'native-captured', 'partial-lines'] as const) {
+    const writer = await ExportTransaction.create(tempDir('arc-site-child-file-coverage-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const child = model.sessions[1];
+      const partialLines = kind === 'partial-lines';
+      const original = turn({
+        finished: true,
+        files: [
+          {
+            path: '/one/src/kept.ts',
+            added: 3,
+            removed: 1,
+            isNew: false,
+            edits: [],
+            ...(partialLines ? { countsUnknown: true as const, unknownReason: 'write' as const } : {}),
+          },
+          ...(!partialLines && kind !== 'native-captured'
+            ? [{ path: '/outside/omitted.ts', added: 7, removed: 2, isNew: false, edits: [] }]
+            : []),
+        ],
+      });
+      const omissions: import('./exportdata').ExportOmission[] = [];
+      const captured = projectTurn(original, 'child-0', { cwd: '/one' }, omissions, 'child', new Map());
+      assert.equal(captured.filesComplete, partialLines || kind === 'native-captured');
+      if (!partialLines && kind !== 'native-captured') assert.equal(omissions[0].reason, 'external-path');
+      child.pages = [await writer.spool({ key: 'child-page', session: 'child', turns: [captured], compactions: [] })];
+      const native = kind.startsWith('native');
+      model.relationships[0].kind = native ? 'subagent' : 'dispatched';
+      model.relationships[0].ownership = 'delegated';
+      const root = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
+      if (native)
+        root.turns[0].agents = [
+          {
+            key: 'native',
+            relationships: ['reader-link'],
+            description: 'Native task',
+            agentType: null,
+            model: null,
+            effort: null,
+            status: 'completed',
+            startedAt: null,
+            durationMs: null,
+            tokens: null,
+            toolUses: null,
+            partial: false,
+            artifacts: { files: [], commits: [], complete: kind !== 'native-captured' },
+          },
+        ];
+      model.sessions[0].pages[0] = await writer.spool(root);
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+      const row = native ? card.agents![0] : card.dispatched![0];
+      const files = row.figures.find((figure) => figure.metric === 'files')!;
+      assert.equal(files.compactLabel, partialLines ? '1 file' : '1+ file');
+      assert.equal(files.added, 3);
+      assert.equal(files.removed, 1);
+      assert.ok(files.record?.footer);
+      assert.ok(Array.isArray(files.record.footer) && files.record.footer.length > 0);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
+test('child and dispatch recorded costs exclude lifetime supplements and retain advisor and compaction usage', async () => {
+  for (const extraRecorded of [false, true]) {
+    const writer = await ExportTransaction.create(tempDir('arc-site-recorded-cost-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const amount = costPartOf({
+        role: 'main',
+        model: 'claude-sonnet-4-5',
+        provider: null,
+        contextWindow: null,
+        usage: {
+          requests: 1,
+          input: 100000,
+          cacheRead: 0,
+          cacheWrite1h: 0,
+          cacheWrite5m: 0,
+          output: 1000,
+          thinking: 0,
+        },
+      });
+      const recorded = extraRecorded ? 0.315 * 3 : 0.315;
+      const child = model.sessions[1];
+      child.numbers = {
+        parts: [
+          amount,
+          { ...amount, origin: 'claude-cost-state' },
+          ...(extraRecorded
+            ? [
+                { ...amount, origin: 'claude-advisor' as const },
+                { ...amount, compactionUsage: true as const },
+              ]
+            : []),
+        ],
+        main: { dollars: recorded + 0.315, partial: false },
+        delegated: { dollars: 0, partial: false },
+        combined: { dollars: recorded + 0.315, partial: false },
+        coverage: { usage: 'complete', cost: 'complete' },
+      };
+      const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
+      childPage.turns[0].finished = true;
+      child.pages = [await writer.spool(childPage)];
+      model.relationships[0].kind = 'dispatched';
+      model.relationships[0].ownership = 'delegated';
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+      assert.equal(
+        card.dispatched![0].figures.find((figure) => figure.metric === 'cost')?.compactLabel,
+        formatCost(recorded),
+      );
+      const own = estimateCost(childPage.turns[0].usage as import('./transcript').TurnUsage, childPage.turns[0].model)!;
+      assert.equal(card.chips!.find((chip) => chip.metric === 'cost')!.label, formatCost(recorded + own));
+      assert.equal(manifest.stats.child.find((stat) => stat.metric === 'cost')!.dollars, recorded + 0.315);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
+test('exported turn figures retain production records, warnings and counted partial lines', () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const original = turn({
+      agent,
+      files: [
+        {
+          path: '/project/src/change.ts',
+          added: 9,
+          removed: 4,
+          isNew: false,
+          edits: [],
+          countsUnknown: true,
+          unknownReason: 'write',
+        },
+      ],
+      usage: {
+        requests: 6,
+        input: 0,
+        cacheRead: 0,
+        cacheWrite1h: 2_000_000,
+        cacheWrite5m: 0,
+        output: 300,
+        thinking: 0,
+      },
+      contextTokens: 34_000,
+      contextWindow: 200_000,
+      outputRate: { output: 300, milliseconds: 2000 },
+      agents: [
+        subagent({
+          durationMs: 123_000,
+          spendFound: true,
+          spend: [
+            {
+              model: 'claude-sonnet-4-5',
+              usage: {
+                requests: 1,
+                input: 100_000,
+                cacheRead: 0,
+                cacheWrite1h: 0,
+                cacheWrite5m: 0,
+                output: 1000,
+                thinking: 0,
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    const captured = projectTurn(original, 'turn', { cwd: '/project' }, [], 'root', new Map());
+    assert.equal(captured.files[0].added, 9);
+    assert.equal(captured.files[0].removed, 4);
+    assert.equal(captured.files[0].reason, 'write');
+    const restored = exportTurn(captured, agent, 'root');
+    const production = toCard(
+      { ...original, files: original.files.map((file) => ({ ...file, path: 'src/change.ts' })) },
+      false,
+      200_000,
+    );
+    const card = exportCard(toCard(restored, false, 200_000));
+    assert.deepEqual(JSON.parse(JSON.stringify(card.chips)), JSON.parse(JSON.stringify(exportCard(production).chips)));
+    for (const metric of ['cost', 'files', 'context', 'tokens', 'agents']) {
+      const chip = card.chips!.find((chip) => chip.metric === metric)!;
+      assert.ok(chip.detailList?.entries, metric);
+      assert.deepEqual(chip.detailList, production.chips.find((chip) => chip.metric === metric)!.detailList);
+    }
+    const files = card.chips!.find((chip) => chip.metric === 'files')!;
+    assert.equal(files.added, 9);
+    assert.equal(files.removed, 4);
+    assert.ok(files.detailList!.footer?.some((line) => line.includes('partial')));
+    const child = card.agents![0];
+    assert.equal(child.figures.find((figure) => figure.metric === 'duration')?.compactLabel, '2m');
+    assert.equal(child.figures.find((figure) => figure.metric === 'cost')?.compactLabel, '$0.32');
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(child.figures)),
+      JSON.parse(JSON.stringify(production.agents[0].figures)),
+    );
+  }
+  const warningUsage = {
+    requests: 6,
+    input: 0,
+    cacheRead: 0,
+    cacheWrite1h: 2_000_000,
+    cacheWrite5m: 0,
+    output: 300,
+    thinking: 0,
+  };
+  const warned = exportCard(
+    toCard(
+      turn({
+        model: 'claude-opus-5-5',
+        usage: warningUsage,
+        usageParts: [
+          {
+            model: 'claude-opus-5-5',
+            provider: null,
+            contextWindow: 1_000_000,
+            contextBand: null,
+            inferenceClass: null,
+            serviceTier: null,
+            usage: warningUsage,
+          },
+        ],
+      }),
+      false,
+      200_000,
+    ),
+  ).chips!.find((chip) => chip.metric === 'cost')!;
+  assert.ok(warned.warnings?.length);
+});
+
+test('linked Subagents and Dispatched rows retain recorded child cost and duration without repeated delegated totals', async () => {
+  for (const kind of ['subagent', 'dispatched', 'printed', 'native-codex'] as const) {
+    const writer = await ExportTransaction.create(tempDir('arc-site-child-figures-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const childSession = model.sessions[1];
+      childSession.agent = kind === 'native-codex' ? 'codex' : 'claude';
+      const childPage = await writer.readSpool<import('./exportdata').ExportPage>(childSession.pages[0]);
+      const child = childPage.turns[0];
+      child.finished = true;
+      child.startedAt = model.capturedAt - 124_000;
+      child.endedAt = model.capturedAt - 1000;
+      const amount = {
+        ...demoSessionCostParts('arc-demo-review')[0],
+        role: 'main' as const,
+        model: 'claude-sonnet-4-5',
+        usage: {
+          requests: 1,
+          input: 100_000,
+          cacheRead: 0,
+          cacheWrite1h: 0,
+          cacheWrite5m: 0,
+          output: 1000,
+          thinking: 0,
+        },
+      };
+      childSession.numbers = {
+        parts: [costPartOf(amount), costPartOf({ ...amount, role: 'delegated' }, 'nested')],
+        main: { dollars: 0.315, partial: false },
+        delegated: { dollars: 0.315, partial: false },
+        combined: { dollars: 0.63, partial: false },
+        coverage: { usage: 'complete', cost: 'complete' },
+      };
+      childSession.pages = [await writer.spool(childPage)];
+      const root = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
+      root.turns[0].startedAt = model.capturedAt - 180_000;
+      root.turns[0].agents =
+        kind !== 'dispatched'
+          ? [
+              {
+                key: 'native',
+                relationships: ['reader-link'],
+                description: 'Native task',
+                agentType: kind === 'printed' ? 'claude-cli' : null,
+                ...(kind === 'printed' ? { spend: [costPartOf(amount)], spendFound: true } : {}),
+                model: kind === 'native-codex' ? 'gpt-5.4' : null,
+                effort: null,
+                status: 'completed',
+                startedAt: null,
+                durationMs: null,
+                tokens: null,
+                toolUses: null,
+                partial: kind !== 'printed',
+              },
+            ]
+          : [];
+      model.relationships[0].kind = kind === 'printed' ? 'dispatched' : kind === 'native-codex' ? 'subagent' : kind;
+      model.relationships[0].ownership = 'delegated';
+      if (kind === 'dispatched') {
+        model.relationships.push({ ...model.relationships[0], key: 'same-dispatch' });
+        root.turns[0].relationships.push('same-dispatch');
+      }
+      model.sessions[0].pages[0] = await writer.spool(root);
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+      const row = kind === 'subagent' || kind === 'native-codex' ? card.agents![0] : card.dispatched![0];
+      if (kind === 'native-codex')
+        assert.equal(
+          row.model,
+          toCard(turn({ agents: [subagent({ model: 'gpt-5.4' })] }), false, model.capturedAt).agents[0].model,
+        );
+      assert.equal(row.figures.find((figure) => figure.metric === 'cost')?.compactLabel, '$0.63');
+      assert.equal(row.figures.find((figure) => figure.metric === 'duration')?.compactLabel, '2m');
+      assert.equal(row.sessionId, 'child');
+      assert.ok(row.figures.find((figure) => figure.metric === 'cost')?.record);
+      assert.equal(
+        card.chips!.find((chip) => chip.metric === 'cost')!.label,
+        formatCost(0.63 + estimateCost(root.turns[0].usage as import('./transcript').TurnUsage, root.turns[0].model)!),
+      );
+      assert.equal(manifest.stats.root.find((stat) => stat.metric === 'cost')!.dollars, 3);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
+
+test('nested child artifacts and unavailable or unfinished figures retain their qualifications', async () => {
+  for (const unfinished of [true, false]) {
+    const writer = await ExportTransaction.create(tempDir('arc-site-nested-figures-'));
+    try {
+      const model = await sessionSiteFixture(writer);
+      const child = model.sessions[1];
+      const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
+      childPage.turns[0].finished = !unfinished;
+      childPage.turns[0].files = [{ path: 'child.ts', added: 3, removed: 1, isNew: false, reason: null }];
+      childPage.turns[0].relationships = ['nested-link'];
+      child.pages = [await writer.spool(childPage)];
+      const nested = { ...child, key: 'nested', title: 'Nested task', numbers: { ...child.numbers, parts: [] } };
+      const nestedPage = structuredClone(childPage);
+      nestedPage.session = 'nested';
+      nestedPage.turns[0].key = 'nested-0';
+      nestedPage.turns[0].finished = true;
+      nestedPage.turns[0].relationships = [];
+      nestedPage.turns[0].files = [{ path: 'nested.ts', added: 7, removed: 2, isNew: false, reason: null }];
+      nested.pages = [await writer.spool(nestedPage)];
+      model.sessions.push(nested);
+      model.relationships.push({
+        key: 'nested-link',
+        from: 'child',
+        to: 'nested',
+        kind: 'subagent',
+        ownership: 'delegated',
+        requestedByReader: false,
+        coverage: 'complete',
+        turn: childPage.turns[0].key,
+      });
+      model.relationships[0].kind = 'dispatched';
+      model.relationships[0].ownership = 'delegated';
+      const unknown = costPartOf({
+        role: 'main',
+        model: 'unknown-model',
+        provider: null,
+        contextWindow: null,
+        usage: { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 2000, thinking: 0 },
+      });
+      child.numbers = {
+        parts: [unknown],
+        main: { dollars: null, partial: true },
+        delegated: { dollars: null, partial: true },
+        combined: { dollars: null, partial: true },
+        coverage: { usage: 'partial', cost: 'unpriced' },
+      };
+      await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+      const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+      const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+      const row = card.dispatched!.find((row) => row.sessionId === 'child')!;
+      assert.equal(row.state, unfinished ? 'open' : 'done');
+      assert.equal(
+        row.figures.some((figure) => figure.metric === 'cost'),
+        false,
+      );
+      assert.equal(
+        row.figures.find((figure) => figure.metric === 'tokens')?.compactLabel,
+        unfinished ? '3k+ tokens' : '3k tokens',
+      );
+      if (unfinished) {
+        const footer = row.figures.find((figure) => figure.metric === 'tokens')?.record?.footer;
+        assert.ok(Array.isArray(footer) && footer.length > 0);
+      }
+      const paths = row.figures.find((figure) => figure.metric === 'files')?.paths;
+      if (unfinished) assert.equal(paths, undefined);
+      else {
+        assert.deepEqual(paths, ['child.ts', 'nested.ts']);
+        assert.equal(row.figures.find((figure) => figure.metric === 'files')?.added, 10);
+      }
+      const missing = card.dispatched!.find((row) => !row.sessionId)!;
+      assert.deepEqual(missing.figures, []);
+      assert.match(missing.description, /missing/);
+    } finally {
+      await writer.dispose();
+    }
+  }
+});
 
 test('serialized compactions keep their timestamp and only recorded summaries', async () => {
   const writer = await ExportTransaction.create(tempDir('arc-site-compaction-'));
@@ -564,7 +1445,7 @@ test('portable projection retains every body beyond previews and removes post-bu
     chips: [{ kind: 'plain', label: '$1', detail: 'Numeric fact', detailList: { actions: true }, record: '/private' }],
   };
   const safe = exportCard(unsafe as unknown as ReturnType<typeof toCard>);
-  assert.doesNotMatch(JSON.stringify(safe), /private|detailList|"record"|headlineHtml|resume/);
+  assert.doesNotMatch(JSON.stringify(safe), /private|"record"|headlineHtml|resume/);
   await writer.dispose();
 });
 
