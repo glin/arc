@@ -4109,11 +4109,12 @@ const COMPACTION_ROW = COMPACTION_SAMPLES[0];
 const COMPACTION_OUTPUT = Math.round(COMPACTION_ROW.summaryChars / CLAUDE_COMPACTION_SUMMARY_CHARS_PER_TOKEN);
 
 // Indexes a parent transcript and optional child, then projects their session cost.
-function indexCompactionSession(lines: readonly object[], child?: readonly object[]) {
+// An unterminated child has no final newline, and the export record limit lets the index accept its last record.
+function indexCompactionSession(lines: readonly object[], child?: readonly object[], unterminated = false) {
   const folder = dir();
   const file = path.join(folder, 'source.jsonl');
-  const write = (target: string, items: readonly object[]) =>
-    fs.writeFileSync(target, items.map((line) => JSON.stringify(line)).join('\n') + '\n');
+  const write = (target: string, items: readonly object[], end = '\n') =>
+    fs.writeFileSync(target, items.map((line) => JSON.stringify(line)).join('\n') + end);
   // Use an unlimited time budget so indexing completes in one pass, including the 256 KiB filler.
 
   const whole = { maxMilliseconds: Number.POSITIVE_INFINITY };
@@ -4123,10 +4124,11 @@ function indexCompactionSession(lines: readonly object[], child?: readonly objec
   const sources: SessionSpendSource[] = [{ sessionId: 's', file, primary: true }];
   if (child) {
     const childFile = path.join(folder, 'child.jsonl');
-    write(childFile, child);
+    write(childFile, child, unterminated ? '' : '\n');
     const makeChildReducer = (state: Parameters<typeof createClaudeUsageLineReducer>[0]) =>
       createClaudeUsageLineReducer(state, { childTranscript: true });
-    records.push(indexSpendFile(undefined, childFile, 'w', makeChildReducer, 1, whole).record);
+    const childBudget = unterminated ? { ...whole, exportRecordBytes: 1 << 20 } : whole;
+    records.push(indexSpendFile(undefined, childFile, 'w', makeChildReducer, 1, childBudget).record);
     sources.push({ sessionId: 's', file: childFile, primary: false });
   }
   const parts = sessionSpendPartsBySession(records, sources).s;
@@ -5521,6 +5523,52 @@ describe('Claude background cost accounting', () => {
     assert.equal(result.complete, true);
     assert.equal(result.progress.reason, undefined);
     assert.deepEqual(result.supplement, whole.supplement);
+  });
+
+  test('an export skips a repeated child record and counts the record after it in the final chunk', () => {
+    const child = [
+      answer('first', at - 3, 100, true),
+      answer('first', at - 3, 100, true),
+      answer('second', at - 2, 7, true),
+    ];
+    const fixture = indexCompactionSession([clock(), snapshot(140)], child);
+    const lines = child.map((line) => Buffer.byteLength(JSON.stringify(line)) + 1);
+    // The repeated record starts at its run start, and the next record starts at its run end.
+    assert.deepEqual(fixture.records[1].claudeRepeated?.runs, [lines[0], lines[0] + lines[1]]);
+    const exported = { now: () => 0, maxBytes: 1 << 20, exportRecordBytes: 1 << 20 };
+    // One read holds the whole child, so every line sits in the final chunk of the export.
+    assert.equal(tokens(replay(fixture, { now: () => 0, maxBytes: 1 << 20 }).supplement!.lifetime), 33);
+    assert.equal(tokens(replay(fixture, exported).supplement!.lifetime), 33);
+    // A slice that expires inside the final chunk resumes from its buffered lines.
+    let result = replay(fixture, { ...late(), exportRecordBytes: 1 << 20 });
+    for (let slice = 0; !result.complete && slice < 20; slice++)
+      result = replay(fixture, { ...late(), exportRecordBytes: 1 << 20 }, result.progress);
+    assert.equal(result.complete, true);
+    assert.equal(tokens(result.supplement!.lifetime), 33);
+  });
+
+  test('an export counts the unterminated last record of a child after a repeated record', () => {
+    const child = [
+      answer('first', at - 3, 100, true),
+      answer('first', at - 3, 100, true),
+      answer('second', at - 2, 7, true),
+    ];
+    const fixture = indexCompactionSession([clock(), snapshot(140)], child, true);
+    const exported = { now: () => 0, maxBytes: 1 << 20, exportRecordBytes: 1 << 20 };
+    assert.equal(tokens(replay(fixture, exported).supplement!.lifetime), 33);
+    // Each expired slice parses one record, and the last one has only the unterminated record pending.
+    let result = replay(fixture, { ...late(), exportRecordBytes: 1 << 20 });
+    for (let slice = 0; !result.complete && slice < 20; slice++)
+      result = replay(fixture, { ...late(), exportRecordBytes: 1 << 20 }, result.progress);
+    assert.equal(result.complete, true);
+    assert.equal(tokens(result.supplement!.lifetime), 33);
+    // Outside an export the unterminated record is not complete, and each expired slice still returns.
+    result = replay(fixture, late());
+    for (let slice = 0; slice < 3; slice++) {
+      assert.equal(result.complete, false);
+      result = replay(fixture, late(), result.progress);
+    }
+    assert.equal(result.complete, false);
   });
 
   test('repeated CLI counters correct intervening parent and child usage in session and Project totals', () => {

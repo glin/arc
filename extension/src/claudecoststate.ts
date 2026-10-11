@@ -572,7 +572,11 @@ export function reconcileClaudeCostState(
         const pendingBytes = Buffer.from(progress.pending, 'base64');
         // The slice parses buffered complete lines before its next read.
         // The buffer then holds at most one chunk and one partial record.
-        const buffered = pendingBytes.includes(10);
+        // At the end of the file in an export, pending bytes without a newline still hold a complete last record.
+        // The slice parses that record without a zero-byte read, so an expired slice makes it its one step.
+        const exporting = budget.exportRecordBytes !== undefined;
+        const buffered =
+          pendingBytes.includes(10) || (exporting && progress.offset === file.size && pendingBytes.length > 0);
         const chunkBytes = buffered ? 0 : Math.min(64 * 1024, file.size - progress.offset, remaining);
         if (!buffered && (progress.resourceBytes ?? 0) + progress.pending.length * 8 + chunkBytes * 8 > maxWorkingSet)
           return withhold();
@@ -592,17 +596,20 @@ export function reconcileClaudeCostState(
               throw new ExportLimitError('record', budget.exportRecordBytes);
           }
         }
-        const terminal = !buffered && budget.exportRecordBytes !== undefined && progress.offset === file.size;
-        const bytes = Buffer.concat([pendingBytes, chunk.subarray(0, read), ...(terminal ? [Buffer.from([10])] : [])]);
+        const ended = exporting && progress.offset === file.size;
+        const bytes = Buffer.concat([pendingBytes, chunk.subarray(0, read)]);
+        // The pending bytes end where the read began, so `bytes` starts at this file offset.
+        const base = progress.offset - bytes.length;
         let start = 0;
-        for (let end = 0; end < bytes.length; end++) {
-          if (bytes[end] !== 10) continue;
+        // At the end of the file in an export, the end of the bytes also ends an unterminated last record.
+        for (let end = 0; end <= bytes.length; end++) {
+          if (end < bytes.length ? bytes[end] !== 10 : !ended || start === end) continue;
           if (expired()) break;
           advanced = true;
           // The parser's admission rule includes nested attachments and excludes ordinary tool results.
           // Charges cover retained objects, indexes, and checkpoint serialization copies.
           // The spend index records the byte ranges of repeated records, and a repeated record adds no cost.
-          if (insideClaudeRepeated(file.claudeRepeated, progress.offset - bytes.length + start)) {
+          if (insideClaudeRepeated(file.claudeRepeated, base + start)) {
             start = end + 1;
             continue;
           }
