@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { WindowChannel } from '../../extension/src/sessionrequests.ts';
+import { parseSessionRequest, WindowChannel } from '../../extension/src/sessionrequests.ts';
+import { sessionListingPage, SESSION_PAGE_LIMITS } from '../../extension/src/sessionreads.ts';
 import { childEnv } from '../../extension/src/agenthost.ts';
 import {
   copyFileSync,
@@ -383,6 +384,42 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
       encoding: 'utf8',
     });
     assert.deepEqual(JSON.parse(paged.stdout).params, { cursor: 'Page-2_x', limit: 5 });
+    const maximum = SESSION_PAGE_LIMITS.rows;
+    assert.equal(maximum, 128);
+    const pageRequest = {
+      sources: [],
+      cursor: null,
+      limit: maximum,
+      catalog: 'complete',
+      fresh: true,
+      scope: 'smoke',
+      secret: Buffer.alloc(32),
+      requester: null,
+      project: () => assert.fail('An empty catalog has no rows to project.'),
+    };
+    assert.equal(sessionListingPage(pageRequest).complete, true);
+    assert.throws(() => sessionListingPage({ ...pageRequest, limit: maximum + 1 }), /Limit must be between/);
+    const wireRequest = {
+      id: 'page-bound',
+      version: 1,
+      token: 'b'.repeat(64),
+      requester: null,
+      method: 'sessions',
+      params: { limit: maximum },
+    };
+    assert.deepEqual(parseSessionRequest(wireRequest), wireRequest);
+    assert.equal(parseSessionRequest({ ...wireRequest, params: { limit: maximum + 1 } }), null);
+    const largest = await run(process.execPath, [cli, 'sessions', '--limit', String(maximum)], {
+      env,
+      encoding: 'utf8',
+    });
+    assert.deepEqual(JSON.parse(largest.stdout).params, { limit: maximum });
+    const atMaximum = requests;
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', '--limit', String(maximum + 1)], { env }),
+      /Limit must be between/,
+    );
+    assert.equal(requests, atMaximum);
     const detail = await run(
       process.execPath,
       [cli, 'session', 'known', '--turns', '2', '--window', channel.hostId, '--json'],

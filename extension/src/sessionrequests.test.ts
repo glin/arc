@@ -1105,7 +1105,10 @@ test('session pages mark every source of a shared session ID, including an overs
     () => ({ limit: 1 }),
   );
   const rows = pages.flatMap((page) => page.sessions);
-  assert.equal(new Set(rows.map((row) => row.source)).size, 5);
+  assert.deepEqual(
+    rows.map((row) => row.source),
+    sessionPageSources(files).map((entry) => entry.source),
+  );
   assert.deepEqual(
     rows
       .filter((row) => row.ambiguous)
