@@ -400,6 +400,7 @@ import {
 } from './promptassets';
 import { fillPanelText, panelValues } from './paneltext';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
+import { RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
 import { withRecoveredCommits } from './childartifacts.ts';
 import {
   hasImageReference,
@@ -1678,6 +1679,8 @@ export class PanelProvider implements vscode.Disposable {
     relative: string;
     agentRun: boolean;
   }>[] = [];
+  // The session rows each panel holds from its last render and session list messages. Created on first use.
+  private rowSenders: WeakMap<PanelHost, RowDeltaSender> | undefined;
   // Session-list placement order, separate from activity-sorted catalog rows. Reconciliation preserves placement and appends newly discovered sessions.
   private railOrder: string[] = [];
   // The latest delivery that carried the rail, and its largest serialized message across
@@ -7544,7 +7547,7 @@ export class PanelProvider implements vscode.Disposable {
         this.startupLoadingSent = JSON.stringify(
           this.loadingLine.held(loadingScope) && !listLoading.complete ? { ...listLoading, held: true } : listLoading,
         );
-        void this.sendToHost(
+        void this.postRows(
           host,
           {
             ...payload,
@@ -8228,7 +8231,7 @@ export class PanelProvider implements vscode.Disposable {
         hidden: [...this.hidden],
         pinnedTop: [...this.pinnedTop],
       };
-      void this.sendToHost(host, message, (serializedBytes) => {
+      void this.postRows(host, message, (serializedBytes) => {
         if (serializedBytes !== null) {
           largestRailBytes = Math.max(largestRailBytes ?? 0, serializedBytes);
         }
@@ -8246,6 +8249,54 @@ export class PanelProvider implements vscode.Disposable {
 
   private folders(): string[] {
     return (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+  }
+
+  private rowSender(host: PanelHost): RowDeltaSender {
+    this.rowSenders ??= new WeakMap();
+    let sender = this.rowSenders.get(host);
+    if (!sender) {
+      sender = new RowDeltaSender();
+      this.rowSenders.set(host, sender);
+    }
+    return sender;
+  }
+
+  // Post a render or session list message with only the session rows the panel does not already hold.
+  // A selection message posts unchanged, because the panel applies it to its drawn rows and not to its held rows.
+  // A message the panel did not accept leaves its rows unknown, so the next message is a snapshot.
+  private postRows(
+    host: PanelHost,
+    message: Record<string, unknown>,
+    measured?: (serializedBytes: number | null) => void,
+  ): Thenable<boolean> {
+    if (message.type !== 'render' && message.type !== 'rail') {
+      return this.sendToHost(host, message, measured);
+    }
+    const sender = this.rowSender(host);
+    // An unready panel drops the post, so it prints no rows. The panel may hold other rows when it becomes ready.
+    if (!this.readyHosts.has(host)) {
+      sender.reset();
+      return this.sendToHost(host, message, measured);
+    }
+    // A change in one of these inputs touches most rows, so it sends a snapshot. Prints cover every other input.
+    // Fields outside `sessions`, `rail` and `stats`, such as `hidden`, `pinnedTop` and `labels`, travel complete in every message.
+    const globals: Record<string, unknown> = {
+      day: railWordingDay(Date.now()),
+      scope: this.repositoryScopeRoots ?? null,
+      folders: this.catalog?.folders ?? null,
+    };
+    const posted = this.sendToHost(
+      host,
+      sender.encode(message as Record<string, unknown> & RowLists, globals),
+      measured,
+    );
+    void Promise.resolve(posted).then(
+      (accepted) => {
+        if (!accepted) sender.reset();
+      },
+      () => sender.reset(),
+    );
+    return posted;
   }
 
   private ensureProjectSpendWorkspace(): void {
@@ -11548,7 +11599,14 @@ export class PanelProvider implements vscode.Disposable {
       await dispatchPanelToHost<void | Promise<void>>(message, {
         health: () => {},
         ready: () => {
+          // A loaded page holds no session rows.
+          this.rowSenders?.get(host)?.reset();
           this.browserReady(host);
+        },
+        // The panel lost a delta. Post its rows again from the catalog the host holds, without a new catalog walk.
+        rowsGap: () => {
+          this.rowSenders?.get(host)?.reset();
+          void this.refresh(true, true);
         },
         painted: (msg) => {
           this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);

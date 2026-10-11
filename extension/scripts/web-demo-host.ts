@@ -8,6 +8,7 @@ export const DEMO_HOST_POLICY = {
   health: 'noop',
   contextDetail: 'handled',
   ready: 'handled',
+  rowsGap: 'noop',
   painted: 'noop',
   initialize: 'noop',
   developmentReload: 'noop',

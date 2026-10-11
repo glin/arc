@@ -31,6 +31,7 @@ import { normalizeSetupValues, SETUP_ID_LIMIT } from '../domain/session-setups.t
 import type { SavedView } from '../domain/views.ts';
 import { isStoredRailLens, type SavedRailFilter } from '../domain/rail-filters.ts';
 import type { TurnComment } from '../view/comments.ts';
+import { rowDeltaHeaderValid, type RowDeltaHeader } from './row-deltas.ts';
 import type { UsageBar } from '../view/usage.ts';
 import type { ProjectSpend } from '../view/projectspend.ts';
 import { RAIL_SORTS, type RailSort } from '../domain/rail-sort.ts';
@@ -161,6 +162,8 @@ export interface RenderMessage extends Record<string, unknown> {
   startup: PanelStartup | null;
   // The initial render carries Timeline layout settings. Configuration changes arrive as layout messages.
   timelineLayout: TimelineLayout;
+  // The row delta header. A message without it carries complete `sessions`, `rail` and `stats`.
+  rows?: RowDeltaHeader;
 }
 
 // Session loading status. A pending status repeats the last relationship source count when the host holds one. A held status
@@ -241,6 +244,7 @@ export type HostToPanel =
       sessionAdoptions: PanelSessionAdoption[];
       hidden: string[];
       pinnedTop: string[];
+      rows?: RowDeltaHeader;
     }
   | { type: 'openPick'; control: string }
   | { type: 'takeDraft'; session: string; text: string }
@@ -310,6 +314,8 @@ export type PanelToHost =
   | { type: 'health'; sequence: number }
   | { type: 'contextDetail'; session: string; request: number; generation: number }
   | { type: 'ready' }
+  // The panel could not apply a session row delta and needs a snapshot.
+  | { type: 'rowsGap' }
   | { type: 'painted'; generation: number; stage: 'railReady' | 'firstCard' | 'completeRender'; usableRows?: true }
   | { type: 'initialize' }
   | { type: 'developmentReload' }
@@ -782,7 +788,8 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         Array.isArray(sessionAdoptions) &&
         sessionAdoptions.every(sessionAdoption) &&
         strings(m.hidden) &&
-        strings(m.pinnedTop)
+        strings(m.pinnedTop) &&
+        rowDeltaHeaderValid(m.rows)
         ? {
             type: 'rail',
             rail: m.rail as PanelRailCard[],
@@ -793,6 +800,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
             sessionAdoptions,
             hidden: m.hidden,
             pinnedTop: m.pinnedTop,
+            ...(m.rows === undefined ? {} : { rows: m.rows as RowDeltaHeader }),
           }
         : null;
     }
@@ -874,7 +882,8 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         Array.isArray(m.iconFonts) &&
         m.iconFonts.every(isString) &&
         Array.isArray(adoptions) &&
-        adoptions.every(sessionAdoption)
+        adoptions.every(sessionAdoption) &&
+        rowDeltaHeaderValid(m.rows)
         ? (m as RenderMessage)
         : null;
     }
@@ -906,6 +915,8 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
             ...(m.usableRows === true ? { usableRows: true as const } : {}),
           }
         : null;
+    case 'rowsGap':
+      return { type: 'rowsGap' };
     case 'initialize':
       return { type: 'initialize' };
     case 'developmentReload':
@@ -1324,6 +1335,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.ready(message);
     case 'painted':
       return handlers.painted(message);
+    case 'rowsGap':
+      return handlers.rowsGap(message);
     case 'initialize':
       return handlers.initialize(message);
     case 'developmentReload':

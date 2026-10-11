@@ -1329,9 +1329,11 @@ import type { WindowState } from './sessionrequests.ts';
 import { CommitRepositoryReservations } from './progressiveworker';
 import * as vscode from 'vscode';
 import { performance } from 'node:perf_hooks';
+import { replaceRows, replaceStats } from './webview/row-deltas.ts';
 import {
   PanelPerformanceCounters,
   savePerformanceDiagnosticsSnapshot,
+  serializedMessageBytes,
   type PerformanceEventSink,
 } from './performancediagnostics.ts';
 import { StartupThresholdWatch, createDiagnosticsLog, HostHealth } from './diagnosticslog.ts';
@@ -6873,7 +6875,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
     /this\.checkpointDerivedCache\(\);/,
     'a populated derived cache still waits for provider disposal before reaching disk',
   );
-  const postAt = layoutIndexOf(refreshBody, 'this.sendToHost(host, {');
+  const postAt = layoutIndexOf(refreshBody, 'this.postRows(host, {');
   const checkpointAt = refreshBody.indexOf('this.checkpointDerivedCache();');
   assert.notEqual(postAt, -1, 'the first render is no longer posted from refresh');
   assert.notEqual(checkpointAt, -1, 'refresh no longer requests the cache checkpoint');
@@ -6965,7 +6967,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
 
 test('the first authoritative render precedes Project cost restoration and pricing', () => {
   const refresh = methodBody('async refresh(');
-  const renderAt = layoutIndexOf(refresh, 'this.sendToHost(host, {');
+  const renderAt = layoutIndexOf(refresh, 'this.postRows(host, {');
   const hydrationAt = refresh.indexOf('this.scheduleProjectSpendHydration(', renderAt);
   assert.ok(
     renderAt >= 0 && hydrationAt > renderAt,
@@ -7517,7 +7519,10 @@ test("the host counts a dispatched session in its parent's cost once and files i
       projectSpendHistoryCutoff: () => passed,
       postProjectSpend: () => {},
       projectSpendRailOwed: false,
-      hosts: [{}],
+      ...(() => {
+        const host = {};
+        return { hosts: [host], readyHosts: new Set([host]) };
+      })(),
       sendToHost: (_host: unknown, message: Rail) => rails.push(message),
       catalog: null,
       railRevision: 0,
@@ -16345,7 +16350,7 @@ test('a rail card wears the status that needs attention', () => {
   const postRail = memberFrom(panelHostSource, postRailAt);
   sourceMatch(
     postRail,
-    /const railAdoptions = sessionAdoptions\(this\.sessionAliases\);[\s\S]*?for \(const host of this\.hosts\) \{[\s\S]*?sharedRail[\s\S]*?railPayload\(this\.railInputFor\([\s\S]*?this\.hostSessions\?\.get\(host\) \?\? this\.showing[\s\S]*?sessionAdoptions: railAdoptions[\s\S]*?void this\.sendToHost\(host, message, \(serializedBytes\) => \{/,
+    /const railAdoptions = sessionAdoptions\(this\.sessionAliases\);[\s\S]*?for \(const host of this\.hosts\) \{[\s\S]*?sharedRail[\s\S]*?railPayload\(this\.railInputFor\([\s\S]*?this\.hostSessions\?\.get\(host\) \?\? this\.showing[\s\S]*?sessionAdoptions: railAdoptions[\s\S]*?void this\.postRows\(host, message, \(serializedBytes\) => \{/,
     'a completed lifetime index updates the rail but leaves the open heading stale',
   );
   sourceMatch(
@@ -23852,6 +23857,8 @@ test('startup selection preserves configured filters until the workspace catalog
     acknowledgePaint: noop,
     pageStyle: { setIconFonts: noop },
     railAcrossSessionAdoption: (rail: unknown, stats: unknown) => ({ rail, stats }),
+    replaceRows,
+    replaceStats,
     labeledSessions: () => [],
     refreshLabeledCards: noop,
     history: { footers: () => [] },
@@ -23860,7 +23867,7 @@ test('startup selection preserves configured filters until the workspace catalog
     `let ${declarationSource(script, 'latest')};`,
     `let ${declarationSource(script, 'workspaceCatalogAvailable')};`,
     'let usageState = null, layout = null;',
-    ...['firstSelection', 'replaceRows', 'replaceStats', 'repaint'].map((name) => declarationSource(script, name)),
+    ...['firstSelection', 'repaint'].map((name) => declarationSource(script, name)),
     `return { selection(msg) {${handlerBody(script, 'selection')}}, rail(msg) {${handlerBody(script, 'rail')}}, render(msg) {${handlerBody(script, 'render')}} };`,
   ].join('\n');
   const compiled = esbuild.transformSync(source, { loader: 'ts' }).code;
@@ -23954,9 +23961,9 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh\([^)]*\b(?:true|false)\s*,\s*true\)/g)];
   assert.equal(
     reusing.length,
-    13,
+    14,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
-      'and the accepted selected-worker follow-up must not repeat catalog enumeration.',
+      'the accepted selected-worker follow-up and row delta recovery must not repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(
@@ -24232,7 +24239,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
     /if \(session\.sessionId === this\.showing\) \{ continue; \}/,
     'catalog enrichment can own a selected-session window read after selected work settles',
   );
-  const renderPost = layoutIndexOf(refresh, 'void this.sendToHost(host, {');
+  const renderPost = layoutIndexOf(refresh, 'void this.postRows(host, {');
   const deferredMetadata = layoutIndexOf(
     refresh,
     'if (metadataAfterRender && !(await this.prepareMetadata(all, generation, controller.signal))) { return; }',
@@ -29628,4 +29635,192 @@ test('a drawn Claude card redraws with its cache-expiry warning when the session
   assert.match(cost?.detailList?.entries[0]?.label ?? '', /^Cache expired after a 1h 12m gap and added \$\d+\.\d\d$/);
   assert.equal(cost?.detailList?.entries[0]?.warning, true);
   assert.ok(seen.includes(dispatched), 'the redraw drew the card without its dispatched costs');
+});
+
+// Post a catalog render of sessions listed newest first, then append to the third newest transcript, redraw, and mark it running.
+// Running sessions are among the newest, so the appended session moves from third place to first.
+async function appendedSessionBytes(count: number): Promise<{ render: number; rail: number }> {
+  const directory = tempDir('row-delta-');
+  const sessions = Array.from({ length: count }, (_, at) => {
+    const sessionId = `${String(at).padStart(8, '0')}-1111-4111-8111-111111111111`;
+    const file = path.join(directory, `${sessionId}.jsonl`);
+    fs.writeFileSync(file, '{}\n');
+    const written = new Date(Date.now() - (at + 1) * 60_000);
+    fs.utimesSync(file, written, written);
+    return {
+      sessionId,
+      file,
+      agent: 'claude',
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+  });
+  const fixture = dispatchedRefreshFixture(sessions, {} as ProgressiveWorker, []);
+  const provider = fixture.provider;
+  await provider.refresh(true, true);
+  await Promise.all(fixture.refreshes);
+  fixture.posted.length = 0;
+  const [moved] = sessions.splice(2, 1);
+  fs.appendFileSync(moved.file, '{"moved":true}\n');
+  sessions.unshift({
+    ...moved,
+    ...revisionOf(fs.statSync(moved.file, { bigint: true })),
+  });
+  await provider.refresh(true, true);
+  await Promise.all(fixture.refreshes);
+  provider.railStatuses = () => ({
+    statuses: new Map([[moved.sessionId, 'running']]),
+    openChildren: new Map(),
+  });
+  provider.postRail = (PanelProvider.prototype as unknown as { postRail: unknown }).postRail;
+  provider.postRail(true);
+  const bytes = (type: string) =>
+    fixture.posted
+      .filter((message) => message.type === type)
+      .reduce((sum, message) => sum + (serializedMessageBytes(message) ?? 0), 0);
+  return { render: bytes('render'), rail: bytes('rail') };
+}
+
+test('one appended transcript posts its changed session row rather than every listed session', async () => {
+  const empty = tempDir('row-delta-roots-');
+  vi.stubEnv('ARC_PROJECTS_ROOT', empty);
+  vi.stubEnv('ARC_CODEX_ROOT', empty);
+  const small = await appendedSessionBytes(100);
+  const large = await appendedSessionBytes(1200);
+  assert.ok(
+    small.render > 0 && small.rail > 0,
+    `the append posted no render or session list update: ${JSON.stringify(small)}`,
+  );
+  const perSession = (large.render + large.rail - small.render - small.rail) / 1100;
+  assert.ok(
+    perSession <= 45,
+    `posted bytes grew ${perSession.toFixed(1)} per listed session: ${JSON.stringify({ small, large })}`,
+  );
+});
+
+// A catalog whose panel already holds rows, so each later render and session list message is a delta until the host forgets them.
+async function rowDeltaProvider() {
+  const empty = tempDir('row-delta-roots-');
+  vi.stubEnv('ARC_PROJECTS_ROOT', empty);
+  vi.stubEnv('ARC_CODEX_ROOT', empty);
+  const directory = tempDir('row-delta-host-');
+  const sessions = Array.from({ length: 6 }, (_, at) => {
+    const sessionId = `${String(at).padStart(8, '0')}-2222-4222-8222-222222222222`;
+    const file = path.join(directory, `${sessionId}.jsonl`);
+    fs.writeFileSync(file, '{}\n');
+    const written = new Date(Date.now() - (at + 1) * 60_000);
+    fs.utimesSync(file, written, written);
+    return { sessionId, file, agent: 'claude', ...revisionOf(fs.statSync(file, { bigint: true })) };
+  });
+  const fixture = dispatchedRefreshFixture(sessions, {} as ProgressiveWorker, []);
+  const provider = fixture.provider;
+  provider.postRail = (PanelProvider.prototype as unknown as { postRail: unknown }).postRail;
+  let change = 0;
+  // Each call marks another session running, so the session list changes and posts.
+  const postRail = () => {
+    change++;
+    provider.railStatuses = () => ({
+      statuses: new Map([[sessions[change % sessions.length].sessionId, 'running']]),
+      openChildren: new Map(),
+    });
+    provider.postRail(true);
+  };
+  const render = async () => {
+    await provider.refresh(true, true);
+    await Promise.all(fixture.refreshes);
+  };
+  // The first message of a type posted from `from` on.
+  const first = (type: string, from: number) =>
+    fixture.posted.slice(from).find((message) => message.type === type) as
+      | (Record<string, unknown> & { rows?: { base: number | null }; rail: unknown[]; sessions?: unknown[] })
+      | undefined;
+  await render();
+  postRail();
+  const from = fixture.posted.length;
+  await render();
+  postRail();
+  assert.notEqual(
+    first('render', from)?.rows?.base ?? null,
+    null,
+    'a render to a panel that holds rows was not a delta',
+  );
+  assert.notEqual(first('rail', from)?.rows?.base ?? null, null, 'a session list update was not a delta');
+  return { fixture, provider, sessions, render, postRail, first };
+}
+
+test('a lost row delta, a reloaded page and an undelivered post each make the next render and session list message a snapshot', async () => {
+  const triggers: Record<string, (held: Awaited<ReturnType<typeof rowDeltaProvider>>) => Promise<void>> = {
+    rowsGap: async ({ provider, fixture }) => provider.onMessage({ type: 'rowsGap' }, fixture.host),
+    ready: async ({ provider, fixture }) => {
+      provider.browserReady = () => {};
+      await provider.onMessage({ type: 'ready' }, fixture.host);
+    },
+    undelivered: async ({ provider, fixture, postRail }) => {
+      const send = provider.sendToHost;
+      let post: Promise<boolean> | undefined;
+      provider.sendToHost = (_host: unknown, message: Record<string, unknown>) => {
+        fixture.posted.push(message);
+        provider.sendToHost = send;
+        return (post = Promise.resolve(false));
+      };
+      postRail();
+      await post;
+    },
+  };
+  for (const [name, trigger] of Object.entries(triggers)) {
+    for (const next of ['render', 'rail']) {
+      const held = await rowDeltaProvider();
+      const refresh = held.provider.refresh;
+      const reposts: unknown[][] = [];
+      if (next === 'rail') {
+        held.provider.refresh = (...args: unknown[]) => {
+          reposts.push(args);
+          return Promise.resolve();
+        };
+      }
+      const from = held.fixture.posted.length + (name === 'undelivered' ? 1 : 0);
+      await trigger(held);
+      if (next === 'rail') {
+        held.postRail();
+        held.provider.refresh = refresh;
+      } else if (name !== 'rowsGap') {
+        await held.render();
+      }
+      await Promise.all(held.fixture.refreshes);
+      const message = held.first(next, from);
+      assert.ok(message, `no ${next} message followed ${name}`);
+      assert.equal(message.rows?.base, null, `the ${next} message after ${name} was a delta`);
+      if (name === 'rowsGap' && next === 'rail') {
+        assert.deepEqual(reposts, [[true, true]], 'a lost row delta did not repost from the held catalog');
+      }
+    }
+  }
+});
+
+test('archiving, pinning and labelling one session post a delta rather than every row', async () => {
+  const { provider, sessions, render, postRail, first, fixture } = await rowDeltaProvider();
+  const id = sessions[3].sessionId;
+  const input = provider.railInputFor;
+  provider.railInputFor = (...args: unknown[]) => ({
+    ...input(...args),
+    labels: { [id]: ['review'] },
+    views: [{ name: 'Review', query: 'label:review' }],
+    railFilters: [{ id: 'review', name: 'Review', query: 'label:review' }],
+  });
+  provider.hidden = new Set([id]);
+  provider.pinnedTop = new Set([id]);
+  const from = fixture.posted.length;
+  await render();
+  postRail();
+  for (const type of ['render', 'rail']) {
+    const message = first(type, from);
+    assert.notEqual(
+      message?.rows?.base ?? null,
+      null,
+      `the ${type} message after one session changed resent every row`,
+    );
+    assert.ok(
+      message!.rail.length < sessions.length,
+      `the ${type} message carried ${message!.rail.length} session list rows`,
+    );
+  }
 });

@@ -22,6 +22,7 @@ import { createAttachmentRenderer } from './attachments.ts';
 import { createStatDetailRenderer, type StatDetailRenderer } from './stat-detail.ts';
 import { renderDetailRows } from './card-rows.ts';
 import { createClock } from './clock.ts';
+import { replaceRows, replaceStats, RowDeltaReceiver } from './row-deltas.ts';
 import { createSearchRenderer } from './search.ts';
 import { createPanelSessionState } from './session-state.ts';
 import { createHistoryOwner } from './history-control.ts';
@@ -118,6 +119,9 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   let history: ReturnType<typeof createHistoryOwner>;
   let labelsFilterable: boolean | undefined;
   let latest: RenderMessage | null = null;
+  // Session rows the host's last render and session list messages left in this panel.
+  // A delta that cannot apply asks the host for a snapshot once, and the drawn rows stay until the snapshot arrives.
+  const rowDeltas = new RowDeltaReceiver(() => vscode.postMessage({ type: 'rowsGap' }));
   const activityCardIndexes = new Map<string, number>();
   let workspaceCatalogAvailable = false;
   let progressStamp: Extract<HostToPanel, { type: 'startupProgress' }> | null = null;
@@ -1065,35 +1069,6 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     acknowledgePaint();
   }
 
-  function replaceRows<T extends { id: string }>(
-    held: readonly T[],
-    changed: readonly T[],
-    replaces: readonly string[],
-  ): T[] {
-    const replacements = new Map(changed.map((row) => [row.id, row]));
-    const heldIds = new Set(held.map((row) => row.id));
-    const replaced = new Set(replaces);
-    return [
-      ...changed.filter((row) => !heldIds.has(row.id)),
-      ...held.flatMap((row) => {
-        const replacement = replacements.get(row.id);
-        return replacement ? [replacement] : replaced.has(row.id) ? [] : [row];
-      }),
-    ];
-  }
-
-  function replaceStats(
-    held: Record<string, PanelStat[]>,
-    changed: Record<string, PanelStat[]>,
-    replaces: readonly string[],
-  ): Record<string, PanelStat[]> {
-    const next = { ...held };
-    for (const id of replaces) {
-      delete next[id];
-    }
-    return Object.assign(next, changed);
-  }
-
   function firstSelection(): RenderMessage {
     return {
       type: 'render',
@@ -1145,12 +1120,15 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   // The typed dispatch requires a handler for every message kind.
   function receiveHostMessage(data: unknown) {
     const startedAt = performance.now();
-    const message = parseHostToPanel(data);
-    if (!message) {
+    const parsed = parseHostToPanel(data);
+    if (!parsed) {
       const kind = data && typeof data === 'object' && 'type' in data ? data.type : undefined;
       console.warn('Arc: a message from the extension was not understood, so nothing was drawn.', kind);
       return;
     }
+    // Rebuild complete session lists from a row delta. A delta that cannot apply draws nothing.
+    const message = parsed.type === 'render' || parsed.type === 'rail' ? rowDeltas.expand(parsed) : parsed;
+    if (!message) return;
     dispatchHostToPanel(message, {
       health: (msg) => vscode.postMessage({ type: 'health', sequence: msg.sequence }),
       visibility: (msg) => visibility.receive(msg),

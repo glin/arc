@@ -24,6 +24,7 @@ export const EXPORT_HOST_POLICY = {
   health: 'blocked',
   contextDetail: 'blocked',
   ready: 'local',
+  rowsGap: 'blocked',
   painted: 'blocked',
   initialize: 'blocked',
   developmentReload: 'blocked',

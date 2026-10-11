@@ -82,6 +82,7 @@ import {
   sameRailInputs,
   selectionPayload,
 } from './payload';
+import { RowDeltaReceiver, RowDeltaSender } from './webview/row-deltas.ts';
 import {
   acceptsProgressiveResult,
   INITIAL_RAIL_READ_BYTES,
@@ -1139,6 +1140,8 @@ function completeDiscoveryHarness(
     'publishWindowState',
     'createDraft',
     'refresh',
+    'postRows',
+    'rowSender',
     'refreshFrom',
     'runPendingRefresh',
     'abandonCatalogRefresh',
@@ -1218,7 +1221,10 @@ function completeDiscoveryHarness(
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
-      hosts = [{ webview: { postMessage: (message) => { this.messages.push(message); return Promise.resolve(true); } }, active: () => false, visible: () => true }]; readyHosts = new Set(this.hosts); panelVisibility = createPanelVisibility();
+      // Messages record the session rows the panel holds after rebuilding each row delta.
+      heldRows = new RowDeltaReceiver();
+      expandRows(message) { const held = this.heldRows.expand(message); if (!held) throw new Error('a ' + message.type + ' message did not apply to the rows the panel holds'); return held; }
+      hosts = [{ webview: { postMessage: (message) => { this.messages.push(message.type === 'render' || message.type === 'rail' ? this.expandRows(message) : message); return Promise.resolve(true); } }, active: () => false, visible: () => true }]; readyHosts = new Set(this.hosts); panelVisibility = createPanelVisibility();
       refreshGeneration = 0; refreshController = null; pendingRefresh = null; refreshReason = 'startup'; targetedRefreshPaths = null; selectionGeneration = 0; selectionWork = null; selectionFailure = null;
       repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; draftProfiles = {}; sessionOrigins = {}; drafts = {}; picks = {};
       refreshUsageHandler = null; initialCatalogRefreshPending = false; initialCatalogRefreshRequested = false;
@@ -1331,6 +1337,8 @@ function completeDiscoveryHarness(
     'railEnrichmentNeeds',
     'railInputKey',
     'railWordingDay',
+    'RowDeltaReceiver',
+    'RowDeltaSender',
     'sameRailInputs',
     'sessionAdoptions',
     'selectionPayload',
@@ -1373,6 +1381,8 @@ function completeDiscoveryHarness(
     railEnrichmentNeeds,
     railInputKey,
     railWordingDay,
+    RowDeltaReceiver,
+    RowDeltaSender,
     sameRailInputs,
     sessionAdoptions,
     selectionPayload,
@@ -3796,8 +3806,10 @@ function titlePublicationHarness(sessions: any[], run: any, cacheFile?: string):
   provider.useSpendSignature(spendSourceSignature);
   provider.useSpendOfferGate(projectSpendSourceOfferDue);
   provider.useRailPayload(railPayload);
-  provider.sendToHost = (_host: unknown, message: unknown) => {
-    provider.messages.push(message);
+  provider.sendToHost = (_host: unknown, message: any) => {
+    provider.messages.push(
+      message.type === 'render' || message.type === 'rail' ? provider.expandRows(message) : message,
+    );
     return Promise.resolve(true);
   };
   provider.spendOffers = [];
@@ -7184,17 +7196,20 @@ test('an oversized full refresh records the largest ready-host message after eac
     spy.mockRestore();
   }
 
+  // Each host prints its rows once to choose the changed rows, then measures the posted message once.
   assert.deepEqual(
     order,
     [
+      'rail row serialized',
       'render posted',
       'render serialized',
+      'rail row serialized',
       'rail row serialized',
       'render posted',
       'render serialized',
       'rail row serialized',
     ],
-    'the oversized full refresh serialized before a post or serialized a host rail twice',
+    'the oversized full refresh serialized before a post or serialized a host rail more than to print and measure it',
   );
   assert.match(warnings[0], /^render message is \d+ bytes, above its 250000-byte budget\. Largest non-rail fields:/);
   const measured = provider.messages.map((message: unknown) => serializedMessageBytes(message));
@@ -7212,8 +7227,16 @@ test('an oversized full refresh records the largest ready-host message after eac
 
 test('a rail update serializes once for each actual ready-host post', () => {
   const provider = railPostHarness(['post', 'sendToHost']);
-  provider.useRailPayload(() => ({ rail: ['changed'], labels: [], views: [], railFilters: [], stats: {} }));
   const order: string[] = [];
+  // A keyed row travels as a row delta, so every print of it reaches the order.
+  const row = {
+    id: 'changed',
+    toJSON() {
+      order.push('rail row serialized');
+      return { id: 'changed' };
+    },
+  };
+  provider.useRailPayload(() => ({ rail: [row], labels: [], views: [], railFilters: [], stats: {} }));
   const host = (name: string) => ({
     webview: {
       postMessage(message: unknown) {
@@ -7241,9 +7264,10 @@ test('a rail update serializes once for each actual ready-host post', () => {
     spy.mockRestore();
   }
 
+  // The ready host prints its row to choose the changed rows, then measures the posted message once.
   assert.deepEqual(
     order,
-    ['ready posted rail', 'rail serialized'],
+    ['rail row serialized', 'ready posted rail', 'rail serialized', 'rail row serialized'],
     'a rail update serialized outside an actual ready-host post or serialized one post more than once',
   );
 });
@@ -7281,9 +7305,10 @@ test('an oversized rail warning does not serialize the rail data again', () => {
 
   provider.postRail(true);
 
+  // One serialization prints the row to choose the changed rows, and one measures the posted message.
   assert.equal(
     railSerializations,
-    1,
+    2,
     'the first oversized rail warning serialized the rail data again for its field breakdown',
   );
   assert.match(warnings[0], /^rail message is \d+ bytes, above its 1100000-byte budget\. Largest non-rail fields:/);
