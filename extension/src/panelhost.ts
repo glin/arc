@@ -6,8 +6,12 @@ import type { WindowState } from './sessionrequests';
 import { archiveRefusal } from './sessionwrites';
 import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLink } from './domain/session-link';
 import {
-  boundedSessionListing,
   boundedSessionRead,
+  readSessionCursor,
+  sessionListingPage,
+  sessionPageSources,
+  sessionScopeDigest,
+  sessionSourceKey,
   sessionAttention,
   sessionReadStatus,
   observeSessionRun,
@@ -16,8 +20,11 @@ import {
   sessionSourceAdmitted,
   type HostedSessionObservation,
   type SessionRunWitness,
-  SESSION_READ_LIMITS,
+  SESSION_PAGE_ERRORS,
+  SESSION_PAGE_LIMITS,
+  type SessionCursorBody,
   type SessionListingRow,
+  type SessionPageSource,
 } from './sessionreads';
 import { selectedDependencies } from './selectedsource';
 import { LOADING_DEFAULTS, type AppliedDefaults, type DefaultContext } from './view/model-picks';
@@ -1724,6 +1731,17 @@ export class PanelProvider implements vscode.Disposable {
   private completeCatalogScope?: string;
   // Programmatic completeness belongs to the exact catalog revisions accepted from complete discovery.
   private sessionReadDiscoveryRevision?: string;
+  // Each provider instance signs its own session cursors, so a reload invalidates every cursor it issued.
+  private sessionCursorSecret?: Buffer;
+  // Session pages over one accepted catalog and scope filter, sort, and serialize that catalog once.
+  private sessionPageIndex?: {
+    catalog: readonly SessionFile[];
+    roots: string;
+    scoped: SessionFile[];
+    ids: Set<string>;
+    sources: SessionPageSource[];
+    discovery: string;
+  };
   // The file and kind of each failed session read that is logged. A failed metadata, turn start, enrichment, or recovery read is logged
   // once per file and kind until that kind of read succeeds, and it never keeps the session list loading.
   private sessionReadFailures = new Set<string>();
@@ -1900,10 +1918,15 @@ export class PanelProvider implements vscode.Disposable {
     if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
     let reason: string | null = null;
     if (action === 'archive') {
-      const listing = this.readSessionRequest({ ...request, method: 'sessions', params: { sessionId: session } }) as {
-        sessions: SessionListingRow[];
-      };
-      const row = listing.sessions.find((row) => row.id === session);
+      // The ID filter applies before paging, so the row is on the first page wherever it sorts.
+      const listing = this.readSessionRequest({
+        ...request,
+        method: 'sessions',
+        params: { sessionId: session },
+        replyBytes: undefined,
+      }) as { sessions: SessionListingRow[] };
+      const key = sessionSourceKey(matches[0].agent, matches[0].sessionId, matches[0].file);
+      const row = listing.sessions.find((row) => row.source === key);
       reason = row ? archiveRefusal(row, force!) : 'The session state is unavailable.';
     }
     if (action === 'pin' && this.hidden.has(session!)) reason = 'Unarchive the session before pinning it.';
@@ -1961,32 +1984,50 @@ export class PanelProvider implements vscode.Disposable {
     const before = scopeKey();
     if (before === null) throw new Error('The repository scope is still loading. Retry the command.');
     const scope = this.repositoryScope.snapshot(this.folders());
-    const accepted = this.authoritativeCatalogScope === JSON.stringify(scope.roots) ? this.authoritativeCatalog : null;
-    const sessions = (accepted ?? []).filter(
-      (source) =>
-        (!source.cwd || isInside(source.cwd, scope.roots)) &&
-        (request.method !== 'sessions' || !request.params.sessionId || source.sessionId === request.params.sessionId),
-    );
+    const roots = JSON.stringify(scope.roots);
+    const accepted = this.authoritativeCatalogScope === roots ? this.authoritativeCatalog : null;
+    const index = accepted ? this.sessionPageIndexFor(accepted, roots, scope.roots) : null;
     if (before !== scopeKey()) throw new Error('The repository scope changed. Retry the command.');
     if (request.method === 'session') {
-      if (!accepted)
-        throw new Error('The session catalog is unavailable for this repository scope. Open Arc and retry.');
-      const matches = sessions.filter((source) => source.sessionId === request.params.sessionId);
+      if (!index) throw new Error(SESSION_PAGE_ERRORS.catalog);
+      const matches = index.scoped.filter((source) => source.sessionId === request.params.sessionId);
       if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
       return boundedSessionRead(matches[0], request.params.turns!, scopeKey, request.requester, scope.roots);
     }
+    // Only the internal archive read sets sessionId. It filters before paging.
+    const target = request.params.sessionId;
+    const sources = !index
+      ? []
+      : target === undefined
+        ? index.sources
+        : sessionPageSources(index.scoped.filter((source) => source.sessionId === target));
+    const secret = (this.sessionCursorSecret ??= crypto.randomBytes(32));
+    const scopeDigest = sessionScopeDigest(before);
+    let cursor: SessionCursorBody | null = null;
+    if (request.params.cursor !== undefined) {
+      const check = readSessionCursor(request.params.cursor, secret, scopeDigest);
+      if (check.status !== 'valid') throw new Error(SESSION_PAGE_ERRORS[check.status === 'scope' ? 'scope' : 'cursor']);
+      cursor = check.body;
+    }
+    const limit = request.params.limit ?? SESSION_PAGE_LIMITS.rows;
     const edges = this.sessionParentEdgeSet?.edges ?? new Map<string, SessionParentEdge>();
-    const ids = new Set(sessions.map((source) => source.sessionId));
+    const ids = index?.ids ?? new Set<string>();
     const visible = this.anyVisible();
     const pending = this.pendingWatch.snapshot();
     const fresh = visible && this.watching && !this.refreshController && !pending.eventCount && !pending.broadRequired;
-    const counts = visible ? this.unreadCounts() : null;
-    let revisionsCurrent = true;
-    const rows: SessionListingRow[] = sessions.slice(0, SESSION_READ_LIMITS.sessions).map((source) => {
+    let counts: Map<string, NewCount> | null | undefined;
+    const project = (entry: SessionPageSource) => {
+      const source = entry.session;
+      // The page serves a prefix of the limit sources after its first projection, so counts read only their windows.
+      if (counts === undefined) {
+        const at = sources.indexOf(entry);
+        counts = visible
+          ? this.unreadCounts(sources.slice(at, at + limit).map(({ session }) => session.sessionId))
+          : null;
+      }
       const meta = this.titles.get(source.file);
       const revision = this.revisionOf(source);
       const sourceCurrent = sameProgressiveRevision(revision, source);
-      revisionsCurrent &&= sourceCurrent;
       const current = fresh && sourceCurrent && meta !== undefined && sameSessionRevision(meta, source);
       const outcome = sourceCurrent && meta && sameSessionRevision(meta, source) ? meta.outcome : undefined;
       const held = this.cache.get(source.file);
@@ -2030,7 +2071,7 @@ export class PanelProvider implements vscode.Disposable {
         !meta.backgroundCommands?.length
       )
         status = 'none';
-      return {
+      const row: SessionListingRow = {
         id: source.sessionId,
         provider: source.agent,
         name: this.sessionLabel(source).fullLabel,
@@ -2061,22 +2102,43 @@ export class PanelProvider implements vscode.Disposable {
         agentRun: current ? this.agentRunFor(source, edges) : source.childTranscript === true ? true : null,
         facts: current ? 'current' : meta ? 'stale' : 'unparsed',
       };
+      return { row, current: sourceCurrent };
+    };
+    return sessionListingPage({
+      sources,
+      cursor,
+      limit,
+      replyBytes: request.replyBytes,
+      catalog:
+        !accepted || !index
+          ? 'unavailable'
+          : !this.dispatchDiscoveryPending &&
+              index.scoped.length === accepted.length &&
+              this.sessionReadDiscoveryRevision === index.discovery
+            ? 'complete'
+            : 'incomplete',
+      fresh,
+      scope: scopeDigest,
+      secret,
+      requester: request.requester,
+      project,
     });
-    return boundedSessionListing(
-      rows,
-      accepted !== null &&
-        fresh &&
-        !this.dispatchDiscoveryPending &&
-        revisionsCurrent &&
-        sessions.length === accepted.length &&
-        sessions.length <= SESSION_READ_LIMITS.sessions &&
-        this.sessionReadDiscoveryRevision ===
-          JSON.stringify([
-            JSON.stringify(scope.roots),
-            accepted.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino]),
-          ]),
-      request.requester,
-    );
+  }
+
+  // Keyed by catalog array identity and scope roots. A refresh publishes a new catalog array.
+  private sessionPageIndexFor(accepted: SessionFile[], roots: string, scopeRoots: string[]) {
+    const held = this.sessionPageIndex;
+    if (held?.catalog === accepted && held.roots === roots) return held;
+    const scoped = accepted.filter((source) => !source.cwd || isInside(source.cwd, scopeRoots));
+    this.sessionPageIndex = {
+      catalog: accepted,
+      roots,
+      scoped,
+      ids: new Set(scoped.map((source) => source.sessionId)),
+      sources: sessionPageSources(scoped),
+      discovery: JSON.stringify([roots, accepted.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino])]),
+    };
+    return this.sessionPageIndex;
   }
 
   public setWindowStateHandler(handler: (state: WindowState) => void): void {
@@ -7784,8 +7846,12 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Missing metadata stays unknown. Only a completed turn-start read can establish zero unread turns.
-  private unreadCounts(): Map<string, NewCount> {
-    return newCounts([], this.windows, this.saved.read, new Map(Object.entries(this.saved.readTo)), this.saved.since);
+  // A session listing passes the IDs it can serve, so the count reads only those windows.
+  private unreadCounts(sessions?: readonly string[]): Map<string, NewCount> {
+    const windows = sessions
+      ? new Map(sessions.flatMap((id) => (this.windows.has(id) ? [[id, this.windows.get(id)!] as const] : [])))
+      : this.windows;
+    return newCounts([], windows, this.saved.read, new Map(Object.entries(this.saved.readTo)), this.saved.since);
   }
 
   // Rail read watermarks use the same selection-independent starts as unread counts.

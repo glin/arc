@@ -102,7 +102,7 @@ arc session SESSION_ID --turns 2 --window WINDOW_ID --json
 arc pin SESSION_ID --dry-run --window WINDOW_ID
 ```
 
-Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` and `panelReady` before proceeding. Replace `SESSION_ID` with a listed session. If the list is empty, skip the session read and pin dry run. Reads leave reader attention unchanged, and the pin dry run writes no state. Preserve incomplete or unknown results when reporting the check.
+Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` and `panelReady` before proceeding. When the listing returns a `next` cursor, run `arc sessions --window WINDOW_ID --cursor NEXT --json` until `next` is `null`. Replace `SESSION_ID` with a listed session. If the list is empty, skip the session read and pin dry run. Reads leave reader attention unchanged, and the pin dry run writes no state. Preserve incomplete or unknown results when reporting the check.
 
 An optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. In `arc setups`, reusable rows appear in `primary`, `inherited`, `pinned`, and `recent`. Each row supplies a `key` and a `profile.agent`. Use a row for the intended provider, and exclude pinned rows whose `available` is false.
 
@@ -149,6 +149,22 @@ arc archive CLAUDE_SESSION_ID --force --window WINDOW_ID
 ```
 
 Hidden or unavailable attention refuses archive. Leave the Codex session unarchived and send a follow-up through its Prompt box to check reader continuation. No launch check requires automatic cleanup of session state.
+
+## Session cost reports
+
+Arc supplies raw session and cost data. The agent assembles any report by label, parent, or time. Arc has no report dashboard, label accounting, or report schedule.
+
+`arc cost` reads Claude and Codex transcripts from disk and needs no running window. It searches every project and Codex store, not the window's repository scope. List every page first. Then read each listed row once by its exact path:
+
+```text
+arc cost PATH --since START --until END --by-model --json
+```
+
+Take each row's `parent` subtotal. Add each `children[]` entry whose file is not a listed `path`, once across the whole report. These unlisted children include Codex guardian threads and linked print sessions. A child transcript that is also a listed row counts only through its own row. A row's `parent` link appears when Arc knows the edge. The agent chooses whether a child's cost joins its parent's labels. A row whose `path` is `null`, or whose cost read fails, is an explicit unknown cost.
+
+Use an explicit timezone and a half-open interval of request times. Include sessions with requests in that interval, even when they started earlier. Do not select sessions by last activity or creation date alone.
+
+Labels are the reader's current labels, not the labels a session had during the interval. A session with more than one label needs an accounting rule for that report. Keep unlabelled work visible. Keep null full totals, known priced subtotals, legacy estimates, model gaps, and request coverage as Arc reports them. List-price estimates are not subscription charges.
 
 ## Cache expiry and handoff
 

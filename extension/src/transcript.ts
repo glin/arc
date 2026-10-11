@@ -4296,10 +4296,7 @@ export function claudeChildSessionFiles(
 }
 
 interface CachedClaudeChildSession {
-  size: number;
-  mtimeMs: number;
-  dev: number;
-  ino: number;
+  revision: FileRevision;
   cwd: string | null;
 }
 
@@ -4310,10 +4307,10 @@ export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
 
   read(reference: ClaudeSubagentSessionReference, repositoryRoots: readonly string[]): ClaudeChildSessionFile | null {
     const key = normalizeFsPath(reference.file);
-    let stat: fs.Stats;
+    let stat: fs.BigIntStats;
     try {
-      stat = fs.statSync(reference.file);
-      if (!stat.isFile() || stat.size === 0) {
+      stat = fs.statSync(reference.file, { bigint: true });
+      if (!stat.isFile() || stat.size === 0n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
         this.entries.delete(key);
         return null;
       }
@@ -4321,10 +4318,16 @@ export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
       this.entries.delete(key);
       return null;
     }
+    // Physical identity uses the same decimal strings as root catalog rows, so a paged listing can prove the source unchanged.
+    const revision = revisionOf(stat);
     const held = this.entries.get(key);
     let unreadable = false;
     const cwd =
-      held && held.size === stat.size && held.mtimeMs === stat.mtimeMs && held.dev === stat.dev && held.ino === stat.ino
+      held &&
+      held.revision.size === revision.size &&
+      held.revision.mtimeMs === revision.mtimeMs &&
+      held.revision.dev === revision.dev &&
+      held.revision.ino === revision.ino
         ? held.cwd
         : this.cwdOf === readSessionCwd
           ? scanSessionCwd(reference.file, () => {
@@ -4332,7 +4335,7 @@ export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
             })
           : this.cwdOf(reference.file);
     if (unreadable) throw new Error(`Cannot read session: ${reference.file}`);
-    this.entries.set(key, { size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino, cwd });
+    this.entries.set(key, { revision, cwd });
     if (!cwd || !isInside(cwd, [...repositoryRoots])) {
       return null;
     }
@@ -4342,8 +4345,7 @@ export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
       sessionId: reference.sessionId,
       parentSessionId: reference.parentSessionId,
       toolUseIds: [...reference.toolUseIds],
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
+      ...revision,
       cwd,
       agentRun: true,
       childTranscript: true,

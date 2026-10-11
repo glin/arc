@@ -13,7 +13,7 @@ function help(): string {
   return [
     'Usage: arc statusline [--json | --next-turn] [--width COLUMNS]',
     '       arc windows [--json]',
-    '       arc sessions [--window ID] [--json]',
+    '       arc sessions [--window ID] [--limit 1-128] [--cursor CURSOR] [--json]',
     '       arc session ID [--turns 1-20] [--window ID] [--json]',
     '       arc setups [--window ID] [--json]',
     '       arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]',
@@ -28,7 +28,8 @@ function help(): string {
     '--source-only reads an exact transcript file path without discovering children.',
     '--by-model adds billing subtotals for each model to the parent and child sources.',
     'Windows lists running Arc windows and their panel and repository readiness.',
-    "Sessions lists the selected window's repository sessions as JSON. Session reads bounded turns without marking them read.",
+    "Sessions lists one page of the selected window's repository sessions as JSON. Pass its next value to --cursor for the following page.",
+    'Session reads bounded turns without marking them read.',
     '--window selects an Arc window. Otherwise ARC_WINDOW or one unambiguous live window selects it.',
     '--request-id accepts a fresh ID prefixed with the selected window hostId and a colon.',
     'Use the returned requestId for identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',

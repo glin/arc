@@ -16,7 +16,6 @@ import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot.ts';
 import {
   boundedSessionRead,
-  boundedSessionListing,
   encodeSessionCursor,
   readSessionCursor,
   sessionAttention,
@@ -231,8 +230,21 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
     { ...valid, extra: true },
     { ...valid, method: 'sessions', replyBytes: 1000 },
     { ...valid, method: 'sessions', params: { replyBytes: 1000 } },
+    { ...valid, method: 'sessions', params: { sessionId: 'known' } },
+    { ...valid, method: 'sessions', params: { limit: 0 } },
+    { ...valid, method: 'sessions', params: { limit: 129 } },
+    { ...valid, method: 'sessions', params: { limit: 1.5 } },
+    { ...valid, method: 'sessions', params: { limit: '5' } },
+    { ...valid, method: 'sessions', params: { cursor: '' } },
+    { ...valid, method: 'sessions', params: { cursor: 'a'.repeat(513) } },
+    { ...valid, method: 'sessions', params: { cursor: 'abc=' } },
+    { ...valid, method: 'sessions', params: { cursor: 7 } },
   ]) {
     assert.equal(parseSessionRequest(invalid), null);
+  }
+  for (const params of [{ cursor: 'A-_z'.repeat(128), limit: 128 }, { limit: 1 }, { cursor: 'c' }]) {
+    const paged = { ...valid, method: 'sessions', params };
+    assert.deepEqual(parseSessionRequest(paged), paged);
   }
 });
 
@@ -400,7 +412,7 @@ test('session replies with valid large window metadata refuse excess envelope by
   });
 });
 
-test('session output limits preserve unknown attention and report excluded content', () => {
+test('session attention stays unknown for hidden panels and unavailable facts', () => {
   assert.equal(sessionAttention(false, 'waiting', true), 'unknown');
   assert.equal(sessionAttention(true, 'waiting', false), 'input');
   for (const status of ['running', 'subagents', 'background'] as const)
@@ -408,26 +420,6 @@ test('session output limits preserve unknown attention and report excluded conte
   assert.equal(sessionAttention(true, 'done', true), 'unread');
   assert.equal(sessionAttention(true, 'done', false), 'idle');
   assert.equal(sessionAttention(true, undefined, null), 'unknown');
-  const row: SessionListingRow = {
-    id: 's',
-    provider: 'claude',
-    name: 'x'.repeat(20000),
-    setup: { model: null, effort: null, source: 'unavailable' },
-    labels: [],
-    pinned: false,
-    archived: false,
-    runStatus: 'unknown',
-    attention: 'unknown',
-    lastActivity: null,
-    parent: null,
-    agentRun: null,
-    facts: 'unparsed',
-  };
-  const result = boundedSessionListing(Array(200).fill(row), true, null);
-  assert.equal(result.complete, false);
-  assert.ok(result.sessions.length < 200);
-  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= SESSION_READ_LIMITS.outputBytes);
-  assert.ok(result.notes.length > 0);
 });
 
 const pageSecret = crypto.randomBytes(32);
@@ -521,7 +513,7 @@ test('session pages reach every source exactly once above the row and byte limit
     const served = pages.flatMap((page) => page.sessions.map((row) => row.source));
     assert.deepEqual(served, keys);
     assert.ok(pages.reduce((sum, page) => sum + pageBytes(page), 0) > 4 * SESSION_READ_LIMITS.outputBytes);
-    assert.ok(pages.length > 300 / SESSION_READ_LIMITS.sessions + 1);
+    assert.ok(pages.length > 300 / SESSION_PAGE_LIMITS.rows + 1);
     assert.ok(pageProjections <= files.length + pages.length);
     for (const [index, page] of pages.entries()) {
       assert.ok(pageBytes(page) <= Math.min(SESSION_READ_LIMITS.outputBytes, replyBytes ?? Infinity));

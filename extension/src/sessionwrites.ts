@@ -14,6 +14,9 @@ export interface SessionWriteParams {
   action?: 'label-add' | 'label-remove' | 'pin' | 'unpin' | 'archive' | 'unarchive';
   dryRun?: boolean;
   force?: boolean;
+  // A sessions listing page. The host signs the cursor, and the CLI passes it through unread.
+  cursor?: string;
+  limit?: number;
 }
 
 export function validSessionWrite(method: string, params: Record<string, unknown>): boolean {

@@ -163,6 +163,11 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
     await second.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
     const listing = await run(process.execPath, [cli, 'sessions'], { env, encoding: 'utf8' });
     assert.deepEqual(JSON.parse(listing.stdout), { method: 'sessions', params: {}, requester: 'requesting-agent' });
+    const paged = await run(process.execPath, [cli, 'sessions', '--limit', '5', '--cursor', 'Page-2_x', '--json'], {
+      env,
+      encoding: 'utf8',
+    });
+    assert.deepEqual(JSON.parse(paged.stdout).params, { cursor: 'Page-2_x', limit: 5 });
     const detail = await run(
       process.execPath,
       [cli, 'session', 'known', '--turns', '2', '--window', channel.hostId, '--json'],
@@ -176,9 +181,24 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
       ['session', 'known', '--turns', '0'],
       ['session', 'known', '--turns', '1.5'],
       ['sessions', '--turns', '1'],
+      ['sessions', '--limit', '1', '--limit', '2'],
+      ['sessions', '--cursor', 'a', '--cursor', 'b'],
+      ['session', 'known', '--limit', '1'],
       ['session'],
     ]) {
       await assert.rejects(run(process.execPath, [cli, ...args], { env }));
+    }
+    // The window would also refuse these, so the message shows that the CLI refused them first.
+    for (const [args, message] of [
+      [['--limit', '0'], /Limit must be between 1 and 128/],
+      [['--limit', '129'], /Limit must be between 1 and 128/],
+      [['--limit', '1.5'], /Limit must be between 1 and 128/],
+      [['--limit'], /Limit must be between 1 and 128/],
+      [['--cursor'], /Restart the listing without --cursor/],
+      [['--cursor', 'abc='], /Restart the listing without --cursor/],
+      [['--cursor', 'a'.repeat(513)], /Restart the listing without --cursor/],
+    ]) {
+      await assert.rejects(run(process.execPath, [cli, 'sessions', ...args], { env }), message);
     }
     assert.equal(requests, before);
     await assert.rejects(

@@ -46,6 +46,9 @@ export interface WindowDiscovery {
   complete: boolean;
 }
 
+// A sessions cursor is base64url text that the host validates. The wire admits its length and alphabet only.
+export const SESSION_CURSOR = /^[A-Za-z0-9_-]{1,512}$/;
+
 export interface SessionRequest {
   id: string;
   version: typeof SESSION_REQUEST_VERSION;
@@ -110,6 +113,14 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       return null;
   } else if (['setups', 'start', 'curate'].includes(value.method as string)) {
     if (!validSessionWrite(value.method as string, value.params)) return null;
+  } else if (value.method === 'sessions') {
+    const { cursor, limit, ...rest } = value.params;
+    if (
+      Object.keys(rest).length !== 0 ||
+      (cursor !== undefined && (typeof cursor !== 'string' || !SESSION_CURSOR.test(cursor))) ||
+      (limit !== undefined && (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 128))
+    )
+      return null;
   } else if (Object.keys(value.params).length !== 0) return null;
   return value as unknown as SessionRequest;
 }

@@ -19,13 +19,13 @@ import type { SessionStatus } from './domain/session-query.ts';
 import { railStatusRuns } from './domain/session-query.ts';
 import { onlyGrew } from './derivedcache.ts';
 
-export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024, sessions: 128 } as const;
+export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024 } as const;
 export type SessionAttention = Extract<SessionStatus, 'input' | 'unread' | 'running'> | 'idle' | 'unknown';
 
 // A paged row names each field that its cap shortened or emptied.
 export type SessionTruncatedField = 'id' | 'path' | 'name' | 'setup.model' | 'setup.effort' | 'labels' | 'parent.id';
 
-// The page builder fills source, path, ambiguous, and truncated. The single-call listing omits them.
+// The host projection omits source, path, ambiguous, and truncated. The page builder fills them.
 export interface SessionListingRow {
   source?: string;
   id: string | null;
@@ -196,30 +196,8 @@ export function sessionAttention(
   return status !== undefined && unread !== null ? 'idle' : 'unknown';
 }
 
-export function boundedSessionListing(rows: SessionListingRow[], complete: boolean, requester: string | null) {
-  const result = { version: 1, requester, sessions: [] as SessionListingRow[], complete, notes: [] as string[] };
-  for (const row of rows) {
-    if (result.sessions.length >= SESSION_READ_LIMITS.sessions) {
-      result.complete = false;
-      break;
-    }
-    result.sessions.push(row);
-    if (Buffer.byteLength(JSON.stringify(result)) > SESSION_READ_LIMITS.outputBytes - 512) {
-      result.sessions.pop();
-      result.complete = false;
-      break;
-    }
-  }
-  if (!result.complete)
-    result.notes.push('The session listing is incomplete. Discovery or the response limit excluded sessions.');
-  if (rows.some((row) => row.facts !== 'current'))
-    result.notes.push('Some session facts are stale or unparsed. Unknown values remain unavailable.');
-  if (rows.some((row) => row.attention === 'unknown'))
-    result.notes.push('Live attention is unknown when the panel is hidden or its facts are unavailable.');
-  return result;
-}
-
-export const SESSION_PAGE_LIMITS = { fieldBytes: 4 * 1024, cursorLength: 512 } as const;
+// A page holds at most rows sessions. The default request limit is the same value.
+export const SESSION_PAGE_LIMITS = { rows: 128, fieldBytes: 4 * 1024, cursorLength: 512 } as const;
 
 export const SESSION_PAGE_ERRORS = {
   cursor: 'The session cursor is invalid or expired. Restart the listing without --cursor.',
@@ -265,6 +243,8 @@ export interface SessionPageSource<T extends SessionFile = SessionFile> {
   session: T;
   dev: string | null;
   ino: string | null;
+  // The serialized [source, dev, ino] prefix tuple, so a cached source list serializes each tuple once.
+  tuple: string;
   ambiguous: boolean;
 }
 
@@ -324,11 +304,14 @@ export function sessionPageSources<T extends SessionFile>(sessions: readonly T[]
     const source = sessionSourceKey(session.agent, session.sessionId, session.file);
     if (keyed.has(source)) continue;
     const identified = supportedFileIdentity(session);
+    const dev = identified ? String(session.dev) : null;
+    const ino = identified ? String(session.ino) : null;
     keyed.set(source, {
       source,
       session,
-      dev: identified ? String(session.dev) : null,
-      ino: identified ? String(session.ino) : null,
+      dev,
+      ino,
+      tuple: JSON.stringify([source, dev, ino]) + '\n',
       ambiguous: false,
     });
   }
@@ -480,7 +463,7 @@ interface PageState {
 // The prefix digest covers [source, dev, ino] for each source through the cursor's last key.
 // Size and modification time stay out of the tuple, so appends keep the digest.
 function extendPrefix(state: PageState, entry: SessionPageSource): PageState {
-  state.hash.update(JSON.stringify([entry.source, entry.dev, entry.ino]) + '\n');
+  state.hash.update(entry.tuple);
   state.identified &&= entry.dev !== null && entry.ino !== null;
   return state;
 }
@@ -488,7 +471,7 @@ function extendPrefix(state: PageState, entry: SessionPageSource): PageState {
 // A page serves the sources after the cursor in key order. The builder measures each candidate reply with its own next cursor and notes.
 export function sessionListingPage<T extends SessionFile>(request: SessionPageRequest<T>): SessionPage {
   const { sources, cursor, limit, catalog, scope, secret, requester } = request;
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > SESSION_READ_LIMITS.sessions)
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > SESSION_PAGE_LIMITS.rows)
     throw new Error(SESSION_PAGE_ERRORS.limit);
   if (cursor && catalog === 'unavailable') throw new Error(SESSION_PAGE_ERRORS.catalog);
   const budget = Math.min(SESSION_READ_LIMITS.outputBytes, request.replyBytes ?? Infinity);

@@ -128,6 +128,7 @@ test('response session navigation releases only its invoking clear route and ret
   }
 });
 import type { TurnOutcome } from './transcript';
+import { sessionSourceKey } from './sessionreads.ts';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
 import { openReadWindow, closeReadWindow } from './readmeter';
 import { responseRateForTurn, savedResponseRates } from './outputrate';
@@ -1118,6 +1119,7 @@ import {
   readSession,
   readSessionMeta,
   revisionOf,
+  ClaudeChildSessionCache,
   sessionOutcomeOf,
   sessionStatFactsOf,
   scanForPerson,
@@ -1994,7 +1996,15 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
   let save!: () => void;
   let writes = 0;
   const messages: any[] = [];
-  let row = { id: 'known', facts: 'current', runStatus: 'done', attention: 'idle' };
+  // Archive matches its listing row by source key, so the stub row carries the catalog entry's key.
+  const knownFile = 'C:/workspace/known.jsonl';
+  let row = {
+    source: sessionSourceKey('codex', 'known', knownFile),
+    id: 'known',
+    facts: 'current',
+    runStatus: 'done',
+    attention: 'idle',
+  };
   Object.assign(provider, {
     saved: normalizePanelState({
       showing: 'reader',
@@ -2010,7 +2020,7 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
     repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
     authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
     authoritativeCatalog: [
-      { sessionId: 'known', cwd: 'C:/workspace', agent: 'codex' },
+      { sessionId: 'known', cwd: 'C:/workspace', agent: 'codex', file: knownFile },
       { sessionId: 'outside', cwd: 'C:/foreign', agent: 'codex' },
     ],
     readSessionRequest: () => ({ sessions: [row] }),
@@ -2412,6 +2422,186 @@ test('window session listings reject removed children and report pending, hidden
   } finally {
     clock.mockRestore();
   }
+});
+
+// Counts full iterations and keyed reads, so a listing that reads every retained window's starts shows up.
+class CountingWindows extends Map<string, { starts: number[]; whole: boolean }> {
+  iterated = 0;
+  hasReads = 0;
+  getReads = 0;
+  override has(key: string) {
+    this.hasReads++;
+    return super.has(key);
+  }
+  override get(key: string) {
+    this.getReads++;
+    return super.get(key);
+  }
+  override [Symbol.iterator]() {
+    this.iterated++;
+    return super[Symbol.iterator]();
+  }
+  override entries() {
+    this.iterated++;
+    return super.entries();
+  }
+}
+
+// A scoped population above one page of rows and bytes, with one Claude child transcript read through the child cache.
+function pagedListingFixture(count: number) {
+  const directory = tempDir('window-session-pages-');
+  const roots = [directory];
+  const scope = { revision: 1 };
+  const sources: any[] = [];
+  for (let n = 0; n < count; n++) {
+    const file = path.join(directory, `Session-${n}.jsonl`);
+    fs.writeFileSync(file, `${n}\n`);
+    const agent = n % 2 ? 'codex' : 'claude';
+    sources.push({
+      agent,
+      sessionId: `session-${n}`,
+      cwd: directory,
+      file,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    });
+  }
+  const threshold = sources.map((source) => sessionSourceKey(source.agent, source.sessionId, source.file)).sort()[20];
+  let n = 0;
+  while (sessionSourceKey('claude', `child-${n}`, path.join(directory, `child-${n}.jsonl`)) >= threshold) n++;
+  const childFile = path.join(directory, `child-${n}.jsonl`);
+  fs.writeFileSync(childFile, 'child\n');
+  const child = new ClaudeChildSessionCache(() => directory).read(
+    { parentSessionId: 'session-0', sessionId: `child-${n}`, file: childFile, toolUseIds: [] },
+    roots,
+  )!;
+  sources.push(child);
+  const key = (source: any) => sessionSourceKey(source.agent, source.sessionId, source.file);
+  const target = sources.reduce((last, source) => (key(source) > key(last) ? source : last));
+  const windows = new CountingWindows(sources.map((source) => [source.sessionId, { starts: [1000], whole: true }]));
+  const outcome = { startedAt: 1000, endedAt: 1001, finished: true, error: false, interrupted: false };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    folders: () => [directory],
+    repositoryScope: { snapshot: () => ({ ready: true, roots, revision: scope.revision }) },
+    authoritativeCatalog: sources,
+    authoritativeCatalogScope: JSON.stringify(roots),
+    sessionReadDiscoveryRevision: JSON.stringify([
+      JSON.stringify(roots),
+      sources.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino]),
+    ]),
+    anyVisible: () => true,
+    watching: true,
+    refreshController: null,
+    dispatchDiscoveryPending: false,
+    pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
+    windows,
+    saved: { ...normalizePanelState(null), readTo: { [target.sessionId]: 5000 } },
+    titles: new Map(sources.map((source) => [source.file, { ...source, outcome, activityMs: 1001 }])),
+    cache: new Map(),
+    pinnedTop: new Set(),
+    hidden: new Set(),
+    running: new Set(),
+    asks: [],
+    runningSinceKeys: new Map(),
+    sessionLabel: (source: any) => ({ fullLabel: `${source.sessionId} ${'n'.repeat(300)}` }),
+    agentRunFor: () => false,
+    readyHosts: new Set([{}]),
+    memento: { update: async () => {} },
+    sessionWriteQueue: Promise.resolve(),
+    post: async () => {},
+    postRail() {},
+  });
+  // Records each page's window reads and its serializations of [source, dev, ino] prefix tuples.
+  const traverse = () => {
+    const pages: any[] = [];
+    const reads: { has: number; get: number; tuples: number }[] = [];
+    const keys = new Set(sources.map(key));
+    const stringify = JSON.stringify;
+    let tuples = 0;
+    JSON.stringify = function (value: any, ...rest: any[]) {
+      if (Array.isArray(value) && value.length === 3 && keys.has(value[0])) tuples++;
+      return stringify.call(JSON, value, ...rest);
+    } as typeof JSON.stringify;
+    try {
+      let cursor: string | null = null;
+      do {
+        windows.hasReads = windows.getReads = tuples = 0;
+        const page: any = provider.readSessionRequest({
+          method: 'sessions',
+          requester: null,
+          params: cursor ? { cursor } : {},
+        });
+        reads.push({ has: windows.hasReads, get: windows.getReads, tuples });
+        pages.push(page);
+        cursor = page.next ?? null;
+      } while (cursor && pages.length < 50);
+    } finally {
+      JSON.stringify = stringify;
+    }
+    return { pages, reads };
+  };
+  return { sources, child, target, windows, scope, provider, traverse };
+}
+
+// Agents must reach every scoped session when the catalog exceeds one page of rows and bytes. Each session appears once.
+test('window session listings page every scoped session past 128 rows and 48 KiB to a complete final page', () => {
+  const { sources, child, windows, traverse } = pagedListingFixture(300);
+  const { pages, reads } = traverse();
+  const served = pages.flatMap((page) => page.sessions.map((row: any) => row.id));
+  assert.equal(served.length, sources.length, `served ${served.length} of ${sources.length} in ${pages.length} pages`);
+  assert.deepEqual([...served].sort(), sources.map((source) => source.sessionId).sort());
+  assert.ok(pages.length > 2);
+  assert.ok(pages.reduce((sum, page) => sum + Buffer.byteLength(JSON.stringify(page)), 0) > 48 * 1024);
+  for (const [index, page] of pages.entries()) {
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 48 * 1024);
+    assert.equal(page.complete, index === pages.length - 1);
+    assert.equal(page.coverage, 'complete', `page ${index} lost coverage`);
+    assert.equal(page.freshness, 'current');
+  }
+  // A child transcript row served before the last page keeps coverage only when it carries physical identity.
+  const childPage = pages.findIndex((page) => page.sessions.some((row: any) => row.id === child.sessionId));
+  assert.ok(childPage >= 0 && childPage < pages.length - 1);
+  // Unread counts read only the served sessions' windows, not every retained window.
+  assert.equal(windows.iterated, 0);
+  for (const [index, read] of reads.entries()) {
+    assert.ok(read.has <= 128 && read.get <= 128, `page ${index} read ${read.has} has and ${read.get} get windows`);
+  }
+  // A traversal over an unchanged catalog serializes each prefix tuple once, on the first page.
+  assert.ok(reads[0].tuples >= sources.length);
+  assert.deepEqual(
+    reads.slice(1).map((read) => read.tuples),
+    reads.slice(1).map(() => 0),
+  );
+  assert.ok(pages.flatMap((page) => page.sessions).every((row: any) => ['unread', 'idle'].includes(row.attention)));
+});
+
+// Archive must find a session wherever it sorts, and a cursor must not survive a missing catalog as an empty final page.
+test('window session pages archive a target past the first page and refuse cursors without a catalog or scope', async () => {
+  const { sources, target, scope, provider } = pagedListingFixture(300);
+  const first = provider.readSessionRequest({ method: 'sessions', requester: null, params: {} });
+  assert.ok(first.next && !first.sessions.some((row: any) => row.id === target.sessionId));
+  const archive = await provider.handleSessionRequest({
+    method: 'curate',
+    requester: null,
+    params: { sessionId: target.sessionId, action: 'archive', force: false, dryRun: true },
+  });
+  assert.equal(archive.status, 'dry-run', archive.reason);
+  const request = { method: 'sessions', requester: null, params: { cursor: first.next } };
+  provider.authoritativeCatalog = null;
+  assert.throws(() => provider.readSessionRequest(request), /catalog is unavailable/);
+  const empty = provider.readSessionRequest({ ...request, params: {} });
+  assert.deepEqual([empty.sessions, empty.coverage, empty.next, empty.complete], [[], 'unavailable', null, false]);
+  provider.authoritativeCatalog = sources;
+  assert.ok(provider.readSessionRequest(request).sessions.length > 0);
+  assert.throws(
+    () => provider.readSessionRequest({ ...request, params: { cursor: `${first.next.slice(0, -2)}AA` } }),
+    /invalid or expired.*without --cursor/,
+  );
+  scope.revision = 2;
+  assert.throws(() => provider.readSessionRequest(request), /scope changed.*without --cursor/);
+  scope.revision = 1;
+  const limited = provider.readSessionRequest({ method: 'sessions', requester: null, params: { limit: 3 } });
+  assert.equal(limited.sessions.length, 3);
 });
 
 test('hosted session publication keeps instance tokens through idle and both event paths', () => {
@@ -4762,10 +4952,10 @@ test('the panel answers every message the contract declares', () => {
 
 test('rail counts use metadata windows until the progressive read is accepted', () => {
   // Session list counts and read watermarks use metadata windows during selected-turn parsing.
-  const counts = memberFrom(panelHostSource, panelHostSource.indexOf('private unreadCounts():'));
+  const counts = memberFrom(panelHostSource, panelHostSource.indexOf('private unreadCounts('));
   sourceMatch(
     counts,
-    /newCounts\(\s*\[\], this\.windows,/,
+    /: this\.windows;\s*return newCounts\(\s*\[\], windows,/,
     'the rail count depends on selected turns that have not reached the host',
   );
   const newest = memberFrom(panelHostSource, panelHostSource.indexOf('private newestTurns():'));
