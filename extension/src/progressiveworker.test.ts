@@ -260,6 +260,249 @@ test('commit ownership workers resume a parent across children and reject change
     worker.stop();
   }
 });
+
+// Children of one parent each record a commit and its evidence after ignored records. On the sliced worker clock each
+// request classifies one record of each source, so every child scan takes several requests.
+function commitSiblings(prefix: string, count: number) {
+  const directory = tempDir(prefix);
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const record = (type: string, payload: object) =>
+    JSON.stringify({ type, timestamp: '2026-08-25T12:00:00Z', payload }) + '\n';
+  const command = worktreeCreationCommand(['C:/first']);
+  fs.writeFileSync(
+    parentFile,
+    record('session_meta', { id: 'parent' }) +
+      record('event_msg', { type: 'task_started', turn_id: 'parent-turn' }) +
+      record('turn_context', { turn_id: 'parent-turn', current_date: '2026-08-25' }) +
+      record('event_msg', {
+        type: 'item_completed',
+        item: {
+          type: 'CommandExecution',
+          command: ['powershell.exe', '-Command', command],
+          parsed_cmd: [{ cmd: command }],
+          cwd: 'file:///C:/outer',
+          stdout: '',
+          status: 'completed',
+          exit_code: 0,
+          started_at_ms: 1,
+          completed_at_ms: 2,
+        },
+      }),
+  );
+  const hash = 'a'.repeat(40);
+  const epoch = Date.parse('2026-08-25T12:00:00Z');
+  const writeChild = (id: string) => {
+    const file = path.join(directory, `${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      record('session_meta', { id, parent_thread_id: 'parent' }) +
+        record('event_msg', { type: 'task_started', turn_id: 'child-turn' }) +
+        record('turn_context', { turn_id: 'child-turn', current_date: '2026-08-25' }) +
+        Array.from({ length: 8 }, (_, index) => record('ignored', { index })).join('') +
+        record('event_msg', {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            command: ['powershell.exe', '-Command', 'git commit -m recorded'],
+            parsed_cmd: [{ cmd: 'git commit -m recorded' }],
+            cwd: 'file:///C:/outer',
+            stdout: `[main ${hash.slice(0, 7)}] Recorded`,
+            status: 'completed',
+            exit_code: 0,
+            started_at_ms: epoch + 2,
+            completed_at_ms: epoch + 3,
+          },
+        }) +
+        record('event_msg', {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            command: ['powershell.exe', '-Command', 'python report.py'],
+            parsed_cmd: [{ cmd: 'python report.py' }],
+            cwd: 'file:///C:/outer',
+            stdout: JSON.stringify({ sha: hash, repository: 'C:/first/.claude/worktrees/worker' }),
+            status: 'completed',
+            exit_code: 0,
+            started_at_ms: epoch + 3,
+            completed_at_ms: epoch + 4,
+          },
+        }),
+    );
+    const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
+    return { file, sessionId: id, revision: { size, mtimeMs, dev, ino } };
+  };
+  const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(parentFile, { bigint: true }));
+  const parent = { file: parentFile, sessionId: 'parent', revision: { size, mtimeMs, dev, ino } };
+  const children = Array.from({ length: count }, (_, index) => writeChild(`child-${index}`));
+  const commits = [
+    {
+      sha: hash,
+      at: epoch + 3,
+      evidenceAt: epoch + 4,
+      dirs: ['C:/first/.claude/worktrees/worker'],
+      turnId: 'child-turn',
+    },
+  ];
+  // Each read of this worker clock advances it past the 15 ms scan slice, so every request classifies one record
+  // of each source and stops. Progress then depends only on resuming the cursor that the returned token names.
+  const slicedSource = 'let sliceClock=0;Date.now=()=>(sliceClock+=1000);' + source;
+  const ledger = new CommitRepositoryReservations();
+  let attempt = 0;
+  const request = (
+    worker: ProgressiveWorker,
+    child: (typeof children)[number],
+    token: string | null,
+    signal = new AbortController().signal,
+  ) =>
+    worker.run(
+      {
+        kind: 'commit-repositories',
+        parent,
+        child,
+        commits,
+        parserVersion: COMMIT_REPOSITORY_PARSER_VERSION,
+        token,
+        ...ledger.reserve(parent, child),
+      },
+      attempt++,
+      signal,
+    );
+  const reply = async (worker: ProgressiveWorker, child: (typeof children)[number], token: string | null) => {
+    const result = await request(worker, child, token);
+    assert.ok(result?.value.kind === 'commit-repositories');
+    return result.value;
+  };
+  return { directory, children, slicedSource, request, reply };
+}
+
+test('commit ownership workers resume two children of one parent when their requests alternate', async () => {
+  const { children, slicedSource, reply } = commitSiblings('commit-worker-siblings-', 2);
+  // A single child scanned alone sets the bound for each child when two children alternate.
+  let alone = 0;
+  const single = new ProgressiveWorker(slicedSource);
+  try {
+    let token: string | null = null;
+    for (; alone < 64;) {
+      alone++;
+      const result = await reply(single, children[0], token);
+      if (result.status !== 'pending') {
+        assert.equal(result.status, 'complete');
+        break;
+      }
+      token = result.token;
+    }
+  } finally {
+    single.stop();
+  }
+  assert.ok(alone > 4 && alone < 64, `a single child completed after ${alone} requests`);
+  const worker = new ProgressiveWorker(slicedSource);
+  try {
+    const states = children.map(() => ({ token: null as string | null, through: 0, requests: 0, done: false }));
+    for (let round = 0; round < alone && states.some((state) => !state.done); round++)
+      for (const [index, child] of children.entries()) {
+        const state = states[index];
+        if (state.done) continue;
+        state.requests++;
+        const result = await reply(worker, child, state.token);
+        assert.ok(
+          result.covered.child[1] > state.through,
+          `${child.sessionId} request ${state.requests} covered ${result.covered.child[1]} bytes after ${state.through}`,
+        );
+        state.through = result.covered.child[1];
+        if (result.status === 'pending') {
+          state.token = result.token;
+          continue;
+        }
+        assert.equal(result.status, 'complete');
+        assert.equal(result.targets[0].dirs[0], 'C:/first');
+        state.done = true;
+      }
+    for (const [index, state] of states.entries())
+      assert.ok(state.done, `${children[index].sessionId} did not complete within ${alone} requests`);
+    // A token from an earlier reply of the same child starts that child again from offset 0.
+    const first = await reply(worker, children[0], null);
+    const second = await reply(worker, children[0], first.token);
+    assert.equal(second.status, 'pending');
+    assert.ok(second.covered.child[1] > first.covered.child[1]);
+    const earlier = await reply(worker, children[0], first.token);
+    assert.equal(earlier.covered.child[1], first.covered.child[1], 'an earlier token resumed the child cursor');
+    // The current token of a child that appended since its reply also starts the new revision from offset 0.
+    fs.appendFileSync(children[0].file, '{"type":"ignored","payload":{}}\n');
+    const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(children[0].file, { bigint: true }));
+    const appended = await reply(worker, { ...children[0], revision: { size, mtimeMs, dev, ino } }, earlier.token);
+    assert.equal(appended.status, 'pending');
+    assert.equal(appended.covered.child[1], first.covered.child[1], 'a cursor resumed on a changed child revision');
+  } finally {
+    worker.stop();
+  }
+});
+
+test('commit ownership workers keep the eight most recently used child cursors', async () => {
+  const { children, slicedSource, reply } = commitSiblings('commit-worker-evict-', 9);
+  const worker = new ProgressiveWorker(slicedSource);
+  try {
+    const firsts: Awaited<ReturnType<typeof reply>>[] = [];
+    for (const child of children) {
+      const first = await reply(worker, child, null);
+      assert.equal(first.status, 'pending');
+      firsts.push(first);
+    }
+    const resumed = (index: number) => async () => {
+      const next = await reply(worker, children[index], firsts[index].token);
+      return next.covered.child[1] > firsts[index].covered.child[1];
+    };
+    assert.ok(await resumed(1)(), 'the second child cursor did not survive a ninth child');
+    assert.equal(await resumed(0)(), false, 'the oldest child cursor survived a ninth child');
+    assert.ok(await resumed(8)(), 'the most recent child cursor did not survive');
+  } finally {
+    worker.stop();
+  }
+});
+
+test('a cancelled commit ownership request keeps its child cursor for the retry', async () => {
+  const { directory, children, slicedSource, request, reply } = commitSiblings('commit-worker-retry-', 2);
+  const armed = path.join(directory, 'armed');
+  const reading = path.join(directory, 'reading');
+  const released = path.join(directory, 'released');
+  // While armed, the first read of the first child blocks until the test writes the release file. The worker then
+  // delivers its queued messages, so the cancel reaches the request before the scan checks its signal again.
+  const prelude = `const retryFs=require('node:fs'),retryThreads=require('node:worker_threads');
+    const retryOpen=retryFs.openSync,retryRead=retryFs.readSync,retryFiles=new Map();let retryBlocked=false;
+    retryFs.openSync=function(file,...rest){const fd=retryOpen.call(this,file,...rest);retryFiles.set(fd,String(file));return fd;};
+    retryFs.readSync=function(fd,...rest){const count=retryRead.call(this,fd,...rest);
+      if(!retryBlocked&&retryFiles.get(fd)===${JSON.stringify(children[0].file)}&&retryFs.existsSync(${JSON.stringify(armed)})){
+        retryBlocked=true;retryFs.writeFileSync(${JSON.stringify(reading)},'reading');
+        while(!retryFs.existsSync(${JSON.stringify(released)}))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);
+        let queued;while((queued=retryThreads.receiveMessageOnPort(retryThreads.parentPort)))retryThreads.parentPort.emit('message',queued.message);
+      }
+      return count;};`;
+  const worker = new ProgressiveWorker(prelude + slicedSource);
+  try {
+    let token: string | null = null;
+    let through = 0;
+    for (let step = 0; step < 2; step++) {
+      const next = await reply(worker, children[0], token);
+      assert.equal(next.status, 'pending');
+      assert.ok(next.covered.child[1] > through);
+      ({ token } = next);
+      through = next.covered.child[1];
+    }
+    fs.writeFileSync(armed, 'armed');
+    const controller = new AbortController();
+    const cancelled = request(worker, children[0], token, controller.signal);
+    await vi.waitFor(() => assert.ok(fs.existsSync(reading)), { timeout: 5000, interval: 1 });
+    // The pending sibling request keeps the worker alive when the first request aborts.
+    const sibling = reply(worker, children[1], null);
+    controller.abort();
+    assert.equal(await cancelled, null);
+    fs.writeFileSync(released, 'released');
+    assert.equal((await sibling).status, 'pending');
+    const retry = await reply(worker, children[0], token);
+    assert.ok(retry.covered.child[1] > through, `the retry covered ${retry.covered.child[1]} bytes after ${through}`);
+  } finally {
+    worker.stop();
+  }
+});
 import {
   CLAUDE_METADATA_TAIL_BYTES,
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,

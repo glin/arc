@@ -1298,8 +1298,13 @@ function workerMemory(): import('./progressiveworker').WorkerMemory {
   };
 }
 let commitParentCursor: import('./codexhistory').CommitRepositoryCursor | null = null;
-let commitChildCursor: import('./codexhistory').CommitRepositoryCursor | null = null;
-let commitCursorToken: string | null = null;
+// Children of one parent share the parent cursor and keep their own child cursors. Visible sessions on sibling
+// children therefore resume their own scans when their requests alternate. Map order is least recently used first.
+const COMMIT_CHILD_CURSORS = 8;
+const commitChildCursors = new Map<
+  string,
+  { cursor: import('./codexhistory').CommitRepositoryCursor; token: string }
+>();
 let commitCursorSequence = 0;
 
 async function executeCommitRepositories(
@@ -1316,24 +1321,29 @@ async function executeCommitRepositories(
   } = await import('./codexhistory.js');
   const { commitRepositorySourceKey } = await import('./progressiveworker.js');
   const key = commitRepositorySourceKey;
-  const clone = (cursor: import('./codexhistory').CommitRepositoryCursor) => {
-    const copy = structuredClone(cursor);
-    copy.fragment = Buffer.from(copy.fragment);
-    copy.queue = Buffer.from(copy.queue);
-    copy.head = Buffer.from(copy.head);
-    copy.anchor = Buffer.from(copy.anchor);
-    return copy;
+  // A copy holds only the bytes of each buffer view, not the read chunk behind the view.
+  const clone = (
+    cursor: import('./codexhistory').CommitRepositoryCursor,
+  ): import('./codexhistory').CommitRepositoryCursor => {
+    const { fragment, queue, head, anchor, ...rest } = cursor;
+    return {
+      ...structuredClone(rest),
+      fragment: Buffer.from(fragment),
+      queue: Buffer.from(queue),
+      head: Buffer.from(head),
+      anchor: Buffer.from(anchor),
+    };
   };
   const parent =
     commitParentCursor && key(commitParentCursor.source) === key(request.parent)
       ? clone(commitParentCursor)
       : createCommitRepositoryCursor(request.parent, null);
+  // One entry serves each child file and parent pair. It resumes only for its token and the same child revision.
+  const childKey = JSON.stringify([request.child.file, request.child.sessionId, request.parent.sessionId]);
+  const held = commitChildCursors.get(childKey);
   const child =
-    commitChildCursor &&
-    key(commitChildCursor.source) === key(request.child) &&
-    commitChildCursor.parentSessionId === request.parent.sessionId &&
-    request.token === commitCursorToken
-      ? clone(commitChildCursor)
+    held && request.token === held.token && key(held.cursor.source) === key(request.child)
+      ? clone(held.cursor)
       : createCommitRepositoryCursor(
           request.child,
           request.parent.sessionId,
@@ -1372,15 +1382,21 @@ async function executeCommitRepositories(
   }
   if (!commitSourceRevision(request.parent) || !commitSourceRevision(request.child)) status = 'stale';
   const targets = status === 'complete' ? commitRepositoryTargets(parent, child, request.commits) : [];
-  if (status === 'pending' || status === 'complete') {
-    commitParentCursor = parent;
-    commitChildCursor = status === 'pending' ? child : null;
-    commitCursorToken = `${++commitCursorSequence}`;
+  const token = status === 'pending' || status === 'complete' ? `${++commitCursorSequence}` : null;
+  if (status === 'pending' || status === 'complete') commitParentCursor = parent;
+  // A cancelled request keeps the entry, so the retry with the same token resumes where the last pending reply stopped.
+  if (status !== 'cancelled') commitChildCursors.delete(childKey);
+  if (status === 'pending' && token) {
+    commitChildCursors.set(childKey, { cursor: clone(child), token });
+    for (const oldest of commitChildCursors.keys()) {
+      if (commitChildCursors.size <= COMMIT_CHILD_CURSORS) break;
+      commitChildCursors.delete(oldest);
+    }
   }
   return {
     kind: 'commit-repositories',
     status,
-    token: status === 'pending' || status === 'complete' ? commitCursorToken : null,
+    token,
     parent: request.parent,
     child: request.child,
     parserVersion: request.parserVersion,
