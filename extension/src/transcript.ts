@@ -8171,7 +8171,8 @@ export function reduceClaudeUsageRecordEvents(
 function claudeCompactionPrefixRead(at: number, lifetime: CacheLifetime | null, request: UsageEvent): number | null {
   const first = request.firstPassUsage ?? request.usage;
   if (first.cacheRead > 0) return first.cacheRead;
-  return lifetime !== null && !cacheLapsedBy(at, lifetime, request.timestamp) ? 0 : null;
+  // Compaction has its own cache lifetime. A zero read proves an empty prefix only before five minutes expire.
+  return lifetime !== null && !cacheLapsedBy(at, '5m', request.timestamp) ? 0 : null;
 }
 
 function refineClaudeCompactionEstimate(state: ClaudeUsageReducerState, request: UsageEvent): UsageEvent[] {

@@ -4435,6 +4435,70 @@ test('a compaction card and the session total price the same compaction the same
 
 const COLD_ROW = COMPACTION_SAMPLES.find((row) => row.name === '386c0253 cold')!;
 
+test('a zero read after five minutes preserves a cold Claude compaction prefix across main cache lifetimes', () => {
+  for (const lifetime of ['5m', '1h'] as const) {
+    for (const passes of [1, 2]) {
+      for (const [minutes, read] of [
+        [4, 0],
+        [5, 0],
+        [6, 0],
+        [6, 18825],
+      ] as const) {
+        const lines = claudeCompactionTranscript({ ...COLD_ROW, lifetime });
+        const { file, record } = indexCompactionSession(lines);
+        const folder = dir();
+        saveSpendLedger(folder, 'w', [record]);
+        const [restored] = loadSpendLedger(folder, 'w').files;
+        const lastAt = Math.max(...lines.map((line) => Date.parse((line as { timestamp: string }).timestamp)));
+        lines.push({
+          type: 'assistant',
+          uuid: 'following-response',
+          timestamp: new Date(lastAt + minutes * 60_000).toISOString(),
+          message: {
+            id: 'following-response',
+            model: COLD_ROW.model,
+            content: [{ type: 'text', text: 'Complete.' }],
+            usage: {
+              input_tokens: 2000 + (passes === 2 ? 2 : 0),
+              cache_read_input_tokens: read + (passes === 2 ? 18825 : 0),
+              output_tokens: 30 + (passes === 2 ? 4 : 0),
+              ...(passes === 2
+                ? {
+                    iterations: [
+                      advisorIteration({ input_tokens: 2000, cache_read_input_tokens: read, output_tokens: 30 }),
+                      advisorIteration({ input_tokens: 2, cache_read_input_tokens: 18825, output_tokens: 4 }),
+                    ],
+                  }
+                : {}),
+            },
+          },
+        });
+        fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join('\n') + '\n');
+        const reducer: UsageReducerFactory = (state) =>
+          createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined);
+        const resumed = indexSpendFile(restored, file, 'w', reducer, 2, { maxMilliseconds: Infinity }).record;
+        const whole = indexSpendFile(undefined, file, 'w', reducer, 2, { maxMilliseconds: Infinity }).record;
+        assert.deepEqual(resumed.lifetimeBuckets, whole.lifetimeBuckets);
+        const [compaction] = readSession(file, 's').compactions;
+        const expected = read > 0 ? read : minutes < 5 ? 0 : null;
+        assert.equal(
+          compaction.postCompactionCacheRead,
+          expected,
+          `${lifetime}, ${passes} passes, ${minutes} minutes, ${read} read`,
+        );
+        const estimate = resumed.lifetimeBuckets!.find((bucket) => bucket.compactionEstimate)!;
+        const prefix = expected ?? COLD_ROW.firstRead!;
+        assert.equal(estimate.usage.cacheWrite1h + estimate.usage.cacheWrite5m, prefix);
+        assert.equal(estimate.usage.input, previousContextOf(COLD_ROW) + CLAUDE_COMPACTION_INSTRUCTION_TOKENS - prefix);
+        assert.equal(
+          toCompactionCard(compaction).chips.find((chip) => chip.metric === 'cost')?.label,
+          `$${publicProjectSpendPrice(estimate)!.dollars.toFixed(2)}`,
+        );
+      }
+    }
+  }
+});
+
 test('a cold Claude compaction reaches the session total as a write of the shared prefix and uncached input', () => {
   const { file, projection, estimates } = indexCompactionSession(claudeCompactionTranscript(COLD_ROW));
   assert.equal(estimates.length, 1);
