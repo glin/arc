@@ -2228,6 +2228,23 @@ test('host compaction waits through a scope change that keeps its session and de
   assert.equal(compactState(host), 'uncertain');
 });
 
+test('a ready scope cancels deferred compaction before hidden session rows refresh', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  host.scopeChanged();
+  assert.equal(compactState(host), 'queued', 'loading scope is not evidence of removal');
+  host.scopeChanged(new Set(['self']));
+  assert.equal(compactState(host), 'cancelled');
+  host.scopeChanged(new Set());
+  host.sessionsRefreshed();
+  await host.drain('self');
+  assert.equal(fixture.writes, 0, 'a returning scope revived the cancelled assignment');
+});
+
 // Catches admission while reader input waits: B runs while C waits, and B's agent asks to compact.
 // The refusal leaves no record, so nothing can compact after C.
 test('host compaction refuses a request while reader input waits in the queue', () => {
@@ -2408,82 +2425,110 @@ test('host compaction evidence reaches only the request whose submission it name
 });
 
 // Catches the late turn of an unanswered compaction completing a newer request of the same child.
-test('host compaction waits while an earlier compaction of its child has no answer', async () => {
-  vi.useFakeTimers();
-  try {
-    const { fixture } = compactHostFixture();
-    const { host, state } = fixture;
-    const sent: { id?: number; method?: string }[] = [];
-    const starts = () => sent.filter((message) => message.method === 'thread/compact/start').length;
-    const wire = new CodexWire({
-      send: (line) => sent.push(JSON.parse(line)),
-      emit: (event) => {
-        if (event.kind === 'native') host.native(child, event.event, undefined);
-      },
-      clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
-      cwd: 'C:\\ws',
-      deadlineMs: 1_000,
-    });
-    const child: CompactChild = {
-      key: 'wire',
-      agent: 'codex',
-      state: () => state,
-      compactionUnresolved: () => wire.compactionUnresolved(),
-      compact: (beforeWrite) => wire.compact(beforeWrite),
-    };
-    fixture.current = child;
-    const opening = wire.startThread({ cwd: 'C:\\ws' });
-    wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: { thread: { id: 'self' } } }));
-    await opening;
-    const ids = ['aaaaaaaa', 'bbbbbbbb'].map((head) => `${compactWindow}:${head}-1111-2222-3333-444444444444`);
-    const status = (requestId: string) =>
-      (host.handle({ method: 'compact-status', params: { requestId } }) as { state: string }).state;
-    // Each request runs in its own reader turn and drains once that turn ends.
-    const request = (requestId: string, turn: number) => {
-      const turnId = `root-${turn}`;
-      state.busy = true;
-      host.submitted(child, turn);
-      const command = compactLiteral.replace(compactPayload.requestId, requestId);
-      host.native(child, compactEvent('toolStart', { turnId, toolId: turnId, command }), turn);
-      host.handle({ method: 'compact-request', params: { ...compactPayload, requestId } });
-      host.native(child, compactEvent('toolEnd', { turnId, toolId: turnId }), turn);
-      host.replyRetained(child, turn);
-      host.native(child, compactEvent('rootEnd', { turnId }), turn);
-      state.busy = false;
-      void host.drain('self');
-    };
-    const runTurn = (id: string) => {
-      const item = { type: 'contextCompaction', id: `${id}-item` };
-      const send = (method: string, params: Record<string, unknown>) =>
-        wire.receive(JSON.stringify({ method, params: { threadId: 'self', ...params } }));
-      send('turn/started', { turn: { id } });
-      send('item/started', { turnId: id, item });
-      send('item/completed', { turnId: id, item });
-      send('turn/completed', { turn: { id, status: 'completed' } });
-    };
-    // Request A gets no answer before the deadline. Request B waits for A's late turn.
-    request(ids[0], 7);
-    await vi.advanceTimersByTimeAsync(1_000);
-    assert.equal(status(ids[0]), 'uncertain');
-    request(ids[1], 8);
-    await vi.advanceTimersByTimeAsync(1_000);
-    assert.equal(starts(), 1, 'B was submitted while A had no answer');
-    assert.equal(status(ids[1]), 'queued');
-    runTurn('late');
-    assert.equal(status(ids[1]), 'queued', "A's late turn reached B");
-    assert.equal(status(ids[0]), 'completed');
-    // The end of A's receipt drains B without another host event.
-    await vi.advanceTimersByTimeAsync(0);
-    assert.equal(starts(), 2);
-    wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: {} }));
-    runTurn('second');
-    await vi.advanceTimersByTimeAsync(0);
-    assert.equal(status(ids[1]), 'completed');
-    wire.close('finished');
-  } finally {
-    vi.useRealTimers();
-  }
-});
+test.each(['turn', 'refusal', 'bound refusal', 'early timeout', 'early refusal'])(
+  'host compaction waits for an unanswered receipt until its late %s',
+  async (ending) => {
+    vi.useFakeTimers();
+    try {
+      const { fixture } = compactHostFixture();
+      const { host, state } = fixture;
+      const sent: { id?: number; method?: string }[] = [];
+      const starts = () => sent.filter((message) => message.method === 'thread/compact/start').length;
+      const wire = new CodexWire({
+        send: (line) => sent.push(JSON.parse(line)),
+        emit: (event) => {
+          if (event.kind === 'native') host.native(child, event.event, undefined);
+        },
+        clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
+        cwd: 'C:\\ws',
+        deadlineMs: 1_000,
+      });
+      const child: CompactChild = {
+        key: 'wire',
+        agent: 'codex',
+        state: () => state,
+        compactionUnresolved: () => wire.compactionUnresolved(),
+        compact: (beforeWrite) => wire.compact(beforeWrite),
+      };
+      fixture.current = child;
+      const opening = wire.startThread({ cwd: 'C:\\ws' });
+      wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: { thread: { id: 'self' } } }));
+      await opening;
+      const ids = ['aaaaaaaa', 'bbbbbbbb'].map((head) => `${compactWindow}:${head}-1111-2222-3333-444444444444`);
+      const status = (requestId: string) =>
+        (host.handle({ method: 'compact-status', params: { requestId } }) as { state: string }).state;
+      // Each request runs in its own reader turn and drains once that turn ends.
+      const request = (requestId: string, turn: number) => {
+        const turnId = `root-${turn}`;
+        state.busy = true;
+        host.submitted(child, turn);
+        const command = compactLiteral.replace(compactPayload.requestId, requestId);
+        host.native(child, compactEvent('toolStart', { turnId, toolId: turnId, command }), turn);
+        host.handle({ method: 'compact-request', params: { ...compactPayload, requestId } });
+        host.native(child, compactEvent('toolEnd', { turnId, toolId: turnId }), turn);
+        host.replyRetained(child, turn);
+        host.native(child, compactEvent('rootEnd', { turnId }), turn);
+        state.busy = false;
+        void host.drain('self');
+      };
+      const runTurn = (id: string) => {
+        const item = { type: 'contextCompaction', id: `${id}-item` };
+        const send = (method: string, params: Record<string, unknown>) =>
+          wire.receive(JSON.stringify({ method, params: { threadId: 'self', ...params } }));
+        send('turn/started', { turn: { id } });
+        send('item/started', { turnId: id, item });
+        send('item/completed', { turnId: id, item });
+        send('turn/completed', { turn: { id, status: 'completed' } });
+      };
+      // Request A gets no answer before the deadline. Request B waits for A's late turn.
+      request(ids[0], 7);
+      const firstRpc = sent.at(-1)!.id;
+      if (ending.startsWith('early')) {
+        wire.receive(JSON.stringify({ method: 'turn/started', params: { threadId: 'self', turn: { id: 'late' } } }));
+        if (ending === 'early refusal') wire.receive(JSON.stringify({ id: firstRpc, error: { message: 'not now' } }));
+      }
+      await vi.advanceTimersByTimeAsync(1_000);
+      assert.equal(status(ids[0]), ending === 'early timeout' ? 'started' : 'uncertain');
+      if (ending.startsWith('early')) {
+        assert.equal(wire.hasOpenTurns(), true, 'the native turn must stay busy after its initial RPC settles');
+        assert.equal(wire.compactionUnresolved(), true);
+      }
+      request(ids[1], 8);
+      await vi.advanceTimersByTimeAsync(1_000);
+      assert.equal(starts(), 1, 'B was submitted while A had no answer');
+      assert.equal(status(ids[1]), 'queued');
+      if (ending === 'bound refusal') {
+        wire.receive(JSON.stringify({ method: 'turn/started', params: { threadId: 'self', turn: { id: 'late' } } }));
+        wire.receive(JSON.stringify({ id: firstRpc, error: { message: 'not now' } }));
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal(starts(), 1, "B reached the provider before A's bound native turn ended");
+        assert.equal(status(ids[1]), 'queued');
+        assert.equal(status(ids[0]), 'uncertain', 'contradictory native evidence must stay unknown');
+      }
+      if (ending !== 'refusal') runTurn('late');
+      else wire.receive(JSON.stringify({ id: firstRpc, error: { message: 'not now' } }));
+      assert.equal(status(ids[1]), 'queued', "A's late turn reached B");
+      assert.equal(
+        status(ids[0]),
+        ending === 'turn' || ending === 'early timeout' ? 'completed' : ending === 'refusal' ? 'failed' : 'uncertain',
+      );
+      assert.equal(wire.hasOpenTurns(), false);
+      assert.equal(wire.compactionUnresolved(), false, 'terminal evidence must clear the delivery barrier');
+      // Resolving A's receipt drains B without another host event.
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(starts(), 2);
+      wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: {} }));
+      runTurn('second');
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(status(ids[1]), 'completed');
+      await host.drain('self');
+      assert.equal(starts(), 2, 'B must drain exactly once');
+      wire.close('finished');
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
 
 // Catches a busy child or a new ask at the write boundary cancelling work that only had to wait, and expiry reported as a change.
 test('self compaction keeps waiting while the session is briefly not ready and reports expiry', async () => {

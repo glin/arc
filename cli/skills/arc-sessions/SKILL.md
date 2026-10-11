@@ -63,7 +63,7 @@ Both window values are the `hostId` of the window that hosts this session. `ARC_
 
 Arc admits the request only while this tool call runs in a session that this window's panel holds. The session must have no open asks, no queued reader prompts, and no reader action since this turn's prompt. An answer to one of this turn's asks given before the request does not block admission. Any reader action after admission, including an answer, cancels the request. Each turn holds one pending request. Each request ID is admitted once in a window activation.
 
-Read the `state` field of the result. The command returns at once. After `queued`, finish the successful final response. Reader intervention cancels unsubmitted compaction.
+Read the `state` field of the result. The command returns at once. After `queued`, finish the successful final response. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
 
 Observe a known request without submitting work:
 
@@ -73,7 +73,7 @@ arc compact status --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 
 The `state` field names one outcome:
 
-- `queued`: Arc compacts after this turn succeeds and the panel saves the final response.
+- `queued`: the request waits for this turn to succeed, a saved final response, and delivery checks.
 - `started`: the agent accepted the compaction.
 - `completed`: the agent finished the compaction.
 - `cancelled`: a reader action, a session change, the session leaving the window's scope, the agent process ending, the window closing, or the 15-minute deadline stopped the request before Arc sent it.

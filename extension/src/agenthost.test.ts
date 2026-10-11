@@ -60,7 +60,7 @@ test('measurement windows refuse agent processes before launch', () => {
   }
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
-import { sandboxPolicy } from './codexwire.ts';
+import { CODEX_DEADLINE_MS, sandboxPolicy } from './codexwire.ts';
 import { requesterIdentity } from './sessionrequests.ts';
 import { GuardedAttempt, McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
 import {
@@ -2807,6 +2807,7 @@ test('Codex compaction stays pending through its reported turn and sends no prom
   child.reply({ thread: { id: 'thread-7' } });
   const session = await starting;
 
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
   const compacting = session.compact();
   assert.equal(session.state().busy, true);
   const request = child.sent().at(-1);
@@ -2818,7 +2819,7 @@ test('Codex compaction stays pending through its reported turn and sends no prom
   );
 
   child.reply({});
-  await tick();
+  await vi.advanceTimersByTimeAsync(0);
   assert.equal(session.state().busy, true, 'the request acknowledgement ended the compaction');
   child.say(
     JSON.stringify({
@@ -2827,6 +2828,14 @@ test('Codex compaction stays pending through its reported turn and sends no prom
     }) + '\n',
   );
   assert.equal(session.state().busy, true);
+  await vi.advanceTimersByTimeAsync(CODEX_DEADLINE_MS);
+  assert.equal(session.state().busy, true, 'the reader lost the running state before native completion');
+  const stopping = session.interrupt();
+  await vi.advanceTimersByTimeAsync(0);
+  assert.equal(child.sent().at(-1)?.method, 'turn/interrupt');
+  assert.deepEqual(child.sent().at(-1)?.params, { threadId: 'thread-7', turnId: 'compact-turn' });
+  child.reply({});
+  await stopping;
   child.say(
     JSON.stringify({
       method: 'turn/completed',
@@ -2836,6 +2845,77 @@ test('Codex compaction stays pending through its reported turn and sends no prom
   await compacting;
   assert.equal(session.state().busy, false);
 });
+
+test.each(['early timeout', 'early refusal', 'late timeout', 'unattributed timeout'])(
+  'Codex native compaction retains reader busy state and Stop through %s',
+  async (ending) => {
+    const { host, children } = fakeHost();
+    const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+    const child = children[0];
+    await answerCodexHandshake(child);
+    child.reply({ thread: { id: 'thread-7' } });
+    const session = await starting;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const unanswered: number[] = [];
+    if (ending === 'unattributed timeout') {
+      const first = assert.rejects(session.compact(), /did not answer/);
+      unanswered.push(child.sent().at(-1)!.id as number);
+      await vi.advanceTimersByTimeAsync(CODEX_DEADLINE_MS);
+      await first;
+    }
+    const compacting = assert.rejects(
+      session.compact(),
+      ending === 'early refusal' ? /not now/ : ending === 'unattributed timeout' ? /did not finish/ : /did not answer/,
+    );
+    if (ending === 'unattributed timeout') {
+      unanswered.push(child.sent().at(-1)!.id as number);
+      child.reply({});
+    }
+    const startTurn = () =>
+      child.say(
+        JSON.stringify({
+          method: 'turn/started',
+          params: { threadId: 'thread-7', turn: { id: 'compact-turn' } },
+        }) + '\n',
+      );
+    if (ending !== 'late timeout') startTurn();
+    if (ending === 'unattributed timeout')
+      child.say(
+        JSON.stringify({
+          method: 'item/started',
+          params: {
+            threadId: 'thread-7',
+            turnId: 'compact-turn',
+            item: { id: 'compact-item', type: 'contextCompaction' },
+          },
+        }) + '\n',
+      );
+    if (ending === 'early refusal') child.replyError(-32600, 'not now');
+    await vi.advanceTimersByTimeAsync(CODEX_DEADLINE_MS);
+    await compacting;
+    for (const id of unanswered) child.say(JSON.stringify({ id, error: { message: 'not now' } }) + '\n');
+    if (ending === 'late timeout') {
+      assert.equal(session.state().busy, false);
+      startTurn();
+    }
+    assert.equal(session.state().busy, true, 'the exact native turn must remain visible as running');
+    assert.equal(session.compactionUnresolved(), true);
+    const stopping = session.interrupt();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(child.sent().at(-1)?.method, 'turn/interrupt');
+    assert.deepEqual(child.sent().at(-1)?.params, { threadId: 'thread-7', turnId: 'compact-turn' });
+    child.reply({});
+    await stopping;
+    child.say(
+      JSON.stringify({
+        method: 'turn/completed',
+        params: { threadId: 'thread-7', turn: { id: 'compact-turn', status: 'completed', items: [] } },
+      }) + '\n',
+    );
+    assert.equal(session.state().busy, false);
+    assert.equal(session.compactionUnresolved(), false);
+  },
+);
 
 test('Codex clear starts a replacement thread and reports the previous session', async () => {
   const { host, children, events } = fakeHost();

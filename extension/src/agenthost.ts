@@ -1465,6 +1465,14 @@ export class AgentSession {
     // A native event names its accepted submission only when one owner is identifiable.
     if (event.kind === 'native') {
       const native = event.event;
+      if (
+        native.kind === 'compact' &&
+        (native.stage === 'turnStart' || native.stage === 'itemStart') &&
+        this.driver.hasOpenTurns
+      ) {
+        this.busy = this.driver.hasOpenTurns();
+        this.changed();
+      }
       const owner = this.driver.hasOpenTurns
         ? native.turnId
           ? this.nativeTurnOwners.get(native.turnId)

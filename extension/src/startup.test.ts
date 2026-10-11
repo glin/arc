@@ -3,7 +3,7 @@ import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
 import { selectedDependencies } from './selectedsource';
-import { projectSlug } from './transcript';
+import { projectSlug, isInside } from './transcript';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -1186,7 +1186,7 @@ function completeDiscoveryHarness(
     .join('\n');
   const compiled = transformSync(
     `
-    const isInside = () => true;
+    const isInside = ${scope.scopeInside ? 'scopeInside' : '() => true'};
     const pickShowing = (sessions, wanted) => wanted && sessions.includes(wanted) ? wanted : sessions[0] ?? null;
     const sessionLauncherView = (_state, recent) => ({ recent, primary: recent?.[0] ? { key: 'recent:0', profile: recent[0] } : null });
     const launcherProfile = (view, request) => (request.kind === 'row' && view.primary?.key === request.key ? { ...view.primary.profile } : null);
@@ -7120,6 +7120,85 @@ test('a refresh posts the render the panel paints from before it offers a spend 
     order.indexOf('render posted') < order.indexOf('spend sources offered'),
     'the paint waited on the spend offer, which stats every source the listing walk did not describe',
   );
+});
+
+test('a ready scope reports removed sessions while every panel is hidden and rows remain retained', async () => {
+  const provider = paintHarness(['repositoryScopeChanged'], { scopeInside: isInside });
+  provider.anyVisible = () => false;
+  provider.selectionWorks = new Map();
+  provider.refreshFrom = () => {};
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots: ['C:/kept'] }) };
+  provider.authoritativeCatalog = [
+    { sessionId: 'kept', cwd: 'C:/kept/project' },
+    { sessionId: 'removed', cwd: 'C:/removed/project' },
+    { sessionId: 'unknown', cwd: null },
+  ];
+  provider.newDrafts = { draft: { draftId: 'draft', cwd: 'C:/removed/draft' } };
+  provider.awaitingSessionRecords = { awaiting: { sessionId: 'awaiting', cwd: 'C:/removed/new' } };
+  const changes: (ReadonlySet<string> | undefined)[] = [];
+  provider.onScopeChange = (outOfScope?: ReadonlySet<string>) => changes.push(outOfScope);
+  provider.repositoryScopeChanged();
+  await provider.refresh(true);
+  assert.equal(changes[0], undefined, 'delivery must wait before scope publication');
+  assert.deepEqual([...(changes[1] ?? [])], ['removed', 'draft', 'awaiting']);
+  assert.equal(provider.authoritativeCatalog.length, 3, 'hidden refresh must retain its catalog');
+});
+
+test('hidden workspace-folder changes retain known directories until the replacement scope cancels removed sessions', async () => {
+  const provider = paintHarness(['workspaceFoldersChanged', 'repositoryScopeChanged'], { scopeInside: isInside });
+  provider.anyVisible = () => false;
+  provider.selectionWorks = new Map();
+  provider.refreshFrom = () => {};
+  provider.cancelProjectSpendHydration = () => {};
+  provider.allowThemeFiles = () => {};
+  let ready = false;
+  let roots = ['C:/kept'];
+  provider.repositoryScope = { snapshot: () => ({ ready, roots: ready ? roots : [] }) };
+  provider.authoritativeCatalog = [
+    { sessionId: 'kept', cwd: 'C:/kept/project' },
+    { sessionId: 'removed', cwd: 'C:/removed/project' },
+    { sessionId: 'unknown', cwd: null },
+  ];
+  provider.newDrafts = {};
+  provider.awaitingSessionRecords = {};
+  const changes: (ReadonlySet<string> | undefined)[] = [];
+  provider.onScopeChange = (outOfScope?: ReadonlySet<string>) => changes.push(outOfScope);
+  provider.workspaceFoldersChanged();
+  await provider.refresh(true);
+  assert.equal(provider.authoritativeCatalog, null, 'workspace invalidation must remove the old rendering catalog');
+  assert.equal(
+    changes.some((sessions) => sessions?.has('removed')),
+    false,
+    'an unresolved scope must keep assignments waiting',
+  );
+  ready = true;
+  provider.repositoryScopeChanged();
+  await provider.refresh(true);
+  assert.deepEqual([...(changes.at(-1) ?? [])], ['removed']);
+  assert.deepEqual(
+    [...provider.scopeSessionDirectories],
+    [['kept', 'C:/kept/project']],
+    'a surviving session must keep its directory until catalog replacement',
+  );
+  assert.equal(provider.authoritativeCatalog, null, 'hidden cancellation must not require a rebuilt catalog');
+  ready = false;
+  provider.workspaceFoldersChanged();
+  await provider.refresh(true);
+  roots = ['C:/different'];
+  ready = true;
+  provider.repositoryScopeChanged();
+  await provider.refresh(true);
+  assert.deepEqual(
+    [...(changes.at(-1) ?? [])],
+    ['kept'],
+    'a second hidden scope change must cancel the surviving assignment when it leaves',
+  );
+  assert.equal(
+    provider.scopeSessionDirectories.size,
+    0,
+    'confirmed departures must release their retained directories',
+  );
+  assert.equal(provider.authoritativeCatalog, null);
 });
 
 test('a full deferred-metadata refresh retains hosted starts until matching authoritative publication', async () => {

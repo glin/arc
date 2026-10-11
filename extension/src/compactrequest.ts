@@ -432,6 +432,7 @@ class NativeCompactOperation {
   private terminal: NativeEvent | null = null;
   private compactSuccess = false;
   private manualBoundary = false;
+  private conflictingRefusal = false;
   constructor(
     private readonly binding: Readonly<CompactBinding>,
     private readonly report: (state: 'started' | 'completed' | 'failed' | 'uncertain', reason?: string) => void,
@@ -466,9 +467,13 @@ class NativeCompactOperation {
       return;
     }
     if (event.stage === 'refused') {
-      this.report('failed', 'The agent refused the compaction request.');
+      if (this.turn !== null) {
+        this.conflictingRefusal = true;
+        this.report('uncertain', 'The agent reported both a compaction turn and a refusal.');
+      } else this.report('failed', 'The agent refused the compaction request.');
       return;
     }
+    if (this.conflictingRefusal) return;
     if (event.stage === 'accepted') {
       this.report('started');
       return;
@@ -555,9 +560,14 @@ export class CompactHost<C extends CompactChild> {
     );
   }
 
-  // The session rows still name the previous scope here, so delivery waits for the next rows refresh.
-  scopeChanged(): void {
+  // Known directories outside a ready scope cancel assignments before any rows refresh.
+  // Delivery still waits until the session rows reflect the scope.
+  scopeChanged(outOfScope: ReadonlySet<string> = new Set()): void {
     this.settling = true;
+    this.requests.invalidate(
+      (binding) => outOfScope.has(binding.sessionId),
+      "The session left this window's scope before compaction started.",
+    );
   }
 
   // Runs after each full rows refresh. A session that left the panel's scope cancels its unsubmitted
@@ -591,8 +601,9 @@ export class CompactHost<C extends CompactChild> {
     if (event.kind === 'submission' || event.kind === 'compact') {
       const generation = this.generations.get(child);
       if (generation !== undefined) this.requests.observeSubmitted(event, generation);
-      // The adapter ends an unanswered request's receipt right after it reports that turn's end.
-      if (event.kind === 'compact' && event.stage === 'turnEnd') queueMicrotask(() => void this.drain(event.sessionId));
+      // A terminal turn or an unbound RPC refusal releases the adapter's unanswered receipt.
+      if (event.kind === 'compact' && (event.stage === 'turnEnd' || event.stage === 'refused'))
+        queueMicrotask(() => void this.drain(event.sessionId));
       return;
     }
     const binding = this.binding(child, event, turnId);

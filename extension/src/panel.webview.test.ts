@@ -7181,7 +7181,7 @@ test('repository scope changes, workspace folder changes and rows refreshes repo
     'both the unchanged and the rebuilt full refresh report rows',
   );
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
-  assert.match(extensionSource, /panel\.onScopeChange = \(\) => owner\.scopeChanged\(\);/);
+  assert.match(extensionSource, /panel\.onScopeChange = \(outOfScope\) => owner\.scopeChanged\(outOfScope\);/);
   assert.match(extensionSource, /panel\.onSessionRowsRefreshed = \(\) => owner\.sessionsRefreshed\(\);/);
 });
 

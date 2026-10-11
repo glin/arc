@@ -138,11 +138,12 @@ interface ActiveTurn {
 }
 
 // Bounds the unanswered compactions whose late turns a wire still reports. At a full bound, a reader's
-// compaction drops the oldest reader receipt and is still written. A deferred compaction is refused,
-// so no deferred receipt is dropped before its late turn ends.
+// compaction drops an unbound reader receipt and is still written. Lost identity withholds attribution
+// until the thread changes. Deferred and already-bound receipts stay retained.
 const UNANSWERED_COMPACTIONS = 8;
 
 interface PendingCompaction {
+  requestId: number | null;
   // Numbers each compaction request. Native compaction evidence carries it as its generation.
   generation: number;
   threadId: string;
@@ -350,25 +351,30 @@ export class CodexWire {
   // Starts stay in send order. Codex can accept another prompt into the turn already in
   // progress, so starts that return the same id are folded into one server turn.
   private readonly turns: ActiveTurn[] = [];
-  // The compaction request only acknowledges that work started. Its turn id and terminal
-  // result arrive later as notifications, so the operation stays here until that result.
+  // The compaction request only acknowledges startup. Notifications identify and end its native turn.
+  // Caller errors transfer any running turn to a receipt without ending native ownership.
   private compaction: PendingCompaction | null = null;
-  // Compactions whose request got no answer before the deadline can still run. Each later turn
-  // keeps reporting native evidence under its own generation, while the operation itself has already failed.
+  // Compactions with unanswered requests or caller errors during a native turn can still run.
+  // Each retained turn reports native evidence under its own generation after caller settlement.
   // A receipt ends with its turn, with its thread or with the wire.
   private unanswered: {
+    requestId: number;
     generation: number;
     threadId: string;
     turnId: string | null;
     deferred: boolean;
   }[] = [];
   private compactions = 0;
+  private lostCompactionIdentity = false;
+  private ambiguousCompaction = false;
   // Root turn ids this child has seen in any notification or response, each with the order of its
   // first sighting. A guarded start that returns one seen before its write joined existing work.
   private readonly seenTurns = new Map<string, number>();
   // Root turns the server reported as started and has not yet ended, including turns no
   // request of this client started.
   private readonly runningRootTurns = new Set<string>();
+  // Native compaction ownership does not require an attributable request generation.
+  private readonly runningCompactionTurns = new Set<string>();
   private endedRootTurns = 0;
   // Permission overrides selected by the reader travel together on the next turn/start.
   // The server applies them to that turn and subsequent turns.
@@ -404,12 +410,12 @@ export class CodexWire {
   }
 
   hasOpenTurns(): boolean {
-    return this.turns.length > 0 || this.compaction !== null;
+    return this.turns.length > 0 || this.compaction !== null || this.runningCompactionTurns.size > 0;
   }
 
-  // True while a compaction request that got no answer can still start or finish its late turn.
+  // True while a settled caller's compaction can still start or finish its native turn.
   compactionUnresolved(): boolean {
-    return this.unanswered.length > 0;
+    return this.unanswered.length > 0 || this.lostCompactionIdentity || this.ambiguousCompaction;
   }
 
   // Positive idle evidence: a root turn has ended in this child, and no root turn or request is open.
@@ -597,8 +603,9 @@ export class CodexWire {
     if (this.unanswered.length >= UNANSWERED_COMPACTIONS) {
       if (deferred) throw new Error('the agent has not answered earlier compaction requests');
       // Deferred delivery waits while any receipt is open, so a full bound holds at most one deferred receipt.
-      const dropped = this.unanswered.findIndex((receipt) => !receipt.deferred);
+      const dropped = this.unanswered.findIndex((receipt) => !receipt.deferred && receipt.turnId === null);
       if (dropped >= 0) this.unanswered.splice(dropped, 1);
+      this.lostCompactionIdentity = true;
     }
     const pending = this.pendingCompaction(this.thread);
     this.compaction = pending;
@@ -616,7 +623,9 @@ export class CodexWire {
           text: '/compact',
         },
       });
-      await this.request('thread/compact/start', { threadId: this.thread }).catch((error: unknown) => {
+      await this.request('thread/compact/start', { threadId: this.thread }, (id) => {
+        pending.requestId = id;
+      }).catch((error: unknown) => {
         if (error instanceof RequestRefused)
           this.emit({
             kind: 'native',
@@ -630,14 +639,6 @@ export class CodexWire {
               stage: 'refused',
             },
           });
-        else if (error instanceof NoAnswer && this.compaction === pending) {
-          this.unanswered.push({
-            generation: pending.generation,
-            threadId: pending.threadId,
-            turnId: pending.turnId,
-            deferred,
-          });
-        }
         throw error;
       });
       this.emit({
@@ -652,8 +653,28 @@ export class CodexWire {
           stage: 'accepted',
         },
       });
-      await pending.finished;
+      const timer = setTimeout(() => {
+        if (pending.turnId === null) pending.rejectFinished(new NoAnswer('the agent did not finish compaction'));
+      }, this.deadlineMs);
+      if (typeof timer === 'object' && typeof timer.unref === 'function') timer.unref();
+      try {
+        await pending.finished;
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (error) {
+      // Caller settlement cannot end a native turn. Its receipt keeps ownership until termination.
+      if (this.compaction === pending && (error instanceof NoAnswer || pending.turnId !== null)) {
+        if (this.unanswered.length < UNANSWERED_COMPACTIONS)
+          this.unanswered.push({
+            requestId: pending.requestId!,
+            generation: pending.generation,
+            threadId: pending.threadId,
+            turnId: pending.turnId,
+            deferred,
+          });
+        else this.lostCompactionIdentity = true;
+      }
       if (this.compaction === pending) {
         this.failCompaction(pending, error as Error);
       }
@@ -784,6 +805,11 @@ export class CodexWire {
         continue;
       }
       await this.request('turn/interrupt', { threadId: active.threadId, turnId });
+      return;
+    }
+    const nativeTurnId = this.runningCompactionTurns.values().next().value;
+    if (nativeTurnId) {
+      await this.request('turn/interrupt', { threadId: this.thread, turnId: nativeTurnId });
       return;
     }
     const pending = this.compaction;
@@ -1011,6 +1037,10 @@ export class CodexWire {
     if (this.compaction) {
       this.failCompaction(this.compaction, new Error(reason));
     }
+    this.unanswered = [];
+    this.runningCompactionTurns.clear();
+    this.lostCompactionIdentity = false;
+    this.ambiguousCompaction = false;
     for (const [, waiting] of this.waiting) {
       if (waiting.timer) {
         clearTimeout(waiting.timer);
@@ -1041,6 +1071,12 @@ export class CodexWire {
     this.thread = id;
     // The wire ignores another thread's turns, so that thread's receipts can never end.
     this.unanswered = this.unanswered.filter((receipt) => receipt.threadId === id);
+    if (previous !== id) {
+      this.lostCompactionIdentity = false;
+      this.ambiguousCompaction = false;
+      this.runningRootTurns.clear();
+      this.runningCompactionTurns.clear();
+    }
     // An answer to a question asked on another thread must never reach this one. A cleared
     // session starts a new thread, so its open questions close with it.
     for (const [askId, asked] of [...this.asyncAsks]) {
@@ -1439,6 +1475,7 @@ export class CodexWire {
     void started.catch(() => undefined);
     void finished.catch(() => undefined);
     return {
+      requestId: null,
       generation: ++this.compactions,
       threadId,
       turnId: null,
@@ -1479,12 +1516,14 @@ export class CodexWire {
           },
         });
     }
-    const generation = item.type === 'contextCompaction' ? this.compactionTurn(turnId) : null;
-    if (generation !== null)
+    if (item.type === 'contextCompaction') {
+      if (this.runningRootTurns.has(turnId)) this.runningCompactionTurns.add(turnId);
+      const generation = this.compactionTurn(turnId);
       this.emit({
         kind: 'native',
         event: { ...base, generation, kind: 'compact', stage: completed ? 'itemEnd' : 'itemStart' },
       });
+    }
   }
 
   // Names the generation of the compaction that owns a turn, or null for any other turn.
@@ -1499,9 +1538,10 @@ export class CodexWire {
     if (!sessionId || sessionId !== this.thread || !turnId) return;
     const base = { provider: 'codex' as const, sessionId, turnId, generation: null, evidence: params };
     const generation = this.compactionTurn(turnId);
-    if (generation !== null) {
+    if (generation !== null || this.runningCompactionTurns.has(turnId)) {
       this.emit({ kind: 'native', event: { ...base, generation, kind: 'compact', stage: 'turnEnd' } });
-    } else
+    }
+    if (generation === null)
       this.emit({
         kind: 'native',
         event: { ...base, kind: 'rootEnd', success: !failed && obj(params.turn)?.status === 'completed' },
@@ -1513,19 +1553,26 @@ export class CodexWire {
     if (!turnId) return;
     this.seeTurn(turnId);
     this.runningRootTurns.delete(turnId);
+    this.runningCompactionTurns.delete(turnId);
 
     this.endedRootTurns += 1;
+    if (!this.compaction && !this.unanswered.length && !this.runningRootTurns.size) this.ambiguousCompaction = false;
   }
 
   private startCompactionTurn(params: Json): void {
     const pending = this.compaction;
-    // A late turn belongs to the oldest unanswered compaction only while no compaction is pending
-    // and no prompt waits for its own turn.
-    const late = this.unanswered.find((receipt) => receipt.turnId === null);
-    if (!pending && late && this.turns.length === 0) {
+    const turnId = str(obj(params.turn)?.id) ?? str(params.turnId);
+    if (!turnId || str(params.threadId) !== this.thread || this.compactionTurn(turnId) !== null) return;
+    const unbound = this.unanswered.filter((receipt) => receipt.turnId === null);
+    const candidates = unbound.length + (pending && pending.turnId === null ? 1 : 0);
+    if (candidates > 1 || (candidates > 0 && this.runningRootTurns.size > 1)) this.ambiguousCompaction = true;
+    if (this.lostCompactionIdentity || this.ambiguousCompaction || this.turns.length > 0) return;
+    const late = unbound[0];
+    if (late && candidates === 1) {
       const turnId = str(obj(params.turn)?.id) ?? str(params.turnId);
       if (str(params.threadId) !== late.threadId || !turnId) return;
       late.turnId = turnId;
+      this.runningCompactionTurns.add(turnId);
       this.emit({
         kind: 'native',
         event: {
@@ -1547,11 +1594,8 @@ export class CodexWire {
     if (threadId && threadId !== pending.threadId) {
       return;
     }
-    const turnId = str(obj(params.turn)?.id) ?? str(params.turnId);
-    if (!turnId) {
-      return;
-    }
     pending.turnId = turnId;
+    this.runningCompactionTurns.add(turnId);
     if (threadId === pending.threadId)
       this.emit({
         kind: 'native',
@@ -1569,10 +1613,12 @@ export class CodexWire {
   }
 
   private finishCompaction(params: Json, outcome: TurnOutcome): boolean {
+    if (str(params.threadId) !== this.thread) return false;
     // The late turn of an unanswered compaction ends its receipt and never settles a later compaction.
     const ended = str(obj(params.turn)?.id) ?? str(params.turnId);
     if (ended && this.unanswered.some((receipt) => receipt.turnId === ended)) {
       this.unanswered = this.unanswered.filter((receipt) => receipt.turnId !== ended);
+      if (!this.unanswered.length && !this.compaction && !this.runningRootTurns.size) this.ambiguousCompaction = false;
       return false;
     }
     const pending = this.compaction;
@@ -1584,12 +1630,8 @@ export class CodexWire {
       return false;
     }
     const turnId = str(obj(params.turn)?.id) ?? str(params.turnId);
-    if (!turnId || (pending.turnId && pending.turnId !== turnId)) {
+    if (!turnId || pending.turnId !== turnId) {
       return false;
-    }
-    if (!pending.turnId) {
-      pending.turnId = turnId;
-      pending.resolveStarted(turnId);
     }
     this.compaction = null;
     if (outcome.status === 'ok') {
@@ -1610,6 +1652,7 @@ export class CodexWire {
     if (this.compaction === pending) {
       this.compaction = null;
     }
+    if (!this.unanswered.length && !this.compaction && !this.runningRootTurns.size) this.ambiguousCompaction = false;
     pending.rejectStarted(error);
     pending.rejectFinished(error);
   }
@@ -1838,6 +1881,26 @@ export class CodexWire {
   private settle(id: number, message: Json): void {
     const waiting = this.take(id);
     if (!waiting) {
+      const receipt = this.unanswered.find((entry) => entry.requestId === id);
+      const failure = obj(message.error);
+      if (receipt && failure) {
+        // A refusal cannot remove a turn the server already reported as running.
+        if (receipt.turnId === null) this.unanswered = this.unanswered.filter((entry) => entry !== receipt);
+        if (!this.unanswered.length && !this.compaction && !this.runningRootTurns.size)
+          this.ambiguousCompaction = false;
+        this.emit({
+          kind: 'native',
+          event: {
+            kind: 'compact',
+            provider: 'codex',
+            sessionId: receipt.threadId,
+            turnId: receipt.turnId,
+            generation: receipt.generation,
+            evidence: { error: str(failure.message) ?? 'the agent refused the request' },
+            stage: 'refused',
+          },
+        });
+      }
       return;
     }
     const failure = obj(message.error);
@@ -1846,7 +1909,7 @@ export class CodexWire {
     } else waiting.resolve(obj(message.result) ?? {});
   }
 
-  private request(method: string, params: Json): Promise<Json> {
+  private request(method: string, params: Json, beforeWrite?: (id: number) => void): Promise<Json> {
     if (this.closed) {
       return Promise.reject(new Error('the agent is no longer running'));
     }
@@ -1863,6 +1926,7 @@ export class CodexWire {
         timer.unref();
       }
       this.waiting.set(id, { resolve, reject, timer });
+      beforeWrite?.(id);
       this.write({ id, method, params });
     });
   }

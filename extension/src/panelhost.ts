@@ -1590,7 +1590,7 @@ export class PanelProvider implements vscode.Disposable {
   // The facts of each session's latest current read. An equal source revision means the same bytes.
   private guardedReads?: Map<string, GuardedObservationFacts>;
   // Runs synchronously when the repository scope or the workspace folders change.
-  public onScopeChange: (() => void) | null = null;
+  public onScopeChange: ((outOfScope?: ReadonlySet<string>) => void) | null = null;
   // Runs after a full refresh rebuilds the session rows under a ready repository scope.
   public onSessionRowsRefreshed: (() => void) | null = null;
   public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean) | null = null;
@@ -1774,6 +1774,8 @@ export class PanelProvider implements vscode.Disposable {
   // metadata. A working catalog can move while that work is still in flight. Local drafts
   // compose with this accepted list, or with no existing rows before the first publication.
   private authoritativeCatalog: SessionFile[] | null = null;
+  // Working directories survive catalog invalidation until the replacement scope is ready.
+  private scopeSessionDirectories = new Map<string, string>();
   // The repository scope roots the authoritative catalog was listed under. Only a list complete under these roots holds the loading line.
   private authoritativeCatalogScope?: string;
   // The repository scope roots under which the published catalog was built from a complete discovery reply. A catalog reused after an
@@ -2921,6 +2923,20 @@ export class PanelProvider implements vscode.Disposable {
       this.repositoryScopeRoots = scope.ready ? scope.roots : [];
       this.publishWindowState();
     }
+    if (scope.ready) {
+      const removed = new Set(
+        [
+          ...(this.authoritativeCatalog ?? []),
+          ...[...(this.scopeSessionDirectories ?? [])].map(([sessionId, cwd]) => ({ sessionId, cwd })),
+          ...Object.values(this.newDrafts ?? {}),
+          ...Object.values(this.awaitingSessionRecords ?? {}),
+        ]
+          .filter((source) => source.cwd && !isInside(source.cwd, scope.roots))
+          .map((source) => ('sessionId' in source ? source.sessionId : source.draftId)),
+      );
+      this.onScopeChange?.(removed);
+      for (const sessionId of removed) this.scopeSessionDirectories?.delete(sessionId);
+    }
     this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
     this.abandonCatalogRefresh();
     this.refreshFrom('repository-scope', true);
@@ -2936,6 +2952,10 @@ export class PanelProvider implements vscode.Disposable {
     this.selectionWorks?.clear();
     this.selectionWork?.controller.abort();
     this.selectionWork = null;
+    this.scopeSessionDirectories ??= new Map();
+    for (const source of this.authoritativeCatalog ?? []) {
+      if (source.cwd) this.scopeSessionDirectories.set(source.sessionId, source.cwd);
+    }
     this.authoritativeCatalog = null;
     this.authoritativeCatalogScope = undefined;
     this.completeCatalogScope = undefined;
@@ -7397,6 +7417,7 @@ export class PanelProvider implements vscode.Disposable {
       if (!selectedOnly && !metadataAfterRender) {
         const catalogScope = JSON.stringify(this.repositoryScopeRoots);
         this.authoritativeCatalog = all;
+        this.scopeSessionDirectories?.clear();
         this.authoritativeCatalogScope = catalogScope;
         const answered = this.discoveryComplete?.scope === catalogScope ? this.discoveryComplete.files : undefined;
         if (answered && all.every((session) => answered.has(session.file))) {

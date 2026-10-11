@@ -513,7 +513,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
     compaction = owner;
     panel.onReaderAction = (session, answer) => owner.readerAction(session, answer);
-    panel.onScopeChange = () => owner.scopeChanged();
+    panel.onScopeChange = (outOfScope) => owner.scopeChanged(outOfScope);
     panel.onSessionRowsRefreshed = () => owner.sessionsRefreshed();
     channel.setCompactRequestHandler((request) => owner.handle(request));
     context.subscriptions.push({ dispose: () => owner.dispose() });
