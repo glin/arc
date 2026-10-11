@@ -1813,7 +1813,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
   }
   if (kind === 'thread_settings_applied') {
     const settings = (payload.thread_settings || {}) as Record<string, unknown>;
-    const model = typeof settings.model === 'string' ? settings.model : str(settings.model_id);
+    const model = str(settings.model) ?? str(settings.model_id) ?? (settings.model === '' ? '' : null);
     const provider = str(settings.model_provider_id);
     const serviceTier = str(settings.service_tier);
     state.reasoningEffort = str(settings.reasoning_effort) ?? state.reasoningEffort;
@@ -5976,7 +5976,7 @@ function reduceCodexSessionLine(
 
   if (kind === 'thread_settings_applied') {
     const settings = isRecord(payload.thread_settings) ? payload.thread_settings : {};
-    const model = typeof settings.model === 'string' ? settings.model : str(settings.model_id);
+    const model = str(settings.model) ?? str(settings.model_id) ?? (settings.model === '' ? '' : null);
     const provider = str(settings.model_provider_id);
     const serviceTier = str(settings.service_tier);
     if (model) {

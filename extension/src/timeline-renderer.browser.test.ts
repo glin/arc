@@ -1755,7 +1755,7 @@ test('latest compaction stays with context and uses turns only as its fallback',
         requestServiceTier: null,
         requestContextWindow: null,
       };
-      const turns = sessionTurnStats({ turnCount: 22, compactionCount: 3, firstTurnAt: 0, lastTurnAt: 600_000 });
+      const turns = sessionTurnStats({ turnCount: 22, compactionCount: 3, firstTurnAt: 1, lastTurnAt: 600_001 });
       const fallback = withSessionContextDetail(turns, sessionCompactionContextDetail([fact]));
       payload.stats.s1 = fallback as unknown as Payload['stats']['s1'];
       await post(page, payload);

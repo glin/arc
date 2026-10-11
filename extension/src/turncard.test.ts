@@ -8680,9 +8680,38 @@ test('the turn figure lists its counts as label and value rows and folds its not
   );
 });
 
-test('a session with no compactions shows a zero count row', () => {
+test('a session with no compactions omits the compaction row', () => {
   const chip = sessionTurnStats(turnStats(12, { compactionCount: 0 }))[0];
-  assert.deepEqual(chip.detailList?.entries.at(-1), { label: 'Compactions', value: '0' });
+  assert.equal(
+    chip.detailList?.entries.some((entry) => entry.label === 'Compactions'),
+    false,
+  );
+});
+
+test('a first running turn and unavailable clocks omit elapsed detail', () => {
+  const first = Date.UTC(2026, 0, 1);
+  for (const [firstTurnAt, lastTurnAt] of [
+    [first, first],
+    [first, first + 499],
+    [0, first],
+    [first, 0],
+    [0, 0],
+    [first, first - 1000],
+    [NaN, first],
+    [first, Infinity],
+    [-1000, first],
+    [null, first],
+    [first, null],
+  ]) {
+    const chip = sessionTurnStats(turnStats(1, { firstTurnAt, lastTurnAt, compactionCount: 0 }))[0];
+    assert.equal(chip.detail, 'Turns in the main session: 1\nThe turn count excludes delegated work.');
+  }
+  const chip = sessionTurnStats(turnStats(1, { firstTurnAt: first, lastTurnAt: first + 500, compactionCount: 1 }))[0];
+  assert.deepEqual(chip.detailList?.entries.slice(1), [
+    { label: 'First to last turn', value: '1s' },
+    { label: 'Compactions', value: '1' },
+  ]);
+  assert.ok(chip.detailList?.notes?.includes('Elapsed time includes gaps between turns.'));
 });
 
 test('a total that could not price every turn is marked as a floor and says how many', () => {

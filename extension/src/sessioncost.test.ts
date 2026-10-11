@@ -1171,7 +1171,7 @@ test('billing usage receives delayed model metadata and retains pending tools', 
   assert.equal(sessionCostReport(file).parent.pricedRequests, 1);
 });
 
-test('Codex compaction billing keeps settings across response ID shapes and native arrival orders', () => {
+test('Codex compaction billing keeps model identities across response ID shapes and native arrival orders', () => {
   const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
   const usage = {
     input_tokens: 3000,
@@ -1181,47 +1181,52 @@ test('Codex compaction billing keeps settings across response ID shapes and nati
     reasoning_output_tokens: 0,
     total_tokens: 3030,
   };
-  for (const explicit of [true, false])
-    for (const nativeFirst of [true, false]) {
-      const native = {
-        type: 'token_usage_record',
-        timestamp: at(nativeFirst ? 3 : 6),
-        payload: { response_id: 'compact', turn_id: 'turn', usage },
-      };
-      const compact = {
-        type: 'compacted',
-        timestamp: at(4),
-        payload: {
-          ...(explicit ? { compaction_response_id: 'compact' } : {}),
-          latest_token_usage_record: { response_id: 'compact', usage },
-        },
-      };
-      const settings = {
-        type: 'event_msg',
-        timestamp: at(5),
-        payload: {
-          type: 'thread_settings_applied',
-          thread_settings: {
-            model: 'openai.gpt-6-astra',
-            model_provider_id: 'amazon-bedrock',
-            service_tier: 'standard',
+  for (const identity of [{ model: 'openai.gpt-6-astra' }, { model: '', model_id: 'openai.gpt-6-astra' }])
+    for (const explicit of [true, false])
+      for (const nativeFirst of [true, false]) {
+        const native = {
+          type: 'token_usage_record',
+          timestamp: at(nativeFirst ? 3 : 6),
+          payload: { response_id: 'compact', turn_id: 'turn', usage },
+        };
+        const compact = {
+          type: 'compacted',
+          timestamp: at(4),
+          payload: {
+            ...(explicit ? { compaction_response_id: 'compact' } : {}),
+            latest_token_usage_record: { response_id: 'compact', usage },
           },
-        },
-      };
-      const file = write(path.join(directory(), 'rollout-parent.jsonl'), [
-        { type: 'session_meta', timestamp: at(0), payload: { id: 'parent', source: 'cli', model_provider: 'openai' } },
-        { type: 'event_msg', timestamp: at(1), payload: { type: 'task_started', turn_id: 'turn' } },
-        { type: 'turn_context', timestamp: at(2), payload: { turn_id: 'turn', model: 'gpt-5.6-sol' } },
-        ...(nativeFirst ? [native, compact, settings] : [compact, settings, native]),
-      ]);
-      const request = readSessionRequests(file).find((request) => request.billingRecord)!;
-      assert.deepEqual(
-        [request.model, request.provider, request.serviceTier, request.inferenceClass],
-        ['openai.gpt-6-astra', 'amazon-bedrock', 'standard', 'in-region'],
-      );
-      assert.equal(request.compactionUsage, true);
-      assert.equal(request.incomplete, undefined);
-    }
+        };
+        const settings = {
+          type: 'event_msg',
+          timestamp: at(5),
+          payload: {
+            type: 'thread_settings_applied',
+            thread_settings: {
+              ...identity,
+              model_provider_id: 'amazon-bedrock',
+              service_tier: 'standard',
+            },
+          },
+        };
+        const file = write(path.join(directory(), 'rollout-parent.jsonl'), [
+          {
+            type: 'session_meta',
+            timestamp: at(0),
+            payload: { id: 'parent', source: 'cli', model_provider: 'openai' },
+          },
+          { type: 'event_msg', timestamp: at(1), payload: { type: 'task_started', turn_id: 'turn' } },
+          { type: 'turn_context', timestamp: at(2), payload: { turn_id: 'turn', model: 'gpt-5.6-sol' } },
+          ...(nativeFirst ? [native, compact, settings] : [compact, settings, native]),
+        ]);
+        const request = readSessionRequests(file).find((request) => request.billingRecord)!;
+        assert.deepEqual(
+          [request.model, request.provider, request.serviceTier, request.inferenceClass],
+          ['openai.gpt-6-astra', 'amazon-bedrock', 'standard', 'in-region'],
+        );
+        assert.equal(request.compactionUsage, true);
+        assert.equal(request.incomplete, undefined);
+      }
 });
 
 test('identified compaction usage keeps its priced subtotal beside a native normal bill', () => {

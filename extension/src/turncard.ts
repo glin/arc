@@ -5545,12 +5545,22 @@ export function sessionTurnStats(stats: SessionTurnStats | null | undefined): Se
   const notes = ['The turn count excludes delegated work.'];
   const first = stats?.firstTurnAt;
   const last = stats?.lastTurnAt;
-  if (typeof first === 'number' && typeof last === 'number') {
-    entries.push({ label: 'First to last turn', value: formatExpiryGap(Math.max(0, last - first)) });
-    notes.push('Elapsed time includes gaps between turns.');
+  if (
+    typeof first === 'number' &&
+    typeof last === 'number' &&
+    Number.isFinite(first) &&
+    Number.isFinite(last) &&
+    first > 0 &&
+    last > first
+  ) {
+    const duration = formatExpiryGap(last - first);
+    if (duration !== '0s') {
+      entries.push({ label: 'First to last turn', value: duration });
+      notes.push('Elapsed time includes gaps between turns.');
+    }
   }
   const compactions = stats?.compactionCount;
-  if (typeof compactions === 'number') {
+  if (typeof compactions === 'number' && compactions > 0) {
     entries.push({ label: 'Compactions', value: String(compactions) });
   }
   const detailList: StatDetailList = { layout: 'economics', entries, notes };

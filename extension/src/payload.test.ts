@@ -46,17 +46,17 @@ const RAIL_NAME_BOUND = 200;
 const CEILINGS = {
   // The render total includes session data and the fixed card fixture. Session names and unsent text each travel once per row.
 
-  renderTotal: 3_105_039,
+  renderTotal: 3_103_033,
   renderRail: 1_146_658,
-  renderStats: 1_479_000,
+  renderStats: 1_476_262,
   renderSessions: 305_000,
   // The card ceiling includes commit branches, repository paths, and author sessions.
 
   renderCards: 113_000,
-  selectionTotal: 8_124,
-  railMessageTotal: 2_678_977,
+  selectionTotal: 8_070,
+  railMessageTotal: 2_676_966,
   railRow: 1_255,
-  duplicateWaste: 246_000,
+  duplicateWaste: 243_665,
 };
 
 // Each ceiling stays within five percent of its measured fixture.

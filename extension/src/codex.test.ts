@@ -16266,6 +16266,50 @@ test('Codex compaction usage without settings or response identity keeps cost in
   }
 });
 
+test('Codex compaction settings select populated model identities across pricing consumers', () => {
+  for (const [settings, expected] of [
+    [{ model: '', model_id: 'gpt-6-astra' }, 'gpt-6-astra'],
+    [{ model: 'gpt-6-astra', model_id: 'gpt-5.6-sol' }, 'gpt-6-astra'],
+    [{ model_id: 'gpt-6-astra' }, 'gpt-6-astra'],
+    [{ model: '' }, ''],
+    [{ model: '', model_id: '' }, ''],
+    [{}, 'gpt-5.6-sol'],
+  ] as const) {
+    const records = [
+      ...ordinaryTurn().slice(0, 8),
+      {
+        type: 'compacted',
+        timestamp: at(9),
+        payload: {
+          latest_token_usage_record: {
+            response_id: 'compact',
+            usage: usage({ input_tokens: 3000, output_tokens: 30 }),
+          },
+        },
+      },
+      event('thread_settings_applied', 10, { thread_settings: { ...settings, model_provider_id: 'openai' } }),
+      event('task_complete', 11, { turn_id: TURN }),
+    ];
+    const file = writeRollout(records);
+    const indexed = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+      maxMilliseconds: Infinity,
+    }).record;
+    const dated = indexed.buckets.filter((bucket) => bucket.compactionUsage);
+    const lifetime = indexed.lifetimeBuckets!.filter((bucket) => bucket.compactionUsage);
+    assert.equal(dated[0].model, expected);
+    assert.equal(lifetime[0].model, expected);
+    const read = readCodexSession(file, 'session');
+    assert.equal(read.compactions[0].model, expected);
+    const projection = sessionCostProjection(
+      lifetime.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' })),
+      false,
+    );
+    const turn = read.turns[0];
+    assert.equal(turn.usageParts?.find((part) => part.compactionUsage)?.model, expected);
+    assert.equal(projection.total.dollars !== null, expected !== '');
+  }
+});
+
 test('a delayed copied-turn date retracts identified Codex compaction billing after restore', () => {
   const response = {
     response_id: 'copied-compaction',
