@@ -868,13 +868,23 @@ export function sameSessionRevision(
   return cached.mtimeMs === current.mtimeMs && cached.size === current.size;
 }
 
+type CatalogRevision = Pick<SessionFile, 'mtimeMs' | 'size'> & Partial<Pick<SessionFile, 'dev' | 'ino'>>;
+
+// A file replaced at the same path has a new device or inode. Only a full walk accepts it.
+function replacedAtPath(held: SessionFile, now: CatalogRevision): boolean {
+  return (
+    (held.dev !== undefined && now.dev !== undefined && String(held.dev) !== String(now.dev)) ||
+    (held.ino !== undefined && now.ino !== undefined && String(held.ino) !== String(now.ino))
+  );
+}
+
 // Updates one selected session revision in a held catalog without changing its order.
 // The selected tail needs its current size to include new records.
-// Returns null for a missing selection, catalog row, or file.
+// Returns null for a missing selection, catalog row, or file, or a file replaced at its path.
 export function revalidatedCatalog(
   sessions: readonly SessionFile[],
   showing: string | null,
-  statOf: (file: string) => Pick<SessionFile, 'mtimeMs' | 'size'> | null,
+  statOf: (file: string) => CatalogRevision | null,
 ): SessionFile[] | null {
   if (!showing) {
     return null;
@@ -885,7 +895,7 @@ export function revalidatedCatalog(
   }
   const held = sessions[at];
   const now = statOf(held.file);
-  if (!now) {
+  if (!now || replacedAtPath(held, now)) {
     return null;
   }
   const out = [...sessions];
@@ -896,13 +906,13 @@ export function revalidatedCatalog(
 }
 
 // Revalidate only the files a directory watcher reported. Every path must already belong
-// to the held catalog, and every file must still exist. A miss means the directory changed
-// shape, so the caller falls back to the authoritative walk that can discover additions and
-// removals.
+// to the held catalog, and every file must still exist with its held device and inode. A miss
+// means the directory changed shape, so the caller falls back to the authoritative walk that
+// can discover additions, removals, and replacements.
 export function revalidatedCatalogPaths(
   sessions: readonly SessionFile[],
   files: readonly string[],
-  statOf: (file: string) => Pick<SessionFile, 'mtimeMs' | 'size'> | null,
+  statOf: (file: string) => CatalogRevision | null,
 ): SessionFile[] | null {
   if (files.length === 0) {
     return null;
@@ -915,7 +925,7 @@ export function revalidatedCatalogPaths(
       return null;
     }
     const now = statOf(out[at].file);
-    if (!now) {
+    if (!now || replacedAtPath(out[at], now)) {
       return null;
     }
     if (!sameSessionRevision(out[at], now)) {

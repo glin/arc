@@ -296,6 +296,36 @@ export function sessionScopeDigest(scopeKey: string): string {
   return digest(scopeKey);
 }
 
+const identityText = (value: number | string | undefined) => (value === undefined ? null : String(value));
+
+// Catalog membership under one scope: each accepted file with its device and inode. Size, modification time, and catalog order
+// stay out, so an append or an activity reorder keeps the same membership. An added, removed, or replaced file changes it.
+export function sessionCatalogMembership(
+  scope: string,
+  sessions: readonly Pick<SessionFile, 'file' | 'dev' | 'ino'>[],
+): string {
+  const members = sessions.map(({ file, dev, ino }) => JSON.stringify([file, identityText(dev), identityText(ino)]));
+  return JSON.stringify([scope, members.sort()]);
+}
+
+// The membership a complete discovery reply proves for a published catalog, or undefined when the reply did not answer each file
+// at its current device and inode. A file that only grew after the reply is still the file the reply answered.
+export function sessionDiscoveryMembership(
+  scope: string,
+  catalog: readonly SessionFile[],
+  answered: ReadonlyMap<string, SessionFile>,
+): string | undefined {
+  const proven = catalog.every((source) => {
+    const reply = answered.get(source.file);
+    return (
+      !!reply &&
+      identityText(reply.dev) === identityText(source.dev) &&
+      identityText(reply.ino) === identityText(source.ino)
+    );
+  });
+  return proven ? sessionCatalogMembership(scope, catalog) : undefined;
+}
+
 // Keys order the sources by ordinal comparison. A repeated provider, ID, and file is one source.
 // A source has physical identity only when supportedFileIdentity holds, which requires a positive inode.
 export function sessionPageSources<T extends SessionFile>(sessions: readonly T[]): SessionPageSource<T>[] {

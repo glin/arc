@@ -27,6 +27,7 @@ import { tempDir } from './temproot.ts';
 import { buildSync, transformSync } from 'esbuild';
 import { messageByteBudget, PanelPerformanceCounters, serializedMessageBytes } from './performancediagnostics';
 import { SessionLoadingLine } from './sessionloadingline';
+import { sessionCatalogMembership, sessionDiscoveryMembership } from './sessionreads.ts';
 import { REPOSITORY_SCOPE_CONFIRM_MS, REPOSITORY_SCOPE_REFRESH_MS, RepositoryScope } from './repositoryscope';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -1357,6 +1358,7 @@ function completeDiscoveryHarness(
     'countedDispatchedCosts',
     'SessionLoadingLine',
     'pendingResponseSessionAdmitted',
+    'sessionDiscoveryMembership',
     ...Object.keys(scope),
     compiled,
   )(
@@ -1401,6 +1403,7 @@ function completeDiscoveryHarness(
     countedDispatchedCosts,
     SessionLoadingLine,
     pendingResponseSessionAdmitted,
+    sessionDiscoveryMembership,
     ...Object.values(scope),
   );
   return new module.exports.Harness();
@@ -2267,6 +2270,42 @@ test('disposing a ready host before handler registration clears its catalog dema
     provider.usageRequests.push([agent, force]);
   });
   assert.deepEqual(provider.usageRequests, []);
+});
+
+// Listing coverage must survive a transcript that grows between a complete discovery reply and catalog publication.
+test('a refresh stamps the published membership when a source grew after its complete discovery reply', async () => {
+  const answered = {
+    file: 'grown.jsonl',
+    sessionId: 'grown',
+    agent: 'claude',
+    activity: 1,
+    size: 10,
+    mtimeMs: 1,
+    dev: '7',
+    ino: '9',
+  };
+  const provider = completeDiscoveryHarness();
+  provider.partial = [{ ...answered, size: 20, mtimeMs: 2 }];
+  provider.catalog = { sessions: provider.partial };
+  provider.discovery = Promise.resolve(true);
+  provider.prepareClaudeChildren = function (this: any) {
+    this.discoveryComplete = {
+      scope: JSON.stringify(this.repositoryScopeRoots),
+      files: new Set([answered.file]),
+      revisions: new Map([[answered.file, answered]]),
+    };
+    return this.discovery;
+  };
+  await provider.refresh(true);
+  const published = provider.authoritativeCatalog;
+  assert.deepEqual(
+    published.map((source: any) => [source.size, source.dev, source.ino]),
+    [[20, '7', '9']],
+  );
+  assert.equal(
+    provider.sessionReadDiscoveryRevision,
+    sessionCatalogMembership(JSON.stringify(provider.repositoryScopeRoots), published),
+  );
 });
 
 test('complete discovery has one stable final order across Claude and Codex sessions', () => {

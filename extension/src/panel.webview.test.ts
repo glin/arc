@@ -128,7 +128,7 @@ test('response session navigation releases only its invoking clear route and ret
   }
 });
 import type { TurnOutcome } from './transcript';
-import { sessionSourceKey } from './sessionreads.ts';
+import { sessionCatalogMembership, sessionDiscoveryMembership, sessionSourceKey } from './sessionreads.ts';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
 import { openReadWindow, closeReadWindow } from './readmeter';
 import { responseRateForTurn, savedResponseRates } from './outputrate';
@@ -2182,10 +2182,7 @@ test('window session listings reject removed children and report pending, hidden
       authoritativeCatalog: [parent, child],
       authoritativeCatalogScope: scopeKey(),
       completeCatalogScope: scopeKey(),
-      sessionReadDiscoveryRevision: JSON.stringify([
-        scopeKey(),
-        [parent, child].map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino]),
-      ]),
+      sessionReadDiscoveryRevision: sessionCatalogMembership(scopeKey(), [parent, child]),
       anyVisible: () => visible,
       watching: true,
       refreshController: null,
@@ -2490,10 +2487,7 @@ function pagedListingFixture(count: number) {
     repositoryScope: { snapshot: () => ({ ready: true, roots, revision: scope.revision }) },
     authoritativeCatalog: sources,
     authoritativeCatalogScope: JSON.stringify(roots),
-    sessionReadDiscoveryRevision: JSON.stringify([
-      JSON.stringify(roots),
-      sources.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino]),
-    ]),
+    sessionReadDiscoveryRevision: sessionCatalogMembership(JSON.stringify(roots), sources),
     anyVisible: () => true,
     watching: true,
     refreshController: null,
@@ -2516,8 +2510,9 @@ function pagedListingFixture(count: number) {
     post: async () => {},
     postRail() {},
   });
-  // Records each page's window reads and its serializations of [source, dev, ino] prefix tuples.
-  const traverse = () => {
+  // Records each page's window reads and its serializations of [source, dev, ino] prefix tuples. `afterPage` runs after
+  // each page, before the next request.
+  const traverse = ({ limit, afterPage }: { limit?: number; afterPage?: (index: number) => void } = {}) => {
     const pages: any[] = [];
     const reads: { has: number; get: number; tuples: number }[] = [];
     const keys = new Set(sources.map(key));
@@ -2534,11 +2529,12 @@ function pagedListingFixture(count: number) {
         const page: any = provider.readSessionRequest({
           method: 'sessions',
           requester: null,
-          params: cursor ? { cursor } : {},
+          params: { ...(cursor ? { cursor } : {}), ...(limit === undefined ? {} : { limit }) },
         });
         reads.push({ has: windows.hasReads, get: windows.getReads, tuples });
         pages.push(page);
         cursor = page.next ?? null;
+        afterPage?.(pages.length - 1);
       } while (cursor && pages.length < 50);
     } finally {
       JSON.stringify = stringify;
@@ -2578,6 +2574,117 @@ test('window session listings page every scoped session past 128 rows and 48 KiB
     reads.slice(1).map(() => 0),
   );
   assert.ok(pages.flatMap((page) => page.sessions).every((row: any) => ['unread', 'idle'].includes(row.attention)));
+});
+
+// Pagination must stay usable while existing sessions append. A rebuilt catalog with the same members keeps coverage, and the
+// changed transcript reports stale freshness.
+test('window session pages keep coverage when a transcript grows and the catalog is rebuilt between pages', () => {
+  const { sources, target, provider, traverse } = pagedListingFixture(300);
+  const scope = JSON.stringify([path.dirname(target.file)]);
+  const answered = new Map(sources.map((source) => [source.file, { ...source }]));
+  const afterPage = (index: number) => {
+    if (index === 0) {
+      // A refresh with no new discovery reply publishes the grown transcript in a reordered catalog.
+      fs.appendFileSync(target.file, 'appended\n');
+      const grown = { ...target, ...revisionOf(fs.statSync(target.file, { bigint: true })) };
+      provider.authoritativeCatalog = sources.map((source) => (source === target ? grown : { ...source })).reverse();
+    } else if (index === 1) {
+      // A complete discovery reply answered the sources before the append, and the refresh publishes the grown catalog.
+      provider.authoritativeCatalog = [...provider.authoritativeCatalog];
+      provider.sessionReadDiscoveryRevision = sessionDiscoveryMembership(
+        scope,
+        provider.authoritativeCatalog,
+        answered,
+      );
+    } else if (index === 2) {
+      fs.appendFileSync(target.file, 'appended again\n');
+    }
+  };
+  const { pages } = traverse({ limit: 64, afterPage });
+  assert.ok(pages.length > 3, `${pages.length} pages`);
+  const served = pages.flatMap((page) => page.sessions.map((row: any) => row.source));
+  assert.equal(new Set(served).size, served.length);
+  assert.deepEqual(
+    [...served].sort(),
+    sources.map((source) => sessionSourceKey(source.agent, source.sessionId, source.file)).sort(),
+  );
+  assert.deepEqual(
+    pages.map((page) => page.coverage),
+    pages.map(() => 'complete'),
+  );
+  assert.equal(pages.at(-1).freshness, 'stale');
+  assert.equal(pages.at(-1).complete, false);
+});
+
+// A transcript replaced at its path is a new member, so a watcher or reused-catalog refresh that publishes it must clear
+// listing coverage for a traversal that already served it.
+test('window session pages lose coverage when a served transcript is replaced at its path', () => {
+  for (const route of ['targeted', 'reuse']) {
+    const { sources, provider, traverse } = pagedListingFixture(150);
+    const dependencies = {
+      fs,
+      fileRevisionOf: revisionOf,
+      revalidatedCatalog,
+      revalidatedCatalogPaths,
+      orderSessionCatalog,
+      projectsRoot: () => '',
+      codexSessionsRoot: () => '',
+      // The full walk stats every source again.
+      sessionFilesFor: () =>
+        sources.map((source) => ({ ...source, ...revisionOf(fs.statSync(source.file, { bigint: true })) })),
+      readSessionCwd: () => null,
+      staleMetas: () => [],
+      discoverClaudeSessionSpendSources: () => [],
+      codexSessionFiles: () => ({ walked: [], sessions: [], sources: [], subagents: [] }),
+    };
+    const code = ts.transpileModule(
+      `function listing(reuseCatalog = false) { ${methodBody('private allSessions(')} }`,
+      {
+        compilerOptions: { target: ts.ScriptTarget.ES2022 },
+      },
+    ).outputText;
+    const listing = new Function(...Object.keys(dependencies), code + '\nreturn listing;')(
+      ...Object.values(dependencies),
+    );
+    Object.assign(provider, {
+      // The scope revision is 1, as the fixture's repository scope reports.
+      catalog: { folders: [provider.folders().join('\n'), 1].join('\0'), sessions: sources },
+      publishWindowState() {},
+      hasHumanPrompt: () => true,
+      activityFor: () => 1,
+      codexMetas: { revision: 0, keys: () => [] },
+      codexStats: { keys: () => [] },
+      subagentDirectories: { sweep() {} },
+      cwds: new Map(),
+      claudeChildren: [],
+      derivedCacheCheckpointState: { markChanged() {} },
+    });
+    // The first source in key order is served on the first page.
+    const key = (source: any) => sessionSourceKey(source.agent, source.sessionId, source.file);
+    const held = sources.reduce((first, source) => (key(source) < key(first) ? source : first));
+    const { pages } = traverse({
+      limit: 64,
+      afterPage: (index) => {
+        if (index !== 0) return;
+        const replacement = `${held.file}.next`;
+        fs.writeFileSync(replacement, 'replaced\n');
+        fs.renameSync(replacement, held.file);
+        const now = revisionOf(fs.statSync(held.file, { bigint: true }));
+        assert.ok(now.dev !== held.dev || now.ino !== held.ino, `${route} replacement kept its inode`);
+        provider.targetedRefreshPaths = route === 'targeted' ? [held.file] : null;
+        provider.showing = held.sessionId;
+        // The refresh publishes the revalidated catalog with no new discovery reply.
+        provider.authoritativeCatalog = listing.call(provider, route === 'reuse');
+      },
+    });
+    assert.ok(pages.length > 1, `${route} served ${pages.length} pages`);
+    assert.ok(
+      pages[0].sessions.some((row: any) => row.id === held.sessionId),
+      route,
+    );
+    assert.equal(pages[0].coverage, 'complete', route);
+    assert.equal(pages.at(-1).coverage, 'incomplete', route);
+  }
 });
 
 // Archive must find a session wherever it sorts, and a cursor must not survive a missing catalog as an empty final page.

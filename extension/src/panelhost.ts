@@ -8,6 +8,8 @@ import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLin
 import {
   boundedSessionRead,
   readSessionCursor,
+  sessionCatalogMembership,
+  sessionDiscoveryMembership,
   sessionListingPage,
   sessionPageSources,
   sessionScopeDigest,
@@ -1729,7 +1731,8 @@ export class PanelProvider implements vscode.Disposable {
   // The repository scope roots under which the published catalog was built from a complete discovery reply. A catalog reused after an
   // incomplete pass keeps the stamp it had, and a scope change clears it. The session list is complete when it equals the current roots.
   private completeCatalogScope?: string;
-  // Programmatic completeness belongs to the exact catalog revisions accepted from complete discovery.
+  // Programmatic completeness belongs to the catalog membership accepted from complete discovery: each file with its device and
+  // inode. Transcript appends leave it unchanged.
   private sessionReadDiscoveryRevision?: string;
   // Each provider instance signs its own session cursors, so a reload invalidates every cursor it issued.
   private sessionCursorSecret?: Buffer;
@@ -2136,7 +2139,7 @@ export class PanelProvider implements vscode.Disposable {
       scoped,
       ids: new Set(scoped.map((source) => source.sessionId)),
       sources: sessionPageSources(scoped),
-      discovery: JSON.stringify([roots, accepted.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino])]),
+      discovery: sessionCatalogMembership(roots, accepted),
     };
     return this.sessionPageIndex;
   }
@@ -7246,13 +7249,8 @@ export class PanelProvider implements vscode.Disposable {
           this.completeCatalogScope = catalogScope;
           const revisions = this.discoveryComplete?.revisions;
           this.sessionReadDiscoveryRevision =
-            !this.dispatchDiscoveryPending &&
-            revisions &&
-            all.every((source) => {
-              const answeredSource = revisions.get(source.file);
-              return answeredSource && sameSessionRevision(answeredSource, source) && answeredSource.ino === source.ino;
-            })
-              ? JSON.stringify([catalogScope, all.map(({ file, size, mtimeMs, ino }) => [file, size, mtimeMs, ino])])
+            !this.dispatchDiscoveryPending && revisions
+              ? sessionDiscoveryMembership(catalogScope, all, revisions)
               : undefined;
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
