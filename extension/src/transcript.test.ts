@@ -10163,7 +10163,7 @@ test('completed manual CLI compaction removes the running command card in every 
       assert.deepEqual(resumed.read().turns, full.turns);
       assert.deepEqual(
         resumed.read().compactions,
-        full.compactions.map(({ firstRequestCacheRead: _read, ...compaction }) => compaction),
+        full.compactions.map(({ firstRequestCachedTokens: _read, ...compaction }) => compaction),
       );
     }
     const appended = [

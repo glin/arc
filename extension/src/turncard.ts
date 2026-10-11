@@ -945,13 +945,7 @@ function hintDetailLine(line: StatDetailLine): string {
 
 // Cost breakdown for a child figure, excluding its displayed total.
 // Coverage-only blocks become standalone lines without headings. Compaction notes go to `notes`.
-function agentCostEntries(
-  agent: TurnAgent,
-  partial: boolean,
-  runner: AgentKind,
-  noEnding: boolean,
-  notes: string[],
-): StatDetailEntry[] {
+function agentCostEntries(agent: TurnAgent, runner: AgentKind, noEnding: boolean, notes: string[]): StatDetailEntry[] {
   if (!agent.spend.length) {
     return [];
   }
@@ -968,14 +962,13 @@ function agentCostEntries(
     entries.push(entry);
   }
   // Include usage from every spend part, including unpriced parts.
-  // Partial cost labels this scope explicitly.
   const total = emptyUsage();
   for (const spend of agent.spend) {
     addUsage(total, spend.usage);
   }
   const usage = usageDetailEntries(
     total,
-    partial ? [{ label: 'Every part above, priced or not' }] : [],
+    [],
     agent.outputRateModel ? agent.outputRate : undefined,
     runner,
     agent.outputRateModel,
@@ -1074,7 +1067,7 @@ function costRecordList(
   noEnding: boolean,
 ): Omit<StatDetailList, 'heading'> {
   const notes: string[] = [];
-  const entries = agentCostEntries(agent, partial, runner, noEnding, notes);
+  const entries = agentCostEntries(agent, runner, noEnding, notes);
   return notes.length ? { entries, notes } : { entries };
 }
 
@@ -1990,6 +1983,7 @@ export function sessionCostUsageOf({ bucket, role, scopeId }: SessionSpendPart):
     ...(bucket.incomplete ? { incomplete: true } : {}),
     ...(bucket.requestCountExact === false ? { requestCountExact: false as const } : {}),
     ...(bucket.compactionEstimate ? { compactionEstimate: true as const } : {}),
+    ...(bucket.compactionUsage ? { compactionUsage: true as const } : {}),
     usage: bucket.usage,
   };
 }
@@ -2655,10 +2649,10 @@ function costDetailList(
     );
   // A dispatched session's notes follow the session total's rules.
   const compactionNote = compactionEstimateNote(sharedCosts);
-  // The main agent's estimated compactions, which the turn names under "Included above".
+  // The main agent's recorded and estimated compactions, which the turn names under "Included above".
   const mainCosts = mainParts.map(priceSessionCost);
   const compactions = mainCosts
-    .filter((cost) => cost.part.compactionEstimate)
+    .filter((cost) => cost.part.compactionEstimate || cost.part.compactionUsage)
     .reduce((sum, cost) => sum + (cost.part.usage.requests ?? 0), 0);
   const included = includedAboveEntries(
     compactions > 0 ? { count: compactions, cost: compactionOverheadCost(compactions, mainCosts) } : null,
@@ -3070,7 +3064,9 @@ const CLAUDE_COMPACTION_ESTIMATE = 'Claude Code records no usage for a compactio
 function claudeCompactionEstimateLine({ usage, basis }: CompactionEstimate): string {
   const parts = [
     usage.cacheRead ? `${formatTokens(usage.cacheRead)} of cached input reads` : null,
-    usage.cacheWrite5m ? `${formatTokens(usage.cacheWrite5m)} of new cache writes` : null,
+    usage.cacheWrite5m ? `${formatTokens(usage.cacheWrite5m)} of 5-minute cache writes` : null,
+    usage.cacheWrite30m ? `${formatTokens(usage.cacheWrite30m)} of 30-minute cache writes` : null,
+    usage.cacheWrite1h ? `${formatTokens(usage.cacheWrite1h)} of 1-hour cache writes` : null,
     usage.input ? `${formatTokens(usage.input)} of uncached input` : null,
   ].filter((part): part is string => part !== null);
   const list = parts.length > 2 ? `${parts.slice(0, -1).join(', ')}, and ${parts.at(-1)}` : parts.join(' and ');
@@ -3125,7 +3121,8 @@ function compactionChips(c: Compaction): StatChip[] {
     contextBefore: c.contextBefore,
     contextAfter: c.contextAfter,
     previousRequest: c.previousRequest ?? null,
-    firstRequestCacheRead: c.firstRequestCacheRead ?? null,
+    firstRequestCachedTokens: c.firstRequestCachedTokens ?? null,
+    postCompactionCacheRead: c.postCompactionCacheRead ?? null,
     summaryChars: c.summaryChars ?? null,
   };
   const estimated = exactUsage ? null : compactionEstimate(estimateInput);
@@ -4668,6 +4665,7 @@ function costStat(
 
 export interface SessionCostUsage {
   usageOrigin?: 'claude-cost-state';
+  linkedInvocationId?: string | null;
   agent?: string | null;
   role?: 'main' | 'delegated';
   scopeId?: string;
@@ -4684,6 +4682,7 @@ export interface SessionCostUsage {
   requestCountExact?: false;
   // Estimated compaction requests, which the source recorded no usage for.
   compactionEstimate?: true;
+  compactionUsage?: true;
   usage: Turn['usage'];
 }
 
@@ -4715,8 +4714,8 @@ export function cacheWriteWarnings(scopes: readonly CacheWriteScope[]): CacheWri
       let scopeCost = 0;
       let cacheWriteCost = 0;
       for (const part of scope.parts) {
-        // A compaction estimate is not recorded usage, so no warning rests on it.
-        if (part.compactionEstimate || part.usageOrigin === 'claude-cost-state') {
+        // Compaction requests and cost snapshots supply no cache-write warning.
+        if (part.compactionEstimate || part.compactionUsage || part.usageOrigin === 'claude-cost-state') {
           continue;
         }
         if (
@@ -4914,6 +4913,10 @@ function priceSessionCost(part: SessionCostUsage): PricedSessionCost {
       : estimateCost(usage, part.model, part.provider, part.contextWindow, null, priceContext));
   const partial =
     part.incomplete === true ||
+    (part.requestCountExact === false &&
+      part.usageOrigin !== 'claude-cost-state' &&
+      part.agent?.toLowerCase() !== 'claude' &&
+      !part.linkedInvocationId) ||
     (dollars === null && spentTokens(part.usage)) ||
     (!hasRecordedListCost && (part.unclassifiedCacheWrite ?? 0) > 0);
   return {
@@ -5218,7 +5221,7 @@ function delegatedCostLines(
       held.priced = true;
     }
     held.costs.push(cost);
-    if (!cost.part.compactionEstimate) {
+    if (!cost.part.compactionEstimate && !cost.part.compactionUsage) {
       addUsage(held.usage, cost.part.usage);
     }
     held.complete = held.complete && !cost.part.incomplete && !cost.part.unclassifiedCacheWrite;
@@ -5248,9 +5251,12 @@ function delegatedCostLines(
     });
 }
 
-// The costs priced from recorded usage, without compaction estimates.
+// The costs priced from ordinary recorded requests.
 function recordedCosts(costs: readonly PricedSessionCost[]): PricedSessionCost[] {
-  return costs.filter((cost) => !cost.part.compactionEstimate && cost.part.usageOrigin !== 'claude-cost-state');
+  return costs.filter(
+    (cost) =>
+      !cost.part.compactionEstimate && !cost.part.compactionUsage && cost.part.usageOrigin !== 'claude-cost-state',
+  );
 }
 
 function requestInputOf(usage: Turn['usage']): number {
@@ -5284,14 +5290,13 @@ function overheadCostValue(cost: CacheExpiryCost): string {
   return `${formatCost(cost.dollars) ?? ZERO_COST}${cost.status === 'atLeast' ? '+' : ''}`;
 }
 
-// Prices `count` compactions from the Claude estimates among `costs`, which are in the total.
-// A Codex compaction's recorded usage is not in the total, so it stays unpriced. Fewer priced
-// compactions than counted make the cost a lower bound.
+// Prices recorded and estimated compaction requests already included in the total.
+// Fewer priced compactions than counted make the cost a lower bound.
 function compactionOverheadCost(count: number, costs: readonly PricedSessionCost[]): CacheExpiryCost {
   let dollars = 0;
   let priced = 0;
   for (const cost of costs) {
-    if (cost.part.compactionEstimate && cost.dollars !== null) {
+    if ((cost.part.compactionEstimate || cost.part.compactionUsage) && cost.dollars !== null) {
       dollars += cost.dollars;
       priced += cost.part.usage.requests ?? 0;
     }
@@ -5313,6 +5318,8 @@ function includedAboveEntries(
           {
             label: `${compactions.count} compaction${compactions.count === 1 ? '' : 's'}`,
             value: overheadCostValue(compactions.cost),
+            valueTitle:
+              'A cold Claude compaction avoids the history cache-write charge included in a cold next turn. It still pays for uncached history and summary output.',
           },
         ]
       : []),
@@ -5732,8 +5739,8 @@ function cacheReadCostOf(turn: SessionFigureTurn): number | null {
   }
   let dollars = 0;
   for (const part of turn.usageParts) {
-    // A compaction estimate is modelled, not recorded, so it stays out of recorded cache reads.
-    if (part.compactionEstimate || part.usage.cacheRead <= 0) {
+    // Compaction requests stay out of ordinary request cache reads.
+    if (part.compactionEstimate || part.compactionUsage || part.usage.cacheRead <= 0) {
       continue;
     }
     const usage = part.contextBand ? usageInContextBand(part.usage, part.contextBand) : part.usage;

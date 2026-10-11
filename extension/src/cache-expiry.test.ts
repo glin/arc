@@ -2497,8 +2497,6 @@ test('a Claude compaction between two prompts counts one expiry from the compact
   assert.deepEqual(summary(record), { ...NOTHING, counts: { '5m': 1, '30m': 0, '1h': 0 }, longestGapMs: 58 * MINUTE });
   const [returned] = facts(record).returns;
   assert.equal(returned.visibleTurnId, 'claude-turn:2');
-  // No record names the prefix before the first request after the compaction, and that request
-  // is the cold return, so the count stands and the dollars are unavailable.
   assert.equal(returned.previousInputSide, null);
   assert.deepEqual(cacheExpiryExtraCost(facts(record), pricer), { dollars: null, status: 'unknown' });
   assert.deepEqual(
@@ -2511,7 +2509,11 @@ test('a Claude compaction between two prompts counts one expiry from the compact
   const file = path.join(storage, 'source.jsonl');
   fs.writeFileSync(file, `${lines.slice(0, 4).join('\n')}\n`);
   const trailing = indexSpendFile(undefined, file, 'w', claudeReducer, Date.now(), stillClock).record;
-  assert.deepEqual(trailing.cacheExpiry!.carry!.compaction, { ordinal: 1, at: Date.parse(at(2)), prefixTokens: null });
+  assert.deepEqual(trailing.cacheExpiry!.carry!.compaction, {
+    ordinal: 1,
+    at: Date.parse(at(2)),
+    prefixTokens: 300_000,
+  });
   saveSpendLedger(storage, 'w', [trailing]);
   const [restored] = loadSpendLedger(storage, 'w').files;
   assert.deepEqual(restored.cacheExpiry, trailing.cacheExpiry, 'the carry measured from a compaction loads again');

@@ -142,7 +142,7 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
           pages: [await writer.spool(page)],
           turnCount: source.length,
           compactionCount: DEMO_COMPACTIONS[id]?.length ?? 0,
-          firstRequestCacheRead: null,
+          firstRequestCachedTokens: null,
           numbers: {
             parts: parts.flatMap((part) => costPartsOf(part, part.scopeId)),
             main: price('main'),

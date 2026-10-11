@@ -93,11 +93,13 @@ export interface UsageEvent {
   // An estimated compaction request rather than a recorded one. It reaches the lifetime buckets
   // only, and never the ordered request pass.
   compactionEstimate?: true;
+  compactionUsage?: true;
   // The compaction that an estimated request stands for, in request order. The ordered pass
   // measures the next return from it.
   compactionSignal?: CompactionSignal;
   usage: UsageCounts;
   requestKey: string | null;
+  responseId?: string;
 }
 
 export interface ProjectUsageBucket {
@@ -121,6 +123,7 @@ export interface ProjectUsageBucket {
   requestCountExact?: false;
   // These buckets estimate compaction requests without recorded request usage.
   compactionEstimate?: true;
+  compactionUsage?: true;
   usage: UsageCounts;
   requests: number;
 }
@@ -311,19 +314,25 @@ function sameWaiting(held: ReadonlyMap<string, boolean> | null, next: ReadonlyMa
   );
 }
 
-function spendRecordOwnershipPending(record: SpendFileIndex | undefined): boolean {
-  const state = record?.parserState as { pendingOwnership?: Record<string, true> } | undefined;
-  return record?.parserKind === 'codex' && Object.keys(state?.pendingOwnership ?? {}).length > 0;
+function spendRecordUsagePending(record: SpendFileIndex | undefined): boolean {
+  const state = record?.parserState as
+    | { pendingOwnership?: Record<string, true>; pendingRequests?: Record<string, UsageEvent[]> }
+    | undefined;
+  return (
+    record?.parserKind === 'codex' &&
+    (Object.keys(state?.pendingOwnership ?? {}).length > 0 ||
+      Object.values(state?.pendingRequests ?? {}).some((events) => events.length > 0))
+  );
 }
 
-// A whole source has no unfinished line or unresolved native ownership.
+// A whole source has no unfinished line or unresolved usage.
 function spendRecordWhole(record: SpendFileIndex | undefined): record is SpendFileIndex {
   return (
     !!record &&
     record.complete !== false &&
     !record.trailingBytes &&
     !record.trailing &&
-    !spendRecordOwnershipPending(record) &&
+    !spendRecordUsagePending(record) &&
     Array.isArray(record.lifetimeBuckets)
   );
 }
@@ -466,7 +475,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 50;
+export const PROJECT_SPEND_PARSER_GENERATION = 54;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -1200,7 +1209,11 @@ function carryFor(event: UsageEvent): CacheExpiryCarry {
 // work is excluded by its link, and a removal or a replacement by its negative request count.
 function primaryOrderedRequest(event: UsageEvent): boolean {
   return (
-    !event.compactionEstimate && !event.linkedSessionId && !event.linkedInvocationId && (event.usage.requests ?? 1) > 0
+    !event.compactionEstimate &&
+    !event.compactionUsage &&
+    !event.linkedSessionId &&
+    !event.linkedInvocationId &&
+    (event.usage.requests ?? 1) > 0
   );
 }
 
@@ -1658,6 +1671,7 @@ function readIncremental(
           incomplete: event.incomplete === true,
           ...(event.requestCountExact === false ? { requestCountExact: false as const } : {}),
           ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
+          ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
           reportedCost: event.reportedCost === null ? null : 0,
           usage: emptyUsage(),
           requests: 0,
@@ -2288,6 +2302,7 @@ function directClaudeSources(files: readonly SpendFileIndex[]): {
 
 function addBucket(total: Accumulator, bucket: ProjectUsageBucket, price: ProjectSpendPrice | null): void {
   total.activity = true;
+  if (bucket.requestCountExact === false && bucket.agent.toLowerCase() === 'codex') total.partial = true;
   total.seen += bucket.requests;
   if (!price) {
     total.unpriced += bucket.requests;
@@ -2360,7 +2375,7 @@ export function prepareProjectSpendView(
   let lastIndexedAt: number | null = null;
   for (const file of files) {
     lastIndexedAt = lastIndexedAt === null ? file.indexedAt : Math.max(lastIndexedAt, file.indexedAt);
-    const unresolvedOwnership = spendRecordOwnershipPending(file);
+    const unresolvedOwnership = spendRecordUsagePending(file);
     if (unresolvedOwnership) evidencedAgents.add('codex');
     if (file.complete !== false && (file.trailingBytes || file.trailing || unresolvedOwnership)) {
       const modified = localDate(file.mtimeMs);

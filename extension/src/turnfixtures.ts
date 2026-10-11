@@ -139,7 +139,7 @@ export async function sessionSiteFixture(writer: ExportTransaction): Promise<Ses
       pages,
       turnCount: count,
       compactionCount: 0,
-      firstRequestCacheRead: 20,
+      firstRequestCachedTokens: 20,
       numbers,
       parentOutsideExport: false,
       provenance: { sourceBytes: 100, sha256: 'a'.repeat(64) },

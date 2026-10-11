@@ -1140,8 +1140,9 @@ test('a later turn setting does not change a preceding compaction response', () 
       },
     },
   ]);
-  const request = readSessionRequests(file)[0];
-  assert.deepEqual([request.model, request.provider, request.serviceTier], ['gpt-6-sol', 'openai', null]);
+  const request = readSessionRequests(file).find((request) => request.billingRecord)!;
+  assert.deepEqual([request.model, request.provider, request.serviceTier], [null, 'openai', null]);
+  assert.equal(request.incomplete, true);
 });
 
 test('billing usage receives delayed model metadata and retains pending tools', () => {
@@ -1168,6 +1169,132 @@ test('billing usage receives delayed model metadata and retains pending tools', 
     [['gpt-6-sol', 1]],
   );
   assert.equal(sessionCostReport(file).parent.pricedRequests, 1);
+});
+
+test('Codex compaction billing keeps settings across response ID shapes and native arrival orders', () => {
+  const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
+  const usage = {
+    input_tokens: 3000,
+    cached_input_tokens: 2000,
+    cache_write_input_tokens: 0,
+    output_tokens: 30,
+    reasoning_output_tokens: 0,
+    total_tokens: 3030,
+  };
+  for (const explicit of [true, false])
+    for (const nativeFirst of [true, false]) {
+      const native = {
+        type: 'token_usage_record',
+        timestamp: at(nativeFirst ? 3 : 6),
+        payload: { response_id: 'compact', turn_id: 'turn', usage },
+      };
+      const compact = {
+        type: 'compacted',
+        timestamp: at(4),
+        payload: {
+          ...(explicit ? { compaction_response_id: 'compact' } : {}),
+          latest_token_usage_record: { response_id: 'compact', usage },
+        },
+      };
+      const settings = {
+        type: 'event_msg',
+        timestamp: at(5),
+        payload: {
+          type: 'thread_settings_applied',
+          thread_settings: {
+            model: 'openai.gpt-6-astra',
+            model_provider_id: 'amazon-bedrock',
+            service_tier: 'standard',
+          },
+        },
+      };
+      const file = write(path.join(directory(), 'rollout-parent.jsonl'), [
+        { type: 'session_meta', timestamp: at(0), payload: { id: 'parent', source: 'cli', model_provider: 'openai' } },
+        { type: 'event_msg', timestamp: at(1), payload: { type: 'task_started', turn_id: 'turn' } },
+        { type: 'turn_context', timestamp: at(2), payload: { turn_id: 'turn', model: 'gpt-5.6-sol' } },
+        ...(nativeFirst ? [native, compact, settings] : [compact, settings, native]),
+      ]);
+      const request = readSessionRequests(file).find((request) => request.billingRecord)!;
+      assert.deepEqual(
+        [request.model, request.provider, request.serviceTier, request.inferenceClass],
+        ['openai.gpt-6-astra', 'amazon-bedrock', 'standard', 'in-region'],
+      );
+      assert.equal(request.compactionUsage, true);
+      assert.equal(request.incomplete, undefined);
+    }
+});
+
+test('identified compaction usage keeps its priced subtotal beside a native normal bill', () => {
+  const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
+  const usage = (input: number, cached: number, output: number) => ({
+    input_tokens: input,
+    cached_input_tokens: cached,
+    cache_write_input_tokens: 0,
+    output_tokens: output,
+    reasoning_output_tokens: 0,
+    total_tokens: input + output,
+  });
+  const normal = usage(100, 40, 10);
+  const compact = usage(3000, 2000, 30);
+  for (const nativeCompaction of [false, true]) {
+    const file = write(path.join(directory(), 'rollout-parent.jsonl'), [
+      { type: 'session_meta', timestamp: at(0), payload: { id: 'parent', source: 'cli', model_provider: 'openai' } },
+      { type: 'event_msg', timestamp: at(1), payload: { type: 'task_started', turn_id: 'turn' } },
+      { type: 'turn_context', timestamp: at(2), payload: { turn_id: 'turn', model: 'gpt-5.6-sol' } },
+      {
+        type: 'event_msg',
+        timestamp: at(3),
+        payload: { type: 'token_count', info: { last_token_usage: normal, total_token_usage: normal } },
+      },
+      {
+        type: 'token_usage_record',
+        timestamp: at(4),
+        payload: {
+          thread_id: 'parent',
+          session_id: 'parent',
+          turn_id: 'turn',
+          response_id: 'normal',
+          usage: normal,
+          thread_token_usage: normal,
+          turn_token_usage: normal,
+        },
+      },
+      {
+        type: 'compacted',
+        timestamp: at(5),
+        payload: { compaction_response_id: 'compact', latest_token_usage_record: { usage: compact } },
+      },
+      {
+        type: 'event_msg',
+        timestamp: at(6),
+        payload: {
+          type: 'thread_settings_applied',
+          thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' },
+        },
+      },
+      ...(nativeCompaction
+        ? [
+            {
+              type: 'token_usage_record',
+              timestamp: at(7),
+              payload: { thread_id: 'parent', turn_id: 'turn', response_id: 'compact', usage: compact },
+            },
+          ]
+        : []),
+      {
+        type: 'event_msg',
+        timestamp: at(8),
+        payload: { type: 'task_complete', turn_id: 'turn', last_agent_message: 'Complete.' },
+      },
+    ]);
+    const requests = readSessionRequests(file);
+    const summary = summarizeRequests(requests);
+    assert.equal(summary.pricedRequests, 2);
+    assert.equal(summary.pricedCostUsd, 0.014);
+    assert.equal(requests.filter((request) => request.compactionUsage && !request.evidenceOnly).length, 1);
+    assert.equal(summary.costUsd, null);
+    assert.equal(summary.coverage, 'billed-with-unknown-coverage');
+  }
 });
 
 test('equal billing usage on separate responses does not merge across a preceding snapshot', () => {
@@ -1428,7 +1555,7 @@ test('a partial token snapshot and its billing record count one request', () => 
   assert.equal(report.parent.unpricedRequests, 0);
 });
 
-test('a Codex compaction zero-token snapshot without model metadata is not an unpriced request', () => {
+test('a Codex compaction zero-token snapshot preserves unidentified compaction coverage', () => {
   const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
   const usage = (input: number, output: number) => ({
     input_tokens: input,
@@ -1450,10 +1577,12 @@ test('a Codex compaction zero-token snapshot without model metadata is not an un
     },
   ]);
   assert.deepEqual(
-    readSessionRequests(file).filter((request) => !request.coverageDefect),
-    [],
+    readSessionRequests(file)
+      .filter((request) => !request.coverageDefect)
+      .map((request) => request.incomplete),
+    [true],
   );
-  assert.equal(sessionCostReport(file).parent.requests, 0);
+  assert.equal(sessionCostReport(file).parent.requests, 1);
   fs.appendFileSync(
     file,
     JSON.stringify({
@@ -1463,8 +1592,8 @@ test('a Codex compaction zero-token snapshot without model metadata is not an un
     }) + '\n',
   );
   const summary = sessionCostReport(file).parent;
-  assert.equal(summary.requests, 1);
-  assert.equal(summary.unpricedRequests, 1);
+  assert.equal(summary.requests, 2);
+  assert.equal(summary.unpricedRequests, 2);
   assert.equal(summary.costUsd, null);
 });
 

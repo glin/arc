@@ -185,7 +185,7 @@ export interface SemanticHistoryPage<State = unknown> {
   compactions: Compaction[];
   // Recorded unfinished body, supplied only on the first explicit capture page.
   unfinished?: { turn: Turn; start: number; end: number } | null;
-  firstRequestCacheRead?: number | null;
+  firstRequestCachedTokens?: number | null;
   recoveryBytes?: number;
   nextOlderCursor: SourceHistoryCursor<State> | null;
 }
@@ -199,7 +199,7 @@ export interface SemanticParse<State> {
   compactions: Array<{ compaction: Compaction; start: number; end: number }>;
   openRange: { start: number; end: number } | null;
   unfinished?: { turn: Turn; start: number; end: number } | null;
-  firstRequestCacheRead?: number | null;
+  firstRequestCachedTokens?: number | null;
   adapterState: State;
   olderEvidence?: SemanticEvidenceClaim[];
   deferOlderEvidence?: boolean;
@@ -912,7 +912,7 @@ function* scanSemanticHistoryPage<State>(
         turns,
         compactions,
         ...(limits ? { unfinished: cursor.pageEnd === cursor.revision.size ? (parsed.unfinished ?? null) : null } : {}),
-        ...(limits && atBeginning ? { firstRequestCacheRead: parsed.firstRequestCacheRead } : {}),
+        ...(limits && atBeginning ? { firstRequestCachedTokens: parsed.firstRequestCachedTokens } : {}),
         recoveryBytes,
         nextOlderCursor,
       },

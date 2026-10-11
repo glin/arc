@@ -949,6 +949,7 @@ test('a linked Claude result is used only when its direct transcript is absent',
       reportedCostBasis: 'list',
       linkedSessionId: sessionId,
       linkedInvocationId: `parent-command:${sessionId}`,
+      requestCountExact: false,
     }),
   ]);
   const direct = aggregateUsageEvents([
@@ -994,6 +995,8 @@ test('a linked Claude result is used only when its direct transcript is absent',
   const directSource = record(path.join('claude-project', `${sessionId}.jsonl`), direct);
   const onlyLinked = prepareProjectSpendView([parent], publicProjectSpendPrice, { now: at });
   assert.equal(onlyLinked.windows[0].dollars, 3.25);
+  assert.equal(onlyLinked.windows[0].status, 'exact');
+  assert.equal(onlyLinked.windows[0].display, '$3.25');
   assert.equal(onlyLinked.rateSources[0]?.source, 'Claude CLI recorded list price');
 
   for (const files of [
@@ -4191,7 +4194,7 @@ test('a compaction card and the session total price the same compaction the same
 
 const COLD_ROW = COMPACTION_SAMPLES.find((row) => row.name === '386c0253 cold')!;
 
-test('a cold Claude compaction reaches the session total as a read of the first request and uncached input', () => {
+test('a cold Claude compaction reaches the session total as a write of the shared prefix and uncached input', () => {
   const { file, projection, estimates } = indexCompactionSession(claudeCompactionTranscript(COLD_ROW));
   assert.equal(estimates.length, 1);
   const { usage } = estimates[0].bucket;
@@ -4199,17 +4202,17 @@ test('a cold Claude compaction reaches the session total as a read of the first 
     [usage.input, usage.cacheRead, usage.cacheWrite5m, usage.cacheWrite1h],
     [
       previousContextOf(COLD_ROW) + CLAUDE_COMPACTION_INSTRUCTION_TOKENS - COLD_ROW.firstRead!,
+      0,
+      0,
       COLD_ROW.firstRead,
-      0,
-      0,
     ],
   );
   const cost = toCompactionCard(readSession(file, 's').compactions[0]).chips.find((chip) => chip.metric === 'cost');
   assert.match(
     cost?.detail ?? '',
-    /Estimated as 10k of cached input reads and 222k of uncached input, because the cache had expired and the context was sent again without it\./,
+    /Estimated as 10k of 1-hour cache writes and 222k of uncached input, because the cache had expired and the context was sent again without it\./,
   );
-  assert.doesNotMatch(cost?.detail ?? '', /cache write/);
+  assert.doesNotMatch(cost?.detail ?? '', /cached input reads/);
   assert.ok((projection.stats[0]?.detail ?? '').includes(`Includes an estimated ${cost?.label} for 1 compaction.`));
 });
 
@@ -4232,7 +4235,7 @@ const WINDOW_BYTES = 64 * 1024;
 function assertCardMatchesTotal(name: string, compactions: readonly Compaction[], totalDetail: string) {
   assert.equal(compactions.length, 1, name);
   const cost = toCompactionCard(compactions[0]).chips.find((chip) => chip.metric === 'cost');
-  assert.match(cost?.detail ?? '', /10k of cached input reads/, name);
+  assert.match(cost?.detail ?? '', /10k of 1-hour cache writes/, name);
   assert.ok(
     totalDetail.includes(`Includes an estimated ${cost?.label} for 1 compaction.`),
     `${name}: the card says ${cost?.label} and the total says ${totalDetail}`,
@@ -4274,7 +4277,7 @@ test('a child transcript compaction card past its read window prices the first r
 test('a transcript is read from its head once until the file is replaced', () => {
   const { file } = indexCompactionSession(coldCompactionPastTheWindow());
   const tailBytes = WINDOW_BYTES;
-  const firstRead = (read: SessionRead | null) => read?.compactions[0]?.firstRequestCacheRead;
+  const firstRead = (read: SessionRead | null) => read?.compactions[0]?.firstRequestCachedTokens;
   const first = readClaudeSessionIncremental(file, 's', undefined, { tailBytes });
   assert.equal(firstRead(first.read), COLD_ROW.firstRead);
   // The same file with a different first request, the same size and the same identity.
@@ -4468,7 +4471,11 @@ test('a spend record saved between the halves of a compaction keeps its estimate
     assert.ok(loaded, `${name}: the saved record reads back`);
     const state = loaded.parserState as ClaudeUsageReducerState;
     assert.ok(summaryFirst ? state.unsizedCompaction : state.pendingCompactionSize, `${name}: the first half survives`);
-    assert.equal(state.firstRequestCacheRead, COMPACTION_ROW.previousRead, `${name}: the first request survives`);
+    assert.equal(
+      state.firstRequestCachedTokens,
+      COMPACTION_ROW.previousRead + COMPACTION_ROW.previousWrite,
+      `${name}: the first request survives`,
+    );
     assert.deepEqual(
       [state.lastRequest?.cacheRead, state.lastRequest?.cacheWrite],
       [COMPACTION_ROW.previousRead, COMPACTION_ROW.previousWrite],
@@ -6299,3 +6306,61 @@ test('Bedrock Astra rebuilds literal parser generation 37 at unchanged EOF befor
   assert.equal(fs.statSync(file).size, before.size);
   assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
 });
+
+for (const childTranscript of [false, true])
+  test(`a cold Claude prefix follows the first later cache read across ledger restoration, child=${childTranscript}`, () => {
+    const reducer: UsageReducerFactory = (state) =>
+      createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, { childTranscript });
+    const lines = claudeCompactionTranscript(COLD_ROW);
+    const folder = dir();
+    const file = path.join(folder, 'source.jsonl');
+    fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join('\n') + '\n');
+    const initial = indexSpendFile(undefined, file, 'w', reducer, 1, {
+      maxMilliseconds: Infinity,
+    }).record;
+    saveSpendLedger(folder, 'w', [initial]);
+    const [restored] = loadSpendLedger(folder, 'w').files;
+    assert.ok(restored);
+    const lastAt = Math.max(...lines.map((line) => Date.parse((line as { timestamp: string }).timestamp)));
+    lines.push(
+      {
+        type: 'user',
+        uuid: 'following-prompt',
+        timestamp: new Date(lastAt + 1000).toISOString(),
+        message: { role: 'user', content: 'Continue.' },
+      },
+      {
+        type: 'assistant',
+        uuid: 'following-response',
+        timestamp: new Date(lastAt + 2000).toISOString(),
+        message: {
+          id: 'following-response',
+          model: COLD_ROW.model,
+          content: [{ type: 'text', text: 'Complete.' }],
+          usage: { input_tokens: 2000, cache_read_input_tokens: 18825, output_tokens: 30 },
+        },
+      },
+    );
+    fs.writeFileSync(file, lines.map((line) => JSON.stringify(line)).join('\n') + '\n');
+    const resumed = indexSpendFile(restored, file, 'w', reducer, 2, {
+      maxMilliseconds: Infinity,
+    }).record;
+    const whole = indexSpendFile(undefined, file, 'w', reducer, 2, {
+      maxMilliseconds: Infinity,
+    }).record;
+    assert.deepEqual(resumed.lifetimeBuckets, whole.lifetimeBuckets);
+    const estimates = resumed.lifetimeBuckets!.filter((bucket) => bucket.compactionEstimate);
+    assert.equal(
+      estimates.reduce((sum, bucket) => sum + bucket.requests, 0),
+      1,
+    );
+    assert.equal(estimates[0].usage.cacheRead, 0);
+    assert.equal(estimates[0].usage.cacheWrite1h, 18825);
+    const [compaction] = readSession(file, 'session').compactions;
+    assert.equal(compaction.postCompactionCacheRead, 18825);
+    const dollars = publicProjectSpendPrice(estimates[0])!.dollars;
+    assert.equal(
+      toCompactionCard(compaction).chips.find((chip) => chip.metric === 'cost')?.label,
+      `$${dollars.toFixed(2)}`,
+    );
+  });

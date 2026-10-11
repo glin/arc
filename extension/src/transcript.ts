@@ -58,9 +58,11 @@ import {
 import { withoutRichContent } from './richtext';
 import {
   compactionEstimate,
+  cacheLapsedBy,
   contextBandForRequest,
   requestInputTokens,
   type CompactionPreviousRequest,
+  type CompactionEstimateInput,
 } from './pricing';
 import { activityDetail, ActivityDetailFormat, ActivityDetailPolicy, describeToolInput } from './activitydetail';
 import { shortenTo } from './domain/text.ts';
@@ -305,6 +307,7 @@ export interface TurnUsagePart {
   linkedInvocationId?: string | null;
   // An estimated compaction request, which the transcript recorded no usage for.
   compactionEstimate?: true;
+  compactionUsage?: true;
   usage: TurnUsage;
 }
 
@@ -320,7 +323,8 @@ function samePricedPart(part: TurnUsagePart, event: UsageEvent | TurnUsagePart):
     part.incomplete === event.incomplete &&
     part.requestCountExact === event.requestCountExact &&
     part.linkedInvocationId === event.linkedInvocationId &&
-    part.compactionEstimate === event.compactionEstimate
+    part.compactionEstimate === event.compactionEstimate &&
+    part.compactionUsage === event.compactionUsage
   );
 }
 
@@ -346,6 +350,8 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
   const same = parts.find((part) => samePricedPart(part, event));
   if (same) {
     addUsage(same.usage, event.usage, event.contextBand);
+    if (Object.values(same.usage).every((value) => typeof value !== 'number' || value === 0))
+      parts.splice(parts.indexOf(same), 1);
     return;
   }
   const usage = { ...event.usage };
@@ -364,6 +370,7 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
     ...(event.requestCountExact === undefined ? {} : { requestCountExact: event.requestCountExact }),
     ...(event.linkedInvocationId === undefined ? {} : { linkedInvocationId: event.linkedInvocationId }),
     ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
+    ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
     usage,
   });
 }
@@ -434,9 +441,11 @@ export interface UsageEvent {
   compactionsBefore?: number;
   usage: TurnUsage;
   requestKey: string;
+  responseId?: string;
   // An estimated compaction request. Claude Code records no usage for one, so the reducer
   // estimates it and marks it here. It is never one of the ordered primary requests.
   compactionEstimate?: true;
+  compactionUsage?: true;
   // The compaction that the estimated request stands for, which the ordered pass measures the
   // next cache-expiry return from.
   compactionSignal?: CompactionSignal;
@@ -462,6 +471,7 @@ export interface ReducerCompaction {
   // The compaction request's own usage, where the record carries it. Codex writes it on the
   // compacted record. Claude writes none, and leaves this null.
   requestUsage: TurnUsage | null;
+  responseId?: string;
   // That request's billing identity. A compacted record does not carry it, and current Codex
   // rollouts supply it in the following settings record, so these are filled from there when
   // one arrives before the compaction's turn closes.
@@ -941,6 +951,8 @@ export interface Compaction {
   summary: string; // the summary that carried over, as markdown
   // Compaction request usage when recorded. Claude records none.
   usage?: TurnUsage;
+  responseId?: string;
+  postCompactionCacheRead?: number | null;
   provider?: string | null;
   contextWindow?: number | null;
   inferenceClass?: UsageInferenceClass;
@@ -950,9 +962,9 @@ export interface Compaction {
   previousRequest?: CompactionPreviousRequest | null;
   // The length of a Claude summary's stored text, counted as `compactSummaryChars` counts it.
   summaryChars?: number;
-  // The cache read of the first request in the Claude transcript, from `claudeFirstRequestCacheRead`.
+  // The cache read plus cache write of the first request in the Claude transcript, from `claudeFirstRequestCachedTokens`.
   // Absent where the head of the file holds no request.
-  firstRequestCacheRead?: number;
+  firstRequestCachedTokens?: number;
 }
 
 // Compaction metadata from a Claude system record.
@@ -7009,9 +7021,10 @@ export interface ClaudeUsageReducerState {
   pendingCompaction?: ClaudePendingCompaction | null;
   // The newest main request, which sizes the next compaction's input.
   lastRequest?: ClaudeLastRequest | null;
-  // The cache read of the first request this transcript billed, set once. A cold compaction
-  // reads back that much, and null means no request has been read yet.
-  firstRequestCacheRead?: number | null;
+  // The cache read plus cache write of the first request this transcript billed, set once. A cold compaction
+  // writes that shared prefix, and null means no request has been read yet.
+  firstRequestCachedTokens?: number | null;
+  pendingCompactionEstimate?: { event: UsageEvent; input: CompactionEstimateInput } | null;
   toolListNames?: string[];
   toolListVersion?: number;
   // How many visible user prompts this transcript has opened. A request emitted while this
@@ -7889,7 +7902,8 @@ export function reduceClaudeUsageRecord(
   const serviceTier = claudeServiceTier(usage);
   const model = typeof message.model === 'string' && message.model ? message.model : null;
   // A request without a recorded cache-write lifetime retains the preceding request's lifetime for compaction estimates.
-  state.firstRequestCacheRead ??= counted.cacheRead;
+  state.firstRequestCachedTokens ??=
+    counted.cacheRead + counted.cacheWrite1h + counted.cacheWrite5m + (counted.cacheWrite30m ?? 0);
   state.lastRequest = {
     tokens: counted.input + counted.cacheRead + counted.cacheWrite1h + counted.cacheWrite5m,
     cacheRead: counted.cacheRead,
@@ -7926,6 +7940,44 @@ export function reduceClaudeUsageRecord(
   };
 }
 
+function claudeCompactionPrefixRead(at: number, lifetime: CacheLifetime | null, request: UsageEvent): number | null {
+  if (request.usage.cacheRead > 0) return request.usage.cacheRead;
+  return lifetime !== null && !cacheLapsedBy(at, lifetime, request.timestamp) ? 0 : null;
+}
+
+function refineClaudeCompactionEstimate(state: ClaudeUsageReducerState, request: UsageEvent): UsageEvent[] {
+  const held = state.pendingCompactionEstimate;
+  if (!held || request.compactionEstimate || request.timestamp < held.event.timestamp) return [];
+  state.pendingCompactionEstimate = null;
+  if (
+    request.compactionsBefore !== held.event.compactionsBefore ||
+    !state.recentCompactions.some(
+      (item) => item.ordinal === held.event.compactionsBefore && item.at === held.event.timestamp,
+    )
+  )
+    return [];
+  const prefix = claudeCompactionPrefixRead(
+    held.event.timestamp,
+    held.input.previousRequest?.lifetime ?? null,
+    request,
+  );
+  if (held.event.compactionSignal) request.compactionSignal = { ...held.event.compactionSignal, prefixTokens: prefix };
+  if (prefix === null) return [];
+  const usage = compactionEstimate({ ...held.input, postCompactionCacheRead: prefix })?.usage;
+  if (!usage) return [];
+  if (Object.entries(usage).every(([key, value]) => value === held.event.usage[key as keyof TurnUsage])) return [];
+  const negative = removalFor(held.event);
+  const positive = {
+    ...held.event,
+    usage,
+    compactionSignal: held.event.compactionSignal
+      ? { ...held.event.compactionSignal, prefixTokens: prefix }
+      : undefined,
+    contextBand: contextBandForRequest(held.event.model, null, requestInputTokens(usage)),
+  };
+  return [negative, positive];
+}
+
 // The estimated request behind a compaction once its summary and its boundary sizes are both
 // read, in either order. Null until then, and null when no earlier request names the model that
 // ran it. Pairing clears both halves, so neither carries into a later compaction.
@@ -7944,20 +7996,21 @@ function claudeCompactionEstimateEvent(state: ClaudeUsageReducerState): UsageEve
   const at = compaction.at;
   // The timeline sizes a compaction from the request before it when the boundary names no
   // context, so the total does the same.
-  const usage = compactionEstimate({
+  const input: CompactionEstimateInput = {
     model: previous.model,
     at,
     durationMs: size.durationMs,
     contextBefore: size.before || previous.tokens,
     contextAfter: size.after,
     previousRequest: previous,
-    firstRequestCacheRead: state.firstRequestCacheRead ?? null,
+    firstRequestCachedTokens: state.firstRequestCachedTokens ?? null,
     summaryChars: compaction.summaryChars ?? null,
-  })?.usage;
+  };
+  const usage = compactionEstimate(input)?.usage;
   if (!usage) {
     return null;
   }
-  return {
+  const event: UsageEvent = {
     timestamp: at > 0 ? at : (previous.at ?? 0),
     agent: 'claude',
     provider: null,
@@ -7971,10 +8024,16 @@ function claudeCompactionEstimateEvent(state: ClaudeUsageReducerState): UsageEve
     visibleTurnId: null,
     compactionsBefore: compaction.ordinal,
     compactionEstimate: true,
-    compactionSignal: { ordinal: compaction.ordinal, at: at > 0 ? at : null, prefixTokens: null },
+    compactionSignal: {
+      ordinal: compaction.ordinal,
+      at: at > 0 ? at : null,
+      prefixTokens: Math.min(previous.tokens, state.firstRequestCachedTokens ?? 0),
+    },
     usage,
     requestKey: `claude-compaction:${compaction.ordinal}`,
   };
+  state.pendingCompactionEstimate = { event, input };
+  return event;
 }
 
 function acceptsClaudeUsageLine(line: string): boolean {
@@ -8133,7 +8192,10 @@ export function createClaudeUsageLineReducer(
               ? { pendingCompaction: copyPendingCompaction(restored.pendingCompaction) }
               : {}),
             lastRequest: restored.lastRequest ? { ...restored.lastRequest } : null,
-            firstRequestCacheRead: restored.firstRequestCacheRead ?? null,
+            firstRequestCachedTokens: restored.firstRequestCachedTokens ?? null,
+            pendingCompactionEstimate: restored.pendingCompactionEstimate
+              ? cloneParserState(restored.pendingCompactionEstimate)
+              : null,
             ...(restored.modelProfile ? { modelProfile: restored.modelProfile } : {}),
             visibleTurns: restored.visibleTurns ?? 0,
             firstTurnAt: restored.firstTurnAt ?? null,
@@ -8182,13 +8244,17 @@ export function createClaudeUsageLineReducer(
       }
       if (!event || !opts.childTranscript || !event.requestKey) {
         if (event) noteClaudeCostEvent(state.costState, event);
-        return event ? [event] : [];
+        const refinements = event ? refineClaudeCompactionEstimate(state, event) : [];
+        for (const refinement of refinements) noteClaudeCostEvent(state.costState, refinement);
+        return event ? [...refinements, event] : [];
       }
       const events = replaceClaudeUsageEvent(
         state,
         event,
         opts.retainAllRequests ? Number.POSITIVE_INFINITY : RETAINED_REQUESTS,
       );
+      const refinements = events.includes(event) ? refineClaudeCompactionEstimate(state, event) : [];
+      events.unshift(...refinements);
       for (const accepted of events) noteClaudeCostEvent(state.costState, accepted);
       return events;
     },
@@ -8214,7 +8280,10 @@ export function createClaudeUsageLineReducer(
             ...(state.compactionParents?.length ? { compactionParents: [...state.compactionParents] } : {}),
             ...(state.pendingCompaction ? { pendingCompaction: copyPendingCompaction(state.pendingCompaction) } : {}),
             lastRequest: state.lastRequest ? { ...state.lastRequest } : null,
-            firstRequestCacheRead: state.firstRequestCacheRead ?? null,
+            firstRequestCachedTokens: state.firstRequestCachedTokens ?? null,
+            pendingCompactionEstimate: state.pendingCompactionEstimate
+              ? cloneParserState(state.pendingCompactionEstimate)
+              : null,
             ...(state.modelProfile ? { modelProfile: state.modelProfile } : {}),
             visibleTurns: state.visibleTurns,
             firstTurnAt: state.firstTurnAt,
@@ -8549,7 +8618,8 @@ function readClaudeOwnSpend(
       return;
     }
     const message = o.message as { id?: string; model?: string; usage?: ClaudeUsage; content?: unknown } | undefined;
-    reduceClaudeUsageRecord(compactionState, o, compactionOptions);
+    const request = reduceClaudeUsageRecord(compactionState, o, compactionOptions);
+    if (request) estimates.push(...refineClaudeCompactionEstimate(compactionState, request));
     if (failedATurn(o) || message?.model === '<synthetic>') {
       return;
     }
@@ -8703,10 +8773,10 @@ interface FirstRequestRead {
 const firstRequestReads = new Map<string, FirstRequestRead>();
 const FIRST_REQUEST_READS_KEPT = 512;
 
-// First request's cache-read count, scanned with the shared usage reducer.
+// First request's cache read plus cache write, scanned with the shared usage reducer.
 // Reuse an answer while device and inode match and the file has not shrunk.
 // A missing-request answer is read again after growth. Other same-identity rewrites are not detected by these checks.
-export function claudeFirstRequestCacheRead(file: string, childTranscript = false): number | null {
+export function claudeFirstRequestCachedTokens(file: string, childTranscript = false): number | null {
   let stat: fs.Stats;
   try {
     stat = fs.statSync(file);
@@ -8747,28 +8817,28 @@ function scanClaudeFirstRequestCacheRead(file: string, childTranscript: boolean)
       return false;
     }
     reduceClaudeUsageRecord(state, record, opts);
-    return state.firstRequestCacheRead != null;
+    return state.firstRequestCachedTokens != null;
   });
-  return state.firstRequestCacheRead ?? null;
+  return state.firstRequestCachedTokens ?? null;
 }
 
-// Gives each Claude compaction the cache read of its transcript's first request. A tail read
+// Gives each Claude compaction the cache read plus cache write of its transcript's first request. A tail read
 // never sees that request on a large transcript, so the head of the file answers it, as the spend
 // index answers it for the session total. Only a compaction with a request before it asks, and
 // only when it does not carry the answer already.
 export function withClaudeFirstRequest(file: string, compactions: Compaction[], childTranscript = false): void {
   const asking = compactions.filter(
-    (compaction) => compaction.previousRequest && compaction.firstRequestCacheRead === undefined,
+    (compaction) => compaction.previousRequest && compaction.firstRequestCachedTokens === undefined,
   );
   if (!asking.length) {
     return;
   }
-  const read = claudeFirstRequestCacheRead(file, childTranscript);
+  const read = claudeFirstRequestCachedTokens(file, childTranscript);
   if (read === null) {
     return;
   }
   for (const compaction of asking) {
-    compaction.firstRequestCacheRead = read;
+    compaction.firstRequestCachedTokens = read;
   }
 }
 
@@ -9518,7 +9588,8 @@ function chargeHeldClaudeCompaction(state: ClaudeSessionParserState, turn: Sourc
     contextBefore: compaction.contextBefore,
     contextAfter: compaction.contextAfter,
     previousRequest: previous,
-    firstRequestCacheRead: compaction.firstRequestCacheRead ?? state.usageState.firstRequestCacheRead ?? null,
+    firstRequestCachedTokens: compaction.firstRequestCachedTokens ?? state.usageState.firstRequestCachedTokens ?? null,
+    postCompactionCacheRead: compaction.postCompactionCacheRead ?? null,
     summaryChars: compaction.summaryChars ?? null,
   })?.usage;
   if (!usage) {
@@ -10406,6 +10477,18 @@ function reduceClaudeSessionLine(
       if (ids.length > 512) ids.shift();
     }
     const usage = usageEvent.usage;
+    const latestCompaction = state.compactions.at(-1);
+    if (
+      latestCompaction &&
+      latestCompaction.postCompactionCacheRead === undefined &&
+      usageEvent.timestamp >= latestCompaction.at
+    ) {
+      latestCompaction.postCompactionCacheRead = claudeCompactionPrefixRead(
+        latestCompaction.at,
+        latestCompaction.previousRequest?.lifetime ?? null,
+        usageEvent,
+      );
+    }
     cur.contextTokens = usage.input + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m;
     const wrote = message.usage ? claudeCacheLifetime(message.usage) : null;
     if (wrote) {

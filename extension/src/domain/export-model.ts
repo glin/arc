@@ -58,6 +58,7 @@ export interface ExportCostPart {
   incomplete: boolean;
   requestCountExact: boolean;
   estimated: boolean;
+  compactionUsage?: true;
   origin: 'recorded' | 'claude-cost-state';
   usage: ExportUsage;
 }
@@ -174,6 +175,7 @@ export interface ExportCompaction {
     serviceTier: string | null;
   } | null;
   summaryChars: number | null;
+  postCompactionCacheRead?: number | null;
   retainedContext: { tokens: number; window: number | null } | null;
   contextWindow: number | null;
   inferenceClass: 'in-region' | 'geo' | 'global' | 'bedrock-regional' | null | undefined;
@@ -192,7 +194,7 @@ export interface ExportSession {
   pages: string[];
   turnCount: number;
   compactionCount: number;
-  firstRequestCacheRead: number | null;
+  firstRequestCachedTokens: number | null;
   numbers: ExportNumbers;
   parentOutsideExport: boolean;
   provenance: { sourceBytes: number; sha256: string };

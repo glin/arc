@@ -52,7 +52,8 @@ const CLAUDE_STATE_KEYS = {
   compactionParents: true,
   pendingCompaction: true,
   lastRequest: true,
-  firstRequestCacheRead: true,
+  firstRequestCachedTokens: true,
+  pendingCompactionEstimate: true,
   toolListNames: true,
   toolListVersion: true,
   visibleTurns: true,
@@ -115,6 +116,9 @@ const CODEX_STATE_KEYS = {
   recentCompactions: true,
   compactionTurnOrdinals: true,
   pendingCompactionBilling: true,
+  recentResponseUsage: true,
+  recentRequestEvents: true,
+  compactionResponseIds: true,
   firstTurnAt: true,
   lastTurnAt: true,
   currentTurnStartedAt: true,
@@ -350,9 +354,21 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
     !pendingCompaction(value.pendingCompaction, value.compactionCount) ||
     !lastClaudeRequest(value.lastRequest) ||
     !(
-      value.firstRequestCacheRead === undefined ||
-      value.firstRequestCacheRead === null ||
-      nonNegative(value.firstRequestCacheRead)
+      value.pendingCompactionEstimate === undefined ||
+      value.pendingCompactionEstimate === null ||
+      (record(value.pendingCompactionEstimate) &&
+        transcriptUsageEvent(value.pendingCompactionEstimate.event, 'claude') &&
+        record(value.pendingCompactionEstimate.input) &&
+        nullableText(value.pendingCompactionEstimate.input.model) &&
+        timestamp(value.pendingCompactionEstimate.input.at) &&
+        nonNegative(value.pendingCompactionEstimate.input.contextBefore) &&
+        nonNegative(value.pendingCompactionEstimate.input.contextAfter) &&
+        lastClaudeRequest(value.pendingCompactionEstimate.input.previousRequest))
+    ) ||
+    !(
+      value.firstRequestCachedTokens === undefined ||
+      value.firstRequestCachedTokens === null ||
+      nonNegative(value.firstRequestCachedTokens)
     ) ||
     !(
       value.toolListNames === undefined ||
@@ -499,6 +515,24 @@ function codexState(value: unknown): value is CodexUsageReducerState {
     !trueDictionary(value.seenClaudeCommands) ||
     !boundedIdentityList(value.pendingClaudeResultIds) ||
     !dictionary(value.pendingClaudeResults, (item) => transcriptUsageEvent(item, 'claude')) ||
+    !Array.isArray(value.recentResponseUsage) ||
+    value.recentResponseUsage.length > CODEX_USAGE_ASSOCIATION_LIMIT ||
+    !value.recentResponseUsage.every(
+      (item) =>
+        record(item) &&
+        nonEmptyText(item.responseId) &&
+        typeof item.turnId === 'string' &&
+        turnUsage(item.usage) &&
+        (item.matched === undefined || item.matched === true) &&
+        (item.explicitSnapshot === undefined || item.explicitSnapshot === true) &&
+        (item.suppressedSnapshot === undefined || transcriptUsageEvent(item.suppressedSnapshot, 'codex')),
+    ) ||
+    !Array.isArray(value.recentRequestEvents) ||
+    value.recentRequestEvents.length > CODEX_USAGE_ASSOCIATION_LIMIT ||
+    !value.recentRequestEvents.every(
+      (item) => transcriptUsageEvent(item, 'codex') || transcriptUsageEvent(item, 'claude'),
+    ) ||
+    !boundedIdentityList(value.compactionResponseIds) ||
     !nonNegativeInteger(value.closedTurns) ||
     typeof value.currentTurnDidSomething !== 'boolean' ||
     typeof value.currentTurnCompleted !== 'boolean' ||
@@ -568,7 +602,7 @@ function codexState(value: unknown): value is CodexUsageReducerState {
     for (const item of items as TranscriptUsageEvent[]) {
       const eventTurnId =
         item.agent === 'codex'
-          ? /^codex:([^:]+):/.exec(item.requestKey)?.[1]
+          ? (item.visibleTurnId?.replace(/^codex-turn:/, '') ?? /^codex:([^:]+):/.exec(item.requestKey)?.[1])
           : item.visibleTurnId?.replace(/^codex-turn:/, '');
       if (
         eventTurnId !== turnId ||
@@ -613,6 +647,7 @@ interface UsageIdentity {
   incomplete?: boolean;
   requestCountExact?: false;
   compactionEstimate?: true;
+  compactionUsage?: true;
 }
 
 export function projectUsageKey(value: UsageIdentity, date: string): string {
@@ -633,6 +668,7 @@ export function projectUsageKey(value: UsageIdentity, date: string): string {
     value.incomplete === true,
     value.requestCountExact === false,
     value.compactionEstimate === true,
+    Boolean(value.compactionUsage),
     value.usageOrigin ?? null,
   ]);
 }
@@ -663,6 +699,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
     (value.incomplete !== undefined && typeof value.incomplete !== 'boolean') ||
     (value.requestCountExact !== undefined && value.requestCountExact !== false) ||
     (value.compactionEstimate !== undefined && value.compactionEstimate !== true) ||
+    (value.compactionUsage !== undefined && !value.compactionUsage) ||
     (value.usageOrigin !== undefined && value.usageOrigin !== 'claude-cost-state') ||
     (value.usageOrigin === 'claude-cost-state' &&
       (value.requests !== 0 ||
@@ -693,6 +730,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
     ...(value.incomplete === undefined ? {} : { incomplete: value.incomplete }),
     ...(value.requestCountExact === false ? { requestCountExact: false as const } : {}),
     ...(value.compactionEstimate === true ? { compactionEstimate: true as const } : {}),
+    ...(value.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(value.usageOrigin === 'claude-cost-state' ? { usageOrigin: 'claude-cost-state' as const } : {}),
     usage: {
       requests: value.usage.requests,
@@ -760,7 +798,7 @@ function pendingCompactionBilling(value: unknown, compactionCount: unknown, comp
     return false;
   }
   const held = compactions.find((item) => record(item) && item.ordinal === value);
-  return record(held) && held.requestUsage !== null;
+  return record(held) && (held.requestUsage !== null || nonEmptyText(held.responseId));
 }
 
 function cacheTier(value: unknown): value is '5m' | '30m' | '1h' {

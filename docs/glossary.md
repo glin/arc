@@ -95,7 +95,7 @@ The panel has a session list beside one selected session view. Use the region na
 | **Included above** | The group in a cost detail that names overheads the total already counts: compactions and cache expiries. | Its rows are part of the total and are never added to it again. Each row leads with its count, and its value is money. |
 | **Cached-input share** | The share of recorded input tokens served from the prompt cache. | State the denominator in UI copy, for example **input tokens from cache**. Do not confuse it with the share of cost attributed to cached reads. |
 | **Next-turn starting price** | The estimated minimum price of the next request's existing context before new prompt text or output. | Its cached and uncached bounds depend on what the record can establish about cache reuse. Never say **floor** to the reader. |
-| **Estimated total** | A list-price estimate for supported recorded usage, Claude compaction estimates, and supported supplemental Claude usage. | It is not an invoice. A partial total is a lower bound. |
+| **Estimated total** | A list-price estimate for supported recorded usage, Claude compaction estimates, identified Codex compaction usage, and supported supplemental Claude usage. | It is not an invoice. A partial total is a lower bound. |
 
 ## Code alignment
 

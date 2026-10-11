@@ -709,7 +709,7 @@ export interface NextTurnFloor {
 
 // Claude compaction estimates resend the previous main request's context plus an uncached summary instruction.
 // Warm estimates retain the previous cache-read count and repeat cache writes at the five-minute tier.
-// Cold estimates read the first request's cached prefix and send the remaining context uncached.
+// Cold estimates write the shared prefix and send the remaining context uncached.
 // Stored summary text supplies an output estimate. The character ratio includes discarded analysis output.
 export const CLAUDE_COMPACTION_INSTRUCTION_TOKENS = 2_000;
 export const CLAUDE_COMPACTION_SUMMARY_CHARS_PER_TOKEN = 2.2;
@@ -718,12 +718,13 @@ export const CLAUDE_COMPACTION_SUMMARY_CHARS_PER_TOKEN = 2.2;
 function claudeCompactionInput(
   previous: Pick<CompactionPreviousRequest, 'tokens' | 'cacheRead' | 'cacheWrite'>,
   cold: boolean,
-  firstRequestCacheRead: number | null,
+  prefixTokens: number | null,
+  lifetime: CacheTier | null,
 ): Partial<TurnUsage> {
   if (cold) {
-    const prefix = firstRequestCacheRead ?? 0;
+    const prefix = Math.min(previous.tokens, Math.max(0, prefixTokens ?? 0));
     return {
-      cacheRead: prefix,
+      ...writeCounts(lifetime ?? '1h', prefix),
       input: Math.max(0, previous.tokens + CLAUDE_COMPACTION_INSTRUCTION_TOKENS - prefix),
     };
   }
@@ -1117,8 +1118,10 @@ export interface CompactionEstimateInput {
   contextBefore: number;
   contextAfter: number;
   previousRequest?: CompactionPreviousRequest | null;
-  // The cache read of the first request in the same transcript, or null where none is known.
-  firstRequestCacheRead?: number | null;
+  // The cache read plus cache write of the first request, or null where none is known.
+  firstRequestCachedTokens?: number | null;
+  // The first request after compaction reads the prefix the compaction wrote.
+  postCompactionCacheRead?: number | null;
   // The length of the stored summary text in characters, preamble included, or null where no
   // summary was paired with the record.
   summaryChars?: number | null;
@@ -1138,7 +1141,7 @@ export function cacheLapsedBy(requestAt: number | null, lifetime: CacheTier | nu
 }
 
 // Warm estimates repeat prior cache reads and five-minute writes, with the instruction sent uncached.
-// Cold estimates read the first request's cached prefix and send the rest uncached.
+// Cold estimates write the shared prefix and send the rest uncached.
 // Read estimates price non-modern-Claude context as cached input.
 export type CompactionEstimateBasis = 'warm' | 'cold' | 'read';
 
@@ -1168,7 +1171,12 @@ export function compactionEstimate(estimate: CompactionEstimateInput): Compactio
   return {
     usage: {
       ...NO_USAGE,
-      ...claudeCompactionInput(previous ?? { tokens: contextBefore }, cold, estimate.firstRequestCacheRead ?? null),
+      ...claudeCompactionInput(
+        previous ?? { tokens: contextBefore },
+        cold,
+        estimate.postCompactionCacheRead ?? estimate.firstRequestCachedTokens ?? null,
+        previous?.lifetime ?? null,
+      ),
       output: summaryChars > 0 ? Math.round(summaryChars / CLAUDE_COMPACTION_SUMMARY_CHARS_PER_TOKEN) : contextAfter,
     },
     basis: cold ? 'cold' : 'warm',

@@ -452,7 +452,7 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
         compactions: merged.completedCompactions(),
         openRange,
         ...(opts.captureSessionText
-          ? { firstRequestCacheRead: snapshot.usageState.firstRequestCacheRead ?? null }
+          ? { firstRequestCachedTokens: snapshot.usageState.firstRequestCachedTokens ?? null }
           : {}),
         ...(opts.captureSessionText
           ? { unfinished: unfinished && openRange ? { turn: unfinished, ...openRange } : null }

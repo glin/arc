@@ -15,6 +15,10 @@ import { ExportCancelled, ExportTransaction, withExportTransaction } from './exp
 import { ExportLimitError } from './exportlimits.ts';
 import { projectSessionSite } from './exportsite.ts';
 import type { SiteManifest } from './webview/export-model.ts';
+import type { SessionStatChip } from './turncard.ts';
+import { readCodexSession } from './codex.ts';
+import { toCard } from './turncard.ts';
+import { formatCost } from './pricing.ts';
 const CODEX_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
@@ -544,7 +548,7 @@ for (const agent of ['claude', 'codex'] as const) {
         asks.map((_ask, index) => `later ${index}`),
       );
       assert.equal(captured.model.sessions[0].turnCount, 3);
-      if (agent === 'claude') assert.equal(captured.model.sessions[0].firstRequestCacheRead, 30);
+      if (agent === 'claude') assert.equal(captured.model.sessions[0].firstRequestCachedTokens, 30);
       assert.ok(captured.model.sessions[0].numbers.parts.length > 0);
     });
     assert.deepEqual(fs.readdirSync(f.output), []);
@@ -671,6 +675,165 @@ test('distinct paired launches to one session retain their relationships without
       1,
     );
   });
+});
+
+test('recorded Codex compactions retain priced overhead and request averages through export', async () => {
+  for (const input of [1000, 100_000]) {
+    for (const identified of [true, false]) {
+      const f = fixture();
+      const records = codexTurn('parent');
+      records.splice(
+        records.length - 1,
+        0,
+        record('compacted', 1, {
+          payload: {
+            latest_token_usage_record: {
+              ...(identified ? { response_id: 'compact' } : {}),
+              usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: 0, total_tokens: input },
+            },
+          },
+        }),
+        record('event_msg', 1, {
+          payload: {
+            type: 'thread_settings_applied',
+            thread_settings: { model: 'gpt-5.4', model_provider_id: 'openai' },
+          },
+        }),
+      );
+      const root = f.codexSession(CODEX_ID, undefined, records);
+      const live = toCard(readCodexSession(root, CODEX_ID).turns[0], false, f.options.capturedAt).chips.find(
+        (stat) => stat.metric === 'cost',
+      )!;
+      const result = await withExportTransaction(f.output, (writer) =>
+        completeSessionExport(
+          writer,
+          { ...f.options, root: { ...f.options.root, agent: 'codex', file: root, sessionId: CODEX_ID } },
+          (capture, transaction) => projectSessionSite(capture.model, transaction, { script: '', stylesheet: '' }),
+        ),
+      );
+      const { manifest, data } = exportedSiteData(result.directory);
+      const session = manifest.sessions.find((value) => value.key === manifest.root)!;
+      const sessionCost = manifest.stats[manifest.root].find(
+        (stat) => stat.metric === 'cost',
+      )! as unknown as SessionStatChip;
+      const card = [...data.values()]
+        .map((value) => value as { card?: import('./webview/payload-contracts').CardView })
+        .find((value) => value.card?.kind === 'turn')!.card!;
+      const turnCost = card.chips!.find((stat) => stat.metric === 'cost')!;
+      assert.equal(session.numbers.combined.partial, !identified);
+      assert.equal(turnCost.label, live.label);
+      assert.equal(turnCost.detail, live.detail);
+      for (const cost of [sessionCost]) {
+        assert.equal(
+          cost.detailList!.entries.find((entry) => entry.label === '1 compaction')?.value,
+          identified ? formatCost((input * 2.5) / 1_000_000) : 'cost unavailable',
+        );
+        if (identified) {
+          assert.match(JSON.stringify(cost.detailList), /"requestScale":\[1,100\]/);
+          assert.doesNotMatch(cost.detail, /usage.*incomplete|may be low/i);
+        } else {
+          assert.match(cost.detail, /usage.*incomplete|may be low/i);
+        }
+      }
+      if (identified) {
+        const recorded = session.numbers.parts.find((part) => part.compactionUsage)!;
+        assert.equal(recorded.estimated, false);
+        assert.equal(recorded.usage.requests, 1);
+      }
+    }
+  }
+});
+
+test('linked Claude command dollars stay exact through exported session and turn totals', async () => {
+  for (const provisional of [false, true]) {
+    const f = fixture();
+    const records = codexTurn('parent').filter(
+      (item) => provisional || (item as { payload?: { type?: string } }).payload?.type !== 'token_count',
+    );
+    if (provisional)
+      records.splice(
+        records.length - 1,
+        0,
+        record('compacted', 1, {
+          payload: {
+            latest_token_usage_record: {
+              usage: { input_tokens: 3000, cached_input_tokens: 2000, output_tokens: 30, total_tokens: 3030 },
+            },
+          },
+        }),
+        record('event_msg', 1, {
+          payload: {
+            type: 'thread_settings_applied',
+            thread_settings: { model: 'gpt-5.4', model_provider_id: 'openai' },
+          },
+        }),
+      );
+    records.splice(
+      records.length - 1,
+      0,
+      record('event_msg', 1, {
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            id: 'linked-claude',
+            command: ['claude', '-p', 'Read the recorded accounting.', '--output-format', 'json'],
+            parsed_cmd: [{ type: 'unknown', cmd: 'claude -p review --output-format json' }],
+            status: 'completed',
+            exit_code: 0,
+            stdout: JSON.stringify({
+              type: 'result',
+              session_id: 'cccccccc-3333-4333-8333-333333333333',
+              total_cost_usd: 3.25,
+              duration_ms: 100,
+              is_error: false,
+              modelUsage: {
+                'claude-opus-5': {
+                  inputTokens: 20,
+                  outputTokens: 40,
+                  cacheReadInputTokens: 300,
+                  cacheCreationInputTokens: 0,
+                  thinkingTokens: 0,
+                  costUSD: 3.25,
+                  contextWindow: 1_000_000,
+                  canonicalModel: 'claude-opus-5',
+                  costBasis: 'list',
+                },
+              },
+            }),
+          },
+        },
+      }),
+    );
+    const root = f.codexSession(CODEX_ID, undefined, records);
+    const result = await withExportTransaction(f.output, (writer) =>
+      completeSessionExport(
+        writer,
+        { ...f.options, root: { ...f.options.root, agent: 'codex', file: root, sessionId: CODEX_ID } },
+        (capture, transaction) => projectSessionSite(capture.model, transaction, { script: '', stylesheet: '' }),
+      ),
+    );
+    const { manifest, data } = exportedSiteData(result.directory);
+    const session = manifest.sessions.find((session) => session.key === manifest.root)!;
+    const cost = manifest.stats[manifest.root].find((stat) => stat.metric === 'cost')! as unknown as SessionStatChip;
+    const card = [...data.values()]
+      .map((value) => value as { card?: import('./webview/payload-contracts').CardView })
+      .find((value) => value.card?.agents?.some((agent) => agent.description === 'Claude CLI'))!.card!;
+    const turnCost = card.chips!.find((stat) => stat.metric === 'cost')!;
+    const linked = session.numbers.parts.find((part) => part.recordedCost === 3.25)!;
+    assert.equal(linked.requestCountExact, false);
+    assert.equal(session.numbers.combined.partial, provisional);
+    assert.equal(cost.label, provisional ? '$3.25+' : '$3.25');
+    assert.equal(turnCost.label, provisional ? '$3.25+' : '$3.25');
+    if (provisional) {
+      assert.ok(session.numbers.combined.dollars! > 3.25);
+      assert.match(cost.detail, /usage.*incomplete|may be low/i);
+    } else {
+      assert.equal(session.numbers.combined.dollars, 3.25);
+      assert.doesNotMatch(cost.detail, /usage.*incomplete|may be low/i);
+      assert.doesNotMatch(String(turnCost.detail), /usage.*incomplete|may be low/i);
+    }
+  }
 });
 
 test('missing native records retain each relationship and an explicit partial reason', async () => {

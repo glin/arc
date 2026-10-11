@@ -1,3 +1,4 @@
+import { sessionCostProjection, sessionCostUsageOf } from './turncard';
 import { revisionOf } from './transcript';
 // extension/src/codex.test.ts
 import { test, vi } from 'vitest';
@@ -4591,7 +4592,10 @@ test('a request the service refused is what the turn failed on', () => {
   records[records.length - 1] = event('task_complete', 8, {
     turn_id: TURN,
     last_agent_message: '',
-    error: { message: 'You’ve hit your usage limit.\nTry again later.', codex_error_info: 'usage_limit_exceeded' },
+    error: {
+      message: 'You’ve hit your usage limit.\nTry again later.',
+      codex_error_info: 'usage_limit_exceeded',
+    },
   });
   const { turns } = readCodexSession(writeRollout(records), 'sess');
   // Recorded as an object rather than as text, so reading the field straight across would
@@ -15897,3 +15901,716 @@ for (const [child, count, expected] of [
     assert.ok(Math.abs(publicProjectSpendPrice(rebuilt.record.buckets[0])!.dollars - expected) < 1e-10);
   });
 }
+
+test('Codex compaction billing enters session and turn totals once across response arrival and restore', () => {
+  const exact = usage({
+    input_tokens: 183791,
+    cached_input_tokens: 174336,
+    output_tokens: 4443,
+    reasoning_output_tokens: 0,
+  });
+  const response = {
+    thread_id: '01a032c9-1a92-7931-845c-723117d24dbe',
+    turn_id: TURN,
+    response_id: 'compaction-response',
+    usage: exact,
+  };
+  const native = { type: 'token_usage_record', timestamp: at(8), payload: response };
+  const compacted = {
+    type: 'compacted',
+    timestamp: at(9),
+    payload: {
+      latest_token_usage_record: response,
+      compaction_response_id: response.response_id,
+      replacement_history: [],
+    },
+  };
+  const count = tokens(8, exact);
+  const settings = event('thread_settings_applied', 10, {
+    thread_settings: { model: 'gpt-5.6-sol', model_provider_id: 'openai', service_tier: 'standard' },
+  });
+  for (const order of [
+    [native, compacted, settings],
+    [native, count, compacted, settings],
+    [compacted, native, settings, count],
+    [count, native, compacted, settings],
+    [compacted, settings, count, native],
+    [count, compacted, settings, native],
+  ]) {
+    const records = [
+      ...ordinaryTurn().slice(0, 8),
+      ...order,
+      tokens(11, { input_tokens: 30000, cached_input_tokens: 12000, output_tokens: 25 }),
+      event('task_complete', 12, { turn_id: TURN, last_agent_message: 'Complete.' }),
+    ];
+    const file = writeRollout(records);
+    const record = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+      maxMilliseconds: Infinity,
+    }).record;
+    const compactBuckets = record.lifetimeBuckets!.filter((bucket) => bucket.compactionUsage);
+    assert.equal(
+      compactBuckets.reduce((sum, bucket) => sum + bucket.requests, 0),
+      1,
+    );
+    assert.equal(
+      record.lifetimeBuckets!.reduce((sum, bucket) => sum + bucket.requests, 0),
+      3,
+    );
+    const cost = publicProjectSpendPrice(compactBuckets[0])!.dollars;
+    assert.ok(cost !== null && cost > 0);
+    const projection = sessionCostProjection(
+      record.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' })),
+      false,
+      { compactionCount: 1 },
+    );
+    assert.ok(
+      projection.stats[0].detailList?.entries.some(
+        (entry) => entry.label === '1 compaction' && entry.value === `$${cost.toFixed(2)}`,
+      ),
+    );
+    const read = readCodexSession(file, 'session');
+    assert.equal(read.compactions[0].responseId, response.response_id);
+    const turn = read.turns[0];
+    assert.equal(turn.usage.requests, 2);
+    assert.ok(costDetail(turn).join(' ').includes('1 compaction'));
+    const expected = record.lifetimeBuckets!.reduce(
+      (sum, bucket) => sum + (publicProjectSpendPrice(bucket)?.dollars ?? 0),
+      0,
+    );
+    assert.ok(Math.abs(turnCost(turn).dollars! - expected) < 1e-9);
+    for (let seam = 1; seam < records.length; seam++) {
+      const initial = createCodexUsageLineReducer();
+      const events = records.slice(0, seam).flatMap((row) => initial.pushLine(JSON.stringify(row)));
+      const partialFile = writeRollout(records.slice(0, seam));
+      const partial = indexSpendFile(undefined, partialFile, 'workspace', createCodexUsageLineReducer, 1, {
+        maxMilliseconds: Infinity,
+      }).record;
+      const storage = tempDir('compaction-seam-');
+      saveSpendLedger(storage, 'workspace', [partial]);
+      assert.equal(loadSpendLedger(storage, 'workspace').files.length, 1, `disk restore at ${seam}`);
+      const resumed = createCodexUsageLineReducer(initial.snapshot());
+      events.push(...records.slice(seam).flatMap((row) => resumed.pushLine(JSON.stringify(row))));
+      const totals = events.reduce((sum, event) => sum + (event.usage.requests ?? 1), 0);
+      assert.equal(totals, 3, `restore at ${seam}`);
+    }
+    const folder = tempDir('compaction-ledger-');
+    saveSpendLedger(folder, 'workspace', [record]);
+    assert.equal(
+      (loadSpendLedger(folder, 'workspace').files[0].parserState as ReturnType<typeof emptyCodexUsageReducerState>)
+        .recentRequestEvents.length,
+      (record.parserState as ReturnType<typeof emptyCodexUsageReducerState>).recentRequestEvents.length,
+    );
+  }
+});
+
+test('Codex delayed-model compaction and identical ordinary counters bill each operation once', () => {
+  const exact = usage({ input_tokens: 183791, cached_input_tokens: 174336, output_tokens: 4443 });
+  const native = (id: string, second: number) => ({
+    type: 'token_usage_record',
+    timestamp: at(second),
+    payload: { response_id: id, turn_id: TURN, usage: exact },
+  });
+  const compacted = {
+    type: 'compacted',
+    timestamp: at(10),
+    payload: { latest_token_usage_record: { response_id: 'compact', usage: exact } },
+  };
+  const settings = event('thread_settings_applied', 12, {
+    thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' },
+  });
+  const context = { type: 'turn_context', timestamp: at(11), payload: { turn_id: TURN, model: 'gpt-5.6-sol' } };
+  const distinct = event('token_count', 14, {
+    info: {
+      last_token_usage: exact,
+      total_token_usage: usage({ input_tokens: 367582, cached_input_tokens: 348672, output_tokens: 8886 }),
+    },
+  });
+  for (const order of [
+    [tokens(9, exact), compacted, context, settings, native('compact', 13), distinct, native('ordinary', 15)],
+    [compacted, settings, native('compact', 13), distinct, native('ordinary', 15), context],
+    [compacted, settings, native('compact', 13), distinct, context, native('ordinary', 15)],
+  ]) {
+    const records = [
+      ...ordinaryTurn()
+        .slice(0, 8)
+        .filter((row) => (row as { type: string }).type !== 'turn_context'),
+      ...order,
+      event('task_complete', 16, { turn_id: TURN }),
+    ];
+    const file = writeRollout(records);
+    const record = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+      maxMilliseconds: Infinity,
+    }).record;
+    assert.equal(
+      record.lifetimeBuckets!.reduce((sum, bucket) => sum + bucket.requests, 0),
+      3,
+    );
+    assert.equal(
+      record
+        .lifetimeBuckets!.filter((bucket) => bucket.compactionUsage)
+        .reduce((sum, bucket) => sum + bucket.requests, 0),
+      1,
+    );
+    const turn = readCodexSession(file, 'session').turns[0];
+    assert.equal(turn.usage.requests, 2);
+    const dollars = record.lifetimeBuckets!.reduce(
+      (sum, bucket) => sum + (publicProjectSpendPrice(bucket)?.dollars ?? 0),
+      0,
+    );
+    assert.ok(Math.abs(turnCost(turn).dollars! - dollars) < 1e-9);
+    assert.equal(turnCost(turn).partial, true);
+  }
+});
+
+for (const delayedModel of [false, true]) {
+  for (const ordinaryBefore of [false, true]) {
+    for (const separateNative of ['absent', 'before', 'after']) {
+      test(`Codex ordinary usage survives a compaction without a snapshot (${delayedModel ? 'pending' : 'emitted'}, ordinary ${ordinaryBefore ? 'before' : 'after'}, native compaction ${separateNative})`, () => {
+        const exact = usage({ input_tokens: 183791, cached_input_tokens: 174336, output_tokens: 4443 });
+        const native = (id: string, second: number) => ({
+          type: 'token_usage_record',
+          timestamp: at(second),
+          payload: { response_id: id, turn_id: TURN, usage: exact },
+        });
+        const context = turnContext(delayedModel ? 10 : 2, TURN, 'gpt-5.6-sol', 'high');
+        const records = [
+          meta(),
+          event('task_started', 1, { turn_id: TURN, model_context_window: 258400 }),
+          ...(!delayedModel ? [context] : []),
+          event('user_message', 3, { message: 'Keep both request costs.' }),
+          tokens(4, exact),
+          ...(ordinaryBefore ? [native('ordinary', 5)] : []),
+          ...(separateNative === 'before' ? [native('compact', 5)] : []),
+          {
+            type: 'compacted',
+            timestamp: at(6),
+            payload: { latest_token_usage_record: { response_id: 'compact', usage: exact } },
+          },
+          event('thread_settings_applied', 7, {
+            thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' },
+          }),
+          ...(separateNative === 'after' ? [native('compact', 8)] : []),
+          ...(!ordinaryBefore ? [native('ordinary', 9)] : []),
+          ...(delayedModel ? [context] : []),
+          event('task_complete', 11, { turn_id: TURN, last_agent_message: 'Both requests completed.' }),
+        ];
+        for (let seam = 1; seam <= records.length; seam++) {
+          const file = writeRollout(records.slice(0, seam));
+          const partial = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+            maxMilliseconds: Infinity,
+          }).record;
+          const storage = tempDir('compaction-collision-seam-');
+          saveSpendLedger(storage, 'workspace', [partial]);
+          const saved = loadSpendLedger(storage, 'workspace').files;
+          assert.equal(saved.length, 1, `disk restore at ${seam}`);
+          if (seam < records.length) {
+            fs.appendFileSync(
+              file,
+              `${records
+                .slice(seam)
+                .map((row) => JSON.stringify(row))
+                .join('\n')}\n`,
+            );
+          }
+          const record = indexSpendFile(saved[0], file, 'workspace', createCodexUsageLineReducer, 2, {
+            maxMilliseconds: Infinity,
+          }).record;
+          for (const buckets of [record.buckets, record.lifetimeBuckets!]) {
+            const ordinary = buckets.filter((bucket) => !bucket.compactionUsage);
+            const compactions = buckets.filter((bucket) => bucket.compactionUsage);
+            assert.equal(
+              ordinary.reduce((sum, bucket) => sum + bucket.requests, 0),
+              1,
+              `ordinary at ${seam}`,
+            );
+            assert.equal(
+              compactions.reduce((sum, bucket) => sum + bucket.requests, 0),
+              1,
+              `compaction at ${seam}`,
+            );
+            assert.equal(
+              ordinary.reduce((sum, bucket) => sum + bucket.usage.input, 0),
+              9455,
+            );
+            assert.equal(
+              ordinary.reduce((sum, bucket) => sum + bucket.usage.cacheRead, 0),
+              174336,
+            );
+            assert.equal(
+              ordinary.reduce((sum, bucket) => sum + bucket.usage.output, 0),
+              4443,
+            );
+            assert.equal(ordinary[0].model, 'gpt-5.6-sol');
+            assert.equal(compactions[0].model, 'gpt-6-astra');
+          }
+          const lifetimeCost = record.lifetimeBuckets!.reduce(
+            (sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars,
+            0,
+          );
+          const datedCost = record.buckets.reduce((sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars, 0);
+          const projection = sessionCostProjection(
+            record.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' })),
+            false,
+            { compactionCount: 1 },
+          );
+          const turn = readCodexSession(file, 'session').turns[0];
+          assert.equal(turn.usage.requests, 1);
+          assert.equal(turn.usage.input, 9455);
+          assert.equal(turn.usage.cacheRead, 174336);
+          assert.equal(turn.usage.output, 4443);
+          assert.ok(Math.abs(datedCost - lifetimeCost) < 1e-9);
+          assert.ok(Math.abs(projection.total.dollars! - lifetimeCost) < 1e-9);
+          assert.ok(Math.abs(turnCost(turn).dollars! - lifetimeCost) < 1e-9);
+          assert.equal(projection.total.partial, !ordinaryBefore);
+          assert.equal(turnCost(turn).partial, !ordinaryBefore);
+        }
+      });
+    }
+  }
+}
+
+test('Codex compaction checkpoints retain turnless joins and pending response keys on disk', () => {
+  for (const turnless of [false, true]) {
+    const records = turnless ? ordinaryTurn().slice(0, 1) : ordinaryTurn().slice(0, 8);
+    records.push({
+      type: 'compacted',
+      timestamp: at(9),
+      payload: {
+        latest_token_usage_record: { response_id: 'compact', usage: usage({ input_tokens: 3000, output_tokens: 30 }) },
+      },
+    });
+    const file = writeRollout(records);
+    const indexed = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+      maxMilliseconds: Infinity,
+    }).record;
+    const state = indexed.parserState as ReturnType<typeof emptyCodexUsageReducerState>;
+    if (!turnless) {
+      const held = state.recentRequestEvents.find((event) => event.compactionUsage)!;
+      state.pendingRequests[TURN] = [held];
+      state.pendingRequestKeys = [held.requestKey];
+    }
+    const storage = tempDir('compaction-pending-');
+    saveSpendLedger(storage, 'workspace', [indexed]);
+    assert.equal(loadSpendLedger(storage, 'workspace').files.length, 1);
+  }
+});
+
+test('Codex compaction usage without settings or response identity keeps cost incomplete', () => {
+  for (const normalUsage of [true, false]) {
+    const records = ordinaryTurn()
+      .slice(0, 8)
+      .filter((record) => normalUsage || (record as { payload?: { type?: string } }).payload?.type !== 'token_count');
+    records.push({
+      type: 'compacted',
+      timestamp: at(9),
+      payload: {
+        latest_token_usage_record: {
+          usage: usage({ input_tokens: 3000, cached_input_tokens: 2000, output_tokens: 30 }),
+        },
+      },
+    });
+    records.push(
+      event('thread_settings_applied', 10, { thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' } }),
+    );
+    const file = writeRollout(records);
+    const indexed = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+      maxMilliseconds: Infinity,
+    }).record;
+    const parts = indexed.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+    const projection = sessionCostProjection(parts, false, { compactionCount: 1 });
+    assert.equal(
+      projection.stats[0]?.detailList?.entries.find((entry) => entry.label === '1 compaction')?.value,
+      normalUsage ? 'cost unavailable' : undefined,
+    );
+    assert.equal(projection.total.partial, true);
+    const read = readCodexSession(file, 'session');
+    assert.ok(toCompactionCard(read.compactions[0]).chips.some((chip) => chip.label.startsWith('$')));
+    if (normalUsage) {
+      assert.equal(
+        toCard(read.turns[0], false, Date.parse(at(11)))
+          .chips.find((chip) => chip.metric === 'cost')
+          ?.detailList?.entries.find((entry) => entry.label === '1 compaction')?.value,
+        'cost unavailable',
+      );
+    }
+  }
+  for (const ending of [null, 'task_complete', 'turn_aborted']) {
+    for (const identified of [true, false]) {
+      const records = [
+        ...ordinaryTurn().slice(0, 8),
+        {
+          type: 'compacted',
+          timestamp: at(9),
+          payload: {
+            latest_token_usage_record: {
+              ...(identified ? { response_id: 'compact' } : {}),
+              usage: usage({ input_tokens: 3000, output_tokens: 30 }),
+            },
+          },
+        },
+      ];
+      if (ending) records.push(event(ending, 10, { turn_id: TURN }));
+      const file = writeRollout(records);
+      const indexed = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+        maxMilliseconds: Infinity,
+      }).record;
+      const parts = indexed.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+      assert.equal(sessionCostProjection(parts, false, { compactionCount: 1 }).total.partial, true);
+      assert.equal(turnCost(readCodexSession(file, 'session').turns[0]).partial, true);
+    }
+  }
+});
+
+test('a delayed copied-turn date retracts identified Codex compaction billing after restore', () => {
+  const response = {
+    response_id: 'copied-compaction',
+    usage: usage({ input_tokens: 183791, cached_input_tokens: 174336, output_tokens: 4443 }),
+  };
+  const records = [
+    ...ordinaryTurn().slice(0, 8),
+    { type: 'compacted', timestamp: at(9), payload: { latest_token_usage_record: response } },
+    event('thread_settings_applied', 10, { thread_settings: { model: 'gpt-5.6-sol', model_provider_id: 'openai' } }),
+  ];
+  const reducer = createCodexUsageLineReducer();
+  const events = records.flatMap((row) => reducer.pushLine(JSON.stringify(row)));
+  assert.equal(
+    events.filter((event) => event.compactionUsage).reduce((sum, event) => sum + (event.usage.requests ?? 1), 0),
+    1,
+  );
+  const resumed = createCodexUsageLineReducer(reducer.snapshot());
+  events.push(
+    ...resumed.pushLine(
+      JSON.stringify({
+        type: 'turn_context',
+        timestamp: at(11),
+        payload: { turn_id: TURN, current_date: '2020-01-01' },
+      }),
+    ),
+  );
+  assert.equal(resumed.compactionCount(), 0);
+  assert.equal(
+    events.reduce((sum, event) => sum + (event.usage.requests ?? 1), 0),
+    0,
+  );
+});
+
+test('Codex provisional compaction associations preserve accounting across every disk seam', () => {
+  const exact = usage({ input_tokens: 183791, cached_input_tokens: 174336, output_tokens: 4443, total_tokens: 188234 });
+  const native = (id: string, second: number) => ({
+    type: 'token_usage_record',
+    timestamp: at(second),
+    payload: { turn_id: TURN, response_id: id, usage: exact },
+  });
+  const count = (second: number, multiple: number, id?: string) =>
+    event('token_count', second, {
+      ...(id ? { response_id: id } : {}),
+      info: {
+        last_token_usage: exact,
+        total_token_usage: Object.fromEntries(Object.entries(exact).map(([key, value]) => [key, value * multiple])),
+      },
+    });
+  for (const pending of [false, true])
+    for (const before of [false, true])
+      for (const separate of ['absent', 'before', 'after'])
+        for (const nativeFirst of [false, true])
+          for (const missingSnapshot of [false, true])
+            for (const lateSettings of [false, true]) {
+              const context = turnContext(2, TURN, 'gpt-5.6-sol', 'high');
+              const records: Array<{ type: string; timestamp: string; payload: Record<string, unknown> }> = [
+                meta(),
+                event('task_started', 1, { turn_id: TURN }),
+                event('user_message', 1, { message: 'Check compaction accounting.' }),
+                ...(!pending ? [context] : []),
+                ...(before ? [count(3, 1)] : []),
+                ...(separate === 'before' ? [native('compact', 4)] : []),
+                {
+                  type: 'compacted',
+                  timestamp: at(5),
+                  payload: { latest_token_usage_record: { response_id: 'compact', usage: exact } },
+                },
+                ...(!before ? [count(6, 1)] : []),
+                event('thread_settings_applied', 7, {
+                  thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' },
+                }),
+                ...(separate === 'after' ? [native('compact', 8)] : []),
+                ...(missingSnapshot
+                  ? [native('ordinary', 9)]
+                  : nativeFirst
+                    ? [native('ordinary', 9), count(10, 2)]
+                    : [count(10, 2), native('ordinary', 9)]),
+                ...(pending ? [context] : []),
+                event('task_complete', 12, { turn_id: TURN }),
+              ];
+              if (lateSettings) {
+                const index = records.findIndex((row) => row.payload.type === 'thread_settings_applied');
+                const [settings] = records.splice(index, 1);
+                records.splice(records.length - 1, 0, settings);
+              }
+              const midnight = new Date(2026, 9, 9, 23, 59, 54).getTime();
+              const dated = records.map((row, index) =>
+                recordedAt(row, new Date(midnight + index * 1000).toISOString()),
+              );
+              const freshFile = writeRollout(dated);
+              const fresh = indexSpendFile(undefined, freshFile, 'workspace', createCodexUsageLineReducer, 1, {
+                maxMilliseconds: Infinity,
+              }).record;
+              const normal = fresh.lifetimeBuckets!.filter((bucket) => !bucket.compactionUsage);
+              const compact = fresh.lifetimeBuckets!.filter((bucket) => bucket.compactionUsage);
+              assert.equal(
+                normal.reduce((sum, bucket) => sum + bucket.requests, 0),
+                1,
+              );
+              assert.equal(
+                normal.reduce((sum, bucket) => sum + bucket.usage.input, 0),
+                9455,
+              );
+              assert.equal(
+                normal.reduce((sum, bucket) => sum + bucket.usage.cacheRead, 0),
+                174336,
+              );
+              assert.equal(
+                normal.reduce((sum, bucket) => sum + bucket.usage.output, 0),
+                4443,
+              );
+              assert.equal(
+                compact.reduce((sum, bucket) => sum + bucket.requests, 0),
+                1,
+              );
+              assert.equal(normal[0].model, 'gpt-5.6-sol');
+              assert.equal(compact[0].model, 'gpt-6-astra');
+              assert.equal(normal[0].requestCountExact, false);
+              const projection = sessionCostProjection(
+                fresh.lifetimeBuckets!.map((bucket) => sessionCostUsageOf({ bucket, role: 'main' })),
+                false,
+                { compactionCount: 1 },
+              );
+              const compactionCost = compact.reduce((sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars, 0);
+              assert.equal(
+                projection.stats[0].detailList?.entries.find((entry) => entry.label === '1 compaction')?.value,
+                `$${compactionCost.toFixed(2)}`,
+              );
+              const turn = readCodexSession(freshFile, 'session').turns[0];
+              const cost = fresh.lifetimeBuckets!.reduce(
+                (sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars,
+                0,
+              );
+              assert.equal(turn.usage.requests, 1);
+              assert.ok(
+                Math.abs(turnCost(turn).dollars! - cost) < 1e-9,
+                JSON.stringify({
+                  pending,
+                  before,
+                  separate,
+                  nativeFirst,
+                  missingSnapshot,
+                  cost,
+                  turnCost: turnCost(turn),
+                  parts: turn.usageParts,
+                }),
+              );
+              assert.equal(turnCost(turn).partial, true);
+              assert.equal(projection.total.partial, true);
+              assert.ok(Math.abs(projection.total.dollars! - cost) < 1e-9);
+              for (let seam = 1; seam <= dated.length; seam++) {
+                const file = writeRollout(dated.slice(0, seam));
+                const partial = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+                  maxMilliseconds: Infinity,
+                }).record;
+                const storage = tempDir('provisional-ledger-');
+                saveSpendLedger(storage, 'workspace', [partial]);
+                const saved = loadSpendLedger(storage, 'workspace').files;
+                assert.equal(saved.length, 1, `disk seam ${seam}`);
+                fs.appendFileSync(
+                  file,
+                  dated
+                    .slice(seam)
+                    .map((row) => JSON.stringify(row) + '\n')
+                    .join(''),
+                );
+                const resumed = indexSpendFile(saved[0], file, 'workspace', createCodexUsageLineReducer, 2, {
+                  maxMilliseconds: Infinity,
+                }).record;
+                assert.deepEqual(resumed.buckets, fresh.buckets, `dated seam ${seam}`);
+                assert.deepEqual(resumed.lifetimeBuckets, fresh.lifetimeBuckets, `lifetime seam ${seam}`);
+                const state = resumed.parserState as ReturnType<typeof emptyCodexUsageReducerState>;
+                assert.deepEqual(state.pendingRequestKeys, []);
+                assert.deepEqual(state.pendingRequestSources, {});
+                assert.deepEqual(state.pendingRequests, {});
+              }
+            }
+});
+
+test('Codex provisional associations preserve distinct equal-counter IDs and explicit compaction evidence', () => {
+  const exact = usage({ input_tokens: 100, cached_input_tokens: 40, output_tokens: 10 });
+  const native = (id: string) => ({
+    type: 'token_usage_record',
+    timestamp: at(6),
+    payload: { turn_id: TURN, response_id: id, usage: exact },
+  });
+  const count = (multiple: number, id?: string) =>
+    event('token_count', 7, {
+      ...(id ? { response_id: id } : {}),
+      info: {
+        last_token_usage: exact,
+        total_token_usage: usage({
+          input_tokens: 100 * multiple,
+          cached_input_tokens: 40 * multiple,
+          output_tokens: 10 * multiple,
+        }),
+      },
+    });
+  for (const explicit of [false, true])
+    for (const nativesFirst of [false, true])
+      for (const copiedAt of [0, 5, 7, 9]) {
+        const start = [
+          meta(),
+          event('task_started', 1, { turn_id: TURN }),
+          turnContext(2, TURN, 'gpt-5.6-sol', 'high'),
+          count(1, explicit ? 'compact' : undefined),
+          {
+            type: 'compacted',
+            timestamp: at(4),
+            payload: { latest_token_usage_record: { response_id: 'compact', usage: exact } },
+          },
+          event('thread_settings_applied', 5, {
+            thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' },
+          }),
+        ];
+        if (explicit) {
+          const identified = createCodexUsageLineReducer();
+          const observed = [...start, native('one'), native('two')].flatMap((row) =>
+            identified.pushLine(JSON.stringify(row)),
+          );
+          assert.equal(
+            observed.filter((row) => !row.compactionUsage).reduce((sum, row) => sum + (row.usage.requests ?? 1), 0),
+            0,
+          );
+        }
+        const ordinary = nativesFirst
+          ? [
+              native('one'),
+              native('two'),
+              count(2, explicit ? 'one' : undefined),
+              count(3, explicit ? 'two' : undefined),
+            ]
+          : [
+              native('one'),
+              count(2, explicit ? 'one' : undefined),
+              native('two'),
+              count(3, explicit ? 'two' : undefined),
+            ];
+        const records: Array<{ type: string; timestamp: string; payload: Record<string, unknown> }> = [
+          ...start,
+          ...ordinary,
+        ];
+        if (copiedAt)
+          records.splice(copiedAt, 0, {
+            type: 'turn_context',
+            timestamp: at(8),
+            payload: { turn_id: TURN, current_date: '2020-01-01' },
+          });
+        const reducer = createCodexUsageLineReducer();
+        const events = records.flatMap((row) => reducer.pushLine(JSON.stringify(row)));
+        assert.equal(
+          events.filter((row) => !row.compactionUsage).reduce((sum, row) => sum + (row.usage.requests ?? 1), 0),
+          copiedAt ? 0 : 2,
+        );
+        assert.equal(
+          events.filter((row) => row.compactionUsage).reduce((sum, row) => sum + (row.usage.requests ?? 1), 0),
+          copiedAt ? 0 : 1,
+        );
+        if (explicit && !copiedAt)
+          assert.equal(reducer.snapshot().recentRequestEvents.filter((row) => !row.compactionUsage).length, 2);
+        const snapshot = reducer.snapshot();
+        assert.equal(snapshot.compactionCount, copiedAt ? 0 : 1);
+        assert.deepEqual(snapshot.pendingRequestKeys, []);
+        for (let seam = 1; seam <= records.length; seam++) {
+          const file = writeRollout(records.slice(0, seam));
+          const partial = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1, {
+            maxMilliseconds: Infinity,
+          }).record;
+          const storage = tempDir('provisional-copy-seam-');
+          saveSpendLedger(storage, 'workspace', [partial]);
+          const saved = loadSpendLedger(storage, 'workspace').files;
+          assert.equal(saved.length, 1);
+          fs.appendFileSync(
+            file,
+            records
+              .slice(seam)
+              .map((row) => JSON.stringify(row) + '\n')
+              .join(''),
+          );
+          const resumed = indexSpendFile(saved[0], file, 'workspace', createCodexUsageLineReducer, 2, {
+            maxMilliseconds: Infinity,
+          }).record;
+          const fresh = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 2, {
+            maxMilliseconds: Infinity,
+          }).record;
+          assert.deepEqual(resumed.buckets, fresh.buckets);
+          assert.deepEqual(resumed.lifetimeBuckets, fresh.lifetimeBuckets);
+          assert.deepEqual(
+            (resumed.parserState as ReturnType<typeof emptyCodexUsageReducerState>).pendingRequestKeys,
+            [],
+          );
+        }
+        const repeated = reducer.pushLine(JSON.stringify(native('two')));
+        assert.deepEqual(repeated, []);
+      }
+});
+
+test('Codex provisional association eviction preserves partial coverage and bounded histories', () => {
+  const exact = usage({ input_tokens: 100, cached_input_tokens: 40, output_tokens: 10 });
+  const reducer = createCodexUsageLineReducer();
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    turnContext(2, TURN, 'gpt-5.6-sol', 'high'),
+    tokens(3, exact),
+    {
+      type: 'compacted',
+      timestamp: at(4),
+      payload: { latest_token_usage_record: { response_id: 'compact', usage: exact } },
+    },
+    event('thread_settings_applied', 5, { thread_settings: { model: 'gpt-6-astra', model_provider_id: 'openai' } }),
+  ];
+  const events = records.flatMap((row) => reducer.pushLine(JSON.stringify(row)));
+  for (let n = 1; n <= CODEX_USAGE_ASSOCIATION_LIMIT + 2; n++) {
+    events.push(
+      ...reducer.pushLine(
+        JSON.stringify({
+          type: 'token_usage_record',
+          timestamp: at(6 + n),
+          payload: { turn_id: TURN, response_id: `normal-${n}`, usage: exact },
+        }),
+      ),
+    );
+    events.push(
+      ...reducer.pushLine(
+        JSON.stringify(
+          event('token_count', 6 + n, {
+            info: {
+              last_token_usage: exact,
+              total_token_usage: usage({
+                input_tokens: 100 * (n + 1),
+                cached_input_tokens: 40 * (n + 1),
+                output_tokens: 10 * (n + 1),
+              }),
+            },
+          }),
+        ),
+      ),
+    );
+  }
+  const state = reducer.snapshot();
+  assert.equal(
+    events.filter((row) => !row.compactionUsage).reduce((sum, row) => sum + (row.usage.requests ?? 1), 0),
+    CODEX_USAGE_ASSOCIATION_LIMIT + 2,
+  );
+  assert.ok(events.some((row) => row.requestCountExact === false && !row.compactionUsage));
+  assert.ok(state.recentResponseUsage.length <= CODEX_USAGE_ASSOCIATION_LIMIT);
+  assert.ok(state.recentRequestEvents.length <= CODEX_USAGE_ASSOCIATION_LIMIT);
+  assert.ok(state.compactionResponseIds.length <= CODEX_USAGE_ASSOCIATION_LIMIT);
+  assert.ok(state.recentCompactions.length <= RETAINED_COMPACTIONS);
+  const restored = createCodexUsageLineReducer(state);
+  assert.deepEqual(restored.snapshot(), state);
+});

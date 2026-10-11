@@ -1059,12 +1059,12 @@ function sampleEstimate(row: CompactionCalibrationRow) {
       at: COMPACTED_AT - row.idleMinutes * 60_000,
       lifetime: row.lifetime,
     },
-    firstRequestCacheRead: row.firstRead,
+    firstRequestCachedTokens: row.firstRead,
     summaryChars: row.summaryChars,
   };
 }
 
-for (const row of COMPACTION_SAMPLES) {
+for (const row of COMPACTION_SAMPLES.filter((sample) => sample.firstRead === null)) {
   test(`the compaction ${row.name} is estimated within 20% of its real cost`, () => {
     const input = sampleEstimate(row);
     assert.equal(compactionEstimate(input)?.basis, row.firstRead === null ? 'warm' : 'cold', row.name);
@@ -1093,14 +1093,14 @@ test('a warm compaction reads back what the request before it read and writes wh
   );
 });
 
-test('a cold compaction reads back the first request and sends the rest of its context uncached', () => {
+test('a cold compaction writes the shared prefix and sends the remaining context uncached', () => {
   const row = COMPACTION_SAMPLES.find((item) => item.name === '386c0253 cold')!;
   const usage = compactionEstimate(sampleEstimate(row))!.usage;
   assert.deepEqual(
     [usage.cacheRead, usage.cacheWrite5m, usage.cacheWrite1h, usage.input],
-    [10_086, 0, 0, previousContextOf(row) + CLAUDE_COMPACTION_INSTRUCTION_TOKENS - 10_086],
+    [0, 0, 10_086, previousContextOf(row) + CLAUDE_COMPACTION_INSTRUCTION_TOKENS - 10_086],
   );
-  const unknown = compactionEstimate({ ...sampleEstimate(row), firstRequestCacheRead: null })!.usage;
+  const unknown = compactionEstimate({ ...sampleEstimate(row), firstRequestCachedTokens: null })!.usage;
   assert.deepEqual(
     [unknown.cacheRead, unknown.input],
     [0, previousContextOf(row) + CLAUDE_COMPACTION_INSTRUCTION_TOKENS],
@@ -1110,9 +1110,10 @@ test('a cold compaction reads back the first request and sends the rest of its c
 
 test('a cold compaction sends no negative uncached input when the first request read more than the context', () => {
   const row = COMPACTION_SAMPLES.find((item) => item.name === '386c0253 cold')!;
-  const usage = compactionEstimate({ ...sampleEstimate(row), firstRequestCacheRead: 400_000 })!.usage;
-  assert.equal(usage.input, 0);
-  const cost = estimateCompactionCost({ ...sampleEstimate(row), firstRequestCacheRead: 400_000 });
+  const usage = compactionEstimate({ ...sampleEstimate(row), firstRequestCachedTokens: 400_000 })!.usage;
+  assert.equal(usage.input, CLAUDE_COMPACTION_INSTRUCTION_TOKENS);
+  assert.equal(usage.cacheWrite1h, previousContextOf(row));
+  const cost = estimateCompactionCost({ ...sampleEstimate(row), firstRequestCachedTokens: 400_000 });
   const output = estimateCost({ ...usage, cacheRead: 0 }, row.model);
   assert.ok(cost !== null && output !== null && cost >= output, `${cost} is at least the output ${output}`);
 });
@@ -1904,4 +1905,34 @@ test('effort cache policy distinguishes exact Claude models and detectable Bedro
   }
   assert.equal(effortChangeKeepsCache('gpt-5.6', null), false);
   assert.equal(effortChangeKeepsCache('claude-opus-5-5', 'amazon-bedrock'), false);
+});
+
+test('a cold Claude compaction writes the measured shared prefix without reading the expired cache', () => {
+  for (const lifetime of ['5m', '30m', '1h'] as const) {
+    const input = {
+      model: 'claude-haiku-5-5',
+      at: COMPACTED_AT,
+      contextBefore: 180604,
+      contextAfter: 1561,
+      firstRequestCachedTokens: 18000,
+      postCompactionCacheRead: 18825,
+      previousRequest: {
+        tokens: 180604,
+        cacheRead: 160000,
+        cacheWrite: 20604,
+        at: COMPACTED_AT - 2 * 60 * 60_000,
+        lifetime,
+      },
+    };
+    const estimated = compactionEstimate(input)!;
+    assert.equal(estimated.basis, 'cold');
+    assert.equal(estimated.usage.cacheRead, 0);
+    assert.equal(estimated.usage.input, 163779);
+    assert.equal(
+      estimated.usage.cacheWrite1h + estimated.usage.cacheWrite5m + (estimated.usage.cacheWrite30m ?? 0),
+      18825,
+    );
+    const fallback = compactionEstimate({ ...input, postCompactionCacheRead: null })!.usage;
+    assert.equal(fallback.cacheWrite1h + fallback.cacheWrite5m + (fallback.cacheWrite30m ?? 0), 18000);
+  }
 });

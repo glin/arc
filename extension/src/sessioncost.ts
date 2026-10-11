@@ -1491,6 +1491,10 @@ export function readSessionRequests(
   const codexTools = new Map<string, Map<string, number>>();
   const compactionPlaceholders = new Set<string>();
   const billingRecords = new Map<string, CodexBillEvidence>();
+  const compactionBilling = new Map<
+    string,
+    { model: string | null; provider: string | null; serviceTier: string | null }
+  >();
   const costSnapshots: CodexCostSnapshot[] = [];
   const costBoundaries: { timestamp: number; segment: number; turnId: string | null; order: number }[] = [];
   let sourceOrder = 0;
@@ -1505,7 +1509,6 @@ export function readSessionRequests(
   const turnModels = new Map<string, string>();
   const turnWindows = new Map<string, number>();
   let replayingTurn = false;
-  let pendingCompactionResponseId: string | null = null;
   let afterCompaction = false;
   const consumeCodexTools = (event: UsageEvent, previous = 0): number => {
     if (!codex || event.linkedInvocationId) return previous;
@@ -1786,44 +1789,7 @@ export function readSessionRequests(
         // A malformed record cannot establish a billed request.
       }
     }
-    if (codex && line.includes('compacted')) {
-      try {
-        const raw = JSON.parse(line) as { type?: string; payload?: { compaction_response_id?: string } };
-        if (raw.type === 'compacted') pendingCompactionResponseId = raw.payload?.compaction_response_id ?? null;
-      } catch {
-        // A malformed boundary cannot identify a compaction request.
-      }
-    }
-    if (codex && pendingCompactionResponseId && line.includes('thread_settings_applied')) {
-      try {
-        const raw = JSON.parse(line) as {
-          type?: string;
-          payload?: {
-            thread_settings?: { model?: string; model_id?: string; model_provider_id?: string; service_tier?: string };
-          };
-        };
-        if (
-          raw.type === 'event_msg' &&
-          (raw.payload as { type?: string } | undefined)?.type === 'thread_settings_applied'
-        ) {
-          const billed = billingRecords.get(pendingCompactionResponseId);
-          const settings = raw.payload?.thread_settings;
-          if (billed) {
-            billed.request.model = settings?.model ?? settings?.model_id ?? billed.request.model;
-            billed.request.provider = settings?.model_provider_id ?? billed.request.provider;
-            billed.request.serviceTier = settings?.service_tier ?? billed.request.serviceTier;
-            billed.request.compactionMetadata = true;
-          }
-          pendingCompactionResponseId = null;
-        }
-      } catch {
-        // A malformed settings record cannot resolve billing identity.
-      }
-    }
     const record = codex ? codexSnapshotRecord(line) : null;
-    if (record?.kind === 'task_started' || record?.kind === 'task_complete' || record?.kind === 'turn_aborted') {
-      pendingCompactionResponseId = null;
-    }
     if (record?.kind === 'compacted') afterCompaction = true;
     const placeholder = afterCompaction && record?.kind === 'token_count' && record.zeroUsage;
     const pendingBefore = placeholder
@@ -1899,6 +1865,17 @@ export function readSessionRequests(
         ? { ...event, model: null, contextBand: null, inferenceClass: null }
         : event,
     );
+    if (codex && line.includes('thread_settings_applied')) {
+      const state = (reducer as ReturnType<typeof createCodexUsageLineReducer>).snapshot();
+      for (const compaction of state.recentCompactions) {
+        if (compaction.responseId && !compaction.requestUsage)
+          compactionBilling.set(compaction.responseId, {
+            model: compaction.requestModel,
+            provider: compaction.requestProvider,
+            serviceTier: compaction.requestServiceTier,
+          });
+      }
+    }
     if (codex && line.includes('session_meta')) {
       try {
         const state = (reducer as ReturnType<typeof createCodexUsageLineReducer>).snapshot();
@@ -2040,10 +2017,30 @@ export function readSessionRequests(
       const id = request?.incomplete ? /^codex:([^:]+):/.exec(request.requestKey)?.[1] : null;
       if (id && !state.datedCopiedTurnIds[id]) copiedTurns.delete(id);
     }
+    for (const request of ordered.values()) {
+      if (!request?.compactionUsage || !request.responseId) continue;
+      const billed = billingRecords.get(request.responseId);
+      if (!billed) continue;
+      Object.assign(billed.request, {
+        model: request.model,
+        provider: request.provider,
+        serviceTier: request.serviceTier,
+        inferenceClass: request.inferenceClass,
+        contextBand: request.contextBand,
+        compactionUsage: true,
+        compactionMetadata: true,
+      });
+      if (request.incomplete) billed.request.incomplete = true;
+    }
     for (const [id, billed] of billingRecords) {
       if (copiedTurns.has(billed.turnId)) {
         billingRecords.delete(id);
         continue;
+      }
+      const identity = compactionBilling.get(id);
+      if (identity) {
+        Object.assign(billed.request, identity);
+        billed.request.compactionMetadata = true;
       }
       if (!billed.request.compactionMetadata)
         billed.request.model = turnModels.get(billed.turnId) ?? billed.request.model;
@@ -2058,6 +2055,7 @@ export function readSessionRequests(
   }
   const requests = [...ordered.values()]
     .filter((request): request is SessionRequest => request !== null)
+    .filter((request) => !request.compactionUsage || !request.responseId || !billingRecords.has(request.responseId))
     .filter((request) => !compactionPlaceholders.has(request.requestKey))
     .filter((request) => !replayRequests.has(request.requestKey))
     .filter((request) => !codex || !copiedTurns.has(/^codex:([^:]+):/.exec(request.requestKey)?.[1] ?? ''))
@@ -2170,7 +2168,7 @@ export function readSessionRequests(
       .sort((left, right) => left.timestamp - right.timestamp);
   return [
     ...requests.map((request) =>
-      request.agent === 'codex'
+      request.agent === 'codex' && !(request.compactionUsage && request.responseId)
         ? {
             ...request,
             evidenceOnly: true as const,

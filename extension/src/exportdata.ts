@@ -366,7 +366,13 @@ function usageOf(usage: TurnUsage): ExportUsage {
 export function costPartOf(part: SessionCostUsage, scope: string | null = null): ExportCostPart {
   return {
     role: part.role ?? 'main',
-    scope,
+    scope:
+      scope ??
+      (part.linkedInvocationId
+        ? `invocation:${part.linkedInvocationId}`
+        : part.scopeId?.startsWith('invocation:')
+          ? part.scopeId
+          : null),
     model: part.model,
     provider: part.provider,
     contextWindow: part.contextWindow,
@@ -379,6 +385,7 @@ export function costPartOf(part: SessionCostUsage, scope: string | null = null):
     incomplete: part.incomplete === true,
     requestCountExact: part.requestCountExact !== false && part.usage.requests !== undefined,
     estimated: part.compactionEstimate === true,
+    ...(part.compactionUsage ? { compactionUsage: true as const } : {}),
     origin: part.usageOrigin ?? 'recorded',
     usage: usageOf(part.usage),
   };
@@ -600,6 +607,7 @@ export function projectCompaction(compaction: Compaction, key: string): ExportCo
         }
       : null,
     summaryChars: compaction.summaryChars ?? null,
+    postCompactionCacheRead: compaction.postCompactionCacheRead ?? null,
     retainedContext: compaction.retainedContext
       ? { tokens: compaction.retainedContext.tokens, window: compaction.retainedContext.window }
       : null,
@@ -1114,7 +1122,7 @@ export async function captureSessionExport(
       pages: [],
       turnCount: 0,
       compactionCount: 0,
-      firstRequestCacheRead: null,
+      firstRequestCachedTokens: null,
       numbers: emptyNumbers(),
       parentOutsideExport:
         !parentIndex.has(key) &&
@@ -1233,7 +1241,7 @@ export async function captureSessionExport(
         });
         session.pages.push(spool);
       }
-      if (page.firstRequestCacheRead !== undefined) session.firstRequestCacheRead = page.firstRequestCacheRead;
+      if (page.firstRequestCachedTokens !== undefined) session.firstRequestCachedTokens = page.firstRequestCachedTokens;
       if (!sameStamp(await fs.lstat(entry.file), entry.stamp)) throw new SourceChanged();
       if (!page.nextOlderCursor) {
         if (page.ownedRange.start !== 0) throw new Error('The session history is incomplete.');

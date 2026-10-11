@@ -1179,10 +1179,18 @@ export interface CodexUsageReducerState {
   // A delayed turn context can identify an earlier turn as copied. Keep its compaction
   // ordinals so that correction removes both the count and the retained detail.
   compactionTurnOrdinals: Record<string, number[]>;
-  // The ordinal of a compaction still waiting for the settings record that names its billing
-  // identity. Cleared when that record arrives, and when the compaction's turn closes without
-  // one. Only a compaction whose own usage the record carried ever waits.
+  // Following settings name the compaction's billing identity. Clear its ordinal when settings arrive or the turn closes.
   pendingCompactionBilling: number | null;
+  recentResponseUsage: Array<{
+    responseId: string;
+    turnId: string;
+    usage: TurnUsage;
+    matched?: true;
+    explicitSnapshot?: true;
+    suppressedSnapshot?: UsageEvent;
+  }>;
+  recentRequestEvents: UsageEvent[];
+  compactionResponseIds: string[];
   // The very first non-copied turn's startedAt, epoch milliseconds. Set once and never moved.
   firstTurnAt: number | null;
   // The latest counted turn's end, or its start when it never completed. Updated on each counted close.
@@ -1246,6 +1254,9 @@ export function emptyCodexUsageReducerState(
     recentCompactions: [],
     compactionTurnOrdinals: {},
     pendingCompactionBilling: null,
+    recentResponseUsage: [],
+    recentRequestEvents: [],
+    compactionResponseIds: [],
     firstTurnAt: null,
     lastTurnAt: null,
     currentTurnStartedAt: null,
@@ -1644,7 +1655,34 @@ function sameCounters(left: readonly number[], right: readonly number[]): boolea
 }
 
 // Reduces records that affect request identity as well as token counts.
+function sameCodexRequestUsage(left: TurnUsage, right: TurnUsage): boolean {
+  return ['input', 'cacheRead', 'cacheWrite1h', 'cacheWrite5m', 'cacheWrite30m', 'output', 'thinking'].every(
+    (key) => (left[key as keyof TurnUsage] ?? 0) === (right[key as keyof TurnUsage] ?? 0),
+  );
+}
+
+function removeCodexRequest(event: UsageEvent): UsageEvent {
+  return {
+    ...event,
+    usage: Object.fromEntries(Object.entries(event.usage).map(([key, value]) => [key, -value])) as unknown as TurnUsage,
+  };
+}
+
 export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: CodexUsageRecord): readonly UsageEvent[] {
+  state.recentResponseUsage ??= [];
+  state.recentRequestEvents ??= [];
+  state.compactionResponseIds ??= [];
+  const events = reduceCodexUsageEventsInner(state, record);
+  for (const event of events) {
+    const index = state.recentRequestEvents.findIndex((held) => held.requestKey === event.requestKey);
+    if (index >= 0) state.recentRequestEvents.splice(index, 1);
+    if ((event.usage.requests ?? 1) > 0) state.recentRequestEvents.push(event);
+  }
+  state.recentRequestEvents.splice(0, Math.max(0, state.recentRequestEvents.length - CODEX_USAGE_ASSOCIATION_LIMIT));
+  return events;
+}
+
+function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: CodexUsageRecord): readonly UsageEvent[] {
   const { kind, payload } = record;
   if (kind === 'session_meta') {
     const sessionId = str(payload.id) ?? str(payload.session_id);
@@ -1666,7 +1704,81 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
     return [];
   }
   if (kind === 'token_usage_record') {
+    const corrections: UsageEvent[] = [];
     const turnId = str(payload.turn_id);
+    const responseId = str(payload.response_id);
+    const usage = codexRequestUsage(payload.usage);
+    if (
+      turnId &&
+      responseId &&
+      usage &&
+      !state.foreignSessionMeta &&
+      !state.datedCopiedTurnIds[turnId] &&
+      (!state.openingSessionId || !str(payload.thread_id) || str(payload.thread_id) === state.openingSessionId)
+    ) {
+      const prior = state.recentResponseUsage.find((item) => item.responseId === responseId);
+      const association = prior ?? { responseId, turnId, usage };
+      if (!prior) state.recentResponseUsage.push(association);
+      state.recentResponseUsage.splice(
+        0,
+        Math.max(0, state.recentResponseUsage.length - CODEX_USAGE_ASSOCIATION_LIMIT),
+      );
+      const anonymous = association.matched
+        ? undefined
+        : [...state.recentRequestEvents, ...(state.pendingRequests[turnId] ?? [])]
+            .reverse()
+            .find(
+              (event) =>
+                !event.responseId &&
+                event.visibleTurnId === `codex-turn:${turnId}` &&
+                sameCodexRequestUsage(event.usage, usage),
+            );
+      if (anonymous) {
+        anonymous.responseId = responseId;
+        association.matched = true;
+        if (state.compactionResponseIds.includes(responseId)) {
+          const pending = releasePendingRequest(state, anonymous.requestKey);
+          if (!pending) corrections.push(removeCodexRequest(anonymous));
+          association.suppressedSnapshot = anonymous;
+        }
+      } else if (!prior && !state.compactionResponseIds.includes(responseId)) {
+        const held = [...state.recentResponseUsage]
+          .reverse()
+          .find(
+            (item) =>
+              state.compactionResponseIds.includes(item.responseId) &&
+              !item.explicitSnapshot &&
+              item.turnId === turnId &&
+              item.suppressedSnapshot &&
+              sameCodexRequestUsage(item.usage, usage),
+          );
+        if (held?.suppressedSnapshot) {
+          const restored = {
+            ...held.suppressedSnapshot,
+            responseId,
+            requestKey: `codex-response:${responseId}`,
+            requestCountExact: false as const,
+          };
+          restored.model ??= state.turnModels[turnId] ?? null;
+          restored.contextBand = contextBandForRequest(
+            restored.model,
+            restored.provider,
+            requestInputTokens(restored.usage),
+          );
+          restored.inferenceClass =
+            restored.provider === 'amazon-bedrock' ? bedrockInferenceClass(restored.model) : null;
+          association.suppressedSnapshot = restored;
+          if (!restored.model || state.pendingOwnership[turnId]) {
+            (state.pendingRequests[turnId] ??= []).push(restored);
+            if (record.sourceStart !== undefined)
+              state.pendingRequestSources[restored.requestKey] = {
+                start: record.sourceStart,
+                end: record.sourceEnd ?? record.sourceStart,
+              };
+          } else corrections.push(restored);
+        }
+      }
+    }
     if (
       !turnId ||
       !state.pendingOwnership[turnId] ||
@@ -1675,7 +1787,7 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
       !str(payload.response_id) ||
       state.datedCopiedTurnIds[turnId]
     )
-      return [];
+      return corrections;
     delete state.pendingOwnership[turnId];
     if (state.currentTurnId !== turnId || !state.currentTurnRepeated) delete state.copiedTurnIds[turnId];
     if (state.currentTurnId === turnId && !state.currentTurnRepeated) {
@@ -1691,7 +1803,7 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
     if (waiting.length) state.pendingRequests[turnId] = waiting;
     else delete state.pendingRequests[turnId];
     for (const event of ready) forgetIdentity(state.pendingRequestKeys, event.requestKey);
-    return ready;
+    return [...corrections, ...ready];
   }
   if (kind === 'rate_limits') {
     state.planKnown = true;
@@ -1700,7 +1812,7 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
   }
   if (kind === 'thread_settings_applied') {
     const settings = (payload.thread_settings || {}) as Record<string, unknown>;
-    const model = str(settings.model) ?? str(settings.model_id);
+    const model = typeof settings.model === 'string' ? settings.model : str(settings.model_id);
     const provider = str(settings.model_provider_id);
     const serviceTier = str(settings.service_tier);
     state.reasoningEffort = str(settings.reasoning_effort) ?? state.reasoningEffort;
@@ -1716,7 +1828,23 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
       held.requestServiceTier = serviceTier ?? held.requestServiceTier;
     }
     state.pendingCompactionBilling = null;
-    return [];
+    if (!held) return [];
+    const key = held.responseId ? `codex-response:${held.responseId}` : `codex-compaction:${held.ordinal}`;
+    const pending = Object.values(state.pendingRequests)
+      .flat()
+      .find((item) => item.compactionUsage && item.requestKey === key);
+    const emitted = state.recentRequestEvents.find((item) => item.compactionUsage && item.requestKey === key);
+    const event = pending ?? (emitted ? { ...emitted } : undefined);
+    if (!event) return [];
+    event.model = held.requestModel;
+    event.provider = held.requestProvider;
+    event.serviceTier = held.requestServiceTier;
+    event.inferenceClass = event.provider === 'amazon-bedrock' ? bedrockInferenceClass(event.model) : null;
+    event.contextBand = contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage));
+    if (event.model && held.responseId) delete event.incomplete;
+    const turnId = event.visibleTurnId?.replace(/^codex-turn:/, '') ?? '';
+    if (state.pendingOwnership[turnId]) return [];
+    return pending ? [releasePendingRequest(state, key)!] : [removeCodexRequest(emitted!), event];
   }
   if (kind === 'task_started') {
     if (state.currentTurnId && !state.currentTurnCopied && state.currentTurnDidSomething) {
@@ -1764,6 +1892,10 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
   }
   if (state.currentTurnRepeated && state.nativeSpawnedAt !== null) return [];
   if (kind === 'compacted') {
+    const latest = isRecord(payload.latest_token_usage_record) ? payload.latest_token_usage_record : {};
+    const responseId = str(payload.compaction_response_id) ?? str(latest.response_id);
+    if (responseId && state.compactionResponseIds.includes(responseId)) return [];
+    const corrections: UsageEvent[] = [];
     if (!state.currentTurnCopied) {
       state.compactionCount++;
       // Retain the compaction's own request usage and the turn's model and window.
@@ -1785,6 +1917,7 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
         requestProvider: state.provider,
         requestServiceTier: state.serviceTier,
         requestContextWindow: turnId ? (state.turnWindows[turnId] ?? null) : null,
+        ...(responseId ? { responseId } : {}),
       });
       if (turnId) {
         const ordinals = (state.compactionTurnOrdinals[turnId] ??= []);
@@ -1793,13 +1926,112 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
           ordinals.shift();
         }
       }
-      // Wait for billing identity only when the compaction carries its own request usage.
-      state.pendingCompactionBilling = requestUsage ? state.compactionCount : null;
+      // Identified responses and recorded usage retain the following billing settings.
+      state.pendingCompactionBilling = requestUsage || responseId ? state.compactionCount : null;
+      if (requestUsage && responseId) {
+        if (responseId) {
+          let association = state.recentResponseUsage.find((item) => item.responseId === responseId);
+          if (!association) {
+            association = { responseId, turnId: turnId ?? '', usage: requestUsage };
+            state.recentResponseUsage.push(association);
+          }
+          state.recentResponseUsage.splice(
+            0,
+            Math.max(0, state.recentResponseUsage.length - CODEX_USAGE_ASSOCIATION_LIMIT),
+          );
+          state.compactionResponseIds.push(responseId);
+          state.compactionResponseIds.splice(
+            0,
+            Math.max(0, state.compactionResponseIds.length - CODEX_USAGE_ASSOCIATION_LIMIT),
+          );
+          const prior = [...state.recentRequestEvents]
+            .reverse()
+            .find(
+              (item) =>
+                item.responseId === responseId ||
+                (!item.responseId &&
+                  item.visibleTurnId === `codex-turn:${turnId}` &&
+                  sameCodexRequestUsage(item.usage, requestUsage)),
+            );
+          if (prior) {
+            corrections.push(removeCodexRequest(prior));
+            if (!association.explicitSnapshot) association.suppressedSnapshot = prior;
+            association.matched = true;
+          }
+          const pending = Object.values(state.pendingRequests)
+            .flat()
+            .find(
+              (item) =>
+                item.responseId === responseId ||
+                (!item.responseId &&
+                  item.visibleTurnId === `codex-turn:${turnId}` &&
+                  sameCodexRequestUsage(item.usage, requestUsage)),
+            );
+          if (pending) {
+            releasePendingRequest(state, pending.requestKey);
+            if (!association.explicitSnapshot) association.suppressedSnapshot = pending;
+            association.matched = true;
+          }
+        }
+        const event: UsageEvent = {
+          timestamp: record.timestamp,
+          agent: 'codex',
+          provider: state.provider,
+          model: null,
+          contextWindow: turnId ? (state.turnWindows[turnId] ?? null) : null,
+          contextBand: null,
+          billingClass:
+            state.provider && state.provider !== 'openai'
+              ? 'metered'
+              : state.planType
+                ? 'subscription'
+                : state.planKnown
+                  ? 'metered'
+                  : 'unknown',
+          inferenceClass: null,
+          serviceTier: state.serviceTier,
+          reportedCost: null,
+          visibleTurnId: turnId ? `codex-turn:${turnId}` : null,
+          compactionUsage: true,
+          incomplete: true,
+          compactionsBefore: state.compactionCount,
+          usage: requestUsage,
+          requestKey: responseId ? `codex-response:${responseId}` : `codex-compaction:${state.compactionCount}`,
+          ...(responseId ? { responseId } : {}),
+        };
+        if (turnId && state.pendingOwnership[turnId]) (state.pendingRequests[turnId] ??= []).push(event);
+        else corrections.push(event);
+      } else if (requestUsage) {
+        corrections.push({
+          timestamp: record.timestamp,
+          agent: 'codex',
+          provider: state.provider,
+          model: null,
+          contextWindow: null,
+          contextBand: null,
+          billingClass: 'unknown',
+          inferenceClass: null,
+          serviceTier: state.serviceTier,
+          reportedCost: null,
+          visibleTurnId: turnId ? `codex-turn:${turnId}` : null,
+          compactionUsage: true,
+          incomplete: true,
+          requestCountExact: false,
+          usage: { ...emptyUsage(), requests: 1 },
+          requestKey: `codex-compaction:${state.compactionCount}`,
+        });
+      }
     }
-    return [];
+    return corrections;
   }
   if (kind === 'turn_context') {
     applyCodexTurnDate(state, payload);
+    const id = str(payload.turn_id);
+    if (id && state.datedCopiedTurnIds[id]) {
+      return state.recentRequestEvents
+        .filter((event) => event.visibleTurnId === `codex-turn:${id}`)
+        .map(removeCodexRequest);
+    }
   }
   if (state.currentTurnId && !state.currentTurnCompleted) {
     const entry = { kind, at: record.timestamp, payload };
@@ -1948,7 +2180,9 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
     if (!model) {
       return [];
     }
-    const pending = state.pendingRequests[turnId] ?? [];
+    const held = state.pendingRequests[turnId] ?? [];
+    const pending = held.filter((event) => !event.compactionUsage);
+    const compactions = held.filter((event) => event.compactionUsage);
     if (state.pendingOwnership[turnId]) {
       for (const event of pending) {
         if (event.agent !== 'codex') continue;
@@ -1959,6 +2193,7 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
       return [];
     }
     delete state.pendingRequests[turnId];
+    if (compactions.length) state.pendingRequests[turnId] = compactions;
     for (const event of pending) {
       discardPendingRequestKey(state, event.requestKey);
     }
@@ -2007,6 +2242,41 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
   }
   const parsedUsage = codexRequestUsage(info.last_token_usage);
   const usage = parsedUsage ?? { ...emptyUsage(), requests: 1 };
+  const explicitResponseId = str(payload.response_id);
+  const association = [...state.recentResponseUsage]
+    .reverse()
+    .find((item) => !item.matched && item.turnId === state.currentTurnId && sameCodexRequestUsage(item.usage, usage));
+  const responseId = explicitResponseId ?? association?.responseId;
+  let identified = explicitResponseId
+    ? state.recentResponseUsage.find((item) => item.responseId === explicitResponseId)
+    : association;
+  if (explicitResponseId && !identified) {
+    identified = { responseId: explicitResponseId, turnId: state.currentTurnId, usage };
+    state.recentResponseUsage.push(identified);
+    state.recentResponseUsage.splice(0, Math.max(0, state.recentResponseUsage.length - CODEX_USAGE_ASSOCIATION_LIMIT));
+  } else if (
+    explicitResponseId &&
+    identified?.matched &&
+    !identified.suppressedSnapshot &&
+    !state.compactionResponseIds.includes(explicitResponseId)
+  ) {
+    return [];
+  }
+  const corrections: UsageEvent[] = [];
+  const provisional =
+    identified && !state.compactionResponseIds.includes(identified.responseId)
+      ? identified.suppressedSnapshot
+      : undefined;
+  if (provisional) {
+    const pending = releasePendingRequest(state, provisional.requestKey);
+    const emitted = state.recentRequestEvents.find((item) => item.requestKey === provisional.requestKey);
+    if (!pending && emitted) corrections.push(removeCodexRequest(emitted));
+    delete identified!.suppressedSnapshot;
+  }
+  if (identified) {
+    identified.matched = true;
+    if (explicitResponseId) identified.explicitSnapshot = true;
+  }
   state.requestNumber++;
   const turnId = state.currentTurnId;
   const model = state.turnModels[turnId] ?? null;
@@ -2036,9 +2306,24 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
     cacheLifetime: null,
     compactionsBefore: state.compactionCount,
     ...(parsedUsage ? {} : { incomplete: true }),
+    ...(!explicitResponseId &&
+    (provisional ||
+      state.recentResponseUsage.some(
+        (item) =>
+          state.compactionResponseIds.includes(item.responseId) &&
+          item.suppressedSnapshot &&
+          sameCodexRequestUsage(item.usage, usage),
+      ))
+      ? { requestCountExact: false as const }
+      : {}),
     usage,
-    requestKey: `codex:${turnId}:${record.timestamp ?? ''}:${state.requestNumber}`,
+    requestKey: provisional?.requestKey ?? `codex:${turnId}:${record.timestamp ?? ''}:${state.requestNumber}`,
+    ...(responseId ? { responseId } : {}),
   };
+  if (responseId && state.compactionResponseIds.includes(responseId)) {
+    if (association && !explicitResponseId) association.suppressedSnapshot = event;
+    return [];
+  }
   if (!model || state.pendingOwnership[turnId]) {
     (state.pendingRequests[turnId] ??= []).push(event);
     if (record.sourceStart !== undefined) {
@@ -2047,9 +2332,9 @@ export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: Co
         end: record.sourceEnd ?? record.sourceStart,
       };
     }
-    return [];
+    return corrections;
   }
-  return [event];
+  return [...corrections, event];
 }
 
 // Returns the first released usage event. Incremental scanners must use the plural reducer to retain every released request.
@@ -2111,8 +2396,8 @@ export interface CodexUsageLineReducer {
   turnCount(): number;
   compactionCount(): number;
   recentCompactions(): readonly ReducerCompaction[];
-  // Compactions recorded since the last call, oldest first. A compacted record emits no usage
-  // event, so the cache-expiry scan reads its compactions here.
+  // Compactions recorded since the last call, oldest first. Recorded compaction usage stays
+  // outside request adjacency, so the cache-expiry scan reads its boundaries here.
   takeCompactionSignals(): CompactionSignal[];
   firstTurnAt(): number | null;
   lastTurnAt(): number | null;
@@ -2178,6 +2463,9 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
           number[]
         >,
         pendingCompactionBilling: restored.pendingCompactionBilling ?? null,
+        recentResponseUsage: restored.recentResponseUsage ?? [],
+        recentRequestEvents: restored.recentRequestEvents ?? [],
+        compactionResponseIds: restored.compactionResponseIds ?? [],
         firstTurnAt: restored.firstTurnAt ?? null,
         lastTurnAt: restored.lastTurnAt ?? null,
         currentTurnStartedAt: restored.currentTurnStartedAt ?? null,
@@ -5337,6 +5625,17 @@ function addCodexRequest(
   modelSource?: { start: number; end: number } | null,
   turnStart = source.start,
 ): void {
+  const hasCompactionUsage = turn.usageParts?.some((part) => part.compactionUsage) === true;
+  if (event.compactionUsage) {
+    if ((turn.usage.requests ?? 0) > 0 || hasCompactionUsage) addTurnUsagePart(turn, event);
+    return;
+  }
+  if ((turn.usage.requests ?? 0) === 0 && (event.usage.requests ?? 0) > 0 && !hasCompactionUsage) {
+    for (const compaction of state.usageState.recentRequestEvents) {
+      if (compaction.compactionUsage && compaction.visibleTurnId === `codex-turn:${turn.promptId}`)
+        addTurnUsagePart(turn, compaction);
+    }
+  }
   addUsage(turn.usage, event.usage, event.contextBand);
   addTurnUsagePart(turn, event);
   const contextTokens = event.usage.input + event.usage.cacheRead + (event.usage.cacheWrite30m ?? 0);
@@ -5475,6 +5774,13 @@ function reduceCodexSessionLine(
       delete state.usageState.pendingRequestSources[event.requestKey];
     }
   };
+  if (kind === 'compacted' || kind === 'thread_settings_applied') {
+    for (const event of usageEvents) {
+      const id = event.visibleTurnId?.replace(/^codex-turn:/, '');
+      const turn = state.open?.promptId === id ? state.open : state.turns[latestCodexTurnIndex(state, id ?? '')];
+      if (turn) addCodexRequest(state, turn, event, usageSources.get(event.requestKey) ?? currentSource);
+    }
+  }
 
   if (kind === 'token_usage_record') {
     if (ownershipId && ownershipPending && !state.usageState.pendingOwnership[ownershipId]) {
@@ -5658,7 +5964,7 @@ function reduceCodexSessionLine(
 
   if (kind === 'thread_settings_applied') {
     const settings = isRecord(payload.thread_settings) ? payload.thread_settings : {};
-    const model = str(settings.model) ?? str(settings.model_id);
+    const model = typeof settings.model === 'string' ? settings.model : str(settings.model_id);
     const provider = str(settings.model_provider_id);
     const serviceTier = str(settings.service_tier);
     if (model) {
@@ -5732,6 +6038,13 @@ function reduceCodexSessionLine(
       ),
       model: exactUsage ? null : model,
       summary: '',
+      ...((str(payload.compaction_response_id) ??
+      (isRecord(payload.latest_token_usage_record) ? str(payload.latest_token_usage_record.response_id) : null))
+        ? {
+            responseId: (str(payload.compaction_response_id) ??
+              str((payload.latest_token_usage_record as Record<string, unknown>).response_id))!,
+          }
+        : {}),
       ...(exactUsage
         ? {
             usage: exactUsage,

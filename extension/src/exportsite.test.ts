@@ -16,7 +16,86 @@ import { demoPayload, demoSessionCostParts, DEMO_COMPACTIONS } from '../scripts/
 import { sessionCostProjection } from './turncard';
 import { estimateCost, formatCost } from './pricing';
 import { writeDemoExports } from '../scripts/web-demo-export';
-import { costPartOf } from './exportdata';
+import { costPartOf, costPartsOf, projectTurn } from './exportdata';
+
+test('exported turn cost parts retain recorded compactions across request bands', () => {
+  const usage = { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 0, thinking: 0 };
+  const original = turn({
+    agent: 'codex',
+    usageParts: [
+      {
+        model: 'gpt-5.4',
+        provider: 'openai',
+        contextWindow: null,
+        contextBand: null,
+        inferenceClass: null,
+        serviceTier: null,
+        compactionUsage: true,
+        usage: { ...usage, byContextBand: { short: usage } },
+      },
+    ],
+  });
+  const parts = costPartsOf(original.usageParts![0]);
+  assert.equal(parts[0].compactionUsage, true);
+  assert.equal(parts[0].estimated, false);
+  const exported = projectTurn(original, 'recorded-turn', { cwd: '/project' }, [], 'session', new Map());
+  assert.equal(exportTurn(exported, 'codex', 'session').usageParts![0].compactionUsage, true);
+  delete exported.usageParts[0].compactionUsage;
+  const legacy = exportTurn(exported, 'codex', 'session').usageParts![0];
+  assert.equal(legacy.compactionUsage, undefined);
+  assert.equal(legacy.compactionEstimate, undefined);
+});
+
+test('linked Claude usage parts retain exact dollars through exported turns', () => {
+  const original = turn({
+    agent: 'codex',
+    usageParts: [
+      {
+        model: 'claude-opus-5',
+        provider: null,
+        contextWindow: 1_000_000,
+        contextBand: null,
+        inferenceClass: null,
+        serviceTier: null,
+        linkedInvocationId: 'printed-result',
+        requestCountExact: false,
+        usage: {
+          requests: 1,
+          input: 1_000_000,
+          cacheRead: 0,
+          cacheWrite1h: 0,
+          cacheWrite5m: 0,
+          output: 0,
+          thinking: 0,
+        },
+      },
+    ],
+  });
+  const exported = projectTurn(original, 'linked-turn', { cwd: '/project' }, [], 'session', new Map());
+  const restored = exportTurn(exported, 'codex', 'session');
+  assert.equal(restored.usageParts![0].requestCountExact, false);
+  const cost = exportCard(toCard(restored, false, 1)).chips!.find((stat) => stat.metric === 'cost')!;
+  assert.equal(cost.label, toCard(original, false, 1).chips.find((stat) => stat.metric === 'cost')!.label);
+  assert.ok(!cost.label.endsWith('+'));
+  assert.doesNotMatch(String(cost.detail), /usage.*incomplete|may be low/i);
+  original.usageParts!.push({
+    model: 'gpt-5.4',
+    provider: 'openai',
+    contextWindow: null,
+    contextBand: null,
+    inferenceClass: null,
+    serviceTier: null,
+    incomplete: true,
+    requestCountExact: false,
+    usage: { requests: 1, input: 0, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 0, thinking: 0 },
+  });
+  const incomplete = projectTurn(original, 'incomplete-turn', { cwd: '/project' }, [], 'session', new Map());
+  const partial = exportCard(toCard(exportTurn(incomplete, 'codex', 'session'), false, 1)).chips!.find(
+    (stat) => stat.metric === 'cost',
+  )!;
+  assert.equal(partial.label, `${cost.label}+`);
+  assert.match(String(partial.detail), /usage record incomplete/);
+});
 
 test('exported named response links retain labels without live session navigation', () => {
   const summary = '[Claude cache controls](arc-session:7390194c-8fea-4b6d-80be-e7e8c7684426)';

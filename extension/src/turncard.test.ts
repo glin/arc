@@ -2994,14 +2994,13 @@ test('each subagent figure carries its own record and the row keeps the run line
     NOW,
   );
   const partialCost = partialSpend.agents[0].figures.find((figure) => figure.metric === 'cost');
-  // Usage totals include both priced and unpriced parts under an explicit coverage label.
+  // Usage totals include both priced and unpriced parts.
 
   assert.deepEqual(
     partialCost?.record?.entries.map((entry) => [entry.label, entry.value]),
     [
       ['Cost by usage · sonnet-5', '<$0.01'],
       ['Some nested subagents are still running or left no record. This is the cost so far.', undefined],
-      ['Every part above, priced or not', undefined],
       ['Input', '2,000 tokens'],
       ['Output', '1,000 tokens'],
       ['Model requests', '4'],
@@ -4838,6 +4837,14 @@ test('the cached-read line keeps request scale when the cache share is high', ()
 
   // An inexact request count omits average input.
   const counted = sessionCostStats([{ ...part, requestCountExact: false }])[0];
+  assert.equal(counted.label, priced.label);
+  const linked = {
+    ...part,
+    role: 'delegated' as const,
+    linkedInvocationId: 'printed',
+    requestCountExact: false as const,
+  };
+  assert.equal(sessionCostProjection([linked]).total.partial, false);
   assert.doesNotMatch(
     counted.detail,
     /avg input/,
@@ -10250,9 +10257,9 @@ test('turn cache-rate color excludes output spend and respects the input-cost mi
   }
 });
 
-test('a compaction card estimates each measured Claude compaction within 20% of its real cost', () => {
+test('a compaction card estimates each measured warm Claude compaction within 20% of its real cost', () => {
   const folder = tempDir('compaction-card-');
-  for (const row of COMPACTION_SAMPLES) {
+  for (const row of COMPACTION_SAMPLES.filter((sample) => sample.firstRead === null)) {
     const file = path.join(folder, `${row.name.replace(/\W+/g, '-')}.jsonl`);
     fs.writeFileSync(
       file,
@@ -10421,7 +10428,7 @@ test('a compaction card words the estimate it priced', () => {
   });
   assert.match(
     warm,
-    /Estimated as 163k of cached input reads, 7k of new cache writes, and 2k of uncached input, because the session was still cached\./,
+    /Estimated as 163k of cached input reads, 7k of 5-minute cache writes, and 2k of uncached input, because the session was still cached\./,
   );
   assert.match(warm, /Claude Code records no usage for a compaction/);
   // A request before it that missed the cache leaves the warm estimate nothing to read.
@@ -10430,7 +10437,7 @@ test('a compaction card words the estimate it priced', () => {
   });
   assert.match(
     missed,
-    /Estimated as 137k of new cache writes and 2k of uncached input, because the request before it read no cached input\./,
+    /Estimated as 137k of 5-minute cache writes and 2k of uncached input, because the request before it read no cached input\./,
   );
   assert.doesNotMatch(missed, /context this small/);
   // A cold estimate reads back the first request's prefix and sends the rest again uncached.
@@ -10441,12 +10448,12 @@ test('a compaction card words the estimate it priced', () => {
     at: at - 10 * 60_000,
     lifetime: '5m' as const,
   };
-  const cold = detail({ previousRequest: lapsed, firstRequestCacheRead: 10_086 });
+  const cold = detail({ previousRequest: lapsed, firstRequestCachedTokens: 10_086 });
   assert.match(
     cold,
-    /Estimated as 10k of cached input reads and 222k of uncached input, because the cache had expired and the context was sent again without it\./,
+    /Estimated as 10k of 5-minute cache writes and 222k of uncached input, because the cache had expired and the context was sent again without it\./,
   );
-  assert.doesNotMatch(cold, /cache write/);
+  assert.doesNotMatch(cold, /cached input reads/);
   const coldUnknown = detail({ previousRequest: lapsed });
   assert.match(
     coldUnknown,

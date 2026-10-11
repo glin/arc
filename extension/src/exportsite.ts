@@ -212,7 +212,9 @@ function sessionCostUsage(part: ExportCostPart): SessionCostUsage & TurnUsagePar
     unclassifiedCacheWrite: part.unclassifiedCacheWrite,
     incomplete: part.incomplete,
     ...(part.requestCountExact ? {} : { requestCountExact: false as const }),
+    ...(part.scope?.startsWith('invocation:') ? { linkedInvocationId: part.scope.slice('invocation:'.length) } : {}),
     ...(part.estimated ? { compactionEstimate: true as const } : {}),
+    ...(part.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(part.origin === 'claude-cost-state' ? { usageOrigin: part.origin } : {}),
     usage: usage(part.usage),
   };
@@ -348,7 +350,11 @@ function turnCard(value: ExportTurn, agent: 'claude' | 'codex', session: string,
   return card;
 }
 
-function exportCompaction(value: ExportCompaction, session: string, firstRequestCacheRead: number | null): Compaction {
+function exportCompaction(
+  value: ExportCompaction,
+  session: string,
+  firstRequestCachedTokens: number | null,
+): Compaction {
   const compaction: Compaction = {
     sessionId: session,
     at: value.at,
@@ -377,11 +383,12 @@ function exportCompaction(value: ExportCompaction, session: string, firstRequest
         }
       : null,
     summaryChars: value.summaryChars ?? undefined,
+    postCompactionCacheRead: value.postCompactionCacheRead ?? undefined,
     retainedContext: value.retainedContext ?? undefined,
     contextWindow: value.contextWindow,
     inferenceClass: value.inferenceClass,
     serviceTier: value.serviceTier,
-    firstRequestCacheRead: firstRequestCacheRead ?? undefined,
+    firstRequestCachedTokens: firstRequestCachedTokens ?? undefined,
   };
   return compaction;
 }
@@ -389,10 +396,10 @@ function exportCompaction(value: ExportCompaction, session: string, firstRequest
 function compactionCard(
   value: ExportCompaction,
   session: string,
-  firstRequestCacheRead: number | null,
+  firstRequestCachedTokens: number | null,
   capturedAt: number,
 ): CardView {
-  const compaction = exportCompaction(value, session, firstRequestCacheRead);
+  const compaction = exportCompaction(value, session, firstRequestCachedTokens);
   const card = exportCard(toCompactionCard(compaction, capturedAt));
   card.key = value.key;
   card.summaryHtml ||= '<p>Recorded details</p>';
@@ -442,12 +449,12 @@ export async function projectSessionSite(
           const card =
             'turn' in entry
               ? turnCard(entry.turn, session.agent, session.key, model.capturedAt)
-              : compactionCard(entry.compaction, session.key, session.firstRequestCacheRead, model.capturedAt);
+              : compactionCard(entry.compaction, session.key, session.firstRequestCachedTokens, model.capturedAt);
           newestAt = Math.max(newestAt, card.endedAt ?? card.startedAt);
           card.sessionTitle = title;
           if ('compaction' in entry)
             compactions.push(
-              exportCompaction({ ...entry.compaction, summary: '' }, session.key, session.firstRequestCacheRead),
+              exportCompaction({ ...entry.compaction, summary: '' }, session.key, session.firstRequestCachedTokens),
             );
           if ('turn' in entry) {
             const numeric = exportTurn({ ...entry.turn, blocks: [] }, session.agent, session.key);
