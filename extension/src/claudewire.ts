@@ -52,6 +52,7 @@ import {
   num,
   arr,
   AgentPromptInput,
+  GuardedAttempt,
   normalizeAgentPrompt,
 } from './agentwire';
 import { agentTakesAsset, validatePromptAssetBytes } from './promptassets';
@@ -126,6 +127,9 @@ export interface SpawnOptions {
   sessionId?: string;
   persistSession?: boolean;
   settings?: string;
+  // Echoes each received user message with `isReplay`. Only a fresh start that carries a requester sets it,
+  // because guarded follow-ups use the echo as their receipt.
+  replayUserMessages?: boolean;
 }
 
 // `-p` enables print mode and streamed stdin.
@@ -164,6 +168,9 @@ export function spawnArgs(o: SpawnOptions): string[] {
   }
   if (o.settings) {
     args.push('--settings', o.settings);
+  }
+  if (o.replayUserMessages) {
+    args.push('--replay-user-messages');
   }
   return args;
 }
@@ -450,6 +457,9 @@ interface Waiting {
 // Turn events have no control-request deadline.
 export const CONTROL_DEADLINE_MS = 60_000;
 
+// The write exchange bound for a guarded prompt, counted from the input write.
+export const GUARDED_RECEIPT_MS = 120_000;
+
 // The origin Claude Code writes on a prompt a person typed. See `ClaudeWire.prompt`.
 const HUMAN_ORIGIN = { kind: 'human' } as const;
 
@@ -511,6 +521,15 @@ export class ClaudeWire {
   private nativeGeneration = 0;
   private closed = false;
   private readonly contextRequests = new Set<string>();
+  // The last session state the CLI reported. Every user-frame write clears it until the CLI reports again.
+  private reportedState: 'idle' | 'running' | null = null;
+  // The guarded prompt that waits for its replayed user message.
+  private replayWait: {
+    attempt: GuardedAttempt;
+    session: string;
+    text: string;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
   contextFrame(text: string): string | null {
     if (!this.contextRequests.size) return null;
@@ -551,12 +570,14 @@ export class ClaudeWire {
 
   // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
   // Every prompt carries a human origin. The transcript's `agentRunIn` rule uses it to identify reader-owned sessions across windows.
-  prompt(input: AgentPromptInput, beforeWrite?: () => void): Promise<void> {
+  prompt(input: AgentPromptInput, guard?: GuardedAttempt, beforeWrite?: () => void): Promise<void> {
     this.responseClock.reset();
     if (this.closed) {
       throw new Error('the agent is no longer running');
     }
     const prompt = normalizeAgentPrompt(input);
+    if (guard) return this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard);
+    this.reportedState = null;
     if (!prompt.assets.length && prompt.text) {
       beforeWrite?.();
       this.nativeSubmission(prompt.text);
@@ -579,6 +600,60 @@ export class ClaudeWire {
       this.nativeSubmission(prompt.text);
       this.write({ type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN });
     });
+  }
+
+  // Positive idle evidence: the CLI reported idle after the last prompt write, and no guarded prompt waits.
+  idleEvidence(): boolean {
+    return !this.closed && this.reportedState === 'idle' && this.replayWait === null;
+  }
+
+  // Writes a text-only prompt with a client UUID. Only the matching replay accepts it.
+  // Every refusal here happens before the write, so the attempt never starts.
+  private guardedPrompt(text: string, hasAssets: boolean, attempt: GuardedAttempt): Promise<void> {
+    if (hasAssets || !text) throw new Error('a guarded prompt carries text only');
+    if (this.replayWait) throw new Error('another guarded prompt is still unsettled');
+    if (!this.session) throw new Error('the session identity is unknown');
+    this.write({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text }] },
+      origin: HUMAN_ORIGIN,
+      uuid: attempt.clientUuid,
+    });
+    attempt.markWritten();
+    const timer = setTimeout(
+      () => this.endReplayWait('The agent did not confirm the prompt in time.'),
+      GUARDED_RECEIPT_MS,
+    );
+    if (typeof timer === 'object' && typeof timer.unref === 'function') timer.unref();
+    this.replayWait = { attempt, session: this.session, text, timer };
+    return Promise.resolve();
+  }
+
+  // A replay settles the attempt only for the same UUID, session, root scope, and exact text.
+  private replay(m: Json): void {
+    const wait = this.replayWait;
+    if (!wait || str(m.type) !== 'user' || str(m.uuid) !== wait.attempt.clientUuid) return;
+    if (str(m.session_id) !== wait.session || (m.parent_tool_use_id !== undefined && m.parent_tool_use_id !== null))
+      return;
+    const message = obj(m.message);
+    const content = message?.content;
+    const blocks = arr(content);
+    const exact =
+      message?.role === 'user' &&
+      (content === wait.text ||
+        (blocks.length === 1 && obj(blocks[0])?.type === 'text' && obj(blocks[0])?.text === wait.text));
+    if (!exact) return;
+    clearTimeout(wait.timer);
+    this.replayWait = null;
+    wait.attempt.settle({ outcome: 'accepted', nativeTurnId: null, reason: '' });
+  }
+
+  private endReplayWait(reason: string): void {
+    const wait = this.replayWait;
+    if (!wait) return;
+    clearTimeout(wait.timer);
+    this.replayWait = null;
+    wait.attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason });
   }
 
   // Renames the session through a control request, including while a turn runs.
@@ -740,6 +815,11 @@ export class ClaudeWire {
     if (!m) {
       return;
     }
+    // Replayed user messages are receipts only. Display, session tracking, and turn tracking ignore them.
+    if (m.isReplay === true) {
+      this.replay(m);
+      return;
+    }
 
     const session = str(m.session_id);
     if (session && session !== this.session) {
@@ -772,6 +852,7 @@ export class ClaudeWire {
         this.partial(obj(m.event));
         return;
       case 'result':
+        this.endReplayWait('The agent finished a turn without confirming the prompt.');
         this.responseClock.reset();
         this.responseTimingBlocked = false;
         this.emit({ kind: 'turnEnd', outcome: readOutcome(m) });
@@ -789,9 +870,14 @@ export class ClaudeWire {
         // tasks. `requires_action` is a running turn that waits on a permission answer.
         if (subtype === 'session_state_changed') {
           const state = str(m.state);
-          if (state === 'idle') this.emit({ kind: 'sessionState', state: 'idle' });
-          else if (state === 'running' || state === 'requires_action')
+          if (state === 'idle') {
+            this.endReplayWait('The agent went idle without confirming the prompt.');
+            this.reportedState = 'idle';
+            this.emit({ kind: 'sessionState', state: 'idle' });
+          } else if (state === 'running' || state === 'requires_action') {
+            this.reportedState = 'running';
             this.emit({ kind: 'sessionState', state: 'running' });
+          }
         }
         // The CLI sends `init` after the first prompt and repeats it for local commands.
         // Read its skill catalog whenever present. A missing or non-array `skills` value emits no catalog event.
@@ -902,6 +988,7 @@ export class ClaudeWire {
   close(reason: string): void {
     this.responseClock.reset();
     this.contextRequests.clear();
+    this.endReplayWait(reason);
     if (this.closed) {
       return;
     }
@@ -1181,10 +1268,13 @@ export class ClaudeWire {
     });
   }
 
+  // A user frame starts new input, so idle evidence from before it no longer holds.
   private write(message: Json): void {
+    if (message.type === 'user') this.reportedState = null;
     if (this.closed) {
       return;
     }
+
     this.send(JSON.stringify(message) + '\n');
   }
 }

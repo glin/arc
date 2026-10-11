@@ -37,6 +37,7 @@ import {
   PromptEntry,
   UsageReadResult,
   AgentPromptInput,
+  GuardedAttempt,
 } from './agentwire';
 import {
   AskMode,
@@ -220,7 +221,10 @@ export interface Driver {
   receive(line: string): void;
   // Completes initialization. Session plans also open a Codex thread after reading skills.
   open(): Promise<PromptEntry[]>;
-  prompt(prompt: AgentPromptInput): Promise<void | string>;
+  // A guarded prompt carries an attempt. The wire marks it written when it writes the input and settles it by its provider receipt.
+  prompt(prompt: AgentPromptInput, guard?: GuardedAttempt): Promise<void | string>;
+  // Whether the provider positively reported that nothing runs. An absent report is not idle.
+  idleEvidence?(): boolean;
   compact(beforeWrite?: () => void): Promise<void>;
   clear(name?: string): Promise<void>;
   answer(id: string, answer: AskAnswer): boolean;
@@ -334,8 +338,9 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
         contextFrame: (text) => wire.contextFrame(text),
         contextOverflow: (id) => wire.contextOverflow(id),
         open: () => wire.initialize(),
-        prompt: async (prompt) => wire.prompt(prompt),
-        compact: async (beforeWrite) => wire.prompt(compactCommand('claude'), beforeWrite),
+        prompt: async (prompt, guard) => wire.prompt(prompt, guard),
+        idleEvidence: () => wire.idleEvidence(),
+        compact: async (beforeWrite) => wire.prompt(compactCommand('claude'), undefined, beforeWrite),
         clear: async () => wire.prompt(clearCommand('claude')),
         answer: (id, answer) => wire.answer(id, answer),
         interrupt: () => wire.interrupt(true),
@@ -433,7 +438,8 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
           await wire.setEffort(options.effort ?? '');
           return commands;
         },
-        prompt: (prompt) => wire.prompt(prompt),
+        prompt: (prompt, guard) => wire.prompt(prompt, guard),
+        idleEvidence: () => wire.idleEvidence(),
         compact: (beforeWrite) => wire.compact(beforeWrite),
         clear: async (name) => {
           await wire.startThread(options, name);
@@ -769,6 +775,8 @@ export class AgentSession {
   private readonly responseRateOwners = new Map<string, number>();
   private readonly pendingResponses: WireEvent[] = [];
   private acceptingPrompts = 0;
+  // Turn ends this child reported. Guarded observations use it to tell tracked source growth from outside change.
+  private turnEnds = 0;
   // Claude reported `running` and has not reported `idle` since. It keeps the session busy
   // through a turn the CLI started by itself. It also covers a prompt that reached the CLI
   // just after its last `result` but before Arc read that `result`, which the `idle` after it settles.
@@ -900,7 +908,11 @@ export class AgentSession {
 
   // Marks the session busy while the CLI accepts a prompt. The returned id identifies that submission.
   // An exited child rejects the prompt and retains the failure in session state.
-  async prompt(prompt: AgentPromptInput, onSubmitted?: (turnId: number) => void): Promise<number> {
+  async prompt(
+    prompt: AgentPromptInput,
+    onSubmitted?: (turnId: number) => void,
+    guard?: GuardedAttempt,
+  ): Promise<number> {
     if (this.exited) {
       // Retain the opening refusal when its failed child has already closed.
       this.lastError = this.lastError ?? 'the agent is no longer running, so the prompt was not sent';
@@ -938,11 +950,13 @@ export class AgentSession {
       this.acceptingPrompts += 1;
       let nativeTurnId: void | string;
       try {
-        nativeTurnId = await this.driver.prompt(prompt);
+        nativeTurnId = await this.driver.prompt(prompt, guard);
       } finally {
         this.acceptingPrompts -= 1;
       }
-      if (nativeTurnId) this.nativeTurnOwners.set(nativeTurnId, submitted.id);
+      // A guarded prompt that joined a shared turn leaves that turn with the submission that already owns it.
+      if (nativeTurnId && !(guard?.settled?.sharedTurn && this.nativeTurnOwners.has(nativeTurnId)))
+        this.nativeTurnOwners.set(nativeTurnId, submitted.id);
       if (this.driver.hasOpenTurns) {
         this.busy = this.driver.hasOpenTurns();
         this.changed();
@@ -966,12 +980,47 @@ export class AgentSession {
         this.busy = this.countedBusy();
       }
       const refusal = `the agent would not take the prompt: ${(error as Error).message}`;
+      guard?.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message });
       this.lastError = refusal;
       this.changed();
       // A prompt refusal can leave the session idle. A successful held effort send retains this diagnostic.
       this.drainHeldEffort();
       throw new Error(refusal, { cause: error });
     }
+  }
+
+  // Why this child cannot take a guarded prompt now, or null with positive idle evidence.
+  // Initial `busy: false` alone is not evidence: the provider must have reported idle after its last input.
+  guardedIdle(): string | null {
+    if (this.exited || !this.ready || this.childTerminated) return 'unavailable';
+    if (
+      this.busy ||
+      this.delivering.size > 0 ||
+      this.asks.size > 0 ||
+      this.heldEffort !== null ||
+      this.effortSent !== null ||
+      this.preparingTurns.size > 0 ||
+      this.openTurns.size > 0 ||
+      this.acceptingPrompts > 0 ||
+      this.agentRunning ||
+      this.driver.hasOpenTurns?.()
+    )
+      return 'busy';
+    return this.driver.idleEvidence?.() === true ? null : 'unconfirmed';
+  }
+
+  guardedTurnEnds(): number {
+    return this.turnEnds;
+  }
+
+  // Writes one guarded text prompt through the ordinary prompt accounting. The attempt's
+  // `written` promise resolves at the input write, and `receipt` settles by the provider receipt.
+  guardedPrompt(text: string, clientUuid: string, onSubmitted?: (turnId: number) => void): GuardedAttempt {
+    const attempt = new GuardedAttempt(clientUuid);
+    this.prompt({ text, assets: [] }, onSubmitted, attempt).catch((error: unknown) =>
+      attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message }),
+    );
+    return attempt;
   }
 
   // Compaction uses the same running and refusal state as a prompt but a different driver
@@ -1510,6 +1559,7 @@ export class AgentSession {
     // Before the ending is reported, so that nothing reading this session sees it idle with
     // a pick still waiting. A prompt the reader sent in the meantime goes after the command.
     if (event.kind === 'turnEnd') {
+      this.turnEnds += 1;
       if (endedTurnId !== undefined) this.respondingTurns.delete(endedTurnId);
       this.drainHeldEffort();
     }

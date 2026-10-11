@@ -8,7 +8,16 @@ import { writeFileAtomically } from './atomicfile.ts';
 import { ARC_IDENTITY } from './identity.ts';
 import { arcHome } from './store.ts';
 import { WindowsPipeServer } from './windowpipe.ts';
-import { SessionWriteRequests, validSessionWrite, type SessionWriteParams } from './sessionwrites.ts';
+import {
+  GUARDED_SEND_REASONS,
+  SessionWriteRequests,
+  guardedRefusal,
+  sessionWriteBinding,
+  validSessionWrite,
+  type GuardedSendResult,
+  type RequesterProvider,
+  type SessionWriteParams,
+} from './sessionwrites.ts';
 import { validCompactPayload } from './compactrequest.ts';
 
 export const SESSION_REQUEST_VERSION = 1;
@@ -34,7 +43,12 @@ export interface WindowInfo extends WindowState {
   hostId: string;
   pid: number;
   version: number;
+  // Request fields this window accepts beyond its version. A window without the list accepts none.
+  capabilities?: string[];
 }
+
+// The window accepts `requesterProvider` on start, send, and session requests.
+export const REQUESTER_PROVIDER_CAPABILITY = 'requesterProvider';
 
 export interface HostRegistration extends WindowInfo {
   address: string;
@@ -61,10 +75,14 @@ export interface SessionRequest {
     | 'setups'
     | 'start'
     | 'curate'
+    | 'send'
     | 'compact-ready'
     | 'compact-request'
     | 'compact-status';
   requester: string | null;
+  // The requester's provider. The CLI sends it on send, session reads, and `arc start --arc-dispatch`, and only
+  // when exactly one provider variable is set and the window lists `REQUESTER_PROVIDER_CAPABILITY`.
+  requesterProvider?: RequesterProvider;
   params: SessionWriteParams & { requestId?: string; window?: string; self?: true; afterTurn?: true };
   // The channel sets the payload allowance for sessions requests. The wire parser refuses this key.
   replyBytes?: number;
@@ -89,12 +107,44 @@ function windowInfo(value: unknown): value is WindowInfo {
     value.folders.every((folder) => typeof folder === 'string' && folder.length <= 2048) &&
     typeof value.scopeReady === 'boolean' &&
     typeof value.panelReady === 'boolean' &&
-    typeof value.panelVisible === 'boolean'
+    typeof value.panelVisible === 'boolean' &&
+    (value.capabilities === undefined ||
+      (Array.isArray(value.capabilities) &&
+        value.capabilities.length <= 16 &&
+        value.capabilities.every((one) => typeof one === 'string' && one.length <= 64)))
   );
 }
 
+// Ordinary commands keep the attribution they always had. Only an unambiguous environment names a provider.
+export function requesterIdentity(env: NodeJS.ProcessEnv = process.env): {
+  requester: string | null;
+  provider: RequesterProvider | null;
+  ambiguous: boolean;
+} {
+  const claude = env.CLAUDE_CODE_SESSION_ID || null;
+  const codex = env.CODEX_THREAD_ID || null;
+  return {
+    requester: claude || codex || null,
+    provider: claude && codex ? null : claude ? 'claude' : codex ? 'codex' : null,
+    ambiguous: !!claude && !!codex,
+  };
+}
+
 export function parseSessionRequest(value: unknown): SessionRequest | null {
-  if (!record(value) || Object.keys(value).sort().join(',') !== 'id,method,params,requester,token,version') return null;
+  const keys = record(value) ? Object.keys(value).sort().join(',') : '';
+  if (
+    !record(value) ||
+    (keys !== 'id,method,params,requester,token,version' &&
+      keys !== 'id,method,params,requester,requesterProvider,token,version')
+  )
+    return null;
+  if (
+    value.requesterProvider !== undefined &&
+    (!['claude', 'codex'].includes(value.requesterProvider as string) ||
+      !['start', 'send', 'session'].includes(value.method as string) ||
+      value.requester === null)
+  )
+    return null;
   if (
     typeof value.id !== 'string' ||
     !value.id.length ||
@@ -109,6 +159,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       'setups',
       'start',
       'curate',
+      'send',
       'compact-ready',
       'compact-request',
       'compact-status',
@@ -144,7 +195,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       (value.params.turns as number) > 20
     )
       return null;
-  } else if (['setups', 'start', 'curate'].includes(value.method as string)) {
+  } else if (['setups', 'start', 'curate', 'send'].includes(value.method as string)) {
     if (!validSessionWrite(value.method as string, value.params)) return null;
   } else if (value.method === 'sessions') {
     const { cursor, limit, ...rest } = value.params;
@@ -275,6 +326,7 @@ export class WindowChannel {
   private disposal: Promise<void> | null = null;
   private requestHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private compactHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
+  private guardedSendHandler: ((request: SessionRequest) => Promise<GuardedSendResult>) | null = null;
 
   setRequestHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
     this.requestHandler = handler;
@@ -282,6 +334,11 @@ export class WindowChannel {
 
   setCompactRequestHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
     this.compactHandler = handler;
+  }
+
+  // Without a handler, every send refuses before input because no session has a recorded owner.
+  setGuardedSendHandler(handler: (request: SessionRequest) => Promise<GuardedSendResult>): void {
+    this.guardedSendHandler = handler;
   }
 
   constructor(
@@ -328,6 +385,7 @@ export class WindowChannel {
       hostId: this.hostId,
       pid: process.pid,
       version: SESSION_REQUEST_VERSION,
+      capabilities: [REQUESTER_PROVIDER_CAPABILITY],
     };
   }
 
@@ -445,6 +503,16 @@ export class WindowChannel {
                 return result;
               });
             }
+            const write = request.method === 'start' || request.method === 'curate' || request.method === 'send';
+            if (request.method === 'send') {
+              const send = () =>
+                this.guardedSendHandler
+                  ? this.guardedSendHandler(request)
+                  : guardedRefusal(request.id, request.params.prompt ?? '', GUARDED_SEND_REASONS.unrelated);
+              return this.writes
+                .runGuarded(request.id, this.binding(request), send)
+                .then((data) => ({ window: this.info(), data: { ...(data as object), requestId: request.id } }));
+            }
             if (!this.requestHandler) throw new Error('Session reads are unavailable in this window.');
             // A sessions reply reuses this window object, so its payload can fill the rest of the line.
             const window = request.method === 'sessions' ? this.info() : null;
@@ -458,13 +526,11 @@ export class WindowChannel {
                 }
               : request;
             const apply = () => this.requestHandler!(handled);
-            const data =
-              request.method === 'start' || request.method === 'curate'
-                ? this.writes.run(request.id, { method: request.method, params: request.params }, apply)
-                : Promise.resolve().then(apply);
+            const data = write
+              ? this.writes.run(request.id, this.binding(request), apply)
+              : Promise.resolve().then(apply);
             return Promise.resolve(data).then((data) => {
-              if (request.method === 'start' || request.method === 'curate')
-                data = { ...(data as object), requestId: request.id };
+              if (write) data = { ...(data as object), requestId: request.id };
               const result = { window: window ?? this.info(), data };
               if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
                 throw new Error("The session response exceeds this window's channel limit.");
@@ -484,6 +550,16 @@ export class WindowChannel {
           });
       },
       120_000,
+    );
+  }
+
+  private binding(request: SessionRequest): unknown {
+    return sessionWriteBinding(
+      this.hostId,
+      request.method,
+      request.params,
+      request.requester,
+      request.requesterProvider ?? null,
     );
   }
 
@@ -571,15 +647,30 @@ async function exchangeWindow(
   method: SessionRequest['method'] = 'ping',
   params: SessionRequest['params'] = {},
   requestId?: string,
+  attributed = false,
 ): Promise<unknown | null> {
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
+  const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
+  const identity = requesterIdentity();
+  const request: SessionRequest = {
+    id,
+    version: SESSION_REQUEST_VERSION,
+    token: entry.token,
+    method,
+    requester: identity.requester,
+    ...(attributed && identity.provider && providerCapable(entry) ? { requesterProvider: identity.provider } : {}),
+    params,
+  };
+  const line = JSON.stringify(request) + '\n';
+  // A line above the channel bound would close the connection after the write. Refuse it before connecting.
+  if (Buffer.byteLength(line) > SESSION_REQUEST_LIMITS.lineBytes)
+    throw new Error('The request exceeds the Arc window channel limit. Nothing was sent.');
   const socket =
     process.platform === 'win32'
       ? await WindowsPipeServer.connect(entry.address, entry.pid, entry.transportPid!, registrationFile, deadlineMs)
       : net.createConnection(entry.address);
   return new Promise((resolve, reject) => {
-    const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
     const challenge = crypto.randomBytes(32).toString('hex');
     let authenticated = false;
     let settled = false;
@@ -608,15 +699,7 @@ async function exchangeWindow(
             return;
           }
           authenticated = true;
-          const request: SessionRequest = {
-            id,
-            version: SESSION_REQUEST_VERSION,
-            token: entry.token,
-            method,
-            requester: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || null,
-            params,
-          };
-          socket.write(JSON.stringify(request) + '\n');
+          socket.write(line);
           return;
         }
         if (record(reply) && reply.id === id && typeof reply.error === 'string') {
@@ -669,12 +752,19 @@ export async function pingWindow(
   return (await exchangeWindow(entry, deadlineMs, registrationFile).catch(() => null)) as WindowInfo | null;
 }
 
+// A window that predates `requesterProvider` refuses any request that carries it, so the CLI sends it only when listed.
+function providerCapable(entry: WindowInfo): boolean {
+  return entry.capabilities?.includes(REQUESTER_PROVIDER_CAPABILITY) ?? false;
+}
+
+// `guardedStart` marks `arc start --arc-dispatch`, the only start that carries the requester's provider.
 export async function requestWindow(
   method: Exclude<SessionRequest['method'], 'ping'>,
   params: SessionRequest['params'],
   selector = process.env[`${ARC_IDENTITY.environmentPrefix}WINDOW`],
   home = arcHome(),
   requestId?: string,
+  guardedStart = false,
 ): Promise<unknown> {
   let selected = selector;
   if (!selected) {
@@ -705,8 +795,11 @@ export async function requestWindow(
   const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
   if (requestId && !requestId.startsWith(entry.hostId + ':'))
     throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
-  const write = method === 'start' || method === 'curate' || method === 'compact-request';
-  const result = await exchangeWindow(entry, write ? 120_000 : 1_000, file, method, params, id);
+  if (method === 'send' && !providerCapable(entry))
+    throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
+  const write = method === 'start' || method === 'curate' || method === 'send' || method === 'compact-request';
+  const attributed = method === 'send' || method === 'session' || (method === 'start' && guardedStart);
+  const result = await exchangeWindow(entry, write ? 120_000 : 1_000, file, method, params, id, attributed);
   if (result === null) {
     if (method === 'compact-request')
       return {

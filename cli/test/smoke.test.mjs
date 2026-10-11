@@ -224,6 +224,136 @@ test('bundled management commands carry explicit classification, prompt files an
   }
 });
 
+test('bundled send reads Unicode multiline prompt files, requires observations and request IDs, and refuses ambiguity before sending', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc send smoke '));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const sends = [];
+  channel.setGuardedSendHandler(async (request) => {
+    sends.push(request);
+    return {
+      version: 1,
+      status: 'accepted',
+      requestId: request.id,
+      payloadSha256: 'host',
+      nativeTurnId: 'turn-1',
+      reason: 'The session received the prompt.',
+    };
+  });
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const env = {
+      ...process.env,
+      ARC_HOME: home,
+      ARC_WINDOW: channel.hostId,
+      CLAUDE_CODE_SESSION_ID: 'coordinator',
+      CODEX_THREAD_ID: '',
+    };
+    const prompt = join(home, 'follow up.txt');
+    const text = 'Línea uno ✓\nSecond line\r\n';
+    writeFileSync(prompt, '\uFEFF' + text);
+    const observation = 'a'.repeat(40) + '.' + 'b'.repeat(43);
+    const id = `${channel.hostId}:one`;
+    const args = [cli, 'send', 'worker', '--prompt-file', prompt, '--observation', observation, '--request-id', id];
+    const reply = JSON.parse((await run(process.execPath, [...args, '--json'], { env, encoding: 'utf8' })).stdout);
+    assert.equal(reply.status, 'accepted');
+    assert.equal(reply.requestId, id);
+    assert.equal(sends[0].params.prompt, text);
+    assert.equal(sends[0].requester, 'coordinator');
+    assert.equal(sends[0].requesterProvider, 'claude');
+    const retried = await run(process.execPath, args, { env, encoding: 'utf8' });
+    assert.match(retried.stdout, /received the prompt\. Request ID: /);
+    assert.equal(sends.length, 1);
+    const refusals = [
+      [args.filter((arg) => arg !== '--observation' && arg !== observation), env, /Usage: arc send/],
+      [args.slice(0, -2), env, /Usage: arc send/],
+      [args.map((arg) => (arg === observation ? 'stale' : arg)), env, /observation is invalid/],
+      [[...args, '--untagged'], env, /unavailable for send/],
+      [args, { ...env, CODEX_THREAD_ID: 'codex-thread' }, /Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID/],
+      [args, { ...env, CLAUDE_CODE_SESSION_ID: '' }, /Run send from/],
+    ];
+    for (const [refused, refusedEnv, pattern] of refusals)
+      await assert.rejects(run(process.execPath, refused, { env: refusedEnv }), pattern);
+    for (const [content, pattern] of [
+      ['/compact', /prompt-box command/],
+      [' \n', /prompt-box command/],
+      ['x'.repeat(48 * 1024 + 1), /exceeds 48 KiB/],
+      ['"'.repeat(40_000), /channel limit/],
+    ]) {
+      writeFileSync(prompt, content);
+      await assert.rejects(run(process.execPath, args, { env }), pattern);
+    }
+    assert.equal(sends.length, 1);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bundled guarded starts refuse ambiguous requesters, and a window without the provider capability gets only the base request keys', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc guarded start smoke '));
+  const channel = new WindowChannel(home);
+  // A window from before the provider field publishes no capabilities, and its parser accepts only the base keys.
+  const info = channel.info;
+  channel.info = function () {
+    const { capabilities: _capabilities, ...rest } = info.call(this);
+    return rest;
+  };
+  const run = promisify(execFile);
+  const requests = [];
+  channel.setRequestHandler((request) => {
+    requests.push(request);
+    return request.method === 'start'
+      ? { status: 'accepted', provider: 'claude', sessionId: 'worker' }
+      : { state: 'current', turns: [] };
+  });
+  const sends = [];
+  channel.setGuardedSendHandler(async (request) => {
+    sends.push(request);
+    return { version: 1, status: 'accepted', requestId: request.id, payloadSha256: 'x', nativeTurnId: 't', reason: '' };
+  });
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const env = {
+      ...process.env,
+      ARC_HOME: home,
+      ARC_WINDOW: channel.hostId,
+      CLAUDE_CODE_SESSION_ID: 'coordinator',
+      CODEX_THREAD_ID: '',
+    };
+    const prompt = join(home, 'prompt.txt');
+    writeFileSync(prompt, 'Prepare the worktree.');
+    const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt, '--untagged'];
+    const dispatched = await run(process.execPath, [...start, '--arc-dispatch'], { env, encoding: 'utf8' });
+    assert.match(dispatched.stdout, /ARC_DISPATCH_SESSION=/);
+    await run(process.execPath, [cli, 'session', 'worker', '--json'], { env, encoding: 'utf8' });
+    const base = 'id,method,params,requester,token,version';
+    assert.deepEqual(
+      requests.map((request) => Object.keys(request).sort().join(',')),
+      [base, base],
+    );
+    const observation = 'a'.repeat(40) + '.' + 'b'.repeat(43);
+    const send = [cli, 'send', 'worker', '--prompt-file', prompt, '--observation', observation];
+    await assert.rejects(
+      run(process.execPath, [...send, '--request-id', `${channel.hostId}:send`], { env }),
+      /must reload/,
+    );
+    assert.equal(sends.length, 0);
+    const ambiguous = { ...env, CODEX_THREAD_ID: 'codex-thread' };
+    await assert.rejects(
+      run(process.execPath, [...start, '--arc-dispatch'], { env: ambiguous }),
+      /Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID/,
+    );
+    assert.equal(requests.length, 2);
+    await run(process.execPath, start, { env: ambiguous, encoding: 'utf8' });
+    assert.equal(requests.length, 3, 'a start without --arc-dispatch keeps working and records no owner');
+    assert.equal('requesterProvider' in requests[2], false);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bundled session commands select one window, reject unknown IDs, and bound turns before sending', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc-session-smoke-'));
   const channel = new WindowChannel(home);

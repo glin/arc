@@ -270,3 +270,48 @@ export function num(v: unknown): number | null {
 export function arr(v: unknown): unknown[] {
   return Array.isArray(v) ? v : [];
 }
+
+// How one guarded prompt ended at the provider. `accepted` confirms receipt of that exact input, not finished work.
+// `refused` needs a correlated rejection, and `unknown` covers every attempt without a conclusive answer.
+export interface GuardedReceipt {
+  outcome: 'accepted' | 'refused' | 'unknown';
+  nativeTurnId: string | null;
+  reason: string;
+  // Codex returned a turn that already existed, so the input joined work in progress.
+  sharedTurn?: boolean;
+}
+
+// One guarded prompt from the input write to its provider receipt. The first settlement wins.
+// `written` resolves when the wire writes the input, which is the moment the attempt starts.
+export class GuardedAttempt {
+  readonly written: Promise<void>;
+  readonly receipt: Promise<GuardedReceipt>;
+  private wrote = false;
+  private result: GuardedReceipt | null = null;
+  private resolveWritten!: () => void;
+  private resolveReceipt!: (receipt: GuardedReceipt) => void;
+
+  constructor(readonly clientUuid: string) {
+    this.written = new Promise((resolve) => (this.resolveWritten = resolve));
+    this.receipt = new Promise((resolve) => (this.resolveReceipt = resolve));
+  }
+
+  // The host reads a shared-turn receipt here, because the wire settles it before the prompt call returns.
+  get settled(): GuardedReceipt | null {
+    return this.result;
+  }
+
+  markWritten(): void {
+    if (this.wrote) return;
+    this.wrote = true;
+    this.resolveWritten();
+  }
+
+  settle(receipt: GuardedReceipt): boolean {
+    if (this.result) return false;
+    // An attempt without a write can never have reached the provider.
+    this.result = this.wrote ? receipt : { outcome: 'refused', nativeTurnId: null, reason: receipt.reason };
+    this.resolveReceipt(this.result);
+    return true;
+  }
+}

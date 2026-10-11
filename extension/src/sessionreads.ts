@@ -620,13 +620,22 @@ function revision(file: string): string | null {
   }
 }
 
+// The exact physical revision a guarded follow-up binds: device, inode, size, write time, and change time.
+// Unlike `sessionSourceAdmitted`, it gives append growth no allowance. Null means the source is unreadable.
+export function guardedSourceRevision(file: string): string | null {
+  return revision(file);
+}
+
 // The source comes from the window's catalog. A requester never supplies a file path.
+// `observe` receives the checked revision of a current read. Its observation joins the reply only when it returns one
+// and the reply still holds the latest turn the observation names.
 export function boundedSessionRead(
   source: SessionFile,
   turns: number,
   scope: () => string | null,
   requester: string | null,
   roots: readonly string[],
+  observe?: (facts: { scope: string; sourceRevision: string; latestTurn: string | null }) => string | null,
 ) {
   if (!Number.isSafeInteger(turns) || turns < 1 || turns > SESSION_READ_LIMITS.turns)
     throw new Error('Turns must be between 1 and 20.');
@@ -683,17 +692,28 @@ export function boundedSessionRead(
   }
   result.state = read.turns.length ? 'current' : 'unparsed';
   result.partial = read.readBytes < source.size || read.turnLimitReached;
+  const latest = read.turns.at(-1);
+  const observation =
+    observe && result.state === 'current' && latest
+      ? observe({ scope: beforeScope, sourceRevision: before, latestTurn: latest.promptId ?? null })
+      : null;
+  // The response limit below reserves room for the observation.
+  const reserved = observation ? Buffer.byteLength(JSON.stringify({ observation })) : 0;
   for (const turn of [...read.turns].reverse()) {
     const { promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error } = turn;
     result.turns.push({ promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error });
-    if (Buffer.byteLength(JSON.stringify(result)) > SESSION_READ_LIMITS.outputBytes - 512) {
+    if (Buffer.byteLength(JSON.stringify(result)) + reserved > SESSION_READ_LIMITS.outputBytes - 512) {
       result.turns.pop();
       result.partial = true;
       result.notes.push('The response limit excluded this turn and older turns.');
       break;
     }
   }
+  // An observation authorizes a continuation only from facts the reply delivers, so it needs the latest turn.
+  if (observation && result.turns.length && result.turns[0].promptId === latest!.promptId)
+    Object.assign(result, { observation });
   if (result.partial) result.notes.push('The bounded read does not establish complete session history.');
+
   if (result.state === 'unparsed')
     result.notes.push('No turns were parsed in the bounded window. This does not establish an empty session.');
   return result;

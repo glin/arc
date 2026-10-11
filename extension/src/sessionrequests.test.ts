@@ -1,5 +1,6 @@
 import { revisionOf, supportedFileIdentity, type SessionFile } from './transcript';
-import { sessionSourceAdmitted } from './sessionreads';
+import { guardedSourceRevision, sessionSourceAdmitted } from './sessionreads';
+import { GuardedAttempt } from './agentwire.ts';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import filesystem from 'node:fs';
@@ -30,8 +31,23 @@ import {
   type SessionPageRequest,
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
-import { requestWindow } from './sessionrequests.ts';
-import { SessionWriteRequests, archiveRefusal } from './sessionwrites.ts';
+import { requestWindow, requesterIdentity } from './sessionrequests.ts';
+import {
+  GUARDED_SEND_REASONS,
+  GuardedSends,
+  SessionWriteRequests,
+  archiveRefusal,
+  guardedChannelSend,
+  guardedDeliveryPort,
+  guardedPanelPorts,
+  guardedStartContext,
+  interveneOnReaderInput,
+  recordGuardedStart,
+  runGuardedSend,
+  type GuardedOwner,
+  type GuardedSendRequest,
+  type GuardedTargetFacts,
+} from './sessionwrites.ts';
 import {
   CompactHost,
   CompactRequests,
@@ -449,6 +465,9 @@ test('the authenticated window channel retains write acceptance across a disconn
     setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
   };
   const id = channel.hostId + ':one';
+  // The binding includes the requester, so the retry runs with the same absent requester as the raw request.
+  vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
+  vi.stubEnv('CODEX_THREAD_ID', '');
   const socket =
     process.platform === 'win32'
       ? await WindowsPipeServer.connect(
@@ -476,6 +495,7 @@ test('the authenticated window channel retains write acceptance across a disconn
 const sockets: Duplex[] = [];
 afterEach(async () => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   for (const socket of sockets.splice(0)) socket.destroy();
   await Promise.all(channels.splice(0).map((channel) => channel.dispose()));
 });
@@ -686,6 +706,32 @@ test('bounded session reads preserve native provider turns and reject stale scop
     assert.equal(result.turns[0].prompt, 'prompt 3');
     assert.equal(result.turns[0].summary, 'answer 3');
     assert.equal(result.requester, 'local-agent');
+    assert.equal('observation' in result, false);
+    const observed = boundedSessionRead(
+      source,
+      2,
+      () => 'scope',
+      'local-agent',
+      [directory],
+      (facts) => JSON.stringify(facts),
+    ) as { observation?: string; turns: { promptId: string }[] };
+    assert.deepEqual(JSON.parse(observed.observation!), {
+      scope: 'scope',
+      sourceRevision: guardedSourceRevision(file),
+      latestTurn: observed.turns[0].promptId,
+    });
+    assert.equal(
+      'observation' in
+        boundedSessionRead(
+          source,
+          2,
+          () => 'scope',
+          null,
+          [directory],
+          () => null,
+        ),
+      false,
+    );
     assert.equal(
       boundedSessionRead({ ...source, dev: '999999999999999999999' }, 2, () => 'scope', null, [directory]).state,
       'stale',
@@ -709,6 +755,54 @@ test('bounded session reads preserve native provider turns and reject stale scop
     assert.equal(changed.state, 'stale');
     assert.deepEqual(changed.turns, []);
   }
+  // A latest turn too large for the response leaves the reply without that turn, so it carries no observation.
+  const file = path.join(directory, 'oversized.jsonl');
+  const prompt = (content: string, timestamp: string) => ({
+    type: 'user',
+    sessionId: 'known',
+    cwd: directory,
+    timestamp,
+    message: { role: 'user', content },
+  });
+  const reply = (n: number, timestamp: string) => ({
+    type: 'assistant',
+    timestamp,
+    message: {
+      id: `reply-${n}`,
+      role: 'assistant',
+      model: 'claude-opus-5-5',
+      content: [{ type: 'text', text: `answer ${n}` }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  });
+  const records = [
+    prompt('small prompt', '2026-10-08T12:00:01Z'),
+    reply(1, '2026-10-08T12:00:01Z'),
+    prompt('y'.repeat(SESSION_READ_LIMITS.outputBytes), '2026-10-08T12:00:02Z'),
+    reply(2, '2026-10-08T12:00:02Z'),
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const source = {
+    agent: 'claude' as const,
+    file,
+    sessionId: 'known',
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ino: stat.ino,
+  };
+  const oversized = boundedSessionRead(
+    source,
+    2,
+    () => 'scope',
+    'local-agent',
+    [directory],
+    () => 'signed',
+  );
+  assert.equal(oversized.state, 'current');
+  assert.deepEqual(oversized.turns, []);
+  assert.equal('observation' in oversized, false);
 });
 
 test('session replies with valid large window metadata refuse excess envelope bytes without losing the channel', async () => {
@@ -2444,4 +2538,635 @@ test('self compaction returns the current record for a retried request ID and re
   const later = { ...compactBinding, turn: 'later', submissionId: 'later' };
   book.observe(later, compactEvent('toolStart', { toolId: 'later', turnId: 'later' }));
   assert.throws(() => book.admit(compactPayload, () => true), /already used/);
+});
+
+// These guards catch guarded sends that reach a child they must not reach, with fake children and no provider startup.
+class GuardChild {
+  readonly key = 'worker-key';
+  readonly agent = 'claude';
+  idle: string | null = null;
+  turnEnds = 0;
+  attempts: string[] = [];
+  guardedTurnEnds() {
+    return this.turnEnds;
+  }
+  guardedPrompt(text: string, clientUuid: string) {
+    this.attempts.push(text);
+    return new GuardedAttempt(clientUuid);
+  }
+  sessionId = 'worker';
+  exited = false;
+  lastError: string | null = null;
+  state() {
+    return { sessionId: this.sessionId, exited: this.exited, lastError: this.lastError };
+  }
+  guardedIdle() {
+    return this.idle;
+  }
+}
+
+function guardFixture() {
+  const policy = new GuardedSends<GuardChild>('window');
+  const child = new GuardChild();
+  const coordinator = { provider: 'claude' as const, id: 'coordinator' };
+  policy.recordStart({
+    requester: coordinator,
+    activation: 'window',
+    worker: 'worker',
+    child,
+  });
+  const facts: GuardedTargetFacts = {
+    current: true,
+    archived: false,
+    scope: 'scope',
+    sourceRevision: 'revision-1',
+    latestTurn: 'turn-1',
+    queued: 0,
+    pendingSubmissions: 0,
+    pendingControls: 0,
+    background: false,
+    writerConflict: false,
+  };
+  policy.facts = () => facts;
+  const writes: GuardedAttempt[] = [];
+  const port = {
+    alive: true,
+    leased: true,
+    live: (owner: GuardedOwner<GuardChild>) => (port.alive ? owner.child : null),
+    withLease: async <T>(_child: GuardChild, work: () => Promise<T>) => (port.leased ? work() : null),
+    write: (_child: GuardChild, _text: string) => {
+      const attempt = new GuardedAttempt(`uuid-${writes.length}`);
+      attempt.markWritten();
+      writes.push(attempt);
+      return attempt;
+    },
+  };
+  let serial = 0;
+  const send = (changes: Partial<GuardedSendRequest> = {}) =>
+    runGuardedSend(
+      policy,
+      {
+        requestId: `window:${++serial}`,
+        activation: 'window',
+        sessionId: 'worker',
+        prompt: 'Apply the accepted corrections.',
+        observation: policy.observe('worker', coordinator, facts) ?? '',
+        requester: coordinator,
+        ...changes,
+      },
+      port,
+    );
+  return { policy, child, coordinator, facts, writes, port, send };
+}
+
+test('guarded sends refuse other coordinators, old activations, ambiguous requesters, and prompt-box commands with no write', async () => {
+  const { policy, coordinator, facts, writes, send } = guardFixture();
+  assert.equal(policy.observe('worker', { provider: 'codex', id: 'coordinator' }, facts), null);
+  assert.equal(policy.observe('worker', { provider: 'claude', id: 'other' }, facts), null);
+  for (const requester of [
+    { provider: 'claude' as const, id: 'other' },
+    { provider: 'codex' as const, id: 'coordinator' },
+  ])
+    assert.equal((await send({ requester })).reason, GUARDED_SEND_REASONS.unrelated);
+  assert.equal((await send({ activation: 'reloaded' })).reason, GUARDED_SEND_REASONS.unrelated);
+  assert.equal((await send({ sessionId: 'unrecorded' })).reason, GUARDED_SEND_REASONS.unrelated);
+  assert.equal((await send({ requester: null })).reason, GUARDED_SEND_REASONS.requester);
+  for (const prompt of ['', '  \n', '/compact', '  /clear now'])
+    assert.equal((await send({ prompt })).reason, GUARDED_SEND_REASONS.prompt);
+  assert.deepEqual(requesterIdentity({ CLAUDE_CODE_SESSION_ID: 'a', CODEX_THREAD_ID: 'b' }), {
+    requester: 'a',
+    provider: null,
+    ambiguous: true,
+  });
+  assert.deepEqual(requesterIdentity({ CODEX_THREAD_ID: 'b' }), {
+    requester: 'b',
+    provider: 'codex',
+    ambiguous: false,
+  });
+  assert.equal(
+    policy.recordStart({
+      requester: coordinator,
+      activation: 'old',
+      worker: 'w2',
+      child: new GuardChild(),
+    }),
+    false,
+  );
+  assert.equal(writes.length, 0);
+  const wire = { id: 'w:1', version: 1, token: 'b'.repeat(64), requester: 'coordinator', method: 'send' };
+  const sendParams = { sessionId: 'worker', prompt: 'next', observation: 'a.' + 'b'.repeat(43) };
+  assert.ok(parseSessionRequest({ ...wire, requesterProvider: 'claude', params: sendParams }));
+  assert.ok(parseSessionRequest({ ...wire, params: sendParams }));
+  for (const invalid of [
+    { ...wire, requesterProvider: 'other', params: sendParams },
+    { ...wire, requester: null, requesterProvider: 'codex', params: sendParams },
+    { ...wire, method: 'curate', requesterProvider: 'claude', params: sendParams },
+    { ...wire, params: { ...sendParams, observation: 'no-signature' } },
+    { ...wire, params: { ...sendParams, path: '/tmp/prompt' } },
+  ])
+    assert.equal(parseSessionRequest(invalid), null);
+});
+
+test('guarded sends consume observations, bind source, scope, turn and assignment, and refuse unexplained changes before input', async () => {
+  const { policy, child, coordinator, facts, writes, send } = guardFixture();
+  const observation = policy.observe('worker', coordinator, facts)!;
+  const first = send({ observation });
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.unsettled);
+  writes[0].settle({ outcome: 'accepted', nativeTurnId: 'turn-2', reason: '' });
+  const accepted = await first;
+  assert.equal(accepted.status, 'accepted');
+  assert.equal(accepted.nativeTurnId, 'turn-2');
+  assert.equal(
+    accepted.payloadSha256,
+    crypto.createHash('sha256').update('Apply the accepted corrections.').digest('hex'),
+  );
+  assert.equal((await send({ observation })).reason, GUARDED_SEND_REASONS.stale);
+  const tampered = observation.slice(0, -2) + (observation.endsWith('AA') ? 'BB' : 'AA');
+  assert.equal((await send({ observation: tampered })).reason, GUARDED_SEND_REASONS.stale);
+  for (const [field, value, reason] of [
+    ['sourceRevision', 'revision-grown', GUARDED_SEND_REASONS.changed],
+    ['sourceRevision', 'revision-after-turn', GUARDED_SEND_REASONS.stale],
+    ['latestTurn', 'turn-after-turn', GUARDED_SEND_REASONS.stale],
+    ['latestTurn', 'turn-9', GUARDED_SEND_REASONS.changed],
+    ['scope', 'other-scope', GUARDED_SEND_REASONS.changed],
+    ['sourceRevision', null, GUARDED_SEND_REASONS.unavailable],
+    ['current', false, GUARDED_SEND_REASONS.unavailable],
+    ['archived', true, GUARDED_SEND_REASONS.unavailable],
+    ['queued', 1, GUARDED_SEND_REASONS.busy],
+    ['pendingSubmissions', 1, GUARDED_SEND_REASONS.busy],
+    ['pendingControls', 1, GUARDED_SEND_REASONS.busy],
+    ['background', true, GUARDED_SEND_REASONS.busy],
+    ['background', null, GUARDED_SEND_REASONS.unavailable],
+  ] as const) {
+    const observed = policy.observe('worker', coordinator, facts)!;
+    const saved = (facts as any)[field];
+    (facts as any)[field] = value;
+    // A tracked turn end explains the change, so the observation is stale rather than changed outside Arc.
+    if (String(value).endsWith('after-turn')) child.turnEnds += 1;
+    assert.equal((await send({ observation: observed })).reason, reason, `${field} ${value}`);
+    (facts as any)[field] = saved;
+  }
+  // An observation from before an accepted delivery sees the delivery's growth as tracked work.
+  const beforeDelivery = policy.observe('worker', coordinator, facts)!;
+  const delivery = send();
+  await vi.waitFor(() => assert.equal(writes.length, 2));
+  writes[1].settle({ outcome: 'accepted', nativeTurnId: 'turn-3', reason: '' });
+  assert.equal((await delivery).status, 'accepted');
+  facts.sourceRevision = 'revision-after-delivery';
+  assert.equal((await send({ observation: beforeDelivery })).reason, GUARDED_SEND_REASONS.stale);
+  facts.sourceRevision = 'revision-1';
+  for (const [idle, reason] of [
+    ['busy', GUARDED_SEND_REASONS.busy],
+    ['unconfirmed', GUARDED_SEND_REASONS.unavailable],
+    ['unavailable', GUARDED_SEND_REASONS.ownership],
+  ] as const) {
+    child.idle = idle;
+    assert.equal((await send()).reason, reason);
+  }
+  child.idle = null;
+  child.sessionId = 'cleared-successor';
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  child.sessionId = 'worker';
+  assert.equal(writes.length, 2);
+});
+
+test('reader intervention, retirement, writer conflicts, and unknown or shared-turn outcomes block guarded sends without a resend', async () => {
+  const { policy, coordinator, facts, writes, port, send } = guardFixture();
+  for (const reader of ['worker', 'coordinator']) {
+    const observation = policy.observe('worker', coordinator, facts)!;
+    policy.intervene(reader);
+    assert.equal((await send({ observation })).reason, GUARDED_SEND_REASONS.stale, reader);
+  }
+  policy.intervene('unrelated-session');
+  port.alive = false;
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  port.alive = true;
+  port.leased = false;
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  port.leased = true;
+  assert.equal(writes.length, 0);
+  const unknown = send();
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'unknown', nativeTurnId: null, reason: 'the agent did not answer' });
+  assert.equal((await unknown).status, 'unknown');
+  const later = policy.observe('worker', coordinator, facts)!;
+  assert.equal((await send({ observation: later, prompt: 'Different text.' })).reason, GUARDED_SEND_REASONS.blocked);
+  policy.intervene('coordinator');
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.blocked);
+  policy.intervene('worker');
+  const shared = send();
+  await vi.waitFor(() => assert.equal(writes.length, 2));
+  const pending = policy.observe('worker', coordinator, facts)!;
+  writes[1].settle({ outcome: 'unknown', nativeTurnId: 'turn-1', reason: 'joined', sharedTurn: true });
+  assert.deepEqual([(await shared).status, (await shared).nativeTurnId], ['unknown', 'turn-1']);
+  assert.equal((await send({ observation: pending })).reason, GUARDED_SEND_REASONS.stale);
+  policy.intervene('worker');
+  facts.writerConflict = true;
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  facts.writerConflict = false;
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  assert.equal(writes.length, 2);
+});
+
+test('the window channel retains guarded sends by requester, provider, target, observation and exact text, and refuses without an owner record', async () => {
+  const { channel, home } = await fixture();
+  const observation = 'b'.repeat(40) + '.' + 'c'.repeat(43);
+  const params = { sessionId: 'worker', prompt: 'Line one\nLínea dos ✓', observation };
+  vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+  vi.stubEnv('CODEX_THREAD_ID', '');
+  try {
+    const refused = (await requestWindow('send', params, channel.hostId, home, channel.hostId + ':none')) as any;
+    assert.equal(refused.status, 'refused');
+    assert.equal(refused.reason, GUARDED_SEND_REASONS.unrelated);
+    const seen: any[] = [];
+    let release!: () => void;
+    channel.setGuardedSendHandler(async (request) => {
+      seen.push(request);
+      await new Promise<void>((resolve) => (release = resolve));
+      return {
+        version: 1,
+        status: 'accepted',
+        requestId: request.id,
+        payloadSha256: 'x',
+        nativeTurnId: 't',
+        reason: '',
+      };
+    });
+    const id = channel.hostId + ':one';
+    const first = requestWindow('send', params, channel.hostId, home, id);
+    await vi.waitFor(() => assert.equal(seen.length, 1));
+    assert.equal(seen[0].requesterProvider, 'claude');
+    assert.equal(seen[0].params.prompt, params.prompt);
+    const retry = requestWindow('send', params, channel.hostId, home, id);
+    release();
+    assert.deepEqual(await first, await retry);
+    assert.equal(seen.length, 1);
+    await assert.rejects(
+      requestWindow('send', { ...params, prompt: 'Other text' }, channel.hostId, home, id),
+      /different request/,
+    );
+    await assert.rejects(
+      requestWindow('send', { ...params, observation: 'd' + observation.slice(1) }, channel.hostId, home, id),
+      /different request/,
+    );
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
+    vi.stubEnv('CODEX_THREAD_ID', 'coordinator');
+    await assert.rejects(requestWindow('send', params, channel.hostId, home, id), /different request/);
+    await assert.rejects(
+      requestWindow('send', { ...params, prompt: '"'.repeat(40_000) }, channel.hostId, home, channel.hostId + ':big'),
+      /channel limit/,
+    );
+    assert.equal(seen.length, 1);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('guarded source revisions refuse growth that ordinary admission accepts, replacement, and unreadable sources', () => {
+  const file = path.join(tempDir('guarded-source-'), 'session.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const observed = guardedSourceRevision(file)!;
+  assert.equal(guardedSourceRevision(file), observed);
+  const before = revisionOf(fs.statSync(file, { bigint: true }));
+  fs.appendFileSync(file, '{"type":"summary"}\n');
+  const after = revisionOf(fs.statSync(file, { bigint: true }));
+  if (supportedFileIdentity(before) && supportedFileIdentity(after))
+    assert.equal(
+      sessionSourceAdmitted(
+        {
+          agent: 'claude',
+          file,
+          sessionId: 's',
+          size: before.size,
+          mtimeMs: before.mtimeMs,
+          dev: before.dev,
+          ino: before.ino,
+        },
+        after,
+      ),
+      true,
+    );
+  const grown = guardedSourceRevision(file);
+  assert.notEqual(grown, observed);
+  fs.writeFileSync(file, '{"a":1}\n');
+  assert.notEqual(guardedSourceRevision(file), observed);
+  assert.notEqual(guardedSourceRevision(file), grown);
+  fs.rmSync(file);
+  assert.equal(guardedSourceRevision(file), null);
+});
+
+test('guarded sends keep an observation that a wire refusal before the write left unused, and compose full-sentence reasons', async () => {
+  const { policy, coordinator, facts, writes, port, send } = guardFixture();
+  const observation = policy.observe('worker', coordinator, facts)!;
+  const write = port.write;
+  const unwritten = (reason: string) => (_child: GuardChild, _text: string) => {
+    const attempt = new GuardedAttempt('unwritten');
+    attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason });
+    return attempt;
+  };
+  port.write = unwritten('another guarded prompt is still unsettled');
+  const refused = await send({ observation });
+  assert.deepEqual(
+    [refused.status, refused.reason],
+    ['refused', 'Another guarded prompt is still unsettled. No prompt was sent.'],
+  );
+  port.write = unwritten('the agent is no longer running, so the prompt was not sent');
+  assert.equal((await send({ observation })).reason, 'The agent is no longer running, so the prompt was not sent.');
+  port.write = write;
+  const pending = send({ observation });
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'unknown', nativeTurnId: null, reason: 'the agent did not answer' });
+  const unknown = await pending;
+  assert.equal(unknown.status, 'unknown');
+  assert.equal(unknown.reason, 'The agent did not answer. Delivery is unknown. Arc will not resend this prompt.');
+});
+
+test('only reader input a directing callback accepts for the worker clears the unknown-delivery block', async () => {
+  const { policy, coordinator, facts, writes, send } = guardFixture();
+  const unknown = send();
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'unknown', nativeTurnId: null, reason: 'the agent did not answer' });
+  assert.equal((await unknown).status, 'unknown');
+  const results: Record<string, unknown> = {};
+  const panel = {
+    onSendPrompt: async (..._args: unknown[]) => results.send,
+    onCompact: async (..._args: unknown[]) => results.compact,
+    onClear: async (..._args: unknown[]) => results.clear,
+    onStopTurn: (..._args: unknown[]) => undefined,
+    onAnswerAsk: (..._args: unknown[]) => results.answer,
+  };
+  interveneOnReaderInput(panel, policy);
+  const prompt = () => panel.onSendPrompt('claude', 'worker', null, { text: 'x', assets: [] });
+  const rejected: [string, Record<string, unknown>, () => unknown][] = [
+    ['rejected answer', { answer: false }, () => panel.onAnswerAsk('worker', 'ask', 'yes')],
+    ['rejected prompt', { send: { delivered: false, reason: 'busy' } }, prompt],
+    ['prompt delivered to a forked successor', { send: { delivered: true, reason: '', session: 'forked' } }, prompt],
+    [
+      'rejected compaction',
+      { compact: { delivered: false, reason: 'no' } },
+      () => panel.onCompact('claude', 'worker', null),
+    ],
+    ['stop with no acceptance signal', {}, () => panel.onStopTurn('claude', 'worker')],
+  ];
+  for (const [name, setup, call] of rejected) {
+    Object.assign(results, setup);
+    const before = policy.observe('worker', coordinator, facts)!;
+    await call();
+    assert.equal(policy.precheck(guardedRequest(before, coordinator)), GUARDED_SEND_REASONS.stale, name);
+    const after = policy.observe('worker', coordinator, facts)!;
+    assert.equal(policy.precheck(guardedRequest(after, coordinator)), GUARDED_SEND_REASONS.blocked, name);
+  }
+  results.answer = true;
+  assert.equal(panel.onAnswerAsk('worker', 'ask', 'yes'), true, 'the wrapper returns the answer result unchanged');
+  assert.equal(policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)), null);
+
+  const again = send();
+  await vi.waitFor(() => assert.equal(writes.length, 2));
+  writes[1].settle({ outcome: 'unknown', nativeTurnId: null, reason: 'the agent did not answer' });
+  assert.equal((await again).status, 'unknown');
+  results.send = { delivered: true, reason: '', turnId: 4 };
+  assert.deepEqual(await prompt(), results.send);
+  assert.equal(policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)), null);
+  assert.equal(writes.length, 2);
+});
+
+function guardedRequest(observation: string, requester: { provider: 'claude'; id: string }): GuardedSendRequest {
+  return {
+    requestId: 'window:check',
+    activation: 'window',
+    sessionId: 'worker',
+    prompt: 'Next.',
+    observation,
+    requester,
+  };
+}
+
+test('guarded wiring intervenes on each directing reader callback, records only fresh starts, and delivers through the guarded prompt mode', async () => {
+  const { policy, child, coordinator, facts } = guardFixture();
+  const calls: unknown[][] = [];
+  const callback =
+    (name: string) =>
+    (...args: unknown[]) =>
+      calls.push([name, ...args]);
+  const panel = {
+    onSendPrompt: callback('send'),
+    onCompact: callback('compact'),
+    onClear: callback('clear'),
+    onStopTurn: callback('stop'),
+    onAnswerAsk: callback('answer'),
+  };
+  interveneOnReaderInput(panel, policy);
+  const directing: [() => unknown, string][] = [
+    [() => panel.onSendPrompt('claude', 'worker', null, { text: 'x', assets: [] }), 'onSendPrompt'],
+    [() => panel.onCompact('claude', 'worker', null), 'onCompact'],
+    [() => panel.onClear('claude', 'worker', null, 'name'), 'onClear'],
+    [() => panel.onStopTurn('claude', 'worker'), 'onStopTurn'],
+    [() => panel.onAnswerAsk('worker', 'ask', 'yes'), 'onAnswerAsk'],
+  ];
+  for (const [call, name] of directing) {
+    const observation = policy.observe('worker', coordinator, facts)!;
+    call();
+    assert.equal(policy.precheck(guardedRequest(observation, coordinator)), GUARDED_SEND_REASONS.stale, name);
+  }
+  assert.equal(calls.length, directing.length);
+  const kept = policy.observe('worker', coordinator, facts)!;
+  panel.onSendPrompt('claude', 'worker', null, { text: 'x', assets: [] }, undefined, { requestId: 'window:g' });
+  assert.equal(policy.precheck(guardedRequest(kept, coordinator)), null, 'guarded delivery is not reader input');
+
+  const ports = guardedPanelPorts(policy);
+  const read = { id: 'window:read', requester: 'coordinator', params: { sessionId: 'worker' } };
+  assert.equal(ports.guardedObservation(read, facts), null, 'a read without the provider gets no observation');
+  const signed = ports.guardedObservation({ ...read, requesterProvider: 'claude' }, facts)!;
+  assert.equal(policy.precheck(guardedRequest(signed, coordinator)), null);
+  ports.onReaderDirected('worker');
+  assert.equal(policy.precheck(guardedRequest(signed, coordinator)), GUARDED_SEND_REASONS.stale);
+  const installed = policy.facts;
+  ports.installGuardedFacts(null);
+  assert.equal(policy.facts, null);
+  policy.facts = installed;
+
+  const fresh = new GuardChild();
+  fresh.sessionId = 'fresh';
+  const start = guardedStartContext({
+    id: 'window:start',
+    requester: 'coordinator',
+    requesterProvider: 'codex',
+    params: {},
+  });
+  assert.deepEqual(start, { requestId: 'window:start', requester: { provider: 'codex', id: 'coordinator' } });
+  const unattributed = guardedStartContext({ id: 'window:plain', requester: 'coordinator', params: {} });
+  assert.equal(recordGuardedStart(policy, unattributed, fresh, fresh), false);
+  assert.equal(
+    recordGuardedStart(policy, start, fresh, new GuardChild()),
+    false,
+    'a replacement took the first prompt',
+  );
+  assert.equal(policy.owner('fresh'), null);
+  assert.equal(recordGuardedStart(policy, start, fresh, fresh), true);
+  assert.equal(policy.owner('fresh')?.child, fresh);
+
+  let found: GuardChild | null = child;
+  const delivery = guardedDeliveryPort(
+    policy,
+    {
+      find: (_agent, _session) => found,
+      withActivity: async (_key, work) => work(found!),
+    },
+    (error) => error === 'writer lock',
+    () => 'uuid-1',
+  );
+  const owner = policy.owner('worker')!;
+  assert.equal(delivery.live(owner), child);
+  found = new GuardChild();
+  assert.equal(delivery.live(owner), null, 'a different live child is not the recorded writer');
+  assert.equal(await delivery.withLease(child, async () => 'leased'), null);
+  found = child;
+  assert.equal(await delivery.withLease(child, async () => 'leased'), 'leased');
+  assert.equal(delivery.write(child, 'text').clientUuid, 'uuid-1');
+  assert.deepEqual(child.attempts, ['text']);
+
+  const sent: unknown[][] = [];
+  const result = await guardedChannelSend(
+    policy,
+    {
+      id: 'window:send',
+      requester: 'coordinator',
+      requesterProvider: 'claude',
+      params: { sessionId: 'worker', prompt: 'Follow up.', observation: 'o.b' },
+    },
+    async (...args) => {
+      sent.push(args);
+      return {};
+    },
+  );
+  assert.deepEqual(sent, [
+    [
+      'claude',
+      'worker',
+      null,
+      { text: 'Follow up.', assets: [] },
+      undefined,
+      {
+        requestId: 'window:send',
+        activation: 'window',
+        sessionId: 'worker',
+        observation: 'o.b',
+        requester: { provider: 'claude', id: 'coordinator' },
+      },
+    ],
+  ]);
+  assert.equal(result.status, 'refused');
+
+  child.lastError = 'writer lock';
+  delivery.live(owner);
+  assert.equal(
+    policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)),
+    GUARDED_SEND_REASONS.ownership,
+  );
+});
+
+test('guarded send refusals stay out of the write table, observe same-ID duplicates, and never block a later start', async () => {
+  const { channel, home } = await fixture();
+  (channel as any).writes = new SessionWriteRequests(channel.hostId, 2);
+  let handled = 0;
+  channel.setGuardedSendHandler(async (request) => {
+    handled += 1;
+    return {
+      version: 1,
+      status: 'refused',
+      requestId: request.id,
+      payloadSha256: 'x',
+      nativeTurnId: null,
+      reason: GUARDED_SEND_REASONS.busy,
+    };
+  });
+  const starts: unknown[] = [];
+  channel.setRequestHandler((request) => {
+    starts.push(request);
+    return { status: 'accepted' };
+  });
+  const params = { sessionId: 'worker', prompt: 'Next.', observation: 'b'.repeat(40) + '.' + 'c'.repeat(43) };
+  vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+  vi.stubEnv('CODEX_THREAD_ID', '');
+  try {
+    for (const n of [1, 2, 3])
+      assert.equal(
+        ((await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-${n}`)) as any).reason,
+        GUARDED_SEND_REASONS.busy,
+      );
+    const again = (await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-1`)) as any;
+    assert.equal(again.reason, GUARDED_SEND_REASONS.busy);
+    assert.equal(handled, 3, 'a same-ID duplicate observes the retained refusal');
+    await assert.rejects(
+      requestWindow('send', { ...params, prompt: 'Other.' }, channel.hostId, home, `${channel.hostId}:busy-1`),
+      /different request/,
+    );
+    const start = {
+      setup: { kind: 'custom' as const, agent: 'claude', model: '', effort: '', permissionMode: '' },
+      prompt: 'Start.',
+      agentRun: true,
+      pinned: false,
+      labels: [] as string[],
+    };
+    for (const n of [1, 2])
+      assert.equal(
+        ((await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:start-${n}`)) as any).status,
+        'accepted',
+      );
+    assert.equal(starts.length, 2);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test('session reads and guarded starts carry the requester provider only to a window that lists it', async () => {
+  const { channel, home } = await fixture();
+  const seen: any[] = [];
+  channel.setRequestHandler((request) => {
+    seen.push(request);
+    return request.method === 'start' ? { status: 'accepted' } : { state: 'current', turns: [] };
+  });
+  const start = {
+    setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
+    prompt: 'Start.',
+    agentRun: false,
+    pinned: false,
+    labels: [] as string[],
+  };
+  vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
+  vi.stubEnv('CODEX_THREAD_ID', 'coordinator');
+  try {
+    await requestWindow('session', { sessionId: 'worker', turns: 5 }, channel.hostId, home);
+    await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:plain`);
+    await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:guarded`, true);
+    assert.deepEqual(
+      seen.map((request) => [request.method, request.requester, request.requesterProvider]),
+      [
+        ['session', 'coordinator', 'codex'],
+        ['start', 'coordinator', undefined],
+        ['start', 'coordinator', 'codex'],
+      ],
+    );
+    // A window that predates the field refuses it, so the CLI omits it there and refuses send before connecting.
+    const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
+    const listed = JSON.parse(fs.readFileSync(registration, 'utf8'));
+    assert.deepEqual(listed.capabilities, ['requesterProvider']);
+    delete listed.capabilities;
+    fs.writeFileSync(registration, JSON.stringify(listed));
+    await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:old`, true);
+    assert.equal('requesterProvider' in seen.at(-1), false);
+    await assert.rejects(
+      requestWindow(
+        'send',
+        { sessionId: 'worker', prompt: 'Next.', observation: 'b.' + 'c'.repeat(43) },
+        channel.hostId,
+        home,
+        `${channel.hostId}:send`,
+      ),
+      /must reload/,
+    );
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });

@@ -14,7 +14,10 @@ import {
   Ask,
   TurnOutcome,
   RateLimit,
+  GUARDED_RECEIPT_MS,
 } from './claudewire.ts';
+import { GuardedAttempt } from './agentwire.ts';
+import { createHash } from 'node:crypto';
 
 // Protocol fixtures retain the fields consumed by the wire adapter, including the unified context window.
 
@@ -74,7 +77,7 @@ test('Claude native evidence retains root envelopes, successful tool settlement 
   assert.equal(native[3].evidence.uuid, 'root-result');
   assert.equal(native[3].turnId, null);
   let checks = 0;
-  await wire.prompt('/compact', () => {
+  await wire.prompt('/compact', undefined, () => {
     assert.equal(writes.length, 1);
     checks++;
   });
@@ -91,7 +94,7 @@ test('Claude native evidence retains root envelopes, successful tool settlement 
   );
   await assert.rejects(
     async () =>
-      wire.prompt('/compact', () => {
+      wire.prompt('/compact', undefined, () => {
         throw new Error('reader intervened');
       }),
     /reader intervened/,
@@ -2224,4 +2227,132 @@ test('Claude default metadata sends a control request without a prompt', async (
     h.parsed().some((message) => message.type === 'user'),
     false,
   );
+});
+
+test('Claude guarded prompts settle only on the matching root replay, and replay frames stay out of display and session tracking', () => {
+  vi.useFakeTimers();
+  try {
+    const sent: Record<string, any>[] = [];
+    const events: WireEvent[] = [];
+    const wire = new ClaudeWire({
+      send: (line) => sent.push(JSON.parse(line)),
+      emit: (e) => events.push(e),
+      sessionId: SESSION,
+    });
+    const state = (value: string) =>
+      wire.receive(
+        JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: value, session_id: SESSION }),
+      );
+    assert.equal(wire.idleEvidence(), false, 'an absent report is not idle');
+    state('idle');
+    assert.equal(wire.idleEvidence(), true);
+    const text = 'Fix the review findings.\nLínea dos ✓';
+    const attempt = new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000001');
+    void wire.prompt({ text, assets: [] }, attempt);
+    assert.equal(sent.at(-1)!.uuid, attempt.clientUuid);
+    assert.deepEqual(sent.at(-1)!.origin, { kind: 'human' });
+    assert.deepEqual(sent.at(-1)!.message.content, [{ type: 'text', text }]);
+    assert.equal(wire.idleEvidence(), false);
+    assert.throws(() => wire.prompt('second', new GuardedAttempt('other')), /unsettled/);
+    const before = events.length;
+    const replay = (changes: Record<string, unknown> = {}) =>
+      wire.receive(
+        JSON.stringify({
+          type: 'user',
+          isReplay: true,
+          session_id: SESSION,
+          parent_tool_use_id: null,
+          uuid: attempt.clientUuid,
+          message: { role: 'user', content: [{ type: 'text', text }] },
+          ...changes,
+        }),
+      );
+    for (const changes of [
+      { uuid: 'historical-uuid' },
+      { session_id: 'b1f0b8f2-0000-4000-8000-000000000009' },
+      { parent_tool_use_id: 'toolu_nested' },
+      { message: { role: 'user', content: [{ type: 'text', text: 'Fix the review findings.' }] } },
+      {
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text },
+            { type: 'text', text: 'extra' },
+          ],
+        },
+      },
+      { type: 'assistant' },
+    ])
+      replay(changes);
+    replay({ isReplay: false });
+    assert.equal(attempt.settled, null);
+    assert.equal(events.length, before, 'replay frames emit no display or session events');
+    assert.equal(wire.sessionId(), SESSION);
+    replay();
+    assert.deepEqual(attempt.settled, { outcome: 'accepted', nativeTurnId: null, reason: '' });
+    replay();
+    assert.equal(events.length, before);
+
+    const endings: [string, () => void][] = [
+      ['idle', () => state('idle')],
+      [
+        'result',
+        () => wire.receive(JSON.stringify({ type: 'result', subtype: 'success', session_id: SESSION, result: 'done' })),
+      ],
+      ['deadline', () => vi.advanceTimersByTime(GUARDED_RECEIPT_MS)],
+    ];
+    for (const [name, end] of endings) {
+      const pending = new GuardedAttempt(`uuid-${name}`);
+      void wire.prompt('next step', pending);
+      if (name === 'deadline') vi.advanceTimersByTime(GUARDED_RECEIPT_MS - 1);
+      assert.equal(pending.settled, null, name);
+      end();
+      assert.equal(pending.settled?.outcome, 'unknown', name);
+    }
+    const refused = new GuardedAttempt('uuid-assets');
+    const sentBefore = sent.length;
+    assert.throws(() =>
+      wire.prompt(
+        {
+          text: 'with file',
+          assets: [{ id: 'a', name: 'a.txt', mime: 'text/plain', size: 1, digest: 'd', path: 'p' }],
+        },
+        refused,
+      ),
+    );
+    assert.equal(sent.length, sentBefore);
+    assert.equal(refused.settled, null);
+    const closing = new GuardedAttempt('uuid-close');
+    void wire.prompt('last', closing);
+    wire.close('the agent stopped');
+    assert.deepEqual(closing.settled, { outcome: 'unknown', nativeTurnId: null, reason: 'the agent stopped' });
+    assert.equal(spawnArgs({ cwd: 'C:\\ws' }).includes('--replay-user-messages'), false);
+    assert.equal(spawnArgs({ cwd: 'C:\\ws', replayUserMessages: true }).includes('--replay-user-messages'), true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Claude idle evidence clears at every user frame, including a delayed attachment write and an effort command', async () => {
+  const bytes = new TextEncoder().encode('x');
+  let release!: (bytes: Uint8Array) => void;
+  const h = harness(undefined, SESSION, () => new Promise<Uint8Array>((resolve) => (release = resolve)));
+  const idle = () =>
+    h.wire.receive(
+      JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: SESSION }),
+    );
+  idle();
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const asset = { id: 'a', name: 'a.txt', mime: 'text/plain', size: 1, digest, path: 'p' };
+  const prompting = h.wire.prompt({ text: 'See the file.', assets: [asset] });
+  idle();
+  assert.equal(h.wire.idleEvidence(), true, 'the report arrived while the attachment was still loading');
+  release(bytes);
+  await prompting;
+  assert.equal(h.parsed().at(-1).type, 'user');
+  assert.equal(h.wire.idleEvidence(), false);
+  idle();
+  await h.wire.effortCommand('high');
+  assert.equal(h.parsed().at(-1).message.content[0].text, '/effort high');
+  assert.equal(h.wire.idleEvidence(), false);
 });

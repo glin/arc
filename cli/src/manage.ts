@@ -1,6 +1,33 @@
 import * as fs from 'node:fs';
-import { requestWindow } from '../../extension/src/sessionrequests.ts';
-import type { SessionWriteParams } from '../../extension/src/sessionwrites.ts';
+import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
+import {
+  SESSION_OBSERVATION,
+  guardedPromptRefusal,
+  payloadSha256,
+  type SessionWriteParams,
+} from '../../extension/src/sessionwrites.ts';
+
+// Reads at most 48 KiB from a regular file and drops a leading byte-order mark. The decoded text is the payload.
+export function readPromptFile(file: string): string {
+  const fd = fs.openSync(file, 'r');
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('The prompt file must be a regular file.');
+    const buffer = Buffer.alloc(48 * 1024 + 1);
+    let count = 0;
+    while (count < buffer.length) {
+      const read = fs.readSync(fd, buffer, count, buffer.length - count, null);
+      if (!read) break;
+      count += read;
+    }
+    if (count > 48 * 1024) throw new Error('The prompt file exceeds 48 KiB.');
+    return buffer
+      .subarray(0, count)
+      .toString('utf8')
+      .replace(/^\uFEFF/, '');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 export async function runManagement(command: string, args: string[]): Promise<string> {
   const options = new Map<string, string>();
@@ -18,6 +45,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--prompt-file',
     '--name',
     '--label',
+    '--observation',
   ]);
   const switches = new Set([
     '--json',
@@ -43,25 +71,34 @@ export async function runManagement(command: string, args: string[]): Promise<st
   const allowed =
     command === 'setups'
       ? ['--window', '--json']
-      : command === 'start'
-        ? [
-            '--window',
-            '--request-id',
-            '--setup',
-            '--provider',
-            '--model',
-            '--effort',
-            '--permissions',
-            '--prompt-file',
-            '--name',
-            '--label',
-            '--json',
-            '--agent-run',
-            '--untagged',
-            '--pinned',
-            '--arc-dispatch',
-          ]
-        : ['--window', '--request-id', '--label', '--json', '--dry-run', ...(command === 'archive' ? ['--force'] : [])];
+      : command === 'send'
+        ? ['--window', '--request-id', '--prompt-file', '--observation', '--json']
+        : command === 'start'
+          ? [
+              '--window',
+              '--request-id',
+              '--setup',
+              '--provider',
+              '--model',
+              '--effort',
+              '--permissions',
+              '--prompt-file',
+              '--name',
+              '--label',
+              '--json',
+              '--agent-run',
+              '--untagged',
+              '--pinned',
+              '--arc-dispatch',
+            ]
+          : [
+              '--window',
+              '--request-id',
+              '--label',
+              '--json',
+              '--dry-run',
+              ...(command === 'archive' ? ['--force'] : []),
+            ];
   for (const arg of [...options.keys(), ...flags, ...(labels.length ? ['--label'] : [])]) {
     if (!allowed.includes(arg)) throw new Error(`${arg} is unavailable for ${command}.`);
   }
@@ -71,6 +108,31 @@ export async function runManagement(command: string, args: string[]): Promise<st
     if (sessions.length) throw new Error('Usage: arc setups [--window ID] [--json]');
     return JSON.stringify(await requestWindow('setups', {}, window));
   }
+  if (command === 'send') {
+    if (sessions.length !== 1 || !options.has('--prompt-file') || !options.has('--observation') || !requestId)
+      throw new Error(
+        'Usage: arc send ID --prompt-file FILE --observation OBSERVATION --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
+      );
+    if (!SESSION_OBSERVATION.test(options.get('--observation')!))
+      throw new Error('The observation is invalid. Copy it from arc session --json.');
+    const identity = requesterIdentity();
+    if (identity.ambiguous)
+      throw new Error(
+        'Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID are set, so Arc cannot tell which session is asking. No prompt was sent.',
+      );
+    if (!identity.provider) throw new Error('Run send from a Claude Code or Codex session. No prompt was sent.');
+    const prompt = readPromptFile(options.get('--prompt-file')!);
+    if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt without a prompt-box command.');
+    const params: SessionWriteParams = { sessionId: sessions[0], prompt, observation: options.get('--observation')! };
+    const result = (await requestWindow('send', params, window, undefined, requestId)) as {
+      status: string;
+      reason: string;
+    };
+    // A client-side unknown still names the exact payload, so a retry can be matched to it.
+    const reply = { payloadSha256: payloadSha256(prompt), nativeTurnId: null, ...result };
+    if (flags.has('--json')) return JSON.stringify(reply);
+    return reply.status === 'refused' ? reply.reason : `${reply.reason} Request ID: ${requestId}.`;
+  }
   if (command === 'start') {
     if (sessions.length || !options.has('--prompt-file')) throw new Error('Start requires --prompt-file PATH.');
     if (flags.has('--agent-run') === flags.has('--untagged')) throw new Error('Choose --agent-run or --untagged.');
@@ -79,28 +141,14 @@ export async function runManagement(command: string, args: string[]): Promise<st
       throw new Error('A setup key cannot combine with explicit setup values.');
     if (!key && !['claude', 'codex'].includes(options.get('--provider') ?? ''))
       throw new Error('Choose --provider claude or codex, or --setup KEY.');
-    const file = options.get('--prompt-file')!;
-    const fd = fs.openSync(file, 'r');
-    let prompt: string;
-    try {
-      if (!fs.fstatSync(fd).isFile()) throw new Error('The prompt file must be a regular file.');
-      const buffer = Buffer.alloc(48 * 1024 + 1);
-      let count = 0;
-      while (count < buffer.length) {
-        const read = fs.readSync(fd, buffer, count, buffer.length - count, null);
-        if (!read) break;
-        count += read;
-      }
-      if (count > 48 * 1024) throw new Error('The prompt file exceeds 48 KiB.');
-      prompt = buffer
-        .subarray(0, count)
-        .toString('utf8')
-        .replace(/^\uFEFF/, '');
-    } finally {
-      fs.closeSync(fd);
-    }
-    if (!prompt.trim() || prompt.trimStart().startsWith('/'))
-      throw new Error('Supply a nonempty prompt without a prompt-box command.');
+    // `--arc-dispatch` makes a guarded start, which records the requesting session as the worker's owner.
+    const guarded = flags.has('--arc-dispatch');
+    if (guarded && requesterIdentity().ambiguous)
+      throw new Error(
+        'Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID are set, so Arc cannot tell which session is asking. No session was started.',
+      );
+    const prompt = readPromptFile(options.get('--prompt-file')!);
+    if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt without a prompt-box command.');
     const params: SessionWriteParams = {
       setup: key
         ? { kind: 'row', key }
@@ -117,13 +165,14 @@ export async function runManagement(command: string, args: string[]): Promise<st
       labels,
       ...(options.has('--name') ? { name: options.get('--name')! } : {}),
     };
-    const result = (await requestWindow('start', params, window, undefined, requestId)) as {
+    const result = (await requestWindow('start', params, window, undefined, requestId, guarded)) as {
       status: string;
       sessionId?: string;
       provider?: string;
     };
     const json = JSON.stringify(result);
-    if (!flags.has('--arc-dispatch') || !result.sessionId || !result.status.startsWith('accepted')) return json;
+    if (!guarded || !result.sessionId || !result.status.startsWith('accepted')) return json;
+
     return `${json}\nARC_DISPATCH_SESSION=${JSON.stringify({ agent: result.provider, session_id: result.sessionId, ...(options.has('--name') ? { name: options.get('--name') } : {}), ...(params.agentRun ? {} : { owned: true }) })}`;
   }
   if (sessions.length !== 1) throw new Error(`${command} requires one session ID.`);

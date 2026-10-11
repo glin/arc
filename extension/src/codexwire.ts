@@ -28,6 +28,7 @@ import {
   arr,
   AgentPromptInput,
   CodexEffectiveMode,
+  GuardedAttempt,
   normalizeAgentPrompt,
 } from './agentwire';
 import {
@@ -362,6 +363,13 @@ export class CodexWire {
     deferred: boolean;
   }[] = [];
   private compactions = 0;
+  // Root turn ids this child has seen in any notification or response, each with the order of its
+  // first sighting. A guarded start that returns one seen before its write joined existing work.
+  private readonly seenTurns = new Map<string, number>();
+  // Root turns the server reported as started and has not yet ended, including turns no
+  // request of this client started.
+  private readonly runningRootTurns = new Set<string>();
+  private endedRootTurns = 0;
   // Permission overrides selected by the reader travel together on the next turn/start.
   // The server applies them to that turn and subsequent turns.
   // Without an override, the thread retains its startup permissions.
@@ -402,6 +410,21 @@ export class CodexWire {
   // True while a compaction request that got no answer can still start or finish its late turn.
   compactionUnresolved(): boolean {
     return this.unanswered.length > 0;
+  }
+
+  // Positive idle evidence: a root turn has ended in this child, and no root turn or request is open.
+  idleEvidence(): boolean {
+    return !this.closed && !this.hasOpenTurns() && this.runningRootTurns.size === 0 && this.endedRootTurns > 0;
+  }
+
+  private seeTurn(turnId: string): void {
+    if (!this.seenTurns.has(turnId)) this.seenTurns.set(turnId, this.seenTurns.size + 1);
+  }
+
+  private rootTurn(params: Json): string | null {
+    const threadId = str(params.threadId);
+    if (!this.thread || (threadId && threadId !== this.thread)) return null;
+    return str(obj(params.turn)?.id) ?? str(params.turnId);
   }
 
   // Limits applied-default reads to server versions with confirmed configuration behavior.
@@ -633,10 +656,12 @@ export class CodexWire {
 
   // Returns the turn id after the server accepts the prompt.
   // Notifications report the turn's subsequent progress and completion.
-  async prompt(input: AgentPromptInput): Promise<string> {
+  async prompt(input: AgentPromptInput, guard?: GuardedAttempt): Promise<string> {
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
     }
+    if (guard && (this.closed || this.hasOpenTurns() || this.runningRootTurns.size))
+      throw new Error('the session is not idle');
     const threadId = this.thread;
     const prompt = normalizeAgentPrompt(input);
     const content: Record<string, unknown>[] = [];
@@ -653,6 +678,8 @@ export class CodexWire {
     if (!content.length) {
       throw new Error('the prompt has no text or attachments');
     }
+    // A guarded start records how many turns were known when it wrote its input. A response naming one of them is a shared turn.
+    const known = guard ? this.seenTurns.size : 0;
     const response = this.request('turn/start', {
       threadId,
       input: content,
@@ -666,6 +693,7 @@ export class CodexWire {
       ...(this.model !== null ? { model: this.model } : {}),
       ...(this.effort !== null ? { effort: this.effort } : {}),
     });
+    guard?.markWritten();
     let active: ActiveTurn;
     const start = response.then((result) => {
       const turn = obj(result.turn);
@@ -673,6 +701,21 @@ export class CodexWire {
       if (!turnId) {
         throw new Error('the agent accepted a turn without naming it');
       }
+      const shared =
+        !!guard &&
+        ((this.seenTurns.get(turnId) ?? Infinity) <= known ||
+          this.turns.some((turn) => turn !== active && turn.id === turnId && turn.threadId === threadId));
+      if (threadId === this.thread) this.seeTurn(turnId);
+      guard?.settle(
+        shared
+          ? {
+              outcome: 'unknown',
+              nativeTurnId: turnId,
+              reason: 'The prompt joined a turn that was already running.',
+              sharedTurn: true,
+            }
+          : { outcome: 'accepted', nativeTurnId: turnId, reason: '' },
+      );
       active.id = turnId;
       const ending = active.endingsBeforeStart.get(turnId);
       active.endingsBeforeStart.clear();
@@ -697,6 +740,8 @@ export class CodexWire {
       return await start;
     } catch (error) {
       this.forgetTurn(active);
+      // The guarded rejection allowlist is empty. No error response proves this input had no effect.
+      guard?.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message });
       throw error;
     }
   }
@@ -1222,9 +1267,15 @@ export class CodexWire {
 
   private notification(method: string, params: Json): void {
     switch (method) {
-      case 'turn/started':
+      case 'turn/started': {
+        const turnId = this.rootTurn(params);
+        if (turnId) {
+          this.seeTurn(turnId);
+          this.runningRootTurns.add(turnId);
+        }
         this.startCompactionTurn(params);
         return;
+      }
       case 'item/started':
         this.nativeItem(params, false);
         this.itemStarted(obj(params.item));
@@ -1294,6 +1345,7 @@ export class CodexWire {
       case 'turn/completed':
         {
           this.nativeEnding(params);
+          this.endRootTurn(params);
           this.endAsyncAskTurn(params);
           const outcome = turnOutcome(obj(params.turn));
           if (this.finishCompaction(params, outcome)) {
@@ -1316,6 +1368,7 @@ export class CodexWire {
       case 'turn/failed':
         {
           this.nativeEnding(params, true);
+          this.endRootTurn(params);
           this.endAsyncAskTurn(params);
           const outcome: TurnOutcome = {
             status: 'error',
@@ -1446,6 +1499,15 @@ export class CodexWire {
         kind: 'native',
         event: { ...base, kind: 'rootEnd', success: !failed && obj(params.turn)?.status === 'completed' },
       });
+  }
+
+  private endRootTurn(params: Json): void {
+    const turnId = this.rootTurn(params);
+    if (!turnId) return;
+    this.seeTurn(turnId);
+    this.runningRootTurns.delete(turnId);
+
+    this.endedRootTurns += 1;
   }
 
   private startCompactionTurn(params: Json): void {

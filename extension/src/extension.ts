@@ -78,6 +78,7 @@ import {
   runningKey,
   busyInSession,
   failedPromptDelivery,
+  type PromptDelivery,
   failedCompactionDelivery,
   failedClearDelivery,
   acceptedSessionSettings,
@@ -97,6 +98,19 @@ import { normalizeWorkspace } from './projectspend';
 import { ConfigWatches } from './configwatch';
 import { WindowChannel } from './sessionrequests';
 import { CompactHost } from './compactrequest';
+import {
+  GuardedSends,
+  guardedChannelSend,
+  guardedDeliveryPort,
+  guardedPanelPorts,
+  interveneOnReaderInput,
+  recordGuardedStart,
+  runGuardedSend,
+  type GuardedDelivery,
+  type GuardedPromptSender,
+  type GuardedSendResult,
+  type GuardedStartContext,
+} from './sessionwrites';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
 declare const EXTENSION_VERSION: string;
@@ -1340,6 +1354,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  // Guarded follow-up ownership for this activation. The panel host reaches the same policy through its
+  // read facts and reader intervention ports, which are assigned beside its other callbacks.
+  const guardedSends = new GuardedSends<AgentSession>(channel?.hostId ?? '');
+  Object.assign(panel, guardedPanelPorts(guardedSends));
+  const guardedPort = guardedDeliveryPort(guardedSends, host, activeWriterFailure, randomUUID);
   // Read Codex context from the panel's source. Read Claude context only through the current live child for this session.
   panel.contextSource = (agent, sessionId) => {
     if (agent === 'codex') return panel.codexContextSource(sessionId);
@@ -1353,7 +1372,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         host.withActivity(child.key, (live) => (live === child ? live.contextUsage() : Promise.resolve(null))),
     };
   };
-  panel.onSendPrompt = async (agent, sessionId, cwd, prompt, onSubmitted) => {
+  panel.onSendPrompt = async (
+    agent,
+    sessionId,
+    cwd,
+    prompt,
+    onSubmitted,
+    guarded?: GuardedDelivery,
+  ): Promise<PromptDelivery & { guarded?: GuardedSendResult }> => {
+    if (guarded) {
+      // Guarded delivery mode. It requires the recorded child and never reopens, resumes, forks, or shows a dialog.
+      // It writes only the requested text, with no attachments, comments, or prompt history.
+      // Structured results replace failure classification and recovery dialogs after attempted input.
+      const result = await runGuardedSend(guardedSends, { ...guarded, prompt: prompt.text }, guardedPort).finally(
+        () => void panel.refresh(),
+      );
+      return { delivered: result.status === 'accepted', reason: result.reason, guarded: result };
+    }
     try {
       const turnId = await withExistingSessionActivity(agent as AgentName, sessionId, cwd, async (session) => {
         validateResolvedPromptAssets(prompt.assets);
@@ -1369,6 +1404,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void panel.refresh();
       return { delivered: true, reason: '', turnId };
     } catch (error) {
+      if (activeWriterFailure(error)) guardedSends.noteWriterConflict(sessionId);
       if (agent === 'codex' && activeWriterFailure(error)) {
         const action = 'Fork and continue in Arc';
         const picked = await vscode.window.showWarningMessage(
@@ -1446,15 +1482,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
   const acceptedDrafts = new Set<string>();
-  panel.onSendDraftPrompt = async (draft, prompt, onSubmitted) => {
+  panel.onSendDraftPrompt = async (draft, prompt, onSubmitted, start?: GuardedStartContext) => {
     const acceptedProject = setupProjects.resolve(draft.cwd);
     let accepted: { session: string; turnId: number } | null = null;
     try {
-      const liveSession = await startFreshSession(draft);
+      // Only a start that carries a requester echoes user messages, because guarded follow-ups use the echo as a receipt.
+      const liveSession = await startFreshSession(draft, !!start?.requester);
       validateResolvedPromptAssets(prompt.assets);
+      let prompted: AgentSession | null = null;
       const turnId = await withStartedSessionActivity(
         liveSession,
         async (live) => {
+          prompted = live;
           const turnId = await live.prompt(prompt, (turnId) => {
             compaction?.submitted(live, turnId);
             const session = live.state().sessionId;
@@ -1468,6 +1507,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         resumePlanForDraft(draft, () => liveSession.state().sessionId),
       );
       host.cancelSessionRetirement(liveSession.key);
+      // The association is recorded with the actual child before any asynchronous metadata save.
+      if (start) recordGuardedStart(guardedSends, start, liveSession, prompted);
       draftMcpKeys.delete(draft.draftId);
       mcpRefreshes.cancel(draft.draftId);
       const sessionId = liveSession.state().sessionId;
@@ -1832,7 +1873,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     publishPicks();
     return session;
   };
-  const freshPlanForDraft = (draft: NewSessionDraft): AgentPlanSource => {
+  const freshPlanForDraft = (draft: NewSessionDraft, replayUserMessages = false): AgentPlanSource => {
     const launch = launchFor(draft.profile.agent);
     if (launch.problem) {
       throw new Error(launch.problem);
@@ -1850,6 +1891,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
             model: draft.profile.model,
             effort: draft.profile.effort,
+            ...(replayUserMessages ? { replayUserMessages } : {}),
           })
         : codexPlan(launch, {
             cwd: draft.cwd,
@@ -1888,8 +1930,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             effort: draft.profile.effort,
           });
     };
-  const startFreshSession = async (draft: NewSessionDraft) => {
-    return await ensureSession(freshHostKey(draft.profile.agent, draft.draftId), freshPlanForDraft(draft));
+  const startFreshSession = async (draft: NewSessionDraft, replayUserMessages = false) => {
+    return await ensureSession(
+      freshHostKey(draft.profile.agent, draft.draftId),
+      freshPlanForDraft(draft, replayUserMessages),
+    );
   };
 
   // Warn when the child stops waiting before the reader sends an answer.
@@ -1921,6 +1966,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     reportAnswer(answered);
     return answered;
   };
+  // Reader input makes observations of the session it directs stale before the provider sees it.
+  // Only input a callback accepts for that worker clears the block an unknown delivery left.
+  interveneOnReaderInput(panel, guardedSends);
+  // The panel host's callback type omits the guarded mode, which only this handler and the panel host's later port use.
+  channel?.setGuardedSendHandler((request) =>
+    guardedChannelSend(guardedSends, request, (...args) =>
+      (panel.onSendPrompt as unknown as GuardedPromptSender)(...args),
+    ),
+  );
 }
 
 // Extract a nonempty path from the command's context object. Invalid arguments copy nothing.

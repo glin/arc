@@ -11,7 +11,7 @@ import {
   readDefaultConfiguration,
   turnOutcome,
 } from './codexwire.ts';
-import { WireEvent, Ask, RateLimit } from './agentwire.ts';
+import { WireEvent, Ask, RateLimit, GuardedAttempt } from './agentwire.ts';
 
 // App-server fixtures retain protocol fields, including request ID 0. A truthiness check must not discard that ID.
 
@@ -3077,5 +3077,74 @@ test('Codex default snapshots retain only original model and effort configuratio
     assert.deepEqual(snapshot.configuration, { config });
     assert.deepEqual(snapshot.policy, { requirements: {} });
     assert.equal(JSON.stringify(snapshot).includes('private'), false);
+  }
+});
+
+test('Codex guarded prompts accept only their own correlated turn and settle shared, failed, and silent starts as unknown', async () => {
+  const h = harness(50);
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD, path: 'C:\\rollout.jsonl' } });
+  await starting;
+  assert.equal(h.wire.idleEvidence(), false, 'an open thread with no ended turn is not idle evidence');
+  const first = h.wire.prompt('initial assignment');
+  await completeLastTurn(h, 'turn-initial');
+  await first;
+  assert.equal(h.wire.idleEvidence(), true);
+  h.wire.receive(
+    JSON.stringify({ method: 'turn/started', params: { threadId: 'child-thread', turn: { id: 'nested' } } }),
+  );
+  assert.equal(h.wire.idleEvidence(), true, 'a nested thread turn is not root activity');
+  h.wire.receive(JSON.stringify({ method: 'turn/started', params: { threadId: THREAD, turn: { id: 'unsolicited' } } }));
+  assert.equal(h.wire.idleEvidence(), false, 'an unsolicited root turn is running work');
+  await assert.rejects(h.wire.prompt('blocked', new GuardedAttempt('u0')), /not idle/);
+  h.wire.receive(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: THREAD, turn: { id: 'unsolicited', status: 'completed', items: [] } },
+    }),
+  );
+  assert.equal(h.wire.idleEvidence(), true);
+
+  const accepted = new GuardedAttempt('u1');
+  const prompting = h.wire.prompt('Apply the fixes.', accepted);
+  h.wire.receive(
+    JSON.stringify({ method: 'turn/started', params: { threadId: THREAD, turn: { id: 'turn-guarded' } } }),
+  );
+  assert.equal(accepted.settled, null, 'an uncorrelated notification grants no acceptance');
+  reply(h, { turn: { id: 'turn-guarded', status: 'inProgress' } });
+  assert.equal(await prompting, 'turn-guarded');
+  assert.deepEqual(accepted.settled, { outcome: 'accepted', nativeTurnId: 'turn-guarded', reason: '' });
+  h.wire.receive(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: THREAD, turn: { id: 'turn-guarded', status: 'completed', items: [] } },
+    }),
+  );
+
+  const shared = new GuardedAttempt('u2');
+  const joining = h.wire.prompt('Joins old work.', shared);
+  reply(h, { turn: { id: 'turn-initial', status: 'inProgress' } });
+  await joining.catch(() => {});
+  assert.deepEqual(
+    [shared.settled?.outcome, shared.settled?.nativeTurnId, shared.settled?.sharedTurn],
+    ['unknown', 'turn-initial', true],
+  );
+  h.wire.receive(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: THREAD, turn: { id: 'turn-initial', status: 'completed', items: [] } },
+    }),
+  );
+
+  for (const [name, answer] of [
+    ['writer lock', () => refuseLast(h, 'thread already has an active writer')],
+    ['unnamed turn', () => reply(h, { turn: {} })],
+    ['deadline', () => {}],
+  ] as const) {
+    const attempt = new GuardedAttempt(name);
+    const pending = h.wire.prompt('Uncertain.', attempt);
+    answer();
+    await waitForDeadline(pending.catch(() => {}));
+    assert.equal(attempt.settled?.outcome, 'unknown', name);
   }
 });

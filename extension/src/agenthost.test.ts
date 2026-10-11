@@ -61,7 +61,7 @@ test('measurement windows refuse agent processes before launch', () => {
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
 import { sandboxPolicy } from './codexwire.ts';
-import { McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
+import { GuardedAttempt, McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
 import {
   CLAUDE_ASK_MODES,
   CODEX_ASK_MODES,
@@ -77,7 +77,7 @@ import {
 } from './composerview.ts';
 import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
 import { tempDir } from './temproot.ts';
-import { statementFrom, sourceMatch } from '../test/source-contract.ts';
+import { callSources, declarationSource, statementFrom, sourceMatch } from '../test/source-contract.ts';
 
 const CLAUDE = { command: 'C:\\claude.exe', leadingArgs: [], env: {} };
 const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
@@ -1623,6 +1623,65 @@ test('Claude native events name their submission only while one open turn owns t
   await joining;
   emit(native);
   assert.equal(reported.at(-1)?.turnId, undefined, 'two open turns leave the owner unknown');
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+test('a shared guarded Codex receipt leaves the native turn with the reader submission that owns it', async () => {
+  let emit!: (event: WireEvent) => void;
+  const accepts: ((id: string) => void)[] = [];
+  const guards: (GuardedAttempt | undefined)[] = [];
+  const plan: AgentPlan = {
+    agent: 'codex',
+    sessionId: 'session',
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: (_send, report) => {
+      emit = report;
+      return {
+        receive: () => undefined,
+        open: () => Promise.resolve([]),
+        prompt: (_prompt, guard) =>
+          new Promise<string>((resolve) => {
+            guard?.markWritten();
+            guards.push(guard);
+            accepts.push(resolve);
+          }),
+        compact: () => Promise.resolve(),
+        clear: () => Promise.resolve(),
+        answer: () => false,
+        interrupt: () => Promise.resolve(),
+        sessionId: () => 'session',
+        close: () => undefined,
+        hasOpenTurns: () => true,
+      };
+    },
+  };
+  const child = new FakeChild();
+  const reported: Array<{ event: WireEvent; turnId?: number }> = [];
+  const session = new AgentSession(
+    'shared-turn',
+    plan,
+    () => child,
+    (event, turnId) => reported.push({ event, turnId }),
+    () => undefined,
+  );
+  await session.start();
+  const reader = session.prompt('reader prompt');
+  const guarded = new GuardedAttempt('uuid-shared');
+  const delivery = session.prompt('guarded prompt', undefined, guarded);
+  await vi.waitFor(() => assert.equal(accepts.length, 2));
+  accepts[0]('native-shared');
+  const readerTurn = await reader;
+  guards[1]!.settle({ outcome: 'unknown', nativeTurnId: 'native-shared', reason: 'Joined.', sharedTurn: true });
+  accepts[1]('native-shared');
+  const guardedTurn = await delivery;
+  assert.notEqual(guardedTurn, readerTurn);
+  emit({ kind: 'delta', text: 'Reply', nativeTurnId: 'native-shared' });
+  assert.equal(reported.at(-1)?.turnId, readerTurn);
   const disposing = session.dispose();
   child.exit(0);
   await disposing;
@@ -3771,6 +3830,22 @@ test('the extension binds its packaged CLI and current window to every child ent
   sourceMatch(source, /const host = new AgentHost\(\{\s*spawner,/);
   for (const helper of ['askIdle', 'askIdleMcp', 'askIdleMcpChange', 'askIdleDefaults'])
     sourceMatch(source, new RegExp(helper + '\\(plan, spawner(?:[,\\)])'));
+});
+
+test('activate wires the guarded send policy into reader callbacks, draft starts, the channel, and the panel ports', () => {
+  const activate = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
+  sourceMatch(activate, /Object\.assign\(panel, guardedPanelPorts\(guardedSends\)\);/);
+  const intervention = activate.indexOf('interveneOnReaderInput(panel, guardedSends);');
+  assert.ok(intervention >= 0, 'activate wraps the directing reader callbacks');
+  for (const name of ['onSendPrompt', 'onCompact', 'onClear', 'onStopTurn', 'onAnswerAsk']) {
+    const assigned = activate.lastIndexOf(`panel.${name} =`);
+    assert.ok(assigned >= 0 && assigned < intervention, `the wrapper runs after the last panel.${name} assignment`);
+  }
+  const draft = statementFrom(activate, activate.indexOf('panel.onSendDraftPrompt ='));
+  sourceMatch(draft, /recordGuardedStart\(guardedSends, start, liveSession, prompted\)/);
+  const [handler] = callSources(activate, 'channel?.setGuardedSendHandler');
+  assert.ok(handler, 'activate installs the channel guarded send handler');
+  sourceMatch(handler, /guardedChannelSend\(guardedSends, request,[\s\S]*panel\.onSendPrompt/);
 });
 
 test('Arc CLI targeting reaches fresh, resumed, draft, idle, and rename children for both agents', async () => {
@@ -7126,4 +7201,56 @@ test('an idle Codex rename rejects with the server refusal', async () => {
   child.exit(0);
   await assert.rejects(renamed, /name refused/);
   assert.equal(child.sent().some(MODEL_TURN), false);
+});
+
+test('a guarded Claude prompt needs positive idle evidence, releases its lease at the write, and never reopens a retired child', async () => {
+  const fake = fakeHost();
+  const starting = fake.host.session(
+    'guarded',
+    claudePlan(CLAUDE, { cwd: WS, sessionId: 'worker-session', replayUserMessages: true }),
+  );
+  const child = fake.children[0];
+  child.answerHandshake();
+  const session = await starting;
+  assert.ok(fake.commands[0].includes('--replay-user-messages'));
+  assert.equal(session.guardedIdle(), 'unconfirmed', 'initial busy false alone is not idle evidence');
+  await session.prompt('initial assignment');
+  assert.equal(session.guardedIdle(), 'busy');
+  child.say(sessionState('running'));
+  child.say(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' }) + '\n');
+  child.say(sessionState('idle'));
+  assert.equal(session.guardedIdle(), null);
+
+  let receiptSettled = false;
+  const attempt = await fake.host.withActivity('guarded', async (live) => {
+    const written = live.guardedPrompt('Apply the accepted corrections.', 'uuid-guarded');
+    void written.receipt.then(() => (receiptSettled = true));
+    await written.written;
+    return written;
+  });
+  assert.ok(attempt);
+  assert.equal(receiptSettled, false, 'the activity lease ends at the write, before any receipt');
+  assert.equal(session.guardedIdle(), 'busy');
+  const line = child.sent().at(-1)!;
+  assert.equal(line.uuid, 'uuid-guarded');
+  child.say(
+    JSON.stringify({
+      type: 'user',
+      isReplay: true,
+      uuid: 'uuid-guarded',
+      session_id: 'worker-session',
+      parent_tool_use_id: null,
+      message: { role: 'user', content: [{ type: 'text', text: 'Apply the accepted corrections.' }] },
+    }) + '\n',
+  );
+  assert.equal((await attempt.receipt).outcome, 'accepted');
+
+  const pending = session.guardedPrompt('Uncertain follow-up.', 'uuid-exit');
+  await pending.written;
+  child.exit(1);
+  assert.equal((await pending.receipt).outcome, 'unknown');
+  assert.equal(session.guardedIdle(), 'unavailable');
+  assert.equal(await fake.host.withActivity('guarded', async () => 'reopened'), null);
+  assert.equal(fake.host.find('claude', 'worker-session'), null);
+  assert.equal(fake.children.length, 1, 'no second writer starts');
 });

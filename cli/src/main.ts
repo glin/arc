@@ -23,6 +23,7 @@ function help(): string {
     '       arc label add|remove ID --label NAME [--dry-run] [--window ID] [--request-id ID]',
     '       arc pin|unpin|archive|unarchive ID [--dry-run] [--window ID] [--request-id ID]',
     '       arc archive ID --force [--window ID] [--request-id ID]',
+    '       arc send ID --prompt-file PATH --observation OBSERVATION --request-id ID [--window ID] [--json]',
     '       arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
     '',
     'Reads Claude Code status-line JSON from stdin.',
@@ -37,6 +38,7 @@ function help(): string {
     '--request-id accepts a fresh ID prefixed with the selected window hostId and a colon.',
     'Start and curation accept identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',
     'Never retry a compaction request with uncertain admission.',
+    'Send delivers a follow-up to an idle session that the calling session started with --arc-dispatch in that window. The observation comes from arc session --json.',
   ].join('\n');
 }
 
@@ -82,7 +84,7 @@ async function run(): Promise<void> {
     process.stdout.write(`${await runSessions(args[0], args.slice(1))}\n`);
     return;
   }
-  if (['setups', 'start', 'pin', 'unpin', 'archive', 'unarchive'].includes(args[0])) {
+  if (['setups', 'start', 'send', 'pin', 'unpin', 'archive', 'unarchive'].includes(args[0])) {
     process.stdout.write(`${await runManagement(args[0], args.slice(1))}\n`);
     return;
   }
