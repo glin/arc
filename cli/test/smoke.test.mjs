@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WindowChannel } from '../../extension/src/sessionrequests.ts';
+import { childEnv } from '../../extension/src/agenthost.ts';
 import {
   copyFileSync,
   lstatSync,
@@ -421,6 +422,35 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
     );
   } finally {
     await Promise.all([channel.dispose(), second.dispose()]);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bundled session commands attribute child requests only to their native session identity', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-child-requester-smoke-'));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  channel.setRequestHandler((request) => ({ requester: request.requester }));
+  const launched = childEnv(
+    { ...process.env, CLAUDE_CODE_SESSION_ID: 'parent-claude', CODEX_THREAD_ID: 'parent-codex' },
+    { ARC_HOME: home, ARC_WINDOW: channel.hostId },
+    'codex',
+  );
+  try {
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    for (const [native, requester] of [
+      [{}, null],
+      [{ CODEX_THREAD_ID: 'native-codex' }, 'native-codex'],
+      [{ CLAUDE_CODE_SESSION_ID: 'native-claude' }, 'native-claude'],
+    ]) {
+      const result = await run(process.execPath, [cli, 'session', 'target-session', '--json'], {
+        env: { ...launched, ...native },
+        encoding: 'utf8',
+      });
+      assert.deepEqual(JSON.parse(result.stdout), { requester });
+    }
+  } finally {
+    await channel.dispose();
     rmSync(home, { recursive: true, force: true });
   }
 });

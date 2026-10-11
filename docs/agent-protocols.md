@@ -203,7 +203,7 @@ The following flags provide stream framing, permission requests, and partial res
 - `--permission-prompt-tool stdio` enables permission requests. It does not appear in `claude --help`. Without it the CLI silently allows every tool in headless mode and the reader is never asked.
 - `--include-partial-messages` publishes response text while the agent writes it. Without it, the CLI emits no response text until the turn ends.
 
-`childEnv` removes inherited `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_AGENT_SDK_CLIENT_APP`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, and `CLAUDE_CODE_CONTAINER_ID` before applying launch variables. Removal includes every case variant of these environment names. Without an explicit override, print-mode Claude uses its ordinary `sdk-cli` entrypoint. Without a generated title, the session keeps the name the session-name rules give it.
+`childEnv` removes inherited `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_AGENT_SDK_CLIENT_APP`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, and `CLAUDE_CODE_CONTAINER_ID` before applying launch variables. It also removes `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` inherited from the editor's process environment. Removal includes every case variant of these environment names. Without an explicit override, print-mode Claude uses its ordinary `sdk-cli` entrypoint. Without a generated title, the session keeps the name the session-name rules give it.
 
 ### Claude attribution selection
 

@@ -61,6 +61,7 @@ test('measurement windows refuse agent processes before launch', () => {
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
 import { sandboxPolicy } from './codexwire.ts';
+import { requesterIdentity } from './sessionrequests.ts';
 import { GuardedAttempt, McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
 import {
   CLAUDE_ASK_MODES,
@@ -3641,6 +3642,44 @@ test('the environment a launch asks for is added to what the child would have in
 
 test('a launch that asks for no environment of its own adds nothing to the child', () => {
   assert.deepEqual(childEnv({ PATH: '/bin' }, {}), { PATH: '/bin', ELECTRON_RUN_AS_NODE: '1' });
+});
+
+test('child launches remove inherited requester identities without inventing a native identity', () => {
+  const codexClient = { cwd: WS, clientInfo: CODEX_CLIENT };
+  const plans = [
+    claudePlan(CLAUDE, { cwd: WS }),
+    claudeRenamePlan(CLAUDE, { cwd: WS, resume: 'session-1', title: 'Named' }),
+    claudeIdlePlan(CLAUDE, WS),
+    codexPlan(CODEX, codexClient),
+    codexIdlePlan(CODEX, codexClient),
+    codexRenamePlan(CODEX, { ...codexClient, threadId: 'thread-1', title: 'Named' }),
+  ];
+  for (const inherited of [
+    { CLAUDE_CODE_SESSION_ID: 'parent-claude', CODEX_THREAD_ID: 'parent-codex' },
+    { Claude_Code_Session_Id: 'parent-claude', Codex_Thread_Id: 'parent-codex' },
+  ]) {
+    for (const plan of plans) {
+      const env = childEnv({ PATH: '/bin', ...inherited }, plan.env);
+      assert.deepEqual(requesterIdentity(env), { requester: null, provider: null, ambiguous: false });
+      assert.equal(
+        Object.keys(env).some((key) => ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID'].includes(key.toUpperCase())),
+        false,
+      );
+      assert.equal(env.PATH, '/bin');
+      for (const [key, value] of Object.entries(plan.env)) assert.equal(env[key], value);
+      for (const [key, provider] of [
+        ['CLAUDE_CODE_SESSION_ID', 'claude'],
+        ['CODEX_THREAD_ID', 'codex'],
+      ]) {
+        assert.deepEqual(requesterIdentity({ ...env, [key]: 'native-session' }), {
+          requester: 'native-session',
+          provider,
+          ambiguous: false,
+        });
+        assert.equal(childEnv(inherited, { ...plan.env, [key]: 'intentional-session' })[key], 'intentional-session');
+      }
+    }
+  }
 });
 
 test('what a launch asks for in the environment reaches the child it starts', async () => {

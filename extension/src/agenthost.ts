@@ -87,7 +87,7 @@ export function unstartable(command: string, platform: string): string | null {
   );
 }
 
-// Inherited Claude client identity variables are removed before launch variables are applied.
+// `childEnv` removes inherited Claude client variables and provider session identities before applying launch variables.
 // These variables affect request attribution, session links, generated titles, and child-session behavior.
 // Every case variant is removed, including on Windows.
 // `childEnv` sets `ELECTRON_RUN_AS_NODE` so VS Code's Electron executable can run a package script.
@@ -99,6 +99,8 @@ const HOST_IDENTITY_ENV_NAMES = [
   'CLAUDE_CODE_REMOTE_SESSION_ID',
   'CLAUDE_CODE_CHILD_SESSION',
   'CLAUDE_CODE_CONTAINER_ID',
+  'CLAUDE_CODE_SESSION_ID',
+  'CODEX_THREAD_ID',
 ];
 
 export interface ArcCliEnvironment {
