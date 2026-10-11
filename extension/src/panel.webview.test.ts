@@ -48,6 +48,7 @@ test('native Copy Path and Copy Relative Path retain citation filename suffixes'
 });
 
 test('response citation presses open external literal files without workspace or snapshot routing', async () => {
+  const { linkCandidates } = await import('./transcript.js');
   const opened: Array<{ path: string; options: Record<string, unknown> }> = [];
   const commands: unknown[][] = [];
   const notices: string[] = [];
@@ -102,6 +103,7 @@ test('response citation presses open external literal files without workspace or
     'vscode',
     'path',
     'normalizeFsPath',
+    'linkCandidates',
     'nativeCitationPath',
     'linkTargetIsImage',
     'linkTargetIsHtml',
@@ -111,6 +113,7 @@ test('response citation presses open external literal files without workspace or
     host,
     path,
     (file: string) => file.replace(/\\/g, '/').toLowerCase(),
+    linkCandidates,
     nativeCitationPath,
     (file: string) => file.endsWith('.png'),
     (file: string) => file.endsWith('.html'),
@@ -124,8 +127,9 @@ test('response citation presses open external literal files without workspace or
   }
   assert.equal(commands.length, 0);
   await open(`${outside}/file.csv`, 2);
-  assert.equal(opened.length, 6);
-  assert.match(notices.pop()!, /outside this workspace/);
+  assert.equal(opened.length, 7);
+  assert.equal(opened.at(-1)!.path, path.normalize(`${outside}/file.csv`));
+  assert.equal(notices.length, 0);
   await open(`${root}/file.csv#L10-L12`, 1);
   assert.equal(opened.at(-1)!.path, path.resolve(root, 'file.csv'));
   assert.equal((opened.at(-1)!.options.selection as { from: number }).from, 9);
@@ -172,6 +176,201 @@ test('response citation presses open external literal files without workspace or
     { destination: { kind: 'fileCitation', path: `${outside}/one%20.csv#L10` }, beside: true },
   );
   assert.deepEqual(routed, [[`${outside}/one%20.csv#L10`, 2, true]]);
+});
+
+test('clicked local links open outside workspace folders through their existing editor routes', async () => {
+  const { linkCandidates } = await import('./transcript.js');
+  const source = ts.transpileModule(declarationSource(panelHostSource, 'openLink'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  for (const [platform, roots, skill, text, parent] of [
+    [
+      'win32',
+      ['C:/Workspace/App', 'C:/Workspace/Lib'],
+      'C:/Users/Reader/Notes/.claude/skills/arc-session-digest/SKILL.md',
+      'D:/Notes/Mixed.ts',
+      'C:/Workspace/Outside.ts',
+    ],
+    [
+      'darwin',
+      ['/Users/Reader/Workspace/App', '/Users/Reader/Workspace/Lib'],
+      '/Users/Reader/Notes/SKILL.md',
+      '/Users/Reader/Notes/Mixed.ts',
+      '/Users/Reader/Workspace/Outside.ts',
+    ],
+    [
+      'linux',
+      ['/home/reader/Workspace/App', '/home/reader/Workspace/Lib'],
+      '/home/reader/Notes/SKILL.md',
+      '/home/reader/Notes/Mixed.ts',
+      '/home/reader/Workspace/Outside.ts',
+    ],
+  ] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const uri = (file: string) => ({ scheme: 'file', fsPath: file, toString: () => `file://${file}` });
+    const commands: unknown[][] = [];
+    const opened: Array<{ file: ReturnType<typeof uri>; options: Record<string, unknown> }> = [];
+    const notices: string[] = [];
+    const checked: string[] = [];
+    const external: string[] = [];
+    const existing = new Map<string, number>();
+    let previewFails = false;
+    const host = {
+      Uri: {
+        file: uri,
+        parse: (href: string) => href,
+        joinPath: (base: ReturnType<typeof uri>, file: string) => uri(paths.join(base.fsPath, file)),
+      },
+      FileType: { Directory: 2, File: 1 },
+      workspace: {
+        workspaceFolders: roots.map((root) => ({ uri: uri(root) })),
+        fs: {
+          stat: async (file: ReturnType<typeof uri>) => {
+            checked.push(file.fsPath);
+            const type = existing.get(file.fsPath);
+            if (type === undefined) throw new Error('missing');
+            return { type };
+          },
+        },
+      },
+      env: {
+        openExternal: async (href: string) => {
+          external.push(href);
+        },
+      },
+      commands: {
+        executeCommand: async (...args: unknown[]) => {
+          commands.push(args);
+          if (previewFails && args[0] === 'vscode.openWith') throw new Error('preview unavailable');
+        },
+      },
+      Range: class {
+        constructor(
+          public from: number,
+          public start: number,
+          public to: number,
+          public end: number,
+        ) {}
+      },
+      window: {
+        showInformationMessage: (message: string) => notices.push(message),
+        showTextDocument: async (file: ReturnType<typeof uri>, options: Record<string, unknown>) => {
+          opened.push({ file, options });
+        },
+      },
+    };
+    const open = new Function(
+      'vscode',
+      'path',
+      'normalizeFsPath',
+      'linkCandidates',
+      'nativeCitationPath',
+      'linkTargetIsImage',
+      'linkTargetIsHtml',
+      'linkTargetIsMarkdown',
+      `${source}\nreturn openLink;`,
+    )(
+      host,
+      paths,
+      (file: string) => file.replace(/\\/g, '/').toLowerCase(),
+      (target: string, folders: string[]) => linkCandidates(target, folders, platform),
+      nativeCitationPath,
+      (file: string) => /\.png$/i.test(file),
+      (file: string) => /\.html?$/i.test(file),
+      (file: string) => /\.(md|markdown)$/i.test(file),
+    );
+    const skillPath = paths.normalize(skill);
+    existing.set(skillPath, 1);
+    await open(skill, 2);
+    assert.equal(commands.at(-1)?.[0], 'vscode.openWith', `${platform}: outside Markdown was blocked`);
+    assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, skillPath);
+    assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).scheme, 'file');
+    assert.deepEqual(commands.at(-1)!.slice(2), ['vscode.markdown.preview.editor', 2]);
+    assert.deepEqual(checked, [skillPath]);
+    assert.deepEqual(notices, []);
+    if (platform === 'win32') {
+      await open(skill.replace(/\//g, '\\'), 1);
+      assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, skillPath);
+      assert.equal(commands.at(-1)![3], 1);
+    }
+    existing.set(paths.normalize(text), 1);
+    for (const [suffix, column, from, to] of [
+      ['#L42-L51', 2, 41, 50],
+      [':42', 1, 41, 41],
+    ] as const) {
+      await open(text + suffix, column);
+      assert.equal(opened.at(-1)!.file.scheme, 'file');
+      assert.equal(opened.at(-1)!.file.fsPath, paths.normalize(text));
+      assert.equal(opened.at(-1)!.options.viewColumn, column);
+      assert.deepEqual({ ...(opened.at(-1)!.options.selection as object) }, { from, start: 0, to, end: 0 });
+    }
+    existing.set(paths.normalize(parent), 1);
+    await open('../Outside.ts', 2);
+    assert.equal(opened.at(-1)!.file.fsPath, paths.normalize(parent));
+    for (const name of ['Inside.ts', 'store.ts', 'command', 'file']) existing.set(paths.join(roots[0], name), 1);
+    await open('Inside.ts', 1);
+    assert.equal(opened.at(-1)!.file.fsPath, paths.join(roots[0], 'Inside.ts'));
+    await open(paths.join(roots[0], 'Inside.ts'), 2);
+    assert.equal(opened.at(-1)!.file.fsPath, paths.join(roots[0], 'Inside.ts'));
+    for (const name of ['store.ts:42', 'store.ts:42:7', 'command:42', 'file:42']) {
+      await open(name, 1);
+      assert.equal(opened.at(-1)!.file.fsPath, paths.join(roots[0], name.split(':')[0]));
+      assert.equal(opened.at(-1)!.file.scheme, 'file');
+      assert.deepEqual({ ...(opened.at(-1)!.options.selection as object) }, { from: 41, start: 0, to: 41, end: 0 });
+    }
+    const lib = paths.join(roots[1], 'Only.ts');
+    existing.set(lib, 1);
+    checked.length = 0;
+    await open('Only.ts', 2);
+    assert.deepEqual(checked, [paths.join(roots[0], 'Only.ts'), lib]);
+    assert.equal(opened.at(-1)!.file.fsPath, lib);
+    for (const [name, command] of [
+      ['Folder.html', 'revealInExplorer'],
+      ['image.png', 'vscode.open'],
+      ['page.html', 'workbench.action.browser.open'],
+    ] as const) {
+      const file = paths.join(paths.dirname(text), name);
+      existing.set(file, name === 'Folder.html' ? 2 : 1);
+      await open(file, 2);
+      assert.equal(commands.at(-1)![0], command);
+      assert.equal(
+        command === 'workbench.action.browser.open'
+          ? commands.at(-1)![1]
+          : (commands.at(-1)![1] as ReturnType<typeof uri>).fsPath,
+        command === 'workbench.action.browser.open' ? `file://${file}` : file,
+      );
+    }
+    const beforePreview = opened.length;
+    previewFails = true;
+    await open(skill, 2);
+    assert.equal(opened.length, beforePreview);
+    assert.equal(notices.pop(), `Arc: VS Code did not open ${skillPath} in Markdown Preview.`);
+    previewFails = false;
+    await open(text + '.missing', 1);
+    assert.equal(notices.pop(), `Arc: no file at ${text}.missing.`);
+    for (const href of ['command:workbench.action.files.openFile', 'file:///tmp/file', 'mailto:reader@example.com']) {
+      checked.length = 0;
+      const commandCount = commands.length;
+      await open(href, 1);
+      assert.deepEqual(
+        checked,
+        roots.map((root) => paths.join(root, href)),
+      );
+      assert.equal(commands.length, commandCount);
+      assert.equal(notices.pop(), `Arc: no file at ${href}.`);
+    }
+    checked.length = 0;
+    for (const href of ['http://example.com/a.md', 'HTTPS://example.com/a.md']) await open(href, 2);
+    assert.deepEqual(external, ['http://example.com/a.md', 'HTTPS://example.com/a.md']);
+    assert.deepEqual(checked, []);
+    host.workspace.workspaceFolders = [];
+    await open(skill, 2);
+    assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, skillPath);
+    checked.length = 0;
+    await open('missing.ts', 1);
+    assert.deepEqual(checked, []);
+    assert.equal(notices.pop(), 'Arc: no file at missing.ts.');
+  }
 });
 
 test('recorded, restored and live response citations share summary, earlier-answer and Activity rendering', () => {

@@ -90,6 +90,7 @@ import {
   isInside,
   linkTargetIsHtml,
   linkTargetIsMarkdown,
+  linkCandidates,
   agentSpendDependencyKey,
   childSpendVersion,
   claudeChildFileFor,
@@ -690,7 +691,7 @@ function pendingIn(manifest: Manifest | null, filePath: string): ManifestEntry |
   return entry;
 }
 
-// Ordinary response links use workspace containment and optional line ranges.
+// Ordinary response links open local paths with optional line ranges.
 // Explicit file citations retain literal absolute paths and open only after a press.
 async function openLink(href: string, column: vscode.ViewColumn, literal = false): Promise<void> {
   if (literal && !nativeCitationPath(href, process.platform)) return;
@@ -708,27 +709,14 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
   }
 
   const folders = vscode.workspace.workspaceFolders ?? [];
-  // Resolve each path before checking open-folder containment. Unresolved parent
-  // segments can pass a prefix check while naming a file outside the folder.
-  const inWorkspace = (p: string) =>
-    folders.some((f) => {
-      const base = normalizeFsPath(f.uri.fsPath).replace(/\/$/, '');
-      const t = normalizeFsPath(path.resolve(p));
-      return t === base || t.startsWith(base + '/');
-    });
-  if (!literal && path.isAbsolute(target) && !inWorkspace(target)) {
-    void vscode.window.showInformationMessage(`Arc: ${target} is outside this workspace.`);
-    return;
-  }
   const candidates = (
-    literal || path.isAbsolute(target)
-      ? [vscode.Uri.file(literal ? target : path.resolve(target))]
-      : folders.map((f) => vscode.Uri.joinPath(f.uri, target))
-  ).filter((uri) => literal || inWorkspace(uri.fsPath));
-  if (!candidates.length) {
-    void vscode.window.showInformationMessage(`Arc: ${target} is outside this workspace.`);
-    return;
-  }
+    literal
+      ? [target]
+      : linkCandidates(
+          target,
+          folders.map((f) => f.uri.fsPath),
+        )
+  ).map((file) => vscode.Uri.file(file));
   for (const uri of candidates) {
     try {
       const stat = await vscode.workspace.fs.stat(uri);
@@ -774,9 +762,7 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
       /* Continue to another candidate when this file cannot open. */
     }
   }
-  void vscode.window.showInformationMessage(
-    literal ? `Arc: no file at ${target}.` : `Arc: no file at ${target} in this workspace.`,
-  );
+  void vscode.window.showInformationMessage(`Arc: no file at ${target}.`);
 }
 
 // Open a response image in the editor's viewer. imagePathFor checks the path

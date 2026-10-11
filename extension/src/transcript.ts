@@ -3216,6 +3216,17 @@ export function linkTargetIsMarkdown(target: string): boolean {
   return /\.(?:md|markdown)$/i.test(target);
 }
 
+// Local paths in folder order. Parent segments can name files outside the folders.
+export function linkCandidates(
+  target: string,
+  folders: string[],
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (!target) return [];
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  return paths.isAbsolute(target) ? [paths.resolve(target)] : folders.map((folder) => paths.join(folder, target));
+}
+
 // Returns an absolute target, the first existing workspace-relative target, or the first joined fallback.
 export function resolveLink(target: string, folders: string[], exists: (p: string) => boolean): string | null {
   if (!target) {
@@ -3224,7 +3235,7 @@ export function resolveLink(target: string, folders: string[], exists: (p: strin
   if (path.isAbsolute(target)) {
     return target;
   }
-  const joined = folders.map((f) => path.join(f, target));
+  const joined = linkCandidates(target, folders);
   return joined.find(exists) ?? joined[0] ?? null;
 }
 

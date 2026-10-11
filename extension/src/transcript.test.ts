@@ -322,6 +322,7 @@ import {
   linkTargetIsHtml,
   linkTargetIsMarkdown,
   resolveLink,
+  linkCandidates,
   holdsHumanPrompt,
   promptScanLists,
   scanForHumanPrompt,
@@ -11694,6 +11695,22 @@ test('a relative link resolves to the folder that holds it, or the first folder'
     resolveLink('', folders, () => false),
     null,
   );
+});
+
+test('local link candidates preserve platform spelling and allow paths outside open folders', () => {
+  for (const [platform, root, outside, expected] of [
+    ['win32', 'C:/Work/App', 'D:/Notes/Guide.md', 'D:\\Notes\\Guide.md'],
+    ['darwin', '/Users/Reader/Work/App', '/Users/Reader/Notes/Guide.md', '/Users/Reader/Notes/Guide.md'],
+    ['linux', '/home/reader/Work/App', '/home/reader/Notes/Guide.md', '/home/reader/Notes/Guide.md'],
+  ] as const) {
+    assert.deepEqual(linkCandidates(outside, [root], platform), [expected]);
+    assert.deepEqual(linkCandidates(outside, [], platform), [expected]);
+    const parent = platform === 'win32' ? 'C:\\Work\\Guide.md' : root.replace(/\/App$/, '/Guide.md');
+    assert.deepEqual(linkCandidates('../Guide.md', [root], platform), [parent]);
+    assert.deepEqual(linkCandidates('Guide.md', [], platform), []);
+    assert.deepEqual(linkCandidates('', [root], platform), []);
+  }
+  assert.deepEqual(linkCandidates('c:\\Notes\\Mixed.md', ['C:/Work'], 'win32'), ['c:\\Notes\\Mixed.md']);
 });
 
 test('a session was last active when it last recorded a time, not when its file was touched', () => {

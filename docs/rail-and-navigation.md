@@ -174,6 +174,8 @@ Links in rendered responses follow their destination, and the extension tests ea
 
 Integrated-browser placement follows `workbench.browser.newTabPlacement`. VS Code applies workspace trust to local HTML navigation.
 
+Clicked local links can open files outside every workspace folder. Absolute paths need no open folder. Relative paths use open folders in order, including parent paths through `..`. Relative paths have no base in a folderless window. `#L42-L51` and `:42` select lines in text files. A trailing column in `:42:7` does not change that selection. Markdown Preview failures report the target without opening raw text. Local links interpret non-HTTP/HTTPS addresses as filesystem paths, without executing other URI schemes.
+
 Commit links open through VS Code's Git extension only when the repository directory is known and the command is available. A commit made outside the open workspace carries its repository name. An unresolvable repository leaves the hash as text rather than opening the wrong tree.
 
 When Git reports the ref that created a commit, the row shows its named branch or says that the commit was detached. This distinguishes a temporary isolated-checkout commit from a later branch commit without merging rows that merely share a subject and statistics. A commit made in a worktree whose directory is named for that branch shows the branch and no place, and its hover still names the worktree.

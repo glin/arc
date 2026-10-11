@@ -600,7 +600,7 @@ function decodedTarget(target: string): string {
 }
 
 // Resolves local image paths within the open folders.
-// Resolve `..` before comparing prefixes, as `openLink` does.
+// Resolve `..` before comparing prefixes.
 // Comparing an unresolved prefix can admit a file outside the folder.
 // The check uses the written path. A symlink inside a folder can point outside it.
 function imageInFolders(written: string, folders: readonly string[]): string | null {
