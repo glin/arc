@@ -1624,7 +1624,7 @@ test('human admission uses walked sizes and stats reused rows only until evidenc
   assert.equal(stat.mock.calls.length, 2, 'confirmed evidence does not stat a stale row');
 });
 
-test('current whole-file facts archive a listed session with no turn and refuse unavailable or active facts', async () => {
+test('current whole-file facts archive a listed session with no turn, refuse unavailable facts, and archive known active work only with force', async () => {
   const directory = tempDir('empty-session-archive-');
   const file = path.join(directory, 'empty.jsonl');
   fs.writeFileSync(file, JSON.stringify({ type: 'mode', mode: 'normal' }) + '\n');
@@ -1715,6 +1715,124 @@ test('current whole-file facts archive a listed session with no turn and refuse 
     (await provider.handleSessionRequest({ ...request, params: { ...request.params, force: true } })).status,
     'applied',
   );
+  unread = undefined;
+  // Known running or Needs input evidence admits a forced archive while the transcript metadata is stale.
+  const forced = { ...request, params: { ...request.params, force: true } };
+  const saves: string[][] = [];
+  provider.memento = {
+    update: async (_key: string, state: { hidden: string[] }) => {
+      saves.push([...state.hidden]);
+    },
+  };
+  provider.pendingWatch = { snapshot: () => ({ eventCount: 1, broadRequired: false }) };
+  for (const [active, live] of [
+    ['running', () => provider.running.add('claude:empty')],
+    ['input', () => (provider.asks = [{ session: 'empty' }])],
+  ] as const) {
+    assert.equal(
+      (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } })).status,
+      'applied',
+    );
+    provider.pinnedTop = new Set(['empty']);
+    live();
+    assert.deepEqual([row().facts, row().attention], ['stale', active]);
+    await refuse(/running or needs input\. Use --force/);
+    assert.equal(provider.hidden.has('empty'), false);
+    assert.equal(
+      (await provider.handleSessionRequest({ ...forced, params: { ...forced.params, dryRun: true } })).status,
+      'dry-run',
+    );
+    assert.equal(provider.hidden.has('empty'), false);
+    saves.length = 0;
+    const result = await provider.handleSessionRequest(forced);
+    assert.deepEqual([result.status, result.archived, result.pinned], ['applied', true, false], result.reason);
+    assert.deepEqual(saves, [['empty']]);
+    assert.equal(provider.pinnedTop.has('empty'), false);
+    provider.running.clear();
+    provider.asks = [];
+  }
+  // A rejected save leaves a forced archive of an active session unapplied and keeps its pin.
+  assert.equal(
+    (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } })).status,
+    'applied',
+  );
+  provider.pinnedTop = new Set(['empty']);
+  provider.running.add('claude:empty');
+  const update = provider.memento.update;
+  provider.memento.update = async () => {
+    throw new Error('save refused');
+  };
+  await assert.rejects(provider.handleSessionRequest(forced), /save refused/);
+  assert.equal(provider.hidden.has('empty'), false);
+  assert.equal(provider.pinnedTop.has('empty'), true);
+  provider.memento.update = update;
+  provider.running.clear();
+  // A hidden panel leaves attention unknown, and known running evidence still admits the forced archive.
+  visible = false;
+  provider.running.add('claude:empty');
+  assert.deepEqual([row().runStatus, row().attention, row().facts], ['running', 'unknown', 'stale']);
+  await refuse(/--force/);
+  assert.equal((await provider.handleSessionRequest(forced)).status, 'applied');
+  provider.running.clear();
+  // A forced archive admits an inactive session whose state Arc cannot read, and ordinary archive still refuses it.
+  // The first row has stale facts. The second row has a known run status behind a hidden panel.
+  const finished = {
+    startedAt: Date.now() - 2000,
+    endedAt: Date.now() - 1000,
+    finished: true,
+    error: false,
+    interrupted: false,
+  };
+  for (const [unreadable, state] of [
+    [() => (visible = true), ['unknown', 'unknown', 'stale']],
+    [
+      () => {
+        visible = false;
+        provider.pendingWatch = { snapshot: () => ({ eventCount: 0, broadRequired: false }) };
+        entry.outcome = finished;
+      },
+      ['done', 'unknown', 'stale'],
+    ],
+  ] as const) {
+    assert.equal(
+      (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } })).status,
+      'applied',
+    );
+    provider.pinnedTop = new Set(['empty']);
+    unreadable();
+    assert.deepEqual([row().runStatus, row().attention, row().facts], state);
+    const refused = await provider.handleSessionRequest(request);
+    assert.deepEqual(
+      [refused.status, refused.reason],
+      ['refused', 'The session state is unavailable. Show Arc and retry.'],
+    );
+    assert.equal(provider.hidden.has('empty'), false);
+    saves.length = 0;
+    const result = await provider.handleSessionRequest(forced);
+    assert.deepEqual([result.status, result.archived, result.pinned], ['applied', true, false], result.reason);
+    assert.deepEqual(saves, [['empty']]);
+    assert.equal(provider.pinnedTop.has('empty'), false);
+  }
+  // A finished turn that left background work running refuses archive, with force too.
+  visible = true;
+  for (const [outcome, runStatus] of [
+    [{ ...finished, openChildren: ['child'] }, 'subagents'],
+    [{ ...finished, backgroundCommands: [{ id: 'command', startedAt: Date.now() - 1000 }] }, 'background'],
+  ] as const) {
+    assert.equal(
+      (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } })).status,
+      'applied',
+    );
+    entry.outcome = outcome;
+    saves.length = 0;
+    for (const attempt of [forced, request]) {
+      const result = await provider.handleSessionRequest(attempt);
+      assert.deepEqual([result.status, provider.hidden.has('empty')], ['refused', false], runStatus);
+      assert.match(result.reason, /^Arc cannot tell whether background work in the session ended/);
+    }
+    assert.deepEqual(saves, []);
+    assert.deepEqual([row().runStatus, row().attention, row().facts], [runStatus, 'running', 'current']);
+  }
 });
 
 test('window session reads leave reader state and live capabilities unchanged and reject unknown IDs', () => {
@@ -2056,7 +2174,7 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
   await vi.waitFor(() => assert.equal(writes, 1));
   const archive = provider.handleSessionRequest({
     ...request,
-    params: { ...request.params, action: 'archive', force: true },
+    params: { ...request.params, action: 'archive', force: false },
   });
   row = { ...row, runStatus: 'waiting', attention: 'input' };
   assert.equal(settled, false);
@@ -2120,6 +2238,44 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
     (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } })).status,
     'applied',
   );
+  assert.equal(provider.hidden.has('known'), false);
+  // Background work refuses archive at the command boundary, with force too.
+  for (const runStatus of ['subagents', 'background'] as const) {
+    row = { ...row, facts: 'current', runStatus, attention: 'running' };
+    const result = await provider.handleSessionRequest({
+      ...request,
+      params: { ...request.params, action: 'archive', force: true },
+    });
+    assert.equal(result.status, 'refused');
+    assert.match(result.reason, /^Arc cannot tell whether background work in the session ended/);
+    assert.doesNotMatch(result.reason, /--force/);
+  }
+  assert.equal(provider.hidden.has('known'), false);
+  // A forced archive rechecks admission when it applies, after the earlier save settles.
+  provider.memento.update = () => {
+    writes++;
+    return new Promise<void>((resolve) => {
+      save = resolve;
+    });
+  };
+  row = { ...row, facts: 'current', runStatus: 'running', attention: 'running' };
+  const held = writes;
+  const labelling = provider.handleSessionRequest({ ...request, params: { ...request.params, labels: ['Forced'] } });
+  await vi.waitFor(() => assert.equal(writes, held + 1));
+  const forcedArchive = provider.handleSessionRequest({
+    ...request,
+    params: { ...request.params, action: 'archive', force: true },
+  });
+  row = { ...row, facts: 'current', runStatus: 'subagents', attention: 'running' };
+  provider.memento.update = async () => {
+    writes++;
+  };
+  save();
+  assert.equal((await labelling).status, 'applied');
+  const recheck = await forcedArchive;
+  assert.equal(recheck.status, 'refused');
+  assert.match(recheck.reason, /^Arc cannot tell whether background work in the session ended/);
+  assert.equal(writes, held + 1);
   assert.equal(provider.hidden.has('known'), false);
   assert.equal(
     JSON.stringify([
@@ -2271,7 +2427,28 @@ test('window session listings reject removed children and report pending, hidden
     };
     provider.titles.set(file, { ...parent, outcome: retained });
     const childReadWindow = openReadWindow();
+    // A finished turn reports the background work it left running, and subagents take precedence.
+    const retainedWork = parentRow(provider.readSessionRequest(request));
+    assert.deepEqual([retainedWork.runStatus, retainedWork.attention], ['subagents', 'running']);
+    provider.titles.set(file, { ...parent, outcome: { ...retained, openChildren: ['closed'] } });
+    assert.equal(parentRow(provider.readSessionRequest(request)).runStatus, 'background');
+    // Closed children and commands past the cap leave the listing unable to say whether work still runs.
+    provider.titles.set(file, {
+      ...parent,
+      outcome: {
+        ...retained,
+        openChildren: undefined,
+        closedChildren: undefined,
+        backgroundCommands: [{ id: 'command', startedAt: 1 }],
+      },
+    });
     assert.equal(parentRow(provider.readSessionRequest(request)).runStatus, 'unknown');
+    provider.titles.set(file, {
+      ...parent,
+      outcome: { ...retained, openChildren: undefined, backgroundCommands: undefined },
+    });
+    assert.equal(parentRow(provider.readSessionRequest(request)).runStatus, 'unknown');
+    provider.titles.set(file, { ...parent, outcome: retained });
     publishExit();
     const nativeClosedParent = provider.readSessionRequest(request);
     assert.equal(parentRow(nativeClosedParent).runStatus, 'done');
@@ -3091,7 +3268,11 @@ test.each(
       // A replacement starts idle and cannot inherit the previous process exit.
       clock.mockReturnValue(start + 30);
       publish(2, false, false);
-      assert.equal(status(), 'unknown', 'idle replacement revokes closure');
+      assert.equal(
+        status(),
+        symptom === 'older reader window' ? 'subagents' : 'unknown',
+        'idle replacement revokes closure, so the retained child counts again',
+      );
       clock.mockReturnValue(start + 40);
       publish(2, true, false);
       assert.equal(status(), 'running', 'replacement busy outranks old exit');
@@ -3120,7 +3301,11 @@ test.each(
       if (meta) provider.titles.set(file, { ...meta, ...source });
       clock.mockReturnValue(start + 110);
       publish(3, false, true);
-      assert.equal(status(), 'unknown', 'refreshed catalog cannot recapture post-exit append');
+      assert.equal(
+        status(),
+        symptom === 'older reader window' ? 'subagents' : 'unknown',
+        'refreshed catalog cannot recapture post-exit append',
+      );
       provider.asks = [{ session: 'parent' }];
       assert.equal(status(), 'waiting', 'request survives revoked closure');
       provider.asks = [];

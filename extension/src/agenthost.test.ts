@@ -2081,6 +2081,31 @@ test('an archived busy session retires only after housekeeping settles', async (
   assert.equal(children[0].ended, true);
 });
 
+test('an archived session with an open ask keeps the question and retires only after it is answered', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, children } = fakeHost(undefined, undefined, { timer });
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await starting;
+  settle(host, 'one');
+  children[0].say(
+    JSON.stringify({
+      type: 'control_request',
+      request_id: 'ask-1',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'dir' }, tool_use_id: 'tu1' },
+    }) + '\n',
+  );
+
+  host.setArchived(['sess-1']);
+  assert.strictEqual(host.get('one'), session, 'archive retired a session that waits on a question');
+  assert.equal(children[0].ended, false);
+  assert.equal(session.state().asks.length, 1);
+  assert.equal(session.answer('ask-1', { decision: 'allow' }), true);
+  settle(host, 'one');
+  assert.equal(host.get('one'), null);
+  assert.equal(children[0].ended, true);
+});
+
 test('archiving after turn end still waits for its control reads to settle', async () => {
   const timer = new FakeAgentHostTimer();
   const { host, children } = fakeHost(undefined, undefined, { timer });

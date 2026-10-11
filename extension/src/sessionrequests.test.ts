@@ -75,18 +75,57 @@ test('session writes retain one acceptance across equal concurrent retries and r
   assert.equal(calls, 1);
 });
 
-test('archive refuses current live work and stale attention even with force, while completed unread requires force', () => {
+test('archive requires force for live work, completed unread work, and unavailable state', () => {
   const row = { facts: 'current', runStatus: 'done', attention: 'idle' } as SessionListingRow;
   assert.equal(archiveRefusal(row, false), null);
   assert.equal(archiveRefusal({ ...row, runStatus: 'none' }, false), null);
   assert.match(archiveRefusal({ ...row, attention: 'unread' }, false)!, /--force/);
   assert.equal(archiveRefusal({ ...row, attention: 'unread' }, true), null);
-  for (const runStatus of ['running', 'waiting', 'subagents', 'background'] as const)
-    assert.match(archiveRefusal({ ...row, runStatus }, true)!, /running or needs input/);
-  for (const facts of ['stale', 'unparsed'] as const)
-    assert.match(archiveRefusal({ ...row, facts }, true)!, /unavailable/);
-  assert.match(archiveRefusal({ ...row, attention: 'unknown' }, true)!, /unavailable/);
-  assert.match(archiveRefusal({ ...row, runStatus: 'unknown' }, true)!, /unavailable/);
+  const active = [
+    ...(['running', 'waiting'] as const).map((runStatus) => ({ runStatus })),
+    ...(['running', 'input'] as const).map((attention) => ({ attention })),
+  ];
+  for (const live of active) {
+    assert.match(archiveRefusal({ ...row, ...live }, false)!, /running or needs input\. Use --force/);
+    for (const facts of ['current', 'stale', 'unparsed'] as const)
+      for (const attention of ['idle', 'unread', 'unknown'] as const)
+        assert.equal(archiveRefusal({ ...row, attention, ...live, facts }, true), null, JSON.stringify(live));
+  }
+  const unavailable = [
+    ...(['stale', 'unparsed'] as const).flatMap((facts) =>
+      (['done', 'none', 'unknown'] as const).map((runStatus) => ({ facts, runStatus })),
+    ),
+    { attention: 'unknown' as const },
+    { runStatus: 'unknown' as const },
+    { runStatus: 'unknown' as const, attention: 'unread' as const },
+    { runStatus: 'unknown' as const, attention: 'unknown' as const },
+  ];
+  for (const state of unavailable) {
+    const label = JSON.stringify(state);
+    assert.equal(
+      archiveRefusal({ ...row, ...state }, false),
+      'The session state is unavailable. Show Arc and retry.',
+      label,
+    );
+    assert.equal(archiveRefusal({ ...row, ...state }, true), null, label);
+  }
+});
+
+test('archive refuses background subagents and background commands with and without force, and never suggests force', () => {
+  for (const runStatus of ['subagents', 'background'] as const)
+    for (const visible of [true, false])
+      for (const facts of ['current', 'stale', 'unparsed'] as const)
+        for (const force of [false, true]) {
+          const attention = sessionAttention(visible, runStatus, false);
+          const reason = archiveRefusal({ facts, runStatus, attention } as SessionListingRow, force);
+          const label = JSON.stringify({ runStatus, attention, facts, force });
+          assert.match(
+            reason ?? '',
+            /^Arc cannot tell whether background work in the session ended, and archive can end it\./,
+            label,
+          );
+          assert.doesNotMatch(reason ?? '', /--force/, label);
+        }
 });
 
 test('the authenticated window channel retains write acceptance across a disconnected caller and rejects conflicting retries', async () => {

@@ -88,14 +88,19 @@ export class SessionWriteRequests {
 }
 
 // Current no-turn rows use the same archive checks as completed turns.
+// Rows listed as subagents or background refuse archive even with force. The listing reports them while Arc has
+// no end record for that work. The CLI reports idle while that work runs, so archive retirement can end the
+// process that holds it.
+// Known running or Needs input evidence admits a forced archive whatever the transcript facts say.
+// Force also admits a session whose state is unavailable, as archiving from the rail does.
+// Archive keeps the current turn and open asks, and retirement waits for both to settle.
 export function archiveRefusal(row: SessionListingRow, force: boolean): string | null {
-  if (
-    ['running', 'waiting', 'subagents', 'background'].includes(row.runStatus) ||
-    ['running', 'input'].includes(row.attention)
-  )
-    return 'The session is running or needs input.';
+  if (row.runStatus === 'subagents' || row.runStatus === 'background')
+    return 'Arc cannot tell whether background work in the session ended, and archive can end it.';
+  if (['running', 'waiting'].includes(row.runStatus) || ['running', 'input'].includes(row.attention))
+    return force ? null : 'The session is running or needs input. Use --force to archive it.';
   if (row.facts !== 'current' || row.attention === 'unknown' || row.runStatus === 'unknown')
-    return 'The session state is unavailable. Show Arc and retry.';
+    return force ? null : 'The session state is unavailable. Show Arc and retry.';
   if (row.attention === 'unread' && !force) return 'The completed session is unread. Use --force to archive it.';
   return null;
 }

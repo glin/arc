@@ -14,7 +14,7 @@ import {
   type FileRevision,
 } from './transcript.ts';
 import type { RailStatus, SessionParentEdge } from './turnrail.ts';
-import { sessionStatusOf } from './turnrail.ts';
+import { liveBackgroundCommands, sessionStatusOf } from './turnrail.ts';
 import type { SessionStatus } from './domain/session-query.ts';
 import { railStatusRuns } from './domain/session-query.ts';
 import { onlyGrew } from './derivedcache.ts';
@@ -142,6 +142,11 @@ export function sessionExitMatches(
 }
 
 // Programmatic status uses held outcomes and native facts without reopening child transcripts.
+// A finished turn reads subagents while a background subagent it launched has no close record. The panel also
+// requires a fresh child transcript, which this read never opens. It reads background while a background command
+// has no end record and is younger than the panel's command cap. Subagents take precedence over background, as in
+// the panel. A closed child reopens only on later work in its own transcript, so a finished turn whose remaining
+// records are only closed children or commands past the cap reads unknown.
 export function sessionReadStatus(
   id: string,
   outcome: TurnOutcome | null | undefined,
@@ -163,15 +168,25 @@ export function sessionReadStatus(
     source.mtimeMs <= exited;
   const active = running && !ended;
   const observedOutcome = outcome && ended ? { ...outcome, processEndedAt: exited } : outcome;
+  const closed = new Set(
+    (observedOutcome?.closedChildren ?? []).map((child) => (typeof child === 'string' ? child : child.id)),
+  );
+  const openChildren =
+    observedOutcome && observedOutcome.processEndedAt === undefined
+      ? new Set((observedOutcome.openChildren ?? []).filter((child) => !closed.has(child))).size
+      : 0;
+  const now = Date.now();
   const statuses = sessionStatusOf(
     !outcome && ended
       ? [{ sessionId: id, kind: 'turn', startedAt: boundary, processEndedAt: exited, status: 'stopped' }]
       : [],
     active ? new Set([id]) : new Set(),
     observedOutcome ? new Map([[id, observedOutcome]]) : new Map(),
-    Date.now(),
+    now,
     waiting ? new Set([id]) : new Set(),
     since !== undefined ? new Map([[id, since]]) : new Map(),
+    new Map([[id, openChildren]]),
+    liveBackgroundCommands(new Map([[id, observedOutcome ?? null]]), new Map(), now),
   );
   const status = statuses.get(id);
   if (status === 'running' && !active) return undefined;

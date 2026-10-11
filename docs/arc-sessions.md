@@ -78,7 +78,7 @@ arc CLI <--- local channel ---> Selected ready Arc window
 4. Start each session through `arc start`. Save accepted session IDs and preserve uncertain request IDs without launching replacements.
 5. Arc's adapters run the native CLIs. Arc reads Claude transcripts and Codex rollouts for recorded turns. The panel shows live process activity, and session listings show live run status.
 6. Read recorded turns through `arc session`. Report each session's result and recorded settings without changing reader attention.
-7. Apply only authorized labels and pins, using `--dry-run` first. Archive only authorized completed sessions with known attention. Running and Needs input sessions refuse archive. Unread completion requires explicit `--force` authority.
+7. Apply only authorized labels and pins, using `--dry-run` first. Archive only authorized sessions. Running, Needs input, unread completed, and unavailable-state sessions refuse archive without `--force`. Pass `--force` for a running, Needs input, or unavailable-state session only when the reader explicitly asked to archive that session. A session whose listing reports background work refuses archive even with `--force`. Archive removes the pin. [Session management](cli.md#session-management) owns what a forced archive admits and keeps.
 8. Leave the requested continuation session available. The reader opens it and sends the next prompt through its Prompt box.
 
 `arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
@@ -160,7 +160,7 @@ Archiving is a separate reader decision. To archive the completed Claude check s
 arc archive CLAUDE_SESSION_ID --force --window WINDOW_ID
 ```
 
-Hidden or unavailable attention refuses archive. Leave the Codex session unarchived and send a follow-up through its Prompt box to check reader continuation. No launch check requires automatic cleanup of session state.
+Hidden or unavailable attention refuses archive without `--force`. Leave the Codex session unarchived and send a follow-up through its Prompt box to check reader continuation. No launch check requires automatic cleanup of session state.
 
 ## Session cost reports
 

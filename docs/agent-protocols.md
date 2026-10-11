@@ -129,7 +129,7 @@ A session with a running child renames through that child, whatever that child i
 
 The timer rechecks that the child is live, idle, and has no open ask.
 
-The panel publishes its restored archive set when the host connects. It also publishes archive changes and an empty set when the reader clears workspace state. Archiving retires an eligible child immediately. A busy or waiting child remains available until its turn and control reads settle. Unarchiving cancels deferred archive retirement.
+The panel publishes its restored archive set when the host connects. It also publishes archive changes and an empty set when the reader clears workspace state. Archiving retires an eligible child immediately. A child is eligible when it has no busy turn, no open asks, no held lease or opening reservation, and settled housekeeping. Otherwise the host retires the archived child at the first later settlement that meets those conditions. Unarchiving cancels deferred archive retirement. Eligibility ignores background subagents and background commands, so retirement can run while that work is in progress. Retirement closes the child's input and requests termination of the child process when it outlives a grace period. Arc sends no signal to processes the child started.
 
 Prompt and control operations hold an activity lease. The lease cancels timed retirement before work starts. Its release starts a new full idle window when the child remains eligible. Retirement removes only the child. The saved session id and accepted session settings let the next prompt resume the session from disk with the same configuration.
 
