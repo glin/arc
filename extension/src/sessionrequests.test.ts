@@ -1,4 +1,4 @@
-import { revisionOf, supportedFileIdentity } from './transcript';
+import { revisionOf, supportedFileIdentity, type SessionFile } from './transcript';
 import { sessionSourceAdmitted } from './sessionreads';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -17,9 +17,18 @@ import { tempDir } from './temproot.ts';
 import {
   boundedSessionRead,
   boundedSessionListing,
+  encodeSessionCursor,
+  readSessionCursor,
   sessionAttention,
+  sessionListingPage,
+  sessionPageSources,
+  sessionScopeDigest,
+  sessionSourceKey,
+  SESSION_PAGE_LIMITS,
   SESSION_READ_LIMITS,
   type SessionListingRow,
+  type SessionPage,
+  type SessionPageRequest,
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
 import { requestWindow } from './sessionrequests.ts';
@@ -220,6 +229,8 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
     { ...valid, requester: [] },
     { ...valid, requester: '' },
     { ...valid, extra: true },
+    { ...valid, method: 'sessions', replyBytes: 1000 },
+    { ...valid, method: 'sessions', params: { replyBytes: 1000 } },
   ]) {
     assert.equal(parseSessionRequest(invalid), null);
   }
@@ -349,16 +360,39 @@ test('session replies with valid large window metadata refuse excess envelope by
   const data = { content: 'x'.repeat(48 * 1024 - 1000) };
   const { home, channel } = await fixture();
   channel.setRequestHandler(() => data);
-  await channel.update({
-    ...state,
-    folders: Array.from({ length: 12 }, (_, n) => `C:/project-${n}/${'folder'.repeat(280)}`),
-  });
+  const folders = Array.from({ length: 12 }, (_, n) => `C:/project-${n}/${'folder'.repeat(280)}`);
+  await channel.update({ ...state, folders });
   for (const method of ['sessions', 'session'] as const) {
     await assert.rejects(
       requestWindow(method, method === 'session' ? { sessionId: 'known', turns: 1 } : {}, channel.hostId, home),
       /session response exceeds.*channel limit/,
     );
   }
+  let replyBytes = 0;
+  let extra = 0;
+  channel.setRequestHandler((request) => {
+    replyBytes = request.replyBytes ?? -1;
+    return { fill: 'x'.repeat(replyBytes - Buffer.byteLength('{"fill":""}') + extra) };
+  });
+  const filled = await requestWindow('sessions', {}, channel.hostId, home);
+  assert.ok(replyBytes > 0 && replyBytes < SESSION_READ_LIMITS.outputBytes);
+  assert.equal(pageBytes(filled), replyBytes);
+  extra = 1;
+  await assert.rejects(requestWindow('sessions', {}, channel.hostId, home), /channel limit/);
+  channel.setRequestHandler((request) => {
+    void channel.update({ ...state, folders: [...folders, 'C:/added-during-the-read'] });
+    return { fill: 'x'.repeat(request.replyBytes! - Buffer.byteLength('{"fill":""}')) };
+  });
+  assert.ok(pageBytes(await requestWindow('sessions', {}, channel.hostId, home)) > 0);
+  await channel.update({ ...state, folders });
+  channel.setRequestHandler((request) => ({ replyBytes: request.replyBytes ?? null }));
+  assert.deepEqual(await requestWindow('session', { sessionId: 'known', turns: 1 }, channel.hostId, home), {
+    replyBytes: null,
+  });
+  const files = Array.from({ length: 300 }, (_, n) => pageFile(n));
+  channel.setRequestHandler((request) => listPage(files, null, { replyBytes: request.replyBytes, row: variedName }));
+  const page = (await requestWindow('sessions', {}, channel.hostId, home)) as SessionPage;
+  assert.ok(page.next && page.sessions.length > 0 && pageBytes(page) <= replyBytes);
   channel.setRequestHandler(() => ({ complete: false, notes: ['Bounded listing.'] }));
   assert.deepEqual(await requestWindow('sessions', {}, channel.hostId, home), {
     complete: false,
@@ -394,6 +428,331 @@ test('session output limits preserve unknown attention and report excluded conte
   assert.ok(result.sessions.length < 200);
   assert.ok(Buffer.byteLength(JSON.stringify(result)) <= SESSION_READ_LIMITS.outputBytes);
   assert.ok(result.notes.length > 0);
+});
+
+const pageSecret = crypto.randomBytes(32);
+const pageScope = sessionScopeDigest('mixed-case scope');
+let pageProjections = 0;
+type PageOptions = Partial<SessionPageRequest<SessionFile>> & {
+  row?: (session: SessionFile) => Partial<SessionListingRow>;
+  current?: (session: SessionFile) => boolean;
+};
+
+function pageFile(n: number, changes: Partial<SessionFile> = {}): SessionFile {
+  return {
+    agent: n % 2 ? 'codex' : 'claude',
+    file: `C:/Users/Mixed/Sessions/${n}.jsonl`,
+    sessionId: `session-${n}`,
+    mtimeMs: 1,
+    size: 10,
+    dev: '7',
+    ino: String(1000 + n),
+    ...changes,
+  };
+}
+
+function listPage(files: SessionFile[], cursor: string | null, options: PageOptions = {}): SessionPage {
+  const { row, current, ...request } = options;
+  const check = cursor === null ? null : readSessionCursor(cursor, pageSecret, pageScope);
+  if (check && check.status !== 'valid') throw new Error(`Cursor ${check.status}.`);
+  return sessionListingPage({
+    sources: sessionPageSources(files),
+    cursor: check?.status === 'valid' ? check.body : null,
+    limit: 128,
+    catalog: 'complete',
+    fresh: true,
+    scope: pageScope,
+    secret: pageSecret,
+    requester: null,
+    project: ({ session }) => {
+      pageProjections++;
+      return {
+        row: {
+          id: session.sessionId,
+          provider: session.agent,
+          name: `Session ${session.sessionId}`,
+          setup: { model: 'model', effort: 'high', source: 'recorded' },
+          labels: [],
+          pinned: false,
+          archived: false,
+          runStatus: 'done',
+          attention: 'idle',
+          lastActivity: 1,
+          parent: null,
+          agentRun: false,
+          facts: 'current',
+          ...row?.(session),
+        },
+        current: current?.(session) ?? true,
+      };
+    },
+    ...request,
+  });
+}
+
+function traverse(files: (page: number) => SessionFile[], options: (page: number) => PageOptions = () => ({})) {
+  const pages: SessionPage[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = listPage(files(pages.length), cursor, options(pages.length));
+    pages.push(page);
+    cursor = page.next;
+  } while (cursor && pages.length < 2000);
+  assert.equal(cursor, null);
+  return pages;
+}
+
+const pageBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+// Row sizes vary, so pages end at different distances from their budget.
+const variedName = (session: SessionFile) => ({
+  name: 'n'.repeat(400 + ((Number(session.sessionId.slice('session-'.length)) * 7919) % 600)),
+});
+
+// Agents must read every scoped session when the catalog exceeds one page of rows or of bytes.
+test('session pages reach every source exactly once above the row and byte limits in measured pages', () => {
+  const files = Array.from({ length: 300 }, (_, n) => pageFile(n));
+  const keys = sessionPageSources(files).map((entry) => entry.source);
+  for (const replyBytes of [undefined, 6000]) {
+    pageProjections = 0;
+    const pages = traverse(
+      () => files,
+      () => ({ replyBytes, row: variedName }),
+    );
+    const served = pages.flatMap((page) => page.sessions.map((row) => row.source));
+    assert.deepEqual(served, keys);
+    assert.ok(pages.reduce((sum, page) => sum + pageBytes(page), 0) > 4 * SESSION_READ_LIMITS.outputBytes);
+    assert.ok(pages.length > 300 / SESSION_READ_LIMITS.sessions + 1);
+    assert.ok(pageProjections <= files.length + pages.length);
+    for (const [index, page] of pages.entries()) {
+      assert.ok(pageBytes(page) <= Math.min(SESSION_READ_LIMITS.outputBytes, replyBytes ?? Infinity));
+      assert.ok(page.sessions.length > 0);
+      assert.equal(page.complete, index === pages.length - 1);
+      assert.equal(page.coverage, 'complete');
+      assert.equal(page.freshness, 'current');
+    }
+  }
+  const noted = traverse(
+    () => files,
+    () => ({
+      replyBytes: 6000,
+      fresh: false,
+      row: (session) => ({ ...variedName(session), facts: 'stale', attention: 'unknown' }),
+    }),
+  );
+  assert.deepEqual(
+    noted.flatMap((page) => page.sessions.map((row) => row.source)),
+    keys,
+  );
+  for (const page of noted) assert.ok(page.notes.length === 3 && pageBytes(page) <= 6000);
+  const rows = traverse(
+    () => files,
+    () => ({ limit: 7 }),
+  );
+  assert.ok(rows.every((page) => page.sessions.length <= 7));
+  assert.equal(rows.length, Math.ceil(300 / 7));
+});
+
+// A forged or stale cursor must refuse instead of serving a wrong or empty page, and every cursor stays short.
+test('session cursors refuse forgery, modification, truncation, other secrets, and foreign bodies, and report scope changes separately', () => {
+  const files = Array.from({ length: 3 }, (_, n) => pageFile(n, { sessionId: `${'L'.repeat(100_000)}${n}` }));
+  const first = listPage(files, null, { limit: 1 });
+  const cursor = first.next!;
+  assert.ok(cursor.length <= 512);
+  assert.equal(readSessionCursor(cursor, pageSecret, pageScope).status, 'valid');
+  const bytes = Buffer.from(cursor, 'base64url');
+  const flipped = (index: number) => {
+    const copy = Buffer.from(bytes);
+    copy[index] ^= 1;
+    return copy.toString('base64url');
+  };
+  const body = JSON.parse(bytes.subarray(32).toString('utf8'));
+  const signed = (value: unknown) => {
+    const text = Buffer.from(JSON.stringify(value));
+    return Buffer.concat([crypto.createHmac('sha256', pageSecret).update(text).digest(), text]).toString('base64url');
+  };
+  assert.equal(readSessionCursor(signed(body), pageSecret, pageScope).status, 'valid');
+  for (const refused of [
+    crypto.randomBytes(200).toString('base64url'),
+    flipped(0),
+    flipped(bytes.length - 3),
+    cursor.slice(0, -4),
+    cursor.slice(0, 40),
+    `${cursor}A`,
+    `${cursor}=`,
+    'A'.repeat(513),
+    '',
+    signed({ ...body, extra: true }),
+    signed({ ...body, coverage: 'true' }),
+    signed({ ...body, version: 2 }),
+    signed({ ...body, last: 'short' }),
+    signed([body]),
+    Buffer.concat([crypto.createHmac('sha256', pageSecret).update('{').digest(), Buffer.from('{')]).toString(
+      'base64url',
+    ),
+    12,
+    null,
+  ])
+    assert.equal(readSessionCursor(refused, pageSecret, pageScope).status, 'refused');
+  assert.equal(readSessionCursor(cursor, crypto.randomBytes(32), pageScope).status, 'refused');
+  assert.equal(readSessionCursor(cursor, pageSecret, sessionScopeDigest('other scope')).status, 'scope');
+  assert.equal(readSessionCursor(cursor, crypto.randomBytes(32), sessionScopeDigest('other scope')).status, 'refused');
+  for (const coverage of [true, false])
+    for (const fresh of [true, false])
+      assert.ok(encodeSessionCursor({ ...body, coverage, fresh }, pageSecret).length <= 512);
+});
+
+// Oversized recorded values must not hide a session or push the reply past its budget.
+test('session pages cap oversized fields, reduce a row to its identity, and refuse when no row or empty page fits', () => {
+  const huge = 'x'.repeat(20_000);
+  const file = pageFile(1, { sessionId: 'I'.repeat(5000), file: `C:/Users/Mixed/${'P'.repeat(5000)}.jsonl` });
+  const capped = listPage([file], null, {
+    row: () => ({
+      name: '\u{1F600}'.repeat(3000),
+      setup: { model: huge, effort: huge, source: 'recorded' },
+      labels: Array.from({ length: 300 }, (_, n) => ({ name: `label-${n}`, source: 'reader' as const })),
+      parent: { id: huge, relation: 'reader' },
+    }),
+  });
+  const [row] = capped.sessions;
+  assert.deepEqual(row.truncated, ['id', 'path', 'name', 'setup.model', 'setup.effort', 'labels', 'parent.id']);
+  assert.deepEqual([row.id, row.path, row.setup.model, row.setup.effort, row.labels], [null, null, null, null, null]);
+  assert.deepEqual(row.parent, { id: null, relation: 'reader' });
+  assert.ok(row.name!.length > 2000 && pageBytes(row.name) <= SESSION_PAGE_LIMITS.fieldBytes);
+  assert.equal(row.name, '\u{1F600}'.repeat(row.name!.length / 2));
+  assert.equal(row.source, sessionSourceKey(file.agent, file.sessionId, file.file));
+  assert.ok(capped.notes.some((note) => note.includes('truncated')));
+  const edge = 'n'.repeat(SESSION_PAGE_LIMITS.fieldBytes - 2);
+  const kept = listPage([pageFile(2)], null, {
+    row: () => ({ name: edge, setup: { model: edge, effort: null, source: 'recorded' } }),
+  });
+  assert.deepEqual([kept.sessions[0].name, kept.sessions[0].setup.model, kept.sessions[0].truncated], [edge, edge, []]);
+  const tight = traverse(
+    () => [pageFile(3), pageFile(4)],
+    () => ({ replyBytes: 1500, row: () => ({ name: 'n'.repeat(4000) }) }),
+  );
+  assert.equal(tight.length, 2);
+  for (const page of tight) {
+    assert.ok(pageBytes(page) <= 1500);
+    assert.equal(page.sessions.length, 1);
+    const [minimal] = page.sessions;
+    assert.deepEqual(
+      [minimal.id, minimal.path, minimal.name, minimal.setup.model, minimal.labels],
+      [null, null, null, null, null],
+    );
+    assert.deepEqual(minimal.truncated, ['id', 'path', 'name', 'setup.model', 'setup.effort', 'labels']);
+    assert.deepEqual([minimal.runStatus, minimal.facts, minimal.ambiguous], ['done', 'current', false]);
+  }
+  assert.throws(() => listPage([pageFile(3)], null, { replyBytes: 300 }), /window metadata/);
+  const pair = sessionPageSources([pageFile(5), pageFile(6)]).map((entry) => entry.session);
+  const exhausted = listPage(pair, null, { limit: 1 }).next;
+  for (const [files, cursor, catalog] of [
+    [[], null, 'complete'],
+    [[], null, 'unavailable'],
+    [pair.slice(0, 1), exhausted, 'complete'],
+  ] as const) {
+    const empty = listPage([...files], cursor, { catalog });
+    assert.deepEqual([empty.sessions, empty.next], [[], null]);
+    const bytes = pageBytes(empty);
+    assert.deepEqual(listPage([...files], cursor, { catalog, replyBytes: bytes }), empty);
+    assert.throws(() => listPage([...files], cursor, { catalog, replyBytes: bytes - 1 }), /window metadata/);
+  }
+});
+
+// Agents must tell apart transcripts that share a session ID, and notes must not echo that ID.
+test('session pages mark every source of a shared session ID, including an oversized one, without naming it in notes', () => {
+  const longId = 'S'.repeat(9000);
+  const files = [
+    pageFile(1, { sessionId: 'shared-id' }),
+    pageFile(2, { sessionId: 'shared-id' }),
+    pageFile(3, { sessionId: longId }),
+    pageFile(4, { sessionId: longId }),
+    pageFile(5),
+  ];
+  const pages = traverse(
+    () => files,
+    () => ({ limit: 1 }),
+  );
+  const rows = pages.flatMap((page) => page.sessions);
+  assert.equal(new Set(rows.map((row) => row.source)).size, 5);
+  assert.deepEqual(
+    rows
+      .filter((row) => row.ambiguous)
+      .map((row) => sessionSourceKey(row.provider, row.id ?? longId, row.path!))
+      .sort(),
+    files
+      .slice(0, 4)
+      .map((file) => sessionSourceKey(file.agent, file.sessionId, file.file))
+      .sort(),
+  );
+  for (const page of pages) {
+    const notes = page.notes.join(' ');
+    assert.ok(!notes.includes('shared-id') && !notes.includes('SSS'));
+    assert.equal(notes.includes('more than one transcript'), page.sessions[0].ambiguous);
+  }
+});
+
+// A traversal must report incomplete coverage whenever a source before the cursor could have been missed.
+test('session page coverage survives appends and later additions but clears on earlier changes, missing identity, and incomplete discovery', () => {
+  const sorted = sessionPageSources(Array.from({ length: 6 }, (_, n) => pageFile(n))).map((entry) => entry.session);
+  const key = (file: SessionFile) => sessionSourceKey(file.agent, file.sessionId, file.file);
+  const extras = Array.from({ length: 200 }, (_, n) => pageFile(100 + n));
+  const after = extras.find((file) => key(file) > key(sorted.at(-1)!))!;
+  const before = extras.find((file) => key(file) < key(sorted[0]))!;
+  const run = (change: (page: number) => SessionFile[], options: (page: number) => PageOptions = () => ({})) =>
+    traverse(change, (page) => ({ limit: 2, ...options(page) }));
+  const grown = run((page) => sorted.map((file) => ({ ...file, size: file.size + page * 100, mtimeMs: page + 1 })));
+  assert.deepEqual([grown.at(-1)!.coverage, grown.at(-1)!.complete], ['complete', true]);
+  for (const dev of [0, '0']) {
+    const zero = run(() => [{ ...sorted[0], dev }, ...sorted.slice(1)]);
+    assert.deepEqual([zero.at(-1)!.coverage, zero.at(-1)!.complete], ['complete', true]);
+  }
+  const added = run((page) => (page ? [...sorted, after] : sorted));
+  assert.deepEqual(
+    added.flatMap((page) => page.sessions.map((row) => row.source)),
+    sessionPageSources([...sorted, after]).map((entry) => entry.source),
+  );
+  assert.deepEqual([added.at(-1)!.coverage, added.at(-1)!.complete], ['complete', true]);
+  for (const change of [
+    (page: number) => (page === 1 ? [before, ...sorted] : sorted),
+    (page: number) => (page ? sorted.slice(1) : sorted),
+    (page: number) => (page ? [{ ...sorted[0], dev: '8' }, ...sorted.slice(1)] : sorted),
+    () => [{ ...sorted[0], dev: undefined }, ...sorted.slice(1)],
+    () => [{ ...sorted[0], ino: 2 ** 60 }, ...sorted.slice(1)],
+    () => [{ ...sorted[0], ino: 0 }, ...sorted.slice(1)],
+    () => [{ ...sorted[0], ino: '0' }, ...sorted.slice(1)],
+  ]) {
+    const pages = run(change);
+    assert.deepEqual(
+      pages.slice(1).map((page) => [page.coverage, page.complete]),
+      pages.slice(1).map(() => ['incomplete', false]),
+    );
+    assert.ok(pages.at(-1)!.notes.some((note) => note.includes('incomplete')));
+  }
+  const discovery = run(
+    () => sorted,
+    (page) => ({ catalog: page === 1 ? 'incomplete' : 'complete' }),
+  );
+  assert.deepEqual(
+    discovery.map((page) => page.coverage),
+    ['complete', 'incomplete', 'incomplete'],
+  );
+  for (const [options, freshness] of [
+    [(page: number): PageOptions => ({ fresh: page !== 0 }), ['stale', 'stale', 'stale']],
+    [
+      (page: number): PageOptions => ({ current: (file) => page !== 1 || file !== sorted[2] }),
+      ['current', 'stale', 'stale'],
+    ],
+  ] as const) {
+    const pages = run(() => sorted, options);
+    assert.deepEqual(
+      pages.map((page) => page.freshness),
+      freshness,
+    );
+    assert.deepEqual([pages.at(-1)!.coverage, pages.at(-1)!.complete], ['complete', false]);
+  }
+  assert.throws(() => listPage(sorted, grown[0].next, { catalog: 'unavailable' }), /catalog is unavailable/);
+  const empty = listPage([], null, { catalog: 'unavailable' });
+  assert.deepEqual([empty.sessions, empty.next, empty.coverage, empty.complete], [[], null, 'unavailable', false]);
 });
 
 test('ARC_HOME selects the registry and independent same-folder hosts retain distinct identities', async () => {

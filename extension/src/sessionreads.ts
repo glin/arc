@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { readCodexSession, readCodexSessionMeta, CODEX_OPENING_BYTES } from './codex.ts';
 import {
@@ -21,20 +22,28 @@ import { onlyGrew } from './derivedcache.ts';
 export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024, sessions: 128 } as const;
 export type SessionAttention = Extract<SessionStatus, 'input' | 'unread' | 'running'> | 'idle' | 'unknown';
 
+// A paged row names each field that its cap shortened or emptied.
+export type SessionTruncatedField = 'id' | 'path' | 'name' | 'setup.model' | 'setup.effort' | 'labels' | 'parent.id';
+
+// The page builder fills source, path, ambiguous, and truncated. The single-call listing omits them.
 export interface SessionListingRow {
-  id: string;
+  source?: string;
+  id: string | null;
   provider: SessionFile['agent'];
-  name: string;
+  path?: string | null;
+  ambiguous?: boolean;
+  name: string | null;
   setup: { model: string | null; effort: string | null; source: 'recorded' | 'unavailable' };
-  labels: { name: string; source: 'reader' }[];
+  labels: { name: string; source: 'reader' }[] | null;
   pinned: boolean;
   archived: boolean;
   runStatus: RailStatus | 'none' | 'unknown';
   attention: SessionAttention;
   lastActivity: number | null;
-  parent: { id: string; relation: SessionParentEdge['relation'] | 'reader' } | null;
+  parent: { id: string | null; relation: SessionParentEdge['relation'] | 'reader' } | null;
   agentRun: boolean | null;
   facts: 'current' | 'stale' | 'unparsed';
+  truncated?: SessionTruncatedField[];
 }
 
 export interface HostedSessionObservation {
@@ -208,6 +217,355 @@ export function boundedSessionListing(rows: SessionListingRow[], complete: boole
   if (rows.some((row) => row.attention === 'unknown'))
     result.notes.push('Live attention is unknown when the panel is hidden or its facts are unavailable.');
   return result;
+}
+
+export const SESSION_PAGE_LIMITS = { fieldBytes: 4 * 1024, cursorLength: 512 } as const;
+
+export const SESSION_PAGE_ERRORS = {
+  cursor: 'The session cursor is invalid or expired. Restart the listing without --cursor.',
+  scope: 'The repository scope changed. Restart the listing without --cursor.',
+  catalog: 'The session catalog is unavailable for this repository scope. Open Arc and retry.',
+  window: 'The window metadata leaves no room for one session row. Open fewer or shorter workspace folders and retry.',
+  limit: 'Limit must be between 1 and 128.',
+} as const;
+
+const SESSION_PAGE_NOTES = {
+  unavailable: 'The session catalog is unavailable for this repository scope.',
+  incomplete:
+    'The session listing is incomplete. Discovery was incomplete, or Arc could not confirm that sessions before the cursor stayed unchanged.',
+  stale: 'Some pages of this listing were read while session facts were not current.',
+  facts: 'Some session facts are stale or unparsed. Unknown values remain unavailable.',
+  attention: 'Live attention is unknown when the panel is hidden or its facts are unavailable.',
+  ambiguous: 'Some session IDs belong to more than one transcript. Use source or path to tell those rows apart.',
+  truncated: 'Some fields exceed the field limit. Each row lists its shortened or omitted fields in truncated.',
+} as const;
+
+const TRUNCATED_ORDER: readonly SessionTruncatedField[] = [
+  'id',
+  'path',
+  'name',
+  'setup.model',
+  'setup.effort',
+  'labels',
+  'parent.id',
+];
+const DIGEST = /^[A-Za-z0-9_-]{43}$/;
+const CURSOR = /^[A-Za-z0-9_-]+$/;
+const TAG_BYTES = 32;
+
+export type SessionPageRow = SessionListingRow & {
+  source: string;
+  path: string | null;
+  ambiguous: boolean;
+  truncated: SessionTruncatedField[];
+};
+
+export interface SessionPageSource<T extends SessionFile = SessionFile> {
+  source: string;
+  session: T;
+  dev: string | null;
+  ino: string | null;
+  ambiguous: boolean;
+}
+
+export interface SessionCursorBody {
+  version: 1;
+  scope: string;
+  last: string;
+  prefix: string;
+  coverage: boolean;
+  fresh: boolean;
+}
+
+export type SessionCursorCheck = { status: 'valid'; body: SessionCursorBody } | { status: 'refused' | 'scope' };
+
+export interface SessionPage {
+  version: 1;
+  requester: string | null;
+  sessions: SessionPageRow[];
+  complete: boolean;
+  notes: string[];
+  next: string | null;
+  coverage: 'complete' | 'incomplete' | 'unavailable';
+  freshness: 'current' | 'stale';
+}
+
+export interface SessionPageRequest<T extends SessionFile> {
+  // Sorted by source key, as sessionPageSources returns them.
+  sources: readonly SessionPageSource<T>[];
+  cursor: SessionCursorBody | null;
+  limit: number;
+  replyBytes?: number;
+  catalog: 'complete' | 'incomplete' | 'unavailable';
+  // True when the panel is visible and the host's fresh expression holds for this page.
+  fresh: boolean;
+  scope: string;
+  secret: Buffer;
+  requester: string | null;
+  // Runs for each served source and for at most one source that did not fit.
+  project: (source: SessionPageSource<T>) => { row: SessionListingRow; current: boolean };
+}
+
+const digest = (text: string) => crypto.createHash('sha256').update(text).digest('base64url');
+
+export function sessionSourceKey(provider: SessionFile['agent'], sessionId: string, file: string): string {
+  return digest(`${provider}\0${sessionId}\0${file}`);
+}
+
+export function sessionScopeDigest(scopeKey: string): string {
+  return digest(scopeKey);
+}
+
+// Keys order the sources by ordinal comparison. A repeated provider, ID, and file is one source.
+// A source has physical identity only when supportedFileIdentity holds, which requires a positive inode.
+export function sessionPageSources<T extends SessionFile>(sessions: readonly T[]): SessionPageSource<T>[] {
+  const keyed = new Map<string, SessionPageSource<T>>();
+  for (const session of sessions) {
+    const source = sessionSourceKey(session.agent, session.sessionId, session.file);
+    if (keyed.has(source)) continue;
+    const identified = supportedFileIdentity(session);
+    keyed.set(source, {
+      source,
+      session,
+      dev: identified ? String(session.dev) : null,
+      ino: identified ? String(session.ino) : null,
+      ambiguous: false,
+    });
+  }
+  const sorted = [...keyed.values()].sort((a, b) => (a.source < b.source ? -1 : a.source > b.source ? 1 : 0));
+  const ids = new Map<string, number>();
+  for (const entry of sorted) ids.set(entry.session.sessionId, (ids.get(entry.session.sessionId) ?? 0) + 1);
+  for (const entry of sorted) entry.ambiguous = ids.get(entry.session.sessionId)! > 1;
+  return sorted;
+}
+
+const cursorTag = (secret: Buffer, body: Buffer) => crypto.createHmac('sha256', secret).update(body).digest();
+
+export function encodeSessionCursor(body: SessionCursorBody, secret: Buffer): string {
+  if (![body.scope, body.last, body.prefix].every((value) => DIGEST.test(value)))
+    throw new Error('Invalid session cursor body.');
+  const { version, scope, last, prefix, coverage, fresh } = body;
+  const bytes = Buffer.from(JSON.stringify({ version, scope, last, prefix, coverage, fresh }));
+  const cursor = Buffer.concat([cursorTag(secret, bytes), bytes]).toString('base64url');
+  if (cursor.length > SESSION_PAGE_LIMITS.cursorLength) throw new Error('Invalid session cursor body.');
+  return cursor;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Every failure before the scope comparison has one outcome, so a caller cannot tell which step refused.
+export function readSessionCursor(cursor: unknown, secret: Buffer, scope: string): SessionCursorCheck {
+  const refused = { status: 'refused' } as const;
+  if (typeof cursor !== 'string' || cursor.length > SESSION_PAGE_LIMITS.cursorLength || !CURSOR.test(cursor))
+    return refused;
+  const bytes = Buffer.from(cursor, 'base64url');
+  if (bytes.length <= TAG_BYTES || bytes.toString('base64url') !== cursor) return refused;
+  const body = bytes.subarray(TAG_BYTES);
+  if (!crypto.timingSafeEqual(bytes.subarray(0, TAG_BYTES), cursorTag(secret, body))) return refused;
+  let value: unknown;
+  try {
+    value = JSON.parse(body.toString('utf8'));
+  } catch {
+    return refused;
+  }
+  if (
+    !record(value) ||
+    Object.keys(value).sort().join(',') !== 'coverage,fresh,last,prefix,scope,version' ||
+    value.version !== 1 ||
+    ![value.scope, value.last, value.prefix].every((field) => typeof field === 'string' && DIGEST.test(field)) ||
+    typeof value.coverage !== 'boolean' ||
+    typeof value.fresh !== 'boolean'
+  )
+    return refused;
+  if (value.scope !== scope) return { status: 'scope' };
+  return { status: 'valid', body: value as unknown as SessionCursorBody };
+}
+
+const fieldBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+// The cut falls on a code-point boundary and keeps the serialized name within its cap.
+function capName(name: string): string {
+  let bytes = 2;
+  let end = 0;
+  for (const point of name) {
+    const size = fieldBytes(point) - 2;
+    if (bytes + size > SESSION_PAGE_LIMITS.fieldBytes) break;
+    bytes += size;
+    end += point.length;
+  }
+  return name.slice(0, end);
+}
+
+// Identity comes from the source. Facts come from the projected row.
+function cappedRow(entry: SessionPageSource, row: SessionListingRow): SessionPageRow {
+  const truncated = new Set<SessionTruncatedField>();
+  const cap = <V>(field: SessionTruncatedField, value: V | null): V | null => {
+    if (value === null || fieldBytes(value) <= SESSION_PAGE_LIMITS.fieldBytes) return value;
+    truncated.add(field);
+    return null;
+  };
+  let name = row.name;
+  if (name !== null && fieldBytes(name) > SESSION_PAGE_LIMITS.fieldBytes) {
+    name = capName(name);
+    truncated.add('name');
+  }
+  const { session } = entry;
+  return {
+    source: entry.source,
+    id: cap('id', session.sessionId),
+    provider: session.agent,
+    path: cap('path', session.file),
+    ambiguous: entry.ambiguous,
+    name,
+    setup: {
+      model: cap('setup.model', row.setup.model),
+      effort: cap('setup.effort', row.setup.effort),
+      source: row.setup.source,
+    },
+    labels: cap('labels', row.labels),
+    pinned: row.pinned,
+    archived: row.archived,
+    runStatus: row.runStatus,
+    attention: row.attention,
+    lastActivity: row.lastActivity,
+    parent: row.parent && { id: cap('parent.id', row.parent.id), relation: row.parent.relation },
+    agentRun: row.agentRun,
+    facts: row.facts,
+    truncated: TRUNCATED_ORDER.filter((field) => truncated.has(field)),
+  };
+}
+
+// The minimal row keeps the source key, the provider, and the fixed-size facts.
+function minimalRow(row: SessionPageRow): SessionPageRow {
+  const truncated = new Set(row.truncated);
+  const drop = (field: SessionTruncatedField, value: unknown): null => {
+    if (value !== null) truncated.add(field);
+    return null;
+  };
+  return {
+    ...row,
+    id: drop('id', row.id),
+    path: drop('path', row.path),
+    name: drop('name', row.name),
+    setup: {
+      model: drop('setup.model', row.setup.model),
+      effort: drop('setup.effort', row.setup.effort),
+      source: row.setup.source,
+    },
+    labels: drop('labels', row.labels),
+    parent: row.parent && { id: drop('parent.id', row.parent.id), relation: row.parent.relation },
+    truncated: TRUNCATED_ORDER.filter((field) => truncated.has(field)),
+  };
+}
+
+function pageNotes(rows: readonly SessionPageRow[], coverage: SessionPage['coverage'], fresh: boolean): string[] {
+  const notes: string[] = [];
+  if (coverage !== 'complete') notes.push(SESSION_PAGE_NOTES[coverage]);
+  if (!fresh) notes.push(SESSION_PAGE_NOTES.stale);
+  if (rows.some((row) => row.facts !== 'current')) notes.push(SESSION_PAGE_NOTES.facts);
+  if (rows.some((row) => row.attention === 'unknown')) notes.push(SESSION_PAGE_NOTES.attention);
+  if (rows.some((row) => row.ambiguous)) notes.push(SESSION_PAGE_NOTES.ambiguous);
+  if (rows.some((row) => row.truncated.length)) notes.push(SESSION_PAGE_NOTES.truncated);
+  return notes;
+}
+
+interface PageState {
+  hash: crypto.Hash;
+  identified: boolean;
+  fresh: boolean;
+}
+
+// The prefix digest covers [source, dev, ino] for each source through the cursor's last key.
+// Size and modification time stay out of the tuple, so appends keep the digest.
+function extendPrefix(state: PageState, entry: SessionPageSource): PageState {
+  state.hash.update(JSON.stringify([entry.source, entry.dev, entry.ino]) + '\n');
+  state.identified &&= entry.dev !== null && entry.ino !== null;
+  return state;
+}
+
+// A page serves the sources after the cursor in key order. The builder measures each candidate reply with its own next cursor and notes.
+export function sessionListingPage<T extends SessionFile>(request: SessionPageRequest<T>): SessionPage {
+  const { sources, cursor, limit, catalog, scope, secret, requester } = request;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > SESSION_READ_LIMITS.sessions)
+    throw new Error(SESSION_PAGE_ERRORS.limit);
+  if (cursor && catalog === 'unavailable') throw new Error(SESSION_PAGE_ERRORS.catalog);
+  const budget = Math.min(SESSION_READ_LIMITS.outputBytes, request.replyBytes ?? Infinity);
+  let start = 0;
+  if (cursor) {
+    let high = sources.length;
+    while (start < high) {
+      const middle = (start + high) >>> 1;
+      if (sources[middle].source > cursor.last) high = middle;
+      else start = middle + 1;
+    }
+  }
+  let state: PageState = { hash: crypto.createHash('sha256'), identified: true, fresh: request.fresh };
+  for (let index = 0; index < start; index++) extendPrefix(state, sources[index]);
+  const covered =
+    catalog === 'complete' &&
+    (!cursor || (cursor.coverage && state.identified && state.hash.copy().digest('base64url') === cursor.prefix));
+  if (cursor) state.fresh &&= cursor.fresh;
+  const page: SessionPageRow[] = [];
+  const assemble = (end: number, at: PageState): SessionPage => {
+    const more = end < sources.length;
+    const kept = covered && (!more || at.identified);
+    const next = more
+      ? encodeSessionCursor(
+          {
+            version: 1,
+            scope,
+            last: sources[end - 1].source,
+            prefix: at.hash.copy().digest('base64url'),
+            coverage: kept,
+            fresh: at.fresh,
+          },
+          secret,
+        )
+      : null;
+    const coverage = catalog === 'unavailable' ? 'unavailable' : kept ? 'complete' : 'incomplete';
+    return {
+      version: 1,
+      requester,
+      sessions: page,
+      complete: next === null && coverage === 'complete' && at.fresh,
+      notes: pageNotes(page, coverage, at.fresh),
+      next,
+      coverage,
+      freshness: at.fresh ? 'current' : 'stale',
+    };
+  };
+  let rowBytes = 0;
+  const measure = (row: SessionPageRow, end: number, at: PageState) => {
+    page.push(row);
+    const bytes = fieldBytes(row);
+    const reply = assemble(end, at);
+    if (fieldBytes({ ...reply, sessions: [] }) + rowBytes + bytes + page.length - 1 <= budget) return { reply, bytes };
+    page.pop();
+    return null;
+  };
+  let result: SessionPage | null = null;
+  for (let index = start; index < sources.length && page.length < limit; index++) {
+    const entry = sources[index];
+    const projected = request.project(entry);
+    const candidate = extendPrefix(
+      { hash: state.hash.copy(), identified: state.identified, fresh: state.fresh && projected.current },
+      entry,
+    );
+    const row = cappedRow(entry, projected.row);
+    let accepted = measure(row, index + 1, candidate);
+    if (!accepted && page.length) break;
+    accepted ??= measure(minimalRow(row), index + 1, candidate);
+    if (!accepted) throw new Error(SESSION_PAGE_ERRORS.window);
+    result = accepted.reply;
+    rowBytes += accepted.bytes;
+    state = candidate;
+  }
+  if (result) return result;
+  const empty = assemble(start, state);
+  if (fieldBytes(empty) > budget) throw new Error(SESSION_PAGE_ERRORS.window);
+  return empty;
 }
 
 export type SessionTurn = Pick<

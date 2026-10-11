@@ -53,6 +53,8 @@ export interface SessionRequest {
   method: 'ping' | 'sessions' | 'session' | 'setups' | 'start' | 'curate';
   requester: string | null;
   params: SessionWriteParams;
+  // The channel sets the payload allowance for sessions requests. The wire parser refuses this key.
+  replyBytes?: number;
 }
 
 export type SessionReply = { id: string | null; result: unknown } | { id: string | null; error: string };
@@ -382,7 +384,18 @@ export class WindowChannel {
             if (this.closed) throw new Error('Window unavailable.');
             if (request.method === 'ping') return this.ping(this.info());
             if (!this.requestHandler) throw new Error('Session reads are unavailable in this window.');
-            const apply = () => this.requestHandler!(request);
+            // A sessions reply reuses this window object, so its payload can fill the rest of the line.
+            const window = request.method === 'sessions' ? this.info() : null;
+            const handled = window
+              ? {
+                  ...request,
+                  replyBytes:
+                    this.limits.lineBytes -
+                    Buffer.byteLength(JSON.stringify({ id: request.id, result: { window, data: null } }) + '\n') +
+                    Buffer.byteLength('null'),
+                }
+              : request;
+            const apply = () => this.requestHandler!(handled);
             const data =
               request.method === 'start' || request.method === 'curate'
                 ? this.writes.run(request.id, { method: request.method, params: request.params }, apply)
@@ -390,7 +403,7 @@ export class WindowChannel {
             return Promise.resolve(data).then((data) => {
               if (request.method === 'start' || request.method === 'curate')
                 data = { ...(data as object), requestId: request.id };
-              const result = { window: this.info(), data };
+              const result = { window: window ?? this.info(), data };
               if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
                 throw new Error("The session response exceeds this window's channel limit.");
               return result;
