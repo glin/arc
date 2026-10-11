@@ -223,6 +223,13 @@ function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex')
     nullableText(value.model) &&
     (value.contextWindow === null || nonNegativeInteger(value.contextWindow)) &&
     (value.contextTokens === undefined || nonNegativeInteger(value.contextTokens)) &&
+    (value.firstPassUsage === undefined || usageCounts(value.firstPassUsage)) &&
+    (value.firstPassContextBand === undefined ||
+      value.firstPassContextBand === null ||
+      value.firstPassContextBand === 'short' ||
+      value.firstPassContextBand === 'long') &&
+    (value.finalPassOutputTokens === undefined || nonNegativeInteger(value.finalPassOutputTokens)) &&
+    (value.finalPassCacheRead === undefined || nonNegativeInteger(value.finalPassCacheRead)) &&
     (value.contextBand === null || value.contextBand === 'short' || value.contextBand === 'long') &&
     (value.billingClass === 'metered' || value.billingClass === 'subscription' || value.billingClass === 'unknown') &&
     (value.inferenceClass === null ||
@@ -712,7 +719,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
         !record(value.usage) ||
         value.usage.requests !== 0 ||
         value.compactionEstimate !== undefined)) ||
-    !usageCounts(value.usage) ||
+    !turnUsage(value.usage) ||
     !nonNegativeInteger(value.requests)
   ) {
     return null;
@@ -741,6 +748,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
       : {}),
     usage: {
       requests: value.usage.requests,
+      ...(value.usage.byContextBand === undefined ? {} : { byContextBand: structuredClone(value.usage.byContextBand) }),
       input: value.usage.input,
       cacheWrite1h: value.usage.cacheWrite1h,
       cacheWrite5m: value.usage.cacheWrite5m,
@@ -885,6 +893,13 @@ function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
     !nonNegativeInteger(value.gapMs) ||
     !(value.visibleTurnId === undefined || value.visibleTurnId === null || nonEmptyText(value.visibleTurnId)) ||
     !(value.requestKey === undefined || value.requestKey === null || nonEmptyText(value.requestKey)) ||
+    !(value.firstPassUsage === undefined || usageCounts(value.firstPassUsage)) ||
+    !(
+      value.firstPassContextBand === undefined ||
+      value.firstPassContextBand === null ||
+      value.firstPassContextBand === 'short' ||
+      value.firstPassContextBand === 'long'
+    ) ||
     !(
       value.previousInputSide === undefined ||
       value.previousInputSide === null ||
@@ -902,6 +917,12 @@ function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
         visibleTurnId: value.visibleTurnId ?? null,
         requestKey: value.requestKey ?? null,
         previousInputSide: value.previousInputSide ?? null,
+        ...(value.firstPassUsage === undefined
+          ? {}
+          : {
+              firstPassUsage: { ...value.firstPassUsage },
+              firstPassContextBand: value.firstPassContextBand,
+            }),
       }
     : null;
 }

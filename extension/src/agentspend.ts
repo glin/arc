@@ -106,7 +106,7 @@ export function addUsage(into: TurnUsage, add: TurnUsage, contextBand: UsageCont
     delete into.byContextBand;
     return;
   }
-  if (contextBand) {
+  if (contextBand && !add.byContextBand) {
     const held = into.byContextBand?.[contextBand] ?? emptyUsage();
     addUsageCounts(held, add);
     (into.byContextBand ??= {})[contextBand] = held;

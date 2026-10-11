@@ -91,6 +91,7 @@ import {
   advisorIteration,
   advisorProbeRecords,
   advisorResponseRecords,
+  MIXED_PASS_ITERATIONS,
   claudeCompactionTranscript,
   previousContextOf,
   subagent,
@@ -4160,6 +4161,108 @@ function indexCompactionSession(lines: readonly object[], child?: readonly objec
   const estimates = parts.filter(({ bucket }) => bucket.compactionEstimate);
   return { file, childFile: path.join(folder, 'child.jsonl'), record, records, sources, parts, projection, estimates };
 }
+
+test('per-pass pricing replaces growing child bands after a ledger reload without losing zero-request slices', () => {
+  const folder = dir();
+  const file = path.join(folder, 'child.jsonl');
+  const storage = path.join(folder, 'ledger');
+  const makeChildReducer = (state: Parameters<typeof createClaudeUsageLineReducer>[0]) =>
+    createClaudeUsageLineReducer(state, { childTranscript: true });
+  const budget = { maxBytes: 1 << 20, maxMilliseconds: Number.POSITIVE_INFINITY };
+  const write = (records: object[]) => records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  fs.writeFileSync(
+    file,
+    write(advisorResponseRecords({ sidechain: true, iterations: MIXED_PASS_ITERATIONS.slice(0, 1), blocks: 1 })),
+  );
+  const first = indexSpendFile(undefined, file, 'w', makeChildReducer, 1, budget).record;
+  saveSpendLedger(storage, 'w', [first]);
+  const restored = loadSpendLedger(storage, 'w').files[0];
+  fs.appendFileSync(file, write(advisorResponseRecords({ sidechain: true, iterations: MIXED_PASS_ITERATIONS })));
+  const resumed = indexSpendFile(restored, file, 'w', makeChildReducer, 2, budget).record;
+  const full = indexSpendFile(undefined, file, 'w', makeChildReducer, 2, budget).record;
+  assert.deepEqual(resumed.buckets, full.buckets);
+  assert.equal(
+    resumed.buckets.reduce((sum, bucket) => sum + bucket.requests, 0),
+    1,
+  );
+  assert.equal(resumed.buckets.find((bucket) => bucket.contextBand === 'short')?.requests, 0);
+  const dollars = resumed.buckets.reduce((sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars, 0);
+  assert.ok(Math.abs(dollars - 0.0600315) < 1e-12);
+});
+
+test('Project cost counts a recorded response cost once across two pass bands', () => {
+  const { record } = indexCompactionSession(
+    advisorResponseRecords({ iterations: MIXED_PASS_ITERATIONS, reportedCost: 0.123 }),
+  );
+  assert.equal(record.buckets[0].reportedCost, 0.123);
+  assert.equal(publicProjectSpendPrice(record.buckets[0])?.dollars, 0.123);
+  assert.equal(
+    record.buckets.reduce((sum, bucket) => sum + (bucket.reportedCost ?? 0), 0),
+    0.123,
+  );
+  assert.equal(
+    record.buckets.reduce((sum, bucket) => sum + (publicProjectSpendPrice(bucket)?.dollars ?? 0), 0),
+    0.123,
+  );
+  assert.equal(record.buckets.length, 1);
+});
+
+test('Project cost keeps same-model advisor and executor buckets separate on later responses', () => {
+  const iterations = [
+    advisorIteration({ input_tokens: 1000 }),
+    advisorIteration({ type: 'advisor_message', model: 'claude-haiku-5-5', input_tokens: 2000 }),
+  ];
+  const { record } = indexCompactionSession([
+    ...advisorResponseRecords({ id: 'first', iterations }),
+    ...advisorResponseRecords({ id: 'second', at: 30, iterations }),
+  ]);
+  const advisor = event(stamp('2026-10-11T09:08:09Z'), { usageOrigin: 'claude-advisor' });
+  const executor = event(advisor.timestamp);
+  const once = aggregateUsageEvents([advisor, executor]);
+  assert.deepEqual(once.map((b) => b.usageOrigin ?? null).sort(), ['claude-advisor', null]);
+  assert.equal(aggregateUsageEvents([], once).length, 2);
+  assert.equal(record.buckets.length, 2);
+  assert.deepEqual(
+    record.buckets.map((bucket) => [bucket.usageOrigin ?? null, bucket.requests, bucket.usage.input]),
+    [
+      ['claude-advisor', 2, 4000],
+      [null, 2, 2000],
+    ],
+  );
+});
+
+test('per-pass pricing retains first-pass expiry cost through a spend-ledger reload', () => {
+  const prompt = (at: number) => ({
+    ...advisorProbeRecords()[0],
+    uuid: `prompt-${at}`,
+    timestamp: new Date(Date.parse('2026-10-11T09:08:09Z') + at * 1000).toISOString(),
+  });
+  const lines = [
+    prompt(0),
+    ...advisorResponseRecords({
+      id: 'before',
+      iterations: [
+        advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 1000, ephemeral_1h_input_tokens: 0 } }),
+      ],
+    }),
+    prompt(599),
+    ...advisorResponseRecords({
+      id: 'after',
+      at: 600,
+      iterations: [
+        advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 100000, ephemeral_1h_input_tokens: 0 } }),
+        advisorIteration({ cache_read_input_tokens: 100001 }),
+      ],
+    }),
+  ];
+  const { record } = indexCompactionSession(lines);
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [record]);
+  const facts = loadSpendLedger(storage, 'w').files[0].cacheExpiry!.facts;
+  assert.equal(facts.returns.length, 1);
+  assert.ok(Math.abs(cacheExpiryExtraCost(facts, publicProjectSpendPrice).dollars! - 0.000115) < 1e-12);
+  assert.equal(facts.returns[0].firstPassContextBand, 'short');
+});
 
 const estimatedRequests = (buckets: readonly ProjectUsageBucket[]) =>
   buckets.filter((bucket) => bucket.compactionEstimate).reduce((sum, bucket) => sum + bucket.requests, 0);

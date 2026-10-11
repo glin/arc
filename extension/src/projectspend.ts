@@ -48,6 +48,7 @@ import type {
 } from './transcript';
 import { normalizeFsPath } from './transcript';
 import { ExportLimitError } from './exportlimits';
+import { addUsage as addPricedUsage } from './agentspend';
 
 export interface UsageCounts {
   requests?: number;
@@ -69,6 +70,8 @@ export interface UsageEvent {
   contextWindow: number | null;
   // Retained context from the final executor pass, separate from summed billing usage.
   contextTokens?: number;
+  firstPassUsage?: UsageCounts;
+  firstPassContextBand?: 'short' | 'long' | null;
   // A rate band applies to one request. It must not be inferred from the sum of a daily
   // bucket after several requests have been combined.
   contextBand?: 'short' | 'long' | null;
@@ -103,7 +106,7 @@ export interface UsageEvent {
   compactionSignal?: CompactionSignal;
   // A Claude advisor consultation. It counts in cost and requests and stays out of cache adjacency.
   usageOrigin?: 'claude-advisor';
-  usage: UsageCounts;
+  usage: TurnUsage;
   requestKey: string | null;
   responseId?: string;
 }
@@ -130,7 +133,7 @@ export interface ProjectUsageBucket {
   // These buckets estimate compaction requests without recorded request usage.
   compactionEstimate?: true;
   compactionUsage?: true;
-  usage: UsageCounts;
+  usage: TurnUsage;
   requests: number;
 }
 
@@ -481,7 +484,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 56;
+export const PROJECT_SPEND_PARSER_GENERATION = 57;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -751,6 +754,7 @@ export function publicProjectSpendPrice(
   if (
     hasRequestContextPricing(bucket.model, bucket.provider) &&
     bucket.contextBand == null &&
+    !bucket.usage.byContextBand &&
     bucket.requests > 1 &&
     contextBandForRequest(bucket.model, bucket.provider, summedTokens) !== 'short' &&
     bucket.reportedCost === null &&
@@ -763,7 +767,7 @@ export function publicProjectSpendPrice(
     model: bucket.model,
     provider: bucket.provider,
     contextWindow: bucket.contextWindow,
-    requestTokens: bucket.contextBand == null ? summedTokens : null,
+    requestTokens: bucket.contextBand == null && !bucket.usage.byContextBand ? summedTokens : null,
     contextBand: bucket.contextBand,
     inferenceClass: bucket.inferenceClass,
     serviceTier: bucket.serviceTier,
@@ -862,15 +866,14 @@ export function projectSpendWindows(
   ];
 }
 
-function addUsage(into: UsageCounts, add: UsageCounts): void {
-  into.requests = (into.requests ?? 0) + (add.requests ?? 0);
-  into.input += add.input;
-  into.cacheWrite1h += add.cacheWrite1h;
-  into.cacheWrite5m += add.cacheWrite5m;
-  into.cacheWrite30m = (into.cacheWrite30m ?? 0) + (add.cacheWrite30m ?? 0);
-  into.cacheRead += add.cacheRead;
-  into.output += add.output;
-  into.thinking += add.thinking;
+// Band slices carry token volume. The final pass's band owns the response's one request.
+function usageBandEvents(event: UsageEvent): UsageEvent[] {
+  const bands = event.usage.byContextBand;
+  if (!bands || event.reportedCost !== null) return [event];
+  return (['short', 'long'] as const).flatMap((contextBand) => {
+    const usage = bands[contextBand];
+    return usage ? [{ ...event, contextBand, usage: { ...usage } }] : [];
+  });
 }
 
 function requestInputTokens(usage: UsageCounts): number {
@@ -897,12 +900,16 @@ export function aggregateUsageEvents(
   existing: ProjectUsageBucket[] = [],
 ): ProjectUsageBucket[] {
   const byKey = new Map(
-    existing.map((bucket) => [projectUsageKey(bucket, bucket.localDate), { ...bucket, usage: { ...bucket.usage } }]),
+    existing.map((bucket) => [
+      projectUsageKey(bucket, bucket.localDate),
+      { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
+    ]),
   );
-  for (const event of events) {
+  for (const event of events.flatMap(usageBandEvents)) {
     const date = localDate(event.timestamp);
-    const contextBand =
-      event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage));
+    const contextBand = event.usage.byContextBand
+      ? (event.contextBand ?? null)
+      : (event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage)));
     const keyed = { ...event, contextBand };
     const key = projectUsageKey(keyed, date);
     let bucket = byKey.get(key);
@@ -922,13 +929,14 @@ export function aggregateUsageEvents(
         linkedInvocationId: event.linkedInvocationId ?? null,
         incomplete: event.incomplete === true,
         ...(event.requestCountExact === false ? { requestCountExact: false as const } : {}),
+        ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
         reportedCost: event.reportedCost === null ? null : 0,
         usage: emptyUsage(),
         requests: 0,
       };
       byKey.set(key, bucket);
     }
-    addUsage(bucket.usage, event.usage);
+    addPricedUsage(bucket.usage, event.usage);
     bucket.unclassifiedCacheWrite = (bucket.unclassifiedCacheWrite ?? 0) + (event.unclassifiedCacheWrite ?? 0);
     if (!bucket.unclassifiedCacheWrite) {
       delete bucket.unclassifiedCacheWrite;
@@ -972,6 +980,8 @@ export interface CacheExpiryReturn {
   // Null where no record establishes that size, or
   // where a saved return does not name it, which leaves its cost added unavailable.
   previousInputSide: number | null;
+  firstPassUsage?: UsageCounts;
+  firstPassContextBand?: 'short' | 'long' | null;
 }
 
 export interface CacheExpiryFacts {
@@ -1171,8 +1181,9 @@ export function classifyCacheExpiry(
 
 function requestBucket(event: UsageEvent): ProjectUsageBucket {
   const date = localDate(event.timestamp);
-  const contextBand =
-    event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage));
+  const contextBand = event.usage.byContextBand
+    ? (event.contextBand ?? null)
+    : (event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage)));
   return {
     localDate: date,
     agent: event.agent,
@@ -1189,7 +1200,7 @@ function requestBucket(event: UsageEvent): ProjectUsageBucket {
     incomplete: event.incomplete === true,
     ...(event.requestCountExact === false ? { requestCountExact: false as const } : {}),
     reportedCost: event.reportedCost,
-    usage: { ...event.usage, requests: 1 },
+    usage: { ...structuredClone(event.usage), requests: 1 },
     requests: 1,
   };
 }
@@ -1214,7 +1225,7 @@ function carryFor(event: UsageEvent): CacheExpiryCarry {
 
 // Whether this event is one primary-session request the order pass can compare. Delegated
 // work is excluded by its link, and a removal or a replacement by its negative request count.
-// An advisor consultation reads the session uncached, so it is no cache-expiry neighbor.
+// Advisor consultations do not establish executor cache-expiry neighbors.
 function primaryOrderedRequest(event: UsageEvent): boolean {
   return (
     !event.compactionEstimate &&
@@ -1382,6 +1393,8 @@ export class CacheExpiryScan {
     const newestReturn = this.facts.returns[this.facts.returns.length - 1];
     if (newestReturn && this.newestReturnKey === event.requestKey) {
       newestReturn.request = requestBucket(event);
+      newestReturn.firstPassUsage = event.firstPassUsage;
+      newestReturn.firstPassContextBand = event.firstPassContextBand;
     }
     const newestCompaction = this.compactions[this.compactions.length - 1];
     if (newestCompaction && this.newestCompactionKey === event.requestKey) {
@@ -1441,7 +1454,7 @@ export class CacheExpiryScan {
   }
 
   private judge(previous: CacheExpiryCarry, next: CacheExpiryCarry, event: UsageEvent): void {
-    const verdict = classifyCacheExpiry(previous, next, event.usage);
+    const verdict = classifyCacheExpiry(previous, next, event.firstPassUsage ?? event.usage);
     if (verdict.kind === 'unavailable') {
       this.facts.unavailable++;
       return;
@@ -1463,6 +1476,9 @@ export class CacheExpiryScan {
       visibleTurnId: next.visibleTurnId!,
       requestKey: event.requestKey,
       previousInputSide: previous.compaction ? previous.compaction.prefixTokens : previous.inputTokens,
+      ...(event.firstPassUsage
+        ? { firstPassUsage: { ...event.firstPassUsage }, firstPassContextBand: event.firstPassContextBand }
+        : {}),
     });
     this.newestReturnKey = event.requestKey;
     while (this.facts.returns.length > RETAINED_CACHE_EXPIRY_RETURNS) {
@@ -1559,9 +1575,13 @@ export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpe
       partial = true;
       continue;
     }
-    const { paid, asRead } = cacheExpiryRebuiltUsage(item.previousInputSide, item.request.usage);
-    const paidPrice = pricer({ ...item.request, usage: paid });
-    const readPrice = pricer({ ...item.request, usage: asRead });
+    const { paid, asRead } = cacheExpiryRebuiltUsage(item.previousInputSide, item.firstPassUsage ?? item.request.usage);
+    const request = {
+      ...item.request,
+      contextBand: item.firstPassUsage ? (item.firstPassContextBand ?? null) : item.request.contextBand,
+    };
+    const paidPrice = pricer({ ...request, usage: paid });
+    const readPrice = pricer({ ...request, usage: asRead });
     if (!paidPrice || !readPrice) {
       partial = true;
       continue;
@@ -1645,22 +1665,26 @@ function readIncremental(
     let stoppedBetweenLines = false;
     let classified = false;
     const byKey = new Map(
-      buckets.map((bucket) => [projectUsageKey(bucket, bucket.localDate), { ...bucket, usage: { ...bucket.usage } }]),
+      buckets.map((bucket) => [
+        projectUsageKey(bucket, bucket.localDate),
+        { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
+      ]),
     );
     const lifetimeByKey = new Map(
       lifetimeBuckets.map((bucket) => [
         projectUsageKey(bucket, bucket.localDate),
-        { ...bucket, usage: { ...bucket.usage } },
+        { ...bucket, usage: bucket.usage.byContextBand ? structuredClone(bucket.usage) : { ...bucket.usage } },
       ]),
     );
-    const addTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
+    const addSliceTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
       const date = localDate(event.timestamp);
-      const contextBand =
-        event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage));
+      const contextBand = event.usage.byContextBand
+        ? (event.contextBand ?? null)
+        : (event.contextBand ?? contextBandForRequest(event.model, event.provider, requestInputTokens(event.usage)));
       const keyed = { ...event, contextBand };
       const key = projectUsageKey(keyed, date);
       let bucket = target.get(key);
-      if (!bucket && (event.usage.requests ?? 1) < 0) {
+      if (!bucket && Object.values(event.usage).some((value) => typeof value === 'number' && value < 0)) {
         return;
       }
       if (!bucket) {
@@ -1688,7 +1712,7 @@ function readIncremental(
         };
         target.set(key, bucket);
       }
-      addUsage(bucket.usage, event.usage);
+      addPricedUsage(bucket.usage, event.usage);
       bucket.unclassifiedCacheWrite = (bucket.unclassifiedCacheWrite ?? 0) + (event.unclassifiedCacheWrite ?? 0);
       if (!bucket.unclassifiedCacheWrite) {
         delete bucket.unclassifiedCacheWrite;
@@ -1700,6 +1724,9 @@ function readIncremental(
       if (bucketIsEmpty(bucket)) {
         target.delete(key);
       }
+    };
+    const addTo = (target: Map<string, ProjectUsageBucket>, event: UsageEvent) => {
+      for (const slice of usageBandEvents(event)) addSliceTo(target, slice);
     };
     // Track request order before bucket aggregation removes adjacency.
     const ordered = reducer.recentCompactions ? new CacheExpiryScan(cacheExpiry ?? undefined) : null;

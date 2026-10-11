@@ -105,6 +105,9 @@ import {
   NOW,
   advisorProbeRecords,
   advisorResponseRecords,
+  advisorIteration,
+  PER_PASS_ITERATIONS,
+  MIXED_PASS_ITERATIONS,
   claudeCompactionTranscript,
   compaction,
   counts,
@@ -4438,6 +4441,78 @@ test('turn token detail keeps advisor billing and executor cache percentages and
   assert.match(detail, /Cached input reads: .*\(50% of input\)/);
   assert.ok(detail.includes(`Average input per request: ${formatTokens(86_702)} tokens`));
   assert.ok(detail.includes(`Input: ${formatTokens(263_018)} tokens`));
+});
+
+test('per-pass pricing corrects turn cost and executor input facts without an advisor entry', () => {
+  const file = path.join(tempDir('pass-cost-'), 'session.jsonl');
+  fs.writeFileSync(
+    file,
+    [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations: PER_PASS_ITERATIONS, thinking: 152 })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const subject = readSession(file, 'advisor-probe').turns[0];
+  assert.ok(Math.abs(turnCost(subject).dollars! - 0.153730325) < 1e-12);
+  assert.ok(Math.abs(pricing.estimateCost(subject.usageParts![0].usage, subject.model)! - 0.013920325) < 1e-12);
+  assert.equal(averageContextPerRequest(subject.usageParts![0].usage), 131617);
+  const detail = costDetail(subject).join('\n');
+  assert.match(detail, /50% cached · 1 request · 132k avg input/);
+  assert.doesNotMatch(detail, /advisor/i);
+  assert.equal(subject.usage.requests, 2);
+  assert.equal(subject.usage.cacheRead, 65580);
+});
+
+test('per-pass pricing keeps both threshold bands on a turn without an advisor', () => {
+  const file = path.join(tempDir('pass-bands-'), 'session.jsonl');
+  fs.writeFileSync(
+    file,
+    [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations: MIXED_PASS_ITERATIONS, thinking: 3 })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const subject = readSession(file, 'advisor-probe').turns[0];
+  assert.ok(Math.abs(turnCost(subject).dollars! - 0.0600315) < 1e-12);
+  assert.equal(subject.usage.requests, 1);
+  assert.equal(subject.usageParts?.[0].contextBand, null);
+  assert.deepEqual([subject.usage.byContextBand?.short?.requests, subject.usage.byContextBand?.long?.requests], [0, 1]);
+  assert.equal(subject.usage.byContextBand?.long?.thinking, 3);
+});
+
+test('per-pass pricing uses only the final answer for the next-turn starting price', () => {
+  const file = path.join(tempDir('pass-next-'), 'session.jsonl');
+  const iterations = [
+    advisorIteration({ input_tokens: 99800, output_tokens: 150 }),
+    advisorIteration({ cache_read_input_tokens: 99980, output_tokens: 10 }),
+  ];
+  fs.writeFileSync(
+    file,
+    [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const subject = readSession(file, 'advisor-probe').turns[0];
+  const basis = nextTurnBasisOf(subject, null)!;
+  assert.equal(basis.tokens, 99980);
+  assert.equal(basis.outputTokens, 10);
+  assert.equal(subject.contextRequest?.readBack, true);
+  const price = pricing.nextTurnFloor({
+    contextTokens: basis.tokens,
+    freshTokens: basis.outputTokens,
+    model: basis.model,
+    tier: '5m',
+  })!;
+  assert.ok(Math.abs(price.cold - 0.01249875) < 1e-12);
+  fs.appendFileSync(
+    file,
+    advisorResponseRecords({
+      id: 'cold-final',
+      at: 30,
+      iterations: [advisorIteration({ cache_read_input_tokens: 4500 }), advisorIteration({ input_tokens: 99990 })],
+    })
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  assert.equal(readSession(file, 'advisor-probe').turns[0].contextRequest?.readBack, false);
 });
 
 test('token and cost details keep shared usage labels in one relative order', () => {

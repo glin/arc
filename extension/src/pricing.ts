@@ -872,6 +872,24 @@ function costAtRate(usage: TurnUsage, rate: Rate, cacheWritesFree = false): numb
 
 // Quotes retain their pricing source. Recorded charges take precedence over configured rates and public definitions.
 export function quoteUsage(input: UsageQuoteInput): UsageQuote | null {
+  if (input.usage.byContextBand) {
+    if (input.reportedCost != null)
+      return quoteUsage({ ...input, usage: { ...input.usage, byContextBand: undefined }, requestTokens: null });
+    const slices = (['short', 'long'] as const).flatMap((band) => {
+      const usage = input.usage.byContextBand![band];
+      return usage ? [{ ...input, usage, contextBand: band, requestTokens: null, reportedCost: null }] : [];
+    });
+    const quotes = slices.map(quoteUsage);
+    if (!quotes.length || quotes.some((quote) => quote === null)) return null;
+    const cost = estimateCost(input.usage, input.model, input.provider, input.contextWindow, null, input);
+    if (cost === null) return null;
+    return {
+      ...quotes[0]!,
+      cost,
+      rate: quotes.length > 1 ? null : quotes[0]!.rate,
+      contextBand: quotes.length > 1 ? null : quotes[0]!.contextBand,
+    };
+  }
   const provider = input.provider ?? null;
   const requestBand = contextBandForRequest(input.model, provider, input.requestTokens ?? null);
   const contextBand = input.contextBand ?? requestBand;
@@ -991,12 +1009,14 @@ export function estimateCost(
       combined.output += part.output;
       combined.thinking += part.thinking;
       const quoted = quoteUsage({
+        ...priceContext,
         usage: part,
         model,
         provider,
         contextWindow,
         contextBand: band,
-        ...priceContext,
+        requestTokens: null,
+        reportedCost: null,
       });
       if (!quoted) {
         return null;
@@ -1038,6 +1058,7 @@ export function estimateCacheReadCost(
   model: string | null,
   provider: string | null = null,
   contextWindow: number | null = null,
+  priceContext: UsagePriceContext = {},
 ): number | null {
   const requestTokens = requestInputTokens(usage);
   if (
@@ -1076,9 +1097,9 @@ export function estimateCacheReadCost(
         thinking: 0,
       };
     }
-    return estimateCost(part, model, provider, contextWindow);
+    return estimateCost(part, model, provider, contextWindow, null, priceContext);
   }
-  return estimateCost(part, model, provider, contextWindow, requestTokens);
+  return estimateCost(part, model, provider, contextWindow, requestTokens, priceContext);
 }
 
 // Round a positive starting-price estimate upward so the displayed amount covers the estimated cost.

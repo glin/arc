@@ -1,4 +1,9 @@
-import { bedrockAstraRecords } from '../../extension/src/turnfixtures.ts';
+import {
+  bedrockAstraRecords,
+  advisorProbeRecords,
+  advisorResponseRecords,
+  PER_PASS_ITERATIONS,
+} from '../../extension/src/turnfixtures.ts';
 import { tempDir } from '../../extension/src/temproot.ts';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -59,6 +64,27 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
   for (const key of ['source', 'window', 'byToolKind', 'untilText', 'parentWindow'])
     assert.deepEqual(detail[key], ordinary[key]);
 }
+
+test('per-pass pricing reaches arc cost for the e2a025b8 response', () => {
+  const { file, projects, codex } = fixture();
+  fs.writeFileSync(
+    file,
+    [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations: PER_PASS_ITERATIONS, thinking: 152 })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const { parent } = JSON.parse(
+    runCost([file, '--projects', projects, '--codex-sessions', codex, '--by-model', '--json']),
+  );
+  assert.equal(parent.costUsd, 0.1537);
+  assert.equal(parent.requests, 2);
+  assert.equal(parent.contextMean, 66035);
+  assert.equal(parent.cacheReadShareOfCost, 0.004);
+  assert.deepEqual(
+    parent.modelCosts.map((row: { costUsd: number }) => row.costUsd),
+    [0.0139, 0.1398],
+  );
+});
 
 test('cost rejects unsupported formats before applying an empty request window', () => {
   const { root, file } = fixture();

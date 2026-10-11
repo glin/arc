@@ -22,6 +22,7 @@ import {
   ModelSpend,
   addModelUsage,
   addUsage,
+  emptyUsage,
   agentSpendIsOpen,
   heaviestModel,
   childSpendRevisionKey,
@@ -361,7 +362,9 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
     return;
   }
   const usage = { ...event.usage };
-  if (event.contextBand) {
+  if (event.usage.byContextBand) {
+    usage.byContextBand = structuredClone(event.usage.byContextBand);
+  } else if (event.contextBand) {
     usage.byContextBand = { [event.contextBand]: { ...event.usage } };
   }
   parts.push({
@@ -448,6 +451,10 @@ export interface UsageEvent {
   compactionsBefore?: number;
   // The final executor pass's input. Billing usage sums every pass of the response.
   contextTokens?: number;
+  firstPassUsage?: UsageCounts;
+  firstPassContextBand?: UsageContextBand | null;
+  finalPassOutputTokens?: number;
+  finalPassCacheRead?: number;
   usage: TurnUsage;
   requestKey: string;
   responseId?: string;
@@ -459,8 +466,8 @@ export interface UsageEvent {
   // next cache-expiry return from.
   compactionSignal?: CompactionSignal;
   // A Claude advisor consultation inside the response named by `requestKey`'s parent key. It
-  // bills as its own request of the advisor model and reads the session uncached, so it
-  // counts in cost and request totals and stays out of every context and cache figure.
+  // bills as its own request of the advisor model and can record cache reads and writes.
+  // It counts in cost and request totals, outside executor context, cache-expiry adjacency, and compaction figures.
   usageOrigin?: 'claude-advisor';
 }
 
@@ -7835,6 +7842,7 @@ export function claudeCacheLifetime(usage: ClaudeUsage): CacheLifetime | null {
 // executor's passes only, and their cache-write split can omit the writes of a later pass.
 interface ClaudeResponseUsage {
   executor: TurnUsage;
+  passes: TurnUsage[];
   lifetime: CacheLifetime | null;
   // The first and last executor passes. The last one read the context the response ended on.
   first: TurnUsage;
@@ -7867,7 +7875,15 @@ function claudeResponseUsage(usage: ClaudeUsage): ClaudeResponseUsage {
   if (!passes.length) {
     const counted = claudeUsage(usage);
     const lifetime = claudeCacheLifetime(usage);
-    return { executor: counted, lifetime, first: counted, last: counted, advisors, unknownIterations };
+    return {
+      executor: counted,
+      passes: [counted],
+      lifetime,
+      first: counted,
+      last: counted,
+      advisors,
+      unknownIterations,
+    };
   }
   const counted = passes.map(claudeUsage);
   const executor: TurnUsage = {
@@ -7892,7 +7908,15 @@ function claudeResponseUsage(usage: ClaudeUsage): ClaudeResponseUsage {
   const written = passes.filter((_, index) => counted[index].cacheWrite1h + counted[index].cacheWrite5m > 0);
   const lifetimes = new Set(written.map(claudeCacheLifetime));
   const lifetime = lifetimes.size === 1 ? [...lifetimes][0] : null;
-  return { executor, lifetime, first: counted[0], last: counted[counted.length - 1], advisors, unknownIterations };
+  return {
+    executor,
+    passes: counted,
+    lifetime,
+    first: counted[0],
+    last: counted[counted.length - 1],
+    advisors,
+    unknownIterations,
+  };
 }
 
 function numericUsageField(value: unknown): number | null {
@@ -8062,6 +8086,19 @@ export function reduceClaudeUsageRecordEvents(
   const inferenceClass = claudeRequestInferenceClass(messageId, state.modelProfile, usage.inference_geo);
   const serviceTier = claudeServiceTier(usage);
   const model = typeof message.model === 'string' && message.model ? message.model : null;
+  const bands = response.passes.map((pass) => contextBandForRequest(model, null, requestInputTokens(pass)));
+  const contextBand = bands.every((band) => band === bands[0]) ? bands[0] : null;
+  if (response.passes.length > 1 && bands.every((band) => band !== null)) {
+    counted.byContextBand = {};
+    response.passes.forEach((pass, index) => {
+      const band = bands[index];
+      const contribution = { ...pass, requests: 0, thinking: 0 };
+      addUsage((counted.byContextBand![band] ??= emptyUsage()), contribution);
+    });
+    const finalBand = counted.byContextBand[bands.at(-1)!]!;
+    finalBand.requests = 1;
+    finalBand.thinking = counted.thinking;
+  }
   // A request without a recorded cache-write lifetime retains the preceding request's lifetime for compaction estimates.
   // A response with several executor passes starts from its first pass's prefix and ends on its last pass's context.
   const { first, last } = response;
@@ -8084,8 +8121,8 @@ export function reduceClaudeUsageRecordEvents(
     provider: null,
     model,
     contextWindow: null,
-    // A Claude model with request-band pricing prices each request by its total input. Other models get no band.
-    contextBand: contextBandForRequest(model, null, requestInputTokens(counted)),
+    // Each executor pass selects its price from its own input length.
+    contextBand,
     billingClass: 'unknown',
     inferenceClass,
     serviceTier,
@@ -8098,6 +8135,14 @@ export function reduceClaudeUsageRecordEvents(
     cacheLifetime: response.lifetime,
     compactionsBefore: state.compactionCount,
     contextTokens: state.lastRequest.tokens,
+    ...(response.passes.length > 1
+      ? {
+          firstPassUsage: { ...first },
+          firstPassContextBand: bands[0],
+          finalPassOutputTokens: last.output,
+          finalPassCacheRead: last.cacheRead,
+        }
+      : {}),
     usage: counted,
     requestKey,
   };
@@ -8110,6 +8155,10 @@ export function reduceClaudeUsageRecordEvents(
     reportedCost: null,
     cacheLifetime: null,
     contextTokens: undefined,
+    firstPassUsage: undefined,
+    firstPassContextBand: undefined,
+    finalPassOutputTokens: undefined,
+    finalPassCacheRead: undefined,
     usage: advisor.usage,
     requestKey: `${requestKey}:advisor:${advisor.index}`,
     usageOrigin: 'claude-advisor',
@@ -8120,7 +8169,8 @@ export function reduceClaudeUsageRecordEvents(
 }
 
 function claudeCompactionPrefixRead(at: number, lifetime: CacheLifetime | null, request: UsageEvent): number | null {
-  if (request.usage.cacheRead > 0) return request.usage.cacheRead;
+  const first = request.firstPassUsage ?? request.usage;
+  if (first.cacheRead > 0) return first.cacheRead;
   return lifetime !== null && !cacheLapsedBy(at, lifetime, request.timestamp) ? 0 : null;
 }
 
@@ -8311,6 +8361,13 @@ function negativeUsage(usage: TurnUsage): TurnUsage {
     cacheRead: -usage.cacheRead,
     output: -usage.output,
     thinking: -usage.thinking,
+    ...(usage.byContextBand
+      ? {
+          byContextBand: Object.fromEntries(
+            Object.entries(usage.byContextBand).map(([band, counts]) => [band, negativeUsage(counts)]),
+          ),
+        }
+      : {}),
   };
 }
 
@@ -8318,6 +8375,11 @@ function removalFor(event: UsageEvent): UsageEvent {
   return {
     ...event,
     reportedCost: event.reportedCost === null ? null : -event.reportedCost,
+    contextTokens: undefined,
+    firstPassUsage: undefined,
+    firstPassContextBand: undefined,
+    finalPassOutputTokens: undefined,
+    finalPassCacheRead: undefined,
     usage: negativeUsage(event.usage),
   };
 }
@@ -10696,8 +10758,8 @@ function reduceClaudeSessionLine(
       lifetime: wrote ?? state.lastLifetime,
       inferenceClass: usageEvent.inferenceClass,
       serviceTier: usageEvent.serviceTier,
-      readBack: usage.cacheRead > 0,
-      outputTokens: usage.output,
+      readBack: (usageEvent.finalPassCacheRead ?? usage.cacheRead) > 0,
+      outputTokens: usageEvent.finalPassOutputTokens ?? usage.output,
     };
     const turnStart = cur[SOURCE_START] ?? sourceStart;
     state.lastContext = cur.contextTokens;

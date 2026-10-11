@@ -12,7 +12,14 @@ import {
   rolloutFiles,
   scanCodexDispatchReferences,
 } from './codex';
-import { CACHE_LIFETIME_MS, PROMOTIONS, cacheLifetimeFor, quoteUsage, type CacheTier } from './pricing';
+import {
+  CACHE_LIFETIME_MS,
+  PROMOTIONS,
+  cacheLifetimeFor,
+  quoteUsage,
+  estimateCacheReadCost,
+  type CacheTier,
+} from './pricing';
 import { cacheExpiryRebuiltUsage, discoverClaudeSessionSpendSources, spendFileIsClaudeChild } from './projectspend';
 import {
   createClaudeUsageLineReducer,
@@ -240,7 +247,8 @@ function requestQuote(request: SessionRequest) {
         model: request.model,
         provider: request.provider,
         contextWindow: request.contextWindow,
-        requestTokens: inputTokens(request),
+        requestTokens: request.usage.byContextBand ? null : inputTokens(request),
+        contextBand: request.usage.byContextBand ? request.contextBand : null,
         inferenceClass: request.inferenceClass,
         serviceTier: request.serviceTier,
         reportedCost: request.reportedCost,
@@ -260,13 +268,13 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
     excludedAmbiguous: 0,
     largest: [],
   };
-  // An advisor consultation reads the session uncached, so it is no cache-expiry neighbor.
+  // Advisor consultations do not establish executor cache-expiry neighbors.
   const rows = requests.filter((request) => !request.evidenceOnly && !request.usageOrigin);
   for (let index = 1; index < rows.length; index++) {
     const before = rows[index - 1];
     const after = rows[index];
-    if (!(after.usage.input || after.usage.cacheWrite5m || after.usage.cacheWrite1h || after.usage.cacheWrite30m))
-      continue;
+    const first = after.firstPassUsage ?? after.usage;
+    if (!(first.input || first.cacheWrite5m || first.cacheWrite1h || first.cacheWrite30m)) continue;
     if (
       !before.timestamp ||
       !after.timestamp ||
@@ -315,7 +323,12 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
         model: after.model,
         provider: after.provider,
         contextWindow: after.contextWindow,
-        requestTokens: inputTokens(after),
+        requestTokens: after.firstPassUsage ? null : inputTokens(after),
+        contextBand: after.firstPassUsage
+          ? after.firstPassContextBand
+          : after.usage.byContextBand
+            ? after.contextBand
+            : null,
         inferenceClass: after.inferenceClass,
         serviceTier: after.serviceTier,
         reportedCost: null,
@@ -323,10 +336,31 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
     const quote =
       after.reportedCost !== null || after.incomplete || (after.unclassifiedCacheWrite ?? 0) > 0
         ? null
-        : quoteOf({ ...after.usage, requests: 1, cacheRead: 0, output: 0, thinking: 0 });
+        : quoteUsage({
+            ...after,
+            reportedCost: null,
+            requestTokens: after.usage.byContextBand ? null : inputTokens(after),
+            contextBand: after.usage.byContextBand ? after.contextBand : null,
+            usage: {
+              ...after.usage,
+              cacheRead: 0,
+              output: 0,
+              thinking: 0,
+              ...(after.usage.byContextBand
+                ? {
+                    byContextBand: Object.fromEntries(
+                      Object.entries(after.usage.byContextBand).map(([band, usage]) => [
+                        band,
+                        { ...usage, cacheRead: 0, output: 0, thinking: 0 },
+                      ]),
+                    ),
+                  }
+                : {}),
+            },
+          });
     if (!quote) report.inputCostAfterExpiryUsd = null;
     else if (report.inputCostAfterExpiryUsd !== null) report.inputCostAfterExpiryUsd += quote.cost;
-    const rebuilt = quote ? cacheExpiryRebuiltUsage(requestContextTokens(before), after.usage) : null;
+    const rebuilt = quote ? cacheExpiryRebuiltUsage(requestContextTokens(before), first) : null;
     const paid = rebuilt ? quoteOf(rebuilt.paid) : null;
     const asRead = rebuilt ? quoteOf(rebuilt.asRead) : null;
     if (!paid || !asRead) report.extraCostAfterExpiryUsd = null;
@@ -512,7 +546,7 @@ export function summarizeRequests(
     0,
   );
   const allPriced = priced.length === count;
-  // An advisor consultation's input is its own uncached read, not the session's context.
+  // Advisor input does not establish the executor's retained context.
   const contexts = pricedRequests.filter((request) => !request.usageOrigin).map(requestContextTokens);
   const fifths: (number | null)[] = [];
   for (let index = 0; index < Math.min(5, count); index++) {
@@ -525,10 +559,14 @@ export function summarizeRequests(
         : null,
     );
   }
-  const readCost = costs.reduce((sum, quote, index) => {
-    if (!quote?.rate) return sum;
-    const rate = quote.rate.cacheRead ?? quote.rate.input * 0.1;
-    return sum + (pricedRequests[index].usage.cacheRead * rate) / 1_000_000;
+  const readCost = costs.reduce<number | null>((sum, quote, index) => {
+    if (sum === null || !quote || quote.reported) return sum;
+    const request = pricedRequests[index];
+    const estimate = estimateCacheReadCost(request.usage, request.model, request.provider, request.contextWindow, {
+      inferenceClass: request.inferenceClass,
+      serviceTier: request.serviceTier,
+    });
+    return estimate === null ? null : sum + estimate;
   }, 0);
   const models = new Set<string>();
   const unpricedModels = new Set<string>();
@@ -538,13 +576,11 @@ export function summarizeRequests(
     if (
       !costs[index] &&
       !quoteUsage({
-        usage: pricedRequests[index].usage,
-        model: model ?? null,
-        provider: pricedRequests[index].provider,
-        contextWindow: pricedRequests[index].contextWindow,
-        requestTokens: inputTokens(pricedRequests[index]),
-        inferenceClass: pricedRequests[index].inferenceClass,
+        ...pricedRequests[index],
+        reportedCost: null,
         serviceTier: null,
+        requestTokens: pricedRequests[index].usage.byContextBand ? null : inputTokens(pricedRequests[index]),
+        contextBand: pricedRequests[index].usage.byContextBand ? pricedRequests[index].contextBand : null,
       })
     )
       unpricedModels.add(model ?? 'unknown');
@@ -593,7 +629,7 @@ export function summarizeRequests(
     outputTokens: pricedRequests.reduce((sum, request) => sum + request.usage.output, 0),
     reasoningOutputTokens: pricedRequests.reduce((sum, request) => sum + request.usage.thinking, 0),
     cacheReadShareOfCost:
-      requestCountExact && allPriced && priced.every((quote) => quote.rate !== null) && total > 0
+      requestCountExact && allPriced && readCost !== null && priced.every((quote) => !quote.reported) && total > 0
         ? round(readCost / total, 3)
         : null,
     toolCalls:

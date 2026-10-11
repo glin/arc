@@ -273,6 +273,8 @@ import {
   OPEN_SPEND_BAND_MS,
   OPEN_SPEND_BYTES_PER_MS,
   readChildSpend,
+  addUsage,
+  emptyUsage,
   spendTokens,
 } from './agentspend.ts';
 import { estimateCost, quoteUsage } from './pricing.ts';
@@ -15815,16 +15817,20 @@ test('a Claude advisor consultation is its own request, and the executor prices 
     ],
   );
   // The top-level split names only the first pass's hour writes. The last pass wrote 244 five-minute tokens.
-  assert.deepEqual(events[0].usage, {
-    requests: 1,
-    input: 4,
-    cacheRead: 43_227,
-    cacheWrite1h: 43_227,
-    cacheWrite5m: 244,
-    cacheWrite30m: 0,
-    output: 41,
-    thinking: 0,
-  });
+  assert.deepEqual(
+    { ...events[0].usage, byContextBand: undefined },
+    {
+      byContextBand: undefined,
+      requests: 1,
+      input: 4,
+      cacheRead: 43_227,
+      cacheWrite1h: 43_227,
+      cacheWrite5m: 244,
+      cacheWrite30m: 0,
+      output: 41,
+      thinking: 0,
+    },
+  );
   const price = events.reduce((sum, event) => sum + (estimateCost(event.usage, event.model) ?? Number.NaN), 0);
   assert.ok(Math.abs(price - 0.10366307) < 1e-9, String(price));
   // The context is what the last executor pass read: 2 input, 43,227 cache read and 244 cache write.
@@ -15879,6 +15885,46 @@ test('a child read replaces each advisor consultation of a growing response, acr
   // A saved state is JSON, so the resumed read starts from a JSON copy.
   const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())), { childTranscript: true });
   assert.deepEqual(totals([...head, ...lines.slice(2).flatMap((line) => resumed.pushLine(line))]), single);
+});
+
+test('per-pass pricing keeps growing child bands equal through a restored checkpoint', () => {
+  const iterations = [
+    advisorIteration({ input_tokens: 100000, output_tokens: 7 }),
+    advisorIteration({ input_tokens: 100001, output_tokens: 11 }),
+  ];
+  const line = (count: number) =>
+    JSON.stringify(advisorResponseRecords({ sidechain: true, iterations: iterations.slice(0, count), blocks: 1 })[0]);
+  const initial = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  const total = emptyUsage();
+  for (const event of initial.pushLine(line(1))) addUsage(total, event.usage, event.contextBand);
+  const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(initial.snapshot())), {
+    childTranscript: true,
+  });
+  for (const event of resumed.pushLine(line(2))) addUsage(total, event.usage, event.contextBand);
+  for (const event of resumed.pushLine(line(2))) addUsage(total, event.usage, event.contextBand);
+  assert.ok(Math.abs(estimateCost(total, 'claude-haiku-5-5')! - 0.0600315) < 1e-12);
+  const full = createClaudeUsageLineReducer(undefined, { childTranscript: true }).pushLine(line(2))[0].usage;
+  assert.deepEqual(total, full);
+});
+
+test('per-pass pricing measures the post-compaction prefix from the first executor pass', () => {
+  const prefix = claudeCompactionTranscript(COMPACTION_SAMPLES[0]);
+  const lastAt = Math.max(...prefix.map((record) => Date.parse((record as { timestamp: string }).timestamp)));
+  const after = advisorResponseRecords({
+    iterations: [
+      advisorIteration({ cache_read_input_tokens: 1200 }),
+      advisorIteration({ cache_read_input_tokens: 4000 }),
+    ],
+  }).map((record) => ({ ...record, timestamp: new Date(lastAt + 1000).toISOString() }));
+  const file = writeTranscript([...prefix, ...after]);
+  const read = readSession(file, 's');
+  assert.equal(read.compactions.at(-1)?.postCompactionCacheRead, 1200);
+  const reducer = createClaudeUsageLineReducer();
+  const events = [...prefix, ...after].flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+  assert.equal(
+    events.filter((event) => !event.usageOrigin && !event.compactionEstimate).at(-1)?.compactionSignal?.prefixTokens,
+    1200,
+  );
 });
 
 test('a child agent names its executor model when its advisor used more tokens', () => {

@@ -406,8 +406,17 @@ import {
 } from './codexopenings.ts';
 import { spawn } from 'node:child_process';
 import type { AgentRunScan, SessionRead, SessionStatFacts, TurnOutcome } from './transcript.ts';
-import { readSessionMeta, scanForAgentRun } from './transcript.ts';
-import { bedrockAstraRecords, runningSdkTranscript, powershellDispatchExecution } from './turnfixtures.ts';
+import { readSessionMeta, scanForAgentRun, readSession, sessionStatFactsOf } from './transcript.ts';
+import {
+  bedrockAstraRecords,
+  runningSdkTranscript,
+  powershellDispatchExecution,
+  advisorProbeRecords,
+  advisorResponseRecords,
+  MIXED_PASS_ITERATIONS,
+} from './turnfixtures.ts';
+import { estimateCost } from './pricing.ts';
+import { averageContextPerRequest } from './turncard.ts';
 import { railBuckets } from './view/rail.ts';
 
 const folder = () => tempDir('derived-cache-');
@@ -465,6 +474,25 @@ const title: DerivedTitleEntry = {
   starts: { starts: [10], whole: true },
   foldedLabel: 'a session',
 };
+
+test('per-pass pricing survives a derived-cache reload with both bands and request input averages', () => {
+  const directory = folder();
+  const source = path.join(directory, 'session.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  fs.writeFileSync(
+    source,
+    [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations: MIXED_PASS_ITERATIONS, thinking: 3 })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const facts = sessionStatFactsOf(readSession(source, 's'));
+  assert.ok(facts);
+  saveDerivedCache(cache, [[source, { ...title, stats: facts }]]);
+  const restored = loadDerivedCache(cache).titles.get(source)!.stats!.turns[0];
+  assert.ok(Math.abs(estimateCost(restored.usage, restored.model)! - 0.0600315) < 1e-12);
+  assert.equal(averageContextPerRequest(restored.usage), 200001);
+  assert.deepEqual(restored.usage, facts.turns[0].usage);
+});
 
 test('prior derived generations drop saved figures and carry valid names for bounded rereading', () => {
   for (const version of [35, 36]) {

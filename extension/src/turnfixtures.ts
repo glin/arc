@@ -1556,6 +1556,26 @@ export const ADVISOR_ITERATIONS: readonly AdvisorIteration[] = [
   }),
 ];
 
+export const PER_PASS_ITERATIONS: readonly AdvisorIteration[] = [
+  advisorIteration({
+    input_tokens: 2,
+    output_tokens: 179,
+    cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 65580 },
+  }),
+  advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 67325, output_tokens: 516 }),
+  advisorIteration({
+    input_tokens: 2,
+    output_tokens: 4,
+    cache_read_input_tokens: 65580,
+    cache_creation: { ephemeral_5m_input_tokens: 453, ephemeral_1h_input_tokens: 0 },
+  }),
+];
+
+export const MIXED_PASS_ITERATIONS: readonly AdvisorIteration[] = [
+  advisorIteration({ input_tokens: 100000, output_tokens: 7 }),
+  advisorIteration({ input_tokens: 100001, output_tokens: 11 }),
+];
+
 export interface AdvisorResponseOptions {
   id?: string;
   // Seconds after the probe's first assistant record.
@@ -1564,6 +1584,8 @@ export interface AdvisorResponseOptions {
   sidechain?: boolean;
   // How many of the three content-block records to write.
   blocks?: number;
+  reportedCost?: number;
+  thinking?: number;
 }
 
 const ADVISOR_PROBE_AT = Date.parse('2026-10-11T09:08:10.214Z');
@@ -1577,6 +1599,8 @@ export function advisorResponseRecords(options: AdvisorResponseOptions = {}): ob
   const sum = (field: 'input_tokens' | 'output_tokens' | 'cache_read_input_tokens' | 'cache_creation_input_tokens') =>
     passes.reduce((total, item) => total + item[field], 0);
   const usage = {
+    ...(options.reportedCost === undefined ? {} : { cost_usd: options.reportedCost }),
+    ...(options.thinking === undefined ? {} : { output_tokens_details: { thinking_tokens: options.thinking } }),
     input_tokens: sum('input_tokens'),
     cache_creation_input_tokens: sum('cache_creation_input_tokens'),
     cache_read_input_tokens: sum('cache_read_input_tokens'),

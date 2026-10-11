@@ -4812,6 +4812,7 @@ function sessionCostTotalOf(costs: readonly SessionCostTotal[]): SessionCostTota
 }
 
 function usageInContextBand(usage: Turn['usage'], band: 'short' | 'long'): Turn['usage'] {
+  if (usage.byContextBand) return usage;
   const counts = {
     requests: usage.requests ?? 0,
     input: usage.input,
@@ -5273,7 +5274,7 @@ function delegatedCostLines(
     });
 }
 
-// The costs priced from ordinary recorded requests. Advisor consultations read no session cache.
+// Advisor consultations can record cache reads and writes. These figures cover executor requests alone.
 function recordedCosts(costs: readonly PricedSessionCost[]): PricedSessionCost[] {
   return costs.filter((cost) => !cost.part.compactionEstimate && !cost.part.compactionUsage && !cost.part.usageOrigin);
 }

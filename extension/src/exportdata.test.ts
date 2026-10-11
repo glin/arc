@@ -9,6 +9,8 @@ import {
   ADVISOR_EXECUTOR,
   ADVISOR_MODEL,
   advisorResponseRecords,
+  advisorProbeRecords,
+  MIXED_PASS_ITERATIONS,
   claudeCostState,
   claudeDispatchTranscript,
   exportedSiteData,
@@ -25,18 +27,38 @@ import {
 } from './exportdata.ts';
 import { ExportCancelled, ExportTransaction, withExportTransaction } from './exportwriter.ts';
 import { ExportLimitError } from './exportlimits.ts';
-import { projectSessionSite } from './exportsite.ts';
+import { projectSessionSite, exportTurn } from './exportsite.ts';
 import type { SiteManifest } from './webview/export-model.ts';
 import type { SessionStatChip } from './turncard.ts';
 import { readCodexSession } from './codex.ts';
-import { toCard } from './turncard.ts';
+import { toCard, turnCost, averageContextPerRequest } from './turncard.ts';
 import { formatCost } from './pricing.ts';
-import { readClaudeAgentSpend, readSessionMeta, scanForAgentRun, agentRunOfScan } from './transcript.ts';
+import { readClaudeAgentSpend, readSessionMeta, scanForAgentRun, agentRunOfScan, readSession } from './transcript.ts';
 import { needsAgentRunScan } from './derivedcache.ts';
 const CODEX_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
 const record = (type: string, second: number, fields: object) => ({ type, timestamp: at(second), ...fields });
+
+test('per-pass pricing survives an export round trip with both bands and one executor request', () => {
+  const f = fixture();
+  const file = f.write(f.root, [
+    advisorProbeRecords()[0],
+    ...advisorResponseRecords({ iterations: MIXED_PASS_ITERATIONS, thinking: 3 }),
+  ]);
+  const original = readSession(file, 'root').turns[0];
+  const saved = projectTurn(original, 'turn', { cwd: '/project' }, [], 'root', new Map());
+  const restored = exportTurn(JSON.parse(JSON.stringify(saved)), 'claude', 'root');
+  assert.ok(Math.abs(turnCost(restored).dollars! - 0.0600315) < 1e-12);
+  assert.equal(averageContextPerRequest(restored.usage), 200001);
+  assert.equal(restored.usage.requests, 1);
+  assert.equal(saved.usageParts.length, 2);
+  assert.deepEqual(
+    saved.usageParts.map((part) => part.usage.requests),
+    [0, 1],
+  );
+  assert.deepEqual(turnCost(restored), turnCost(original));
+});
 
 test('export capture retains child advisor usage origins beside executor spend', () => {
   const f = fixture();

@@ -6,6 +6,7 @@ import {
   advisorIteration,
   advisorProbeRecords,
   advisorResponseRecords,
+  MIXED_PASS_ITERATIONS,
   bedrockAstraRecords,
 } from './turnfixtures';
 import assert from 'node:assert/strict';
@@ -44,6 +45,41 @@ function write(file: string, records: object[]): string {
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   return file;
 }
+
+test('per-pass pricing applies a recorded response cost once across two bands', () => {
+  const file = write(
+    path.join(directory(), 'recorded.jsonl'),
+    advisorResponseRecords({ iterations: MIXED_PASS_ITERATIONS, reportedCost: 0.123 }),
+  );
+  const requests = readSessionRequests(file);
+  assert.equal(summarizeRequests(requests).costUsd, 0.123);
+  assert.equal(requests[0].contextBand, null);
+});
+
+test('per-pass pricing measures cache expiry from the returning first pass', () => {
+  const prompt = (at: number) => ({
+    ...advisorProbeRecords()[0],
+    uuid: `p-${at}`,
+    timestamp: new Date(Date.parse('2026-10-11T09:08:09Z') + at * 1000).toISOString(),
+  });
+  const first = [
+    advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 1000, ephemeral_1h_input_tokens: 0 } }),
+  ];
+  const after = [
+    advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 100000, ephemeral_1h_input_tokens: 0 } }),
+    advisorIteration({ cache_read_input_tokens: 100001 }),
+  ];
+  const file = write(path.join(directory(), 'return.jsonl'), [
+    prompt(0),
+    ...advisorResponseRecords({ id: 'before', iterations: first }),
+    prompt(599),
+    ...advisorResponseRecords({ id: 'after', at: 600, iterations: after }),
+  ]);
+  const report = summarizeRequests(readSessionRequests(file));
+  assert.equal(report.cacheExpiry?.returns, 1);
+  assert.equal(report.cacheExpiry?.extraCostAfterExpiryUsd, 0.0001);
+  assert.equal(report.cacheExpiry?.inputCostAfterExpiryUsd, 0.0125);
+});
 
 function claudeRequest(id: string, output: number, tools: string[] = [], model = 'claude-opus-5'): object {
   return {
@@ -2439,6 +2475,52 @@ test('missing speed rate is separate from a missing model rate', () => {
     },
   ]);
   assert.equal(sessionCostReport(file).parent.fastModeUnpricedRequests, 0);
+});
+
+test('a request without pass bands prices its recorded token volume despite a different context band', () => {
+  const request = pricedRequest('claude-haiku-5-5', 100001, { contextBand: 'short' });
+  const summary = summarizeRequests([request]);
+  assert.equal(summary.pricedRequests, 1);
+  assert.equal(summary.costUsd, 0.05);
+});
+
+test('cache-expiry amounts use recorded request input without pass bands despite a different context band', () => {
+  const before = pricedRequest('claude-haiku-5-5', 0, { contextBand: 'short', visibleTurnId: 'first' });
+  before.usage.cacheWrite5m = 1000;
+  const after = pricedRequest('claude-haiku-5-5', 100001, {
+    contextBand: 'short',
+    timestamp: before.timestamp + 600_000,
+    visibleTurnId: 'second',
+  });
+  const expiry = summarizeRequests([before, after]).cacheExpiry!;
+  assert.equal(expiry.returns, 1);
+  assert.equal(expiry.inputCostAfterExpiryUsd, 0.05);
+  assert.equal(expiry.extraCostAfterExpiryUsd, 0.0005);
+});
+
+test('an incomplete recorded cost does not hide a model without a public rate', () => {
+  const unknown = pricedRequest('future-model', 1000, { incomplete: true, reportedCost: 0.123 });
+  const known = pricedRequest('claude-opus-5', 1000, { incomplete: true, reportedCost: 0.123 });
+  assert.deepEqual(summarizeRequests([unknown]).unpricedModels, ['future-model']);
+  assert.deepEqual(summarizeRequests([known]).unpricedModels, []);
+});
+
+test('cached-read cost share stays unavailable when a priced aggregate has no request bands', () => {
+  const request = pricedRequest('claude-haiku-5-5', 200001, {
+    usage: {
+      requests: 2,
+      input: 100000,
+      cacheRead: 100001,
+      cacheWrite5m: 0,
+      cacheWrite1h: 0,
+      output: 0,
+      thinking: 0,
+    },
+  });
+  const summary = summarizeRequests([request]);
+  assert.equal(summary.pricedRequests, 1);
+  assert.equal(summary.costUsd, 0.055);
+  assert.equal(summary.cacheReadShareOfCost, null);
 });
 
 test('a cumulative Claude child uses the speed on its final usage record', () => {

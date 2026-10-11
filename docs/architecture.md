@@ -146,7 +146,7 @@ Closed Claude subagents reopen only when a user or assistant timestamp exceeds t
 
 The line filter in `transcript.ts` that keeps ordinary tool results out of JSON parsing must admit a result marked `toolEndsTurn`. A dropped result leaves a subagent session running, then stopped, and never done.
 
-Claude advisor tokens appear only in `usage.iterations`, as `advisor_message` entries that name their own `model`. The top-level usage fields count the executor's passes only. Their cache-write split can name only the first pass's writes when a response has several passes. The usage reducer therefore prices the executor from its `message` iterations. Request events retain final-pass context separately from billed usage for CLI context summaries, cache-expiry prefix estimates, and Project cost compaction figures.
+Claude advisor tokens appear only in `usage.iterations`, as `advisor_message` entries that name their own `model`. The top-level usage fields count the executor's passes only. Their cache-write split can name only the first pass's writes when a response has several passes. Summed executor usage measures billing volume, not one request input. Request events retain pass bands, first-pass usage, and final-pass context separately from that volume. Pricing and boundary readers use these facts through aggregation, saved checkpoints, and exports.
 
 Direct child activity is only a temporary overlay on the newest turn. Stable protocol ids let the transcript copy replace it. Work started in another window or terminal still comes from the transcript because this host does not own that process.
 

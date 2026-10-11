@@ -300,7 +300,7 @@ test('same-model delegated scopes cannot pool input cost or requests into a warn
 });
 
 test('cache-write warning leaves advisor consultations out of its shares', () => {
-  // An advisor reads the session uncached at its own model's rates.
+  // Advisor consultations can record cache reads and writes outside executor cache figures.
   const advisor = part({
     model: 'claude-opus-5',
     usageOrigin: 'claude-advisor',
