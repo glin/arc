@@ -1,5 +1,6 @@
 import { revisionOf, supportedFileIdentity, type SessionFile } from './transcript';
 import { guardedSourceRevision, sessionSourceAdmitted } from './sessionreads';
+import { activeWriterFailure } from './composerview';
 import { GuardedAttempt } from './agentwire.ts';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -39,6 +40,7 @@ import {
   archiveRefusal,
   guardedChannelSend,
   guardedDeliveryPort,
+  guardedRefusal,
   guardedFactsWithCompaction,
   guardedPanelPorts,
   guardedStartContext,
@@ -2544,7 +2546,7 @@ test('self compaction returns the current record for a retried request ID and re
 // These guards catch guarded sends that reach a child they must not reach, with fake children and no provider startup.
 class GuardChild {
   readonly key = 'worker-key';
-  readonly agent = 'claude';
+  agent = 'claude';
   idle: string | null = null;
   turnEnds = 0;
   attempts: string[] = [];
@@ -3041,7 +3043,9 @@ test('guarded wiring intervenes on each directing reader callback, records only 
   const owner = policy.owner('worker')!;
   assert.equal(delivery.live(owner), child);
   found = new GuardChild();
+  found.lastError = 'writer lock';
   assert.equal(delivery.live(owner), null, 'a different live child is not the recorded writer');
+  assert.equal(policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)), null);
   assert.equal(await delivery.withLease(child, async () => 'leased'), null);
   found = child;
   assert.equal(await delivery.withLease(child, async () => 'leased'), 'leased');
@@ -3137,30 +3141,171 @@ test('a guarded follow-up refuses as busy while a deferred self-compaction waits
   assert.equal((await admitted).status, 'accepted');
 });
 
-// Catches refusal retention that forgets an old request ID, so an equal retry runs again and a changed payload
-// under that ID is no longer a conflict.
-test('a refused guarded send keeps its request binding after hundreds of later refusals', async () => {
+// Catches unbounded refused bindings and eviction that permits an old request ID to run again.
+test('guarded admission exhaustion stops distinct refusals and retains the oldest equal and conflicting retries', async () => {
   const book = new SessionWriteRequests('window', 2);
   let applied = 0;
   const refuse = (id: string) => () => {
     applied += 1;
-    return {
-      version: 1 as const,
-      status: 'refused' as const,
-      requestId: id,
-      payloadSha256: 'x',
-      nativeTurnId: null,
-      reason: GUARDED_SEND_REASONS.busy,
-    };
+    return guardedRefusal(id, 'Next.', GUARDED_SEND_REASONS.busy);
   };
-  for (let n = 0; n <= 300; n++) await book.runGuarded(`window:${n}`, { prompt: `p${n}` }, refuse(`window:${n}`));
+  for (const n of [0, 1]) await book.runGuarded(`window:${n}`, { prompt: `p${n}` }, refuse(`window:${n}`));
+  for (const n of [2, 3])
+    await assert.rejects(book.runGuarded(`window:${n}`, { prompt: `p${n}` }, refuse(`window:${n}`)), /limit/);
+  await assert.rejects(book.runGuarded('window:2', { prompt: 'changed' }, refuse('window:2')), /limit/);
   const again = (await book.runGuarded('window:0', { prompt: 'p0' }, refuse('window:0'))) as { requestId: string };
   assert.equal(again.requestId, 'window:0');
-  assert.equal(applied, 301, 'an equal retry of an old refused ID ran again');
   await assert.rejects(book.runGuarded('window:0', { prompt: 'changed' }, refuse('window:0')), /different request/);
+  await assert.rejects(new SessionWriteRequests('reloaded').runGuarded('window:0', {}, refuse('window:0')), /unknown/);
+  assert.equal(applied, 2, 'exhausted or retained request IDs invoked a handler');
 });
 
-test('guarded send refusals stay out of the write table, observe same-ID duplicates, and never block a later start', async () => {
+// Catches asynchronous reservations that let concurrent requests exceed the lifetime allowance.
+test('guarded admissions reserve capacity before concurrent handlers run and equal retries share the pending outcome', async () => {
+  const book = new SessionWriteRequests('window', 2);
+  const finish: (() => void)[] = [];
+  let applied = 0;
+  const refuse = (id: string) => () => {
+    applied++;
+    return new Promise<ReturnType<typeof guardedRefusal>>((resolve) => {
+      finish.push(() => resolve(guardedRefusal(id, 'Next.', GUARDED_SEND_REASONS.busy)));
+    });
+  };
+  const first = book.runGuarded('window:1', { prompt: 'Next.' }, refuse('window:1'));
+  const equal = book.runGuarded('window:1', { prompt: 'Next.' }, refuse('window:1'));
+  const second = book.runGuarded('window:2', { prompt: 'Next.' }, refuse('window:2'));
+  await assert.rejects(book.runGuarded('window:3', {}, refuse('window:3')), /limit/);
+  await assert.rejects(book.runGuarded('window:1', { prompt: 'Other.' }, refuse('window:1')), /different request/);
+  assert.equal(applied, 2);
+  assert.equal(finish.length, 2);
+  for (const settle of finish) settle();
+  assert.deepEqual(await first, await equal);
+  await second;
+  await assert.rejects(book.runGuarded('window:3', {}, refuse('window:3')), /limit/);
+  assert.equal(applied, 2, 'settled refusals returned lifetime capacity');
+});
+
+// Catches accepted or unknown outcomes returning lifetime capacity or being delivered again at exhaustion.
+test('accepted and unknown guarded admissions consume lifetime capacity and preserve duplicates without another delivery', async () => {
+  const book = new SessionWriteRequests('window', 4, 3);
+  let applied = 0;
+  const outcomes = ['refused', 'accepted', 'unknown'] as const;
+  const deliver = (status: (typeof outcomes)[number]) => () => {
+    applied++;
+    return { ...guardedRefusal(`window:${status}`, 'Next.', ''), status };
+  };
+  for (const status of outcomes) await book.runGuarded(`window:${status}`, { prompt: status }, deliver(status));
+  await assert.rejects(book.runGuarded('window:overflow', {}, deliver('accepted')), /limit/);
+  for (const status of outcomes) {
+    const again = await book.runGuarded(`window:${status}`, { prompt: status }, deliver(status));
+    assert.equal((again as { status: string }).status, status);
+    await assert.rejects(
+      book.runGuarded(`window:${status}`, { prompt: 'Other.' }, deliver(status)),
+      /different request/,
+    );
+  }
+  assert.equal(applied, 3);
+});
+
+// Catches starts and curation consuming the independent guarded lifetime allowance.
+test('ordinary writes before a guarded send leave its lifetime allowance available', async () => {
+  const book = new SessionWriteRequests('window', 4, 1);
+  await book.run('window:start', { method: 'start' }, () => ({ status: 'accepted' }));
+  await book.run('window:curate', { method: 'curate' }, () => ({ status: 'accepted' }));
+  let applied = 0;
+  const result = await book.runGuarded('window:send', { prompt: 'Next.' }, () => {
+    applied++;
+    return guardedRefusal('window:send', 'Next.', GUARDED_SEND_REASONS.busy);
+  });
+  assert.equal((result as { status: string }).status, 'refused');
+  assert.equal(applied, 1);
+});
+
+// Catches loss of the production writer diagnostic or a conflict that clears with the transient child error.
+test('the guarded delivery port recognizes Codex writer conflicts persistently and keeps attempted input unknown', async () => {
+  const message = 'thread thread-7 already has an active writer';
+  for (const race of ['before-input', 'receipt', 'retired', 'reader'] as const) {
+    const attempted = race !== 'before-input';
+    const { policy, child, coordinator, facts } = guardFixture();
+    child.agent = 'codex';
+    let found: GuardChild | null = child;
+    const delivery = guardedDeliveryPort(
+      policy,
+      { find: () => found, withActivity: async (_key, work) => work(child) },
+      activeWriterFailure,
+      () => 'uuid-conflict',
+    );
+    const send = () =>
+      runGuardedSend(policy, guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator), delivery);
+    if (attempted) {
+      const sent: { id: number; method: string }[] = [];
+      const wire = new CodexWire({
+        send: (line) => sent.push(JSON.parse(line)),
+        emit: () => {},
+        clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
+        cwd: 'C:\\ws',
+      });
+      const opening = wire.startThread({ cwd: 'C:\\ws' });
+      wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: { thread: { id: 'worker' } } }));
+      await opening;
+      let providerFinished: Promise<void> | undefined;
+      vi.spyOn(child, 'guardedPrompt').mockImplementation((text, uuid) => {
+        child.attempts.push(text);
+        const attempt = new GuardedAttempt(uuid);
+        // AgentSession stores its transient error after the wire settles the receipt.
+        providerFinished = wire.prompt(text, attempt).then(
+          () => {},
+          (error: Error) => {
+            child.lastError = `the agent would not take the prompt: ${error.message}`;
+          },
+        );
+        if (race === 'reader') {
+          // This observer runs before the delivery port's observer and clears mutable child evidence.
+          void attempt.receipt.then(() => {
+            policy.intervene('worker');
+            child.lastError = null;
+          });
+        }
+        assert.equal(sent.at(-1)!.method, 'turn/start');
+        wire.receive(JSON.stringify({ id: sent.at(-1)!.id, error: { code: -32000, message } }));
+        if (race === 'retired') found = null;
+        return attempt;
+      });
+      const result = await send();
+      assert.equal(result.status, 'unknown', race);
+      assert.equal(
+        result.reason,
+        `Thread thread-7 already has an active writer. ${GUARDED_SEND_REASONS.unknown}`,
+        race,
+      );
+      await providerFinished;
+      wire.close('finished');
+      vi.spyOn(child, 'guardedPrompt').mockImplementation((text, uuid) => {
+        child.attempts.push(text);
+        const attempt = new GuardedAttempt(uuid);
+        attempt.markWritten();
+        attempt.settle({ outcome: 'accepted', nativeTurnId: 'unexpected-turn', reason: '' });
+        return attempt;
+      });
+    } else {
+      child.lastError = message;
+      assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+    }
+    child.lastError = null;
+    policy.intervene('worker');
+    found = child;
+    const refused = await send();
+    assert.equal(refused.status, 'refused');
+    assert.equal(refused.reason, GUARDED_SEND_REASONS.ownership);
+    assert.equal(
+      child.attempts.length,
+      attempted ? 1 : 0,
+      `a persistent writer conflict allowed further input: ${race}`,
+    );
+  }
+});
+
+test('guarded exhaustion retains same-ID refusals and leaves the independent start and curation allowance usable', async () => {
   const { channel, home } = await fixture();
   (channel as any).writes = new SessionWriteRequests(channel.hostId, 2);
   let handled = 0;
@@ -3184,14 +3329,15 @@ test('guarded send refusals stay out of the write table, observe same-ID duplica
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
   vi.stubEnv('CODEX_THREAD_ID', '');
   try {
-    for (const n of [1, 2, 3])
+    for (const n of [1, 2])
       assert.equal(
         ((await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-${n}`)) as any).reason,
         GUARDED_SEND_REASONS.busy,
       );
+    await assert.rejects(requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-3`), /limit/);
     const again = (await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-1`)) as any;
     assert.equal(again.reason, GUARDED_SEND_REASONS.busy);
-    assert.equal(handled, 3, 'a same-ID duplicate observes the retained refusal');
+    assert.equal(handled, 2, 'a same-ID duplicate observes the retained refusal');
     await assert.rejects(
       requestWindow('send', { ...params, prompt: 'Other.' }, channel.hostId, home, `${channel.hostId}:busy-1`),
       /different request/,
@@ -3203,11 +3349,22 @@ test('guarded send refusals stay out of the write table, observe same-ID duplica
       pinned: false,
       labels: [] as string[],
     };
-    for (const n of [1, 2])
-      assert.equal(
-        ((await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:start-${n}`)) as any).status,
-        'accepted',
-      );
+    assert.equal(
+      ((await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:start-1`)) as any).status,
+      'accepted',
+    );
+    assert.equal(
+      (
+        (await requestWindow(
+          'curate',
+          { sessionId: 'worker', action: 'pin', dryRun: false, force: false },
+          channel.hostId,
+          home,
+          `${channel.hostId}:curate-1`,
+        )) as any
+      ).status,
+      'accepted',
+    );
     assert.equal(starts.length, 2);
   } finally {
     vi.unstubAllEnvs();

@@ -83,17 +83,27 @@ export function sessionWriteBinding(
   return { activation, method, params, requester, requesterProvider };
 }
 
-// Retention never evicts an accepted ID. A full activation refuses further writes.
-// A guarded send that refused before input moves to a separate table that keeps every refusal for the activation.
-// A same-ID duplicate observes that refusal, and refusals never use up the table that start, curate, and send share.
+// Retention never evicts an admitted ID. New guarded sends reserve lifetime capacity before their handlers run.
+// Refused sends move to a separate table, so they keep their bindings without filling the shared result table.
 export class SessionWriteRequests {
   private readonly results = new Map<string, { payload: string; result: Promise<unknown> }>();
   private readonly refusals = new Map<string, { payload: string; result: unknown }>();
+  private guardedAdmissions = 0;
   constructor(
     private readonly windowId: string,
     private readonly limit = 256,
+    private readonly guardedLimit = limit,
   ) {}
   run(id: string, payload: unknown, apply: () => unknown | Promise<unknown>): Promise<unknown> {
+    return this.runBound(id, payload, apply, false);
+  }
+
+  private runBound(
+    id: string,
+    payload: unknown,
+    apply: () => unknown | Promise<unknown>,
+    guarded: boolean,
+  ): Promise<unknown> {
     if (!id.startsWith(this.windowId + ':'))
       return Promise.reject(new Error('The request outcome belongs to another Arc activation and is unknown.'));
     const hash = this.hash(payload);
@@ -107,8 +117,9 @@ export class SessionWriteRequests {
       return held.payload === hash
         ? held.result
         : Promise.reject(new Error('The request ID already names a different request.'));
-    if (this.results.size >= this.limit)
+    if (this.results.size >= this.limit || (guarded && this.guardedAdmissions >= this.guardedLimit))
       return Promise.reject(new Error('This Arc window has reached its session-write request limit.'));
+    if (guarded) this.guardedAdmissions += 1;
     const result = Promise.resolve().then(apply);
     this.results.set(id, { payload: hash, result });
     return result;
@@ -116,7 +127,7 @@ export class SessionWriteRequests {
 
   // Runs a guarded send. Its guarded rejection allowlist is empty, so a refused result never follows attempted input.
   runGuarded(id: string, payload: unknown, apply: () => GuardedSendResult | Promise<GuardedSendResult>) {
-    return this.run(id, payload, apply).then((result) => {
+    return this.runBound(id, payload, apply, true).then((result) => {
       const held = this.results.get(id);
       if ((result as GuardedSendResult).status === 'refused' && held) {
         this.results.delete(id);
@@ -643,12 +654,23 @@ export function guardedDeliveryPort<C extends GuardedWriter>(
   return {
     live: (owner) => {
       const live = host.find(owner.child.agent, owner.worker);
-      if (live && writerFailure(live.state().lastError)) policy.noteWriterConflict(owner.worker);
+      if (live === owner.child && writerFailure(live.state().lastError)) policy.noteWriterConflict(owner.worker);
       return live === owner.child ? live : null;
     },
     withLease: (child, work) =>
       host.withActivity(child.key, (live) => (live === child ? work() : Promise.resolve(null))),
-    write: (child, text) => child.guardedPrompt(text, clientUuid(), (turnId) => submitted?.(child, turnId)),
+    write: (child, text) => {
+      const sessionId = child.state().sessionId;
+      const owner = sessionId ? policy.owner(sessionId) : null;
+      const attempt = child.guardedPrompt(text, clientUuid(), (turnId) => submitted?.(child, turnId));
+      // The receipt retains this attempt's diagnostic before reader input clears the child's error.
+      // Its child can retire before settlement, so classification never looks up the current live child.
+      void attempt.receipt.then((receipt) => {
+        if (owner?.child === child && receipt.outcome !== 'accepted' && writerFailure(receipt.reason))
+          policy.noteWriterConflict(owner.worker);
+      });
+      return attempt;
+    },
   };
 }
 
