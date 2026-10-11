@@ -22,7 +22,7 @@ The reader reviews completed work rather than approving each edit as it happens.
 
 A session has several reading levels: a short heading, turns, activity, and detailed records. The reader opens detail when it helps a decision. Newest turns appear first because the reader usually returns after work has happened.
 
-Read and unread state, archive, pins, labels, and saved views help the reader track attention across sessions. A group connects sessions that serve one piece of work inside the current project. These are reader-owned labels rather than facts inferred from file names or agent summaries.
+Read and unread state, archive, pins, labels, and saved views help the reader track attention across sessions. A group connects sessions that serve one piece of work inside the current project. These are reader-owned labels rather than facts inferred from file names or agent summaries. A session list filter that an agent sets at the reader's request belongs in Arc. The filter changes no label, pin, or archive state, and the reader can change or clear it.
 
 Comments remain attached to the turn or selected passage they answer. Sending a later prompt carries unsent comments to that session. A review that finds a problem can therefore produce a directed response in place.
 
@@ -36,7 +36,7 @@ Context and prompt-cache information help the reader choose whether to continue,
 
 Arc uses VS Code for the file tree, editor, diff viewer, terminal, theme, and platform controls. It adds a graphical agent surface inside that editor. It has no account or hosted service. Each window opens a local channel for the reader's own agents, and the channel closes with the window.
 
-Arc has no code-hosting integration for pull requests, issues, reviews, or remotes. It adds no persistent VS Code status bar UI. The panel covers the open project and its registered worktrees, not every repository on the machine or several unrelated workspaces. It opens existing worktrees but creates and deletes none. The CLI reads sessions, starts agents, sends an agent's follow-ups to the agents it started, and changes labels, pins, and archive membership through the selected local window. Arc has no standalone desktop or web application.
+Arc has no code-hosting integration for pull requests, issues, reviews, or remotes. It adds no persistent VS Code status bar UI. The panel covers the open project and its registered worktrees, not every repository on the machine or several unrelated workspaces. It opens existing worktrees but creates and deletes none. The CLI reads sessions, starts agents, sends an agent's follow-ups to the agents it started, and changes labels, pins, and archive membership through the selected local window. An agent can also ask the CLI to compact its own session after the current turn. Arc has no standalone desktop or web application.
 
 The panel must remain responsive with many sessions. Reads are bounded, derived caches are rebuildable, and expensive history work waits for an explicit request or a background budget.
 
