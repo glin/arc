@@ -2,6 +2,8 @@
 
 Arc is a VS Code extension for working with Claude Code and Codex. **Experimental, personal software.**
 
+I focus on the Claude Code and Codex features I use. Arc does not support every feature.
+
 [Web demo](https://glin.github.io/arc/)
 
 - Keep track of all the agents! See which are running. Vertical tabs, labels, saved views, filters, links to subagent sessions.
@@ -45,6 +47,11 @@ codex login
 ```
 
 ## Features
+
+### Session links and export
+
+- Open named session links in agent responses without leaving Arc.
+- Export a saved session and its linked work as HTML for offline review.
 
 ### Files and commits
 

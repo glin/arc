@@ -229,6 +229,31 @@ describe('read-only web demo', () => {
       expect(readKeys.length).toBeGreaterThan(0);
       await page.locator('[data-control="sessionparent:arc-demo-dispatch"]').click();
       await page.locator('[data-control="session:arc-demo-dispatch"]').waitFor();
+      const responseLink = page.getByRole('link', { name: 'Open session: Check the demo read state', exact: true });
+      for (const href of [
+        'arc-session:unknown-session',
+        'arc-session:%ZZ',
+        'https://example.com/',
+        'C:/demo/file.ts',
+      ]) {
+        await responseLink.evaluate((link, href) => {
+          (link as HTMLElement).dataset.link = href;
+        }, href);
+        await responseLink.click();
+        expect(await picker.inputValue()).toBe('arc-demo-dispatch');
+      }
+      await responseLink.evaluate((link) => {
+        (link as HTMLElement).dataset.link = 'arc-session:arc-demo-review';
+      });
+      await page.getByRole('link', { name: 'Open session: Check the demo read state', exact: true }).click();
+      await page.locator('[data-control="session:arc-demo-review"]').waitFor();
+      await unchanged([
+        { type: 'showSession', session: 'unknown-session', responseLink: true },
+        { type: 'openLink', href: 'https://example.com/' },
+      ]);
+      await move(3, 'arc-demo-dispatch');
+      await move(4, 'arc-demo-review');
+      await move(3, 'arc-demo-dispatch');
       await move(3, 'arc-demo-continuation');
       await page
         .locator('.sessionlabels .sessionlabel')

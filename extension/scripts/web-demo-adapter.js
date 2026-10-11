@@ -398,6 +398,9 @@
     (event) => {
       if (!(event.target instanceof Element)) return;
       if (exportDownloads.has(event.target.closest('a'))) return;
+      const link = event.target.closest('#list .summary a[data-link]');
+      const target = link && sample.parseSessionLink(link.dataset.link || '');
+      if (target?.kind === 'session' && ids.includes(target.session)) return;
       if (event.target.closest('#composer .csend')) {
         event.preventDefault();
         event.stopImmediatePropagation();

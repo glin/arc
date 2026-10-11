@@ -34,6 +34,7 @@ import { applyComment, normalizeComments } from './src/turncomments.ts';
 import { emptyTrail, visitPlace, stepBack, stepForward, trailPlace } from './src/turnplaces.ts';
 import { isSendChord } from './src/domain/composer-editing.ts';
 import { navigationShortcut } from './src/webview/navigation.ts';
+import { parseSessionLink } from './src/domain/session-link.ts';
 import { installMenu } from './scripts/web-demo-menu.ts';
 import { demoHost } from './scripts/web-demo-host.ts';
 window.__ARC_DEMO_SAMPLES__.host = demoHost;
@@ -43,6 +44,7 @@ window.__ARC_DEMO_SAMPLES__.commentRules = { applyComment, normalizeComments };
 window.__ARC_DEMO_SAMPLES__.placeRules = { emptyTrail, visitPlace, stepBack, stepForward, trailPlace };
 window.__ARC_DEMO_SAMPLES__.isSendChord = isSendChord;
 window.__ARC_DEMO_SAMPLES__.navigationShortcut = navigationShortcut;
+window.__ARC_DEMO_SAMPLES__.parseSessionLink = parseSessionLink;
 window.__ARC_DEMO_SAMPLES__.installMenu = installMenu;`,
     resolveDir: path.join(__dirname, '..'),
     loader: 'ts',

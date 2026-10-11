@@ -1003,7 +1003,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       endedAt: start - 4 * 60_000,
       prompt: 'Ask Codex to review the web demo. Report any behavior that needs a follow-up.',
       summary:
-        'Codex found one read-state issue. Marking a response unread leaves its session outside the Unread filter.\n\nA fresh session can check that small follow-up.',
+        'Codex found one read-state issue. Marking a response unread leaves its session outside the Unread filter.\n\nRead [Check the demo read state](arc-session:arc-demo-review) for the finding. A fresh session can check that small follow-up.',
       model: 'claude-opus-5-5',
       effort: 'high',
       usage: { ...emptyUsage(), requests: 4, input: 8_000, cacheWrite5m: 20_000, cacheRead: 64_000, output: 2_500 },
