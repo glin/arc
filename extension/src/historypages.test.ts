@@ -1692,10 +1692,17 @@ test('Codex capture reuses older evidence bytes across semantic pages within the
 
 test('Codex capture shares the raw page allowance with growing unfinished fragments', async () => {
   const file = path.join(tempDir('capture-fragment-budget-'), 'capture.jsonl');
+  const limits = {
+    ...EXPORT_LIMITS,
+    sliceBytes: 4 * 1024,
+    recordBytes: 128 * 1024,
+    turnBytes: 256 * 1024,
+    pageBytes: 768 * 1024,
+  };
   const record = (type: string, payload: object) =>
     JSON.stringify({ type, timestamp: '2026-09-29T12:00:00Z', payload });
   const rows = [record('session_meta', { id: 'capture', cwd: '/project' })];
-  for (let index = 0; index < 7; index++) rows.push(record('ignored', { padding: 'x'.repeat(7 * 1024 * 1024) }));
+  for (let index = 0; index < 7; index++) rows.push(record('ignored', { padding: 'x'.repeat(112 * 1024) }));
   const ids = Array.from({ length: 96 }, (_value, index) => `turn-${index}`);
   for (const id of ids)
     rows.push(
@@ -1711,7 +1718,7 @@ test('Codex capture shares the raw page allowance with growing unfinished fragme
   do {
     let result: Awaited<ReturnType<typeof readCodexHistoryPageAsync>>;
     try {
-      result = await readCodexHistoryPageAsync(file, 'capture', cursor, { exportLimits: EXPORT_LIMITS });
+      result = await readCodexHistoryPageAsync(file, 'capture', cursor, { exportLimits: limits });
     } catch (error) {
       assert.ok(error instanceof ExportLimitError && error.boundary === 'page');
       reachedPageLimit = true;
@@ -1726,8 +1733,8 @@ test('Codex capture shares the raw page allowance with growing unfinished fragme
       const retained = (cursor.exportRanges ?? []).reduce((bytes, range) => bytes + range.bytes.length, 0);
       const held = cursor.heldRecords.reduce((bytes, record) => bytes + record.end - record.start + 1, 0);
       assert.ok(
-        retained + held + cursor.fragment.length <= EXPORT_LIMITS.pageBytes,
-        `cursor retains ${retained + held + cursor.fragment.length} bytes against ${EXPORT_LIMITS.pageBytes}`,
+        retained + held + cursor.fragment.length <= limits.pageBytes,
+        `cursor retains ${retained + held + cursor.fragment.length} bytes against ${limits.pageBytes}`,
       );
     }
   } while (cursor);
