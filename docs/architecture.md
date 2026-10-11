@@ -197,7 +197,7 @@ The first column is checked against the shipped extension directory by `architec
 | --- | --- | --- |
 | `extension.ts` | Activation, local window channel lifetime, watcher registration, commands, editor integration, and the agent host | yes |
 | `configwatch.ts` | Non-recursive applied-defaults configuration watches for queried folders and their ancestors, with directory checks and watch lifecycle | no |
-| `identity.ts` | Arc product, extension, command, storage, environment, and package identifiers, plus the saved-state keys and the multi-root spend workspace path | no |
+| `identity.ts` | Re-exports product identifiers and owns measurement environment names, saved-state keys, and the multi-root spend workspace path | no |
 | `projectsetups.ts` | Canonical setup project identity, project-entry normalization, one-time legacy pin import, and serialized pin and accepted-profile persistence | no |
 | `sessiondetails.ts` | Narrows a card list to the session the panel is showing | no |
 | `panelhost.ts` | Extension-host side of the panel webview, window state publication, per-host readiness, durable initial catalog demand, staged loading, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance | yes |
@@ -257,7 +257,7 @@ The first column is checked against the shipped extension directory by `architec
 | `paneldevelopment.ts` | Validates the loopback development origin and component updates, then builds production or development panel HTML and CSP | no |
 | `paneltext.ts` | Replaces named panel tokens with values prepared by tested modules | no |
 | `payload.ts` | Shapes the render, selection, and session list messages the extension posts, and weighs a message by field, by session list row, and by repeated long string | no |
-| `richtext.ts` | Safe block and noninteractive inline Markdown, validated disclosure structure, host-only content references, local picture rules, and fallback text | no |
+| `richtext.ts` | Safe block and noninteractive inline Markdown, named response session anchors, validated disclosure structure, host-only content references, local picture rules, and fallback text | no |
 | `uris.ts` | Read-only URI schemes used by diff editors | yes |
 | `config.ts` | Reads and writes extension settings through `vscode` | yes |
 | `store.ts` | Snapshot manifests, path matching, current-file comparison, expiry, lazy cache partition ownership, and conservative folderless retention | no |
@@ -356,6 +356,8 @@ The first column is checked against the shipped extension directory by `architec
 | `domain/rail-filters.ts` | Browser-safe saved session list filter records, normalization, live-filter identity, the lens words a lens press writes, the migration of older stored lenses into those words, naming, and query-term toggles | no |
 | `domain/rail-sort.ts` | Browser-safe session list sort values, normalization, and display names | no |
 | `domain/resume.ts` | Browser-safe terminal resume command for each supported agent, and the session identities that may not become one | no |
+| `domain/identity.ts` | Browser-safe product, extension, storage, package, and scheme identifiers, re-exported by `identity.ts` | no |
+| `domain/session-link.ts` | Browser-safe response session link parsing and formatting, native context masks, exact target resolution, and pending target admission | no |
 | `domain/session-query.ts` | Browser-safe session-query grammar, quoting, caret tokens, cost, cache-expiry, status and caller-answered cache terms, matching, and content-search eligibility | no |
 | `domain/session-setups.ts` | Browser-safe pinned setup records, value checks, and recent setup limits | no |
 | `domain/export-model.ts` | Browser-safe captured session contracts | no |
@@ -465,6 +467,8 @@ The root `turn*.ts` modules own the host projections by subject. New imports nam
 `progressiveworker.ts` carries cancellable parsing and discovery requests. `panelhost.ts` accepts their revisioned answers, admits handoff reads through retained-history ownership, and composes session list and timeline payloads. It retains accepted metadata name changes until every ready visible host accepts a complete render. Later read failures and cancellations preserve that demand. Hidden hosts receive a forced refresh when they become visible. The browser keeps stable session and turn nodes while their content changes. [`timeline.md`](timeline.md#cache-ownership) owns read budgets, checkpoints, and refresh rules.
 
 Pending discovery applies the cursor retention limit to both its reply and the worker's held entries. Unfinished Claude cursors retain unmatched launches and record fragments above the soft budget. A partial reply does not release worker memory by itself.
+
+Named response links use `arc-session:` and navigate inside the invoking panel. Resolution uses the current scoped authoritative catalog and hosted pending starts. Provider collisions refuse navigation. Missing catalog publication reports loading unless a unique scoped pending start resolves. Successful navigation releases only that panel's clear redirect for the destination. Invalid links leave selection and redirects unchanged. Pending starts remain hosted until the current scoped authoritative catalog admits their provider and raw session ID. Exported response links render inert labels.
 
 A selected session opens once the published catalog lists it. A session absent from that catalog waits for ordinary discovery. Locally started drafts and accepted sessions retain their host-owned state until their records appear. Imported children receive no local awaiting-session ownership. `selectedsource.ts` filters descendant dependencies for selected windows. The host checks the originating selection and repository scope again before accepting a window. Selection changes cancel obsolete reads. Source changes retry through ordinary revision and append recovery. Completed response blocks carry native message identity and replace their streamed copy on the temporary turn card. Accepted submission identity binds response text and terminal outcomes to their prompts. Pending prompt delivery retains events for its native destination until the receipt establishes adoption or continuation. Failed delivery and provider disposal clear those events. Unresolved ownership expires after five minutes. Codex native turn IDs map to those accepted submissions. Completed, interrupted, and failed responses remain readable until recorded replacement. Clearing a session keeps terminal responses and their replacement ownership in the source session.
 

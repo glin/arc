@@ -1,4 +1,5 @@
 import { test, vi } from 'vitest';
+import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
 import { selectedDependencies } from './selectedsource';
@@ -1347,6 +1348,7 @@ function completeDiscoveryHarness(
     'invalidateClaudeCostSupplements',
     'countedDispatchedCosts',
     'SessionLoadingLine',
+    'pendingResponseSessionAdmitted',
     ...Object.keys(scope),
     compiled,
   )(
@@ -1388,6 +1390,7 @@ function completeDiscoveryHarness(
     invalidateClaudeCostSupplements,
     countedDispatchedCosts,
     SessionLoadingLine,
+    pendingResponseSessionAdmitted,
     ...Object.values(scope),
   );
   return new module.exports.Harness();
@@ -7066,6 +7069,61 @@ test('a refresh posts the render the panel paints from before it offers a spend 
     order.indexOf('render posted') < order.indexOf('spend sources offered'),
     'the paint waited on the spend offer, which stats every source the listing walk did not describe',
   );
+});
+
+test('a full deferred-metadata refresh retains hosted starts until matching authoritative publication', async () => {
+  const provider = paintHarness(['railRows', 'rowForSession'], { stableRailOrder });
+  const pending = { sessionId: 'accepted-start', createdAt: 1, agent: 'codex', cwd: 'project' };
+  const source = { ...pending, file: 'accepted.jsonl', size: 0, mtimeMs: 1 };
+  provider.partial = [source];
+  provider.authoritativeCatalog = [];
+  provider.authoritativeCatalogScope = JSON.stringify(['project']);
+  provider.awaitingSessionRecords = { [pending.sessionId]: pending };
+  await provider.refresh(true, true, true);
+  assert.equal(provider.awaitingSessionRecords[pending.sessionId], pending);
+  assert.deepEqual(provider.authoritativeCatalog, []);
+  assert.equal(
+    resolveResponseSession(
+      pending.sessionId,
+      provider.authoritativeCatalog,
+      Object.values(provider.awaitingSessionRecords),
+      () => true,
+    ).kind,
+    'resolved',
+  );
+  provider.partial = [{ ...source, agent: 'claude' }];
+  provider.railOrder = [pending.sessionId];
+  await provider.refresh(true, true, false);
+  assert.equal(provider.awaitingSessionRecords[pending.sessionId], pending);
+  const displayed = provider.railRows(new Map());
+  assert.equal(displayed.find((row: any) => row.id === pending.sessionId)?.agentKey, 'claude');
+  let selectedAgent: string | null = null;
+  provider.onSelectionChanged = (_session: string, agent: string) => {
+    selectedAgent = agent;
+  };
+  provider.ownCwdForSession = () => 'project';
+  const refresh = provider.refresh;
+  provider.refresh = () => Promise.resolve();
+  try {
+    provider.show(pending.sessionId);
+    assert.equal(selectedAgent, 'claude', 'the displayed Claude session selects the pending Codex identity');
+  } finally {
+    provider.refresh = refresh;
+  }
+  assert.equal(provider.rowForSession(pending.sessionId)?.agentKey, 'claude');
+  assert.equal(provider.sessionRows.filter((row: any) => row.id === pending.sessionId).length, 1);
+  assert.equal(
+    resolveResponseSession(
+      pending.sessionId,
+      provider.authoritativeCatalog,
+      Object.values(provider.awaitingSessionRecords),
+      () => true,
+    ).kind,
+    'ambiguous',
+  );
+  provider.partial = [source];
+  await provider.refresh(true, true, false);
+  assert.deepEqual(provider.awaitingSessionRecords, {});
 });
 
 test('an oversized full refresh records the largest ready-host message after each post', async () => {

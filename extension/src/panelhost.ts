@@ -4,6 +4,7 @@ import { ContextDemand, unavailableContext, validContextDetail, type ContextIden
 import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
 import { archiveRefusal } from './sessionwrites';
+import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLink } from './domain/session-link';
 import {
   boundedSessionListing,
   boundedSessionRead,
@@ -7191,9 +7192,11 @@ export class PanelProvider implements vscode.Disposable {
         }
         this.discoveryComplete = undefined;
       }
-      const recorded = new Set(all.map((session) => session.sessionId));
       for (const session of Object.keys(this.awaitingSessionRecords)) {
-        if (!selectedOnly && recorded.has(session)) {
+        if (
+          this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) &&
+          pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])
+        ) {
           delete this.awaitingSessionRecords[session];
         }
       }
@@ -11508,7 +11511,7 @@ export class PanelProvider implements vscode.Disposable {
         ? {
             ...parsed,
             session:
-              parsed.type === 'showReaderParent'
+              parsed.type === 'showReaderParent' || (parsed.type === 'showSession' && parsed.responseLink === true)
                 ? resolveSessionAlias(this.sessionAliases, parsed.session)
                 : this.panelSession(parsed.session, host),
           }
@@ -11815,6 +11818,35 @@ export class PanelProvider implements vscode.Disposable {
           this.show(msg.session || null, host);
         },
         showSession: (msg) => {
+          if (msg.responseLink === true) {
+            const scope = this.repositoryScope.snapshot(this.folders());
+            const catalog =
+              scope.ready && this.authoritativeCatalogScope === JSON.stringify(scope.roots)
+                ? this.authoritativeCatalog
+                : null;
+            const target = resolveResponseSession(
+              msg.session,
+              catalog,
+              scope.ready ? Object.values(this.awaitingSessionRecords) : [],
+              (cwd) => isInside(cwd, scope.roots),
+            );
+            if (target.kind !== 'resolved') {
+              outcome = 'rejected';
+              const status =
+                target.kind === 'loading'
+                  ? 'Sessions are loading. Try the session link again.'
+                  : target.kind === 'ambiguous'
+                    ? 'This session link matches more than one session.'
+                    : 'This session link is unavailable in this project.';
+              void vscode.window.setStatusBarMessage(`Arc: ${status}`, 1500);
+              return;
+            }
+            const route = this.clearRoutes?.get(msg.session);
+            if (route) {
+              route.hosts.delete(host);
+              if (!route.hosts.size) this.clearRoutes.delete(msg.session);
+            }
+          }
           this.show(msg.session || null, host);
         },
         // Build label-editor rows from current provider state on each opening.
@@ -11901,7 +11933,7 @@ export class PanelProvider implements vscode.Disposable {
           void this.loadOlderHistory(showing);
         },
         openLink: async (msg) => {
-          if (!msg.href) {
+          if (!msg.href || parseSessionLink(msg.href).kind !== 'other') {
             return;
           }
           // Ctrl, or Cmd on a Mac, asks for a group of its own, the same press a file row takes.

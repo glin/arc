@@ -6,6 +6,7 @@
 import * as path from 'path';
 import { marked } from 'marked';
 import { isLocalLinkPath } from './domain/link-path';
+import { parseSessionLink } from './domain/session-link';
 import { ARC_IDENTITY } from './identity';
 
 export const VISUALIZATION_SCHEME = ARC_IDENTITY.visualizationScheme;
@@ -533,6 +534,12 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, i
     };
     renderer.link = (href: string, title: string | null | undefined, body: string) => {
       if (inert) return body;
+      const sessionLink = parseSessionLink(href || '');
+      if (sessionLink.kind === 'invalid') return insideLink(body);
+      if (sessionLink.kind === 'session') {
+        const label = insideLink(body);
+        return `<a href="#" data-link="${escapeHtml(href)}" aria-label="Open session: ${label.replace(/<[^>]*>/g, '').replace(/"/g, '&quot;')}">${label}</a>`;
+      }
       const visualization = visualizationPath(href || '');
       if (visualization) {
         return (

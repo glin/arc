@@ -1,6 +1,46 @@
 import { test } from 'vitest';
 import assert from 'node:assert';
 import * as path from 'path';
+import { formatSessionLink, parseSessionLink } from './domain/session-link';
+
+test('named session links decode once, reject malformed destinations, and keep exports inert', () => {
+  for (const session of ['7390194c-8fea-4b6d-80be-e7e8c7684426', 'transcript-id', 'literal%2f', 'a:b', 'é']) {
+    const href = formatSessionLink(session)!;
+    assert.deepEqual(parseSessionLink(href), { kind: 'session', session });
+    assert.deepEqual(parseSessionLink('  ' + href.toUpperCase().slice(0, 12) + href.slice(12)), {
+      kind: 'session',
+      session,
+    });
+  }
+  for (const target of [
+    '',
+    '%',
+    '%zz',
+    '%2f',
+    '%5c',
+    '%00',
+    '%7f',
+    '%C2%80',
+    'id?x',
+    'id#x',
+    'id/path',
+    'id\\path',
+    ' id',
+    'id ',
+  ]) {
+    assert.deepEqual(parseSessionLink('arc-session:' + target), { kind: 'invalid' });
+    if (!target.includes(' '))
+      assert.doesNotMatch(renderRichMarkdown(`[Name](arc-session:${target})`), /data-link="arc-session:/);
+  }
+  assert.deepEqual(parseSessionLink('https://example.com'), { kind: 'other' });
+  assert.equal(formatSessionLink('bad/id'), null);
+  const text = '[**Cache & controls**](arc-session:saved-id)';
+  const html = renderRichMarkdown(text);
+  assert.match(html, /aria-label="Open session: Cache &amp; controls"/);
+  assert.match(html, /<strong>Cache &amp; controls<\/strong>/);
+  assert.doesNotMatch(renderRichMarkdown(text, undefined, true), /<a|arc-session:|data-link/);
+  assert.match(renderRichMarkdown('`arc-session:saved-id`'), /<code>arc-session:saved-id<\/code>/);
+});
 import {
   hasImageReference,
   imageFileFor,

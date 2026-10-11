@@ -18,6 +18,13 @@ import { estimateCost, formatCost } from './pricing';
 import { writeDemoExports } from '../scripts/web-demo-export';
 import { costPartOf } from './exportdata';
 
+test('exported named response links retain labels without live session navigation', () => {
+  const summary = '[Claude cache controls](arc-session:7390194c-8fea-4b6d-80be-e7e8c7684426)';
+  const card = exportCard(toCard(turn({ summary }), false, 1));
+  assert.match(card.summaryHtml ?? '', /Claude cache controls/);
+  assert.doesNotMatch(card.summaryHtml ?? '', /arc-session:|<a|data-link/);
+});
+
 test('export cost details distinguish missing prices from missing usage', async () => {
   for (const role of ['main', 'delegated'] as const) {
     const directory = tempDir('arc-export-unpriced-usage-');

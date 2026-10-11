@@ -1,4 +1,132 @@
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
+import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
+
+test('response session targets require a unique scoped accepted identity without provisional drafts', () => {
+  const inside = (cwd: string) => cwd === 'project';
+  const source = { sessionId: 'saved-id', agent: 'claude', cwd: 'project' };
+  const other = { ...source, agent: 'codex' };
+  assert.equal(resolveResponseSession('saved-id', [source], [source], inside).kind, 'resolved');
+  assert.equal(resolveResponseSession('saved-id', [source], [other], inside).kind, 'ambiguous');
+  assert.equal(resolveResponseSession('saved-id', null, [source], inside).kind, 'resolved');
+  assert.equal(resolveResponseSession('saved-id', null, [], inside).kind, 'loading');
+  assert.equal(resolveResponseSession('saved-id', [], [{ ...source, cwd: 'elsewhere' }], inside).kind, 'missing');
+  assert.equal(resolveResponseSession('saved-id', [], [{ ...source, cwd: null }], inside).kind, 'missing');
+  assert.equal(resolveResponseSession('short', [source], [], inside).kind, 'missing');
+  assert.equal(
+    resolveResponseSession('draft:provisional', [{ ...source, sessionId: 'draft:provisional' }], [], inside).kind,
+    'missing',
+  );
+  assert.equal(pendingResponseSessionAdmitted(source, [other]), false);
+  assert.equal(pendingResponseSessionAdmitted(source, [source]), true);
+});
+
+test('response session anchor masks suppress inherited turn, selection, comment and copy menus', () => {
+  const entries = manifestMenu(manifest);
+  for (const arcSelection of [true, false]) {
+    const inherited = {
+      webviewSection: 'arcTurnReadSummary',
+      session: 'source',
+      key: 'source:1',
+      arcTurn: true,
+      arcComments: true,
+      arcCopyLink: true,
+      arcSelection,
+    };
+    assert.ok(menuGroups(entries, inherited).flat().length > 0);
+    assert.deepEqual(menuGroups(entries, { ...inherited, ...sessionLinkContext('arc-session:saved-id') }).flat(), []);
+  }
+});
+
+test('response session navigation releases only its invoking clear route and retains rejected state', async () => {
+  const first = { active: () => true };
+  const second = { active: () => false };
+  const outcomes: string[] = [];
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    healthPanel: () => ({ id: 1 }),
+    health: { begin: () => 1, settle: (_action: number, outcome: string) => outcomes.push(outcome) },
+    readyHosts: new Set([first, second]),
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['project'] }) },
+    folders: () => ['project'],
+    authoritativeCatalogScope: JSON.stringify(['project']),
+    authoritativeCatalog: [{ sessionId: 'source', agent: 'claude', cwd: 'project' }],
+    awaitingSessionRecords: {},
+    sessionAliases: new Map([['draft:old', { actual: 'source', expiresAt: Date.now() + 60000 }]]),
+    clearRoutes: new Map([
+      [
+        'source',
+        {
+          successor: 'successor',
+          hosts: new Map([
+            [first, 7],
+            [second, 8],
+          ]),
+        },
+      ],
+    ]),
+    hostSessions: new Map([
+      [first, 'reader'],
+      [second, 'successor'],
+    ]),
+    newDrafts: { reader: { text: 'unsent' } },
+    runningNow: new Set(['claude:source']),
+    trail: visitPlace(emptyTrail(), 'reader'),
+    show(session: string, host: { active: () => boolean }) {
+      this.hostSessions.set(host, session);
+    },
+  });
+  const draft = provider.newDrafts.reader;
+  const trail = provider.trail;
+  const original = vscode.window.setStatusBarMessage;
+  const notices: string[] = [];
+  Object.assign(vscode.window, {
+    setStatusBarMessage: (message: string) => {
+      notices.push(message);
+    },
+  });
+  try {
+    for (const session of ['missing', 'draft:unadopted'])
+      await provider.onMessage({ type: 'showSession', session, responseLink: true }, first);
+    assert.equal(provider.hostSessions.get(first), 'reader');
+    assert.equal(provider.clearRoutes.get('source').hosts.size, 2);
+    assert.equal(notices.length, 2);
+    assert.deepEqual(outcomes, ['rejected', 'rejected']);
+    const accepted = provider.authoritativeCatalog;
+    provider.authoritativeCatalog = null;
+    await provider.onMessage({ type: 'showSession', session: 'source', responseLink: true }, first);
+    assert.match(notices.at(-1)!, /loading/);
+    assert.equal(outcomes.at(-1), 'rejected');
+    assert.equal(provider.clearRoutes.get('source').hosts.size, 2);
+    provider.awaitingSessionRecords = { source: { ...accepted[0], createdAt: 1 } };
+    provider.authoritativeCatalogScope = 'stale-scope';
+    provider.authoritativeCatalog = [{ ...accepted[0], agent: 'codex' }];
+    await provider.onMessage({ type: 'showSession', session: 'source', responseLink: true }, first);
+    assert.equal(provider.hostSessions.get(first), 'source');
+    provider.clearRoutes.get('source').hosts.set(first, 7);
+    provider.hostSessions.set(first, 'reader');
+    provider.authoritativeCatalogScope = JSON.stringify(['project']);
+    await provider.onMessage({ type: 'showSession', session: 'source', responseLink: true }, first);
+    assert.match(notices.at(-1)!, /more than one/);
+    assert.equal(outcomes.at(-1), 'rejected');
+    assert.equal(provider.hostSessions.get(first), 'reader');
+    assert.equal(provider.clearRoutes.get('source').hosts.size, 2);
+    provider.authoritativeCatalog = accepted;
+    provider.awaitingSessionRecords = {};
+    await provider.onMessage({ type: 'showSession', session: 'draft:old', responseLink: true }, first);
+    assert.equal(provider.hostSessions.get(first), 'source');
+    assert.equal(provider.hostSessions.get(second), 'successor');
+    assert.deepEqual([...provider.clearRoutes.get('source').hosts.keys()], [second]);
+    await provider.onMessage({ type: 'showSession', session: 'source' }, second);
+    assert.equal(provider.hostSessions.get(second), 'successor');
+    await provider.onMessage({ type: 'showSession', session: 'source', responseLink: true }, second);
+    assert.equal(provider.clearRoutes.size, 0);
+    assert.equal(provider.panelSession('source', first), 'source');
+    assert.equal(provider.newDrafts.reader, draft);
+    assert.equal(provider.trail, trail);
+    assert.equal(provider.runningNow.has('claude:source'), true);
+  } finally {
+    Object.assign(vscode.window, { setStatusBarMessage: original });
+  }
+});
 import type { TurnOutcome } from './transcript';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
 import { openReadWindow, closeReadWindow } from './readmeter';
@@ -12381,6 +12509,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     'revalidatedCatalog',
     'orderSessionCatalog',
     'isInside',
+    'pendingResponseSessionAdmitted',
     'pickShowing',
     'visitPlace',
     'prunePlaces',
@@ -12395,6 +12524,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     (held: unknown[]) => held,
     (held: unknown[]) => held,
     () => true,
+    pendingResponseSessionAdmitted,
     pickShowing,
     visitPlace,
     prunePlaces,
@@ -12603,7 +12733,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   const refresh = panelHostSource.slice(refreshAt, panelHostSource.indexOf('private glanceAt(', refreshAt));
   const clearAt = layoutIndexOf(
     refresh,
-    'if (!selectedOnly && recorded.has(session)) { delete this.awaitingSessionRecords[session]; }',
+    'if (this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) && pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])) { delete this.awaitingSessionRecords[session]; }',
   );
   const pendingAt = refresh.indexOf('const scopedPendingRecords =');
   const selectAt = refresh.indexOf('this.showing = pickShowing(');
@@ -27592,6 +27722,67 @@ function catalogSendProvider(agent: 'claude' | 'codex') {
   });
   return { provider, host, session, worktree, posted, delivered };
 }
+
+test.each(['archived', 'filtered'] as const)(
+  '%s response destinations resolve through the accepted catalog',
+  async (presentation) => {
+    const { provider, host, session, worktree } = catalogSendProvider('claude');
+    Object.assign(provider, {
+      readyHosts: new Set([host]),
+      repositoryScope: { snapshot: () => ({ ready: true, roots: [worktree] }) },
+      authoritativeCatalogScope: JSON.stringify([worktree]),
+      repositoryScopeRoots: [worktree],
+      hostPreviousSessions: new Map(),
+      selectionGeneration: 0,
+      selectionWorks: new Map(),
+      showing: 'reader',
+      hostSessions: new Map([[host, 'reader']]),
+      hidden: new Set(presentation === 'archived' ? [session] : []),
+      saved: { ...provider.saved, railFilter: presentation === 'filtered' ? 'agent:codex' : '' },
+      refresh: () => new Promise(() => {}),
+      completeSelectedWindow: () => Promise.resolve(),
+    });
+    const original = vscode.window.setStatusBarMessage;
+    Object.assign(vscode.window, { setStatusBarMessage: () => {} });
+    try {
+      await provider.onMessage({ type: 'showSession', session, responseLink: true }, host);
+    } finally {
+      Object.assign(vscode.window, { setStatusBarMessage: original });
+    }
+    assert.equal(provider.hostSessions.get(host), session);
+    assert.equal(provider.showing, session);
+    assert.deepEqual([...provider.hidden], presentation === 'archived' ? [session] : []);
+    assert.equal(provider.saved.railFilter, presentation === 'filtered' ? 'agent:codex' : '');
+  },
+);
+
+test.each(['claude', 'codex'] as const)(
+  'reopening a cleared %s source sends a later prompt there before render acknowledgement',
+  async (agent) => {
+    const { provider, host, session, worktree, delivered } = catalogSendProvider(agent);
+    Object.assign(provider, {
+      readyHosts: new Set([host]),
+      repositoryScope: { snapshot: () => ({ ready: true, roots: [worktree] }) },
+      authoritativeCatalogScope: JSON.stringify([worktree]),
+      repositoryScopeRoots: [worktree],
+      hostPreviousSessions: new Map(),
+      selectionGeneration: 0,
+      selectionWorks: new Map(),
+      showing: 'successor',
+      hostSessions: new Map([[host, 'successor']]),
+      clearRoutes: new Map([[session, { successor: 'successor', hosts: new Map([[host, 1]]) }]]),
+      refresh: () => new Promise(() => {}),
+      completeSelectedWindow: () => Promise.resolve(),
+    });
+    await provider.onMessage({ type: 'showSession', session, responseLink: true }, host);
+    assert.equal(provider.hostSessions.get(host), session);
+    assert.equal(provider.clearRoutes.size, 0);
+    const text = 'Continue the reopened source';
+    const attempt = { id: `reopened-${agent}`, order: 1, source: session, revision: 1, text };
+    await provider.acceptSubmission(text, session, 1, session, host, attempt);
+    assert.deepEqual(delivered, [{ session, cwd: worktree, text }]);
+  },
+);
 
 test.each(['claude', 'codex'] as const)(
   'catalog-backed %s sending and queue delivery retain the recorded working directory after completion',

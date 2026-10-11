@@ -26,6 +26,7 @@ test('Arc identity names the product, extension, storage and package identifiers
     snapshotsDirectory: 'snapshots',
     environmentPrefix: 'ARC_',
     visualizationScheme: 'arc-visualization:',
+    sessionScheme: 'arc-session:',
     cliPackageName: '@glin/arc',
     cliExecutable: 'arc-status',
     vsixFileName: 'arc.vsix',
@@ -67,13 +68,14 @@ test('every contributed command registers under its Arc id', () => {
 
 test('shipping sources take Arc identifiers from the identity contract', () => {
   const sourceRoot = __dirname;
-  const exemptions = new Set(['identity.ts']);
+  const exemptions = new Set(['identity.ts', 'domain/identity.ts']);
   const identifiers = [
     ARC_IDENTITY.extensionId,
     ARC_IDENTITY.panelType,
     ARC_IDENTITY.panelStateKey,
     ARC_IDENTITY.environmentPrefix,
     ARC_IDENTITY.visualizationScheme,
+    ARC_IDENTITY.sessionScheme,
     ARC_IDENTITY.cliPackageName,
     ARC_IDENTITY.cliExecutable,
     ARC_IDENTITY.vsixFileName,

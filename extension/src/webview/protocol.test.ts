@@ -2,6 +2,17 @@ import { unavailableContext } from '../domain/context-detail.ts';
 import { test } from 'vitest';
 import assert from 'node:assert';
 
+test('response session navigation retains its explicit marker and rejects malformed markers', () => {
+  const message = { type: 'showSession', session: 'saved-id', responseLink: true };
+  assert.deepEqual(parsePanelToHost(message), message);
+  for (const responseLink of [false, 'true', 1, null])
+    assert.equal(parsePanelToHost({ ...message, responseLink }), null);
+  assert.deepEqual(parsePanelToHost({ type: 'showSession', session: 'row-id' }), {
+    type: 'showSession',
+    session: 'row-id',
+  });
+});
+
 test('HTML export requires its initiating saved session and dispatches that identity', () => {
   for (const session of [undefined, null, 7, ''])
     assert.equal(parsePanelToHost({ type: 'exportSession', session }), null);

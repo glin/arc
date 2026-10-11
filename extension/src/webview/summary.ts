@@ -1,5 +1,6 @@
 import type { PanelToHost } from './protocol.ts';
 import { isLocalLinkPath } from '../domain/link-path.ts';
+import { parseSessionLink, sessionLinkContext } from '../domain/session-link.ts';
 
 export interface SummaryWords {
   codeCopy: string;
@@ -98,6 +99,11 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
   }
   for (const link of Array.from(root.querySelectorAll<HTMLAnchorElement>('a[data-link]'))) {
     const href = link.dataset.link || '';
+    if (parseSessionLink(href).kind !== 'other') {
+      link.dataset.vscodeContext = JSON.stringify(sessionLinkContext(href));
+      link.setAttribute('aria-label', `Open session: ${link.textContent || ''}`);
+      continue;
+    }
     const inTable = !!link.closest('table');
     const webLink = /^https?:/i.test(href.trimStart());
     if (webLink && !inTable) {
@@ -159,7 +165,12 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
     }
     event.preventDefault();
     event.stopPropagation();
-    options.post({ type: 'openLink', href: link.dataset.link || '', beside: event.ctrlKey || event.metaKey });
+    const target = parseSessionLink(link.dataset.link || '');
+    if (target.kind === 'session') {
+      options.post({ type: 'showSession', session: target.session, responseLink: true });
+    } else if (target.kind === 'other') {
+      options.post({ type: 'openLink', href: link.dataset.link || '', beside: event.ctrlKey || event.metaKey });
+    }
   };
   root.addEventListener('click', activate);
   return () => {

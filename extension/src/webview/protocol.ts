@@ -356,7 +356,7 @@ export type PanelToHost =
   | { type: 'armSessionDetails'; session: string }
   | { type: 'armComposer' }
   | { type: 'showReaderParent'; session: string }
-  | { type: 'showSession'; session: string; parent?: true }
+  | { type: 'showSession'; session: string; parent?: true; responseLink?: true }
   | { type: 'labelEditor'; session: string }
   | { type: 'setLabels'; session: string; names: string[] }
   | { type: 'setViews'; views: SavedView[] }
@@ -1115,8 +1115,13 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'showReaderParent':
       return isString(m.session) && m.session.length > 0 ? { type: 'showReaderParent', session: m.session } : null;
     case 'showSession':
-      return isString(m.session)
-        ? { type: 'showSession', session: m.session, ...(m.parent === true ? { parent: true as const } : {}) }
+      return isString(m.session) && (m.responseLink === undefined || m.responseLink === true)
+        ? {
+            type: 'showSession',
+            session: m.session,
+            ...(m.parent === true ? { parent: true as const } : {}),
+            ...(m.responseLink === true ? { responseLink: true as const } : {}),
+          }
         : null;
     case 'labelEditor':
       return isString(m.session) ? { type: 'labelEditor', session: m.session } : null;

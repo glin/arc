@@ -1,23 +1,5 @@
-export const ARC_IDENTITY = {
-  productName: 'Arc',
-  repositoryName: 'arc',
-  publisher: 'glin',
-  extensionName: 'arc',
-  extensionId: 'glin.arc',
-  commandPrefix: 'arc',
-  settingsSection: 'arc',
-  panelType: 'arc.panel',
-  panelStateKey: 'arc.panelState',
-  homeDirectory: '.arc',
-  snapshotsDirectory: 'snapshots',
-  environmentPrefix: 'ARC_',
-  visualizationScheme: 'arc-visualization:',
-  cliPackageName: '@glin/arc',
-  cliExecutable: 'arc-status',
-  vsixFileName: 'arc.vsix',
-  baselineScheme: 'arc-baseline',
-  patchScheme: 'arc-patch',
-} as const;
+import { ARC_IDENTITY } from './domain/identity';
+export { ARC_IDENTITY } from './domain/identity';
 
 export const MEASUREMENT_ENVIRONMENT = {
   blockAgents: `${ARC_IDENTITY.environmentPrefix}MEASURE_BLOCK_AGENTS`,

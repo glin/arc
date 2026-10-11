@@ -3139,6 +3139,59 @@ test('a compaction summary link keeps Copy Path context without handoff identity
   }
 });
 
+test('named response session links activate inside Arc by click and Enter, including tables', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const id = '7390194c-8fea-4b6d-80be-e7e8c7684426';
+    const card = {
+      ...payload.cards[0],
+      summaryHtml:
+        renderRichMarkdown(
+          `[**Claude cache controls**](arc-session:${id})\n\n| Session |\n| --- |\n| [Cache controls](ARC-SESSION:${id}) |`,
+        ) +
+        `<p><a href="#" data-link="  ArC-SeSsIoN:${id}">Scoped session</a> <a href="#" data-link="arc-session:%zz">Invalid session</a></p>`,
+    };
+    await post(page, { ...payload, cards: [card] });
+    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
+    const entries = manifestMenu(JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')));
+    for (const link of await page.locator('a[data-link]').all()) {
+      const context = await link.evaluate((node) => {
+        const ancestors = [];
+        for (let at: Element | null = node; at; at = at.parentElement) {
+          const raw = at.getAttribute('data-vscode-context');
+          if (raw) ancestors.unshift(JSON.parse(raw));
+        }
+        return Object.assign({}, ...ancestors);
+      });
+      assert.deepEqual(
+        menuGroups(entries, { ...context, ...JSON.parse((await link.getAttribute('data-vscode-context'))!) }).flat(),
+        [],
+      );
+      assert.match((await link.getAttribute('aria-label'))!, /Open session:/);
+    }
+    await page.evaluate('window.__posted.length = 0');
+    await page.locator('a[data-link] strong').click();
+    await page.locator('table a[data-link]').focus();
+    await page.keyboard.press('Enter');
+    await page.locator('a[data-link]').filter({ hasText: 'Scoped session' }).click();
+    await page.locator('a[data-link]').filter({ hasText: 'Invalid session' }).click();
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'showSession', session: id, responseLink: true },
+      { type: 'showSession', session: id, responseLink: true },
+      { type: 'showSession', session: id, responseLink: true },
+    ]);
+  } finally {
+    await browser.close();
+  }
+});
+
 test('a rendered Markdown table link offers Copy Link for its destination', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
