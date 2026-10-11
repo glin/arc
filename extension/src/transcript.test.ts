@@ -277,7 +277,7 @@ import {
 } from './agentspend.ts';
 import { estimateCost, quoteUsage } from './pricing.ts';
 import { renderInlineMarkdown } from './richtext.ts';
-import type { BackwardRangeReader, TurnCommit } from './transcript.ts';
+import type { BackwardRangeReader, TurnCommit, TurnUsage } from './transcript.ts';
 import {
   projectsRoot,
   readTurns,
@@ -380,7 +380,15 @@ import {
 } from './derivedcache.ts';
 import type { TurnOutcome } from './transcript.ts';
 import {
+  ADVISOR_EXECUTOR,
+  ADVISOR_ITERATIONS,
+  ADVISOR_MODEL,
+  advisorIteration,
+  advisorProbeRecords,
+  advisorResponseRecords,
   bgAwaySummaryTranscript,
+  claudeCompactionTranscript,
+  COMPACTION_SAMPLES,
   bgSessionTranscript,
   bgWorkerFollowUpTranscript,
   claudeDispatchTranscript,
@@ -9528,6 +9536,7 @@ test('Claude usage events retain request metadata and deduplicate after state is
     visibleTurnId: null,
     cacheLifetime: null,
     compactionsBefore: 0,
+    contextTokens: 24,
     usage: {
       requests: 1,
       input: 12,
@@ -15776,4 +15785,117 @@ test('a subagent head read counts its bounded bytes once and a cached head count
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('a Claude advisor consultation is its own request, and the executor prices and measures from its passes', () => {
+  const reducer = createClaudeUsageLineReducer();
+  const events = advisorProbeRecords().flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+  assert.deepEqual(
+    events.map((event) => [event.model, event.usageOrigin ?? null, event.requestKey]),
+    [
+      [ADVISOR_EXECUTOR, null, 'claude:msg_011CfvBmiDT7FY5p5pPVZ2WC'],
+      [ADVISOR_MODEL, 'claude-advisor', 'claude:msg_011CfvBmiDT7FY5p5pPVZ2WC:advisor:1'],
+    ],
+  );
+  // The top-level split names only the first pass's hour writes. The last pass wrote 244 five-minute tokens.
+  assert.deepEqual(events[0].usage, {
+    requests: 1,
+    input: 4,
+    cacheRead: 43_227,
+    cacheWrite1h: 43_227,
+    cacheWrite5m: 244,
+    cacheWrite30m: 0,
+    output: 41,
+    thinking: 0,
+  });
+  const price = events.reduce((sum, event) => sum + (estimateCost(event.usage, event.model) ?? Number.NaN), 0);
+  assert.ok(Math.abs(price - 0.10366307) < 1e-9, String(price));
+  // The context is what the last executor pass read: 2 input, 43,227 cache read and 244 cache write.
+  assert.equal(reducer.snapshot().lastRequest?.tokens, 43_473);
+  assert.equal(events[0].contextTokens, 43_473);
+  assert.equal(events[1].contextTokens, undefined);
+  assert.equal(reducer.snapshot().firstRequestCachedTokens, 43_227);
+  const file = path.join(tempDir('advisor-turns-'), 'advisor-probe.jsonl');
+  fs.writeFileSync(
+    file,
+    advisorProbeRecords()
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const turn = readTurns(file, 'advisor-probe').at(-1)!;
+  assert.equal(turn.contextTokens, 43_473);
+  assert.deepEqual(
+    turn.usageParts?.map((part) => [part.model, part.usage.requests, part.usageOrigin ?? null]),
+    [
+      [ADVISOR_EXECUTOR, 1, null],
+      [ADVISOR_MODEL, 1, 'claude-advisor'],
+    ],
+  );
+});
+
+test('a child read replaces each advisor consultation of a growing response, across a restored state', () => {
+  // The child transcript writes the response while it runs, so later records carry more iterations.
+  const lines = [1, 2, 3, 3].map((count) =>
+    JSON.stringify(
+      advisorResponseRecords({ sidechain: true, blocks: 1, iterations: ADVISOR_ITERATIONS.slice(0, count) })[0],
+    ),
+  );
+  const totals = (events: readonly { model: string | null; usage: TurnUsage }[]) => {
+    const byModel = new Map<string | null, [number, number]>();
+    for (const { model, usage } of events) {
+      const [requests, tokens] = byModel.get(model) ?? [0, 0];
+      byModel.set(model, [
+        requests + (usage.requests ?? 0),
+        tokens + usage.input + usage.output + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m,
+      ]);
+    }
+    return [...byModel].filter(([, [requests, tokens]]) => requests || tokens);
+  };
+  const single = [
+    [ADVISOR_EXECUTOR, [1, 4 + 41 + 43_227 + 43_227 + 244]],
+    [ADVISOR_MODEL, [1, 44_807 + 492]],
+  ];
+  const full = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  assert.deepEqual(totals(lines.flatMap((line) => full.pushLine(line))), single);
+  const first = createClaudeUsageLineReducer(undefined, { childTranscript: true });
+  const head = lines.slice(0, 2).flatMap((line) => first.pushLine(line));
+  // A saved state is JSON, so the resumed read starts from a JSON copy.
+  const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())), { childTranscript: true });
+  assert.deepEqual(totals([...head, ...lines.slice(2).flatMap((line) => resumed.pushLine(line))]), single);
+});
+
+test('a child agent names its executor model when its advisor used more tokens', () => {
+  const iterations = [
+    advisorIteration({ input_tokens: 10, output_tokens: 5 }),
+    advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 50_000, output_tokens: 600 }),
+  ];
+  const file = path.join(tempDir('advisor-child-'), 'agent-advisor.jsonl');
+  fs.writeFileSync(file, JSON.stringify(advisorResponseRecords({ sidechain: true, iterations })[0]) + '\n');
+  const spend = readClaudeAgentSpend(file);
+  assert.equal(spend.ownModel, ADVISOR_EXECUTOR);
+  assert.deepEqual(spend.models.map((model) => model.model).sort(), [ADVISOR_EXECUTOR, ADVISOR_MODEL]);
+});
+
+test('an advisor consultation before a compaction leaves the compaction estimate unchanged', () => {
+  const row = COMPACTION_SAMPLES[0];
+  const estimate = (advised: boolean) => {
+    const records = claudeCompactionTranscript(row).map((record) => {
+      const message = (record as { message?: { id?: string; usage?: Record<string, unknown> } }).message;
+      if (!advised || message?.id !== 'answer-1' || !message.usage) return record;
+      const consultation = advisorIteration({
+        type: 'advisor_message',
+        model: ADVISOR_MODEL,
+        input_tokens: 400_000,
+        output_tokens: 900,
+      });
+      const usage = { ...message.usage, iterations: [{ type: 'message', ...message.usage }, consultation] };
+      return { ...record, message: { ...message, usage } };
+    });
+    const reducer = createClaudeUsageLineReducer();
+    const events = records.flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+    return events.filter((event) => event.compactionEstimate).map((event) => [event.model, event.usage]);
+  };
+  const plain = estimate(false);
+  assert.equal(plain.length, 1);
+  assert.deepEqual(estimate(true), plain);
 });

@@ -228,6 +228,10 @@ function inputTokens(request: SessionRequest): number {
   );
 }
 
+function requestContextTokens(request: SessionRequest): number {
+  return request.contextTokens ?? inputTokens(request);
+}
+
 function requestQuote(request: SessionRequest) {
   return request.incomplete || ((request.unclassifiedCacheWrite ?? 0) > 0 && typeof request.reportedCost !== 'number')
     ? null
@@ -256,7 +260,8 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
     excludedAmbiguous: 0,
     largest: [],
   };
-  const rows = requests.filter((request) => !request.evidenceOnly);
+  // An advisor consultation reads the session uncached, so it is no cache-expiry neighbor.
+  const rows = requests.filter((request) => !request.evidenceOnly && !request.usageOrigin);
   for (let index = 1; index < rows.length; index++) {
     const before = rows[index - 1];
     const after = rows[index];
@@ -321,7 +326,7 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
         : quoteOf({ ...after.usage, requests: 1, cacheRead: 0, output: 0, thinking: 0 });
     if (!quote) report.inputCostAfterExpiryUsd = null;
     else if (report.inputCostAfterExpiryUsd !== null) report.inputCostAfterExpiryUsd += quote.cost;
-    const rebuilt = quote ? cacheExpiryRebuiltUsage(inputTokens(before), after.usage) : null;
+    const rebuilt = quote ? cacheExpiryRebuiltUsage(requestContextTokens(before), after.usage) : null;
     const paid = rebuilt ? quoteOf(rebuilt.paid) : null;
     const asRead = rebuilt ? quoteOf(rebuilt.asRead) : null;
     if (!paid || !asRead) report.extraCostAfterExpiryUsd = null;
@@ -507,7 +512,8 @@ export function summarizeRequests(
     0,
   );
   const allPriced = priced.length === count;
-  const contexts = pricedRequests.map(inputTokens);
+  // An advisor consultation's input is its own uncached read, not the session's context.
+  const contexts = pricedRequests.filter((request) => !request.usageOrigin).map(requestContextTokens);
   const fifths: (number | null)[] = [];
   for (let index = 0; index < Math.min(5, count); index++) {
     const start = Math.floor((index * count) / Math.min(5, count));
@@ -567,9 +573,12 @@ export function summarizeRequests(
     ...(legacy ? { estimatedCostUsd: round(estimated, 4) } : {}),
     costPerRequest: allPriced && requestCountExact ? round(total / count, 4) : null,
     costPerRequestByFifth: fifths,
-    contextMean: contextExact ? roundHalfEven(contexts.reduce((sum, value) => sum + value, 0) / count) : null,
-    contextMax: contextExact ? contexts.reduce((max, value) => Math.max(max, value), 0) : null,
-    contextFirst: contextExact ? contexts[0] : null,
+    contextMean:
+      contextExact && contexts.length
+        ? roundHalfEven(contexts.reduce((sum, value) => sum + value, 0) / contexts.length)
+        : null,
+    contextMax: contextExact && contexts.length ? contexts.reduce((max, value) => Math.max(max, value), 0) : null,
+    contextFirst: contextExact && contexts.length ? contexts[0] : null,
     uncachedInputTokens: pricedRequests.reduce((sum, request) => sum + request.usage.input, 0),
     cachedInputTokens: pricedRequests.reduce((sum, request) => sum + request.usage.cacheRead, 0),
     cacheWriteInputTokens: pricedRequests.reduce(
@@ -772,6 +781,7 @@ export function sessionCostReport(
     if (launch < 0) throw new Error(`No Agent launch found for agent id ${agentId} in ${parent.file}`);
     const rows = allParentRequests.slice(launch).filter((request) => until === null || request.timestamp <= until);
     const costs = rows.map(requestQuote);
+    const contexts = rows.filter((request) => !request.usageOrigin).map(requestContextTokens);
     parentWindow = {
       agentIdStartRequest: allParentRequests[launch].requestKey.replace(/^claude:/, ''),
       until: until === null ? null : new Date(until).toISOString(),
@@ -782,8 +792,8 @@ export function sessionCostReport(
             4,
           )
         : null,
-      contextAtStart: rows.length ? inputTokens(rows[0]) : null,
-      contextAtPeak: rows.length ? rows.reduce((peak, request) => Math.max(peak, inputTokens(request)), 0) : null,
+      contextAtStart: contexts.length ? contexts[0] : null,
+      contextAtPeak: contexts.length ? contexts.reduce((peak, tokens) => Math.max(peak, tokens), 0) : null,
       ...(options.byToolKind ? { byToolKind: toolKindCosts(rows) } : {}),
     };
   }

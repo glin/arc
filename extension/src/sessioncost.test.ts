@@ -1,4 +1,13 @@
-import { bedrockAstraRecords } from './turnfixtures';
+import {
+  ADVISOR_EXECUTOR,
+  ADVISOR_ITERATIONS,
+  ADVISOR_MODEL,
+  ADVISOR_MODEL_USAGE,
+  advisorIteration,
+  advisorProbeRecords,
+  advisorResponseRecords,
+  bedrockAstraRecords,
+} from './turnfixtures';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -3610,4 +3619,134 @@ test('cache-expiry evidence reports the cost a warm cache would have saved besid
     expiry.extraCostAfterExpiryUsd,
     Number((300_000 * (rate('cacheWrite5m') - rate('cacheRead'))).toFixed(4)),
   );
+});
+
+test('session cost prices a Claude advisor consultation at the advisor model rates', () => {
+  const root = directory();
+  const projects = path.join(root, 'projects');
+  const file = write(path.join(projects, 'advisor-probe', 'advisor-probe.jsonl'), advisorProbeRecords());
+  const report = sessionCostReport(file, {
+    roots: { codexSessions: path.join(root, 'sessions'), projects },
+    byModel: true,
+  });
+  const executor = ADVISOR_MODEL_USAGE[ADVISOR_EXECUTOR].costUSD;
+  const advisor = ADVISOR_MODEL_USAGE[ADVISOR_MODEL].costUSD;
+  assert.equal(report.parent.requests, 2);
+  assert.equal(report.parent.unpricedRequests, 0);
+  assert.equal(report.parent.costUsd, Number((executor + advisor).toFixed(4)));
+  assert.deepEqual(
+    [report.parent.contextFirst, report.parent.contextMean, report.parent.contextMax],
+    [43_473, 43_473, 43_473],
+  );
+  assert.deepEqual(
+    report.parent.modelCosts?.map((row) => [row.model, row.requests, row.costUsd]),
+    [
+      [ADVISOR_EXECUTOR, 1, Number(executor.toFixed(4))],
+      [ADVISOR_MODEL, 1, Number(advisor.toFixed(4))],
+    ],
+  );
+  // The CLI priced the executor's five-minute writes from its last pass, which the top-level split omits.
+  const unrounded = readSessionRequests(file)
+    .filter((request) => !request.evidenceOnly)
+    .reduce(
+      (sum, request) =>
+        sum +
+        (quoteUsage({ usage: request.usage, model: request.model, provider: null, contextWindow: null })?.cost ?? NaN),
+      0,
+    );
+  assert.ok(Math.abs(unrounded - (executor + advisor)) < 1e-9, String(unrounded));
+});
+
+test('advisor consultations stay out of cache-expiry returns and context figures', () => {
+  const root = directory();
+  const first = [
+    advisorIteration({
+      input_tokens: 3,
+      output_tokens: 20,
+      cache_creation: { ephemeral_5m_input_tokens: 30_000, ephemeral_1h_input_tokens: 0 },
+    }),
+    advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 90_000, output_tokens: 400 }),
+    advisorIteration({ input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 30_000 }),
+  ];
+  // Ten minutes later the five-minute write has lapsed, and the next response writes the prefix again.
+  const later = [
+    advisorIteration({
+      input_tokens: 4,
+      output_tokens: 12,
+      cache_creation: { ephemeral_5m_input_tokens: 60_050, ephemeral_1h_input_tokens: 0 },
+    }),
+    advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 95_000, output_tokens: 300 }),
+  ];
+  const summary = (advised: boolean) => {
+    const keep = (items: typeof first) => (advised ? items : items.filter((item) => item.type === 'message'));
+    const records = [
+      ...advisorResponseRecords({ id: 'first', iterations: keep(first) }),
+      ...advisorResponseRecords({ id: 'later', at: 600, iterations: keep(later) }),
+    ];
+    return summarizeRequests(readSessionRequests(write(path.join(root, `${advised}.jsonl`), records)));
+  };
+  const advised = summary(true);
+  const plain = summary(false);
+  assert.equal(advised.requests, plain.requests + 2);
+  assert.equal(plain.cacheExpiry?.returns, 1);
+  assert.equal(advised.contextFirst, 30_002);
+  assert.equal(plain.contextFirst, 30_002);
+  const figures = ({ cacheExpiry, contextMean, contextMax }: typeof plain) => ({
+    returns: cacheExpiry?.returns,
+    contextMean,
+    contextMax,
+  });
+  assert.deepEqual(figures(advised), figures(plain));
+  assert.equal(advised.contextMean, 45_028);
+  assert.equal(advised.contextMax, 60_054);
+  assert.equal(advised.cacheExpiry?.extraCostAfterExpiryUsd, 0.0035);
+});
+
+test('an advisor cannot become the parent window peak context after an Agent launch', () => {
+  const root = directory();
+  const launch = {
+    type: 'assistant',
+    uuid: 'launch-record',
+    timestamp: '2026-10-11T09:08:09Z',
+    message: {
+      id: 'launch',
+      role: 'assistant',
+      model: ADVISOR_EXECUTOR,
+      content: [{ type: 'tool_use', id: 'agent-call', name: 'Agent', input: { prompt: 'Review.' } }],
+      usage: { input_tokens: 30_000, output_tokens: 10 },
+    },
+  };
+  const result = {
+    type: 'user',
+    timestamp: '2026-10-11T09:08:09.500Z',
+    toolUseResult: { agentId: 'child' },
+    message: { content: [{ type: 'tool_result', tool_use_id: 'agent-call', content: 'Finished.' }] },
+  };
+  const file = write(path.join(root, 'parent.jsonl'), [
+    launch,
+    result,
+    ...advisorResponseRecords({
+      iterations: [
+        advisorIteration({ input_tokens: 20_000, output_tokens: 10 }),
+        advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 95_000, output_tokens: 300 }),
+        advisorIteration({ input_tokens: 40_000, output_tokens: 20 }),
+      ],
+    }),
+  ]);
+  const report = sessionCostReport(file, { windowAgent: 'child' });
+  assert.equal(report.parentWindow?.requests, 3);
+  assert.equal(report.parentWindow?.contextAtStart, 30_000);
+  assert.equal(report.parentWindow?.contextAtPeak, 40_000);
+  assert.equal(report.parentWindow?.costUsd, report.parent.costUsd);
+  assert.ok((report.parentWindow?.costUsd ?? 0) > 0.19);
+});
+
+test('an unknown Claude usage iteration leaves the session cost partial', () => {
+  const root = directory();
+  const iterations = [...ADVISOR_ITERATIONS, advisorIteration({ type: 'future_message', input_tokens: 500 })];
+  const file = write(path.join(root, 'unknown.jsonl'), advisorResponseRecords({ iterations }));
+  const summary = summarizeRequests(readSessionRequests(file));
+  assert.equal(summary.requests, 2);
+  assert.equal(summary.unpricedRequests, 1);
+  assert.equal(summary.costUsd, null);
 });

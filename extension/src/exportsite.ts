@@ -215,7 +215,7 @@ function sessionCostUsage(part: ExportCostPart): SessionCostUsage & TurnUsagePar
     ...(part.scope?.startsWith('invocation:') ? { linkedInvocationId: part.scope.slice('invocation:'.length) } : {}),
     ...(part.estimated ? { compactionEstimate: true as const } : {}),
     ...(part.compactionUsage ? { compactionUsage: true as const } : {}),
-    ...(part.origin === 'claude-cost-state' ? { usageOrigin: part.origin } : {}),
+    ...(part.origin === 'claude-cost-state' || part.origin === 'claude-advisor' ? { usageOrigin: part.origin } : {}),
     usage: usage(part.usage),
   };
 }
@@ -283,6 +283,7 @@ export function exportTurn(value: ExportTurn, agent: 'claude' | 'codex', session
         costBasis: part.costBasis ?? undefined,
         unclassifiedCacheWrite: part.unclassifiedCacheWrite,
         usage: usage(part.usage),
+        usageParts: [sessionCostUsage(part)],
       })),
       spendFound: agent.spendFound ?? false,
       spendPartial: agent.partial,

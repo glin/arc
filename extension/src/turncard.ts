@@ -71,6 +71,7 @@ import {
   responseAnswerIndex,
   sameCommitSha,
   shortenTo,
+  type UsageOrigin,
 } from './transcript';
 import { formatClock, formatDuration, formatRelative, formatTokens, formatWhen, shortModel } from './turnformat';
 import { turnKey } from './turnread';
@@ -972,6 +973,12 @@ function agentCostEntries(agent: TurnAgent, runner: AgentKind, noEnding: boolean
     agent.outputRateModel ? agent.outputRate : undefined,
     runner,
     agent.outputRateModel,
+    cacheDetailUsage(
+      total,
+      agent.spend.flatMap<Pick<SessionCostUsage, 'usage' | 'usageOrigin'>>((spend) =>
+        spend.usageParts?.length ? spend.usageParts : [spend],
+      ),
+    ),
   );
   if (usage.length) {
     entries.push({ ...usage[0], separateBefore: true }, ...usage.slice(1));
@@ -1100,6 +1107,12 @@ function agentTokensFigure(agent: TurnAgent, priced: boolean, running = false, n
             agent.outputRateModel ? agent.outputRate : undefined,
             'codex',
             agent.outputRateModel,
+            cacheDetailUsage(
+              total,
+              agent.spend.flatMap<Pick<SessionCostUsage, 'usage' | 'usageOrigin'>>((spend) =>
+                spend.usageParts?.length ? spend.usageParts : [spend],
+              ),
+            ),
           ),
           ...(running ? { footer: [noEnding ? AGENT_USAGE_NO_ENDING : AGENT_USAGE_SO_FAR] } : {}),
         },
@@ -1666,9 +1679,9 @@ function detailedTokens(tokens: number): string {
   return tokens < 10_000 ? Math.round(tokens).toLocaleString('en-US') : formatTokens(tokens);
 }
 
-function inputTokenCategoryLines(usage: Turn['usage']): string[] {
+function inputTokenCategoryLines(usage: Turn['usage'], cacheUsage = usage): string[] {
   const out: string[] = [];
-  const hit = cacheHitPercent(usage);
+  const hit = cacheHitPercent(cacheUsage);
   if (usage.cacheRead) {
     out.push(
       `Cached input reads: ${detailedTokens(usage.cacheRead)} tokens${hit == null ? '' : ` (${hit}% of input)`}`,
@@ -1712,6 +1725,7 @@ function usageDetailEntries(
   measurement?: OutputRate,
   provider: AgentKind = 'claude',
   measuredModel?: string,
+  cacheUsage = u,
 ): StatDetailEntry[] {
   const entries: StatDetailEntry[] = [...lead];
   const input = inputSideTokens(u);
@@ -1743,7 +1757,7 @@ function usageDetailEntries(
     });
   }
   const requests = u.requests ?? 0;
-  const average = averageContextPerRequest(u);
+  const average = averageContextPerRequest(cacheUsage);
   if (requests) {
     entries.push({
       label: 'Model requests',
@@ -1753,11 +1767,23 @@ function usageDetailEntries(
         : {}),
     });
   }
-  const breakdown = inputTokenCategoryLines(u);
+  const breakdown = inputTokenCategoryLines(u, cacheUsage);
   if (breakdown.length) {
     entries.push({ label: 'Input breakdown', separateBefore: true, lines: breakdown });
   }
   return entries;
+}
+
+function cacheDetailUsage(
+  total: Turn['usage'],
+  parts: readonly Pick<SessionCostUsage, 'usage' | 'usageOrigin' | 'compactionEstimate' | 'compactionUsage'>[],
+): Turn['usage'] {
+  if (!parts.length) return total;
+  const usage = emptyUsage();
+  for (const part of parts) {
+    if (!part.usageOrigin && !part.compactionEstimate && !part.compactionUsage) addUsage(usage, part.usage);
+  }
+  return usage;
 }
 
 // Token detail includes main-agent usage alone when the turn has children.
@@ -1767,6 +1793,8 @@ function tokenDetailList(turn: Turn): StatDetailList {
     turn.agents.length ? [{ label: 'Main agent only' }] : [],
     turn.interrupted ? undefined : turn.outputRate,
     turn.agent,
+    undefined,
+    cacheDetailUsage(turn.usage, turn.usageParts ?? []),
   );
   return { entries };
 }
@@ -4664,7 +4692,7 @@ function costStat(
 }
 
 export interface SessionCostUsage {
-  usageOrigin?: 'claude-cost-state';
+  usageOrigin?: UsageOrigin;
   linkedInvocationId?: string | null;
   agent?: string | null;
   role?: 'main' | 'delegated';
@@ -4714,8 +4742,8 @@ export function cacheWriteWarnings(scopes: readonly CacheWriteScope[]): CacheWri
       let scopeCost = 0;
       let cacheWriteCost = 0;
       for (const part of scope.parts) {
-        // Compaction requests and cost snapshots supply no cache-write warning.
-        if (part.compactionEstimate || part.compactionUsage || part.usageOrigin === 'claude-cost-state') {
+        // Compaction requests, cost snapshots and advisor consultations supply no cache-write warning.
+        if (part.compactionEstimate || part.compactionUsage || part.usageOrigin) {
           continue;
         }
         if (
@@ -5154,11 +5182,10 @@ function sessionCostIdentityEntries(
     });
 }
 
-function delegatedCacheRateDetail(
-  usage: Turn['usage'],
-  allCosts: readonly PricedSessionCost[],
-): { cacheHit?: CacheHitDetail } {
+function delegatedCacheRateDetail(allCosts: readonly PricedSessionCost[]): { cacheHit?: CacheHitDetail } {
   const costs = recordedCosts(allCosts);
+  const usage = emptyUsage();
+  for (const cost of costs) addUsage(usage, cost.part.usage);
   const exactRequests = costs.every(
     (cost) => cost.part.requestCountExact !== false && cost.part.usage.requests !== undefined,
   );
@@ -5199,7 +5226,6 @@ function delegatedCostLines(
       priced: boolean;
       partial: boolean;
       reasons: Set<string>;
-      usage: Turn['usage'];
       complete: boolean;
       costs: PricedSessionCost[];
     }
@@ -5212,7 +5238,6 @@ function delegatedCostLines(
       priced: false,
       partial: false,
       reasons: new Set<string>(),
-      usage: emptyUsage(),
       complete: true,
       costs: [],
     };
@@ -5221,9 +5246,6 @@ function delegatedCostLines(
       held.priced = true;
     }
     held.costs.push(cost);
-    if (!cost.part.compactionEstimate && !cost.part.compactionUsage) {
-      addUsage(held.usage, cost.part.usage);
-    }
     held.complete = held.complete && !cost.part.incomplete && !cost.part.unclassifiedCacheWrite;
     held.partial = held.partial || cost.partial;
     if (cost.partial) {
@@ -5246,17 +5268,14 @@ function delegatedCostLines(
           : 'no billed usage';
       return {
         text: `${identity.label}: ${value}`,
-        ...(identity.complete && !short ? delegatedCacheRateDetail(identity.usage, identity.costs) : {}),
+        ...(identity.complete && !short ? delegatedCacheRateDetail(identity.costs) : {}),
       };
     });
 }
 
-// The costs priced from ordinary recorded requests.
+// The costs priced from ordinary recorded requests. Advisor consultations read no session cache.
 function recordedCosts(costs: readonly PricedSessionCost[]): PricedSessionCost[] {
-  return costs.filter(
-    (cost) =>
-      !cost.part.compactionEstimate && !cost.part.compactionUsage && cost.part.usageOrigin !== 'claude-cost-state',
-  );
+  return costs.filter((cost) => !cost.part.compactionEstimate && !cost.part.compactionUsage && !cost.part.usageOrigin);
 }
 
 function requestInputOf(usage: Turn['usage']): number {

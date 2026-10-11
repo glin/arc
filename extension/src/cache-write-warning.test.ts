@@ -298,3 +298,15 @@ test('same-model delegated scopes cannot pool input cost or requests into a warn
   assert.deepEqual(flags([child('a', 250000), child('b', 100)]), [true]);
   assert.deepEqual(flags([child(undefined, 500000)]), [false]);
 });
+
+test('cache-write warning leaves advisor consultations out of its shares', () => {
+  // An advisor reads the session uncached at its own model's rates.
+  const advisor = part({
+    model: 'claude-opus-5',
+    usageOrigin: 'claude-advisor',
+    usage: counts({ requests: 5, input: 3_000_000, output: 20_000 }),
+  });
+  const baseline = cacheWriteWarnings([main(part())]);
+  assert.equal(baseline.length, 1);
+  assert.deepEqual(cacheWriteWarnings([main(part(), advisor)]), baseline);
+});

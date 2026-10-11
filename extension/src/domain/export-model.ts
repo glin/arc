@@ -59,7 +59,7 @@ export interface ExportCostPart {
   requestCountExact: boolean;
   estimated: boolean;
   compactionUsage?: true;
-  origin: 'recorded' | 'claude-cost-state';
+  origin: 'recorded' | 'claude-cost-state' | 'claude-advisor';
   usage: ExportUsage;
 }
 export interface ExportCost {

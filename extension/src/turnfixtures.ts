@@ -1492,6 +1492,142 @@ export function codexContextRecords(session = 's1', compacted = false): Array<Re
 }
 
 // Native child billing shares the parent's session_id and keeps its own thread_id.
+// The advisor probe session: Claude Code with `--model haiku --advisor sonnet`. One response
+// consulted the advisor and was recorded as three content-block records with one shared usage.
+export const ADVISOR_EXECUTOR = 'claude-haiku-5-5';
+export const ADVISOR_MODEL = 'claude-sonnet-5-5';
+// The cost-state `modelUsage` of the probe session, with the CLI's own prices.
+export const ADVISOR_MODEL_USAGE = {
+  [ADVISOR_EXECUTOR]: {
+    inputTokens: 4,
+    outputTokens: 41,
+    cacheReadInputTokens: 43227,
+    cacheCreationInputTokens: 43471,
+    costUSD: 0.00912907,
+  },
+  [ADVISOR_MODEL]: {
+    inputTokens: 44807,
+    outputTokens: 492,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    costUSD: 0.094534,
+  },
+};
+
+export interface AdvisorIteration {
+  type: string;
+  model?: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_creation: { ephemeral_5m_input_tokens: number; ephemeral_1h_input_tokens: number };
+}
+
+export function advisorIteration(over: Partial<AdvisorIteration> = {}): AdvisorIteration {
+  const write5m = over.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+  const write1h = over.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+  return {
+    type: 'message',
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: write5m + write1h,
+    cache_creation: { ephemeral_5m_input_tokens: write5m, ephemeral_1h_input_tokens: write1h },
+    ...over,
+  };
+}
+
+// The probe response's iterations: an executor pass, the advisor consultation, then the executor's answer pass.
+export const ADVISOR_ITERATIONS: readonly AdvisorIteration[] = [
+  advisorIteration({
+    input_tokens: 2,
+    output_tokens: 26,
+    cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 43227 },
+  }),
+  advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 44807, output_tokens: 492 }),
+  advisorIteration({
+    input_tokens: 2,
+    output_tokens: 15,
+    cache_read_input_tokens: 43227,
+    cache_creation: { ephemeral_5m_input_tokens: 244, ephemeral_1h_input_tokens: 0 },
+  }),
+];
+
+export interface AdvisorResponseOptions {
+  id?: string;
+  // Seconds after the probe's first assistant record.
+  at?: number;
+  iterations?: readonly AdvisorIteration[];
+  sidechain?: boolean;
+  // How many of the three content-block records to write.
+  blocks?: number;
+}
+
+const ADVISOR_PROBE_AT = Date.parse('2026-10-11T09:08:10.214Z');
+
+// The content-block records of one advisor response. Top-level usage sums the executor passes
+// and carries a cache-write split that names only the first pass's writes, as the probe recorded it.
+export function advisorResponseRecords(options: AdvisorResponseOptions = {}): object[] {
+  const id = options.id ?? 'msg_011CfvBmiDT7FY5p5pPVZ2WC';
+  const iterations = options.iterations ?? ADVISOR_ITERATIONS;
+  const passes = iterations.filter((item) => item.type === 'message');
+  const sum = (field: 'input_tokens' | 'output_tokens' | 'cache_read_input_tokens' | 'cache_creation_input_tokens') =>
+    passes.reduce((total, item) => total + item[field], 0);
+  const usage = {
+    input_tokens: sum('input_tokens'),
+    cache_creation_input_tokens: sum('cache_creation_input_tokens'),
+    cache_read_input_tokens: sum('cache_read_input_tokens'),
+    output_tokens: sum('output_tokens'),
+    cache_creation: passes[0]?.cache_creation ?? { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+    iterations,
+  };
+  const content = [
+    { type: 'server_tool_use', id: `${id}-advisor`, name: 'advisor', input: {} },
+    {
+      type: 'advisor_tool_result',
+      tool_use_id: `${id}-advisor`,
+      content: { type: 'advisor_redacted_result', encrypted_content: 'redacted' },
+    },
+    { type: 'text', text: 'Canberra.' },
+  ].slice(0, options.blocks ?? 3);
+  const offsets = [0, 5257, 5281];
+  return content.map((block, index) => ({
+    type: 'assistant',
+    uuid: `${id}-block-${index}`,
+    sessionId: 'advisor-probe',
+    isSidechain: options.sidechain === true,
+    effort: 'medium',
+    advisorModel: 'sonnet',
+    timestamp: new Date(ADVISOR_PROBE_AT + (options.at ?? 0) * 1000 + offsets[index]).toISOString(),
+    message: {
+      id,
+      type: 'message',
+      role: 'assistant',
+      model: ADVISOR_EXECUTOR,
+      content: [block],
+      stop_reason: 'end_turn',
+      usage,
+    },
+  }));
+}
+
+// The probe session: its prompt, the advisor response, a later timed record, and the process-end record.
+export function advisorProbeRecords(): object[] {
+  return [
+    {
+      type: 'user',
+      uuid: 'advisor-prompt',
+      sessionId: 'advisor-probe',
+      timestamp: '2026-10-11T09:08:09.292Z',
+      message: { role: 'user', content: 'Before you answer, consult the advisor tool once.' },
+    },
+    ...advisorResponseRecords(),
+    { type: 'system', subtype: 'stop_hook_summary', timestamp: '2026-10-11T09:08:15.629Z' },
+    claudeCostState(ADVISOR_MODEL_USAGE, 1791709688209, 'advisor-probe'),
+  ];
+}
+
 export function bedrockAstraRecords(child = false): object[] {
   const parentId = 'bedrock-astra-parent';
   const id = child ? 'bedrock-astra-plato' : parentId;

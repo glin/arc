@@ -99,10 +99,12 @@ import { turnMenuContext } from './view/card-menu.ts';
 import type { SessionCostUsage, SessionOverheads, StatDetailLine, TurnCard } from './turncard.ts';
 import type { TurnStep } from './transcript.ts';
 import { answerPart, commentAnchorText } from './turncomments.ts';
-import { formatWhen } from './turnformat.ts';
+import { formatTokens, formatWhen } from './turnformat.ts';
 import {
   COMPACTION_SAMPLES,
   NOW,
+  advisorProbeRecords,
+  advisorResponseRecords,
   claudeCompactionTranscript,
   compaction,
   counts,
@@ -4417,6 +4419,25 @@ test('the token detail reconciles output, thinking, input and cache volume', () 
     '  5-minute cache writes: 20k tokens',
     '  30-minute cache writes: 30k tokens',
   ]);
+});
+
+test('turn token detail keeps advisor billing and executor cache percentages and averages', () => {
+  const file = path.join(tempDir('advisor-token-detail-'), 'session.jsonl');
+  fs.writeFileSync(
+    file,
+    [advisorProbeRecords()[0], ...advisorResponseRecords(), ...advisorResponseRecords({ id: 'second', at: 30 })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const subject = readSession(file, 'advisor-probe').turns[0];
+  assert.equal(subject.usage.requests, 4);
+  assert.equal(subject.usage.input, 89_622);
+  assert.equal(subject.usage.output, 1_066);
+  const detail = tokenLines(subject).join('\n');
+  assert.match(detail, /Model requests: 4/);
+  assert.match(detail, /Cached input reads: .*\(50% of input\)/);
+  assert.ok(detail.includes(`Average input per request: ${formatTokens(86_702)} tokens`));
+  assert.ok(detail.includes(`Input: ${formatTokens(263_018)} tokens`));
 });
 
 test('token and cost details keep shared usage labels in one relative order', () => {
@@ -10341,6 +10362,36 @@ test('a compaction estimate raises no cache-write warning and leaves the cached 
   assert.equal(both.warnings, undefined);
   assert.deepEqual(both.cacheHit, alone.cacheHit);
   assert.ok(alone.cacheHit, 'the recorded usage carries a cached share');
+});
+
+test('delegated advisor usage cannot dilute executor cache detail or create advisor-only cache detail', () => {
+  const executor: SessionCostUsage = {
+    role: 'delegated',
+    scopeId: 'child',
+    model: 'claude-sonnet-5-5',
+    provider: null,
+    contextWindow: null,
+    usage: { requests: 2, input: 2_000, cacheRead: 18_000, cacheWrite1h: 0, cacheWrite5m: 0, output: 20, thinking: 0 },
+  };
+  const advisor: SessionCostUsage = {
+    ...executor,
+    usageOrigin: 'claude-advisor',
+    usage: { ...executor.usage, requests: 1, input: 95_000, cacheRead: 0, output: 300 },
+  };
+  const detail = (parts: SessionCostUsage[]) => {
+    const projection = sessionCostProjection(parts);
+    const lines = projection.stats[0].detailList!.entries.flatMap((entry) => entry.lines ?? []);
+    return {
+      dollars: projection.total.dollars!,
+      hits: lines.flatMap((line) => (typeof line === 'object' && 'cacheHit' in line ? [line.cacheHit] : [])),
+    };
+  };
+  const plain = detail([executor]);
+  const advised = detail([executor, advisor]);
+  assert.ok(advised.dollars > plain.dollars);
+  assert.deepEqual(advised.hits, [{ percent: 90, warning: false, requestScale: [2, 10_000] }]);
+  assert.deepEqual(advised.hits, plain.hits);
+  assert.deepEqual(detail([advisor]).hits, []);
 });
 
 // Unjoined dispatched cost marks the delegated remainder across detail layouts. Independently priced scopes and model entries keep their own totals.

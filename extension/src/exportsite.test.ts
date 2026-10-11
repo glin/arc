@@ -6,7 +6,7 @@ import { EXPORT_LIMITS } from './exportlimits';
 import { ExportTransaction, ExportCancelled } from './exportwriter';
 import { exportCard, exportTurn, exportScriptJson, projectSessionSite } from './exportsite';
 import { type SessionStatChip, toCard } from './turncard';
-import { turn, sessionSiteFixture, exportedSiteData } from './turnfixtures';
+import { turn, subagent, sessionSiteFixture, exportedSiteData } from './turnfixtures';
 import { tempDir } from './temproot';
 import type { CardView } from './webview/payload-contracts';
 import type { ExportBlock } from './exportdata';
@@ -17,6 +17,31 @@ import { sessionCostProjection } from './turncard';
 import { estimateCost, formatCost } from './pricing';
 import { writeDemoExports } from '../scripts/web-demo-export';
 import { costPartOf, costPartsOf, projectTurn } from './exportdata';
+
+test('export site projection retains advisor origins in child cost and cache detail', () => {
+  const advisor = {
+    model: 'claude-sonnet-5-5',
+    provider: null,
+    contextWindow: null,
+    contextBand: null,
+    inferenceClass: null,
+    serviceTier: null,
+    usageOrigin: 'claude-advisor' as const,
+    usage: { requests: 1, input: 44_807, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 492, thinking: 0 },
+  };
+  const original = turn({
+    agents: [subagent({ model: advisor.model, spend: [{ ...advisor, usageParts: [advisor] }] })],
+  });
+  const saved = projectTurn(original, 'turn', { cwd: '/project' }, [], 'root', new Map());
+  saved.agents[0].spend = [costPartOf({ ...advisor, role: 'delegated' })];
+  const restored = exportTurn(saved, 'claude', 'root');
+  assert.equal(restored.agents[0].spend[0].usageParts?.[0].usageOrigin, 'claude-advisor');
+  const originalCost = toCard(original, false, 1).chips.find((chip) => chip.metric === 'cost')!;
+  const restoredCost = toCard(restored, false, 1).chips.find((chip) => chip.metric === 'cost')!;
+  assert.equal(restoredCost.label, originalCost.label);
+  assert.deepEqual(restoredCost.detailList, originalCost.detailList);
+  assert.doesNotMatch(restoredCost.detail, /of input|avg input|Average input per request/);
+});
 
 test('exported turn cost parts retain recorded compactions across request bands', () => {
   const usage = { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 0, thinking: 0 };
@@ -507,6 +532,7 @@ test('readable exported facts preserve literal source values that match classifi
   }
   assert.equal(exportFactValue('role', 'main'), 'Main agent');
   assert.equal(exportFactValue('ownership', 'navigation'), 'Navigation only, no delegated cost');
+  assert.equal(exportFactValue('origin', 'claude-advisor'), 'claude-advisor');
   assert.match(exportFactValue('dollars', 1.23456789), /1\.23456789 USD/);
 });
 

@@ -562,14 +562,20 @@ export function projectTurn(
     },
     agents: turn.agents.map((agent, index) => ({
       relationships: agent.toolUseId ? (links.get(agent.toolUseId) ?? []) : [],
-      spend: agent.spend.flatMap((part) =>
-        costPartsOf({
-          ...part,
-          provider: part.provider ?? null,
-          contextWindow: part.contextWindow ?? null,
-          role: 'delegated',
-        }),
-      ),
+      spend: agent.spend.flatMap((part) => {
+        const parts =
+          part.usageParts?.length && !(recordedCostBasis(part.costBasis) && part.recordedCost !== undefined)
+            ? part.usageParts
+            : [part];
+        return parts.flatMap((usagePart) =>
+          costPartsOf({
+            ...usagePart,
+            provider: usagePart.provider ?? null,
+            contextWindow: usagePart.contextWindow ?? null,
+            role: 'delegated',
+          }),
+        );
+      }),
       spendFound: agent.spendFound,
       key: `${key}-a${index + 1}`,
       description: agent.description,

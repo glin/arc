@@ -308,8 +308,13 @@ export interface TurnUsagePart {
   // An estimated compaction request, which the transcript recorded no usage for.
   compactionEstimate?: true;
   compactionUsage?: true;
+  usageOrigin?: UsageOrigin;
   usage: TurnUsage;
 }
+
+// Usage that is not one ordinary recorded request. `claude-cost-state` is Claude supplemental
+// accounting from a process-end record. `claude-advisor` is one advisor consultation.
+export type UsageOrigin = 'claude-cost-state' | 'claude-advisor';
 
 function samePricedPart(part: TurnUsagePart, event: UsageEvent | TurnUsagePart): boolean {
   return (
@@ -324,7 +329,8 @@ function samePricedPart(part: TurnUsagePart, event: UsageEvent | TurnUsagePart):
     part.requestCountExact === event.requestCountExact &&
     part.linkedInvocationId === event.linkedInvocationId &&
     part.compactionEstimate === event.compactionEstimate &&
-    part.compactionUsage === event.compactionUsage
+    part.compactionUsage === event.compactionUsage &&
+    part.usageOrigin === event.usageOrigin
   );
 }
 
@@ -371,6 +377,7 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
     ...(event.linkedInvocationId === undefined ? {} : { linkedInvocationId: event.linkedInvocationId }),
     ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
     ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
+    ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
     usage,
   });
 }
@@ -439,6 +446,8 @@ export interface UsageEvent {
   visibleTurnId?: string | null;
   cacheLifetime?: CacheLifetime | null;
   compactionsBefore?: number;
+  // The final executor pass's input. Billing usage sums every pass of the response.
+  contextTokens?: number;
   usage: TurnUsage;
   requestKey: string;
   responseId?: string;
@@ -449,6 +458,10 @@ export interface UsageEvent {
   // The compaction that the estimated request stands for, which the ordered pass measures the
   // next cache-expiry return from.
   compactionSignal?: CompactionSignal;
+  // A Claude advisor consultation inside the response named by `requestKey`'s parent key. It
+  // bills as its own request of the advisor model and reads the session uncached, so it
+  // counts in cost and request totals and stays out of every context and cache figure.
+  usageOrigin?: 'claude-advisor';
 }
 
 // One compaction in request order, for the cache-expiry scan.
@@ -7012,6 +7025,8 @@ export type ClaudeUsage = {
   inference_geo?: unknown;
   cost_usd?: unknown;
   cost?: unknown;
+  // Per-pass usage of one response. Advisor passes appear only here, never in the top-level fields.
+  iterations?: unknown;
 };
 
 // Kept as JSON data so an incremental scanner can save it beside its byte offset and resume
@@ -7772,6 +7787,70 @@ export function claudeCacheLifetime(usage: ClaudeUsage): CacheLifetime | null {
   return null;
 }
 
+// One recorded Claude response split by `usage.iterations`. The top-level fields count the
+// executor's passes only, and their cache-write split can omit the writes of a later pass.
+interface ClaudeResponseUsage {
+  executor: TurnUsage;
+  lifetime: CacheLifetime | null;
+  // The first and last executor passes. The last one read the context the response ended on.
+  first: TurnUsage;
+  last: TurnUsage;
+  advisors: { index: number; model: string | null; usage: TurnUsage }[];
+  // An iteration of a type this reader does not price.
+  unknownIterations: boolean;
+}
+
+function claudeResponseUsage(usage: ClaudeUsage): ClaudeResponseUsage {
+  const iterations = Array.isArray(usage.iterations) ? (usage.iterations as unknown[]) : [];
+  const passes: ClaudeUsage[] = [];
+  const advisors: ClaudeResponseUsage['advisors'] = [];
+  let unknownIterations = false;
+  iterations.forEach((iteration, index) => {
+    const item =
+      iteration && typeof iteration === 'object' ? (iteration as ClaudeUsage & Record<string, unknown>) : null;
+    if (item?.type === 'message') {
+      passes.push(item);
+    } else if (item?.type === 'advisor_message') {
+      advisors.push({
+        index,
+        model: typeof item.model === 'string' && item.model ? item.model : null,
+        usage: claudeUsage(item),
+      });
+    } else {
+      unknownIterations = true;
+    }
+  });
+  if (!passes.length) {
+    const counted = claudeUsage(usage);
+    const lifetime = claudeCacheLifetime(usage);
+    return { executor: counted, lifetime, first: counted, last: counted, advisors, unknownIterations };
+  }
+  const counted = passes.map(claudeUsage);
+  const executor: TurnUsage = {
+    requests: 1,
+    input: 0,
+    cacheRead: 0,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheWrite30m: 0,
+    output: 0,
+    // The top-level output detail is the executor's own, and passes need not repeat it.
+    thinking: claudeUsage(usage).thinking,
+  };
+  for (const pass of counted) {
+    executor.input += pass.input;
+    executor.cacheRead += pass.cacheRead;
+    executor.cacheWrite1h += pass.cacheWrite1h;
+    executor.cacheWrite5m += pass.cacheWrite5m;
+    executor.output += pass.output;
+  }
+  // Passes that wrote different tiers, or wrote without a split, establish no single lifetime.
+  const written = passes.filter((_, index) => counted[index].cacheWrite1h + counted[index].cacheWrite5m > 0);
+  const lifetimes = new Set(written.map(claudeCacheLifetime));
+  const lifetime = lifetimes.size === 1 ? [...lifetimes][0] : null;
+  return { executor, lifetime, first: counted[0], last: counted[counted.length - 1], advisors, unknownIterations };
+}
+
 function numericUsageField(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
@@ -7893,23 +7972,34 @@ function seenRequestIndex(state: ClaudeUsageReducerState): Set<string> {
   return index;
 }
 
-// Reduces one parsed Claude transcript record into its billed request. The caller owns the
-// state, which makes a full scan and an appended-chunk scan take exactly the same path.
+// The executor request of one parsed Claude transcript record, without its advisor consultations.
+// Readers of context, cache and compaction facts take this one.
 export function reduceClaudeUsageRecord(
   state: ClaudeUsageReducerState,
   record: Record<string, unknown>,
   opts: ClaudeUsageReadOptions = {},
 ): UsageEvent | null {
+  return reduceClaudeUsageRecordEvents(state, record, opts)[0] ?? null;
+}
+
+// Reduces one parsed Claude transcript record into its billed requests: the executor request
+// first, then one request per advisor consultation. The caller owns the state, which makes a
+// full scan and an appended-chunk scan take exactly the same path.
+export function reduceClaudeUsageRecordEvents(
+  state: ClaudeUsageReducerState,
+  record: Record<string, unknown>,
+  opts: ClaudeUsageReadOptions = {},
+): UsageEvent[] {
   if (record.type !== 'assistant') {
-    return null;
+    return [];
   }
   if (record.isSidechain && opts.countSidechain !== true) {
-    return null;
+    return [];
   }
   const message = record.message as ClaudeRequestMessage | undefined;
   const usage = message?.usage;
   if (!usage || message?.model === '<synthetic>') {
-    return null;
+    return [];
   }
   const messageId = typeof message.id === 'string' && message.id ? message.id : null;
   const timestamp = Date.parse(String(record.timestamp ?? ''));
@@ -7918,29 +8008,31 @@ export function reduceClaudeUsageRecord(
     // Parent reads retain every billed request key because content-block repeats can follow many unrelated requests.
     const seen = seenRequestIndex(state);
     if (seen.has(requestKey)) {
-      return null;
+      return [];
     }
     seen.add(requestKey);
     state.seenRequestKeys.push(requestKey);
   }
-  const counted = claudeUsage(usage);
+  const response = claudeResponseUsage(usage);
+  const counted = response.executor;
   const inferenceClass = claudeRequestInferenceClass(messageId, state.modelProfile, usage.inference_geo);
   const serviceTier = claudeServiceTier(usage);
   const model = typeof message.model === 'string' && message.model ? message.model : null;
   // A request without a recorded cache-write lifetime retains the preceding request's lifetime for compaction estimates.
-  state.firstRequestCachedTokens ??=
-    counted.cacheRead + counted.cacheWrite1h + counted.cacheWrite5m + (counted.cacheWrite30m ?? 0);
+  // A response with several executor passes starts from its first pass's prefix and ends on its last pass's context.
+  const { first, last } = response;
+  state.firstRequestCachedTokens ??= first.cacheRead + first.cacheWrite1h + first.cacheWrite5m;
   state.lastRequest = {
-    tokens: counted.input + counted.cacheRead + counted.cacheWrite1h + counted.cacheWrite5m,
-    cacheRead: counted.cacheRead,
-    cacheWrite: counted.cacheWrite1h + counted.cacheWrite5m + (counted.cacheWrite30m ?? 0),
+    tokens: last.input + last.cacheRead + last.cacheWrite1h + last.cacheWrite5m,
+    cacheRead: last.cacheRead,
+    cacheWrite: last.cacheWrite1h + last.cacheWrite5m,
     at: Number.isNaN(timestamp) ? null : timestamp,
-    lifetime: claudeCacheLifetime(usage) ?? state.lastRequest?.lifetime ?? null,
+    lifetime: response.lifetime ?? state.lastRequest?.lifetime ?? null,
     inferenceClass,
     serviceTier,
     model,
   };
-  return {
+  const executor: UsageEvent = {
     timestamp: Number.isNaN(timestamp) ? 0 : timestamp,
     agent: 'claude',
     // Claude records no provider identity on this response. A model family is not proof of
@@ -7959,11 +8051,28 @@ export function reduceClaudeUsageRecord(
     // A sidechain response runs under the child agent's own prompt, and this reader counts
     // no visible turn for it. It reports none rather than the parent turn that was open.
     visibleTurnId: record.isSidechain || state.visibleTurns === 0 ? null : `claude-turn:${state.visibleTurns}`,
-    cacheLifetime: claudeCacheLifetime(usage),
+    cacheLifetime: response.lifetime,
     compactionsBefore: state.compactionCount,
+    contextTokens: state.lastRequest.tokens,
     usage: counted,
     requestKey,
   };
+  // Each consultation bills at its own model's rates. Its key extends the response's key with the
+  // iteration's position, so a child read's growing record replaces each one under the same key.
+  const advisors = response.advisors.map((advisor): UsageEvent => ({
+    ...executor,
+    model: advisor.model,
+    contextBand: contextBandForRequest(advisor.model, null, requestInputTokens(advisor.usage)),
+    reportedCost: null,
+    cacheLifetime: null,
+    contextTokens: undefined,
+    usage: advisor.usage,
+    requestKey: `${requestKey}:advisor:${advisor.index}`,
+    usageOrigin: 'claude-advisor',
+  }));
+  // An iteration type this reader does not price leaves the executor's cost partial.
+  if (response.unknownIterations) executor.incomplete = true;
+  return [executor, ...advisors];
 }
 
 function claudeCompactionPrefixRead(at: number, lifetime: CacheLifetime | null, request: UsageEvent): number | null {
@@ -8093,19 +8202,28 @@ export function reduceClaudeUsageLine(
   line: string,
   opts: ClaudeUsageReadOptions = {},
 ): UsageEvent | null {
+  return reduceClaudeUsageLineEvents(state, line, opts)[0] ?? null;
+}
+
+// The executor request of one line first, then its advisor consultations.
+function reduceClaudeUsageLineEvents(
+  state: ClaudeUsageReducerState,
+  line: string,
+  opts: ClaudeUsageReadOptions = {},
+): UsageEvent[] {
   if (!acceptsClaudeUsageLine(line)) {
-    return null;
+    return [];
   }
   let record: Record<string, unknown>;
   try {
     record = JSON.parse(line) as Record<string, unknown>;
   } catch {
-    return null;
+    return [];
   }
   // Own-spend reads skip this step. They count cost, and an abandoned compaction still billed.
   followClaudeCompactionLineage(state, record, opts.countSidechain === true);
   reduceClaudeTurnRecord(state, record, opts.countSidechain === true);
-  return record.type === 'assistant' ? reduceClaudeUsageRecord(state, record, opts) : null;
+  return record.type === 'assistant' ? reduceClaudeUsageRecordEvents(state, record, opts) : [];
 }
 
 export interface ClaudeUsageLineReducer {
@@ -8257,7 +8375,7 @@ export function createClaudeUsageLineReducer(
     pushLine: (line, end) => {
       state.costState ??= emptyClaudeCostCapture();
       captureClaudeCostLine(state.costState, line, end);
-      const event = reduceClaudeUsageLine(
+      const [event, ...advisors] = reduceClaudeUsageLineEvents(
         state,
         line,
         opts.childTranscript ? { countSidechain: true, emitRepeats: true } : {},
@@ -8268,19 +8386,19 @@ export function createClaudeUsageLineReducer(
         noteClaudeCostEvent(state.costState, estimate);
         return [estimate];
       }
+      // Only the executor request measures the cached prefix that a compaction left.
       if (!event || !opts.childTranscript || !event.requestKey) {
         if (event) noteClaudeCostEvent(state.costState, event);
         const refinements = event ? refineClaudeCompactionEstimate(state, event) : [];
         for (const refinement of refinements) noteClaudeCostEvent(state.costState, refinement);
-        return event ? [...refinements, event] : [];
+        for (const advisor of advisors) noteClaudeCostEvent(state.costState, advisor);
+        return event ? [...refinements, event, ...advisors] : [];
       }
-      const events = replaceClaudeUsageEvent(
-        state,
-        event,
-        opts.retainAllRequests ? Number.POSITIVE_INFINITY : RETAINED_REQUESTS,
-      );
+      const retain = opts.retainAllRequests ? Number.POSITIVE_INFINITY : RETAINED_REQUESTS;
+      const events = replaceClaudeUsageEvent(state, event, retain);
       const refinements = events.includes(event) ? refineClaudeCompactionEstimate(state, event) : [];
       events.unshift(...refinements);
+      for (const advisor of advisors) events.push(...replaceClaudeUsageEvent(state, advisor, retain));
       for (const accepted of events) noteClaudeCostEvent(state.costState, accepted);
       return events;
     },
@@ -8528,6 +8646,8 @@ interface ClaudeOwnSpend {
   revision: string;
   found: boolean;
   byModel: [string | null, TurnUsage][];
+  // The heaviest model of this transcript's own requests, without advisor consultations.
+  executorModel: string | null;
   usageParts: TurnUsagePart[];
   // Retained subagent launch IDs. Failed launch results remove their IDs before metadata matching.
   launches: string[];
@@ -8662,15 +8782,17 @@ function readClaudeOwnSpend(
         partial = true;
       }
     }
-    const event = reduceClaudeUsageRecord(usageState, o, { countSidechain: true, emitRepeats: true });
-    if (event) {
+    for (const event of reduceClaudeUsageRecordEvents(usageState, o, { countSidechain: true, emitRepeats: true })) {
       replaceClaudeUsageEvent(usageState, event, Number.POSITIVE_INFINITY);
     }
   });
   const byRequest = Object.values(usageState.requestEvents ?? {});
   const byModel = new Map<string | null, TurnUsage>();
+  // The row names the model this transcript ran, so an advisor consultation never answers.
+  const byExecutorModel = new Map<string | null, TurnUsage>();
   for (const request of byRequest) {
     addModelUsage(byModel, request.model, request.usage, request.contextBand);
+    if (!request.usageOrigin) addModelUsage(byExecutorModel, request.model, request.usage, request.contextBand);
   }
   const exact = { usageParts: [] as TurnUsagePart[] };
   for (const request of [...byRequest, ...estimates]) {
@@ -8713,6 +8835,7 @@ function readClaudeOwnSpend(
     revision,
     found,
     byModel: [...byModel],
+    executorModel: heaviestModel(modelSpends(byExecutorModel)),
     usageParts: exact.usageParts,
     launches: [...launches].filter((id) => !failedToolUses.has(id)),
     partial,
@@ -8778,7 +8901,7 @@ function readClaudeSpendTree(
   const record = own.record ? structuredClone(own.record) : {};
   // Descendant spend remains partial until its own record supplies a closed last turn.
   // The row names the model this transcript ran, so a nested subagent's heavier model never answers.
-  const ownModel = heaviestModel(modelSpends(new Map(own.byModel)));
+  const ownModel = own.executorModel;
   return { spend: { models, ownModel, found: true, partial, effort: own.effort, ...record }, finished: own.finished };
 }
 
@@ -10490,7 +10613,7 @@ function reduceClaudeSessionLine(
   } else if (message.stop_reason) {
     cur.finished = finishedATurn(o);
   }
-  const usageEvent = reduceClaudeUsageRecord(
+  const [usageEvent, ...advisorEvents] = reduceClaudeUsageRecordEvents(
     state.usageState,
     o,
     opts.childTranscript ? { countSidechain: true, emitRepeats: true } : {},
@@ -10515,8 +10638,10 @@ function reduceClaudeSessionLine(
         usageEvent,
       );
     }
-    cur.contextTokens = usage.input + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m;
-    const wrote = message.usage ? claudeCacheLifetime(message.usage) : null;
+    // The reducer measured the context from the response's last executor pass.
+    const context = state.usageState.lastRequest;
+    cur.contextTokens = context?.tokens ?? usage.input + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m;
+    const wrote = usageEvent.cacheLifetime ?? null;
     if (wrote) {
       state.lastLifetime = wrote;
     }
@@ -10534,8 +10659,8 @@ function reduceClaudeSessionLine(
     state.lastContext = cur.contextTokens;
     state.lastContextRequest = cur.contextRequest;
     state.lastContextCache = {
-      read: usage.cacheRead,
-      write: usage.cacheWrite1h + usage.cacheWrite5m + (usage.cacheWrite30m ?? 0),
+      read: context?.cacheRead ?? usage.cacheRead,
+      write: context?.cacheWrite ?? usage.cacheWrite1h + usage.cacheWrite5m + (usage.cacheWrite30m ?? 0),
     };
     state.lastContextSource = { start: Math.min(turnStart, sourceStart), end: sourceEnd };
     state.lastModel = cur.model;
@@ -10549,7 +10674,10 @@ function reduceClaudeSessionLine(
     if (!opts.childTranscript) {
       chargeHeldClaudeCompaction(state, cur);
     }
-    const events = opts.childTranscript ? replaceClaudeUsageEvent(state.usageState, usageEvent) : [usageEvent];
+    // Advisor consultations count in the turn's cost and stay out of its context figures above.
+    const events = opts.childTranscript
+      ? [usageEvent, ...advisorEvents].flatMap((event) => replaceClaudeUsageEvent(state.usageState, event))
+      : [usageEvent, ...advisorEvents];
     for (const event of events) {
       addUsage(cur.usage, event.usage, event.contextBand);
       addTurnUsagePart(cur, event);

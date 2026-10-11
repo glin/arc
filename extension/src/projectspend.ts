@@ -44,6 +44,7 @@ import type {
   TurnOutcome,
   TurnUsage,
   UsageInferenceClass,
+  UsageOrigin,
 } from './transcript';
 import { normalizeFsPath } from './transcript';
 import { ExportLimitError } from './exportlimits';
@@ -66,6 +67,8 @@ export interface UsageEvent {
   provider: string | null;
   model: string | null;
   contextWindow: number | null;
+  // Retained context from the final executor pass, separate from summed billing usage.
+  contextTokens?: number;
   // A rate band applies to one request. It must not be inferred from the sum of a daily
   // bucket after several requests have been combined.
   contextBand?: 'short' | 'long' | null;
@@ -98,13 +101,15 @@ export interface UsageEvent {
   // The compaction that an estimated request stands for, in request order. The ordered pass
   // measures the next return from it.
   compactionSignal?: CompactionSignal;
+  // A Claude advisor consultation. It counts in cost and requests and stays out of cache adjacency.
+  usageOrigin?: 'claude-advisor';
   usage: UsageCounts;
   requestKey: string | null;
   responseId?: string;
 }
 
 export interface ProjectUsageBucket {
-  usageOrigin?: 'claude-cost-state';
+  usageOrigin?: UsageOrigin;
   localDate: string;
   agent: string;
   provider: string | null;
@@ -476,7 +481,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 55;
+export const PROJECT_SPEND_PARSER_GENERATION = 56;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -962,9 +967,9 @@ export interface CacheExpiryReturn {
   // The return request's key, which a Claude card matches against its turn's response ids, or
   // null where a saved return does not name it.
   requestKey: string | null;
-  // The input-side tokens a warm cache could have held for the return: the previous request's
-  // uncached input, cache reads, and cache writes. A return measured from a compaction holds the
-  // cached prefix the compaction left instead. Null where no record establishes that size, or
+  // The reusable context from the previous request's final executor pass.
+  // A return measured from a compaction holds its cached prefix instead.
+  // Null where no record establishes that size, or
   // where a saved return does not name it, which leaves its cost added unavailable.
   previousInputSide: number | null;
 }
@@ -1029,6 +1034,7 @@ export interface CacheExpiryCarry {
   toolListVersion?: number | null;
   inferenceClass: 'in-region' | 'geo' | 'global' | 'bedrock-regional' | null;
   compactionsBefore: number;
+  // Final-pass context, or aggregate input when the event supplies no separate measurement.
   inputTokens: number;
   incomplete: boolean;
   // The newest compaction after this request, when one came before the next request. The next
@@ -1201,17 +1207,19 @@ function carryFor(event: UsageEvent): CacheExpiryCarry {
     effort: event.effort ?? null,
     toolListVersion: event.toolListVersion ?? null,
     compactionsBefore: event.compactionsBefore ?? 0,
-    inputTokens: requestInputTokens(event.usage),
+    inputTokens: event.contextTokens ?? requestInputTokens(event.usage),
     incomplete: event.incomplete === true,
   };
 }
 
 // Whether this event is one primary-session request the order pass can compare. Delegated
 // work is excluded by its link, and a removal or a replacement by its negative request count.
+// An advisor consultation reads the session uncached, so it is no cache-expiry neighbor.
 function primaryOrderedRequest(event: UsageEvent): boolean {
   return (
     !event.compactionEstimate &&
     !event.compactionUsage &&
+    !event.usageOrigin &&
     !event.linkedSessionId &&
     !event.linkedInvocationId &&
     (event.usage.requests ?? 1) > 0
@@ -1673,6 +1681,7 @@ function readIncremental(
           ...(event.requestCountExact === false ? { requestCountExact: false as const } : {}),
           ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
           ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
+          ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
           reportedCost: event.reportedCost === null ? null : 0,
           usage: emptyUsage(),
           requests: 0,

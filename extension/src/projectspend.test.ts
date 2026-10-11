@@ -20,6 +20,7 @@ import {
   sessionCacheFactsBySession,
   SessionFiguresCache,
   aggregateUsageEvents,
+  cacheExpiryExtraCost,
   discoverClaudeSessionSpendSources,
   discoverClaudeSpendSources,
   discoverCodexSessionSpendSources,
@@ -85,6 +86,11 @@ import { costDetail, sessionCostProjection, sessionCostUsageOf, toCompactionCard
 import { dispatchedParents, sessionParentIndex } from './turnrail.ts';
 import {
   COMPACTION_SAMPLES,
+  ADVISOR_MODEL,
+  ADVISOR_MODEL_USAGE,
+  advisorIteration,
+  advisorProbeRecords,
+  advisorResponseRecords,
   claudeCompactionTranscript,
   previousContextOf,
   subagent,
@@ -1925,6 +1931,24 @@ function malformedSpendFixture() {
         };
       }),
     ],
+    ...[-1, 1.5, '40000', null].map(
+      (contextTokens) =>
+        [
+          `invalid retained context measurement ${JSON.stringify(contextTokens)}`,
+          changed((record) => {
+            record.parserState = {
+              ...emptyClaudeUsageReducerState(),
+              seenRequestKeys: ['claude:request'],
+              requestEvents: {
+                'claude:request': {
+                  ...event(1, { agent: 'claude', contextBand: null, requestKey: 'claude:request' }),
+                  contextTokens,
+                },
+              },
+            };
+          }),
+        ] as [string, string],
+    ),
     [
       'invalid interrupted checkpoint',
       changed((record) => {
@@ -4140,6 +4164,118 @@ function indexCompactionSession(lines: readonly object[], child?: readonly objec
 const estimatedRequests = (buckets: readonly ProjectUsageBucket[]) =>
   buckets.filter((bucket) => bucket.compactionEstimate).reduce((sum, bucket) => sum + bucket.requests, 0);
 
+test('Project spend prices an expired return from final executor context across checkpoint restoration', () => {
+  for (const childTranscript of [false, true]) {
+    const prompt = { ...advisorProbeRecords()[0], isSidechain: childTranscript };
+    const before = [
+      prompt,
+      ...advisorResponseRecords({
+        id: 'two-pass',
+        sidechain: childTranscript,
+        iterations: [
+          advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 30_000, ephemeral_1h_input_tokens: 0 } }),
+          advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 40_000, ephemeral_1h_input_tokens: 0 } }),
+          advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 90_000 }),
+        ],
+      }),
+    ];
+    const after = [
+      {
+        ...prompt,
+        uuid: 'return-prompt',
+        timestamp: '2026-10-11T09:14:10.214Z',
+        message: { role: 'user', content: 'Continue after the cache expires.' },
+      },
+      ...advisorResponseRecords({
+        id: 'return',
+        at: 361,
+        sidechain: childTranscript,
+        iterations: [
+          advisorIteration({ cache_creation: { ephemeral_5m_input_tokens: 70_000, ephemeral_1h_input_tokens: 0 } }),
+          advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 90_000 }),
+        ],
+      }),
+    ];
+    const file = path.join(dir(), 'source.jsonl');
+    const makeReducer = (state: Parameters<typeof createClaudeUsageLineReducer>[0]) =>
+      createClaudeUsageLineReducer(state, { childTranscript });
+    const budget = { maxMilliseconds: Number.POSITIVE_INFINITY };
+    fs.writeFileSync(file, before.map((line) => JSON.stringify(line)).join('\n') + '\n');
+    const first = indexSpendFile(undefined, file, 'w', makeReducer, 1, budget).record;
+    const storage = dir();
+    saveSpendLedger(storage, 'w', [first]);
+    const [loaded] = loadSpendLedger(storage, 'w').files;
+    assert.ok(loaded);
+    fs.appendFileSync(file, after.map((line) => JSON.stringify(line)).join('\n') + '\n');
+    const resumed = indexSpendFile(loaded, file, 'w', makeReducer, 2, budget);
+    assert.equal(resumed.rebuilt, false);
+    const whole = indexSpendFile(undefined, file, 'w', makeReducer, 2, budget).record;
+    for (const record of [whole, resumed.record]) {
+      assert.ok(record.cacheExpiry);
+      const extra = cacheExpiryExtraCost(record.cacheExpiry.facts, publicProjectSpendPrice);
+      assert.equal(extra.status, 'exact');
+      const expected = childTranscript ? 0 : 0.0046;
+      assert.ok(Math.abs(extra.dollars! - expected) < 1e-12, `expired context cost was ${extra.dollars}`);
+      assert.equal(record.cacheExpiry.facts.counts['5m'], childTranscript ? 0 : 1);
+      if (!childTranscript) assert.equal(record.cacheExpiry.facts.returns[0].previousInputSide, 40_000);
+      assert.equal(record.cacheExpiry.carry?.requestKey, 'claude:return');
+    }
+    assert.equal(loaded.cacheExpiry?.carry?.inputTokens, 40_000);
+    assert.equal(loaded.lifetimeBuckets?.find((bucket) => !bucket.usageOrigin)?.usage.cacheWrite5m, 70_000);
+    if (childTranscript) {
+      const state = loaded.parserState as ClaudeUsageReducerState;
+      assert.equal(state.requestEvents?.['claude:two-pass'].contextTokens, 40_000);
+    }
+    assert.deepEqual(resumed.record.cacheExpiry, whole.cacheExpiry);
+  }
+});
+
+test('Project spend compaction figures use final executor context across checkpoint restoration', () => {
+  const [prompt, , boundary, summary] = claudeCompactionTranscript(COMPACTION_ROW, { gapMs: 60_000 });
+  const [before] = advisorResponseRecords({
+    id: 'before-compaction',
+    iterations: [
+      advisorIteration({ cache_read_input_tokens: 30_000 }),
+      advisorIteration({ cache_read_input_tokens: 40_000 }),
+      advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 90_000 }),
+    ],
+    blocks: 1,
+  });
+  const [after] = advisorResponseRecords({
+    id: 'after-compaction',
+    iterations: [
+      advisorIteration({ cache_read_input_tokens: 5_000 }),
+      advisorIteration({ cache_read_input_tokens: 6_000 }),
+      advisorIteration({ type: 'advisor_message', model: ADVISOR_MODEL, input_tokens: 90_000 }),
+    ],
+    blocks: 1,
+  });
+  const prefix = [prompt, { ...before, timestamp: '2026-09-20T10:00:01.000Z' }, boundary, summary];
+  const suffix = { ...after, timestamp: '2026-09-20T10:01:02.000Z' };
+  const { file, record: first } = indexCompactionSession(prefix);
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [first]);
+  const [loaded] = loadSpendLedger(storage, 'w').files;
+  assert.ok(loaded);
+  fs.appendFileSync(file, JSON.stringify(suffix) + '\n');
+  const resumed = indexSpendFile(loaded, file, 'w', createClaudeUsageLineReducer, 2, {
+    maxMilliseconds: Number.POSITIVE_INFINITY,
+  });
+  assert.equal(resumed.rebuilt, false);
+  const whole = indexCompactionSession([...prefix, suffix]).record;
+  for (const record of [whole, resumed.record]) {
+    const [fact] = record.cacheExpiry!.compactions;
+    assert.equal(fact.contextBefore, 40_000);
+    assert.equal(fact.contextAfter, 6_000);
+    assert.equal(fact.requestsAfter, 1);
+    assert.equal(fact.firstRequestAfter?.usage.cacheRead, 11_000);
+    assert.equal(record.cacheExpiry?.carry?.requestKey, 'claude:after-compaction');
+  }
+  assert.equal(loaded.cacheExpiry?.compactions[0].contextBefore, 40_000);
+  assert.equal(loaded.cacheExpiry?.compactions[0].contextAfter, null);
+  assert.deepEqual(resumed.record.cacheExpiry, whole.cacheExpiry);
+});
+
 test('a Claude compaction reaches the session total whichever of its summary and boundary comes first', () => {
   for (const summaryFirst of [false, true]) {
     const { projection, estimates } = indexCompactionSession(
@@ -5958,6 +6094,25 @@ describe('Claude background cost accounting', () => {
         .total.dollars,
       null,
     );
+  });
+
+  test('advisor usage explains its cost-state counters, so Claude supplemental accounting adds nothing', () => {
+    const expected = Object.values(ADVISOR_MODEL_USAGE).reduce((sum, usage) => sum + usage.costUSD, 0);
+    const check = (fixture: ReturnType<typeof indexCompactionSession>) => {
+      assert.equal(replay(fixture).complete, true);
+      const parts = sessionSpendPartsBySession(fixture.records, fixture.sources).s;
+      // A zero supplement alone proves nothing: reconciliation skips a model whose recorded usage exceeds its counter.
+      assert.deepEqual(
+        parts.filter(({ bucket }) => bucket.usageOrigin === 'claude-cost-state'),
+        [],
+      );
+      const total = sessionCostProjection(parts.map(sessionCostUsageOf)).total.dollars;
+      assert.ok(Math.abs(total! - expected) < 1e-9, String(total));
+    };
+    check(indexCompactionSession(advisorProbeRecords()));
+    // An ancestor's process-end record also counts the advisor usage of its native child.
+    const probe = advisorProbeRecords();
+    check(indexCompactionSession([probe[0], ...probe.slice(-2)], advisorResponseRecords({ sidechain: true })));
   });
 
   test('Project cost includes actual compaction residual independently of lifetime estimates', () => {

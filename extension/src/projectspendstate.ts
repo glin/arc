@@ -34,6 +34,7 @@ import type {
   TurnOutcome,
   TurnUsage,
   UsageEvent as TranscriptUsageEvent,
+  UsageOrigin,
 } from './transcript';
 
 type PersistedClaudeUsageReducerState = Omit<ClaudeUsageReducerState, 'seenRequests' | 'closedChildIndex'>;
@@ -221,6 +222,7 @@ function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex')
     nullableText(value.provider) &&
     nullableText(value.model) &&
     (value.contextWindow === null || nonNegativeInteger(value.contextWindow)) &&
+    (value.contextTokens === undefined || nonNegativeInteger(value.contextTokens)) &&
     (value.contextBand === null || value.contextBand === 'short' || value.contextBand === 'long') &&
     (value.billingClass === 'metered' || value.billingClass === 'subscription' || value.billingClass === 'unknown') &&
     (value.inferenceClass === null ||
@@ -243,6 +245,7 @@ function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex')
       value.cacheLifetime === '30m' ||
       value.cacheLifetime === '1h') &&
     (value.compactionsBefore === undefined || nonNegativeInteger(value.compactionsBefore)) &&
+    (value.usageOrigin === undefined || value.usageOrigin === 'claude-advisor') &&
     turnUsage(value.usage) &&
     nonEmptyText(value.requestKey)
   );
@@ -631,7 +634,7 @@ function parserState(
 }
 
 interface UsageIdentity {
-  usageOrigin?: 'claude-cost-state';
+  usageOrigin?: UsageOrigin;
   agent: string;
   provider: string | null;
   model: string | null;
@@ -700,7 +703,9 @@ function bucket(value: unknown): ProjectUsageBucket | null {
     (value.requestCountExact !== undefined && value.requestCountExact !== false) ||
     (value.compactionEstimate !== undefined && value.compactionEstimate !== true) ||
     (value.compactionUsage !== undefined && !value.compactionUsage) ||
-    (value.usageOrigin !== undefined && value.usageOrigin !== 'claude-cost-state') ||
+    (value.usageOrigin !== undefined &&
+      value.usageOrigin !== 'claude-cost-state' &&
+      value.usageOrigin !== 'claude-advisor') ||
     (value.usageOrigin === 'claude-cost-state' &&
       (value.requests !== 0 ||
         value.requestCountExact !== false ||
@@ -731,7 +736,9 @@ function bucket(value: unknown): ProjectUsageBucket | null {
     ...(value.requestCountExact === false ? { requestCountExact: false as const } : {}),
     ...(value.compactionEstimate === true ? { compactionEstimate: true as const } : {}),
     ...(value.compactionUsage ? { compactionUsage: true as const } : {}),
-    ...(value.usageOrigin === 'claude-cost-state' ? { usageOrigin: 'claude-cost-state' as const } : {}),
+    ...(value.usageOrigin === 'claude-cost-state' || value.usageOrigin === 'claude-advisor'
+      ? { usageOrigin: value.usageOrigin }
+      : {}),
     usage: {
       requests: value.usage.requests,
       input: value.usage.input,

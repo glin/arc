@@ -5,10 +5,20 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tempDir } from './temproot.ts';
-import { claudeCostState, claudeDispatchTranscript, exportedSiteData } from './turnfixtures.ts';
+import {
+  ADVISOR_EXECUTOR,
+  ADVISOR_MODEL,
+  advisorResponseRecords,
+  claudeCostState,
+  claudeDispatchTranscript,
+  exportedSiteData,
+  subagent,
+  turn,
+} from './turnfixtures.ts';
 import {
   captureSessionExport,
   completeSessionExport,
+  projectTurn,
   type ExportCaptureOptions,
   type ExportPage,
   type SessionExport,
@@ -21,10 +31,27 @@ import type { SessionStatChip } from './turncard.ts';
 import { readCodexSession } from './codex.ts';
 import { toCard } from './turncard.ts';
 import { formatCost } from './pricing.ts';
+import { readClaudeAgentSpend } from './transcript';
 const CODEX_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
 const record = (type: string, second: number, fields: object) => ({ type, timestamp: at(second), ...fields });
+
+test('export capture retains child advisor usage origins beside executor spend', () => {
+  const f = fixture();
+  const child = readClaudeAgentSpend(f.write(f.child('advisor'), advisorResponseRecords({ sidechain: true })));
+  const original = turn({ agents: [subagent({ model: child.ownModel, spend: child.models })] });
+  const saved = projectTurn(original, 'turn', { cwd: '/project' }, [], 'root', new Map());
+  assert.ok(saved.agents[0].spend);
+  assert.deepEqual(
+    saved.agents[0].spend.map((part) => [part.model, part.origin, part.usage.requests]),
+    [
+      [ADVISOR_EXECUTOR, 'recorded', 1],
+      [ADVISOR_MODEL, 'claude-advisor', 1],
+    ],
+  );
+  assert.equal(saved.agents[0].spend[1].usage.input, 44_807);
+});
 function claudeTurn(id: string, second = 0, finished = true, sidechain = false): object[] {
   return [
     record('user', second, {
