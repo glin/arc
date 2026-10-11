@@ -131,6 +131,8 @@ const dispatchFacts = new Map<
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
+const admittedCompletions = new Set<string>();
+const epochChildSessions = new Map<string, import('./transcript').ClaudeChildSessionFile | null>();
 let discoveryPosition = 0;
 let metadataRecovery: {
   file: string;
@@ -367,8 +369,12 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
-    // A created epoch, or a saved one this worker did not hold, starts with every unchanged finished source marked complete.
+    // A new worker checks saved completions as their sources become reachable.
     const seeding = heldEpoch?.epoch !== epoch.epoch;
+    if (seeding) {
+      admittedCompletions.clear();
+      epochChildSessions.clear();
+    }
     const completed = new Set(epoch.completed);
     const completionChanges = new Map<string, boolean>();
     const charges: DiscoveryCharges = {
@@ -415,8 +421,9 @@ async function execute(
     const checkMissing = (file: string) => parentCheck(() => missingFile(file));
     let continuation = false;
     let incomplete = false;
+    let admitting = seeding;
     const candidates = new Map<string, import('./transcript').SessionFile>();
-    // The child head charge covers the whole walk, whose file work is a stat and a bounded head read per subagent transcript.
+    // Each epoch retains admitted child metadata. The charge covers newly resolved child heads.
     const walk = () => {
       candidates.clear();
       const reads = openReadWindow();
@@ -428,7 +435,29 @@ async function execute(
             const key = normalizeFsPath(parent.file);
             candidates.set(key, parent);
             const entry = claudeChildReferences.get(key);
-            if (!entry) return [];
+            if (!entry) {
+              if (!admittedCompletions.has(key) && completed.delete(key)) completionChanges.set(key, false);
+              return [];
+            }
+            // Saved completions require admission when an ancestor first exposes their source.
+            if (completed.has(key) && !admittedCompletions.has(key)) {
+              const revision = checkParent(parent.file);
+              if (revision && unchangedFinished(entry, parent, revision)) admittedCompletions.add(key);
+              else {
+                completed.delete(key);
+                completionChanges.set(key, false);
+                claudeChildReferences.set(key, {
+                  ...entry,
+                  complete: false,
+                  relationshipComplete: false,
+                  visitedEof: false,
+                });
+              }
+            }
+            // Completed cuts stay fixed for this epoch. Later writes enter the next refresh.
+            if (!admitting && completed.has(key)) return entry.references;
+            // Unfinished Claude sources expose no edges until their scanner qualifies the cut.
+            if (!admitting) return parent.agent === 'codex' ? entry.references : [];
             const current = checkParent(parent.file)!;
             return (
               parent.agent === 'codex'
@@ -443,7 +472,16 @@ async function execute(
               ? entry.references
               : [];
           },
-          claudeChildSessions,
+          {
+            read(reference, roots) {
+              const key = normalizeFsPath(reference.file);
+              if (!epochChildSessions.has(key)) epochChildSessions.set(key, claudeChildSessions.read(reference, roots));
+              const child = epochChildSessions.get(key);
+              return child
+                ? { ...child, parentSessionId: reference.parentSessionId, toolUseIds: [...reference.toolUseIds] }
+                : null;
+            },
+          },
         );
       } catch {
         incomplete = true;
@@ -509,22 +547,12 @@ async function execute(
         });
       else delete epoch.protectedFile;
     }
-    for (const [key, parent] of candidates) {
-      const current = checkParent(parent.file);
-      if (!current || !unchangedFinished(claudeChildReferences.get(key), parent, current)) {
-        if (completed.delete(key)) completionChanges.set(key, false);
-        const entry = claudeChildReferences.get(key);
-        if (entry)
-          claudeChildReferences.set(key, { ...entry, complete: false, relationshipComplete: false, visitedEof: false });
-      }
-    }
     if (epoch.protectedFile && completed.has(epoch.protectedFile)) delete epoch.protectedFile;
     // Scanners capture their own revision. Admission shares one source observation before the publication walk.
     const seedMissing = new Set<string>();
     if (seeding) {
       let checked = 0;
       for (const [key, parent] of candidates) {
-        if (completed.has(key)) continue;
         if (++checked % 256 === 0) {
           await new Promise<void>((resolve) => setImmediate(resolve));
           if (signal.aborted) break;
@@ -533,13 +561,25 @@ async function execute(
         if (!revision) seedMissing.add(key);
         if (revision && unchangedFinished(claudeChildReferences.get(key), parent, revision)) {
           charges.hits++;
+          if (!completed.has(key)) completionChanges.set(key, true);
           completed.add(key);
-          completionChanges.set(key, true);
+          admittedCompletions.add(key);
           if (epoch.protectedFile === key) delete epoch.protectedFile;
+        } else {
+          if (completed.delete(key)) completionChanges.set(key, false);
+          const entry = claudeChildReferences.get(key);
+          if (entry)
+            claudeChildReferences.set(key, {
+              ...entry,
+              complete: false,
+              relationshipComplete: false,
+              visitedEof: false,
+            });
         }
       }
       epoch.completed = [...completed];
     }
+    admitting = false;
     let header = request.discovery?.epoch === epoch.epoch ? undefined : { ...epoch, completed: [...completed] };
     if (signal.aborted) return pending();
     // The seeded count reaches the host at once, whatever agent the remaining sources belong to.
@@ -561,8 +601,10 @@ async function execute(
       if (!revision) {
         if (checkMissing(parent.file)) {
           completed.add(key);
+          admittedCompletions.add(key);
           completionChanges.set(key, true);
           claudeChildReferences.delete(key);
+          epochChildSessions.set(key, null);
           dispatchFacts.delete(parent.file);
           if (epoch.protectedFile === key) delete epoch.protectedFile;
           continue;
@@ -579,6 +621,7 @@ async function execute(
       if (unchangedFinished(held, parent, revision)) {
         charges.hits++;
         completed.add(key);
+        admittedCompletions.add(key);
         completionChanges.set(key, true);
         continue;
       }
@@ -703,8 +746,12 @@ async function execute(
         if (!reachedTarget && claudeCursor && pendingBytes > 64 * 1024 * 1024) epoch.protectedFile ??= key;
         if (finished || parent.agent === 'codex') {
           completed.add(key);
+          admittedCompletions.add(key);
           completionChanges.set(key, true);
         }
+        const childCut = epochChildSessions.get(key);
+        if (childCut && !sameRevision({ ...childCut, dev: childCut.dev ?? '', ino: childCut.ino ?? '' }, scanRevision))
+          epochChildSessions.delete(key);
         if (qualified && reachedTarget && epoch.protectedFile === key) delete epoch.protectedFile;
         if (
           !reachedTarget &&
@@ -749,6 +796,7 @@ async function execute(
     if (incomplete || [...candidates].some(([key, parent]) => parent.agent === 'claude' && !completed.has(key)))
       return pending();
     for (const [file] of candidates) {
+      if (completed.has(file)) continue;
       const entry = claudeChildReferences.get(file);
       if (!entry) {
         continuation ||= !checkMissing(file);

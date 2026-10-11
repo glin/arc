@@ -674,6 +674,329 @@ test('acknowledged Claude discovery resumes after worker restart while metadata 
   }
 });
 
+test('completed Claude sources defer growth while many discovery passes keep source checks bounded', async () => {
+  const directory = tempDir('claude-completed-growth-');
+  const parents = Array.from({ length: 128 }, (_, index) => {
+    const file = path.join(directory, `${index}.jsonl`);
+    const children = path.join(directory, String(index), 'subagents');
+    fs.mkdirSync(children, { recursive: true });
+    const records = (child?: string) =>
+      [
+        { type: 'user', cwd: directory, message: { content: 'hello' } },
+        ...(child
+          ? [
+              { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Agent', id: 'launch' }] } },
+              {
+                type: 'user',
+                message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+                toolUseResult: { agentId: child },
+              },
+            ]
+          : []),
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n';
+    fs.writeFileSync(file, records(`child${index}`));
+    fs.writeFileSync(path.join(children, `agent-child${index}.jsonl`), records(`grand${index}`));
+    fs.writeFileSync(path.join(children, `agent-grand${index}.jsonl`), records());
+    return {
+      file,
+      sessionId: String(index),
+      agent: 'claude' as const,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+  });
+  const growing = parents[0];
+  const key = normalizeFsPath(growing.file);
+  const prelude = `performance.now=()=>0;const countedFs=require('node:fs');const originalStat=countedFs.statSync;
+    const stats={};countedFs.statSync=function(file,...rest){stats[String(file)]=(stats[String(file)]||0)+1;return originalStat.call(this,file,...rest);};
+    const port=require('node:worker_threads').parentPort;const post=port.postMessage;port.postMessage=function(message){if(message.result)message.result.stats={...stats};return post.call(this,message);};`;
+  const worker = new ProgressiveWorker(prelude + source);
+  const request = { kind: 'claude-children' as const, parents, repositoryRoots: [directory], discoveryBytes: 65536 };
+  let checkpoint: import('./progressiveworker').DiscoveryCheckpoint | undefined;
+  let firstStats = 0;
+  let checks = 0;
+  let passes = 0;
+  let completed = false;
+  try {
+    for (let pass = 0; pass < 80; pass++) {
+      if (pass) fs.appendFileSync(growing.file, '{"type":"ignored"}\n');
+      const result = await worker.run({ ...request, discovery: checkpoint }, pass, new AbortController().signal);
+      assert.ok(
+        result && (result.value.kind === 'claude-children-progress' || result.value.kind === 'claude-children'),
+      );
+      const stats = (result as typeof result & { stats: Record<string, number> }).stats;
+      if (!pass) firstStats = stats[growing.file];
+      assert.equal(stats[growing.file], firstStats, 'a completed source was statted again within its epoch');
+      assert.ok(result.value.charges!.parentChecks <= (pass ? 9 : parents.length), 'a pass checked the whole catalog');
+      checks += result.value.charges!.parentChecks;
+      passes++;
+      checkpoint = result.value.checkpoint;
+      assert.ok(checkpoint!.completed.includes(key), 'growth removed a completed source from the captured epoch');
+      const entry = new Map(result.value.referenceEntries).get(key)!;
+      assert.equal(entry.claudeCursor!.offset, growing.size, 'growth restarted the completed source');
+      if (result.value.kind === 'claude-children') {
+        assert.equal(result.value.continuation, false);
+        assert.equal(checkpoint!.completed.length, 3 * parents.length);
+        assert.equal(result.value.children.length, 2 * parents.length);
+        const transcriptStats = Object.entries(stats)
+          .filter(([file]) => file.endsWith('.jsonl'))
+          .reduce((sum, [, count]) => sum + count, 0);
+        assert.ok(
+          transcriptStats <= 12 * 3 * parents.length,
+          `recursive source stats grew with passes: ${transcriptStats}`,
+        );
+        completed = true;
+        break;
+      }
+    }
+    assert.ok(completed, 'a continuously growing completed source withheld the complete reply');
+    assert.ok(passes >= 16, 'the fixture did not span many requests');
+    assert.ok(checks <= 9 * parents.length, 'source checks grew with catalog size times passes');
+    const refreshed = await completeDiscovery(worker, request, 30, new AbortController().signal);
+    assert.ok(refreshed?.value.kind === 'claude-children');
+    assert.equal(
+      new Map(refreshed.value.referenceEntries).get(key)!.claudeCursor!.offset,
+      fs.statSync(growing.file).size,
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
+test('a restored epoch checks a rewritten completed prefix before reusing saved discovery', async () => {
+  const directory = tempDir('claude-restored-completed-rewrite-');
+  const file = path.join(directory, 'parent.jsonl');
+  const pending = path.join(directory, 'pending.jsonl');
+  fs.writeFileSync(
+    file,
+    claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch',
+      'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa"}',
+      'launch',
+    )
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  fs.writeFileSync(pending, '{"type":"ignored","text":"' + 'x'.repeat(300000) + '"}\n');
+  const parents = [file, pending].map((file) => ({
+    file,
+    sessionId: path.basename(file),
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  }));
+  const request = {
+    kind: 'claude-children' as const,
+    parents,
+    repositoryRoots: [directory],
+    discoveryBytes: 65536,
+    quantumBytes: 65536,
+  };
+  let worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const first = await worker.run(request, 1, new AbortController().signal);
+    assert.ok(first?.value.kind === 'claude-children-progress');
+    const key = normalizeFsPath(file);
+    assert.ok(first.value.checkpoint.completed.includes(key));
+    const original = new Map(first.value.referenceEntries).get(key)!;
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replaceAll('aaaaaaaa', 'bbbbbbbb') + '{"type":"ignored"}\n');
+    fs.utimesSync(file, 100, original.mtimeMs / 1000 + 2);
+    worker.stop();
+    worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+    const restored = await completeDiscovery(
+      worker,
+      { ...request, referenceEntries: first.value.referenceEntries, discovery: first.value.checkpoint },
+      2,
+      new AbortController().signal,
+    );
+    assert.ok(restored?.value.kind === 'claude-children');
+    const entry = new Map(restored.value.referenceEntries).get(key)!;
+    assert.deepEqual(
+      entry.references.map((reference) => reference.sessionId),
+      ['bbbbbbbb'],
+    );
+    assert.equal(entry.sourceGeneration, original.sourceGeneration! + 1);
+    assert.equal(entry.relationshipComplete, true);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('restored completed descendants validate rewritten prefixes behind a growing ancestor', async () => {
+  const directory = tempDir('claude-hidden-restored-child-');
+  const file = path.join(directory, 'parent.jsonl');
+  const childDirectory = path.join(directory, 'parent', 'subagents');
+  fs.mkdirSync(childDirectory, { recursive: true });
+  const child = path.join(childDirectory, 'agent-child.jsonl');
+  const pending = path.join(directory, 'pending.jsonl');
+  fs.writeFileSync(
+    file,
+    [
+      { type: 'user', cwd: directory },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Agent', id: 'launch' }] } },
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'launch' }] },
+        toolUseResult: { agentId: 'child' },
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  fs.writeFileSync(
+    child,
+    JSON.stringify({ type: 'user', cwd: directory }) +
+      '\n' +
+      claudeDispatchTranscript(
+        'python dispatch.py --arc-dispatch',
+        'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa"}',
+        'dispatch',
+      )
+        .map((row) => JSON.stringify(row))
+        .join('\n') +
+      '\n',
+  );
+  fs.writeFileSync(pending, '{"type":"ignored","text":"' + 'x'.repeat(300000) + '"}\n');
+  const session = (file: string) => ({
+    file,
+    sessionId: path.basename(file, '.jsonl'),
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const request = {
+    kind: 'claude-children' as const,
+    parents: [session(file)],
+    repositoryRoots: [directory],
+    discoveryBytes: 65536,
+    quantumBytes: 65536,
+  };
+  let worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const warm = await completeDiscovery(worker, request, 1, new AbortController().signal);
+    assert.ok(warm?.value.kind === 'claude-children');
+    const heldRequest = { ...request, parents: [...request.parents, session(pending)] };
+    const saved = await worker.run(heldRequest, 2, new AbortController().signal);
+    assert.ok(saved?.value.kind === 'claude-children-progress');
+    const key = normalizeFsPath(child);
+    assert.ok(saved.value.checkpoint.completed.includes(key));
+    const previous = new Map(saved.value.referenceEntries).get(key)!;
+    fs.appendFileSync(file, '{"type":"ignored"}\n');
+    fs.utimesSync(file, 100, fs.statSync(file).mtimeMs / 1000 + 2);
+    fs.writeFileSync(child, fs.readFileSync(child, 'utf8').replaceAll('aaaaaaaa', 'bbbbbbbb') + '{"type":"ignored"}\n');
+    fs.utimesSync(child, 100, previous.mtimeMs / 1000 + 2);
+    worker.stop();
+    worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+    const restored = await completeDiscovery(
+      worker,
+      { ...heldRequest, referenceEntries: saved.value.referenceEntries, discovery: saved.value.checkpoint },
+      3,
+      new AbortController().signal,
+    );
+    assert.ok(restored?.value.kind === 'claude-children');
+    const entry = new Map(restored.value.referenceEntries).get(key)!;
+    assert.deepEqual(
+      entry.references.map((reference) => reference.sessionId),
+      ['bbbbbbbb'],
+    );
+    assert.equal(entry.sourceGeneration, previous.sourceGeneration! + 1);
+    assert.equal(entry.relationshipComplete, true);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('cancelled restored admission never reuses an unchecked completed prefix on same-worker resume', async () => {
+  const directory = tempDir('claude-cancelled-admission-');
+  const parents = Array.from({ length: 260 }, (_, index) => {
+    const file = path.join(directory, `${index}.jsonl`);
+    fs.writeFileSync(
+      file,
+      claudeDispatchTranscript(
+        'python dispatch.py --arc-dispatch',
+        'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa"}',
+        'launch',
+      )
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    return {
+      file,
+      sessionId: String(index),
+      agent: 'claude' as const,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+  });
+  const pending = path.join(directory, 'pending.jsonl');
+  fs.writeFileSync(pending, '{"type":"ignored","text":"' + 'x'.repeat(300000) + '"}\n');
+  const request = {
+    kind: 'claude-children' as const,
+    parents,
+    repositoryRoots: [directory],
+    discoveryBytes: 65536,
+    quantumBytes: 65536,
+  };
+  let worker = new ProgressiveWorker('performance.now=()=>0;' + source);
+  try {
+    const warm = await completeDiscovery(worker, request, 1, new AbortController().signal);
+    assert.ok(warm?.value.kind === 'claude-children');
+    const heldRequest = {
+      ...request,
+      parents: [
+        ...parents,
+        {
+          file: pending,
+          sessionId: 'pending',
+          agent: 'claude' as const,
+          ...revisionOf(fs.statSync(pending, { bigint: true })),
+        },
+      ],
+    };
+    const saved = await worker.run(heldRequest, 2, new AbortController().signal);
+    assert.ok(saved?.value.kind === 'claude-children-progress');
+    const file = parents[259].file;
+    const key = normalizeFsPath(file);
+    const previous = new Map(saved.value.referenceEntries).get(key)!;
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replaceAll('aaaaaaaa', 'bbbbbbbb') + '{"type":"ignored"}\n');
+    fs.utimesSync(file, 100, previous.mtimeMs / 1000 + 2);
+    worker.stop();
+    const controller = new AbortController();
+    let yielded = false;
+    let resumedRequest: Promise<ProgressiveResult | null> | undefined;
+    const prelude = `performance.now=()=>0;const admissionPort=require('node:worker_threads').parentPort;const immediate=setImmediate;let armed=true;
+      global.setImmediate=function(callback,...args){if(!armed)return immediate(callback,...args);armed=false;
+        admissionPort.on('message',function resume(message){if(message.cancel===undefined)return;admissionPort.off('message',resume);immediate(callback,...args);});
+        admissionPort.postMessage({repeatedCoverage:'admission-yield'});};`;
+    worker = new ProgressiveWorker(prelude + source, undefined, (file) => {
+      assert.equal(file, 'admission-yield');
+      yielded = true;
+      resumedRequest = worker.run(heldRequest, 4, new AbortController().signal);
+      controller.abort();
+    });
+    const cancelled = await worker.run(
+      { ...heldRequest, referenceEntries: saved.value.referenceEntries, discovery: saved.value.checkpoint },
+      3,
+      controller.signal,
+    );
+    assert.equal(cancelled, null);
+    assert.ok(yielded, 'the fixture did not cancel at the admission yield');
+    const continued = await resumedRequest;
+    assert.ok(
+      continued && (continued.value.kind === 'claude-children-progress' || continued.value.kind === 'claude-children'),
+    );
+    const resumed = await completeDiscovery(worker, heldRequest, 4, new AbortController().signal);
+    assert.ok(resumed?.value.kind === 'claude-children');
+    const entry = new Map(resumed.value.referenceEntries).get(key)!;
+    assert.deepEqual(
+      entry.references.map((reference) => reference.sessionId),
+      ['bbbbbbbb'],
+    );
+    assert.equal(entry.sourceGeneration, previous.sourceGeneration! + 1);
+    assert.equal(entry.relationshipComplete, true);
+  } finally {
+    worker.stop();
+  }
+});
+
 test('bounded Claude discovery visits all roots and serves selected history during catalog quanta', async () => {
   const directory = tempDir('claude-fair-discovery-');
   const parents = Array.from({ length: 1100 }, (_, index) => {
@@ -1043,6 +1366,19 @@ test('Claude recursive closure removes deleted descendants and restores later ap
       result.value.children.map((child) => child.sessionId),
       ['child', 'grand'],
     );
+    fs.appendFileSync(childFile, JSON.stringify({ type: 'ignored', text: 'x'.repeat(300000) }) + '\n');
+    fs.utimesSync(childFile, 100, changed.getTime() / 1000 + 2);
+    const scanning = await worker.run(
+      { ...request, quantumBytes: 65536, discoveryBytes: 65536 },
+      5,
+      new AbortController().signal,
+    );
+    assert.ok(scanning?.value.kind === 'claude-children-progress');
+    assert.equal(scanning.value.checkpoint.completed.includes(normalizeFsPath(childFile)), false);
+    fs.unlinkSync(childFile);
+    const disappeared = await completeDiscovery(worker, request, 6, new AbortController().signal);
+    assert.ok(disappeared?.value.kind === 'claude-children');
+    assert.deepEqual(disappeared.value.children, [], 'a missing unfinished child retained its admitted metadata');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -1802,7 +2138,7 @@ test.each(['claude', 'codex'] as const)(
       assert.equal(afterIo.ioReads - beforeIo.ioReads, reads, 'validation split a buffer into individual block reads');
       assert.equal(
         afterIo.ioStats - beforeIo.ioStats,
-        2 * reads + 5,
+        2 * reads + 4,
         'validation repeated source stats between hash blocks',
       );
       const cursor =
@@ -3489,7 +3825,7 @@ test('stable partial Codex parents yield to a later dispatch and resume after an
   }
 });
 
-test('a Codex parent that grows after its scan keeps discovery pending until the next pass reads the new bytes', async () => {
+test('a completed Codex parent defers later growth until the next refresh reads the new bytes', async () => {
   const directory = tempDir('panel-progressive-codex-grown-');
   const childId = '6b8c18d2-c0d0-4e07-8fc3-9f02a710a992';
   const child = path.join(directory, `${childId}.jsonl`);
@@ -3515,7 +3851,7 @@ test('a Codex parent that grows after its scan keeps discovery pending until the
       },
     },
   });
-  // The launch lands after the parent scan and before the walk that checks every parent again.
+  // The launch lands after the parent scan and before the publication walk.
   const mutate = path.join(directory, 'mutate');
   const parts = source.split('found = walk();');
   assert.equal(parts.length, 3, 'the worker no longer walks once before and once after its parent scans');
@@ -3539,7 +3875,7 @@ test('a Codex parent that grows after its scan keeps discovery pending until the
     const grown = await discoveryState(worker, request(), 1, new AbortController().signal);
     assert.ok(grown?.value.kind === 'claude-children');
     assert.equal(fs.existsSync(mutate), false, 'the parent did not grow during the pass');
-    assert.equal(grown.value.continuation, true, 'a parent that grew during the pass claimed discovery complete');
+    assert.equal(grown.value.continuation, false, 'a completed parent withheld publication after later growth');
     assert.equal(grown.value.references.length, 0, 'the pass read bytes written after its scan');
     const next = await discoveryState(worker, request(grown.value.referenceEntries), 2, new AbortController().signal);
     assert.ok(next?.value.kind === 'claude-children');
@@ -5420,7 +5756,7 @@ test('Claude child discovery retries interrupted and concurrently changed parent
       try {
         const first = await worker.run({ ...request, parents }, 1, new AbortController().signal);
         assert.ok(
-          first?.value.kind === 'claude-children-progress',
+          first?.value.kind === (fault === 'grow' ? 'claude-children' : 'claude-children-progress'),
           `${fault}: source progress or its fixed cut was lost`,
         );
         const firstReads = (first as typeof first & { faultReads: Record<string, number> }).faultReads;
@@ -9682,7 +10018,7 @@ test.each(['claude', 'codex'] as const)(
       return { file, sessionId, agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
     };
     const dispatched = { ...session(dispatchedFile, id), agent };
-    // A parent whose file is gone is checked again for absence, before its scan and again before publication.
+    // A missing parent gets an admission check and an absence check before its scan.
     const gone = { file: goneFile, sessionId: 'gone', agent: 'claude' as const, size: 1, mtimeMs: 1 };
     // A Codex dispatched session is a catalog entry with a native descendant, never a relationship parent.
     const parents = [session(parentFile, 'parent'), gone, ...(agent === 'claude' ? [dispatched] : [])];
@@ -9746,13 +10082,13 @@ test.each(['claude', 'codex'] as const)(
       assert.equal(cold.charges.hits, candidates);
       assert.equal(
         cold.charges.parentChecks,
-        2 * candidates + 3,
-        'source checks share admission observations and recheck publication and missing files',
+        candidates + 2,
+        'source checks share admission observations and confirm missing files',
       );
-      assert.equal(cold.charges.parentCheckMs, 2 * candidates + 3);
+      assert.equal(cold.charges.parentCheckMs, candidates + 2);
       assert.equal(cold.charges.childHeadFiles, 1);
       assert.equal(cold.charges.childHeadBytes, fs.statSync(childFile).size);
-      assert.equal(cold.charges.childHeadMs, 4 * candidates + 2, 'walk duration includes source checks in both walks');
+      assert.equal(cold.charges.childHeadMs, 2 * candidates + 2, 'walk duration includes initial source checks');
       assert.equal(cold.charges.dispatchSpendVisits, 1);
       assert.equal(cold.charges.dispatchSpendRereads, 1);
       assert.equal(cold.charges.dispatchSpendFiles, agent === 'claude' ? 1 : 2);
