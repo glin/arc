@@ -1113,6 +1113,17 @@ interface SelectionWork {
   scope?: string;
 }
 
+// Reader messages that carry an instruction or setting for a session. Draft text is not one.
+// An `answerAsk` message is reported separately because it can approve the requesting command.
+const READER_INSTRUCTIONS: ReadonlySet<string> = new Set([
+  'sendPrompt',
+  'compact',
+  'stopTurn',
+  'pick',
+  'dequeue',
+  'acceptQueuedEdit',
+]);
+
 export class PanelProvider implements vscode.Disposable {
   private submissionWrites: Promise<void> = Promise.resolve();
   private submissionsInFlight = new Set<string>();
@@ -1546,6 +1557,13 @@ export class PanelProvider implements vscode.Disposable {
     | ((session: string, settings: SessionSettingSelection) => void | Promise<void>)
     | null = null;
   public onStopTurn: ((agent: string, session: string) => void) | null = null;
+  // Runs synchronously when the reader sends, queues, edits a queued prompt, stops, compacts, answers or picks a setting,
+  // and when the panel delivers a queued prompt. `answer` marks an answer to an ask.
+  public onReaderAction: ((session: string, answer: boolean) => void) | null = null;
+  // Runs synchronously when the repository scope or the workspace folders change.
+  public onScopeChange: (() => void) | null = null;
+  // Runs after a full refresh rebuilds the session rows under a ready repository scope.
+  public onSessionRowsRefreshed: (() => void) | null = null;
   public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean) | null = null;
   public onArchivedSessionsChange: ((sessions: ReadonlySet<string>) => void) | null = null;
   public archivedSessions(): ReadonlySet<string> {
@@ -2807,6 +2825,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
+    this.onScopeChange?.();
     // A catalog listed under the previous roots cannot render the current scope.
     for (const work of this.selectionWorks.values()) work.controller.abort();
     this.selectionWorks.clear();
@@ -2829,6 +2848,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private workspaceFoldersChanged(): void {
+    this.onScopeChange?.();
     this.cancelProjectSpendHydration();
     this.projectSpendHydrationReady = false;
     this.repositoryScopeReady = false;
@@ -4585,9 +4605,24 @@ export class PanelProvider implements vscode.Disposable {
     if (delivery.delivered) for (const post of pending) post();
   }
 
-  public noteCompletedReply(session: string, text: string, sourceId?: string, turnId?: number): void {
+  // `saved` runs once the reply is held for reader review: on the response card, or in the
+  // recorded turn that the selected window shows after the card's press reconciled to it.
+  public noteCompletedReply(
+    session: string,
+    text: string,
+    sourceId?: string,
+    turnId?: number,
+    saved?: () => void,
+  ): void {
+    if (!this.disposed && turnId !== undefined && this.reconciledResponseOwners?.get(turnId) === session) {
+      saved?.();
+      if (this.showing === session) void this.completeSelectedWindow(session, this.selectionGeneration);
+      return;
+    }
     const held = this.live[session];
-    const press = this.responsePress(session, turnId, () => this.noteCompletedReply(session, text, sourceId, turnId));
+    const press = this.responsePress(session, turnId, () =>
+      this.noteCompletedReply(session, text, sourceId, turnId, saved),
+    );
     if (!press) return;
     let snapshot = this.responseSnapshots.get(session);
     const owner = sourceId ? snapshot?.owners.get(sourceId) : undefined;
@@ -4600,6 +4635,7 @@ export class PanelProvider implements vscode.Disposable {
     snapshot.blocks.set(sourceId ?? 'response', text);
     const reply = [...snapshot.blocks.values()].join('\n\n');
     this.live[session] = held.map((one) => (one === press ? { ...one, reply } : one));
+    saved?.();
     this.postReply();
     if (this.showing === session || [...this.hostSessions.values()].includes(session))
       void this.completeSelectedWindow(session, this.selectionGeneration);
@@ -4856,6 +4892,14 @@ export class PanelProvider implements vscode.Disposable {
     return state.queued.some((entry) => this.queueHandoffs.has(entry.id));
   }
 
+  // Reports reader work that deferred compaction must not pass. A session the panel does not
+  // hold is absent. Queued prompts and a clear in progress are pending.
+  public readerWork(session: string): 'none' | 'pending' | 'absent' {
+    const state = this.stateFor(session);
+    if (!state) return 'absent';
+    return state.clearing || state.queued.length > 0 || this.pendingQueueDrains.has(session) ? 'pending' : 'none';
+  }
+
   // Deliver the session's oldest eligible queued submission when it is idle.
   public flushQueue(session: string): void {
     // Drain the caller's session, independent of the session displayed in the prompt box.
@@ -4901,6 +4945,8 @@ export class PanelProvider implements vscode.Disposable {
       this.flushQueue(session);
       return;
     }
+    // Delivering queued input is a reader action, and it happens before the prompt is submitted.
+    this.onReaderAction?.(state.sessionId, false);
     // Record the attempt before crossing the protocol boundary. If this process stops after
     // the agent accepts but before its answer is stored, the next process must not submit the
     // same prompt again. The waiting card then asks the reader to decide whether to retry.
@@ -7412,6 +7458,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!selectedOnly) {
           this.performanceCounters.recordRefreshStage('unchanged');
         }
+        if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
         if (!selectedOnly) {
           this.scheduleProjectSpendHydration(generation);
           const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
@@ -7487,6 +7534,7 @@ export class PanelProvider implements vscode.Disposable {
         ),
         ...this.sessionRows,
       ];
+      if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
       if (!selectedOnly && this.authoritativeCatalog !== null) {
         this.drainInitialCatalogRefresh();
         this.drainPendingQueues();
@@ -11670,6 +11718,9 @@ export class PanelProvider implements vscode.Disposable {
       this.health?.event('unready', this.healthPanel(host).id);
       return;
     }
+    // A reader instruction cancels deferred compaction before any await in its own handler.
+    if ('session' in message && (READER_INSTRUCTIONS.has(message.type) || message.type === 'answerAsk'))
+      this.onReaderAction?.(message.session, message.type === 'answerAsk');
     // Resolve current cards by key. Missing cards cannot supply action targets.
     const cardFor = (key: string): { card: RenderCard; sessionId: string } | null => {
       const card = this.cards.find((c) => c.key === key);

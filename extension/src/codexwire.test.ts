@@ -114,6 +114,69 @@ function reply(h: ReturnType<typeof harness>, result: unknown): void {
   h.wire.receive(JSON.stringify({ id: last.id, result }));
 }
 
+test('Codex native evidence requires exact thread fields and separates command exit, compaction acceptance and completion', async () => {
+  const h = harness();
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const item = {
+    type: 'commandExecution',
+    id: 'command',
+    command: 'arc compact request literal',
+    processId: '123',
+    source: 'unifiedExecStartup',
+    status: 'inProgress',
+  };
+  const send = (method: string, params: Record<string, unknown>) => h.wire.receive(JSON.stringify({ method, params }));
+  send('item/started', { turnId: TURN, item });
+  send('item/started', { threadId: 'foreign', turnId: TURN, item });
+  assert.equal(h.events.filter((e) => e.kind === 'native').length, 0);
+  send('item/started', { threadId: THREAD, turnId: TURN, item });
+  send('item/completed', { threadId: THREAD, turnId: TURN, item: { ...item, status: 'completed', exitCode: 0 } });
+  send('turn/completed', { threadId: THREAD, turn: { id: TURN, status: 'completed' } });
+  const native = h.events.filter((e) => e.kind === 'native').map((e) => e.event);
+  assert.deepEqual(
+    native.map((e) => e.kind),
+    ['toolStart', 'toolEnd', 'rootEnd'],
+  );
+  assert.equal(native[0].evidence.threadId, THREAD);
+  assert.equal(native[0].kind === 'toolStart' && native[0].foreground, true);
+  assert.equal(native[1].kind === 'toolEnd' && native[1].success, true);
+  let checks = 0;
+  const pending = h.wire.compact(() => {
+    checks++;
+  });
+  const compactTurn = 'compact-turn';
+  send('turn/started', { threadId: THREAD, turn: { id: compactTurn } });
+  send('item/started', {
+    threadId: THREAD,
+    turnId: compactTurn,
+    item: { type: 'contextCompaction', id: 'compact-item' },
+  });
+  send('item/completed', {
+    threadId: THREAD,
+    turnId: compactTurn,
+    item: { type: 'contextCompaction', id: 'compact-item' },
+  });
+  send('turn/completed', { threadId: THREAD, turn: { id: compactTurn, status: 'completed' } });
+  reply(h, {});
+  await pending;
+  assert.equal(checks, 1);
+  assert.deepEqual(
+    h.events.flatMap((e) => (e.kind === 'native' && e.event.kind === 'compact' ? [e.event.stage] : [])),
+    ['turnStart', 'itemStart', 'itemEnd', 'turnEnd', 'accepted'],
+  );
+  const before = h.sent.length;
+  await assert.rejects(
+    h.wire.compact(() => {
+      throw new Error('reader intervened');
+    }),
+    /reader intervened/,
+  );
+  assert.equal(h.sent.length, before);
+  h.wire.close('finished');
+});
+
 async function completeLastTurn(h: ReturnType<typeof harness>, turnId: string): Promise<void> {
   const starts = h.parsed().filter((message) => message.method === 'turn/start');
   const start = starts[starts.length - 1];
@@ -332,6 +395,155 @@ test('compaction uses the app-server thread control and never starts a model tur
   assert.equal(h.events.filter((event) => event.kind === 'turnEnd').length, 1);
 });
 
+// Catches a compaction whose request timed out losing its late native evidence, and an error answer reported as an unknown outcome.
+test('a compaction keeps native evidence after its request goes unanswered and reports a refused request', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = harness(1_000);
+    const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+    reply(h, { thread: { id: THREAD } });
+    await starting;
+    const send = (method: string, params: Record<string, unknown>) =>
+      h.wire.receive(JSON.stringify({ method, params }));
+    const stages = () =>
+      h.events.flatMap((e) =>
+        e.kind === 'native' && e.event.kind === 'compact' ? [`${e.event.stage} ${e.event.generation}`] : [],
+      );
+    const submissions = () =>
+      h.events.flatMap((e) => (e.kind === 'native' && e.event.kind === 'submission' ? [e.event.generation] : []));
+    const runTurn = (id: string) => {
+      const item = { type: 'contextCompaction', id: `${id}-item` };
+      send('turn/started', { threadId: THREAD, turn: { id } });
+      send('item/started', { threadId: THREAD, turnId: id, item });
+      send('item/completed', { threadId: THREAD, turnId: id, item });
+      send('turn/completed', {
+        threadId: THREAD,
+        turn: { id, status: 'completed' },
+      });
+    };
+    // Request A gets no answer. Request B then starts, is answered and completes its own turn.
+    const unanswered = assert.rejects(h.wire.compact(), /did not answer/);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await unanswered;
+    const later = h.wire.compact();
+    reply(h, {});
+    runTurn('later');
+    await later;
+    assert.deepEqual(submissions(), [1, 2]);
+    assert.deepEqual(stages().sort(), ['accepted 2', 'itemEnd 2', 'itemStart 2', 'turnEnd 2', 'turnStart 2']);
+    // A's late turn still reports under A's own generation.
+    runTurn('late');
+    assert.deepEqual(stages().slice(5), ['turnStart 1', 'itemStart 1', 'itemEnd 1', 'turnEnd 1']);
+    const refused = assert.rejects(h.wire.compact(), /not now/);
+    const request = h.parsed().at(-1);
+    h.wire.receive(JSON.stringify({ id: request.id, error: { message: 'not now' } }));
+    await refused;
+    assert.equal(stages().at(-1), 'refused 3');
+    h.wire.close('finished');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Catches the receipt bound dropping the oldest unanswered compaction, which hands every late turn to the wrong request.
+test('a full bound of unanswered compactions refuses a deferred one and keeps every receipt until its turn or thread ends', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = harness(1_000);
+    const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+    reply(h, { thread: { id: THREAD } });
+    await starting;
+    const send = (method: string, params: Record<string, unknown>) =>
+      h.wire.receive(JSON.stringify({ method, params: { threadId: THREAD, ...params } }));
+    const runTurn = (id: string) => {
+      const item = { type: 'contextCompaction', id: `${id}-item` };
+      send('turn/started', { turn: { id } });
+      send('item/started', { turnId: id, item });
+      send('item/completed', { turnId: id, item });
+      send('turn/completed', { turn: { id, status: 'completed' } });
+    };
+    const writes = () => h.parsed().filter((message) => message.method === 'thread/compact/start').length;
+    const turnStarts = () =>
+      h.events.flatMap((e) =>
+        e.kind === 'native' && e.event.kind === 'compact' && e.event.stage === 'turnStart' ? [e.event.generation] : [],
+      );
+    // Nine requests in a row get no answer. The first and the last check at their write boundary, as a deferred request does.
+    const outcomes: string[] = [];
+    for (let attempt = 0; attempt < 9; attempt++) {
+      const pending = h.wire.compact(attempt === 0 || attempt === 8 ? () => {} : undefined).then(
+        () => 'answered',
+        (error: Error) => error.message,
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      outcomes.push(await pending);
+    }
+    assert.equal(h.wire.compactionUnresolved(), true);
+    for (let late = 1; late <= 8; late++) runTurn(`late-${late}`);
+    assert.deepEqual(turnStarts(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.equal(writes(), 8);
+    assert.match(outcomes[0], /did not answer/);
+    assert.equal(outcomes[8], 'the agent has not answered earlier compaction requests');
+    assert.equal(h.wire.compactionUnresolved(), false);
+    // A new thread ends the receipts of the previous one, because the wire ignores that thread's turns.
+    const unanswered = h.wire.compact().catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await unanswered;
+    assert.equal(h.wire.compactionUnresolved(), true);
+    const clearing = h.wire.startThread({ cwd: 'C:\\ws' });
+    reply(h, { thread: { id: 'next-thread' } });
+    await clearing;
+    assert.equal(h.wire.compactionUnresolved(), false);
+    h.wire.close('finished');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Catches the receipt bound refusing a reader's compaction, and a reader's compaction dropping a deferred receipt.
+test('a full bound of unanswered compactions still writes a reader compaction and keeps the deferred receipt', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = harness(1_000);
+    const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+    reply(h, { thread: { id: THREAD } });
+    await starting;
+    const send = (method: string, params: Record<string, unknown>) =>
+      h.wire.receive(JSON.stringify({ method, params: { threadId: THREAD, ...params } }));
+    const runTurn = (id: string) => {
+      const item = { type: 'contextCompaction', id: `${id}-item` };
+      send('turn/started', { turn: { id } });
+      send('item/started', { turnId: id, item });
+      send('item/completed', { turnId: id, item });
+      send('turn/completed', { turn: { id, status: 'completed' } });
+    };
+    const writes = () => h.parsed().filter((message) => message.method === 'thread/compact/start').length;
+    const turnStarts = () =>
+      h.events.flatMap((e) =>
+        e.kind === 'native' && e.event.kind === 'compact' && e.event.stage === 'turnStart' ? [e.event.generation] : [],
+      );
+    // A deferred request and seven reader requests get no answer and fill the bound.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const pending = h.wire.compact(attempt === 0 ? () => {} : undefined).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await pending;
+    }
+    assert.equal(writes(), 8);
+    // The provider recovers. A ninth reader request is written, answered and completed on its own turn.
+    const ninth = h.wire.compact();
+    assert.equal(writes(), 9);
+    reply(h, {});
+    runTurn('ninth');
+    await ninth;
+    // The deferred receipt survives. The oldest reader receipt made room for the ninth request.
+    for (let late = 1; late <= 7; late++) runTurn(`late-${late}`);
+    assert.deepEqual(turnStarts(), [9, 1, 3, 4, 5, 6, 7, 8]);
+    assert.equal(h.wire.compactionUnresolved(), false);
+    h.wire.close('finished');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('a native compaction reports its terminal failure', async () => {
   const h = harness();
   const starting = h.wire.startThread({ cwd: 'C:\\ws' });
@@ -354,7 +566,7 @@ test('a native compaction reports its terminal failure', async () => {
   );
   await assert.rejects(compacting, /context could not be compacted/);
   assert.equal(h.wire.hasOpenTurns(), false);
-  assert.deepEqual(h.events.at(-1), {
+  assert.deepEqual(h.events.filter((event) => event.kind !== 'native').at(-1), {
     kind: 'turnEnd',
     nativeTurnId: '01a04792-152f-72f1-b738-f4b20621e59a',
     outcome: { status: 'error', text: 'context could not be compacted', costUsd: null, turns: null, deniedTools: [] },

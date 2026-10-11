@@ -136,7 +136,14 @@ interface ActiveTurn {
   endingsBeforeStart: Map<string, { outcome: TurnOutcome; emitted: boolean }>;
 }
 
+// Bounds the unanswered compactions whose late turns a wire still reports. At a full bound, a reader's
+// compaction drops the oldest reader receipt and is still written. A deferred compaction is refused,
+// so no deferred receipt is dropped before its late turn ends.
+const UNANSWERED_COMPACTIONS = 8;
+
 interface PendingCompaction {
+  // Numbers each compaction request. Native compaction evidence carries it as its generation.
+  generation: number;
   threadId: string;
   turnId: string | null;
   started: Promise<string>;
@@ -345,6 +352,16 @@ export class CodexWire {
   // The compaction request only acknowledges that work started. Its turn id and terminal
   // result arrive later as notifications, so the operation stays here until that result.
   private compaction: PendingCompaction | null = null;
+  // Compactions whose request got no answer before the deadline can still run. Each later turn
+  // keeps reporting native evidence under its own generation, while the operation itself has already failed.
+  // A receipt ends with its turn, with its thread or with the wire.
+  private unanswered: {
+    generation: number;
+    threadId: string;
+    turnId: string | null;
+    deferred: boolean;
+  }[] = [];
+  private compactions = 0;
   // Permission overrides selected by the reader travel together on the next turn/start.
   // The server applies them to that turn and subsequent turns.
   // Without an override, the thread retains its startup permissions.
@@ -380,6 +397,11 @@ export class CodexWire {
 
   hasOpenTurns(): boolean {
     return this.turns.length > 0 || this.compaction !== null;
+  }
+
+  // True while a compaction request that got no answer can still start or finish its late turn.
+  compactionUnresolved(): boolean {
+    return this.unanswered.length > 0;
   }
 
   // Limits applied-default reads to server versions with confirmed configuration behavior.
@@ -533,17 +555,73 @@ export class CodexWire {
   // Starts compaction through thread/compact/start.
   // Its response acknowledges startup. Turn notifications settle completion and report failures.
   // The pending operation keeps the session busy until completion.
-  async compact(): Promise<void> {
+  // Only deferred delivery passes beforeWrite, so its presence marks the request's receipt as deferred.
+  async compact(beforeWrite?: () => void): Promise<void> {
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
     }
     if (this.hasOpenTurns()) {
       throw new Error('the session already has a turn running');
     }
+    const deferred = beforeWrite !== undefined;
+    if (this.unanswered.length >= UNANSWERED_COMPACTIONS) {
+      if (deferred) throw new Error('the agent has not answered earlier compaction requests');
+      // Deferred delivery waits while any receipt is open, so a full bound holds at most one deferred receipt.
+      const dropped = this.unanswered.findIndex((receipt) => !receipt.deferred);
+      if (dropped >= 0) this.unanswered.splice(dropped, 1);
+    }
     const pending = this.pendingCompaction(this.thread);
     this.compaction = pending;
     try {
-      await this.request('thread/compact/start', { threadId: this.thread });
+      beforeWrite?.();
+      this.emit({
+        kind: 'native',
+        event: {
+          kind: 'submission',
+          provider: 'codex',
+          sessionId: pending.threadId,
+          turnId: null,
+          generation: pending.generation,
+          evidence: {},
+          text: '/compact',
+        },
+      });
+      await this.request('thread/compact/start', { threadId: this.thread }).catch((error: unknown) => {
+        if (error instanceof RequestRefused)
+          this.emit({
+            kind: 'native',
+            event: {
+              kind: 'compact',
+              provider: 'codex',
+              sessionId: pending.threadId,
+              turnId: null,
+              generation: pending.generation,
+              evidence: { error: error.message },
+              stage: 'refused',
+            },
+          });
+        else if (error instanceof NoAnswer && this.compaction === pending) {
+          this.unanswered.push({
+            generation: pending.generation,
+            threadId: pending.threadId,
+            turnId: pending.turnId,
+            deferred,
+          });
+        }
+        throw error;
+      });
+      this.emit({
+        kind: 'native',
+        event: {
+          kind: 'compact',
+          provider: 'codex',
+          sessionId: pending.threadId,
+          turnId: pending.turnId,
+          generation: pending.generation,
+          evidence: {},
+          stage: 'accepted',
+        },
+      });
       await pending.finished;
     } catch (error) {
       if (this.compaction === pending) {
@@ -909,6 +987,8 @@ export class CodexWire {
         : null;
     const previous = this.thread;
     this.thread = id;
+    // The wire ignores another thread's turns, so that thread's receipts can never end.
+    this.unanswered = this.unanswered.filter((receipt) => receipt.threadId === id);
     // An answer to a question asked on another thread must never reach this one. A cleared
     // session starts a new thread, so its open questions close with it.
     for (const [askId, asked] of [...this.asyncAsks]) {
@@ -1146,9 +1226,11 @@ export class CodexWire {
         this.startCompactionTurn(params);
         return;
       case 'item/started':
+        this.nativeItem(params, false);
         this.itemStarted(obj(params.item));
         return;
       case 'item/completed':
+        this.nativeItem(params, true);
         this.itemCompleted(obj(params.item), params);
         return;
       case 'item/fileChange/patchUpdated': {
@@ -1211,6 +1293,7 @@ export class CodexWire {
       }
       case 'turn/completed':
         {
+          this.nativeEnding(params);
           this.endAsyncAskTurn(params);
           const outcome = turnOutcome(obj(params.turn));
           if (this.finishCompaction(params, outcome)) {
@@ -1232,6 +1315,7 @@ export class CodexWire {
         return;
       case 'turn/failed':
         {
+          this.nativeEnding(params, true);
           this.endAsyncAskTurn(params);
           const outcome: TurnOutcome = {
             status: 'error',
@@ -1295,6 +1379,7 @@ export class CodexWire {
     void started.catch(() => undefined);
     void finished.catch(() => undefined);
     return {
+      generation: ++this.compactions,
       threadId,
       turnId: null,
       started,
@@ -1306,8 +1391,86 @@ export class CodexWire {
     };
   }
 
+  private nativeItem(params: Json, completed: boolean): void {
+    const sessionId = str(params.threadId);
+    const turnId = str(params.turnId);
+    const item = obj(params.item);
+    const toolId = str(item?.id);
+    if (!sessionId || sessionId !== this.thread || !turnId || !item || !toolId) return;
+    const base = { provider: 'codex' as const, sessionId, turnId, generation: null, evidence: params };
+    if (item.type === 'commandExecution' && str(item.command)) {
+      if (completed)
+        this.emit({
+          kind: 'native',
+          event: { ...base, kind: 'toolEnd', toolId, success: item.status === 'completed' && item.exitCode === 0 },
+        });
+      else
+        this.emit({
+          kind: 'native',
+          event: {
+            ...base,
+            kind: 'toolStart',
+            toolId,
+            command: str(item.command)!,
+            foreground:
+              item.source === 'unifiedExecStartup' &&
+              typeof item.processId === 'string' &&
+              item.status === 'inProgress',
+          },
+        });
+    }
+    const generation = item.type === 'contextCompaction' ? this.compactionTurn(turnId) : null;
+    if (generation !== null)
+      this.emit({
+        kind: 'native',
+        event: { ...base, generation, kind: 'compact', stage: completed ? 'itemEnd' : 'itemStart' },
+      });
+  }
+
+  // Names the generation of the compaction that owns a turn, or null for any other turn.
+  private compactionTurn(turnId: string): number | null {
+    if (this.compaction?.turnId === turnId) return this.compaction.generation;
+    return this.unanswered.find((receipt) => receipt.turnId === turnId)?.generation ?? null;
+  }
+
+  private nativeEnding(params: Json, failed = false): void {
+    const sessionId = str(params.threadId);
+    const turnId = str(obj(params.turn)?.id) ?? str(params.turnId);
+    if (!sessionId || sessionId !== this.thread || !turnId) return;
+    const base = { provider: 'codex' as const, sessionId, turnId, generation: null, evidence: params };
+    const generation = this.compactionTurn(turnId);
+    if (generation !== null) {
+      this.emit({ kind: 'native', event: { ...base, generation, kind: 'compact', stage: 'turnEnd' } });
+    } else
+      this.emit({
+        kind: 'native',
+        event: { ...base, kind: 'rootEnd', success: !failed && obj(params.turn)?.status === 'completed' },
+      });
+  }
+
   private startCompactionTurn(params: Json): void {
     const pending = this.compaction;
+    // A late turn belongs to the oldest unanswered compaction only while no compaction is pending
+    // and no prompt waits for its own turn.
+    const late = this.unanswered.find((receipt) => receipt.turnId === null);
+    if (!pending && late && this.turns.length === 0) {
+      const turnId = str(obj(params.turn)?.id) ?? str(params.turnId);
+      if (str(params.threadId) !== late.threadId || !turnId) return;
+      late.turnId = turnId;
+      this.emit({
+        kind: 'native',
+        event: {
+          kind: 'compact',
+          provider: 'codex',
+          sessionId: late.threadId,
+          turnId,
+          generation: late.generation,
+          evidence: params,
+          stage: 'turnStart',
+        },
+      });
+      return;
+    }
     if (!pending || pending.turnId) {
       return;
     }
@@ -1320,10 +1483,29 @@ export class CodexWire {
       return;
     }
     pending.turnId = turnId;
+    if (threadId === pending.threadId)
+      this.emit({
+        kind: 'native',
+        event: {
+          kind: 'compact',
+          provider: 'codex',
+          sessionId: threadId,
+          turnId,
+          generation: pending.generation,
+          evidence: params,
+          stage: 'turnStart',
+        },
+      });
     pending.resolveStarted(turnId);
   }
 
   private finishCompaction(params: Json, outcome: TurnOutcome): boolean {
+    // The late turn of an unanswered compaction ends its receipt and never settles a later compaction.
+    const ended = str(obj(params.turn)?.id) ?? str(params.turnId);
+    if (ended && this.unanswered.some((receipt) => receipt.turnId === ended)) {
+      this.unanswered = this.unanswered.filter((receipt) => receipt.turnId !== ended);
+      return false;
+    }
     const pending = this.compaction;
     if (!pending) {
       return false;

@@ -32,6 +32,16 @@ import {
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
 import { requestWindow } from './sessionrequests.ts';
 import { SessionWriteRequests, archiveRefusal } from './sessionwrites.ts';
+import {
+  CompactHost,
+  CompactRequests,
+  compactCommandPayload,
+  COMPACT_LIMITS,
+  type CompactBinding,
+  type CompactChild,
+} from './compactrequest';
+import type { NativeEvent } from './agentwire';
+import { CodexWire } from './codexwire.ts';
 import { arcCliSpawner, childEnv } from './agenthost.ts';
 import {
   discoverWindows,
@@ -50,6 +60,300 @@ import {
 // These Node guards catch access, resource exhaustion, wrong-window discovery, and lifecycle leaks without browser startup.
 const state: WindowState = { folders: [], scopeReady: true, panelReady: false, panelVisible: false };
 const channels: WindowChannel[] = [];
+
+const compactWindow = 'a'.repeat(24);
+const compactPayload = {
+  requestId: compactWindow + ':aaaaaaaa-1111-2222-3333-444444444444',
+  window: compactWindow,
+  self: true as const,
+  afterTurn: true as const,
+};
+const compactBinding: CompactBinding = {
+  activation: compactWindow,
+  provider: 'codex',
+  sessionId: 'self',
+  childGeneration: 1,
+  turn: 'root',
+  submissionId: 'reader',
+  readerRevision: 1,
+};
+const compactLiteral = `arc compact request --self --after-turn --request-id ${compactPayload.requestId} --window ${compactWindow} --json`;
+function compactEvent(kind: 'toolStart' | 'toolEnd' | 'rootEnd', extra: Record<string, unknown> = {}): NativeEvent {
+  return {
+    provider: 'codex',
+    sessionId: 'self',
+    turnId: 'root',
+    generation: null,
+    evidence: {},
+    kind,
+    toolId: 'call',
+    command: compactLiteral,
+    foreground: true,
+    success: true,
+    ...extra,
+  };
+}
+
+test('self compaction joins one live literal root call and acknowledges before the tool and exact turn finish', async () => {
+  let clock = 0;
+  const book = new CompactRequests(compactWindow, () => clock);
+  assert.throws(() => book.admit(compactPayload, () => true), /live requesting tool/);
+  book.observe(compactBinding, compactEvent('toolStart', { sessionId: 'foreign' }));
+  assert.equal(book.ready(compactPayload), false);
+  book.observe(compactBinding, compactEvent('toolStart', { foreground: false }));
+  assert.equal(book.ready(compactPayload), false);
+  book.observe(compactBinding, compactEvent('toolStart'));
+  assert.equal(book.ready(compactPayload), true);
+  const ack = book.admit(compactPayload, () => true);
+  assert.equal(ack.state, 'queued');
+  assert.deepEqual(
+    book.admit({ ...compactPayload }, () => false),
+    ack,
+  );
+  assert.throws(
+    () => book.admit({ ...compactPayload, afterTurn: false } as unknown as typeof compactPayload, () => true),
+    /different arguments/,
+  );
+  let writes = 0;
+  let attempts = 0;
+  const delivery = {
+    eligible: () => true,
+    submit: async (_binding: Readonly<CompactBinding>, check: () => void) => {
+      attempts++;
+      // A provider adapter reaches its write boundary after its own bookkeeping await.
+      await Promise.resolve();
+      check();
+      writes++;
+    },
+  };
+  await book.deliver(compactPayload.requestId, delivery);
+  assert.equal(writes, 0);
+  book.observe(compactBinding, compactEvent('toolEnd'));
+  await book.deliver(compactPayload.requestId, delivery);
+  assert.equal(writes, 0);
+  book.observe(compactBinding, compactEvent('rootEnd', { turnId: 'another' }), true);
+  await book.deliver(compactPayload.requestId, delivery);
+  assert.equal(writes, 0);
+  book.observe(compactBinding, compactEvent('rootEnd'), true);
+  await Promise.all([
+    book.deliver(compactPayload.requestId, delivery),
+    book.deliver(compactPayload.requestId, delivery),
+  ]);
+  assert.equal(attempts, 1, 'a concurrent delivery must not reach the provider');
+  assert.equal(writes, 1);
+  assert.equal(book.status(compactPayload.requestId)?.state, 'uncertain');
+  assert.deepEqual(
+    book.admit(compactPayload, () => false),
+    book.status(compactPayload.requestId),
+  );
+  book.nativeOutcome(compactPayload.requestId, { ...compactBinding, childGeneration: 2 }, 'completed');
+  assert.equal(book.status(compactPayload.requestId)?.state, 'uncertain');
+  book.nativeOutcome(compactPayload.requestId, compactBinding, 'completed');
+  assert.equal(book.status(compactPayload.requestId)?.state, 'completed');
+  book.nativeOutcome(compactPayload.requestId, compactBinding, 'failed');
+  assert.equal(book.status(compactPayload.requestId)?.state, 'uncertain');
+  clock = COMPACT_LIMITS.retentionMs * 2;
+  assert.ok(book.status(compactPayload.requestId));
+});
+
+test('self compaction cancels synchronously across the adapter wait and the final provider write check', async () => {
+  for (const reason of [
+    'reader send',
+    'steering',
+    'queue',
+    'Stop',
+    'clear',
+    'answer',
+    'model',
+    'effort',
+    'permission',
+    'replacement',
+    'exit',
+    'scope',
+    'shutdown',
+    'deadline',
+  ]) {
+    let clock = 0;
+    const book = new CompactRequests(compactWindow, () => clock);
+    book.observe(compactBinding, compactEvent('toolStart'));
+    book.admit(compactPayload, () => true);
+    book.observe(compactBinding, compactEvent('toolEnd'));
+    book.observe(compactBinding, compactEvent('rootEnd'), true);
+    let reach!: () => void;
+    let writes = 0;
+    const pending = book.deliver(compactPayload.requestId, {
+      eligible: () => true,
+      submit: async (_binding, check) => {
+        // A provider adapter reaches its write boundary after its own bookkeeping await.
+        await new Promise<void>((resolve) => {
+          reach = resolve;
+        });
+        check();
+        writes++;
+      },
+    });
+    if (reason === 'shutdown') book.dispose();
+    else if (reason === 'deadline') clock = COMPACT_LIMITS.admissionMs;
+    else book.invalidate((b) => b.sessionId === 'self', reason);
+    reach();
+    await pending;
+    assert.equal(writes, 0, reason);
+    assert.equal(book.status(compactPayload.requestId)?.state, 'cancelled', reason);
+    if (reason === 'deadline') assert.match(book.status(compactPayload.requestId)!.reason, /expired/);
+  }
+});
+
+test('self compaction rejects failed tools, lost final responses, replay, full retention and expired assignments', async () => {
+  for (const failure of ['tool', 'turn', 'final']) {
+    const book = new CompactRequests(compactWindow);
+    book.observe(compactBinding, compactEvent('toolStart'));
+    book.admit(compactPayload, () => true);
+    book.observe(compactBinding, compactEvent('toolEnd', { success: failure !== 'tool' }));
+    book.observe(compactBinding, compactEvent('rootEnd', { success: failure !== 'turn' }), failure !== 'final');
+    let writes = 0;
+    await book.deliver(compactPayload.requestId, {
+      eligible: () => true,
+      submit: async () => {
+        writes++;
+      },
+    });
+    assert.equal(writes, 0, failure);
+    assert.equal(book.status(compactPayload.requestId)?.state, 'failed');
+  }
+  let clock = 0;
+  const book = new CompactRequests(compactWindow, () => clock, 1);
+  book.observe(compactBinding, compactEvent('toolStart'));
+  book.admit(compactPayload, () => true);
+  clock = COMPACT_LIMITS.admissionMs;
+  assert.equal(book.status(compactPayload.requestId)?.state, 'cancelled');
+  assert.throws(
+    () =>
+      book.admit({ ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' }, () => true),
+    /unavailable/,
+  );
+  clock += COMPACT_LIMITS.retentionMs;
+  assert.equal(book.status(compactPayload.requestId), null);
+  book.observe(compactBinding, compactEvent('toolStart'));
+  assert.throws(() => book.admit(compactPayload, () => true), /already used/);
+});
+
+test('self compaction admits only exact literal POSIX or Windows foreground commands', () => {
+  assert.deepEqual(compactCommandPayload(compactLiteral), compactPayload);
+  assert.deepEqual(
+    compactCommandPayload(
+      '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "' + compactLiteral + '"',
+    ),
+    compactPayload,
+  );
+  for (const literal of [
+    compactLiteral + ' &',
+    compactLiteral + ' > result',
+    'echo x; ' + compactLiteral,
+    compactLiteral.replace(compactWindow, '$ARC_WINDOW'),
+    compactLiteral.replace('--self', '--session foreign'),
+    compactLiteral.replace('--json', '--json --json'),
+  ])
+    assert.equal(compactCommandPayload(literal), null, literal);
+});
+
+// Catches a refused Windows Codex request. The Codex app-server reports these exact command strings for a bare
+// literal with no single quote: the path keeps doubled backslashes, the script sits in single quotes, and
+// `-NoProfile` sometimes precedes `-Command`.
+test('self compaction admits the PowerShell wrappers Codex reports and nothing composed around them', () => {
+  const executable = String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`;
+  for (const command of [
+    `${executable} -Command '${compactLiteral}'`,
+    `${executable} -NoProfile -Command '${compactLiteral}'`,
+    `${executable} -Command "${compactLiteral}"`,
+    `powershell.exe -Command '${compactLiteral}'`,
+    `"pwsh.exe" -NoProfile -Command '${compactLiteral}'`,
+    String.raw`"C:\Program Files (x86)\PowerShell\7\pwsh.exe" -Command '` + compactLiteral + "'",
+  ])
+    assert.deepEqual(compactCommandPayload(command), compactPayload, command);
+  for (const command of [
+    `${executable} -Command '${compactLiteral}"`,
+    `${executable} -Command '${compactLiteral}; echo x'`,
+    `${executable} -Command '${compactLiteral}' -NoExit`,
+    `${executable} -ExecutionPolicy Bypass -Command '${compactLiteral}'`,
+    `${executable} -NoProfile -NoProfile -Command '${compactLiteral}'`,
+    `${executable} -NoLogo -Command '${compactLiteral}'`,
+    `${executable} -Command '$(${compactLiteral})'`,
+    `${executable} -Command '${compactLiteral.replace(compactWindow, '$env:ARC_WINDOW')}'`,
+    String.raw`C:\\Windows\\powershell.exe -Command '` + compactLiteral + "'",
+    `"cmd.exe" -Command '${compactLiteral}'`,
+    `${executable}  -Command '${compactLiteral}'`,
+    String.raw`"C:\$(Write-Output injected)\powershell.exe" -Command '` + compactLiteral + "'",
+    '"C:\\a`b\\powershell.exe" -Command \'' + compactLiteral + "'",
+    String.raw`"C:\a;b\powershell.exe" -Command '` + compactLiteral + "'",
+  ])
+    assert.equal(compactCommandPayload(command), null, command);
+});
+
+test('self compaction completion joins native command evidence without confusing acceptance with completion', async () => {
+  for (const provider of ['claude', 'codex'] as const) {
+    const observedStates: (string | undefined)[] = [];
+    const binding = { ...compactBinding, provider, turn: provider === 'claude' ? '1' : 'root' };
+    const book = new CompactRequests(compactWindow);
+    const base = {
+      provider,
+      sessionId: 'self',
+      turnId: provider === 'codex' ? 'root' : null,
+      generation: provider === 'claude' ? 1 : null,
+      evidence: {},
+    };
+    book.observe(binding, { ...base, kind: 'toolStart', command: compactLiteral, toolId: 'call', foreground: true });
+    book.admit(compactPayload, () => true);
+    book.observe(binding, { ...base, kind: 'toolEnd', toolId: 'call', success: true });
+    book.observe(binding, { ...base, kind: 'rootEnd', success: true }, true);
+    const compact = (
+      stage: 'accepted' | 'status' | 'boundary' | 'turnStart' | 'itemStart' | 'itemEnd' | 'turnEnd',
+      evidence = {},
+    ) =>
+      book.observeSubmitted(
+        {
+          ...base,
+          kind: 'compact',
+          turnId: provider === 'codex' ? 'compact' : null,
+          generation: 2,
+          stage,
+          evidence,
+        },
+        binding.childGeneration,
+      );
+    let writes = 0;
+    await book.deliver(compactPayload.requestId, {
+      eligible: () => true,
+      submit: async (_binding, check) => {
+        check();
+        writes++;
+        book.observeSubmitted(
+          { ...base, kind: 'submission', text: '/compact', generation: 2 },
+          binding.childGeneration,
+        );
+        if (provider === 'claude') compact('status', { status: 'compacting' });
+        else compact('turnStart');
+        observedStates.push(book.status(compactPayload.requestId)?.state);
+        if (provider === 'claude') {
+          compact('status', { compact_result: 'success' });
+          compact('boundary', { compact_metadata: { trigger: 'auto' } });
+          compact('turnEnd', { subtype: 'success', is_error: false, local_command: 'compact' });
+          observedStates.push(book.status(compactPayload.requestId)?.state);
+          compact('boundary', { compact_metadata: { trigger: 'manual' } });
+        } else {
+          compact('itemStart', { item: { id: 'compact-item' } });
+          compact('itemEnd', { item: { id: 'wrong-item' } });
+          compact('turnEnd', { turn: { status: 'completed' } });
+          observedStates.push(book.status(compactPayload.requestId)?.state);
+          compact('itemEnd', { item: { id: 'compact-item' } });
+          compact('accepted');
+        }
+      },
+    });
+    assert.equal(writes, 1);
+    assert.deepEqual(observedStates, ['started', 'started']);
+    assert.equal(book.status(compactPayload.requestId)?.state, 'completed');
+  }
+});
 // These cases catch duplicate acceptance and unsafe archive admission with no provider or browser startup.
 test('session writes retain one acceptance across equal concurrent retries and refuse conflicts, capacity and old activations', async () => {
   const book = new SessionWriteRequests('window', 1);
@@ -1624,4 +1928,520 @@ test('exact decimal source identity distinguishes adjacent Windows inodes and ke
   ]) {
     assert.equal(sessionSourceAdmitted(source, { ...before, ...change }), false);
   }
+});
+
+// A retained child whose state each case changes between host observations.
+function compactHostFixture(agent: 'claude' | 'codex' = 'codex') {
+  const state = { sessionId: 'self' as string | null, busy: true, asks: [] as unknown[], ready: true, exited: false };
+  const fixture = {
+    clock: 0,
+    calls: 0,
+    writes: 0,
+    // The last native submission generation. The requesting turn of the Claude cases is generation 1.
+    compactions: 1,
+    work: 'none' as 'none' | 'pending' | 'absent',
+    beforeWrite: () => {},
+    state,
+    child: null as unknown as CompactChild,
+    current: null as CompactChild | null,
+    host: null as unknown as CompactHost<CompactChild>,
+  };
+  // Like the adapters, the child reports its compaction submission right after the write callback.
+  const makeChild = (key: string): CompactChild => {
+    const child: CompactChild = {
+      key,
+      agent,
+      state: () => state,
+      compactionUnresolved: () => false,
+      compact: async (check) => {
+        fixture.calls++;
+        state.busy = true;
+        fixture.beforeWrite();
+        check();
+        fixture.writes++;
+        const submission = {
+          kind: 'submission',
+          text: '/compact',
+          generation: ++fixture.compactions,
+        } as const;
+        fixture.host.native(
+          child,
+          {
+            provider: agent,
+            sessionId: 'self',
+            turnId: null,
+            evidence: {},
+            ...submission,
+          },
+          undefined,
+        );
+      },
+    };
+    return child;
+  };
+  fixture.child = makeChild('child');
+  fixture.current = fixture.child;
+  fixture.host = new CompactHost<CompactChild>(
+    compactWindow,
+    {
+      find: (provider, sessionId) =>
+        provider === agent && fixture.current?.state().sessionId === sessionId ? fixture.current : null,
+      withActivity: async (child, work) => {
+        if (child !== fixture.current || child.state().exited) return null;
+        await work(child);
+        return undefined;
+      },
+      readerWork: () => fixture.work,
+    },
+    () => fixture.clock,
+  );
+  return { fixture, makeChild };
+}
+
+// Admits a request from a live root tool call in reader turn 7, then settles the tool.
+function admittedCompaction(fixture: ReturnType<typeof compactHostFixture>['fixture']) {
+  const { host, child } = fixture;
+  host.submitted(child, 7);
+  host.native(child, compactEvent('toolStart'), 7);
+  assert.deepEqual(host.handle({ method: 'compact-ready', params: compactPayload }), { ready: true });
+  const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+  assert.equal(ack.state, 'queued');
+  host.native(child, compactEvent('toolEnd'), 7);
+}
+
+const compactState = (host: CompactHost<CompactChild>) =>
+  (host.handle({ method: 'compact-status', params: { requestId: compactPayload.requestId } }) as { state: string })
+    .state;
+
+test('host compaction runs once after the exact turn succeeds and its final response is saved', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 0, 'a root success without a saved final response must wait');
+  host.replyRetained(child, 7);
+  state.busy = true;
+  await host.drain('self');
+  assert.equal(fixture.writes, 0, 'a busy child must not receive compaction');
+  assert.equal(compactState(host), 'queued');
+  state.busy = false;
+  await Promise.all([host.drain('self'), host.drain('self')]);
+  await host.drain('self');
+  assert.equal(fixture.calls, 1, 'one assignment issues one provider command');
+  assert.equal(fixture.writes, 1);
+  assert.equal(compactState(host), 'uncertain');
+  const stages = [
+    ['turnStart', {}],
+    ['itemStart', { item: { id: 'item' } }],
+    ['itemEnd', { item: { id: 'item' } }],
+    ['turnEnd', { turn: { status: 'completed' } }],
+  ] as const;
+  for (const [stage, evidence] of stages)
+    host.native(
+      child,
+      { provider: 'codex', sessionId: 'self', turnId: 'compact', generation: 2, evidence, kind: 'compact', stage },
+      undefined,
+    );
+  assert.equal(compactState(host), 'completed');
+});
+
+test('host compaction fails when no final response follows the requesting tool or the turn fails', async () => {
+  for (const ending of ['reply before tool', 'failed turn'] as const) {
+    const { fixture } = compactHostFixture();
+    const { host, child, state } = fixture;
+    host.submitted(child, 7);
+    host.native(child, compactEvent('toolStart'), 7);
+    host.handle({ method: 'compact-request', params: compactPayload });
+    if (ending === 'reply before tool') host.replyRetained(child, 7);
+    host.native(child, compactEvent('toolEnd'), 7);
+    host.native(child, compactEvent('rootEnd', { success: ending !== 'failed turn' }), 7);
+    if (ending === 'failed turn') host.replyRetained(child, 7);
+    host.turnEnded(child);
+    state.busy = false;
+    await host.drain('self');
+    assert.equal(fixture.writes, 0, ending);
+    assert.equal(compactState(host), 'failed', ending);
+  }
+});
+
+test('host compaction cancels unsubmitted work on reader action, child change, scope loss and disposal', async () => {
+  for (const change of [
+    'reader',
+    'answer',
+    'replacement',
+    'exit',
+    'scope',
+    'scope restored',
+    'disposal',
+    'write boundary',
+  ] as const) {
+    const { fixture, makeChild } = compactHostFixture();
+    const { host, child, state } = fixture;
+    admittedCompaction(fixture);
+    host.replyRetained(child, 7);
+    host.native(child, compactEvent('rootEnd'), 7);
+    state.busy = false;
+    if (change === 'reader') host.readerAction('self');
+    if (change === 'answer') host.readerAction('self', true);
+    // The rows refresh after a scope change shows the session gone, and a later change returns it before the next drain.
+    if (change === 'scope restored') {
+      host.scopeChanged();
+      fixture.work = 'absent';
+      host.sessionsRefreshed();
+      fixture.work = 'none';
+      host.scopeChanged();
+      host.sessionsRefreshed();
+    }
+    if (change === 'replacement') fixture.current = makeChild('child');
+    if (change === 'exit') {
+      state.exited = true;
+      host.childGone('child');
+    }
+    if (change === 'scope') fixture.work = 'absent';
+    if (change === 'disposal') host.dispose();
+    if (change === 'write boundary') fixture.beforeWrite = () => host.readerAction('self');
+    await host.drain('self');
+    assert.equal(fixture.writes, 0, change);
+    assert.equal(compactState(host), 'cancelled', change);
+  }
+  const { fixture } = compactHostFixture();
+  fixture.host.submitted(fixture.child, 7);
+  fixture.host.native(fixture.child, compactEvent('toolStart'), 7);
+  fixture.host.readerAction('self');
+  const refused = fixture.host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+  assert.equal(refused.state, 'refused');
+});
+
+// Catches a worktree change or a failed Git read cancelling a request whose session never left the window's scope.
+test('host compaction waits through a scope change that keeps its session and delivers after the rows refresh', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  host.scopeChanged();
+  await host.drain('self');
+  assert.equal(fixture.writes, 0, 'delivery waits until the rows show the new scope');
+  assert.equal(compactState(host), 'queued');
+  host.sessionsRefreshed();
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
+  assert.equal(compactState(host), 'uncertain');
+});
+
+// Catches admission while reader input waits: B runs while C waits, and B's agent asks to compact.
+// The refusal leaves no record, so nothing can compact after C.
+test('host compaction refuses a request while reader input waits in the queue', () => {
+  const { fixture } = compactHostFixture();
+  const { host, child } = fixture;
+  fixture.work = 'pending';
+  host.submitted(child, 7);
+  host.native(child, compactEvent('toolStart'), 7);
+  const refused = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+  assert.equal(refused.state, 'refused');
+  assert.equal(compactState(host), 'unavailable');
+});
+
+// Catches an approval of the requesting command refusing its own request.
+test('host compaction keeps a request the reader approved inside its turn', () => {
+  const { fixture } = compactHostFixture();
+  const { host, child } = fixture;
+  host.submitted(child, 7);
+  host.native(child, compactEvent('toolStart'), 7);
+  host.readerAction('self', true);
+  const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+  assert.equal(ack.state, 'queued');
+});
+
+// Catches a stuck record blocking later turns, and a replacement child completing the old child's request.
+test('host compaction outcomes that never arrive block only their own turn and child', async () => {
+  const { fixture, makeChild } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(compactState(host), 'uncertain');
+  const second = { ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+  const literal = compactLiteral.replace(compactPayload.requestId, second.requestId);
+  state.exited = true;
+  host.childGone('child');
+  const next = makeChild('next');
+  fixture.current = next;
+  state.exited = false;
+  state.busy = true;
+  host.submitted(next, 9);
+  host.native(next, compactEvent('toolStart', { turnId: 'later', toolId: 'later', command: literal }), 9);
+  const ack = host.handle({ method: 'compact-request', params: second }) as { state: string };
+  assert.equal(ack.state, 'queued');
+  const stages = [
+    ['turnStart', {}],
+    ['itemStart', { item: { id: 'item' } }],
+    ['itemEnd', { item: { id: 'item' } }],
+    ['turnEnd', { turn: { status: 'completed' } }],
+  ] as const;
+  for (const [stage, evidence] of stages)
+    host.native(
+      next,
+      { provider: 'codex', sessionId: 'self', turnId: 'compact', generation: 2, evidence, kind: 'compact', stage },
+      undefined,
+    );
+  assert.equal(compactState(host), 'uncertain');
+});
+
+// Catches an error answer from the provider being reported as an unknown outcome.
+test('host compaction reports a refused provider request as failed', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  host.native(
+    child,
+    {
+      provider: 'codex',
+      sessionId: 'self',
+      turnId: null,
+      generation: 2,
+      evidence: {},
+      kind: 'compact',
+      stage: 'refused',
+    },
+    undefined,
+  );
+  assert.equal(compactState(host), 'failed');
+});
+
+// Catches a Claude request that never binds to its prompt generation or never completes from the manual compact result.
+test('host compaction binds a Claude request to its prompt generation and completes on the manual compact result', async () => {
+  const { fixture } = compactHostFixture('claude');
+  const { host, child, state } = fixture;
+  const claude = (event: Record<string, unknown>) =>
+    ({ provider: 'claude', sessionId: 'self', turnId: null, generation: 1, evidence: {}, ...event }) as NativeEvent;
+  host.submitted(child, 7);
+  host.native(child, claude({ kind: 'toolStart', toolId: 'call', command: compactLiteral, foreground: true }), 7);
+  const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+  assert.equal(ack.state, 'queued');
+  host.native(child, claude({ kind: 'toolEnd', toolId: 'call', success: true }), 7);
+  host.replyRetained(child, 7);
+  host.native(child, claude({ kind: 'rootEnd', success: true }), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  const compact = (stage: string, evidence: Record<string, unknown>) =>
+    host.native(child, claude({ kind: 'compact', stage, generation: 2, evidence }), undefined);
+  compact('status', { status: 'compacting' });
+  assert.equal(compactState(host), 'started');
+  compact('status', { compact_result: 'success' });
+  compact('boundary', { compact_metadata: { trigger: 'manual' } });
+  compact('turnEnd', { subtype: 'success', is_error: false, local_command: 'compact' });
+  assert.equal(compactState(host), 'completed');
+});
+
+// Catches compaction evidence that completes or reopens another request on the same child, and a timed-out
+// request whose late turn no longer completes it after a later request ran.
+test('host compaction evidence reaches only the request whose submission it names', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  const ids = ['aaaaaaaa', 'bbbbbbbb', 'cccccccc'].map(
+    (head) => `${compactWindow}:${head}-1111-2222-3333-444444444444`,
+  );
+  const status = (requestId: string) =>
+    (
+      host.handle({ method: 'compact-status', params: { requestId } }) as {
+        state: string;
+      }
+    ).state;
+  const compact = (generation: number, stage: string, evidence: Record<string, unknown> = {}) =>
+    host.native(
+      child,
+      {
+        provider: 'codex',
+        sessionId: 'self',
+        turnId: `compact-${generation}`,
+        generation,
+        evidence,
+        kind: 'compact',
+        stage,
+      } as NativeEvent,
+      undefined,
+    );
+  const succeed = (generation: number) => {
+    compact(generation, 'turnStart');
+    compact(generation, 'itemStart', { item: { id: `item-${generation}` } });
+    compact(generation, 'itemEnd', { item: { id: `item-${generation}` } });
+    compact(generation, 'turnEnd', { turn: { status: 'completed' } });
+  };
+  // Each request runs in its own reader turn and is delivered once that turn ends.
+  const request = async (requestId: string, turn: number) => {
+    const turnId = `root-${turn}`;
+    state.busy = true;
+    host.submitted(child, turn);
+    const command = compactLiteral.replace(compactPayload.requestId, requestId);
+    host.native(child, compactEvent('toolStart', { turnId, toolId: turnId, command }), turn);
+    const ack = host.handle({
+      method: 'compact-request',
+      params: { ...compactPayload, requestId },
+    });
+    assert.equal((ack as { state: string }).state, 'queued');
+    host.native(child, compactEvent('toolEnd', { turnId, toolId: turnId }), turn);
+    host.replyRetained(child, turn);
+    host.native(child, compactEvent('rootEnd', { turnId }), turn);
+    state.busy = false;
+    await host.drain('self');
+  };
+  // Request A has no native evidence yet. The child holds no unanswered compaction, so B still runs.
+  await request(ids[0], 7);
+  await request(ids[1], 8);
+  succeed(3);
+  assert.equal(status(ids[1]), 'completed');
+  assert.equal(status(ids[0]), 'uncertain', "B's evidence completed A");
+  await request(ids[2], 9);
+  compact(4, 'refused');
+  assert.equal(status(ids[2]), 'failed');
+  assert.equal(status(ids[1]), 'completed', "C's refusal reopened B");
+  succeed(2);
+  assert.equal(status(ids[0]), 'completed');
+  assert.equal(fixture.writes, 3);
+});
+
+// Catches the late turn of an unanswered compaction completing a newer request of the same child.
+test('host compaction waits while an earlier compaction of its child has no answer', async () => {
+  vi.useFakeTimers();
+  try {
+    const { fixture } = compactHostFixture();
+    const { host, state } = fixture;
+    const sent: { id?: number; method?: string }[] = [];
+    const starts = () => sent.filter((message) => message.method === 'thread/compact/start').length;
+    const wire = new CodexWire({
+      send: (line) => sent.push(JSON.parse(line)),
+      emit: (event) => {
+        if (event.kind === 'native') host.native(child, event.event, undefined);
+      },
+      clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
+      cwd: 'C:\\ws',
+      deadlineMs: 1_000,
+    });
+    const child: CompactChild = {
+      key: 'wire',
+      agent: 'codex',
+      state: () => state,
+      compactionUnresolved: () => wire.compactionUnresolved(),
+      compact: (beforeWrite) => wire.compact(beforeWrite),
+    };
+    fixture.current = child;
+    const opening = wire.startThread({ cwd: 'C:\\ws' });
+    wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: { thread: { id: 'self' } } }));
+    await opening;
+    const ids = ['aaaaaaaa', 'bbbbbbbb'].map((head) => `${compactWindow}:${head}-1111-2222-3333-444444444444`);
+    const status = (requestId: string) =>
+      (host.handle({ method: 'compact-status', params: { requestId } }) as { state: string }).state;
+    // Each request runs in its own reader turn and drains once that turn ends.
+    const request = (requestId: string, turn: number) => {
+      const turnId = `root-${turn}`;
+      state.busy = true;
+      host.submitted(child, turn);
+      const command = compactLiteral.replace(compactPayload.requestId, requestId);
+      host.native(child, compactEvent('toolStart', { turnId, toolId: turnId, command }), turn);
+      host.handle({ method: 'compact-request', params: { ...compactPayload, requestId } });
+      host.native(child, compactEvent('toolEnd', { turnId, toolId: turnId }), turn);
+      host.replyRetained(child, turn);
+      host.native(child, compactEvent('rootEnd', { turnId }), turn);
+      state.busy = false;
+      void host.drain('self');
+    };
+    const runTurn = (id: string) => {
+      const item = { type: 'contextCompaction', id: `${id}-item` };
+      const send = (method: string, params: Record<string, unknown>) =>
+        wire.receive(JSON.stringify({ method, params: { threadId: 'self', ...params } }));
+      send('turn/started', { turn: { id } });
+      send('item/started', { turnId: id, item });
+      send('item/completed', { turnId: id, item });
+      send('turn/completed', { turn: { id, status: 'completed' } });
+    };
+    // Request A gets no answer before the deadline. Request B waits for A's late turn.
+    request(ids[0], 7);
+    await vi.advanceTimersByTimeAsync(1_000);
+    assert.equal(status(ids[0]), 'uncertain');
+    request(ids[1], 8);
+    await vi.advanceTimersByTimeAsync(1_000);
+    assert.equal(starts(), 1, 'B was submitted while A had no answer');
+    assert.equal(status(ids[1]), 'queued');
+    runTurn('late');
+    assert.equal(status(ids[1]), 'queued', "A's late turn reached B");
+    assert.equal(status(ids[0]), 'completed');
+    // The end of A's receipt drains B without another host event.
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(starts(), 2);
+    wire.receive(JSON.stringify({ id: sent.at(-1)!.id, result: {} }));
+    runTurn('second');
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(status(ids[1]), 'completed');
+    wire.close('finished');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Catches a busy child or a new ask at the write boundary cancelling work that only had to wait, and expiry reported as a change.
+test('self compaction keeps waiting while the session is briefly not ready and reports expiry', async () => {
+  let clock = 0;
+  const book = new CompactRequests(compactWindow, () => clock);
+  book.observe(compactBinding, compactEvent('toolStart'));
+  book.admit(compactPayload, () => true);
+  book.observe(compactBinding, compactEvent('toolEnd'));
+  book.observe(compactBinding, compactEvent('rootEnd'), true);
+  let ready = false;
+  let writes = 0;
+  const delivery = {
+    eligible: () => ready,
+    submit: async (_binding: Readonly<CompactBinding>, check: () => void) => {
+      ready = false;
+      check();
+      writes++;
+    },
+  };
+  await book.deliver(compactPayload.requestId, delivery);
+  assert.equal(book.status(compactPayload.requestId)?.state, 'queued');
+  ready = true;
+  await book.deliver(compactPayload.requestId, delivery);
+  assert.equal(book.status(compactPayload.requestId)?.state, 'queued');
+  clock = COMPACT_LIMITS.admissionMs;
+  ready = true;
+  await book.deliver(compactPayload.requestId, delivery);
+  assert.equal(writes, 0);
+  assert.equal(book.status(compactPayload.requestId)?.state, 'cancelled');
+  assert.match(book.status(compactPayload.requestId)!.reason, /expired/);
+});
+
+// Catches a frozen acknowledgement for a finished record, a copied payload in another call, and a request ID reused after its record expired.
+test('self compaction returns the current record for a retried request ID and refuses it for another call or after expiry', () => {
+  let clock = 0;
+  const book = new CompactRequests(compactWindow, () => clock);
+  book.observe(compactBinding, compactEvent('toolStart'));
+  book.admit(compactPayload, () => true);
+  const other = { ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+  book.observe(
+    compactBinding,
+    compactEvent('toolStart', {
+      toolId: 'other',
+      command: compactLiteral.replace(compactPayload.requestId, other.requestId),
+    }),
+  );
+  assert.throws(() => book.admit(other, () => true), /already has a pending/);
+  book.invalidate(() => true, 'The reader acted.');
+  assert.equal(book.admit(compactPayload, () => true).state, 'cancelled');
+  book.observe(compactBinding, compactEvent('toolStart', { toolId: 'copy' }));
+  assert.throws(() => book.admit(compactPayload, () => true), /already used/);
+  assert.equal(book.ready(compactPayload), false);
+  clock += COMPACT_LIMITS.retentionMs;
+  assert.equal(book.status(compactPayload.requestId), null);
+  const later = { ...compactBinding, turn: 'later', submissionId: 'later' };
+  book.observe(later, compactEvent('toolStart', { toolId: 'later', turnId: 'later' }));
+  assert.throws(() => book.admit(compactPayload, () => true), /already used/);
 });

@@ -508,6 +508,7 @@ export class ClaudeWire {
   private streamingMessageId: string | null = null;
   private counter = 0;
   private promptGeneration = 0;
+  private nativeGeneration = 0;
   private closed = false;
   private readonly contextRequests = new Set<string>();
 
@@ -550,13 +551,15 @@ export class ClaudeWire {
 
   // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
   // Every prompt carries a human origin. The transcript's `agentRunIn` rule uses it to identify reader-owned sessions across windows.
-  prompt(input: AgentPromptInput): Promise<void> {
+  prompt(input: AgentPromptInput, beforeWrite?: () => void): Promise<void> {
     this.responseClock.reset();
     if (this.closed) {
       throw new Error('the agent is no longer running');
     }
     const prompt = normalizeAgentPrompt(input);
     if (!prompt.assets.length && prompt.text) {
+      beforeWrite?.();
+      this.nativeSubmission(prompt.text);
       this.write({
         type: 'user',
         message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
@@ -572,6 +575,8 @@ export class ClaudeWire {
       if (generation !== this.promptGeneration) {
         throw new Error('the prompt was stopped before it reached the agent');
       }
+      beforeWrite?.();
+      this.nativeSubmission(prompt.text);
       this.write({ type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN });
     });
   }
@@ -746,6 +751,7 @@ export class ClaudeWire {
       this.emit({ kind: 'session', sessionId: session, previous });
     }
 
+    this.nativeMessage(m);
     switch (str(m.type)) {
       case 'control_response':
         this.settle(obj(m.response));
@@ -802,6 +808,94 @@ export class ClaudeWire {
       default:
         return;
     }
+  }
+
+  private nativeSubmission(text: string): void {
+    this.nativeGeneration++;
+    if (this.session)
+      this.emit({
+        kind: 'native',
+        event: {
+          kind: 'submission',
+          provider: 'claude',
+          sessionId: this.session,
+          generation: this.nativeGeneration,
+          turnId: null,
+          text,
+          evidence: {},
+        },
+      });
+  }
+
+  private nativeMessage(message: Json): void {
+    const sessionId = str(message.session_id);
+    if (this.closed || !sessionId || sessionId !== this.session) return;
+    const base = {
+      provider: 'claude' as const,
+      sessionId,
+      generation: this.nativeGeneration,
+      turnId: null,
+      evidence: message,
+    };
+    if (message.type === 'assistant' && message.parent_tool_use_id === null) {
+      for (const block of arr(obj(message.message)?.content)) {
+        const tool = obj(block);
+        const input = obj(tool?.input);
+        const command = str(input?.command);
+        const toolId = str(tool?.id);
+        if (
+          tool?.type === 'tool_use' &&
+          tool.name === 'Bash' &&
+          obj(tool.caller)?.type === 'direct' &&
+          command &&
+          toolId
+        )
+          this.emit({
+            kind: 'native',
+            event: { ...base, kind: 'toolStart', toolId, command, foreground: input?.run_in_background !== true },
+          });
+      }
+    }
+    if (message.type === 'user' && message.parent_tool_use_id === null) {
+      for (const block of arr(obj(message.message)?.content)) {
+        const tool = obj(block);
+        const toolId = str(tool?.tool_use_id);
+        if (tool?.type === 'tool_result' && toolId)
+          this.emit({
+            kind: 'native',
+            event: {
+              ...base,
+              kind: 'toolEnd',
+              toolId,
+              success: tool.is_error === false && obj(message.tool_use_result)?.interrupted === false,
+            },
+          });
+      }
+    }
+    if (
+      message.type === 'result' &&
+      (message.parent_tool_use_id === undefined || message.parent_tool_use_id === null) &&
+      str(message.uuid) &&
+      Number.isSafeInteger(message.result_index)
+    ) {
+      if (message.local_command === 'compact')
+        this.emit({ kind: 'native', event: { ...base, kind: 'compact', stage: 'turnEnd' } });
+      else if (message.local_command === undefined && typeof message.num_turns === 'number' && message.num_turns > 0)
+        this.emit({
+          kind: 'native',
+          event: {
+            ...base,
+            kind: 'rootEnd',
+            success:
+              message.subtype === 'success' && message.is_error === false && message.terminal_reason === 'completed',
+          },
+        });
+    }
+    if (message.type === 'system' && (message.subtype === 'status' || message.subtype === 'compact_boundary'))
+      this.emit({
+        kind: 'native',
+        event: { ...base, kind: 'compact', stage: message.subtype === 'status' ? 'status' : 'boundary' },
+      });
   }
 
   // Rejects pending control requests and clears asks when the child exits.

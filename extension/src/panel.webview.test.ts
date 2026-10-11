@@ -217,6 +217,196 @@ test('Claude response speed persists after a running prompt reconciles to its re
   assert.equal(saves.length, 2);
 });
 
+// Catches a final reply whose saved callback is lost after a panel refresh retires the prompt card, because the
+// selected window already shows the recorded turn. Every admitted Claude request then failed after a successful turn.
+// The wire lines follow the order a Claude CLI turn sends: tool use, tool result, final text, end of turn, result.
+test('a Claude self-compaction request compacts once after its turn when the selected window already shows that turn', async () => {
+  const window = 'b'.repeat(24);
+  const requestId = window + ':aaaaaaaa-1111-2222-3333-444444444444';
+  const payload = { requestId, window, self: true, afterTurn: true };
+  const literal = `arc compact request --self --after-turn --request-id ${requestId} --window ${window} --json`;
+  const session = 'compact-session';
+  const press = {
+    ...livePress({ sessionId: session, agent: 'claude' }),
+    at: 1000,
+    ran: true,
+    started: true,
+    turnId: 7,
+  };
+  const fixture = liveProviderFixture(press, turn({ sessionId: session, agent: 'claude', startedAt: press.at }));
+  const provider = fixture.provider as any;
+  provider.completeSelectedWindow = () => Promise.resolve();
+  provider.running.add('claude:' + session);
+  const state = {
+    sessionId: session,
+    busy: true,
+    asks: [] as unknown[],
+    ready: true,
+    exited: false,
+  };
+  let writes = 0;
+  const child: CompactChild = {
+    key: 'child',
+    agent: 'claude',
+    state: () => state,
+    compactionUnresolved: () => false,
+    compact: async (beforeWrite) => {
+      beforeWrite();
+      writes++;
+    },
+  };
+  const owner = new CompactHost<CompactChild>(window, {
+    find: () => child,
+    withActivity: async (_child, work) => {
+      await work(child);
+      return undefined;
+    },
+    readerWork: () => 'none',
+  });
+  // Routes wire events as extension.ts does while turn 7 is the one open turn.
+  const wire = new ClaudeWire({
+    send() {},
+    sessionId: session,
+    emit: (event) => {
+      if (event.kind === 'native') owner.native(child, event.event, 7);
+      if (event.kind === 'text')
+        provider.noteCompletedReply(session, event.text, event.sourceId, 7, () => owner.replyRetained(child, 7));
+      if (event.kind === 'turnEnd') {
+        provider.noteResponseEnded(session, event.outcome, 7);
+        owner.turnEnded(child);
+      }
+    },
+  });
+  owner.submitted(child, 7);
+  await wire.prompt('Save the handoff, then compact this session.');
+  const send = (line: Record<string, unknown>) =>
+    wire.receive(
+      JSON.stringify({
+        session_id: session,
+        parent_tool_use_id: null,
+        ...line,
+      }),
+    );
+  const stream = (event: Record<string, unknown>) => send({ type: 'stream_event', event });
+  const input = {
+    command: literal,
+    description: 'Request owner after this turn',
+  };
+  const tool = {
+    type: 'tool_use',
+    id: 'toolu_compact',
+    name: 'Bash',
+    input,
+    caller: { type: 'direct' },
+  };
+  stream({
+    type: 'message_start',
+    message: { id: 'msg_tool', role: 'assistant', content: [] },
+  });
+  stream({
+    type: 'content_block_start',
+    index: 0,
+    content_block: { ...tool, input: {} },
+  });
+  stream({
+    type: 'content_block_delta',
+    index: 0,
+    delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) },
+  });
+  send({
+    type: 'assistant',
+    uuid: 'tool-envelope',
+    message: { id: 'msg_tool', role: 'assistant', content: [tool] },
+  });
+  stream({ type: 'content_block_stop', index: 0 });
+  stream({ type: 'message_delta', delta: { stop_reason: 'tool_use' } });
+  stream({ type: 'message_stop' });
+  assert.deepEqual(owner.handle({ method: 'compact-ready', params: payload }), {
+    ready: true,
+  });
+  assert.equal(
+    (
+      owner.handle({ method: 'compact-request', params: payload }) as {
+        state: string;
+      }
+    ).state,
+    'queued',
+  );
+  // A refresh shows the recorded turn in the selected window and retires the prompt card.
+  assert.equal(fixture.call.dropSpentPresses(), true);
+  assert.equal(provider.live[session], undefined);
+  send({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        {
+          tool_use_id: 'toolu_compact',
+          type: 'tool_result',
+          content: 'queued',
+          is_error: false,
+        },
+      ],
+    },
+    tool_use_result: { stdout: 'queued', stderr: '', interrupted: false },
+  });
+  send({ type: 'system', subtype: 'status', status: 'requesting' });
+  const reply = 'The handoff is saved. Compaction is queued.';
+  stream({
+    type: 'message_start',
+    message: { id: 'msg_final', role: 'assistant', content: [] },
+  });
+  stream({
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'text', text: '' },
+  });
+  stream({
+    type: 'content_block_delta',
+    index: 0,
+    delta: { type: 'text_delta', text: reply },
+  });
+  send({
+    type: 'assistant',
+    uuid: 'final',
+    message: {
+      id: 'msg_final',
+      role: 'assistant',
+      content: [{ type: 'text', text: reply }],
+    },
+  });
+  stream({ type: 'content_block_stop', index: 0 });
+  stream({ type: 'message_delta', delta: { stop_reason: 'end_turn' } });
+  stream({ type: 'message_stop' });
+  send({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    stop_reason: 'end_turn',
+    terminal_reason: 'completed',
+    num_turns: 2,
+    result: reply,
+    uuid: 'root-result',
+    result_index: 0,
+  });
+  send({ type: 'system', subtype: 'session_state_changed', state: 'idle' });
+  const status = () =>
+    owner.handle({ method: 'compact-status', params: { requestId } }) as {
+      state: string;
+      reason: string;
+    };
+  assert.equal(status().state, 'queued', status().reason);
+  assert.deepEqual(
+    owner.requests.deliverable(session).map(({ id }) => id),
+    [requestId],
+  );
+  state.busy = false;
+  await owner.drain(session);
+  assert.equal(writes, 1);
+  assert.equal(status().state, 'uncertain');
+  wire.close('finished');
+});
+
 test('the host reads closed child work once per file version and never reads open child work', () => {
   const start = panelHostSource.indexOf('private liveOpenChildren(');
   const source = memberFrom(panelHostSource, start).replace('private liveOpenChildren(', 'function liveOpenChildren(');
@@ -1314,6 +1504,8 @@ import { withRecoveredCommits } from './childartifacts.ts';
 import { sameCommitSha, listSessionFiles, readTurns } from './transcript.ts';
 import { handoffRefusalMessage, pressIsMidTurn, pressesAfter } from './composerview.ts';
 import { compaction, livePress, powershellDispatchExecution, subagentCommitTurn, turn } from './turnfixtures.ts';
+import { ClaudeWire } from './claudewire.ts';
+import { CompactHost, type CompactChild } from './compactrequest.ts';
 import { currentRecordsBySession, turnKey } from './turnread.ts';
 import { ProgressiveWorker, acceptsProgressiveResult, type ProgressiveInput } from './progressiveworker.ts';
 import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webview/navigation.ts';
@@ -6522,6 +6714,44 @@ const protocolSource = fs.readFileSync(path.join(__dirname, 'webview', 'protocol
 const bootstrapSource = fs.readFileSync(path.join(__dirname, 'webview', 'bootstrap.ts'), 'utf8');
 const stateSource = fs.readFileSync(path.join(__dirname, 'webview', 'state.ts'), 'utf8');
 
+// Catches a renamed reader message or a reader-action report moved below an await. Either one lets deferred compaction pass reader input.
+test('every reader instruction names a panel message and reports before the panel awaits or delivers', () => {
+  const set = /const READER_INSTRUCTIONS[^=]*= new Set\(\[([^\]]*)\]\)/.exec(panelHostSource);
+  assert.ok(set, 'panelhost.ts no longer declares READER_INSTRUCTIONS');
+  const names = [...set[1].matchAll(/'([^']+)'/g)].map((match) => match[1]).concat('answerAsk');
+  const from = protocolSource.indexOf('export type PanelToHost =');
+  const union = protocolSource.slice(from, protocolSource.indexOf('\nexport ', from + 1));
+  for (const name of names) assert.ok(union.includes(`type: '${name}'`), `PanelToHost has no '${name}' message`);
+  const start = panelHostSource.indexOf('private async onMessage(');
+  const report = panelHostSource.indexOf('this.onReaderAction?.(message.session', start);
+  assert.ok(start !== -1 && report !== -1, 'the panel message handler no longer reports reader actions');
+  const code = panelHostSource.slice(start, report).replace(/\/\/.*$/gm, '');
+  assert.ok(!/\bawait\s/.test(code), 'a reader action must be reported before any await');
+  const flush = panelHostSource.indexOf('public flushQueue(');
+  const delivered = panelHostSource.indexOf('this.onReaderAction?.(state.sessionId', flush);
+  assert.ok(flush !== -1 && delivered !== -1, 'queued delivery no longer reports a reader action');
+  assert.ok(delivered < panelHostSource.indexOf('this.send(ready', flush), 'queued delivery reports before it sends');
+});
+
+// Catches a scope change or a rows refresh that no longer reaches deferred compaction. A lost report lets compaction
+// run in a session that left the window's scope.
+test('repository scope changes, workspace folder changes and rows refreshes report to deferred compaction', () => {
+  for (const member of ['private repositoryScopeChanged(', 'private workspaceFoldersChanged(']) {
+    const start = panelHostSource.indexOf(member);
+    assert.ok(start !== -1, member);
+    assert.match(memberFrom(panelHostSource, start), /^\s*this\.onScopeChange\?\.\(\);/m, member);
+  }
+  assert.equal(
+    panelHostSource.match(/if \(!selectedOnly && this\.repositoryScopeReady\) this\.onSessionRowsRefreshed\?\.\(\);/g)
+      ?.length,
+    2,
+    'both the unchanged and the rebuilt full refresh report rows',
+  );
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  assert.match(extensionSource, /panel\.onScopeChange = \(\) => owner\.scopeChanged\(\);/);
+  assert.match(extensionSource, /panel\.onSessionRowsRefreshed = \(\) => owner\.sessionsRefreshed\(\);/);
+});
+
 // The panel source files used by static ownership and wording guards.
 const script = fs.readFileSync(path.join(__dirname, 'webview', 'panel.ts'), 'utf8');
 const browserComposerSource = fs.readFileSync(path.join(__dirname, 'webview', 'composer.ts'), 'utf8');
@@ -10628,6 +10858,7 @@ test('removing a permission override stores every session before the agent defau
     'sessionSettings',
     'withSessionSettings',
     'panel',
+    'compaction',
     code,
   )(
     loaded,
@@ -10654,10 +10885,13 @@ test('removing a permission override stores every session before the agent defau
     {
       clearEffectiveModes: (_agent: string, sessions: string[]) => events.push(`cleared ${sessions.sort().join(',')}`),
     },
+    { readerAction: (session: string) => events.push(`reader ${session}`) },
   );
 
   await loaded.exports.setAskModeFor('codex', { value: '', label: '', description: '' }, 'one');
   assert.deepEqual(events, [
+    'reader one',
+    'reader two',
     'barrier',
     'all barred',
     'cleared one,two',
@@ -10709,6 +10943,7 @@ test('an explicit permission pick mutates no state when a default transition own
     'sessionSettings',
     'withSessionSettings',
     'panel',
+    'compaction',
     code,
   )(
     loaded,
@@ -10732,6 +10967,7 @@ test('an explicit permission pick mutates no state when a default transition own
     sessionSettings,
     withSessionSettings,
     { clearEffectiveModes: () => undefined },
+    null,
   );
 
   const changing = loaded.exports.setAskModeFor(
@@ -22533,7 +22769,7 @@ test('completed responses replace streamed text and survive consecutive prompts 
     const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
     sourceMatch(
       extensionSource,
-      /if \(event\.kind === 'text'\) \{[\s\S]*?panel\.noteCompletedReply\(where, event\.text, event\.sourceId, turnId\);[\s\S]*?return;/,
+      /if \(event\.kind === 'text'\) \{[\s\S]*?panel\.noteCompletedReply\(where, event\.text, event\.sourceId, turnId,[\s\S]*?return;/,
       'completed response delivery waits for catalog refresh',
     );
     await vi.runOnlyPendingTimersAsync();
@@ -29868,6 +30104,7 @@ function draftDeliveryCallback(panel: any, rejected: boolean): void {
   const scope = {
     panel,
     startFreshSession: async () => live,
+    compaction: null,
     validateResolvedPromptAssets() {},
     withStartedSessionActivity: (_session: unknown, work: (session: typeof live) => unknown) => work(live),
     resumePlanForDraft() {},

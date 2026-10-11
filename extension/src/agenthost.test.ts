@@ -1518,10 +1518,26 @@ test('Codex native turn identity binds early and obsolete response events to acc
   });
   assert.equal(typeof submitted, 'number');
   emit({ kind: 'text', text: 'Early completed response', sourceId: 'first-response', nativeTurnId: 'native-first' });
+  // A root tool can start before the turn start answer names the turn.
+  emit({
+    kind: 'native',
+    event: {
+      provider: 'codex',
+      sessionId: 'session',
+      turnId: 'native-first',
+      generation: null,
+      evidence: {},
+      kind: 'toolStart',
+      toolId: 'call',
+      command: 'arc',
+      foreground: true,
+    },
+  });
   accept('native-first');
   const first = await pending;
   assert.equal(submitted, first);
   assert.equal(reported.at(-1)?.turnId, first);
+  assert.equal(reported.find(({ event }) => event.kind === 'native')?.turnId, first);
   const next = session.prompt('second');
   accept('native-second');
   const second = await next;
@@ -1537,6 +1553,76 @@ test('Codex native turn identity binds early and obsolete response events to acc
     reported.slice(-4).map(({ turnId }) => turnId),
     [second, first, first, second],
   );
+  const disposing = session.dispose();
+  child.exit(0);
+  await disposing;
+});
+
+// Catches a Claude native event credited to a turn while another prompt is preparing or another turn is open.
+test('Claude native events name their submission only while one open turn owns them', async () => {
+  let emit!: (event: WireEvent) => void;
+  let accept!: () => void;
+  const plan: AgentPlan = {
+    agent: 'claude',
+    sessionId: 'session',
+    command: 'c',
+    args: [],
+    cwd: WS,
+    env: {},
+    driver: (_send, report) => {
+      emit = report;
+      return {
+        receive: () => undefined,
+        open: () => Promise.resolve([]),
+        prompt: () =>
+          new Promise<void>((resolve) => {
+            accept = resolve;
+          }),
+        compact: () => Promise.resolve(),
+        clear: () => Promise.resolve(),
+        answer: () => false,
+        interrupt: () => Promise.resolve(),
+        sessionId: () => 'session',
+        close: () => undefined,
+      };
+    },
+  };
+  const child = new FakeChild();
+  const reported: Array<{ event: WireEvent; turnId?: number }> = [];
+  const session = new AgentSession(
+    'claude-native',
+    plan,
+    () => child,
+    (event, turnId) => reported.push({ event, turnId }),
+    () => undefined,
+  );
+  await session.start();
+  const native: WireEvent = {
+    kind: 'native',
+    event: {
+      provider: 'claude',
+      sessionId: 'session',
+      turnId: null,
+      generation: 1,
+      evidence: {},
+      kind: 'toolStart',
+      toolId: 'call',
+      command: 'arc',
+      foreground: true,
+    },
+  };
+  const opening = session.prompt('first');
+  accept();
+  const first = await opening;
+  emit(native);
+  assert.equal(reported.at(-1)?.turnId, first);
+  const joining = session.prompt('second');
+  emit(native);
+  assert.equal(reported.at(-1)?.turnId, undefined, 'a preparing prompt leaves the owner unknown');
+  accept();
+  await joining;
+  emit(native);
+  assert.equal(reported.at(-1)?.turnId, undefined, 'two open turns leave the owner unknown');
   const disposing = session.dispose();
   child.exit(0);
   await disposing;

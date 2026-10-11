@@ -71,6 +71,8 @@ arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MOD
 arc label add|remove ID --label NAME [--dry-run] [--window ID] [--request-id ID]
 arc pin|unpin|archive|unarchive ID [--dry-run] [--window ID] [--request-id ID]
 arc archive ID --force [--window ID] [--request-id ID]
+arc compact request --self --after-turn --request-id WINDOW:UUID --window WINDOW --json
+arc compact status --request-id WINDOW:UUID --window WINDOW --json
 ```
 
 `setups` returns the runtime catalog, permissions, and current, pinned, and recent setup keys. Use a returned key or explicit values. Omitted model, effort, and permissions retain provider defaults. Starts require a ready panel, project setup storage, and a loaded catalog for the chosen provider. Unsupported setup values refuse launch.
@@ -80,6 +82,8 @@ arc archive ID --force [--window ID] [--request-id ID]
 Write results print JSON with `requestId` and a status. Starts report `accepted`, `accepted-with-errors`, or `refused`. Accepted results include `sessionId`, provider, requested setup, classification, attribution, and save errors. Requested settings do not establish observed provider execution. Curation reports `applied`, `dry-run`, or `refused`. A rejected save produces an error. Dry runs perform no writes. Archive refuses running, needs-input, and completed unread sessions unless the request passes `--force`. A session whose run status is `subagents` or `background` refuses archive even with `--force`. Archive also refuses a session with unavailable state or hidden attention unless the request passes `--force`. Arc can miss background work in a session with unavailable state, and a forced archive then admits the session while that work runs. A forced archive keeps the current turn and any open question. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) owns when Arc ends the process of a session it hosts. Archive removes the pin. Unarchive preserves reader state and leaves the session unpinned.
 
 A disconnected or timed-out write returns `unknown` with its request ID when delivery is uncertain. Use the returned ID for an identical-payload retry in the selected window. Fresh IDs are also accepted when prefixed with that window's `hostId` and a colon. The `windows` descriptor supplies `hostId`, which identifies one window activation. Arc retains one result per ID and refuses a conflicting payload. A window reload creates a new activation and makes an old ID's outcome unknown. Never change the ID to retry an uncertain launch. Requester text supplies attribution and grants no authority.
+
+`compact request` asks Arc to compact the requesting agent's own session after its current turn. Both window values must name the same activation. The command reads readiness up to four times across two seconds, then makes one admission attempt. A window without compaction support reports no readiness, so the command returns `refused`. Every compaction result names its outcome in a `state` field and carries the caller's request ID. The outcomes are `queued`, `started`, `completed`, `cancelled`, `refused`, `failed`, `uncertain`, and `unavailable`. A lost admission reply returns `uncertain`, which permits no retry or alternate transport. `compact status` observes a request ID without submitting work. It reports `unavailable` when the window holds no record of the ID or does not answer.
 
 ```sh
 arc setups --window WINDOW_ID

@@ -20,6 +20,86 @@ import {
 
 const SESSION = 'c0129cee-9323-4aea-a448-ec90642971ea';
 
+test('Claude native evidence retains root envelopes, successful tool settlement and distinct manual compaction', async () => {
+  const events: WireEvent[] = [];
+  const writes: string[] = [];
+  const wire = new ClaudeWire({
+    send: (line) => writes.push(line),
+    emit: (event) => events.push(event),
+    sessionId: SESSION,
+  });
+  await wire.prompt('Save the handoff, then compact.');
+  const tool = {
+    type: 'tool_use',
+    id: 'root-call',
+    name: 'Bash',
+    input: { command: 'arc compact request literal' },
+    caller: { type: 'direct' },
+  };
+  const send = (payload: Record<string, unknown>) => wire.receive(JSON.stringify({ session_id: SESSION, ...payload }));
+  for (const parent of ['child', undefined])
+    send({ type: 'assistant', parent_tool_use_id: parent, message: { content: [tool] } });
+  assert.equal(events.filter((e) => e.kind === 'native' && e.event.kind === 'toolStart').length, 0);
+  send({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    uuid: 'envelope',
+    request_id: 'native-request',
+    message: { content: [tool] },
+  });
+  send({
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { content: [{ type: 'tool_result', tool_use_id: 'root-call', is_error: false }] },
+    tool_use_result: { interrupted: false },
+  });
+  const result = {
+    type: 'result',
+    uuid: 'root-result',
+    result_index: 0,
+    num_turns: 2,
+    subtype: 'success',
+    is_error: false,
+    terminal_reason: 'completed',
+  };
+  send(result);
+  const native = events.filter((e) => e.kind === 'native').map((e) => e.event);
+  assert.deepEqual(
+    native.map((e) => e.kind),
+    ['submission', 'toolStart', 'toolEnd', 'rootEnd'],
+  );
+  assert.equal(native[1].evidence.request_id, 'native-request');
+  assert.equal(native[1].generation, 1);
+  assert.equal(native[2].kind === 'toolEnd' && native[2].success, true);
+  assert.equal(native[3].evidence.uuid, 'root-result');
+  assert.equal(native[3].turnId, null);
+  let checks = 0;
+  await wire.prompt('/compact', () => {
+    assert.equal(writes.length, 1);
+    checks++;
+  });
+  send({ type: 'system', subtype: 'status', status: 'compacting' });
+  send({ type: 'system', subtype: 'status', status: null, compact_result: 'success' });
+  send({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'manual' } });
+  send({ ...result, local_command: 'compact', result_index: 1, num_turns: 0 });
+  const compact = events.flatMap((e) => (e.kind === 'native' && e.event.kind === 'compact' ? [e.event] : []));
+  assert.equal(checks, 1);
+  assert.equal(compact.length, 4);
+  assert.equal(
+    compact.every((e) => e.generation === 2),
+    true,
+  );
+  await assert.rejects(
+    async () =>
+      wire.prompt('/compact', () => {
+        throw new Error('reader intervened');
+      }),
+    /reader intervened/,
+  );
+  assert.equal(writes.length, 2);
+  wire.close('finished');
+});
+
 test('Claude response speed uses final actual output and commits only a stopped main response', () => {
   const events: WireEvent[] = [];
   let clock = 1000;
@@ -1109,7 +1189,11 @@ test('a control answer settles the request its id names, and a late one settles 
   // settles nothing and the wire keeps working.
   h.wire.receive(renameAnswer());
   await h.wire.prompt('next');
-  assert.deepEqual(h.events, [], 'a control answer reached the timeline');
+  assert.deepEqual(
+    h.events.filter((event) => event.kind !== 'native'),
+    [],
+    'a control answer reached the timeline',
+  );
 });
 
 test('an empty name sends nothing', async () => {

@@ -1,0 +1,76 @@
+import { requestWindow } from '../../extension/src/sessionrequests.ts';
+import { validCompactPayload } from '../../extension/src/compactrequest.ts';
+
+// Readiness spreads its reads across this window, so a tool start that reaches the host late can still be admitted.
+const READINESS = { attempts: 4, intervalMs: 500, deadlineMs: 2_000 } as const;
+
+export async function runCompact(args: string[]): Promise<string> {
+  const command = args[0];
+  if (command !== 'request' && command !== 'status') throw new Error('Use compact request or compact status.');
+  const values = new Map<string, string>();
+  const flags = new Set<string>();
+  for (let index = 1; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--request-id' || arg === '--window') {
+      const value = args[++index];
+      if (!value || value.startsWith('-') || values.has(arg)) throw new Error(`Invalid or repeated argument: ${arg}`);
+      values.set(arg, value);
+    } else if (
+      ['--json', ...(command === 'request' ? ['--self', '--after-turn'] : [])].includes(arg) &&
+      !flags.has(arg)
+    )
+      flags.add(arg);
+    else throw new Error(`Unknown or repeated argument: ${arg}`);
+  }
+  const payload = {
+    requestId: values.get('--request-id') ?? '',
+    window: values.get('--window') ?? '',
+    self: true as const,
+    afterTurn: true as const,
+  };
+  if (
+    !validCompactPayload(payload) ||
+    !flags.has('--json') ||
+    (command === 'request' && (!flags.has('--self') || !flags.has('--after-turn')))
+  )
+    throw new Error(
+      'Supply --request-id WINDOW:UUID, --window WINDOW and --json. Request also requires --self --after-turn.',
+    );
+  // Local outcomes use the window's `state` field, so an agent reads one field for every outcome.
+  const result = (state: string, reason: string) =>
+    JSON.stringify({ version: 1, state, requestId: payload.requestId, window: payload.window, reason });
+  if (command === 'status') {
+    try {
+      return JSON.stringify(await requestWindow('compact-status', { requestId: payload.requestId }, payload.window));
+    } catch (error) {
+      return result('unavailable', error instanceof Error ? error.message : 'The Arc window is unavailable.');
+    }
+  }
+  try {
+    let ready = false;
+    const deadline = Date.now() + READINESS.deadlineMs;
+    for (let attempt = 0; attempt < READINESS.attempts && Date.now() < deadline; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, READINESS.intervalMs));
+      if (Date.now() >= deadline) break;
+      const observation = (await requestWindow('compact-ready', payload, payload.window)) as { ready?: boolean };
+      if (observation.ready === true) {
+        ready = true;
+        break;
+      }
+    }
+    if (!ready)
+      return result('refused', 'The live requesting tool is unavailable. No compaction request was admitted.');
+  } catch (error) {
+    return result('refused', error instanceof Error ? error.message : 'The Arc window is unavailable.');
+  }
+  try {
+    return JSON.stringify(
+      await requestWindow('compact-request', payload, payload.window, undefined, payload.requestId),
+    );
+  } catch {
+    return result(
+      'uncertain',
+      'Admission is uncertain. Observe this request without retrying or switching transports.',
+    );
+  }
+}

@@ -76,6 +76,90 @@ test('the bundled CLI reports the package version', () => {
   assert.equal(output.trim(), packageJson.version);
 });
 
+test('bundled self compaction uses read-only readiness, one admission and observation without retries', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc compact smoke '));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const requests = [];
+  let ready = true;
+  let loseReply = false;
+  const readyTimes = [];
+  channel.setCompactRequestHandler(async (request) => {
+    requests.push(request);
+    if (request.method === 'compact-ready') readyTimes.push(Date.now());
+    if (request.method === 'compact-ready') return { ready };
+    if (request.method === 'compact-request' && loseReply) {
+      await channel.dispose();
+      return {};
+    }
+    return { state: 'queued', requestId: request.params.requestId };
+  });
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const env = { ...process.env, ARC_HOME: home };
+    const requestId = channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444';
+    const args = [
+      cli,
+      'compact',
+      'request',
+      '--self',
+      '--after-turn',
+      '--request-id',
+      requestId,
+      '--window',
+      channel.hostId,
+      '--json',
+    ];
+    const output = await run(process.execPath, args, { env });
+    assert.equal(JSON.parse(output.stdout).state, 'queued');
+    assert.deepEqual(
+      requests.map((r) => r.method),
+      ['compact-ready', 'compact-request'],
+    );
+    assert.equal(requests[1].id, requestId);
+    await run(
+      process.execPath,
+      [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
+      { env },
+    );
+    assert.equal(requests.at(-1).method, 'compact-status');
+    const before = requests.length;
+    for (const extra of ['--session', '--background', '--self'])
+      await assert.rejects(run(process.execPath, [...args, extra], { env }));
+    assert.equal(requests.length, before);
+    ready = false;
+    const readsBefore = readyTimes.length;
+    const refused = JSON.parse((await run(process.execPath, args, { env })).stdout);
+    assert.equal(refused.state, 'refused');
+    // Back-to-back reads would end before a late native tool start reaches the window.
+    const reads = readyTimes.slice(readsBefore);
+    assert.ok(reads.length >= 2, 'readiness reads more than once');
+    assert.ok(reads.at(-1) - reads[0] >= 450 * (reads.length - 1), 'readiness reads are spread across its deadline');
+    assert.equal(
+      requests.slice(before).every((r) => r.method === 'compact-ready'),
+      true,
+    );
+    ready = true;
+    loseReply = true;
+    const writesBefore = requests.filter((r) => r.method === 'compact-request').length;
+    const uncertain = JSON.parse((await run(process.execPath, args, { env })).stdout);
+    assert.equal(uncertain.state, 'uncertain');
+    assert.equal(uncertain.requestId, requestId);
+    assert.equal(requests.filter((r) => r.method === 'compact-request').length, writesBefore + 1);
+    // The lost reply closed the window, so status names the outcome instead of failing.
+    const gone = await run(
+      process.execPath,
+      [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
+      { env },
+    );
+    assert.equal(JSON.parse(gone.stdout).state, 'unavailable');
+    assert.equal(JSON.parse(gone.stdout).requestId, requestId);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // This packaged check catches argument routing and unwanted dispatch receipts with one local channel.
 test('bundled management commands carry explicit classification, prompt files and curation without implicit receipts', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc management smoke '));

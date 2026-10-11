@@ -3,6 +3,7 @@ import { runCost } from './cost.ts';
 import { runWindows } from './windows.ts';
 import { runSessions } from './sessions.ts';
 import { runManagement } from './manage.ts';
+import { runCompact } from './compact.ts';
 
 declare const ARC_VERSION: string;
 
@@ -13,6 +14,8 @@ function help(): string {
   return [
     'Usage: arc statusline [--json | --next-turn] [--width COLUMNS]',
     '       arc windows [--json]',
+    '       arc compact request --self --after-turn --request-id WINDOW:UUID --window WINDOW --json',
+    '       arc compact status --request-id WINDOW:UUID --window WINDOW --json',
     '       arc sessions [--window ID] [--limit 1-128] [--cursor CURSOR] [--json]',
     '       arc session ID [--turns 1-20] [--window ID] [--json]',
     '       arc setups [--window ID] [--json]',
@@ -32,7 +35,8 @@ function help(): string {
     'Session reads bounded turns without marking them read.',
     '--window selects an Arc window. Otherwise ARC_WINDOW or one unambiguous live window selects it.',
     '--request-id accepts a fresh ID prefixed with the selected window hostId and a colon.',
-    'Use the returned requestId for identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',
+    'Start and curation accept identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',
+    'Never retry a compaction request with uncertain admission.',
   ].join('\n');
 }
 
@@ -68,6 +72,10 @@ async function run(): Promise<void> {
   }
   if (args[0] === 'windows') {
     process.stdout.write(`${await runWindows(args.slice(1))}\n`);
+    return;
+  }
+  if (args[0] === 'compact') {
+    process.stdout.write(`${await runCompact(args.slice(1))}\n`);
     return;
   }
   if (args[0] === 'sessions' || args[0] === 'session') {

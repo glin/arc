@@ -221,7 +221,7 @@ export interface Driver {
   // Completes initialization. Session plans also open a Codex thread after reading skills.
   open(): Promise<PromptEntry[]>;
   prompt(prompt: AgentPromptInput): Promise<void | string>;
-  compact(): Promise<void>;
+  compact(beforeWrite?: () => void): Promise<void>;
   clear(name?: string): Promise<void>;
   answer(id: string, answer: AskAnswer): boolean;
   interrupt(): Promise<void>;
@@ -235,6 +235,8 @@ export interface Driver {
   // wire therefore owns the count. Claude ends each prompt separately, so the session can
   // count those events without asking its wire.
   hasOpenTurns?(): boolean;
+  // Codex keeps a receipt for each compaction request that got no answer until its late turn ends.
+  compactionUnresolved?(): boolean;
   // Whether an ask stays open when its turn ends. Most asks hold a request the agent stops
   // waiting on when the turn ends. A Codex async question holds none, and the reader can
   // answer it later.
@@ -333,7 +335,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
         contextOverflow: (id) => wire.contextOverflow(id),
         open: () => wire.initialize(),
         prompt: async (prompt) => wire.prompt(prompt),
-        compact: async () => wire.prompt(compactCommand('claude')),
+        compact: async (beforeWrite) => wire.prompt(compactCommand('claude'), beforeWrite),
         clear: async () => wire.prompt(clearCommand('claude')),
         answer: (id, answer) => wire.answer(id, answer),
         interrupt: () => wire.interrupt(true),
@@ -432,7 +434,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
           return commands;
         },
         prompt: (prompt) => wire.prompt(prompt),
-        compact: () => wire.compact(),
+        compact: (beforeWrite) => wire.compact(beforeWrite),
         clear: async (name) => {
           await wire.startThread(options, name);
         },
@@ -441,6 +443,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
         sessionId: () => wire.threadId(),
         close: (reason) => wire.close(reason),
         hasOpenTurns: () => wire.hasOpenTurns(),
+        compactionUnresolved: () => wire.compactionUnresolved(),
         outlivesTurn: (id) => wire.outlivesTurn(id),
         usageSupported: (rediscover) => wire.usageSupported(rediscover),
         async rateLimits(refreshAuthentication) {
@@ -975,8 +978,13 @@ export class AgentSession {
   // operation. Claude's operation starts a command turn and ends through its normal result.
   // Codex starts through a native request and its wire keeps the reported control turn open
   // until the server reports how it ended.
-  async compact(): Promise<number> {
-    return this.commandTurn(() => this.driver.compact(), {
+  // True while an earlier compaction request can still start or finish a turn without an answer.
+  compactionUnresolved(): boolean {
+    return this.driver.compactionUnresolved?.() ?? false;
+  }
+
+  async compact(beforeWrite?: () => void): Promise<number> {
+    return this.commandTurn(() => this.driver.compact(beforeWrite), {
       gone: 'the agent is no longer running, so the session was not compacted',
       lost: 'the compaction was stopped before it reached the agent',
       refused: 'compact the session',
@@ -1401,6 +1409,25 @@ export class AgentSession {
       this.drainHeldEffort();
       this.report({ kind: 'sessionState', state: 'idle', settledTurnIds });
       this.changed();
+      return;
+    }
+    // A native event names its accepted submission only when one owner is identifiable.
+    if (event.kind === 'native') {
+      const native = event.event;
+      const owner = this.driver.hasOpenTurns
+        ? native.turnId
+          ? this.nativeTurnOwners.get(native.turnId)
+          : undefined
+        : this.openTurns.size === 1 && this.preparingTurns.size === 0
+          ? this.openTurns.values().next().value?.id
+          : undefined;
+      // A root event can arrive before the turn start answer names its owner. Hold it the way responses wait.
+      const rooted = native.kind === 'toolStart' || native.kind === 'toolEnd' || native.kind === 'rootEnd';
+      if (owner === undefined && rooted && this.driver.hasOpenTurns && native.turnId && this.acceptingPrompts) {
+        this.pendingResponses.push(event);
+        return;
+      }
+      this.report(event, owner);
       return;
     }
     let endedTurnId: number | undefined;

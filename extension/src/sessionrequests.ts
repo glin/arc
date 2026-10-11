@@ -9,6 +9,7 @@ import { ARC_IDENTITY } from './identity.ts';
 import { arcHome } from './store.ts';
 import { WindowsPipeServer } from './windowpipe.ts';
 import { SessionWriteRequests, validSessionWrite, type SessionWriteParams } from './sessionwrites.ts';
+import { validCompactPayload } from './compactrequest.ts';
 
 export const SESSION_REQUEST_VERSION = 1;
 export const SESSION_REQUEST_LIMITS = {
@@ -53,9 +54,18 @@ export interface SessionRequest {
   id: string;
   version: typeof SESSION_REQUEST_VERSION;
   token: string;
-  method: 'ping' | 'sessions' | 'session' | 'setups' | 'start' | 'curate';
+  method:
+    | 'ping'
+    | 'sessions'
+    | 'session'
+    | 'setups'
+    | 'start'
+    | 'curate'
+    | 'compact-ready'
+    | 'compact-request'
+    | 'compact-status';
   requester: string | null;
-  params: SessionWriteParams;
+  params: SessionWriteParams & { requestId?: string; window?: string; self?: true; afterTurn?: true };
   // The channel sets the payload allowance for sessions requests. The wire parser refuses this key.
   replyBytes?: number;
 }
@@ -92,7 +102,17 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     value.version !== SESSION_REQUEST_VERSION ||
     typeof value.token !== 'string' ||
     !TOKEN.test(value.token) ||
-    !['ping', 'sessions', 'session', 'setups', 'start', 'curate'].includes(value.method as string) ||
+    ![
+      'ping',
+      'sessions',
+      'session',
+      'setups',
+      'start',
+      'curate',
+      'compact-ready',
+      'compact-request',
+      'compact-status',
+    ].includes(value.method as string) ||
     !(
       value.requester === null ||
       (typeof value.requester === 'string' && value.requester.length > 0 && value.requester.length <= 256)
@@ -100,7 +120,20 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     !record(value.params)
   )
     return null;
-  if (value.method === 'session') {
+  if (value.method === 'compact-ready' || value.method === 'compact-request') {
+    if (
+      !validCompactPayload(value.params) ||
+      (value.method === 'compact-request' && value.id !== value.params.requestId)
+    )
+      return null;
+  } else if (value.method === 'compact-status') {
+    if (
+      Object.keys(value.params).join(',') !== 'requestId' ||
+      typeof value.params.requestId !== 'string' ||
+      !/^[a-f0-9]{24}:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value.params.requestId)
+    )
+      return null;
+  } else if (value.method === 'session') {
     if (
       Object.keys(value.params).sort().join(',') !== 'sessionId,turns' ||
       typeof value.params.sessionId !== 'string' ||
@@ -241,9 +274,14 @@ export class WindowChannel {
   private inFlight = 0;
   private disposal: Promise<void> | null = null;
   private requestHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
+  private compactHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
 
   setRequestHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
     this.requestHandler = handler;
+  }
+
+  setCompactRequestHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
+    this.compactHandler = handler;
   }
 
   constructor(
@@ -394,6 +432,19 @@ export class WindowChannel {
           .then<unknown>(() => {
             if (this.closed) throw new Error('Window unavailable.');
             if (request.method === 'ping') return this.ping(this.info());
+            if (request.method.startsWith('compact-')) {
+              const data = this.compactHandler
+                ? this.compactHandler(request)
+                : request.method === 'compact-ready'
+                  ? { ready: false }
+                  : { requestId: request.params.requestId, state: 'unavailable' };
+              return Promise.resolve(data).then((data) => {
+                const result = { window: this.info(), data };
+                if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
+                  throw new Error("The compaction response exceeds this window's channel limit.");
+                return result;
+              });
+            }
             if (!this.requestHandler) throw new Error('Session reads are unavailable in this window.');
             // A sessions reply reuses this window object, so its payload can fill the rest of the line.
             const window = request.method === 'sessions' ? this.info() : null;
@@ -654,9 +705,17 @@ export async function requestWindow(
   const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
   if (requestId && !requestId.startsWith(entry.hostId + ':'))
     throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
-  const write = method === 'start' || method === 'curate';
+  const write = method === 'start' || method === 'curate' || method === 'compact-request';
   const result = await exchangeWindow(entry, write ? 120_000 : 1_000, file, method, params, id);
   if (result === null) {
+    if (method === 'compact-request')
+      return {
+        version: 1,
+        state: 'uncertain',
+        requestId: id,
+        window: entry.hostId,
+        reason: 'Admission is uncertain. Observe this request without retrying or switching transports.',
+      };
     if (write)
       return {
         version: 1,

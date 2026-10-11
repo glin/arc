@@ -1,6 +1,6 @@
 ---
 name: arc-sessions
-description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when the user asks to start sessions in Arc, inspect session progress, label or pin sessions, or archive completed work. Excludes terminal-only launches and automatic ongoing supervision.'
+description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, label, pin or archive sessions, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
 ---
 
 # Arc sessions
@@ -38,7 +38,42 @@ Choose exactly one classification. `--untagged` marks work the reader asked for 
 
 `refused` means no accepted launch. A timeout, disconnect, malformed response, or missing acknowledgment leaves delivery unknown. Preserve the window, request ID, prompt, and settings. Never launch a replacement or switch transports after an unknown outcome.
 
-An explicit identical-payload retry uses the same `--request-id` in the same activation. Arc retains results by ID and refuses conflicting payloads. A reload changes the activation and leaves the old outcome unknown. Never change the ID to retry. Do not retry automatically.
+Start and curation accept an explicit identical-payload retry with the same `--request-id` in the same activation. Arc retains results by ID and refuses conflicting payloads. A reload changes the activation and leaves the old outcome unknown. Never change the ID to retry. Do not retry automatically.
+
+## Request compaction of this session
+
+Request compaction only when the reader explicitly delegates it for this turn. Save the handoff the reader asked for first. Only the main agent can request compaction. Arc refuses a subagent's request. Inherited environment, session IDs, and archived prompts supply no authority.
+
+Run one foreground command in this exact form. Write the window `hostId` and a fresh lowercase UUID as literal text:
+
+```text
+arc compact request --self --after-turn --request-id WINDOW_ID:UUID --window WINDOW_ID --json
+```
+
+Both window values are the `hostId` of the window that hosts this session. `ARC_WINDOW` names it when supplied. Claude agents run the command with the Bash tool. Arc does not admit it from the Claude PowerShell tool. Codex agents run the bare command as a foreground shell command. Codex adds its own PowerShell wrapper on Windows, so never write a wrapper. Do not use shell substitutions, command chains, background execution, or payload files.
+
+Arc admits the request only while this tool call runs in a session that this window's panel holds. The session must have no open asks, no queued reader prompts, and no reader action since this turn's prompt. An answer to one of this turn's asks given before the request does not block admission. Any reader action after admission, including an answer, cancels the request. Each turn holds one pending request. Each request ID is admitted once in a window activation.
+
+Read the `state` field of the result. The command returns at once. After `queued`, finish the successful final response. Reader intervention cancels unsubmitted compaction.
+
+Observe a known request without submitting work:
+
+```text
+arc compact status --request-id WINDOW_ID:UUID --window WINDOW_ID --json
+```
+
+The `state` field names one outcome:
+
+- `queued`: Arc compacts after this turn succeeds and the panel saves the final response.
+- `started`: the agent accepted the compaction.
+- `completed`: the agent finished the compaction.
+- `cancelled`: a reader action, a session change, the session leaving the window's scope, the agent process ending, the window closing, or the 15-minute deadline stopped the request before Arc sent it.
+- `refused`: Arc did not admit the request, or did not send it. A window without compaction support also refuses.
+- `failed`: the requesting tool or turn failed, the final response was not saved, or the agent refused or failed the compaction.
+- `uncertain`: admission or the compaction outcome is not known yet. Arc also reports this right after it sends the compaction, until native evidence arrives. When the request command returns it, report it and finish the turn. Never resend, change transport, reopen the session, or fork the session.
+- `unavailable`: the window holds no record of this request ID, or the window did not answer the status read.
+
+Start and curation retry advice does not apply to compaction.
 
 ## Report session links
 

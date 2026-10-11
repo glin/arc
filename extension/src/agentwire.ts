@@ -197,7 +197,25 @@ export interface CodexEffectiveMode {
   sandbox: string;
 }
 
+export type NativeEvent = {
+  provider: 'claude' | 'codex';
+  sessionId: string;
+  turnId: string | null;
+  generation: number | null;
+  evidence: Json;
+} & (
+  | { kind: 'toolStart'; toolId: string; command: string; foreground: boolean }
+  | { kind: 'toolEnd'; toolId: string; success: boolean }
+  | { kind: 'rootEnd'; success: boolean }
+  | { kind: 'submission'; text: string }
+  | {
+      kind: 'compact';
+      stage: 'accepted' | 'refused' | 'status' | 'boundary' | 'itemStart' | 'itemEnd' | 'turnStart' | 'turnEnd';
+    }
+);
+
 export type WireEvent =
+  | { kind: 'native'; event: NativeEvent }
   | { kind: 'responseStarted'; sourceId: string }
   | { kind: 'responseRate'; sourceId: string; rate: import('./outputrate').ResponseRate }
   | { kind: 'ready'; commands: PromptEntry[] }

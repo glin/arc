@@ -95,6 +95,7 @@ import { sameSkillList, withDirectorySkills } from './domain/claude-skills';
 import { normalizeWorkspace } from './projectspend';
 import { ConfigWatches } from './configwatch';
 import { WindowChannel } from './sessionrequests';
+import { CompactHost } from './compactrequest';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
 declare const EXTENSION_VERSION: string;
@@ -324,10 +325,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       hosted,
     );
   };
+  // One deferred self-compaction owner per window activation. It never opens a missing child.
+  let compaction: CompactHost<AgentSession> | null = null;
   const host = new AgentHost({
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
     onEvent: ({ key, event, turnId }) => {
+      if (event.kind === 'native') {
+        const child = host.get(key);
+        if (child) compaction?.native(child, event.event, turnId);
+        return;
+      }
       if (event.kind === 'responseRate') {
         const where = host.get(key)?.state().sessionId;
         if (where === event.rate.sessionId) panel.noteResponseRate(where, event.rate, turnId);
@@ -349,8 +357,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       if (event.kind === 'text') {
-        const where = host.get(key)?.state().sessionId;
-        if (where) panel.noteCompletedReply(where, event.text, event.sourceId, turnId);
+        const child = host.get(key);
+        const where = child?.state().sessionId;
+        if (where)
+          panel.noteCompletedReply(where, event.text, event.sourceId, turnId, () => {
+            if (child && turnId !== undefined) compaction?.replyRetained(child, turnId);
+          });
         return;
       }
       const agent = host.get(key)?.agent;
@@ -411,6 +423,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Move panel ownership when the child reports a successor session. `/clear` leaves the previous transcript on disk.
       // Use the session event's ID. The earlier reset message names a different ID from the successor transcript.
       if (event.kind === 'session' && event.previous && event.previous !== event.sessionId) {
+        compaction?.sessionMoved(event.previous);
         panel.noteSessionMoved(event.previous, event.sessionId, agent ?? 'claude', host.get(key)?.state().cwd ?? null);
       }
       if (event.kind === 'session' && event.effectiveMode) {
@@ -432,6 +445,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
           panel.releaseDeliveredPromptAssets(ended, turnEndCompletesEveryPrompt(agent ?? ''), turnId);
           panel.flushQueue(ended);
+          const child = host.get(key);
+          if (child) compaction?.turnEnded(child);
+          void compaction?.drain(ended);
         }
       }
       // Claude's idle report ends the prompts that joined a running turn. The running set above
@@ -442,12 +458,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (idle && event.state === 'idle') {
           panel.releaseDeliveredPromptAssets(idle, false, event.settledTurnIds);
           panel.flushQueue(idle);
+          void compaction?.drain(idle);
         }
         return;
       }
       void panel.refresh();
     },
     onStateChange: (state) => {
+      if (state.exited) compaction?.childGone(state.key);
+      else if (!state.busy && state.sessionId) void compaction?.drain(state.sessionId);
       if (commandStateChanges.delete(state.key)) {
         return;
       }
@@ -470,6 +489,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
   });
+  const activation = channel?.windowId;
+  if (channel && activation) {
+    const owner = new CompactHost<AgentSession>(activation, {
+      find: (provider, sessionId) => host.find(provider, sessionId),
+      withActivity: (child, work) => host.withActivity(child.key, work),
+      readerWork: (sessionId) => panel.readerWork(sessionId),
+    });
+    compaction = owner;
+    panel.onReaderAction = (session, answer) => owner.readerAction(session, answer);
+    panel.onScopeChange = () => owner.scopeChanged();
+    panel.onSessionRowsRefreshed = () => owner.sessionsRefreshed();
+    channel.setCompactRequestHandler((request) => owner.handle(request));
+    context.subscriptions.push({ dispose: () => owner.dispose() });
+  }
   panel.onArchivedSessionsChange = (sessions) => host.setArchived(sessions);
   host.setArchived(panel.archivedSessions());
   context.subscriptions.push(
@@ -637,6 +670,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Store each accepted value so a retired session resumes with the same configuration.
   const setAskModeFor = async (agent: AgentName, mode: AskMode, session?: string): Promise<void> => {
     const liveTargets = host.states().filter((state) => state.agent === agent && !state.exited);
+    // The pick changes every live session of this agent, so each one counts as a reader action.
+    for (const state of liveTargets) if (state.sessionId) compaction?.readerAction(state.sessionId);
     const applyMode = async (sessions: ReadonlyMap<string, AgentSession>): Promise<boolean> => {
       const targets = liveTargets.map((state) => ({
         session: state.sessionId,
@@ -1322,7 +1357,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const turnId = await withExistingSessionActivity(agent as AgentName, sessionId, cwd, async (session) => {
         validateResolvedPromptAssets(prompt.assets);
         // Retain prompt text until the child accepts the turn. The returned promise reports protocol refusals to the retained card.
-        return await session.prompt(prompt, (turnId) => onSubmitted?.(session.state().sessionId ?? sessionId, turnId));
+        return await session.prompt(prompt, (turnId) => {
+          compaction?.submitted(session, turnId);
+          onSubmitted?.(session.state().sessionId ?? sessionId, turnId);
+        });
       });
       if (turnId === null) {
         return failedPromptDelivery(agent, new Error('no agent session could be opened'));
@@ -1351,7 +1389,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             const turnId = await withStartedSessionActivity(
               forkedSession,
-              (live) => live.prompt(prompt, (turnId) => onSubmitted?.(continued, turnId)),
+              (live) =>
+                live.prompt(prompt, (turnId) => {
+                  compaction?.submitted(live, turnId);
+                  onSubmitted?.(continued, turnId);
+                }),
               existingSessionPlan('codex', continued, cwd!),
             );
             void panel.refresh();
@@ -1413,6 +1455,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         liveSession,
         async (live) => {
           const turnId = await live.prompt(prompt, (turnId) => {
+            compaction?.submitted(live, turnId);
             const session = live.state().sessionId;
             onSubmitted?.(session ?? '', turnId);
           });
