@@ -1909,6 +1909,17 @@ test('replayed Codex snapshot and failed completion do not add usage or failures
 });
 
 test('a large Codex failure history remains reportable', () => {
+  const createReducer = codexReader.createCodexUsageLineReducer;
+  let snapshots = 0;
+  vi.spyOn(codexReader, 'createCodexUsageLineReducer').mockImplementation((...args) => {
+    const reducer = createReducer(...args);
+    const snapshot = reducer.snapshot;
+    reducer.snapshot = () => {
+      snapshots++;
+      return snapshot();
+    };
+    return reducer;
+  });
   const file = path.join(directory(), 'rollout-2026-09-26T00-00-00-parent.jsonl');
   const failure = JSON.stringify({
     type: 'event_msg',
@@ -1932,6 +1943,7 @@ test('a large Codex failure history remains reportable', () => {
     ].join('\n') + '\n',
   );
   assert.equal(sessionCostReport(file).parent.failedToolCalls, 130_000);
+  assert.ok(snapshots < 10, `${snapshots} complete state copies for one turn's failure history`);
 }, 30_000);
 
 test('billing identity survives a duplicate across a snapshot and delayed metadata after 65 turns', () => {

@@ -2393,6 +2393,7 @@ export interface CodexUsageLineReducer {
   snapshot(): CodexUsageReducerState;
   pendingRequestKeys(): readonly string[];
   currentToolTurnId(): string | null;
+  currentTurnIdentity(): { id: string | null; copied: boolean };
   turnCount(): number;
   compactionCount(): number;
   recentCompactions(): readonly ReducerCompaction[];
@@ -2499,6 +2500,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
     pendingRequestKeys: () => state.pendingRequestKeys,
     currentToolTurnId: () =>
       state.currentTurnId && !state.currentTurnCopied && !state.currentTurnCompleted ? state.currentTurnId : null,
+    currentTurnIdentity: () => ({ id: state.currentTurnId, copied: state.currentTurnCopied }),
     turnCount: () => state.closedTurns + (currentCodexTurnCounts(state) ? 1 : 0),
     compactionCount: () => state.compactionCount,
     recentCompactions: () => state.recentCompactions.map((item) => ({ ...item })),

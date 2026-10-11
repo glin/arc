@@ -1600,9 +1600,9 @@ export function readSessionRequests(
           raw.payload.item?.status === 'failed' &&
           ['CommandExecution', 'FileChange', 'McpToolCall', 'CollabAgentToolCall'].includes(raw.payload.item.type ?? '')
         ) {
-          const state = (reducer as ReturnType<typeof createCodexUsageLineReducer>).snapshot();
-          if (!replayingTurn && !state.currentTurnCopied && !copiedTurns.has(state.currentTurnId ?? ''))
-            failureCandidates.push({ turnId: state.currentTurnId, timestamp: Date.parse(raw.timestamp ?? '') || 0 });
+          const current = (reducer as ReturnType<typeof createCodexUsageLineReducer>).currentTurnIdentity();
+          if (!replayingTurn && !current.copied && !copiedTurns.has(current.id ?? ''))
+            failureCandidates.push({ turnId: current.id, timestamp: Date.parse(raw.timestamp ?? '') || 0 });
         }
       } catch {
         /* A malformed completion cannot identify a failed tool. */
