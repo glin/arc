@@ -2302,6 +2302,39 @@ export function agentRunOfScan(scan: AgentRunScan, size: number): boolean {
   );
 }
 
+// Complete admitted export lines use the metadata rule for short sources and the whole-file scan rule for large sources.
+export function createClaudeRunClassifier(requireLaunchEvidence = false) {
+  const run: AgentRunScan = {
+    bytes: 0,
+    prompts: 0,
+    finished: false,
+    unattended: false,
+    changedFile: false,
+    deniedTool: false,
+    command: false,
+    bridgeSession: false,
+    bg: false,
+    person: false,
+  };
+  const reader: PersonScan = { bytes: 0, person: false, prompts: 0, bg: false, start: 0, userBefore: false };
+  return {
+    pushLine(line: string) {
+      if (!line.trim()) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        run.person = true;
+        return;
+      }
+      run.person ||= personSignIn(parsed, run);
+      reader.person ||= personSpokeIn(parsed, reader);
+    },
+    agentRun: () => !run.person && (requireLaunchEvidence ? agentRunOfScan(run, 0) : agentRunOfTally(run)),
+    person: () => reader.person,
+  };
+}
+
 // Resumes classification from the complete-line cursor and stops at the first reader sign.
 // Malformed complete lines establish reader evidence. Shrinkage restarts the tally.
 export function scanForAgentRun(file: string, size: number, prev?: AgentRunScan): AgentRunScan {

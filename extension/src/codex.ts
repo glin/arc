@@ -4612,6 +4612,34 @@ function codexPersonRecord(scan: CodexPersonScan, record: Entry): void {
   scan.prompt = { text, at: record.at, kind: record.kind, turn };
 }
 
+// Export classification consumes complete admitted lines without a second source read.
+export function createCodexRunClassifier(meta: CodexSessionMeta | null) {
+  const scan: CodexPersonScan = {
+    bytes: 0,
+    headless: meta?.launchSource === 'exec',
+    interactive: false,
+    openedAt: meta?.openedAt ?? null,
+    person: false,
+    prompts: [],
+    fragment: Buffer.alloc(0),
+    prompt: null,
+    usage: emptyCodexUsageReducerState(
+      meta?.modelProvider ?? null,
+      meta?.replayBoundaryAt ?? null,
+      meta?.sessionId ?? null,
+      meta?.agentPath ?? null,
+    ),
+  };
+  return {
+    pushLine(line: string) {
+      const record = parseRecord(line);
+      if (record) codexPersonRecord(scan, record);
+    },
+    agentRun: () => meta !== null && isAgentRun(meta),
+    person: () => scan.person,
+  };
+}
+
 export function scanForCodexPerson(
   file: string,
   size: number,

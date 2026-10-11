@@ -139,6 +139,8 @@ export async function writeDemoExports(destination: string): Promise<Record<stri
           key: id,
           agent: source[0].agent,
           title: source[0].sessionTitle!,
+          archived: false,
+          agentRun: false,
           pages: [await writer.spool(page)],
           turnCount: source.length,
           compactionCount: DEMO_COMPACTIONS[id]?.length ?? 0,

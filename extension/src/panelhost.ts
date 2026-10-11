@@ -55,6 +55,7 @@ import { baselineUri, turnFileUri, PATCH_SCHEME } from './uris';
 import { readSetting, writeSetting } from './config';
 import { saveTimelineLayout } from './view/timeline-layout';
 import { exportSavedSession, savedExportSource, writeSavedSession } from './sessionexport';
+import type { ExportIdentity } from './domain/export-model';
 import { RAIL_FOLDS } from './view/rail';
 import { settingName } from './settings';
 import { ARC_IDENTITY, MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity';
@@ -6813,12 +6814,25 @@ export class PanelProvider implements vscode.Disposable {
     const sources = this.catalog?.sessions ?? [];
     const source = savedExportSource(session, sources);
     const title = source ? this.sessionLabel(source).fullLabel : session;
+    const parents = this.sessionParentEdges(sources).edges;
+    const identity = (source: SessionFile): ExportIdentity => ({
+      agent: source.agent,
+      sessionId: source.sessionId,
+      ...(source.childTranscript && parents.get(source.sessionId)
+        ? { parentSessionId: parents.get(source.sessionId)!.parent }
+        : {}),
+    });
     return exportSavedSession(
-      source,
+      source && { ...source, ...(source.childTranscript ? { parentSessionId: identity(source).parentSessionId } : {}) },
       title,
       {
         roots: { claude: projectsRoot(), codex: codexSessionsRoot() },
         readerParents: { ...this.saved.readerParents },
+        readerState: {
+          archived: sources.filter((source) => this.hidden.has(source.sessionId)).map(identity),
+          startedHere: sources.filter((source) => this.startedHere.has(source.sessionId)).map(identity),
+          agentRuns: sources.filter((source) => this.saved.agentRuns?.includes(source.sessionId)).map(identity),
+        },
         capturedAt: Date.now(),
         ...(this.diagnostics.enabled()
           ? {

@@ -9,6 +9,7 @@ import {
   scanClaudeRelationshipQuantum,
   claudeSubagentMetaOf,
   createClaudeUsageLineReducer,
+  createClaudeRunClassifier,
   readSessionCwd,
   type ClaudeRelationshipCursor,
   type ClaudeUsageReducerState,
@@ -28,6 +29,7 @@ import {
   isHiddenThread,
   scanCodexDispatchReferencesAsync,
   createCodexUsageLineReducer,
+  createCodexRunClassifier,
   readThreadNames,
   codexTitleFor,
   readCodexSessionTitlePair,
@@ -39,7 +41,7 @@ import { readCodexHistoryPageAsync, type CodexHistoryCursor } from './codexhisto
 import type { SemanticHistoryResult, SemanticHistoryPage } from './history';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits';
 import { checkExportCancellation, type ExportTransaction } from './exportwriter';
-import { sessionParentIndex } from './turnrail';
+import { agentRunAnswer, sessionParentIndex } from './turnrail';
 import { sessionCostProjection, sessionCostUsageOf, type SessionCostUsage } from './turncard';
 import {
   indexSpendFile,
@@ -53,11 +55,13 @@ import {
 } from './projectspend';
 import { reconcileClaudeCostState, type ClaudeCostProgress } from './claudecoststate';
 import { recordedCostBasis } from './pricing';
+import { needsAgentRunScan } from './derivedcache';
 
 export type ExportLimits = { [K in keyof typeof EXPORT_LIMITS]: number };
 export type {
   ExportIdentity,
   ExportReaderLink,
+  ExportReaderState,
   ExportOmissionReason,
   ExportOmission,
   ExportRelationship,
@@ -92,6 +96,7 @@ export interface ExportCaptureOptions {
   roots?: { claude?: string; codex?: string };
   readerLinks?: readonly ExportReaderLink[];
   readerParents?: Readonly<Record<string, string>>;
+  readerState?: import('./domain/export-model').ExportReaderState;
   capturedAt?: number;
   signal?: AbortSignal;
   limits?: Partial<ExportLimits>;
@@ -112,6 +117,16 @@ export interface ExportCapture {
   recheck: () => Promise<void>;
 }
 
+export function snapshotExportReaderState(state: import('./domain/export-model').ExportReaderState | undefined) {
+  if (!state) return undefined;
+  const copy = (values: readonly ExportIdentity[]) => Object.freeze(values.map((value) => Object.freeze({ ...value })));
+  return Object.freeze({
+    archived: copy(state.archived),
+    startedHere: copy(state.startedHere),
+    agentRuns: copy(state.agentRuns),
+  });
+}
+
 interface Stamp {
   dev: number;
   ino: number;
@@ -120,6 +135,7 @@ interface Stamp {
   ctimeMs: number;
 }
 interface Entry extends SessionFile {
+  runClassifier?: ReturnType<typeof createClaudeRunClassifier>;
   parentSessionId?: string;
   opening?: CodexSessionMeta | null;
   openingHash?: string;
@@ -848,13 +864,27 @@ async function numericRecord(
   limits: ExportLimits,
 ): Promise<SpendFileIndex> {
   let record: SpendFileIndex | undefined;
-  const factory = (state: unknown): UsageLineReducer =>
+  const classifier =
     entry.agent === 'claude'
-      ? createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
-          childTranscript: entry.childTranscript === true,
-          retainAllRequests: true,
-        })
-      : createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
+      ? createClaudeRunClassifier(needsAgentRunScan(entry))
+      : createCodexRunClassifier(entry.opening ?? null);
+  entry.runClassifier = classifier;
+  const factory = (state: unknown): UsageLineReducer => {
+    const reducer =
+      entry.agent === 'claude'
+        ? createClaudeUsageLineReducer(state as ClaudeUsageReducerState | undefined, {
+            childTranscript: entry.childTranscript === true,
+            retainAllRequests: true,
+          })
+        : createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
+    return {
+      ...reducer,
+      pushLine(line, end) {
+        classifier.pushLine(line);
+        return reducer.pushLine(line, end);
+      },
+    };
+  };
   for (;;) {
     checkExportCancellation(options.signal);
     const result = indexSpendFile(record, entry.file, entry.cwd ?? 'export', factory, {
@@ -872,6 +902,7 @@ export async function captureSessionExport(
   options: ExportCaptureOptions,
   writer: ExportTransaction,
 ): Promise<ExportCapture> {
+  options = { ...options, readerState: snapshotExportReaderState(options.readerState) };
   const limits: ExportLimits = { ...EXPORT_LIMITS, ...options.limits };
   for (const limit of Object.values(limits))
     if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('The export limit is invalid.');
@@ -1190,6 +1221,8 @@ export async function captureSessionExport(
       key,
       agent: entry.agent,
       title: title ?? 'Session',
+      archived: options.readerState?.archived.some((identity) => identityKey(identity) === identityKey(entry)) ?? false,
+      agentRun: false,
       pages: [],
       turnCount: 0,
       compactionCount: 0,
@@ -1212,6 +1245,19 @@ export async function captureSessionExport(
     options.progress?.('numbers', sessions.length);
     const numericSource = await numericRecord(entry, options, limits);
     numeric.set(key, numericSource);
+    const membership = (kind: 'startedHere' | 'agentRuns') =>
+      options.readerState?.[kind].some((identity) => identityKey(identity) === identityKey(entry)) ?? false;
+    const parent = parentIndex.get(key);
+    const dispatched = parent?.relation === 'dispatched';
+    const runEvidence = membership('agentRuns') || entry.runClassifier!.agentRun();
+    session.agentRun = agentRunAnswer(
+      runEvidence,
+      key,
+      membership('startedHere') ? new Set([key]) : new Set(),
+      entry.childTranscript === true,
+      dispatched && runEvidence,
+      dispatched && (parent.owned === true || entry.runClassifier!.person()),
+    );
     readPhase('text');
     let cursor: SemanticHistoryPage['nextOlderCursor'] = null;
     const links = new Map<string, string[]>();
@@ -1525,6 +1571,7 @@ export async function completeSessionExport(
   options: ExportCaptureOptions,
   project: (capture: ExportCapture, writer: ExportTransaction) => Promise<void>,
 ): Promise<{ model: SessionExport; directory: string; index: string }> {
+  options = { ...options, readerState: snapshotExportReaderState(options.readerState) };
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const capture = await captureSessionExport(options, writer);

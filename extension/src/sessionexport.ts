@@ -2,7 +2,7 @@ import { withReadMetrics } from './readmeter';
 import type { SessionFile } from './transcript';
 import { shortenTo } from './domain/text';
 import type { ExportCaptureOptions } from './exportdata';
-import { completeSessionExport } from './exportdata';
+import { completeSessionExport, snapshotExportReaderState } from './exportdata';
 import { packagedExportAssets } from './exportassets';
 import { projectSessionSite } from './exportsite';
 import { ExportCancelled, withExportTransaction } from './exportwriter';
@@ -47,6 +47,7 @@ export async function exportSavedSession(
     return;
   }
   const root = { ...source };
+  options = { ...options, readerState: snapshotExportReaderState(options.readerState) };
   try {
     if (!(await ports.confirm(`Export ${displayTitle} as HTML?`, EXPORT_CONFIRMATION))) return;
     const destination = await ports.chooseFolder();

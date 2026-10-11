@@ -92,6 +92,24 @@ test('native declines, cancellation and failures never offer a partial export', 
   }
 });
 
+test('native choices retain the initiating archive and launch membership snapshot', async () => {
+  const f = fixture();
+  const readerState = {
+    archived: [{ agent: 'claude' as const, sessionId: 'saved' }],
+    startedHere: [{ agent: 'codex' as const, sessionId: 'reader' }],
+    agentRuns: [{ agent: 'claude' as const, sessionId: 'run' }],
+  };
+  const expected = structuredClone(readerState);
+  f.ports.confirm = async () => {
+    readerState.archived[0].sessionId = 'later';
+    readerState.startedHere.length = 0;
+    readerState.agentRuns.length = 0;
+    return true;
+  };
+  await exportSavedSession(source, 'Saved session', { readerState }, f.ports);
+  assert.deepEqual(f.written()!.readerState, expected);
+});
+
 test('only an unambiguous saved catalog source can start export', async () => {
   assert.equal(savedExportSource('draft', [source]), null);
   assert.equal(savedExportSource('saved', [source, { ...source, agent: 'codex' }]), null);

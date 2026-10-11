@@ -7,6 +7,8 @@ import { browserOrNone } from '../test/browser.ts';
 import { tempDir } from './temproot';
 import { ExportTransaction } from './exportwriter';
 import { exportedSiteData, sessionSiteFixture } from './turnfixtures';
+import { captureSessionExport, type ExportPage } from './exportdata';
+import { themed } from './panelfixture';
 import { projectSessionSite } from './exportsite';
 import { exportBrowserAssets } from './panelbundle';
 import { EXPORT_LIMITS } from './exportlimits';
@@ -153,6 +155,217 @@ describe('portable saved-session site', () => {
     expect(await page.locator('.quotefloat:visible, .noteedit:visible').count()).toBe(0);
     expect(await page.locator('[data-control^="diff:"]').count()).toBe(0);
     await page.close();
+  });
+
+  it('keeps decoded compaction ages fixed and the selected archived root reachable across render phases and visits', async (t) => {
+    if (!browser) t.skip('Edge or Chrome is required');
+    const writer = await ExportTransaction.create(tempDir('arc-site-clock-'));
+    try {
+      const capturedAt = Date.parse('2026-09-29T12:00:00Z');
+      const at = capturedAt - 120_000;
+      const sources = tempDir('arc-site-clock-sources-');
+      const claude = path.join(sources, 'projects');
+      const codex = path.join(sources, 'sessions');
+      fs.mkdirSync(path.join(claude, 'project'), { recursive: true });
+      fs.mkdirSync(codex);
+      const rootFile = path.join(claude, 'project', 'root.jsonl');
+      const childFile = path.join(claude, 'project', 'child.jsonl');
+      fs.writeFileSync(
+        rootFile,
+        [
+          {
+            type: 'user',
+            uuid: 'root-p',
+            promptId: 'root-p',
+            timestamp: new Date(at - 2000).toISOString(),
+            message: { role: 'user', content: 'Review this session' },
+          },
+          {
+            type: 'assistant',
+            uuid: 'root-a',
+            timestamp: new Date(at - 1000).toISOString(),
+            message: {
+              id: 'root-a',
+              role: 'assistant',
+              model: 'claude-sonnet-4-5',
+              stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'Reviewed the session' }],
+            },
+          },
+          {
+            type: 'system',
+            subtype: 'compact_boundary',
+            timestamp: new Date(at).toISOString(),
+            compactMetadata: { trigger: 'manual', preTokens: 1000, postTokens: 100 },
+          },
+          {
+            type: 'user',
+            uuid: 'empty-summary',
+            isCompactSummary: true,
+            timestamp: new Date(at).toISOString(),
+            message: { role: 'user', content: '' },
+          },
+          {
+            type: 'user',
+            uuid: 'root-followup-p',
+            promptId: 'root-followup-p',
+            timestamp: new Date(at).toISOString(),
+            message: { role: 'user', content: 'Continue reviewing' },
+          },
+          {
+            type: 'assistant',
+            uuid: 'root-followup-a',
+            timestamp: new Date(at).toISOString(),
+            message: {
+              id: 'root-followup-a',
+              role: 'assistant',
+              model: 'claude-sonnet-4-5',
+              stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'Continued reviewing' }],
+            },
+          },
+          {
+            type: 'system',
+            subtype: 'compact_boundary',
+            timestamp: new Date(at + 1).toISOString(),
+            compactMetadata: { trigger: 'manual', preTokens: 1000, postTokens: 100 },
+          },
+          {
+            type: 'user',
+            uuid: 'summary',
+            isCompactSummary: true,
+            timestamp: new Date(at + 1).toISOString(),
+            message: { role: 'user', content: 'Keep this recorded summary' },
+          },
+        ]
+          .map((record) => JSON.stringify(record))
+          .join('\n') + '\n',
+      );
+      fs.writeFileSync(
+        childFile,
+        [
+          { type: 'custom-title', customTitle: 'Linked session' },
+          {
+            type: 'user',
+            uuid: 'child-p',
+            promptId: 'child-p',
+            timestamp: new Date(at).toISOString(),
+            message: { role: 'user', content: 'Inspect linked work' },
+          },
+          {
+            type: 'assistant',
+            uuid: 'child-a',
+            timestamp: new Date(at + 1).toISOString(),
+            message: {
+              id: 'child-a',
+              role: 'assistant',
+              model: 'claude-sonnet-4-5',
+              stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'Inspected linked work' }],
+            },
+          },
+        ]
+          .map((record) => JSON.stringify(record))
+          .join('\n') + '\n',
+      );
+      const capture = await captureSessionExport(
+        {
+          root: {
+            agent: 'claude',
+            file: rootFile,
+            sessionId: 'root',
+            size: fs.statSync(rootFile).size,
+            mtimeMs: fs.statSync(rootFile).mtimeMs,
+          },
+          roots: { claude, codex },
+          capturedAt,
+          readerLinks: [
+            { parent: { agent: 'claude', sessionId: 'root' }, child: { agent: 'claude', sessionId: 'child' } },
+          ],
+          readerState: {
+            archived: [{ agent: 'claude', sessionId: 'root' }],
+            startedHere: [{ agent: 'claude', sessionId: 'root' }],
+            agentRuns: [{ agent: 'claude', sessionId: 'child' }],
+          },
+        },
+        writer,
+      );
+      const model = capture.model;
+      const compactions = (
+        await Promise.all(model.sessions[0].pages.map((key) => writer.readSpool<ExportPage>(key)))
+      ).flatMap((page) => page.compactions);
+      const empty = compactions.find((compaction) => compaction.summary === '')!;
+      const real = compactions.find((compaction) => compaction.summary !== '')!;
+      expect(empty).toBeDefined();
+      expect(real).toBeDefined();
+      expect(empty.at).toBe(at);
+      expect(real.at).toBe(at + 1);
+      expect(real.summary).toBe('Keep this recorded summary');
+      const childKey = model.sessions[1].key;
+      const childTurn = (await writer.readSpool<ExportPage>(model.sessions[1].pages[0])).turns[0].key;
+      await projectSessionSite(model, writer, exportBrowserAssets());
+      const captured = await writer.publish(capture.recheck);
+      const decoded = exportedSiteData(captured.directory);
+      const cards = [...decoded.data.values()].map(
+        (value) => (value as { card: { key: string; at: number; summaryHtml: string } }).card,
+      );
+      const emptyCard = cards.find((card) => card.key === empty.key)!;
+      const realCard = cards.find((card) => card.key === real.key)!;
+      expect(emptyCard.at).toBe(at);
+      expect(emptyCard.summaryHtml).toBe('');
+      expect(realCard.at).toBe(at + 1);
+      expect(realCard.summaryHtml).toContain('Keep this recorded summary');
+      const html = themed(fs.readFileSync(captured.index, 'utf8'), 'dark').replace(
+        'data-theme="onedark"',
+        'data-theme="dark"',
+      );
+      const file = path.join(captured.directory, 'clock.html');
+      fs.writeFileSync(file, html);
+      const page = await browser!.newPage();
+      await page.clock.install();
+      await page.addInitScript(() => {
+        (window as unknown as { framesSeen: string[][] }).framesSeen = [];
+        window.addEventListener('message', (event) => {
+          if (event.data.type === 'render')
+            (window as unknown as { framesSeen: string[][] }).framesSeen.push(event.data.hidden);
+        });
+      });
+      await page.goto(pathToFileURL(file).href);
+      const card = page.locator(`[data-key="${empty.key}"]`);
+      await card.waitFor();
+      await card.locator('[data-at]').evaluate((node) => {
+        node.textContent = '';
+      });
+      await page.clock.runFor(2000);
+      expect(await card.locator('[data-at]').getAttribute('data-at')).toBe(String(at));
+      expect(await card.locator('[data-at]').innerText()).toBe('2 mins ago');
+      await card.locator('.head').click();
+      expect(await card.locator('.summary').count()).toBe(0);
+      const summaryCard = page.locator(`[data-key="${real.key}"]`);
+      await summaryCard.locator('.head').click();
+      expect(await summaryCard.locator('.summary').innerText()).toBe('Keep this recorded summary');
+      await page.locator('.railbucket').filter({ hasText: 'Archived' }).getByRole('button').click();
+      const root = page.locator(`#rail .railcard[data-session="${model.root}"]`);
+      await root.waitFor();
+      expect(await root.getAttribute('aria-current')).toBe('true');
+      await page.locator('#rail .railcard').filter({ hasText: 'Linked session' }).click();
+      await page.locator(`article[data-key="${childTurn}"]`).waitFor();
+      expect(await page.locator(`#rail .railcard[data-session="${childKey}"]`).getAttribute('aria-current')).toBe(
+        'true',
+      );
+      await page.goBack();
+      await card.waitFor();
+      expect(await root.getAttribute('aria-current')).toBe('true');
+      await page.goForward();
+      await page.locator(`article[data-key="${childTurn}"]`).waitFor();
+      const frames = await page.evaluate(() => (window as unknown as { framesSeen: string[][] }).framesSeen);
+      expect(frames.length).toBeGreaterThanOrEqual(8);
+      expect(frames.every((hidden) => hidden.length === 1 && hidden[0] === model.root)).toBe(true);
+      expect(await page.locator('.railact:visible, #composer:visible, .railnewsplit:visible').count()).toBe(0);
+      await page.close();
+    } finally {
+      await writer.dispose();
+    }
   });
 
   it('restores real browser visits and page ranges with platform shortcuts and editable exclusions', async (t) => {

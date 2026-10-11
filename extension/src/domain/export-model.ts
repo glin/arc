@@ -7,6 +7,11 @@ export interface ExportReaderLink {
   parent: ExportIdentity;
   child: ExportIdentity;
 }
+export interface ExportReaderState {
+  archived: readonly ExportIdentity[];
+  startedHere: readonly ExportIdentity[];
+  agentRuns: readonly ExportIdentity[];
+}
 export type ExportOmissionReason =
   | 'missing'
   | 'unreadable'
@@ -191,6 +196,8 @@ export interface ExportSession {
   key: string;
   agent: 'claude' | 'codex';
   title: string;
+  archived: boolean;
+  agentRun: boolean;
   pages: string[];
   turnCount: number;
   compactionCount: number;

@@ -62,6 +62,7 @@ export function exportCard(value: ReturnType<typeof toCard> | ReturnType<typeof 
     status: turn?.status ?? 'done',
     statusWord: value.statusWord,
     relative: value.relative,
+    at: value.kind === 'compaction' ? value.at : undefined,
     absolute: value.absolute,
     duration: value.duration,
     durationWord: value.durationWord,
@@ -403,7 +404,6 @@ function compactionCard(
   const compaction = exportCompaction(value, session, firstRequestCachedTokens);
   const card = exportCard(toCompactionCard(compaction, capturedAt));
   card.key = value.key;
-  card.summaryHtml ||= '<p>Recorded details</p>';
   return card;
 }
 
@@ -417,7 +417,7 @@ export async function projectSessionSite(
   const stylesheet = await writer.writeAsset('css', assets.stylesheet);
   let sequence = 0;
   const sessions: SiteManifest['sessions'] = [];
-  const rows: PanelSessionRow[] = [];
+  const rows: (PanelSessionRow & { agentRun: boolean })[] = [];
   const stats: Record<string, PanelStat[]> = {};
   const sources = new Map(model.sessions.map((session) => [session.key, session]));
   const encode = (id: string, json: string) =>
@@ -522,6 +522,7 @@ export async function projectSessionSite(
         agent: session.agent === 'codex' ? 'Codex' : 'Claude',
         agentKey: session.agent,
         persisted: true,
+        agentRun: session.agentRun,
         at: newestAt,
         relative: formatRelative(newestAt, model.capturedAt),
         when: new Date(newestAt).toLocaleString(),
@@ -583,7 +584,7 @@ export async function projectSessionSite(
       new Map(),
       new Map(rows.map((row) => [row.id, row.at])),
       new Map(),
-      new Set(),
+      new Set(model.sessions.filter((session) => session.archived).map((session) => session.key)),
       model.root,
       new Set(),
       new Map(),

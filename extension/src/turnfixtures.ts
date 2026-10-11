@@ -136,6 +136,8 @@ export async function sessionSiteFixture(writer: ExportTransaction): Promise<Ses
       key,
       agent: key === 'root' ? 'claude' : 'codex',
       title: key === 'root' ? 'Review export' : 'Linked session',
+      archived: false,
+      agentRun: false,
       pages,
       turnCount: count,
       compactionCount: 0,

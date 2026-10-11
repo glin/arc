@@ -2,11 +2,12 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { runInNewContext } from 'node:vm';
 import { EXPORT_LIMITS } from './exportlimits';
 import { ExportTransaction, ExportCancelled } from './exportwriter';
 import { exportCard, exportTurn, exportScriptJson, projectSessionSite } from './exportsite';
 import { type SessionStatChip, toCard } from './turncard';
-import { turn, subagent, sessionSiteFixture, exportedSiteData } from './turnfixtures';
+import { turn, subagent, compaction, sessionSiteFixture, exportedSiteData } from './turnfixtures';
 import { tempDir } from './temproot';
 import type { CardView } from './webview/payload-contracts';
 import type { ExportBlock } from './exportdata';
@@ -16,7 +17,97 @@ import { demoPayload, demoSessionCostParts, DEMO_COMPACTIONS } from '../scripts/
 import { sessionCostProjection } from './turncard';
 import { estimateCost, formatCost } from './pricing';
 import { writeDemoExports } from '../scripts/web-demo-export';
-import { costPartOf, costPartsOf, projectTurn } from './exportdata';
+import { costPartOf, costPartsOf, projectTurn, projectCompaction } from './exportdata';
+import { railBuckets } from './view/rail';
+
+test('serialized compactions keep their timestamp and only recorded summaries', async () => {
+  const writer = await ExportTransaction.create(tempDir('arc-site-compaction-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    const page = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
+    const at = model.capturedAt - 120_000;
+    page.compactions = ['', 'Recorded carryover'].map((summary, index) =>
+      projectCompaction(compaction({ at: at + index, summary }), `compact-${index}`),
+    );
+    model.sessions[0].pages[0] = await writer.spool(page);
+    model.sessions[0].archived = true;
+    model.sessions[1].agentRun = true;
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const cards = [...data.values()].map((value) => (value as { card: CardView }).card);
+    const empty = cards.find((card) => card.key === 'compact-0')!;
+    const real = cards.find((card) => card.key === 'compact-1')!;
+    assert.equal(empty.at, at);
+    assert.equal(empty.relative, '2 mins ago');
+    assert.equal(empty.summaryHtml, '');
+    assert.equal(real.at, at + 1);
+    assert.match(real.summaryHtml!, /Recorded carryover/);
+    assert.equal(manifest.rail.find((row) => row.id === 'root')!.archived, true);
+    assert.equal(manifest.rail.find((row) => row.id === 'child')!.agentRun, true);
+    assert.deepEqual(
+      railBuckets(manifest.rail, model.capturedAt).buckets.map((bucket) => bucket.id),
+      ['agent', 'archived'],
+    );
+  } finally {
+    await writer.dispose();
+  }
+});
+
+test('captured Date retains constructor arity and local calendar boundaries', async () => {
+  const host = await fs.readFile(path.join(__dirname, 'webview', 'export-host.ts'), 'utf8');
+  const clock = host.slice(host.indexOf('const RealDate = Date;'), host.indexOf('const archived ='));
+  const capturedAt = Date.parse('2026-11-02T18:00:00Z');
+  const sandbox = { Date, window: { Date }, catalog: { capturedAt } };
+  runInNewContext(clock, sandbox);
+  const CapturedDate = sandbox.window.Date;
+  assert.equal(new CapturedDate().getTime(), capturedAt);
+  assert.equal(CapturedDate.now(), capturedAt);
+  assert.equal(CapturedDate(), new Date(capturedAt).toString());
+  const cases = [
+    [undefined],
+    [null],
+    ['invalid'],
+    [123],
+    ['2026-10-09T12:00:00Z'],
+    [new Date(123)],
+    [2026, 9],
+    [2026, 9, 9],
+    [2026, 9, 9, undefined],
+    [2026, 9, 9, 12, 34, 56, 789],
+  ];
+  for (const args of cases)
+    assert.equal(Reflect.construct(CapturedDate, args).getTime(), Reflect.construct(Date, args).getTime());
+  assert.equal(CapturedDate.parse('2026-10-09'), Date.parse('2026-10-09'));
+  assert.equal(CapturedDate.UTC(2026, 9, 9), Date.UTC(2026, 9, 9));
+  assert.ok(new CapturedDate(123) instanceof Date);
+  for (const timezone of ['America/Chicago', 'Pacific/Auckland', 'UTC']) {
+    const previous = process.env.TZ;
+    try {
+      process.env.TZ = timezone;
+      const day = new Date(capturedAt);
+      const start = new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+      const yesterday = new Date(day.getFullYear(), day.getMonth(), day.getDate() - 1).getTime();
+      const rows = [start, start - 1, yesterday - 1, start - 12 * 86400_000].map((at) => ({
+        at,
+        archived: false,
+        pinnedTop: false,
+        current: false,
+      }));
+      const bucket = runInNewContext(`(${railBuckets.toString()})(rows, now)`, {
+        Date: CapturedDate,
+        rows,
+        now: capturedAt,
+      });
+      assert.deepEqual(
+        Array.from(bucket.buckets, (value: { id: string }) => value.id),
+        ['today', 'yesterday', 'week', 'older'],
+      );
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  }
+});
 
 test('export site projection retains advisor origins in child cost and cache detail', () => {
   const advisor = {

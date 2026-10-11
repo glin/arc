@@ -31,7 +31,8 @@ import type { SessionStatChip } from './turncard.ts';
 import { readCodexSession } from './codex.ts';
 import { toCard } from './turncard.ts';
 import { formatCost } from './pricing.ts';
-import { readClaudeAgentSpend } from './transcript';
+import { readClaudeAgentSpend, readSessionMeta, scanForAgentRun, agentRunOfScan } from './transcript.ts';
+import { needsAgentRunScan } from './derivedcache.ts';
 const CODEX_ID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const NATIVE_CODEX_ID = 'bbbbbbbb-2222-4222-8222-222222222222';
 const at = (second: number) => new Date(Date.UTC(2026, 8, 29, 12, 0, second)).toISOString();
@@ -236,6 +237,185 @@ test('large Codex export retains following dispatch and hashes one sequential re
   assert.equal(metrics.relationships.repeatedBytes, 0);
   assert.equal(metrics.relationships.cursorCopies, 0);
   assert.equal(metrics.digest?.bytes ?? 0, 0);
+});
+
+test('uncached admitted runs retain provider classification and reader dispatch overrides', async () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    for (const behavior of [
+      'agent',
+      'requested',
+      'human',
+      'headless',
+      'retained',
+      'retained-human',
+      'retained-requested',
+      'retained-started',
+      'neutral',
+      'retained-neutral',
+    ] as const) {
+      if (agent === 'claude' && behavior.endsWith('neutral')) continue;
+      const f = fixture();
+      const id = CODEX_ID;
+      const opening = (source: string, second = 0) => record('session_meta', second, { payload: { id, source } });
+      const headless =
+        agent === 'claude'
+          ? claudeTurn('launch').map((value) => ({ ...value, entrypoint: 'sdk-cli', promptSource: 'sdk' }))
+          : [opening(behavior.endsWith('neutral') ? 'cli' : 'exec'), ...codexTurn('launch')];
+      const extra = behavior.includes('human')
+        ? agent === 'claude'
+          ? claudeTurn('followup', 10).map((value) => ({ ...value, origin: { kind: 'human' } }))
+          : [opening('cli', 10), ...codexTurn('followup', 11)]
+        : behavior === 'headless'
+          ? agent === 'claude'
+            ? claudeTurn('followup', 10).map((value) => ({ ...value, promptSource: 'sdk' }))
+            : codexTurn('followup', 10)
+          : [];
+      const file =
+        agent === 'claude'
+          ? f.claudeSession(id, [...headless, ...extra])
+          : f.write(path.join(f.codex, 'rollout-worker.jsonl'), [...headless, ...extra]);
+      f.write(
+        f.root,
+        claudeDispatchTranscript(
+          'python dispatch.py --arc-dispatch',
+          `ARC_DISPATCH_SESSION=${JSON.stringify({ agent, session_id: id, ...(behavior.includes('requested') ? { owned: true } : {}) })}`,
+        ),
+      );
+      await withExportTransaction(f.output, async (writer) => {
+        const state = {
+          archived: [
+            { agent, sessionId: id },
+            { agent, sessionId: 'unrelated-private' },
+          ],
+          startedHere: behavior === 'retained-started' ? [{ agent, sessionId: id }] : [],
+          agentRuns: behavior.startsWith('retained') ? [{ agent, sessionId: id }] : [],
+        };
+        const capture = await captureSessionExport(
+          { ...f.options, readerState: state, limits: { sliceBytes: 32768 } },
+          writer,
+        );
+        assert.equal(capture.model.sessions.length, 2, JSON.stringify(capture.model.relationships));
+        const child = capture.model.sessions.find((session) => session.key !== capture.model.root)!;
+        assert.equal(
+          child.agentRun,
+          !behavior.includes('requested') &&
+            !behavior.includes('human') &&
+            behavior !== 'retained-started' &&
+            behavior !== 'neutral',
+          `${agent} ${behavior}`,
+        );
+        assert.equal(capture.model.relationships[0].requestedByReader, behavior.includes('requested'));
+        assert.equal(child.archived, true);
+        assert.equal(capture.model.sessions[0].archived, false);
+        assert.ok(!JSON.stringify(capture.model).includes('unrelated-private'));
+        assert.equal(child.provenance.sha256, createHash('sha256').update(fs.readFileSync(file)).digest('hex'));
+      });
+      // With no dispatch relationship, source metadata still classifies an external root.
+      await withExportTransaction(f.output, async (writer) => {
+        const capture = await captureSessionExport(
+          { ...f.options, root: { ...f.options.root, agent, file, sessionId: id } },
+          writer,
+        );
+        assert.equal(
+          capture.model.sessions[0].agentRun,
+          agent === 'claude' ? !behavior.includes('human') : !behavior.endsWith('neutral'),
+        );
+      });
+    }
+  }
+});
+
+test('uncached complete Claude exports match production short and large source classification', async () => {
+  for (const large of [false, true]) {
+    const f = fixture();
+    const records = claudeTurn('external');
+    if (large) records.push(record('progress', 2, { data: 'x'.repeat(300 * 1024) }));
+    const file = f.claudeSession('external', records);
+    const source = { agent: 'claude', size: fs.statSync(file).size };
+    const production = needsAgentRunScan(source)
+      ? agentRunOfScan(scanForAgentRun(file, source.size), source.size)
+      : readSessionMeta(file).agentRun;
+    assert.equal(production, !large);
+    await withExportTransaction(f.output, async (writer) => {
+      const capture = await captureSessionExport(
+        { ...f.options, root: { ...f.options.root, file, sessionId: 'external' } },
+        writer,
+      );
+      assert.equal(capture.model.sessions[0].agentRun, production);
+      await capture.recheck();
+    });
+  }
+});
+
+test('reader membership is provider and parent qualified and survives a source-change retry', async () => {
+  const f = fixture();
+  f.codexSession('root');
+  f.claudeSession('peer', claudeTurn('peer'), 'project');
+  f.child('same');
+  f.child('same', null, 'peer');
+  const readerState = {
+    archived: [
+      { agent: 'claude' as const, sessionId: 'root' },
+      { agent: 'claude' as const, sessionId: 'same', parentSessionId: 'peer' },
+    ],
+    startedHere: [],
+    agentRuns: [],
+  };
+  let projections = 0;
+  await withExportTransaction(f.output, async (writer) => {
+    const result = await completeSessionExport(
+      writer,
+      {
+        ...f.options,
+        readerState,
+        readerLinks: [
+          { parent: { agent: 'claude', sessionId: 'root' }, child: { agent: 'claude', sessionId: 'peer' } },
+          { parent: { agent: 'claude', sessionId: 'root' }, child: { agent: 'codex', sessionId: 'root' } },
+        ],
+      },
+      async (capture, transaction) => {
+        if (++projections === 1) {
+          readerState.archived.length = 0;
+          fs.appendFileSync(f.root, '\n');
+        }
+        await projectSessionSite(capture.model, transaction, { script: '', stylesheet: '' });
+      },
+    );
+    assert.equal(projections, 2);
+    assert.equal(result.model.sessions.find((session) => session.key === result.model.root)!.archived, true);
+    assert.equal(result.model.sessions.find((session) => session.agent === 'codex')!.archived, false);
+    const children = result.model.relationships.filter((edge) => edge.kind === 'subagent');
+    assert.equal(children.length, 2);
+    for (const edge of children) {
+      const owner = result.model.sessions.find((session) => session.key === edge.from)!;
+      assert.equal(
+        result.model.sessions.find((session) => session.key === edge.to)!.archived,
+        owner.key !== result.model.root,
+      );
+    }
+  });
+});
+
+test('an archived native selected root retains its parent-qualified membership', async () => {
+  const f = fixture();
+  const file = f.child('selected');
+  await withExportTransaction(f.output, async (writer) => {
+    const capture = await captureSessionExport(
+      {
+        ...f.options,
+        root: { ...f.options.root, file, sessionId: 'selected', childTranscript: true, parentSessionId: 'root' },
+        readerState: {
+          archived: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
+          startedHere: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
+          agentRuns: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
+        },
+      },
+      writer,
+    );
+    assert.equal(capture.model.sessions[0].key, capture.model.root);
+    assert.equal(capture.model.sessions[0].archived, true);
+    assert.equal(capture.model.sessions[0].agentRun, true);
+  });
 });
 
 test('Codex capture reads structural child lifecycle once across semantic reductions', async () => {

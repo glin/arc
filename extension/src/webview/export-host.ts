@@ -69,14 +69,18 @@ const deliver = (data: unknown) => {
   window.dispatchEvent(event);
 };
 const RealDate = Date;
-window.Date = class CapturedDate extends RealDate {
-  constructor(value: string | number = catalog.capturedAt) {
-    super(value);
-  }
-  static now() {
-    return catalog.capturedAt;
-  }
-} as DateConstructor;
+window.Date = new Proxy(RealDate, {
+  construct(target, args, constructor) {
+    return Reflect.construct(target, args.length ? args : [catalog.capturedAt], constructor);
+  },
+  apply() {
+    return new RealDate(catalog.capturedAt).toString();
+  },
+  get(target, property, receiver) {
+    return property === 'now' ? () => catalog.capturedAt : Reflect.get(target, property, receiver);
+  },
+});
+const archived = catalog.sessions.filter((session) => session.archived).map((session) => session.key);
 
 function show(session: string, index = 0, turn?: string, visit = true, append = false, restoredStart?: number): void {
   const captured = catalog.sessions.find((value) => value.key === session);
@@ -110,7 +114,7 @@ function show(session: string, index = 0, turn?: string, visit = true, append = 
     sessions: catalog.rows,
     rail: catalog.rail,
     stats: catalog.stats,
-    hidden: [],
+    hidden: archived,
     pinnedTop: [],
     comments: [],
     labels: [],
@@ -162,7 +166,7 @@ function show(session: string, index = 0, turn?: string, visit = true, append = 
       sessions: rows,
       rail: catalog.rail.map((row) => ({ ...row, current: row.id === session })),
       stats: catalog.stats,
-      hidden: [],
+      hidden: archived,
       pinnedTop: [],
       comments: [],
       labels: [],
@@ -194,7 +198,7 @@ window.acquireVsCodeApi = () => ({
   getState: () => state,
   setState(value) {
     if (value && typeof value === 'object')
-      state = { ...value, composerHidden: true, comments: [], hidden: [], pinnedTop: [], submittedPrompts: [] };
+      state = { ...value, composerHidden: true, comments: [], hidden: archived, pinnedTop: [], submittedPrompts: [] };
   },
   postMessage(raw) {
     const message = parsePanelToHost(raw);

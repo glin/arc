@@ -18,6 +18,10 @@ function overlayStaticSources(source: string): void {
   for (const file of [
     'panelbundle.ts',
     'sessionexport.ts',
+    'exportdata.ts',
+    'transcript.ts',
+    'codex.ts',
+    'domain/export-model.ts',
     'readmeter.ts',
     'webview/card.ts',
     'webview/export-host.ts',
