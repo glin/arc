@@ -413,8 +413,15 @@ export class CodexWire {
   }
 
   // Positive idle evidence: a root turn has ended in this child, and no root turn or request is open.
+  // A compaction that got no answer can still start its late turn, so it also withholds the evidence.
   idleEvidence(): boolean {
-    return !this.closed && !this.hasOpenTurns() && this.runningRootTurns.size === 0 && this.endedRootTurns > 0;
+    return (
+      !this.closed &&
+      !this.hasOpenTurns() &&
+      !this.compactionUnresolved() &&
+      this.runningRootTurns.size === 0 &&
+      this.endedRootTurns > 0
+    );
   }
 
   private seeTurn(turnId: string): void {
@@ -660,7 +667,7 @@ export class CodexWire {
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
     }
-    if (guard && (this.closed || this.hasOpenTurns() || this.runningRootTurns.size))
+    if (guard && (this.closed || this.hasOpenTurns() || this.compactionUnresolved() || this.runningRootTurns.size))
       throw new Error('the session is not idle');
     const threadId = this.thread;
     const prompt = normalizeAgentPrompt(input);

@@ -1,6 +1,6 @@
 ---
 name: arc-sessions
-description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, label, pin or archive sessions, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
+description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, send a follow-up to a session this session started, label, pin or archive sessions, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
 ---
 
 # Arc sessions
@@ -22,6 +22,7 @@ Run `arc setups --window WINDOW_ID` before choosing settings. Use a returned set
 | List one page of scoped sessions and attention | `arc sessions --window WINDOW_ID --json`, then add `--cursor NEXT` for each later page |
 | Read recent turns without marking them read | `arc session SESSION_ID --turns 5 --window WINDOW_ID --json` |
 | List offered setups | `arc setups --window WINDOW_ID` |
+| Send a follow-up to a session this session started | `arc send SESSION_ID --prompt-file PROMPT_PATH --observation OBSERVATION --request-id WINDOW_ID:UUID --window WINDOW_ID --json` |
 | Start requested work | `arc start --window WINDOW_ID --setup SETUP_KEY --prompt-file PROMPT_PATH --untagged --name NAME --arc-dispatch` |
 | Add or remove a reader label | `arc label add SESSION_ID --label LABEL --window WINDOW_ID` or `arc label remove SESSION_ID --label LABEL --window WINDOW_ID` |
 | Pin or unpin a session | `arc pin SESSION_ID --window WINDOW_ID` or `arc unpin SESSION_ID --window WINDOW_ID` |
@@ -39,6 +40,14 @@ Choose exactly one classification. `--untagged` marks work the reader asked for 
 `refused` means no accepted launch. A timeout, disconnect, malformed response, or missing acknowledgment leaves delivery unknown. Preserve the window, request ID, prompt, and settings. Never launch a replacement or switch transports after an unknown outcome.
 
 Start and curation accept an explicit identical-payload retry with the same `--request-id` in the same activation. Arc retains results by ID and refuses conflicting payloads. A reload changes the activation and leaves the old outcome unknown. Never change the ID to retry. Do not retry automatically.
+
+## Send a follow-up
+
+Send only to a session that this session started with `arc start --arc-dispatch` in the same window activation. A reload of the window ends that relationship. Read the session first with `arc session SESSION_ID --turns 5 --window WINDOW_ID --json`. Write the follow-up from that reply's turns. Copy the reply's `observation` string unchanged into `--observation`. A reply without `observation` means Arc accepts no follow-up for that session now. The prompt file follows the start rules. Use a fresh `WINDOW_ID:UUID` request ID for each new follow-up, where `WINDOW_ID` is the window's `hostId`.
+
+Read the `status` field. `accepted` means the agent received the prompt, not that its work succeeded. `refused` means no prompt was sent, and `reason` says why. Each observation serves one follow-up attempt. It also goes stale when the reader gives that session or this one input through the panel, or when that session ends a turn or takes a follow-up. Read the session again and write the new follow-up from that reply. `unknown` means delivery is uncertain. Report it to the reader. A retry with the same request ID and prompt file returns the first result and sends nothing again. Never retry under a new request ID, start a replacement, or resume the session. Arc refuses later follow-ups to that session until the reader directs it in the panel, for example with a prompt, an answer, or Stop. A setting change alone does not lift that block.
+
+Arc delivers through the session's existing process in that window and never resumes or forks a copy. It cannot prevent an independent resume outside that window. Arc judges idle state from Claude idle reports, Codex root turns, and the panel's queues and status. Work that none of these report stays invisible to that check.
 
 ## Request compaction of this session
 
@@ -73,7 +82,7 @@ The `state` field names one outcome:
 - `uncertain`: admission or the compaction outcome is not known yet. Arc also reports this right after it sends the compaction, until native evidence arrives. When the request command returns it, report it and finish the turn. Never resend, change transport, reopen the session, or fork the session.
 - `unavailable`: the window holds no record of this request ID, or the window did not answer the status read.
 
-Start and curation retry advice does not apply to compaction.
+Start and curation retry advice does not apply to compaction. Follow-ups follow their own rules in Send a follow-up.
 
 ## Report session links
 

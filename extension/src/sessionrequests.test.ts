@@ -39,6 +39,7 @@ import {
   archiveRefusal,
   guardedChannelSend,
   guardedDeliveryPort,
+  guardedFactsWithCompaction,
   guardedPanelPorts,
   guardedStartContext,
   interveneOnReaderInput,
@@ -2550,8 +2551,11 @@ class GuardChild {
   guardedTurnEnds() {
     return this.turnEnds;
   }
-  guardedPrompt(text: string, clientUuid: string) {
+  // The local submission number the child assigns to its next prompt.
+  submission = 7;
+  guardedPrompt(text: string, clientUuid: string, onSubmitted?: (turnId: number) => void) {
     this.attempts.push(text);
+    onSubmitted?.(this.submission);
     return new GuardedAttempt(clientUuid);
   }
   sessionId = 'worker';
@@ -2731,6 +2735,27 @@ test('guarded sends consume observations, bind source, scope, turn and assignmen
   assert.equal(writes.length, 2);
 });
 
+test('a guarded send read while an accepted follow-up still runs refuses as busy, not as changed outside Arc', async () => {
+  const { policy, child, coordinator, facts, writes, send } = guardFixture();
+  const delivery = send();
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'accepted', nativeTurnId: 'turn-2', reason: '' });
+  assert.equal((await delivery).status, 'accepted');
+  // The coordinator reads the worker while the accepted turn runs, and that turn then grows the source.
+  child.idle = 'busy';
+  const running = policy.observe('worker', coordinator, facts)!;
+  facts.sourceRevision = 'revision-running-growth';
+  facts.latestTurn = 'turn-2';
+  assert.equal((await send({ observation: running })).reason, GUARDED_SEND_REASONS.busy);
+  child.idle = null;
+  facts.pendingControls = 1;
+  assert.equal((await send({ observation: running })).reason, GUARDED_SEND_REASONS.busy);
+  facts.pendingControls = 0;
+  // With idle evidence and no tracked turn end, the same growth stays unexplained.
+  assert.equal((await send({ observation: running })).reason, GUARDED_SEND_REASONS.changed);
+  assert.equal(writes.length, 1);
+});
+
 test('reader intervention, retirement, writer conflicts, and unknown or shared-turn outcomes block guarded sends without a resend', async () => {
   const { policy, coordinator, facts, writes, port, send } = guardFixture();
   for (const reader of ['worker', 'coordinator']) {
@@ -2882,53 +2907,50 @@ test('guarded sends keep an observation that a wire refusal before the write lef
   assert.equal(unknown.reason, 'The agent did not answer. Delivery is unknown. Arc will not resend this prompt.');
 });
 
-test('only reader input a directing callback accepts for the worker clears the unknown-delivery block', async () => {
+// Catches a second place that clears the unknown-delivery block, such as a callback wrapper or the port for input
+// the panel has not accepted yet. Only the accepted-input port clears it.
+test('reader callbacks and unaccepted input make observations stale, and only accepted reader input clears an unknown block', async () => {
   const { policy, coordinator, facts, writes, send } = guardFixture();
   const unknown = send();
   await vi.waitFor(() => assert.equal(writes.length, 1));
   writes[0].settle({ outcome: 'unknown', nativeTurnId: null, reason: 'the agent did not answer' });
   assert.equal((await unknown).status, 'unknown');
-  const results: Record<string, unknown> = {};
   const panel = {
-    onSendPrompt: async (..._args: unknown[]) => results.send,
-    onCompact: async (..._args: unknown[]) => results.compact,
-    onClear: async (..._args: unknown[]) => results.clear,
+    onSendPrompt: async (..._args: unknown[]) => ({ delivered: true, reason: '', turnId: 4 }),
+    onCompact: async (..._args: unknown[]) => ({ delivered: true, reason: '' }),
+    onClear: async (..._args: unknown[]) => ({ delivered: false, reason: 'no' }),
     onStopTurn: (..._args: unknown[]) => undefined,
-    onAnswerAsk: (..._args: unknown[]) => results.answer,
+    onAnswerAsk: (..._args: unknown[]) => true,
   };
   interveneOnReaderInput(panel, policy);
-  const prompt = () => panel.onSendPrompt('claude', 'worker', null, { text: 'x', assets: [] });
-  const rejected: [string, Record<string, unknown>, () => unknown][] = [
-    ['rejected answer', { answer: false }, () => panel.onAnswerAsk('worker', 'ask', 'yes')],
-    ['rejected prompt', { send: { delivered: false, reason: 'busy' } }, prompt],
-    ['prompt delivered to a forked successor', { send: { delivered: true, reason: '', session: 'forked' } }, prompt],
-    [
-      'rejected compaction',
-      { compact: { delivered: false, reason: 'no' } },
-      () => panel.onCompact('claude', 'worker', null),
-    ],
-    ['stop with no acceptance signal', {}, () => panel.onStopTurn('claude', 'worker')],
+  const ports = guardedPanelPorts(policy);
+  const unaccepted: [string, () => unknown][] = [
+    ['delivered prompt', () => panel.onSendPrompt('claude', 'worker', null, { text: 'x', assets: [] })],
+    ['delivered compaction', () => panel.onCompact('claude', 'worker', null)],
+    ['rejected clear', () => panel.onClear('claude', 'worker', null, 'name')],
+    ['stop', () => panel.onStopTurn('claude', 'worker')],
+    ['accepted answer', () => panel.onAnswerAsk('worker', 'ask', 'yes')],
+    ['input the panel has not accepted yet', () => ports.onReaderInput('worker')],
   ];
-  for (const [name, setup, call] of rejected) {
-    Object.assign(results, setup);
+  for (const [name, call] of unaccepted) {
     const before = policy.observe('worker', coordinator, facts)!;
     await call();
     assert.equal(policy.precheck(guardedRequest(before, coordinator)), GUARDED_SEND_REASONS.stale, name);
     const after = policy.observe('worker', coordinator, facts)!;
     assert.equal(policy.precheck(guardedRequest(after, coordinator)), GUARDED_SEND_REASONS.blocked, name);
   }
-  results.answer = true;
-  assert.equal(panel.onAnswerAsk('worker', 'ask', 'yes'), true, 'the wrapper returns the answer result unchanged');
+  assert.equal(panel.onAnswerAsk('worker', 'ask', 'yes'), true, 'the wrapper returns the callback result unchanged');
+  ports.onReaderDirected('coordinator');
+  assert.equal(
+    policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)),
+    GUARDED_SEND_REASONS.blocked,
+    'accepted input to the coordinator cleared its worker block',
+  );
+  const before = policy.observe('worker', coordinator, facts)!;
+  ports.onReaderDirected('worker');
+  assert.equal(policy.precheck(guardedRequest(before, coordinator)), GUARDED_SEND_REASONS.stale);
   assert.equal(policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)), null);
-
-  const again = send();
-  await vi.waitFor(() => assert.equal(writes.length, 2));
-  writes[1].settle({ outcome: 'unknown', nativeTurnId: null, reason: 'the agent did not answer' });
-  assert.equal((await again).status, 'unknown');
-  results.send = { delivered: true, reason: '', turnId: 4 };
-  assert.deepEqual(await prompt(), results.send);
-  assert.equal(policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)), null);
-  assert.equal(writes.length, 2);
+  assert.equal(writes.length, 1);
 });
 
 function guardedRequest(observation: string, requester: { provider: 'claude'; id: string }): GuardedSendRequest {
@@ -3064,6 +3086,78 @@ test('guarded wiring intervenes on each directing reader callback, records only 
     policy.precheck(guardedRequest(policy.observe('worker', coordinator, facts)!, coordinator)),
     GUARDED_SEND_REASONS.ownership,
   );
+});
+
+// Catches a guarded write that skips the submission registration ordinary delivery performs. A deferred compaction
+// that the follow-up turn requests then has no owning submission and is refused.
+test('a deferred compaction requested from a guarded follow-up turn binds to that turn on both providers', () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const { fixture } = compactHostFixture(agent);
+    const { host, child } = fixture;
+    const policy = new GuardedSends<GuardChild>('window');
+    const writer = new GuardChild();
+    const delivery = guardedDeliveryPort(
+      policy,
+      { find: () => writer, withActivity: async (_key, work) => work(writer) },
+      () => false,
+      () => 'uuid-follow-up',
+      (_writer, turnId) => host.submitted(child, turnId),
+    );
+    delivery.write(writer, 'Apply the corrections, then compact.');
+    const generation = agent === 'claude' ? 1 : null;
+    host.native(child, compactEvent('toolStart', { provider: agent, generation }), writer.submission);
+    const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+    assert.equal(ack.state, 'queued', agent);
+  }
+});
+
+// Catches a follow-up admitted while a deferred self-compaction waits for the worker. The follow-up would run on the
+// context the session asked to shrink, and the compaction would follow the wrong turn.
+test('a guarded follow-up refuses as busy while a deferred self-compaction waits for the worker', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  state.sessionId = 'worker';
+  host.submitted(child, 7);
+  host.native(child, compactEvent('toolStart', { sessionId: 'worker' }), 7);
+  assert.equal(
+    (host.handle({ method: 'compact-request', params: compactPayload }) as { state: string }).state,
+    'queued',
+  );
+  const { policy, facts, writes, send } = guardFixture();
+  policy.facts = guardedFactsWithCompaction(
+    () => facts,
+    (sessionId) => host.requests.waitingSessions().includes(sessionId),
+  );
+  assert.equal((await send()).reason, GUARDED_SEND_REASONS.busy);
+  assert.equal(writes.length, 0);
+  host.requests.invalidate(() => true, 'The reader acted.');
+  const admitted = send();
+  await vi.waitFor(() => assert.equal(writes.length, 1));
+  writes[0].settle({ outcome: 'accepted', nativeTurnId: 'turn-2', reason: '' });
+  assert.equal((await admitted).status, 'accepted');
+});
+
+// Catches refusal retention that forgets an old request ID, so an equal retry runs again and a changed payload
+// under that ID is no longer a conflict.
+test('a refused guarded send keeps its request binding after hundreds of later refusals', async () => {
+  const book = new SessionWriteRequests('window', 2);
+  let applied = 0;
+  const refuse = (id: string) => () => {
+    applied += 1;
+    return {
+      version: 1 as const,
+      status: 'refused' as const,
+      requestId: id,
+      payloadSha256: 'x',
+      nativeTurnId: null,
+      reason: GUARDED_SEND_REASONS.busy,
+    };
+  };
+  for (let n = 0; n <= 300; n++) await book.runGuarded(`window:${n}`, { prompt: `p${n}` }, refuse(`window:${n}`));
+  const again = (await book.runGuarded('window:0', { prompt: 'p0' }, refuse('window:0'))) as { requestId: string };
+  assert.equal(again.requestId, 'window:0');
+  assert.equal(applied, 301, 'an equal retry of an old refused ID ran again');
+  await assert.rejects(book.runGuarded('window:0', { prompt: 'changed' }, refuse('window:0')), /different request/);
 });
 
 test('guarded send refusals stay out of the write table, observe same-ID duplicates, and never block a later start', async () => {

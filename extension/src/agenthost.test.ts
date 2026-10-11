@@ -3834,7 +3834,14 @@ test('the extension binds its packaged CLI and current window to every child ent
 
 test('activate wires the guarded send policy into reader callbacks, draft starts, the channel, and the panel ports', () => {
   const activate = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
-  sourceMatch(activate, /Object\.assign\(panel, guardedPanelPorts\(guardedSends\)\);/);
+  sourceMatch(
+    activate,
+    /Object\.assign\(panel, guardedPanelPorts\(guardedSends\)\);\s*panel\.installGuardedFacts\?\.\(\s*guardedFactsWithCompaction\(\s*\(sessionId\) => panel\.guardedTargetFacts\(sessionId\),\s*\(sessionId\) => compaction\?\.requests\.waitingSessions\(\)\.includes\(sessionId\) \?\? false,\s*\),\s*\);/,
+  );
+  sourceMatch(
+    activate,
+    /guardedDeliveryPort\(guardedSends, host, activeWriterFailure, randomUUID, \(child, turnId\) =>\s*compaction\?\.submitted\(child, turnId\),?\s*\)/,
+  );
   const intervention = activate.indexOf('interveneOnReaderInput(panel, guardedSends);');
   assert.ok(intervention >= 0, 'activate wraps the directing reader callbacks');
   for (const name of ['onSendPrompt', 'onCompact', 'onClear', 'onStopTurn', 'onAnswerAsk']) {
@@ -3843,6 +3850,8 @@ test('activate wires the guarded send policy into reader callbacks, draft starts
   }
   const draft = statementFrom(activate, activate.indexOf('panel.onSendDraftPrompt ='));
   sourceMatch(draft, /recordGuardedStart\(guardedSends, start, liveSession, prompted\)/);
+  const askMode = statementFrom(activate, activate.indexOf('const setAskModeFor ='));
+  sourceMatch(askMode, /for \(const state of liveTargets\)[\s\S]*?guardedSends\.invalidate\(state\.sessionId\)/);
   const [handler] = callSources(activate, 'channel?.setGuardedSendHandler');
   assert.ok(handler, 'activate installs the channel guarded send handler');
   sourceMatch(handler, /guardedChannelSend\(guardedSends, request,[\s\S]*panel\.onSendPrompt/);

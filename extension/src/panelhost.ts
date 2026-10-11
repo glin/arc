@@ -3,11 +3,22 @@ import { savedResponseRates, retainResponseRate, responseRateForTurn } from './o
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
 import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
-import { archiveRefusal } from './sessionwrites';
+import {
+  archiveRefusal,
+  guardedStartContext,
+  type AttributedRequest,
+  type GuardedDelivery,
+  type GuardedFactsPort,
+  type GuardedObservationFacts,
+  type GuardedSendResult,
+  type GuardedStartContext,
+  type GuardedTargetFacts,
+} from './sessionwrites';
 import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLink } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
 import {
   boundedSessionRead,
+  guardedSourceRevision,
   readSessionCursor,
   sessionCatalogMembership,
   sessionDiscoveryMembership,
@@ -1111,6 +1122,9 @@ interface SelectionWork {
   scope?: string;
 }
 
+// Rail statuses that report work still running in a session, including background children and commands.
+const ACTIVE_RAIL_STATUSES: ReadonlySet<string> = new Set(['running', 'waiting', 'subagents', 'background']);
+
 // Reader messages that carry an instruction or setting for a session. Draft text is not one.
 // An `answerAsk` message is reported separately because it can approve the requesting command.
 const READER_INSTRUCTIONS: ReadonlySet<string> = new Set([
@@ -1411,6 +1425,7 @@ export class PanelProvider implements vscode.Disposable {
     | ((agent: string, session: string, control: string, value: string, model: string, cwd: string | null) => void)
     | null = null;
   // Sends to the named session and returns delivery status. Successful delivery removes submitted comments, while failure retains them for retry.
+  // The guarded mode delivers a coordinator's follow-up to the session's retained child and returns its structured result.
   public onSendPrompt:
     | ((
         agent: string,
@@ -1418,7 +1433,8 @@ export class PanelProvider implements vscode.Disposable {
         cwd: string | null,
         prompt: AgentPrompt,
         onSubmitted?: (session: string, turnId: number) => void,
-      ) => Promise<PromptDelivery>)
+        guarded?: GuardedDelivery,
+      ) => Promise<PromptDelivery & { guarded?: GuardedSendResult }>)
     | null = null;
   private contextGenerations = new Map<string, number>();
   private contextDemands = new WeakMap<PanelHost, ContextDemand>();
@@ -1543,6 +1559,7 @@ export class PanelProvider implements vscode.Disposable {
         draft: NewSessionDraft,
         prompt: AgentPrompt,
         onSubmitted?: (session: string, turnId: number) => void,
+        start?: GuardedStartContext,
       ) => Promise<PromptDelivery>)
     | null = null;
   public setupProject: string | null = null;
@@ -1558,6 +1575,20 @@ export class PanelProvider implements vscode.Disposable {
   // Runs synchronously when the reader sends, queues, edits a queued prompt, stops, compacts, answers or picks a setting,
   // and when the panel delivers a queued prompt. `answer` marks an answer to an ask.
   public onReaderAction: ((session: string, answer: boolean) => void) | null = null;
+  // Guarded follow-up ports, which `extension.ts` assigns from the window's follow-up policy.
+  // Signs the facts of a current session read for the requester that started the session.
+  public guardedObservation: ((request: AttributedRequest, facts: GuardedObservationFacts) => string | null) | null =
+    null;
+  // Installs the target facts the policy reads when it admits a follow-up.
+  public installGuardedFacts: ((port: GuardedFactsPort | null) => void) | null = null;
+  // Runs synchronously when directing reader input for a session arrives, before the panel knows whether it accepts it.
+  // It makes earlier follow-up observations stale and leaves the unknown-delivery block in place.
+  public onReaderInput: ((session: string) => void) | null = null;
+  // Runs synchronously after the panel accepts directing reader input for a session, before it queues or delivers it.
+  // It also clears the unknown-delivery block, so a rejected input never reaches it.
+  public onReaderDirected: ((session: string) => void) | null = null;
+  // The facts of each session's latest current read. An equal source revision means the same bytes.
+  private guardedReads?: Map<string, GuardedObservationFacts>;
   // Runs synchronously when the repository scope or the workspace folders change.
   public onScopeChange: (() => void) | null = null;
   // Runs after a full refresh rebuilds the session rows under a ready repository scope.
@@ -1870,7 +1901,7 @@ export class PanelProvider implements vscode.Disposable {
       Date.now(),
       profile,
     );
-    const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] });
+    const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] }, undefined, guardedStartContext(request));
     if (!delivery.delivered || !delivery.session)
       return { version: 1, status: 'refused', reason: delivery.reason, requester: request.requester };
     const session = delivery.session;
@@ -1994,13 +2025,61 @@ export class PanelProvider implements vscode.Disposable {
     await this.post({ type: 'labelsChanged', session: browserSession });
   }
 
-  public readSessionRequest(request: import('./sessionrequests').SessionRequest): unknown {
-    const scopeKey = (): string | null => {
-      if (this.disposed) return null;
-      const folders = this.folders();
-      const scope = this.repositoryScope.snapshot(folders);
-      return scope.ready ? JSON.stringify([folders, scope.roots, scope.revision]) : null;
+  // The repository scope a session read binds. Null while the scope loads or after disposal.
+  private readScopeKey(): string | null {
+    if (this.disposed) return null;
+    const folders = this.folders();
+    const scope = this.repositoryScope.snapshot(folders);
+    return scope.ready ? JSON.stringify([folders, scope.roots, scope.revision]) : null;
+  }
+
+  // Keeps the facts of a current session read and returns the observation the policy signs for them, if any.
+  private observeGuardedRead(request: AttributedRequest, facts: GuardedObservationFacts): string | null {
+    if (request.params.sessionId) (this.guardedReads ??= new Map()).set(request.params.sessionId, facts);
+    return this.guardedObservation?.(request, facts) ?? null;
+  }
+
+  // Read facts port. Reports one session's facts when the policy admits a follow-up. A session without exactly one
+  // catalog entry in the current scope, or without a panel row, is not current. Unknown rail status reports null.
+  public guardedTargetFacts(session: string): GuardedTargetFacts | null {
+    const scope = this.readScopeKey();
+    if (scope === null) return null;
+    const roots = this.repositoryScope.snapshot(this.folders()).roots;
+    const key = JSON.stringify(roots);
+    const accepted = this.authoritativeCatalogScope === key ? this.authoritativeCatalog : null;
+    const matches = accepted
+      ? this.sessionPageIndexFor(accepted, key, roots).scoped.filter((source) => source.sessionId === session)
+      : [];
+    const sourceRevision = matches.length === 1 ? guardedSourceRevision(matches[0].file) : null;
+    const read = this.guardedReads?.get(session);
+    const state = this.stateFor(session);
+    const presses = (this.live[session] ?? []).filter((press) => !press.completed && !press.failed);
+    const prompts = presses.filter((press) => press.kind === 'prompt').length;
+    const status = this.railStatuses(Date.now()).statuses.get(session);
+    return {
+      current: matches.length === 1 && state !== null,
+      archived: this.hidden.has(session),
+      scope,
+      sourceRevision,
+      latestTurn: read && sourceRevision !== null && read.sourceRevision === sourceRevision ? read.latestTurn : null,
+      queued: (this.queues[session] ?? []).length,
+      pendingSubmissions:
+        prompts +
+        Number(this.submissionsInFlight?.has(session) ?? false) +
+        Number(this.assetHandoffs.has(session)) +
+        Number(this.staging.has(session)),
+      pendingControls:
+        presses.length -
+        prompts +
+        Number(Boolean(state?.clearing) || this.clearSettlements.has(session)) +
+        Number(this.pendingQueueDrains.has(session)),
+      background: status === undefined ? null : ACTIVE_RAIL_STATUSES.has(status),
+      writerConflict: false,
     };
+  }
+
+  public readSessionRequest(request: import('./sessionrequests').SessionRequest): unknown {
+    const scopeKey = (): string | null => this.readScopeKey();
     const before = scopeKey();
     if (before === null) throw new Error('The repository scope is still loading. Retry the command.');
     const scope = this.repositoryScope.snapshot(this.folders());
@@ -2012,7 +2091,9 @@ export class PanelProvider implements vscode.Disposable {
       if (!index) throw new Error(SESSION_PAGE_ERRORS.catalog);
       const matches = index.scoped.filter((source) => source.sessionId === request.params.sessionId);
       if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
-      return boundedSessionRead(matches[0], request.params.turns!, scopeKey, request.requester, scope.roots);
+      return boundedSessionRead(matches[0], request.params.turns!, scopeKey, request.requester, scope.roots, (facts) =>
+        this.observeGuardedRead(request, facts),
+      );
     }
     // Only the internal archive read sets sessionId. It filters before paging.
     const target = request.params.sessionId;
@@ -4945,6 +5026,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     // Delivering queued input is a reader action, and it happens before the prompt is submitted.
     this.onReaderAction?.(state.sessionId, false);
+    this.onReaderDirected?.(state.sessionId);
     // Record the attempt before crossing the protocol boundary. If this process stops after
     // the agent accepts but before its answer is stored, the next process must not submit the
     // same prompt again. The waiting card then asks the reader to decide whether to retry.
@@ -5560,6 +5642,9 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       this.submissionsInFlight.add(session);
+      // The submission is directing input from here on. Prompt retention can wait, so earlier observations of this
+      // session, and of the workers it coordinates, go stale before it does.
+      this.onReaderInput?.(session);
       this.submittingDrafts ??= new Map();
       if (captured)
         this.submittingDrafts.set(session, {
@@ -5735,6 +5820,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
         return;
       }
+      this.onReaderDirected?.(state.sessionId);
       this.queues[state.sessionId] = queued;
       this.holdDraft(state.sessionId, '');
       this.releaseSubmittedCommentClaims(state);
@@ -5783,6 +5869,7 @@ export class PanelProvider implements vscode.Disposable {
           void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
           return;
         }
+        this.onReaderDirected?.(state.sessionId);
         this.holdDraft(state.sessionId, '');
         this.queues[state.sessionId] = recoveryId
           ? queued.map((entry, index) => (index === queued.length - 1 ? { ...entry, recoveryId } : entry))
@@ -5834,6 +5921,7 @@ export class PanelProvider implements vscode.Disposable {
           void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
           return;
         }
+        this.onReaderDirected?.(state.sessionId);
         this.holdDraft(state.sessionId, '');
         this.queues[state.sessionId] = recoveryId
           ? queued.map((entry, index) => (index === queued.length - 1 ? { ...entry, recoveryId } : entry))
@@ -5883,6 +5971,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
         return;
       }
+      this.onReaderDirected?.(state.sessionId);
       this.holdDraft(state.sessionId, '');
       this.queues[state.sessionId] = recoveryId
         ? queued.map((entry, index) => (index === queued.length - 1 ? { ...entry, recoveryId } : entry))
@@ -5899,6 +5988,7 @@ export class PanelProvider implements vscode.Disposable {
       void this.post({ type: 'usage', usage: this.usagePayload() });
       return;
     }
+    this.onReaderDirected?.(state.sessionId);
     this.holdDraft(state.sessionId, '');
     this.answerOpenAsks(state.sessionId, meant);
     this.send(state, text, null, capturedDraft, capturedAssets, recoveryId);
@@ -6206,6 +6296,7 @@ export class PanelProvider implements vscode.Disposable {
         );
         return;
       }
+      this.onReaderDirected?.(state.sessionId);
       this.queues[state.sessionId] = queued;
       void this.writeDrafts();
       void this.post({ type: 'usage', usage: this.usagePayload() });
@@ -6215,6 +6306,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private startCompaction(state: ComposerState, queued: QueuedSubmission | null = null): void {
+    this.onReaderDirected?.(state.sessionId);
     if (this.contextSource) this.invalidateContext(state.sessionId);
     // Create an empty live compaction card before agent delivery.
     const pressed = this.noteLive(state, 'compact', '');
@@ -6335,6 +6427,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!request) {
       return;
     }
+    this.onReaderDirected?.(state.sessionId);
     const queuedResetId = queued?.delivery && 'resetId' in queued.delivery ? queued.delivery.resetId : undefined;
     const settlement: ClearSettlement = {
       source: state.sessionId,
@@ -6398,6 +6491,7 @@ export class PanelProvider implements vscode.Disposable {
     if (!removed || this.queueHandoffs.has(id) || this.queuedEditReservations.has(id)) {
       return;
     }
+    this.onReaderDirected?.(state.sessionId);
     this.queues[state.sessionId] = queueAfterClearRecovery(state.agent, queueWithout(state.queued, id), removed);
     if (!this.queues[state.sessionId].length) {
       delete this.queues[state.sessionId];
@@ -6465,6 +6559,7 @@ export class PanelProvider implements vscode.Disposable {
       );
       return;
     }
+    this.onReaderDirected?.(state.sessionId);
     this.queuedEditReservations.add(id);
     this.queuedEditOffers.set(host, {
       id,
@@ -6572,6 +6667,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const wanted = swap.submission;
+    this.onReaderDirected?.(state.sessionId);
     this.queues[state.sessionId] = swap.queued;
     if (!swap.queued.length) {
       delete this.queues[state.sessionId];
@@ -11821,6 +11917,8 @@ export class PanelProvider implements vscode.Disposable {
             this.pickOnDraft(msg.session, msg.control, msg.value);
             return;
           }
+          // The panel cannot tell whether the agent applies the setting, so a pick leaves the unknown-delivery block.
+          this.onReaderInput?.(msg.session);
           this.onPicked?.(
             aimed.agent,
             msg.session,
@@ -11873,7 +11971,8 @@ export class PanelProvider implements vscode.Disposable {
         },
         answerAsk: (msg) => {
           const answered = this.onAnswerAsk?.(msg.session, msg.id, msg.answer) ?? false;
-          if (!answered) {
+          if (answered) this.onReaderDirected?.(msg.session);
+          else {
             void this.post({ type: 'askRejected', session: browserSession ?? msg.session, id: msg.id });
           }
         },
@@ -11956,6 +12055,7 @@ export class PanelProvider implements vscode.Disposable {
           // Stop the session named by the message, independent of the current panel selection.
           const aimed = this.stateFor(msg.session);
           if (aimed) {
+            this.onReaderDirected?.(aimed.sessionId);
             this.cancelClearSettlement(aimed.sessionId, 'The clear request stopped before a new session opened.');
             this.onStopTurn?.(aimed.agent, aimed.sessionId);
           }

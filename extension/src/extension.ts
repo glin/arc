@@ -102,12 +102,12 @@ import {
   GuardedSends,
   guardedChannelSend,
   guardedDeliveryPort,
+  guardedFactsWithCompaction,
   guardedPanelPorts,
   interveneOnReaderInput,
   recordGuardedStart,
   runGuardedSend,
   type GuardedDelivery,
-  type GuardedPromptSender,
   type GuardedSendResult,
   type GuardedStartContext,
 } from './sessionwrites';
@@ -686,7 +686,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const setAskModeFor = async (agent: AgentName, mode: AskMode, session?: string): Promise<void> => {
     const liveTargets = host.states().filter((state) => state.agent === agent && !state.exited);
     // The pick changes every live session of this agent, so each one counts as a reader action.
-    for (const state of liveTargets) if (state.sessionId) compaction?.readerAction(state.sessionId);
+    // It also changes how each guarded worker runs, so earlier follow-up observations of them go stale.
+    for (const state of liveTargets)
+      if (state.sessionId) {
+        compaction?.readerAction(state.sessionId);
+        guardedSends.invalidate(state.sessionId);
+      }
     const applyMode = async (sessions: ReadonlyMap<string, AgentSession>): Promise<boolean> => {
       const targets = liveTargets.map((state) => ({
         session: state.sessionId,
@@ -1358,7 +1363,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // read facts and reader intervention ports, which are assigned beside its other callbacks.
   const guardedSends = new GuardedSends<AgentSession>(channel?.hostId ?? '');
   Object.assign(panel, guardedPanelPorts(guardedSends));
-  const guardedPort = guardedDeliveryPort(guardedSends, host, activeWriterFailure, randomUUID);
+  panel.installGuardedFacts?.(
+    guardedFactsWithCompaction(
+      (sessionId) => panel.guardedTargetFacts(sessionId),
+      (sessionId) => compaction?.requests.waitingSessions().includes(sessionId) ?? false,
+    ),
+  );
+  // A guarded write registers its submission like ordinary delivery, so a deferred compaction its turn requests binds.
+  const guardedPort = guardedDeliveryPort(guardedSends, host, activeWriterFailure, randomUUID, (child, turnId) =>
+    compaction?.submitted(child, turnId),
+  );
   // Read Codex context from the panel's source. Read Claude context only through the current live child for this session.
   panel.contextSource = (agent, sessionId) => {
     if (agent === 'codex') return panel.codexContextSource(sessionId);
@@ -1967,13 +1981,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return answered;
   };
   // Reader input makes observations of the session it directs stale before the provider sees it.
-  // Only input a callback accepts for that worker clears the block an unknown delivery left.
+  // The wrapper never clears the block an unknown delivery left. The panel host's `onReaderDirected` port does.
   interveneOnReaderInput(panel, guardedSends);
-  // The panel host's callback type omits the guarded mode, which only this handler and the panel host's later port use.
+  // The channel's send reaches the guarded mode of the wrapped `onSendPrompt`, which skips reader intervention.
   channel?.setGuardedSendHandler((request) =>
-    guardedChannelSend(guardedSends, request, (...args) =>
-      (panel.onSendPrompt as unknown as GuardedPromptSender)(...args),
-    ),
+    guardedChannelSend(guardedSends, request, (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({})),
   );
 }
 

@@ -2333,6 +2333,45 @@ test('Claude guarded prompts settle only on the matching root replay, and replay
   }
 });
 
+// Catches a guarded follow-up that reuses the previous native generation, so a deferred compaction its turn requests
+// binds to the earlier turn instead.
+test('a Claude guarded prompt starts its own native submission, and its root tool calls carry that generation', async () => {
+  const events: WireEvent[] = [];
+  const wire = new ClaudeWire({ send: () => undefined, emit: (event) => events.push(event), sessionId: SESSION });
+  await wire.prompt('initial assignment');
+  void wire.prompt('Apply the corrections, then compact.', new GuardedAttempt('uuid-follow-up'));
+  wire.receive(
+    JSON.stringify({
+      session_id: SESSION,
+      type: 'assistant',
+      parent_tool_use_id: null,
+      uuid: 'envelope',
+      request_id: 'native-request',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'root-call',
+            name: 'Bash',
+            input: { command: 'arc compact request --self --after-turn' },
+            caller: { type: 'direct' },
+          },
+        ],
+      },
+    }),
+  );
+  const native = events.flatMap((e) => (e.kind === 'native' ? [e.event] : []));
+  assert.deepEqual(
+    native.map((e) => [e.kind, e.generation]),
+    [
+      ['submission', 1],
+      ['submission', 2],
+      ['toolStart', 2],
+    ],
+  );
+  assert.equal(native[1].kind === 'submission' && native[1].text, 'Apply the corrections, then compact.');
+});
+
 test('Claude idle evidence clears at every user frame, including a delayed attachment write and an effort command', async () => {
   const bytes = new TextEncoder().encode('x');
   let release!: (bytes: Uint8Array) => void;

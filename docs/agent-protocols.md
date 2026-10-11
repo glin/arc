@@ -73,6 +73,8 @@ A command the CLI answers by itself still reports a result. The result carries t
 
 `system/init` repeats before every local command result, so its arrival means nothing on its own. Only a change of session id does.
 
+A fresh start that carries a requester adds `--replay-user-messages`, because a guarded follow-up uses the replay as its receipt. The follow-up write starts a native submission, as an ordinary prompt does. The follow-up carries a client UUID. Only a replay frame with that UUID, the same session, root scope, and exact text accepts it. A result, an idle report, child exit, or 120 seconds without that frame leave the outcome unknown. Replay frames never reach display or turn tracking.
+
 ## Codex app-server
 
 Codex speaks JSON-RPC through `codex app-server`. Server requests carry both a method and an `id`. Request id `0` is valid and must not be tested for truthiness. Notifications carry no request id.
@@ -102,6 +104,8 @@ An agent message can also carry `delivery: async`, the marker for an item return
 A rollout records an async item as an `event_msg` `item_completed` record whose `AgentMessage` item carries `delivery: "async"`, `phase: "final_answer"`, and the `questions` array. The model's tool call sits beside it as a `function_call` record, and no `response_item` message repeats its text. Codex leaves the item out of the `last_agent_message` that `task_complete` records. `codex.ts` reads the item as one Activity update under the item id, with the text of the live Activity row, and never as an answer. A recorded user message that is only a reply envelope reads as each question followed by its answer, in the prompt, in a later prompt, and in the session title. A user message with any other text around the envelope stays ordinary prompt text.
 
 Codex image files become `localImage` inputs. Other files become `mention` inputs with their display name and staged path. The JSON request contains paths and metadata only. It never contains the file bytes. The staged file is checked against its saved SHA-256 digest before delivery and remains available until the Codex turn ends.
+
+A guarded follow-up is accepted on its own `turn/start` response. A returned turn ID that the wire saw before the write, or that another pending start holds, means the input joined a shared turn. That outcome is unknown, and the follow-up's assignment goes stale. Every error response after the write also leaves the outcome unknown. A compaction request that got no answer withholds idle evidence and refuses a guarded follow-up until its late turn ends, because that turn can still start.
 
 ## Session rename
 

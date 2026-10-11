@@ -613,6 +613,8 @@ export class ClaudeWire {
     if (hasAssets || !text) throw new Error('a guarded prompt carries text only');
     if (this.replayWait) throw new Error('another guarded prompt is still unsettled');
     if (!this.session) throw new Error('the session identity is unknown');
+    // Like an ordinary prompt, the write starts a native submission, so a deferred compaction it requests binds to it.
+    this.nativeSubmission(text);
     this.write({
       type: 'user',
       message: { role: 'user', content: [{ type: 'text', text }] },

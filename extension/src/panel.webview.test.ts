@@ -547,7 +547,12 @@ test('response session navigation releases only its invoking clear route and ret
   }
 });
 import type { TurnOutcome } from './transcript';
-import { sessionCatalogMembership, sessionDiscoveryMembership, sessionSourceKey } from './sessionreads.ts';
+import {
+  guardedSourceRevision,
+  sessionCatalogMembership,
+  sessionDiscoveryMembership,
+  sessionSourceKey,
+} from './sessionreads.ts';
 import { ClaudeChildWorkCache, liveTimelineChildren } from './timelinestate';
 import { openReadWindow, closeReadWindow } from './readmeter';
 import { responseRateForTurn, savedResponseRates } from './outputrate';
@@ -1748,7 +1753,15 @@ import {
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert';
 import { parseSessionRequest } from './sessionrequests.ts';
-import { SessionWriteRequests } from './sessionwrites.ts';
+import {
+  GUARDED_SEND_REASONS,
+  GuardedSends,
+  SessionWriteRequests,
+  guardedPanelPorts,
+  interveneOnReaderInput,
+  runGuardedSend,
+  type GuardedOwner,
+} from './sessionwrites.ts';
 import { orderSessionCatalog, AGENT_NAMES } from './turnview.ts';
 import { BoundedTrailingScheduler, PendingWatcherWake } from './scheduler.ts';
 import { searchablePrompt, searchableSummary } from './turnsearch.ts';
@@ -1770,6 +1783,7 @@ import {
   currentContextOf,
   nextTurnBasisOf,
   DRAFT_TEXT_LIMIT,
+  QUEUED_SUBMISSION_LIMIT,
   hasUnsentPrompt,
   normalizeQueuedSubmissions,
   queuedSubmissionBookFits,
@@ -1953,7 +1967,7 @@ import { StartupThresholdWatch, createDiagnosticsLog, HostHealth } from './diagn
 import { answerSessionRename, sessionRenameTitle } from './sessionrename.ts';
 import * as renameTranscripts from './transcript.ts';
 import { claudeSkillPath } from './claudeskillpath.ts';
-import type { PromptEntry } from './agentwire.ts';
+import { GuardedAttempt, type PromptEntry } from './agentwire.ts';
 import { drawnSessionCards } from './sessiondetails.ts';
 import { railPayload, renderPayload, selectionPayload } from './payload.ts';
 import { olderHistoryControl, olderHistoryPossible } from './historypages.ts';
@@ -11278,6 +11292,7 @@ test('removing a permission override stores every session before the agent defau
     'withSessionSettings',
     'panel',
     'compaction',
+    'guardedSends',
     code,
   )(
     loaded,
@@ -11305,6 +11320,7 @@ test('removing a permission override stores every session before the agent defau
       clearEffectiveModes: (_agent: string, sessions: string[]) => events.push(`cleared ${sessions.sort().join(',')}`),
     },
     { readerAction: (session: string) => events.push(`reader ${session}`) },
+    { invalidate: () => undefined },
   );
 
   await loaded.exports.setAskModeFor('codex', { value: '', label: '', description: '' }, 'one');
@@ -11363,6 +11379,7 @@ test('an explicit permission pick mutates no state when a default transition own
     'withSessionSettings',
     'panel',
     'compaction',
+    'guardedSends',
     code,
   )(
     loaded,
@@ -11387,6 +11404,7 @@ test('an explicit permission pick mutates no state when a default transition own
     withSessionSettings,
     { clearEffectiveModes: () => undefined },
     null,
+    { invalidate: () => undefined },
   );
 
   const changing = loaded.exports.setAskModeFor(
@@ -19965,7 +19983,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
   // The send callback returns a PromptDelivery answer.
   sourceMatch(
     panelHostSource,
-    /public onSendPrompt: \|? ?\(\(agent: string, session: string, cwd: string \| null, prompt: AgentPrompt, onSubmitted\?: \(session: string, turnId: number\) => void\) => Promise<PromptDelivery>\) \| null/,
+    /public onSendPrompt: \|? ?\(\(agent: string, session: string, cwd: string \| null, prompt: AgentPrompt, onSubmitted\?: \(session: string, turnId: number\) => void, guarded\?: GuardedDelivery\) => Promise<PromptDelivery & \{ guarded\?: GuardedSendResult \}>\) \| null/,
     'the send handoff does not have to say whether the prompt went, so the panel cannot wait for it',
   );
   // The host keeps no saved.sent field.
@@ -30966,4 +30984,438 @@ test('archiving, pinning and labelling one session post a delta rather than ever
       `the ${type} message carried ${message!.rail.length} session list rows`,
     );
   }
+});
+
+const hostMember = (name: string) => memberFrom(panelHostSource, panelHostSource.indexOf(name));
+
+// A worker the coordinator started, behind a panel wired to a real follow-up policy the way `activate` wires it.
+class GuardedPanelChild {
+  readonly key = 'worker-key';
+  readonly agent = 'claude';
+  state() {
+    return { sessionId: 'worker', exited: false, lastError: null };
+  }
+  guardedIdle() {
+    return null;
+  }
+  guardedTurnEnds() {
+    return 1;
+  }
+}
+
+function guardedPanelFixture() {
+  const root = tempDir('guarded-panel-');
+  const worktree = path.join(root, 'worktree');
+  const file = path.join(root, 'worker.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const stat = fs.statSync(file);
+  const source = { agent: 'claude', file, sessionId: 'worker', cwd: worktree, size: stat.size, mtimeMs: stat.mtimeMs };
+  const roots = [worktree];
+  const { provider } = queueRecoveryProvider();
+  const host = { webview: {} };
+  const readerSent: string[] = [];
+  const replacements: unknown[] = [];
+  // Sessions the fixture reports as running, and the directing callbacks that reached the agent side, in order.
+  const busy = new Set<string>();
+  const delivered: string[] = [];
+  Object.assign(provider, {
+    hosts: [host],
+    authoritativeCatalog: [source],
+    authoritativeCatalogScope: JSON.stringify(roots),
+    repositoryScope: { snapshot: () => ({ ready: true, roots, revision: 1 }) },
+    folders: () => [worktree],
+    hidden: new Set<string>(),
+    stateFor: (session: string) =>
+      ['worker', 'coordinator'].includes(session)
+        ? { ...COMPOSER_STATE, sessionId: session, queued: provider.queues[session] ?? [], running: busy.has(session) }
+        : null,
+    railStatuses: () => ({ statuses: new Map([['worker', 'done']]), openChildren: new Map() }),
+    send: (_state: unknown, text: string) => readerSent.push(text),
+    onSendDraftPrompt: async (...args: unknown[]) => {
+      replacements.push(args);
+      return { delivered: false, reason: '' };
+    },
+    onCompact: async () => (delivered.push('compact'), { delivered: true, reason: '' }),
+    onClear: async () => (delivered.push('clear'), { delivered: true, reason: '' }),
+    onStopTurn: () => void delivered.push('stop'),
+    onAnswerAsk: (_session: string, _id: string, answer: string) => (delivered.push('answer'), answer === 'yes'),
+    onPicked: () => void delivered.push('pick'),
+    sendToHost: async () => true,
+  });
+  const coordinator = { provider: 'claude' as const, id: 'coordinator' };
+  const child = new GuardedPanelChild();
+  const policy = new GuardedSends<GuardedPanelChild>('window');
+  policy.recordStart({ requester: coordinator, activation: 'window', worker: 'worker', child });
+  Object.assign(provider, guardedPanelPorts(policy));
+  provider.installGuardedFacts((sessionId: string) => provider.guardedTargetFacts(sessionId));
+  interveneOnReaderInput(provider as any, policy);
+  // What each accepted-input report saw: the texts in the session's queue and how many callbacks had already run.
+  const directed: { session: string; queue: string[]; delivered: number }[] = [];
+  const report = provider.onReaderDirected;
+  provider.onReaderDirected = (session: string) => {
+    const queue = (provider.queues[session] ?? []).map((entry: { text: string }) => entry.text);
+    directed.push({ session, queue, delivered: delivered.length });
+    report(session);
+  };
+  // The coordinator's session read, with the facts the read checked.
+  const observe = () =>
+    provider.observeGuardedRead(
+      { id: 'window:read', requester: 'coordinator', requesterProvider: 'claude', params: { sessionId: 'worker' } },
+      { scope: provider.readScopeKey(), sourceRevision: guardedSourceRevision(file), latestTurn: 'turn-1' },
+    ) as string;
+  const writes: string[] = [];
+  const port = {
+    outcome: 'accepted' as 'accepted' | 'unknown',
+    live: (owner: GuardedOwner<GuardedPanelChild>) => owner.child,
+    withLease: <T>(_child: GuardedPanelChild, work: () => Promise<T>) => work(),
+    write: (_child: GuardedPanelChild, text: string) => {
+      writes.push(text);
+      const attempt = new GuardedAttempt(`uuid-${writes.length}`);
+      attempt.markWritten();
+      attempt.settle({
+        outcome: port.outcome,
+        nativeTurnId: port.outcome === 'accepted' ? 'turn-2' : null,
+        reason: '',
+      });
+      return attempt;
+    },
+  };
+  let requests = 0;
+  const send = (observation: string) =>
+    runGuardedSend(
+      policy,
+      {
+        requestId: `window:${++requests}`,
+        activation: 'window',
+        sessionId: 'worker',
+        prompt: 'Next.',
+        observation,
+        requester: coordinator,
+      },
+      port,
+    );
+  // A reader submission whose prompt retention waits until the test releases it.
+  const submit = (session: string, text: string) => {
+    let release!: () => void;
+    provider.importPromptRecovery = () => new Promise<void>((resolve) => (release = resolve));
+    const pending = provider.acceptSubmission(text, session, 1, session, host, {
+      id: `reader-${text}`,
+      order: 1,
+      source: session,
+      revision: 1,
+      text,
+    }) as Promise<void>;
+    return { pending, release: () => release() };
+  };
+  const precheck = (observation: string) =>
+    policy.precheck({
+      requestId: 'window:check',
+      activation: 'window',
+      sessionId: 'worker',
+      prompt: 'Next.',
+      observation,
+      requester: coordinator,
+    });
+  // Leaves the worker blocked, as a settled unknown follow-up does.
+  const block = () => policy.settle('worker', { outcome: 'unknown', nativeTurnId: null, reason: 'no answer' });
+  return {
+    provider,
+    host,
+    file,
+    observe,
+    send,
+    submit,
+    writes,
+    port,
+    readerSent,
+    replacements,
+    busy,
+    delivered,
+    directed,
+    precheck,
+    block,
+  };
+}
+
+// Catches a follow-up admitted while a reader prompt is still being retained. Both would reach the worker as competing input.
+test('a guarded follow-up refuses before input while a reader submission to the worker is in flight', async () => {
+  const { observe, send, submit, writes, readerSent } = guardedPanelFixture();
+  const earlier = observe();
+  const reader = submit('worker', 'Reader direction.');
+  assert.match((await send(earlier)).reason, /observation is stale/, 'the submission left an older observation usable');
+  const competing = await send(observe());
+  assert.equal(competing.status, 'refused');
+  assert.match(competing.reason, /running or needs input/);
+  assert.deepEqual(writes, [], 'the follow-up reached the worker beside the reader prompt');
+  reader.release();
+  await reader.pending;
+  assert.deepEqual(readerSent, ['Reader direction.'], 'the refused follow-up changed the reader prompt');
+});
+
+// Catches reader input that the panel accepts without revising the worker's assignment. An observation read while the
+// reader prompt was retained would then authorize a continuation of the older assignment.
+test('reader input accepted after delayed retention makes an observation read during the retention stale', async () => {
+  const { observe, send, submit, writes } = guardedPanelFixture();
+  const reader = submit('worker', 'Change course.');
+  const observation = observe();
+  reader.release();
+  await reader.pending;
+  const result = await send(observation);
+  assert.equal(result.status, 'refused');
+  assert.match(result.reason, /observation is stale/);
+  assert.deepEqual(writes, []);
+  const fresh = await send(observe());
+  assert.equal(fresh.status, 'accepted', 'a new read after the reader input prepares a usable continuation');
+});
+
+// Catches coordinator steering that leaves its workers' observations valid, so the coordinator could act on direction
+// the reader just replaced.
+test('reader input to the coordinator makes observations of its worker stale', async () => {
+  const { observe, send, submit, writes } = guardedPanelFixture();
+  const observation = observe();
+  const reader = submit('coordinator', 'Stop assigning review work.');
+  const during = await send(observation);
+  assert.match(during.reason, /observation is stale/, 'a follow-up passed while the coordinator prompt was retained');
+  assert.deepEqual(writes, []);
+  reader.release();
+  await reader.pending;
+  const result = await send(observation);
+  assert.match(result.reason, /observation is stale/);
+  assert.deepEqual(writes, []);
+});
+
+// Catches a guarded follow-up that touches reader-owned state or opens a replacement, and a rejected reader input that
+// clears the block an unknown delivery left.
+test('guarded follow-ups keep reader state, never open a replacement, and only accepted reader input clears an unknown block', async () => {
+  const { provider, observe, send, submit, writes, port, readerSent, replacements } = guardedPanelFixture();
+  provider.drafts.worker = 'reader draft';
+  provider.assets.worker = [{ id: 'asset-1', name: 'shot.png' }];
+  provider.sentPrompts.worker = ['earlier prompt'];
+  const before = structuredClone({
+    drafts: provider.drafts,
+    assets: provider.assets,
+    sentPrompts: provider.sentPrompts,
+    queues: provider.queues,
+    saved: provider.saved,
+  });
+  const accepted = await send(observe());
+  assert.equal(accepted.status, 'accepted');
+  port.outcome = 'unknown';
+  const unknown = await send(observe());
+  assert.equal(unknown.status, 'unknown');
+  assert.deepEqual(
+    structuredClone({
+      drafts: provider.drafts,
+      assets: provider.assets,
+      sentPrompts: provider.sentPrompts,
+      queues: provider.queues,
+      saved: provider.saved,
+    }),
+    before,
+  );
+  port.outcome = 'accepted';
+  assert.match((await send(observe())).reason, /unknown outcome/);
+  provider.dequeue('missing', 'worker');
+  assert.match((await send(observe())).reason, /unknown outcome/, 'a rejected reader input cleared the block');
+  assert.deepEqual(writes, ['Next.', 'Next.'], 'an unknown delivery was resent');
+  assert.deepEqual(replacements, [], 'a follow-up opened a replacement session');
+  assert.deepEqual(readerSent, []);
+  // The attachment stays with the reader's draft, so the reader's next prompt goes without it.
+  delete provider.assets.worker;
+  const reader = submit('worker', 'I saw it.');
+  reader.release();
+  await reader.pending;
+  assert.deepEqual(readerSent, ['I saw it.']);
+  assert.equal((await send(observe())).status, 'accepted', 'accepted reader input left the block in place');
+});
+
+const guardedQueued = (id: string, text = 'Queued step.') =>
+  queueSubmissionAfter([], id, text, [], [], 0, false, { agent: 'claude', owner: 'worker' });
+const runHandler = (provider: Record<string, any>, name: string, msg: Record<string, unknown>) =>
+  new Function('msg', 'browserSession', handlerBody(panelHostSource, name)).call(provider, msg, undefined);
+
+// Catches a directing entry point that stops revising the worker's assignment, clears the unknown block for input it
+// has not accepted, or reports only after the input entered the queue or reached the agent.
+test('each directing reader entry point makes older observations stale and reports acceptance before it queues or delivers', async () => {
+  const fixture = guardedPanelFixture();
+  const { provider, host, observe, busy, delivered, directed, precheck, block } = fixture;
+  const none = () => undefined;
+  const entries: [string, () => void, () => unknown][] = [
+    ['compaction queued behind a running turn', () => busy.add('worker'), () => provider.compact('worker')],
+    ['compaction', () => busy.delete('worker'), () => provider.compact('worker')],
+    ['clear', none, () => provider.startClear(provider.stateFor('worker'))],
+    [
+      'queued prompt removal',
+      () => (provider.queues.worker = guardedQueued('remove-me')),
+      () => provider.dequeue('remove-me', 'worker'),
+    ],
+    [
+      'queued prompt edit request',
+      () => (provider.queues.worker = guardedQueued('edit-me')),
+      () => provider.requestQueuedEdit('edit-me', 'worker', 1, host),
+    ],
+    ['queued prompt edit acceptance', none, () => provider.acceptQueuedEdit('edit-me', 'worker', 1, 1, true, host)],
+    [
+      'queued prompt delivery',
+      () => (provider.queues.worker = guardedQueued('deliver-me', 'Queued delivery.')),
+      () => provider.flushQueue('worker'),
+    ],
+    ['Stop', none, () => runHandler(provider, 'stopTurn', { session: 'worker' })],
+    ['answer', none, () => runHandler(provider, 'answerAsk', { session: 'worker', id: 'ask', answer: 'yes' })],
+    [
+      'prompt queued behind a waiting prompt',
+      () => (busy.add('worker'), (provider.queues.worker = guardedQueued('waiting'))),
+      () => provider.sendPrompt('Queued prompt.', 'worker', 1),
+    ],
+    [
+      'compaction typed behind a running turn',
+      () => busy.add('worker'),
+      () => provider.sendPrompt('/compact', 'worker', 1),
+    ],
+    ['clear typed behind a running turn', () => busy.add('worker'), () => provider.sendPrompt('/clear', 'worker', 1)],
+    // Last, because the panel drains the recovered prompt after it saves the queue.
+    [
+      'prompt into a draft recovery slot',
+      () => {
+        busy.delete('worker');
+        provider.queues.worker = [
+          {
+            id: 'recover',
+            text: '',
+            commentIds: [],
+            assets: [],
+            at: 1,
+            delivery: { phase: 'draft-recovery', owner: 'worker', source: 'worker', resetId: 'recover' },
+          },
+        ];
+      },
+      () => provider.sendPrompt('Recovered prompt.', 'worker', 1),
+    ],
+  ];
+  for (const [name, setup, call] of entries) {
+    setup();
+    block();
+    const before = observe();
+    const queue = (provider.queues.worker ?? []).map((entry: { text: string }) => entry.text);
+    const ran = delivered.length;
+    const reports = directed.length;
+    await call();
+    assert.equal(precheck(before), GUARDED_SEND_REASONS.stale, `${name} left an older observation usable`);
+    assert.equal(precheck(observe()), null, `${name} left the unknown block in place after accepting the input`);
+    const seen = directed.slice(reports);
+    assert.ok(seen.length >= 1, `${name} accepted input without reporting it`);
+    // An answer is accepted only when its callback says so, so it reports right after the callback.
+    assert.equal(seen[0].delivered, ran + Number(name === 'answer'), `${name} reached the agent before it reported`);
+    assert.deepEqual(seen[0].queue, queue, `${name} changed the queue before it reported the input`);
+  }
+});
+
+// Catches a facts mapping that reports active work as idle, or a fact the panel cannot establish as known.
+test('guarded target facts map rail status, archive, pending work, and a read of older bytes the way admission needs', () => {
+  const { provider, file, observe } = guardedPanelFixture();
+  const facts = (session = 'worker') => provider.guardedTargetFacts(session);
+  const status = (value?: string) =>
+    (provider.railStatuses = () => ({
+      statuses: new Map(value ? [['worker', value]] : []),
+      openChildren: new Map(),
+    }));
+  for (const active of ['running', 'waiting', 'subagents', 'background']) {
+    status(active);
+    assert.equal(facts().background, true, active);
+  }
+  status();
+  assert.equal(facts().background, null, 'a session without a rail status reported known background state');
+  status('done');
+  assert.equal(facts().background, false);
+  assert.equal(facts('nobody').current, false);
+  assert.equal(facts().latestTurn, null, 'the newest turn was reported without a read');
+  observe();
+  assert.deepEqual([facts().current, facts().archived, facts().latestTurn, facts().queued], [true, false, 'turn-1', 0]);
+  provider.hidden.add('worker');
+  assert.equal(facts().archived, true);
+  provider.hidden.delete('worker');
+  provider.live.worker = [
+    { kind: 'prompt', completed: false, failed: false },
+    { kind: 'prompt', completed: true, failed: false },
+    { kind: 'compact', completed: false, failed: false },
+    { kind: 'clear', completed: false, failed: true },
+  ];
+  assert.deepEqual([facts().pendingSubmissions, facts().pendingControls], [1, 1]);
+  provider.live.worker = [];
+  provider.pendingQueueDrains.add('worker');
+  provider.clearSettlements.set('worker', {});
+  assert.equal(facts().pendingControls, 2);
+  provider.pendingQueueDrains.delete('worker');
+  provider.clearSettlements.delete('worker');
+  provider.queues.worker = guardedQueued('waiting');
+  assert.equal(facts().queued, 1);
+  delete provider.queues.worker;
+  fs.appendFileSync(file, '{"type":"user"}\n');
+  assert.notEqual(facts().sourceRevision, null);
+  assert.equal(facts().latestTurn, null, 'a read of older bytes supplied the newest turn');
+});
+
+// Catches a rejected reader input that clears the block an unknown delivery left, and a setting pick that clears it
+// before the panel can know that the agent applied the setting.
+test('rejected reader input and setting picks keep the unknown block that an earlier follow-up left', async () => {
+  const { provider, host, observe, precheck, block, delivered, submit, readerSent } = guardedPanelFixture();
+  block();
+  const rejected: [string, () => unknown][] = [
+    ['removal of a missing queued prompt', () => provider.dequeue('missing', 'worker')],
+    ['edit request for a missing queued prompt', () => provider.requestQueuedEdit('missing', 'worker', 1, host)],
+    ['edit acceptance without an offer', () => provider.acceptQueuedEdit('missing', 'worker', 1, 1, true, host)],
+    ['refused answer', () => runHandler(provider, 'answerAsk', { session: 'worker', id: 'ask', answer: 'no' })],
+    [
+      'prompt the full waiting queue cannot hold',
+      () => {
+        provider.queues.worker = Array.from(
+          { length: QUEUED_SUBMISSION_LIMIT },
+          (_, index) => guardedQueued(`q${index}`)[0],
+        );
+        provider.sendPrompt('One more.', 'worker', 1);
+      },
+    ],
+    [
+      'submission whose panel closed during prompt retention',
+      async () => {
+        const reader = submit('worker', 'Too late.');
+        provider.hosts = [];
+        reader.release();
+        await reader.pending;
+        provider.hosts = [host];
+      },
+    ],
+  ];
+  const notices: string[] = [];
+  const original = vscode.window.showInformationMessage;
+  Object.assign(vscode.window, { showInformationMessage: (message: string) => void notices.push(message) });
+  try {
+    for (const [name, call] of rejected) {
+      await call();
+      assert.equal(precheck(observe()), GUARDED_SEND_REASONS.blocked, `${name} cleared the block`);
+    }
+  } finally {
+    Object.assign(vscode.window, { showInformationMessage: original });
+  }
+  assert.equal(notices.length, 1, 'the full waiting queue accepted the prompt');
+  assert.equal(provider.queues.worker.length, QUEUED_SUBMISSION_LIMIT);
+  assert.deepEqual(readerSent, [], 'the submission reached the worker after its panel closed');
+  const before = observe();
+  runHandler(provider, 'pick', { session: 'worker', control: 'effort', value: 'high', model: 'opus' });
+  assert.equal(delivered.at(-1), 'pick');
+  assert.equal(precheck(before), GUARDED_SEND_REASONS.stale, 'a setting pick left an older observation usable');
+  assert.equal(precheck(observe()), GUARDED_SEND_REASONS.blocked, 'a setting pick cleared the block');
+});
+
+// Catches a session read or a channel start that stops reaching the follow-up policy. Without the read port no
+// observation joins a session reply, and without the start context no start records ownership.
+test('session reads and channel starts reach the follow-up policy through the panel ports', () => {
+  sourceMatch(
+    hostMember('public readSessionRequest('),
+    /boundedSessionRead\([^;]*\(facts\) =>\s*this\.observeGuardedRead\(request, facts\)/,
+  );
+  sourceMatch(
+    hostMember('public async handleSessionRequest('),
+    /this\.onSendDraftPrompt\(draft, \{ text, assets: \[\] \}, undefined, guardedStartContext\(request\)\)/,
+  );
 });

@@ -3080,6 +3080,39 @@ test('Codex default snapshots retain only original model and effort configuratio
   }
 });
 
+// Catches a guarded follow-up written while a compaction request that got no answer can still start its late turn.
+test('a Codex compaction with no answer withholds idle evidence and refuses a guarded prompt until its late turn ends', async () => {
+  const h = harness(1_000);
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const first = h.wire.prompt('initial assignment');
+  await completeLastTurn(h, 'turn-initial');
+  await first;
+  assert.equal(h.wire.idleEvidence(), true);
+  vi.useFakeTimers();
+  try {
+    const unanswered = assert.rejects(h.wire.compact(), /did not answer/);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await unanswered;
+    assert.equal(h.wire.compactionUnresolved(), true);
+    assert.equal(h.wire.idleEvidence(), false, 'an unanswered compaction is not idle');
+    const written = h.parsed().length;
+    const attempt = new GuardedAttempt('uuid-follow-up');
+    await assert.rejects(h.wire.prompt('Follow up.', attempt), /not idle/);
+    assert.equal(h.parsed().length, written, 'the guarded prompt reached the wire');
+    const send = (method: string, params: Record<string, unknown>) =>
+      h.wire.receive(JSON.stringify({ method, params }));
+    send('turn/started', { threadId: THREAD, turn: { id: 'late' } });
+    send('turn/completed', { threadId: THREAD, turn: { id: 'late', status: 'completed' } });
+    assert.equal(h.wire.compactionUnresolved(), false);
+    assert.equal(h.wire.idleEvidence(), true, 'the late turn ending restores idle evidence');
+    h.wire.close('finished');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('Codex guarded prompts accept only their own correlated turn and settle shared, failed, and silent starts as unknown', async () => {
   const h = harness(50);
   const starting = h.wire.startThread({ cwd: 'C:\\ws' });

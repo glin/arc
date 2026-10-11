@@ -84,15 +84,14 @@ export function sessionWriteBinding(
 }
 
 // Retention never evicts an accepted ID. A full activation refuses further writes.
-// A guarded send that refused before input moves to a separate bounded table. A same-ID duplicate still
-// observes that refusal, and refusals never use up the table that start, curate, and send share.
+// A guarded send that refused before input moves to a separate table that keeps every refusal for the activation.
+// A same-ID duplicate observes that refusal, and refusals never use up the table that start, curate, and send share.
 export class SessionWriteRequests {
   private readonly results = new Map<string, { payload: string; result: Promise<unknown> }>();
   private readonly refusals = new Map<string, { payload: string; result: unknown }>();
   constructor(
     private readonly windowId: string,
     private readonly limit = 256,
-    private readonly refusalLimit = 256,
   ) {}
   run(id: string, payload: unknown, apply: () => unknown | Promise<unknown>): Promise<unknown> {
     if (!id.startsWith(this.windowId + ':'))
@@ -122,7 +121,6 @@ export class SessionWriteRequests {
       if ((result as GuardedSendResult).status === 'refused' && held) {
         this.results.delete(id);
         this.refusals.set(id, { payload: held.payload, result });
-        if (this.refusals.size > this.refusalLimit) this.refusals.delete(this.refusals.keys().next().value!);
       }
       return result;
     });
@@ -177,7 +175,7 @@ export const GUARDED_SEND_REASONS = {
   stale: 'The observation is stale. Read the session again and prepare a new follow-up. No prompt was sent.',
   unsettled: 'An earlier follow-up to this session is still unsettled. No prompt was sent.',
   blocked:
-    'An earlier follow-up to this session has an unknown outcome. Arc sends no more follow-ups until the reader sends this session a prompt. No prompt was sent.',
+    'An earlier follow-up to this session has an unknown outcome. Arc sends no more follow-ups until the reader directs this session in the panel. No prompt was sent.',
   busy: 'The session is running or needs input. No prompt was sent.',
   unavailable: 'The session state is unavailable. Show Arc and retry. No prompt was sent.',
   accepted: 'The session received the prompt. This does not confirm that its work succeeded.',
@@ -317,14 +315,16 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
     return this.workers.get(sessionId)?.owner ?? null;
   }
 
-  // Reader intervention port. The host calls it when it accepts directing input, before any provider operation.
+  // Reader intervention port for accepted input. The host calls it once it knows it accepted directing input,
+  // before any provider operation. It is the only place that clears the block an unknown attempt left.
   intervene(sessionId: string): void {
     this.invalidate(sessionId);
-    this.acceptReaderInput(sessionId);
+    const worker = this.workers.get(sessionId);
+    if (worker?.attempt === 'blocked') worker.attempt = 'none';
   }
 
   // Directing reader input to a worker advances its assignment, and input to a coordinator advances its steering.
-  // Either change makes every earlier observation stale. It runs before the input is known to be accepted.
+  // Either change makes every earlier observation stale. It can run before the input is known to be accepted.
   invalidate(sessionId: string): void {
     const worker = this.workers.get(sessionId);
     if (worker) worker.assignment += 1;
@@ -333,12 +333,6 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
         this.steering.set(sessionId, (this.steering.get(sessionId) ?? 0) + 1);
         break;
       }
-  }
-
-  // Only accepted reader directing input to a worker clears the block an unknown attempt left.
-  acceptReaderInput(sessionId: string): void {
-    const worker = this.workers.get(sessionId);
-    if (worker?.attempt === 'blocked') worker.attempt = 'none';
   }
 
   // An observed writer-lock failure refuses every later guarded send to that worker in this activation.
@@ -429,19 +423,21 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
     // Exact revision equality. Unlike ordinary source admission, any growth since the read refuses.
     if (facts.sourceRevision === null || facts.scope === null) return GUARDED_SEND_REASONS.unavailable;
     if (observation.scope !== digest(facts.scope)) return GUARDED_SEND_REASONS.changed;
+    const moved = facts.sourceRevision !== observation.source || observation.turn !== digest(facts.latestTurn);
     // Growth after a turn end or an accepted delivery that Arc tracked makes the observation stale.
-    if (facts.sourceRevision !== observation.source || observation.turn !== digest(facts.latestTurn))
-      return observation.tracked !== this.tracked(worker) ? GUARDED_SEND_REASONS.stale : GUARDED_SEND_REASONS.changed;
+    if (moved && observation.tracked !== this.tracked(worker)) return GUARDED_SEND_REASONS.stale;
     const idle = child.guardedIdle();
+    const busy =
+      idle !== 'unavailable' &&
+      (idle === 'busy' ||
+        facts.queued > 0 ||
+        facts.pendingSubmissions > 0 ||
+        facts.pendingControls > 0 ||
+        facts.background === true);
+    // Any known busy state reports busy ahead of the changed reason.
+    if (moved && !busy) return GUARDED_SEND_REASONS.changed;
     if (idle === 'unavailable') return GUARDED_SEND_REASONS.ownership;
-    if (
-      idle === 'busy' ||
-      facts.queued > 0 ||
-      facts.pendingSubmissions > 0 ||
-      facts.pendingControls > 0 ||
-      facts.background
-    )
-      return GUARDED_SEND_REASONS.busy;
+    if (busy) return GUARDED_SEND_REASONS.busy;
     if (idle !== null || facts.background !== false) return GUARDED_SEND_REASONS.unavailable;
     worker.attempt = 'unsettled';
     return null;
@@ -566,7 +562,10 @@ export interface GuardedPanelPorts {
   guardedObservation(request: AttributedRequest, facts: GuardedObservationFacts): string | null;
   // Read facts port. Installs the target facts the policy reads at admission.
   installGuardedFacts(port: GuardedFactsPort | null): void;
-  // Reader intervention port. The panel host calls it when it accepts directing input.
+  // Reader intervention port. The panel host calls it when directing input arrives, before it knows whether it
+  // accepts the input. It makes earlier observations stale and keeps the unknown-delivery block.
+  onReaderInput(sessionId: string): void;
+  // Reader intervention port. The panel host calls it once it accepted directing input. It also clears the block.
   onReaderDirected(sessionId: string): void;
 }
 
@@ -576,53 +575,49 @@ export function guardedPanelPorts<C extends GuardedChild>(policy: GuardedSends<C
     installGuardedFacts: (port) => {
       policy.facts = port;
     },
+    onReaderInput: (sessionId) => policy.invalidate(sessionId),
     onReaderDirected: (sessionId) => policy.intervene(sessionId),
+  };
+}
+
+// Adds work outside the panel to its target facts. A deferred self-compaction that waits for the session counts as a
+// pending control, so a follow-up never runs on the context the session asked to shrink.
+export function guardedFactsWithCompaction(
+  panelFacts: GuardedFactsPort,
+  compactionWaiting: (sessionId: string) => boolean,
+): GuardedFactsPort {
+  return (sessionId) => {
+    const facts = panelFacts(sessionId);
+    return facts && compactionWaiting(sessionId) ? { ...facts, pendingControls: facts.pendingControls + 1 } : facts;
   };
 }
 
 type ReaderCallback = ((...args: any[]) => unknown) | null;
 
-// A delivery result accepts the input for the named session only when it delivered there and not to a successor.
-const deliveredTo = (result: unknown, sessionId: string): boolean => {
-  const delivery = result as { delivered?: unknown; session?: unknown } | null;
-  return delivery?.delivered === true && (delivery.session === undefined || delivery.session === sessionId);
-};
-
-// The panel host callbacks that carry directing reader input. Each entry names the argument that holds its session,
-// and reads whether the callback's result accepted the input for that session.
+// The panel host callbacks that carry directing reader input, each with the argument that holds its session.
 // A guarded delivery through `onSendPrompt` carries a sixth argument and is not reader input.
-// `onStopTurn` returns nothing, so its input never counts as accepted.
 export const READER_DIRECTING_CALLBACKS = {
-  onSendPrompt: { session: (args: unknown[]) => (args[5] === undefined ? args[1] : null), accepted: deliveredTo },
-  onCompact: { session: (args: unknown[]) => args[1], accepted: deliveredTo },
-  onClear: { session: (args: unknown[]) => args[1], accepted: deliveredTo },
-  onStopTurn: { session: (args: unknown[]) => args[1], accepted: (_result: unknown, _sessionId: string) => false },
-  onAnswerAsk: {
-    session: (args: unknown[]) => args[0],
-    accepted: (result: unknown, _sessionId: string) => result === true,
-  },
+  onSendPrompt: (args: unknown[]) => (args[5] === undefined ? args[1] : null),
+  onCompact: (args: unknown[]) => args[1],
+  onClear: (args: unknown[]) => args[1],
+  onStopTurn: (args: unknown[]) => args[1],
+  onAnswerAsk: (args: unknown[]) => args[0],
 } as const;
 
-// Wraps each assigned directing callback. Earlier observations become stale before the callback runs.
-// The unknown-delivery block clears only after the callback reports that it accepted the input.
+// Wraps each assigned directing callback so earlier observations become stale before the callback runs, even when
+// the callback then rejects the input. It never clears the unknown-delivery block. Only `onReaderDirected` does.
 export function interveneOnReaderInput(
   panel: { -readonly [K in keyof typeof READER_DIRECTING_CALLBACKS]: ReaderCallback },
-  policy: { invalidate(sessionId: string): void; acceptReaderInput(sessionId: string): void },
+  policy: { invalidate(sessionId: string): void },
 ): void {
   for (const name of Object.keys(READER_DIRECTING_CALLBACKS) as (keyof typeof READER_DIRECTING_CALLBACKS)[]) {
     const callback = panel[name];
     if (!callback) continue;
-    const { session, accepted } = READER_DIRECTING_CALLBACKS[name];
+    const session = READER_DIRECTING_CALLBACKS[name];
     panel[name] = (...args: unknown[]) => {
       const id = session(args);
-      if (typeof id !== 'string') return callback(...args);
-      policy.invalidate(id);
-      const settle = (result: unknown) => {
-        if (accepted(result, id)) policy.acceptReaderInput(id);
-        return result;
-      };
-      const result = callback(...args);
-      return result instanceof Promise ? result.then(settle) : settle(result);
+      if (typeof id === 'string') policy.invalidate(id);
+      return callback(...args);
     };
   }
 }
@@ -630,7 +625,7 @@ export function interveneOnReaderInput(
 // The live child as the delivery port reads it. `AgentSession` implements it.
 export interface GuardedWriter extends GuardedChild {
   readonly agent: string;
-  guardedPrompt(text: string, clientUuid: string): GuardedAttempt;
+  guardedPrompt(text: string, clientUuid: string, onSubmitted?: (turnId: number) => void): GuardedAttempt;
 }
 
 // Delivery-mode port over the host's retained children. It never opens a child.
@@ -642,6 +637,8 @@ export function guardedDeliveryPort<C extends GuardedWriter>(
   },
   writerFailure: (error: unknown) => boolean,
   clientUuid: () => string,
+  // Registers the submission the way ordinary delivery does, so work the guarded turn requests can bind to it.
+  submitted?: (child: C, turnId: number) => void,
 ): GuardedDeliveryPort<C> {
   return {
     live: (owner) => {
@@ -651,7 +648,7 @@ export function guardedDeliveryPort<C extends GuardedWriter>(
     },
     withLease: (child, work) =>
       host.withActivity(child.key, (live) => (live === child ? work() : Promise.resolve(null))),
-    write: (child, text) => child.guardedPrompt(text, clientUuid()),
+    write: (child, text) => child.guardedPrompt(text, clientUuid(), (turnId) => submitted?.(child, turnId)),
   };
 }
 
