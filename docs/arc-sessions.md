@@ -97,7 +97,7 @@ An agent reports a known session with a named Markdown link:
 [name](arc-session:<id>)
 ```
 
-Links open only inside the live extension panel that contains the invoking conversation. The [skill's reporting rules](../cli/skills/arc-sessions/SKILL.md#report-session-links) define identity sources, label escaping, destination encoding, scope, and plain-text fallbacks.
+Links open only inside the live extension panel that contains the invoking session. The [skill's reporting rules](../cli/skills/arc-sessions/SKILL.md#report-session-links) define identity sources, label escaping, destination encoding, scope, and plain-text fallbacks.
 
 The response link complements the Dispatched link. Its receipt, attribution, and delegated cost accounting remain part of that relationship. [Architecture](architecture.md#module-boundaries) owns response-link resolution and navigation.
 
