@@ -89,6 +89,18 @@ Read each result before describing it. Recorded model and effort establish execu
 
 Personal `ship` and `dispatch` skills define their own implementation and review workflows. Arc does not package them. The session skill does not automatically review changes, send corrections, rotate coordinator context, or supervise workers continuously. There is no `arc send` command. The reader sends follow-up prompts through the panel.
 
+## Named session links
+
+An agent reports a known session with a named Markdown link:
+
+```markdown
+[name](arc-session:<id>)
+```
+
+Links open only inside the live extension panel that contains the invoking conversation. The [skill's reporting rules](../cli/skills/arc-sessions/SKILL.md#report-session-links) define identity sources, label escaping, destination encoding, scope, and plain-text fallbacks.
+
+The response link complements the Dispatched link. Its receipt, attribution, and delegated cost accounting remain part of that relationship. [Architecture](architecture.md#module-boundaries) owns response-link resolution and navigation.
+
 ## Manual check
 
 Start with read-only commands. Open Arc in the intended repository and keep the panel visible.
