@@ -2,6 +2,25 @@ import { unavailableContext } from '../domain/context-detail.ts';
 import { test } from 'vitest';
 import assert from 'node:assert';
 
+test('response file citations retain their typed literal destination at the host boundary', () => {
+  for (const path of ['C:/outside/file%20.csv#L10', '/outside/file:10']) {
+    const message = { type: 'openLink', destination: { kind: 'fileCitation', path }, beside: true };
+    assert.deepEqual(parsePanelToHost(message), message);
+  }
+  for (const destination of [
+    null,
+    {},
+    { kind: 'fileCitation' },
+    { kind: 'fileCitation', path: 4 },
+    { kind: 'url', path: '/a' },
+  ])
+    assert.equal(parsePanelToHost({ type: 'openLink', destination }), null);
+  assert.equal(
+    parsePanelToHost({ type: 'openLink', destination: { kind: 'fileCitation', path: '/a' }, href: '/b' }),
+    null,
+  );
+});
+
 test('response session navigation retains its explicit marker and rejects malformed markers', () => {
   const message = { type: 'showSession', session: 'saved-id', responseLink: true };
   assert.deepEqual(parsePanelToHost(message), message);

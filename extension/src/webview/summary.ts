@@ -42,6 +42,7 @@ function focusSignature(node: Element): string {
   return JSON.stringify([
     node.tagName,
     node.getAttribute('data-link'),
+    node.getAttribute('data-link-kind'),
     node.getAttribute('data-image'),
     node.getAttribute('data-visualization'),
     node.className,
@@ -119,6 +120,7 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
     link.dataset.vscodeContext = JSON.stringify({
       webviewSection: webLink ? 'arcTableLink' : 'arcLink',
       link: link.dataset.link,
+      ...(link.dataset.linkKind === 'file-citation' ? { destination: { kind: 'fileCitation', path: href } } : {}),
       ...(inTable ? { arcCopyLink: true } : {}),
       ...source,
       preventDefaultContextMenuItems: true,
@@ -169,7 +171,15 @@ export function enhanceSummary(root: HTMLElement, options: SummaryOptions): () =
     if (target.kind === 'session') {
       options.post({ type: 'showSession', session: target.session, responseLink: true });
     } else if (target.kind === 'other') {
-      options.post({ type: 'openLink', href: link.dataset.link || '', beside: event.ctrlKey || event.metaKey });
+      if (link.dataset.linkKind === 'file-citation') {
+        options.post({
+          type: 'openLink',
+          destination: { kind: 'fileCitation', path: link.dataset.link || '' },
+          beside: event.ctrlKey || event.metaKey,
+        });
+      } else {
+        options.post({ type: 'openLink', href: link.dataset.link || '', beside: event.ctrlKey || event.metaKey });
+      }
     }
   };
   root.addEventListener('click', activate);

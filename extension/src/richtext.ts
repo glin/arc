@@ -6,6 +6,7 @@
 import * as path from 'path';
 import { marked } from 'marked';
 import { isLocalLinkPath } from './domain/link-path';
+import { maskedCitationSource, nativeCitationPath } from './domain/file-citation';
 import { parseSessionLink } from './domain/session-link';
 import { ARC_IDENTITY } from './identity';
 
@@ -155,9 +156,134 @@ interface MarkdownDisclosure {
   valid: boolean;
 }
 
-// Match structure before Markdown lexing, which otherwise consumes tight bodies as HTML.
-// Literal regions never supply tags. The disclosure depth bounds rendering and disclosure stack storage.
-function markdownDisclosures(text: string): MarkdownDisclosure[] {
+function markdownContainerPositions(raw: string, body: string, start: number, position: (index: number) => number) {
+  // Marked removes container prefixes, task markers, and final whitespace.
+  // Match each remaining line's suffix to retain positions in the original source.
+  body = body.replace(/^( *)(\t+)/gm, (_, spaces, tabs) => spaces + '    '.repeat(tabs.length));
+  const rawLines = raw.split('\n');
+  const bodyLines = body.split('\n');
+  const positions: number[] = [];
+  let rawOffset = start;
+  for (let line = 0; line < bodyLines.length; line += 1) {
+    const content = bodyLines[line].trimStart();
+    const head = bodyLines[line].length - content.length;
+    const contentStart = rawLines[line].lastIndexOf(content);
+    for (let index = 0; index < bodyLines[line].length; index += 1) {
+      positions.push(position(rawOffset + Math.max(0, contentStart - head + index)));
+    }
+    if (line < bodyLines.length - 1) positions.push(position(rawOffset + rawLines[line].length));
+    rawOffset += rawLines[line].length + 1;
+  }
+  return { text: body, positions };
+}
+
+// Consume directives and existing Markdown protection in source order.
+// Emphasis and tables run only after eligible interiors become opaque.
+function visitCitationMarkdown(text: string, consume: (start: number) => number): void {
+  const tokenizer = new marked.Tokenizer() as marked.Tokenizer & marked.TokenizerThis;
+  const lexer = new marked.Lexer({ gfm: true, breaks: true, tokenizer });
+  tokenizer.lexer = lexer;
+  // Only source extents and reference destinations are needed here.
+  lexer.inline = (_source, tokens = []) => tokens;
+  lexer.inlineTokens = (_source, tokens = []) => tokens;
+  lexer.blockTokens(text, []);
+  // Marked's declaration names an array here, but its runtime accepts the link registry.
+  const reflink = tokenizer.reflink as unknown as (
+    source: string,
+    links: marked.TokensList['links'],
+  ) => marked.Token | undefined;
+  const pending: { text: string; positions: number[] | null; offset: number }[] = [
+    { text, positions: null, offset: 0 },
+  ];
+  let consumed = 0;
+  while (pending.length) {
+    const frame = pending.at(-1)!;
+    const { text, positions } = frame;
+    const position = (index: number): number => (positions ? positions[index] : index);
+    if (frame.offset >= text.length) {
+      pending.pop();
+      continue;
+    }
+    if (position(frame.offset) < consumed) {
+      do frame.offset += 1;
+      while (frame.offset < text.length && position(frame.offset) < consumed);
+      continue;
+    }
+    const offset = frame.offset;
+    const source = text.slice(offset);
+    const block = tokenizer.space(source) ?? tokenizer.fences(source) ?? tokenizer.code(source);
+    if (block) {
+      frame.offset += block.raw.length;
+      continue;
+    }
+    const disclosure = /^ {0,3}<\/?(?:details|summary)\b[^>]*>/i.exec(source);
+    if (disclosure) {
+      frame.offset += disclosure[0].length;
+      continue;
+    }
+    const quote = tokenizer.blockquote(source);
+    if (quote) {
+      frame.offset += quote.raw.length;
+      pending.push({ ...markdownContainerPositions(quote.raw, quote.text, offset, position), offset: 0 });
+      continue;
+    }
+    const list = tokenizer.list(source);
+    if (list) {
+      frame.offset += list.raw.length;
+      let itemOffset = offset;
+      const items = list.items.map((item) => {
+        const mapped = { ...markdownContainerPositions(item.raw, item.text, itemOffset, position), offset: 0 };
+        itemOffset += item.raw.length;
+        return mapped;
+      });
+      for (let index = items.length - 1; index >= 0; index -= 1) pending.push(items[index]);
+      continue;
+    }
+    const protectedBlock = tokenizer.html(source) ?? tokenizer.def(source);
+    if (protectedBlock) {
+      frame.offset += protectedBlock.raw.length;
+      continue;
+    }
+    const raw = (tokenizer.paragraph(source) ?? tokenizer.text(source)).raw;
+    frame.offset += raw.length;
+    const syntax = /:+|\\|`+|<|!?\[/g;
+    for (let match = syntax.exec(raw); match; match = syntax.exec(raw)) {
+      const start = offset + match.index;
+      if (position(start) < consumed) continue;
+      const tail = raw.slice(match.index);
+      if (match[0][0] === ':' && !lexer.state.inLink && !lexer.state.inRawBlock) {
+        const end = consume(position(start));
+        if (end > position(start)) {
+          consumed = end;
+          let next = match.index + 1;
+          while (next < raw.length && position(offset + next) < end) next += 1;
+          syntax.lastIndex = next;
+          continue;
+        }
+      }
+      const character = match[0][0];
+      const token =
+        character === '\\'
+          ? tokenizer.escape(tail)
+          : character === '<'
+            ? (tokenizer.tag(tail) ?? tokenizer.autolink(tail, (value) => value))
+            : character === '`'
+              ? tokenizer.codespan(tail)
+              : character === '[' || character === '!'
+                ? (tokenizer.link(tail) ?? reflink.call(tokenizer, tail, lexer.tokens.links))
+                : undefined;
+      if (token) syntax.lastIndex = match.index + token.raw.length;
+      else if (tail.startsWith('<!--')) {
+        const close = text.indexOf('-->', start + 4);
+        consumed = close < 0 ? position(text.length - 1) + 1 : position(close + 2) + 1;
+        frame.offset = Math.max(frame.offset, close < 0 ? text.length : close + 3);
+        break;
+      }
+    }
+  }
+}
+
+function markdownLiteralRanges(text: string): Uint8Array {
   const literal = new Uint8Array(text.length);
   const pending: { text: string; positions: number[] | null }[] = [{ text, positions: null }];
   while (pending.length) {
@@ -168,24 +294,7 @@ function markdownDisclosures(text: string): MarkdownDisclosure[] {
       else for (let index = start; index < end; index += 1) literal[positions[index]] = 1;
     };
     const container = (raw: string, body: string, start: number): void => {
-      // Marked removes container prefixes, task markers, and final whitespace.
-      // Match each remaining line's suffix to retain positions in the original source.
-      body = body.replace(/^( *)(\t+)/gm, (_, spaces, tabs) => spaces + '    '.repeat(tabs.length));
-      const rawLines = raw.split('\n');
-      const bodyLines = body.split('\n');
-      const mapped: number[] = [];
-      let rawOffset = start;
-      for (let line = 0; line < bodyLines.length; line += 1) {
-        const content = bodyLines[line].trimStart();
-        const head = bodyLines[line].length - content.length;
-        const contentStart = rawLines[line].lastIndexOf(content);
-        for (let index = 0; index < bodyLines[line].length; index += 1) {
-          mapped.push(position(rawOffset + Math.max(0, contentStart - head + index)));
-        }
-        if (line < bodyLines.length - 1) mapped.push(position(rawOffset + rawLines[line].length));
-        rawOffset += rawLines[line].length + 1;
-      }
-      pending.push({ text: body, positions: mapped });
+      pending.push(markdownContainerPositions(raw, body, start, position));
     };
     const tokenizer = new marked.Tokenizer() as marked.Tokenizer & marked.TokenizerThis;
     // Initialize the same block rules that render the disclosure's Markdown body.
@@ -268,6 +377,13 @@ function markdownDisclosures(text: string): MarkdownDisclosure[] {
       offset = end;
     }
   }
+  return literal;
+}
+
+// Match structure before Markdown lexing, which otherwise consumes tight bodies as HTML.
+// Literal regions never supply tags. The disclosure depth bounds rendering and disclosure stack storage.
+function markdownDisclosures(text: string): MarkdownDisclosure[] {
+  const literal = markdownLiteralRanges(text);
   const roots: MarkdownDisclosure[] = [];
   const stack: MarkdownDisclosure[] = [];
   let excess = 0;
@@ -353,8 +469,29 @@ export function visibleTextOf(html: string): string {
     .replace(/&#39;/g, "'");
 }
 
-function renderMarkdownBlocks(text: string, renderer: marked.Renderer): string {
-  const options = { ...marked.getDefaults(), async: false, gfm: true, breaks: true, mangle: false, renderer };
+interface CitationExtensions {
+  inline: Array<
+    (this: marked.TokenizerThis, source: string, tokens: marked.Token[]) => marked.Tokens.Generic | undefined
+  >;
+  renderers: Record<string, (token: marked.Tokens.Generic) => string>;
+}
+
+function renderMarkdownBlocks(
+  text: string,
+  renderer: marked.Renderer,
+  extensions?: CitationExtensions,
+  tokenizer?: marked.Tokenizer,
+): string {
+  const options = {
+    ...marked.getDefaults(),
+    async: false,
+    gfm: true,
+    breaks: true,
+    mangle: false,
+    renderer,
+    extensions,
+    tokenizer,
+  };
   if (!/<details\b/i.test(text)) return marked.parse(text, options);
   text = text
     .replace(/\r\n|\r/g, '\n')
@@ -502,6 +639,51 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, i
     return '';
   }
   try {
+    const original = inert ? text : richMarkdown(text);
+    const masked = maskedCitationSource(original, (consume) => visitCitationMarkdown(original, consume));
+    const source = masked.text;
+    const names = new Map<string, Set<string>>();
+    const citations: CitationExtensions = {
+      inline: [
+        function (source, tokens) {
+          if (this.lexer.state.inLink || this.lexer.state.inRawBlock) return undefined;
+          const marker = source.slice(0, 10);
+          const candidate = masked.directives.get(marker);
+          if (!candidate) return undefined;
+          const directive = candidate.directive;
+          if (!directive || (tokens.at(-1)?.type === 'escape' && tokens.at(-1)?.raw === '\\:'))
+            return { type: 'fileCitation', raw: marker };
+          const file =
+            directive.name === 'codex-file-citation'
+              ? nativeCitationPath(directive.attributes.get('path') || '', process.platform)
+              : null;
+          if (!file) return { type: 'fileCitation', raw: marker };
+          const name = (process.platform === 'win32' ? path.win32.basename(file) : path.posix.basename(file)) || file;
+          const peers = names.get(name) ?? new Set<string>();
+          peers.add(file);
+          names.set(name, peers);
+          return { type: 'fileCitation', raw: marker, file, name, purpose: directive.attributes.get('purpose') };
+        },
+      ],
+      renderers: {
+        fileCitation: (token) => {
+          if (!token.file) return escapeHtml(token.raw);
+          const purpose = token.purpose === 'source' ? 'Source: ' : token.purpose === 'output' ? 'Output: ' : '';
+          if (inert) return escapeHtml(purpose + token.file);
+          const label = escapeHtml(purpose + (names.get(token.name)!.size > 1 ? token.file : token.name));
+          return `<a href="#" data-link="${escapeHtml(token.file)}" data-link-kind="file-citation" title="${escapeHtml(token.file)}" aria-label="${escapeHtml(purpose + token.file)}">${label}</a>`;
+        },
+      },
+    };
+    const tokenizer = new marked.Tokenizer() as marked.Tokenizer & marked.TokenizerThis;
+    const inlineText = tokenizer.inlineText;
+    const textRule = ((marked.Lexer.rules.inline as marked.Rules).breaks as marked.Rules).text as RegExp;
+    // Add the mask delimiter to Marked's text boundaries without changing its URL or email rules.
+    const citationText = new RegExp(textRule.source.replace('|$)', '|\uE000|$)'), textRule.flags);
+    tokenizer.inlineText = function (source, smartypants) {
+      const matched = citationText.exec(source);
+      return inlineText.call(this, matched?.[0] ?? '', smartypants);
+    };
     const renderer = new marked.Renderer();
     renderer.html = (html: string) => escapeHtml(html);
     // Renders local images with an open action. Remote image addresses render as links.
@@ -555,7 +737,11 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, i
       );
     };
     // renderMarkdownBlocks disables random email mangling so unchanged responses keep stable HTML.
-    return renderMarkdownBlocks(inert ? text : richMarkdown(text), renderer);
+    const html = renderMarkdownBlocks(source, renderer, citations, tokenizer);
+    return html.replace(/\uE000[0-9a-f]{8}\uE001/g, (marker) => {
+      const candidate = masked.directives.get(marker);
+      return candidate ? escapeHtml(candidate.raw) : marker;
+    });
   } catch {
     return `<pre>${escapeHtml(text)}</pre>`;
   }

@@ -1,5 +1,225 @@
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
+import { nativeCitationPath } from './domain/file-citation';
+
+test('native Copy Path and Copy Relative Path retain citation filename suffixes', async () => {
+  const { linkTarget, resolveLink, relativePath, nativePath } = await import('./transcript.js');
+  const copied: string[] = [];
+  const root = process.platform === 'win32' ? 'C:/workspace' : '/workspace';
+  const outside = process.platform === 'win32' ? 'C:/Downloads' : '/Downloads';
+  const host = {
+    workspace: { workspaceFolders: [{ uri: { fsPath: root } }] },
+    env: {
+      clipboard: {
+        writeText: async (text: string) => {
+          copied.push(text);
+        },
+      },
+    },
+    window: { setStatusBarMessage() {} },
+  };
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const compiled = ts.transpileModule(declarationSource(extensionSource, 'copyPath'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const copy = new Function(
+    'vscode',
+    'fs',
+    'pathFrom',
+    'linkTarget',
+    'resolveLink',
+    'relativePath',
+    'nativePath',
+    'nativeCitationPath',
+    `${compiled}\nreturn copyPath;`,
+  )(host, fs, () => null, linkTarget, resolveLink, relativePath, nativePath, nativeCitationPath);
+  for (const folder of [root, outside]) {
+    for (const suffix of ['#L10', ':10', '%20']) {
+      const file = `${folder}/report.csv${suffix}`;
+      for (const relative of [false, true]) {
+        await copy({ link: file, destination: { kind: 'fileCitation', path: file } }, relative);
+        assert.equal(copied.at(-1), nativePath(relative ? relativePath(file, [root]) : file));
+        await copy({ link: file }, relative);
+        const ordinary = linkTarget(file)!;
+        assert.equal(copied.at(-1), nativePath(relative ? relativePath(ordinary, [root]) : ordinary));
+      }
+    }
+  }
+});
+
+test('response citation presses open external literal files without workspace or snapshot routing', async () => {
+  const opened: Array<{ path: string; options: Record<string, unknown> }> = [];
+  const commands: unknown[][] = [];
+  const notices: string[] = [];
+  const checked: string[] = [];
+  let kind = 1;
+  let missing = false;
+  const root = process.platform === 'win32' ? 'C:/workspace' : '/workspace';
+  const outside = process.platform === 'win32' ? 'C:/Downloads' : '/Downloads';
+  const uri = (file: string) => ({ scheme: 'file', fsPath: file, toString: () => `file://${file}` });
+  const host = {
+    Uri: { file: uri, joinPath: (base: { fsPath: string }, file: string) => uri(path.join(base.fsPath, file)) },
+    FileType: { Directory: 2, File: 1 },
+    workspace: {
+      workspaceFolders: [{ uri: uri(root) }],
+      fs: {
+        stat: async (file: { fsPath: string }) => {
+          checked.push(file.fsPath);
+          if (missing) throw new Error('missing');
+          return { type: kind };
+        },
+      },
+    },
+    env: {
+      openExternal: async () => {
+        throw new Error('unexpected external URL');
+      },
+    },
+    commands: {
+      executeCommand: async (...args: unknown[]) => {
+        commands.push(args);
+      },
+    },
+    Range: class {
+      constructor(
+        public from: number,
+        public start: number,
+        public to: number,
+        public end: number,
+      ) {}
+    },
+    window: {
+      showInformationMessage: (message: string) => notices.push(message),
+      showTextDocument: async (file: { fsPath: string }, options: Record<string, unknown>) => {
+        opened.push({ path: file.fsPath, options });
+      },
+    },
+  };
+  const source = ts.transpileModule(declarationSource(panelHostSource, 'openLink'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const open = new Function(
+    'vscode',
+    'path',
+    'normalizeFsPath',
+    'nativeCitationPath',
+    'linkTargetIsImage',
+    'linkTargetIsHtml',
+    'linkTargetIsMarkdown',
+    `${source}\nreturn openLink;`,
+  )(
+    host,
+    path,
+    (file: string) => file.replace(/\\/g, '/').toLowerCase(),
+    nativeCitationPath,
+    (file: string) => file.endsWith('.png'),
+    (file: string) => file.endsWith('.html'),
+    (file: string) => file.endsWith('.md'),
+  );
+  for (const name of ['one%20.csv', 'one .csv', 'one#L10', 'one:10', 'Case.csv', 'case.csv']) {
+    const file = `${outside}/${name}`;
+    await open(file, 2, true);
+    assert.deepEqual(opened.at(-1), { path: file, options: { selection: undefined, preview: true, viewColumn: 2 } });
+    assert.equal(checked.at(-1), file);
+  }
+  assert.equal(commands.length, 0);
+  await open(`${outside}/file.csv`, 2);
+  assert.equal(opened.length, 6);
+  assert.match(notices.pop()!, /outside this workspace/);
+  await open(`${root}/file.csv#L10-L12`, 1);
+  assert.equal(opened.at(-1)!.path, path.resolve(root, 'file.csv'));
+  assert.equal((opened.at(-1)!.options.selection as { from: number }).from, 9);
+  for (const file of [
+    'relative.csv',
+    'https://example.com',
+    'file:///tmp/file',
+    process.platform === 'win32' ? '/foreign/file' : 'C:/foreign/file',
+  ]) {
+    const count = checked.length;
+    await open(file, 2, true);
+    assert.equal(checked.length, count, file);
+  }
+  kind = 2;
+  await open(`${outside}/folder`, 2, true);
+  assert.match(notices.pop()!, /is a folder/);
+  assert.equal(commands.length, 0);
+  kind = 1;
+  missing = true;
+  await open(`${outside}/missing.csv`, 2, true);
+  assert.equal(notices.pop(), `Arc: no file at ${outside}/missing.csv.`);
+  missing = false;
+  for (const [name, command] of [
+    ['picture.png', 'vscode.open'],
+    ['page.html', 'workbench.action.browser.open'],
+    ['guide.md', 'vscode.openWith'],
+  ]) {
+    await open(`${outside}/${name}`, 2, true);
+    assert.equal(commands.at(-1)![0], command);
+  }
+  const routed: unknown[][] = [];
+  const handler = new Function(
+    'openLink',
+    'vscode',
+    'parseSessionLink',
+    `return async function(msg){${handlerBody(panelHostSource, 'openLink')}}`,
+  )(
+    (...args: unknown[]) => routed.push(args),
+    { ViewColumn: { Beside: 2 } },
+    () => ({ kind: 'other' }),
+  );
+  await handler.call(
+    { column: () => 1 },
+    { destination: { kind: 'fileCitation', path: `${outside}/one%20.csv#L10` }, beside: true },
+  );
+  assert.deepEqual(routed, [[`${outside}/one%20.csv#L10`, 2, true]]);
+});
+
+test('recorded, restored and live response citations share summary, earlier-answer and Activity rendering', () => {
+  const file = process.platform === 'win32' ? 'C:/Downloads/source.csv' : '/Downloads/source.csv';
+  const source = `:codex-file-citation{path='${file}' purpose=source}`;
+  const original = turn({
+    summary: source,
+    answers: [{ text: 'Earlier ' + source, at: 2, stepsBefore: 0 }],
+    updates: [
+      { sourceId: 'commentary', kind: 'commentary', text: source, at: 3, stepsBefore: 0, status: 'done' },
+      { sourceId: 'reasoning', kind: 'reasoning', text: source, at: 4, stepsBefore: 0, status: 'done' },
+    ],
+  });
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    live: {},
+    turnsByKey: new Map(),
+    dispatchedCostsForTurn: () => [],
+    cardCacheExpiryWarning: () => null,
+    withActivity: (turn: unknown) => turn,
+  });
+  for (const [recorded, latest] of [
+    [original, false],
+    [JSON.parse(JSON.stringify(original)), false],
+    [original, true],
+  ] as const) {
+    const card = provider.renderTurnCard(
+      recorded,
+      latest,
+      'Source session',
+      5,
+      [],
+      new Set(),
+      new Map(),
+      new Map(),
+      () => ({}),
+      () => ({}),
+    );
+    const surfaces = [
+      card.summaryHtml,
+      ...card.earlierAnswers.map((answer: any) => answer.summaryHtml),
+      ...card.saidMessages.map((message: any) => message.summaryHtml),
+      ...card.activity.filter((row: any) => row.kind === 'message').map((row: any) => row.summaryHtml),
+    ];
+    assert.ok(surfaces.length >= 4);
+    for (const html of surfaces) assert.ok(html.includes(`data-link="${file}" data-link-kind="file-citation"`), html);
+    assert.equal(recorded.summary, source);
+  }
+});
 
 test('response session targets require a unique scoped accepted identity without provisional drafts', () => {
   const inside = (cwd: string) => cwd === 'project';

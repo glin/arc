@@ -318,6 +318,7 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
     'identity.ts',
     'domain/identity.ts',
     'domain/session-link.ts',
+    'domain/file-citation.ts',
   ]) {
     fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
   }

@@ -220,6 +220,34 @@ test('exported named response links retain labels without live session navigatio
   assert.doesNotMatch(card.summaryHtml ?? '', /arc-session:|<a|data-link/);
 });
 
+test('export citations preserve source bodies and identify every response surface without file actions', () => {
+  const file = process.platform === 'win32' ? 'C:/outside/report%20.csv#L10' : '/outside/report%20.csv#L10';
+  const source = `:codex-file-citation{path='${file}' purpose=output}`;
+  const original = turn({
+    summary: source,
+    answers: [{ text: 'Earlier ' + source, at: 2, stepsBefore: 0 }],
+    updates: [
+      { sourceId: 'commentary', kind: 'commentary', text: source, at: 3, stepsBefore: 0, status: 'done' },
+      { sourceId: 'reasoning', kind: 'reasoning', text: source, at: 4, stepsBefore: 0, status: 'done' },
+    ],
+  });
+  const card = exportCard(toCard(original, false, 1));
+  const surfaces = [
+    card.summaryHtml,
+    ...(card.earlierAnswers ?? []).map((answer) => answer.summaryHtml),
+    ...(card.saidMessages ?? []).map((message) => message.summaryHtml),
+    ...(card.activity ?? []).filter((row) => row.kind === 'message').map((row) => row.summaryHtml),
+  ];
+  assert.ok(surfaces.length >= 4);
+  for (const html of surfaces) {
+    assert.ok(html?.includes(`Output: ${file}`), html);
+    assert.doesNotMatch(html ?? '', /<a|data-link|<button|codex-file-citation/);
+  }
+  assert.equal(card.summary, source);
+  assert.equal(original.answers[0].text, 'Earlier ' + source);
+  assert.equal(card.saidMessages!.find((message) => message.kind === 'commentary')!.text, source);
+});
+
 test('export cost details distinguish missing prices from missing usage', async () => {
   for (const role of ['main', 'delegated'] as const) {
     const directory = tempDir('arc-export-unpriced-usage-');

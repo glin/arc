@@ -17,6 +17,7 @@ import {
 } from './store';
 import { SCHEME } from './uris';
 import { relativePath, nativePath, linkTarget, resolveLink, projectsRoot, sessionFileFor } from './transcript';
+import { nativeCitationPath } from './domain/file-citation';
 import { sessionRenameTitle } from './sessionrename';
 import { registerPanel, PanelProvider } from './panelhost';
 import { readSetting } from './config';
@@ -2092,10 +2093,15 @@ function editView(panel: PanelProvider, arg: unknown, mode: 'rename' | 'delete')
 
 async function copyPath(arg: unknown, relative: boolean): Promise<void> {
   const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
-  // A file row carries a path. A summary link requires anchor removal and relative-path resolution before copying its file path.
+  // Citation filenames keep literal suffixes. Ordinary summary links remove line anchors before path resolution.
   const link = (arg as { link?: string } | undefined)?.link;
+  const destination = (arg as { destination?: { kind?: unknown; path?: unknown } } | undefined)?.destination;
+  const literal =
+    destination?.kind === 'fileCitation' && typeof destination.path === 'string'
+      ? nativeCitationPath(destination.path, process.platform)
+      : null;
   const named = typeof link === 'string' ? linkTarget(link) : null;
-  const target = pathFrom(arg) ?? (named ? resolveLink(named, folders, fs.existsSync) : null);
+  const target = pathFrom(arg) ?? literal ?? (named ? resolveLink(named, folders, fs.existsSync) : null);
   if (!target) {
     return;
   }

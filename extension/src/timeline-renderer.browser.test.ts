@@ -12,6 +12,59 @@ import {
 } from './turncard.ts';
 import { createCodexSessionReducer } from './codex.ts';
 import { renderRichMarkdown } from './richtext.ts';
+
+test('response citations retain literal destinations through mouse, keyboard and streamed card updates', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const card = payload.cards.find((card) => card.kind !== 'compaction')!;
+    const file = process.platform === 'win32' ? 'C:/Downloads/file%20.csv#L10' : '/Downloads/file%20.csv#L10';
+    const source = `:codex-file-citation{path='${file}' purpose=source}`;
+    card.summaryHtml = renderRichMarkdown(source.slice(0, -1));
+    payload.cards = [card];
+    await post(page, payload);
+    await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
+    assert.equal(await page.locator('a[data-link-kind="file-citation"]').count(), 0);
+    await post(page, {
+      type: 'activity',
+      session: card.sessionId,
+      card: { ...card, summaryHtml: renderRichMarkdown(source) },
+    });
+    const link = page.locator('a[data-link-kind="file-citation"]');
+    const context = JSON.parse((await link.getAttribute('data-vscode-context')) || '{}');
+    assert.deepEqual(context.destination, { kind: 'fileCitation', path: file });
+    await page.evaluate('window.__posted.length=0');
+    await link.click({ modifiers: ['Control'] });
+    await link.focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(
+      () => (window as any).__posted.filter((message: any) => message.type === 'openLink').length === 2,
+    );
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'openLink', destination: { kind: 'fileCitation', path: file }, beside: true },
+      { type: 'openLink', destination: { kind: 'fileCitation', path: file }, beside: false },
+    ]);
+    await post(page, payload);
+    await post(page, {
+      type: 'activity',
+      session: card.sessionId,
+      card: { ...card, summaryHtml: renderRichMarkdown(source) },
+    });
+    await page.evaluate('window.__posted.length=0');
+    await link.click();
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'openLink', destination: { kind: 'fileCitation', path: file }, beside: false },
+    ]);
+  } finally {
+    await browser.close();
+  }
+});
 import type { CompactionFact } from './projectspend.ts';
 import { RAIL_FOLDS, RAIL_MIN_WIDTH, RAIL_WIDTH_MIN } from './view/rail.ts';
 import { CARD_ACTIONS } from './view/card-words.ts';

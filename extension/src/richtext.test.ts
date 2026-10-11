@@ -1,7 +1,397 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as path from 'path';
 import { formatSessionLink, parseSessionLink } from './domain/session-link';
+import { citationScanner, nativeCitationPath } from './domain/file-citation';
+import { marked } from 'marked';
+
+const reportedSources =
+  'Sources: :codex-file-citation{path="C:/Users/example/Downloads/claude_api_cost_2026_09_11_to_2026_10_10.csv" purpose="source"} and :codex-file-citation{path="C:/Users/example/Downloads/claude_api_tokens_2026_09_11_to_2026_10_10.csv" purpose="source"}';
+
+test('reported Codex Sources response exposes both literal file destinations', () => {
+  if (process.platform !== 'win32') return;
+  const html = renderRichMarkdown(reportedSources);
+  for (const subject of ['cost', 'tokens']) {
+    const filename = `claude_api_${subject}_2026_09_11_to_2026_10_10.csv`;
+    assert.ok(html.includes(`data-link="C:/Users/example/Downloads/${filename}"`), html);
+    assert.ok(html.includes(`>Source: ${filename}</a>`), html);
+  }
+  assert.equal((html.match(/data-link-kind="file-citation"/g) || []).length, 2);
+  assert.doesNotMatch(html, /codex-file-citation\{/);
+});
+
+test('exported Codex Sources response identifies both full paths without local actions', () => {
+  if (process.platform !== 'win32') return;
+  const html = renderRichMarkdown(reportedSources, undefined, true);
+  for (const subject of ['cost', 'tokens'])
+    assert.ok(
+      html.includes(`Source: C:/Users/example/Downloads/claude_api_${subject}_2026_09_11_to_2026_10_10.csv`),
+      html,
+    );
+  assert.doesNotMatch(html, /<a|data-link|data-image|<button|codex-file-citation\{/);
+});
+
+const citationPath = (name: string) => (process.platform === 'win32' ? `C:/outside/${name}` : `/outside/${name}`);
+const citation = (file = citationPath('file.csv'), attributes = '') =>
+  `:codex-file-citation{path='${file}' ${attributes}}`;
+
+test('ordinary prose keeps HTTP autolinks beside citation candidates', () => {
+  for (const source of ['See https://example.com', 'Read http://example.com/a.', '*See https://example.com*']) {
+    assert.match(renderRichMarkdown(source), /data-link="https?:\/\/example.com/);
+    assert.match(renderRichMarkdown(`${source} ${citation()}`), /data-link="https?:\/\/example.com/);
+  }
+});
+
+test('renderer candidate discovery stays bounded across ordinary Markdown tokens', () => {
+  const original = String.prototype.indexOf;
+  for (const count of [100, 1000, 4000]) {
+    for (const suffix of ['', citation()]) {
+      const source = '*a* '.repeat(count) + suffix;
+      let searched = 0;
+      const discovery = vi.spyOn(String.prototype, 'indexOf').mockImplementation(function (
+        this: string,
+        needle: string,
+        position?: number,
+      ) {
+        const found = original.call(this, needle, position);
+        if (needle === ':' || needle === '\uE000') searched += found < 0 ? this.length : found + 1;
+        return found;
+      });
+      try {
+        const html = renderRichMarkdown(source);
+        if (suffix) assert.match(html, /data-link-kind/);
+        else assert.doesNotMatch(html, /data-link-kind/);
+      } finally {
+        discovery.mockRestore();
+      }
+      assert.ok(searched <= source.length * 8, `${source.length} code units requested ${searched} search code units`);
+    }
+  }
+});
+
+test('tables and surrounding emphasis retain literal citation interiors', () => {
+  const actual = process.platform;
+  try {
+    for (const platform of ['win32', 'linux', 'darwin']) {
+      Object.defineProperty(process, 'platform', { value: platform });
+      for (const filename of ['a|b.csv', 'a\\|b.csv']) {
+        const file = citationPath(filename);
+        const source = `| File |\n| --- |\n| ${citation(file, 'purpose=source')} |`;
+        assert.ok(renderRichMarkdown(source).includes(`data-link="${escapeHtml(file)}"`));
+        assert.ok(renderRichMarkdown(source, undefined, true).includes(`Source: ${escapeHtml(file)}`));
+      }
+      const file = citationPath('one.csv');
+      const source = `*See ${citation(file, 'label="*" purpose=output')}*`;
+      assert.ok(renderRichMarkdown(source).includes(`data-link="${file}"`));
+      assert.match(renderRichMarkdown(source), /<em>See <a/);
+      assert.ok(renderRichMarkdown(source, undefined, true).includes(`Output: ${file}`));
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actual });
+  }
+});
+
+test('written private-use text remains literal beside masked citation candidates', () => {
+  for (const prefix of ['\uE000', '\uE00000000000\uE001', '\uE00000000001\uE001']) {
+    const html = renderRichMarkdown(`${prefix} ${citation()}`);
+    assert.ok(html.includes(prefix));
+    assert.match(html, /data-link-kind/);
+  }
+});
+
+test('ignored metadata leaves adjacent citation destinations eligible', () => {
+  const actual = process.platform;
+  try {
+    for (const platform of ['win32', 'linux', 'darwin']) {
+      Object.defineProperty(process, 'platform', { value: platform });
+      const one = citationPath('one%20#L10.csv');
+      const two = citationPath('two:10.csv');
+      for (const [metadata, tail] of [
+        ['<code>', ''],
+        ['<a href="x">', ''],
+        ['<!--', ''],
+        ['<script>', ''],
+        ['`', '`'],
+        ['[', '](x)'],
+        ['![', '](x)'],
+        ['[', '][ref]\n\n[ref]: x'],
+      ]) {
+        const source = `${citation(one, `label='${metadata}' purpose=source`)} ${citation(two, 'purpose=output')} ${tail}`;
+        for (const inert of [false, true]) {
+          const html = renderRichMarkdown(source, undefined, inert);
+          if (inert) {
+            assert.ok(html.includes(`Source: ${one}`), `${platform}: ${source}: ${html}`);
+            assert.ok(html.includes(`Output: ${two}`), `${platform}: ${source}: ${html}`);
+            assert.doesNotMatch(html, /<a|data-link-kind/);
+          } else {
+            for (const file of [one, two])
+              assert.ok(html.includes(`data-link="${file}"`), `${platform}: ${source}: ${html}`);
+            assert.equal((html.match(/data-link-kind="file-citation"/g) || []).length, 2, html);
+          }
+          assert.doesNotMatch(html, /codex-file-citation\{/);
+        }
+      }
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actual });
+  }
+});
+
+test('existing Markdown protection preserves closing syntax inside citation-shaped text', () => {
+  const actual = process.platform;
+  try {
+    for (const platform of ['win32', 'linux', 'darwin']) {
+      Object.defineProperty(process, 'platform', { value: platform });
+      const one = citationPath('one.csv');
+      const two = citationPath('two.csv');
+      for (const [prefix, closing, expected] of [
+        ['`', '`', /<code>:codex-file-citation/],
+        ['[prefix ', '](x)', /data-link="x"/],
+        ['![prefix ', '](x)', /prefix :codex-file-citation/],
+        ['before <code>', '</code>', /&lt;\/code&gt;/],
+        ['before <a href="x">', '</a>', /&lt;\/a&gt;/],
+        ['before <!--', '-->', /--&gt;/],
+        ['before <script>', '</script>', /&lt;\/script&gt;/],
+      ] as const) {
+        for (const gap of prefix.includes('<') ? ['', '\n\n'] : ['']) {
+          const protectedText = `${prefix}${gap}${citation(one, `label='${closing}'`)}`;
+          const source = `${protectedText} ${citation(two)}`;
+          for (const inert of [false, true]) {
+            const html = renderRichMarkdown(source, undefined, inert);
+            assert.ok(visibleTextOf(html).includes(one), `${platform}: ${source}: ${html}`);
+            assert.ok(html.includes('codex-file-citation'), html);
+            if (inert) {
+              assert.doesNotMatch(html, /<a|data-link/);
+              assert.ok(html.includes(two), html);
+            } else {
+              assert.doesNotMatch(html, new RegExp(`data-link="${one}"`));
+              assert.ok(html.includes(`data-link="${two}"`), `${platform}: ${source}: ${html}`);
+              assert.equal((html.match(/data-link-kind="file-citation"/g) || []).length, 1, html);
+              assert.match(html, expected);
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actual });
+  }
+});
+
+test('citation arbitration consumes token-rich source without repeated inline lexing', () => {
+  for (const count of [100, 1000, 4000]) {
+    const source = Array.from({ length: count }, () => `*a* ${citation()} \`literal\` `).join('');
+    let calls = 0;
+    let inlineLength = 0;
+    const spies = (['escape', 'tag', 'link', 'reflink', 'codespan', 'autolink'] as const).map((name) => {
+      const original = marked.Tokenizer.prototype[name];
+      return vi.spyOn(marked.Tokenizer.prototype, name).mockImplementation(function (
+        this: marked.Tokenizer,
+        ...args: unknown[]
+      ) {
+        calls += 1;
+        return Reflect.apply(original, this, args);
+      });
+    });
+    const inline = marked.Lexer.prototype.inlineTokens;
+    spies.push(
+      vi.spyOn(marked.Lexer.prototype, 'inlineTokens').mockImplementation(function (this: marked.Lexer, text, tokens) {
+        inlineLength += text.length;
+        return inline.call(this, text, tokens);
+      }) as (typeof spies)[number],
+    );
+    try {
+      assert.equal((renderRichMarkdown(source).match(/data-link-kind/g) || []).length, count);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+    assert.ok(calls <= count * 100, `${count} citations requested ${calls} tokenizer calls`);
+    assert.ok(
+      inlineLength <= source.length * 4,
+      `${source.length} source units requested ${inlineLength} inline units`,
+    );
+  }
+});
+
+test('nested citations stay literal inside unknown malformed and streamed directives', () => {
+  const inner = citation(citationPath('one.csv'), 'purpose=source');
+  for (const source of [
+    `:artifact{body="${inner}"}`,
+    `:artifact{bad.key="${inner}"}`,
+    `:artifact{body=${inner}}`,
+    `:artifact {body="${inner}"}`,
+    `:artifact{label='<code>' body="${inner}"}`,
+    `:artifact{bad.key='<!--' body="${inner}"}`,
+    `:artifact{body='[ ${inner} ](x)'`,
+  ]) {
+    for (let end = 0; end <= source.length; end += 1) {
+      assert.doesNotMatch(renderRichMarkdown(source.slice(0, end)), /data-link-kind/, `${source}: ${end}`);
+      assert.doesNotMatch(renderRichMarkdown(source.slice(0, end), undefined, true), /<a|data-link/, `${end}`);
+    }
+  }
+});
+
+test('file citations preserve punctuation and announce full literal paths', () => {
+  for (const filename of [
+    'file%20name.csv',
+    'file name.csv',
+    'case#L10',
+    'case:10',
+    'a&copy;[x](y){z}?.csv',
+    '雪.csv',
+    'a"b.csv',
+  ]) {
+    const file = citationPath(filename);
+    const html = renderRichMarkdown(citation(file, 'purpose=output label=ignored sheet=Dashboard range=A1:D8'));
+    assert.ok(html.includes(`data-link="${escapeHtml(file)}"`), html);
+    assert.ok(html.includes(`title="${escapeHtml(file)}"`), html);
+    assert.ok(html.includes(`aria-label="Output: ${escapeHtml(file)}"`), html);
+    assert.ok(html.includes(`>Output: ${escapeHtml(filename)}</a>`), html);
+    assert.doesNotMatch(html, /ignored|Dashboard|A1:D8/);
+  }
+  const html = renderRichMarkdown(citation(citationPath('file.csv'), 'purpose=unknown'));
+  assert.match(html, />file.csv<\/a>/);
+  const apostrophe = citationPath("team's.csv");
+  assert.ok(
+    renderRichMarkdown(`:codex-file-citation{path="${apostrophe}"}`).includes(`data-link="${escapeHtml(apostrophe)}"`),
+  );
+  const root = process.platform === 'win32' ? 'C:/' : '/';
+  assert.ok(renderRichMarkdown(citation(root)).includes(`>${root}</a>`));
+});
+
+test('colliding citation basenames display distinct written paths across Markdown blocks', () => {
+  const one = citationPath('a/same.csv');
+  const two = citationPath('b/same.csv');
+  const html = renderRichMarkdown(`${citation(one)}\n\n${citation(two)}\n\n${citation(one)}`);
+  for (const file of [one, two]) assert.ok(html.includes(`>${file}</a>`), html);
+  assert.ok(renderRichMarkdown(`${citation(one)} and ${citation(one)}`).includes('>same.csv</a>'));
+});
+
+test('citation path admission has independent native platform expectations', () => {
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const windows = platform === 'win32';
+    for (const file of ['C:/Downloads/one.csv', 'c:\\Downloads\\one.csv', 'C:\\Downloads\\'])
+      assert.equal(nativeCitationPath(file, platform), windows ? file : null, `${platform}: ${file}`);
+    for (const file of ['/Downloads/One.csv', '/Downloads/one.csv', '/雪 file.csv', '/Downloads/a:10'])
+      assert.equal(nativeCitationPath(file, platform), windows ? null : file, `${platform}: ${file}`);
+    for (const file of [
+      '',
+      'relative.csv',
+      '~/file.csv',
+      'C:relative.csv',
+      '\\\\server\\file.csv',
+      '//server/file.csv',
+      'file:///tmp/a',
+      'https://example.com/a',
+      'sandbox:/file',
+      '/tmp/a\n.csv',
+      '/tmp/a\u0000',
+    ])
+      assert.equal(nativeCitationPath(file, platform), null, `${platform}: ${file}`);
+  }
+});
+
+test('citation grammar accepts colon counts and quotation modes without decoding filenames', () => {
+  const file = citationPath('one.csv');
+  for (const count of [1, 2, 3])
+    for (const quote of ['', '"', "'"]) {
+      const source = `${':'.repeat(count)}codex-file-citation{path = ${quote}${file}${quote}\tpurpose = source}`;
+      assert.ok(renderRichMarkdown(source).includes(`data-link="${file}"`), source);
+    }
+  const source = `:codex-file-citation{path="${citationPath('a')}\\"b.csv"}`;
+  assert.equal(citationScanner(source.length).scan(source)?.attributes.get('path'), citationPath('a"b.csv'));
+  const trailing = ':codex-file-citation{path="C:\\Downloads\\"}';
+  assert.equal(citationScanner(trailing.length).scan(trailing)?.attributes.get('path'), 'C:\\Downloads\\');
+});
+
+test('malformed and unsupported citations retain original text without file actions', () => {
+  const file = citationPath('one.csv');
+  for (const source of [
+    `::::codex-file-citation{path='${file}'}`,
+    `:Codex-file-citation{path='${file}'}`,
+    `:codex-file-citation {path='${file}'}`,
+    `:codex-file-citation{path='${file}' path='${file}'}`,
+    ':codex-file-citation{path=""}',
+    ':codex-file-citation{path=}',
+    `:codex-file-citation{bad.key=one path='${file}'}`,
+    `:codex-file-citation{path='${file}\n'}`,
+    `:codex-file-citation{path='${file}'`,
+    citation('relative.csv'),
+    citation('file:///tmp/file.csv'),
+    citation(process.platform === 'win32' ? '/tmp/file.csv' : 'C:/Downloads/file.csv'),
+    `:artifact{path='${file}'}`,
+    `:artifact{body="${citation(file)}"}`,
+  ]) {
+    const html = renderRichMarkdown(source);
+    assert.doesNotMatch(html, /data-link-kind/, source);
+    assert.ok(visibleTextOf(html.replace(/<br>/g, '\n')).includes(source), `${source}: ${html}`);
+  }
+});
+
+test('Markdown literal contexts never create citation actions', () => {
+  const marker = citation();
+  for (const source of [
+    `\`${marker}\``,
+    `\`\`\`text\n${marker}\n\`\`\``,
+    `~~~\n${marker}\n~~~`,
+    `    ${marker}`,
+    `>     ${marker}`,
+    `- item\n\n      ${marker}`,
+    `[${marker}](file.csv)`,
+    `![${marker}](file.csv)`,
+    `[label](<${marker}>)`,
+    `[ref]: <${marker}>\n\n[Read][ref]`,
+    `<div title="${marker}">text</div>`,
+    `<!-- ${marker} -->`,
+    `before <!-- ${marker} --> after`,
+    `before <code>${marker}</code> after`,
+    `\\${marker}`,
+    marker.replace(':', '&#58;'),
+    `\\:${marker}`,
+    `\\::${marker}`,
+    marker.replace('codex', '&#99;odex'),
+    `<details><summary>${marker}</summary>\nBody\n</details>`,
+  ])
+    assert.doesNotMatch(renderRichMarkdown(source), /data-link-kind/, source);
+  assert.match(renderRichMarkdown(`\\\\${marker}`), /data-link-kind/);
+  assert.match(renderRichMarkdown(`<details><summary>Files</summary>\n${marker}\n</details>`), /data-link-kind/);
+  assert.doesNotMatch(renderInlineMarkdown(marker), /<a|data-link/);
+});
+
+test('malformed directives in protected Markdown leave later citations eligible', () => {
+  for (const protectedText of [
+    '` :artifact{body= `',
+    '```\n:artifact{body=\n```',
+    '[ :artifact{body= ](file.csv)',
+    '[ :artifact{body= ][ref]\n\n[ref]: file.csv',
+    'before <code>:artifact{body=</code>',
+    '<!-- :artifact{body= -->',
+  ]) {
+    const html = renderRichMarkdown(`${protectedText}\n\n${citation()}`);
+    assert.equal((html.match(/data-link-kind/g) || []).length, 1, html);
+  }
+});
+
+test('every streamed citation prefix stays nonactionable until its closing brace arrives', () => {
+  const source = citation(citationPath('file%20name.csv'), 'purpose=source');
+  for (let end = 0; end < source.length; end += 1)
+    assert.doesNotMatch(renderRichMarkdown(source.slice(0, end)), /data-link-kind/, `${end}`);
+  assert.match(renderRichMarkdown(source), /data-link-kind/);
+  assert.equal(source, citation(citationPath('file%20name.csv'), 'purpose=source'));
+});
+
+test('malformed citation scanning shares a four-code-unit allowance across retries', () => {
+  const source = ':codex-file-citation{path='.repeat(1000) + 'tail';
+  const scanner = citationScanner(source.length);
+  for (let offset = 0; offset < source.length; offset += 1)
+    if (source[offset] === ':') scanner.scan(source.slice(offset));
+  assert.equal(scanner.inspected, source.length * 4);
+  assert.equal(scanner.exhausted, true);
+  assert.equal(scanner.scan(citation()), null);
+  assert.doesNotMatch(renderRichMarkdown(source), /data-link-kind/);
+  const many = Array.from({ length: 300 }, (_, index) => citation(citationPath(`${index}.csv`))).join(' ');
+  assert.equal((renderRichMarkdown(many).match(/data-link-kind/g) || []).length, 300);
+});
 
 test('named session links decode once, reject malformed destinations, and keep exports inert', () => {
   for (const session of ['7390194c-8fea-4b6d-80be-e7e8c7684426', 'transcript-id', 'literal%2f', 'a:b', 'é']) {
@@ -42,6 +432,8 @@ test('named session links decode once, reject malformed destinations, and keep e
   assert.match(renderRichMarkdown('`arc-session:saved-id`'), /<code>arc-session:saved-id<\/code>/);
 });
 import {
+  escapeHtml,
+  visibleTextOf,
   hasImageReference,
   imageFileFor,
   imagePathFor,

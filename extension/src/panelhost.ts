@@ -5,6 +5,7 @@ import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
 import { archiveRefusal } from './sessionwrites';
 import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLink } from './domain/session-link';
+import { nativeCitationPath } from './domain/file-citation';
 import {
   boundedSessionRead,
   readSessionCursor,
@@ -689,15 +690,16 @@ function pendingIn(manifest: Manifest | null, filePath: string): ManifestEntry |
   return entry;
 }
 
-// Open a summary URL or workspace path with an optional line range. The supplied
-// column keeps file navigation in the selected editor group.
-async function openLink(href: string, column: vscode.ViewColumn): Promise<void> {
-  if (/^https?:\/\//i.test(href)) {
+// Ordinary response links use workspace containment and optional line ranges.
+// Explicit file citations retain literal absolute paths and open only after a press.
+async function openLink(href: string, column: vscode.ViewColumn, literal = false): Promise<void> {
+  if (literal && !nativeCitationPath(href, process.platform)) return;
+  if (!literal && /^https?:\/\//i.test(href)) {
     await vscode.env.openExternal(vscode.Uri.parse(href));
     return;
   }
   // "src/store.ts#L42-L51" and "src/store.ts:42" both name a line to land on.
-  const anchor = /#L(\d+)(?:-L?(\d+))?$/.exec(href) || /:(\d+)(?::\d+)?$/.exec(href);
+  const anchor = literal ? null : /#L(\d+)(?:-L?(\d+))?$/.exec(href) || /:(\d+)(?::\d+)?$/.exec(href);
   const target = anchor ? href.slice(0, anchor.index) : href;
   const from = anchor ? Number(anchor[1]) - 1 : -1;
   const to = anchor && anchor[2] ? Number(anchor[2]) - 1 : from;
@@ -714,15 +716,15 @@ async function openLink(href: string, column: vscode.ViewColumn): Promise<void> 
       const t = normalizeFsPath(path.resolve(p));
       return t === base || t.startsWith(base + '/');
     });
-  if (path.isAbsolute(target) && !inWorkspace(target)) {
+  if (!literal && path.isAbsolute(target) && !inWorkspace(target)) {
     void vscode.window.showInformationMessage(`Arc: ${target} is outside this workspace.`);
     return;
   }
   const candidates = (
-    path.isAbsolute(target)
-      ? [vscode.Uri.file(path.resolve(target))]
+    literal || path.isAbsolute(target)
+      ? [vscode.Uri.file(literal ? target : path.resolve(target))]
       : folders.map((f) => vscode.Uri.joinPath(f.uri, target))
-  ).filter((uri) => inWorkspace(uri.fsPath));
+  ).filter((uri) => literal || inWorkspace(uri.fsPath));
   if (!candidates.length) {
     void vscode.window.showInformationMessage(`Arc: ${target} is outside this workspace.`);
     return;
@@ -730,8 +732,16 @@ async function openLink(href: string, column: vscode.ViewColumn): Promise<void> 
   for (const uri of candidates) {
     try {
       const stat = await vscode.workspace.fs.stat(uri);
-      if (stat.type === vscode.FileType.Directory) {
+      if (stat.type === vscode.FileType.Directory || (literal && stat.type & vscode.FileType.Directory)) {
+        if (literal) {
+          void vscode.window.showInformationMessage(`Arc: ${target} is a folder.`);
+          return;
+        }
         await vscode.commands.executeCommand('revealInExplorer', uri);
+        return;
+      }
+      if (literal && !(stat.type & vscode.FileType.File)) {
+        void vscode.window.showInformationMessage(`Arc: no file at ${target}.`);
         return;
       }
       // Open images in the editor's image viewer because showTextDocument rejects them.
@@ -761,10 +771,12 @@ async function openLink(href: string, column: vscode.ViewColumn): Promise<void> 
       await vscode.window.showTextDocument(uri, { selection, preview: true, viewColumn: column });
       return;
     } catch {
-      /* Try the next workspace folder when this candidate cannot open. */
+      /* Continue to another candidate when this file cannot open. */
     }
   }
-  void vscode.window.showInformationMessage(`Arc: no file at ${target} in this workspace.`);
+  void vscode.window.showInformationMessage(
+    literal ? `Arc: no file at ${target}.` : `Arc: no file at ${target} in this workspace.`,
+  );
 }
 
 // Open a response image in the editor's viewer. imagePathFor checks the path
@@ -12126,6 +12138,10 @@ export class PanelProvider implements vscode.Disposable {
           void this.loadOlderHistory(showing);
         },
         openLink: async (msg) => {
+          if ('destination' in msg) {
+            await openLink(msg.destination.path, msg.beside ? vscode.ViewColumn.Beside : this.column(), true);
+            return;
+          }
           if (!msg.href || parseSessionLink(msg.href).kind !== 'other') {
             return;
           }

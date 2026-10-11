@@ -1,3 +1,4 @@
+import type { FileCitationDestination } from '../domain/file-citation.ts';
 import {
   contextIdentity,
   contextNumber,
@@ -378,6 +379,7 @@ export type PanelToHost =
   | { type: 'search'; text: string }
   | { type: 'loadOlder'; session: string; token: string }
   | { type: 'openLink'; href: string; beside: boolean }
+  | { type: 'openLink'; destination: FileCitationDestination; beside: boolean }
   | { type: 'openVisualization'; path: string }
   | { type: 'openImage'; path: string; beside: boolean }
   | { type: 'openTurnDiff'; key: string; beside: boolean }
@@ -1186,6 +1188,16 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     case 'loadOlder':
       return isString(m.session) ? { type: 'loadOlder', session: m.session, token: textOr(m.token, '') } : null;
     case 'openLink':
+      if (m.destination !== undefined) {
+        const destination = record(m.destination);
+        return destination && destination.kind === 'fileCitation' && isString(destination.path) && m.href === undefined
+          ? {
+              type: 'openLink',
+              destination: { kind: 'fileCitation', path: destination.path },
+              beside: m.beside === true,
+            }
+          : null;
+      }
       return isString(m.href) ? { type: 'openLink', href: m.href, beside: m.beside === true } : null;
     case 'openVisualization':
       return isString(m.path) ? { type: 'openVisualization', path: m.path } : null;
