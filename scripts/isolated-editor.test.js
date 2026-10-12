@@ -390,6 +390,102 @@ describe('installed editor CLI', () => {
 });
 
 describe('disposable probe packaging and evidence', () => {
+  test('rejects linked probe manifests and source ancestors without changing source bytes', async () => {
+    for (const ancestor of [true, false]) {
+      const owner = scratch();
+      const manifest = path.join(owner, 'package.json');
+      const bytes = Buffer.from(
+        '{"name":"terminal-probe","publisher":"test","version":"0.1.0","engines":{"vscode":"^1.100.0"},"scripts":{"vscode:prepublish":"echo original"}}',
+      );
+      fs.writeFileSync(manifest, bytes);
+      fs.writeFileSync(path.join(owner, 'extension.js'), 'original probe');
+      let source = path.join(scratch(), 'probe');
+      let link;
+      if (ancestor) {
+        const originalProbe = path.join(owner, 'probe');
+        fs.mkdirSync(originalProbe);
+        fs.copyFileSync(manifest, path.join(originalProbe, 'package.json'));
+        fs.copyFileSync(path.join(owner, 'extension.js'), path.join(originalProbe, 'extension.js'));
+        link = path.dirname(source);
+        fs.symlinkSync(owner, path.join(link, 'redirect'), 'junction');
+        link = path.join(link, 'redirect');
+        source = path.join(link, 'probe');
+      } else {
+        fs.mkdirSync(source);
+        link = path.join(source, 'package.json');
+        try {
+          fs.symlinkSync(manifest, link, 'file');
+        } catch (error) {
+          if (process.platform !== 'win32' || error.code !== 'EPERM') throw error;
+          console.warn(
+            'File symbolic-link fixture requires Windows symbolic-link permission. Directory-link coverage still runs.',
+          );
+          continue;
+        }
+        fs.writeFileSync(path.join(source, 'extension.js'), 'original probe');
+      }
+      const session = editor.createRun({ scratch: scratch(), list: () => [] });
+      try {
+        await assert.rejects(editor.packageProbe(path.resolve(__dirname, '..'), session.layout, source), /is a link/);
+        assert.deepEqual(fs.readFileSync(manifest), bytes);
+        assert.deepEqual(fs.readFileSync(path.join(source, 'package.json')), bytes);
+        assert.equal(fs.readFileSync(path.join(owner, 'extension.js'), 'utf8'), 'original probe');
+      } finally {
+        fs.unlinkSync(link);
+      }
+    }
+  });
+
+  test('keeps run and foreign bytes when retained evidence destinations redirect, then retries safely', async () => {
+    for (const kind of ['ancestor', 'file', 'index']) {
+      const session = editor.createRun({ scratch: scratch(), list: () => [] });
+      const evidence = (session.manifest.evidence = `${session.layout.root}-evidence`);
+      roots.push(evidence);
+      const relative = path.join('user-data', 'logs', 'window1', 'exthost.log');
+      const log = path.join(session.layout.root, relative);
+      fs.mkdirSync(path.dirname(log), { recursive: true });
+      const bytes = Buffer.from('isolated log bytes');
+      fs.writeFileSync(log, bytes);
+      const foreign = scratch();
+      const foreignFile = path.join(foreign, kind === 'ancestor' ? 'window1/exthost.log' : 'foreign.log');
+      fs.mkdirSync(path.dirname(foreignFile), { recursive: true });
+      const original = Buffer.from('foreign bytes');
+      fs.writeFileSync(foreignFile, original);
+      const link =
+        kind === 'ancestor'
+          ? path.join(evidence, 'user-data', 'logs')
+          : kind === 'file'
+            ? path.join(evidence, relative)
+            : path.join(evidence, 'retained-files.json');
+      fs.mkdirSync(path.dirname(link), { recursive: true });
+      try {
+        fs.symlinkSync(kind === 'ancestor' ? foreign : foreignFile, link, kind === 'ancestor' ? 'junction' : 'file');
+      } catch (error) {
+        if (process.platform !== 'win32' || error.code !== 'EPERM' || kind === 'ancestor') throw error;
+        console.warn(
+          'File symbolic-link fixture requires Windows symbolic-link permission. Directory-link coverage still runs.',
+        );
+        continue;
+      }
+      try {
+        const report = await editor.cleanupRun(session.manifest, { list: () => [] });
+        assert.equal(report.ok, false);
+        assert.equal(report.removed, false);
+        assert.match(report.errors.join('\n'), /is a link/);
+        assert.deepEqual(fs.readFileSync(foreignFile), original);
+        assert.deepEqual(fs.readFileSync(log), bytes);
+      } finally {
+        fs.unlinkSync(link);
+      }
+      const retry = await editor.cleanupRun(session.manifest, { list: () => [] });
+      assert.equal(retry.ok, true, retry.errors.join('\n'));
+      assert.deepEqual(fs.readFileSync(path.join(evidence, relative)), bytes);
+      const retained = retry.evidence.files.find((entry) => entry.path === relative);
+      assert.equal(retained.sha256, require('node:crypto').createHash('sha256').update(bytes).digest('hex'));
+      assert.deepEqual(fs.readFileSync(foreignFile), original);
+    }
+  });
+
   test('packages probe bytes beneath the run without running source lifecycle scripts', async () => {
     const source = path.join(scratch(), 'probe source');
     fs.mkdirSync(source);
@@ -1267,6 +1363,115 @@ describe('isolated editor commands', () => {
 });
 
 describe('isolated editor restore check', () => {
+  test('refuses installed restore options before creating a run or launching', async () => {
+    for (const option of ['--vsix', '--probe-extension']) {
+      const parent = scratch();
+      await assert.rejects(
+        editor.main(['restore', '--baseline', 'baseline', '--scratch', parent, option, 'candidate']),
+        /restore takes no/,
+      );
+      assert.deepEqual(fs.readdirSync(parent), []);
+    }
+  });
+
+  test('restarts an installed probe on the same profile and preserves prior installation receipts and archives', async () => {
+    const checkout = fakeCheckout();
+    const cli = cliFixture();
+    const session = editor.createRun({ scratch: scratch(), list: () => [] });
+    const arc = path.join(scratch(), 'arc.vsix');
+    fs.writeFileSync(arc, 'first Arc archive');
+    let source = path.join(scratch(), 'probe');
+    fs.mkdirSync(source);
+    const sourceBytes = Buffer.from(
+      JSON.stringify({
+        name: 'terminal-probe',
+        publisher: 'test',
+        version: '0.1.0',
+        engines: { vscode: '^1.100.0' },
+        main: './extension.js',
+        activationEvents: ['*'],
+      }),
+    );
+    fs.writeFileSync(path.join(source, 'package.json'), sourceBytes);
+    fs.writeFileSync(path.join(source, 'extension.js'), 'exports.activate = () => {};');
+    const install = (_executable, layout, candidate, options) =>
+      editor.installVsix(cli.executable, layout, candidate, {
+        ...options,
+        platform: 'linux',
+        run: () => {
+          const probe = candidate !== arc;
+          const identity = probe ? 'test.terminal-probe' : 'glin.arc';
+          const target = path.join(layout.extensions, identity);
+          fs.mkdirSync(target, { recursive: true });
+          fs.writeFileSync(
+            path.join(target, 'package.json'),
+            probe ? sourceBytes : JSON.stringify({ name: 'arc', publisher: 'glin' }),
+          );
+          return { status: 0, stdout: identity };
+        },
+      });
+    const options = {
+      repository: checkout.root,
+      editor: checkout.install,
+      vsix: arc,
+      probeExtension: source,
+      install,
+      allowFocus: true,
+      packageDisposableProbe: (_repository, layout, probe) =>
+        editor.packageProbe(path.resolve(__dirname, '..'), layout, probe),
+    };
+    const launches = [];
+    globalThis.__isolatedEditorLaunch = async (options) => {
+      launches.push(options);
+      return {
+        evaluate: async () => 5_000_001,
+        process: () => ({ pid: 5_000_000 }),
+        firstWindow: async () => ({ waitForSelector: async () => {} }),
+        close: async () => {},
+      };
+    };
+    try {
+      await editor.startEditor(session, options);
+      const first = structuredClone({ arc: session.manifest.vsix, probe: session.manifest.probeVsix });
+      const prior = [first.arc, first.probe].map((entry) => ({
+        ...entry,
+        bytes: fs.readFileSync(entry.archive ?? entry.candidate),
+        receiptBytes: fs.readFileSync(
+          entry.receipt ??
+            path.join(session.layout.root, entry === first.arc ? 'vsix-install.json' : 'probe-vsix-install.json'),
+        ),
+      }));
+      await editor.stopEditor(session, { clock: fakeClock() });
+      fs.writeFileSync(arc, 'second Arc archive');
+      await editor.startEditor(session, options);
+      assert.equal(launches.length, 2);
+      assert.deepEqual(launches[1].args, launches[0].args);
+      assert.notEqual(session.manifest.vsix.archive, first.arc.archive);
+      assert.notEqual(session.manifest.probeVsix.candidate, first.probe.candidate);
+      assert.notEqual(session.manifest.probeVsix.receipt, first.probe.receipt);
+      assert.deepEqual(fs.readFileSync(path.join(source, 'package.json')), sourceBytes);
+      for (const entry of prior) {
+        assert.deepEqual(fs.readFileSync(entry.archive), entry.bytes);
+        assert.deepEqual(fs.readFileSync(entry.receipt), entry.receiptBytes);
+      }
+      const report = await editor.closeIsolatedEditor(session, { list: () => [] });
+      roots.push(report.evidence.directory);
+      assert.equal(report.ok, true, report.errors.join('\n'));
+      for (const entry of prior) {
+        assert.deepEqual(
+          fs.readFileSync(path.join(report.evidence.directory, path.relative(session.layout.root, entry.archive))),
+          entry.bytes,
+        );
+        assert.deepEqual(
+          fs.readFileSync(path.join(report.evidence.directory, path.relative(session.layout.root, entry.receipt))),
+          entry.receiptBytes,
+        );
+      }
+    } finally {
+      delete globalThis.__isolatedEditorLaunch;
+    }
+  });
+
   const PROFILE_PROCESS = (profile) => ({
     pid: 5_000_001,
     parentPid: 5_000_000,

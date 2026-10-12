@@ -6,7 +6,7 @@
 //   node scripts/isolated-editor.mjs restore (--baseline-commit <revision> | --baseline <checkout>) [options]
 //   node scripts/isolated-editor.mjs cleanup [<run directory or run.json>]
 // Options: --repository <checkout>, --editor <install directory>, --workspace <folder>, --scratch <parent directory>,
-// --vsix <candidate.vsix>, --probe-extension <directory>, --live-data, --allow-focus. restore takes no --live-data.
+// --vsix <candidate.vsix>, --probe-extension <directory>, --live-data, --allow-focus. restore refuses the first three.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -226,6 +226,14 @@ export function installVsix(
   const cwd = editorLaunchCwd(executable, layout, platform);
   const cli = editorCli(executable, platform);
   const digest = createHash('sha256').update(fs.readFileSync(candidate)).digest('hex');
+  const history = path.join(layout.root, 'installations');
+  fs.mkdirSync(history, { recursive: true });
+  const installation = path.join(
+    history,
+    path.basename(fs.mkdtempSync(path.toNamespacedPath(path.join(history, 'install-')))),
+  );
+  const archive = path.join(installation, 'candidate.vsix');
+  fs.copyFileSync(candidate, archive, fs.constants.COPYFILE_EXCL);
   const result = run(
     executable,
     [
@@ -246,40 +254,60 @@ export function installVsix(
       windowsHide: true,
     },
   );
-  fs.writeFileSync(
-    path.join(layout.root, receipt),
-    JSON.stringify(
-      {
-        candidate,
-        sha256: digest,
-        status: result.status,
-        stdout: result.stdout ?? '',
-        stderr: result.stderr ?? '',
-        error: result.error?.message ?? null,
-      },
-      null,
-      2,
-    ),
+  const bytes = JSON.stringify(
+    {
+      candidate,
+      sha256: digest,
+      archive,
+      status: result.status,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+      error: result.error?.message ?? null,
+    },
+    null,
+    2,
   );
+  const retainedReceipt = path.join(installation, receipt);
+  fs.writeFileSync(retainedReceipt, bytes, { flag: 'wx' });
+  fs.writeFileSync(path.join(layout.root, receipt), bytes);
   if (result.error || result.status !== 0) {
     throw new Error(
       `VSIX installation failed for ${candidate}: ${result.error?.message ?? result.stderr ?? result.stdout}`,
     );
   }
-  return { candidate, sha256: digest };
+  return { candidate, sha256: digest, archive, receipt: retainedReceipt };
+}
+
+// Checks every existing path component before a source read or destination write.
+function refuseLinkedPath(location) {
+  let current = path.resolve(location);
+  for (;;) {
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) throw new Error(`The isolated evidence path is a link: ${current}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
 }
 
 // Packages only the disposable probe copy. Packaging runs in this process and invokes no lifecycle script.
 export async function packageProbe(repository, layout, probeExtension) {
   const source = path.resolve(probeExtension);
+  refuseLinkedPath(path.join(source, 'package.json'));
   const manifest = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
   if (Object.keys(manifest.dependencies ?? {}).length)
     throw new Error('The disposable probe must have no dependencies.');
-  const staged = path.join(layout.root, 'probe-source');
+  const staged = path.join(
+    layout.root,
+    path.basename(fs.mkdtempSync(path.toNamespacedPath(path.join(layout.root, 'probe-source-')))),
+  );
   fs.cpSync(source, staged, { recursive: true, errorOnExist: true, force: false });
   delete manifest.scripts;
   fs.writeFileSync(path.join(staged, 'package.json'), JSON.stringify(manifest, null, 2));
-  const candidate = path.join(layout.root, 'probe.vsix');
+  const candidate = path.join(layout.root, `probe-${randomUUID()}.vsix`);
   const require = createRequire(path.join(path.resolve(repository), 'extension', 'package.json'));
   await require('@vscode/vsce').createVSIX({
     cwd: staged,
@@ -300,6 +328,7 @@ export function retainRunEvidence(manifest) {
   const layout = runLayout(manifest.root);
   const evidence = `${layout.root}-evidence`;
   if (manifest.evidence !== evidence) throw new Error('The evidence directory does not belong to this isolated run.');
+  refuseLinkedPath(evidence);
   fs.mkdirSync(evidence, { recursive: true });
   if (fs.lstatSync(evidence).isSymbolicLink()) throw new Error('The isolated evidence directory is a link.');
   const files = [];
@@ -329,6 +358,7 @@ export function retainRunEvidence(manifest) {
     } else if (stat.isFile()) {
       const bytes = fs.readFileSync(source);
       const destination = path.join(evidence, relative);
+      refuseLinkedPath(destination);
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.writeFileSync(destination, bytes);
       files.push({ path: relative, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
@@ -338,12 +368,15 @@ export function retainRunEvidence(manifest) {
     MANIFEST_NAME,
     'vsix-install.json',
     'probe-vsix-install.json',
+    'installations',
     path.join('extensions', 'extensions.json'),
     path.join('user-data', 'User', 'extensions.json'),
     path.join('user-data', 'logs'),
   ])
     copy(relative);
-  fs.writeFileSync(path.join(evidence, 'retained-files.json'), JSON.stringify(files, null, 2));
+  const index = path.join(evidence, 'retained-files.json');
+  refuseLinkedPath(index);
+  fs.writeFileSync(index, JSON.stringify(files, null, 2));
   return { directory: evidence, files };
 }
 
@@ -1391,6 +1424,8 @@ export function parseArguments(argv) {
       throw new Error('restore needs one of --baseline <checkout> or --baseline-commit <revision>.');
     }
     if (options.liveData) throw new Error('restore blocks agents and takes no --live-data.');
+    if (options.vsix !== undefined) throw new Error('restore takes no --vsix.');
+    if (options.probeExtension !== undefined) throw new Error('restore takes no --probe-extension.');
   } else if (options.baseline !== undefined || options.baselineCommit !== undefined) {
     throw new Error('--baseline and --baseline-commit apply only to restore.');
   }

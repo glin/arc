@@ -18,7 +18,7 @@ Use this map to find the owner of a change. The topic guides hold behavior, and 
 | Portable saved-session viewer and static assets | [`export-session.md`](export-session.md) |
 | Setup, tests, and performance capture | [`development.md`](development.md) |
 
-`scripts/isolated-editor.mjs` installs candidate and disposable probe VSIX files into its isolated profile through the selected editor CLI. It retains isolated registration manifests, editor logs, and process receipts before removal. It reads the installed Windows `bin/code.cmd` as data to select its matching CLI. [Isolated extension host](development.md#isolated-extension-host) owns supported layouts and launch directories.
+`scripts/isolated-editor.mjs` installs candidate and disposable probe VSIX files into its isolated profile through the selected editor CLI. It retains isolated registration manifests, editor logs, and process receipts before removal. It reads the installed Windows `bin/code.cmd` as data to select its matching CLI. Windows `mkdtemp` calls use namespace paths for long run directories. [Isolated extension host](development.md#isolated-extension-host) owns supported layouts and launch directories.
 
 ## System shape
 
