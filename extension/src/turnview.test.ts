@@ -681,7 +681,7 @@ test('agent acknowledgments never establish a reader boundary or complete omitte
   }
   assert.deepEqual(newCounts(refs, new Map(), [], new Map(), 0, agent).get('s'), { count: 1, atLeast: false });
   const windows = new Map([['s', { starts: [20], whole: false }]]);
-  assert.deepEqual(newCounts([refs[1]], windows, [], new Map(), 0, agent).get('s'), { count: 0, atLeast: true });
+  assert.deepEqual(newCounts([refs[1]], windows, [], new Map(), 0, agent).get('s'), { count: 1, atLeast: true });
   assert.deepEqual(newCounts([], windows, [], new Map(), 0, agent).get('s'), { count: 1, atLeast: true });
   assert.deepEqual(newCounts([], windows, [], new Map(), 0, agent, new Map([['s', [refs[1]]]])).get('s'), {
     count: 0,
@@ -715,6 +715,37 @@ test('agent acknowledgments never establish a reader boundary or complete omitte
   assert.deepEqual(restored.read, []);
   assert.deepEqual(restored.readTo, {});
   assert.equal('agentRead' in webviewPanelState(restored), false);
+});
+
+test('acknowledged subsets preserve older starts without a complete unique mapping', () => {
+  const newest = { key: 's:20', sessionId: 's', startedAt: 20, promptId: 'p20', kind: 'turn' };
+  const agent = new Map([['s:20', 'p20']]);
+  for (const whole of [true, false]) {
+    const windows = new Map([['s', { starts: [10, 20], whole }]]);
+    for (const mapped of [new Map(), new Map([['s', [newest]]])]) {
+      assert.deepEqual(newCounts([newest], windows, [], new Map(), 0, agent, mapped).get('s'), {
+        count: 2,
+        atLeast: !whole,
+      });
+    }
+    const collisions = [newest, { ...newest, promptId: 'other' }];
+    assert.deepEqual(
+      newCounts(
+        [newest],
+        new Map([['s', { starts: [10, 20, 20], whole }]]),
+        [],
+        new Map(),
+        0,
+        agent,
+        new Map([['s', [{ ...newest, key: 's:10', startedAt: 10, promptId: 'p10' }, ...collisions]]]),
+      ).get('s'),
+      { count: 3, atLeast: !whole },
+    );
+    assert.deepEqual(newCounts([newest], windows, ['s:20'], new Map(), 0, agent).get('s'), {
+      count: 0,
+      atLeast: false,
+    });
+  }
 });
 
 test('the saved panel state is rebuilt rather than trusted', () => {

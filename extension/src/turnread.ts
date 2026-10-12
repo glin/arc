@@ -112,24 +112,25 @@ export function newCounts(
       kind: 'turn',
     }));
     const mapped = mappedWindows.get(id);
+    const mappedByKey = new Map(mapped?.map((turn) => [turn.key, turn]));
     const mappedComplete =
       mapped &&
       mapped.length === starts.length &&
-      starts.every(
-        (one) =>
-          mapped.filter(
-            (other) =>
-              other.sessionId === id &&
-              other.key === one.key &&
-              other.startedAt === one.startedAt &&
-              other.kind === 'turn',
-          ).length === 1,
-      );
+      mappedByKey.size === starts.length &&
+      starts.every((one) => {
+        const other = mappedByKey.get(one.key);
+        return (
+          other?.sessionId === id &&
+          other.startedAt === one.startedAt &&
+          other.kind === 'turn' &&
+          typeof other.promptId === 'string' &&
+          other.promptId.length > 0
+        );
+      });
     const session = parsed.filter((turn) => turn.sessionId === id && turn.kind === 'turn');
     if (
       out.has(id) &&
-      (!mappedComplete ||
-        !session.some((turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId))
+      !session.some((turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId)
     )
       continue;
     const refs: (ReadableTurn & { kind: string })[] = mappedComplete ? [...mapped] : starts;
@@ -140,7 +141,8 @@ export function newCounts(
         else if (refs[held].promptId !== turn.promptId) refs[held] = { ...turn, promptId: undefined };
       }
     }
-    const count = newBySession(refs, readSet, readTo, since, agentRead).get(id) ?? 0;
+    // Incomplete mappings keep timestamp evidence but cannot subtract an agent acknowledgment.
+    const count = newBySession(refs, readSet, readTo, since, mappedComplete ? agentRead : new Map()).get(id) ?? 0;
     const anyRead = refs.some((r) => isTurnRead(r, readSet, readTo, since));
     out.set(id, { count, atLeast: !window.whole && !anyRead });
   }
