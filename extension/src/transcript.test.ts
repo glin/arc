@@ -387,6 +387,7 @@ import {
 } from './derivedcache.ts';
 import type { TurnOutcome } from './transcript.ts';
 import {
+  PER_PASS_ITERATIONS,
   ADVISOR_EXECUTOR,
   ADVISOR_ITERATIONS,
   ADVISOR_MODEL,
@@ -15843,6 +15844,125 @@ test('a subagent head read counts its bounded bytes once and a cached head count
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('mixed-tier prefix lifetime survives only preserved executor prefixes and clears unknown writes', () => {
+  const cases = [
+    ['hour prefix', PER_PASS_ITERATIONS, '1h'],
+    [
+      'short prefix',
+      PER_PASS_ITERATIONS.map((pass) => ({
+        ...pass,
+        cache_creation: {
+          ephemeral_5m_input_tokens: pass.cache_creation.ephemeral_1h_input_tokens,
+          ephemeral_1h_input_tokens: pass.cache_creation.ephemeral_5m_input_tokens,
+        },
+      })),
+      '5m',
+    ],
+    [
+      'rewrite',
+      PER_PASS_ITERATIONS.map((pass, index) => (index === 2 ? { ...pass, cache_read_input_tokens: 65579 } : pass)),
+      null,
+    ],
+    [
+      'initial read',
+      PER_PASS_ITERATIONS.map((pass, index) => (index === 0 ? { ...pass, cache_read_input_tokens: 1 } : pass)),
+      null,
+    ],
+    [
+      'omitted initial read',
+      PER_PASS_ITERATIONS.map((pass, index) => {
+        if (index !== 0) return pass;
+        const { cache_read_input_tokens: _read, ...withoutRead } = pass;
+        return withoutRead;
+      }) as unknown as typeof PER_PASS_ITERATIONS,
+      null,
+    ],
+    [
+      'null initial read',
+      PER_PASS_ITERATIONS.map((pass, index) =>
+        index === 0 ? { ...pass, cache_read_input_tokens: null } : pass,
+      ) as unknown as typeof PER_PASS_ITERATIONS,
+      null,
+    ],
+    [
+      'unknown write',
+      PER_PASS_ITERATIONS.map((pass, index) =>
+        index === 2
+          ? {
+              ...pass,
+              cache_creation: {
+                ephemeral_5m_input_tokens: 0,
+                ephemeral_1h_input_tokens: 0,
+              },
+            }
+          : pass,
+      ),
+      null,
+    ],
+    ['later read lost', [...PER_PASS_ITERATIONS, advisorIteration({ cache_read_input_tokens: 65579 })], null],
+    [
+      'single tier',
+      [
+        PER_PASS_ITERATIONS[0],
+        advisorIteration({
+          cache_creation: {
+            ephemeral_5m_input_tokens: 0,
+            ephemeral_1h_input_tokens: 453,
+          },
+        }),
+      ],
+      '1h',
+    ],
+  ] as const;
+  for (const [name, iterations, expected] of cases) {
+    const seed = advisorResponseRecords({ id: 'known', iterations: [PER_PASS_ITERATIONS[0]], blocks: 1 });
+    const records = advisorResponseRecords({ id: name, at: 30, iterations, blocks: 1 });
+    const first = createClaudeUsageLineReducer();
+    seed.forEach((record) => first.pushLine(JSON.stringify(record)));
+    const restored = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())));
+    const events = records.flatMap((record) => restored.pushLine(JSON.stringify(record)));
+    assert.equal(events[0].cacheLifetime, expected, name);
+    assert.equal(restored.snapshot().lastRequest?.lifetime, expected, name);
+    const readOnly = advisorResponseRecords({
+      id: 'read-only',
+      at: 60,
+      blocks: 1,
+      iterations: [advisorIteration({ cache_read_input_tokens: 66033 })],
+    });
+    const later = readOnly.flatMap((record) => restored.pushLine(JSON.stringify(record)));
+    assert.equal(later[0].cacheLifetime, expected, `${name} read-only`);
+    const turns = readTurns(writeTranscript([userPrompt('prefix', 0), ...seed, ...records, ...readOnly]), 'sess');
+    assert.equal(turns.at(-1)?.contextRequest?.lifetime, expected, `${name} context`);
+  }
+});
+
+test('mixed-tier prefix lifetime keeps a ten-minute compaction warm through a restored reducer', () => {
+  const records = [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations: PER_PASS_ITERATIONS, blocks: 1 })];
+  const initial = createClaudeUsageLineReducer();
+  records.forEach((record) => initial.pushLine(JSON.stringify(record)));
+  const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(initial.snapshot())));
+  assert.equal(resumed.snapshot().lastRequest?.lifetime, '1h');
+  const boundary = {
+    type: 'system',
+    subtype: 'compact_boundary',
+    timestamp: '2026-10-11T09:18:10.214Z',
+    compactMetadata: { trigger: 'manual', preTokens: 66035, postTokens: 1000 },
+  };
+  const summary = {
+    type: 'user',
+    timestamp: '2026-10-11T09:18:10.215Z',
+    isCompactSummary: true,
+    message: { role: 'user', content: 'summary'.repeat(100) },
+  };
+  const estimates = [boundary, summary].flatMap((record) => resumed.pushLine(JSON.stringify(record)));
+  const estimate = estimates.find((event) => event.compactionEstimate)!;
+  assert.ok(estimate);
+  assert.equal(estimate.usage.cacheRead, 65580);
+  assert.equal(estimate.usage.cacheWrite5m, 453);
+  assert.equal(estimate.usage.cacheWrite1h, 0);
+  assert.equal(estimate.usage.input, 2000);
 });
 
 test('a Claude advisor consultation is its own request, and the executor prices and measures from its passes', () => {

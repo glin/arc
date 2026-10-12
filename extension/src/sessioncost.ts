@@ -293,13 +293,15 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
     const lifetime =
       before.agent === 'codex' && before.usage.cacheWrite30m
         ? cacheLifetimeFor(before.model, before.provider)
-        : tiers.length === 1
-          ? tiers[0]
-          : tiers.length > 1
-            ? null
-            : before.usage.cacheRead
-              ? cacheLifetimeFor(before.model, before.provider)
-              : null;
+        : before.agent !== 'codex' && before.cacheLifetime !== undefined
+          ? before.cacheLifetime
+          : tiers.length === 1
+            ? tiers[0]
+            : tiers.length > 1
+              ? null
+              : before.usage.cacheRead
+                ? cacheLifetimeFor(before.model, before.provider)
+                : null;
     if (!lifetime) {
       report.unavailableLifetime++;
       continue;

@@ -7,6 +7,7 @@ import {
   advisorProbeRecords,
   advisorResponseRecords,
   MIXED_PASS_ITERATIONS,
+  PER_PASS_ITERATIONS,
   bedrockAstraRecords,
 } from './turnfixtures';
 import assert from 'node:assert/strict';
@@ -54,6 +55,51 @@ test('per-pass pricing applies a recorded response cost once across two bands', 
   const requests = readSessionRequests(file);
   assert.equal(summarizeRequests(requests).costUsd, 0.123);
   assert.equal(requests[0].contextBand, null);
+});
+
+test('mixed-tier advisor responses retain expiry coverage at ten minutes and expire after one hour', () => {
+  for (const [seconds, expected] of [
+    [600, 0],
+    [3601, 1],
+  ] as const) {
+    const file = write(path.join(directory(), 'mixed-return.jsonl'), [
+      advisorProbeRecords()[0],
+      ...advisorResponseRecords({ id: 'before', iterations: PER_PASS_ITERATIONS, blocks: 1 }),
+      {
+        ...advisorProbeRecords()[0],
+        uuid: 'second-prompt',
+        timestamp: '2026-10-11T09:18:09Z',
+        message: { role: 'user', content: 'Continue the review.' },
+      },
+      ...advisorResponseRecords({
+        id: 'after',
+        at: seconds,
+        blocks: 1,
+        iterations: [advisorIteration({ input_tokens: 66035 })],
+      }),
+    ]);
+    const expiry = summarizeRequests(readSessionRequests(file)).cacheExpiry!;
+    assert.equal(expiry.returns, expected);
+    assert.equal(expiry.unavailableLifetime, 0);
+    assert.equal(expiry.byLifetime['1h'], expected);
+  }
+});
+
+test('CLI expiry uses explicit unknown and reverse-prefix facts and preserves missing-fact fallback', () => {
+  const before = pricedRequest('claude-haiku-5-5', 0, { visibleTurnId: 'first', cacheLifetime: '5m' });
+  before.usage.cacheWrite1h = 453;
+  before.usage.cacheWrite5m = 65580;
+  const after = pricedRequest('claude-haiku-5-5', 66035, {
+    timestamp: before.timestamp + 600000,
+    visibleTurnId: 'second',
+  });
+  assert.equal(summarizeRequests([before, after]).cacheExpiry?.byLifetime['5m'], 1);
+  before.cacheLifetime = null;
+  assert.equal(summarizeRequests([before, after]).cacheExpiry?.unavailableLifetime, 1);
+  before.usage.cacheWrite1h = 0;
+  assert.equal(summarizeRequests([before, after]).cacheExpiry?.unavailableLifetime, 1);
+  delete before.cacheLifetime;
+  assert.equal(summarizeRequests([before, after]).cacheExpiry?.byLifetime['5m'], 1);
 });
 
 test('per-pass pricing measures cache expiry from the returning first pass', () => {

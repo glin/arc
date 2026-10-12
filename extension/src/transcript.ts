@@ -8125,10 +8125,21 @@ function claudeResponseUsage(usage: ClaudeUsage): ClaudeResponseUsage {
     executor.cacheWrite5m += pass.cacheWrite5m;
     executor.output += pass.output;
   }
-  // Passes that wrote different tiers, or wrote without a split, establish no single lifetime.
+  // Mixed tiers require a first writer with recorded zero reads and a named tier on every write.
+  // Later executor passes must read the first writer's full prefix.
   const written = passes.filter((_, index) => counted[index].cacheWrite1h + counted[index].cacheWrite5m > 0);
   const lifetimes = new Set(written.map(claudeCacheLifetime));
-  const lifetime = lifetimes.size === 1 ? [...lifetimes][0] : null;
+  let lifetime = lifetimes.size === 1 ? [...lifetimes][0] : null;
+  if (lifetimes.size > 1 && !lifetimes.has(null)) {
+    const firstWriter = passes.indexOf(written[0]);
+    const prefix = counted[firstWriter];
+    if (
+      written[0].cache_read_input_tokens === 0 &&
+      counted.slice(firstWriter + 1).every((pass) => pass.cacheRead >= prefix.cacheWrite1h + prefix.cacheWrite5m)
+    ) {
+      lifetime = claudeCacheLifetime(written[0]);
+    }
+  }
   return {
     executor,
     passes: counted,
@@ -8320,7 +8331,7 @@ export function reduceClaudeUsageRecordEvents(
     finalBand.requests = 1;
     finalBand.thinking = counted.thinking;
   }
-  // A request without a recorded cache-write lifetime retains the preceding request's lifetime for compaction estimates.
+  // Read-only requests retain the preceding lifetime. An unknown writing lifetime clears it.
   // A response with several executor passes starts from its first pass's prefix and ends on its last pass's context.
   const { first, last } = response;
   state.firstRequestCachedTokens ??= first.cacheRead + first.cacheWrite1h + first.cacheWrite5m;
@@ -8329,7 +8340,8 @@ export function reduceClaudeUsageRecordEvents(
     cacheRead: last.cacheRead,
     cacheWrite: last.cacheWrite1h + last.cacheWrite5m,
     at: Number.isNaN(timestamp) ? null : timestamp,
-    lifetime: response.lifetime ?? state.lastRequest?.lifetime ?? null,
+    lifetime:
+      counted.cacheWrite1h + counted.cacheWrite5m > 0 ? response.lifetime : (state.lastRequest?.lifetime ?? null),
     inferenceClass,
     serviceTier,
     model,
@@ -8353,7 +8365,7 @@ export function reduceClaudeUsageRecordEvents(
     // A sidechain response runs under the child agent's own prompt, and this reader counts
     // no visible turn for it. It reports none rather than the parent turn that was open.
     visibleTurnId: record.isSidechain || state.visibleTurns === 0 ? null : `claude-turn:${state.visibleTurns}`,
-    cacheLifetime: response.lifetime,
+    cacheLifetime: state.lastRequest.lifetime,
     compactionsBefore: state.compactionCount,
     contextTokens: state.lastRequest.tokens,
     ...(response.passes.length > 1
@@ -10974,7 +10986,7 @@ function reduceClaudeSessionLine(
     const context = state.usageState.lastRequest;
     cur.contextTokens = context?.tokens ?? usage.input + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m;
     const wrote = usageEvent.cacheLifetime ?? null;
-    if (wrote) {
+    if (usage.cacheWrite1h + usage.cacheWrite5m > 0) {
       state.lastLifetime = wrote;
     }
     cur.contextRequest = {

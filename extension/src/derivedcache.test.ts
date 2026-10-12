@@ -416,6 +416,7 @@ import {
   powershellDispatchExecution,
   advisorProbeRecords,
   advisorResponseRecords,
+  PER_PASS_ITERATIONS,
   MIXED_PASS_ITERATIONS,
 } from './turnfixtures.ts';
 import { estimateCost } from './pricing.ts';
@@ -677,6 +678,47 @@ test('a later cache entry checkpoints even when the first render changed nothing
     'an ordinary revision update bypassed the checkpoint interval',
   );
   assert.equal(checkpoint.nextDelay(31_001, 30_000), 0);
+});
+
+test('generation 61 discards mixed-tier normal and held context facts and persists inferred lifetime', () => {
+  const directory = folder();
+  const source = path.join(directory, 'advisor.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  fs.writeFileSync(
+    source,
+    [advisorProbeRecords()[0], ...advisorResponseRecords({ iterations: PER_PASS_ITERATIONS })]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const fresh = sessionStatFactsOf(readSession(source, 'advisor-probe'))!;
+  assert.equal(fresh.turns[0].contextRequest?.lifetime, '1h');
+  const stale = {
+    ...fresh,
+    turns: fresh.turns.map((turn) => ({ ...turn, contextRequest: { ...turn.contextRequest!, lifetime: null } })),
+  };
+  fs.writeFileSync(
+    cache,
+    JSON.stringify({
+      version: 61,
+      codexMetas: [],
+      titles: [
+        { file: source, entry: { ...title, stats: stale } },
+        { file: '/held.jsonl', entry: { ...title, stats: null, heldStats: stale } },
+      ],
+    }),
+  );
+  const loaded = loadDerivedCache(cache);
+  assert.equal(loaded.titles.size, 0);
+  assert.equal(loaded.reuse?.reason, 'generation-mismatch');
+  saveDerivedCache(cache, [
+    [source, { ...title, stats: fresh }],
+    ['/held.jsonl', { ...title, stats: null, heldStats: fresh }],
+  ]);
+  for (let refresh = 0; refresh < 3; refresh++) {
+    const restored = loadDerivedCache(cache).titles;
+    assert.equal(restored.get(source)?.stats?.turns[0].contextRequest?.lifetime, '1h');
+    assert.equal(restored.get('/held.jsonl')?.heldStats?.turns[0].contextRequest?.lifetime, '1h');
+  }
 });
 
 test('derived cache round trips positive metadata and outcome facts', () => {

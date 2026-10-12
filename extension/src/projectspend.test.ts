@@ -92,6 +92,7 @@ import {
   advisorProbeRecords,
   advisorResponseRecords,
   MIXED_PASS_ITERATIONS,
+  PER_PASS_ITERATIONS,
   claudeCompactionTranscript,
   previousContextOf,
   subagent,
@@ -4229,6 +4230,78 @@ test('Project cost keeps same-model advisor and executor buckets separate on lat
       [null, 2, 2000],
     ],
   );
+});
+
+test('generation 60 mixed-tier lifetime rebuilds once and resumes bounded slices through warm ledger reuse', () => {
+  for (const [seconds, returns] of [
+    [600, 0],
+    [3601, 1],
+  ] as const) {
+    const prompt = {
+      ...advisorProbeRecords()[0],
+      uuid: 'later-prompt',
+      timestamp: new Date(Date.parse('2026-10-11T09:08:09Z') + seconds * 1000).toISOString(),
+      message: { role: 'user', content: 'Review the next item.' },
+    };
+    const fixture = indexCompactionSession([
+      advisorProbeRecords()[0],
+      ...advisorResponseRecords({ id: 'prefix', iterations: PER_PASS_ITERATIONS }),
+      prompt,
+      ...advisorResponseRecords({ id: 'return', at: seconds, iterations: [advisorIteration({ input_tokens: 66035 })] }),
+    ]);
+    const storage = dir();
+    saveSpendLedger(storage, 'w', [{ ...fixture.record, parserGeneration: 60 }]);
+    let record = loadSpendLedger(storage, 'w').files[0];
+    const options = { maxBytes: 2048, maxMilliseconds: Number.POSITIVE_INFINITY };
+    let rebuilds = 0;
+    let slices = 0;
+    do {
+      assert.ok(slices++ < 32, 'bounded ledger slices stopped advancing');
+      const before = record.scanOffset ?? record.offset;
+      const result = indexSpendFile(record, fixture.file, 'w', createClaudeUsageLineReducer, 2, options);
+      rebuilds += Number(result.rebuilt);
+      if (!result.rebuilt) assert.ok((result.record.scanOffset ?? result.record.offset) > before);
+      record = result.record;
+      saveSpendLedger(storage, 'w', [record]);
+      record = loadSpendLedger(storage, 'w').files[0];
+    } while (!record.complete);
+    assert.equal(rebuilds, 1);
+    assert.equal(record.cacheExpiry?.facts.returns.length, returns);
+    assert.equal(record.cacheExpiry?.facts.unavailable, 0);
+    assert.equal((record.parserState as ClaudeUsageReducerState).lastRequest?.lifetime, '1h');
+    for (let refresh = 0; refresh < 3; refresh++) {
+      const result = indexSpendFile(record, fixture.file, 'w', createClaudeUsageLineReducer, 3 + refresh, options);
+      assert.equal(result.rebuilt, false);
+      assert.equal(result.changed, false);
+      assert.strictEqual(result.record, record);
+    }
+  }
+});
+
+test('a Claude explicit unknown lifetime never acquires a documented model lifetime in saved expiry facts', () => {
+  const file = path.join(dir(), 'unknown-lifetime.jsonl');
+  const first = event(stamp('2026-10-11T09:00:00Z'), {
+    model: 'gpt-6.1-sol',
+    provider: 'openai',
+    visibleTurnId: 'first',
+    cacheLifetime: null,
+    usage: { ...usage(), cacheWrite5m: 1000 },
+  });
+  const second = event(first.timestamp + 31 * 60000, {
+    model: first.model,
+    provider: first.provider,
+    visibleTurnId: 'second',
+    cacheLifetime: null,
+  });
+  fs.writeFileSync(file, [first, second].map((item) => JSON.stringify(item)).join('\n') + '\n');
+  const makeReducer: typeof reducer = (state) => ({ ...reducer(state), recentCompactions: () => [] });
+  const record = indexSpendFile(undefined, file, 'w', makeReducer, 1).record;
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [record]);
+  const saved = loadSpendLedger(storage, 'w').files[0];
+  assert.equal(saved.cacheExpiry?.facts.unavailable, 1);
+  assert.equal(saved.cacheExpiry?.facts.returns.length, 0);
+  assert.equal(saved.cacheExpiry?.carry?.lifetime, null);
 });
 
 test('per-pass pricing retains first-pass expiry cost through a spend-ledger reload', () => {

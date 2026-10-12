@@ -25,12 +25,13 @@ const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.me
 fixture.prompt_cache.expires_at = Math.ceil(Date.now() / 1000) + 300;
 const input = JSON.stringify(fixture);
 const cli = fileURLToPath(new URL('../dist/arc.cjs', import.meta.url));
+const smokeEnv = { ...process.env, CLAUDE_CODE_SESSION_ID: '', CODEX_THREAD_ID: '' };
 
 test('the bundled windows command reaches authenticated hosts and keeps secrets out of both output formats', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc-windows-smoke-'));
   const first = new WindowChannel(home);
   const second = new WindowChannel(home);
-  const env = { ...process.env, ARC_HOME: home };
+  const env = { ...smokeEnv, ARC_HOME: home };
   const run = promisify(execFile);
   try {
     await first.update({
@@ -75,7 +76,7 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
 });
 
 test('the bundled CLI reports the package version', () => {
-  const output = execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' });
+  const output = execFileSync(process.execPath, [cli, '--version'], { env: smokeEnv, encoding: 'utf8' });
   assert.equal(output.trim(), packageJson.version);
 });
 
@@ -108,7 +109,7 @@ process.stdin[Symbol.asyncIterator] = deny;
   );
   try {
     const options = {
-      env: { ...process.env, ARC_HOME: home, ARC_WINDOW: 'unavailable' },
+      env: { ...smokeEnv, ARC_HOME: home, ARC_WINDOW: 'unavailable' },
       encoding: 'utf8',
       timeout: 10_000,
     };
@@ -169,7 +170,7 @@ test('bundled self compaction uses read-only readiness, one admission and observ
   });
   try {
     await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
-    const env = { ...process.env, ARC_HOME: home };
+    const env = { ...smokeEnv, ARC_HOME: home };
     const requestId = channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444';
     const args = [
       cli,
@@ -247,7 +248,7 @@ test('bundled management commands carry reader-default classification, prompt fi
   });
   try {
     await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
-    const env = { ...process.env, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+    const env = { ...smokeEnv, CLAUDE_CODE_SESSION_ID: 'coordinator', ARC_HOME: home, ARC_WINDOW: channel.hostId };
     const prompt = join(home, 'initial prompt.txt');
     writeFileSync(prompt, 'Review this project.');
     for (const provider of ['claude', 'codex'])
@@ -397,7 +398,7 @@ test('bundled send reads Unicode multiline prompt files, requires observations a
   try {
     await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
     const env = {
-      ...process.env,
+      ...smokeEnv,
       ARC_HOME: home,
       ARC_WINDOW: channel.hostId,
       CLAUDE_CODE_SESSION_ID: 'coordinator',
@@ -469,7 +470,7 @@ test('bundled guarded starts refuse ambiguous requesters, and a window without t
   try {
     await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
     const env = {
-      ...process.env,
+      ...smokeEnv,
       ARC_HOME: home,
       ARC_WINDOW: channel.hostId,
       CLAUDE_CODE_SESSION_ID: 'coordinator',
@@ -520,7 +521,7 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
     return { method: request.method, params: request.params, requester: request.requester };
   });
   const env = {
-    ...process.env,
+    ...smokeEnv,
     ARC_HOME: home,
     ARC_WINDOW: channel.hostId,
     CODEX_THREAD_ID: 'requesting-agent',
@@ -621,7 +622,7 @@ test('bundled session commands attribute child requests only to their native ses
   const run = promisify(execFile);
   channel.setRequestHandler((request) => ({ requester: request.requester }));
   const launched = childEnv(
-    { ...process.env, CLAUDE_CODE_SESSION_ID: 'parent-claude', CODEX_THREAD_ID: 'parent-codex' },
+    { ...smokeEnv, CLAUDE_CODE_SESSION_ID: 'parent-claude', CODEX_THREAD_ID: 'parent-codex' },
     { ARC_HOME: home, ARC_WINDOW: channel.hostId },
     'codex',
   );
@@ -633,7 +634,7 @@ test('bundled session commands attribute child requests only to their native ses
       [{ CLAUDE_CODE_SESSION_ID: 'native-claude' }, 'native-claude'],
     ]) {
       const result = await run(process.execPath, [cli, 'session', 'target-session', '--json'], {
-        env: { ...launched, ...native },
+        env: { ...smokeEnv, ...launched, ...native },
         encoding: 'utf8',
       });
       assert.deepEqual(JSON.parse(result.stdout), { requester });
@@ -646,6 +647,7 @@ test('bundled session commands attribute child requests only to their native ses
 
 test('the bundled CLI reads Claude JSON and emits its versioned JSON contract', () => {
   const output = execFileSync(process.execPath, [cli, 'statusline', '--json'], {
+    env: smokeEnv,
     input,
     encoding: 'utf8',
   });
@@ -661,6 +663,7 @@ test('the bundled CLI reads Claude JSON and emits its versioned JSON contract', 
 
 test('the bundled CLI emits a compact text status line', () => {
   const output = execFileSync(process.execPath, [cli, 'statusline', '--width', '70'], {
+    env: smokeEnv,
     input,
     encoding: 'utf8',
   });
@@ -671,6 +674,7 @@ test('the bundled CLI emits a compact text status line', () => {
 
 test('the bundled CLI emits only the next-turn segment for another status line', () => {
   const output = execFileSync(process.execPath, [cli, 'statusline', '--next-turn'], {
+    env: smokeEnv,
     input,
     encoding: 'utf8',
   });
@@ -679,6 +683,7 @@ test('the bundled CLI emits only the next-turn segment for another status line',
 
 test('the bundled CLI rejects malformed JSON without writing status output', () => {
   const result = spawnSync(process.execPath, [cli, 'statusline'], {
+    env: smokeEnv,
     input: '{',
     encoding: 'utf8',
   });
@@ -709,7 +714,7 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     }) + '\n',
   );
   const env = {
-    ...process.env,
+    ...smokeEnv,
     CLAUDE_CONFIG_DIR: root,
     CODEX_HOME: root,
     ARC_PROJECTS_ROOT: projects,
@@ -792,7 +797,7 @@ test('the packed package installs only arc globally and runs locally offline', (
   writeFileSync(join(root, 'global.npmrc'), '');
   writeFileSync(join(consumer, 'package.json'), JSON.stringify({ name: 'arc-smoke-consumer', private: true }));
   const env = {
-    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toLowerCase().startsWith('npm_config_'))),
+    ...Object.fromEntries(Object.entries(smokeEnv).filter(([key]) => !key.toLowerCase().startsWith('npm_config_'))),
     npm_config_userconfig: join(root, 'user.npmrc'),
     npm_config_globalconfig: join(root, 'global.npmrc'),
     npm_config_cache: join(root, 'cache'),
@@ -923,7 +928,7 @@ test('bundled filter commands retrieve selected identities and clear through an 
     requests.push(request);
     return { method: request.method, params: request.params };
   });
-  const env = { ...process.env, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+  const env = { ...smokeEnv, ARC_HOME: home, ARC_WINDOW: channel.hostId };
   try {
     await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
     const query = 'session:claude:one OR session:codex:two';

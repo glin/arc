@@ -201,7 +201,7 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
     window: 200_000,
   },
   // https://platform.claude.com/docs/en/about-claude/pricing
-  // A prompt over 100,000 tokens pays five times every rate. The threshold counts total request
+  // A request over 100,000 input tokens pays five times every rate. The threshold counts total request
   // input, cache reads and writes included, as the shared request band does for every banded model.
   {
     effortChangeKeepsCache: true,
