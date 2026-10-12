@@ -23,7 +23,7 @@ The source installer builds and installs the editor extension from local or temp
 
 The panel shots and their test write WebP files with the ImageMagick 7 `magick` command. Put `magick` on the `PATH` before running the full test suite.
 
-A built source tree exposes the same durable installer used by the VSIX. Each command performs only its named operation. Command installation leaves PATH configuration unchanged.
+A built source tree exposes durable source setup helpers. The VSIX prepares private commands automatically. Each command performs only its named operation. Command installation leaves PATH configuration unchanged.
 
 ```bash
 node extension/dist/setup.cjs --commands
@@ -300,7 +300,7 @@ The launch passes the checkout as a positional folder argument on Windows. Do no
 
 The development server binds to `127.0.0.1:5173` with a strict port. A port conflict stops the command. Stop the conflicting process, then run the command again. A panel opened while the server is down shows the command that restores it and reloads when the server returns. A syntax error leaves the last working panel active during an update. Fix and save the source to recover. Close and reopen the panel or restore an editor tab to confirm both paths reconnect.
 
-Extension-host source saves rebuild `extension/dist/extension.js`. Reload the Extension Development Host to apply them. The panel does not present extension-host changes as hot updates.
+Development hosts select the watch build's `dist/bin` commands without requiring a production package identity. CLI source saves update `dist/cli.cjs`. Extension-host source saves rebuild `extension/dist/extension.js`. Reload the Extension Development Host to apply them. The panel does not present extension-host changes as hot updates.
 
 This workflow supports a local Windows Extension Development Host. Remote extension hosts and port-forwarded development servers are unsupported. The webview loads its loopback address on the local VS Code machine, while a remote command binds on the remote machine.
 
@@ -308,7 +308,7 @@ Run `npm --prefix extension run build` after development. The production build r
 
 ## Isolated extension host
 
-`scripts/isolated-editor.mjs` launches the installed VS Code with a fresh profile, loads Arc from a checkout, and drives the window through Playwright. Agents use it to check a change in a real editor. It never touches the owner's own VS Code windows.
+`scripts/isolated-editor.mjs` launches the installed VS Code with a fresh profile, loads Arc from a checkout or an installed candidate VSIX, and drives the window through Playwright. Agents use it to check a change in a real editor. It never touches the owner's own VS Code windows.
 
 Build the checkout first with `npm --prefix extension run build`. Then run a check script:
 
@@ -332,13 +332,17 @@ The last line of output is one JSON object with `ok`, the `run` directory, the e
 | --- | --- |
 | `--timeout <seconds>` | Bounds the run once the browser lane lock is held. The default is 300. The wait for the lock has its own ten-minute deadline |
 | `--repository <checkout>` | Loads that checkout's `extension` folder and its `playwright-core`. The default is the checkout that holds the script |
+| `--vsix <candidate.vsix>` | Installs the candidate into the run's isolated profile and extensions directory. Omits development mode and requires isolated data |
+| `--probe-extension <directory>` | Packages and installs a disposable probe extension through the selected editor CLI. Requires `--vsix` |
 | `--editor <install directory>` | Selects the VS Code install. `ARC_MEASURE_EDITOR` does the same when the option is absent |
 | `--workspace <folder>` | Opens that folder instead of the empty run workspace |
 | `--scratch <directory>` | Creates the run directory there instead of in the system temporary directory |
 | `--live-data` | Keeps the owner's transcript roots and lets Arc start agents |
 | `--allow-focus` | Keeps the editor's own window focus behavior |
 
-Each run creates its own `arc-isolated-editor-<id>` directory with user data, an extensions directory, an Arc home, transcript roots, and a workspace. The empty extensions directory keeps installed extensions out of the window. The profile settings turn off workspace trust, telemetry, updates, the startup editor, and AI features, so no Restricted Mode banner or sign-in prompt appears.
+Each run creates its own `arc-isolated-editor-<id>` directory with user data, an extensions directory, an Arc home, transcript roots, and a workspace. The extensions directory excludes the owner's installed extensions. Candidate checks record Arc installation in `vsix-install.json` and probe installation in `probe-vsix-install.json`. The run manifest keeps their digests separate. Before cleanup removes an installed run, its sibling evidence directory retains these receipts, `run.json`, available extensions registration manifests, and editor logs. The cleanup report names that directory and its retained file hashes. A retention failure keeps the run directory. The profile settings turn off workspace trust, telemetry, updates, the startup editor, and AI features, so no Restricted Mode banner or sign-in prompt appears.
+
+Windows starts the installer and editor from the selected installation directory. That directory must use an absolute drive path shorter than 260 characters. Profile, extension, workspace, and candidate arguments remain absolute. macOS and Linux use the run directory. The Windows CLI accepts flat resources or a ten-hexadecimal version directory selected by the standard launcher. Unsupported or ambiguous launcher forms stop installation. Without a launcher, only the flat layout applies. The CLI file must remain inside the installation and be readable. macOS uses the bundle's `Contents/Resources/app/out/cli.js`. Linux uses `resources/app/out/cli.js` beside the executable.
 
 The editor's environment drops every variable whose name starts with `VSCODE`, `ELECTRON`, `ARC_`, `CLAUDE`, `NODE_OPTIONS`, or `GIT_`, in any letter case. Arc gives the agents it starts `ELECTRON_RUN_AS_NODE=1`, and VS Code started with that variable runs as Node and opens no window. The run then points `ARC_HOME`, `ARC_PROJECTS_ROOT`, `ARC_CODEX_ROOT`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME` at the run's empty directories. It sets `ARC_MEASURE_BLOCK_AGENTS=1` and points `ARC_MEASURE_STATE` at an empty state file. Arc then opens its panel at activation, shows no real sessions, and starts no agent. Pass `--live-data` only when the task asks for the owner's live sessions. That mode opens the panel through the command palette.
 

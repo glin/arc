@@ -22,6 +22,34 @@ function scratch() {
   return root;
 }
 
+function cliFixture(relative = 'resources/app/out/cli.js') {
+  const installation = path.join(scratch(), 'VS Code with spaces');
+  const executable = path.join(installation, 'Code.exe');
+  const cli = path.join(installation, relative);
+  fs.mkdirSync(path.dirname(cli), { recursive: true });
+  fs.writeFileSync(executable, '');
+  fs.writeFileSync(cli, 'process.stdout.write(JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }));');
+  return { installation, executable, cli };
+}
+
+function writeLauncher(installation, relative = 'resources/app/out/cli.js') {
+  const launcher = path.join(installation, 'bin', 'code.cmd');
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.writeFileSync(
+    launcher,
+    [
+      '@echo off',
+      'setlocal',
+      'set VSCODE_DEV=',
+      'set ELECTRON_RUN_AS_NODE=1',
+      `"%~dp0..\\Code.exe" "%~dp0..\\${relative.replaceAll('/', '\\')}" %*`,
+      'IF %ERRORLEVEL% NEQ 0 EXIT /b %ERRORLEVEL%',
+      'endlocal',
+    ].join('\r\n'),
+  );
+  return launcher;
+}
+
 // A clock whose sleep advances time at once, so deadline tests never wait.
 // A wait that ignores its deadline fails here instead of spinning forever.
 function fakeClock() {
@@ -162,6 +190,52 @@ describe('isolated editor environment', () => {
     assert.ok(args.includes('--disable-workspace-trust'));
   });
 
+  test('installed candidates use only the isolated profile and omit development mode', () => {
+    const layout = editor.runLayout(path.join(scratch(), 'candidate run'));
+    fs.mkdirSync(layout.root, { recursive: true });
+    const vsix = path.join(layout.root, 'candidate with spaces.vsix');
+    fs.writeFileSync(vsix, 'fixture-vsix');
+    const fixture = cliFixture();
+    const seen = [];
+    const receipt = editor.installVsix(fixture.executable, layout, vsix, {
+      platform: process.platform === 'win32' ? 'win32' : 'linux',
+      timeoutMs: 1234,
+      run: (command, args, options) => {
+        seen.push({ command, args, options });
+        return { status: 0, stdout: 'installed', stderr: '' };
+      },
+    });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].args[0], fixture.cli);
+    assert.equal(seen[0].options.cwd, process.platform === 'win32' ? fixture.installation : layout.root);
+    assert.equal(seen[0].args[seen[0].args.indexOf('--user-data-dir') + 1], layout.userData);
+    assert.equal(seen[0].args[seen[0].args.indexOf('--extensions-dir') + 1], layout.extensions);
+    assert.equal(seen[0].args[seen[0].args.indexOf('--install-extension') + 1], vsix);
+    assert.equal(seen[0].options.timeout, 1234);
+    assert.equal(seen[0].options.env.ARC_HOME, layout.arcHome);
+    assert.equal(seen[0].options.env.ARC_MEASURE_BLOCK_AGENTS, '1');
+    assert.equal(seen[0].options.env.ELECTRON_RUN_AS_NODE, '1');
+    assert.match(receipt.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(layout.root, 'vsix-install.json'))).stdout, 'installed');
+    const args = editor.editorArguments(layout, {
+      extensionPath: '/checkout/extension',
+      workspace: layout.workspace,
+      vsix,
+    });
+    assert.equal(args.includes('--extensionDevelopmentPath'), false);
+    assert.equal(args.includes('/checkout/extension'), false);
+    assert.equal(args[args.indexOf('--extensions-dir') + 1], layout.extensions);
+    assert.equal(editor.childEnvironment(process.env, layout).ELECTRON_RUN_AS_NODE, undefined);
+    assert.throws(
+      () =>
+        editor.installVsix(fixture.executable, layout, vsix, {
+          platform: process.platform === 'win32' ? 'win32' : 'linux',
+          run: () => ({ status: 1, stderr: 'installation refused' }),
+        }),
+      /installation refused/,
+    );
+  });
+
   test('an explicit install directory wins over ARC_MEASURE_EDITOR', () => {
     const exists = (file) => file.includes('explicit') || file.includes('named');
     const found = editor.editorExecutable({
@@ -179,6 +253,381 @@ describe('isolated editor environment', () => {
       () => editor.editorExecutable({ environment: {}, platform: 'linux', exists: () => false }),
       /--editor <install directory> or set ARC_MEASURE_EDITOR/,
     );
+  });
+});
+
+describe('installed editor CLI', () => {
+  test('retains separate Arc and probe installation receipts and digests', () => {
+    const fixture = cliFixture();
+    const layout = editor.runLayout(scratch());
+    const arc = path.join(layout.root, 'arc.vsix');
+    const probe = path.join(layout.root, 'probe.vsix');
+    fs.writeFileSync(arc, 'Arc archive');
+    fs.writeFileSync(probe, 'probe archive');
+    const run = (_executable, args, options) => {
+      assert.equal(args[args.indexOf('--user-data-dir') + 1], layout.userData);
+      assert.equal(args[args.indexOf('--extensions-dir') + 1], layout.extensions);
+      assert.equal(options.env.ARC_MEASURE_BLOCK_AGENTS, '1');
+      return { status: 0, stdout: args[args.indexOf('--install-extension') + 1] };
+    };
+    const arcInstall = editor.installVsix(fixture.executable, layout, arc, { run, platform: 'linux' });
+    const arcReceipt = fs.readFileSync(path.join(layout.root, 'vsix-install.json'));
+    const probeInstall = editor.installVsix(fixture.executable, layout, probe, {
+      run,
+      platform: 'linux',
+      receipt: 'probe-vsix-install.json',
+    });
+    assert.notEqual(arcInstall.sha256, probeInstall.sha256);
+    assert.deepEqual(fs.readFileSync(path.join(layout.root, 'vsix-install.json')), arcReceipt);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(layout.root, 'probe-vsix-install.json'))).candidate, probe);
+  });
+
+  test('executes the exact Windows launcher selection with spaces and ignores other update directories', () => {
+    const relative = 'abcdef0123/resources/app/out/cli.js';
+    const fixture = cliFixture(relative);
+    writeLauncher(fixture.installation, relative);
+    for (const other of ['resources/app/out/cli.js', 'fffffffffe/resources/app/out/cli.js']) {
+      const cli = path.join(fixture.installation, other);
+      fs.mkdirSync(path.dirname(cli), { recursive: true });
+      fs.writeFileSync(cli, 'throw new Error("Wrong editor runtime");');
+    }
+    const selected = editor.editorCli(fixture.executable, 'win32');
+    const result = spawnSync(process.execPath, [selected, 'argument with spaces'], {
+      cwd: fixture.installation,
+      encoding: 'utf8',
+      timeout: 5000,
+      windowsHide: true,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).args, ['argument with spaces']);
+    assert.equal(selected, fixture.cli);
+    assert.equal(JSON.parse(result.stdout).cwd, fixture.installation);
+    fs.rmSync(path.join(fixture.installation, 'resources'), { recursive: true });
+    const versionedOnly = spawnSync(process.execPath, [editor.editorCli(fixture.executable, 'win32')], {
+      cwd: fixture.installation,
+      encoding: 'utf8',
+      timeout: 5000,
+      windowsHide: true,
+    });
+    assert.equal(versionedOnly.status, 0, versionedOnly.stderr);
+  });
+
+  test('resolves readable flat Windows, Linux and macOS CLI layouts', () => {
+    const flat = cliFixture();
+    assert.equal(editor.editorCli(flat.executable, 'win32'), flat.cli);
+    writeLauncher(flat.installation);
+    assert.equal(editor.editorCli(flat.executable, 'win32'), flat.cli);
+    assert.equal(editor.editorCli(path.join(flat.installation, 'code'), 'linux'), flat.cli);
+    const bundle = cliFixture('Contents/Resources/app/out/cli.js');
+    assert.equal(editor.editorCli(path.join(bundle.installation, 'Contents/MacOS/Electron'), 'darwin'), bundle.cli);
+    fs.rmSync(flat.cli);
+    assert.throws(() => editor.editorCli(flat.executable, 'linux'), /ENOENT/);
+  });
+
+  test('refuses ambiguous, escaping and unsupported launchers even when a flat CLI exists', () => {
+    const fixture = cliFixture();
+    const launcher = writeLauncher(fixture.installation);
+    const original = fs.readFileSync(launcher, 'utf8');
+    for (const text of [
+      original + '\r\n' + original.split('\r\n')[4],
+      original.replace('resources\\app', '..\\resources\\app'),
+      original.replace('Code.exe', 'Other.exe'),
+      original.replace('resources\\app', 'unselected\\resources\\app'),
+      original.replace('setlocal', 'call arbitrary.cmd'),
+      'x'.repeat(8193),
+    ]) {
+      fs.writeFileSync(launcher, text);
+      assert.throws(() => editor.editorCli(fixture.executable, 'win32'), /Unsupported|ambiguous/);
+    }
+  });
+
+  test('keeps the run working directory on Linux and macOS', () => {
+    const layout = editor.runLayout(path.join(scratch(), 'run'));
+    for (const platform of ['linux', 'darwin']) {
+      assert.equal(editor.editorLaunchCwd('/installed/editor', layout, platform), layout.root);
+    }
+  });
+
+  test.skipIf(process.platform !== 'win32')(
+    'installs from a long owned run directory through the selected Windows CLI',
+    () => {
+      const fixture = cliFixture('abcdef0123/resources/app/out/cli.js');
+      writeLauncher(fixture.installation, 'abcdef0123/resources/app/out/cli.js');
+      const layout = editor.runLayout(path.join(scratch(), ...Array(6).fill('owned run directory with spaces')));
+      fs.mkdirSync(layout.root, { recursive: true });
+      assert.ok(layout.root.length > 260);
+      const vsix = path.join(layout.root, 'candidate with spaces.vsix');
+      fs.writeFileSync(vsix, 'fixture');
+      editor.installVsix(fixture.executable, layout, vsix, {
+        run: (command, args, options) => {
+          assert.equal(command, fixture.executable);
+          return spawnSync(process.execPath, args, options);
+        },
+        timeoutMs: 5000,
+      });
+      const output = JSON.parse(JSON.parse(fs.readFileSync(path.join(layout.root, 'vsix-install.json'))).stdout);
+      assert.equal(output.cwd, fixture.installation);
+      assert.equal(output.args[output.args.indexOf('--user-data-dir') + 1], layout.userData);
+      assert.equal(output.args[output.args.indexOf('--extensions-dir') + 1], layout.extensions);
+      assert.equal(output.args[output.args.indexOf('--install-extension') + 1], vsix);
+    },
+  );
+
+  test.skipIf(process.platform !== 'win32')(
+    'refuses an overlong Windows installation directory before spawning',
+    () => {
+      const installation = path.join(scratch(), ...Array(8).fill('long installation directory'));
+      fs.mkdirSync(installation, { recursive: true });
+      assert.ok(installation.length > 260);
+      assert.throws(
+        () => editor.editorLaunchCwd(path.join(installation, 'Code.exe'), editor.runLayout(scratch())),
+        /Unsupported VS Code installation directory/,
+      );
+      assert.throws(() => editor.editorLaunchCwd('relative/Code.exe', editor.runLayout(scratch())), /Unsupported/);
+    },
+  );
+});
+
+describe('disposable probe packaging and evidence', () => {
+  test('packages probe bytes beneath the run without running source lifecycle scripts', async () => {
+    const source = path.join(scratch(), 'probe source');
+    fs.mkdirSync(source);
+    const marker = path.join(source, 'lifecycle-ran');
+    const manifest = {
+      name: 'terminal-probe',
+      publisher: 'test',
+      version: '0.1.0',
+      engines: { vscode: '^1.100.0' },
+      main: './extension.js',
+      activationEvents: ['*'],
+      scripts: { 'vscode:prepublish': 'node lifecycle.js' },
+    };
+    const original = JSON.stringify(manifest);
+    fs.writeFileSync(path.join(source, 'package.json'), original);
+    fs.writeFileSync(
+      path.join(source, 'lifecycle.js'),
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran');`,
+    );
+    fs.writeFileSync(path.join(source, 'extension.js'), 'exports.activate = () => {};');
+    const session = editor.createRun({ scratch: scratch(), list: () => [] });
+    const archive = await editor.packageProbe(path.resolve(__dirname, '..'), session.layout, source);
+    assert.equal(path.dirname(archive), session.layout.root);
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(fs.readFileSync(path.join(source, 'package.json'), 'utf8'), original);
+    const { createRequire } = await import('node:module');
+    const extensionRequire = createRequire(path.resolve(__dirname, '../extension/package.json'));
+    const yauzl = extensionRequire('yauzl');
+    const entries = await new Promise((resolve, reject) => {
+      const files = new Map();
+      yauzl.open(archive, { lazyEntries: true }, (error, zip) => {
+        if (error) return reject(error);
+        zip.on('error', reject);
+        zip.on('end', () => resolve(files));
+        zip.on('entry', (entry) => {
+          zip.openReadStream(entry, (streamError, stream) => {
+            if (streamError) return reject(streamError);
+            const chunks = [];
+            stream.on('error', reject);
+            stream.on('data', (chunk) => chunks.push(chunk));
+            stream.on('end', () => {
+              files.set(entry.fileName, Buffer.concat(chunks));
+              zip.readEntry();
+            });
+          });
+        });
+        zip.readEntry();
+      });
+    });
+    assert.equal(entries.get('extension/extension.js').toString(), 'exports.activate = () => {};');
+    const packaged = JSON.parse(entries.get('extension/package.json'));
+    assert.equal(packaged.name, manifest.name);
+    assert.equal(packaged.publisher, manifest.publisher);
+    assert.equal(packaged.scripts, undefined);
+    const cleanup = await editor.closeIsolatedEditor(session, { list: () => [] });
+    assert.equal(cleanup.ok, true);
+  });
+
+  test('retains registration, logs and process identities after success and process-settlement failure', async () => {
+    for (const running of [false, true]) {
+      const session = editor.createRun({ scratch: scratch(), list: () => [] });
+      session.manifest.evidence = `${session.layout.root}-evidence`;
+      session.manifest.processes = [
+        { pid: 991, created: '2026-10-12T04:00:00.000Z', command: editor.commandDigest('fixture running') },
+      ];
+      editor.writeManifest(session.layout, session.manifest);
+      const log = path.join(session.layout.userData, 'logs', 'window1', 'exthost.log');
+      fs.mkdirSync(path.dirname(log), { recursive: true });
+      fs.writeFileSync(log, 'isolated log');
+      const profile = path.join(session.layout.extensions, 'extensions.json');
+      fs.writeFileSync(
+        profile,
+        JSON.stringify([{ identifier: { id: 'glin.arc' } }, { identifier: { id: 'test.terminal-probe' } }]),
+      );
+      const report = await editor.cleanupRun(session.manifest, {
+        platform: 'linux',
+        list: () =>
+          running
+            ? [{ pid: 991, parentPid: 1, created: '2026-10-12T04:00:00.000Z', commandLine: 'fixture running' }]
+            : [],
+        stop: () => {},
+        clock: fakeClock(),
+        deadlineMs: 1000,
+      });
+      const evidence = report.evidence.directory;
+      roots.push(evidence);
+      assert.equal(report.ok, !running);
+      assert.equal(fs.existsSync(session.layout.root), running);
+      assert.deepEqual(
+        JSON.parse(fs.readFileSync(path.join(evidence, 'run.json'))).processes[0],
+        session.manifest.processes[0],
+      );
+      assert.equal(
+        fs.readFileSync(path.join(evidence, path.relative(session.layout.root, log)), 'utf8'),
+        'isolated log',
+      );
+      assert.deepEqual(
+        fs.readFileSync(path.join(evidence, 'extensions', 'extensions.json')),
+        fs.existsSync(profile)
+          ? fs.readFileSync(profile)
+          : Buffer.from(
+              JSON.stringify([{ identifier: { id: 'glin.arc' } }, { identifier: { id: 'test.terminal-probe' } }]),
+            ),
+      );
+    }
+  });
+
+  test('keeps the run and excludes logs reached through a directory link', async () => {
+    const session = editor.createRun({ scratch: scratch(), list: () => [] });
+    session.manifest.evidence = `${session.layout.root}-evidence`;
+    const owner = scratch();
+    fs.writeFileSync(path.join(owner, 'owner.log'), 'owner data');
+    fs.symlinkSync(owner, path.join(session.layout.userData, 'logs'), 'junction');
+    const report = await editor.cleanupRun(session.manifest, { list: () => [] });
+    roots.push(session.manifest.evidence);
+    assert.equal(report.ok, false);
+    assert.equal(report.removed, false);
+    assert.match(report.errors.join('\n'), /evidence path is a link/);
+    assert.equal(fs.existsSync(path.join(session.manifest.evidence, 'user-data', 'logs', 'owner.log')), false);
+    fs.unlinkSync(path.join(session.layout.userData, 'logs'));
+    assert.equal(fs.readFileSync(path.join(owner, 'owner.log'), 'utf8'), 'owner data');
+  });
+});
+
+describe('installed candidate launch', () => {
+  test('launches the installed candidate with its disposable probe and refuses live data', async () => {
+    const repository = path.join(scratch(), 'installed checkout');
+    const extension = path.join(repository, 'extension');
+    const playwright = path.join(extension, 'node_modules', 'playwright-core');
+    fs.mkdirSync(playwright, { recursive: true });
+    fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({ name: 'arc', publisher: 'glin' }));
+    fs.writeFileSync(
+      path.join(playwright, 'index.js'),
+      'module.exports = { _electron: { launch: (options) => globalThis.__installedCandidateLaunch(options) } };',
+    );
+    const installDirectory = path.join(repository, 'editor');
+    const executable =
+      process.platform === 'win32' ? 'Code.exe' : process.platform === 'darwin' ? 'Contents/MacOS/Electron' : 'code';
+    fs.mkdirSync(path.dirname(path.join(installDirectory, executable)), { recursive: true });
+    fs.writeFileSync(path.join(installDirectory, executable), '');
+    const probeExtension = path.join(repository, 'probe');
+    fs.mkdirSync(probeExtension);
+    fs.writeFileSync(
+      path.join(probeExtension, 'package.json'),
+      JSON.stringify({ name: 'terminal-probe', publisher: 'test', version: '0.1.0', engines: { vscode: '^1.100.0' } }),
+    );
+    fs.writeFileSync(path.join(probeExtension, 'extension.js'), 'probe fixture');
+    const session = {};
+    let launch;
+    let installed = 0;
+    let profile;
+    const admitted = () => JSON.parse(fs.readFileSync(profile, 'utf8')).map((entry) => entry.identifier.id);
+    globalThis.__installedCandidateLaunch = async (options) => {
+      launch = options;
+      assert.deepEqual(admitted(), ['glin.arc', 'test.terminal-probe']);
+      throw new Error('fixture launch stop');
+    };
+    const options = {
+      repository,
+      editor: installDirectory,
+      scratch: scratch(),
+      vsix: 'candidate.vsix',
+      probeExtension,
+      list: () => [],
+      packageDisposableProbe: async (_repository, layout, probe) => {
+        const archive = path.join(layout.root, 'probe.vsix');
+        fs.writeFileSync(
+          archive,
+          JSON.stringify({
+            manifest: JSON.parse(fs.readFileSync(path.join(probe, 'package.json'), 'utf8')),
+            code: fs.readFileSync(path.join(probe, 'extension.js'), 'utf8'),
+          }),
+        );
+        return archive;
+      },
+      install: (selectedEditor, layout, candidate, installOptions) => {
+        assert.equal(selectedEditor, path.resolve(installDirectory, executable));
+        installed++;
+        profile = path.join(layout.extensions, 'extensions.json');
+        const probe = installed === 2 ? JSON.parse(fs.readFileSync(candidate, 'utf8')) : null;
+        const identity = probe ? 'test.terminal-probe' : 'glin.arc';
+        const target = path.join(layout.extensions, `${identity}-0.1.0`);
+        fs.mkdirSync(target);
+        fs.writeFileSync(
+          path.join(target, 'package.json'),
+          JSON.stringify(probe?.manifest ?? { name: 'arc', publisher: 'glin' }),
+        );
+        if (probe) fs.writeFileSync(path.join(target, 'extension.js'), probe.code);
+        const entries = fs.existsSync(profile) ? JSON.parse(fs.readFileSync(profile, 'utf8')) : [];
+        entries.push({ identifier: { id: identity }, version: '0.1.0', location: { path: target } });
+        fs.writeFileSync(profile, JSON.stringify(entries));
+        fs.writeFileSync(path.join(layout.root, installOptions.receipt ?? 'vsix-install.json'), identity);
+        return { candidate, sha256: probe ? 'probe-digest' : 'fixture-digest' };
+      },
+    };
+    try {
+      await assert.rejects(editor.launchIsolatedEditor({ ...options, liveData: true }, {}), /require isolated data/);
+      assert.equal(installed, 0);
+      await assert.rejects(editor.launchIsolatedEditor(options, session), /fixture launch stop/);
+      assert.equal(installed, 2);
+      assert.equal(launch.args.includes('--extensionDevelopmentPath'), false);
+      assert.equal(launch.args[launch.args.indexOf('--extensions-dir') + 1], session.layout.extensions);
+      assert.equal(launch.env.ELECTRON_RUN_AS_NODE, undefined);
+      assert.equal(launch.env.ARC_MEASURE_BLOCK_AGENTS, '1');
+      assert.equal(session.manifest.mode, 'installed');
+      assert.equal(session.manifest.vsix.sha256, 'fixture-digest');
+      assert.equal(session.manifest.probeVsix.sha256, 'probe-digest');
+      assert.equal(session.manifest.probeVsix.id, 'test.terminal-probe');
+      assert.equal(
+        fs.readFileSync(path.join(session.manifest.probeExtension, 'extension.js'), 'utf8'),
+        'probe fixture',
+      );
+      assert.ok(session.manifest.extensionPath.startsWith(session.layout.extensions + path.sep));
+      assert.deepEqual(session.manifest.processes, []);
+      const log = path.join(session.layout.userData, 'logs', 'launch', 'window1', 'exthost', 'exthost.log');
+      fs.mkdirSync(path.dirname(log), { recursive: true });
+      fs.writeFileSync(log, 'activation fixture');
+      const report = await editor.closeIsolatedEditor(session, { list: () => [] });
+      assert.equal(report.ok, true, report.errors.join('\n'));
+      assert.equal(fs.existsSync(session.layout.root), false);
+      const retained = report.evidence.directory;
+      roots.push(retained);
+      assert.deepEqual(
+        JSON.parse(fs.readFileSync(path.join(retained, 'extensions', 'extensions.json'))).map(
+          (entry) => entry.identifier.id,
+        ),
+        ['glin.arc', 'test.terminal-probe'],
+      );
+      assert.equal(
+        fs.readFileSync(path.join(retained, path.relative(session.layout.root, log)), 'utf8'),
+        'activation fixture',
+      );
+      assert.equal(fs.readFileSync(path.join(retained, 'vsix-install.json'), 'utf8'), 'glin.arc');
+      assert.equal(fs.readFileSync(path.join(retained, 'probe-vsix-install.json'), 'utf8'), 'test.terminal-probe');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(retained, 'run.json'))).mode, 'installed');
+    } finally {
+      delete globalThis.__installedCandidateLaunch;
+    }
   });
 });
 
@@ -204,6 +653,41 @@ function fakeCheckout() {
 }
 
 describe('isolated editor launch', () => {
+  test.skipIf(process.platform !== 'win32')('starts a native child with a long owned run directory', async () => {
+    const checkout = fakeCheckout();
+    const parent = path.join(scratch(), ...Array(6).fill('owned editor run directory'));
+    const session = {};
+    let result;
+    globalThis.__isolatedEditorLaunch = async (options) => {
+      assert.ok(session.layout.root.length > 260);
+      assert.ok(fs.statSync(session.layout.root).isDirectory());
+      result = spawnSync(process.execPath, ['-p', 'process.cwd()'], {
+        ...options,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.trim(), checkout.install);
+      throw new Error('fixture native child completed');
+    };
+    try {
+      await assert.rejects(
+        editor.launchIsolatedEditor(
+          { repository: checkout.root, editor: checkout.install, scratch: parent, list: () => [] },
+          session,
+        ),
+        /fixture native child completed/,
+      );
+      assert.equal(result.status, 0);
+      assert.equal(session.manifest.profile, session.layout.userData);
+      assert.ok(fs.existsSync(session.layout.manifest));
+      assert.deepEqual(session.manifest.processes, []);
+    } finally {
+      delete globalThis.__isolatedEditorLaunch;
+    }
+  });
+
   test('writes the manifest before the editor starts and records the main process after', async () => {
     const checkout = fakeCheckout();
     const parent = path.join(scratch(), 'scratch parent');
@@ -253,6 +737,7 @@ describe('isolated editor launch', () => {
     assert.equal(atLaunch.profile, path.join(atLaunch.root, 'user-data'));
     assert.equal(atLaunch.driverPid, process.pid);
     assert.equal(options.env.ELECTRON_RUN_AS_NODE, undefined);
+    assert.equal(options.cwd, process.platform === 'win32' ? checkout.install : session.layout.root);
     assert.equal(options.args[options.args.indexOf('--user-data-dir') + 1], atLaunch.profile);
     const recorded = editor.readManifest(session.layout.root);
     assert.equal(recorded.mainPid, 4_000_001);
@@ -667,6 +1152,14 @@ describe('isolated editor driver', () => {
       liveData: false,
       allowFocus: false,
     });
+    assert.equal(
+      editor.parseArguments(['run', '--vsix', 'candidate.vsix', '--probe-extension', 'probe']).vsix,
+      'candidate.vsix',
+    );
+    assert.equal(
+      editor.parseArguments(['run', '--vsix', 'candidate.vsix', '--probe-extension', 'probe']).probeExtension,
+      'probe',
+    );
     assert.throws(() => editor.parseArguments(['drive']), /Choose a command/);
     assert.throws(() => editor.parseArguments(['run', '--timeout', '0']), /positive number/);
     assert.throws(() => editor.parseArguments(['run', '--focus']), /Unknown option: --focus/);

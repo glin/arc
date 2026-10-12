@@ -4232,7 +4232,7 @@ test('window state publication follows scope changes, workspace changes, browser
   sourceMatch(lifecycle, /windowChannel\?\.dispose\(\)/, 'deactivation returns before its channel closes');
 });
 
-test('channel construction failure leaves panel activation and provider registration available', () => {
+test('channel construction failure leaves panel activation and provider registration available', async () => {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const activation = declarationSource(extensionSource, 'activate');
   const start = activation.indexOf('const activationAt');
@@ -4252,6 +4252,9 @@ test('channel construction failure leaves panel activation and provider registra
     },
     windowChannel: null,
     arcCliSpawner: () => () => {},
+    TerminalTools: function () {
+      return { refresh: async () => {} };
+    },
     storeRoot: () => '/Arc/Store',
     cacheRoot: () => '/Arc/Cache',
     normalizedWorkspaceIdentity: () => 'workspace',
@@ -4283,7 +4286,7 @@ test('channel construction failure leaves panel activation and provider registra
       };
     },
   };
-  new Function(...Object.keys(scope), compiled)(...Object.values(scope));
+  await new Function(...Object.keys(scope), 'return (async () => {' + compiled + '})()')(...Object.values(scope));
   assert.deepEqual(providers, ['arc-snapshot']);
   assert.equal(panels, 1);
   assert.doesNotThrow(() => publish({ folders: [], scopeReady: true, panelReady: false, panelVisible: false }));
@@ -20326,7 +20329,6 @@ test('the command palette gives every command an approved visibility policy', ()
     });
 
   assert.deepEqual(visible(true), [
-    'arc.setupCommands',
     'arc.setupClaudeSnapshots',
     'arc.savePerformanceDiagnostics',
     'arc.openDiagnosticsLog',
@@ -20336,7 +20338,6 @@ test('the command palette gives every command an approved visibility policy', ()
     'arc.resetPanelState',
   ]);
   assert.deepEqual(visible(false), [
-    'arc.setupCommands',
     'arc.setupClaudeSnapshots',
     'arc.savePerformanceDiagnostics',
     'arc.openDiagnosticsLog',

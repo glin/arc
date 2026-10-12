@@ -6,7 +6,7 @@ Show context, prompt-cache status, and the next turn's starting price in Claude 
 
 ## Install
 
-The Arc VSIX also offers durable command installation through **Arc: Set up terminal commands**. [Extension installation](../README.md#try-it) owns its runtime and PATH setup.
+The Arc VSIX supplies matching private commands. [Terminal availability](../README.md#terminal-availability) describes integrated terminals and Arc sessions. Standalone installation uses npm.
 
 Requires Node.js 18 or later. [Build from source](#build-from-source) and install the local tarball.
 

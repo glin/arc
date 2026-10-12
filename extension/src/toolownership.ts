@@ -72,6 +72,67 @@ export function acquireToolLock(file: string): { file: string; token: string; re
   };
 }
 
+export function waitForToolLock(file: string, signal: AbortSignal): Promise<ReturnType<typeof acquireToolLock>>;
+export function waitForToolLock(
+  file: string,
+  signal: AbortSignal,
+  ready: () => string | undefined,
+): Promise<ReturnType<typeof acquireToolLock> | string>;
+export function waitForToolLock(
+  file: string,
+  signal: AbortSignal,
+  ready?: () => string | undefined,
+): Promise<ReturnType<typeof acquireToolLock> | string> {
+  return new Promise((resolve, reject) => {
+    let watcher: fs.FSWatcher | undefined;
+    let retry: ReturnType<typeof setInterval> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const finish = (error?: unknown, result?: ReturnType<typeof acquireToolLock> | string) => {
+      if (settled) return;
+      settled = true;
+      watcher?.close();
+      clearInterval(retry);
+      clearTimeout(deadline);
+      signal.removeEventListener('abort', canceled);
+      if (result) resolve(result);
+      else reject(error);
+    };
+    const canceled = () => finish(new Error('Arc setup was canceled.'));
+    const attempt = () => {
+      if (settled) return;
+      if (signal.aborted) return canceled();
+      try {
+        const directory = ready?.();
+        if (directory) return finish(undefined, directory);
+        finish(undefined, acquireToolLock(file));
+      } catch (error) {
+        if ((error as Error & { cause?: NodeJS.ErrnoException }).cause?.code !== 'EEXIST') finish(error);
+      }
+    };
+    signal.addEventListener('abort', canceled, { once: true });
+    attempt();
+    if (settled) return;
+    retry = setInterval(attempt, 250);
+    deadline = setTimeout(
+      () =>
+        finish(
+          new Error(
+            `Arc cannot prepare its commands while ${file} remains owned. Close related Claude processes before resolving ownership manually.`,
+          ),
+        ),
+      30_000,
+    );
+    try {
+      watcher = fs.watch(path.dirname(file), attempt);
+      watcher.on('error', () => watcher?.close());
+      attempt();
+    } catch {
+      // Condition checks continue when filesystem notifications are unavailable.
+    }
+  });
+}
+
 export function retainedToolOwnership(error: unknown): boolean {
   const seen = new Set<unknown>();
   while (error && typeof error === 'object' && !seen.has(error)) {

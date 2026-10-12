@@ -6,7 +6,7 @@
 //   node scripts/isolated-editor.mjs restore (--baseline-commit <revision> | --baseline <checkout>) [options]
 //   node scripts/isolated-editor.mjs cleanup [<run directory or run.json>]
 // Options: --repository <checkout>, --editor <install directory>, --workspace <folder>, --scratch <parent directory>,
-// --live-data, --allow-focus. restore takes no --live-data.
+// --vsix <candidate.vsix>, --probe-extension <directory>, --live-data, --allow-focus. restore takes no --live-data.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -135,7 +135,7 @@ export function childEnvironment(parent, layout, { liveData = false, openPanel =
 }
 
 // Each path is its own array entry, so a path with spaces reaches the editor as one argument.
-export function editorArguments(layout, { extensionPath, workspace }) {
+export function editorArguments(layout, { extensionPath, workspace, vsix }) {
   return [
     '--user-data-dir',
     layout.userData,
@@ -144,10 +144,207 @@ export function editorArguments(layout, { extensionPath, workspace }) {
     '--disable-workspace-trust',
     '--skip-welcome',
     '--skip-release-notes',
-    '--extensionDevelopmentPath',
-    extensionPath,
+    ...(vsix ? [] : ['--extensionDevelopmentPath', extensionPath]),
     workspace,
   ];
+}
+
+// Windows native launches require a supported installation directory even when the run directory exists.
+export function editorLaunchCwd(executable, layout, platform = process.platform) {
+  if (platform !== 'win32') return layout.root;
+  const directory = path.dirname(path.resolve(executable));
+  if (
+    !path.isAbsolute(executable) ||
+    !/^[a-z]:\\$/i.test(path.parse(directory).root) ||
+    directory.length >= 260 ||
+    /[\x00-\x1f]/.test(directory) ||
+    !fs.statSync(directory).isDirectory()
+  ) {
+    throw new Error(`Unsupported VS Code installation directory: ${directory}`);
+  }
+  return directory;
+}
+
+// Reads the installed Windows launcher's selected CLI without executing batch commands or choosing an update folder.
+export function editorCli(executable, platform = process.platform) {
+  const directory = path.dirname(path.resolve(executable));
+  let cli =
+    platform === 'darwin'
+      ? path.resolve(directory, '../Resources/app/out/cli.js')
+      : path.join(directory, 'resources/app/out/cli.js');
+  if (platform === 'win32') {
+    const launcher = path.join(directory, 'bin', 'code.cmd');
+    if (fs.existsSync(launcher)) {
+      const stat = fs.statSync(launcher);
+      if (
+        !stat.isFile() ||
+        stat.size > 8192 ||
+        path.relative(fs.realpathSync(directory), fs.realpathSync(launcher)) !== path.join('bin', 'code.cmd')
+      )
+        throw new Error(`Unsupported VS Code launcher: ${launcher}`);
+      const lines = fs.readFileSync(launcher, 'utf8').trim().split(/\r?\n/);
+      const invocation =
+        /^"%~dp0\.\.\\Code\.exe" "%~dp0\.\.\\((?:[0-9a-f]{10}\\)?resources\\app\\out\\cli\.js)" %\*$/i.exec(
+          lines[4] ?? '',
+        );
+      if (
+        lines.length !== 7 ||
+        lines[0].toLowerCase() !== '@echo off' ||
+        lines[1].toLowerCase() !== 'setlocal' ||
+        lines[2].toLowerCase() !== 'set vscode_dev=' ||
+        lines[3].toLowerCase() !== 'set electron_run_as_node=1' ||
+        lines[5].toLowerCase() !== 'if %errorlevel% neq 0 exit /b %errorlevel%' ||
+        lines[6].toLowerCase() !== 'endlocal' ||
+        !invocation ||
+        path.basename(executable).toLowerCase() !== 'code.exe'
+      ) {
+        throw new Error(`Unsupported or ambiguous VS Code launcher: ${launcher}`);
+      }
+      cli = path.join(directory, ...invocation[1].split('\\'));
+    }
+    const relative = path.relative(fs.realpathSync(directory), fs.realpathSync(cli));
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      throw new Error(`VS Code CLI leaves its installation directory: ${cli}`);
+    }
+  }
+  if (!fs.statSync(cli).isFile()) throw new Error(`Expected a VS Code CLI file: ${cli}`);
+  fs.accessSync(cli, fs.constants.R_OK);
+  return cli;
+}
+
+// Installs a candidate only into the run's profile and extensions directory.
+export function installVsix(
+  executable,
+  layout,
+  vsix,
+  { run = spawnSync, platform = process.platform, timeoutMs = 90_000, receipt = 'vsix-install.json' } = {},
+) {
+  const candidate = path.resolve(vsix);
+  if (path.extname(candidate).toLowerCase() !== '.vsix' || !fs.statSync(candidate).isFile()) {
+    throw new Error(`Expected a VSIX file: ${candidate}`);
+  }
+  const cwd = editorLaunchCwd(executable, layout, platform);
+  const cli = editorCli(executable, platform);
+  const digest = createHash('sha256').update(fs.readFileSync(candidate)).digest('hex');
+  const result = run(
+    executable,
+    [
+      cli,
+      '--user-data-dir',
+      layout.userData,
+      '--extensions-dir',
+      layout.extensions,
+      '--install-extension',
+      candidate,
+      '--force',
+    ],
+    {
+      cwd,
+      env: { ...childEnvironment(process.env, layout), ELECTRON_RUN_AS_NODE: '1' },
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true,
+    },
+  );
+  fs.writeFileSync(
+    path.join(layout.root, receipt),
+    JSON.stringify(
+      {
+        candidate,
+        sha256: digest,
+        status: result.status,
+        stdout: result.stdout ?? '',
+        stderr: result.stderr ?? '',
+        error: result.error?.message ?? null,
+      },
+      null,
+      2,
+    ),
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `VSIX installation failed for ${candidate}: ${result.error?.message ?? result.stderr ?? result.stdout}`,
+    );
+  }
+  return { candidate, sha256: digest };
+}
+
+// Packages only the disposable probe copy. Packaging runs in this process and invokes no lifecycle script.
+export async function packageProbe(repository, layout, probeExtension) {
+  const source = path.resolve(probeExtension);
+  const manifest = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
+  if (Object.keys(manifest.dependencies ?? {}).length)
+    throw new Error('The disposable probe must have no dependencies.');
+  const staged = path.join(layout.root, 'probe-source');
+  fs.cpSync(source, staged, { recursive: true, errorOnExist: true, force: false });
+  delete manifest.scripts;
+  fs.writeFileSync(path.join(staged, 'package.json'), JSON.stringify(manifest, null, 2));
+  const candidate = path.join(layout.root, 'probe.vsix');
+  const require = createRequire(path.join(path.resolve(repository), 'extension', 'package.json'));
+  await require('@vscode/vsce').createVSIX({
+    cwd: staged,
+    packagePath: candidate,
+    dependencies: false,
+    useYarn: false,
+    followSymlinks: false,
+    allowMissingRepository: true,
+    allowStarActivation: true,
+    skipLicense: true,
+  });
+  return candidate;
+}
+
+// Retains only files from the isolated run. Links never supply evidence from another directory.
+export function retainRunEvidence(manifest) {
+  if (!manifest.evidence) return null;
+  const layout = runLayout(manifest.root);
+  const evidence = `${layout.root}-evidence`;
+  if (manifest.evidence !== evidence) throw new Error('The evidence directory does not belong to this isolated run.');
+  fs.mkdirSync(evidence, { recursive: true });
+  if (fs.lstatSync(evidence).isSymbolicLink()) throw new Error('The isolated evidence directory is a link.');
+  const files = [];
+  const copy = (relative) => {
+    const source = path.join(layout.root, relative);
+    let ancestor = path.dirname(source);
+    while (ancestor !== layout.root) {
+      try {
+        if (fs.lstatSync(ancestor).isSymbolicLink())
+          throw new Error(`The isolated evidence ancestor is a link: ${ancestor}`);
+      } catch (error) {
+        if (error.code === 'ENOENT') return;
+        throw error;
+      }
+      ancestor = path.dirname(ancestor);
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(source);
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error(`The isolated evidence path is a link: ${source}`);
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(source)) copy(path.join(relative, name));
+    } else if (stat.isFile()) {
+      const bytes = fs.readFileSync(source);
+      const destination = path.join(evidence, relative);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination, bytes);
+      files.push({ path: relative, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+    }
+  };
+  for (const relative of [
+    MANIFEST_NAME,
+    'vsix-install.json',
+    'probe-vsix-install.json',
+    path.join('extensions', 'extensions.json'),
+    path.join('user-data', 'User', 'extensions.json'),
+    path.join('user-data', 'logs'),
+  ])
+    copy(relative);
+  fs.writeFileSync(path.join(evidence, 'retained-files.json'), JSON.stringify(files, null, 2));
+  return { directory: evidence, files };
 }
 
 function editorRoots(environment, platform) {
@@ -532,7 +729,14 @@ export async function cleanupRun(
   } catch (error) {
     report.errors.push(error.message);
   }
-  if (exited) {
+  let retained = true;
+  try {
+    report.evidence = retainRunEvidence(manifest);
+  } catch (error) {
+    retained = false;
+    report.errors.push(`Could not retain isolated editor evidence: ${error.message}`);
+  }
+  if (exited && retained) {
     try {
       await waitFor(
         `removal of ${manifest.root}`,
@@ -548,7 +752,7 @@ export async function cleanupRun(
     }
   } else {
     report.errors.push(
-      `Kept ${manifest.root}, because cleanup did not confirm that every run process stopped. Run cleanup on it again.`,
+      `Kept ${manifest.root}, because cleanup did not confirm process settlement and evidence retention. Run cleanup on it again.`,
     );
   }
   try {
@@ -753,21 +957,79 @@ const CANCELLED_MESSAGE = 'The run ended before this step started.';
 // same profile, extensions directory, and workspace, so a second start sees what the first one saved.
 export async function startEditor(
   session,
-  { repository = ownRepository, editor, allowFocus = false, deadlineMs = 90_000, openPanel = true } = {},
+  {
+    repository = ownRepository,
+    editor,
+    vsix,
+    probeExtension,
+    install = installVsix,
+    packageDisposableProbe = packageProbe,
+    allowFocus = false,
+    deadlineMs = 90_000,
+    openPanel = true,
+  } = {},
 ) {
   if (session.cancelled) throw new Error(CANCELLED_MESSAGE);
-  const extensionPath = requireBuild(repository);
-  const executablePath = editorExecutable({ editor });
+  const extensionPath = vsix ? path.join(path.resolve(repository), 'extension') : requireBuild(repository);
+  const executablePath = path.resolve(editorExecutable({ editor }));
   const { layout, manifest } = session;
   Object.assign(manifest, { executablePath, extensionPath, launcherPid: null, mainPid: null, mainCreated: null });
   writeManifest(layout, manifest);
   session.extensionId = extensionIdOf(extensionPath);
+  manifest.mode = vsix ? 'installed' : 'development';
+  if (vsix) manifest.evidence = `${layout.root}-evidence`;
+  writeManifest(layout, manifest);
+  if (vsix) {
+    try {
+      manifest.vsix = install(executablePath, layout, vsix, { timeoutMs: deadlineMs });
+    } finally {
+      recordRunProcesses(session);
+    }
+    const installed = fs
+      .readdirSync(layout.extensions, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(layout.extensions, entry.name))
+      .filter(
+        (directory) =>
+          fs.existsSync(path.join(directory, 'package.json')) && extensionIdOf(directory) === session.extensionId,
+      );
+    if (installed.length !== 1)
+      throw new Error(`Expected one installed ${session.extensionId} extension in ${layout.extensions}.`);
+    manifest.extensionPath = installed[0];
+    if (probeExtension) {
+      const probe = path.resolve(probeExtension);
+      const id = extensionIdOf(probe);
+      if (!/^[a-z0-9-]+[.][a-z0-9-]+$/i.test(id) || id.toLowerCase() === session.extensionId.toLowerCase()) {
+        throw new Error(`Invalid probe extension identity: ${id}`);
+      }
+      const candidate = await packageDisposableProbe(repository, layout, probe);
+      if (session.cancelled) throw new Error(CANCELLED_MESSAGE);
+      try {
+        manifest.probeVsix = install(executablePath, layout, candidate, {
+          timeoutMs: deadlineMs,
+          receipt: 'probe-vsix-install.json',
+        });
+        manifest.probeVsix.id = id;
+      } finally {
+        recordRunProcesses(session);
+      }
+      const probes = fs
+        .readdirSync(layout.extensions, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(layout.extensions, entry.name))
+        .filter((directory) => fs.existsSync(path.join(directory, 'package.json')) && extensionIdOf(directory) === id);
+      if (probes.length !== 1) throw new Error(`Expected one installed ${id} probe in ${layout.extensions}.`);
+      manifest.probeExtension = probes[0];
+    }
+    writeManifest(layout, manifest);
+  }
+  if (session.cancelled) throw new Error(CANCELLED_MESSAGE);
   const { _electron } = loadPlaywright(path.resolve(repository));
   session.app = await _electron.launch({
     executablePath,
-    args: editorArguments(layout, { extensionPath, workspace: session.workspace }),
+    args: editorArguments(layout, { extensionPath, workspace: session.workspace, vsix }),
     env: childEnvironment(process.env, layout, { liveData: session.liveData, openPanel }),
-    cwd: layout.root,
+    cwd: editorLaunchCwd(executablePath, layout),
     timeout: deadlineMs,
   });
   if (!allowFocus) session.windowsBeforeHook = await quietWindows(session.app);
@@ -788,6 +1050,10 @@ export async function launchIsolatedEditor(
     repository = ownRepository,
     editor,
     workspace,
+    vsix,
+    probeExtension,
+    install = installVsix,
+    packageDisposableProbe = packageProbe,
     scratch = os.tmpdir(),
     liveData = false,
     allowFocus = false,
@@ -796,10 +1062,21 @@ export async function launchIsolatedEditor(
   } = {},
   session = {},
 ) {
-  requireBuild(repository);
+  if (vsix && liveData) throw new Error('Installed VSIX checks require isolated data.');
+  if (probeExtension && !vsix) throw new Error('A probe extension requires --vsix.');
+  if (!vsix) requireBuild(repository);
   editorExecutable({ editor });
   createRun({ scratch, workspace, liveData, list }, session);
-  return startEditor(session, { repository, editor, allowFocus, deadlineMs });
+  return startEditor(session, {
+    repository,
+    editor,
+    vsix,
+    probeExtension,
+    install,
+    packageDisposableProbe,
+    allowFocus,
+    deadlineMs,
+  });
 }
 
 // Writes the PID and start time of each run process to the manifest. A helper that passes no profile is found
@@ -1084,6 +1361,8 @@ export function parseArguments(argv) {
     '--repository': 'repository',
     '--editor': 'editor',
     '--workspace': 'workspace',
+    '--vsix': 'vsix',
+    '--probe-extension': 'probeExtension',
     '--scratch': 'scratch',
     '--baseline': 'baseline',
     '--baseline-commit': 'baselineCommit',

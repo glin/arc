@@ -5,7 +5,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { ARC_IDENTITY } from './identity';
 import { writeFileAtomically } from './atomicfile';
-import { acquireToolLock, admitToolPath, canonicalToolPath, retainedToolOwnership } from './toolownership';
+import {
+  acquireToolLock,
+  admitToolPath,
+  canonicalToolPath,
+  retainedToolOwnership,
+  waitForToolLock,
+} from './toolownership';
 
 export interface ToolPayload {
   schemaVersion: number;
@@ -96,6 +102,23 @@ export function readToolPackage(dist: string, platform = process.platform): Tool
   return { directory, payload };
 }
 
+export async function prepareEditorCommands(
+  dist: string,
+  root: string,
+  signal: AbortSignal,
+  development: boolean,
+): Promise<string> {
+  if (signal.aborted) throw new Error('Arc setup was canceled.');
+  if (!development) return new BundledTools(readToolPackage(dist), root).preparePrivateCommands(signal);
+  const directory = path.join(dist, 'bin');
+  admitToolPath(directory);
+  for (const file of ['bin/arc', 'bin/arc.cmd', 'cli.cjs', 'windowpipe.exe']) {
+    const stat = fs.lstatSync(path.join(dist, file));
+    if (!stat.isFile()) throw new Error('Arc development commands are unavailable. Rebuild the extension.');
+  }
+  return directory;
+}
+
 export function toolRoot(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
   return admitToolPath(env[`${ARC_IDENTITY.environmentPrefix}HOME`] || path.join(home, ARC_IDENTITY.homeDirectory));
 }
@@ -125,23 +148,58 @@ export class BundledTools {
 
   private claim(): void {
     admitToolPath(this.tools);
-    const marker = path.join(this.tools, 'ownership.json');
-    if (fs.existsSync(this.tools)) {
-      if (
-        !fs.existsSync(marker) ||
-        JSON.stringify(jsonFile(marker)) !== JSON.stringify({ schemaVersion: 1, root: this.root })
-      )
-        throw new Error(`Arc setup cannot replace unfamiliar files in ${this.tools}.`);
-    } else {
-      fs.mkdirSync(this.tools, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(marker, JSON.stringify({ schemaVersion: 1, root: this.root }), { flag: 'wx', mode: 0o600 });
+    if (!fs.existsSync(this.tools)) {
+      fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+      const staging = fs.mkdtempSync(path.join(this.root, '.arc-tools-'));
+      const created = fs.lstatSync(staging);
+      const ownership = JSON.stringify({ schemaVersion: 1, root: this.root });
+      try {
+        fs.chmodSync(staging, 0o700);
+        fs.writeFileSync(path.join(staging, 'ownership.json'), ownership, { flag: 'wx', mode: 0o600 });
+        try {
+          fs.renameSync(staging, this.tools);
+        } catch (error) {
+          if (!fs.existsSync(this.tools)) throw error;
+        }
+      } finally {
+        try {
+          admitToolPath(staging);
+          const remaining = fs.lstatSync(staging);
+          if (remaining.dev === created.dev && remaining.ino === created.ino) {
+            const names = fs.readdirSync(staging);
+            const stagedMarker = path.join(staging, 'ownership.json');
+            if (
+              names.length === 1 &&
+              names[0] === 'ownership.json' &&
+              fs.lstatSync(stagedMarker).isFile() &&
+              fs.readFileSync(stagedMarker, 'utf8') === ownership
+            ) {
+              fs.unlinkSync(stagedMarker);
+              fs.rmdirSync(staging);
+            } else if (!names.length) fs.rmdirSync(staging);
+          }
+        } catch {
+          // Unfamiliar or replaced staging contents remain for manual inspection.
+        }
+      }
     }
+    this.checkOwnership();
   }
 
-  async owned<T>(operation: (token: string) => Promise<T>, signal: AbortSignal): Promise<T> {
+  private checkOwnership(): void {
+    const marker = path.join(this.tools, 'ownership.json');
+    if (
+      !fs.existsSync(marker) ||
+      JSON.stringify(jsonFile(marker)) !== JSON.stringify({ schemaVersion: 1, root: this.root })
+    )
+      throw new Error(`Arc setup cannot replace unfamiliar files in ${this.tools}.`);
+  }
+
+  async owned<T>(operation: (token: string) => Promise<T>, signal: AbortSignal, wait = false): Promise<T> {
     if (signal.aborted) throw new Error('Arc setup was canceled.');
     this.claim();
-    const lock = acquireToolLock(path.join(this.tools, '.install.lock'));
+    const file = path.join(this.tools, '.install.lock');
+    const lock = wait ? await waitForToolLock(file, signal) : acquireToolLock(file);
     let retain = false;
     try {
       this.claim();
@@ -157,6 +215,8 @@ export class BundledTools {
   }
 
   stage(): string {
+    const existing = this.existingRelease();
+    if (existing) return existing;
     const releases = path.join(this.tools, 'releases');
     admitToolPath(releases);
     fs.mkdirSync(releases, { recursive: true });
@@ -177,7 +237,13 @@ export class BundledTools {
       });
       fs.renameSync(staging, release);
     }
+    return this.existingRelease()!;
+  }
+
+  private existingRelease(): string | undefined {
+    const release = path.join(this.tools, 'releases', this.bundle.payload.contentId);
     admitToolPath(release);
+    if (!fs.existsSync(release)) return undefined;
     if (JSON.stringify(jsonFile(path.join(release, 'release.json'))) !== JSON.stringify(this.bundle.payload))
       throw new Error(
         'The installed Arc release has an unfamiliar identity. Preserve its files and reinstall explicitly.',
@@ -307,6 +373,34 @@ export class BundledTools {
     });
   }
 
+  async preparePrivateCommands(signal: AbortSignal): Promise<string> {
+    if (signal.aborted) throw new Error('Arc setup was canceled.');
+    validateToolFiles(this.bundle.directory, this.bundle.payload.files);
+    const ready = () => {
+      admitToolPath(this.tools);
+      if (fs.existsSync(this.tools)) this.checkOwnership();
+      const release = this.existingRelease();
+      return release && path.join(release, 'launchers');
+    };
+    const existing = ready();
+    if (existing) return existing;
+    this.claim();
+    const selection = await waitForToolLock(path.join(this.tools, '.install.lock'), signal, ready);
+    if (typeof selection === 'string') return selection;
+    let retain = false;
+    try {
+      this.claim();
+      validateToolFiles(this.bundle.directory, this.bundle.payload.files);
+      if (signal.aborted) throw new Error('Arc setup was canceled.');
+      return path.join(this.stage(), 'launchers');
+    } catch (error) {
+      retain = retainedToolOwnership(error);
+      throw error;
+    } finally {
+      if (!retain) selection.release();
+    }
+  }
+
   async installCommands(runtime: string, signal: AbortSignal): Promise<string> {
     const node = probeToolRuntime(runtime);
     return this.owned(async () => {
@@ -342,14 +436,14 @@ export class BundledTools {
         )
           throw new Error(`Arc setup found changed or unfamiliar commands in ${bin}. Preserve them before retrying.`);
       }
-      const runner = `const fs=require('node:fs'),path=require('node:path');try{const root=path.resolve(__dirname,'..');const active=JSON.parse(fs.readFileSync(path.join(root,'tools','active.json'),'utf8'));if(!/^[a-f0-9]{64}$/.test(active.contentId))throw Error('Arc command selection is unreadable.');require(path.join(root,'tools','releases',active.contentId,'cli',${JSON.stringify(ARC_IDENTITY.cliExecutable + '.cjs')}));}catch(e){console.error('Arc command unavailable. Run Arc: Set up terminal commands. '+e.message);process.exitCode=1;}\n`;
+      const runner = `const fs=require('node:fs'),path=require('node:path');try{const root=path.resolve(__dirname,'..');const active=JSON.parse(fs.readFileSync(path.join(root,'tools','active.json'),'utf8'));if(!/^[a-f0-9]{64}$/.test(active.contentId))throw Error('Arc command selection is unreadable.');require(path.join(root,'tools','releases',active.contentId,'cli',${JSON.stringify(ARC_IDENTITY.cliExecutable + '.cjs')}));}catch(e){console.error('Arc command unavailable. Rerun the source command installer. '+e.message);process.exitCode=1;}\n`;
       const quoted = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
       if (/[\r\n"]/u.test(node) || /[\r\n"]/u.test(bin) || (process.platform === 'win32' && /%/u.test(node + bin)))
         throw new Error(
           'Arc command setup cannot quote this runtime or installation path. Choose a path without percent signs, quotes or line breaks.',
         );
-      const sh = `#!/bin/sh\nif [ ! -x ${quoted(node)} ]; then echo 'Arc needs its Node.js runtime. Run Arc: Set up terminal commands.' >&2; exit 1; fi\nexec ${quoted(node)} ${quoted(path.join(bin, 'run.cjs'))} "$@"\n`;
-      const cmd = `@echo off\r\nsetlocal DisableDelayedExpansion\r\nif not exist "${node}" (echo Arc needs its Node.js runtime. Run Arc: Set up terminal commands. 1>&2 & exit /b 1)\r\n"${node}" "${path.join(bin, 'run.cjs')}" %*\r\nexit /b %errorlevel%\r\n`;
+      const sh = `#!/bin/sh\nif [ ! -x ${quoted(node)} ]; then echo 'Arc needs its Node.js runtime. Rerun the source command installer.' >&2; exit 1; fi\nexec ${quoted(node)} ${quoted(path.join(bin, 'run.cjs'))} "$@"\n`;
+      const cmd = `@echo off\r\nsetlocal DisableDelayedExpansion\r\nif not exist "${node}" (echo Arc needs its Node.js runtime. Rerun the source command installer. 1>&2 & exit /b 1)\r\n"${node}" "${path.join(bin, 'run.cjs')}" %*\r\nexit /b %errorlevel%\r\n`;
       const next = Object.fromEntries(
         [ARC_IDENTITY.cliExecutable].flatMap((name) => [
           [name, sh],

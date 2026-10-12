@@ -113,8 +113,8 @@ import {
 } from './sessionwrites';
 import { claudeConfigHome } from './agentpaths';
 import { ClaudePluginOffer, ClaudePluginSetup, pluginTarget } from './claudeplugin';
-import { BundledTools, readToolPackage, resolveToolRuntime, toolRoot } from './bundledtools';
-import { appendWindowsUserPath, existingToolCommands, manualToolPath, terminalToolPath } from './toolpath';
+import { BundledTools, readToolPackage, toolRoot, prepareEditorCommands } from './bundledtools';
+import { TerminalTools } from './toolpath';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
 declare const EXTENSION_VERSION: string;
@@ -134,11 +134,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     /* Window discovery failure leaves panel activation available. */
   }
   windowChannel = channel;
-  const spawner = arcCliSpawner(() => ({
-    directory: path.join(context.extensionPath, 'dist', 'bin'),
-    editorExecutable: process.execPath,
-    windowId: channel?.windowId ?? null,
-  }));
+  const privateTools = new TerminalTools(
+    context.environmentVariableCollection,
+    () => {
+      if (!vscode.workspace.isTrusted) return null;
+      return {
+        root: toolRoot(),
+        identity: JSON.stringify([
+          context.extensionPath,
+          vscode.workspace.workspaceFile?.toString() ?? null,
+          (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString()),
+          os.hostname(),
+        ]),
+      };
+    },
+    (admission, signal) =>
+      prepareEditorCommands(
+        path.join(context.extensionPath, 'dist'),
+        admission.root,
+        signal,
+        context.extensionMode === vscode.ExtensionMode.Development,
+      ),
+    process.execPath,
+  );
+  context.subscriptions.push(privateTools);
+  void privateTools.refresh();
+  const spawner = arcCliSpawner(() => privateTools.current(channel?.windowId ?? null));
   if (channel)
     context.subscriptions.push({
       dispose: () => {
@@ -599,64 +620,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   } catch (error) {
     toolProblem = error instanceof Error ? error.message : String(error);
   }
-  context.subscriptions.push(
-    vscode.commands.registerCommand('arc.setupCommands', async () => {
-      if (!vscode.workspace.isTrusted || !bundledTools) {
-        void vscode.window.showErrorMessage(
-          `Arc: ${toolProblem || 'Trust this window before setting up terminal commands.'}`,
-        );
-        return;
-      }
-      const terminalAction = terminalToolPath(path.join(bundledTools.root, 'bin'))
-        ? ' and append that folder for new editor terminals'
-        : '';
-      const answer = await vscode.window.showInformationMessage(
-        `Install Arc terminal commands in ${path.join(bundledTools.root, 'bin')}${terminalAction}? Existing commands keep precedence. Node.js 18 or later is required.`,
-        { modal: true },
-        'Install',
-        'Cancel',
-      );
-      if (answer !== 'Install') return;
-      let installedPath = '';
-      try {
-        const conflicts = existingToolCommands(process.env);
-        const runtime = resolveToolRuntime(process.env, workspaceCwd() ?? process.cwd());
-        const executable = await bundledTools.installCommands(runtime, new AbortController().signal);
-        installedPath = executable;
-        const bin = path.dirname(executable);
-        const terminalPath = terminalToolPath(bin);
-        if (terminalPath) {
-          context.environmentVariableCollection.description = 'Arc terminal commands';
-          context.environmentVariableCollection.append(terminalPath.variable, terminalPath.value);
-        }
-        let availability = terminalPath
-          ? 'New editor terminals include the Arc folder. Restart existing terminals.'
-          : 'This installation folder cannot be added to PATH. Run the installed command by its full path.';
-        if (terminalPath && process.platform === 'win32') {
-          const consent = await vscode.window.showInformationMessage(
-            `Append ${bin} to your Windows user PATH? Restart terminal hosts and applications to receive the change. Existing entries stay in order.`,
-            { modal: true },
-            'Add to user PATH',
-            'Skip',
-          );
-          if (consent === 'Add to user PATH') {
-            const result = appendWindowsUserPath(bin);
-            availability +=
-              result === 'present'
-                ? ' The Windows user PATH already includes this folder.'
-                : ' The Windows user PATH now includes this folder.';
-          } else availability += ' The Windows user PATH stays unchanged.';
-        } else if (terminalPath) availability += ' ' + manualToolPath(bin);
-        if (conflicts.length) availability += ` Existing commands keep precedence: ${conflicts.join(', ')}.`;
-        void vscode.window.showInformationMessage(`Arc commands installed: ${executable}. ${availability}`);
-      } catch (error) {
-        void vscode.window.showErrorMessage(
-          `Arc: ${installedPath ? 'Commands installed at ' + installedPath + '. PATH setup did not finish. ' : ''}${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }),
-  );
-
   snapshotOffer = new ClaudePluginOffer(
     {
       target: () => {
@@ -696,6 +659,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   snapshotSetup = snapshotOffer;
   const refreshSnapshots = () => {
+    void privateTools.refresh();
     snapshotOffer?.invalidate();
     if (snapshotPanelOpened) void snapshotOffer?.check();
   };

@@ -383,7 +383,7 @@ export class ClaudePluginSetup {
     } catch (error) {
       if (signal.aborted) throw error;
       throw new Error(
-        "Claude snapshot setup needs Node.js in the editor's launch environment. Install Node.js, restart the editor, then run Arc: Set up Claude snapshots.",
+        "Claude snapshot setup needs Node.js in the editor's launch environment. Install Node.js, restart the editor, then run Arc: Set up Claude hooks.",
         { cause: error },
       );
     }

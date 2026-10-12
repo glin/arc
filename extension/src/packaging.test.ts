@@ -3,6 +3,8 @@ import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -11,16 +13,10 @@ import { inflateRawSync } from 'node:zlib';
 import * as vm from 'node:vm';
 import ts from 'typescript';
 import { browserBundle, exportBrowserAssets } from './panelbundle.ts';
-import { BundledTools, readToolPackage } from './bundledtools.ts';
-import {
-  appendedUserPath,
-  appendWindowsUserPath,
-  existingToolCommands,
-  manualToolPath,
-  terminalToolPath,
-} from './toolpath.ts';
-import { admitToolPath, canonicalToolPath } from './toolownership.ts';
+import { BundledTools, readToolPackage, prepareEditorCommands } from './bundledtools.ts';
+import { TerminalTools, terminalToolPath, type ToolAdmission } from './toolpath.ts';
 import { childEnv } from './agenthost.ts';
+import { acquireToolLock, waitForToolLock } from './toolownership.ts';
 import { callSources, declarationSource, sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
 
 const extensionRoot = path.join(__dirname, '..');
@@ -33,6 +29,7 @@ function overlayStaticSources(source: string): void {
   fs.copyFileSync(path.join(extensionRoot, '../LICENSE'), path.join(source, '../LICENSE'));
   fs.cpSync(path.join(extensionRoot, '../plugins'), path.join(source, '../plugins'), { recursive: true });
   for (const file of [
+    'extension.ts',
     'bundledsetup.ts',
     'bundledtools.ts',
     'toolownership.ts',
@@ -366,6 +363,37 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   });
   try {
     await vi.waitFor(() => assert.match(output, /watch ready/), { timeout: 15_000 });
+    assert.throws(() => readToolPackage(path.join(source, 'dist')), /ENOENT/);
+    const directory = await prepareEditorCommands(
+      path.join(source, 'dist'),
+      path.join(root, 'software'),
+      new AbortController().signal,
+      true,
+    );
+    assert.equal(directory, path.join(source, 'dist/bin'));
+    const developmentEnv = childEnv(process.env, {}, undefined, root, {
+      directory,
+      editorExecutable: process.execPath,
+      windowId: 'development-window',
+    });
+    const launch = () =>
+      spawnSync(
+        process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh',
+        process.platform === 'win32' ? ['/d', '/c', 'arc --version'] : ['-c', 'arc --version'],
+        { env: developmentEnv, encoding: 'utf8' },
+      );
+    const version = launch();
+    assert.equal(version.status, 0, version.stderr);
+    assert.equal(version.stdout.trim(), JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version);
+    await assert.rejects(
+      prepareEditorCommands(
+        path.join(source, 'dist'),
+        path.join(root, 'software'),
+        new AbortController().signal,
+        false,
+      ),
+      /ENOENT/,
+    );
     const hostBundle = path.join(source, 'dist/extension.js');
     await vi.waitFor(() => assert.equal(embeddedHostIdentity(hostBundle).unavailable, 'watch'), { timeout: 15_000 });
     for (const marker of ['host health watch one', 'host health watch two']) {
@@ -385,6 +413,7 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
       () => assert.ok(fs.readFileSync(path.join(source, 'dist/cli.cjs'), 'utf8').includes('cli watch fixture')),
       { timeout: 15_000 },
     );
+    assert.match(launch().stdout, /cli watch fixture/);
     watcher.stdin.end('close');
     await vi.waitFor(() => assert.equal(watcher.exitCode, 0), { timeout: 15_000 });
   } finally {
@@ -462,20 +491,19 @@ test('the extension package contains exactly the intended files', () => {
   );
 });
 
-test('bare arc launchers preserve arguments, stdin, exit status, and window targeting with spaced paths', () => {
+test('bare arc launchers preserve arguments, stdin, exit status, and window targeting with spaced paths', async () => {
   const root = tempDir('arc-launchers-');
-  const installed = path.join(root, 'extension with spaces');
-  const bin = path.join(installed, 'bin');
-  fs.mkdirSync(bin, { recursive: true });
+  const tools = new BundledTools(
+    readToolPackage(path.join(extensionRoot, 'dist')),
+    path.join(root, 'software with spaces'),
+  );
+  const installed = tools.stage();
+  const bin = path.join(installed, 'launchers');
   const editor = path.join(root, 'editor with spaces', process.platform === 'win32' ? 'Code.exe' : 'editor');
   fs.mkdirSync(path.dirname(editor));
   fs.copyFileSync(process.execPath, editor);
   fs.chmodSync(editor, 0o755);
-  for (const file of ['arc', 'arc.cmd'])
-    fs.copyFileSync(path.join(extensionRoot, 'dist/bin', file), path.join(bin, file));
-  fs.chmodSync(path.join(bin, 'arc'), 0o755);
-  const bundle = path.join(installed, 'cli.cjs');
-  fs.copyFileSync(path.join(extensionRoot, 'dist/cli.cjs'), bundle);
+  const bundle = path.join(installed, 'cli/arc.cjs');
   const transcript = path.join(root, 'session with spaces.jsonl');
   fs.writeFileSync(
     transcript,
@@ -507,7 +535,16 @@ test('bare arc launchers preserve arguments, stdin, exit status, and window targ
     process.platform === 'win32'
       ? [
           { command: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c'] },
-          { command: 'powershell.exe', args: ['-NoProfile', '-EncodedCommand'] },
+          {
+            command: path.join(
+              process.env.SystemRoot ?? 'C:/Windows',
+              'System32',
+              'WindowsPowerShell',
+              'v1.0',
+              'powershell.exe',
+            ),
+            args: ['-NoProfile', '-EncodedCommand'],
+          },
           {
             command:
               process.env.GIT_BASH_PATH ??
@@ -519,9 +556,86 @@ test('bare arc launchers preserve arguments, stdin, exit status, and window targ
           { command: '/bin/sh', args: ['-c'] },
           { command: 'bash', args: ['--noprofile', '--norc', '-c'] },
         ];
+  const values = new Map<string, { type: 'append' | 'replace'; value: string }>();
+  const collection = {
+    persistent: true,
+    description: undefined as unknown,
+    clear: () => values.clear(),
+    append: (key: string, value: string) => values.set(key, { type: 'append', value }),
+    replace: (key: string, value: string) => values.set(key, { type: 'replace', value }),
+  };
+  const activation = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
+  const start = activation.indexOf('const privateTools');
+  const end = activation.indexOf('const spawner');
+  assert.ok(start >= 0 && end > start);
+  const compiled = ts.transpileModule(activation.slice(start, end), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const subscriptions: TerminalTools[] = [];
+  const scope = {
+    TerminalTools,
+    context: {
+      environmentVariableCollection: collection,
+      subscriptions,
+      extensionPath: extensionRoot,
+      extensionMode: 1,
+    },
+    vscode: { workspace: { isTrusted: true, workspaceFolders: [] }, ExtensionMode: { Development: 2 } },
+    toolRoot: () => path.join(root, 'software with spaces'),
+    prepareEditorCommands: async () => bin,
+    path,
+    os: { hostname: () => 'fixture-host' },
+    process: { execPath: editor },
+  };
+  await vm.runInNewContext('(async () => {' + compiled + '})()', scope);
+  try {
+    await vi.waitFor(() => assert.equal(values.size, 2, 'activation did not publish terminal commands'));
+    for (const casing of process.platform === 'win32' ? ['PATH', 'Path', 'path'] : ['PATH']) {
+      const terminalEnv: NodeJS.ProcessEnv = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (!/^(PATH|ARC_|ELECTRON_RUN_AS_NODE)$/i.test(key) && !key.startsWith('ARC_')) terminalEnv[key] = value;
+      }
+      terminalEnv[casing] =
+        process.platform === 'win32'
+          ? path.dirname(process.env.ComSpec ?? 'C:/Windows/System32/cmd.exe')
+          : '/usr/bin:/bin';
+      for (const [key, mutation] of values) {
+        const actual =
+          process.platform === 'win32'
+            ? (Object.keys(terminalEnv).find((name) => name.toLowerCase() === key.toLowerCase()) ?? key)
+            : key;
+        terminalEnv[actual] =
+          mutation.type === 'append' ? (terminalEnv[actual] ?? '') + mutation.value : mutation.value;
+      }
+      assert.equal(terminalEnv.ARC_WINDOW, undefined);
+      assert.equal(terminalEnv.ELECTRON_RUN_AS_NODE, undefined);
+      for (const shell of shells) {
+        const command = 'arc --version';
+        const script = shell.args.includes('-EncodedCommand')
+          ? Buffer.from(command, 'utf16le').toString('base64')
+          : command;
+        const result = spawnSync(shell.command, [...shell.args, script], {
+          cwd: root,
+          env: terminalEnv,
+          encoding: 'utf8',
+          windowsVerbatimArguments: shell.args.includes('/c'),
+        });
+        assert.ifError(result.error);
+        assert.equal(result.status, 0, `${shell.command} (${casing}): ${result.stderr}`);
+        assert.equal(
+          result.stdout.trim(),
+          JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+        );
+      }
+    }
+  } finally {
+    subscriptions.forEach((owner) => owner.dispose());
+  }
   for (const shell of shells) {
     const run = (command: string, input?: string) => {
-      const script = shell.command === 'powershell.exe' ? Buffer.from(command, 'utf16le').toString('base64') : command;
+      const script = shell.args.includes('-EncodedCommand')
+        ? Buffer.from(command, 'utf16le').toString('base64')
+        : command;
       const result = spawnSync(shell.command, [...shell.args, script], {
         cwd: root,
         env,
@@ -561,7 +675,9 @@ test('bare arc launchers preserve arguments, stdin, exit status, and window targ
   );
   for (const shell of shells) {
     const command = 'arc "argument with spaces"';
-    const script = shell.command === 'powershell.exe' ? Buffer.from(command, 'utf16le').toString('base64') : command;
+    const script = shell.args.includes('-EncodedCommand')
+      ? Buffer.from(command, 'utf16le').toString('base64')
+      : command;
     const result = spawnSync(shell.command, [...shell.args, script], {
       cwd: root,
       env,
@@ -1080,120 +1196,593 @@ test('damaged bundled bytes and unfamiliar installed files preserve the previous
 });
 
 test.each(['win32', 'darwin', 'linux'] as const)(
-  'command setup retains absolute launchers without publishing separator-containing PATH entries on %s',
+  'private terminal publication follows admission and disposal on %s',
   async (platform) => {
-    const source = fs.readFileSync(path.join(extensionRoot, 'src/extension.ts'), 'utf8');
-    const [setup] = callSources(source, 'vscode.commands.registerCommand', 'arc.setupCommands');
-    assert.ok(setup);
-    const paths = platform === 'win32' ? path.win32 : path.posix;
-    const root = platform === 'win32' ? 'C:/Arc;Tools' : '/home/user/arc:tools';
-    const executable = paths.join(root, 'bin', platform === 'win32' ? 'arc.cmd' : 'arc');
-    const appended: unknown[][] = [];
-    const messages: string[] = [];
-    const errors: string[] = [];
-    let installed = 0;
-    let run: (() => Promise<void>) | undefined;
-    vm.runInNewContext(transformSync(setup, { loader: 'ts', target: 'node18' }).code, {
-      path: paths,
-      process: { platform, env: {}, cwd: () => '/project' },
-      AbortController,
-      context: { environmentVariableCollection: { append: (...args: unknown[]) => appended.push(args) } },
-      bundledTools: {
-        root,
-        installCommands: async () => {
-          installed += 1;
-          return executable;
-        },
+    const values = new Map<string, string>();
+    const collection = {
+      persistent: true,
+      description: undefined as unknown,
+      clear: () => values.clear(),
+      append: (key: string, value: string) => values.set(key, value),
+      replace: (key: string, value: string) => values.set(key, value),
+    };
+    values.set('ARC_WINDOW', 'persisted-window');
+    let admission: ToolAdmission | null = { root: 'software', identity: 'trusted-local-project' };
+    let failure = false;
+    let admissionFailure = false;
+    const bin = platform === 'win32' ? 'C:/Arc Tools/release/launchers' : '/home/user/arc;tools/release/launchers';
+    const owner = new TerminalTools(
+      collection,
+      () => {
+        if (admissionFailure) throw new Error('Redirected ancestor: /fixture/redirected-root');
+        return admission;
       },
-      workspaceCwd: () => '/project',
-      resolveToolRuntime: () => process.execPath,
-      existingToolCommands: () => [],
-      manualToolPath,
-      terminalToolPath: (bin: string) => terminalToolPath(bin, platform),
-      appendWindowsUserPath: () => {
-        throw new Error('persistent PATH was requested');
+      async () => {
+        if (failure) throw new Error('storage unavailable');
+        return bin;
       },
-      vscode: {
-        workspace: { isTrusted: true },
-        commands: {
-          registerCommand: (_name: string, callback: () => Promise<void>) => {
-            run = callback;
-          },
-        },
-        window: {
-          showInformationMessage: async (message: string, _options: unknown, choice?: string) => {
-            messages.push(message);
-            return choice === 'Install' ? 'Install' : 'Skip';
-          },
-          showErrorMessage: (message: string) => errors.push(message),
-        },
+      '/editor',
+      platform,
+    );
+    assert.equal(collection.persistent, false);
+    assert.equal(values.size, 0);
+    await owner.refresh();
+    const entry = terminalToolPath(bin, platform)!;
+    assert.deepEqual(
+      [...values],
+      [
+        [entry.variable, entry.value],
+        ['ARC_EDITOR_EXECUTABLE', '/editor'],
+      ],
+    );
+    assert.equal(owner.current('actual-window').windowId, 'actual-window');
+    assert.equal(owner.current(null).directory, bin);
+    admission = null;
+    assert.throws(() => owner.current('actual-window'), /unavailable/);
+    assert.equal(values.size, 0);
+    await owner.refresh();
+    assert.equal(values.size, 0);
+    admission = { root: 'software', identity: 'new-workspace' };
+    failure = true;
+    await owner.refresh();
+    assert.equal(values.size, 0);
+    assert.throws(
+      () => owner.current('failed-window'),
+      (error: Error) => {
+        assert.match(error.message, /storage unavailable/);
+        assert.match(error.message, /reload the window/i);
+        return true;
       },
-    });
-    assert.ok(run);
-    await run();
-    assert.equal(installed, 1);
-    assert.deepEqual(errors, []);
-    assert.deepEqual(appended, [], platform);
-    assert.ok(messages.at(-1)?.includes(executable));
-    assert.doesNotMatch(messages.at(-1)!, /New editor terminals include|export PATH|fish_add_path/);
-    assert.doesNotMatch(manualToolPath('/home/user/arc:tools/bin'), /export PATH|fish_add_path/);
+    );
+    failure = false;
+    await owner.refresh();
+    assert.equal(values.size, 2);
+    admissionFailure = true;
+    assert.throws(
+      () => owner.current('rejected-window'),
+      (error: Error) => {
+        assert.ok(error.message.includes('/fixture/redirected-root'));
+        return true;
+      },
+    );
+    assert.equal(values.size, 0);
+    await owner.refresh();
+    assert.throws(() => owner.current(null), /redirected-root/);
+    assert.equal(values.size, 0);
+    owner.dispose();
+    assert.equal(values.size, 0);
+    await owner.refresh();
+    assert.equal(values.size, 0);
+    assert.throws(() => owner.current(null), /unavailable/);
+    assert.equal(terminalToolPath(platform === 'win32' ? 'C:/bad;entry' : '/bad:entry', platform), undefined);
   },
 );
 
-test('PATH append preserves raw Windows entries, registry representation and existing command precedence', () => {
-  for (const kind of ['String', 'ExpandString'] as const) {
-    const previous = { value: '%USERPROFILE%\\old;"C:\\quoted dir";;C:\\other;', kind };
-    const result = appendedUserPath(previous, 'C:\\Arc Bin');
-    assert.deepEqual(result, { value: previous.value + 'C:\\Arc Bin', kind });
-    assert.equal(appendedUserPath(result, 'c:/arc bin/'), result);
-  }
-  assert.throws(() => appendedUserPath({ value: null, kind: 'String' }, 'C:/arc;wrong'), /cannot/);
-  assert.deepEqual(terminalToolPath('C:/Arc Bin', 'win32'), { variable: 'Path', value: ';C:/Arc Bin' });
-  for (const platform of ['darwin', 'linux'] as const)
-    assert.deepEqual(terminalToolPath('/home/user/arc;tools/bin', platform), {
-      variable: 'PATH',
-      value: ':/home/user/arc;tools/bin',
-    });
-  const root = tempDir('arc-existing-command-');
-  fs.writeFileSync(path.join(root, 'arc.cmd'), '@echo off');
-  fs.writeFileSync(path.join(root, 'arc'), '#!/bin/sh');
-  fs.chmodSync(path.join(root, 'arc'), 0o755);
-  assert.equal(existingToolCommands({ PATH: root }, 'win32')[0], path.join(root, 'arc'));
-  if (process.platform !== 'win32') {
-    for (const platform of ['linux', 'darwin'] as const)
-      assert.equal(existingToolCommands({ PATH: root }, platform)[0], path.join(root, 'arc'));
-  }
-  assert.match(manualToolPath('/home/user/arc tools'), /first available ~\/.bash_profile/);
-  assert.match(manualToolPath('/home/user/arc tools'), /ZDOTDIR/);
-  assert.match(manualToolPath('/home/user/arc tools'), /fish_add_path --append --path/);
-  assert.throws(() => admitToolPath('relative'), /absolute/);
-  const bin = path.join(root, 'bin');
-  fs.mkdirSync(bin);
-  const previous = { value: '%USERPROFILE%\\old;"C:\\quoted dir";;', kind: 'String' as const };
-  const writes: unknown[] = [];
-  const execute = (script: string) => {
-    assert.equal(fs.existsSync(path.join(root, '.arc-command-path.lock')), true);
-    const encoded = /FromBase64String\('([^']+)'\)/.exec(script);
-    if (!encoded) return JSON.stringify(previous);
-    const change = JSON.parse(Buffer.from(encoded[1], 'base64').toString('utf8'));
-    assert.deepEqual(change.previous, previous);
-    assert.deepEqual(change.next, appendedUserPath(previous, canonicalToolPath(bin)));
-    assert.throws(() => appendWindowsUserPath(root, root, 'win32', execute), /Another Arc setup/);
-    writes.push(change);
-    return 'appended';
+test('obsolete private preparation never publishes after admission changes or disposal', async () => {
+  const values = new Map<string, string>();
+  const collection = {
+    persistent: true,
+    description: undefined as unknown,
+    clear: () => values.clear(),
+    append: (key: string, value: string) => values.set(key, value),
+    replace: (key: string, value: string) => values.set(key, value),
   };
-  assert.equal(appendWindowsUserPath(bin, root, 'win32', execute), 'appended');
-  assert.equal(writes.length, 1);
-  assert.equal(fs.existsSync(path.join(root, '.arc-command-path.lock')), false);
+  let admission: ToolAdmission | null = { root: 'one', identity: 'local' };
+  let complete!: (directory: string) => void;
+  let signal!: AbortSignal;
+  const owner = new TerminalTools(
+    collection,
+    () => admission,
+    async (_admission, wantedSignal) => {
+      signal = wantedSignal;
+      return new Promise<string>((resolve) => {
+        complete = resolve;
+      });
+    },
+    '/editor',
+    'linux',
+  );
+  const first = owner.refresh();
+  await vi.waitFor(() => assert.ok(complete));
+  assert.throws(() => owner.current('waiting-window'), /preparing/);
+  assert.equal(signal.aborted, false);
+  admission = null;
+  await owner.refresh();
+  assert.equal(signal.aborted, true);
+  complete('/obsolete');
+  await first;
+  assert.equal(values.size, 0);
+  admission = { root: 'two', identity: 'local' };
+  const second = owner.refresh();
+  await vi.waitFor(() => assert.equal(signal.aborted, false));
+  owner.dispose();
+  complete('/disposed');
+  await second;
+  assert.equal(values.size, 0);
+});
+
+test('simultaneous first-window preparation publishes ownership before another window reads it', async () => {
+  const root = tempDir('arc-first-windows-');
+  const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), path.join(root, 'software'));
+  const other = new BundledTools(tools.bundle, tools.root);
+  const signal = new AbortController().signal;
+  let second: Promise<string> | undefined;
+  let failure: unknown;
+  let started = false;
+  const collide = () => {
+    if (!started) {
+      started = true;
+      second = other.preparePrivateCommands(signal).catch((error) => {
+        failure = error;
+        return '';
+      });
+    }
+  };
+  const mkdir = fs.mkdirSync;
+  const rename = fs.renameSync;
+  const mkdirSpy = vi.spyOn(nativeFs, 'mkdirSync').mockImplementation(((
+    folder: fs.PathLike,
+    options: fs.MakeDirectoryOptions,
+  ) => {
+    const result = mkdir(folder, options);
+    if (folder === tools.tools) collide();
+    return result;
+  }) as typeof fs.mkdirSync);
+  const renameSpy = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+    if (to === tools.tools) collide();
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  let first: Promise<string>;
+  try {
+    first = tools.preparePrivateCommands(signal);
+  } finally {
+    mkdirSpy.mockRestore();
+    renameSpy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  assert.ok(second);
+  const [one, two] = await Promise.all([first, second]);
+  assert.ifError(failure);
+  assert.equal(one, two);
+  assert.deepEqual(fs.readdirSync(tools.root), ['tools']);
+  assert.equal(fs.existsSync(path.join(tools.tools, '.install.lock')), false);
+});
+
+test.each(['empty', 'unfamiliar', 'redirected'] as const)(
+  'failed first-window publication preserves only unfamiliar staging contents: %s',
+  async (contents) => {
+    const root = tempDir('arc-failed-claim-');
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), path.join(root, 'software'));
+    const target = path.join(root, 'target');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'keep'), 'external');
+    let staged = '';
+    const renameSpy = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+      assert.equal(to, tools.tools);
+      staged = String(from);
+      if (contents === 'unfamiliar') fs.writeFileSync(path.join(staged, 'keep'), 'unfamiliar');
+      if (contents === 'redirected') {
+        fs.unlinkSync(path.join(staged, 'ownership.json'));
+        fs.rmdirSync(staged);
+        fs.symlinkSync(target, staged, process.platform === 'win32' ? 'junction' : 'dir');
+      }
+      throw new Error('publication failed');
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(tools.preparePrivateCommands(new AbortController().signal), /publication failed/);
+      assert.equal(fs.existsSync(staged), contents !== 'empty');
+      if (contents === 'unfamiliar') assert.equal(fs.readFileSync(path.join(staged, 'keep'), 'utf8'), 'unfamiliar');
+      assert.equal(fs.readFileSync(path.join(target, 'keep'), 'utf8'), 'external');
+    } finally {
+      renameSpy.mockRestore();
+      syncBuiltinESMExports();
+      if (contents === 'redirected' && fs.existsSync(staged)) fs.unlinkSync(staged);
+    }
+  },
+);
+
+test('a second window prepares its private CLI after another setup releases ownership', async () => {
+  const root = tempDir('arc-window-contention-');
+  const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), path.join(root, 'software'));
+  let release!: () => void;
+  const held = tools.owned(
+    async () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    new AbortController().signal,
+  );
+  const lock = path.join(tools.tools, '.install.lock');
+  const bytes = fs.readFileSync(lock);
+  const values = new Map<string, string>();
+  let requested = false;
+  let signal!: AbortSignal;
+  const owner = new TerminalTools(
+    {
+      persistent: true,
+      description: undefined,
+      clear: () => values.clear(),
+      append: (key, value) => values.set(key, value),
+      replace: (key, value) => values.set(key, value),
+    },
+    () => ({ root: tools.root, identity: 'second-window' }),
+    (admission, wantedSignal) => {
+      requested = true;
+      signal = wantedSignal;
+      return new BundledTools(tools.bundle, admission.root).preparePrivateCommands(wantedSignal);
+    },
+    process.execPath,
+  );
+  const refreshed = owner.refresh();
+  await vi.waitFor(() => assert.equal(requested, true));
+  try {
+    assert.throws(() => owner.current('second-window'), /preparing/);
+    assert.equal(signal.aborted, false);
+    assert.deepEqual(fs.readFileSync(lock), bytes);
+  } finally {
+    release();
+    await held;
+    await refreshed;
+  }
+  const environment = owner.current('second-window');
+  assert.equal(environment.directory, path.join(tools.tools, 'releases', tools.bundle.payload.contentId, 'launchers'));
+  assert.equal(environment.windowId, 'second-window');
+  assert.equal(values.has('ARC_WINDOW'), false);
+  assert.equal(fs.existsSync(lock), false);
+  owner.dispose();
+});
+
+test('private ownership waits preserve retained locks until canceled', async () => {
+  const root = tempDir('arc-retained-lock-');
+  const file = path.join(root, '.install.lock');
+  const lock = acquireToolLock(file);
+  const bytes = fs.readFileSync(file);
+  vi.useFakeTimers();
+  try {
+    const controller = new AbortController();
+    let settled = false;
+    const waiting = waitForToolLock(file, controller.signal);
+    const canceled = assert.rejects(waiting, /canceled/).then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    assert.equal(settled, false);
+    assert.deepEqual(fs.readFileSync(file), bytes);
+    controller.abort();
+    await canceled;
+    assert.deepEqual(fs.readFileSync(file), bytes);
+  } finally {
+    vi.useRealTimers();
+    lock.release();
+  }
+});
+
+test('a published private release remains available under retained software ownership', async () => {
+  const root = tempDir('arc-ready-retained-');
+  const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), root);
+  const signal = new AbortController().signal;
+  await tools.installCommands(process.execPath, signal);
+  const active = fs.readFileSync(path.join(tools.tools, 'active.json'));
+  const lock = acquireToolLock(path.join(tools.tools, '.install.lock'));
+  const bytes = fs.readFileSync(lock.file);
+  const values = new Map<string, string>();
+  const owner = new TerminalTools(
+    {
+      persistent: true,
+      description: undefined,
+      clear: () => values.clear(),
+      append: (key, value) => values.set(key, value),
+      replace: (key, value) => values.set(key, value),
+    },
+    () => ({ root: tools.root, identity: 'ready-retained' }),
+    (_admission, wantedSignal) => tools.preparePrivateCommands(wantedSignal),
+    process.execPath,
+  );
+  const stage = vi.spyOn(tools, 'stage');
+  const open = vi.spyOn(nativeFs, 'openSync');
+  const mkdir = vi.spyOn(nativeFs, 'mkdirSync');
+  syncBuiltinESMExports();
+  vi.useFakeTimers();
+  try {
+    const refreshed = owner.refresh();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(
+      owner.current('retained-window').directory,
+      path.join(tools.tools, 'releases', tools.bundle.payload.contentId, 'launchers'),
+    );
+    await refreshed;
+    assert.equal(stage.mock.calls.length, 0);
+    assert.equal(mkdir.mock.calls.length, 0);
+    assert.equal(
+      open.mock.calls.some(([file, flags]) => file === lock.file && flags === 'wx'),
+      false,
+    );
+    assert.deepEqual(fs.readFileSync(lock.file), bytes);
+    assert.deepEqual(fs.readFileSync(path.join(tools.tools, 'active.json')), active);
+    assert.equal(values.has('ARC_WINDOW'), false);
+  } finally {
+    owner.dispose();
+    stage.mockRestore();
+    open.mockRestore();
+    mkdir.mockRestore();
+    syncBuiltinESMExports();
+    vi.useRealTimers();
+    lock.release();
+  }
+});
+
+test.each(['absent', 'different'] as const)(
+  'retained software ownership ends private preparation without a matching release: %s',
+  async (release) => {
+    const root = tempDir('arc-unready-retained-');
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), root);
+    await tools.owned(async () => {
+      if (release === 'different') {
+        const published = tools.stage();
+        fs.renameSync(published, published + '-other');
+      }
+    }, new AbortController().signal);
+    const lock = acquireToolLock(path.join(tools.tools, '.install.lock'));
+    const bytes = fs.readFileSync(lock.file);
+    const values = new Map<string, string>();
+    const owner = new TerminalTools(
+      {
+        persistent: true,
+        description: undefined,
+        clear: () => values.clear(),
+        append: (key, value) => values.set(key, value),
+        replace: (key, value) => values.set(key, value),
+      },
+      () => ({ root: tools.root, identity: 'unready-retained' }),
+      (_admission, wantedSignal) => tools.preparePrivateCommands(wantedSignal),
+      process.execPath,
+    );
+    vi.useFakeTimers();
+    try {
+      const refreshed = owner.refresh();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.throws(() => owner.current('waiting'), /preparing/);
+      await vi.advanceTimersByTimeAsync(30_000);
+      assert.throws(
+        () => owner.current('failed'),
+        (error: Error) => error.message.includes(lock.file) && error.message.includes('remains owned'),
+      );
+      await refreshed;
+      assert.equal(values.size, 0);
+      assert.deepEqual(fs.readFileSync(lock.file), bytes);
+      assert.equal(fs.existsSync(path.join(tools.tools, 'releases', tools.bundle.payload.contentId)), false);
+    } finally {
+      owner.dispose();
+      vi.useRealTimers();
+      lock.release();
+    }
+  },
+);
+
+test.each(['silent', 'unavailable', 'error'] as const)(
+  'private preparation checks readiness without filesystem notifications: %s',
+  async (watching) => {
+    const root = tempDir('arc-readiness-poll-');
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), root);
+    await tools.owned(async () => undefined, new AbortController().signal);
+    const lock = acquireToolLock(path.join(tools.tools, '.install.lock'));
+    const bytes = fs.readFileSync(lock.file);
+    const watcher = {
+      close: vi.fn<() => void>(),
+      on: (_event: string, callback: () => void) => {
+        if (watching === 'error') callback();
+        return watcher;
+      },
+    };
+    const watch = vi.spyOn(nativeFs, 'watch').mockImplementation((() => {
+      if (watching === 'unavailable') throw new Error('notifications unavailable');
+      return watcher;
+    }) as unknown as typeof fs.watch);
+    syncBuiltinESMExports();
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    try {
+      let selected: string | undefined;
+      const waiting = tools.preparePrivateCommands(controller.signal).then((directory) => {
+        selected = directory;
+      });
+      const release = tools.stage();
+      await vi.advanceTimersByTimeAsync(250);
+      assert.equal(selected, path.join(release, 'launchers'));
+      await waiting;
+      assert.deepEqual(fs.readFileSync(lock.file), bytes);
+      lock.release();
+      const next = acquireToolLock(lock.file);
+      const acquired = waitForToolLock(lock.file, controller.signal);
+      next.release();
+      let settled = false;
+      void acquired.then((owned) => {
+        settled = true;
+        owned.release();
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      assert.equal(settled, true);
+      await acquired;
+    } finally {
+      controller.abort();
+      watch.mockRestore();
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+      lock.release();
+    }
+  },
+);
+
+test.each(['ownership', 'manifest', 'bytes', 'redirected'] as const)(
+  'retained ownership never admits an invalid private release: %s',
+  async (defect) => {
+    const root = tempDir('arc-invalid-ready-');
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), path.join(root, 'software'));
+    const signal = new AbortController().signal;
+    const directory = await tools.preparePrivateCommands(signal);
+    const lock = acquireToolLock(path.join(tools.tools, '.install.lock'));
+    const bytes = fs.readFileSync(lock.file);
+    const release = path.dirname(directory);
+    let link: string | undefined;
+    if (defect === 'ownership') fs.writeFileSync(path.join(tools.tools, 'ownership.json'), '{}');
+    if (defect === 'manifest') fs.writeFileSync(path.join(release, 'release.json'), '{}');
+    if (defect === 'bytes') fs.appendFileSync(path.join(release, 'cli/arc.cjs'), 'damaged');
+    if (defect === 'redirected') {
+      const moved = release + '-kept';
+      fs.renameSync(release, moved);
+      fs.symlinkSync(moved, release, process.platform === 'win32' ? 'junction' : 'dir');
+      link = release;
+    }
+    try {
+      await assert.rejects(tools.preparePrivateCommands(signal), /unfamiliar|damaged|redirected/);
+      assert.deepEqual(fs.readFileSync(lock.file), bytes);
+    } finally {
+      if (link) fs.unlinkSync(link);
+      lock.release();
+    }
+  },
+);
+
+test.each(['canceled', 'admission', 'disposed'] as const)(
+  'private contention preserves retained ownership after %s',
+  async (ending) => {
+    const root = tempDir('arc-canceled-contention-');
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), root);
+    await tools.owned(async () => undefined, new AbortController().signal);
+    const lock = acquireToolLock(path.join(tools.tools, '.install.lock'));
+    const bytes = fs.readFileSync(lock.file);
+    const values = new Map<string, string>();
+    let admission: ToolAdmission | null = { root: tools.root, identity: 'original' };
+    let signal: AbortSignal | undefined;
+    const owner = new TerminalTools(
+      {
+        persistent: true,
+        description: undefined,
+        clear: () => values.clear(),
+        append: (key, value) => values.set(key, value),
+        replace: (key, value) => values.set(key, value),
+      },
+      () => admission,
+      (_admission, wantedSignal) => {
+        signal = wantedSignal;
+        return tools.preparePrivateCommands(wantedSignal);
+      },
+      process.execPath,
+    );
+    vi.useFakeTimers();
+    try {
+      const refreshed = owner.refresh();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(signal?.aborted, false);
+      if (ending === 'disposed') owner.dispose();
+      else {
+        admission = null;
+        if (ending === 'canceled') await owner.refresh();
+        else assert.throws(() => owner.current('changed'), /unavailable/);
+      }
+      if (ending === 'admission') tools.stage();
+      await vi.advanceTimersByTimeAsync(250);
+      await refreshed;
+      assert.equal(values.size, 0);
+      assert.throws(() => owner.current('ended'), /unavailable/);
+      assert.deepEqual(fs.readFileSync(lock.file), bytes);
+    } finally {
+      owner.dispose();
+      vi.useRealTimers();
+      lock.release();
+    }
+  },
+);
+
+test('the extension removes global setup and refreshes private tools with workspace admission', () => {
+  const source = fs.readFileSync(path.join(extensionRoot, 'src/extension.ts'), 'utf8');
+  const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8'));
+  assert.doesNotMatch(
+    source,
+    /arc\.setupCommands|appendWindowsUserPath|installCommands|environmentVariableCollection\.append/,
+  );
+  assert.ok(
+    !manifest.contributes.commands.some((command: { command: string }) => command.command === 'arc.setupCommands'),
+  );
+  assert.ok(
+    !manifest.contributes.menus.commandPalette.some(
+      (command: { command: string }) => command.command === 'arc.setupCommands',
+    ),
+  );
   assert.equal(
-    appendWindowsUserPath(bin, root, 'win32', () => JSON.stringify({ value: bin, kind: 'ExpandString' })),
-    'present',
+    manifest.contributes.commands.find((command: { command: string }) => command.command === 'arc.setupClaudeSnapshots')
+      .title,
+    'Set up Claude hooks',
   );
-  assert.throws(
-    () => appendWindowsUserPath(bin, root, 'win32', () => JSON.stringify({ value: 'x', kind: 'DWord' })),
-    /unsupported/,
+  sourceMatch(source, /if \(!vscode\.workspace\.isTrusted\) return null/);
+  sourceMatch(source, /void privateTools\.refresh\(\)/);
+  sourceMatch(source, /context\.extensionMode === vscode\.ExtensionMode\.Development/);
+  sourceMatch(source, /const refreshSnapshots = \(\) => \{\s*void privateTools\.refresh\(\)/);
+  sourceMatch(source, /onDidGrantWorkspaceTrust\(refreshSnapshots\)/);
+  sourceMatch(source, /onDidChangeWorkspaceFolders\(refreshSnapshots\)/);
+});
+
+test('private CLI releases retain shared selection and select matching bytes before earlier npm commands for children', async () => {
+  const root = tempDir('arc-private-commands-');
+  const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), path.join(root, 'software'));
+  const signal = new AbortController().signal;
+  await tools.installCommands(process.execPath, signal);
+  const active = fs.readFileSync(path.join(tools.tools, 'active.json'));
+  const directory = await tools.preparePrivateCommands(signal);
+  assert.equal(directory, path.join(tools.tools, 'releases', tools.bundle.payload.contentId, 'launchers'));
+  assert.deepEqual(fs.readFileSync(path.join(tools.tools, 'active.json')), active);
+  const npm = path.join(root, 'npm');
+  fs.mkdirSync(npm);
+  fs.writeFileSync(path.join(npm, 'arc.cmd'), '@echo off\r\necho npm-old\r\n');
+  fs.writeFileSync(path.join(npm, 'arc'), '#!/bin/sh\necho npm-old\n', { mode: 0o755 });
+  const inherited = {
+    ...process.env,
+    PATH: npm,
+    ARC_HOME: path.join(root, 'data'),
+    ARC_EDITOR_EXECUTABLE: process.execPath,
+  };
+  for (const key of Object.keys(inherited))
+    if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete inherited[key as keyof typeof inherited];
+  const run = (env: NodeJS.ProcessEnv) =>
+    spawnSync(
+      process.platform === 'win32' ? (process.env.ComSpec ?? 'C:/Windows/System32/cmd.exe') : '/bin/sh',
+      process.platform === 'win32' ? ['/d', '/c', 'arc --version'] : ['-c', 'arc --version'],
+      { cwd: root, env, encoding: 'utf8' },
+    );
+  const ordinary = run({ ...inherited, PATH: npm + terminalToolPath(directory)!.value });
+  assert.equal(ordinary.status, 0, ordinary.stderr);
+  assert.equal(ordinary.stdout.trim(), 'npm-old');
+  const child = run(
+    childEnv(inherited, {}, undefined, root, { directory, editorExecutable: process.execPath, windowId: 'own-window' }),
   );
-  assert.throws(() => appendWindowsUserPath(bin, root, 'linux', execute), /only on Windows/);
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(
+    child.stdout.trim(),
+    JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+  );
+  assert.equal(fs.existsSync(inherited.ARC_HOME), false);
 });
 
 test('copied bundled hooks capture baselines and publish Stop after the extension payload disappears', async () => {

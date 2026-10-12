@@ -34,8 +34,19 @@ export function bundledTools(dist, sourceRoot, build) {
   };
   for (const folder of ['.claude-plugin', 'hooks', 'scripts']) visit(folder);
   copy(path.join(plugin, 'LICENSE'), 'plugin/LICENSE');
-  for (const name of ['arc', 'arc.cmd'])
-    copy(path.join(dist, 'bin', name), `launchers/${name}`, name === 'arc' ? 0o755 : 0o644);
+  const launchers = {
+    arc: '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$ARC_EDITOR_EXECUTABLE" "${0%/*}/../cli/arc.cjs" "$@"\n',
+    'arc.cmd':
+      '@echo off\r\nsetlocal DisableDelayedExpansion\r\nset "ELECTRON_RUN_AS_NODE=1"\r\n"%ARC_EDITOR_EXECUTABLE%" "%~dp0..\\cli\\arc.cjs" %*\r\nexit /b %errorlevel%\r\n',
+  };
+  for (const [name, bytes] of Object.entries(launchers)) {
+    const relative = `launchers/${name}`;
+    const mode = name === 'arc' ? 0o755 : 0o644;
+    fs.mkdirSync(path.join(destination, 'launchers'), { recursive: true });
+    fs.writeFileSync(path.join(destination, relative), bytes, { mode });
+    fs.chmodSync(path.join(destination, relative), mode);
+    files[relative] = { sha256: createHash('sha256').update(bytes).digest('hex'), mode };
+  }
   const pluginManifest = JSON.parse(fs.readFileSync(path.join(plugin, '.claude-plugin/plugin.json'), 'utf8'));
   const identity = {
     schemaVersion: 1,

@@ -197,6 +197,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
     return async () => undefined;
   }
 
+  await cli.rebuild();
   await current.context.watch();
   await cli.watch();
   let watchers = [];

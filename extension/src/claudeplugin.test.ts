@@ -1108,6 +1108,18 @@ test('bundled configuration catalogs retain independent releases and never activ
   assert.equal(fs.existsSync(path.join(a.tools.tools, 'active.json')), false);
 });
 
+test('private CLI preparation retains older releases without selecting standalone commands', async () => {
+  const a = bundledFixture();
+  const b = bundledFixture('B', a.tools.root);
+  const first = await a.tools.preparePrivateCommands(a.f.signal);
+  const second = await b.tools.preparePrivateCommands(b.f.signal);
+  assert.notEqual(first, second);
+  assert.ok(fs.existsSync(path.join(path.dirname(first), 'release.json')));
+  assert.ok(fs.existsSync(path.join(path.dirname(second), 'release.json')));
+  assert.equal(fs.existsSync(path.join(a.tools.tools, 'active.json')), false);
+  assert.equal(fs.existsSync(path.join(a.tools.root, 'bin')), false);
+});
+
 test('bundled wrapped unsettled mutations retain software and configuration locks and block command setup', async () => {
   const a = bundledFixture();
   a.mutation(async () => {

@@ -4122,7 +4122,7 @@ test('the extension binds its packaged CLI and current window to every child ent
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   sourceMatch(
     source,
-    /const spawner = arcCliSpawner\(\(\) => \(\{\s*directory: path\.join\(context\.extensionPath, 'dist', 'bin'\),\s*editorExecutable: process\.execPath,\s*windowId: channel\?\.windowId \?\? null/,
+    /const spawner = arcCliSpawner\(\(\) => privateTools\.current\(channel\?\.windowId \?\? null\)\)/,
   );
   sourceMatch(source, /const host = new AgentHost\(\{\s*spawner,/);
   for (const helper of ['askIdle', 'askIdleMcp', 'askIdleMcpChange', 'askIdleDefaults'])

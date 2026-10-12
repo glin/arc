@@ -10,7 +10,7 @@ The Arc CLI reports session cost from disk, renders Claude Code status-line inpu
 
 Agents started by the panel can run `arc` from their shell commands through the extension's packaged launchers. [Agent runtime](agent-protocols.md#runtime-shape) owns their environment and window targeting.
 
-The installed VSIX commands read their selected release from their own installation root. Caller `ARC_HOME` still selects CLI data. Offline cost and status-line commands work with the editor closed. [Extension installation](../README.md#try-it) owns command setup and PATH consent.
+Private VSIX launchers run their matching immutable release. Caller `ARC_HOME` still selects CLI data. [Extension installation](../README.md#try-it) owns terminal availability. Standalone commands use the separate npm installation route.
 
 From a source checkout, build the CLI from the repository root:
 

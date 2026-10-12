@@ -99,13 +99,8 @@
     },
     "commands": [
       {
-        "command": "arc.setupCommands",
-        "title": "Set up terminal commands",
-        "category": "Arc"
-      },
-      {
         "command": "arc.setupClaudeSnapshots",
-        "title": "Set up Claude snapshots",
+        "title": "Set up Claude hooks",
         "category": "Arc"
       },
       {
@@ -548,10 +543,6 @@
         }
       ],
       "commandPalette": [
-        {
-          "command": "arc.setupCommands",
-          "when": "true"
-        },
         {
           "command": "arc.setupClaudeSnapshots",
           "when": "true"
