@@ -4139,6 +4139,11 @@ test('activate wires the guarded send policy into reader callbacks, draft starts
     activate,
     /guardedDeliveryPort\(guardedSends, host, activeWriterFailure, randomUUID, \(child, turnId\) =>\s*compaction\?\.submitted\(child, turnId\),?\s*\)/,
   );
+  sourceMatch(
+    activate,
+    /new GuardedSends<AgentSession>\(channel\?\.hostId \?\? '', \(owner\) =>\s*host\.find\(owner\.child\.agent, owner\.worker\),?\s*\)/,
+    'guarded observations require the exact child retained by the host',
+  );
   const intervention = activate.indexOf('interveneOnReaderInput(panel, guardedSends);');
   assert.ok(intervention >= 0, 'activate wraps the directing reader callbacks');
   for (const name of ['onSendPrompt', 'onCompact', 'onClear', 'onStopTurn', 'onAnswerAsk']) {

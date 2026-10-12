@@ -2733,8 +2733,8 @@ class GuardChild {
 }
 
 function guardFixture() {
-  const policy = new GuardedSends<GuardChild>('window');
   const child = new GuardChild();
+  const policy = new GuardedSends<GuardChild>('window', (owner) => port.live(owner));
   const coordinator = { provider: 'claude' as const, id: 'coordinator' };
   policy.recordStart({
     requester: coordinator,
@@ -2758,8 +2758,9 @@ function guardFixture() {
   const writes: GuardedAttempt[] = [];
   const port = {
     alive: true,
+    retained: child as GuardChild | null,
     leased: true,
-    live: (owner: GuardedOwner<GuardChild>) => (port.alive ? owner.child : null),
+    live: (_owner: GuardedOwner<GuardChild>) => (port.alive ? port.retained : null),
     withLease: async <T>(_child: GuardChild, work: () => Promise<T>) => (port.leased ? work() : null),
     write: (_child: GuardChild, _text: string) => {
       const attempt = new GuardedAttempt(`uuid-${writes.length}`);
@@ -2892,8 +2893,9 @@ test('guarded sends consume observations, bind source, scope, turn and assignmen
     assert.equal((await send()).reason, reason);
   }
   child.idle = null;
+  const beforeClear = policy.observe('worker', coordinator, facts)!;
   child.sessionId = 'cleared-successor';
-  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  assert.equal((await send({ observation: beforeClear })).reason, GUARDED_SEND_REASONS.ownership);
   child.sessionId = 'worker';
   assert.equal(writes.length, 2);
 });
@@ -2919,6 +2921,46 @@ test('a guarded send read while an accepted follow-up still runs refuses as busy
   assert.equal(writes.length, 1);
 });
 
+// A removed child can still report unexited while its disposal finishes.
+test('guarded observations require the exact retained child and keep retirement before the lease unwritten', async () => {
+  const { policy, child, coordinator, facts, writes, port, send } = guardFixture();
+  const ports = guardedPanelPorts(policy);
+  const request = {
+    id: 'window:read',
+    requester: 'coordinator',
+    requesterProvider: 'claude' as const,
+    params: { sessionId: 'worker' },
+  };
+  const live = ports.guardedObservation(request, facts)!;
+  assert.equal(typeof live, 'string');
+  assert.equal(policy.precheck(guardedRequest(live, coordinator)), null);
+  port.retained = null;
+  assert.equal(child.state().exited, false);
+  assert.equal(ports.guardedObservation(request, facts), null, 'retirement signed a read before disposal finished');
+  assert.equal((await send({ observation: live })).reason, GUARDED_SEND_REASONS.ownership);
+  const replacement = new GuardChild();
+  port.retained = replacement;
+  assert.equal(ports.guardedObservation(request, facts), null, 'a same-ID replacement signed the original child read');
+  assert.equal((await send({ observation: live })).reason, GUARDED_SEND_REASONS.ownership);
+  port.retained = child;
+  child.exited = true;
+  assert.equal(ports.guardedObservation(request, facts), null);
+  child.exited = false;
+  child.sessionId = 'another-session';
+  assert.equal(ports.guardedObservation(request, facts), null);
+  child.sessionId = 'worker';
+  const beforeLease = ports.guardedObservation(request, facts)!;
+  assert.equal(typeof beforeLease, 'string');
+  port.withLease = async () => {
+    port.retained = null;
+    return null;
+  };
+  assert.equal((await send({ observation: beforeLease })).reason, GUARDED_SEND_REASONS.ownership);
+  assert.deepEqual(writes, []);
+  assert.deepEqual(child.attempts, []);
+  assert.deepEqual(replacement.attempts, []);
+});
+
 test('reader intervention, retirement, writer conflicts, and unknown or shared-turn outcomes block guarded sends without a resend', async () => {
   const { policy, coordinator, facts, writes, port, send } = guardFixture();
   for (const reader of ['worker', 'coordinator']) {
@@ -2927,8 +2969,9 @@ test('reader intervention, retirement, writer conflicts, and unknown or shared-t
     assert.equal((await send({ observation })).reason, GUARDED_SEND_REASONS.stale, reader);
   }
   policy.intervene('unrelated-session');
+  const beforeRetirement = policy.observe('worker', coordinator, facts)!;
   port.alive = false;
-  assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
+  assert.equal((await send({ observation: beforeRetirement })).reason, GUARDED_SEND_REASONS.ownership);
   port.alive = true;
   port.leased = false;
   assert.equal((await send()).reason, GUARDED_SEND_REASONS.ownership);
@@ -3259,8 +3302,8 @@ test('a deferred compaction requested from a guarded follow-up turn binds to tha
   for (const agent of ['claude', 'codex'] as const) {
     const { fixture } = compactHostFixture(agent);
     const { host, child } = fixture;
-    const policy = new GuardedSends<GuardChild>('window');
     const writer = new GuardChild();
+    const policy = new GuardedSends<GuardChild>('window', () => writer);
     const delivery = guardedDeliveryPort(
       policy,
       { find: () => writer, withActivity: async (_key, work) => work(writer) },

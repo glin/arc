@@ -307,7 +307,10 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
   private readonly steering = new Map<string, number>();
   facts: GuardedFactsPort | null = null;
 
-  constructor(readonly activation: string) {}
+  constructor(
+    readonly activation: string,
+    private readonly live: (owner: GuardedOwner<C>) => C | null,
+  ) {}
 
   // Labels, parent links, and supplied IDs never create an association. Only a recorded start does.
   recordStart(owner: GuardedOwner<C>): boolean {
@@ -357,6 +360,9 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
   observe(sessionId: string, requester: RequesterIdentity | null, facts: GuardedObservationFacts): string | null {
     const worker = this.workers.get(sessionId);
     if (!worker || !requester || !sameRequester(worker.owner.requester, requester)) return null;
+    const child = this.live(worker.owner);
+    const state = child?.state();
+    if (child !== worker.owner.child || !state || state.exited || state.sessionId !== sessionId) return null;
     if (facts.scope === null || facts.sourceRevision === null) return null;
     const observation: Observation = {
       activation: this.activation,

@@ -2108,7 +2108,7 @@ export class PanelProvider implements vscode.Disposable {
     const state = this.stateFor(session);
     const presses = (this.live[session] ?? []).filter((press) => !press.completed && !press.failed);
     const prompts = presses.filter((press) => press.kind === 'prompt').length;
-    const status = this.railStatuses(Date.now()).statuses.get(session);
+    const status = this.railStatuses(Date.now(), session).statuses.get(session);
     return {
       current: matches.length === 1 && state !== null,
       archived: this.hidden.has(session),
@@ -8408,38 +8408,54 @@ export class PanelProvider implements vscode.Disposable {
 
   // Each session's rail status and live open child count, from one clock reading, so a card in
   // the `subagents` state always draws its count.
-  private railStatuses(now: number): {
+  private railStatuses(
+    now: number,
+    session?: string,
+  ): {
     statuses: ReturnType<typeof sessionStatusOf>;
     openChildren: Map<string, number>;
   } {
+    const outcomes =
+      session === undefined ? this.sessionOutcomes : new Map([[session, this.sessionOutcomes.get(session) ?? null]]);
+    const rows = session === undefined ? this.sessionRows : this.sessionRows.filter((row) => row.id === session);
     return timelineRailState(
-      this.sessionOutcomes,
-      this.liveOpenChildren(now),
-      this.runningSessions(),
-      this.waitingSessions(),
-      this.runningSince(),
-      this.liveBackgroundCommands(now),
+      outcomes,
+      this.liveOpenChildren(now, outcomes, rows),
+      session === undefined ? this.runningSessions() : runningSessions(rows, [...this.running]),
+      session === undefined
+        ? this.waitingSessions()
+        : new Set(this.asks.filter((entry) => entry.session === session).map((entry) => entry.session)),
+      session === undefined ? this.runningSince() : runningSessionsSince(rows, this.runningSinceKeys),
+      this.liveBackgroundCommands(now, outcomes, rows),
       now,
     );
   }
 
   // Derive background command counts from held outcomes, exit times, and the supplied clock.
-  private liveBackgroundCommands(now: number): Map<string, number> {
-    return liveBackgroundCommands(
-      this.sessionOutcomes,
-      runningSessionsSince(this.sessionRows, this.exitedSinceKeys),
-      now,
-    );
+  private liveBackgroundCommands(
+    now: number,
+    outcomes = this.sessionOutcomes,
+    rows = this.sessionRows,
+  ): Map<string, number> {
+    return liveBackgroundCommands(outcomes, runningSessionsSince(rows, this.exitedSinceKeys), now);
   }
 
   // Closed children read work timestamps once per changed file version. Open children use held write times.
-  private liveOpenChildren(now: number): Map<string, string[]> {
+  private liveOpenChildren(
+    now: number,
+    outcomes = this.sessionOutcomes,
+    rows = this.sessionRows,
+  ): Map<string, string[]> {
     return liveTimelineChildren(
-      this.sessionOutcomes,
-      this.claudeChildren,
-      this.claudeChildReferences,
+      outcomes,
+      outcomes === this.sessionOutcomes
+        ? this.claudeChildren
+        : this.claudeChildren.filter((child) => outcomes.has(child.parentSessionId)),
+      outcomes === this.sessionOutcomes
+        ? this.claudeChildReferences
+        : this.claudeChildReferences.filter((child) => outcomes.has(child.parentSessionId)),
       this.claudeChildStatWrites,
-      runningSessionsSince(this.sessionRows, this.exitedSinceKeys),
+      runningSessionsSince(rows, this.exitedSinceKeys),
       now,
       (file) => (this.claudeChildWork ??= new ClaudeChildWorkCache()).read(file, this.claudeChildVersion(file)),
     );

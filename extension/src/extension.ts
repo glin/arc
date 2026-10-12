@@ -1504,7 +1504,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Guarded follow-up ownership for this activation. The panel host reaches the same policy through its
   // read facts and reader intervention ports, which are assigned beside its other callbacks.
-  const guardedSends = new GuardedSends<AgentSession>(channel?.hostId ?? '');
+  const guardedSends = new GuardedSends<AgentSession>(channel?.hostId ?? '', (owner) =>
+    host.find(owner.child.agent, owner.worker),
+  );
   Object.assign(panel, guardedPanelPorts(guardedSends));
   panel.installGuardedFacts?.(
     guardedFactsWithCompaction(

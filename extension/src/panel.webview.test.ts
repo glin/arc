@@ -19500,7 +19500,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
   );
   sourceMatch(
     panelHostSource,
-    /return timelineRailState\(\s*this\.sessionOutcomes,\s*this\.liveOpenChildren\(now\),\s*this\.runningSessions\(\),\s*this\.waitingSessions\(\),\s*this\.runningSince\(\),\s*this\.liveBackgroundCommands\(now\),\s*now,?\s*\)/,
+    /return timelineRailState\(\s*outcomes,\s*this\.liveOpenChildren\(now, outcomes, rows\),/,
     'the rail reads selected cards before their progressive result is accepted',
   );
   sourceMatch(
@@ -31102,7 +31102,7 @@ function guardedPanelFixture() {
   });
   const coordinator = { provider: 'claude' as const, id: 'coordinator' };
   const child = new GuardedPanelChild();
-  const policy = new GuardedSends<GuardedPanelChild>('window');
+  const policy = new GuardedSends<GuardedPanelChild>('window', (owner) => owner.child);
   policy.recordStart({ requester: coordinator, activation: 'window', worker: 'worker', child });
   Object.assign(provider, guardedPanelPorts(policy));
   provider.installGuardedFacts((sessionId: string) => provider.guardedTargetFacts(sessionId));
@@ -31411,6 +31411,150 @@ test('guarded target facts map rail status, archive, pending work, and a read of
   fs.appendFileSync(file, '{"type":"user"}\n');
   assert.notEqual(facts().sourceRevision, null);
   assert.equal(facts().latestTurn, null, 'a read of older bytes supplied the newest turn');
+});
+
+// Admission reads only the target's evidence while preserving the session-list status.
+test('guarded admission preserves target status without reading unrelated closed children', async () => {
+  const now = Date.parse('2026-10-03T03:15:00Z');
+  const close = now - 120_000;
+  const done: TurnOutcome = {
+    finished: true,
+    error: false,
+    interrupted: false,
+    startedAt: close - 1000,
+    endedAt: close,
+  };
+  const cases: [string, string | undefined, (host: Record<string, any>) => void][] = [
+    ['idle', 'done', () => {}],
+    ['running', 'running', (host) => host.running.add('claude:worker')],
+    ['Needs input', 'waiting', (host) => host.asks.push({ session: 'worker' })],
+    [
+      'background command',
+      'background',
+      (host) => (host.sessionOutcomes.get('worker').backgroundCommands = [{ id: 'command', startedAt: close }]),
+    ],
+    ['live child', 'subagents', (host) => (host.sessionOutcomes.get('worker').openChildren = ['child'])],
+    [
+      'closed child',
+      'done',
+      (host) => (host.sessionOutcomes.get('worker').closedChildren = [{ id: 'child', closedAt: close }]),
+    ],
+    [
+      'resumed closed child',
+      'subagents',
+      (host) => {
+        host.sessionOutcomes.get('worker').closedChildren = [{ id: 'child', closedAt: close }];
+        host.workTimes.set('/reference', now);
+      },
+    ],
+    [
+      'stale child',
+      'done',
+      (host) => {
+        host.sessionOutcomes.get('worker').openChildren = ['child'];
+        host.claudeChildStatWrites.set('/reference', now - 24 * 3_600_000);
+      },
+    ],
+    [
+      'dispatch reference',
+      'done',
+      (host) => {
+        host.sessionOutcomes.get('worker').openChildren = ['dispatch'];
+        host.claudeChildReferences.push({
+          parentSessionId: 'worker',
+          sessionId: 'dispatch',
+          file: '/dispatch',
+          mtimeMs: now,
+          kind: 'dispatch',
+        });
+      },
+    ],
+    [
+      'superseded running claim',
+      'done',
+      (host) => {
+        host.running.add('claude:worker');
+        host.runningSinceKeys.set('claude:worker', close - 1000);
+      },
+    ],
+    [
+      'current running claim',
+      'running',
+      (host) => {
+        host.running.add('claude:worker');
+        host.runningSinceKeys.set('claude:worker', close + 1000);
+      },
+    ],
+    [
+      'host exit',
+      'done',
+      (host) => {
+        host.sessionOutcomes.get('worker').openChildren = ['child'];
+        host.sessionOutcomes.get('worker').backgroundCommands = [{ id: 'command', startedAt: close }];
+        host.exitedSinceKeys.set('claude:worker', close);
+      },
+    ],
+    [
+      'earlier host exit',
+      'subagents',
+      (host) => {
+        host.sessionOutcomes.get('worker').openChildren = ['child'];
+        host.exitedSinceKeys.set('claude:worker', close - 2000);
+      },
+    ],
+    ['unknown', undefined, (host) => host.sessionOutcomes.set('worker', null)],
+  ];
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    for (const [name, expected, configure] of cases) {
+      const { provider, observe, send, writes, replacements } = guardedPanelFixture();
+      delete provider.railStatuses;
+      const workTimes = new Map([
+        ['/reference', close],
+        ['/unrelated', close],
+      ]);
+      const read = vi.fn<(file: string) => number | undefined>((file) => workTimes.get(file));
+      const version = vi.fn<(file: string) => string>(() => 'v1');
+      Object.assign(provider, {
+        sessionRows: ['worker', 'unrelated'].map((id) => ({ id, agentKey: 'claude' })),
+        sessionOutcomes: new Map([
+          ['worker', { ...done }],
+          ['unrelated', { ...done, closedChildren: [{ id: 'other', closedAt: close }] }],
+        ]),
+        claudeChildren: [
+          { parentSessionId: 'worker', sessionId: 'child', file: '/discovered', mtimeMs: now - 24 * 3_600_000 },
+          { parentSessionId: 'unrelated', sessionId: 'other', file: '/unrelated', mtimeMs: now },
+        ],
+        claudeChildReferences: [{ parentSessionId: 'worker', sessionId: 'child', file: '/reference', mtimeMs: now }],
+        claudeChildStatWrites: new Map([['/reference', now]]),
+        claudeChildWork: { read },
+        claudeChildVersion: version,
+        exitedSinceKeys: new Map(),
+        workTimes,
+      });
+      configure(provider);
+      assert.equal(provider.railStatuses(now).statuses.get('worker'), expected, name);
+      read.mockClear();
+      version.mockClear();
+      const facts = provider.guardedTargetFacts('worker');
+      const active = expected !== undefined && ['running', 'waiting', 'subagents', 'background'].includes(expected);
+      assert.equal(facts.background, expected === undefined ? null : active, name);
+      const result = await send(observe());
+      assert.equal(result.status, expected !== undefined && !active ? 'accepted' : 'refused', name);
+      assert.equal(writes.length, result.status === 'accepted' ? 1 : 0, name);
+      assert.deepEqual(replacements, [], name);
+      assert.ok(
+        read.mock.calls.every(([file]) => file === '/reference'),
+        name,
+      );
+      assert.ok(
+        version.mock.calls.every(([file]) => file === '/reference'),
+        name,
+      );
+    }
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 // Catches a rejected reader input that clears the block an unknown delivery left, and a setting pick that clears it
