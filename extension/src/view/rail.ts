@@ -18,7 +18,7 @@ export function createSessionLabelIndex() {
   };
 }
 
-import { matchSessions, parseSessionQuery, railStatusRuns } from '../domain/session-query.ts';
+import { matchSessions, parseSessionQuery, railStatusRuns, type SessionQueryContext } from '../domain/session-query.ts';
 import {
   RAIL_KEEPING_LENSES,
   RAIL_LENSES,
@@ -671,6 +671,7 @@ export function railClockCards<Card extends RailActiveCard>(cards: readonly Card
 // The live query that narrows the rail.
 export interface RailNarrowing {
   query: string;
+  queryContext?: SessionQueryContext;
 }
 
 // A keeping lens retains these session ids while the query stays the same. Panel reloads clear retention.
@@ -693,9 +694,9 @@ export function railShownCards<Card extends RailSectionCard>(
   const pool: RailClockCard<Card>[] = stamp ? railClockCards(cards, at) : [...cards];
   const lens = railQueryHeldLens(rail.query);
   if (lens === null) {
-    return matchSessions(pool, rail.query);
+    return matchSessions(pool, rail.query, rail.queryContext);
   }
-  const rest = matchSessions(pool, withoutRailLenses(rail.query));
+  const rest = matchSessions(pool, withoutRailLenses(rail.query), rail.queryContext);
   const matched = new Set(matchSessions(rest, RAIL_LENS_WORDS[lens]).map((card) => card.id));
   const still = kept && kept.query === rail.query && railKeepingQuery(rail.query) ? kept.ids : null;
   return rest.filter(
@@ -732,7 +733,7 @@ export function railHeadCounts(
     const rest = withoutRailLenses(pressRailLens(rail.query, lens));
     let counts = byRest.get(rest);
     if (!counts) {
-      counts = railCountsInRest(cards, shown, at, rest);
+      counts = railCountsInRest(cards, shown, at, rest, rail.queryContext);
       byRest.set(rest, counts);
     }
     return counts;
@@ -750,12 +751,13 @@ function railCountsInRest(
   shown: RailCountsOptions,
   at: number,
   rest: string,
+  queryContext?: SessionQueryContext,
 ): RailCounts {
   if (!parseSessionQuery(rest).terms.length) {
     return railCounts(cards, shown, at);
   }
   const pool: RailClockCard<RailSectionCard>[] = railQueryReadsCache(rest) ? railClockCards(cards, at) : [...cards];
-  const kept = new Set(matchSessions(pool, rest).map((card) => card.id));
+  const kept = new Set(matchSessions(pool, rest, queryContext).map((card) => card.id));
   return railCounts(cards, shown, at, { inQuery: (card) => kept.has(card.id) });
 }
 
@@ -1022,6 +1024,7 @@ export function railAgentWordShown(sectionId: string): boolean {
 
 // How the rail groups its sessions.
 export interface RailGrouping {
+  queryContext?: SessionQueryContext;
   groupBy?: RailGroupBy;
 }
 
@@ -1036,7 +1039,7 @@ export function railSections<T extends RailSectionCard>(
   views: readonly SavedView[],
   railSort: RailSort = 'latest',
   shown: RailCountsOptions = RAIL_SHOWN_BUCKETS,
-  { groupBy = 'time' }: RailGrouping = {},
+  { groupBy = 'time', queryContext }: RailGrouping = {},
 ): { sections: RailSection<T>[]; folded: Record<string, boolean> } {
   const folded: Record<string, boolean> = {};
   const sections: RailSection<T>[] = [];
@@ -1058,7 +1061,7 @@ export function railSections<T extends RailSectionCard>(
     // A view that does not keep archived sessions never sees one, so its section cannot
     // draw a card the reader put away.
     const pool = view.archived ? [...active, ...archived] : active;
-    const matched = matchSessions(pool, view.query);
+    const matched = matchSessions(pool, view.query, queryContext);
     for (const card of matched) {
       claimed.add(card.id);
     }

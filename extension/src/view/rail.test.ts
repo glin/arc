@@ -1852,3 +1852,22 @@ test('zero-match rail shortcuts stay hidden while View choices remain label-only
   );
   assert.ok(values.every((value) => !('figure' in value) && !('disabled' in value)));
 });
+
+test('live and saved prefix queries retain full catalog resolution across coverage changes', () => {
+  const cards = [
+    { id: 'abcdefgh-one', agent: 'Claude', label: 'First', at: 1, pinnedTop: false, current: false, archived: false },
+    { id: 'abcdefgh-hidden', agent: 'Codex', label: 'Hidden', at: 1, pinnedTop: false, current: false, archived: true },
+  ];
+  const identities = cards.map((card) => ({ sessionId: card.id, agent: card.agent }));
+  const view = { id: 'prefix', name: 'Prefix', query: 'id:abcdefgh', archived: false };
+  for (const coverage of ['complete', 'incomplete', 'complete', 'unavailable', 'complete'] as const) {
+    const queryContext = { identities, coverage, scope: 'scope', revision: coverage };
+    const shown = railShownCards(cards, { query: 'id:abcdefgh', queryContext }, 0);
+    assert.equal(shown.length, coverage === 'complete' ? 2 : 0);
+    const result = railSections(cards, 0, [view], 'latest', RAIL_SHOWN_BUCKETS, { queryContext });
+    assert.equal(
+      result.sections.find((section) => section.label === 'Prefix')!.cards.length,
+      coverage === 'complete' ? 1 : 0,
+    );
+  }
+});

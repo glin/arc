@@ -1,3 +1,10 @@
+import {
+  resolveSessionQuery,
+  sessionQueryResolutionError,
+  sessionQueryNeedsShorthand,
+  sessionQueryError,
+  type SessionQueryContext,
+} from './session-query.ts';
 import { test } from 'vitest';
 import assert from 'node:assert';
 import {
@@ -637,4 +644,76 @@ test('listing queries reject unavailable axes and never invert missing agent-run
   assert.equal(listingQueryError('label:arc -is:archived session:a OR session:codex:b'), null);
   const row = { sessionId: 'a', agent: 'claude', title: 'First', labels: [], archived: false, agentRun: null };
   assert.equal(listingTermHolds(parseSessionQuery('-is:agentrun').terms[0], row), false);
+});
+
+test('ID shorthand resolves unions and collisions against complete catalog identities', () => {
+  const rows = [
+    { id: 'abcdefgh-one', agent: 'Claude', label: 'First', labels: ['arc'] },
+    { id: 'ijklmnop-two', agent: 'Codex', label: 'Second', labels: ['arc'] },
+    { id: 'abcdefgh-other', agent: 'Codex', label: 'Hidden', archived: true },
+    { id: 'abcdefgh-one', agent: 'Claude', label: 'Duplicate source' },
+    { id: 'one', agent: 'Claude', label: 'Short' },
+    { id: 'abcdefgh', agent: 'Claude', label: 'Exact' },
+  ];
+  const context = (
+    pool = rows.slice(0, 5),
+    coverage: SessionQueryContext['coverage'] = 'complete',
+  ): SessionQueryContext => ({
+    identities: pool.map((row) => ({ sessionId: row.id, agent: row.agent })),
+    coverage,
+    scope: 'scope',
+    revision: '1',
+  });
+  const full = context();
+  assert.deepEqual(matchSessions(rows, 'id:abcdefgh label:arc id:ijklmnop -id:codex:abcdefgh', full), [
+    rows[0],
+    rows[1],
+  ]);
+  assert.deepEqual(matchSessions(rows, 'id:claude:abcdefgh id:codex:ijklmnop', full), [rows[0], rows[1], rows[3]]);
+  assert.deepEqual(matchSessions(rows, 'session:abcdefgh session:ijklmnop', full), []);
+  assert.deepEqual(matchSessions(rows, 'id:abcdefgh session:ijklmnop', full), []);
+  assert.deepEqual(matchSessions(rows, 'id:abcdefgh OR session:ijklmnop id:one', full), rows.slice(0, 5));
+  assert.deepEqual(matchSessions(rows, 'session:abcdefgh OR session:ijklmnop id:one', full), []);
+  assert.deepEqual(matchSessions(rows, 'id:abcdefg', full), []);
+  assert.deepEqual(matchSessions(rows, 'id:ABCDEFGH', full), []);
+  assert.deepEqual(matchSessions(rows, 'id:one', full), [rows[4]]);
+  assert.deepEqual(matchSessions(rows, 'id:abcdefgh', context(rows)), [rows[5]]);
+  assert.deepEqual(resolveSessionQuery('agent:claude id:abcdefgh', full).notes, ['abcdefgh matches 2 sessions.']);
+  assert.ok(sameQueryTerms('id:abcdefgh id:ijklmnop', 'id:ijklmnop OR id:abcdefgh'));
+  assert.ok(!sameQueryTerms('id:abcdefgh id:ijklmnop', 'session:abcdefgh session:ijklmnop'));
+  for (const query of ['id:', '-id:', 'id:other:abcdefgh', 'id:abcdefgh OR label:arc', 'id:abcdefgh OR -id:ijklmnop'])
+    assert.ok(sessionQueryError(query));
+  assert.deepEqual(parseSessionQuery('find: "id:abcdefgh"').find, ['id:abcdefgh']);
+  for (const query of ['id:abcdefgh', '-id:abcdefgh', 'session:codex:abcdefgh', 'id:one id:abcdefgh']) {
+    for (const coverage of ['incomplete', 'unavailable'] as const) {
+      assert.deepEqual(matchSessions(rows, query, context(undefined, coverage)), []);
+      assert.match(sessionQueryResolutionError(query, context(undefined, coverage))!, /discovery/);
+      assert.ok(
+        resolveSessionQuery(query, context(undefined, coverage)).notes.every((note) => !note.includes('matches')),
+      );
+    }
+    assert.equal(sessionQueryResolutionError(query, full), null);
+  }
+  const uuid = 'ef5a03c3-f255-41b6-b57c-c15af453ac8a';
+  assert.deepEqual(
+    matchSessions(
+      [
+        { id: uuid, agent: 'Claude', label: '' },
+        { id: uuid + 'x', agent: 'Claude', label: '' },
+      ],
+      'id:' + uuid,
+      context(),
+    ),
+    [{ id: uuid, agent: 'Claude', label: '' }],
+  );
+  for (const query of ['id:one', '-ID:claude:abcdefgh', 'session:codex:abcdefgh', '-session:abcdefgh'])
+    assert.ok(sessionQueryNeedsShorthand(query));
+  for (const query of [
+    '"id:abcdefgh"',
+    'find: "id:abcdefgh"',
+    'session:one',
+    'session:' + uuid,
+    '-session:codex:' + uuid,
+  ])
+    assert.ok(!sessionQueryNeedsShorthand(query));
 });

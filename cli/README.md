@@ -42,7 +42,7 @@ Filter a selected window with the existing session list query:
 
 ```sh
 arc sessions --query 'session:claude:one OR session:codex:two' --json
-arc filter 'session:claude:one OR session:codex:two' --json
+arc filter --query 'id:01a12cef id:01a12a6b' --json
 arc filter --clear --json
 ```
 

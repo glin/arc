@@ -56,6 +56,7 @@ export function railMessage(base: PanelPayload, rail: RailCard[]): Record<string
     labels: base.labels,
     views: base.views,
     railFilters: base.railFilters,
+    queryContext: base.queryContext,
     stats: base.stats,
     hidden: Array.isArray(base.hidden) ? base.hidden : [],
     pinnedTop: Array.isArray(base.pinnedTop) ? base.pinnedTop : [],

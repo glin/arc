@@ -6,6 +6,8 @@ import {
   LABEL_PREFIX,
   parseSessionQuery,
   sessionQueryError,
+  resolveSessionQuery,
+  type SessionQueryContext,
   quoteQueryValue,
   type SearchWhere,
   WHERE_PREFIX,
@@ -42,6 +44,10 @@ export function costNote(query: string): string | null {
 export function cacheExpiryNote(query: string): string | null {
   const invalid = parseSessionQuery(query).terms.find((term) => term.field === 'cache-expiry' && !term.comparison);
   return invalid ? `cache-expiry:${invalid.needle} ${CACHE_EXPIRY_UNKNOWN}` : null;
+}
+
+export function sessionIdentityNote(query: string, context?: SessionQueryContext): string | null {
+  return resolveSessionQuery(query, context).notes.join(' ') || null;
 }
 
 export function isNote(query: string): string | null {

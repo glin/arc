@@ -1061,6 +1061,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       latest.railFilters,
       latest.stats,
       workspaceCatalogAvailable,
+      latest.queryContext,
     );
     // Place session list popovers after both owners draw because their timeline-heading anchors can move.
     railRenderer.place();
@@ -1143,6 +1144,25 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       health: (msg) => vscode.postMessage({ type: 'health', sequence: msg.sequence }),
       visibility: (msg) => visibility.receive(msg),
       startupProgress: function (msg) {
+        if (latest && msg.queryContext) {
+          if (
+            latest.queryContext?.scope !== msg.queryContext.scope ||
+            latest.queryContext?.revision !== msg.queryContext.revision ||
+            latest.queryContext?.coverage !== msg.queryContext.coverage
+          )
+            searchRenderer.refresh();
+          latest.queryContext = msg.queryContext;
+          railRenderer.update(
+            latest.rail,
+            latest.labels,
+            latest.views,
+            latest.railFilters,
+            latest.stats,
+            workspaceCatalogAvailable,
+            msg.queryContext,
+          );
+        }
+        if (msg.queryOnly) return;
         if (
           msg.generation < loadingGeneration ||
           (msg.generation === loadingGeneration && loadingComplete) ||
@@ -1263,10 +1283,18 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       },
       // Retain session list updates on latest so later repaints keep the current workspace state.
       rail: function (msg) {
+        if (
+          msg.queryContext &&
+          (latest?.queryContext?.scope !== msg.queryContext.scope ||
+            latest?.queryContext?.revision !== msg.queryContext.revision ||
+            latest?.queryContext?.coverage !== msg.queryContext.coverage)
+        )
+          searchRenderer.refresh();
         sessionState.adopt(msg.hidden, msg.pinnedTop, sessionState.showing(), msg.sessionAdoptions);
         const projected = railAcrossSessionAdoption(msg.rail, msg.stats, msg.sessionAdoptions);
         const labeledBefore = latest ? labeledSessions() : null;
         if (latest) {
+          latest.queryContext = msg.queryContext;
           latest.rail = projected.rail;
           latest.stats = projected.stats;
           latest.labels = msg.labels;
@@ -1282,6 +1310,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           msg.railFilters,
           projected.stats,
           workspaceCatalogAvailable,
+          msg.queryContext,
         );
         // Refresh timeline headings from the same labels and figures as the session list.
         timelineRenderer.refreshHeadings(projected.stats);

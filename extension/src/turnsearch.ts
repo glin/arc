@@ -3,7 +3,13 @@
 
 import { Turn, responseAnswerIndex } from './transcript';
 import { formatWhen } from './turnformat';
-import { NUMERIC_FIELDS, parseSessionQuery, sessionTermHolds, type FilterTerm } from './domain/session-query.ts';
+import {
+  NUMERIC_FIELDS,
+  resolveSessionQuery,
+  sessionTermHolds,
+  type FilterTerm,
+  type SessionQueryContext,
+} from './domain/session-query.ts';
 export {
   canStartSearch,
   FIND_PREFIX,
@@ -190,8 +196,13 @@ export function searchScopeName(scope: { scoped: boolean; whole: boolean }): Sea
 
 // Finds turns containing every search word in the same prompt or answer half.
 // Results sort newest first. The first search word determines the snippet location.
-export function searchTurns(entries: SearchEntry[], query: string, now: number = Date.now()): SearchHit[] {
-  const { find, where, terms } = parseSessionQuery(query);
+export function searchTurns(
+  entries: SearchEntry[],
+  query: string,
+  now: number = Date.now(),
+  context?: SessionQueryContext,
+): SearchHit[] {
+  const { find, where, terms } = resolveSessionQuery(query, context);
   if (terms.some((term) => term.invalid)) return [];
   if (!find.length) {
     return [];

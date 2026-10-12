@@ -72,6 +72,8 @@ The extension never writes a file the agent changed. Hooks write only under the 
 
 ## Data sources
 
+The host publishes scoped catalog identities with discovery coverage, scope, and revision to session query consumers. Live filters, saved views, and content search resolve prefixes before narrowing their pools. Discovery admission suspends prefixes until accepted catalog metadata establishes completion. Coverage-only changes invalidate compiled resolution while preserving the reusable identity index. Content search re-evaluates retained entries when identity context changes. Explicit searches read transcript content. The local channel negotiates shorthand semantics before transporting filter or listing queries.
+
 `install.sh` detects complete source beside the script, then in the working directory, or resolves a GitHub ref and downloads its exact SHA. Remote source, dependencies, and the VSIX live in an installer-owned temporary directory that cleanup removes. Local builds use `npm install` to update existing dependencies. Temporary downloaded builds use `npm ci` for a clean installation. A local marketplace selects its relative plugin in place. The hosted catalog selects the plugin independently of `--repo` and `--ref`. `scripts/package-claude-plugin.js` produces the plugin ZIP, digest, and hosted catalog for the candidate workflow. [Installation](../README.md#try-it) owns source setup and hook options.
 
 The startup panel shell supplies no saved-filter catalog. The session list retains restored view folds until the host supplies the saved-filter catalog and views.
@@ -309,7 +311,7 @@ The first column is checked against the shipped extension directory by `architec
 | `turncomments.ts` | Normalizes, stores, and emits comments, then re-exports shared comment rules | no |
 | `turnread.ts` | Owns unread counts, retained-tail decisions, and current records for each session, then re-exports shared read rules | no |
 | `turnrail.ts` | Host session rows and ordering, the session that started each dispatched or subagent row, and re-exports of shared session list projections | no |
-| `turnsearch.ts` | Host turn-content search and snippets and re-exports shared session-query rules and projections | no |
+| `turnsearch.ts` | Host turn-content search and snippets using full scoped catalog identity resolution and re-exports shared session-query rules and projections | no |
 | `turnformat.ts` | Formats host-only time, duration, size, tokens, and model names and re-exports shared relative-time rules | no |
 | `turnlabels.ts` | Session-label storage, membership, counts, abandoned-draft cleanup, and editor rows and re-exports shared label rules | no |
 | `turnplaces.ts` | The trail of sessions the reader visited, and the walk back and forward along it | no |
@@ -383,7 +385,7 @@ The first column is checked against the shipped extension directory by `architec
 | `domain/resume.ts` | Browser-safe terminal resume command for each supported agent, and the session identities that may not become one | no |
 | `domain/identity.ts` | Browser-safe product, extension, storage, package, and scheme identifiers, re-exported by `identity.ts` | no |
 | `domain/session-link.ts` | Browser-safe response session link parsing and formatting, native context masks, exact target resolution, and pending target admission | no |
-| `domain/session-query.ts` | Browser-safe session-query grammar, quoting, caret tokens, full native session identity alternatives, metadata-only listing predicates, cost, cache-expiry, status and caller-answered cache terms, matching, and content-search eligibility | no |
+| `domain/session-query.ts` | Browser-safe session-query grammar, quoting, caret tokens, native session identity alternatives, catalog-backed prefix resolution and capability requirements, metadata-only listing predicates, cost, cache-expiry, status and caller-answered cache terms, matching, and content-search eligibility | no |
 | `domain/session-setups.ts` | Browser-safe pinned setup records, value checks, and recent setup limits | no |
 | `domain/export-model.ts` | Browser-safe captured session contracts | no |
 | `domain/export-limits.ts` | Capture and static viewer admission limits | no |
@@ -402,7 +404,7 @@ The first column is checked against the shipped extension directory by `architec
 | `view/launcher.ts` | Browser-safe launcher contracts and the custom setup's accessible names for Create draft and the field pin | no |
 | `view/projectspend.ts` | Browser-safe Project cost display contracts, projections, ordering, and indexing timing | no |
 | `view/rail.ts` | Browser-safe session list preferred width, effective viewport bounds, keyboard resize decisions, group-list identities, bucket, section, grouping, sort, density, time-slot, count, label-chip count, cache-mark, figure, drawn-row, row-id, and clock-tick projections, and the pin glyph the session list card and the session heading share, with the pencil glyph beside it | no |
-| `view/session-query.ts` | Browser-safe label suggestions, unknown search-area wording, and the cost and cache-expiry invalid-value notes | no |
+| `view/session-query.ts` | Browser-safe label suggestions, unknown search-area wording, identity resolution notes, and the cost and cache-expiry invalid-value notes | no |
 | `view/stat-detail.ts` | Browser-safe cost-line suffix shared by host and panel renderers, including cached-input share and request scale. Selects which line-count figures appear. Defines the subagent-row figures sent over the wire | no |
 | `view/export-facts.ts` | Browser-safe readable labels and exact captured values with shared figure formatting | no |
 | `view/timeline-layout.ts` | Browser-safe Timeline layout values, defaults, dialog wording, normalization of hand-typed settings, and save-refusal messages | no |

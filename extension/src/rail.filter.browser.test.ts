@@ -2089,17 +2089,23 @@ test(
       const initial = payload();
       const seed = initial.rail[0];
       initial.rail = [
-        { ...seed, id: 'one', agent: 'Claude', label: 'First', current: true, unread: true },
-        { ...seed, id: 'two', agent: 'Codex', label: 'Second', current: false, unread: false },
+        { ...seed, id: 'abcdefgh-one', agent: 'Claude', label: 'First', current: true, unread: true },
+        { ...seed, id: 'ijklmnop-two', agent: 'Codex', label: 'Second', current: false, unread: false },
         { ...seed, id: 'other', agent: 'Claude', label: 'Unrelated', current: false, unread: false },
       ];
-      initial.showing = 'one';
+      initial.showing = 'abcdefgh-one';
       initial.views = [];
+      initial.queryContext = {
+        identities: initial.rail.map((row) => ({ sessionId: row.id, agent: row.agent })),
+        coverage: 'complete',
+        scope: 'scope',
+        revision: '1',
+      };
       const saved = {
         railFilter: 'is:unread -is:archived -is:agentrun',
         railFilterId: 'all',
         railFolds: { railtoday: true },
-        showing: 'one',
+        showing: 'abcdefgh-one',
       };
       await openPage(page, initial, FIXTURE_CLOCK, saved);
       await postToPage(
@@ -2109,7 +2115,7 @@ test(
           initial.rail.map((row) => ({ ...row, unread: false })),
         ),
       );
-      const query = 'session:claude:one OR session:codex:two';
+      const query = 'id:abcdefgh id:ijklmnop';
       await postToPage(page, {
         type: 'applySessionFilter',
         request: 'external-one',
@@ -2124,7 +2130,7 @@ test(
         "window.__posted.find(message => message.type === 'sessionFilterApplied' && message.request === 'external-one')",
       )) as any;
       assert.equal(ack.state.railFilter, query);
-      assert.equal(ack.state.showing, 'one');
+      assert.equal(ack.state.showing, 'abcdefgh-one');
       await postToPage(page, {
         type: 'applySessionFilter',
         request: 'expired',

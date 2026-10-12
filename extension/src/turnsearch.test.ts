@@ -80,6 +80,7 @@ test('every axis the table holds can actually be asked for', () => {
               field: axis.field,
               needle: value,
               identities: { any: new Set([value]), claude: new Set(), codex: new Set() },
+              ...(axis.prefix === 'id' ? { shorthand: true } : {}),
             }
           : { field: axis.field, needle: value };
     assert.deepEqual(
@@ -717,4 +718,27 @@ test('content search narrows mixed-provider results through native session IDs',
   );
   assert.deepEqual(searchTurns(entries, 'session:one OR find:needle'), []);
   assert.equal(searchTurns(entries, 'find: OR').length, 3);
+});
+
+test('content prefix matching reads hidden catalog identities and suspends incomplete exclusions', () => {
+  const entries = [
+    entry({ sessionId: 'abcdefgh-one', agent: 'Claude', prompt: 'needle' }),
+    entry({ sessionId: 'other', agent: 'Codex', prompt: 'needle' }),
+  ];
+  const identities = [
+    { sessionId: 'abcdefgh-one', agent: 'Claude' },
+    { sessionId: 'abcdefgh-hidden', agent: 'Codex' },
+    { sessionId: 'other', agent: 'Codex' },
+  ];
+  const context = { identities, coverage: 'complete' as const, scope: 'scope', revision: '1' };
+  assert.deepEqual(
+    searchTurns(entries, 'id:abcdefgh find:needle', 0, context).map((hit) => hit.sessionId),
+    ['abcdefgh-one'],
+  );
+  for (const coverage of ['incomplete', 'unavailable'] as const)
+    assert.deepEqual(searchTurns(entries, '-id:abcdefgh find:needle', 0, { ...context, coverage }), []);
+  assert.deepEqual(
+    searchTurns(entries, '-id:abcdefgh find:needle', 0, { ...context, revision: '2' }).map((hit) => hit.sessionId),
+    ['other'],
+  );
 });

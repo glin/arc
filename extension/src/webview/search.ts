@@ -26,7 +26,9 @@ function searchWords(): SearchWords {
 
 export interface SearchRendererOptions {
   document: Document;
-  sendToHost(message: { type: 'search'; text: string } | { type: 'showSession'; session: string }): void;
+  sendToHost(
+    message: { type: 'search'; text: string; retained?: boolean } | { type: 'showSession'; session: string },
+  ): void;
 }
 
 export interface SearchRenderer {
@@ -34,6 +36,8 @@ export interface SearchRenderer {
   element: HTMLElement;
   // Turn a plain query into a content search and ask for it.
   start(query: string): void;
+  // Re-evaluate active results after the scoped catalog changes.
+  refresh(): void;
   // Accept a pending query's reply and report whether it was accepted.
   accept(query: string, scope: string, hits: readonly SearchHit[]): boolean;
   // Dismiss results and pending replies. Keep the query for another search.
@@ -118,14 +122,14 @@ export function createSearchRenderer(options: SearchRendererOptions): SearchRend
   let hits: readonly SearchHit[] | null = null;
   let scope: string = DEFAULT_SEARCH_SCOPE;
 
-  const ask = (text: string) => {
+  const ask = (text: string, retained = false) => {
     query = text;
     // The shared grammar decides whether to wait for search results.
     working = isSearch(text);
     if (!working) {
       hits = null;
     }
-    options.sendToHost({ type: 'search', text });
+    options.sendToHost({ type: 'search', text, ...(retained ? { retained: true } : {}) });
   };
 
   const press = (hit: SearchHit) => {
@@ -139,6 +143,11 @@ export function createSearchRenderer(options: SearchRendererOptions): SearchRend
     start(text) {
       // Use the content-search prefix from the shared grammar.
       ask(`${FIND_PREFIX}: ${text}`);
+    },
+    refresh() {
+      if (!hits && !working) return;
+      hits = null;
+      ask(query, true);
     },
     accept(replyQuery, replyScope, replyHits) {
       // Reject replies for an older query or a dismissed search.

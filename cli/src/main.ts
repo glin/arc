@@ -17,7 +17,7 @@ function help(): string {
     '       arc compact request --self --after-turn --request-id WINDOW:UUID --window WINDOW --json',
     '       arc compact status --request-id WINDOW:UUID --window WINDOW --json',
     '       arc sessions [--window ID] [--query QUERY] [--limit 1-128] [--cursor CURSOR] [--json]',
-    '       arc filter QUERY | arc filter --clear [--window ID] [--json]',
+    '       arc filter QUERY | arc filter --query QUERY | arc filter --clear [--window ID] [--json]',
     '       arc session ID [--turns 1-20] [--window ID] [--json]',
     '       arc setups [--window ID] [--json]',
     '       arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]',

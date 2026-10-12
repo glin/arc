@@ -13018,7 +13018,7 @@ test('the session on screen scopes the search, and every wording follows the sco
   // Scope search inputs to the selected session before reading individual files.
   sourceMatch(
     panelHostSource,
-    /searchScope\(this\.searchCorpus\(this\.showing\), this\.showing\)/,
+    /const entries = retained[^;]*this\.searchCorpus\(this\.showing\);[\s\S]*searchScope\(entries, this\.showing\)/,
     'the search is not scoped to the session on screen through the tested rule',
   );
   sourceMatch(
@@ -13097,6 +13097,7 @@ function searchHandler(): (host: object, text: string) => void {
   const member = memberFrom(panelHostSource, panelHostSource.indexOf('private answerSearch(query'));
   const answer = new Function(
     'query',
+    'retained',
     'searchScope',
     'searchScopeName',
     'labelsOf',
@@ -13106,8 +13107,11 @@ function searchHandler(): (host: object, text: string) => void {
   const handle = new Function('msg', 'isSearch', handlerBody(panelHostSource, 'search'));
   return (host, text) => {
     Object.assign(host, {
+      sessionQueryContext() {
+        return undefined;
+      },
       answerSearch(this: object, query: string) {
-        answer.call(this, query, searchScope, searchScopeName, labelsOf, searchTurns);
+        answer.call(this, query, false, searchScope, searchScopeName, labelsOf, searchTurns);
       },
     });
     handle.call(host, { type: 'search', text }, isSearch);
@@ -32329,4 +32333,338 @@ test('qualified listing selectors preserve duplicate-source ambiguity across pro
     assert.ok(page.sessions.every((row: any) => row.ambiguous && row.id === 'session-0'));
     assert.equal(new Set(page.sessions.map((row: any) => row.source)).size, page.sessions.length);
   }
+});
+
+test('catalog prefix resolution suspends through discovery progress failure cancellation and metadata acceptance', async () => {
+  const { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } = await import('./derivedcache.ts');
+  const { sessionIdentityNote } = await import('./view/session-query.ts');
+  const { railShownCards, railSections } = await import('./view/rail.ts');
+  const { provider, sources } = pagedListingFixture(30);
+  sources.sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+  Object.defineProperty(provider, 'loadingLine', { value: { held: () => false, present() {} } });
+  const read = (query: string) => provider.readSessionRequest({ method: 'sessions', params: { query } });
+  assert.equal(read('id:session-').sessions.length, 30);
+  const identities = provider.sessionQueryContext().identities;
+  const posted: any[] = [];
+  let resolve!: (value: any) => void;
+  let progress!: (value: any) => boolean;
+  const roots = JSON.parse(provider.authoritativeCatalogScope);
+  Object.assign(provider, {
+    hosts: [{}],
+    windowStateHandler() {},
+    post: async (message: any) => {
+      posted.push(message);
+    },
+    refreshGeneration: 1,
+    repositoryScopeRoots: roots,
+    claudeParents: sources,
+    catalog: { sessions: sources },
+    claudeChildReferenceEntries: new Map(),
+    claudeChildStatWrites: new Map(),
+    carriedNames: new Map(),
+    derivedCacheCheckpointState: { markChanged() {} },
+    progressiveWorker: {
+      run: (_request: unknown, _generation: number, _signal: AbortSignal, acknowledge: typeof progress) => {
+        progress = acknowledge;
+        return new Promise((done) => {
+          resolve = done;
+        });
+      },
+    },
+    unresolvedLoadingFailure: () => false,
+    sourceCountOf: () => ({ completed: 0, known: sources.length }),
+    failSessionLoading() {},
+    dispatchedDiscoveryWaiting: () => false,
+    hasHumanPrompt: () => true,
+    activityFor: () => 1,
+    updateSessionSpendSources() {},
+    checkpointDerivedCache() {},
+  });
+  const cards = sources.map((source) => ({
+    id: source.sessionId,
+    agent: source.agent === 'codex' ? 'Codex' : 'Claude',
+  }));
+  const savedBefore = JSON.stringify(provider.saved);
+  const check = (pending: boolean) => {
+    assert.equal(provider.sessionQueryContext().identities, identities);
+    const context = posted.at(-1).queryContext;
+    assert.equal(context.coverage, pending ? 'incomplete' : 'complete');
+    if (pending) {
+      for (const query of [
+        'id:session-',
+        '-id:session-',
+        'id:claude:session-',
+        'session:session- OR session:child-0',
+      ]) {
+        assert.throws(() => read(query), /discovery/);
+        assert.throws(() => provider.applySessionFilter({ id: 'prefix', params: { query } }), /discovery/);
+      }
+      assert.equal(JSON.stringify(provider.saved), savedBefore);
+      assert.equal(read('session:' + sources[0].sessionId).sessions.length, 1);
+      assert.equal(read('').sessions.length, sources.length);
+    } else assert.equal(read('id:session-').sessions.length, 30);
+    for (const query of ['id:session-', '-id:session-']) {
+      const expected = pending ? 0 : query.startsWith('-') ? 1 : 30;
+      assert.equal(railShownCards(cards as any, { query, queryContext: context }, 0).length, expected);
+      const views = [{ id: 'saved', name: 'Saved', query, archived: false }];
+      const sections = railSections(
+        cards as any,
+        0,
+        views,
+        'latest',
+        { showArchived: true, showRuns: true },
+        { queryContext: context },
+      ).sections;
+      assert.equal(sections.find((section) => section.label === 'Saved')!.cards.length, expected);
+      assert.equal(sessionIdentityNote(query, context)?.includes('discovery'), pending);
+    }
+  };
+  const checkpoint = {
+    epoch: 'query',
+    sequence: 1,
+    repositoryRoots: roots,
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+  };
+  for (const terminal of ['failure', 'cancel', 'complete']) {
+    const controller = new AbortController();
+    const pending = provider.prepareClaudeChildren(1, controller.signal);
+    check(true);
+    provider.startupProgressAt = 0;
+    assert.equal(
+      progress({ generation: 1, value: { kind: 'claude-children-progress', checkpoint, referenceEntries: [] } }),
+      true,
+    );
+    check(true);
+    if (terminal === 'cancel') controller.abort();
+    resolve(
+      terminal === 'failure'
+        ? null
+        : {
+            generation: 1,
+            value: {
+              kind: 'claude-children',
+              complete: true,
+              continuation: false,
+              scope: roots,
+              roots: sources,
+              references: [],
+              children: [],
+              referenceEntries: [],
+            },
+          },
+    );
+    assert.equal(await pending, terminal === 'complete');
+    check(true);
+  }
+  const refresh = methodBody('async refresh(');
+  const acceptance = refresh.slice(
+    refresh.indexOf('if (!metadataAfterRender &&'),
+    refresh.indexOf('for (const session of Object.keys(this.awaitingSessionRecords))'),
+  );
+  const accept = new Function(
+    'all',
+    'generation',
+    'controller',
+    'orderSessionCatalog',
+    'sessionDiscoveryMembership',
+    `return (async () => { const selectedOnly = false, metadataAfterRender = false; ${acceptance} })();`,
+  );
+  let metadata!: (value: boolean) => void;
+  provider.prepareMetadata = () =>
+    new Promise((done) => {
+      metadata = done;
+    });
+  const accepted = accept.call(
+    provider,
+    sources,
+    1,
+    new AbortController(),
+    orderSessionCatalog,
+    sessionDiscoveryMembership,
+  );
+  check(true);
+  metadata(true);
+  await accepted;
+  check(false);
+  assert.deepEqual(provider.authoritativeCatalog, sources);
+  provider.authoritativeCatalog = null;
+  assert.throws(() => read('-id:session-'), /discovery/);
+  assert.equal(read('').coverage, 'unavailable');
+});
+
+test('unchanged refresh generations keep active plain content search without replacement requests', async () => {
+  const { createSearchRenderer } = await import('./webview/search.ts');
+  const { provider } = pagedListingFixture(30);
+  const context = provider.sessionQueryContext();
+  const requests: any[] = [];
+  const body = handlerBody(script, 'startupProgress');
+  const end = body.indexOf('if (msg.queryOnly) return;');
+  const apply = new Function(
+    'msg',
+    'latest',
+    'searchRenderer',
+    'railRenderer',
+    'workspaceCatalogAvailable',
+    body.slice(0, end),
+  );
+  const latest = { queryContext: context };
+  const renderer = createSearchRenderer({
+    document: { createElement: () => ({}) } as any,
+    sendToHost: (message) => requests.push(message),
+  });
+  renderer.start('needle');
+  renderer.accept('find: needle', 'workspace', []);
+  for (let generation = 2; generation < 6; generation++) {
+    provider.refreshGeneration = generation;
+    apply({ queryContext: provider.sessionQueryContext() }, latest, renderer, { update() {} }, true);
+  }
+  assert.deepEqual(requests, [{ type: 'search', text: 'find: needle' }]);
+  assert.equal(provider.sessionQueryContext(), context);
+});
+
+test('identity updates search retained content without rereading transcripts', () => {
+  const { provider, sources } = pagedListingFixture(30);
+  const sessionId = 'abcdefgh-1234-1234-1234-123456789012';
+  const directory = sources[0].cwd;
+  const admitted = { ...sources[0], sessionId, cwd: path.join(directory, 'admitted') };
+  const excluded = { ...sources[0], sessionId, cwd: path.join(directory, 'excluded'), file: sources[1].file };
+  let roots = [directory];
+  provider.repositoryScope.snapshot = () => ({ ready: true, roots, revision: 1 });
+  const accept = (catalog: any[]) => {
+    provider.authoritativeCatalog = catalog;
+    provider.authoritativeCatalogScope = JSON.stringify(roots);
+    provider.sessionReadDiscoveryRevision = sessionCatalogMembership(JSON.stringify(roots), catalog);
+  };
+  accept([admitted, excluded]);
+  const entry = {
+    key: 'admitted-turn',
+    sessionId,
+    sessionTitle: 'Session',
+    agent: 'Claude',
+    startedAt: 1,
+    prompt: 'admitted needle',
+    summary: '',
+    whole: true,
+  };
+  provider.corpus = new Map([
+    [admitted.file, { entries: [entry] }],
+    [excluded.file, { entries: [{ ...entry, key: 'excluded-turn', prompt: 'excluded needle' }] }],
+  ]);
+  provider.searchCorpus = () => [...provider.corpus.values()].flatMap((source: any) => source.entries);
+  provider.showing = null;
+  let catalogReads = 0;
+  provider.allSessions = () => {
+    catalogReads++;
+    return [admitted, excluded];
+  };
+  provider.archivedSessions = () => new Set();
+  provider.sessionParentEdges = () => ({ edges: new Map() });
+  const posted: any[] = [];
+  provider.post = async (message: any) => {
+    posted.push(message);
+  };
+  provider.answerSearch('find: needle id:abcdefgh');
+  assert.deepEqual(
+    posted
+      .at(-1)
+      .hits.map((hit: any) => hit.key)
+      .sort(),
+    ['admitted-turn', 'excluded-turn'],
+  );
+  provider.searchCorpus = () => {
+    throw new Error('automatic filesystem or transcript read');
+  };
+  provider.answerSearch('find: needle id:abcdefgh', true);
+  assert.equal(posted.at(-1).hits.length, 2);
+  provider.sessionQueryDiscoveryPending = true;
+  provider.answerSearch('find: needle id:abcdefgh', true);
+  assert.equal(posted.at(-1).hits.length, 0);
+  provider.sessionQueryDiscoveryPending = false;
+  provider.answerSearch('find: needle id:abcdefgh', true);
+  assert.equal(posted.at(-1).hits.length, 2);
+  const identities = () => [
+    ...new Set(
+      provider.sessionQueryContext().identities.map((identity: any) => `${identity.agent}:${identity.sessionId}`),
+    ),
+  ];
+  const before = identities();
+  for (const transition of ['removal', 'scope narrowing']) {
+    roots = transition === 'removal' ? [directory] : [admitted.cwd];
+    accept(transition === 'removal' ? [admitted] : [admitted, excluded]);
+    assert.deepEqual(identities(), before, `${transition} changed native identity membership`);
+    provider.answerSearch(`find: excluded id:${sessionId}`, true);
+    assert.equal(posted.at(-1).hits.length, 0, `${transition} retained content from the excluded source`);
+    provider.answerSearch(`find: admitted id:${sessionId}`, true);
+    assert.deepEqual(
+      posted.at(-1).hits.map((hit: any) => hit.key),
+      ['admitted-turn'],
+    );
+    assert.equal(provider.corpus.size, 2, `${transition} discarded retained source content`);
+  }
+  assert.equal(catalogReads, 1, 'retained matching revalidated the filesystem catalog');
+  assert.deepEqual(parsePanelToHost({ type: 'search', text: 'find: needle', retained: true }), {
+    type: 'search',
+    text: 'find: needle',
+    retained: true,
+  });
+});
+
+test('unchanged rail repaints reuse compiled query context and coverage changes invalidate it', async () => {
+  const { resolveSessionQuery } = await import('./domain/session-query.ts');
+  const start = railSource.indexOf(
+    'update(cards, catalog, saved, savedRailFilters, stats, catalogAvailable = false, context)',
+  );
+  const body = railSource.slice(railSource.indexOf('{', start) + 1, railSource.indexOf('countsKnown ||=', start));
+  const compiled = ts.transpileModule(`function update(queryContext, context) { ${body} return queryContext; }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const update = new Function(`${compiled} return update;`)();
+  const context = {
+    scope: 'scope',
+    revision: 'revision',
+    coverage: 'complete',
+    identities: [{ agent: 'claude', sessionId: 'abcdefgh-one' }],
+  };
+  const resolved = resolveSessionQuery('id:abcdefgh', context as any);
+  const same = update(context, { ...context, identities: [...context.identities] });
+  assert.equal(same, context);
+  assert.equal(resolveSessionQuery('id:abcdefgh', same), resolved);
+  const incomplete = update(same, { ...context, coverage: 'incomplete', identities: [...context.identities] });
+  assert.equal(incomplete.identities, context.identities);
+  assert.notEqual(resolveSessionQuery('id:abcdefgh', incomplete), resolved);
+  assert.equal(
+    matchSessions([{ sessionId: 'abcdefgh-one', agent: 'claude', label: '' }], 'id:abcdefgh', incomplete).length,
+    0,
+  );
+});
+
+test('mixed ambiguous identity and invalid cost queries retain visible numeric correction', async () => {
+  const { sessionQueryError } = await import('./domain/session-query.ts');
+  const { costNote, sessionIdentityNote } = await import('./view/session-query.ts');
+  const expression = railSource.match(/const invalidCost = naming\s*\? null\s*: ([\s\S]*?);/)![1];
+  const note = new Function(
+    'filter',
+    'queryContext',
+    'sessionQueryError',
+    'costNote',
+    'sessionIdentityNote',
+    `return ${expression};`,
+  );
+  const context = {
+    scope: 'scope',
+    revision: 'revision',
+    coverage: 'complete',
+    identities: ['abcdefgh-one', 'abcdefgh-two'].map((sessionId) => ({ agent: 'claude', sessionId })),
+  };
+  const query = 'id:abcdefgh cost:5';
+  assert.equal(
+    matchSessions(
+      context.identities.map((identity) => ({ ...identity, label: '' })),
+      query,
+      context as any,
+    ).length,
+    0,
+  );
+  assert.ok(sessionIdentityNote(query, context as any));
+  assert.equal(note(query, context, sessionQueryError, costNote, sessionIdentityNote), costNote(query));
 });

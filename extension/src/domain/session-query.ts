@@ -26,6 +26,8 @@ export interface FilterTerm {
   plain?: boolean;
   identities?: { any: Set<string>; claude: Set<string>; codex: Set<string> };
   invalid?: boolean;
+  shorthand?: boolean;
+  unresolved?: boolean;
   // A leading `-` excludes the sessions the plain term matches.
   negated?: boolean;
   // Present only when a cost or cache-expiry value follows the strict comparison grammar. An
@@ -105,6 +107,7 @@ export const IS_VALUES: SessionStatus[] = [
 ];
 export const IS_SYNONYMS: Record<string, SessionStatus> = { waiting: 'input', blocked: 'input' };
 export const SESSION_AXES: SessionAxis[] = [
+  { prefix: 'id', field: 'session' },
   { prefix: 'session', field: 'session' },
   { prefix: 'agent', field: 'agent' },
   { prefix: 'title', field: 'title' },
@@ -235,7 +238,8 @@ function sessionSelector(word: QueryWord): FilterTerm | null {
   if (word.quotedHead) return null;
   const negated = !word.quotedHead && word.text.startsWith('-');
   const raw = negated ? word.text.slice(1) : word.text;
-  if (wordPrefix(raw) !== 'session') return null;
+  const prefix = wordPrefix(raw);
+  if (prefix !== 'session' && prefix !== 'id') return null;
   const value = raw.slice(raw.indexOf(':') + 1);
   const qualified = /^(claude|codex):(.+)$/i.exec(value);
   const provider = qualified ? (qualified[1].toLowerCase() as 'claude' | 'codex') : 'any';
@@ -247,6 +251,7 @@ function sessionSelector(word: QueryWord): FilterTerm | null {
     field: 'session',
     needle: value,
     identities,
+    ...(prefix === 'id' ? { shorthand: true } : {}),
     ...(negated ? { negated: true } : {}),
     ...(invalid ? { invalid: true } : {}),
   };
@@ -262,7 +267,7 @@ function identityKey(term: FilterTerm): string {
 
 export function sessionQueryError(query: string): string | null {
   return parseSessionQuery(query).terms.some((term) => term.invalid)
-    ? 'Use full session IDs. Join positive session selectors with OR.'
+    ? 'Use session IDs or prefixes of at least eight characters. Join positive selectors with OR.'
     : null;
 }
 
@@ -295,6 +300,7 @@ export function parseSessionQuery(query: string): SessionQuery {
     }
     const first = selectors[left]!;
     const next = selectors[right]!;
+    if (next.shorthand) first.shorthand = true;
     for (const provider of ['any', 'claude', 'codex'] as const) {
       for (const id of next.identities![provider]) first.identities![provider].add(id);
     }
@@ -388,7 +394,107 @@ export function parseSessionQuery(query: string): SessionQuery {
       out.terms.push({ field: 'title', needle: word, plain: true, ...mark });
     }
   }
+  const implicit = out.terms.filter(
+    (term) => term.field === 'session' && term.shorthand && !term.negated && !term.invalid,
+  );
+  if (implicit.length > 1) {
+    const first = implicit[0];
+    for (const next of implicit.slice(1)) {
+      for (const provider of ['any', 'claude', 'codex'] as const)
+        for (const id of next.identities![provider]) first.identities![provider].add(id);
+    }
+    out.terms = out.terms.filter((term) => !implicit.includes(term) || term === first);
+  }
   return out;
+}
+
+export interface SessionQueryIdentity {
+  sessionId: string;
+  agent: string;
+}
+
+export interface SessionQueryContext {
+  identities: readonly SessionQueryIdentity[];
+  coverage: 'complete' | 'incomplete' | 'unavailable';
+  scope: string;
+  revision: string;
+}
+
+const FULL_SESSION_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const prefixValue = (id: string): boolean => id.length >= 8 && !FULL_SESSION_ID.test(id);
+
+// A caller without catalog identities cannot distinguish a long exact ID from a prefix.
+export function sessionQueryNeedsShorthand(query: string): boolean {
+  return parseSessionQuery(query).terms.some(
+    (term) =>
+      term.field === 'session' &&
+      (term.shorthand || Object.values(term.identities ?? {}).some((ids) => [...ids].some(prefixValue))),
+  );
+}
+
+const identityIndexes = new WeakMap<readonly SessionQueryIdentity[], Map<string, Set<string>>>();
+const compiledQueries = new WeakMap<SessionQueryContext, Map<string, SessionQuery & { notes: string[] }>>();
+
+// Resolve once against the complete scoped catalog before callers narrow their row pools.
+export function resolveSessionQuery(query: string, context?: SessionQueryContext): SessionQuery & { notes: string[] } {
+  const cached = context && compiledQueries.get(context)?.get(query);
+  if (cached) return cached;
+  const parsed = { ...parseSessionQuery(query), notes: [] as string[] };
+  let index = context && identityIndexes.get(context.identities);
+  if (context && !index) {
+    index = new Map([
+      ['claude', new Set<string>()],
+      ['codex', new Set<string>()],
+    ]);
+    for (const identity of context.identities) index.get(identity.agent.toLowerCase())?.add(identity.sessionId);
+    identityIndexes.set(context.identities, index);
+  }
+  for (const term of parsed.terms) {
+    if (!term.identities || term.invalid) continue;
+    const resolved = { any: new Set<string>(), claude: new Set<string>(), codex: new Set<string>() };
+    for (const provider of ['any', 'claude', 'codex'] as const) {
+      for (const id of term.identities[provider]) {
+        const providers = provider === 'any' ? (['claude', 'codex'] as const) : [provider];
+        const exact = providers.some((kind) => index?.get(kind)?.has(id));
+        if (exact || !prefixValue(id) || (!context && !term.shorthand)) {
+          resolved[provider].add(id);
+          continue;
+        }
+        if (context?.coverage !== 'complete') {
+          term.unresolved = true;
+          parsed.notes.push(`${id}: session discovery is incomplete. Retry after it finishes.`);
+          continue;
+        }
+        let count = 0;
+        for (const kind of providers)
+          for (const candidate of index?.get(kind) ?? []) {
+            if (candidate.startsWith(id)) {
+              resolved[kind].add(candidate);
+              count++;
+            }
+          }
+        if (count > 1) parsed.notes.push(`${id} matches ${count} sessions.`);
+      }
+    }
+    term.identities = resolved;
+  }
+  if (context) {
+    let cache = compiledQueries.get(context);
+    if (!cache) {
+      cache = new Map();
+      compiledQueries.set(context, cache);
+    }
+    if (cache.size >= 64) cache.clear();
+    cache.set(query, parsed);
+  }
+  return parsed;
+}
+
+export function sessionQueryResolutionError(query: string, context?: SessionQueryContext): string | null {
+  const resolved = resolveSessionQuery(query, context);
+  return resolved.terms.some((term) => term.unresolved)
+    ? 'Session discovery is incomplete. Retry after it finishes.'
+    : null;
 }
 
 export function queryToken(query: string, caret: number): QueryToken {
@@ -557,7 +663,7 @@ export function sessionTermHolds(
   cacheExpiryAtLeast = false,
   sessionId = '',
 ): boolean {
-  if (term.invalid) return false;
+  if (term.invalid || term.unresolved) return false;
   if (term.field === 'session') {
     const identities = term.identities;
     const provider = agent.toLowerCase();
@@ -595,7 +701,7 @@ export function sameQueryTerms(left: string, right: string): boolean {
     const terms = parsed.terms
       .map(
         (term) =>
-          `${term.negated === true ? NEGATE_MARK : ''}${term.field}:${term.field === 'session' ? identityKey(term) + Boolean(term.invalid) : term.needle}`,
+          `${term.negated === true ? NEGATE_MARK : ''}${term.field}:${term.field === 'session' ? identityKey(term) + Boolean(term.invalid) + Boolean(term.shorthand) : term.needle}`,
       )
       .sort();
     return JSON.stringify([terms, [...parsed.find].sort(), parsed.where]);
@@ -638,8 +744,8 @@ export function matchSessions<
     // `costAtLeast` is.
     cacheExpiryAtLeast?: boolean;
   },
->(sessions: T[], query: string): T[] {
-  const { terms } = parseSessionQuery(query);
+>(sessions: T[], query: string, context?: SessionQueryContext): T[] {
+  const { terms } = resolveSessionQuery(query, context);
   // Invalid numeric comparisons match no session.
   if (terms.some((term) => (NUMERIC_FIELDS.includes(term.field) && !term.comparison) || term.invalid)) {
     return [];

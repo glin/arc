@@ -1006,6 +1006,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
     const RAIL_NAME_LIMIT = 200;
     export class Harness {
+      sessionQueryContext() { return undefined; }
+      publishSessionQueryContext() {}
       hasHumanPrompt() { return true; }
       failSessionLoading() {}
       noteSessionRead() {}
@@ -1215,6 +1217,8 @@ function completeDiscoveryHarness(
     const prunePlaces = (trail) => trail; const visitPlace = (trail) => trail;
     let railPayload = () => ({ rail: [], labels: [], views: [], railFilters: [], stats: {} });
     export class Harness {
+      sessionQueryContext() { return undefined; }
+      publishSessionQueryContext() {}
       failSessionLoading() {}
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
@@ -1428,6 +1432,8 @@ function railEnrichmentHarness(
   const compiled = transformSync(
     `
     export class Harness {
+      sessionQueryContext() { return undefined; }
+      publishSessionQueryContext() {}
       failSessionLoading() {}
       titles = new Map();
       refreshGeneration = 1;
@@ -1528,6 +1534,8 @@ function metadataHarness(
   const compiled = transformSync(
     `
     export class Harness {
+      sessionQueryContext() { return undefined; }
+      publishSessionQueryContext() {}
       failSessionLoading() {}
       noteSessionRead() {}
       titles = new Map(); carriedNames = new Map(); refreshGeneration = 1; metadataRevision = 0;
@@ -1624,6 +1632,8 @@ function selectedWindowHarness(
     `
     const TRANSCRIPT_TURN_LIMIT = 40; const TRANSCRIPT_TAIL_BYTES = 1024;
     export class Harness {
+      sessionQueryContext() { return undefined; }
+      publishSessionQueryContext() {}
       failSessionLoading() {}
       noteSessionRead() {}
       selectionGeneration = 1; refreshGeneration = 1; showing = 'selected'; selectionWork = null; selectionFailure = null;

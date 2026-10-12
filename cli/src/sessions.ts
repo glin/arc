@@ -16,7 +16,7 @@ export async function runSessions(command: 'sessions' | 'session' | 'filter', ar
     const arg = args[index];
     if (arg === '--clear' && command === 'filter' && !clear) {
       clear = true;
-    } else if (arg === '--query' && command === 'sessions' && query === undefined) {
+    } else if (arg === '--query' && (command === 'sessions' || command === 'filter') && query === undefined) {
       query = args[++index];
       if (!query || query.startsWith('--')) throw new Error('--query requires a filter query.');
     } else if (arg === '--window' && window === undefined) {
@@ -49,7 +49,7 @@ export async function runSessions(command: 'sessions' | 'session' | 'filter', ar
     throw new Error('Usage: arc session ID [--turns 1-20] [--window ID] [--json]');
   if (command === 'filter') {
     if ((clear && query !== undefined) || (!clear && !query?.trim()))
-      throw new Error('Usage: arc filter QUERY | arc filter --clear [--window ID] [--json]');
+      throw new Error('Usage: arc filter QUERY | arc filter --query QUERY | arc filter --clear [--window ID] [--json]');
     if (clear) query = '';
   }
   if (query !== undefined) {

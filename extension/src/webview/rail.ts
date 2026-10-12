@@ -10,6 +10,7 @@ import {
   LABEL_PREFIX,
   NEGATE_MARK,
   parseSessionQuery,
+  type SessionQueryContext,
   sessionQueryError,
   queryToken,
   replaceToken,
@@ -28,6 +29,7 @@ import {
 import {
   cacheExpiryNote,
   costNote,
+  sessionIdentityNote,
   labelFilterToken,
   labelSuggestions,
   railMenuLabelChips,
@@ -372,6 +374,7 @@ export interface RailRenderer {
     // Figures keyed by session id. Session list cards and session headings read the same source.
     stats: Readonly<Record<string, readonly PanelStat[]>>,
     catalogAvailable?: boolean,
+    queryContext?: SessionQueryContext,
   ): void;
   openViewEditor(view: string, mode: 'rename' | 'delete'): void;
   openSessionRename(session: string, title: string): void;
@@ -1821,7 +1824,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   // Stamp clock facts whenever the filter or any saved-view query reads cache warmth or recent activity.
   const poolReadsCache = (): boolean =>
     railQueryReadsCache(filter) || views.some((view) => railQueryReadsCache(view.query));
-  const narrowing = (): RailNarrowing => ({ query: filter });
+  let queryContext: SessionQueryContext | undefined;
+  const narrowing = (): RailNarrowing => ({ query: filter, queryContext });
   // Every query change goes through here and empties the kept set immediately.
   // Changing the query and putting it back before the next draw also starts the set again.
   const setRailQuery = (query: string) => {
@@ -1870,7 +1874,10 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
   // Build ordered groups and apply reader-owned folds.
   // A narrowing filter opens groups unless the reader has folded them under that filter.
   const layout = () => {
-    const grouped = railSections(shownCards(), now, views, 'latest', shownBuckets(), { groupBy: railGroupBy });
+    const grouped = railSections(shownCards(), now, views, 'latest', shownBuckets(), {
+      groupBy: railGroupBy,
+      queryContext,
+    });
     const ordered = grouped.sections.map((section) => {
       const view = viewOfSection(section.id);
       const sort = view?.sort && view.sort !== 'inherit' ? view.sort : railSort;
@@ -2297,7 +2304,9 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       focused instanceof HTMLElement && topMount.contains(focused) && focused.dataset.control?.startsWith('railcount:')
         ? focused
         : null;
-    const invalidCost = naming ? null : (sessionQueryError(filter) ?? costNote(filter));
+    const invalidCost = naming
+      ? null
+      : (sessionQueryError(filter) ?? costNote(filter) ?? sessionIdentityNote(filter, queryContext));
     // Invalid cache-expiry values have a separate note and DOM id from invalid cost values.
     const invalidCacheExpiry = naming ? null : cacheExpiryNote(filter);
     const open = boxOpen();
@@ -3349,7 +3358,22 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     element: nav,
     sashElement: sash,
     projectSpendMount,
-    update(cards, catalog, saved, savedRailFilters, stats, catalogAvailable = false) {
+    update(cards, catalog, saved, savedRailFilters, stats, catalogAvailable = false, context) {
+      if (
+        context &&
+        queryContext?.scope === context.scope &&
+        queryContext.identities.length === context.identities.length &&
+        context.identities.every(
+          (identity, index) =>
+            identity.sessionId === queryContext!.identities[index].sessionId &&
+            identity.agent === queryContext!.identities[index].agent,
+        )
+      )
+        context =
+          queryContext.coverage === context.coverage && queryContext.revision === context.revision
+            ? queryContext
+            : { ...context, identities: queryContext.identities };
+      queryContext = context;
       countsKnown ||= catalogAvailable;
       // The startup shell carries empty views without a saved-filter catalog.
       if (Array.isArray(savedRailFilters) && Array.isArray(saved)) {

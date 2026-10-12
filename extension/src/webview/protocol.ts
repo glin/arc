@@ -1,5 +1,5 @@
 import { RAIL_FILTER_QUERY_LIMIT } from '../domain/rail-filters.ts';
-import { sessionQueryError } from '../domain/session-query.ts';
+import { sessionQueryError, type SessionQueryContext } from '../domain/session-query.ts';
 import type { FileCitationDestination } from '../domain/file-citation.ts';
 import {
   contextIdentity,
@@ -144,6 +144,7 @@ type LabelEditorRow = LabelRow & { applied: boolean };
 // The panel retains and updates the same object.
 export interface RenderMessage extends Record<string, unknown> {
   type: 'render';
+  queryContext?: SessionQueryContext;
   cards: PanelCard[];
   sessions: PanelSessionRow[];
   rail: PanelRailCard[];
@@ -206,6 +207,8 @@ export type HostToPanel =
   | { type: 'visibility'; visible: boolean; revision: number }
   | {
       type: 'startupProgress';
+      queryOnly?: boolean;
+      queryContext?: SessionQueryContext;
       generation: number;
       epoch: string;
       sequence: number;
@@ -240,6 +243,7 @@ export type HostToPanel =
   | SelectionMessage
   | {
       type: 'rail';
+      queryContext?: SessionQueryContext;
       rail: PanelRailCard[];
       stats: Record<string, PanelStat[]>;
       labels: LabelRow[];
@@ -381,7 +385,7 @@ export type PanelToHost =
   | { type: 'setLayout'; key: 'promptPosition'; value: PromptPosition }
   | { type: 'exportSession'; session: string }
   | { type: 'saveState'; state: unknown }
-  | { type: 'search'; text: string }
+  | { type: 'search'; text: string; retained?: boolean }
   | { type: 'loadOlder'; session: string; token: string }
   | { type: 'openLink'; href: string; beside: boolean }
   | { type: 'openLink'; destination: FileCitationDestination; beside: boolean }
@@ -657,7 +661,9 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         ? { type: 'visibility', visible: m.visible, revision: m.revision as number }
         : null;
     case 'startupProgress':
-      return (m.complete === undefined || typeof m.complete === 'boolean') &&
+      return validQueryContext(m.queryContext) &&
+        (m.queryOnly === undefined || typeof m.queryOnly === 'boolean') &&
+        (m.complete === undefined || typeof m.complete === 'boolean') &&
         (m.failed === undefined || typeof m.failed === 'boolean') &&
         (m.held === undefined || typeof m.held === 'boolean') &&
         Number.isSafeInteger(m.generation) &&
@@ -787,7 +793,8 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
           ? { type: 'activity', session: m.session, card: m.card as PanelCard }
           : null;
     case 'selection':
-      return records(m.cards) &&
+      return validQueryContext(m.queryContext) &&
+        records(m.cards) &&
         records(m.sessions) &&
         records(m.rail) &&
         record(m.stats) !== null &&
@@ -797,7 +804,8 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     case 'rail': {
       const stats = record(m.stats);
       const sessionAdoptions = m.sessionAdoptions === undefined ? [] : m.sessionAdoptions;
-      return records(m.rail) &&
+      return validQueryContext(m.queryContext) &&
+        records(m.rail) &&
         stats !== null &&
         Array.isArray(m.labels) &&
         m.labels.every(labelCount) &&
@@ -810,6 +818,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         rowDeltaHeaderValid(m.rows)
         ? {
             type: 'rail',
+            ...(m.queryContext === undefined ? {} : { queryContext: m.queryContext as SessionQueryContext }),
             rail: m.rail as PanelRailCard[],
             stats: stats as Record<string, PanelStat[]>,
             labels: m.labels,
@@ -886,7 +895,8 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     case 'render': {
       // Preserve the complete render object described by RenderMessage.
       const adoptions = m.sessionAdoptions;
-      return records(m.cards) &&
+      return validQueryContext(m.queryContext) &&
+        records(m.cards) &&
         records(m.sessions) &&
         records(m.rail) &&
         record(m.stats) !== null &&
@@ -908,6 +918,22 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     default:
       return null;
   }
+}
+
+function validQueryContext(value: unknown): boolean {
+  if (value === undefined) return true;
+  const context = record(value);
+  return (
+    !!context &&
+    ['complete', 'incomplete', 'unavailable'].includes(String(context.coverage)) &&
+    isString(context.scope) &&
+    isString(context.revision) &&
+    Array.isArray(context.identities) &&
+    context.identities.every((value) => {
+      const identity = record(value);
+      return !!identity && isString(identity.sessionId) && isString(identity.agent);
+    })
+  );
 }
 
 export function parsePanelToHost(raw: unknown): PanelToHost | null {
@@ -1208,7 +1234,7 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
       // normalizePanelState accepts unknown state values.
       return { type: 'saveState', state: m.state };
     case 'search':
-      return { type: 'search', text: textOr(m.text, '') };
+      return { type: 'search', text: textOr(m.text, ''), ...(m.retained === true ? { retained: true } : {}) };
     case 'loadOlder':
       return isString(m.session) ? { type: 'loadOlder', session: m.session, token: textOr(m.token, '') } : null;
     case 'openLink':

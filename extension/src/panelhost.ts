@@ -1,5 +1,12 @@
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
-import { listingQueryError, listingTermHolds, parseSessionQuery, sessionQueryError } from './domain/session-query';
+import {
+  listingQueryError,
+  listingTermHolds,
+  resolveSessionQuery,
+  sessionQueryResolutionError,
+  sessionQueryError,
+  type SessionQueryContext,
+} from './domain/session-query';
 import { MEASUREMENT_ENVIRONMENT, STORED_STATE_KEYS } from './identity';
 import { savedResponseRates, retainResponseRate, responseRateForTurn } from './outputrate';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
@@ -1794,6 +1801,7 @@ export class PanelProvider implements vscode.Disposable {
     roots: string;
     scoped: SessionFile[];
     ids: Set<string>;
+    identities: SessionQueryContext['identities'];
     sources: SessionPageSource[];
     discovery: string;
   };
@@ -2106,7 +2114,7 @@ export class PanelProvider implements vscode.Disposable {
 
   private applySessionFilter(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
     const query = request.params.query!;
-    const error = sessionQueryError(query);
+    const error = sessionQueryError(query) ?? sessionQueryResolutionError(query, this.sessionQueryContext());
     if (error) throw new Error(error);
     const context = request.filterContext ?? {
       deadline: Date.now() + FILTER_LIMITS.operationMs,
@@ -2117,6 +2125,8 @@ export class PanelProvider implements vscode.Disposable {
       context,
       async (operation) => {
         if (this.disposed || !operation.current()) throw new Error('The filter was not applied.');
+        const resolutionError = sessionQueryResolutionError(query, this.sessionQueryContext());
+        if (resolutionError) throw new Error(resolutionError);
         this.openInEditor();
         const ready = () =>
           this.hosts.find((host) => host.webview === this.editorPanel?.webview && this.readyHosts.has(host));
@@ -2151,6 +2161,8 @@ export class PanelProvider implements vscode.Disposable {
       (operation) => {
         const host = this.hosts.find((host) => host.webview === this.editorPanel?.webview && this.readyHosts.has(host));
         if (!host || this.disposed || !operation.current()) throw new Error('The filter was not applied.');
+        const resolutionError = sessionQueryResolutionError(query, this.sessionQueryContext());
+        if (resolutionError) throw new Error(resolutionError);
         return new Promise<void>((resolve, reject) => {
           this.filterApplications ??= new Map();
           this.filterApplications.set(request.id, { host, saving: false, query, operation, resolve, reject });
@@ -2340,7 +2352,10 @@ export class PanelProvider implements vscode.Disposable {
     };
     let unavailableMetadata = false;
     if (query) {
-      const terms = parseSessionQuery(query).terms;
+      const context = this.sessionQueryContext();
+      const error = sessionQueryResolutionError(query, context);
+      if (error) throw new Error(error);
+      const terms = resolveSessionQuery(query, context).terms;
       const agentRunTerms = terms.filter((term) => term.field === 'status' && term.needle === 'agentrun');
       const identityTerms = terms.filter((term) => term.field !== 'status' || term.needle !== 'agentrun');
       sources = sources.filter((entry) => {
@@ -2399,10 +2414,69 @@ export class PanelProvider implements vscode.Disposable {
       roots,
       scoped,
       ids: new Set(scoped.map((source) => source.sessionId)),
+      identities: scoped.map(({ sessionId, agent }) => ({ sessionId, agent })),
       sources: sessionPageSources(scoped),
       discovery: sessionCatalogMembership(roots, accepted),
     };
     return this.sessionPageIndex;
+  }
+
+  private publishSessionQueryContext(): void {
+    if (!this.hosts?.length || !this.windowStateHandler) return;
+    void this.post({
+      type: 'startupProgress',
+      queryOnly: true,
+      ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
+      generation: this.refreshGeneration ?? 0,
+      epoch: String(this.refreshGeneration ?? 0),
+      sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
+      completed: 0,
+      known: 0,
+    }).catch(() => {});
+  }
+
+  private lastRailQueryContext?: SessionQueryContext;
+
+  private resolvedQueryContext?: { catalog: SessionFile[] | null; context: SessionQueryContext };
+
+  private sessionQueryDiscoveryPending = false;
+
+  private sessionQueryContext(): SessionQueryContext {
+    const scope = this.repositoryScope?.snapshot(this.folders());
+    const roots = JSON.stringify(scope?.roots ?? []);
+    const accepted = scope?.ready && this.authoritativeCatalogScope === roots ? this.authoritativeCatalog : null;
+    const index = accepted ? this.sessionPageIndexFor(accepted, roots, scope?.roots ?? []) : null;
+    const coverage = !index
+      ? 'unavailable'
+      : !this.sessionQueryDiscoveryPending &&
+          !this.dispatchDiscoveryPending &&
+          index.scoped.length === accepted!.length &&
+          this.sessionReadDiscoveryRevision === index.discovery
+        ? 'complete'
+        : 'incomplete';
+    const revision = JSON.stringify([this.sessionReadDiscoveryRevision, index?.discovery]);
+    const held = this.resolvedQueryContext;
+    if (
+      held?.catalog === accepted &&
+      held.context.scope === roots &&
+      held.context.coverage === coverage &&
+      held.context.revision === revision
+    )
+      return held.context;
+    const nextIdentities = index?.identities ?? [];
+    const identities =
+      held?.context.scope === roots &&
+      held.context.identities.length === nextIdentities.length &&
+      nextIdentities.every(
+        (identity, position) =>
+          identity.sessionId === held.context.identities[position].sessionId &&
+          identity.agent === held.context.identities[position].agent,
+      )
+        ? held.context.identities
+        : nextIdentities;
+    const context: SessionQueryContext = { identities, coverage, scope: roots, revision };
+    this.resolvedQueryContext = { catalog: accepted, context };
+    return context;
   }
 
   public setWindowStateHandler(handler: (state: WindowState) => void): void {
@@ -3087,6 +3161,7 @@ export class PanelProvider implements vscode.Disposable {
     this.discoveryComplete = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
+    this.publishSessionQueryContext();
     // Removing roots needs no new loading, so the hold stays unless the new roots add one outside the held scope.
     const scope = this.repositoryScope.snapshot(this.folders());
     if (this.windowStateHandler) {
@@ -3131,6 +3206,7 @@ export class PanelProvider implements vscode.Disposable {
     this.authoritativeCatalogScope = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
+    this.publishSessionQueryContext();
     this.sessionReadFailures?.clear();
     this.startupSourceCheckpoint = null;
     this.loadingLine.release('workspace folders');
@@ -7636,14 +7712,17 @@ export class PanelProvider implements vscode.Disposable {
             !this.dispatchDiscoveryPending && revisions
               ? sessionDiscoveryMembership(catalogScope, all, revisions)
               : undefined;
+          this.sessionQueryDiscoveryPending = !this.sessionReadDiscoveryRevision;
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
           // completes, and the follow-up refresh this schedules lets the line clear.
           const discoveryWaiting = this.dispatchedDiscoveryWaiting();
           this.dispatchDiscoveryPending = true;
+          this.publishSessionQueryContext();
           if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
         }
         this.discoveryComplete = undefined;
+        this.publishSessionQueryContext();
       }
       for (const session of Object.keys(this.awaitingSessionRecords)) {
         if (
@@ -8003,6 +8082,7 @@ export class PanelProvider implements vscode.Disposable {
           host,
           {
             ...payload,
+            ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
             // A held line marks a pending stamp held. A newest-turn read then keeps the stamp incomplete, so the panel's completion
             // acknowledgement waits for it, but the line stays hidden and the read reaches only the log.
             startup:
@@ -8650,7 +8730,12 @@ export class PanelProvider implements vscode.Disposable {
       this.railRevision++;
     }
     const day = railWordingDay(Date.now());
-    if (this.lastRailRevision === this.railRevision && this.lastRailDay === day) {
+    const queryContext = this.sessionQueryContext();
+    if (
+      this.lastRailRevision === this.railRevision &&
+      this.lastRailDay === day &&
+      this.lastRailQueryContext === queryContext
+    ) {
       return;
     }
     if (this.catalog && refreshCatalogFacts) {
@@ -8666,7 +8751,11 @@ export class PanelProvider implements vscode.Disposable {
     const pendingAnswers = this.lifetimeFigures.answers();
     const railAdoptions = sessionAdoptions(this.sessionAliases);
     const adoptionsJson = JSON.stringify(railAdoptions);
-    if (sameRailInputs(this.lastRailKey, key) && adoptionsJson === this.lastRailAdoptionsJson) {
+    if (
+      sameRailInputs(this.lastRailKey, key) &&
+      adoptionsJson === this.lastRailAdoptionsJson &&
+      this.lastRailQueryContext === queryContext
+    ) {
       this.railPendingAnswers = pendingAnswers;
       this.lastRailRevision = this.railRevision;
       this.lastRailDay = day;
@@ -8678,6 +8767,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const host of this.hosts) {
       const message = {
         type: 'rail' as const,
+        ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
         ...((this.hostSessions?.get(host) ?? this.showing) === this.showing
           ? sharedRail
           : railPayload(
@@ -8693,6 +8783,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       });
     }
+    this.lastRailQueryContext = queryContext;
     this.lastRailKey = key;
     this.railPendingAnswers = pendingAnswers;
     this.lastRailMessageType = largestRailBytes === null ? null : 'rail';
@@ -9455,6 +9546,10 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private async prepareClaudeChildren(generation: number, signal: AbortSignal): Promise<boolean> {
+    if (!signal.aborted && generation === this.refreshGeneration) {
+      this.sessionQueryDiscoveryPending = true;
+      this.publishSessionQueryContext();
+    }
     const requestOrder = (this.discoveryRequestSequence = (this.discoveryRequestSequence ?? 0) + 1);
     const spendSources = this.discoveryCheckpoint?.spendSources ?? this.enumeratedSpendSources;
     const acknowledge = (result: import('./progressiveworker').ProgressiveResult): boolean => {
@@ -9596,6 +9691,7 @@ export class PanelProvider implements vscode.Disposable {
           );
           void this.post({
             type: 'startupProgress',
+            ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
             generation: result.generation,
             epoch: String(generation),
             sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
@@ -9643,6 +9739,7 @@ export class PanelProvider implements vscode.Disposable {
     const discoveryWaiting = this.dispatchedDiscoveryWaiting();
     if (progress.kind !== 'claude-children' || !progress.complete) {
       this.dispatchDiscoveryPending = true;
+      this.publishSessionQueryContext();
       this.discoveryComplete = undefined;
       this.checkpointDerivedCache();
       if (this.catalog) this.catalog = { ...this.catalog, sessions: this.authoritativeCatalog ?? [] };
@@ -10109,6 +10206,7 @@ export class PanelProvider implements vscode.Disposable {
     const published = this.loadingLine.present(path, state, scope, blocker);
     void this.post({
       type: 'startupProgress',
+      ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
       ...published,
       epoch: String(state.generation),
       sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
@@ -11838,12 +11936,24 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // The results of one search query, posted to the panel.
-  private answerSearch(query: string): void {
-    // Limit source reads before applying the selected-session search scope.
-    const scope = searchScope(this.searchCorpus(this.showing), this.showing);
+  private answerSearch(query: string, retained = false): void {
+    // Retained matching admits cached files from the accepted scoped catalog without revalidating files.
+    const repository = retained ? this.repositoryScope.snapshot(this.folders()) : null;
+    const roots = JSON.stringify(repository?.roots ?? []);
+    const accepted = repository?.ready && this.authoritativeCatalogScope === roots ? this.authoritativeCatalog : null;
+    const retainedSessions = retained
+      ? accepted
+        ? this.sessionPageIndexFor(accepted, roots, repository?.roots ?? []).scoped
+        : []
+      : null;
+    const admitted = retainedSessions ? new Set(retainedSessions.map((source) => source.file)) : null;
+    const entries = retained
+      ? [...this.corpus.entries()].filter(([file]) => admitted?.has(file)).flatMap(([, source]) => source.entries)
+      : this.searchCorpus(this.showing);
+    const scope = searchScope(entries, this.showing);
     // Apply current labels, archive state, and agent-run classification at search time. Transcript revisions do not track reader state.
     const archived = this.archivedSessions();
-    const sessions = this.allSessions(true);
+    const sessions = retainedSessions ?? this.allSessions(true);
     const parentEdges = this.sessionParentEdges(sessions).edges;
     const runs = new Set(
       sessions.filter((session) => this.agentRunFor(session, parentEdges)).map((session) => session.sessionId),
@@ -11854,7 +11964,7 @@ export class PanelProvider implements vscode.Disposable {
       archived: archived.has(e.sessionId),
       runByAgent: runs.has(e.sessionId),
     }));
-    const hits = searchTurns(labelled, query);
+    const hits = searchTurns(labelled, query, Date.now(), this.sessionQueryContext());
     void this.post({ type: 'results', query, hits, scope: searchScopeName(scope) });
   }
 
@@ -12437,12 +12547,12 @@ export class PanelProvider implements vscode.Disposable {
               .then(() => {
                 if (this.waitingSearch === query) {
                   this.waitingSearch = null;
-                  this.answerSearch(query);
+                  this.answerSearch(query, msg.retained);
                 }
               });
             return;
           }
-          this.answerSearch(query);
+          this.answerSearch(query, msg.retained);
         },
         loadOlder: (msg) => {
           // Reject older-history requests that no longer match this host's selected session.

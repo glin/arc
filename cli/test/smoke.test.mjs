@@ -778,6 +778,7 @@ test('bundled filter commands retrieve selected identities and clear through an 
     for (const args of [
       ['sessions', '--query', query],
       ['filter', query],
+      ['filter', '--query', query],
       ['filter', '--clear'],
     ]) {
       const answer = JSON.parse((await run(process.execPath, [cli, ...args, '--json'], { env })).stdout);
@@ -800,11 +801,27 @@ test('bundled filter commands retrieve selected identities and clear through an 
       ['sessions', '--query', query, '--query', query],
       ['sessions', '--query', 'find:needle'],
       ['filter', '--unknown'],
+      ['filter', '--query'],
+      ['filter', '--query', ''],
+      ['filter', '--query', query, query],
+      ['filter', '--query', query, '--clear'],
+      ['filter', '--query', query, '--query', query],
     ])
       await assert.rejects(run(process.execPath, [cli, ...args], { env }));
     assert.equal(requests.length, before);
     const registration = join(home, 'hosts', `${channel.hostId}.json`);
     const old = JSON.parse(readFileSync(registration, 'utf8'));
+    old.capabilities = ['requesterProvider', 'sessionQuery'];
+    writeFileSync(registration, JSON.stringify(old));
+    for (const prefix of ['id:01a12cef id:01a12a6b', '-session:claude:abcdefgh', 'session:codex:abcdefgh']) {
+      for (const args of [
+        ['filter', prefix],
+        ['filter', '--query', prefix],
+        ['sessions', '--query', prefix],
+      ])
+        await assert.rejects(run(process.execPath, [cli, ...args], { env }), /must reload/);
+    }
+    assert.equal(requests.length, before);
     old.capabilities = ['requesterProvider'];
     writeFileSync(registration, JSON.stringify(old));
     await assert.rejects(run(process.execPath, [cli, 'filter', query], { env }), /must reload/);

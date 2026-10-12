@@ -3450,7 +3450,7 @@ test('session reads and guarded starts carry the requester provider only to a wi
     // A window that predates the field refuses it, so the CLI omits it there and refuses send before connecting.
     const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
     const listed = JSON.parse(fs.readFileSync(registration, 'utf8'));
-    assert.deepEqual(listed.capabilities, ['requesterProvider', 'sessionQuery']);
+    assert.deepEqual(listed.capabilities, ['requesterProvider', 'sessionQuery', 'sessionQueryShorthandV1']);
     delete listed.capabilities;
     fs.writeFileSync(registration, JSON.stringify(listed));
     await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:old`, true);
@@ -3537,4 +3537,45 @@ test('a disconnected filter transport reports an unknown outcome and cancels hos
   assert.equal(((await result) as any).status, 'unknown');
   await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
   finish();
+});
+
+test('older hosts refuse shorthand before either query route connects and retain exact requests', async () => {
+  const home = tempDir('shorthand-negotiation-');
+  const channel = new WindowChannel(home);
+  const seen: any[] = [];
+  channel.setRequestHandler((request) => {
+    seen.push(request);
+    return {};
+  });
+  await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+  const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
+  const old = JSON.parse(fs.readFileSync(registration, 'utf8'));
+  old.capabilities = ['sessionQuery'];
+  fs.writeFileSync(registration, JSON.stringify(old));
+  try {
+    for (const method of ['filter', 'sessions'] as const) {
+      for (const query of [
+        'id:01a12cef id:01a12a6b',
+        '-id:claude:abcdefgh',
+        'id:codex:abcdefgh',
+        'session:claude:abcdefgh',
+        '-session:codex:abcdefgh',
+      ])
+        await assert.rejects(requestWindow(method, { query }, channel.hostId, home), /must reload/);
+      assert.equal(seen.length, method === 'filter' ? 0 : 5);
+      for (const query of [
+        'session:one',
+        'session:one session:two',
+        'session:one OR session:two',
+        'session:ef5a03c3-f255-41b6-b57c-c15af453ac8a',
+        '"id:abcdefgh"',
+      ])
+        await requestWindow(method, { query }, channel.hostId, home);
+    }
+    await requestWindow('filter', { query: '' }, channel.hostId, home);
+    await requestWindow('sessions', {}, channel.hostId, home);
+    assert.equal(seen.length, 12);
+  } finally {
+    await channel.dispose();
+  }
 });

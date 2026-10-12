@@ -1,3 +1,4 @@
+import { sessionQueryNeedsShorthand } from './domain/session-query.ts';
 import { FILTER_LIMITS } from './sessionfilter.ts';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -52,6 +53,7 @@ export interface WindowInfo extends WindowState {
 
 // The window accepts `requesterProvider` on start, send, and session requests.
 export const SESSION_QUERY_CAPABILITY = 'sessionQuery';
+export const SESSION_QUERY_SHORTHAND_CAPABILITY = 'sessionQueryShorthandV1';
 export { FILTER_LIMITS } from './sessionfilter.ts';
 
 export const REQUESTER_PROVIDER_CAPABILITY = 'requesterProvider';
@@ -404,7 +406,7 @@ export class WindowChannel {
       hostId: this.hostId,
       pid: process.pid,
       version: SESSION_REQUEST_VERSION,
-      capabilities: [REQUESTER_PROVIDER_CAPABILITY, SESSION_QUERY_CAPABILITY],
+      capabilities: [REQUESTER_PROVIDER_CAPABILITY, SESSION_QUERY_CAPABILITY, SESSION_QUERY_SHORTHAND_CAPABILITY],
     };
   }
 
@@ -828,6 +830,13 @@ export async function requestWindow(
     !entry.capabilities?.includes(SESSION_QUERY_CAPABILITY)
   )
     throw new Error('The selected Arc window must reload before it can accept filter queries.');
+  if (
+    (method === 'filter' || method === 'sessions') &&
+    params.query !== undefined &&
+    sessionQueryNeedsShorthand(params.query) &&
+    !entry.capabilities?.includes(SESSION_QUERY_SHORTHAND_CAPABILITY)
+  )
+    throw new Error('The selected Arc window must reload before it can accept session ID shorthand.');
   const write = method === 'start' || method === 'curate' || method === 'send' || method === 'compact-request';
   const attributed = method === 'send' || method === 'session' || (method === 'start' && guardedStart);
   const result = await exchangeWindow(
