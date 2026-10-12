@@ -1,6 +1,12 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
-import { readCodexSession, readCodexSessionMeta, CODEX_OPENING_BYTES } from './codex.ts';
+import {
+  readCodexSession,
+  readCodexSessionMeta,
+  CODEX_OPENING_BYTES,
+  createCodexSessionReducer,
+  openingRecordOf,
+} from './codex.ts';
 import {
   readSession,
   readSessionCwd,
@@ -8,6 +14,7 @@ import {
   sameSessionRevision,
   revisionOf,
   supportedFileIdentity,
+  createClaudeSessionReducer,
   type SessionFile,
   type Turn,
   type TurnOutcome,
@@ -19,6 +26,9 @@ import type { SessionStatus } from './domain/session-query.ts';
 import { railStatusRuns } from './domain/session-query.ts';
 import { onlyGrew } from './derivedcache.ts';
 import { READ_OBSERVATION_BYTES, type ReadObservationFacts } from './sessionwrites.ts';
+import { READ_LIMIT, type AgentReadSource } from './domain/read.ts';
+import { createClaudeRepeatedFilter } from './clauderepeated.ts';
+import { meterRead } from './readmeter.ts';
 
 export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024 } as const;
 export type SessionAttention = Extract<SessionStatus, 'input' | 'unread' | 'running'> | 'idle' | 'unknown';
@@ -637,6 +647,144 @@ export function guardedSourceRevision(file: string): string | null {
   return revision(file);
 }
 
+// Canonical physical path and file identity remain stable across appends, but change on replacement.
+export function guardedSourceIdentity(source: Pick<SessionFile, 'file' | 'agent' | 'sessionId'>): string | null {
+  try {
+    const stat = revisionOf(fs.statSync(source.file, { bigint: true }));
+    if (!supportedFileIdentity(stat)) return null;
+    return digest(
+      JSON.stringify([source.agent, source.sessionId, fs.realpathSync.native(source.file), stat.dev, stat.ino]),
+    );
+  } catch {
+    return null;
+  }
+}
+
+export const AGENT_SOURCE_LIMITS = {
+  bytes: 8 * 1024 * 1024,
+  chunkBytes: 256 * 1024,
+  sources: 32,
+  identities: READ_LIMIT,
+} as const;
+
+// Restored acknowledgments resolve through an independent exact read, never a selected-session cache.
+// Large sources and discarded identities retain uncertain coverage and admit no agent keys.
+export class AgentReadSources {
+  private readonly held = new Map<string, AgentReadSource>();
+
+  resolve(
+    source: SessionFile,
+    scope: () => string | null,
+    roots: readonly string[],
+    expectedRevision?: string,
+  ): AgentReadSource | null {
+    const beforeScope = scope();
+    const before = guardedSourceRevision(source.file);
+    const identity = guardedSourceIdentity(source);
+    if (beforeScope === null || before === null || identity === null) return null;
+    const key = sessionSourceKey(source.agent, source.sessionId, source.file);
+    const cached = this.held.get(key);
+    if (cached && (cached.sourceRevision !== before || cached.source !== identity || cached.scope !== beforeScope))
+      this.held.delete(key);
+    if (expectedRevision !== undefined && expectedRevision !== before) return null;
+    const [dev, ino, size, mtimeMs] = JSON.parse(before) as [string, string, number, number];
+    if (
+      size !== source.size ||
+      mtimeMs !== source.mtimeMs ||
+      (source.dev !== undefined && dev !== source.dev) ||
+      (source.ino !== undefined && ino !== source.ino)
+    )
+      return null;
+    const cwd = source.agent === 'codex' ? readCodexSessionMeta(source.file)?.cwd : readSessionCwd(source.file);
+    if (!cwd || !isInside(cwd, [...roots])) return null;
+    const current = () =>
+      scope() === beforeScope &&
+      guardedSourceRevision(source.file) === before &&
+      guardedSourceIdentity(source) === identity;
+    if (this.held.has(key)) {
+      if (!current()) return null;
+      this.held.delete(key);
+      this.held.set(key, cached!);
+      return cached!;
+    }
+    const facts: AgentReadSource = {
+      provider: source.agent,
+      sessionId: source.sessionId,
+      source: identity,
+      scope: beforeScope,
+      sourceRevision: before,
+      identitiesComplete: false,
+      historyComplete: false,
+      turns: [],
+    };
+    if (size <= AGENT_SOURCE_LIMITS.bytes - CODEX_OPENING_BYTES) {
+      let fd = -1;
+      try {
+        fd = fs.openSync(source.file, 'r');
+        const body = Buffer.allocUnsafe(size);
+        let offset = 0;
+        while (offset < size) {
+          const length = Math.min(AGENT_SOURCE_LIMITS.chunkBytes, size - offset);
+          const count = meterRead(source.file, fs.readSync(fd, body, offset, length, offset), offset);
+          if (!count) return null;
+          offset += count;
+        }
+        const lines = body.toString('utf8').split('\n');
+        const reducer =
+          source.agent === 'codex'
+            ? createCodexSessionReducer(
+                source.sessionId,
+                { maxTurns: AGENT_SOURCE_LIMITS.identities, turnsOnly: true },
+                openingRecordOf(lines[0]),
+              )
+            : createClaudeSessionReducer(source.sessionId, {
+                maxTurns: AGENT_SOURCE_LIMITS.identities,
+                turnsOnly: true,
+                childTranscript: source.childTranscript === true,
+              });
+        const repeated = source.agent === 'claude' ? createClaudeRepeatedFilter() : () => false;
+        for (const line of lines) if (!repeated(line)) reducer.pushLine(line);
+        const read = reducer.finish(offset);
+        facts.identitiesComplete = !read.turnLimitReached;
+        facts.historyComplete = !read.turnLimitReached;
+        facts.turns = read.turns.map(({ promptId, startedAt, finished, endedAt }) => ({
+          promptId,
+          startedAt,
+          finished: finished && Number.isFinite(endedAt) && endedAt > 0,
+        }));
+        if (
+          facts.turns.some(
+            (turn) =>
+              typeof turn.promptId !== 'string' || turn.promptId.length > 4096 || !Number.isFinite(turn.startedAt),
+          )
+        ) {
+          facts.identitiesComplete = false;
+          facts.historyComplete = false;
+          facts.turns = [];
+        }
+      } catch {
+        return null;
+      } finally {
+        if (fd >= 0) fs.closeSync(fd);
+      }
+    }
+    if (!current()) return null;
+    facts.turns = Object.freeze(facts.turns.map((turn) => Object.freeze(turn)));
+    Object.freeze(facts);
+    this.held.set(key, facts);
+    while (
+      this.held.size > AGENT_SOURCE_LIMITS.sources ||
+      [...this.held.values()].reduce((count, one) => count + one.turns.length, 0) > AGENT_SOURCE_LIMITS.identities
+    )
+      this.held.delete(this.held.keys().next().value!);
+    return facts;
+  }
+
+  clear(): void {
+    this.held.clear();
+  }
+}
+
 // The source comes from the window's catalog. A requester never supplies a file path.
 // `observe` receives the checked revision of a current read. Its observation joins the reply only when it returns one
 // and the reply still holds the latest turn the observation names.
@@ -726,12 +874,13 @@ export function boundedSessionRead(
   if (observation && result.turns.length && result.turns[0].promptId === latest!.promptId)
     Object.assign(result, { observation });
   if (observeRead && result.state === 'current') {
-    const records = result.turns
+    const identity = guardedSourceIdentity(source);
+    const records = (identity === null ? [] : result.turns)
       .filter((turn) => turn.finished && Number.isFinite(turn.endedAt) && turn.promptId)
       .map((turn) => ({
         provider: source.agent,
         sessionId: source.sessionId,
-        source: sessionSourceKey(source.agent, source.sessionId, source.file),
+        source: identity!,
         scope: beforeScope,
         sourceRevision: before,
         promptId: turn.promptId,

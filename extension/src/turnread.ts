@@ -88,7 +88,7 @@ export function newCounts(
   readTo: ReadonlyMap<string, number>,
   since = 0,
   agentRead: ReadonlyMap<string, string> = new Map(),
-  mappedWindows: ReadonlyMap<string, readonly (ReadableTurn & { kind: string })[]> = new Map(),
+  mappedWindows: ReadonlyMap<string, readonly (ReadableTurn & { kind: string; finished?: boolean })[]> = new Map(),
 ): Map<string, NewCount> {
   const readSet = new Set(read);
   const out = new Map<string, NewCount>();
@@ -113,16 +113,19 @@ export function newCounts(
     }));
     const mapped = mappedWindows.get(id);
     const mappedByKey = new Map(mapped?.map((turn) => [turn.key, turn]));
+    const promptIds = new Set(mapped?.map((turn) => turn.promptId));
     const mappedComplete =
       mapped &&
       mapped.length === starts.length &&
       mappedByKey.size === starts.length &&
+      promptIds.size === starts.length &&
       starts.every((one) => {
         const other = mappedByKey.get(one.key);
         return (
           other?.sessionId === id &&
           other.startedAt === one.startedAt &&
           other.kind === 'turn' &&
+          typeof other.finished === 'boolean' &&
           typeof other.promptId === 'string' &&
           other.promptId.length > 0
         );
@@ -133,12 +136,17 @@ export function newCounts(
       !session.some((turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId)
     )
       continue;
-    const refs: (ReadableTurn & { kind: string })[] = mappedComplete ? [...mapped] : starts;
+    const refs: (ReadableTurn & { kind: string })[] = mappedComplete
+      ? mapped.map((turn) => ({ ...turn, promptId: turn.finished ? turn.promptId : undefined }))
+      : starts;
     if (out.has(id)) {
+      const positions = new Map(refs.map((turn, index) => [turn.key, index]));
       for (const turn of session) {
-        const held = refs.findIndex((one) => one.key === turn.key);
-        if (held < 0) refs.push(turn);
-        else if (refs[held].promptId !== turn.promptId) refs[held] = { ...turn, promptId: undefined };
+        const held = positions.get(turn.key);
+        if (held === undefined) {
+          positions.set(turn.key, refs.length);
+          refs.push(turn);
+        } else if (refs[held].promptId !== turn.promptId) refs[held] = { ...turn, promptId: undefined };
       }
     }
     // Incomplete mappings keep timestamp evidence but cannot subtract an agent acknowledgment.

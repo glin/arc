@@ -77,58 +77,31 @@ export async function runManagement(command: string, args: string[]): Promise<st
         ? ['--window', '--request-id', '--prompt-file', '--observation', '--json']
         : command === 'read'
           ? ['--window', '--request-id', '--observation', '--dry-run', '--json']
-        : command === 'start'
-          ? [
-              '--window',
-              '--request-id',
-              '--setup',
-              '--provider',
-              '--model',
-              '--effort',
-              '--permissions',
-              '--prompt-file',
-              '--name',
-              '--label',
-              '--json',
-              '--agent-run',
-              '--pinned',
-              '--arc-dispatch',
-            ]
-          : [
-              '--window',
-              '--request-id',
-              '--label',
-              '--json',
-              '--dry-run',
-              ...(command === 'archive' ? ['--force'] : []),
-            ];
-||||||| parent of d1d8ba61 (feat(read): add observation-bound session acknowledgments)
-        : command === 'start'
-          ? [
-              '--window',
-              '--request-id',
-              '--setup',
-              '--provider',
-              '--model',
-              '--effort',
-              '--permissions',
-              '--prompt-file',
-              '--name',
-              '--label',
-              '--json',
-              '--agent-run',
-              '--untagged',
-              '--pinned',
-              '--arc-dispatch',
-            ]
-          : [
-              '--window',
-              '--request-id',
-              '--label',
-              '--json',
-              '--dry-run',
-              ...(command === 'archive' ? ['--force'] : []),
-            ];
+          : command === 'start'
+            ? [
+                '--window',
+                '--request-id',
+                '--setup',
+                '--provider',
+                '--model',
+                '--effort',
+                '--permissions',
+                '--prompt-file',
+                '--name',
+                '--label',
+                '--json',
+                '--agent-run',
+                '--pinned',
+                '--arc-dispatch',
+              ]
+            : [
+                '--window',
+                '--request-id',
+                '--label',
+                '--json',
+                '--dry-run',
+                ...(command === 'archive' ? ['--force'] : []),
+              ];
   for (const arg of [...options.keys(), ...flags, ...(labels.length ? ['--label'] : [])]) {
     if (!allowed.includes(arg)) throw new Error(`${arg} is unavailable for ${command}.`);
   }

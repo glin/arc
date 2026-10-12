@@ -91,7 +91,15 @@ export interface AgentReadSource {
   sourceRevision: string;
   // All identities at the supplied timestamps, including unfinished turns.
   identitiesComplete: boolean;
-  turns: readonly { promptId: string; startedAt: number; finished: boolean }[];
+  // Identity coverage does not establish that a delivered window contains all history.
+  historyComplete?: boolean;
+  turns: readonly AgentReadTurnIdentity[];
+}
+
+export interface AgentReadTurnIdentity {
+  promptId: string;
+  startedAt: number;
+  finished: boolean;
 }
 
 export function validAgentReadRecord(value: unknown): value is AgentReadRecord {
@@ -143,7 +151,12 @@ export function currentAgentRead(record: AgentReadRecord, facts: AgentReadSource
   )
     return false;
   const candidates = facts.turns.filter((turn) => turn.startedAt === record.startedAt);
-  return candidates.length === 1 && candidates[0].finished && candidates[0].promptId === record.promptId;
+  return (
+    candidates.length === 1 &&
+    candidates[0].finished &&
+    candidates[0].promptId === record.promptId &&
+    facts.turns.filter((turn) => turn.promptId === record.promptId).length === 1
+  );
 }
 
 export function projectAgentRead(

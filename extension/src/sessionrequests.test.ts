@@ -1,5 +1,11 @@
 import { revisionOf, supportedFileIdentity, type SessionFile } from './transcript';
-import { guardedSourceRevision, sessionSourceAdmitted } from './sessionreads';
+import {
+  guardedSourceRevision,
+  guardedSourceIdentity,
+  AgentReadSources,
+  AGENT_SOURCE_LIMITS,
+  sessionSourceAdmitted,
+} from './sessionreads';
 import { activeWriterFailure } from './composerview';
 import { GuardedAttempt } from './agentwire.ts';
 import assert from 'node:assert/strict';
@@ -54,7 +60,13 @@ import {
   type GuardedSendRequest,
   type GuardedTargetFacts,
 } from './sessionwrites.ts';
-import { OrderedReadOperations, type AgentReadRecord, type AgentReadSource } from './domain/read.ts';
+import {
+  OrderedReadOperations,
+  projectAgentRead,
+  currentAgentRead,
+  type AgentReadRecord,
+  type AgentReadSource,
+} from './domain/read.ts';
 
 test('read receipts refuse changed or foreign work and dry run preserves later admission', async () => {
   const record: AgentReadRecord = {
@@ -933,6 +945,7 @@ test('bounded session reads preserve native provider turns and reject stale scop
       agent === 'claude'
         ? {
             type: 'user',
+            promptId: 'first',
             sessionId: 'known',
             cwd: directory,
             timestamp: '2026-10-08T12:00:00Z',
@@ -950,6 +963,7 @@ test('bounded session reads preserve native provider turns and reject stale scop
         records.push(
           {
             type: 'user',
+            promptId: `prompt-${n}`,
             sessionId: 'known',
             cwd: directory,
             timestamp,
@@ -994,6 +1008,25 @@ test('bounded session reads preserve native provider turns and reject stale scop
     assert.equal(result.turns[0].summary, 'answer 3');
     assert.equal(result.requester, 'local-agent');
     assert.equal('observation' in result, false);
+    const sourceFacts = new AgentReadSources().resolve(source, () => 'scope', [directory])!;
+    assert.equal(sourceFacts.identitiesComplete, true);
+    let completed = 0;
+    const partial = boundedSessionRead(
+      source,
+      2,
+      () => 'scope',
+      'local-agent',
+      [directory],
+      undefined,
+      (facts) => {
+        completed = facts.records.length;
+        for (const record of facts.records) assert.equal(currentAgentRead(record, sourceFacts), true);
+        return 'signed';
+      },
+    );
+    assert.equal(partial.partial, true);
+    assert.equal(completed, 2);
+    assert.equal('readObservation' in partial, true);
     const observed = boundedSessionRead(
       source,
       2,
@@ -3223,6 +3256,185 @@ test('the window channel retains guarded sends by requester, provider, target, o
   } finally {
     vi.unstubAllEnvs();
   }
+});
+
+test('cold source facts validate restored completed identities and invalidate exact source changes', () => {
+  const directory = tempDir('agent-source-facts-');
+  const file = path.join(directory, 'session.jsonl');
+  const timestamp = '2026-10-08T12:00:01Z';
+  const records = [
+    {
+      type: 'user',
+      promptId: 'p1',
+      sessionId: 'known',
+      cwd: directory,
+      timestamp,
+      message: { role: 'user', content: 'prompt' },
+    },
+    {
+      type: 'assistant',
+      timestamp,
+      message: {
+        id: 'answer',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'answer' }],
+        stop_reason: 'end_turn',
+      },
+    },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const source = () => ({
+    agent: 'claude' as const,
+    file,
+    sessionId: 'known',
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const cache = new AgentReadSources();
+  const facts = cache.resolve(source(), () => 'scope', [directory])!;
+  assert.equal(facts.identitiesComplete, true);
+  assert.equal(facts.historyComplete, true);
+  assert.equal(facts.source, guardedSourceIdentity(source()));
+  const record = {
+    provider: facts.provider,
+    sessionId: facts.sessionId,
+    source: facts.source,
+    scope: facts.scope,
+    sourceRevision: facts.sourceRevision,
+    promptId: 'p1',
+    startedAt: Date.parse(timestamp),
+  };
+  const restored = JSON.parse(JSON.stringify([record])) as AgentReadRecord[];
+  assert.equal(
+    projectAgentRead(restored, (one) =>
+      new AgentReadSources().resolve(source(), () => 'scope', [directory], one.sourceRevision),
+    ).size,
+    1,
+  );
+  assert.equal(
+    cache.resolve(source(), () => 'scope', [directory]),
+    facts,
+  );
+  const snapshot = fs.statSync(file, { bigint: true });
+  const stamp = vi.spyOn(filesystem, 'statSync').mockReturnValue({ ...snapshot, ctimeNs: snapshot.ctimeNs + 1n });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(
+      cache.resolve(source(), () => 'scope', [directory], record.sourceRevision),
+      null,
+    );
+    assert.notEqual(guardedSourceRevision(file), record.sourceRevision);
+  } finally {
+    stamp.mockRestore();
+    syncBuiltinESMExports();
+  }
+  fs.appendFileSync(file, '\n');
+  assert.equal(
+    projectAgentRead(restored, (one) => cache.resolve(source(), () => 'scope', [directory], one.sourceRevision)).size,
+    0,
+  );
+  const appended = cache.resolve(source(), () => 'scope', [directory])!;
+  assert.notEqual(appended.sourceRevision, record.sourceRevision);
+  assert.equal(cache.resolve(source(), () => 'other', [directory])!.scope, 'other');
+  fs.writeFileSync(file, '{}\n');
+  assert.equal(
+    projectAgentRead(restored, (one) => cache.resolve(source(), () => 'scope', [directory], one.sourceRevision)).size,
+    0,
+  );
+  fs.renameSync(file, `${file}.old`);
+  fs.writeFileSync(file, records.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+  assert.notEqual(guardedSourceIdentity(source()), record.source);
+  assert.equal(
+    projectAgentRead(restored, (one) => cache.resolve(source(), () => 'scope', [directory], one.sourceRevision)).size,
+    0,
+  );
+  assert.equal(
+    cache.resolve(source(), () => null, [directory]),
+    null,
+  );
+  assert.equal(
+    cache.resolve(source(), () => 'scope', [path.join(directory, 'elsewhere')]),
+    null,
+  );
+  fs.rmSync(file);
+  assert.equal(
+    cache.resolve({ agent: 'claude', file, sessionId: 'known', size: 0, mtimeMs: 0 }, () => 'scope', [directory]),
+    null,
+  );
+});
+
+test('source facts bound bytes and identity coverage without certifying omitted identities', () => {
+  const directory = tempDir('agent-source-bounds-');
+  const file = path.join(directory, 'session.jsonl');
+  const source = () => ({
+    agent: 'claude' as const,
+    file,
+    sessionId: 'known',
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const records = Array.from({ length: AGENT_SOURCE_LIMITS.identities + 1 }, (_, index) => [
+    {
+      type: 'user',
+      promptId: `p${index}`,
+      sessionId: 'known',
+      cwd: directory,
+      timestamp: new Date(1000000 + index * 1000).toISOString(),
+      message: { role: 'user', content: 'prompt' },
+    },
+    {
+      type: 'assistant',
+      timestamp: new Date(1000000 + index * 1000).toISOString(),
+      message: {
+        id: `a${index}`,
+        role: 'assistant',
+        content: [{ type: 'text', text: 'answer' }],
+        stop_reason: 'end_turn',
+      },
+    },
+  ]).flat();
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const cache = new AgentReadSources();
+  const facts = cache.resolve(source(), () => 'scope', [directory])!;
+  assert.equal(facts.identitiesComplete, false);
+  assert.equal(facts.historyComplete, false);
+  assert.equal(facts.turns.length, AGENT_SOURCE_LIMITS.identities);
+  const last = facts.turns.at(-1)!;
+  assert.equal(currentAgentRead({ ...facts, ...last }, facts), false);
+  const firstBytes = source().size;
+  const other = path.join(directory, 'other.jsonl');
+  fs.writeFileSync(other, JSON.stringify(records[0]) + '\n');
+  cache.resolve(
+    { agent: 'claude', file: other, sessionId: 'known', ...revisionOf(fs.statSync(other, { bigint: true })) },
+    () => 'scope',
+    [directory],
+  );
+  const evictedWindow = openReadWindow();
+  cache.resolve(source(), () => 'scope', [directory]);
+  assert.ok(closeReadWindow(evictedWindow).bytes > firstBytes);
+  fs.writeFileSync(file, JSON.stringify(records[0]) + '\n' + ' '.repeat(AGENT_SOURCE_LIMITS.bytes));
+  const window = openReadWindow();
+  const large = cache.resolve(source(), () => 'scope', [directory])!;
+  const tally = closeReadWindow(window);
+  assert.ok(tally.bytes <= AGENT_SOURCE_LIMITS.bytes);
+  assert.equal(large.identitiesComplete, false);
+  assert.deepEqual(large.turns, []);
+  cache.clear();
+  for (let index = 0; index <= AGENT_SOURCE_LIMITS.sources; index++) {
+    const next = path.join(directory, `source-${index}.jsonl`);
+    fs.writeFileSync(next, JSON.stringify(records[0]) + '\n');
+    cache.resolve(
+      { agent: 'claude', file: next, sessionId: 'known', ...revisionOf(fs.statSync(next, { bigint: true })) },
+      () => 'scope',
+      [directory],
+    );
+  }
+  const oldest = path.join(directory, 'source-0.jsonl');
+  const evictedSources = openReadWindow();
+  cache.resolve(
+    { agent: 'claude', file: oldest, sessionId: 'known', ...revisionOf(fs.statSync(oldest, { bigint: true })) },
+    () => 'scope',
+    [directory],
+  );
+  assert.equal(closeReadWindow(evictedSources).bytes, 2 * fs.statSync(oldest).size);
 });
 
 test('guarded source revisions refuse growth that ordinary admission accepts, replacement, and unreadable sources', () => {

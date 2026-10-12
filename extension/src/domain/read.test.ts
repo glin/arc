@@ -42,6 +42,13 @@ test('agent acknowledgments retain full identities and reject replacement or col
   assert.equal(
     projectAgentRead(restored, (record) => ({
       ...sourceFacts(record),
+      turns: [...sourceFacts(record).turns, { promptId: record.promptId, startedAt: 20, finished: true }],
+    })).size,
+    0,
+  );
+  assert.equal(
+    projectAgentRead(restored, (record) => ({
+      ...sourceFacts(record),
       turns: [{ promptId: 'different', startedAt: 10, finished: true }],
     })).size,
     0,

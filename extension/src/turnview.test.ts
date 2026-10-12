@@ -670,6 +670,7 @@ test('agent acknowledgments never establish a reader boundary or complete omitte
     startedAt,
     promptId: `p${startedAt}`,
     kind: 'turn',
+    finished: true,
   }));
   const agent = new Map([['s:20', 'p20']]);
   for (const whole of [true, false]) {
@@ -718,7 +719,7 @@ test('agent acknowledgments never establish a reader boundary or complete omitte
 });
 
 test('acknowledged subsets preserve older starts without a complete unique mapping', () => {
-  const newest = { key: 's:20', sessionId: 's', startedAt: 20, promptId: 'p20', kind: 'turn' };
+  const newest = { key: 's:20', sessionId: 's', startedAt: 20, promptId: 'p20', kind: 'turn', finished: true };
   const agent = new Map([['s:20', 'p20']]);
   for (const whole of [true, false]) {
     const windows = new Map([['s', { starts: [10, 20], whole }]]);
@@ -746,6 +747,32 @@ test('acknowledged subsets preserve older starts without a complete unique mappi
       atLeast: false,
     });
   }
+});
+
+test('count mappings reject repeated prompt identities and unfinished agent acknowledgments', () => {
+  const refs = [10, 20].map((startedAt) => ({
+    key: `s:${startedAt}`,
+    sessionId: 's',
+    startedAt,
+    promptId: 'same',
+    kind: 'turn',
+    finished: true,
+  }));
+  const windows = new Map([['s', { starts: [10, 20], whole: false }]]);
+  const agent = new Map([['s:20', 'same']]);
+  assert.deepEqual(newCounts([], windows, [], new Map(), 0, agent, new Map([['s', refs]])).get('s'), {
+    count: 2,
+    atLeast: true,
+  });
+  const unique = refs.map((turn) => ({ ...turn, promptId: `p${turn.startedAt}`, finished: turn.startedAt === 10 }));
+  assert.deepEqual(
+    newCounts([], windows, [], new Map(), 0, new Map([['s:20', 'p20']]), new Map([['s', unique]])).get('s'),
+    { count: 2, atLeast: true },
+  );
+  assert.deepEqual(newCounts([], windows, ['s:20'], new Map(), 0, agent, new Map([['s', unique]])).get('s'), {
+    count: 0,
+    atLeast: false,
+  });
 });
 
 test('the saved panel state is rebuilt rather than trusted', () => {
