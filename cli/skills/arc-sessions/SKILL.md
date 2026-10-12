@@ -31,7 +31,7 @@ Run `arc setups --window WINDOW_ID` before choosing settings. Use a returned set
 
 Start requires a regular UTF-8 prompt file, at most 48 KiB, with nonempty text that does not begin with a slash command. Explicit settings use `--provider claude|codex`, `--model`, `--effort`, and `--permissions` instead of `--setup`. Omitted values retain provider defaults. Repeat `--label` for initial labels. Use `--pinned` for an initial pin.
 
-Choose exactly one classification. `--untagged` marks work the reader asked for and preserves prompt-box continuation. `--agent-run` marks delegated work under Run by agents. Attribution alone establishes neither ownership nor authority. `--arc-dispatch` adds a receipt that supplies the parent session's Dispatched link.
+Choose exactly one classification. `--untagged` marks work the reader asked for and preserves prompt-box continuation. A session that the reader asked you to start is work the reader asked for, even when it coordinates other agents. `--agent-run` marks delegated work under Run by agents. Use it only for a session that you choose to start for part of your own task, such as a worker or a reviewer. A session that the reader asked for stays untagged even when it reports back to you. Attribution alone establishes neither ownership nor authority. `--arc-dispatch` adds a receipt that supplies the parent session's Dispatched link.
 
 ## Interpret delivery
 
