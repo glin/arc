@@ -8,8 +8,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const vsce = path.join(root, 'node_modules', '@vscode', 'vsce', 'vsce');
 const sizeNotice = /^The file extension\/dist\/extension\.js is large \([^)]+\)\r?\n$/;
 
-// Windows filesystem modes do not retain execute permission in a cross-platform VSIX.
+// Windows filesystem modes do not retain declared permissions in a cross-platform VSIX.
 async function executableLauncher(file) {
+  const identity = JSON.parse(await readFile(path.join(root, 'dist/build-identity.json'), 'utf8'));
   const bytes = await readFile(file);
   let end = bytes.length - 22;
   while (end >= Math.max(0, bytes.length - 65_557)) {
@@ -22,9 +23,13 @@ async function executableLauncher(file) {
     if (bytes.readUInt32LE(at) !== 0x02014b50) throw new Error('The VSIX directory is invalid.');
     const nameBytes = bytes.readUInt16LE(at + 28);
     const name = bytes.toString('utf8', at + 46, at + 46 + nameBytes);
-    if (name === 'extension/dist/bin/arc') {
+    const mode =
+      name === 'extension/dist/bin/arc'
+        ? 0o755
+        : identity.tools.files[name.replace(/^extension\/dist\/tools\//, '')]?.mode;
+    if (mode !== undefined) {
       bytes[at + 5] = 3;
-      bytes.writeUInt32LE((0o100755 << 16) >>> 0, at + 38);
+      bytes.writeUInt32LE(((0o100000 | mode) << 16) >>> 0, at + 38);
       found = true;
     }
     at += 46 + nameBytes + bytes.readUInt16LE(at + 30) + bytes.readUInt16LE(at + 32);

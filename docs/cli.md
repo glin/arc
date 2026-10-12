@@ -10,15 +10,17 @@ The Arc CLI reports session cost from disk, renders Claude Code status-line inpu
 
 Agents started by the panel can run `arc` from their shell commands through the extension's packaged launchers. [Agent runtime](agent-protocols.md#runtime-shape) owns their environment and window targeting.
 
+The installed VSIX commands read their selected release from their own installation root. Caller `ARC_HOME` still selects CLI data. Offline cost and status-line commands work with the editor closed. [Extension installation](../README.md#try-it) owns command setup and PATH consent.
+
 From a source checkout, build the CLI from the repository root:
 
 ```sh
 npm --prefix cli run build
-node cli/dist/arc-status.cjs --help
-node cli/dist/arc-status.cjs --version
+node cli/dist/arc.cjs --help
+node cli/dist/arc.cjs --version
 ```
 
-The [package README](../cli/README.md#install) covers installation, command aliases, replacement of `arc-agent-status`, and runtime requirements. It also covers [Claude Code settings](../cli/README.md#status-line-setup). Source development has separate [Node requirements](development.md#dependencies).
+The [package README](../cli/README.md#install) covers installation and runtime requirements. It also covers [Claude Code settings](../cli/README.md#status-line-setup). Source development has separate [Node requirements](development.md#dependencies).
 
 After global package installation, run `arc`:
 
@@ -296,17 +298,17 @@ For status-line settings, compatibility, and next-turn price meaning, see the [p
 From the repository root in PowerShell, use the included synthetic input:
 
 ```powershell
-Get-Content -Raw cli/test/fixtures/warm.json | node cli/dist/arc-status.cjs statusline --width 70
-Get-Content -Raw cli/test/fixtures/warm.json | node cli/dist/arc-status.cjs statusline --json
-Get-Content -Raw cli/test/fixtures/warm.json | node cli/dist/arc-status.cjs statusline --next-turn
+Get-Content -Raw cli/test/fixtures/warm.json | node cli/dist/arc.cjs statusline --width 70
+Get-Content -Raw cli/test/fixtures/warm.json | node cli/dist/arc.cjs statusline --json
+Get-Content -Raw cli/test/fixtures/warm.json | node cli/dist/arc.cjs statusline --next-turn
 ```
 
 On macOS or Linux, redirect the same input:
 
 ```sh
-node cli/dist/arc-status.cjs statusline --width 70 < cli/test/fixtures/warm.json
-node cli/dist/arc-status.cjs statusline --json < cli/test/fixtures/warm.json
-node cli/dist/arc-status.cjs statusline --next-turn < cli/test/fixtures/warm.json
+node cli/dist/arc.cjs statusline --width 70 < cli/test/fixtures/warm.json
+node cli/dist/arc.cjs statusline --json < cli/test/fixtures/warm.json
+node cli/dist/arc.cjs statusline --next-turn < cli/test/fixtures/warm.json
 ```
 
 The fixture's saved cache expiry is in the past. The complete width-70 text output is:
@@ -348,14 +350,14 @@ Text rounds positive next-turn starting prices below $10 upward to cents and pri
 
 ## Errors
 
-Successful commands write output to stdout and exit with status 0. Errors write one line prefixed with `arc-status:` to stderr and exit with status 1. Errors produce no report on stdout.
+Successful commands write output to stdout and exit with status 0. Errors write one line prefixed with `arc:` to stderr and exit with status 1. Errors produce no report on stdout.
 
 Cost rejects unknown options, missing option values, multiple targets, invalid times, unreadable transcripts, invalid regex syntax, and unresolved Agent launches. JSON arrays and identifiable Claude stream logs are unsupported. Empty files and files without native transcript records produce errors. Metadata-only native sessions and empty request windows remain valid. Status-line input must contain one JSON object. Empty input, malformed JSON, and incompatible output modes produce errors.
 
 These complete stderr examples require no path substitutions:
 
 ```text
-arc-status: --until-text requires --by-tool-kind.
-arc-status: --json and --next-turn cannot be used together.
-arc-status: Claude status input is not valid JSON.
+arc: --until-text requires --by-tool-kind.
+arc: --json and --next-turn cannot be used together.
+arc: Claude status input is not valid JSON.
 ```

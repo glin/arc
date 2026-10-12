@@ -701,6 +701,7 @@ test('terminal extension shutdown closes recorder admission before draining work
     module,
     exports,
     windowChannel: { dispose: () => Promise.resolve() },
+    snapshotSetup: { dispose: () => Promise.resolve() },
     usageRecorder: {
       dispose: () => {
         calls.push('closed');

@@ -7,7 +7,7 @@ The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and o
 | Component | Job | Installation |
 | --- | --- | --- |
 | Arc extension | Displays sessions and connects to agent CLIs. Includes `arc` launchers for panel-started agents. | Source installer or an available VSIX. |
-| Standalone Arc CLI | Makes `arc` and `arc-status` available to ordinary shell commands. | Local npm tarball from the [CLI build instructions](../cli/README.md#build-from-source). |
+| Standalone Arc CLI | Makes `arc` available to ordinary shell commands. | Local npm tarball from the [CLI build instructions](../cli/README.md#build-from-source). |
 | `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Reader installs or links the skill separately. |
 | `arc-hooks` Claude plugin | Captures first-touch file snapshots for Claude file diffs. | Source installer or Claude plugin marketplace. |
 

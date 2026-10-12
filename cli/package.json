@@ -20,11 +20,10 @@
     "url": "https://github.com/glin/arc/issues"
   },
   "bin": {
-    "arc": "dist/arc-status.cjs",
-    "arc-status": "dist/arc-status.cjs"
+    "arc": "dist/arc.cjs"
   },
   "files": [
-    "dist/arc-status.cjs",
+    "dist/arc.cjs",
     "dist/windowpipe.exe",
     "skills/arc-sessions/SKILL.md",
     "README.md",

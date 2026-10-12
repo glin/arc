@@ -16,7 +16,7 @@ try {
 const { version } = JSON.parse(await fs.readFile(new URL('./package.json', import.meta.url), 'utf8'));
 copyWindowsPipe('dist');
 
-await fs.rm('dist/arc-status.cjs.map', { force: true });
+await fs.rm('dist/arc.cjs.map', { force: true });
 
 await esbuild.build({
   entryPoints: ['src/main.ts'],
@@ -26,7 +26,7 @@ await esbuild.build({
   target: 'node18',
   define: { ARC_BUILD_COMMIT: JSON.stringify(buildCommit), ARC_VERSION: JSON.stringify(version) },
   banner: { js: '#!/usr/bin/env node' },
-  outfile: 'dist/arc-status.cjs',
+  outfile: 'dist/arc.cjs',
 });
 
-await fs.chmod('dist/arc-status.cjs', 0o755);
+await fs.chmod('dist/arc.cjs', 0o755);

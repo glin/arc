@@ -17,3 +17,4 @@ vitest.config.ts
 node_modules/**
 **/*.log
 **/*.cpuprofile*
+.tmp-*/**

@@ -23,6 +23,15 @@ The source installer builds and installs the editor extension from local or temp
 
 The panel shots and their test write WebP files with the ImageMagick 7 `magick` command. Put `magick` on the `PATH` before running the full test suite.
 
+A built source tree exposes the same durable installer used by the VSIX. Each command performs only its named operation. Command installation leaves PATH configuration unchanged.
+
+```bash
+node extension/dist/setup.cjs --commands
+node extension/dist/setup.cjs --snapshots
+```
+
+The ordinary source installer retains its local marketplace and hosted catalog routes. These alternate routes remain independent of durable VSIX setup.
+
 ## Panel screenshots
 
 The ordinary command captures the full state matrix in both default themes under `extension/shots`:

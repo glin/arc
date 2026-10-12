@@ -8,13 +8,16 @@ import yauzl from 'yauzl';
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const archive = resolve(process.argv[2] ?? join(extensionRoot, 'arc.vsix'));
 const manifest = JSON.parse(await readFile(join(extensionRoot, 'package.json'), 'utf8'));
+const identity = JSON.parse(await readFile(join(extensionRoot, 'dist/build-identity.json'), 'utf8'));
 const expectedFiles = [
+  ...Object.keys(identity.tools.files).map((file) => `extension/dist/tools/${file}`),
   '[Content_Types].xml',
   'extension.vsixmanifest',
   'extension/LICENSE.txt',
   'extension/dist/extension.js',
   'extension/dist/build-identity.json',
   'extension/dist/cli.cjs',
+  'extension/dist/setup.cjs',
   'extension/dist/export-viewer.js',
   'extension/dist/export-viewer.css',
   'extension/dist/windowpipe.exe',
@@ -36,9 +39,17 @@ async function readArchive(file) {
     zip.on('error', reject);
     zip.on('end', () => resolveEntries(entries));
     zip.on('entry', (entry) => {
-      if (entry.fileName === 'extension/dist/bin/arc') {
-        assert.equal(entry.versionMadeBy >> 8, 3, 'Arc launcher permissions need a Unix archive identity');
-        assert.equal((entry.externalFileAttributes >>> 16) & 0o777, 0o755, 'Arc launcher is not executable');
+      const mode =
+        entry.fileName === 'extension/dist/bin/arc'
+          ? 0o755
+          : identity.tools.files[entry.fileName.replace(/^extension\/dist\/tools\//, '')]?.mode;
+      if (mode !== undefined) {
+        assert.equal(entry.versionMadeBy >> 8, 3, `${entry.fileName} needs a Unix archive identity`);
+        assert.equal(
+          (entry.externalFileAttributes >>> 16) & 0o777,
+          mode,
+          `${entry.fileName} permissions differ from its payload identity`,
+        );
       }
       zip.openReadStream(entry, async (error, stream) => {
         if (error) return reject(error);
@@ -58,6 +69,13 @@ async function readArchive(file) {
 
 const entries = await readArchive(archive);
 assert.deepEqual([...entries.keys()].sort(), expectedFiles.sort(), 'VSIX contents differ from the release allowlist');
+for (const [file, metadata] of Object.entries(identity.tools.files)) {
+  assert.equal(
+    sha256(entries.get(`extension/dist/tools/${file}`)),
+    metadata.sha256,
+    `Bundled tools digest differs for ${file}`,
+  );
+}
 const packaged = JSON.parse(entries.get('extension/package.json').toString('utf8'));
 for (const key of ['name', 'publisher', 'version', 'engines', 'main']) {
   assert.deepEqual(packaged[key], manifest[key], `packaged ${key} differs from the source manifest`);
@@ -73,7 +91,15 @@ assert.equal(
   sha256(await readFile(join(extensionRoot, 'dist', 'extension.js'))),
   'VSIX bundle differs from the current build',
 );
-for (const file of ['cli.cjs', 'export-viewer.js', 'export-viewer.css', 'bin/arc', 'bin/arc.cmd', 'windowpipe.exe']) {
+for (const file of [
+  'cli.cjs',
+  'setup.cjs',
+  'export-viewer.js',
+  'export-viewer.css',
+  'bin/arc',
+  'bin/arc.cmd',
+  'windowpipe.exe',
+]) {
   assert.equal(
     sha256(entries.get(`extension/dist/${file}`)),
     sha256(await readFile(join(extensionRoot, 'dist', file))),

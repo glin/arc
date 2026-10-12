@@ -6,13 +6,11 @@ Show context, prompt-cache status, and the next turn's starting price in Claude 
 
 ## Install
 
+The Arc VSIX also offers durable command installation through **Arc: Set up terminal commands**. [Extension installation](../README.md#try-it) owns its runtime and PATH setup.
+
 Requires Node.js 18 or later. [Build from source](#build-from-source) and install the local tarball.
 
-The package installs `arc` and the compatible `arc-status` alias. If you use the old `arc-agent-status` package, uninstall it first:
-
-```sh
-npm uninstall --global arc-agent-status
-```
+The package installs the `arc` command.
 
 ## Session skill
 
@@ -85,13 +83,13 @@ npm prefix --global
 On Windows, the command takes this form. Use forward slashes:
 
 ```text
-node C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc-status.cjs statusline
+node C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs statusline
 ```
 
 On macOS and Linux, use:
 
 ```text
-node /path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc-status.cjs statusline
+node /path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc.cjs statusline
 ```
 
 ## Session costs

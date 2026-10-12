@@ -111,6 +111,10 @@ import {
   type GuardedSendResult,
   type GuardedStartContext,
 } from './sessionwrites';
+import { claudeConfigHome } from './agentpaths';
+import { ClaudePluginOffer, ClaudePluginSetup, pluginTarget } from './claudeplugin';
+import { BundledTools, readToolPackage, resolveToolRuntime, toolRoot } from './bundledtools';
+import { appendWindowsUserPath, existingToolCommands, manualToolPath, terminalToolPath } from './toolpath';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
 declare const EXTENSION_VERSION: string;
@@ -119,6 +123,7 @@ const usageWrites = new UsageWriteQueue();
 const sessionSettingsWrites = new UsageWriteQueue();
 let usageRecorder: UsageRecorder | null = null;
 let windowChannel: WindowChannel | null = null;
+let snapshotSetup: ClaudePluginOffer | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const activationAt = performance.now();
@@ -172,9 +177,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(watcher);
 
   // Register the panel that displays recorded turns.
+  let snapshotOffer: ClaudePluginOffer | undefined;
+  let snapshotPanelOpened = false;
   const panel = registerPanel(context, root, workspaceCache, activationAt);
   channel?.setRequestHandler((request) => panel.handleSessionRequest(request));
   panel.setWindowStateHandler((state) => {
+    if (state.panelReady && state.panelVisible) {
+      snapshotPanelOpened = true;
+      void snapshotOffer?.check();
+    }
     void channel?.update(state).catch(() => {
       void channel?.dispose();
     });
@@ -573,6 +584,135 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
   });
+
+  let bundledTools: BundledTools | undefined;
+  let toolProblem = '';
+  try {
+    if (vscode.env.remoteName)
+      throw new Error(
+        'Arc tool setup is unavailable in remote windows. Run setup in a local window on the execution host.',
+      );
+    bundledTools = new BundledTools(readToolPackage(path.join(context.extensionPath, 'dist')), toolRoot());
+  } catch (error) {
+    toolProblem = error instanceof Error ? error.message : String(error);
+  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand('arc.setupCommands', async () => {
+      if (!vscode.workspace.isTrusted || !bundledTools) {
+        void vscode.window.showErrorMessage(
+          `Arc: ${toolProblem || 'Trust this window before setting up terminal commands.'}`,
+        );
+        return;
+      }
+      const terminalAction = terminalToolPath(path.join(bundledTools.root, 'bin'))
+        ? ' and append that folder for new editor terminals'
+        : '';
+      const answer = await vscode.window.showInformationMessage(
+        `Install Arc terminal commands in ${path.join(bundledTools.root, 'bin')}${terminalAction}? Existing commands keep precedence. Node.js 18 or later is required.`,
+        { modal: true },
+        'Install',
+        'Cancel',
+      );
+      if (answer !== 'Install') return;
+      let installedPath = '';
+      try {
+        const conflicts = existingToolCommands(process.env);
+        const runtime = resolveToolRuntime(process.env, workspaceCwd() ?? process.cwd());
+        const executable = await bundledTools.installCommands(runtime, new AbortController().signal);
+        installedPath = executable;
+        const bin = path.dirname(executable);
+        const terminalPath = terminalToolPath(bin);
+        if (terminalPath) {
+          context.environmentVariableCollection.description = 'Arc terminal commands';
+          context.environmentVariableCollection.append(terminalPath.variable, terminalPath.value);
+        }
+        let availability = terminalPath
+          ? 'New editor terminals include the Arc folder. Restart existing terminals.'
+          : 'This installation folder cannot be added to PATH. Run the installed command by its full path.';
+        if (terminalPath && process.platform === 'win32') {
+          const consent = await vscode.window.showInformationMessage(
+            `Append ${bin} to your Windows user PATH? Restart terminal hosts and applications to receive the change. Existing entries stay in order.`,
+            { modal: true },
+            'Add to user PATH',
+            'Skip',
+          );
+          if (consent === 'Add to user PATH') {
+            const result = appendWindowsUserPath(bin);
+            availability +=
+              result === 'present'
+                ? ' The Windows user PATH already includes this folder.'
+                : ' The Windows user PATH now includes this folder.';
+          } else availability += ' The Windows user PATH stays unchanged.';
+        } else if (terminalPath) availability += ' ' + manualToolPath(bin);
+        if (conflicts.length) availability += ` Existing commands keep precedence: ${conflicts.join(', ')}.`;
+        void vscode.window.showInformationMessage(`Arc commands installed: ${executable}. ${availability}`);
+      } catch (error) {
+        void vscode.window.showErrorMessage(
+          `Arc: ${installedPath ? 'Commands installed at ' + installedPath + '. PATH setup did not finish. ' : ''}${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }),
+  );
+
+  snapshotOffer = new ClaudePluginOffer(
+    {
+      target: () => {
+        if (
+          !bundledTools ||
+          vscode.env.remoteName ||
+          !vscode.workspace.isTrusted ||
+          process.env[MEASUREMENT_ENVIRONMENT.blockAgents] === '1'
+        )
+          return null;
+        const cwd = workspaceCwd();
+        if (!cwd) return null;
+        const launch = claudeLaunch(readSetting('claudePath'), thisMachine());
+        if (launch.problem) return null;
+        try {
+          return pluginTarget(cwd, claudeConfigHome(), launch, `${vscode.env.remoteName ?? 'local'}:${os.hostname()}`);
+        } catch {
+          return null;
+        }
+      },
+      dismissed: (key) => context.globalState.get<boolean>(key) === true,
+      dismiss: async (key) => {
+        await context.globalState.update(key, true);
+      },
+      offer: async () =>
+        vscode.window.showInformationMessage(
+          "Install the optional Claude snapshot plugin for file baselines? Setup needs Node.js in the editor's launch environment. Arc copies the plugin from this extension. Restart Claude after installation. Earlier baselines stay unavailable.",
+          'Install',
+          'Not now',
+        ),
+      report: (message, error) => {
+        if (error) void vscode.window.showErrorMessage(`Arc: ${message}`);
+        else void vscode.window.showInformationMessage(`Arc: ${message}`);
+      },
+    },
+    new ClaudePluginSetup(undefined, undefined, undefined, bundledTools),
+  );
+  snapshotSetup = snapshotOffer;
+  const refreshSnapshots = () => {
+    snapshotOffer?.invalidate();
+    if (snapshotPanelOpened) void snapshotOffer?.check();
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('arc.setupClaudeSnapshots', () => {
+      if (toolProblem) return vscode.window.showErrorMessage(`Arc: ${toolProblem}`);
+      return snapshotOffer?.check(true);
+    }),
+    vscode.workspace.onDidGrantWorkspaceTrust(refreshSnapshots),
+    vscode.workspace.onDidChangeWorkspaceFolders(refreshSnapshots),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration(settingName('claudePath'))) refreshSnapshots();
+    }),
+    {
+      dispose: () => {
+        void snapshotOffer?.dispose();
+      },
+    },
+  );
+  if (snapshotPanelOpened) void snapshotOffer.check();
 
   // Permission mode keeps an agent-wide launch default and an accepted value per session.
   // Model and effort choices name one session and must not alter a sibling.
@@ -2187,7 +2327,11 @@ async function copyLink(arg: unknown): Promise<void> {
 
 export function deactivate(): Thenable<void> {
   const recording = usageRecorder?.dispose();
-  return Promise.all([recording, windowChannel?.dispose(), usageWrites.drain(), sessionSettingsWrites.drain()]).then(
-    () => undefined,
-  );
+  return Promise.all([
+    recording,
+    snapshotSetup?.dispose(),
+    windowChannel?.dispose(),
+    usageWrites.drain(),
+    sessionSettingsWrites.drain(),
+  ]).then(() => undefined);
 }

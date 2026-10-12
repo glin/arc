@@ -14,7 +14,7 @@ export const ARC_IDENTITY = {
   visualizationScheme: 'arc-visualization:',
   sessionScheme: 'arc-session:',
   cliPackageName: '@glin/arc',
-  cliExecutable: 'arc-status',
+  cliExecutable: 'arc',
   vsixFileName: 'arc.vsix',
   baselineScheme: 'arc-baseline',
   patchScheme: 'arc-patch',

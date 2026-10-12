@@ -99,6 +99,16 @@
     },
     "commands": [
       {
+        "command": "arc.setupCommands",
+        "title": "Set up terminal commands",
+        "category": "Arc"
+      },
+      {
+        "command": "arc.setupClaudeSnapshots",
+        "title": "Set up Claude snapshots",
+        "category": "Arc"
+      },
+      {
         "command": "arc.savePerformanceDiagnostics",
         "title": "Save Performance Diagnostics",
         "category": "Arc"
@@ -538,6 +548,14 @@
         }
       ],
       "commandPalette": [
+        {
+          "command": "arc.setupCommands",
+          "when": "true"
+        },
+        {
+          "command": "arc.setupClaudeSnapshots",
+          "when": "true"
+        },
         {
           "command": "arc.addToArc",
           "when": "false"

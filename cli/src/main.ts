@@ -123,6 +123,6 @@ async function run(): Promise<void> {
 
 run().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`arc-status: ${message}\n`);
+  process.stderr.write(`arc: ${message}\n`);
   process.exitCode = 1;
 });

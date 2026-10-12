@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { require as tsRequire } from 'tsx/cjs/api';
 import { copyWindowsPipe } from '../scripts/windowpipe-build.mjs';
+import { bundledTools } from './scripts/bundled-tools.mjs';
 
 // The scoped TypeScript loader lets Node import panelbundle.ts from this build script.
 const { browserBundle, browserStylesheet, exportBrowserAssets } = tsRequire('./src/panelbundle.ts', import.meta.url);
@@ -139,18 +140,34 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
   if (!watch) {
     const cliResult = await cli.rebuild();
     const result = await current.context.rebuild();
+    const setup = await esbuild.build({
+      entryPoints: ['src/bundledsetup.ts'],
+      bundle: true,
+      format: 'cjs',
+      platform: 'node',
+      target: 'node18',
+      outfile: 'dist/setup.cjs',
+      metafile: true,
+    });
+    const tools = bundledTools(path.resolve('dist'), path.resolve('..'), {
+      extensionVersion: manifestVersion(),
+      sourceCommit: sourceIdentity().sourceCommit,
+    });
     const inputs = [
       ...new Set(
         [
           ...current.inputs,
           ...Object.keys(result.metafile.inputs),
           ...Object.keys(cliResult.metafile.inputs),
+          ...Object.keys(setup.metafile.inputs),
           'package.json',
           'esbuild.mjs',
           'src/panelbundle.ts',
           'resources/windowpipe.exe',
           'resources/windowpipe.json',
           '../scripts/windowpipe-build.mjs',
+          'scripts/bundled-tools.mjs',
+          ...tools.inputs,
         ].map((file) => path.relative(process.cwd(), path.resolve(file)).split(path.sep).join('/')),
       ),
     ];
@@ -160,6 +177,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
       JSON.stringify({
         version: manifestVersion(),
         ...sourceIdentity(),
+        tools: tools.identity,
         extensionSha256: hash('dist/extension.js'),
         exportViewerScriptSha256: hash('dist/export-viewer.js'),
         exportViewerStylesheetSha256: hash('dist/export-viewer.css'),

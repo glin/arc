@@ -20129,6 +20129,8 @@ test('the command palette gives every command an approved visibility policy', ()
     });
 
   assert.deepEqual(visible(true), [
+    'arc.setupCommands',
+    'arc.setupClaudeSnapshots',
     'arc.savePerformanceDiagnostics',
     'arc.openDiagnosticsLog',
     'arc.showProjectSpend',
@@ -20137,6 +20139,8 @@ test('the command palette gives every command an approved visibility policy', ()
     'arc.resetPanelState',
   ]);
   assert.deepEqual(visible(false), [
+    'arc.setupCommands',
+    'arc.setupClaudeSnapshots',
     'arc.savePerformanceDiagnostics',
     'arc.openDiagnosticsLog',
     'arc.showProjectSpend',

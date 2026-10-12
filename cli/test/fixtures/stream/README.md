@@ -1,6 +1,6 @@
 # Synthetic Claude stream corpus
 
-`generate.mjs` writes every stream file and its expected JSON. No input contains a prompt, path, tool argument, tool result, or captured session data. Expected files use the complete `parent`, `children`, `combined`, and `run` sections of the `arc-status cost --json` contract. The generator uses the fixed rates below and checks each total against the hand-calculated value. The audit compares only listed keys.
+`generate.mjs` writes every stream file and its expected JSON. No input contains a prompt, path, tool argument, tool result, or captured session data. Expected files use the complete `parent`, `children`, `combined`, and `run` sections of the `arc cost --json` contract. The generator uses the fixed rates below and checks each total against the hand-calculated value. The audit compares only listed keys.
 
 `clientCostUsd` is null for a scope when one recorded `modelUsage` cost spans the parent and child. `expiryReturns`, `returnInputTokens`, and `returnInputUsd` are null when the stream has no visible turn boundaries. A visible turn with no expiry gives zero.
 
@@ -28,7 +28,7 @@ The rates below were read from `extension/src/pricing.ts` on 2026-09-25. Dollars
 The audit runs a command once per fixture. `{}` becomes the fixture path. It compares expected keys and accepts a dollar difference up to `$0.0001`.
 
 ```bash
-node cli/test/fixtures/stream/audit.mjs -- node cli/dist/arc-status.cjs cost {} --json
+node cli/test/fixtures/stream/audit.mjs -- node cli/dist/arc.cjs cost {} --json
 ```
 
 For a caller with different key names, pass a JSON map from corpus key paths to caller key paths.

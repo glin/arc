@@ -22,7 +22,7 @@ const fixture = JSON.parse(readFileSync(new URL('./fixtures/warm.json', import.m
 const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 fixture.prompt_cache.expires_at = Math.ceil(Date.now() / 1000) + 300;
 const input = JSON.stringify(fixture);
-const cli = fileURLToPath(new URL('../dist/arc-status.cjs', import.meta.url));
+const cli = fileURLToPath(new URL('../dist/arc.cjs', import.meta.url));
 
 test('the bundled windows command reaches authenticated hosts and keeps secrets out of both output formats', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc-windows-smoke-'));
@@ -495,7 +495,7 @@ test('the bundled CLI rejects malformed JSON without writing status output', () 
   });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
-  assert.equal(result.stderr, 'arc-status: Claude status input is not valid JSON.\n');
+  assert.equal(result.stderr, 'arc: Claude status input is not valid JSON.\n');
 });
 
 test('the bundled cost command reads isolated roots and reports failures on stderr', () => {
@@ -583,25 +583,22 @@ test('the bundled cost command reads isolated roots and reports failures on stde
   }
 });
 
-test('the packed package installs both commands globally, replaces the old package, and runs locally offline', () => {
+test('the packed package installs only arc globally and runs locally offline', () => {
   const root = mkdtempSync(join(tmpdir(), 'arc-installed-smoke-'));
   const packageRoot = fileURLToPath(new URL('../', import.meta.url));
   const consumer = join(root, 'consumer');
   const prefix = join(root, 'global');
-  const replacement = join(root, 'replacement');
-  const oldPackage = join(root, 'old-package');
   const packable = join(root, 'package');
   const npmCli = process.env.npm_execpath;
   assert.ok(npmCli, 'Run packaging smoke tests through npm.');
   mkdirSync(consumer);
   mkdirSync(join(packable, 'dist'), { recursive: true });
   mkdirSync(join(packable, 'skills/arc-sessions'), { recursive: true });
-  for (const file of ['package.json', 'README.md', 'LICENSE', 'dist/arc-status.cjs', 'skills/arc-sessions/SKILL.md']) {
+  for (const file of ['package.json', 'README.md', 'LICENSE', 'dist/arc.cjs', 'skills/arc-sessions/SKILL.md']) {
     copyFileSync(join(packageRoot, file), join(packable, file));
   }
   writeFileSync(join(packable, 'dist/obsolete.cjs'), 'obsolete bundle');
-  writeFileSync(join(packable, 'dist/arc-status.cjs.map'), 'source map');
-  mkdirSync(join(oldPackage, 'dist'), { recursive: true });
+  writeFileSync(join(packable, 'dist/arc.cjs.map'), 'source map');
   writeFileSync(join(root, 'user.npmrc'), '');
   writeFileSync(join(root, 'global.npmrc'), '');
   writeFileSync(join(consumer, 'package.json'), JSON.stringify({ name: 'arc-smoke-consumer', private: true }));
@@ -653,7 +650,7 @@ test('the packed package installs both commands globally, replaces the old packa
     assert.deepEqual(packed.files.map(({ path }) => path).sort(), [
       'LICENSE',
       'README.md',
-      'dist/arc-status.cjs',
+      'dist/arc.cjs',
       'package.json',
       'skills/arc-sessions/SKILL.md',
     ]);
@@ -665,6 +662,7 @@ test('the packed package installs both commands globally, replaces the old packa
       readFileSync(join(packageRoot, 'skills/arc-sessions/SKILL.md'), 'utf8'),
     );
     assert.equal(manifest.name, '@glin/arc');
+    assert.deepEqual(manifest.bin, { arc: 'dist/arc.cjs' });
     assert.equal(manifest.license, 'MIT');
     assert.equal(manifest.private, undefined);
     assert.equal(manifest.publishConfig.access, 'public');
@@ -708,7 +706,7 @@ test('the packed package installs both commands globally, replaces the old packa
       execFileSync(process.execPath, [cli, 'statusline', '--json'], { ...options, input: installedInput }),
     );
     const expectedHelp = execFileSync(process.execPath, [cli, '--help'], options);
-    for (const command of ['arc', 'arc-status']) {
+    for (const command of ['arc']) {
       assert.equal(installed(prefix, command, ['--version']).trim(), packageJson.version);
       assert.equal(installed(prefix, command, ['--help']), expectedHelp);
       assert.deepEqual(
@@ -716,27 +714,6 @@ test('the packed package installs both commands globally, replaces the old packa
         expectedStatus,
       );
       assert.deepEqual(JSON.parse(installed(prefix, command, costArgs)), expectedCost);
-    }
-
-    writeFileSync(
-      join(oldPackage, 'dist/arc-status.cjs'),
-      '#!/usr/bin/env node\nconsole.log("old-package-fixture");\n',
-    );
-    writeFileSync(
-      join(oldPackage, 'package.json'),
-      JSON.stringify({
-        name: 'arc-agent-status',
-        version: '0.0.0',
-        bin: { 'arc-status': 'dist/arc-status.cjs' },
-      }),
-    );
-    const [oldPacked] = JSON.parse(npm(['pack', '--json', '--ignore-scripts', '--pack-destination', root], oldPackage));
-    npm(['install', '--global', '--prefix', replacement, join(root, oldPacked.filename)]);
-    assert.equal(installed(replacement, 'arc-status', []).trim(), 'old-package-fixture');
-    npm(['uninstall', '--global', '--prefix', replacement, 'arc-agent-status']);
-    npm(['install', '--global', '--prefix', replacement, tarball]);
-    for (const command of ['arc', 'arc-status']) {
-      assert.equal(installed(replacement, command, ['--version']).trim(), packageJson.version);
     }
 
     npm(['install', tarball]);

@@ -6,16 +6,38 @@ import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
-import { buildSync } from 'esbuild';
+import { buildSync, transformSync } from 'esbuild';
+import { inflateRawSync } from 'node:zlib';
+import * as vm from 'node:vm';
 import ts from 'typescript';
 import { browserBundle, exportBrowserAssets } from './panelbundle.ts';
+import { BundledTools, readToolPackage } from './bundledtools.ts';
+import {
+  appendedUserPath,
+  appendWindowsUserPath,
+  existingToolCommands,
+  manualToolPath,
+  terminalToolPath,
+} from './toolpath.ts';
+import { admitToolPath, canonicalToolPath } from './toolownership.ts';
 import { childEnv } from './agenthost.ts';
 import { callSources, declarationSource, sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
 
 const extensionRoot = path.join(__dirname, '..');
 
 function overlayStaticSources(source: string): void {
+  fs.copyFileSync(
+    path.join(extensionRoot, 'scripts/bundled-tools.mjs'),
+    path.join(source, 'scripts/bundled-tools.mjs'),
+  );
+  fs.copyFileSync(path.join(extensionRoot, '../LICENSE'), path.join(source, '../LICENSE'));
+  fs.cpSync(path.join(extensionRoot, '../plugins'), path.join(source, '../plugins'), { recursive: true });
   for (const file of [
+    'bundledsetup.ts',
+    'bundledtools.ts',
+    'toolownership.ts',
+    'toolpath.ts',
+    'claudeplugin.ts',
     'panelbundle.ts',
     'sessionexport.ts',
     'exportdata.ts',
@@ -100,6 +122,7 @@ test('build identity covers host, browser, worker, and version inputs', () => {
         ...sourceInputs('src/extension.ts'),
         ...sourceInputs('src/progressiveworker-entry.ts'),
         ...sourceInputs('../cli/src/main.ts'),
+        ...sourceInputs('src/bundledsetup.ts'),
         ...browserBundle().inputs,
         ...exportBrowserAssets().inputs,
         'src/webview/panel.css',
@@ -109,6 +132,12 @@ test('build identity covers host, browser, worker, and version inputs', () => {
         'resources/windowpipe.exe',
         'resources/windowpipe.json',
         '../scripts/windowpipe-build.mjs',
+        'scripts/bundled-tools.mjs',
+        '../LICENSE',
+        '../plugins/arc-hooks/LICENSE',
+        ...Object.keys(readToolPackage(path.join(extensionRoot, 'dist')).payload.files)
+          .filter((file) => file.startsWith('plugin/') && file !== 'plugin/LICENSE')
+          .map((file) => '../plugins/arc-hooks/' + file.slice(7)),
       ].map((file) => path.relative(extensionRoot, path.resolve(extensionRoot, file)).split(path.sep).join('/')),
     ),
   ].sort();
@@ -418,11 +447,15 @@ test('the extension package contains exactly the intended files', () => {
       'dist/build-identity.json',
       'dist/extension.js',
       'dist/cli.cjs',
+      'dist/setup.cjs',
       'dist/export-viewer.js',
       'dist/export-viewer.css',
       'dist/windowpipe.exe',
       'dist/bin/arc',
       'dist/bin/arc.cmd',
+      ...Object.keys(readToolPackage(path.join(extensionRoot, 'dist')).payload.files).map(
+        (file) => 'dist/tools/' + file,
+      ),
       'package.json',
     ].sort(),
     'the VSIX candidate list changed; review the new file and update this allowlist only when it belongs',
@@ -952,3 +985,325 @@ test('forgetting panel state also clears persisted usage and its reset timer', (
   );
   sourceMatch(body, /await usageWrites\.drain\(\)/, 'shutdown can race the queued write that clears remembered usage');
 });
+
+test('installed absolute commands run offline after their extension payload disappears and ignore caller software roots', async () => {
+  const root = tempDir('arc-durable-commands-');
+  const dist = path.join(root, 'extension payload');
+  fs.cpSync(path.join(extensionRoot, 'dist'), dist, { recursive: true });
+  const tools = new BundledTools(readToolPackage(dist), path.join(root, 'software with spaces & marks'));
+  const signal = new AbortController().signal;
+  const absolute = await tools.installCommands(process.execPath, signal);
+  assert.deepEqual(fs.readdirSync(path.dirname(absolute)).sort(), ['.arc-commands.json', 'arc', 'arc.cmd', 'run.cjs']);
+  fs.renameSync(dist, dist + '.unavailable');
+  const env = {
+    ...process.env,
+    ARC_HOME: path.join(root, 'data only'),
+    CLAUDE_CONFIG_DIR: path.join(root, 'no claude'),
+    PATH: '',
+    ARC_WINDOW: 'originating-window',
+    ELECTRON_RUN_AS_NODE: undefined,
+  };
+  const shells =
+    process.platform === 'win32'
+      ? [
+          {
+            command: process.env.ComSpec ?? 'C:/Windows/System32/cmd.exe',
+            args: ['/d', '/s', '/c'],
+            quote: (value: string) => '"' + value + '"',
+          },
+          {
+            command: 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+            args: ['-NoProfile', '-EncodedCommand'],
+            quote: (value: string) => "& '" + value.replaceAll("'", "''") + "'",
+          },
+        ]
+      : [{ command: '/bin/sh', args: ['-c'], quote: (value: string) => "'" + value.replaceAll("'", "'\\''") + "'" }];
+  for (const shell of shells) {
+    const run = (args: string, input = '', command = absolute) => {
+      const line = shell.quote(command) + ' ' + args;
+      const script = shell.args.includes('-EncodedCommand')
+        ? Buffer.from(line, 'utf16le').toString('base64')
+        : shell.args.includes('/s')
+          ? '"' + line + '"'
+          : line;
+      return spawnSync(shell.command, [...shell.args, script], {
+        cwd: root,
+        env,
+        input,
+        encoding: 'utf8',
+        windowsVerbatimArguments: shell.args.includes('/c'),
+      });
+    };
+    const version = run('--version');
+    assert.equal(version.status, 0, version.stderr);
+    assert.equal(
+      version.stdout.trim(),
+      JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+    );
+    const status = run('statusline --json', '{}');
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
+    const invalid = run('--invalid-option');
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, /invalid|unknown|Unknown|unrecognized/i);
+  }
+  assert.equal(fs.existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'plugins')), false);
+});
+
+test('damaged bundled bytes and unfamiliar installed files preserve the previous command selection', async () => {
+  const root = tempDir('arc-damaged-payload-');
+  const dist = path.join(root, 'extension');
+  fs.cpSync(path.join(extensionRoot, 'dist'), dist, { recursive: true });
+  const tools = new BundledTools(readToolPackage(dist), path.join(root, 'software'));
+  const signal = new AbortController().signal;
+  await tools.installCommands(process.execPath, signal);
+  const active = fs.readFileSync(path.join(tools.tools, 'active.json'));
+  const identityPath = path.join(dist, 'build-identity.json');
+  const identityBytes = fs.readFileSync(identityPath);
+  const identity = JSON.parse(identityBytes.toString('utf8'));
+  identity.tools.contentId = '0'.repeat(64);
+  fs.writeFileSync(identityPath, JSON.stringify(identity));
+  assert.throws(() => readToolPackage(dist), /identity is damaged/);
+  fs.writeFileSync(identityPath, identityBytes);
+  fs.appendFileSync(path.join(dist, 'tools/cli/arc.cjs'), '\n// damaged fixture\n');
+  assert.throws(() => readToolPackage(dist), /damaged/);
+  await assert.rejects(tools.installCommands(process.execPath, signal), /damaged/);
+  assert.deepEqual(fs.readFileSync(path.join(tools.tools, 'active.json')), active);
+  fs.writeFileSync(path.join(tools.root, 'bin', 'unfamiliar'), 'keep');
+  const fresh = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), tools.root);
+  await assert.rejects(fresh.installCommands(process.execPath, signal), /unfamiliar/);
+  assert.equal(fs.readFileSync(path.join(tools.root, 'bin', 'unfamiliar'), 'utf8'), 'keep');
+  assert.deepEqual(fs.readFileSync(path.join(tools.tools, 'active.json')), active);
+  for (const platform of ['win32', 'darwin', 'linux'] as const)
+    assert.doesNotThrow(() => readToolPackage(path.join(extensionRoot, 'dist'), platform));
+  assert.throws(() => readToolPackage(path.join(extensionRoot, 'dist'), 'freebsd'), /support/);
+});
+
+test.each(['win32', 'darwin', 'linux'] as const)(
+  'command setup retains absolute launchers without publishing separator-containing PATH entries on %s',
+  async (platform) => {
+    const source = fs.readFileSync(path.join(extensionRoot, 'src/extension.ts'), 'utf8');
+    const [setup] = callSources(source, 'vscode.commands.registerCommand', 'arc.setupCommands');
+    assert.ok(setup);
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const root = platform === 'win32' ? 'C:/Arc;Tools' : '/home/user/arc:tools';
+    const executable = paths.join(root, 'bin', platform === 'win32' ? 'arc.cmd' : 'arc');
+    const appended: unknown[][] = [];
+    const messages: string[] = [];
+    const errors: string[] = [];
+    let installed = 0;
+    let run: (() => Promise<void>) | undefined;
+    vm.runInNewContext(transformSync(setup, { loader: 'ts', target: 'node18' }).code, {
+      path: paths,
+      process: { platform, env: {}, cwd: () => '/project' },
+      AbortController,
+      context: { environmentVariableCollection: { append: (...args: unknown[]) => appended.push(args) } },
+      bundledTools: {
+        root,
+        installCommands: async () => {
+          installed += 1;
+          return executable;
+        },
+      },
+      workspaceCwd: () => '/project',
+      resolveToolRuntime: () => process.execPath,
+      existingToolCommands: () => [],
+      manualToolPath,
+      terminalToolPath: (bin: string) => terminalToolPath(bin, platform),
+      appendWindowsUserPath: () => {
+        throw new Error('persistent PATH was requested');
+      },
+      vscode: {
+        workspace: { isTrusted: true },
+        commands: {
+          registerCommand: (_name: string, callback: () => Promise<void>) => {
+            run = callback;
+          },
+        },
+        window: {
+          showInformationMessage: async (message: string, _options: unknown, choice?: string) => {
+            messages.push(message);
+            return choice === 'Install' ? 'Install' : 'Skip';
+          },
+          showErrorMessage: (message: string) => errors.push(message),
+        },
+      },
+    });
+    assert.ok(run);
+    await run();
+    assert.equal(installed, 1);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(appended, [], platform);
+    assert.ok(messages.at(-1)?.includes(executable));
+    assert.doesNotMatch(messages.at(-1)!, /New editor terminals include|export PATH|fish_add_path/);
+    assert.doesNotMatch(manualToolPath('/home/user/arc:tools/bin'), /export PATH|fish_add_path/);
+  },
+);
+
+test('PATH append preserves raw Windows entries, registry representation and existing command precedence', () => {
+  for (const kind of ['String', 'ExpandString'] as const) {
+    const previous = { value: '%USERPROFILE%\\old;"C:\\quoted dir";;C:\\other;', kind };
+    const result = appendedUserPath(previous, 'C:\\Arc Bin');
+    assert.deepEqual(result, { value: previous.value + 'C:\\Arc Bin', kind });
+    assert.equal(appendedUserPath(result, 'c:/arc bin/'), result);
+  }
+  assert.throws(() => appendedUserPath({ value: null, kind: 'String' }, 'C:/arc;wrong'), /cannot/);
+  assert.deepEqual(terminalToolPath('C:/Arc Bin', 'win32'), { variable: 'Path', value: ';C:/Arc Bin' });
+  for (const platform of ['darwin', 'linux'] as const)
+    assert.deepEqual(terminalToolPath('/home/user/arc;tools/bin', platform), {
+      variable: 'PATH',
+      value: ':/home/user/arc;tools/bin',
+    });
+  const root = tempDir('arc-existing-command-');
+  fs.writeFileSync(path.join(root, 'arc.cmd'), '@echo off');
+  fs.writeFileSync(path.join(root, 'arc'), '#!/bin/sh');
+  fs.chmodSync(path.join(root, 'arc'), 0o755);
+  assert.equal(existingToolCommands({ PATH: root }, 'win32')[0], path.join(root, 'arc'));
+  if (process.platform !== 'win32') {
+    for (const platform of ['linux', 'darwin'] as const)
+      assert.equal(existingToolCommands({ PATH: root }, platform)[0], path.join(root, 'arc'));
+  }
+  assert.match(manualToolPath('/home/user/arc tools'), /first available ~\/.bash_profile/);
+  assert.match(manualToolPath('/home/user/arc tools'), /ZDOTDIR/);
+  assert.match(manualToolPath('/home/user/arc tools'), /fish_add_path --append --path/);
+  assert.throws(() => admitToolPath('relative'), /absolute/);
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  const previous = { value: '%USERPROFILE%\\old;"C:\\quoted dir";;', kind: 'String' as const };
+  const writes: unknown[] = [];
+  const execute = (script: string) => {
+    assert.equal(fs.existsSync(path.join(root, '.arc-command-path.lock')), true);
+    const encoded = /FromBase64String\('([^']+)'\)/.exec(script);
+    if (!encoded) return JSON.stringify(previous);
+    const change = JSON.parse(Buffer.from(encoded[1], 'base64').toString('utf8'));
+    assert.deepEqual(change.previous, previous);
+    assert.deepEqual(change.next, appendedUserPath(previous, canonicalToolPath(bin)));
+    assert.throws(() => appendWindowsUserPath(root, root, 'win32', execute), /Another Arc setup/);
+    writes.push(change);
+    return 'appended';
+  };
+  assert.equal(appendWindowsUserPath(bin, root, 'win32', execute), 'appended');
+  assert.equal(writes.length, 1);
+  assert.equal(fs.existsSync(path.join(root, '.arc-command-path.lock')), false);
+  assert.equal(
+    appendWindowsUserPath(bin, root, 'win32', () => JSON.stringify({ value: bin, kind: 'ExpandString' })),
+    'present',
+  );
+  assert.throws(
+    () => appendWindowsUserPath(bin, root, 'win32', () => JSON.stringify({ value: 'x', kind: 'DWord' })),
+    /unsupported/,
+  );
+  assert.throws(() => appendWindowsUserPath(bin, root, 'linux', execute), /only on Windows/);
+});
+
+test('copied bundled hooks capture baselines and publish Stop after the extension payload disappears', async () => {
+  const root = tempDir('arc-installed-hooks-');
+  const dist = path.join(root, 'extension');
+  fs.cpSync(path.join(extensionRoot, 'dist'), dist, { recursive: true });
+  const tools = new BundledTools(readToolPackage(dist), path.join(root, 'software'));
+  const release = await tools.owned(async () => tools.stage(), new AbortController().signal);
+  fs.renameSync(dist, dist + '.unavailable');
+  const cwd = path.join(root, 'project');
+  fs.mkdirSync(cwd);
+  const file = path.join(cwd, 'changed.txt');
+  fs.writeFileSync(file, 'original bytes\n');
+  const env = {
+    ...process.env,
+    ARC_HOME: path.join(root, 'data'),
+    ARC_IGNORE_ROOTS: path.join(root, 'excluded'),
+    PATH: '',
+    ELECTRON_RUN_AS_NODE: undefined,
+  };
+  const session = 'installed-hook-fixture';
+  const hook = (name: string) =>
+    spawnSync(process.execPath, [path.join(release, 'plugin/scripts', name)], {
+      cwd,
+      env,
+      input: JSON.stringify({ session_id: session, cwd, tool_input: { file_path: file } }),
+      encoding: 'utf8',
+    });
+  const before = hook('pretooluse-snapshot.cjs');
+  assert.equal(before.status, 0, before.stderr);
+  const snapshots = path.join(env.ARC_HOME, 'snapshots', session);
+  const baselines = fs.readdirSync(path.join(snapshots, 'baseline'));
+  assert.equal(baselines.length, 1);
+  assert.equal(fs.readFileSync(path.join(snapshots, 'baseline', baselines[0]), 'utf8'), 'original bytes\n');
+  fs.writeFileSync(file, 'changed bytes\n');
+  const stopped = hook('stop-manifest.cjs');
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.equal(fs.existsSync(path.join(snapshots, 'trigger')), true);
+});
+test('packaged tool modes pass Unix payload admission from archive attributes', () => {
+  const root = tempDir('arc-vsix-modes-');
+  const archive = path.join(root, 'arc.vsix');
+  const packaged = spawnSync(process.execPath, ['scripts/package.mjs', '--out', archive], {
+    cwd: extensionRoot,
+    encoding: 'utf8',
+  });
+  assert.equal(packaged.status, 0, packaged.stderr);
+  const identity = readToolPackage(path.join(extensionRoot, 'dist')).payload;
+  const bytes = fs.readFileSync(archive);
+  const extracted = path.join(root, 'tools');
+  const modes = new Map<string, number>();
+  let end = bytes.length - 22;
+  while (end >= 0 && bytes.readUInt32LE(end) !== 0x06054b50) end--;
+  assert.ok(end >= 0);
+  for (let at = bytes.readUInt32LE(end + 16); at < end;) {
+    assert.equal(bytes.readUInt32LE(at), 0x02014b50);
+    const length = bytes.readUInt16LE(at + 28);
+    const name = bytes.toString('utf8', at + 46, at + 46 + length);
+    if (name.startsWith('extension/dist/tools/')) {
+      const relative = name.slice('extension/dist/tools/'.length);
+      assert.ok(identity.files[relative]);
+      assert.equal(bytes[at + 5], 3);
+      const file = path.join(extracted, relative);
+      const local = bytes.readUInt32LE(at + 42);
+      const start = local + 30 + bytes.readUInt16LE(local + 26) + bytes.readUInt16LE(local + 28);
+      const compressed = bytes.subarray(start, start + bytes.readUInt32LE(at + 20));
+      const content = bytes.readUInt16LE(at + 10) === 0 ? compressed : inflateRawSync(compressed);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, content);
+      modes.set(file, bytes.readUInt32LE(at + 38) >>> 16);
+    }
+    at += 46 + length + bytes.readUInt16LE(at + 30) + bytes.readUInt16LE(at + 32);
+  }
+  const source = fs.readFileSync(path.join(extensionRoot, 'src/bundledtools.ts'), 'utf8');
+  const functionSource = source
+    .slice(source.indexOf('export function validateToolFiles'), source.indexOf('export function readToolPackage'))
+    .replace('export function', 'function');
+  const compiled = transformSync(functionSource + '\nmodule.exports = validateToolFiles;', { loader: 'ts' }).code;
+  for (const platform of ['linux', 'darwin']) {
+    const module = { exports: undefined as unknown as typeof import('./bundledtools').validateToolFiles };
+    vm.runInNewContext(compiled, {
+      module,
+      fs: { ...fs, statSync: (file: string) => ({ mode: modes.get(file) }) },
+      path,
+      filesIn: (folder: string) => {
+        assert.equal(folder, extracted);
+        return [...modes.keys()].map((file) => path.relative(extracted, file).split(path.sep).join('/')).sort();
+      },
+      digest: (content: Buffer) => createHash('sha256').update(content).digest('hex'),
+      process: { platform },
+    });
+    module.exports(extracted, identity.files);
+  }
+  const inspected = spawnSync(process.execPath, ['scripts/check-vsix.mjs', archive], {
+    cwd: extensionRoot,
+    encoding: 'utf8',
+  });
+  assert.equal(inspected.status, 0, inspected.stderr);
+  const damaged = Buffer.from(bytes);
+  for (let at = damaged.readUInt32LE(end + 16); at < end;) {
+    const length = damaged.readUInt16LE(at + 28);
+    if (damaged.toString('utf8', at + 46, at + 46 + length) === 'extension/dist/tools/LICENSE')
+      damaged.writeUInt32LE((0o100666 << 16) >>> 0, at + 38);
+    at += 46 + length + damaged.readUInt16LE(at + 30) + damaged.readUInt16LE(at + 32);
+  }
+  const corruptArchive = path.join(root, 'wrong-mode.vsix');
+  fs.writeFileSync(corruptArchive, damaged);
+  const rejected = spawnSync(process.execPath, ['scripts/check-vsix.mjs', corruptArchive], {
+    cwd: extensionRoot,
+    encoding: 'utf8',
+  });
+  assert.notEqual(rejected.status, 0, 'VSIX inspection accepted unsupported tool permissions');
+}, 30_000);
