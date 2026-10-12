@@ -38,6 +38,7 @@ function help(): string {
     '--window selects an Arc window. Otherwise ARC_WINDOW or one unambiguous live window selects it.',
     '--request-id accepts a fresh ID prefixed with the selected window hostId and a colon.',
     'Start and curation accept identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',
+    'Start --untagged keeps work the reader asked for, with prompt-box continuation. --agent-run files delegated work under Run by agents.',
     'Never retry a compaction request with uncertain admission.',
     'Send delivers a follow-up to an idle session that the calling session started with --arc-dispatch in that window. The observation comes from arc session --json.',
   ].join('\n');

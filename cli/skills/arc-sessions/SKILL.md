@@ -1,6 +1,6 @@
 ---
 name: arc-sessions
-description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, send a follow-up to a session this session started, label, pin or archive sessions, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
+description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, send a follow-up to a session this session started, label, pin or archive sessions, link to a session in a reply, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
 ---
 
 # Arc sessions
